@@ -306,6 +306,19 @@ func allRoutes() []route {
 		{"find by registry number", http.MethodGet, "/v1/entities/by-registry-number?registration_number=RC-1", "", http.StatusOK, ""},
 		{"list registry conflicts", http.MethodGet, "/v1/registry-conflicts", "", http.StatusOK, ""},
 		{"resolve registry conflict", http.MethodPost, "/v1/registry-conflicts/conflict-1/resolution", `{"status":"DISMISSED","resolution_note":"n"}`, http.StatusNoContent, "conflict-1"},
+
+		// ── ORG-03 Draft → Verified → Active; merge ─────────────────────────
+		{"request entity verification", http.MethodPost, "/v1/entities/" + entityID + "/verification", `{"verification_evidence_ref":"x"}`, http.StatusAccepted, entityID},
+		{"activate legal entity", http.MethodPost, "/v1/entities/" + entityID + "/activation", `{"reason":"r"}`, http.StatusOK, entityID},
+		{"merge duplicate candidate", http.MethodPost, "/v1/entities/" + entityID + "/merge", `{"survivor_legal_entity_id":"s","reason":"r"}`, http.StatusAccepted, entityID},
+		{"unmerge entity", http.MethodPost, "/v1/entities/" + entityID + "/unmerge", `{"reason":"r"}`, http.StatusAccepted, entityID},
+		{"list entity merge records", http.MethodGet, "/v1/entities/" + entityID + "/merge-records", "", http.StatusOK, entityID},
+
+		// ── Verified maker-checker ──────────────────────────────────────────
+		{"list approval requests", http.MethodGet, "/v1/approval-requests?status=all", "", http.StatusOK, ""},
+		{"get approval request", http.MethodGet, "/v1/approval-requests/apr-1", "", http.StatusOK, "apr-1"},
+		{"approve request", http.MethodPost, "/v1/approval-requests/apr-1/approve", `{"payload_fingerprint":"f"}`, http.StatusOK, "apr-1"},
+		{"reject request", http.MethodPost, "/v1/approval-requests/apr-1/reject", `{"note":"no"}`, http.StatusOK, "apr-1"},
 	}
 }
 
@@ -379,6 +392,13 @@ func TestWriteErr_SentinelToStatus(t *testing.T) {
 		{"invalid input", registry.ErrInvalidInput, http.StatusBadRequest},
 		{"conflict", registry.ErrConflict, http.StatusConflict},
 		{"region unresolved", registry.ErrRegionUnresolved, http.StatusConflict},
+		{"approval required", registry.ErrApprovalRequired, http.StatusUnprocessableEntity},
+		{"self approval", registry.ErrSelfApproval, http.StatusForbidden},
+		{"approval not pending", registry.ErrApprovalNotPending, http.StatusConflict},
+		{"fingerprint mismatch", registry.ErrApprovalFingerprintMismatch, http.StatusConflict},
+		{"approval already pending", registry.ErrApprovalPending, http.StatusConflict},
+		{"onboarding key required", registry.ErrOnboardingKeyRequired, http.StatusUnprocessableEntity},
+		{"entity not operational", registry.ErrEntityNotOperational, http.StatusConflict},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := do(newRouter(&stubSvc{err: tc.err}), http.MethodGet, "/v1/tenants/"+tenantID, "")
@@ -593,5 +613,32 @@ func TestRouteTable_CoversEveryRegisteredRoute(t *testing.T) {
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		t.Fatalf("registered routes with no entry in allRoutes(): %s", strings.Join(missing, ", "))
+	}
+}
+
+// A maker-checker command that was filed rather than executed is a 202 whose
+// body carries the approval request — on every route that can file one — and
+// never the 200/201 the command's own success would be.
+func TestWriteErr_PendingApprovalIs202WithTheRequest(t *testing.T) {
+	pending := &registry.PendingApprovalError{Request: &domain.ApprovalRequest{
+		ApprovalRequestID: "apr-9", PayloadFingerprint: "fp-9", Status: domain.ApprovalPending,
+	}}
+	for _, rt := range []struct{ method, path, body string }{
+		{http.MethodPost, "/v1/tenants/" + tenantID + "/commands/InitiateTermination", `{"reason":"r"}`},
+		{http.MethodPost, "/v1/entities/ent-1/legal-name", `{"legal_name":"X"}`},
+		{http.MethodPost, "/v1/entities/ent-1/profile-amendments", `{"legal_name":"X"}`},
+		{http.MethodPost, "/v1/registry-conflicts/c-1/resolution", `{"status":"DISMISSED","resolution_note":"n"}`},
+	} {
+		t.Run(rt.path, func(t *testing.T) {
+			rec := do(newRouter(&stubSvc{err: pending}), rt.method, rt.path, rt.body)
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("pending approval mapped to %d, want 202", rec.Code)
+			}
+			for _, want := range []string{`"PENDING_APPROVAL"`, `"apr-9"`, `"fp-9"`} {
+				if !strings.Contains(rec.Body.String(), want) {
+					t.Fatalf("202 body %s lacks %s", rec.Body.String(), want)
+				}
+			}
+		})
 	}
 }

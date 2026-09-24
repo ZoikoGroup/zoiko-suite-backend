@@ -37,6 +37,24 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// MakerCheckerLegacyBodyApprover restores the pre-000007 maker-checker, in
+	// which the maker names their own approver in the request body. A
+	// migration aid for the frontend only: refused in staging and production.
+	MakerCheckerLegacyBodyApprover bool
+
+	// ApprovalTTLHours is how long an approval request waits for a decision.
+	ApprovalTTLHours int
+
+	// LegacyEntityCreateActive creates legal entities straight into ACTIVE,
+	// skipping ORG-03's Draft → Verified gate. Frontend migration aid only:
+	// refused in staging and production.
+	LegacyEntityCreateActive bool
+
+	// OnboardingKeyOptional lets ProvisionTenant run without an
+	// external_customer_key. Migration aid only: refused in staging and
+	// production, where a keyless provision is a potential duplicate tenant.
+	OnboardingKeyOptional bool
 }
 
 type DBConfig struct {
@@ -161,6 +179,11 @@ func Load() (*Config, error) {
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+
+		MakerCheckerLegacyBodyApprover: strings.EqualFold(env("MAKER_CHECKER_LEGACY_BODY_APPROVER", "false"), "true"),
+		ApprovalTTLHours:               envInt("APPROVAL_TTL_HOURS", 168),
+		LegacyEntityCreateActive:       strings.EqualFold(env("LEGACY_ENTITY_CREATE_ACTIVE", "false"), "true"),
+		OnboardingKeyOptional:          strings.EqualFold(env("ONBOARDING_KEY_OPTIONAL", "false"), "true"),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -178,9 +201,25 @@ func (c *Config) validate() error {
 		return fmt.Errorf("PORT must be between 1 and 65535, got %d", c.Port)
 	}
 
+	if c.ApprovalTTLHours <= 0 {
+		return fmt.Errorf("APPROVAL_TTL_HOURS must be positive, got %d", c.ApprovalTTLHours)
+	}
+
 	isProdOrStaging := strings.EqualFold(c.Env, "production") || strings.EqualFold(c.Env, "staging")
 	if !isProdOrStaging {
 		return nil
+	}
+
+	// A self-asserted approver is exactly the defect 000007 fixes. Never in
+	// an environment where maker-checker has to mean something.
+	if c.MakerCheckerLegacyBodyApprover {
+		return fmt.Errorf("MAKER_CHECKER_LEGACY_BODY_APPROVER is not permitted in %s environment", c.Env)
+	}
+	if c.LegacyEntityCreateActive {
+		return fmt.Errorf("LEGACY_ENTITY_CREATE_ACTIVE is not permitted in %s environment", c.Env)
+	}
+	if c.OnboardingKeyOptional {
+		return fmt.Errorf("ONBOARDING_KEY_OPTIONAL is not permitted in %s environment", c.Env)
 	}
 
 	if c.DB.Password == "" {

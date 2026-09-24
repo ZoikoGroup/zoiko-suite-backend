@@ -175,6 +175,8 @@ func main() {
 
 	// ── 5. Service ───────────────────────────────────────────────────────────
 	svc := registry.NewService(pgStore, eventPublisher, authzClient, jurisdValidator, cfg.AuthZPlatformScopeID, log)
+	svc.ConfigureMakerChecker(cfg.MakerCheckerLegacyBodyApprover, time.Duration(cfg.ApprovalTTLHours)*time.Hour)
+	svc.ConfigureCompatibility(cfg.LegacyEntityCreateActive, cfg.OnboardingKeyOptional)
 
 	// ── 6. HTTP router ───────────────────────────────────────────────────────
 	r := chi.NewRouter()

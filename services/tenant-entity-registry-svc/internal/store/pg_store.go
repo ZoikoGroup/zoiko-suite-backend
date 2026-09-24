@@ -173,19 +173,37 @@ func (s *PgStore) CreateTenantWithDefaultResidencyPolicy(ctx context.Context, t 
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
+
+		// ORG-02 onboarding key FIRST, so a replay fails here — "this
+		// onboarding already happened" — and not on tenant_code, which would
+		// read as "that code is taken". The FK to tenants is deferred.
+		if t.ExternalCustomerKey != nil {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO tenant_onboarding_keys (external_customer_key, tenant_id, request_fingerprint)
+				VALUES ($1, $2, $3)`,
+				*t.ExternalCustomerKey, t.TenantID, t.ProvisioningFingerprint); err != nil {
+				if isUniqueViolation(err) {
+					return registry.ErrOnboardingKeyExists
+				}
+				return fmt.Errorf("onboarding key: %w", err)
+			}
+		}
+
 		tenantQuery := `
 			INSERT INTO tenants (
 				tenant_id, tenant_code, legal_name, trading_name, status,
 				default_currency_code, primary_timezone, primary_locale,
 				default_data_residency_policy_id, lifecycle_state,
-				created_at, updated_at, created_by_principal_id, updated_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+				created_at, updated_at, created_by_principal_id, updated_by_principal_id,
+				external_customer_key, onboarding_request_ref
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		`
 		if _, err := tx.Exec(ctx, tenantQuery,
 			t.TenantID, t.TenantCode, t.LegalName, t.TradingName, string(t.Status),
 			t.DefaultCurrencyCode, t.PrimaryTimezone, t.PrimaryLocale,
 			t.DefaultDataResidencyPolicyID, string(t.LifecycleState),
 			t.CreatedAt, now, t.CreatedByPrincipalID, t.CreatedByPrincipalID,
+			t.ExternalCustomerKey, t.OnboardingRequestRef,
 		); err != nil {
 			if isUniqueViolation(err) {
 				return fmt.Errorf("%w: tenant_code %s", registry.ErrConflict, t.TenantCode)
@@ -224,7 +242,9 @@ func (s *PgStore) GetTenantByID(ctx context.Context, tenantID string) (*domain.T
 			SELECT tenant_id, tenant_code, legal_name, trading_name, status,
 			       default_currency_code, primary_timezone, primary_locale,
 			       default_data_residency_policy_id, lifecycle_state, record_version,
-			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			       created_at, updated_at, created_by_principal_id, updated_by_principal_id,
+			       external_customer_key, onboarding_request_ref,
+			       provisioning_failure_reason, provisioning_failed_at
 			FROM tenants WHERE tenant_id = $1 AND tenant_id = $2
 		`
 		return tx.QueryRow(ctx, query, tenantID, tid).Scan(
@@ -232,6 +252,8 @@ func (s *PgStore) GetTenantByID(ctx context.Context, tenantID string) (*domain.T
 			&t.DefaultCurrencyCode, &t.PrimaryTimezone, &t.PrimaryLocale,
 			&t.DefaultDataResidencyPolicyID, &t.LifecycleState, &t.RecordVersion,
 			&t.CreatedAt, &t.UpdatedAt, &t.CreatedByPrincipalID, &t.UpdatedByPrincipalID,
+			&t.ExternalCustomerKey, &t.OnboardingRequestRef,
+			&t.ProvisioningFailureReason, &t.ProvisioningFailedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -312,7 +334,9 @@ func (s *PgStore) GetEntityByID(ctx context.Context, legalEntityID string) (*dom
 			       incorporation_date, default_currency_code, fiscal_calendar_id,
 			       parent_legal_entity_id, entity_status, primary_jurisdiction_id,
 			       data_residency_policy_id, record_version, created_at, updated_at,
-			       created_by_principal_id, updated_by_principal_id
+			       created_by_principal_id, updated_by_principal_id,
+			       verified_by_principal_id, verified_at, verification_evidence_ref,
+			       merged_into_legal_entity_id, merged_at
 			FROM legal_entities WHERE legal_entity_id = $1 AND tenant_id = $2
 		`
 		return tx.QueryRow(ctx, query, legalEntityID, tid).Scan(
@@ -322,6 +346,8 @@ func (s *PgStore) GetEntityByID(ctx context.Context, legalEntityID string) (*dom
 			&e.ParentLegalEntityID, &e.EntityStatus, &e.PrimaryJurisdictionID,
 			&e.DataResidencyPolicyID, &e.RecordVersion, &e.CreatedAt, &e.UpdatedAt,
 			&e.CreatedByPrincipalID, &e.UpdatedByPrincipalID,
+			&e.VerifiedByPrincipalID, &e.VerifiedAt, &e.VerificationEvidenceRef,
+			&e.MergedIntoLegalEntityID, &e.MergedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -342,7 +368,9 @@ func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string) ([]
 			       incorporation_date, default_currency_code, fiscal_calendar_id,
 			       parent_legal_entity_id, entity_status, primary_jurisdiction_id,
 			       data_residency_policy_id, record_version, created_at, updated_at,
-			       created_by_principal_id, updated_by_principal_id
+			       created_by_principal_id, updated_by_principal_id,
+			       verified_by_principal_id, verified_at, verification_evidence_ref,
+			       merged_into_legal_entity_id, merged_at
 			FROM legal_entities WHERE tenant_id = $1
 		`
 		rows, err := tx.Query(ctx, query, tenantID)
@@ -360,6 +388,8 @@ func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string) ([]
 				&e.ParentLegalEntityID, &e.EntityStatus, &e.PrimaryJurisdictionID,
 				&e.DataResidencyPolicyID, &e.RecordVersion, &e.CreatedAt, &e.UpdatedAt,
 				&e.CreatedByPrincipalID, &e.UpdatedByPrincipalID,
+				&e.VerifiedByPrincipalID, &e.VerifiedAt, &e.VerificationEvidenceRef,
+				&e.MergedIntoLegalEntityID, &e.MergedAt,
 			); err != nil {
 				return err
 			}

@@ -97,12 +97,24 @@ func (s *PgStore) ExecuteTenantCommand(ctx context.Context, p registry.TenantCom
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
 
+		// The approval that released this command, first: if it is no longer
+		// PENDING (another approver won, or it expired) nothing below runs.
+		if p.Approval != nil {
+			if err := decideApprovalTx(ctx, tx, tid, *p.Approval, domain.ApprovalApproved); err != nil {
+				return err
+			}
+		}
+
 		// UPDATE ... FROM (SELECT ... FOR UPDATE) rather than a subquery in
 		// RETURNING: a RETURNING subquery is not guaranteed to observe the
 		// pre-update row, so the evidence record could name the state the
 		// tenant was moved TO as the state it came FROM. The FOR UPDATE join
 		// reads the prior row and locks it in the same statement.
+		//
+		// The onboarding columns come back with the same statement, so the
+		// lineage record below carries the tenant's onboarding context.
 		var fromState string
+		var onboardRef, extKey *string
 		err := tx.QueryRow(ctx, `
 			UPDATE tenants t
 			   SET lifecycle_state         = $1,
@@ -119,10 +131,11 @@ func (s *PgStore) ExecuteTenantCommand(ctx context.Context, p registry.TenantCom
 			 WHERE t.tenant_id       = o.tenant_id
 			   AND t.record_version  = $7
 			   AND t.lifecycle_state = ANY($8)
-			RETURNING o.prev_state, t.record_version, t.status`,
+			RETURNING o.prev_state, t.record_version, t.status,
+			          t.onboarding_request_ref, t.external_customer_key`,
 			string(p.TargetState), nullableStatus(newStatus), now, p.ActorID,
 			p.TenantID, tid, p.ExpectedVersion, allowed,
-		).Scan(&fromState, &res.NewVersion, &res.Status)
+		).Scan(&fromState, &res.NewVersion, &res.Status, &onboardRef, &extKey)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return registry.ErrConflict
 		}
@@ -136,13 +149,23 @@ func (s *PgStore) ExecuteTenantCommand(ctx context.Context, p registry.TenantCom
 			INSERT INTO tenant_lifecycle_history (
 				lifecycle_event_id, tenant_id, from_state, to_state,
 				command_name, reason, actor_principal_id,
-				approved_by_principal_id, correlation_id, occurred_at
-			) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				approved_by_principal_id, correlation_id, occurred_at,
+				approval_request_id, onboarding_request_ref, external_customer_key
+			) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 			p.TenantID, fromState, string(p.TargetState),
 			string(p.Command), p.Reason, p.ActorID,
 			nullableString(p.ApprovedBy), nullableString(p.CorrelationID), now,
+			approvalID(p.Approval), onboardRef, extKey,
 		); err != nil {
 			return fmt.Errorf("lifecycle history insert: %w", err)
+		}
+
+		// AbandonProvisioning is §4.2's compensating cleanup; it commits with
+		// the move to TERMINATED or not at all.
+		if p.Command == domain.TenantCommandAbandonProvisioning {
+			if err := abandonProvisioningTx(ctx, tx, p.TenantID, p.ActorID, now); err != nil {
+				return err
+			}
 		}
 
 		return s.enqueue(ctx, tx, ev)
@@ -227,7 +250,8 @@ func (s *PgStore) ListTenantLifecycleHistory(ctx context.Context, tenantID strin
 		rows, err := tx.Query(ctx, `
 			SELECT lifecycle_event_id, tenant_id, from_state, to_state,
 			       command_name, reason, actor_principal_id,
-			       approved_by_principal_id, correlation_id, occurred_at
+			       approved_by_principal_id, correlation_id, occurred_at,
+			       approval_request_id, onboarding_request_ref, external_customer_key
 			  FROM tenant_lifecycle_history
 			 WHERE tenant_id = $1
 			 ORDER BY occurred_at DESC, lifecycle_event_id DESC`, tid)
@@ -243,6 +267,7 @@ func (s *PgStore) ListTenantLifecycleHistory(ctx context.Context, tenantID strin
 				&e.LifecycleEventID, &e.TenantID, &from, &e.ToState,
 				&e.CommandName, &e.Reason, &e.ActorPrincipalID,
 				&e.ApprovedByPrincipalID, &e.CorrelationID, &e.OccurredAt,
+				&e.ApprovalRequestID, &e.OnboardingRequestRef, &e.ExternalCustomerKey,
 			); err != nil {
 				return err
 			}
@@ -417,7 +442,8 @@ const profileVersionColumns = `
 	registered_office, incorporation_jurisdiction_id, default_currency_code,
 	effective_from, effective_to, recorded_at, superseded_at,
 	change_reason, source_evidence_ref, created_by_principal_id,
-	approved_by_principal_id`
+	approved_by_principal_id, approval_request_id,
+	lei, lei_source, lei_status, lei_verified_at`
 
 func scanProfileVersion(row pgx.Row) (*domain.LegalEntityProfileVersion, error) {
 	var v domain.LegalEntityProfileVersion
@@ -429,7 +455,8 @@ func scanProfileVersion(row pgx.Row) (*domain.LegalEntityProfileVersion, error) 
 		&office, &v.IncorporationJurisdictionID, &v.DefaultCurrencyCode,
 		&v.EffectiveFrom, &v.EffectiveTo, &v.RecordedAt, &v.SupersededAt,
 		&v.ChangeReason, &v.SourceEvidenceRef, &v.CreatedByPrincipalID,
-		&v.ApprovedByPrincipalID,
+		&v.ApprovedByPrincipalID, &v.ApprovalRequestID,
+		&v.LEI, &v.LEISource, &v.LEIStatus, &v.LEIVerifiedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -453,13 +480,15 @@ func (s *PgStore) CreateInitialProfileVersion(ctx context.Context, v *domain.Leg
 				profile_version_id, tenant_id, legal_entity_id, version_number,
 				legal_name, trading_name, registration_number,
 				incorporation_jurisdiction_id, default_currency_code,
-				effective_from, recorded_at, change_reason, created_by_principal_id
-			) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+				effective_from, recorded_at, change_reason, created_by_principal_id,
+				lei, lei_source, lei_status, lei_verified_at
+			) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
 			v.ProfileVersionID, v.TenantID, v.LegalEntityID,
 			v.LegalName, v.TradingName, v.RegistrationNumber,
 			v.IncorporationJurisdictionID, v.DefaultCurrencyCode,
 			v.EffectiveFrom, time.Now().UTC(),
 			string(domain.ProfileChangeInitial), v.CreatedByPrincipalID,
+			v.LEI, v.LEISource, v.LEIStatus, v.LEIVerifiedAt,
 		)
 		return err
 	})
@@ -496,6 +525,13 @@ func (s *PgStore) AmendLegalProfile(
 	var out *domain.LegalEntityProfileVersion
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
+
+		// The approval that released this amendment, in the same transaction.
+		if next.Approval != nil {
+			if err := decideApprovalTx(ctx, tx, tid, *next.Approval, domain.ApprovalApproved); err != nil {
+				return err
+			}
+		}
 
 		// The version in force at the new version's effective instant. This is
 		// the one being superseded, which for a backdated amendment is NOT
@@ -558,8 +594,9 @@ func (s *PgStore) AmendLegalProfile(
 				registered_office, incorporation_jurisdiction_id, default_currency_code,
 				effective_from, effective_to, recorded_at,
 				change_reason, source_evidence_ref, created_by_principal_id,
-				approved_by_principal_id
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+				approved_by_principal_id, approval_request_id,
+				lei, lei_source, lei_status, lei_verified_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
 			RETURNING `+profileVersionColumns,
 			next.ProfileVersionID, next.TenantID, next.LegalEntityID, next.VersionNumber,
 			next.LegalName, next.TradingName, next.LegalFormCode, next.LegalFormSource,
@@ -567,7 +604,8 @@ func (s *PgStore) AmendLegalProfile(
 			next.RegisteredOffice, next.IncorporationJurisdictionID, next.DefaultCurrencyCode,
 			next.EffectiveFrom, next.EffectiveTo, now,
 			string(next.ChangeReason), next.SourceEvidenceRef, next.CreatedByPrincipalID,
-			next.ApprovedByPrincipalID,
+			next.ApprovedByPrincipalID, next.ApprovalRequestID,
+			next.LEI, next.LEISource, next.LEIStatus, next.LEIVerifiedAt,
 		)
 		created, err := scanProfileVersion(row)
 		if err != nil {
@@ -784,7 +822,7 @@ func (s *PgStore) FindActiveEntityByRegistry(ctx context.Context, registrationNu
 			       created_by_principal_id, updated_by_principal_id
 			  FROM legal_entities
 			 WHERE tenant_id = $1 AND registration_number = $2
-			   AND primary_jurisdiction_id = $3 AND entity_status = 'ACTIVE'
+			   AND primary_jurisdiction_id = $3 AND entity_status IN ('ACTIVE', 'DRAFT', 'VERIFIED')
 			 LIMIT 1`, tid, registrationNumber, jurisdictionID,
 		).Scan(
 			&e.LegalEntityID, &e.TenantID, &e.EntityCode, &e.LegalName, &e.TradingName,
@@ -842,6 +880,7 @@ func (s *PgStore) ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*
 			SELECT conflict_id, tenant_id, registration_number, jurisdiction_id,
 			       existing_legal_entity_id, attempted_payload, status,
 			       resolution_note, resolved_by_principal_id, resolved_at,
+			       approved_by_principal_id, approval_request_id,
 			       detected_at, detected_by_principal_id, correlation_id
 			  FROM entity_registry_conflicts
 			 WHERE tenant_id = $1`
@@ -862,6 +901,7 @@ func (s *PgStore) ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*
 				&c.ConflictID, &c.TenantID, &c.RegistrationNumber, &c.JurisdictionID,
 				&c.ExistingLegalEntityID, &payload, &c.Status,
 				&c.ResolutionNote, &c.ResolvedByPrincipalID, &c.ResolvedAt,
+				&c.ApprovedByPrincipalID, &c.ApprovalRequestID,
 				&c.DetectedAt, &c.DetectedByPrincipalID, &c.CorrelationID,
 			); err != nil {
 				return err
@@ -929,6 +969,14 @@ func nullableStatus(s domain.TenantStatus) *string {
 	}
 	v := string(s)
 	return &v
+}
+
+// approvalID is the approval_request_id column value for an optional decision.
+func approvalID(d *domain.ApprovalDecision) *string {
+	if d == nil {
+		return nil
+	}
+	return &d.ApprovalRequestID
 }
 
 func derefString(p *string) string {

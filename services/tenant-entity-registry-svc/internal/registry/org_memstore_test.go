@@ -34,6 +34,8 @@ type orgState struct {
 	lifecycle       map[string][]*domain.TenantLifecycleEvent      // by tenant_id
 	hostBindings    map[string]*domain.TenantHostBinding           // by hostname
 	conflicts       map[string]*domain.EntityRegistryConflict      // by conflict_id
+	approvals       map[string]*domain.ApprovalRequest             // by approval_request_id
+	gaps            *gapState                                      // 000008 state, see gaps_memstore_test.go
 	outboxRecords   []outbox.Record
 }
 
@@ -88,6 +90,13 @@ func (m *memStore) ExecuteTenantCommand(_ context.Context, p registry.TenantComm
 	if !allowed {
 		return nil, registry.ErrConflict
 	}
+	// The approval is decided in the same "transaction": if it is no longer
+	// pending, the command does not run.
+	if p.Approval != nil {
+		if err := m.decide(*p.Approval, domain.ApprovalApproved); err != nil {
+			return nil, err
+		}
+	}
 
 	from := t.LifecycleState
 	t.LifecycleState = p.TargetState
@@ -114,8 +123,12 @@ func (m *memStore) ExecuteTenantCommand(_ context.Context, p registry.TenantComm
 		Reason:                p.Reason,
 		ActorPrincipalID:      p.ActorID,
 		ApprovedByPrincipalID: approver,
+		ApprovalRequestID:     approvalRef(p.Approval),
 		OccurredAt:            time.Now().UTC(),
 	})
+	if p.Command == domain.TenantCommandAbandonProvisioning {
+		m.abandonProvisioning(p.TenantID)
+	}
 	m.record(ev)
 
 	return &registry.TenantCommandResult{
@@ -229,6 +242,11 @@ func (m *memStore) AmendLegalProfile(_ context.Context, legalEntityID string, ne
 	if !ok {
 		return nil, registry.ErrNotFound
 	}
+	if next.Approval != nil {
+		if err := m.decide(*next.Approval, domain.ApprovalApproved); err != nil {
+			return nil, err
+		}
+	}
 	versions := m.org().profileVersions[legalEntityID]
 
 	maxNum := 0
@@ -337,7 +355,14 @@ func (m *memStore) FindActiveEntityByRegistry(_ context.Context, registrationNum
 		if e.RegistrationNumber == nil || *e.RegistrationNumber != registrationNumber {
 			continue
 		}
-		if e.PrimaryJurisdictionID != jurisdictionID || e.EntityStatus != domain.EntityStatusActive {
+		// DRAFT and VERIFIED entities are claims too: a second draft for the
+		// same registry identity is the same duplicate, earlier.
+		switch e.EntityStatus {
+		case domain.EntityStatusActive, domain.EntityStatusDraft, domain.EntityStatusVerified:
+		default:
+			continue
+		}
+		if e.PrimaryJurisdictionID != jurisdictionID {
 			continue
 		}
 		// Lowest id wins, so the result is stable across map iteration order.
@@ -376,4 +401,12 @@ func (m *memStore) ResolveRegistryConflict(_ context.Context, conflictID string,
 	c.ResolvedByPrincipalID = &actorID
 	c.ResolvedAt = &now
 	return nil
+}
+
+func approvalRef(d *domain.ApprovalDecision) *string {
+	if d == nil {
+		return nil
+	}
+	id := d.ApprovalRequestID
+	return &id
 }

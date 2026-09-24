@@ -162,6 +162,12 @@ func (h *Handler) ProvisionTenant(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
+	// A repeated onboarding key returns the tenant it already created:
+	// 200, not 201, because nothing was created by THIS request.
+	if t.IdempotentReplay {
+		writeJSON(w, http.StatusOK, t)
+		return
+	}
 	writeJSON(w, http.StatusCreated, t)
 }
 
@@ -510,6 +516,16 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	// below because several of them wrap ErrConflict-adjacent meanings that a
 	// broader case would otherwise absorb, losing the distinction between
 	// "your version is stale" and "this tenant may not transact at all".
+	// Not a failure: a maker-checker command was filed rather than executed.
+	var pending *registry.PendingApprovalError
+	if errors.As(err, &pending) {
+		writeJSON(w, http.StatusAccepted, pendingApprovalResponse{
+			Status:          "PENDING_APPROVAL",
+			ApprovalRequest: pending.Request,
+		})
+		return
+	}
+
 	if status, msg, ok := mapORGError(err); ok {
 		writeErrJSON(w, status, msg, corrID)
 		return

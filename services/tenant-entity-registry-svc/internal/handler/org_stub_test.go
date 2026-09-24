@@ -119,3 +119,51 @@ func (s *stubSvc) ResolveRegistryConflict(_ context.Context, id string, _ domain
 	s.gotID = id
 	return s.err
 }
+
+// ── Verified maker-checker ──────────────────────────────────────────────────
+
+func (s *stubSvc) ListApprovalRequests(context.Context, bool) ([]*domain.ApprovalRequest, error) {
+	return []*domain.ApprovalRequest{}, s.err
+}
+
+func (s *stubSvc) GetApprovalRequest(_ context.Context, id string) (*domain.ApprovalRequest, error) {
+	s.gotID = id
+	return &domain.ApprovalRequest{ApprovalRequestID: id}, s.err
+}
+
+func (s *stubSvc) ApproveRequest(_ context.Context, id string, _ domain.ApproveRequestBody) (*domain.ApprovalOutcome, error) {
+	s.gotID = id
+	return &domain.ApprovalOutcome{}, s.err
+}
+
+func (s *stubSvc) RejectRequest(_ context.Context, id string, _ domain.RejectRequestBody) (*domain.ApprovalRequest, error) {
+	s.gotID = id
+	return &domain.ApprovalRequest{ApprovalRequestID: id}, s.err
+}
+
+// ── ORG-03 verification and merge ───────────────────────────────────────────
+
+func (s *stubSvc) RequestEntityVerification(_ context.Context, id string, _ domain.RequestEntityVerificationRequest) error {
+	s.gotID = id
+	return s.err
+}
+
+func (s *stubSvc) ActivateLegalEntity(_ context.Context, id string, _ domain.ActivateLegalEntityRequest) (*domain.LegalEntity, error) {
+	s.gotID = id
+	return &domain.LegalEntity{LegalEntityID: id, EntityStatus: domain.EntityStatusActive}, s.err
+}
+
+func (s *stubSvc) MergeDuplicateCandidate(_ context.Context, id string, _ domain.MergeDuplicateCandidateRequest) error {
+	s.gotID = id
+	return s.err
+}
+
+func (s *stubSvc) UnmergeEntity(_ context.Context, id string, _ domain.UnmergeEntityRequest) error {
+	s.gotID = id
+	return s.err
+}
+
+func (s *stubSvc) ListEntityMergeRecords(_ context.Context, id string) ([]*domain.EntityMergeRecord, error) {
+	s.gotID = id
+	return []*domain.EntityMergeRecord{}, s.err
+}

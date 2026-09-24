@@ -198,7 +198,12 @@ func (s *Service) BindTenantHost(ctx context.Context, tenantID string, req domai
 	if err := s.assertTenantScope(ctx, tenantID); err != nil {
 		return nil, err
 	}
-	if err := s.authorize(ctx, "tenant", "host-binding.create"); err != nil {
+	// A hostname→tenant mapping is a hard isolation identifier (ORG-02 §4.2
+	// "tenant admin cannot change hard isolation identifiers"): it decides
+	// which tenant every request on that host is resolved to. Evaluated in the
+	// PLATFORM scope, so no tenant-scope grant — a tenant admin's — can make
+	// one.
+	if err := s.authorizeIn(ctx, s.platformScopeID, "tenant", "host-binding.create"); err != nil {
 		return nil, err
 	}
 	if err := s.assertTenantMayTransact(ctx, tenantID); err != nil {
@@ -273,15 +278,19 @@ func (s *Service) ExecuteTenantCommand(
 
 	actor := domain.PrincipalFromContext(ctx)
 
-	// Maker-checker. The database CHECK enforces approver != actor
-	// independently, so this is the readable refusal rather than the only one.
-	if command.RequiresMakerChecker() {
-		if strings.TrimSpace(req.ApprovedByPrincipalID) == "" {
-			return nil, fmt.Errorf("%w: %s requires approved_by_principal_id", ErrApprovalRequired, command)
+	// A body-supplied approver is refused outright, on EVERY command. On a
+	// maker-checker command it was the self-asserted approval; on any other it
+	// was worse — written into lifecycle history as an approver of record for
+	// a command nobody approved. Checked before anything is read so the
+	// refusal does not depend on the tenant's state.
+	if s.legacyBodyApprover {
+		if command.RequiresMakerChecker() {
+			if err := s.legacyApproverCheck(req.ApprovedByPrincipalID, actor, string(command)); err != nil {
+				return nil, err
+			}
 		}
-		if req.ApprovedByPrincipalID == actor {
-			return nil, fmt.Errorf("%w: %s cannot be self-approved", ErrApprovalRequired, command)
-		}
+	} else if strings.TrimSpace(req.ApprovedByPrincipalID) != "" {
+		return nil, errBodyApprover
 	}
 
 	// Read to establish the version to guard on, and to give a precise refusal
@@ -310,31 +319,96 @@ func (s *Service) ExecuteTenantCommand(
 			ErrVersionConflict, expected, t.RecordVersion)
 	}
 
-	ev, err := s.tenantCommandEvent(ctx, t, command, target, req)
+	// RetryProvisioning re-runs the failed provisioning step rather than
+	// only moving the state.
+	if command == domain.TenantCommandRetryProvisioning {
+		return s.retryProvisioning(ctx, t, expected, req)
+	}
+
+	// §4.2 maker-checker on creation: the tenant may not leave ONBOARDING
+	// until a second principal has approved its creation.
+	if command == domain.TenantCommandActivate && t.LifecycleState == domain.TenantLifecycleOnboarding {
+		if err := s.requireCreationApproval(ctx, t); err != nil {
+			return nil, err
+		}
+	}
+
+	// §4.2 maker-checker on termination: file, do not execute. The command
+	// runs when a different verified principal approves it.
+	if command.RequiresMakerChecker() && !s.legacyBodyApprover {
+		req.ExpectedVersion = expected
+		req.ApprovedByPrincipalID = ""
+		a, err := s.propose(ctx, proposal{
+			subjectType:     domain.ApprovalSubjectTenantCommand,
+			tenantID:        tenantID,
+			subjectID:       tenantID,
+			command:         string(command),
+			expectedVersion: expected,
+			reason:          req.Reason,
+			payload:         req,
+			correlationID:   req.CorrelationID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return nil, &PendingApprovalError{Request: a}
+	}
+
+	return s.applyTenantCommand(ctx, t, command, target, allowedFrom, expected, req, actor, nil)
+}
+
+// applyTenantCommand writes a validated lifecycle command.
+//
+// maker is the principal of record for the command. d, when non-nil, is the
+// verified approval that released it: its decider becomes the approver of
+// record and the approval is marked APPROVED in the same transaction. When d
+// is nil the approver is the legacy body field, which is empty outside legacy
+// mode for every command that reaches here.
+func (s *Service) applyTenantCommand(
+	ctx context.Context,
+	t *domain.Tenant,
+	command domain.TenantCommand,
+	target domain.TenantLifecycleState,
+	allowedFrom []domain.TenantLifecycleState,
+	expected int64,
+	req domain.ExecuteTenantCommandRequest,
+	maker string,
+	d *domain.ApprovalDecision,
+) (*TenantCommandResult, error) {
+	approver := req.ApprovedByPrincipalID
+	approvalID := ""
+	if d != nil {
+		approver = d.DecidedByPrincipalID
+		approvalID = d.ApprovalRequestID
+	}
+
+	ev, err := s.tenantCommandEvent(t, command, target, req, maker, approver, approvalID)
 	if err != nil {
 		return nil, err
 	}
 
 	res, err := s.store.ExecuteTenantCommand(ctx, TenantCommandParams{
-		TenantID:        tenantID,
+		TenantID:        t.TenantID,
 		Command:         command,
 		TargetState:     target,
 		AllowedFrom:     allowedFrom,
 		ExpectedVersion: expected,
 		Reason:          req.Reason,
-		ActorID:         actor,
-		ApprovedBy:      req.ApprovedByPrincipalID,
+		ActorID:         maker,
+		ApprovedBy:      approver,
 		CorrelationID:   req.CorrelationID,
+		Approval:        d,
 	}, ev)
 	if err != nil {
 		return nil, err
 	}
 
 	s.log.Info("tenant lifecycle command applied",
-		zap.String("tenant_id", tenantID),
+		zap.String("tenant_id", t.TenantID),
 		zap.String("command", string(command)),
 		zap.String("from", string(res.FromState)),
 		zap.String("to", string(res.ToState)),
+		zap.String("approval_request_id", approvalID),
 		zap.String("correlation_id", req.CorrelationID),
 	)
 	return res, nil
@@ -342,32 +416,42 @@ func (s *Service) ExecuteTenantCommand(
 
 // tenantCommandEvent renders the outbox event for a lifecycle command.
 func (s *Service) tenantCommandEvent(
-	ctx context.Context,
 	t *domain.Tenant,
 	command domain.TenantCommand,
 	target domain.TenantLifecycleState,
 	req domain.ExecuteTenantCommandRequest,
+	maker, approver, approvalID string,
 ) (*outbox.Record, error) {
 	eventType := events.TenantCommandEvent(string(command))
 	if eventType == "" {
 		return nil, nil
 	}
+	payload := map[string]any{
+		"tenant_id":        t.TenantID,
+		"tenant_code":      t.TenantCode,
+		"command":          string(command),
+		"from_state":       string(t.LifecycleState),
+		"to_state":         string(target),
+		"reason":           req.Reason,
+		"approved_by":      approver,
+		"previous_version": t.RecordVersion,
+	}
+	if approvalID != "" {
+		payload["approval_request_id"] = approvalID
+	}
+	if t.OnboardingRequestRef != nil {
+		payload["onboarding_request_ref"] = *t.OnboardingRequestRef
+	}
+	if t.ExternalCustomerKey != nil {
+		payload["external_customer_key"] = *t.ExternalCustomerKey
+	}
 	return events.BuildRecord(events.RecordSpec{
 		EventType:     eventType,
 		TenantID:      t.TenantID,
-		ActorID:       domain.PrincipalFromContext(ctx),
+		ActorID:       maker,
 		CorrelationID: req.CorrelationID,
 		PartitionKey:  t.TenantID,
-		Payload: map[string]any{
-			"tenant_id":        t.TenantID,
-			"tenant_code":      t.TenantCode,
-			"command":          string(command),
-			"from_state":       string(t.LifecycleState),
-			"to_state":         string(target),
-			"reason":           req.Reason,
-			"approved_by":      req.ApprovedByPrincipalID,
-			"previous_version": t.RecordVersion,
-		},
+		Payload:       payload,
 	})
 }
 
@@ -497,45 +581,142 @@ func (s *Service) AmendLegalProfile(
 		return nil, fmt.Errorf("%w: change_reason %q is service-assigned", ErrInvalidInput, req.ChangeReason)
 	}
 
-	actor := domain.PrincipalFromContext(ctx)
-	if req.RequiresApproval() {
-		if strings.TrimSpace(req.ApprovedByPrincipalID) == "" {
-			return nil, fmt.Errorf("%w: legal name, registry number and jurisdiction changes require an approver", ErrApprovalRequired)
+	if req.EffectiveFrom.IsZero() {
+		req.EffectiveFrom = time.Now().UTC()
+	}
+	if req.LEI != nil || req.LEISource != nil || req.LEIStatus != nil {
+		if req.LEI != nil {
+			v := strings.TrimSpace(*req.LEI)
+			req.LEI = &v
 		}
-		if req.ApprovedByPrincipalID == actor {
-			return nil, fmt.Errorf("%w: maker cannot approve their own legal-identity change", ErrApprovalRequired)
+		if err := validateLEI(req.LEI, req.LEISource, req.LEIStatus); err != nil {
+			return nil, err
 		}
 	}
 
-	if req.EffectiveFrom.IsZero() {
-		req.EffectiveFrom = time.Now().UTC()
+	actor := domain.PrincipalFromContext(ctx)
+	// As for tenant commands: the body approver is refused on every
+	// amendment, SoD or not, so it can never become false evidence.
+	if !s.legacyBodyApprover && strings.TrimSpace(req.ApprovedByPrincipalID) != "" {
+		return nil, errBodyApprover
+	}
+	if req.RequiresApproval() {
+		if s.legacyBodyApprover {
+			if err := s.legacyApproverCheck(req.ApprovedByPrincipalID, actor, "legal name, registry number and jurisdiction changes"); err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, s.proposeAmendment(ctx, e, req)
+		}
+	}
+
+	return s.executeAmendment(ctx, e, req, actor, nil)
+}
+
+// proposeAmendment files a §4.3 SoD amendment for independent approval.
+//
+// The registry-collision probe runs now as well as at execution, so a
+// proposal that could never apply is refused (and quarantined) before anyone
+// is asked to review it.
+func (s *Service) proposeAmendment(ctx context.Context, e *domain.LegalEntity, req domain.AmendLegalProfileRequest) error {
+	expected := req.ExpectedVersion
+	if expected == 0 {
+		expected = e.RecordVersion
+	} else if expected != e.RecordVersion {
+		return fmt.Errorf("%w: you supplied expected_version %d but this entity is at %d — reload and retry",
+			ErrVersionConflict, expected, e.RecordVersion)
+	}
+	if err := s.checkAmendmentRegistry(ctx, e, req); err != nil {
+		return err
+	}
+	req.ExpectedVersion = expected
+	req.ApprovedByPrincipalID = ""
+	reason := req.SourceEvidenceRef
+	if reason == "" {
+		reason = string(req.ChangeReason)
+	}
+	a, err := s.propose(ctx, proposal{
+		subjectType:     domain.ApprovalSubjectLegalProfileAmendment,
+		tenantID:        e.TenantID,
+		subjectID:       e.LegalEntityID,
+		command:         amendmentCommandName(req.ChangeReason),
+		expectedVersion: expected,
+		reason:          reason,
+		payload:         req,
+		correlationID:   req.CorrelationID,
+	})
+	if err != nil {
+		return err
+	}
+	return &PendingApprovalError{Request: a}
+}
+
+// amendmentCommandName is the §4.3 named command an amendment represents.
+func amendmentCommandName(r domain.ProfileChangeReason) string {
+	switch r {
+	case domain.ProfileChangeLegalNameChange:
+		return "ChangeLegalName"
+	case domain.ProfileChangeRegisteredOfficeChange:
+		return "ChangeRegisteredOffice"
+	}
+	return "AmendLegalProfile"
+}
+
+// checkAmendmentRegistry is §8 NP5 for amendments.
+func (s *Service) checkAmendmentRegistry(ctx context.Context, e *domain.LegalEntity, req domain.AmendLegalProfileRequest) error {
+	if req.RegistrationNumber == nil || *req.RegistrationNumber == "" {
+		return nil
+	}
+	jur := e.PrimaryJurisdictionID
+	if req.IncorporationJurisdictionID != nil && *req.IncorporationJurisdictionID != "" {
+		jur = *req.IncorporationJurisdictionID
+	}
+	existing, err := s.store.FindActiveEntityByRegistry(ctx, *req.RegistrationNumber, jur)
+	if err != nil {
+		return fmt.Errorf("store.FindActiveEntityByRegistry: %w", err)
+	}
+	if existing != nil && existing.LegalEntityID != e.LegalEntityID {
+		if qErr := s.quarantineRegistryConflict(ctx, e.TenantID, *req.RegistrationNumber, jur, existing.LegalEntityID,
+			map[string]any{
+				"attempted_by":    "AmendLegalProfile",
+				"legal_entity_id": e.LegalEntityID,
+				"legal_name":      derefOr(req.LegalName, e.LegalName),
+			}, req.CorrelationID); qErr != nil {
+			return qErr
+		}
+		return fmt.Errorf("%w: registration_number %s is held by entity %s",
+			ErrRegistryConflict, *req.RegistrationNumber, existing.LegalEntityID)
+	}
+	return nil
+}
+
+// executeAmendment writes the next profile version.
+//
+// maker is the principal of record. d, when non-nil, is the verified approval
+// that released the amendment; its decider is the approver of record and the
+// approval is marked APPROVED in the same transaction as the new version.
+func (s *Service) executeAmendment(
+	ctx context.Context,
+	e *domain.LegalEntity,
+	req domain.AmendLegalProfileRequest,
+	maker string,
+	d *domain.ApprovalDecision,
+) (*domain.LegalEntityProfileVersion, error) {
+	legalEntityID := e.LegalEntityID
+	approver := req.ApprovedByPrincipalID
+	var approvalID *string
+	if d != nil {
+		approver = d.DecidedByPrincipalID
+		approvalID = &d.ApprovalRequestID
 	}
 
 	// §8 NP5 applies to amendments too, and it is the more dangerous direction:
 	// creating a duplicate is caught at creation, but AMENDING an entity onto a
 	// registry number another active entity already holds reaches the same
-	// invalid state by a different door.
-	if req.RegistrationNumber != nil && *req.RegistrationNumber != "" {
-		jur := e.PrimaryJurisdictionID
-		if req.IncorporationJurisdictionID != nil && *req.IncorporationJurisdictionID != "" {
-			jur = *req.IncorporationJurisdictionID
-		}
-		existing, err := s.store.FindActiveEntityByRegistry(ctx, *req.RegistrationNumber, jur)
-		if err != nil {
-			return nil, fmt.Errorf("store.FindActiveEntityByRegistry: %w", err)
-		}
-		if existing != nil && existing.LegalEntityID != legalEntityID {
-			if qErr := s.quarantineRegistryConflict(ctx, e.TenantID, *req.RegistrationNumber, jur, existing.LegalEntityID,
-				map[string]any{
-					"attempted_by":    "AmendLegalProfile",
-					"legal_entity_id": legalEntityID,
-					"legal_name":      derefOr(req.LegalName, e.LegalName),
-				}, req.CorrelationID); qErr != nil {
-				return nil, qErr
-			}
-			return nil, fmt.Errorf("%w: registration_number %s is held by entity %s",
-				ErrRegistryConflict, *req.RegistrationNumber, existing.LegalEntityID)
-		}
+	// invalid state by a different door. Re-run at execution because an
+	// approved proposal can be released after another entity took the number.
+	if err := s.checkAmendmentRegistry(ctx, e, req); err != nil {
+		return nil, err
 	}
 
 	// Carry forward from the version currently in force. An amendment that
@@ -553,8 +734,10 @@ func (s *Service) AmendLegalProfile(
 		EffectiveFrom:         req.EffectiveFrom,
 		ChangeReason:          req.ChangeReason,
 		SourceEvidenceRef:     nullableString(req.SourceEvidenceRef),
-		CreatedByPrincipalID:  actor,
-		ApprovedByPrincipalID: nullableString(req.ApprovedByPrincipalID),
+		CreatedByPrincipalID:  maker,
+		ApprovedByPrincipalID: nullableString(approver),
+		ApprovalRequestID:     approvalID,
+		Approval:              d,
 	}
 	if current != nil && current.Profile != nil {
 		p := current.Profile
@@ -568,6 +751,10 @@ func (s *Service) AmendLegalProfile(
 		next.RegisteredOffice = p.RegisteredOffice
 		next.IncorporationJurisdictionID = p.IncorporationJurisdictionID
 		next.DefaultCurrencyCode = p.DefaultCurrencyCode
+		next.LEI = p.LEI
+		next.LEISource = p.LEISource
+		next.LEIStatus = p.LEIStatus
+		next.LEIVerifiedAt = p.LEIVerifiedAt
 	} else {
 		// No prior version — an entity created before migration 000006 whose
 		// backfill did not run, or one created before its own profile write
@@ -603,7 +790,7 @@ func (s *Service) AmendLegalProfile(
 		TenantID:      e.TenantID,
 		LegalEntityID: legalEntityID,
 		Jurisdiction:  e.PrimaryJurisdictionID,
-		ActorID:       actor,
+		ActorID:       maker,
 		CorrelationID: req.CorrelationID,
 		PartitionKey:  legalEntityID,
 		Payload: map[string]any{
@@ -613,7 +800,7 @@ func (s *Service) AmendLegalProfile(
 			"effective_from":   req.EffectiveFrom,
 			"previous_name":    e.LegalName,
 			"new_name":         next.LegalName,
-			"approved_by":      req.ApprovedByPrincipalID,
+			"approved_by":      approver,
 			"evidence_ref":     req.SourceEvidenceRef,
 			"previous_version": e.RecordVersion,
 		},
@@ -667,6 +854,12 @@ func applyAmendment(next *domain.LegalEntityProfileVersion, req domain.AmendLega
 	}
 	if req.DefaultCurrencyCode != nil {
 		next.DefaultCurrencyCode = req.DefaultCurrencyCode
+	}
+	if req.LEI != nil {
+		next.LEI = req.LEI
+		next.LEISource = req.LEISource
+		next.LEIStatus = req.LEIStatus
+		next.LEIVerifiedAt = req.LEIVerifiedAt
 	}
 }
 
@@ -875,8 +1068,37 @@ func (s *Service) ResolveRegistryConflict(ctx context.Context, conflictID string
 	if strings.TrimSpace(req.ResolutionNote) == "" {
 		return fmt.Errorf("%w: resolution_note is required", ErrInvalidInput)
 	}
-	return s.store.ResolveRegistryConflict(ctx, conflictID, req.Status,
-		req.ResolutionNote, domain.PrincipalFromContext(ctx))
+	if s.legacyBodyApprover {
+		return s.store.ResolveRegistryConflict(ctx, conflictID, req.Status,
+			req.ResolutionNote, domain.PrincipalFromContext(ctx))
+	}
+
+	// §4.3 "no self-approval of merge". The resolution is filed, not applied;
+	// a second principal — neither this resolver nor the one whose claim was
+	// quarantined — releases it through /approve.
+	c, err := s.store.GetRegistryConflict(ctx, conflictID)
+	if err != nil {
+		return err
+	}
+	if c == nil {
+		return ErrNotFound
+	}
+	if c.Status != domain.RegistryConflictOpen {
+		return fmt.Errorf("%w: conflict is already %s", ErrConflict, c.Status)
+	}
+	a, err := s.propose(ctx, proposal{
+		subjectType:   domain.ApprovalSubjectRegistryConflictResolution,
+		tenantID:      c.TenantID,
+		subjectID:     c.ConflictID,
+		command:       "ResolveRegistryConflict",
+		reason:        req.ResolutionNote,
+		payload:       req,
+		correlationID: req.CorrelationID,
+	})
+	if err != nil {
+		return err
+	}
+	return &PendingApprovalError{Request: a}
 }
 
 // derefOr returns *p, or fallback when p is nil.

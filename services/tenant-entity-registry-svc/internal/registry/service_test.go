@@ -63,7 +63,16 @@ func (m *memStore) CreateTenant(_ context.Context, t *domain.Tenant) error {
 	return nil
 }
 func (m *memStore) CreateTenantWithDefaultResidencyPolicy(_ context.Context, t *domain.Tenant, p *domain.DataResidencyPolicy) error {
-	m.tenants[t.TenantID] = t
+	// Mirrors the store: the onboarding key is claimed first, and a
+	// repeated key aborts the whole create.
+	if t.ExternalCustomerKey != nil {
+		if _, used := m.gaps().onboardingKeys[*t.ExternalCustomerKey]; used {
+			return registry.ErrOnboardingKeyExists
+		}
+		m.gaps().onboardingKeys[*t.ExternalCustomerKey] = onboardingKey{t.TenantID, t.ProvisioningFingerprint}
+	}
+	cp := *t
+	m.tenants[t.TenantID] = &cp
 	m.residencyPolicies[p.DataResidencyPolicyID] = p
 	return nil
 }
@@ -249,8 +258,14 @@ func (m *memStore) GetTaxIdentityBundleByID(_ context.Context, id string) (*doma
 	}
 	return b, nil
 }
-func (m *memStore) ListTaxIdentityBundlesByEntity(_ context.Context, _ string) ([]*domain.TaxIdentityBundle, error) {
-	return []*domain.TaxIdentityBundle{}, nil
+func (m *memStore) ListTaxIdentityBundlesByEntity(_ context.Context, id string) ([]*domain.TaxIdentityBundle, error) {
+	out := []*domain.TaxIdentityBundle{}
+	for _, b := range m.bundles {
+		if b.LegalEntityID == id {
+			out = append(out, b)
+		}
+	}
+	return out, nil
 }
 func (m *memStore) TransitionTaxIdentityBundleStatus(_ context.Context, id string, status domain.TaxIdentityBundleStatus, _, _ string) error {
 	if b, ok := m.bundles[id]; ok {
@@ -393,6 +408,7 @@ func TestProvisionTenant_Success(t *testing.T) {
 
 	req := domain.ProvisionTenantRequest{
 		TenantCode:                   "ACME",
+		ExternalCustomerKey:          "ck-ACME",
 		LegalName:                    "ACME Corp Ltd",
 		DefaultCurrencyCode:          "USD",
 		PrimaryTimezone:              "UTC",
@@ -434,6 +450,7 @@ func TestTransitionTenantLifecycle_ValidTransition(t *testing.T) {
 	// Create a tenant in ONBOARDING state
 	req := domain.ProvisionTenantRequest{
 		TenantCode:                   "T1",
+		ExternalCustomerKey:          "ck-T1",
 		LegalName:                    "Tenant One",
 		DefaultCurrencyCode:          "GBP",
 		PrimaryTimezone:              "Europe/London",
@@ -444,15 +461,23 @@ func TestTransitionTenantLifecycle_ValidTransition(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.TenantLifecycleOnboarding, tenant.LifecycleState)
 
+	// ORG-02 maker-checker on creation: the generic route may not activate a
+	// tenant whose creation nobody independently approved.
+	transition := func() error {
+		return svc.TransitionTenantLifecycle(tenantCtx(tenant.TenantID), tenant.TenantID,
+			domain.TransitionTenantLifecycleRequest{
+				TargetState:   domain.TenantLifecycleActive,
+				CorrelationID: "corr-002",
+			})
+	}
+	require.ErrorIs(t, transition(), registry.ErrApprovalRequired)
+	require.NotNil(t, tenant.CreationApprovalRequestID)
+	approveByID(t, svc, tenant.TenantID, *tenant.CreationApprovalRequestID)
+
 	// Transition ONBOARDING → ACTIVE (valid). The caller's verified tenant must
 	// be the one being transitioned — reads and transitions are refused when
 	// the path tenant is not the caller's own.
-	err = svc.TransitionTenantLifecycle(tenantCtx(tenant.TenantID), tenant.TenantID,
-		domain.TransitionTenantLifecycleRequest{
-			TargetState:   domain.TenantLifecycleActive,
-			CorrelationID: "corr-002",
-		})
-	require.NoError(t, err)
+	require.NoError(t, transition())
 
 	stored, _ := ms.GetTenantByID(context.Background(), tenant.TenantID)
 	assert.Equal(t, domain.TenantLifecycleActive, stored.LifecycleState)
@@ -463,6 +488,7 @@ func TestTransitionTenantLifecycle_InvalidTransition(t *testing.T) {
 
 	req := domain.ProvisionTenantRequest{
 		TenantCode:                   "T2",
+		ExternalCustomerKey:          "ck-T2",
 		LegalName:                    "Tenant Two",
 		DefaultCurrencyCode:          "EUR",
 		PrimaryTimezone:              "UTC",
@@ -565,7 +591,8 @@ func TestCreateEntity_Success(t *testing.T) {
 	entity, err := svc.CreateEntity(tenantCtx("tenant-001"), req)
 	require.NoError(t, err)
 	assert.NotEmpty(t, entity.LegalEntityID)
-	assert.Equal(t, domain.EntityStatusActive, entity.EntityStatus)
+	// ORG-03 §4.3: a new entity is DRAFT until independently verified.
+	assert.Equal(t, domain.EntityStatusDraft, entity.EntityStatus)
 
 	stored, _ := ms.GetEntityByID(context.Background(), entity.LegalEntityID)
 	require.NotNil(t, stored)
@@ -755,6 +782,10 @@ func TestCreateTaxIdentityBundle_InvalidJurisdiction_FailsClosed(t *testing.T) {
 	ms := newMemStore()
 	svc := newSvc(t, ms, permitAllAuthZ{}, rejectJurisd{})
 
+	// The bundle needs an operational entity; the jurisdiction check is
+	// what is under test.
+	seedEntityFor(ms, "ent-100", "tenant-001", "", "JUR-US")
+
 	req := domain.CreateTaxIdentityBundleRequest{
 		JurisdictionID: "JUR-INVALID",
 		EffectiveFrom:  time.Now().UTC(),
@@ -768,6 +799,10 @@ func TestCreateTaxIdentityBundle_InvalidJurisdiction_FailsClosed(t *testing.T) {
 func TestCreateTaxIdentityBundle_JurisdictionUnavailable_FailsClosed(t *testing.T) {
 	ms := newMemStore()
 	svc := newSvc(t, ms, permitAllAuthZ{}, unavailableJurisd{})
+
+	// The bundle needs an operational entity; the jurisdiction check is
+	// what is under test.
+	seedEntityFor(ms, "ent-100", "tenant-001", "", "JUR-US")
 
 	req := domain.CreateTaxIdentityBundleRequest{
 		JurisdictionID: "JUR-US",
@@ -807,9 +842,11 @@ func TestUpdateEntity_WritesVerifiedActorPrincipalID(t *testing.T) {
 	entityID := "ent-actor-test"
 	seedEntity(ms, entityID)
 
+	// trading_name, not legal_name: legal_name is under ORG-03 SoD and is
+	// refused on this route (see TestUpdateEntity_LegalNameIsNotPatchable).
 	newName := "Updated Name"
 	_, err := svc.UpdateEntity(tenantCtx("tenant-001"), entityID, domain.UpdateEntityRequest{
-		LegalName:     &newName,
+		TradingName:   &newName,
 		CorrelationID: "corr-actor-test",
 	})
 	require.NoError(t, err)
@@ -944,7 +981,7 @@ func TestAuthorizeReceivesVerifiedPrincipalAndTenantScope(t *testing.T) {
 
 	ctx := domain.WithTenant(authCtx(), "ten-verified")
 	newName := "Updated"
-	_, err := svc.UpdateEntity(ctx, entityID, domain.UpdateEntityRequest{LegalName: &newName})
+	_, err := svc.UpdateEntity(ctx, entityID, domain.UpdateEntityRequest{TradingName: &newName})
 	require.NoError(t, err)
 
 	require.Equal(t, 1, rec.calls)
@@ -963,6 +1000,7 @@ func TestProvisionTenantUsesPlatformScope(t *testing.T) {
 
 	_, err := svc.ProvisionTenant(authCtx(), domain.ProvisionTenantRequest{
 		TenantCode:          "ACME",
+		ExternalCustomerKey: "ck-ACME",
 		LegalName:           "Acme Ltd",
 		DefaultCurrencyCode: "GBP",
 		PrimaryTimezone:     "Europe/London",

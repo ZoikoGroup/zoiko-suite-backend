@@ -97,6 +97,8 @@ type Store interface {
 
 	// ORG-02/ORG-03 surfaces — see ORGStore at the bottom of this file.
 	ORGStore
+	ApprovalStore
+	ORGGapStore
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +186,11 @@ type TenantCommandParams struct {
 	ActorID         string
 	ApprovedBy      string
 	CorrelationID   string
+	// Approval, when set, is the verified decision that released this
+	// command. The store marks it APPROVED in the same transaction as the
+	// lifecycle change, guarded on the request still being PENDING and
+	// unexpired, so two approvers racing cannot both release it.
+	Approval *domain.ApprovalDecision
 }
 
 // TenantCommandResult reports what a successful command did.
@@ -239,4 +246,84 @@ type ORGStore interface {
 	RecordRegistryConflict(ctx context.Context, c *domain.EntityRegistryConflict) error
 	ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error)
 	ResolveRegistryConflict(ctx context.Context, conflictID string, status domain.RegistryConflictStatus, note, actorID string) error
+	// GetRegistryConflict returns one conflict, or (nil, nil) if absent.
+	GetRegistryConflict(ctx context.Context, conflictID string) (*domain.EntityRegistryConflict, error)
+	// ResolveRegistryConflictApproved records a resolution released by an
+	// independent approval, in the same transaction as the approval decision.
+	ResolveRegistryConflictApproved(ctx context.Context, conflictID string, status domain.RegistryConflictStatus, note, resolvedBy string, d domain.ApprovalDecision) error
+}
+
+// ---------------------------------------------------------------------------
+// Approval store — verified maker-checker (ORG-02 §4.2, ORG-03 §4.3)
+// ---------------------------------------------------------------------------
+
+// ApprovalStore is the data-access contract for approval requests.
+type ApprovalStore interface {
+	// CreateApprovalRequest files a PENDING request. Any PENDING request for
+	// the same subject whose TTL has passed is marked EXPIRED first, in the
+	// same transaction, so an abandoned proposal cannot block the subject
+	// forever. A live PENDING request for the subject returns ErrApprovalPending.
+	CreateApprovalRequest(ctx context.Context, a *domain.ApprovalRequest) error
+	// GetApprovalRequest returns one request, or (nil, nil) if absent.
+	GetApprovalRequest(ctx context.Context, approvalRequestID string) (*domain.ApprovalRequest, error)
+	// ListApprovalRequests lists the caller's tenant's requests, newest first.
+	// pendingOnly excludes decided and expired ones.
+	ListApprovalRequests(ctx context.Context, pendingOnly bool) ([]*domain.ApprovalRequest, error)
+	// LatestApprovalForSubject returns the most recent request for a subject,
+	// or (nil, nil) if there has never been one.
+	LatestApprovalForSubject(ctx context.Context, subjectType domain.ApprovalSubjectType, subjectID string) (*domain.ApprovalRequest, error)
+	// DecideApprovalRequest moves a PENDING request to status on its own —
+	// for REJECTED, STALE and EXPIRED, and for APPROVED where approval
+	// releases no further write (tenant creation). Returns
+	// ErrApprovalNotPending if the request is no longer PENDING (or, for
+	// APPROVED, has expired).
+	DecideApprovalRequest(ctx context.Context, d domain.ApprovalDecision, status domain.ApprovalStatus) error
+}
+
+// ---------------------------------------------------------------------------
+// ORG gap store — onboarding idempotency, FailedProvisioning, entity
+// verification and non-destructive merge (migration 000008)
+// ---------------------------------------------------------------------------
+
+// ProvisioningCompletion is the follow-on provisioning step: filing the
+// creation approval and enqueueing tenant.created, in one transaction.
+type ProvisioningCompletion struct {
+	TenantID string
+	Approval *domain.ApprovalRequest
+	Event    *outbox.Record
+	// FromFailed is RetryProvisioning: the same step, plus moving the tenant
+	// FAILED_PROVISIONING → ONBOARDING and recording the command, atomically.
+	FromFailed      bool
+	ExpectedVersion int64
+	ActorID         string
+	Reason          string
+	CorrelationID   string
+}
+
+// EntityVerification is an approved DRAFT → VERIFIED transition.
+type EntityVerification struct {
+	LegalEntityID   string
+	VerifiedBy      string
+	EvidenceRef     string
+	ExpectedVersion int64
+	Decision        domain.ApprovalDecision
+}
+
+// ORGGapStore is the data-access contract for the 000008 surfaces.
+type ORGGapStore interface {
+	// ResolveOnboardingKey returns the tenant a key produced and the request
+	// fingerprint it was produced from, or ("", "", nil) for an unused key.
+	// Not tenant-scoped: a replay does not know its tenant.
+	ResolveOnboardingKey(ctx context.Context, key string) (tenantID, fingerprint string, err error)
+	CompleteProvisioning(ctx context.Context, p ProvisioningCompletion) error
+	// MarkProvisioningFailed moves an ONBOARDING tenant to FAILED_PROVISIONING
+	// and records why.
+	MarkProvisioningFailed(ctx context.Context, tenantID, reason, actorID string) error
+
+	VerifyLegalEntity(ctx context.Context, v EntityVerification, ev *outbox.Record) error
+	ActivateLegalEntity(ctx context.Context, legalEntityID, actorID string, expectedVersion int64, ev *outbox.Record) error
+
+	MergeEntities(ctx context.Context, m *domain.EntityMergeRecord, d domain.ApprovalDecision, expectedVersion int64, ev *outbox.Record) error
+	UnmergeEntity(ctx context.Context, duplicateID, unmergedBy, reason string, d domain.ApprovalDecision, expectedVersion int64, ev *outbox.Record) error
+	ListEntityMergeRecords(ctx context.Context, legalEntityID string) ([]*domain.EntityMergeRecord, error)
 }

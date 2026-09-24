@@ -65,7 +65,7 @@ func TenantCommandEvent(command string) string {
 		return EventTenantResumed
 	case "InitiateTermination":
 		return EventTenantTerminationInitiated
-	case "CompleteTermination":
+	case "CompleteTermination", "AbandonProvisioning":
 		return EventTenantTerminated
 	case "ChangeDefaultLocale":
 		return EventTenantDefaultsChanged

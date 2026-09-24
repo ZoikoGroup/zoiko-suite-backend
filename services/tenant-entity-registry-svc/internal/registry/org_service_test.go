@@ -265,10 +265,11 @@ func TestNP5_AmendmentOntoAnotherEntitysRegistryNumberIsAlsoQuarantined(t *testi
 	num := "RC-777"
 	_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "ent-other",
 		domain.AmendLegalProfileRequest{
-			RegistrationNumber:    &num,
-			ChangeReason:          domain.ProfileChangeAmendment,
-			ApprovedByPrincipalID: "approver-1",
+			RegistrationNumber: &num,
+			ChangeReason:       domain.ProfileChangeAmendment,
 		})
+	// Refused at PROPOSAL, not only at execution: nobody is asked to approve
+	// a change that could never apply.
 	require.ErrorIs(t, err, registry.ErrRegistryConflict)
 
 	conflicts, _ := svc.ListRegistryConflicts(tenantCtx(orgTenant), true)
@@ -293,7 +294,8 @@ func TestResolveRegistryConflict_RequiresATerminalStatusAndANote(t *testing.T) {
 		domain.ResolveRegistryConflictRequest{Status: domain.RegistryConflictDismissed}),
 		registry.ErrInvalidInput)
 
-	require.NoError(t, svc.ResolveRegistryConflict(ctx, "c-1",
+	// Filed for approval, not applied; released by a second principal.
+	approvePending(t, svc, orgTenant, svc.ResolveRegistryConflict(ctx, "c-1",
 		domain.ResolveRegistryConflictRequest{
 			Status: domain.RegistryConflictResolvedDistinct, ResolutionNote: "different registrars"}))
 
@@ -315,13 +317,12 @@ func TestNP6_LegalNameChangeCreatesAVersionAndHistoryResolvesTheOriginal(t *test
 	ctx := tenantCtx(orgTenant)
 
 	renamedAt := time.Now().UTC().Add(-1 * time.Hour)
-	v2, err := svc.ChangeLegalName(ctx, "ent-np6", domain.ChangeLegalNameRequest{
-		LegalName:             "Renamed Holdings Plc",
-		EffectiveFrom:         renamedAt,
-		SourceEvidenceRef:     "companies-house/filing/NM01",
-		ApprovedByPrincipalID: "approver-1",
+	_, err := svc.ChangeLegalName(ctx, "ent-np6", domain.ChangeLegalNameRequest{
+		LegalName:         "Renamed Holdings Plc",
+		EffectiveFrom:     renamedAt,
+		SourceEvidenceRef: "companies-house/filing/NM01",
 	})
-	require.NoError(t, err)
+	v2 := approvePending(t, svc, orgTenant, err).Result.(*domain.LegalEntityProfileVersion)
 	assert.Equal(t, 2, v2.VersionNumber)
 	assert.Equal(t, domain.ProfileChangeLegalNameChange, v2.ChangeReason)
 
@@ -353,11 +354,10 @@ func TestNP6_AsOfBoundaryBelongsToTheLaterVersion(t *testing.T) {
 
 	boundary := time.Now().UTC().Add(-2 * time.Hour)
 	_, err := svc.ChangeLegalName(ctx, "ent-b", domain.ChangeLegalNameRequest{
-		LegalName:             "Second Name Ltd",
-		EffectiveFrom:         boundary,
-		ApprovedByPrincipalID: "approver-1",
+		LegalName:     "Second Name Ltd",
+		EffectiveFrom: boundary,
 	})
-	require.NoError(t, err)
+	approvePending(t, svc, orgTenant, err)
 
 	// The interval is half-open [from, to): the exact boundary instant belongs
 	// to the version starting there, not the one ending there. Without this the
@@ -378,8 +378,7 @@ func TestAmendLegalProfile_CarriesForwardUnmentionedFields(t *testing.T) {
 
 	office := `{"line1":"1 New Street"}`
 	v2, err := svc.ChangeRegisteredOffice(ctx, "ent-cf", domain.ChangeRegisteredOfficeRequest{
-		RegisteredOffice:      office,
-		ApprovedByPrincipalID: "approver-1",
+		RegisteredOffice: office,
 	})
 	require.NoError(t, err)
 
@@ -402,9 +401,8 @@ func TestAmendLegalProfile_ServiceAssignedChangeReasonsAreRefused(t *testing.T) 
 		name := "New"
 		_, err := svc.AmendLegalProfile(tenantCtx(orgTenant), "ent-cr",
 			domain.AmendLegalProfileRequest{
-				LegalName:             &name,
-				ChangeReason:          reason,
-				ApprovedByPrincipalID: "approver-1",
+				LegalName:    &name,
+				ChangeReason: reason,
 			})
 		require.ErrorIs(t, err, registry.ErrInvalidInput,
 			"%s describes how a version was born and must not be caller-chosen", reason)
@@ -421,25 +419,38 @@ func TestAmendLegalProfile_LegalIdentityChangeRequiresAnIndependentApprover(t *t
 	ctx := tenantCtx(orgTenant)
 	name := "Renamed Ltd"
 
-	// No approver at all.
+	// The old self-asserted approver field is refused, whoever it names.
+	for _, named := range []string{testPrincipal, "someone-else"} {
+		_, err := svc.AmendLegalProfile(ctx, "ent-sod", domain.AmendLegalProfileRequest{
+			LegalName: &name, ChangeReason: domain.ProfileChangeLegalNameChange,
+			ApprovedByPrincipalID: named,
+		})
+		require.ErrorIs(t, err, registry.ErrApprovalRequired, "body approver %q", named)
+	}
+	assert.Equal(t, "Original Name Ltd", ms.entities["ent-sod"].LegalName)
+
+	// Without it, the change is filed, not applied.
 	_, err := svc.AmendLegalProfile(ctx, "ent-sod", domain.AmendLegalProfileRequest{
 		LegalName: &name, ChangeReason: domain.ProfileChangeLegalNameChange,
 	})
-	require.ErrorIs(t, err, registry.ErrApprovalRequired)
+	a := pendingOf(t, err)
+	assert.Equal(t, "ChangeLegalName", a.CommandName)
+	assert.Equal(t, "Original Name Ltd", ms.entities["ent-sod"].LegalName)
 
 	// "Maker cannot approve legal-name/registry/jurisdiction change" (§4.3).
-	_, err = svc.AmendLegalProfile(ctx, "ent-sod", domain.AmendLegalProfileRequest{
-		LegalName: &name, ChangeReason: domain.ProfileChangeLegalNameChange,
-		ApprovedByPrincipalID: testPrincipal,
-	})
-	require.ErrorIs(t, err, registry.ErrApprovalRequired)
+	_, err = svc.ApproveRequest(ctx, a.ApprovalRequestID,
+		domain.ApproveRequestBody{PayloadFingerprint: a.PayloadFingerprint})
+	require.ErrorIs(t, err, registry.ErrSelfApproval)
+	assert.Equal(t, "Original Name Ltd", ms.entities["ent-sod"].LegalName)
 
-	// A different approver is accepted.
-	_, err = svc.AmendLegalProfile(ctx, "ent-sod", domain.AmendLegalProfileRequest{
-		LegalName: &name, ChangeReason: domain.ProfileChangeLegalNameChange,
-		ApprovedByPrincipalID: "someone-else",
-	})
-	require.NoError(t, err)
+	// A second verified principal releases it, and becomes approver of record.
+	v := approveByID(t, svc, orgTenant, a.ApprovalRequestID).Result.(*domain.LegalEntityProfileVersion)
+	assert.Equal(t, "Renamed Ltd", ms.entities["ent-sod"].LegalName)
+	assert.Equal(t, testPrincipal, v.CreatedByPrincipalID)
+	require.NotNil(t, v.ApprovedByPrincipalID)
+	assert.Equal(t, approverPrincipal, *v.ApprovedByPrincipalID)
+	require.NotNil(t, v.ApprovalRequestID)
+	assert.Equal(t, a.ApprovalRequestID, *v.ApprovalRequestID)
 }
 
 func TestAmendLegalProfile_NonIdentityFieldsNeedNoApprover(t *testing.T) {
@@ -476,14 +487,17 @@ func TestTenantCommands_EachNamedCommandMovesAndRecordsItself(t *testing.T) {
 		t.Run(string(tc.command), func(t *testing.T) {
 			svc, ms := baseSvc(t)
 			ms.tenants[orgTenant].LifecycleState = tc.from
-
-			req := domain.ExecuteTenantCommandRequest{Reason: "test"}
-			if tc.command.RequiresMakerChecker() {
-				req.ApprovedByPrincipalID = "approver-1"
+			if tc.from == domain.TenantLifecycleOnboarding {
+				seedApprovedCreation(ms, orgTenant)
 			}
 
+			req := domain.ExecuteTenantCommandRequest{Reason: "test"}
 			res, err := svc.ExecuteTenantCommand(tenantCtx(orgTenant), orgTenant, tc.command, req)
-			require.NoError(t, err)
+			if tc.command.RequiresMakerChecker() {
+				res = approvePending(t, svc, orgTenant, err).Result.(*registry.TenantCommandResult)
+			} else {
+				require.NoError(t, err)
+			}
 			assert.Equal(t, tc.from, res.FromState)
 			assert.Equal(t, tc.to, res.ToState)
 			assert.Equal(t, int64(2), res.NewVersion, "every command bumps record_version")
@@ -532,13 +546,36 @@ func TestTenantCommands_TerminationRequiresAnIndependentApprover(t *testing.T) {
 	ms.tenants[orgTenant].LifecycleState = domain.TenantLifecycleActive
 	ctx := tenantCtx(orgTenant)
 
+	// The audit's scenario: one person typing a second name. Refused.
 	_, err := svc.ExecuteTenantCommand(ctx, orgTenant, domain.TenantCommandInitiateTermination,
-		domain.ExecuteTenantCommandRequest{Reason: "contract ended"})
+		domain.ExecuteTenantCommandRequest{Reason: "contract ended", ApprovedByPrincipalID: "a-colleague"})
 	require.ErrorIs(t, err, registry.ErrApprovalRequired)
+	assert.Equal(t, domain.TenantLifecycleActive, ms.tenants[orgTenant].LifecycleState)
 
+	// Filed, not executed.
 	_, err = svc.ExecuteTenantCommand(ctx, orgTenant, domain.TenantCommandInitiateTermination,
-		domain.ExecuteTenantCommandRequest{Reason: "contract ended", ApprovedByPrincipalID: testPrincipal})
-	require.ErrorIs(t, err, registry.ErrApprovalRequired, "no self-approval")
+		domain.ExecuteTenantCommandRequest{Reason: "contract ended"})
+	a := pendingOf(t, err)
+	assert.Equal(t, domain.TenantLifecycleActive, ms.tenants[orgTenant].LifecycleState)
+	history, _ := svc.ListTenantLifecycleHistory(ctx, orgTenant)
+	assert.Empty(t, history, "nothing ran, so nothing is recorded as having run")
+
+	// No self-approval.
+	_, err = svc.ApproveRequest(ctx, a.ApprovalRequestID,
+		domain.ApproveRequestBody{PayloadFingerprint: a.PayloadFingerprint})
+	require.ErrorIs(t, err, registry.ErrSelfApproval)
+	assert.Equal(t, domain.TenantLifecycleActive, ms.tenants[orgTenant].LifecycleState)
+	still, _ := svc.GetApprovalRequest(ctx, a.ApprovalRequestID)
+	assert.Equal(t, domain.ApprovalPending, still.Status)
+
+	// A second verified principal releases it.
+	approveByID(t, svc, orgTenant, a.ApprovalRequestID)
+	assert.Equal(t, domain.TenantLifecycleOffboarding, ms.tenants[orgTenant].LifecycleState)
+	history, _ = svc.ListTenantLifecycleHistory(ctx, orgTenant)
+	require.Len(t, history, 1)
+	assert.Equal(t, testPrincipal, history[0].ActorPrincipalID)
+	require.NotNil(t, history[0].ApprovedByPrincipalID)
+	assert.Equal(t, approverPrincipal, *history[0].ApprovedByPrincipalID)
 }
 
 func TestTenantCommands_SuspensionDeliberatelyNeedsNoApprover(t *testing.T) {

@@ -50,6 +50,19 @@ type ORGService interface {
 	FindByRegistryNumber(ctx context.Context, registrationNumber, jurisdictionID string) ([]*domain.LegalEntity, error)
 	ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error)
 	ResolveRegistryConflict(ctx context.Context, conflictID string, req domain.ResolveRegistryConflictRequest) error
+
+	// Verified maker-checker (ORG-02 §4.2, ORG-03 §4.3)
+	ListApprovalRequests(ctx context.Context, pendingOnly bool) ([]*domain.ApprovalRequest, error)
+	GetApprovalRequest(ctx context.Context, id string) (*domain.ApprovalRequest, error)
+	ApproveRequest(ctx context.Context, id string, body domain.ApproveRequestBody) (*domain.ApprovalOutcome, error)
+	RejectRequest(ctx context.Context, id string, body domain.RejectRequestBody) (*domain.ApprovalRequest, error)
+
+	// ORG-03 Draft → Verified → Active, and non-destructive merge
+	RequestEntityVerification(ctx context.Context, legalEntityID string, req domain.RequestEntityVerificationRequest) error
+	ActivateLegalEntity(ctx context.Context, legalEntityID string, req domain.ActivateLegalEntityRequest) (*domain.LegalEntity, error)
+	MergeDuplicateCandidate(ctx context.Context, duplicateID string, req domain.MergeDuplicateCandidateRequest) error
+	UnmergeEntity(ctx context.Context, duplicateID string, req domain.UnmergeEntityRequest) error
+	ListEntityMergeRecords(ctx context.Context, legalEntityID string) ([]*domain.EntityMergeRecord, error)
 }
 
 // registerORGRoutes mounts the ORG-02/ORG-03 endpoints.
@@ -83,6 +96,13 @@ func registerORGRoutes(r chi.Router, h *Handler) {
 		r.Post("/entities/{entityID}/legal-name", h.ChangeLegalName)
 		r.Post("/entities/{entityID}/registered-office", h.ChangeRegisteredOffice)
 
+		// ── ORG-03: Draft → Verified → Active; MergeDuplicateCandidate ──────
+		r.Post("/entities/{entityID}/verification", h.RequestEntityVerification)
+		r.Post("/entities/{entityID}/activation", h.ActivateLegalEntity)
+		r.Post("/entities/{entityID}/merge", h.MergeDuplicateCandidate)
+		r.Post("/entities/{entityID}/unmerge", h.UnmergeEntity)
+		r.Get("/entities/{entityID}/merge-records", h.ListEntityMergeRecords)
+
 		// ── ORG-03: as-of and version reads ─────────────────────────────────
 		r.Get("/entities/{entityID}/versions", h.ListEntityVersions)
 		r.Get("/entities/{entityID}/as-of", h.GetLegalEntityAsOf)
@@ -91,6 +111,14 @@ func registerORGRoutes(r chi.Router, h *Handler) {
 		// ── ORG-03: registry conflict quarantine ────────────────────────────
 		r.Get("/registry-conflicts", h.ListRegistryConflicts)
 		r.Post("/registry-conflicts/{conflictID}/resolution", h.ResolveRegistryConflict)
+
+		// ── Verified maker-checker ──────────────────────────────────────────
+		// A maker-checker command answers 202 with an approval request; a
+		// DIFFERENT verified principal releases or refuses it here.
+		r.Get("/approval-requests", h.ListApprovalRequests)
+		r.Get("/approval-requests/{approvalRequestID}", h.GetApprovalRequest)
+		r.Post("/approval-requests/{approvalRequestID}/approve", h.ApproveRequest)
+		r.Post("/approval-requests/{approvalRequestID}/reject", h.RejectRequest)
 	}
 }
 
@@ -125,6 +153,7 @@ func (h *Handler) ExecuteTenantCommand(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
+	markLegacyApprover(w, req.ApprovedByPrincipalID)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -234,6 +263,7 @@ func (h *Handler) AmendLegalProfile(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
+	markLegacyApprover(w, req.ApprovedByPrincipalID)
 	writeJSON(w, http.StatusCreated, v)
 }
 
@@ -251,6 +281,7 @@ func (h *Handler) ChangeLegalName(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
+	markLegacyApprover(w, req.ApprovedByPrincipalID)
 	writeJSON(w, http.StatusCreated, v)
 }
 
@@ -363,6 +394,161 @@ func (h *Handler) ResolveRegistryConflict(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ---------------------------------------------------------------------------
+// Verified maker-checker handlers
+// ---------------------------------------------------------------------------
+
+// ListApprovalRequests lists the caller's tenant's approval requests —
+// pending ones by default, everything with ?status=all.
+func (h *Handler) ListApprovalRequests(w http.ResponseWriter, r *http.Request) {
+	pendingOnly := !strings.EqualFold(r.URL.Query().Get("status"), "all")
+	out, err := h.svc.ListApprovalRequests(r.Context(), pendingOnly)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// GetApprovalRequest returns one approval request, including the payload and
+// fingerprint an approver must review.
+func (h *Handler) GetApprovalRequest(w http.ResponseWriter, r *http.Request) {
+	a, err := h.svc.GetApprovalRequest(r.Context(), chi.URLParam(r, "approvalRequestID"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+// ApproveRequest releases a proposal. The approver is the verified caller.
+func (h *Handler) ApproveRequest(w http.ResponseWriter, r *http.Request) {
+	var body domain.ApproveRequestBody
+	if !decode(w, r, &body) {
+		return
+	}
+	if body.CorrelationID == "" {
+		body.CorrelationID = correlationID(r)
+	}
+	out, err := h.svc.ApproveRequest(r.Context(), chi.URLParam(r, "approvalRequestID"), body)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// RejectRequest refuses a proposal. The decider is the verified caller.
+func (h *Handler) RejectRequest(w http.ResponseWriter, r *http.Request) {
+	var body domain.RejectRequestBody
+	if !decode(w, r, &body) {
+		return
+	}
+	if body.CorrelationID == "" {
+		body.CorrelationID = correlationID(r)
+	}
+	out, err := h.svc.RejectRequest(r.Context(), chi.URLParam(r, "approvalRequestID"), body)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ---------------------------------------------------------------------------
+// ORG-03 verification and merge handlers
+// ---------------------------------------------------------------------------
+
+// RequestEntityVerification files VerifyLegalEntity; always 202 on success.
+func (h *Handler) RequestEntityVerification(w http.ResponseWriter, r *http.Request) {
+	var req domain.RequestEntityVerificationRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
+	writeFiled(w, r, h, h.svc.RequestEntityVerification(r.Context(), chi.URLParam(r, "entityID"), req))
+}
+
+// ActivateLegalEntity moves a VERIFIED entity to ACTIVE.
+func (h *Handler) ActivateLegalEntity(w http.ResponseWriter, r *http.Request) {
+	var req domain.ActivateLegalEntityRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
+	e, err := h.svc.ActivateLegalEntity(r.Context(), chi.URLParam(r, "entityID"), req)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, e)
+}
+
+// MergeDuplicateCandidate files a non-destructive merge; always 202 on success.
+func (h *Handler) MergeDuplicateCandidate(w http.ResponseWriter, r *http.Request) {
+	var req domain.MergeDuplicateCandidateRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
+	writeFiled(w, r, h, h.svc.MergeDuplicateCandidate(r.Context(), chi.URLParam(r, "entityID"), req))
+}
+
+// UnmergeEntity files the reversal of a merge; always 202 on success.
+func (h *Handler) UnmergeEntity(w http.ResponseWriter, r *http.Request) {
+	var req domain.UnmergeEntityRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
+	writeFiled(w, r, h, h.svc.UnmergeEntity(r.Context(), chi.URLParam(r, "entityID"), req))
+}
+
+// ListEntityMergeRecords returns an entity's merge lineage.
+func (h *Handler) ListEntityMergeRecords(w http.ResponseWriter, r *http.Request) {
+	out, err := h.svc.ListEntityMergeRecords(r.Context(), chi.URLParam(r, "entityID"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// writeFiled answers a command that is always filed for approval: the
+// PendingApprovalError carries the 202 body. A nil error is still a 202 —
+// never routed through writeErr, which would read nil as unhandled.
+func writeFiled(w http.ResponseWriter, r *http.Request, h *Handler, err error) {
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// pendingApprovalResponse is the 202 body of a command filed for approval.
+type pendingApprovalResponse struct {
+	Status          string                  `json:"status"`
+	ApprovalRequest *domain.ApprovalRequest `json:"approval_request"`
+}
+
+// markLegacyApprover flags a success that relied on a self-asserted approver.
+// Only reachable with MAKER_CHECKER_LEGACY_BODY_APPROVER on; otherwise the
+// field is refused before anything runs.
+func markLegacyApprover(w http.ResponseWriter, approver string) {
+	if strings.TrimSpace(approver) != "" {
+		w.Header().Set("Deprecation", "true")
+		w.Header().Set("Warning", `299 - "approved_by_principal_id is deprecated; use /v1/approval-requests"`)
+	}
+}
+
 // writeORGErr extends writeErr with the ORG-specific sentinels.
 //
 // Three statuses worth explaining:
@@ -383,6 +569,18 @@ func mapORGError(err error) (int, string, bool) {
 		return http.StatusConflict, err.Error(), true
 	case errors.Is(err, registry.ErrApprovalRequired):
 		return http.StatusUnprocessableEntity, err.Error(), true
+	// A maker deciding their own proposal is a refusal of THIS principal, so
+	// 403 — but with the SoD reason, not the bare "forbidden" an RBAC denial
+	// gets, so nobody goes looking for a missing grant.
+	case errors.Is(err, registry.ErrSelfApproval):
+		return http.StatusForbidden, err.Error(), true
+	case errors.Is(err, registry.ErrApprovalNotPending),
+		errors.Is(err, registry.ErrApprovalFingerprintMismatch):
+		return http.StatusConflict, err.Error(), true
+	case errors.Is(err, registry.ErrOnboardingKeyRequired):
+		return http.StatusUnprocessableEntity, err.Error(), true
+	case errors.Is(err, registry.ErrEntityNotOperational):
+		return http.StatusConflict, err.Error(), true
 	case errors.Is(err, registry.ErrHostTenantMismatch):
 		// 403 and a body that does NOT echo which tenant the host resolves to:
 		// telling a caller "this host belongs to tenant X" would turn the

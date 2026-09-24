@@ -28,6 +28,25 @@ type Tenant struct {
 	UpdatedAt            time.Time `json:"updated_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
+
+	// CreationApprovalRequestID is set on the ProvisionTenant response only:
+	// the pending ORG-02 creation approval a second principal must decide
+	// before this tenant can be activated. Not persisted on the tenant row.
+	CreationApprovalRequestID *string `json:"creation_approval_request_id,omitempty"`
+
+	// ORG-02 onboarding evidence and idempotency key.
+	ExternalCustomerKey  *string `json:"external_customer_key"`
+	OnboardingRequestRef *string `json:"onboarding_request_ref"`
+	// ProvisioningFailureReason is set while the tenant is FAILED_PROVISIONING.
+	ProvisioningFailureReason *string    `json:"provisioning_failure_reason"`
+	ProvisioningFailedAt      *time.Time `json:"provisioning_failed_at"`
+
+	// ProvisioningFingerprint is written with the onboarding key; never
+	// serialised.
+	ProvisioningFingerprint string `json:"-"`
+	// IdempotentReplay is set on a ProvisionTenant response that returned an
+	// existing tenant for a repeated onboarding key (answered 200, not 201).
+	IdempotentReplay bool `json:"idempotent_replay,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +80,14 @@ type LegalEntity struct {
 	UpdatedAt            time.Time `json:"updated_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
+
+	// ORG-03 verification evidence.
+	VerifiedByPrincipalID   *string    `json:"verified_by_principal_id"`
+	VerifiedAt              *time.Time `json:"verified_at"`
+	VerificationEvidenceRef *string    `json:"verification_evidence_ref"`
+	// Non-destructive merge: a merged duplicate is DORMANT and points here.
+	MergedIntoLegalEntityID *string    `json:"merged_into_legal_entity_id"`
+	MergedAt                *time.Time `json:"merged_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +237,14 @@ type ProvisionTenantRequest struct {
 	// always generates a fresh default policy instead. Field kept only so
 	// older clients sending this key don't fail JSON decoding.
 	DefaultDataResidencyPolicyID string `json:"default_data_residency_policy_id,omitempty"`
+
+	// ExternalCustomerKey is ORG-02's "approved onboarding correlation /
+	// external customer key": a replay with the same key returns the tenant
+	// it already created rather than creating a second one.
+	ExternalCustomerKey string `json:"external_customer_key"`
+	// OnboardingRequestRef is §4.2 evidence: the onboarding request this
+	// tenant was created from.
+	OnboardingRequestRef string `json:"onboarding_request_ref,omitempty"`
 }
 
 type TransitionTenantLifecycleRequest struct {
@@ -237,6 +272,11 @@ type CreateEntityRequest struct {
 	PrimaryJurisdictionID string     `json:"primary_jurisdiction_id"`
 	DataResidencyPolicyID string     `json:"data_residency_policy_id"`
 	CorrelationID         string     `json:"correlation_id"`
+
+	// Optional LEI, with its source and status (ORG-03 mandatory control).
+	LEI       string `json:"lei,omitempty"`
+	LEISource string `json:"lei_source,omitempty"`
+	LEIStatus string `json:"lei_status,omitempty"`
 }
 
 type CreateWorkspaceRequest struct {

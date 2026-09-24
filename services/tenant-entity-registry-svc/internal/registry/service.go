@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -65,6 +66,14 @@ type Service struct {
 	// TENANT_PROVISION must be made against this same ID.
 	platformScopeID string
 
+	// Maker-checker settings — see ConfigureMakerChecker.
+	legacyBodyApprover bool
+	approvalTTL        time.Duration
+
+	// Dev-only compatibility switches for 000008 — see ConfigureCompatibility.
+	legacyEntityCreateActive bool
+	onboardingKeyOptional    bool
+
 	log *zap.Logger
 }
 
@@ -83,6 +92,7 @@ func NewService(
 		authz:           authz,
 		jurisd:          jurisd,
 		platformScopeID: platformScopeID,
+		approvalTTL:     DefaultApprovalTTL,
 		log:             log,
 	}
 }
@@ -111,6 +121,15 @@ func (s *Service) ProvisionTenant(
 		return nil, err
 	}
 
+	// ORG-02 §4.2 idempotency: "Create by approved onboarding correlation /
+	// external customer key". Without it a retried onboarding created a second
+	// tenant.
+	req.ExternalCustomerKey = strings.TrimSpace(req.ExternalCustomerKey)
+	if req.ExternalCustomerKey == "" && !s.onboardingKeyOptional {
+		return nil, ErrOnboardingKeyRequired
+	}
+	fingerprint := domain.ProvisioningFingerprint(req)
+
 	tenantID := newID()
 	policyID := newID()
 	now := time.Now().UTC()
@@ -127,8 +146,12 @@ func (s *Service) ProvisionTenant(
 		PrimaryLocale:                req.PrimaryLocale,
 		DefaultDataResidencyPolicyID: policyID,
 		LifecycleState:               domain.TenantLifecycleOnboarding,
+		RecordVersion:                1,
 		CreatedAt:                    now,
 		CreatedByPrincipalID:         actor,
+		ExternalCustomerKey:          nullableString(req.ExternalCustomerKey),
+		OnboardingRequestRef:         nullableString(strings.TrimSpace(req.OnboardingRequestRef)),
+		ProvisioningFingerprint:      fingerprint,
 	}
 
 	defaultPolicy := &domain.DataResidencyPolicy{
@@ -144,14 +167,21 @@ func (s *Service) ProvisionTenant(
 	}
 
 	if err := s.store.CreateTenantWithDefaultResidencyPolicy(ctx, t, defaultPolicy); err != nil {
+		if errors.Is(err, ErrOnboardingKeyExists) {
+			return s.replayProvisioning(ctx, req, fingerprint)
+		}
 		s.log.Error("create tenant failed", zap.Error(err), zap.String("correlation_id", correlationID))
 		return nil, fmt.Errorf("store.CreateTenantWithDefaultResidencyPolicy: %w", err)
 	}
 
-	go s.events.PublishTenantCreated(ctx, t, correlationID)
+	// The follow-on step — creation approval (§4.2 maker-checker) and the
+	// tenant.created event, in one transaction. A failure here is §4.2's
+	// "provisioning partial failure": the tenant becomes FAILED_PROVISIONING.
+	s.completeProvisioning(ctx, t, correlationID)
 
 	s.log.Info("tenant provisioned",
 		zap.String("tenant_id", t.TenantID),
+		zap.String("lifecycle_state", string(t.LifecycleState)),
 		zap.String("correlation_id", correlationID),
 	)
 	return t, nil
@@ -235,6 +265,24 @@ func (s *Service) TransitionTenantLifecycle(
 		return fmt.Errorf("%w: %s → %s", ErrInvalidTransition, t.LifecycleState, req.TargetState)
 	}
 
+	// This generic route must not be a way around ORG-02's maker-checker.
+	// Before 000007 it moved a tenant to OFFBOARDING or TERMINATED with no
+	// approver at all, while the named commands demanded one.
+	if !s.legacyBodyApprover {
+		switch req.TargetState {
+		case domain.TenantLifecycleOffboarding, domain.TenantLifecycleTerminated:
+			return fmt.Errorf("%w: termination requires independent approval — use "+
+				"POST /v1/tenants/{id}/commands/InitiateTermination or CompleteTermination",
+				ErrApprovalRequired)
+		case domain.TenantLifecycleActive:
+			if t.LifecycleState == domain.TenantLifecycleOnboarding {
+				if err := s.requireCreationApproval(ctx, t); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	return s.store.TransitionTenantLifecycle(ctx, tenantID, req.TargetState, domain.PrincipalFromContext(ctx), req.CorrelationID)
 }
 
@@ -282,6 +330,11 @@ func (s *Service) CreateEntity(
 	// the insert: writing the entity and flagging it afterwards would leave two
 	// active entities holding one registry identity in the authoritative table,
 	// which is the state this negative path exists to prevent.
+	lei, leiSource, leiStatus := nullableString(strings.TrimSpace(req.LEI)), nullableString(req.LEISource), nullableString(req.LEIStatus)
+	if err := validateLEI(lei, leiSource, leiStatus); err != nil {
+		return nil, err
+	}
+
 	if err := s.CheckRegistryIdentity(ctx, req.TenantID, req.RegistrationNumber, req.PrimaryJurisdictionID,
 		map[string]any{
 			"entity_code":         req.EntityCode,
@@ -291,6 +344,13 @@ func (s *Service) CreateEntity(
 			"attempted_by":        "CreateEntity",
 		}, req.CorrelationID); err != nil {
 		return nil, err
+	}
+
+	// ORG-03 §4.3: Draft → Verified → Active. A new entity is a claim until
+	// someone other than its creator has verified it.
+	status := domain.EntityStatusDraft
+	if s.legacyEntityCreateActive {
+		status = domain.EntityStatusActive
 	}
 
 	now := time.Now().UTC()
@@ -306,7 +366,7 @@ func (s *Service) CreateEntity(
 		DefaultCurrencyCode:   req.DefaultCurrencyCode,
 		FiscalCalendarID:      req.FiscalCalendarID,
 		PrimaryJurisdictionID: req.PrimaryJurisdictionID,
-		EntityStatus:          domain.EntityStatusActive,
+		EntityStatus:          status,
 		DataResidencyPolicyID: req.DataResidencyPolicyID,
 		RecordVersion:         1,
 		CreatedAt:             now,
@@ -337,6 +397,9 @@ func (s *Service) CreateEntity(
 		EffectiveFrom:               now,
 		ChangeReason:                domain.ProfileChangeInitial,
 		CreatedByPrincipalID:        e.CreatedByPrincipalID,
+		LEI:                         lei,
+		LEISource:                   leiSource,
+		LEIStatus:                   leiStatus,
 	}
 	if err := s.store.CreateInitialProfileVersion(ctx, initial); err != nil {
 		s.log.Error("initial profile version write failed; as-of reads for this entity will be incomplete",
@@ -370,6 +433,10 @@ func (s *Service) CreateWorkspace(
 	// state forbids transacting. The tenant comes from the verified context,
 	// not from the request body.
 	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
+
+	if err := s.assertEntityOperational(ctx, req.LegalEntityID); err != nil {
 		return nil, err
 	}
 
@@ -609,6 +676,15 @@ func (s *Service) UpdateEntity(
 		return nil, err
 	}
 
+	// legal_name is under ORG-03 SoD ("maker cannot approve legal-name
+	// change") and effective-dating. This PATCH overwrote it in place with
+	// neither, which made it a bypass of both.
+	if req.LegalName != nil && !s.legacyBodyApprover {
+		return nil, fmt.Errorf("%w: legal_name cannot be patched — use "+
+			"POST /v1/entities/{id}/legal-name, which requires independent approval",
+			ErrApprovalRequired)
+	}
+
 	// Populate audit actor from the verified envelope JWT.
 	// actorFromJWT performs payload-only decoding — signature is already
 	// verified by the Authorization Service before this service is called.
@@ -664,6 +740,14 @@ func (s *Service) TransitionEntityStatus(
 	// not from the request body.
 	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
 		return err
+	}
+
+	// A merged duplicate leaves DORMANT only through UnmergeEntity, which is
+	// independently approved and completes the merge lineage. Reactivating it
+	// here would undo a governed merge with an ungoverned write.
+	if cur, err := s.GetEntity(ctx, legalEntityID); err == nil && cur.MergedIntoLegalEntityID != nil {
+		return fmt.Errorf("%w: entity %s is merged into %s — use POST /v1/entities/{id}/unmerge",
+			ErrInvalidTransition, legalEntityID, *cur.MergedIntoLegalEntityID)
 	}
 
 	// Compute the set of valid prior states for the requested target transition.
@@ -738,6 +822,12 @@ func (s *Service) CreateHierarchy(
 		return nil, err
 	}
 
+	for _, id := range []string{req.ParentLegalEntityID, req.ChildLegalEntityID} {
+		if err := s.assertEntityOperational(ctx, id); err != nil {
+			return nil, err
+		}
+	}
+
 	h := &domain.EntityHierarchy{
 		HierarchyID:          newID(),
 		TenantID:             req.TenantID,
@@ -807,6 +897,10 @@ func (s *Service) AssignJurisdiction(
 	// state forbids transacting. The tenant comes from the verified context,
 	// not from the request body.
 	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
+
+	if err := s.assertEntityOperational(ctx, legalEntityID); err != nil {
 		return nil, err
 	}
 
@@ -1015,6 +1109,10 @@ func (s *Service) CreateTaxIdentityBundle(
 		return nil, err
 	}
 
+	if err := s.assertEntityOperational(ctx, legalEntityID); err != nil {
+		return nil, err
+	}
+
 	if req.DataClassification != "" {
 		if !classification.Classification(req.DataClassification).Valid() {
 			return nil, fmt.Errorf("%w: invalid data classification %q", ErrInvalidInput, req.DataClassification)
@@ -1054,12 +1152,40 @@ func (s *Service) GetTaxIdentityBundle(ctx context.Context, bundleID string) (*d
 	if b == nil {
 		return nil, ErrNotFound
 	}
+	// ORG-03 "sensitive identifier access scoped".
+	if sensitiveClassification(b.DataClassification) {
+		if err := s.authorizeSensitiveRead(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return b, nil
 }
 
 // ListTaxIdentityBundles returns all TaxIdentityBundle headers for an entity.
+//
+// Sensitive (RESTRICTED / CONFIDENTIAL) bundles are omitted unless the caller
+// passes the scoped-access gate. Omitted rather than failing the whole list:
+// a caller entitled to the ordinary bundles should still get them.
 func (s *Service) ListTaxIdentityBundles(ctx context.Context, legalEntityID string) ([]*domain.TaxIdentityBundle, error) {
-	return s.store.ListTaxIdentityBundlesByEntity(ctx, legalEntityID)
+	all, err := s.store.ListTaxIdentityBundlesByEntity(ctx, legalEntityID)
+	if err != nil {
+		return nil, err
+	}
+	var permitted *bool
+	out := make([]*domain.TaxIdentityBundle, 0, len(all))
+	for _, b := range all {
+		if sensitiveClassification(b.DataClassification) {
+			if permitted == nil {
+				ok := s.authorizeSensitiveRead(ctx) == nil
+				permitted = &ok
+			}
+			if !*permitted {
+				continue
+			}
+		}
+		out = append(out, b)
+	}
+	return out, nil
 }
 
 // TransitionTaxIdentityBundleStatus applies a status transition on a bundle header.
@@ -1113,7 +1239,24 @@ func (s *Service) authorize(ctx context.Context, resource, action string) error 
 	if scopeID == "" {
 		scopeID = s.platformScopeID
 	}
+	return s.authorizeAs(ctx, principalID, scopeID, resource, action)
+}
 
+// authorizeIn is authorize evaluated in an explicit scope. Used where the
+// decision belongs to the platform rather than the caller's tenant — approving
+// a tenant's creation is a platform decision, like provisioning it.
+func (s *Service) authorizeIn(ctx context.Context, scopeID, resource, action string) error {
+	principalID := domain.PrincipalFromContext(ctx)
+	if principalID == "" {
+		return ErrUnauthenticated
+	}
+	if scopeID == "" {
+		scopeID = domain.TenantFromContext(ctx)
+	}
+	return s.authorizeAs(ctx, principalID, scopeID, resource, action)
+}
+
+func (s *Service) authorizeAs(ctx context.Context, principalID, scopeID, resource, action string) error {
 	if err := s.authz.Authorize(ctx, principalID, scopeID, resource, action); err != nil {
 		switch {
 		case errors.Is(err, authz.ErrUnauthorized):

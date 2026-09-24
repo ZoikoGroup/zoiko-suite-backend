@@ -42,6 +42,13 @@ type LegalEntityProfileVersion struct {
 	IncorporationJurisdictionID *string `json:"incorporation_jurisdiction_id"`
 	DefaultCurrencyCode         *string `json:"default_currency_code"`
 
+	// LEI is an external organizational identifier (ISO 17442), never the
+	// internal key, and always carried with its source and GLEIF status.
+	LEI           *string    `json:"lei"`
+	LEISource     *string    `json:"lei_source"`
+	LEIStatus     *string    `json:"lei_status"`
+	LEIVerifiedAt *time.Time `json:"lei_verified_at"`
+
 	EffectiveFrom time.Time  `json:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to"`
 
@@ -52,6 +59,13 @@ type LegalEntityProfileVersion struct {
 	SourceEvidenceRef     *string             `json:"source_evidence_ref"`
 	CreatedByPrincipalID  string              `json:"created_by_principal_id"`
 	ApprovedByPrincipalID *string             `json:"approved_by_principal_id"`
+	// ApprovalRequestID links a version written under maker-checker to the
+	// approval that released it.
+	ApprovalRequestID *string `json:"approval_request_id"`
+
+	// Approval, when set, is recorded in the same transaction as this version.
+	// Never serialised: it is an instruction to the store, not a fact.
+	Approval *ApprovalDecision `json:"-"`
 }
 
 // ProfileChangeReason names why a profile version exists. It is stored rather
@@ -109,8 +123,14 @@ type TenantLifecycleEvent struct {
 
 	ActorPrincipalID      string    `json:"actor_principal_id"`
 	ApprovedByPrincipalID *string   `json:"approved_by_principal_id"`
+	ApprovalRequestID     *string   `json:"approval_request_id"`
 	CorrelationID         *string   `json:"correlation_id"`
 	OccurredAt            time.Time `json:"occurred_at"`
+
+	// Onboarding context captured on the lineage record (§4.2 evidence: the
+	// "onboarding request" reference the 23 Sep 2026 audit found absent here).
+	OnboardingRequestRef *string `json:"onboarding_request_ref"`
+	ExternalCustomerKey  *string `json:"external_customer_key"`
 }
 
 // TenantCommand is an ORG-02 §4.2 named command.
@@ -131,6 +151,13 @@ const (
 	TenantCommandInitiateTermination TenantCommand = "InitiateTermination"
 	TenantCommandCompleteTermination TenantCommand = "CompleteTermination"
 	TenantCommandChangeDefaultLocale TenantCommand = "ChangeDefaultLocale"
+	// RetryProvisioning re-runs the provisioning steps that failed and
+	// returns the tenant to ONBOARDING.
+	TenantCommandRetryProvisioning TenantCommand = "RetryProvisioning"
+	// AbandonProvisioning is the compensating cleanup: host bindings and
+	// residency policies are deactivated and the tenant is TERMINATED. Rows
+	// are retained. Maker-checker, like any other termination.
+	TenantCommandAbandonProvisioning TenantCommand = "AbandonProvisioning"
 )
 
 // TargetState returns the lifecycle state this command moves a tenant to, and
@@ -160,6 +187,10 @@ func (c TenantCommand) TargetState() (target TenantLifecycleState, from []Tenant
 		return TenantLifecycleOffboarding, []TenantLifecycleState{TenantLifecycleActive, TenantLifecycleSuspended}, true
 	case TenantCommandCompleteTermination:
 		return TenantLifecycleTerminated, []TenantLifecycleState{TenantLifecycleOffboarding}, true
+	case TenantCommandRetryProvisioning:
+		return TenantLifecycleOnboarding, []TenantLifecycleState{TenantLifecycleFailedProvisioning}, true
+	case TenantCommandAbandonProvisioning:
+		return TenantLifecycleTerminated, []TenantLifecycleState{TenantLifecycleFailedProvisioning}, true
 	}
 	return "", nil, false
 }
@@ -193,6 +224,10 @@ func (c TenantCommand) AuthzAction() string {
 		return "defaults.change"
 	case TenantCommandCreate:
 		return "provision"
+	case TenantCommandRetryProvisioning:
+		return "provisioning.retry"
+	case TenantCommandAbandonProvisioning:
+		return "provisioning.abandon"
 	}
 	// An unknown command never reaches authorization — TargetState() refuses it
 	// first — but returning the raw name rather than "" means that if one ever
@@ -212,7 +247,8 @@ func (c TenantCommand) AuthzAction() string {
 // reachable only from SUSPENDED and so cannot be used to escalate.
 func (c TenantCommand) RequiresMakerChecker() bool {
 	switch c {
-	case TenantCommandInitiateTermination, TenantCommandCompleteTermination:
+	case TenantCommandInitiateTermination, TenantCommandCompleteTermination,
+		TenantCommandAbandonProvisioning:
 		return true
 	}
 	return false
@@ -317,6 +353,12 @@ type AmendLegalProfileRequest struct {
 	IncorporationJurisdictionID *string `json:"incorporation_jurisdiction_id"`
 	DefaultCurrencyCode         *string `json:"default_currency_code"`
 
+	// LEI fields travel together: an LEI requires its source and status.
+	LEI           *string    `json:"lei"`
+	LEISource     *string    `json:"lei_source"`
+	LEIStatus     *string    `json:"lei_status"`
+	LEIVerifiedAt *time.Time `json:"lei_verified_at"`
+
 	// EffectiveFrom is BUSINESS time and may legitimately be in the past — a
 	// registry filing learned about a week late is effective from the filing
 	// date, not from when this service heard about it.
@@ -333,10 +375,15 @@ type AmendLegalProfileRequest struct {
 
 // RequiresApproval reports whether this amendment touches a field §4.3 places
 // under segregation of duties.
+//
+// The LEI is included: it is a registry identity like the registration
+// number, and swapping it changes which real-world entity this record claims
+// to be.
 func (r AmendLegalProfileRequest) RequiresApproval() bool {
 	return r.LegalName != nil ||
 		r.RegistrationNumber != nil ||
-		r.IncorporationJurisdictionID != nil
+		r.IncorporationJurisdictionID != nil ||
+		r.LEI != nil
 }
 
 // ChangeLegalNameRequest is the narrow ChangeLegalName command.
@@ -393,6 +440,10 @@ type EntityRegistryConflict struct {
 	ResolutionNote        *string    `json:"resolution_note"`
 	ResolvedByPrincipalID *string    `json:"resolved_by_principal_id"`
 	ResolvedAt            *time.Time `json:"resolved_at"`
+	// ApprovedByPrincipalID is the independent second party to the
+	// resolution — never the resolver, never the detected-by principal.
+	ApprovedByPrincipalID *string `json:"approved_by_principal_id"`
+	ApprovalRequestID     *string `json:"approval_request_id"`
 
 	DetectedAt            time.Time `json:"detected_at"`
 	DetectedByPrincipalID string    `json:"detected_by_principal_id"`
