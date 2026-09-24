@@ -114,6 +114,24 @@ type Store interface {
 	// AST/INV/PRJ domain spec's own §9 "Stock count" assertion.
 	GetUnapprovedVarianceCount(ctx context.Context, legalEntityID, fiscalPeriod string) (int, error)
 	CancelStockCount(ctx context.Context, countID, principalID, reason string, at time.Time) error
+
+	// BIZ-07 (Product & Service Catalog) — see
+	// internal/store/catalog_store.go's own doc comments for the
+	// authority boundary these implement.
+	CreateOffering(ctx context.Context, o *domain.Offering, v *domain.OfferingVersion, variants []domain.CatalogVariantInput) error
+	GetOffering(ctx context.Context, offeringID string) (*domain.Offering, error)
+	GetOfferingVersion(ctx context.Context, versionID string) (*domain.OfferingVersion, error)
+	GetCurrentOfferingVersion(ctx context.Context, offeringID string) (*domain.OfferingVersion, error)
+	CreateVersion(ctx context.Context, v *domain.OfferingVersion, variants []domain.CatalogVariantInput) error
+	ApproveOfferingVersion(ctx context.Context, versionID, principalID string, at time.Time) error
+	ActivateOfferingVersion(ctx context.Context, offeringID, versionID, principalID string, at time.Time) (supersededVersionID *string, err error)
+	SuspendOfferingVersion(ctx context.Context, versionID, principalID, reason string, at time.Time) error
+	RetireOfferingVersion(ctx context.Context, versionID, principalID, reason string, at time.Time) error
+	GetVersionAsOf(ctx context.Context, offeringID string, at time.Time) (*domain.OfferingVersion, error)
+	SearchCatalog(ctx context.Context, legalEntityID, category string) ([]domain.Offering, error)
+	ListVariants(ctx context.Context, versionID string) ([]domain.CatalogVariant, error)
+	LinkMapping(ctx context.Context, m *domain.CatalogMapping) error
+	GetMappings(ctx context.Context, versionID string) ([]domain.CatalogMapping, error)
 }
 
 // InventoryLedgerClient is INV-04's own real "ACC-04" dependency — see
@@ -179,6 +197,15 @@ type Publisher interface {
 	PublishStockCountAdjustmentRequested(ctx context.Context, correlationID, actorID, tenantID, lineID, movementID string)
 	PublishStockCountCertified(ctx context.Context, correlationID, actorID, tenantID string, sc domain.StockCount)
 	PublishStockCountVarianceDetected(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, lineID string, systemQuantity, observedQuantity float64)
+
+	// BIZ-07 (Product & Service Catalog) — the spec's own named Events:
+	// "OfferingCreated; OfferingActivated; OfferingSuspended;
+	// OfferingRetired; OfferingVersionSuperseded."
+	PublishOfferingCreated(ctx context.Context, correlationID, actorID string, o domain.Offering, v domain.OfferingVersion)
+	PublishOfferingActivated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
+	PublishOfferingSuspended(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
+	PublishOfferingRetired(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
+	PublishOfferingVersionSuperseded(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, offeringID, versionID string)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -235,6 +262,19 @@ const (
 	actionInventoryCountRecord  = "INVENTORY_COUNT_RECORD"
 	actionInventoryCountApprove = "INVENTORY_COUNT_APPROVE"
 	actionInventoryCountCertify = "INVENTORY_COUNT_CERTIFY"
+
+	// BIZ-07 (Product & Service Catalog) actions — no dedicated
+	// Permissions field is quoted verbatim in the doc's BIZ-07 section, so
+	// this platform's own CATALOG_* namespace convention is used, mirroring
+	// the shape every other domain in this service already follows.
+	// actionCatalogMappingLink is deliberately distinct from
+	// actionCatalogManage — the doc's own authorization note: "Product/
+	// business owner + specialist review for tax/accounting/legal
+	// mappings."
+	actionCatalogRead        = "CATALOG_READ"
+	actionCatalogManage      = "CATALOG_MANAGE"
+	actionCatalogApprove     = "CATALOG_APPROVE"
+	actionCatalogMappingLink = "CATALOG_MAPPING_LINK"
 )
 
 type Handler struct {
@@ -355,6 +395,23 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 			r.Post("/record-count", h.RecordBlindCount)
 			r.Post("/request-recount", h.RequestRecount)
 			r.Post("/approve-variance", h.ApproveCountVariance)
+		})
+	})
+	r.Route("/v1/catalog/offerings", func(r chi.Router) {
+		r.Post("/", h.CreateOffering)
+		r.Get("/", h.SearchCatalog)
+		r.Get("/{id}", h.GetOffering)
+		r.Get("/{id}/version-as-of", h.GetVersionAsOf)
+		r.Post("/{id}/versions", h.CreateCatalogVersion)
+		r.Route("/{id}/versions/{versionID}", func(r chi.Router) {
+			r.Get("/", h.GetOfferingVersion)
+			r.Get("/variants", h.ListVariants)
+			r.Get("/mappings", h.GetMappings)
+			r.Post("/approve", h.ApproveOffering)
+			r.Post("/activate", h.ActivateOffering)
+			r.Post("/suspend", h.SuspendOfferingVersion)
+			r.Post("/retire", h.RetireOfferingVersion)
+			r.Post("/mappings", h.LinkMapping)
 		})
 	})
 }

@@ -117,10 +117,20 @@ type SendNotificationRequest struct {
 	// Template names a catalogue template to render instead of supplying
 	// subject and body directly. Variables fills its placeholders.
 	//
-	// The two forms are mutually exclusive: accepting both would leave it
-	// ambiguous which one actually reached the recipient.
-	Template  string            `json:"template,omitempty"`
-	Variables map[string]string `json:"variables,omitempty"`
+	// TemplateID (with Locale) names a governed BIZ-03 template instead —
+	// its currently PUBLISHED version for that locale is rendered as the
+	// body. BIZ-03 templates carry no subject field (a document/form
+	// template has no notion of one), so Subject is still supplied
+	// directly even when TemplateID is used — only Body comes from the
+	// render.
+	//
+	// Exactly one of (Template), (TemplateID+Locale), (Subject/Body) may
+	// be used per send — accepting more than one would leave it ambiguous
+	// which content actually reached the recipient.
+	Template   string            `json:"template,omitempty"`
+	TemplateID string            `json:"template_id,omitempty"`
+	Locale     string            `json:"locale,omitempty"`
+	Variables  map[string]string `json:"variables,omitempty"`
 }
 
 // ListFilter carries every constraint on a register read, including the

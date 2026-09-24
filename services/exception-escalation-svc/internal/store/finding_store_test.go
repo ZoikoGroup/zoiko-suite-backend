@@ -30,6 +30,9 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS task_transitions;
+		DROP TABLE IF EXISTS tasks;
+		DROP TABLE IF EXISTS cases;
 		DROP TABLE IF EXISTS finding_closure_assessments;
 		DROP TABLE IF EXISTS remediation_evidence;
 		DROP TABLE IF EXISTS management_responses;

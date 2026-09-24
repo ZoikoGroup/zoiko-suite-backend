@@ -43,7 +43,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS webhook_dlq, action_tokens, email_suppressions, delivery_events, delivery_attempts, message_renders, message_intents, notifications CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS webhook_dlq, action_tokens, email_suppressions, delivery_events, delivery_attempts, message_renders, message_intents, template_versions, template_definitions, notifications CASCADE;`)
 
 	// Every migration, in order — discovered, not listed.
 	//

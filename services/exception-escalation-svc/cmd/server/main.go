@@ -97,6 +97,7 @@ func main() {
 
 	handler.RegisterRoutes(r, h)
 	handler.RegisterFindingRoutes(r, h, pgStore)
+	handler.RegisterTaskRoutes(r, h, pgStore)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

@@ -130,6 +130,68 @@ type stubStore struct {
 
 	completionGates    []domain.CompletionGate
 	completionGatesErr error
+
+	form             *domain.FormDefinition
+	formCreated      bool
+	formCreateErr    error
+	formGetErr       error
+	publishFormErr   error
+	retireFormErr    error
+	submission       *domain.FormSubmission
+	saveDraftErr     error
+	submitFormErr    error
+	validateSubErr   error
+	getSubmissionErr error
+
+	supersedeSubmissionErr  error
+	formRoute               *domain.FormSubmissionRoute
+	routeToDomainErr        error
+	submissionVersion       *domain.FormSubmissionVersionInfo
+	getSubmissionVersionErr error
+	validationResult        *domain.ValidationResult
+	getValidationResultErr  error
+	pendingSubmissions      []*domain.FormSubmission
+	listPendingErr          error
+}
+
+func (s *stubStore) CreateForm(_ context.Context, _ domain.CreateFormParams) (*domain.FormDefinition, bool, error) {
+	return s.form, s.formCreated, s.formCreateErr
+}
+func (s *stubStore) GetForm(_ context.Context, _, _ string) (*domain.FormDefinition, error) {
+	return s.form, s.formGetErr
+}
+func (s *stubStore) PublishForm(_ context.Context, _ domain.PublishFormParams) (*domain.FormDefinition, error) {
+	return s.form, s.publishFormErr
+}
+func (s *stubStore) RetireForm(_ context.Context, _ domain.RetireFormParams) (*domain.FormDefinition, error) {
+	return s.form, s.retireFormErr
+}
+func (s *stubStore) SaveDraft(_ context.Context, _ domain.SaveDraftParams) (*domain.FormSubmission, error) {
+	return s.submission, s.saveDraftErr
+}
+func (s *stubStore) SubmitForm(_ context.Context, _ domain.SubmitFormParams) (*domain.FormSubmission, error) {
+	return s.submission, s.submitFormErr
+}
+func (s *stubStore) ValidateSubmission(_ context.Context, _ domain.ValidateSubmissionParams) (*domain.FormSubmission, error) {
+	return s.submission, s.validateSubErr
+}
+func (s *stubStore) GetSubmission(_ context.Context, _, _ string) (*domain.FormSubmission, error) {
+	return s.submission, s.getSubmissionErr
+}
+func (s *stubStore) SupersedeSubmission(_ context.Context, _ domain.SupersedeSubmissionParams) (*domain.FormSubmission, error) {
+	return s.submission, s.supersedeSubmissionErr
+}
+func (s *stubStore) RouteToDomain(_ context.Context, _ domain.RouteToDomainParams) (*domain.FormSubmissionRoute, error) {
+	return s.formRoute, s.routeToDomainErr
+}
+func (s *stubStore) GetSubmissionVersion(_ context.Context, _, _ string) (*domain.FormSubmissionVersionInfo, error) {
+	return s.submissionVersion, s.getSubmissionVersionErr
+}
+func (s *stubStore) GetValidationResult(_ context.Context, _, _ string) (*domain.ValidationResult, error) {
+	return s.validationResult, s.getValidationResultErr
+}
+func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, _, _ int) ([]*domain.FormSubmission, error) {
+	return s.pendingSubmissions, s.listPendingErr
 }
 
 func (s *stubStore) CreateWorkflow(_ context.Context, _ domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
@@ -300,6 +362,7 @@ type stubPublisher struct {
 	completedCalls   int
 	invalidatedCalls int
 	auditEvents      []string
+	formEvents       []string
 }
 
 func (p *stubPublisher) PublishWorkflowStarted(_ context.Context, _ domain.WorkflowInstance) error {
@@ -328,6 +391,14 @@ func (p *stubPublisher) PublishWorkflowInvalidated(_ context.Context, _ domain.W
 }
 func (p *stubPublisher) PublishAuditEngagementEvent(_ context.Context, eventType string, _ domain.AuditEngagement, _, _ string) error {
 	p.auditEvents = append(p.auditEvents, eventType)
+	return nil
+}
+func (p *stubPublisher) PublishFormPublished(_ context.Context, _ domain.FormDefinition, _, _ string) error {
+	p.formEvents = append(p.formEvents, "form.published")
+	return nil
+}
+func (p *stubPublisher) PublishFormEvent(_ context.Context, eventType string, _ domain.FormSubmission, _, _ string) error {
+	p.formEvents = append(p.formEvents, eventType)
 	return nil
 }
 

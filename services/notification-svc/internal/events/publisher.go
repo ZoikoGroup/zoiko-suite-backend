@@ -89,6 +89,62 @@ func (p *Publisher) PublishFailed(ctx context.Context, correlationID string, n d
 	})
 }
 
+// PublishTemplateCreated backs BIZ-03's TemplateCreated event.
+func (p *Publisher) PublishTemplateCreated(ctx context.Context, correlationID string, d domain.TemplateDefinition) {
+	p.emit(ctx, "template.created", correlationID, d.TenantID, d.LegalEntityID, d.OwnerPrincipalID, d.TemplateID, map[string]any{
+		"template_id":        d.TemplateID,
+		"tenant_id":          d.TenantID,
+		"legal_entity_id":    d.LegalEntityID,
+		"name":               d.Name,
+		"owner_principal_id": d.OwnerPrincipalID,
+	})
+}
+
+// PublishTemplateVersionApproved backs BIZ-03's TemplateVersionApproved
+// event.
+func (p *Publisher) PublishTemplateVersionApproved(ctx context.Context, correlationID string, v domain.TemplateVersion) {
+	actor := ""
+	if v.ApprovedByPrincipalID != nil {
+		actor = *v.ApprovedByPrincipalID
+	}
+	p.emit(ctx, "template.version_approved", correlationID, v.TenantID, v.LegalEntityID, actor, v.VersionID, map[string]any{
+		"version_id":               v.VersionID,
+		"template_id":              v.TemplateID,
+		"tenant_id":                v.TenantID,
+		"legal_entity_id":          v.LegalEntityID,
+		"locale":                   v.Locale,
+		"version_number":           v.VersionNumber,
+		"approved_by_principal_id": actor,
+	})
+}
+
+// PublishTemplatePublished backs BIZ-03's TemplatePublished event.
+func (p *Publisher) PublishTemplatePublished(ctx context.Context, correlationID string, v domain.TemplateVersion) {
+	p.emit(ctx, "template.published", correlationID, v.TenantID, v.LegalEntityID, v.CreatedByPrincipalID, v.VersionID, map[string]any{
+		"version_id":      v.VersionID,
+		"template_id":     v.TemplateID,
+		"tenant_id":       v.TenantID,
+		"legal_entity_id": v.LegalEntityID,
+		"locale":          v.Locale,
+		"version_number":  v.VersionNumber,
+		"content_hash":    v.ContentHash,
+	})
+}
+
+// PublishTemplateRetired backs BIZ-03's TemplateRetired event.
+func (p *Publisher) PublishTemplateRetired(ctx context.Context, correlationID string, d domain.TemplateDefinition) {
+	actor := ""
+	if d.RetiredByPrincipalID != nil {
+		actor = *d.RetiredByPrincipalID
+	}
+	p.emit(ctx, "template.retired", correlationID, d.TenantID, d.LegalEntityID, actor, d.TemplateID, map[string]any{
+		"template_id":             d.TemplateID,
+		"tenant_id":               d.TenantID,
+		"legal_entity_id":         d.LegalEntityID,
+		"retired_by_principal_id": actor,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
