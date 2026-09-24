@@ -276,3 +276,122 @@ func TestOrchestrator_UnknownTemplate_Fails(t *testing.T) {
 		t.Fatalf("expected ErrTemplateNotFound, got: %v", err)
 	}
 }
+
+type mockPolicyResolver struct {
+	allowed bool
+	reason  string
+	err     error
+}
+
+func (m *mockPolicyResolver) Evaluate(ctx context.Context, intent *ledger.MessageIntent, stream ledger.SenderStream) (ledger.PolicyDecision, error) {
+	if m.err != nil {
+		return ledger.PolicyDecision{}, m.err
+	}
+	return ledger.PolicyDecision{
+		Allowed:  m.allowed,
+		Reason:   m.reason,
+		RuleName: "MOCK_POLICY",
+	}, nil
+}
+
+func TestOrchestrator_PolicySuppression_HaltedBeforeRender(t *testing.T) {
+	orc, store, deliverer, _ := setupTestOrchestrator(t)
+	tenantID := "tenant-suppressed"
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	policyMock := &mockPolicyResolver{
+		allowed: false,
+		reason:  "email address is suppressed (HARD_BOUNCE)",
+	}
+	orc.WithPolicyResolver(policyMock)
+
+	req := ledger.EventIngestRequest{
+		EventID:              "evt-supp-001",
+		EventType:            "identity.password_reset_requested",
+		RecipientPrincipalID: "usr-001",
+		LegalEntityID:        "entity-001",
+		TemplateKey:          "ZS-IA-001",
+		CorrelationID:        "corr-supp-001",
+		Variables: map[string]string{
+			"recipient.first_name":           "Alice",
+			"recipient.email_masked":         "a***@example.com",
+			"links.action_url":               "https://auth.zoiko.com/verify?token=xyz",
+			"security.link_expires_at_local": "15 minutes",
+			"message.reference":              "REF-12345",
+		},
+	}
+
+	res, err := orc.IngestEvent(ctx, req, "caller-001")
+	if err != nil {
+		t.Fatalf("expected ingest to succeed with KILLED intent, got error: %v", err)
+	}
+
+	if res.Status != ledger.IntentStatusKilled {
+		t.Errorf("expected status KILLED, got %s", res.Status)
+	}
+	if deliverer.deliverCalls != 0 {
+		t.Errorf("deliverer must NOT be called when email is suppressed, got %d calls", deliverer.deliverCalls)
+	}
+	if len(store.renders) != 0 {
+		t.Errorf("no render should be recorded when suppressed, got %d", len(store.renders))
+	}
+
+	// Verify intent record in store has status KILLED and failure reason
+	key := tenantID + ":id:" + res.MessageIntentID
+	intent, ok := store.intents[key]
+	if !ok {
+		t.Fatalf("intent was not saved in ledger store")
+	}
+	if intent.Status != ledger.IntentStatusKilled {
+		t.Errorf("expected intent in store to have status KILLED, got %s", intent.Status)
+	}
+	if intent.FailureReason == nil || *intent.FailureReason != "policy_suppressed: email address is suppressed (HARD_BOUNCE)" {
+		t.Errorf("unexpected failure reason: %v", intent.FailureReason)
+	}
+}
+
+func TestOrchestrator_PolicyEvaluationError_Fails(t *testing.T) {
+	orc, store, deliverer, _ := setupTestOrchestrator(t)
+	tenantID := "tenant-policy-err"
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	policyMock := &mockPolicyResolver{
+		err: errors.New("db connection failure"),
+	}
+	orc.WithPolicyResolver(policyMock)
+
+	req := ledger.EventIngestRequest{
+		EventID:              "evt-policy-err-001",
+		EventType:            "identity.password_reset_requested",
+		RecipientPrincipalID: "usr-001",
+		LegalEntityID:        "entity-001",
+		TemplateKey:          "ZS-IA-001",
+		CorrelationID:        "corr-001",
+		Variables: map[string]string{
+			"recipient.first_name":           "Alice",
+			"recipient.email_masked":         "a***@example.com",
+			"links.action_url":               "https://auth.zoiko.com/verify?token=xyz",
+			"security.link_expires_at_local": "15 minutes",
+			"message.reference":              "REF-12345",
+		},
+	}
+
+	_, err := orc.IngestEvent(ctx, req, "caller-001")
+	if err == nil {
+		t.Fatalf("expected error from policy failure, got nil")
+	}
+	if deliverer.deliverCalls != 0 {
+		t.Errorf("deliverer must not be called on policy error")
+	}
+
+	// Stored intent should be FAILED
+	dedupKey := ledger.ComputeDeduplicationKey(tenantID, req.EventType, req.EventID)
+	key := tenantID + ":" + dedupKey
+	intent, ok := store.intents[key]
+	if !ok {
+		t.Fatalf("intent was not saved in store")
+	}
+	if intent.Status != ledger.IntentStatusFailed {
+		t.Errorf("expected intent status FAILED, got %s", intent.Status)
+	}
+}

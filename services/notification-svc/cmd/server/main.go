@@ -30,6 +30,7 @@ import (
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
+	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
@@ -246,7 +247,8 @@ func main() {
 		}
 	}
 	killSwitch := ledger.NewKillSwitchManager(log)
-	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log)
+	policyEngine := policy.NewPrecedenceEngine(pgStore, log)
+	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log).WithPolicyResolver(policyEngine)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()

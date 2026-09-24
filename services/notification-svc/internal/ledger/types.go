@@ -139,3 +139,33 @@ type EventIngestRequest struct {
 	CorrelationID        string            `json:"correlation_id"`
 	CausationID          *string           `json:"causation_id,omitempty"`
 }
+
+// SuppressionReason defines the recognized reason for address suppression per ZS-COMMS-EMAIL-001 §4, §7.
+type SuppressionReason string
+
+const (
+	SuppressionReasonHardBounce   SuppressionReason = "HARD_BOUNCE"
+	SuppressionReasonComplaint    SuppressionReason = "COMPLAINT"
+	SuppressionReasonUnsubscribe  SuppressionReason = "UNSUBSCRIBE"
+	SuppressionReasonAdmin        SuppressionReason = "ADMIN_SUPPRESSED"
+)
+
+// EmailSuppression records an active deliverability or preference suppression entry in email_suppressions.
+type EmailSuppression struct {
+	SuppressionID  string            `json:"suppression_id"`
+	TenantID       string            `json:"tenant_id"`
+	RecipientEmail string            `json:"recipient_email"`
+	Reason         SuppressionReason `json:"reason"`
+	SourceStream   string            `json:"source_stream"`
+	ProviderName   *string           `json:"provider_name,omitempty"`
+	RawMetadata    json.RawMessage   `json:"raw_metadata,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
+}
+
+// PolicyDecision defines the outcome of evaluating the 8-level precedence policy before rendering.
+type PolicyDecision struct {
+	Allowed         bool   `json:"allowed"`
+	PrecedenceLevel int    `json:"precedence_level"`
+	RuleName        string `json:"rule_name"`
+	Reason          string `json:"reason,omitempty"`
+}
