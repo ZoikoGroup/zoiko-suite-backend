@@ -70,6 +70,15 @@ func (s *fakeSMTP) addr() (host string, port int) {
 	return "127.0.0.1", a.Port
 }
 
+// messageCount reads s.messages under the same lock handle() writes it
+// under — a direct read races the server goroutine, since nothing besides
+// TCP close orders the client's Send return against the server's append.
+func (s *fakeSMTP) messageCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.messages)
+}
+
 func (s *fakeSMTP) serve() {
 	defer s.wg.Done()
 	for {
@@ -383,8 +392,8 @@ func TestSMTPProvider_ConnectionDroppedAtVerdictIsUnknown(t *testing.T) {
 	if errors.As(err, &re) {
 		t.Fatalf("an ambiguous outcome must not also be classified Retryable — blindly retrying it risks a duplicate send: %v", err)
 	}
-	if len(s.messages) != 1 {
-		t.Fatalf("expected the fake server to have received the message body (proving the ambiguity is real), got %d messages", len(s.messages))
+	if n := s.messageCount(); n != 1 {
+		t.Fatalf("expected the fake server to have received the message body (proving the ambiguity is real), got %d messages", n)
 	}
 }
 
