@@ -15,20 +15,25 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
-	"zoiko.io/exception-escalation-svc/internal/authz"
-	"zoiko.io/exception-escalation-svc/internal/config"
-	svcenvelope "zoiko.io/exception-escalation-svc/internal/envelope"
-	"zoiko.io/exception-escalation-svc/internal/events"
-	"zoiko.io/exception-escalation-svc/internal/handler"
-	"zoiko.io/exception-escalation-svc/internal/health"
-	"zoiko.io/exception-escalation-svc/internal/middleware"
-	"zoiko.io/exception-escalation-svc/internal/mtls"
-	"zoiko.io/exception-escalation-svc/internal/store"
-	"zoiko.io/exception-escalation-svc/internal/telemetry"
+	"zoiko.io/comments-collaboration-svc/internal/authz"
+	"zoiko.io/comments-collaboration-svc/internal/config"
+	svcenvelope "zoiko.io/comments-collaboration-svc/internal/envelope"
+	"zoiko.io/comments-collaboration-svc/internal/events"
+	"zoiko.io/comments-collaboration-svc/internal/handler"
+	"zoiko.io/comments-collaboration-svc/internal/health"
+	"zoiko.io/comments-collaboration-svc/internal/middleware"
+	"zoiko.io/comments-collaboration-svc/internal/mtls"
+	"zoiko.io/comments-collaboration-svc/internal/retention"
+	"zoiko.io/comments-collaboration-svc/internal/store"
+	"zoiko.io/comments-collaboration-svc/internal/telemetry"
 )
 
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+
 func main() {
-	logger, err := telemetry.NewLogger("exception-escalation-svc")
+	logger, err := telemetry.NewLogger("comments-collaboration-svc")
 	if err != nil {
 		fmt.Printf("failed to initialize logger: %v\n", err)
 		os.Exit(1)
@@ -43,7 +48,6 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	var pool *pgxpool.Pool
 	poolCfg, err := pgxpool.ParseConfig(cfg.DSN())
 	if err != nil {
 		logger.Fatal("failed to parse db pool config", zap.Error(err))
@@ -53,7 +57,7 @@ func main() {
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 1 * time.Minute
-	pool, err = pgxpool.NewWithConfig(ctx, poolCfg)
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		logger.Warn("unable to connect to database on startup", zap.Error(err))
 	} else {
@@ -63,11 +67,9 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-
-	const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
-		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "exception-escalation-svc", platformScopeID)
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "comments-collaboration-svc", platformScopeID)
 		if err != nil {
 			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
 		}
@@ -77,13 +79,20 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	retentionClient := retention.NewHTTPClient(cfg.RetentionRegistryURL, logger)
+	h := handler.New(pgStore, publisher, authzClient, logger).WithRetentionClient(retentionClient)
+	// No ObjectVisibilityChecker is registered here yet — no other domain
+	// service exposes a CanView endpoint for comments-collaboration-svc to
+	// call. Until one is, every Mention refuses fail-closed (see
+	// handler.ObjectVisibilityChecker's own doc comment) rather than
+	// silently allowing. Register one per linked_object_type via
+	// h.WithVisibilityChecker(...) as domain services adopt it.
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
-	r.Use(middleware.TenantContextMiddleware)
+	r.Use(middleware.TenantContext())
 
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
 	// Recoverer and telemetry so a refusal is still traced, and ahead of every
@@ -96,9 +105,6 @@ func main() {
 	r.Get("/readyz", health.ReadyzHandler(pool))
 
 	handler.RegisterRoutes(r, h)
-	handler.RegisterFindingRoutes(r, h, pgStore)
-	handler.RegisterTaskRoutes(r, h, pgStore)
-	handler.RegisterDeadlineRoutes(r, h, pgStore)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -109,9 +115,9 @@ func main() {
 	}
 
 	go func() {
-		logger.Info("starting exception-escalation-svc", zap.String("port", cfg.Port))
+		logger.Info("starting comments-collaboration-svc", zap.String("port", cfg.Port))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("server error", zap.Error(err))
+			logger.Fatal("server ListenAndServe error", zap.Error(err))
 		}
 	}()
 
@@ -119,7 +125,7 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
-	logger.Info("shutting down exception-escalation-svc gracefully...")
+	logger.Info("shutting down comments-collaboration-svc gracefully...")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

@@ -71,7 +71,40 @@ type Notification struct {
 	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
 
 	LastAttemptAt *time.Time `json:"last_attempt_at,omitempty"`
+
+	// UnknownAt is set when this notification enters PENDING_UNKNOWN — the
+	// attempt happened (SentAt is set too, same as any concluded attempt)
+	// but the outcome is genuinely ambiguous. Nil for every other status.
+	UnknownAt *time.Time `json:"unknown_at,omitempty"`
+
+	// ResolvedAt/ResolvedByPrincipalID/ResolutionNote are
+	// ResolveDeliveryOutcome's own evidence — who settled an ambiguous
+	// attempt, when, and why. Set exactly once, moving Status to SENT or
+	// FAILED.
+	ResolvedAt            *time.Time `json:"resolved_at,omitempty"`
+	ResolvedByPrincipalID string     `json:"resolved_by_principal_id,omitempty"`
+	ResolutionNote        string     `json:"resolution_note,omitempty"`
+
+	// TemplateID/TemplateVersionID/RenderedContentHash are the doc's own
+	// evidence/lineage requirement ("template/version, rendered hash"),
+	// captured at send time. Empty for a notification sent from free-text
+	// subject/body or the static catalogue (internal/templates), which
+	// name no governed BIZ-03 template version to cite.
+	TemplateID          string `json:"template_id,omitempty"`
+	TemplateVersionID   string `json:"template_version_id,omitempty"`
+	RenderedContentHash string `json:"rendered_content_hash,omitempty"`
 }
+
+// Status values for Notification.Status. Named here so new code has a
+// single source of truth to reference; existing call sites' raw string
+// literals ("PENDING", "SENT", "FAILED") are left as they were — this
+// does not rename anything already written.
+const (
+	StatusPending        = "PENDING"
+	StatusSent           = "SENT"
+	StatusFailed         = "FAILED"
+	StatusPendingUnknown = "PENDING_UNKNOWN"
+)
 
 // Retrying reports whether delivery has not concluded and another attempt is
 // scheduled. Kept as a method so the console and the service agree on what the
@@ -90,6 +123,19 @@ func (n Notification) Retrying() bool {
 type DueRetry struct {
 	NotificationID string
 	TenantID       string
+}
+
+// ResolveDeliveryOutcomeParams — BIZ-10's own ResolveDeliveryOutcome
+// command. ResolvedStatus must be StatusSent or StatusFailed — the two
+// conclusions a real delivery attempt could have reached. ProviderResponse
+// is optional (the resolver may have new acceptance evidence — a provider
+// support ticket confirming the message DID go out — or none at all if
+// resolving to FAILED).
+type ResolveDeliveryOutcomeParams struct {
+	NotificationID, TenantID, ActorPrincipalID string
+	ResolvedStatus                             string
+	ResolutionNote                             string
+	ProviderResponse                           string
 }
 
 type SendNotificationRequest struct {
@@ -178,6 +224,15 @@ type DeliveryOutcome struct {
 	// retry worker possible without re-litigating every historical failure.
 	Retryable bool
 
+	// Unknown marks an outcome that is neither a confirmed acceptance nor a
+	// safely-retryable or terminal failure — the message may or may not
+	// have reached the provider, and guessing either way risks a duplicate
+	// send (guessing "not sent") or a silently dropped notice (guessing
+	// "sent"). Invariant #25: "ambiguous external outcomes SHALL remain
+	// Pending/Unknown rather than being guessed." Mutually exclusive with
+	// Delivered and Retryable — a caller sets at most one of the three.
+	Unknown bool
+
 	// ProviderName records the name of the provider that actually handled or refused
 	// the attempt (e.g. "smtp-primary", "smtp-secondary", "ses").
 	ProviderName string
@@ -192,12 +247,12 @@ const (
 // Channels this service accepts. IN_APP is terminal inside the platform; the
 // other three hand off to a provider outside it.
 const (
-	ChannelEmail   = "EMAIL"
+	ChannelEmail = "EMAIL"
 	// ChannelSMS is NOT accepted for new notifications — the handler's
 	// supportedChannels omits it, so a send naming it is refused at the
 	// request boundary. The constant remains because historical rows carry the
 	// value and the delivery router still has to answer for them truthfully.
-	ChannelSMS = "SMS"
+	ChannelSMS     = "SMS"
 	ChannelInApp   = "IN_APP"
 	ChannelWebhook = "WEBHOOK"
 )
@@ -240,4 +295,23 @@ var (
 	// says which of the two happened, and so a retry worker can tell a
 	// notification worth re-attempting from one that never will be.
 	ErrIdentityServiceUnavailable = errorString("identity-context-svc unavailable")
+
+	// ErrNotPendingUnknown is ResolveDeliveryOutcome's own guard — only a
+	// notification actually in PENDING_UNKNOWN has an ambiguous attempt to
+	// resolve.
+	ErrNotPendingUnknown = errorString("notification is not in PENDING_UNKNOWN — there is no ambiguous outcome to resolve")
+
+	// ErrInvalidResolvedStatus guards ResolveDeliveryOutcome's own target
+	// status — an ambiguous attempt resolves to exactly the two conclusions
+	// a real attempt could have reached, SENT or FAILED.
+	ErrInvalidResolvedStatus = errorString("resolved_status must be SENT or FAILED")
+
+	ErrResolutionNoteRequired = errorString("resolution_note is required")
+
+	// ErrDeliveryOutcomeUnknown is the doc's own named stable error,
+	// DELIVERY_OUTCOME_UNKNOWN: "Provider state ambiguous; original
+	// notification attempt must be resolved." Surfaced on
+	// GetDeliveryStatus for a PENDING_UNKNOWN notification — not a request
+	// failure, a reportable code describing the notification's own state.
+	ErrDeliveryOutcomeUnknown = errorString("provider state ambiguous; original notification attempt must be resolved")
 )

@@ -34,6 +34,14 @@ type fakeSMTP struct {
 	rcptReply string
 	dataReply string
 
+	// dropAfterData closes the connection after reading the full DATA body,
+	// without ever sending a reply — simulating the network dying exactly
+	// at the moment the server's accept-or-reject verdict would have
+	// arrived. The message is captured (s.messages) precisely because a
+	// real server may have accepted it before the connection died; that is
+	// the whole point of the scenario.
+	dropAfterData bool
+
 	// noops counts NOOP commands, so a test can prove Verify completed a real
 	// session rather than merely opening a socket.
 	noops int
@@ -60,6 +68,15 @@ func newFakeSMTP(t *testing.T) *fakeSMTP {
 func (s *fakeSMTP) addr() (host string, port int) {
 	a := s.ln.Addr().(*net.TCPAddr)
 	return "127.0.0.1", a.Port
+}
+
+// messageCount reads s.messages under the same lock handle() writes it
+// under — a direct read races the server goroutine, since nothing besides
+// TCP close orders the client's Send return against the server's append.
+func (s *fakeSMTP) messageCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.messages)
 }
 
 func (s *fakeSMTP) serve() {
@@ -139,7 +156,14 @@ func (s *fakeSMTP) handle(conn net.Conn) {
 			}
 			s.mu.Lock()
 			s.messages = append(s.messages, body.String())
+			drop := s.dropAfterData
 			s.mu.Unlock()
+			if drop {
+				// No reply at all — the client is left waiting on a verdict
+				// that will never come, exactly as a mid-response network
+				// failure would leave it.
+				return
+			}
 			if reply != "" {
 				write(reply)
 				continue
@@ -339,6 +363,66 @@ func TestSMTPProvider_PermanentRejectionIsNotRetryable(t *testing.T) {
 	var re deliver.RetryableError
 	if errors.As(err, &re) {
 		t.Fatalf("an unknown mailbox (SMTP 550) was marked retryable; it would be re-attempted forever: %v", err)
+	}
+}
+
+// TestSMTPProvider_ConnectionDroppedAtVerdictIsUnknown proves the one
+// precise change this wave made: a network fault exactly at the
+// DATA-close step — where the server's accept-or-reject verdict would
+// arrive — is classified Unknown, not Retryable. The message WAS
+// captured by the fake server (s.messages), which is exactly the
+// ambiguity: a real server may have committed the message before the
+// connection died.
+func TestSMTPProvider_ConnectionDroppedAtVerdictIsUnknown(t *testing.T) {
+	s := newFakeSMTP(t)
+	s.dropAfterData = true
+	p := newProvider(t, s, "no-reply@zoiko.test")
+
+	_, err := p.Send(context.Background(), deliver.Message{
+		To: "employee@example.com", Subject: "s", HTMLBody: "<p>b</p>",
+	})
+	if err == nil {
+		t.Fatal("expected an error — the connection was dropped before any reply")
+	}
+	var ue deliver.UnknownError
+	if !errors.As(err, &ue) {
+		t.Fatalf("a connection dropped exactly at the accept-or-reject verdict was not classified Unknown: %v", err)
+	}
+	var re deliver.RetryableError
+	if errors.As(err, &re) {
+		t.Fatalf("an ambiguous outcome must not also be classified Retryable — blindly retrying it risks a duplicate send: %v", err)
+	}
+	if n := s.messageCount(); n != 1 {
+		t.Fatalf("expected the fake server to have received the message body (proving the ambiguity is real), got %d messages", n)
+	}
+}
+
+// TestSMTPProvider_DialFailureIsRetryableNotUnknown is the negative
+// control proving the Unknown classification is scoped precisely to the
+// DATA-close verdict step — a failure before anything was transmitted
+// (nothing for the server to have committed) stays safely Retryable, as
+// it always was.
+func TestSMTPProvider_DialFailureIsRetryableNotUnknown(t *testing.T) {
+	p, err := deliver.NewSMTPProvider(deliver.SMTPConfig{
+		Host: "127.0.0.1", Port: 1, From: "no-reply@zoiko.test",
+		TLSMode: deliver.TLSNone, Timeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewSMTPProvider: %v", err)
+	}
+	_, err = p.Send(context.Background(), deliver.Message{
+		To: "employee@example.com", Subject: "s", HTMLBody: "<p>b</p>",
+	})
+	if err == nil {
+		t.Fatal("expected a connection error")
+	}
+	var ue deliver.UnknownError
+	if errors.As(err, &ue) {
+		t.Fatalf("a dial failure (nothing transmitted yet) was classified Unknown instead of the safely-retryable case it actually is: %v", err)
+	}
+	var re deliver.RetryableError
+	if !errors.As(err, &re) {
+		t.Fatalf("a dial failure was not classified retryable: %v", err)
 	}
 }
 
