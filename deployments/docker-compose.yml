@@ -29,6 +29,7 @@ services:
       - ../services/ai-governance-svc/deployments/migrations:/migrations/ai-governance:ro
       - ../services/kill-switch-registry-svc/deployments/migrations:/migrations/kill-switch-registry:ro
       - ../services/retention-registry-svc/deployments/migrations:/migrations/retention-registry:ro
+      - ../services/comments-collaboration-svc/deployments/migrations:/migrations/comments-collaboration:ro
       - ../services/privacy-purpose-registry-svc/deployments/migrations:/migrations/privacy-purpose-registry:ro
       - ../services/privacy-consent-svc/deployments/migrations:/migrations/privacy-consent:ro
       - ../services/privacy-decision-svc/deployments/migrations:/migrations/privacy-decision:ro
@@ -3539,6 +3540,43 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/retention_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.retention-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── comments-collaboration-svc (Port: 8170) ─────────────────────────────
+  # BIZ-09 of the Business Operations & Content Services spec. A new,
+  # dedicated platform service — unlike BIZ-01..08, comments have no single
+  # privileged parent entity to bolt onto (see migration 000001's own doc
+  # comment for the full placement rationale). Owns CommentThread/Comment/
+  # CommentVersion/Mention/Reaction/CommentAttachment/ModerationTrail;
+  # never writes to the linked business object itself.
+  comments-collaboration-svc:
+    build:
+      context: ../services/comments-collaboration-svc
+      dockerfile: Dockerfile
+    container_name: comments-collaboration-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8170:8170"
+    environment:
+      PORT: "8170"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/comments_collaboration?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.comments-collaboration.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
