@@ -47,6 +47,16 @@ type Config struct {
 	// the router fails over to it after a transient primary failure (§13 P1-12).
 	// All secondary vars default to empty (disabled).
 	SecondaryEmail EmailConfig
+
+	// WebhookDLQ configures the periodic background worker that reprocesses
+	// retryable webhook DLQ records.
+	WebhookDLQ WebhookDLQConfig
+}
+
+type WebhookDLQConfig struct {
+	Enabled   bool
+	Interval  time.Duration
+	BatchSize int
 }
 
 type DBConfig struct {
@@ -245,6 +255,12 @@ func Load() (*Config, error) {
 			TLSMode:        env("SMTP_SECONDARY_TLS_MODE", "starttls"),
 			AllowCleartext: env("SMTP_SECONDARY_ALLOW_CLEARTEXT", "false") == "true",
 			VerifyOnStart:  env("SMTP_SECONDARY_VERIFY_ON_START", "true") == "true",
+		},
+
+		WebhookDLQ: WebhookDLQConfig{
+			Enabled:   env("NOTIFICATION_WEBHOOK_DLQ_ENABLED", "true") == "true",
+			Interval:  envDuration("NOTIFICATION_WEBHOOK_DLQ_INTERVAL", 1*time.Minute),
+			BatchSize: envInt("NOTIFICATION_WEBHOOK_DLQ_BATCH_SIZE", 50),
 		},
 	}
 

@@ -252,8 +252,9 @@ func main() {
 	} else {
 		deliverer = deliver.NewRouter(emailProvider, log)
 	}
+	deliverer.SetMetrics(metrics)
 
-	// â”€â”€ 4b. Retry policy and worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	// ── 4b. Retry policy and worker ──────────────────────────────────────────
 	//
 	// One policy, shared. The handler writes the first schedule when a send
 	// fails transiently and the worker extends it from there, so they cannot
@@ -280,7 +281,9 @@ func main() {
 	}
 	killSwitch := ledger.NewKillSwitchManager(log)
 	policyEngine := policy.NewPrecedenceEngine(pgStore, log)
-	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log).WithPolicyResolver(policyEngine)
+	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log).
+		WithPolicyResolver(policyEngine).
+		WithMetrics(metrics)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -316,6 +319,7 @@ func main() {
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 
 	webhookProcessor := webhook.NewProcessor(pgStore, log)
+	webhookProcessor.SetMetrics(metrics)
 	webhookHandler := webhook.NewHandler(webhookProcessor, log)
 
 	// ── 4d. Action Link Gateway (optional) ──────────────────────────────────────────
@@ -396,6 +400,19 @@ func main() {
 		log,
 	)
 	go housekeepingWorker.Start(workerCtx)
+
+	// ── 6c. Webhook DLQ Reprocessor Worker ───────────────────────────────────
+	if cfg.WebhookDLQ.Enabled {
+		dlqWorker := webhook.NewDLQWorker(
+			webhookProcessor,
+			webhook.DLQWorkerOptions{
+				Interval:  cfg.WebhookDLQ.Interval,
+				BatchSize: cfg.WebhookDLQ.BatchSize,
+			},
+			log,
+		)
+		go dlqWorker.Start(workerCtx)
+	}
 
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)

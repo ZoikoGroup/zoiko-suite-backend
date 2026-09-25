@@ -50,6 +50,11 @@ type PolicyResolver interface {
 	Evaluate(ctx context.Context, intent *MessageIntent, stream SenderStream) (PolicyDecision, error)
 }
 
+// MetricsRecorder records intent and delivery stream metrics.
+type MetricsRecorder interface {
+	RecordIntent(stream, commClass, status string)
+}
+
 // Orchestrator coordinates event ingestion, deduplication, template integrity,
 // kill-switch enforcement, delivery dispatch, and audit ledger recording.
 type Orchestrator struct {
@@ -59,6 +64,7 @@ type Orchestrator struct {
 	policy     PolicyResolver
 	deliverer  Deliverer
 	recipient  RecipientResolver
+	metrics    MetricsRecorder
 	log        *zap.Logger
 }
 
@@ -87,6 +93,12 @@ func NewOrchestrator(
 // WithPolicyResolver attaches a policy precedence and suppression resolver.
 func (o *Orchestrator) WithPolicyResolver(pr PolicyResolver) *Orchestrator {
 	o.policy = pr
+	return o
+}
+
+// WithMetrics attaches a metrics recorder to the Orchestrator.
+func (o *Orchestrator) WithMetrics(m MetricsRecorder) *Orchestrator {
+	o.metrics = m
 	return o
 }
 
@@ -272,6 +284,9 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 				zap.String("rule", decision.RuleName),
 				zap.String("reason", decision.Reason),
 			)
+			if o.metrics != nil {
+				o.metrics.RecordIntent(string(tmplDef.SenderStream), string(tmplDef.CommunicationClass), "suppressed")
+			}
 			suppressReason := fmt.Sprintf("policy_suppressed: %s", decision.Reason)
 			if upErr := o.store.UpdateIntentStatus(ctx, tenantID, intent.MessageIntentID, IntentStatusKilled, &suppressReason); upErr != nil {
 				o.log.Error("failed to update suppressed intent to KILLED", zap.String("intent_id", intent.MessageIntentID), zap.Error(upErr))
@@ -427,6 +442,9 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 	finalStatus := IntentStatusDispatched
 	if !outcome.Delivered {
 		finalStatus = IntentStatusFailed
+	}
+	if o.metrics != nil {
+		o.metrics.RecordIntent(string(tmplDef.SenderStream), string(tmplDef.CommunicationClass), string(finalStatus))
 	}
 	if err := o.store.UpdateIntentStatus(ctx, tenantID, intent.MessageIntentID, finalStatus, attemptFailureReason); err != nil {
 		o.log.Error("failed to update intent status to final outcome",
