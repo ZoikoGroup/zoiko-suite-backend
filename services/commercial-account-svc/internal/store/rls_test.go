@@ -51,6 +51,12 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS commercial_idempotency_keys, price_version_capabilities,
+			price_component_tiers, price_components, product_price_versions,
+			commercial_products, commercial_currencies CASCADE;
+		DROP FUNCTION IF EXISTS reject_idempotency_key_update(), enforce_price_child_draft_only(),
+			enforce_price_version_lifecycle(), reject_commercial_product_mutation(),
+			enforce_commercial_currency_immutability() CASCADE;
 		DROP TABLE IF EXISTS outbox_events, subscription_status_events, billing_source_transfers,
 			subscription_change_requests, commercial_usage_meter_events,
 			contract_entitlement_overlays, evaluation_programs, commercial_subscriptions,
