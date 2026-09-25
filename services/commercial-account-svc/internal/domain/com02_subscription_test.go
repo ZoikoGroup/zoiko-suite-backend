@@ -43,28 +43,52 @@ func TestAddBillingIntervals_ClampsToMonthEndWithoutDrifting(t *testing.T) {
 	}
 }
 
+func monthlySpan(start time.Time) domain.TermSpan {
+	return domain.TermSpan{StartsAt: start, EndsAt: domain.AddBillingIntervals(start, "MONTH", 1, 1), Interval: "MONTH", IntervalCount: 1}
+}
+
 func TestCancellationBoundary_HonoursNoticeAndMinimumTerm(t *testing.T) {
 	anchor := utc(2031, time.January, 1, 0)
-	plan := monthlyPlan(true, 30, 1, nil)
+	terms := []domain.TermSpan{monthlySpan(anchor)}
+	notice := func(now time.Time, days int) time.Time { return now.Add(time.Duration(days) * 24 * time.Hour) }
 
 	// On 15 Jan the next term end (1 Feb) is only 17 days away, inside the
 	// 30-day notice window, so the cancellation lands on 1 March.
-	if got := domain.CancellationBoundary(plan, anchor, utc(2031, time.January, 15, 0)); !got.Equal(utc(2031, time.March, 1, 0)) {
+	now := utc(2031, time.January, 15, 0)
+	if got := domain.CancellationBoundary(terms, 0, notice(now, 30), now); !got.Equal(utc(2031, time.March, 1, 0)) {
 		t.Fatalf("inside the notice window: boundary = %s, want 1 March", got)
 	}
-
 	// Exactly at the notice limit still counts.
-	if got := domain.CancellationBoundary(plan, anchor, utc(2031, time.January, 2, 0)); !got.Equal(utc(2031, time.February, 1, 0)) {
+	now = utc(2031, time.January, 2, 0)
+	if got := domain.CancellationBoundary(terms, 0, notice(now, 30), now); !got.Equal(utc(2031, time.February, 1, 0)) {
 		t.Fatalf("30 days of notice exactly: boundary = %s, want 1 Feb", got)
 	}
-
 	// A 12-month minimum term: nothing ends before it is served.
-	annualCommit := monthlyPlan(true, 0, 12, nil)
-	if got := domain.CancellationBoundary(annualCommit, anchor, utc(2031, time.March, 10, 0)); !got.Equal(utc(2032, time.January, 1, 0)) {
-		t.Fatalf("minimum term: boundary = %s, want 1 Jan 2032", got)
+	minEnd := domain.MinimumTermEnd(terms[0], 12)
+	if !minEnd.Equal(utc(2032, time.January, 1, 0)) {
+		t.Fatalf("minimum term end = %s", minEnd)
 	}
-	if got := domain.MinimumTermEnd(annualCommit, anchor); !got.Equal(utc(2032, time.January, 1, 0)) {
-		t.Fatalf("minimum term end = %s", got)
+	now = utc(2031, time.March, 10, 0)
+	if got := domain.CancellationBoundary(terms, 0, minEnd, now); !got.Equal(minEnd) {
+		t.Fatalf("minimum term: boundary = %s, want %s", got, minEnd)
+	}
+}
+
+// A run of terms anchored on the 31st keeps its anchor across renewals; a
+// change of interval starts a new run from the change.
+func TestNextTermWindow_AnchorsOnTheRunAndRestartsOnIntervalChange(t *testing.T) {
+	a := utc(2031, time.January, 31, 9)
+	terms := []domain.TermSpan{monthlySpan(a)}
+	for i := 0; i < 2; i++ {
+		start, end := domain.NextTermWindow(terms, "MONTH", 1)
+		terms = append(terms, domain.TermSpan{StartsAt: start, EndsAt: end, Interval: "MONTH", IntervalCount: 1})
+	}
+	if !terms[1].EndsAt.Equal(utc(2031, time.March, 31, 9)) || !terms[2].EndsAt.Equal(utc(2031, time.April, 30, 9)) {
+		t.Fatalf("monthly run drifted: %s, %s", terms[1].EndsAt, terms[2].EndsAt)
+	}
+	start, end := domain.NextTermWindow(terms, "YEAR", 1)
+	if !start.Equal(terms[2].EndsAt) || !end.Equal(utc(2032, time.April, 30, 9)) {
+		t.Fatalf("switch to yearly: %s -> %s", start, end)
 	}
 }
 

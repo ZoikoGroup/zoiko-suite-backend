@@ -69,6 +69,8 @@ type planOpts struct {
 	minTerm   int
 	trial     *domain.TrialPolicy
 	seats     bool
+	base      string // default 49.00
+	interval  string // default MONTH
 }
 
 var termsHash = strings.Repeat("cd", 32)
@@ -86,8 +88,20 @@ func (f *subFixture) publishPlan(code string, o planOpts) *domain.PriceVersion {
 	if _, err := f.s.CreateProduct(f.ctx, p, f.claim(maker, "CreateProduct", p.ProductID)); err != nil {
 		f.t.Fatalf("create product: %v", err)
 	}
-	v := f.draft(p.ProductID, day(10), false, maker)
-	v = f.put(v, baseComponent("49.00"))
+	if o.base == "" {
+		o.base = "49.00"
+	}
+	if o.interval == "" {
+		o.interval = "MONTH"
+	}
+	d := &domain.PriceVersion{PriceVersionID: domain.NewCommercialID(domain.PrefixPriceVersion), ProductID: p.ProductID,
+		DisplayName: code, BillingInterval: o.interval, BillingIntervalCount: 1, CurrencyCode: "USD",
+		MarketCodes: []string{"GB", "US"}, EffectiveFrom: day(10), ChangeReason: "test plan", CreatedAt: t0, CreatedByPrincipalID: maker}
+	v, err := f.s.CreateDraftVersion(f.ctx, d, false, f.claim(maker, "CreateDraftVersion", d.PriceVersionID))
+	if err != nil {
+		f.t.Fatalf("create draft: %v", err)
+	}
+	v = f.put(v, baseComponent(o.base))
 	if o.seats {
 		v = f.put(v, seatsComponent())
 	}

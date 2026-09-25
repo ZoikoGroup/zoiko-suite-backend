@@ -1,6 +1,7 @@
 package money_test
 
 import (
+	"math/big"
 	"testing"
 
 	"zoiko.io/commercial-account-svc/internal/money"
@@ -48,6 +49,31 @@ func TestDecimal_ScaleAndCompare(t *testing.T) {
 	z, _ := money.Parse("0.0000")
 	if !z.IsZero() {
 		t.Error("0.0000 must be zero")
+	}
+}
+
+func TestFormatHalfEven(t *testing.T) {
+	cases := []struct {
+		num, den int64
+		scale    int
+		want     string
+	}{
+		{1, 8, 2, "0.12"}, // 0.125 -> tie -> even (2)
+		{3, 8, 2, "0.38"}, // 0.375 -> tie -> even (8)
+		{1, 3, 2, "0.33"},
+		{2, 3, 2, "0.67"},
+		{-1, 8, 2, "-0.12"},
+		{-2, 3, 2, "-0.67"},
+		{-1, 1000, 2, "0.00"}, // rounds to zero: no negative zero
+		{5, 2, 0, "2"},        // 2.5 -> even
+		{7, 2, 0, "4"},        // 3.5 -> even
+		{1029, 31, 2, "33.19"},
+		{49, 1, 3, "49.000"},
+	}
+	for _, tc := range cases {
+		if got := money.FormatHalfEven(big.NewRat(tc.num, tc.den), tc.scale); got != tc.want {
+			t.Errorf("FormatHalfEven(%d/%d, %d) = %s, want %s", tc.num, tc.den, tc.scale, got, tc.want)
+		}
 	}
 }
 

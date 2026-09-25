@@ -252,25 +252,6 @@ func TermEnd(plan *PriceVersion, anchor time.Time, k int) time.Time {
 	return AddBillingIntervals(anchor, plan.BillingInterval, plan.BillingIntervalCount, k)
 }
 
-// MinimumTermEnd is when the plan's minimum commitment has been served.
-func MinimumTermEnd(plan *PriceVersion, anchor time.Time) time.Time {
-	return TermEnd(plan, anchor, plan.Terms.MinimumTermIntervals)
-}
-
-// CancellationBoundary is the earliest term end at which a cancellation
-// requested at now can take effect: after the minimum term, and with at
-// least renewal_notice_days of notice. A request inside the notice window
-// takes effect at the following term end, not the current one.
-func CancellationBoundary(plan *PriceVersion, anchor, now time.Time) time.Time {
-	notice := now.Add(time.Duration(plan.Terms.RenewalNoticeDays) * 24 * time.Hour)
-	for k := plan.Terms.MinimumTermIntervals; ; k++ {
-		e := TermEnd(plan, anchor, k)
-		if e.After(now) && !e.Before(notice) {
-			return e
-		}
-	}
-}
-
 // ── Lifecycle planning ───────────────────────────────────────────────────────
 
 type PlannedVersion struct {

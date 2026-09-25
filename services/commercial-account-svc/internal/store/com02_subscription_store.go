@@ -31,6 +31,9 @@ type SubscriptionStore interface {
 	GetEffectiveVersion(ctx context.Context, subscriptionID string, at time.Time) (*domain.SubscriptionVersion, error)
 	GetChangeHistory(ctx context.Context, subscriptionID string) ([]domain.SubscriptionVersion, error)
 	GetRenewalState(ctx context.Context, subscriptionID string, now time.Time) (*domain.RenewalState, error)
+	PreviewChange(ctx context.Context, subscriptionID string, req domain.ChangeRequest, now time.Time) (*domain.ChangeQuote, error)
+	RequestChange(ctx context.Context, c domain.SubscriptionCommand, req domain.ChangeRequest, expectedQuoteSHA256 string, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error)
+	GetChanges(ctx context.Context, subscriptionID string) ([]domain.SubscriptionChange, error)
 }
 
 var _ SubscriptionStore = (*PgStore)(nil)
@@ -88,7 +91,8 @@ type subscriptionAggregate struct {
 	sub      *domain.Subscription
 	versions []domain.SubscriptionVersion // every version, voided included, by version_number
 	terms    []domain.SubscriptionTerm    // every term, voided included, by term_no
-	plan     *domain.PriceVersion         // the plan price version the subscription is bound to
+	plan     *domain.PriceVersion         // plan of the latest live version
+	pvs      map[string]*domain.PriceVersion
 }
 
 const subscriptionColumns = `subscription_id, organization_id::text, commercial_account_id::text, product_id,
@@ -219,18 +223,105 @@ func loadAggregate(ctx context.Context, tx pgx.Tx, id string, forUpdate bool) (*
 	}
 
 	deriveEffectiveTo(agg.versions)
-	if len(agg.versions) > 0 {
-		for _, it := range agg.versions[len(agg.versions)-1].Items {
-			if it.ItemRole == "PLAN" {
-				// Published or retired price versions are readable from the
-				// tenant plane; a subscription is only ever bound to those.
-				if agg.plan, err = loadVersion(ctx, tx, it.PriceVersionID, false); err != nil {
-					return nil, err
-				}
+
+	// Every price version the subscription has ever referenced, from its
+	// items and its terms. Published and retired versions are readable from
+	// the tenant plane, and a subscription is only ever bound to those.
+	agg.pvs = map[string]*domain.PriceVersion{}
+	var ids []string
+	seen := map[string]bool{}
+	for _, v := range agg.versions {
+		for _, it := range v.Items {
+			if !seen[it.PriceVersionID] {
+				seen[it.PriceVersionID] = true
+				ids = append(ids, it.PriceVersionID)
 			}
 		}
 	}
+	for _, t := range agg.terms {
+		if !seen[t.PriceVersionID] {
+			seen[t.PriceVersionID] = true
+			ids = append(ids, t.PriceVersionID)
+		}
+	}
+	if len(ids) > 0 {
+		pvs, err := queryVersions(ctx, tx, `WHERE v.price_version_id = ANY($1)`, ids)
+		if err != nil {
+			return nil, err
+		}
+		for _, pv := range pvs {
+			agg.pvs[pv.PriceVersionID] = pv
+		}
+	}
+	if l := live(agg.versions); len(l) > 0 {
+		agg.plan = agg.planOf(l[len(l)-1])
+	}
 	return agg, nil
+}
+
+func (a *subscriptionAggregate) planOf(v *domain.SubscriptionVersion) *domain.PriceVersion {
+	for _, it := range v.Items {
+		if it.ItemRole == "PLAN" {
+			return a.pvs[it.PriceVersionID]
+		}
+	}
+	return nil
+}
+
+// planAt is the plan price version in force at t — or, before the
+// subscription starts, the one it will start on. A change scheduled for a
+// term end is therefore the plan that term's renewal is priced under.
+func (a *subscriptionAggregate) planAt(t time.Time) *domain.PriceVersion {
+	if v, _ := a.statusNowOrUpcoming(t); v != nil {
+		return a.planOf(v)
+	}
+	return a.plan
+}
+
+// termSpans is the live terms with the interval each was taken under.
+func (a *subscriptionAggregate) termSpans() ([]domain.TermSpan, []domain.SubscriptionTerm) {
+	lt := liveTerms(a.terms)
+	spans := make([]domain.TermSpan, len(lt))
+	for i, t := range lt {
+		pv := a.pvs[t.PriceVersionID]
+		spans[i] = domain.TermSpan{StartsAt: t.StartsAt, EndsAt: t.EndsAt, Interval: pv.BillingInterval, IntervalCount: pv.BillingIntervalCount}
+	}
+	return spans, lt
+}
+
+// termIndexAt is the index of the live term containing t, or -1.
+func termIndexAt(lt []domain.SubscriptionTerm, t time.Time) int {
+	for i, term := range lt {
+		if !term.StartsAt.After(t) && term.EndsAt.After(t) {
+			return i
+		}
+	}
+	return -1
+}
+
+// minimumTermEnd is when the first term's minimum commitment is served.
+func (a *subscriptionAggregate) minimumTermEnd() *time.Time {
+	spans, lt := a.termSpans()
+	if len(lt) == 0 {
+		return nil
+	}
+	e := domain.MinimumTermEnd(spans[0], lt[0].MinimumTermIntervals)
+	return &e
+}
+
+// cancellationBoundary applies the current term's notice and the minimum
+// term to the current run of terms.
+func (a *subscriptionAggregate) cancellationBoundary(now time.Time) (time.Time, bool) {
+	spans, lt := a.termSpans()
+	i := termIndexAt(lt, now)
+	if i < 0 {
+		return time.Time{}, false
+	}
+	notBefore := now.Add(time.Duration(lt[i].RenewalNoticeDays) * 24 * time.Hour)
+	if minEnd := a.minimumTermEnd(); minEnd != nil && minEnd.After(notBefore) {
+		notBefore = *minEnd
+	}
+	return domain.CancellationBoundary(spans, i, notBefore, now), true
 }
 
 // live returns the non-voided versions ordered by effective time.
@@ -406,7 +497,7 @@ func insertSubscriptionTerm(ctx context.Context, tx pgx.Tx, subID string, termNo
 
 // applyPlan writes a lifecycle plan's versions and terms after the
 // aggregate's existing ones.
-func (a *subscriptionAggregate) applyPlan(ctx context.Context, tx pgx.Tx, p domain.LifecyclePlan, items []domain.SubscriptionItem, m changeMeta) error {
+func (a *subscriptionAggregate) applyPlan(ctx context.Context, tx pgx.Tx, p domain.LifecyclePlan, items []domain.SubscriptionItem, termPlan *domain.PriceVersion, m changeMeta) error {
 	n := a.nextVersionNumber()
 	for i, pv := range p.Versions {
 		if err := insertSubscriptionVersion(ctx, tx, a.sub.SubscriptionID, n+i, pv, items, m); err != nil {
@@ -415,7 +506,7 @@ func (a *subscriptionAggregate) applyPlan(ctx context.Context, tx pgx.Tx, p doma
 	}
 	t := a.nextTermNo()
 	for i, term := range p.Terms {
-		if err := insertSubscriptionTerm(ctx, tx, a.sub.SubscriptionID, t+i, term, a.plan, m); err != nil {
+		if err := insertSubscriptionTerm(ctx, tx, a.sub.SubscriptionID, t+i, term, termPlan, m); err != nil {
 			return err
 		}
 	}
@@ -579,9 +670,8 @@ func (s *PgStore) StartSubscription(ctx context.Context, p domain.StartSubscript
 		if err != nil {
 			return err
 		}
-		agg.plan = plan
 		m := changeMeta{changeID: p.ChangeID, actor: p.Actor, channel: p.Channel, basis: p.CustomerBasisRef, now: p.Now}
-		if err := agg.applyPlan(ctx, tx, lp, items, m); err != nil {
+		if err := agg.applyPlan(ctx, tx, lp, items, plan, m); err != nil {
 			return err
 		}
 		if err := emitSubscriptionEvent(ctx, tx, "subscription.started", agg.sub, m, subscriptionEvent{
@@ -635,14 +725,6 @@ func (s *PgStore) subscriptionCommand(ctx context.Context, c domain.Subscription
 	return out, err
 }
 
-func firstLiveTerm(ts []domain.SubscriptionTerm) *domain.SubscriptionTerm {
-	l := liveTerms(ts)
-	if len(l) == 0 {
-		return nil
-	}
-	return &l[0]
-}
-
 func lastLiveTerm(ts []domain.SubscriptionTerm) *domain.SubscriptionTerm {
 	l := liveTerms(ts)
 	if len(l) == 0 {
@@ -663,6 +745,7 @@ func (s *PgStore) ActivateSubscription(ctx context.Context, c domain.Subscriptio
 			return domain.ErrSubscriptionInvalidState
 		}
 		var lp domain.LifecyclePlan
+		var plan *domain.PriceVersion
 		switch cur.LifecycleStatus {
 		case domain.LifecyclePending:
 			if customerConfirmation {
@@ -672,7 +755,8 @@ func (s *PgStore) ActivateSubscription(ctx context.Context, c domain.Subscriptio
 			if a.sub.StartsAt.After(at) {
 				at = a.sub.StartsAt
 			}
-			lp = domain.PlanActivation(a.plan, at, domain.ChangeActivated)
+			plan = a.planAt(at)
+			lp = domain.PlanActivation(plan, at, domain.ChangeActivated)
 		case domain.LifecycleTrialing:
 			for _, v := range scheduledAfter(a.versions, c.Now) {
 				if v.LifecycleStatus == domain.LifecycleActive {
@@ -682,11 +766,12 @@ func (s *PgStore) ActivateSubscription(ctx context.Context, c domain.Subscriptio
 			if err := voidFuture(ctx, tx, a.sub.SubscriptionID, m, "trial conversion confirmed"); err != nil {
 				return err
 			}
-			lp = domain.PlanActivation(a.plan, *cur.TrialEndsAt, domain.ChangeTrialConversion)
+			plan = a.planAt(c.Now)
+			lp = domain.PlanActivation(plan, *cur.TrialEndsAt, domain.ChangeTrialConversion)
 		default:
 			return fmt.Errorf("%w: cannot activate a %s subscription", domain.ErrSubscriptionInvalidState, cur.LifecycleStatus)
 		}
-		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), m); err != nil {
+		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), plan, m); err != nil {
 			return err
 		}
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, lp.EndsAt); err != nil {
@@ -708,11 +793,15 @@ func (s *PgStore) ScheduleCancellation(ctx context.Context, c domain.Subscriptio
 		if cur == nil || cur.LifecycleStatus != domain.LifecycleActive {
 			return fmt.Errorf("%w: only an ACTIVE subscription can schedule a cancellation", domain.ErrSubscriptionInvalidState)
 		}
-		first := firstLiveTerm(a.terms)
-		if first == nil {
+		// A scheduled configuration change would take effect inside the
+		// cancel-pending window and mask it; resolve one before the other.
+		if len(scheduledAfter(a.versions, c.Now)) > 0 {
+			return domain.ErrChangeAlreadyScheduled
+		}
+		boundary, ok := a.cancellationBoundary(c.Now)
+		if !ok {
 			return domain.ErrSubscriptionInvalidState
 		}
-		boundary := domain.CancellationBoundary(a.plan, first.StartsAt, c.Now)
 		if a.sub.EndsAt != nil && !a.sub.EndsAt.After(boundary) {
 			return fmt.Errorf("%w: the subscription already ends at %s", domain.ErrSubscriptionInvalidState, a.sub.EndsAt.Format(time.RFC3339))
 		}
@@ -720,7 +809,7 @@ func (s *PgStore) ScheduleCancellation(ctx context.Context, c domain.Subscriptio
 			{Status: domain.LifecycleCancelPending, ChangeType: domain.ChangeCancellationScheduled, EffectiveFrom: c.Now},
 			{Status: domain.LifecycleCanceled, ChangeType: domain.ChangeCancellationEffective, EffectiveFrom: boundary},
 		}}
-		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), m); err != nil {
+		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), nil, m); err != nil {
 			return err
 		}
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, &boundary); err != nil {
@@ -742,8 +831,7 @@ func (s *PgStore) CancelNow(ctx context.Context, c domain.SubscriptionCommand, c
 			return domain.ErrSubscriptionEnded
 		}
 		if started && (cur.LifecycleStatus == domain.LifecycleActive || cur.LifecycleStatus == domain.LifecycleCancelPending) {
-			first := firstLiveTerm(a.terms)
-			if first != nil && c.Now.Before(domain.MinimumTermEnd(a.plan, first.StartsAt)) {
+			if minEnd := a.minimumTermEnd(); minEnd != nil && c.Now.Before(*minEnd) {
 				return domain.ErrMinimumTermNotMet
 			}
 		}
@@ -757,7 +845,7 @@ func (s *PgStore) CancelNow(ctx context.Context, c domain.SubscriptionCommand, c
 		lp := domain.LifecyclePlan{Versions: []domain.PlannedVersion{
 			{Status: domain.LifecycleCanceled, ChangeType: domain.ChangeCanceledNow, EffectiveFrom: c.Now},
 		}}
-		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), m); err != nil {
+		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), nil, m); err != nil {
 			return err
 		}
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, &endsAt); err != nil {
@@ -782,7 +870,7 @@ func (s *PgStore) Reactivate(ctx context.Context, c domain.SubscriptionCommand, 
 		lp := domain.LifecyclePlan{Versions: []domain.PlannedVersion{
 			{Status: domain.LifecycleActive, ChangeType: domain.ChangeReactivated, EffectiveFrom: c.Now},
 		}}
-		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), m); err != nil {
+		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), nil, m); err != nil {
 			return err
 		}
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, nil); err != nil {
@@ -797,16 +885,20 @@ func (s *PgStore) Reactivate(ctx context.Context, c domain.SubscriptionCommand, 
 // Renew adds the next term. An auto-renewing subscription renews once its
 // current term has ended (the boundary processor calls this at term end).
 // A subscription that does not auto-renew can be renewed before it expires,
-// which withdraws the scheduled expiry. Renewal keeps the bound price
-// version: a newer published price never reprices it (COM-CTRL-003).
+// which withdraws the scheduled expiry. The new term is priced under the
+// plan in force at the term end: the bound price version, or a change
+// scheduled for that boundary — never a newer published price
+// (COM-CTRL-003).
 func (s *PgStore) Renew(ctx context.Context, c domain.SubscriptionCommand, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error) {
 	return s.subscriptionCommand(ctx, c, claim, func(tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
-		last, first := lastLiveTerm(a.terms), firstLiveTerm(a.terms)
-		if last == nil {
+		spans, lt := a.termSpans()
+		if len(lt) == 0 {
 			return fmt.Errorf("%w: the subscription has no term to renew", domain.ErrSubscriptionInvalidState)
 		}
-		k := len(liveTerms(a.terms)) + 1
-		next := domain.PlannedTerm{StartsAt: last.EndsAt, EndsAt: domain.TermEnd(a.plan, first.StartsAt, k)}
+		last := lt[len(lt)-1]
+		plan := a.planAt(last.EndsAt)
+		start, end := domain.NextTermWindow(spans, plan.BillingInterval, plan.BillingIntervalCount)
+		next := domain.PlannedTerm{StartsAt: start, EndsAt: end}
 		lp := domain.LifecyclePlan{Terms: []domain.PlannedTerm{next}}
 		endsAt := a.sub.EndsAt
 
@@ -814,7 +906,7 @@ func (s *PgStore) Renew(ctx context.Context, c domain.SubscriptionCommand, claim
 		switch {
 		case endsAtTermEnd:
 			expiry := effectiveAt(a.versions, last.EndsAt)
-			if a.plan.Terms.AutoRenew || !c.Now.Before(last.EndsAt) || expiry == nil || expiry.ChangeType != domain.ChangeTermExpiry {
+			if last.AutoRenew || !c.Now.Before(last.EndsAt) || expiry == nil || expiry.ChangeType != domain.ChangeTermExpiry {
 				return domain.ErrSubscriptionEnded
 			}
 			if err := voidFuture(ctx, tx, a.sub.SubscriptionID, m, "renewed before expiry"); err != nil {
@@ -825,7 +917,7 @@ func (s *PgStore) Renew(ctx context.Context, c domain.SubscriptionCommand, claim
 		case c.Now.Before(last.EndsAt):
 			return domain.ErrRenewalNotDue
 		}
-		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), m); err != nil {
+		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), plan, m); err != nil {
 			return err
 		}
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, endsAt); err != nil {
@@ -891,19 +983,20 @@ func (s *PgStore) GetRenewalState(ctx context.Context, id string, now time.Time)
 		}
 		v := a.view(now)
 		rs := &domain.RenewalState{SubscriptionID: id, AsOf: now, Status: v.Status, CurrentTerm: v.CurrentTerm,
-			AutoRenew: a.plan.Terms.AutoRenew, EndsAt: a.sub.EndsAt}
-		if first, last := firstLiveTerm(a.terms), lastLiveTerm(a.terms); first != nil {
-			minEnd := domain.MinimumTermEnd(a.plan, first.StartsAt)
-			rs.MinimumTermEndsAt = &minEnd
+			AutoRenew: a.planAt(now).Terms.AutoRenew, EndsAt: a.sub.EndsAt}
+		if last := lastLiveTerm(a.terms); last != nil {
+			rs.AutoRenew = last.AutoRenew
+			rs.MinimumTermEndsAt = a.minimumTermEnd()
 			continues := a.sub.EndsAt == nil || a.sub.EndsAt.After(last.EndsAt)
-			if a.plan.Terms.AutoRenew && continues {
+			if last.AutoRenew && continues {
 				next := last.EndsAt
 				rs.NextTermStartsAt = &next
 				rs.RenewalDue = !now.Before(last.EndsAt)
 			}
 			if v.Status != nil && *v.Status == domain.LifecycleActive {
-				b := domain.CancellationBoundary(a.plan, first.StartsAt, now)
-				rs.EarliestCancellationBoundary = &b
+				if b, ok := a.cancellationBoundary(now); ok {
+					rs.EarliestCancellationBoundary = &b
+				}
 			}
 		}
 		out = rs

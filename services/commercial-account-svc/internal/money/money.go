@@ -85,6 +85,42 @@ func (d Decimal) whole(up bool) Decimal {
 	return Decimal{unscaled: q, scale: 0, text: q.String()}
 }
 
+// Rat returns the exact value for arithmetic. Every intermediate result in
+// rating and proration stays a big.Rat; rounding happens once, at the end,
+// through FormatHalfEven.
+func (d Decimal) Rat() *big.Rat { return d.rat() }
+
+// FormatHalfEven rounds r to scale fractional digits, ties to even, and
+// formats it with exactly that many digits. Unlike Decimal, the result may be
+// negative: a proration net can be a credit.
+func FormatHalfEven(r *big.Rat, scale int) string {
+	pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+	scaled := new(big.Rat).Mul(r, new(big.Rat).SetInt(pow))
+	num, den := scaled.Num(), scaled.Denom()
+	neg := num.Sign() < 0
+	absNum := new(big.Int).Abs(num)
+	q, rem := new(big.Int).QuoRem(absNum, den, new(big.Int))
+	switch new(big.Int).Mul(rem, big.NewInt(2)).Cmp(den) {
+	case 1:
+		q.Add(q, big.NewInt(1))
+	case 0:
+		if q.Bit(0) == 1 {
+			q.Add(q, big.NewInt(1))
+		}
+	}
+	s := q.String()
+	if scale > 0 {
+		if len(s) <= scale {
+			s = strings.Repeat("0", scale-len(s)+1) + s
+		}
+		s = s[:len(s)-scale] + "." + s[len(s)-scale:]
+	}
+	if neg && q.Sign() != 0 {
+		s = "-" + s
+	}
+	return s
+}
+
 func (d Decimal) rat() *big.Rat {
 	if d.unscaled == nil {
 		return new(big.Rat)

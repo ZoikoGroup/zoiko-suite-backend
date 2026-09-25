@@ -47,6 +47,8 @@ type subStub struct {
 	start        domain.StartSubscriptionParams
 	cmd          domain.SubscriptionCommand
 	confirmation *bool
+	change       domain.ChangeRequest
+	quote        string
 }
 
 func (s *subStub) rec(ctx context.Context, name string, claim domain.IdempotencyClaim) {
@@ -102,6 +104,20 @@ func (s *subStub) GetRenewalState(ctx context.Context, _ string, _ time.Time) (*
 	s.rec(ctx, "GetRenewalState", domain.IdempotencyClaim{})
 	return &domain.RenewalState{}, s.err
 }
+func (s *subStub) PreviewChange(ctx context.Context, _ string, req domain.ChangeRequest, _ time.Time) (*domain.ChangeQuote, error) {
+	s.rec(ctx, "PreviewChange", domain.IdempotencyClaim{})
+	s.change = req
+	return &domain.ChangeQuote{QuoteSHA256: "q"}, s.err
+}
+func (s *subStub) RequestChange(ctx context.Context, cmd domain.SubscriptionCommand, req domain.ChangeRequest, quote string, c domain.IdempotencyClaim) (*domain.SubscriptionView, error) {
+	s.rec(ctx, "RequestChange", c)
+	s.cmd, s.change, s.quote = cmd, req, quote
+	return s.view, s.err
+}
+func (s *subStub) GetChanges(ctx context.Context, _ string) ([]domain.SubscriptionChange, error) {
+	s.rec(ctx, "GetChanges", domain.IdempotencyClaim{})
+	return nil, s.err
+}
 
 var fixedNow = time.Date(2030, 3, 1, 12, 0, 0, 0, time.UTC)
 
@@ -109,7 +125,7 @@ func newSubRouter(st *subStub, az *scopedAuthz) http.Handler {
 	logger, _ := zap.NewDevelopment()
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	RegisterSubscriptionV2Routes(r, NewSubscriptionHandler(st, az, logger).WithClock(func() time.Time { return fixedNow }))
+	RegisterSubscriptionV2Routes(r, NewSubscriptionHandler(st, nil, az, logger).WithClock(func() time.Time { return fixedNow }))
 	return r
 }
 

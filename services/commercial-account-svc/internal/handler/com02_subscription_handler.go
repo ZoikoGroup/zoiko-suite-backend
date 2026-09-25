@@ -44,6 +44,12 @@ const (
 	CodeRenewalNotDue            = "RENEWAL_NOT_DUE"
 	CodeSubscriptionEnded        = "SUBSCRIPTION_ENDED"
 	CodeEndpointRetired          = "ENDPOINT_RETIRED"
+	CodeTransitionNotAllowed     = "TRANSITION_NOT_ALLOWED"
+	CodeTimingNotAllowed         = "TIMING_NOT_ALLOWED"
+	CodeChangeAlreadyScheduled   = "CHANGE_ALREADY_SCHEDULED"
+	CodeNoChange                 = "NO_CHANGE"
+	CodeQuoteChanged             = "QUOTE_CHANGED"
+	CodeTransitionRuleExists     = "TRANSITION_RULE_EXISTS"
 )
 
 var (
@@ -57,13 +63,14 @@ var (
 // SubscriptionHandler serves COM-02.
 type SubscriptionHandler struct {
 	store  store.SubscriptionStore
+	rules  store.TransitionRuleStore
 	authz  AuthzChecker
 	logger *zap.Logger
 	now    func() time.Time
 }
 
-func NewSubscriptionHandler(st store.SubscriptionStore, az AuthzChecker, logger *zap.Logger) *SubscriptionHandler {
-	return &SubscriptionHandler{store: st, authz: az, logger: logger, now: serverNow}
+func NewSubscriptionHandler(st store.SubscriptionStore, rules store.TransitionRuleStore, az AuthzChecker, logger *zap.Logger) *SubscriptionHandler {
+	return &SubscriptionHandler{store: st, rules: rules, authz: az, logger: logger, now: serverNow}
 }
 
 func (h *SubscriptionHandler) WithClock(now func() time.Time) *SubscriptionHandler {
@@ -80,6 +87,11 @@ func RegisterSubscriptionV2Routes(r chi.Router, h *SubscriptionHandler) {
 		r.Get("/subscriptions/{id}/effective-version", h.GetEffectiveVersion)
 		r.Get("/subscriptions/{id}/history", h.GetChangeHistory)
 		r.Get("/subscriptions/{id}/renewal-state", h.GetRenewalState)
+		r.Get("/subscriptions/{id}/changes", h.GetChanges)
+
+		r.Post("/plan-transition-rules", h.CreateTransitionRule)
+		r.Get("/plan-transition-rules", h.ListTransitionRules)
+		r.Post("/plan-transition-rules/{id}", h.TransitionRuleAction)
 	})
 }
 
@@ -224,6 +236,20 @@ func subscriptionFailure(w http.ResponseWriter, r *http.Request, err error) bool
 		p.Status, p.Code = http.StatusConflict, CodeRenewalNotDue
 	case errors.Is(err, domain.ErrSubscriptionEnded):
 		p.Status, p.Code = http.StatusConflict, CodeSubscriptionEnded
+	case errors.Is(err, domain.ErrTransitionNotAllowed):
+		p.Status, p.Code = http.StatusConflict, CodeTransitionNotAllowed
+	case errors.Is(err, domain.ErrTimingNotAllowed):
+		p.Status, p.Code = http.StatusConflict, CodeTimingNotAllowed
+	case errors.Is(err, domain.ErrChangeAlreadyScheduled):
+		p.Status, p.Code = http.StatusConflict, CodeChangeAlreadyScheduled
+	case errors.Is(err, domain.ErrNoChange):
+		p.Status, p.Code = http.StatusUnprocessableEntity, CodeNoChange
+	case errors.Is(err, domain.ErrQuoteChanged):
+		p.Status, p.Code = http.StatusConflict, CodeQuoteChanged
+	case errors.Is(err, domain.ErrTransitionRuleExists), errors.Is(err, domain.ErrTransitionRuleRetired):
+		p.Status, p.Code = http.StatusConflict, CodeTransitionRuleExists
+	case errors.Is(err, domain.ErrTransitionRuleNotFound):
+		p.Status, p.Code = http.StatusNotFound, CodeNotFound
 	default:
 		return false
 	}
@@ -366,11 +392,95 @@ func (h *SubscriptionHandler) StartSubscription(w http.ResponseWriter, r *http.R
 	writeSubscription(w, http.StatusCreated, v)
 }
 
-// ── Lifecycle commands ───────────────────────────────────────────────────────
+// ── Lifecycle and change commands ────────────────────────────────────────────
 
 type subscriptionActionRequest struct {
-	Reason   string           `json:"reason"`
-	Assisted *assistedRequest `json:"assisted"`
+	Reason              string            `json:"reason"`
+	Assisted            *assistedRequest  `json:"assisted"`
+	Operation           string            `json:"operation"`
+	ProductCode         string            `json:"product_code"`
+	Quantities          map[string]string `json:"quantities"`
+	AcceptedTermsSHA256 string            `json:"accepted_terms_sha256"`
+	ExpectedQuoteSHA256 string            `json:"expected_quote_sha256"`
+}
+
+func (req *subscriptionActionRequest) carriesChange() bool {
+	return req.Operation != "" || req.ProductCode != "" || req.Quantities != nil ||
+		req.AcceptedTermsSHA256 != "" || req.ExpectedQuoteSHA256 != ""
+}
+
+// lifecycleActions maps each lifecycle custom method to the operator grant
+// that allows an assisted call of it.
+var lifecycleActions = map[string]string{
+	"activate": ActionSubscriptionActivate, "schedule-cancellation": ActionSubscriptionAssist,
+	"cancel": ActionSubscriptionAssist, "reactivate": ActionSubscriptionAssist, "renew": ActionSubscriptionAssist,
+}
+
+var changeActions = map[string]bool{
+	"change-plan": true, "schedule-downgrade": true, "change-quantity": true, "add-add-on": true, "remove-add-on": true,
+}
+
+// changeRequestFor turns a change action and its body into a ChangeRequest,
+// or names the field that is missing or does not belong.
+func changeRequestFor(action string, req *subscriptionActionRequest) (domain.ChangeRequest, *Problem) {
+	bad := func(field, detail string) (domain.ChangeRequest, *Problem) {
+		return domain.ChangeRequest{}, &Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: field, Detail: detail}
+	}
+	needProduct := func() *Problem {
+		if !queryCodePattern.MatchString(req.ProductCode) {
+			_, p := bad("product_code", "a product_code is required")
+			return p
+		}
+		return nil
+	}
+	needTerms := func() *Problem {
+		if !sha256Pattern.MatchString(req.AcceptedTermsSHA256) {
+			_, p := bad("accepted_terms_sha256", "the SHA-256 of the new product's terms the customer accepted is required")
+			return p
+		}
+		return nil
+	}
+	quantities := req.Quantities
+	if quantities == nil {
+		quantities = map[string]string{}
+	}
+	switch action {
+	case "change-plan", "schedule-downgrade":
+		if p := needProduct(); p != nil {
+			return domain.ChangeRequest{}, p
+		}
+		if p := needTerms(); p != nil {
+			return domain.ChangeRequest{}, p
+		}
+		return domain.ChangeRequest{Kind: domain.ChangeKindPlan, PlanProductCode: req.ProductCode, PlanQuantities: quantities,
+			PlanAcceptedTermsSHA256: req.AcceptedTermsSHA256, ForceNextRenewal: action == "schedule-downgrade"}, nil
+	case "change-quantity":
+		if req.ProductCode != "" || req.AcceptedTermsSHA256 != "" {
+			return bad("product_code", "a quantity change keeps the current plan; send only quantities")
+		}
+		if req.Quantities == nil {
+			return bad("quantities", "the new quantities are required")
+		}
+		return domain.ChangeRequest{Kind: domain.ChangeKindQuantity, PlanQuantities: quantities}, nil
+	case "add-add-on":
+		if p := needProduct(); p != nil {
+			return domain.ChangeRequest{}, p
+		}
+		if p := needTerms(); p != nil {
+			return domain.ChangeRequest{}, p
+		}
+		return domain.ChangeRequest{Kind: domain.ChangeKindAddOn, AddOn: &domain.AddOnSelection{
+			ProductCode: req.ProductCode, Quantities: quantities, AcceptedTermsSHA256: req.AcceptedTermsSHA256}}, nil
+	case "remove-add-on":
+		if p := needProduct(); p != nil {
+			return domain.ChangeRequest{}, p
+		}
+		if req.Quantities != nil || req.AcceptedTermsSHA256 != "" {
+			return bad("quantities", "removing an add-on takes only its product_code")
+		}
+		return domain.ChangeRequest{Kind: domain.ChangeKindAddOn, RemoveAddOnCode: req.ProductCode}, nil
+	}
+	return bad("operation", "must be change-plan, schedule-downgrade, change-quantity, add-add-on or remove-add-on")
 }
 
 // SubscriptionAction dispatches POST /subscriptions/{id}:{action}.
@@ -385,13 +495,10 @@ func (h *SubscriptionHandler) SubscriptionAction(w http.ResponseWriter, r *http.
 	if !ok {
 		return
 	}
-	operatorAction := map[string]string{
-		"activate": ActionSubscriptionActivate, "schedule-cancellation": ActionSubscriptionAssist,
-		"cancel": ActionSubscriptionAssist, "reactivate": ActionSubscriptionAssist, "renew": ActionSubscriptionAssist,
-	}[action]
-	if operatorAction == "" {
+	operatorAction, lifecycle := lifecycleActions[action]
+	if !lifecycle && !changeActions[action] && action != "preview-change" {
 		writeProblem(w, r, Problem{Status: http.StatusNotFound, Code: CodeNotFound,
-			Detail: "unknown action " + strconv.Quote(action) + "; expected activate, schedule-cancellation, cancel, reactivate or renew"})
+			Detail: "unknown action " + strconv.Quote(action)})
 		return
 	}
 	var req subscriptionActionRequest
@@ -403,6 +510,23 @@ func (h *SubscriptionHandler) SubscriptionAction(w http.ResponseWriter, r *http.
 		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "reason", Detail: "at most 1000 characters"})
 		return
 	}
+
+	switch {
+	case action == "preview-change":
+		h.previewChange(w, r, id, &req)
+	case changeActions[action]:
+		h.requestChange(w, r, id, action, &req, raw)
+	default:
+		if req.carriesChange() {
+			writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext,
+				Detail: action + " takes only reason and assisted"})
+			return
+		}
+		h.lifecycle(w, r, id, action, operatorAction, &req, raw)
+	}
+}
+
+func (h *SubscriptionHandler) lifecycle(w http.ResponseWriter, r *http.Request, id, action, operatorAction string, req *subscriptionActionRequest, raw []byte) {
 	sc, ok := h.commandScope(w, r, req.Assisted, ActionSubscriptionManage, operatorAction)
 	if !ok {
 		return
@@ -437,6 +561,183 @@ func (h *SubscriptionHandler) SubscriptionAction(w http.ResponseWriter, r *http.
 		return
 	}
 	writeSubscription(w, http.StatusOK, v)
+}
+
+// previewChange is PreviewPlanChange: the customer sees the timing, the new
+// configuration and the proration, and gets the quote hash to confirm with.
+// It changes nothing.
+func (h *SubscriptionHandler) previewChange(w http.ResponseWriter, r *http.Request, id string, req *subscriptionActionRequest) {
+	if !changeActions[req.Operation] {
+		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "operation",
+			Detail: "operation must be change-plan, schedule-downgrade, change-quantity, add-add-on or remove-add-on"})
+		return
+	}
+	cr, p := changeRequestFor(req.Operation, req)
+	if p != nil {
+		writeProblem(w, r, *p)
+		return
+	}
+	sc, ok := h.commandScope(w, r, req.Assisted, ActionSubscriptionRead, ActionSubscriptionAssist)
+	if !ok {
+		return
+	}
+	q, err := h.store.PreviewChange(sc.ctx, id, cr, h.now())
+	if err != nil {
+		writeFailure(w, r, h.logger, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, q)
+}
+
+func (h *SubscriptionHandler) requestChange(w http.ResponseWriter, r *http.Request, id, action string, req *subscriptionActionRequest, raw []byte) {
+	if req.Operation != "" {
+		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "operation",
+			Detail: "operation belongs to preview-change; the action is the URL's custom method"})
+		return
+	}
+	cr, p := changeRequestFor(action, req)
+	if p != nil {
+		writeProblem(w, r, *p)
+		return
+	}
+	if !sha256Pattern.MatchString(req.ExpectedQuoteSHA256) {
+		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "expected_quote_sha256",
+			Detail: "confirm with the quote_sha256 from preview-change: a change is never made without its quote having been shown"})
+		return
+	}
+	sc, ok := h.commandScope(w, r, req.Assisted, ActionSubscriptionManage, ActionSubscriptionAssist)
+	if !ok {
+		return
+	}
+	cmd, ok := commandFor(w, r, sc.org, sc.principal, "Subscription:"+action, id, raw, true)
+	if !ok {
+		return
+	}
+	c := domain.SubscriptionCommand{
+		SubscriptionID: id, ExpectedVersion: cmd.ifMatch, ChangeID: domain.NewCommercialID(domain.PrefixCommercialChange),
+		Actor: sc.principal, Channel: sc.channel, CustomerBasisRef: sc.basis, Reason: strings.TrimSpace(req.Reason), Now: h.now(),
+	}
+	v, err := h.store.RequestChange(sc.ctx, c, cr, req.ExpectedQuoteSHA256, cmd.claim)
+	if err != nil {
+		h.replayOrFail(w, r, sc, err, http.StatusOK)
+		return
+	}
+	writeSubscription(w, http.StatusOK, v)
+}
+
+// ── Transition rules ─────────────────────────────────────────────────────────
+
+type transitionRuleRequest struct {
+	FromProductCode string `json:"from_product_code"`
+	ToProductCode   string `json:"to_product_code"`
+	Timing          string `json:"timing"`
+	ProrationMethod string `json:"proration_method"`
+}
+
+func (h *SubscriptionHandler) sellerPrincipal(w http.ResponseWriter, r *http.Request, action string) (string, bool) {
+	principal := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
+	if principal == "" {
+		writeProblem(w, r, Problem{Status: http.StatusUnauthorized, Code: CodeUnauthenticated, Detail: "X-Principal-Id is required"})
+		return "", false
+	}
+	return principal, h.authorize(w, r, principal, platformScopeID, action)
+}
+
+// CreateTransitionRule is product policy, set by whoever may publish prices:
+// a rule decides when a change bills and whether it is prorated.
+func (h *SubscriptionHandler) CreateTransitionRule(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.sellerPrincipal(w, r, ActionPriceBookPublish)
+	if !ok {
+		return
+	}
+	var req transitionRuleRequest
+	raw, ok := readBody(w, r, &req, false)
+	if !ok {
+		return
+	}
+	if !queryCodePattern.MatchString(req.FromProductCode) || !queryCodePattern.MatchString(req.ToProductCode) {
+		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext,
+			Detail: "from_product_code and to_product_code are required"})
+		return
+	}
+	if err := domain.ValidateTransitionRule(req.Timing, req.ProrationMethod); err != nil {
+		writeFailure(w, r, h.logger, err)
+		return
+	}
+	rule := &domain.PlanTransitionRule{RuleID: domain.NewCommercialID(domain.PrefixTransitionRule),
+		FromProductCode: req.FromProductCode, ToProductCode: req.ToProductCode, Timing: req.Timing,
+		ProrationMethod: req.ProrationMethod, CreatedAt: h.now(), CreatedByPrincipalID: principal}
+	cmd, ok := commandFor(w, r, domain.SellerScope, principal, "CreateTransitionRule", rule.RuleID, raw, false)
+	if !ok {
+		return
+	}
+	created, err := h.rules.CreateTransitionRule(r.Context(), rule, cmd.claim)
+	if err != nil {
+		var replay *domain.IdempotentReplayError
+		if errors.As(err, &replay) {
+			if rules, lerr := h.rules.ListTransitionRules(r.Context(), req.FromProductCode); lerr == nil {
+				for _, x := range rules {
+					if x.RuleID == replay.ResourceID {
+						w.Header().Set("Idempotent-Replayed", "true")
+						writeJSON(w, http.StatusCreated, x)
+						return
+					}
+				}
+			}
+		}
+		writeFailure(w, r, h.logger, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (h *SubscriptionHandler) ListTransitionRules(w http.ResponseWriter, r *http.Request) {
+	from := r.URL.Query().Get("from_product_code")
+	if from != "" && !queryCodePattern.MatchString(from) {
+		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "from_product_code", Detail: "invalid product code"})
+		return
+	}
+	rules, err := h.rules.ListTransitionRules(r.Context(), from)
+	if err != nil {
+		writeFailure(w, r, h.logger, err)
+		return
+	}
+	if rules == nil {
+		rules = []domain.PlanTransitionRule{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rules": rules})
+}
+
+// TransitionRuleAction dispatches POST /plan-transition-rules/{id}:retire.
+func (h *SubscriptionHandler) TransitionRuleAction(w http.ResponseWriter, r *http.Request) {
+	rawID, action, found := strings.Cut(chi.URLParam(r, "id"), ":")
+	if !found || action != "retire" {
+		writeProblem(w, r, Problem{Status: http.StatusNotFound, Code: CodeNotFound, Detail: "expected /plan-transition-rules/{id}:retire"})
+		return
+	}
+	id, ok := parseID(w, r, domain.PrefixTransitionRule, rawID)
+	if !ok {
+		return
+	}
+	principal, ok := h.sellerPrincipal(w, r, ActionPriceBookPublish)
+	if !ok {
+		return
+	}
+	var req lifecycleRequest
+	if _, ok := readBody(w, r, &req, false); !ok {
+		return
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "reason", Detail: "a reason is required to retire a rule"})
+		return
+	}
+	rule, err := h.rules.RetireTransitionRule(r.Context(), id, principal, reason, h.now())
+	if err != nil {
+		writeFailure(w, r, h.logger, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rule)
 }
 
 // ── Queries ──────────────────────────────────────────────────────────────────
@@ -507,6 +808,28 @@ func (h *SubscriptionHandler) GetChangeHistory(w http.ResponseWriter, r *http.Re
 		vs = []domain.SubscriptionVersion{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"subscription_id": id, "versions": vs})
+}
+
+// GetChanges returns the stored evidence of every configuration change,
+// with the exact proration inputs and results.
+func (h *SubscriptionHandler) GetChanges(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.subscriptionID(w, r)
+	if !ok {
+		return
+	}
+	sc, ok := h.readScope(w, r)
+	if !ok {
+		return
+	}
+	changes, err := h.store.GetChanges(sc.ctx, id)
+	if err != nil {
+		writeFailure(w, r, h.logger, err)
+		return
+	}
+	if changes == nil {
+		changes = []domain.SubscriptionChange{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"subscription_id": id, "changes": changes})
 }
 
 func (h *SubscriptionHandler) GetRenewalState(w http.ResponseWriter, r *http.Request) {
