@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/commercial-account-svc/internal/authz"
+	"zoiko.io/commercial-account-svc/internal/boundary"
 	"zoiko.io/commercial-account-svc/internal/config"
 	svcenvelope "zoiko.io/commercial-account-svc/internal/envelope"
 	"zoiko.io/commercial-account-svc/internal/events"
@@ -101,7 +102,7 @@ func main() {
 	handler.RegisterRoutes(r, h)
 	handler.RegisterSubscriptionRoutes(r, h)
 	handler.RegisterPriceBookRoutes(r, handler.NewPriceBookHandler(pgStore, authzClient, logger))
-	handler.RegisterSubscriptionV2Routes(r, handler.NewSubscriptionHandler(pgStore, pgStore, authzClient, logger))
+	handler.RegisterSubscriptionV2Routes(r, handler.NewSubscriptionHandler(pgStore, pgStore, authzClient, logger).WithGovernance(pgStore))
 
 	// Outbox relay (doc7 backlog item 32 pilot): publishes rows written by
 	// PgStore.CreateSubscription in the same transaction as the business
@@ -111,6 +112,11 @@ func main() {
 	defer relayCancel()
 	relay := outbox.NewRelay(pool, publisher, 5*time.Second, 50, logger)
 	go relay.Start(relayCtx)
+
+	// Subscription boundary worker: renews auto-renewing terms at their end
+	// and publishes events for versions as they take effect. Safe to run in
+	// every replica: items are claimed with FOR UPDATE SKIP LOCKED.
+	go boundary.NewWorker(pgStore, 30*time.Second, 200, logger).Start(relayCtx)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

@@ -71,6 +71,7 @@ type planOpts struct {
 	seats     bool
 	base      string // default 49.00
 	interval  string // default MONTH
+	extra     []domain.PriceComponent
 }
 
 var termsHash = strings.Repeat("cd", 32)
@@ -104,6 +105,9 @@ func (f *subFixture) publishPlan(code string, o planOpts) *domain.PriceVersion {
 	v = f.put(v, baseComponent(o.base))
 	if o.seats {
 		v = f.put(v, seatsComponent())
+	}
+	for _, c := range o.extra {
+		v = f.put(v, c)
 	}
 	v = f.ok(f.s.SetCommercialTerms(f.ctx, v.PriceVersionID, v.RowVersion, &domain.CommercialTerms{
 		TermsDocumentRef: "legal/terms/" + code, TermsDocumentSHA256: termsHash, AutoRenew: o.autoRenew,

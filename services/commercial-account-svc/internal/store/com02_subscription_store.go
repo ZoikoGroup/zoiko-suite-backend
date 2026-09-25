@@ -891,41 +891,46 @@ func (s *PgStore) Reactivate(ctx context.Context, c domain.SubscriptionCommand, 
 // (COM-CTRL-003).
 func (s *PgStore) Renew(ctx context.Context, c domain.SubscriptionCommand, claim domain.IdempotencyClaim) (*domain.SubscriptionView, error) {
 	return s.subscriptionCommand(ctx, c, claim, func(tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
-		spans, lt := a.termSpans()
-		if len(lt) == 0 {
-			return fmt.Errorf("%w: the subscription has no term to renew", domain.ErrSubscriptionInvalidState)
-		}
-		last := lt[len(lt)-1]
-		plan := a.planAt(last.EndsAt)
-		start, end := domain.NextTermWindow(spans, plan.BillingInterval, plan.BillingIntervalCount)
-		next := domain.PlannedTerm{StartsAt: start, EndsAt: end}
-		lp := domain.LifecyclePlan{Terms: []domain.PlannedTerm{next}}
-		endsAt := a.sub.EndsAt
+		return renewApply(ctx, tx, a, m)
+	})
+}
 
-		endsAtTermEnd := a.sub.EndsAt != nil && !a.sub.EndsAt.After(last.EndsAt)
-		switch {
-		case endsAtTermEnd:
-			expiry := effectiveAt(a.versions, last.EndsAt)
-			if last.AutoRenew || !c.Now.Before(last.EndsAt) || expiry == nil || expiry.ChangeType != domain.ChangeTermExpiry {
-				return domain.ErrSubscriptionEnded
-			}
-			if err := voidFuture(ctx, tx, a.sub.SubscriptionID, m, "renewed before expiry"); err != nil {
-				return err
-			}
-			lp.Versions = []domain.PlannedVersion{{Status: domain.LifecycleExpired, ChangeType: domain.ChangeTermExpiry, EffectiveFrom: next.EndsAt}}
-			endsAt = &next.EndsAt
-		case c.Now.Before(last.EndsAt):
-			return domain.ErrRenewalNotDue
+// renewApply is Renew's body, shared with the boundary worker.
+func renewApply(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, m changeMeta) error {
+	spans, lt := a.termSpans()
+	if len(lt) == 0 {
+		return fmt.Errorf("%w: the subscription has no term to renew", domain.ErrSubscriptionInvalidState)
+	}
+	last := lt[len(lt)-1]
+	plan := a.planAt(last.EndsAt)
+	start, end := domain.NextTermWindow(spans, plan.BillingInterval, plan.BillingIntervalCount)
+	next := domain.PlannedTerm{StartsAt: start, EndsAt: end}
+	lp := domain.LifecyclePlan{Terms: []domain.PlannedTerm{next}}
+	endsAt := a.sub.EndsAt
+
+	endsAtTermEnd := a.sub.EndsAt != nil && !a.sub.EndsAt.After(last.EndsAt)
+	switch {
+	case endsAtTermEnd:
+		expiry := effectiveAt(a.versions, last.EndsAt)
+		if last.AutoRenew || !m.now.Before(last.EndsAt) || expiry == nil || expiry.ChangeType != domain.ChangeTermExpiry {
+			return domain.ErrSubscriptionEnded
 		}
-		if err := a.applyPlan(ctx, tx, lp, a.currentItems(), plan, m); err != nil {
+		if err := voidFuture(ctx, tx, a.sub.SubscriptionID, m, "renewed before expiry"); err != nil {
 			return err
 		}
-		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, endsAt); err != nil {
-			return err
-		}
-		return emitSubscriptionEvent(ctx, tx, "subscription.renewed", a.sub, m, subscriptionEvent{
-			EffectiveAt: next.StartsAt, EndsAt: endsAt, TermNo: a.nextTermNo(),
-		})
+		lp.Versions = []domain.PlannedVersion{{Status: domain.LifecycleExpired, ChangeType: domain.ChangeTermExpiry, EffectiveFrom: next.EndsAt}}
+		endsAt = &next.EndsAt
+	case m.now.Before(last.EndsAt):
+		return domain.ErrRenewalNotDue
+	}
+	if err := a.applyPlan(ctx, tx, lp, a.currentItems(), plan, m); err != nil {
+		return err
+	}
+	if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, endsAt); err != nil {
+		return err
+	}
+	return emitSubscriptionEvent(ctx, tx, "subscription.renewed", a.sub, m, subscriptionEvent{
+		EffectiveAt: next.StartsAt, EndsAt: endsAt, TermNo: a.nextTermNo(),
 	})
 }
 

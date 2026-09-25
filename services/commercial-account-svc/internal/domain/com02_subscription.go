@@ -57,6 +57,9 @@ type Channel string
 const (
 	ChannelSelfService Channel = "SELF_SERVICE"
 	ChannelAssisted    Channel = "ASSISTED"
+	// ChannelSystem marks events raised by the boundary worker. It is never
+	// written on a version: the worker only adds renewal terms.
+	ChannelSystem Channel = "SYSTEM"
 )
 
 // Subscription is the stable identity. Its state lives in its versions.

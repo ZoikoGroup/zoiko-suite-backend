@@ -261,6 +261,33 @@ func buildQuote(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, req do
 			}
 			addOns = kept
 		}
+	case domain.ChangeKindMigration:
+		offer, err := eligibleOffer(ctx, tx, req.MigrationOfferID, a.sub.SubscriptionID, now)
+		if err != nil {
+			return nil, nil, err
+		}
+		if offer.FromPriceVersionID != curPlan.PriceVersionID {
+			return nil, nil, fmt.Errorf("%w: the subscription is not on the offer's price version", domain.ErrNotEligibleForMigration)
+		}
+		np, err := loadVersion(ctx, tx, offer.ToPriceVersionID, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		pvs[np.PriceVersionID] = np
+		if req.PlanAcceptedTermsSHA256 != np.Terms.TermsDocumentSHA256 {
+			return nil, nil, domain.ErrTermsNotAccepted
+		}
+		keep := map[string]string{}
+		for _, x := range planItem.Quantities {
+			keep[x.ComponentKey] = x.Quantity
+		}
+		q, err := domain.ValidateQuantities(np, keep)
+		if err != nil {
+			return nil, nil, err
+		}
+		planItem = domain.SubscriptionItem{ItemRole: "PLAN", PriceVersionID: np.PriceVersionID,
+			PriceContentSHA256: *np.ContentSHA256, AcceptedTermsSHA256: req.PlanAcceptedTermsSHA256, Quantities: q}
+		target = np
 	default:
 		return nil, nil, fmt.Errorf("unknown change kind %q", req.Kind)
 	}
@@ -270,17 +297,23 @@ func buildQuote(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, req do
 		return nil, nil, domain.ErrNoChange
 	}
 
-	rule, err := scanTransitionRule(tx.QueryRow(ctx, transitionRuleSelect+`
-		WHERE r.from_product_id = $1 AND r.to_product_id = $2 AND r.retired_at IS NULL`, curPlan.ProductID, target.ProductID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil, fmt.Errorf("%w: %s -> %s", domain.ErrTransitionNotAllowed, curPlan.ProductCode, target.ProductCode)
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	timing, method := rule.Timing, rule.ProrationMethod
-	if req.ForceNextRenewal {
-		timing, method = domain.TimingNextRenewal, domain.ProrationNone
+	// A migration is governed by its published offer and always lands at
+	// the next renewal; every other change needs an active transition rule.
+	var ruleID string
+	timing, method := domain.TimingNextRenewal, domain.ProrationNone
+	if req.Kind != domain.ChangeKindMigration {
+		rule, err := scanTransitionRule(tx.QueryRow(ctx, transitionRuleSelect+`
+			WHERE r.from_product_id = $1 AND r.to_product_id = $2 AND r.retired_at IS NULL`, curPlan.ProductID, target.ProductID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, fmt.Errorf("%w: %s -> %s", domain.ErrTransitionNotAllowed, curPlan.ProductCode, target.ProductCode)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		ruleID, timing, method = rule.RuleID, rule.Timing, rule.ProrationMethod
+		if req.ForceNextRenewal {
+			timing, method = domain.TimingNextRenewal, domain.ProrationNone
+		}
 	}
 
 	spans, lt := a.termSpans()
@@ -289,7 +322,7 @@ func buildQuote(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, req do
 		return nil, nil, fmt.Errorf("%w: the subscription has no current term", domain.ErrSubscriptionInvalidState)
 	}
 	term := lt[i]
-	q := &domain.ChangeQuote{SubscriptionID: a.sub.SubscriptionID, Kind: req.Kind, RuleID: rule.RuleID, Timing: timing,
+	q := &domain.ChangeQuote{SubscriptionID: a.sub.SubscriptionID, Kind: req.Kind, RuleID: ruleID, MigrationOfferID: req.MigrationOfferID, Timing: timing,
 		ProrationMethod: method, FromPlanPriceVersionID: curPlan.PriceVersionID, ToPlanPriceVersionID: target.PriceVersionID,
 		CurrencyCode: a.sub.CurrencyCode, Items: items}
 	switch timing {
@@ -303,6 +336,9 @@ func buildQuote(ctx context.Context, tx pgx.Tx, a *subscriptionAggregate, req do
 			return nil, nil, fmt.Errorf("%w: the subscription ends at this term's end", domain.ErrSubscriptionInvalidState)
 		}
 		q.EffectiveAt = term.EndsAt
+	}
+	if req.Kind == domain.ChangeKindMigration && q.EffectiveAt.Before(target.EffectiveFrom) {
+		return nil, nil, fmt.Errorf("%w: the new price is not in effect by this renewal", domain.ErrNotEligibleForMigration)
 	}
 
 	oldCharge, err := domain.ConfigurationPeriodCharge(cur.Items, pvs)
@@ -357,7 +393,7 @@ func (s *PgStore) RequestChange(ctx context.Context, c domain.SubscriptionComman
 		}
 		changeType := map[domain.ChangeKind]domain.ChangeType{
 			domain.ChangeKindPlan: domain.ChangePlanChanged, domain.ChangeKindQuantity: domain.ChangeQuantityChanged,
-			domain.ChangeKindAddOn: domain.ChangeAddOnChanged,
+			domain.ChangeKindAddOn: domain.ChangeAddOnChanged, domain.ChangeKindMigration: domain.ChangePriceMigrated,
 		}[req.Kind]
 		lp := domain.LifecyclePlan{Versions: []domain.PlannedVersion{
 			{Status: domain.LifecycleActive, ChangeType: changeType, EffectiveFrom: q.EffectiveAt},
@@ -369,7 +405,13 @@ func (s *PgStore) RequestChange(ctx context.Context, c domain.SubscriptionComman
 		_, lt := a.termSpans()
 		term := lt[termIndexAt(lt, c.Now)]
 		var days, remaining *int
-		var credit, charge, net *string
+		var credit, charge, net, ruleID, offerID *string
+		if q.RuleID != "" {
+			ruleID = &q.RuleID
+		}
+		if q.MigrationOfferID != "" {
+			offerID = &q.MigrationOfferID
+		}
 		if q.Proration != nil {
 			days, remaining = &q.Proration.DaysInTerm, &q.Proration.DaysRemaining
 			credit, charge, net = &q.Proration.Credit, &q.Proration.Charge, &q.Proration.Net
@@ -378,13 +420,13 @@ func (s *PgStore) RequestChange(ctx context.Context, c domain.SubscriptionComman
 			INSERT INTO subscription_changes (change_id, subscription_id, change_kind, rule_id, timing, proration_method,
 				effective_at, from_price_version_id, to_price_version_id, currency_code, old_period_charge, new_period_charge,
 				term_starts_at, term_ends_at, days_in_term, days_remaining, proration_credit, proration_charge, proration_net,
-				quote_sha256, channel, customer_basis_ref, requested_by_principal_id, created_at)
+				quote_sha256, channel, customer_basis_ref, requested_by_principal_id, created_at, migration_offer_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::numeric, $12::numeric, $13, $14, $15, $16,
-			        $17::numeric, $18::numeric, $19::numeric, $20, $21, $22, $23, $24)`,
-			c.ChangeID, a.sub.SubscriptionID, req.Kind, q.RuleID, q.Timing, q.ProrationMethod, q.EffectiveAt,
+			        $17::numeric, $18::numeric, $19::numeric, $20, $21, $22, $23, $24, $25)`,
+			c.ChangeID, a.sub.SubscriptionID, req.Kind, ruleID, q.Timing, q.ProrationMethod, q.EffectiveAt,
 			q.FromPlanPriceVersionID, q.ToPlanPriceVersionID, q.CurrencyCode, q.OldPeriodCharge, q.NewPeriodCharge,
 			term.StartsAt, term.EndsAt, days, remaining, credit, charge, net, q.QuoteSHA256, c.Channel,
-			c.CustomerBasisRef, c.Actor, c.Now); err != nil {
+			c.CustomerBasisRef, c.Actor, c.Now, offerID); err != nil {
 			return err
 		}
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, a.sub.EndsAt); err != nil {
@@ -392,7 +434,7 @@ func (s *PgStore) RequestChange(ctx context.Context, c domain.SubscriptionComman
 		}
 		eventType := map[domain.ChangeKind]string{
 			domain.ChangeKindPlan: "subscription.changed", domain.ChangeKindQuantity: "subscription.quantity_changed",
-			domain.ChangeKindAddOn: "subscription.add_on_changed",
+			domain.ChangeKindAddOn: "subscription.add_on_changed", domain.ChangeKindMigration: "subscription.changed",
 		}[req.Kind]
 		return emitSubscriptionEvent(ctx, tx, eventType, a.sub, m, subscriptionEvent{
 			ChangeType: changeType, Status: domain.LifecycleActive, EffectiveAt: q.EffectiveAt,
@@ -413,7 +455,7 @@ func (s *PgStore) GetChanges(ctx context.Context, subscriptionID string) ([]doma
 			       from_price_version_id, to_price_version_id, currency_code, old_period_charge::text,
 			       new_period_charge::text, term_starts_at, term_ends_at, days_in_term, days_remaining,
 			       proration_credit::text, proration_charge::text, proration_net::text, quote_sha256, channel,
-			       customer_basis_ref, requested_by_principal_id, created_at
+			       customer_basis_ref, requested_by_principal_id, created_at, migration_offer_id
 			FROM subscription_changes WHERE subscription_id = $1 ORDER BY created_at, change_id`, subscriptionID)
 		if err != nil {
 			return err
@@ -426,7 +468,8 @@ func (s *PgStore) GetChanges(ctx context.Context, subscriptionID string) ([]doma
 			if err := rows.Scan(&ch.ChangeID, &ch.SubscriptionID, &ch.Kind, &ch.RuleID, &ch.Timing, &ch.ProrationMethod,
 				&ch.EffectiveAt, &ch.FromPriceVersionID, &ch.ToPriceVersionID, &ch.CurrencyCode, &ch.OldPeriodCharge,
 				&ch.NewPeriodCharge, &ch.TermStartsAt, &ch.TermEndsAt, &days, &remaining, &credit, &charge, &net,
-				&ch.QuoteSHA256, &ch.Channel, &ch.CustomerBasisRef, &ch.RequestedByPrincipalID, &ch.CreatedAt); err != nil {
+				&ch.QuoteSHA256, &ch.Channel, &ch.CustomerBasisRef, &ch.RequestedByPrincipalID, &ch.CreatedAt,
+				&ch.MigrationOfferID); err != nil {
 				return err
 			}
 			if net != nil {

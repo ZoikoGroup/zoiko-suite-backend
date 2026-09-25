@@ -94,6 +94,7 @@ type ChangeRequest struct {
 	AddOn                   *AddOnSelection
 	RemoveAddOnCode         string
 	ForceNextRenewal        bool
+	MigrationOfferID        string
 }
 
 // Proration is the evidence for one prorated change, sufficient to recompute
@@ -114,6 +115,7 @@ type ChangeQuote struct {
 	SubscriptionID         string             `json:"subscription_id"`
 	Kind                   ChangeKind         `json:"kind"`
 	RuleID                 string             `json:"rule_id"`
+	MigrationOfferID       string             `json:"migration_offer_id,omitempty"`
 	Timing                 string             `json:"timing"`
 	ProrationMethod        string             `json:"proration_method"`
 	EffectiveAt            time.Time          `json:"effective_at"`
@@ -150,7 +152,8 @@ type SubscriptionChange struct {
 	ChangeID               string     `json:"change_id"`
 	SubscriptionID         string     `json:"subscription_id"`
 	Kind                   ChangeKind `json:"kind"`
-	RuleID                 string     `json:"rule_id"`
+	RuleID                 *string    `json:"rule_id,omitempty"`
+	MigrationOfferID       *string    `json:"migration_offer_id,omitempty"`
 	Timing                 string     `json:"timing"`
 	ProrationMethod        string     `json:"proration_method"`
 	EffectiveAt            time.Time  `json:"effective_at"`

@@ -64,6 +64,7 @@ var (
 type SubscriptionHandler struct {
 	store  store.SubscriptionStore
 	rules  store.TransitionRuleStore
+	gov    store.GovernanceStore
 	authz  AuthzChecker
 	logger *zap.Logger
 	now    func() time.Time
@@ -92,6 +93,15 @@ func RegisterSubscriptionV2Routes(r chi.Router, h *SubscriptionHandler) {
 		r.Post("/plan-transition-rules", h.CreateTransitionRule)
 		r.Get("/plan-transition-rules", h.ListTransitionRules)
 		r.Post("/plan-transition-rules/{id}", h.TransitionRuleAction)
+
+		r.Post("/subscriptions/{id}/discounts", h.ProposeDiscount)
+		r.Get("/subscriptions/{id}/discounts", h.ListDiscounts)
+		r.Post("/subscriptions/{id}/discounts/{discountID}", h.DiscountAction)
+		r.Get("/subscriptions/{id}/migration-offers", h.ListMigrationOffersFor)
+
+		r.Post("/migration-offers", h.CreateMigrationOffer)
+		r.Get("/migration-offers/{id}", h.GetMigrationOffer)
+		r.Post("/migration-offers/{id}", h.MigrationOfferAction)
 	})
 }
 
@@ -251,7 +261,11 @@ func subscriptionFailure(w http.ResponseWriter, r *http.Request, err error) bool
 	case errors.Is(err, domain.ErrTransitionRuleNotFound):
 		p.Status, p.Code = http.StatusNotFound, CodeNotFound
 	default:
-		return false
+		status, code, ok := governanceFailure(err)
+		if !ok {
+			return false
+		}
+		p.Status, p.Code = status, code
 	}
 	writeProblem(w, r, p)
 	return true
@@ -402,11 +416,12 @@ type subscriptionActionRequest struct {
 	Quantities          map[string]string `json:"quantities"`
 	AcceptedTermsSHA256 string            `json:"accepted_terms_sha256"`
 	ExpectedQuoteSHA256 string            `json:"expected_quote_sha256"`
+	MigrationOfferID    string            `json:"migration_offer_id"`
 }
 
 func (req *subscriptionActionRequest) carriesChange() bool {
 	return req.Operation != "" || req.ProductCode != "" || req.Quantities != nil ||
-		req.AcceptedTermsSHA256 != "" || req.ExpectedQuoteSHA256 != ""
+		req.AcceptedTermsSHA256 != "" || req.ExpectedQuoteSHA256 != "" || req.MigrationOfferID != ""
 }
 
 // lifecycleActions maps each lifecycle custom method to the operator grant
@@ -418,6 +433,7 @@ var lifecycleActions = map[string]string{
 
 var changeActions = map[string]bool{
 	"change-plan": true, "schedule-downgrade": true, "change-quantity": true, "add-add-on": true, "remove-add-on": true,
+	"accept-migration": true,
 }
 
 // changeRequestFor turns a change action and its body into a ChangeRequest,
@@ -479,6 +495,18 @@ func changeRequestFor(action string, req *subscriptionActionRequest) (domain.Cha
 			return bad("quantities", "removing an add-on takes only its product_code")
 		}
 		return domain.ChangeRequest{Kind: domain.ChangeKindAddOn, RemoveAddOnCode: req.ProductCode}, nil
+	case "accept-migration":
+		if _, err := domain.ParseCommercialID(domain.PrefixMigrationOffer, req.MigrationOfferID); err != nil {
+			return bad("migration_offer_id", "the migration offer being accepted is required")
+		}
+		if p := needTerms(); p != nil {
+			return domain.ChangeRequest{}, p
+		}
+		if req.ProductCode != "" || req.Quantities != nil {
+			return bad("product_code", "a migration keeps the plan and its quantities; send the offer and the accepted terms")
+		}
+		return domain.ChangeRequest{Kind: domain.ChangeKindMigration, MigrationOfferID: req.MigrationOfferID,
+			PlanAcceptedTermsSHA256: req.AcceptedTermsSHA256}, nil
 	}
 	return bad("operation", "must be change-plan, schedule-downgrade, change-quantity, add-add-on or remove-add-on")
 }
