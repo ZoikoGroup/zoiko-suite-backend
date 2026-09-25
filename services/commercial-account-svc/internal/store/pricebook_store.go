@@ -574,38 +574,39 @@ func (s *PgStore) ListPriceHistory(ctx context.Context, productID string, seller
 func (s *PgStore) ResolveSellableOffers(ctx context.Context, f domain.SellableOfferFilter, now time.Time) ([]domain.PriceVersion, error) {
 	var out []domain.PriceVersion
 	err := s.catalogTx(ctx, false, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT DISTINCT ON (v.product_id, v.currency_code) v.price_version_id
-			FROM product_price_versions v
-			JOIN commercial_products p ON p.product_id = v.product_id
-			JOIN commercial_currencies c ON c.currency_code = v.currency_code
-			WHERE v.status = 'PUBLISHED'
-			  AND v.effective_from <= $1
-			  AND (v.effective_to IS NULL OR v.effective_to > $1)
-			  AND c.sale_enabled
-			  AND ($2 = '' OR p.product_code = $2)
-			  AND ($3 = '' OR v.currency_code = $3)
-			  AND ($4 = '' OR $4 = ANY (v.market_codes))
-			ORDER BY v.product_id, v.currency_code, v.effective_from DESC, v.version_number DESC`,
-			now, f.ProductCode, f.CurrencyCode, f.MarketCode)
-		if err != nil {
-			return err
-		}
-		ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
-			return err
-		}
-		if len(ids) == 0 {
-			return nil
-		}
-		vs, err := queryVersions(ctx, tx, `WHERE v.price_version_id = ANY($1) ORDER BY p.product_code, v.currency_code`, ids)
-		if err != nil {
-			return err
-		}
+		vs, err := resolveOffers(ctx, tx, f, now)
 		out = derefVersions(vs)
-		return nil
+		return err
 	})
 	return out, err
+}
+
+// resolveOffers is the single definition of "sellable", shared by the
+// sellable-offers query and by COM-02 when it binds a subscription, so what a
+// customer is shown and what they are sold can never be resolved differently.
+func resolveOffers(ctx context.Context, tx pgx.Tx, f domain.SellableOfferFilter, now time.Time) ([]*domain.PriceVersion, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT ON (v.product_id, v.currency_code) v.price_version_id
+		FROM product_price_versions v
+		JOIN commercial_products p ON p.product_id = v.product_id
+		JOIN commercial_currencies c ON c.currency_code = v.currency_code
+		WHERE v.status = 'PUBLISHED'
+		  AND v.effective_from <= $1
+		  AND (v.effective_to IS NULL OR v.effective_to > $1)
+		  AND c.sale_enabled
+		  AND ($2 = '' OR p.product_code = $2)
+		  AND ($3 = '' OR v.currency_code = $3)
+		  AND ($4 = '' OR $4 = ANY (v.market_codes))
+		ORDER BY v.product_id, v.currency_code, v.effective_from DESC, v.version_number DESC`,
+		now, f.ProductCode, f.CurrencyCode, f.MarketCode)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || len(ids) == 0 {
+		return nil, err
+	}
+	return queryVersions(ctx, tx, `WHERE v.price_version_id = ANY($1) ORDER BY p.product_code, v.currency_code`, ids)
 }
 
 func derefVersions(vs []*domain.PriceVersion) []domain.PriceVersion {

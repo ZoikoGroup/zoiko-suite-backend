@@ -51,6 +51,11 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS subscription_item_quantities, subscription_items, subscription_terms,
+			subscription_versions, subscriptions CASCADE;
+		DROP FUNCTION IF EXISTS enforce_subscription_insert(), enforce_subscription_update(),
+			reject_legacy_subscription_over_com02(), enforce_void_only_update(),
+			reject_subscription_row_mutation() CASCADE;
 		DROP TABLE IF EXISTS commercial_idempotency_keys, price_version_capabilities,
 			price_component_tiers, price_components, product_price_versions,
 			commercial_products, commercial_currencies CASCADE;

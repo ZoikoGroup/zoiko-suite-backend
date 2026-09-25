@@ -50,3 +50,17 @@ func TestDecimal_ScaleAndCompare(t *testing.T) {
 		t.Error("0.0000 must be zero")
 	}
 }
+
+func TestDecimal_CeilFloor(t *testing.T) {
+	for in, want := range map[string][2]string{
+		"2.3": {"3", "2"}, "2.0000": {"2", "2"}, "7": {"7", "7"}, "0.0001": {"1", "0"},
+	} {
+		d, _ := money.Parse(in)
+		if got := d.Ceil().String(); got != want[0] {
+			t.Errorf("Ceil(%s) = %s, want %s", in, got, want[0])
+		}
+		if got := d.Floor().String(); got != want[1] {
+			t.Errorf("Floor(%s) = %s, want %s", in, got, want[1])
+		}
+	}
+}

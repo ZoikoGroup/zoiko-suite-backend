@@ -55,8 +55,13 @@ type PriceBookHandler struct {
 }
 
 func NewPriceBookHandler(st store.PriceBookStore, az AuthzChecker, logger *zap.Logger) *PriceBookHandler {
-	return &PriceBookHandler{store: st, authz: az, logger: logger, now: func() time.Time { return time.Now().UTC() }}
+	return &PriceBookHandler{store: st, authz: az, logger: logger, now: serverNow}
 }
+
+// serverNow is the server clock at Postgres precision: a version written as
+// effective "now" must not be stored a microsecond later than the now it is
+// then compared against.
+func serverNow() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
 
 // WithClock replaces the server clock. Server time decides every effective
 // boundary; the clock is never taken from a request.
@@ -171,6 +176,12 @@ func readBody(w http.ResponseWriter, r *http.Request, dst any, optional bool) ([
 // request hash covers method, path, If-Match and body: reusing a key for any
 // different request is refused, not silently replayed.
 func (h *PriceBookHandler) newCommand(w http.ResponseWriter, r *http.Request, principal, operation, resourceID string, raw []byte, needsIfMatch bool) (*command, bool) {
+	return commandFor(w, r, domain.SellerScope, principal, operation, resourceID, raw, needsIfMatch)
+}
+
+// commandFor assembles the idempotency claim for a command owned by
+// ownerScope ("seller", or an organization id for tenant-plane commands).
+func commandFor(w http.ResponseWriter, r *http.Request, ownerScope, principal, operation, resourceID string, raw []byte, needsIfMatch bool) (*command, bool) {
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if key == "" || len(key) > 255 {
 		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeIdempotencyKeyRequired,
@@ -197,7 +208,7 @@ func (h *PriceBookHandler) newCommand(w http.ResponseWriter, r *http.Request, pr
 	fmt.Fprintf(sum, "%s\n%s\n%s\n", r.Method, r.URL.Path, ifMatchRaw)
 	sum.Write(raw)
 	cmd.claim = domain.IdempotencyClaim{
-		OwnerScope: domain.SellerScope, PrincipalID: principal, Key: key, Operation: operation,
+		OwnerScope: ownerScope, PrincipalID: principal, Key: key, Operation: operation,
 		RequestSHA256: hex.EncodeToString(sum.Sum(nil)), ResourceID: resourceID,
 	}
 	return cmd, true
@@ -222,8 +233,14 @@ func writeVersion(w http.ResponseWriter, status int, v *domain.PriceVersion) {
 	writeJSON(w, status, v)
 }
 
-// fail maps a store or domain error to its problem response.
 func (h *PriceBookHandler) fail(w http.ResponseWriter, r *http.Request, err error) {
+	writeFailure(w, r, h.logger, err)
+}
+
+// writeFailure maps a store or domain error to its problem response. It is
+// the single mapping for every COM endpoint, so one error always carries one
+// code.
+func writeFailure(w http.ResponseWriter, r *http.Request, logger *zap.Logger, err error) {
 	var ve *domain.ValidationError
 	var blocked *domain.PublicationBlockedError
 	switch {
@@ -265,7 +282,10 @@ func (h *PriceBookHandler) fail(w http.ResponseWriter, r *http.Request, err erro
 	case errors.Is(err, store.ErrCurrencyMinorUnitsFixed):
 		writeProblem(w, r, Problem{Status: http.StatusConflict, Code: CodeCurrencyMinorUnitsFixed, Detail: err.Error()})
 	default:
-		h.logger.Error("price book request failed", zap.String("path", r.URL.Path), zap.Error(err))
+		if subscriptionFailure(w, r, err) {
+			return
+		}
+		logger.Error("commercial request failed", zap.String("path", r.URL.Path), zap.Error(err))
 		writeProblem(w, r, Problem{Status: http.StatusInternalServerError, Code: CodeInternal, Detail: "internal error"})
 	}
 }

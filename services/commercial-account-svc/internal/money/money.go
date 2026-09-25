@@ -66,6 +66,25 @@ func (d Decimal) Cmp(o Decimal) int {
 	return d.rat().Cmp(o.rat())
 }
 
+// Ceil rounds up to a whole number. Amounts are non-negative, so this is
+// "away from zero".
+func (d Decimal) Ceil() Decimal { return d.whole(true) }
+
+// Floor rounds down to a whole number.
+func (d Decimal) Floor() Decimal { return d.whole(false) }
+
+func (d Decimal) whole(up bool) Decimal {
+	if d.unscaled == nil || d.scale == 0 {
+		return d
+	}
+	den := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(d.scale)), nil)
+	q, r := new(big.Int).QuoRem(d.unscaled, den, new(big.Int))
+	if up && r.Sign() != 0 {
+		q.Add(q, big.NewInt(1))
+	}
+	return Decimal{unscaled: q, scale: 0, text: q.String()}
+}
+
 func (d Decimal) rat() *big.Rat {
 	if d.unscaled == nil {
 		return new(big.Rat)
