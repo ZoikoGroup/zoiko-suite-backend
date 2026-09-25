@@ -239,6 +239,20 @@ func (s *stubStore) SetRecipientAddress(_ context.Context, id, _, address, _ str
 	return nil
 }
 
+// --- New interface methods for §3.4 compliance ---
+
+func (s *stubStore) GetAttempts(_ context.Context, notificationID string) ([]domain.DeliveryAttempt, error) {
+	return nil, nil
+}
+
+func (s *stubStore) CreateAttempt(_ context.Context, a *domain.DeliveryAttempt) error {
+	return nil
+}
+
+func (s *stubStore) UpdateAttempt(_ context.Context, attemptID, status, failureReason, providerResponse string, concludedAt *time.Time) error {
+	return nil
+}
+
 type stubDeliverer struct {
 	outcome domain.DeliveryOutcome
 	calls   int
@@ -291,8 +305,8 @@ func TestWorkerConcludesSentOnSuccess(t *testing.T) {
 
 	newWorker(s, d, nil, retry.DefaultPolicy).RunOnce(context.Background())
 
-	if len(s.completed) != 1 || s.completed[0] != "n1:SENT" {
-		t.Fatalf("completed = %v, want [n1:SENT]", s.completed)
+	if len(s.completed) != 1 || s.completed[0] != "n1:PROVIDER_ACCEPTED" {
+		t.Fatalf("completed = %v, want [n1:PROVIDER_ACCEPTED]", s.completed)
 	}
 	if s.eventCounts().sent != 1 || s.eventCounts().failed != 0 {
 		t.Fatalf("published sent=%d failed=%d, want 1/0", s.eventCounts().sent, s.eventCounts().failed)
@@ -378,8 +392,8 @@ func TestWorkerReresolvesAMissingAddressBeforeDelivering(t *testing.T) {
 	if len(d.sawAddr) != 1 || d.sawAddr[0] != "resolved@example.com" {
 		t.Fatalf("deliverer saw %v, want the re-resolved address", d.sawAddr)
 	}
-	if len(s.completed) != 1 || s.completed[0] != "n1:SENT" {
-		t.Fatalf("completed = %v, want [n1:SENT]", s.completed)
+	if len(s.completed) != 1 || s.completed[0] != "n1:PROVIDER_ACCEPTED" {
+		t.Fatalf("completed = %v, want [n1:PROVIDER_ACCEPTED]", s.completed)
 	}
 }
 

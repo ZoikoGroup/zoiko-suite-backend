@@ -136,6 +136,9 @@ func (p *Projector) Scope() string { return p.contract.ScopeName }
 // Contract exposes the contract, for the generation builder's mapping.
 func (p *Projector) Contract() domain.IndexContract { return p.contract }
 
+// Source exposes the source, for checkpoint staleness computation.
+func (p *Projector) Source() domain.SearchSource { return p.source }
+
 // IsRestriction reports whether an event type is on this source's priority
 // visibility-reduction lane.
 func (p *Projector) IsRestriction(eventType string) bool {

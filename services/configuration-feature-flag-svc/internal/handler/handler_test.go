@@ -48,6 +48,124 @@ type stubStore struct {
 	listFlagResult    []*domain.FeatureFlag
 	listFlagErr       error
 	gotListFlagFilter store.ListFilter
+
+	// AA-001 governed surface.
+	gotCreateDefinition domain.CreateDefinitionParams
+	definition          *domain.ConfigDefinition
+	definitionErr       error
+
+	getDefinitionResult *domain.ConfigDefinition
+	getDefinitionErr    error
+
+	gotPublishDefinition domain.PublishDefinitionParams
+	publishVersion       *domain.ConfigDefinitionVersion
+	publishErr           error
+
+	gotResolve    domain.ResolveParams
+	resolveResult *domain.ResolvedConfigSnapshot
+	resolveErr    error
+
+	gotOverride   domain.ActivateOverrideParams
+	overrideEntry *domain.ConfigEntry
+	overrideErr   error
+
+	gotCreateChange domain.CreateChangeParams
+	change          *domain.ConfigChange
+	changeErr       error
+
+	approveChangeID string
+	gotApproval     domain.ChangeApproval
+	approvedChange  *domain.ConfigChange
+	approveErr      error
+
+	activateChangeID string
+	activatedChange  *domain.ConfigChange
+	activateErr      error
+
+	gotEmergency domain.CreateEmergencyChangeParams
+	emergency    *domain.EmergencyChange
+	emergencyErr error
+
+	activateEmergencyID  string
+	activatedEmergency   *domain.EmergencyChange
+	activateEmergencyErr error
+
+	gotAttestation domain.RecordAttestationParams
+	attestation    *domain.RuntimeAttestation
+	attestationErr error
+
+	gotReleasePlan domain.CreateReleasePlanParams
+	releasePlan    *domain.ReleasePlan
+	releasePlanErr error
+
+	gotEvaluate domain.EvaluateFlagParams
+	evaluation  *domain.FlagEvaluation
+	evaluateErr error
+}
+
+func (s *stubStore) CreateDefinition(_ context.Context, params domain.CreateDefinitionParams) (*domain.ConfigDefinition, error) {
+	s.gotCreateDefinition = params
+	return s.definition, s.definitionErr
+}
+
+func (s *stubStore) GetDefinition(_ context.Context, _ string) (*domain.ConfigDefinition, error) {
+	return s.getDefinitionResult, s.getDefinitionErr
+}
+
+func (s *stubStore) PublishDefinition(_ context.Context, params domain.PublishDefinitionParams) (*domain.ConfigDefinitionVersion, error) {
+	s.gotPublishDefinition = params
+	return s.publishVersion, s.publishErr
+}
+
+func (s *stubStore) Resolve(_ context.Context, params domain.ResolveParams) (*domain.ResolvedConfigSnapshot, error) {
+	s.gotResolve = params
+	return s.resolveResult, s.resolveErr
+}
+
+func (s *stubStore) ActivateOverride(_ context.Context, params domain.ActivateOverrideParams) (*domain.ConfigEntry, error) {
+	s.gotOverride = params
+	return s.overrideEntry, s.overrideErr
+}
+
+func (s *stubStore) CreateChange(_ context.Context, params domain.CreateChangeParams) (*domain.ConfigChange, error) {
+	s.gotCreateChange = params
+	return s.change, s.changeErr
+}
+
+func (s *stubStore) ApproveChange(_ context.Context, changeID string, approval domain.ChangeApproval, _ string) (*domain.ConfigChange, error) {
+	s.approveChangeID = changeID
+	s.gotApproval = approval
+	return s.approvedChange, s.approveErr
+}
+
+func (s *stubStore) ActivateChange(_ context.Context, changeID, _, _ string) (*domain.ConfigChange, error) {
+	s.activateChangeID = changeID
+	return s.activatedChange, s.activateErr
+}
+
+func (s *stubStore) CreateEmergencyChange(_ context.Context, params domain.CreateEmergencyChangeParams) (*domain.EmergencyChange, error) {
+	s.gotEmergency = params
+	return s.emergency, s.emergencyErr
+}
+
+func (s *stubStore) ActivateEmergencyChange(_ context.Context, emergencyChangeID, _, _ string) (*domain.EmergencyChange, error) {
+	s.activateEmergencyID = emergencyChangeID
+	return s.activatedEmergency, s.activateEmergencyErr
+}
+
+func (s *stubStore) RecordAttestation(_ context.Context, params domain.RecordAttestationParams) (*domain.RuntimeAttestation, error) {
+	s.gotAttestation = params
+	return s.attestation, s.attestationErr
+}
+
+func (s *stubStore) CreateReleasePlan(_ context.Context, params domain.CreateReleasePlanParams) (*domain.ReleasePlan, error) {
+	s.gotReleasePlan = params
+	return s.releasePlan, s.releasePlanErr
+}
+
+func (s *stubStore) EvaluateFlag(_ context.Context, params domain.EvaluateFlagParams) (*domain.FlagEvaluation, error) {
+	s.gotEvaluate = params
+	return s.evaluation, s.evaluateErr
 }
 
 func (s *stubStore) UpsertConfigEntry(_ context.Context, params domain.UpsertConfigEntryParams) (*domain.ConfigEntry, bool, error) {
@@ -541,11 +659,15 @@ func scoped(req *http.Request) *http.Request {
 // ── authorization contract ───────────────────────────────────────────────────
 
 // gatedRoutes is every route that mutates state, so a route added later
-// cannot quietly skip the gate.
+// cannot quietly skip the gate. The AA-001 governed surface is here as well:
+// every one of those writes is a mutation, and each answers the gate tests at
+// the exact same checkpoints. The POST reads (resolve, evaluate) are not here
+// — they mutate nothing and authorize nothing.
 var gatedRoutes = []struct {
-	name string
-	path string
-	body string
+	name   string
+	method string
+	path   string
+	body   string
 }{
 	// VALID bodies, which these fixtures were not.
 	//
@@ -554,8 +676,20 @@ var gatedRoutes = []struct {
 	// check used to run before the body was parsed, so the payload was never
 	// looked at. The scope being written now chooses which action to authorize,
 	// so the body is decoded first and these had to become real.
-	{name: "upsert config", path: "/v1/config", body: `{"key":"k","value":"v","environment":"production","tenant_id":"` + testTenant + `","created_by_principal_id":"a"}`},
-	{name: "upsert flag", path: "/v1/flags", body: `{"key":"f","environment":"production","enabled":true,"tenant_id":"` + testTenant + `","created_by_principal_id":"a"}`},
+	{name: "upsert config", method: http.MethodPost, path: "/v1/config", body: `{"key":"k","value":"v","environment":"production","tenant_id":"` + testTenant + `","created_by_principal_id":"a"}`},
+	{name: "upsert flag", method: http.MethodPost, path: "/v1/flags", body: `{"key":"f","environment":"production","enabled":true,"tenant_id":"` + testTenant + `","created_by_principal_id":"a"}`},
+
+	// AA-001 governed surface.
+	{name: "create definition", method: http.MethodPost, path: "/v1/config/definitions", body: `{"key":"k","owner":"payroll-svc","value_type":"INTEGER","safety_class":"S2","allowed_scopes":["ENVIRONMENT","TENANT"],"fallback_policy":"SAFE_DEFAULT","sensitivity":"INTERNAL"}`},
+	{name: "publish definition", method: http.MethodPost, path: "/v1/config/definitions/k/publish", body: `{"lifecycle":"PUBLISHED"}`},
+	{name: "activate override", method: http.MethodPut, path: "/v1/config/overrides/environment", body: `{"key":"k","environment":"production","value":5}`},
+	{name: "create change", method: http.MethodPost, path: "/v1/config/changes", body: `{"change_class":"C2","environment":"production","tenant_id":"` + testTenant + `","parts":[{"kind":"config","key":"k","scope":{"environment":"production","tenant_id":"` + testTenant + `"},"new_value":10}]}`},
+	{name: "approve change", method: http.MethodPost, path: "/v1/config/changes/change-1/approve", body: `{"approved":true}`},
+	{name: "activate change", method: http.MethodPost, path: "/v1/config/changes/change-1/activate", body: `{}`},
+	{name: "create emergency change", method: http.MethodPost, path: "/v1/emergency-changes", body: `{"key":"k","environment":"production","new_value":10,"reason":"incident","incident_id":"inc-1","expires_at":"2026-09-26T00:00:00Z"}`},
+	{name: "activate emergency change", method: http.MethodPost, path: "/v1/emergency-changes/ec-1/activate", body: `{}`},
+	{name: "record attestation", method: http.MethodPost, path: "/v1/runtime/attest", body: `{"runtime_id":"rt-1","attest_key":"ak-1","environment":"production","observed_digest":"d"}`},
+	{name: "create release plan", method: http.MethodPost, path: "/v1/flags/new_ui/release-plans", body: `{"environment":"production","strategy":"ALL_OR_NOTHING"}`},
 }
 
 // TestGatedRoutes_401_WithoutPrincipal — this service shipped with no gate of
@@ -576,7 +710,7 @@ func TestGatedRoutes_401_WithoutPrincipal(t *testing.T) {
 			handler.RegisterRoutes(r, handler.New(store, az, testAuthzScopeID, testMetrics(), zap.NewNop()))
 
 			// Deliberately NOT wrapped in authed().
-			req := httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body))
+			req := httptest.NewRequest(route.method, route.path, bytes.NewBufferString(route.body))
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
@@ -606,7 +740,7 @@ func TestGatedRoutes_403_Denied(t *testing.T) {
 			r.Use(svcmiddleware.TenantContext())
 			handler.RegisterRoutes(r, handler.New(store, az, testAuthzScopeID, testMetrics(), zap.NewNop()))
 
-			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			req := authed(httptest.NewRequest(route.method, route.path, bytes.NewBufferString(route.body)))
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
@@ -640,7 +774,7 @@ func TestGatedRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 			r.Use(svcmiddleware.TenantContext())
 			handler.RegisterRoutes(r, handler.New(store, az, testAuthzScopeID, testMetrics(), zap.NewNop()))
 
-			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			req := authed(httptest.NewRequest(route.method, route.path, bytes.NewBufferString(route.body)))
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
@@ -739,5 +873,330 @@ func TestGetConfigEntry_ForeignTenantQueryParam_Refused(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 reading another tenant's config entry, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── AA-001 governed surface ──────────────────────────────────────────────────
+
+func TestCreateConfigDefinition_Success(t *testing.T) {
+	s := &stubStore{definition: &domain.ConfigDefinition{DefinitionID: "def-1", Key: "k"}}
+	r := newTestRouter(s)
+	body := `{"key":"k","owner":"payroll-svc","value_type":"INTEGER","safety_class":"S2","allowed_scopes":["ENVIRONMENT","TENANT"],"fallback_policy":"SAFE_DEFAULT","sensitivity":"INTERNAL"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/definitions", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotCreateDefinition.ActorPrincipalID != testPrincipal {
+		t.Errorf("expected the verified principal recorded as author, got %q", s.gotCreateDefinition.ActorPrincipalID)
+	}
+	if s.gotCreateDefinition.EffectiveModel != domain.EffectiveModelImmediate {
+		t.Errorf("expected effective_model default IMMEDIATE, got %q", s.gotCreateDefinition.EffectiveModel)
+	}
+}
+
+func TestCreateConfigDefinition_MissingField(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/definitions", strings.NewReader(`{"key":"k"}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestFindConfigDefinition_NotFound(t *testing.T) {
+	s := &stubStore{getDefinitionErr: domain.ErrKeyNotRegistered}
+	r := newTestRouter(s)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config/definitions/nope", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestFindConfigDefinition_Found(t *testing.T) {
+	s := &stubStore{getDefinitionResult: &domain.ConfigDefinition{DefinitionID: "def-1", Key: "k"}}
+	r := newTestRouter(s)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config/definitions/k", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestPublishConfigDefinition_ResolvesKeyThenPublishes(t *testing.T) {
+	s := &stubStore{
+		getDefinitionResult: &domain.ConfigDefinition{DefinitionID: "def-1", Key: "k"},
+		publishVersion:      &domain.ConfigDefinitionVersion{VersionID: "ver-1", Version: 1},
+	}
+	r := newTestRouter(s)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/definitions/k/publish", strings.NewReader(`{"lifecycle":"PUBLISHED"}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotPublishDefinition.DefinitionID != "def-1" {
+		t.Errorf("expected publish to name the resolved definition, got %q", s.gotPublishDefinition.DefinitionID)
+	}
+}
+
+func TestActivateOverride_MissingField(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+	req := authed(httptest.NewRequest(http.MethodPut, "/v1/config/overrides/tenant", strings.NewReader(`{"key":"k","environment":"production"}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestActivateOverride_InvalidPathScope(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+	req := authed(httptest.NewRequest(http.MethodPut, "/v1/config/overrides/customer", strings.NewReader(`{"key":"k","environment":"production","value":5}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown override scope, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestActivateOverride_ForeignTenantLayerRefused(t *testing.T) {
+	s := &stubStore{}
+	r := newTestRouter(s)
+	body := `{"key":"k","environment":"production","value":5,"scope_id":"` + otherTenant + `"}`
+	req := authed(httptest.NewRequest(http.MethodPut, "/v1/config/overrides/tenant", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a tenant-layer override of another tenant, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotOverride.Key != "" {
+		t.Error("the store must never be reached for a foreign tenant override")
+	}
+}
+
+func TestActivateOverride_TenantLayerCallsStoreWithScope(t *testing.T) {
+	s := &stubStore{overrideEntry: &domain.ConfigEntry{ConfigID: "cfg-1", Key: "k"}}
+	r := newTestRouter(s)
+	body := `{"key":"k","environment":"production","value":5,"scope_id":"` + testTenant + `"}`
+	req := authed(httptest.NewRequest(http.MethodPut, "/v1/config/overrides/tenant", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotOverride.Layer != domain.ScopeTenant {
+		t.Errorf("expected layer %s, got %s", domain.ScopeTenant, s.gotOverride.Layer)
+	}
+	if s.gotOverride.ScopeID == nil || *s.gotOverride.ScopeID != testTenant {
+		t.Errorf("expected the tenant override to name the claimed tenant, got %v", s.gotOverride.ScopeID)
+	}
+	if s.gotOverride.ActorPrincipalID != testPrincipal {
+		t.Errorf("expected the verified principal as the actor, got %q", s.gotOverride.ActorPrincipalID)
+	}
+}
+
+func TestActivateOverride_CodedRefusalMapped(t *testing.T) {
+	s := &stubStore{overrideErr: domain.ErrScopeNotAllowed}
+	r := newTestRouter(s)
+	req := authed(httptest.NewRequest(http.MethodPut, "/v1/config/overrides/environment", strings.NewReader(`{"key":"k","environment":"production","value":5}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 scope_not_allowed, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResolveConfig_MissingEnvironment(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/config/resolve", strings.NewReader(`{}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResolveConfig_CodedRefusalMapped(t *testing.T) {
+	s := &stubStore{resolveErr: domain.ErrNoAttestedSnapshot}
+	r := newTestRouter(s)
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/config/resolve", strings.NewReader(`{"environment":"production"}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 no_attested_snapshot, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResolveConfig_ForwardsKeys(t *testing.T) {
+	s := &stubStore{resolveResult: &domain.ResolvedConfigSnapshot{SnapshotID: "s-1"}}
+	r := newTestRouter(s)
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/config/resolve", strings.NewReader(`{"environment":"production","keys":["a","b"]}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(s.gotResolve.Keys) != 2 || s.gotResolve.Keys[0] != "a" {
+		t.Errorf("expected the key allowlist forwarded, got %v", s.gotResolve.Keys)
+	}
+}
+
+func TestCreateChange_Created(t *testing.T) {
+	s := &stubStore{change: &domain.ConfigChange{ChangeID: "c-1", Status: domain.ChangeStatusProposed}}
+	r := newTestRouter(s)
+	body := `{"change_class":"C1","environment":"production","parts":[{"kind":"config","key":"k","scope":{"environment":"production"},"new_value":10}]}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/changes", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotCreateChange.CallerTenantID != testTenant {
+		t.Errorf("expected the verified tenant forwarded as caller, got %q", s.gotCreateChange.CallerTenantID)
+	}
+	if s.gotCreateChange.ActorPrincipalID != testPrincipal {
+		t.Errorf("expected the verified principal as the actor, got %q", s.gotCreateChange.ActorPrincipalID)
+	}
+}
+
+func TestApproveChange_NotFound(t *testing.T) {
+	s := &stubStore{approveErr: domain.ErrChangeNotFound}
+	r := newTestRouter(s)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/changes/c-1/approve", strings.NewReader(`{}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 change_not_found, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestApproveChange_ApproverIsVerifiedPrincipal(t *testing.T) {
+	s := &stubStore{approvedChange: &domain.ConfigChange{ChangeID: "c-1", Status: domain.ChangeStatusApproved}}
+	r := newTestRouter(s)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/changes/c-1/approve", strings.NewReader(`{}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !s.gotApproval.Approved {
+		t.Error("expected approval to default to approved=true")
+	}
+	if s.gotApproval.ByPrincipalID != testPrincipal {
+		t.Errorf("expected the verified principal as the approver, got %q", s.gotApproval.ByPrincipalID)
+	}
+}
+
+func TestActivateChange_RequiresApproval(t *testing.T) {
+	s := &stubStore{activateErr: domain.ErrChangeApprovalRequired}
+	r := newTestRouter(s)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config/changes/c-1/activate", strings.NewReader(`{}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 change_approval_required, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateEmergencyChange_NoExpiryRefusedBeforeStore(t *testing.T) {
+	s := &stubStore{}
+	r := newTestRouter(s)
+	body := `{"key":"k","environment":"production","new_value":10,"reason":"incident","incident_id":"inc-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/emergency-changes", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a missing expiry, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotEmergency.Key != "" {
+		t.Error("the store must not be reached for a missing expiry")
+	}
+}
+
+func TestCreateEmergencyChange_StoreRefusesNoExpiry(t *testing.T) {
+	s := &stubStore{emergencyErr: domain.ErrEmergencyChangeNoExpiry}
+	r := newTestRouter(s)
+	body := `{"key":"k","environment":"production","new_value":10,"reason":"incident","incident_id":"inc-1","expires_at":"2026-09-26T00:00:00Z"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/emergency-changes", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 emergency_change_no_expiry, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateEmergencyChange_ForeignTenantRefused(t *testing.T) {
+	s := &stubStore{}
+	r := newTestRouter(s)
+	body := `{"key":"k","environment":"production","new_value":10,"reason":"incident","incident_id":"inc-1","expires_at":"2026-09-26T00:00:00Z","tenant_id":"` + otherTenant + `"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/emergency-changes", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRecordAttestation_Success(t *testing.T) {
+	s := &stubStore{attestation: &domain.RuntimeAttestation{AttestationID: "att-1"}}
+	r := newTestRouter(s)
+	body := `{"runtime_id":"rt-1","attest_key":"ak-1","environment":"production","observed_digest":"abc"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/runtime/attest", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotAttestation.CallerTenantID != testTenant {
+		t.Errorf("expected the verified tenant forwarded as caller, got %q", s.gotAttestation.CallerTenantID)
+	}
+}
+
+func TestCreateReleasePlan_Success(t *testing.T) {
+	s := &stubStore{releasePlan: &domain.ReleasePlan{ReleasePlanID: "rp-1"}}
+	r := newTestRouter(s)
+	body := `{"environment":"production","strategy":"ALL_OR_NOTHING"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags/new_ui/release-plans", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotReleasePlan.FlagKey != "new_ui" {
+		t.Errorf("expected the path flag key forwarded, got %q", s.gotReleasePlan.FlagKey)
+	}
+}
+
+func TestEvaluateFlag_Success(t *testing.T) {
+	s := &stubStore{evaluation: &domain.FlagEvaluation{Key: "new_ui", Enabled: true, Outcome: domain.OutcomeValue}}
+	r := newTestRouter(s)
+	body := `{"environment":"production","subject_key":"user-1","context":{"plan":"enterprise"}}`
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/flags/new_ui/evaluate", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotEvaluate.Key != "new_ui" || s.gotEvaluate.SubjectKey != "user-1" {
+		t.Errorf("expected key and subject forwarded, got %q / %q", s.gotEvaluate.Key, s.gotEvaluate.SubjectKey)
+	}
+	if s.gotEvaluate.Context["plan"] != "enterprise" {
+		t.Errorf("expected evaluation context forwarded, got %v", s.gotEvaluate.Context)
+	}
+}
+
+func TestEvaluateFlag_MissingSubjectKey(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/flags/new_ui/evaluate", strings.NewReader(`{"environment":"production"}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }

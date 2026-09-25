@@ -62,6 +62,7 @@ import (
 	"zoiko.io/search-indexer-svc/internal/events"
 	"zoiko.io/search-indexer-svc/internal/handler"
 	"zoiko.io/search-indexer-svc/internal/health"
+	"zoiko.io/search-indexer-svc/internal/hydrator"
 	"zoiko.io/search-indexer-svc/internal/indexer"
 	svckafka "zoiko.io/search-indexer-svc/internal/kafka"
 	"zoiko.io/search-indexer-svc/internal/query"
@@ -183,14 +184,15 @@ func run(log *zap.Logger) error {
 		FacetMinCount:      cfg.FacetMinCount,
 		MaxPages:           100,
 		MinQueryLength:     2,
-	}, cfg.CursorSigningKey)
+	}, st, cfg.CursorSigningKey)
 
-	// Hydrator is nil in this deployment: no scope is registered R2 yet, and
-	// a hydrator wired to nothing would be worse than none — the retriever
-	// answers ESR-014 for an R2 scope with no hydrator, which is a loud and
-	// correct refusal, where a hydrator that returned index content would be
-	// a silent freshness lie.
-	retriever := retrieval.New(engine, azClient, nil, metrics, log, cfg.SourceHydrationTimeout)
+	// Hydrator for R2/R3 retrieval. Configured via SOURCE_SERVICE_URL_<SOURCE_TYPE>
+	// env vars (e.g. SOURCE_SERVICE_URL_OBLIGATION=http://obligations-svc:8080).
+	// If no URLs are configured, the hydrator is a no-op and R2/R3 scopes
+	// answer ESR-014 — a loud refusal rather than a silent downgrade.
+	hyd := hydrator.New(log, cfg.SourceHydrationTimeout)
+
+	retriever := retrieval.New(engine, azClient, hyd, metrics, log, cfg.SourceHydrationTimeout)
 
 	runner := svckafka.NewRunner(cfg.Kafka.Brokers, cfg.Kafka.GroupID, ix, metrics, log)
 	defer runner.Close()

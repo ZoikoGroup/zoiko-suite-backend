@@ -24,17 +24,6 @@ func send(t *testing.T, r chi.Router, principalID string, body map[string]any) d
 	return n
 }
 
-func inAppTo(recipient, correlationID string) map[string]any {
-	return map[string]any{
-		"recipient_principal_id": recipient,
-		"legal_entity_id":        "le-us",
-		"channel":                "IN_APP",
-		"subject":                "Payroll run finalized",
-		"body":                   "August payroll has been finalized.",
-		"correlation_id":         correlationID,
-	}
-}
-
 // ── marking read ─────────────────────────────────────────────────────────────
 
 func TestMarkRead_RecipientMarksTheirOwnNotice(t *testing.T) {
@@ -114,6 +103,7 @@ func TestMarkRead_RefusedForChannelsWithNoReadState(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Your payslip is available",
 		"correlation_id":         "corr-email",
+		"purpose_context":        "TEST_PURPOSE",
 	})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/"+created.NotificationID+"/read", nil, "employee-9")
@@ -155,6 +145,7 @@ func TestUnreadCount_CountsOnlyTheCallersUnreadInAppNotices(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Payslip",
 		"correlation_id":         "corr-4",
+		"purpose_context":        "TEST_PURPOSE",
 	})
 
 	if got := unreadCount(t, r, "employee-9"); got != 2 {

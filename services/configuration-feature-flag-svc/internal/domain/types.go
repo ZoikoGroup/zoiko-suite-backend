@@ -120,6 +120,10 @@ var ErrConfigEntryNotFound = errorString("config entry not found")
 // flag exists for the requested (key, environment, tenant_id) scope.
 var ErrFeatureFlagNotFound = errorString("feature flag not found")
 
+// ErrChangeNotFound is returned when a governed change (config_changes row or
+// emergency_changes row) with the requested id does not exist.
+var ErrChangeNotFound = errorString("change not found")
+
 // ErrStoreUnavailable is returned when the database cannot be reached.
 // Callers must fail-closed — treat as unavailable, not as "not found".
 var ErrStoreUnavailable = errorString("configuration store unavailable")

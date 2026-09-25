@@ -44,6 +44,22 @@ type Config struct {
 	// never affect whether a request is let through.
 	SIEMServiceURL string
 
+	// IdentityJWKSMTLSEnabled/IdentityJWKSMTLSURL wire the JWKS client into
+	// the mTLS pilot for calling identity-context-svc. Disabled by default —
+	// plain HTTP JWKSURL keeps being used unless explicitly turned on.
+	IdentityJWKSMTLSEnabled bool
+	IdentityJWKSMTLSURL     string
+
+	// TenantRegistryMTLSEnabled/TenantRegistryMTLSURL wire the tenant context
+	// resolver into the mTLS pilot for calling tenant-entity-registry-svc.
+	// Disabled by default.
+	TenantRegistryMTLSEnabled bool
+	TenantRegistryMTLSURL     string
+
+	// MTLSManagementServiceURL is the mtls-management-svc endpoint used to
+	// provision this service's client identity for mTLS calls.
+	MTLSManagementServiceURL string
+
 	// TenantRegistryURL is tenant-entity-registry-svc — the tenant and legal
 	// entity master GOV-01 resolves context against. Empty disables resolution
 	// entirely: the gateway then verifies the token and forwards, exactly as it
@@ -94,6 +110,11 @@ func Load() (*Config, error) {
 		ExpectedAudience:        strEnv("EXPECTED_AUDIENCE", "zoiko-internal"),
 		CartaServiceURL:         strEnv("CARTA_SERVICE_URL", ""),
 		SIEMServiceURL:          strEnv("SIEM_SERVICE_URL", ""),
+		IdentityJWKSMTLSEnabled: strEnv("IDENTITY_JWKS_MTLS_ENABLED", "false") == "true",
+		IdentityJWKSMTLSURL:     strEnv("IDENTITY_JWKS_MTLS_URL", "https://identity-svc:8449/.well-known/jwks.json"),
+		TenantRegistryMTLSEnabled: strEnv("TENANT_REGISTRY_MTLS_ENABLED", "false") == "true",
+		TenantRegistryMTLSURL:     strEnv("TENANT_REGISTRY_MTLS_URL", "https://tenant-entity-registry-svc:8449"),
+		MTLSManagementServiceURL:  strEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		TenantRegistryURL:       strEnv("TENANT_REGISTRY_URL", ""),
 		OTELExporterEndpoint:    strEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		TenantContextTTL:        time.Duration(ctxTTL) * time.Second,

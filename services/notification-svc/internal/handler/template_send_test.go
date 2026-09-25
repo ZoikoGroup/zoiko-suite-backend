@@ -18,6 +18,7 @@ func TestSendNotification_RendersTemplate(t *testing.T) {
 		"legal_entity_id":        "le-us",
 		"channel":                "EMAIL",
 		"correlation_id":         "corr-tmpl-approved",
+		"purpose_context":        "TEST_PURPOSE",
 		"template":               "approved",
 		"variables": map[string]string{
 			"organization_name": "Acme Logistics",
@@ -52,6 +53,7 @@ func TestSendNotification_TemplateAndBodyConflict(t *testing.T) {
 		"legal_entity_id":        "le-us",
 		"channel":                "EMAIL",
 		"correlation_id":         "corr-tmpl-conflict",
+		"purpose_context":        "TEST_PURPOSE",
 		"template":               "approved",
 		"subject":                "Something else entirely",
 	}, "principal-1")
@@ -69,6 +71,7 @@ func TestSendNotification_UnknownTemplate(t *testing.T) {
 		"legal_entity_id":        "le-us",
 		"channel":                "EMAIL",
 		"correlation_id":         "corr-tmpl-unknown",
+		"purpose_context":        "TEST_PURPOSE",
 		"template":               "welcome_aboard",
 	}, "principal-1")
 
@@ -88,6 +91,7 @@ func TestSendNotification_MissingTemplateVariables(t *testing.T) {
 		"legal_entity_id":        "le-us",
 		"channel":                "EMAIL",
 		"correlation_id":         "corr-tmpl-missing-vars",
+		"purpose_context":        "TEST_PURPOSE",
 		"template":               "approved",
 		"variables":              map[string]string{"organization_name": "Acme"},
 	}, "principal-1")
@@ -112,6 +116,7 @@ func TestSendNotification_RawSubjectAndBodyStillWork(t *testing.T) {
 		"legal_entity_id":        "le-us",
 		"channel":                "EMAIL",
 		"correlation_id":         "corr-tmpl-raw",
+		"purpose_context":        "TEST_PURPOSE",
 		"subject":                "Handwritten subject",
 		"body":                   "Handwritten body",
 	}, "principal-1")

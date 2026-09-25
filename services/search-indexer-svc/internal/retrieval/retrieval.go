@@ -315,6 +315,13 @@ func (r *Retriever) Execute(ctx context.Context, plan *query.Plan, tc query.Cont
 		for field, buckets := range raw.Facets {
 			out := make([]Bucket, 0, len(buckets))
 			for _, b := range buckets {
+				// §7.3 / NP-08: minimum-cell suppression applied at decode time
+				// as well as request time. A facet count of one can reveal a
+				// single privileged record; the engine's min_doc_count is the
+				// first line, this re-application is the belt.
+				if b.Count < int64(plan.Execution.FacetMinCount) {
+					continue
+				}
 				out = append(out, Bucket{Value: b.Value, Count: b.Count})
 			}
 			// The ".keyword" suffix is an engine implementation detail the

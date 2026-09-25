@@ -31,7 +31,12 @@ import (
 // act" expressible to authorization-svc rather than each service inventing a
 // synthetic entity id.
 
-// requirePlatform authorizes a control-plane act against platform scope.
+// requirePlatform authorizes a control-plane WRITE against platform scope.
+// Control-plane writes (sources, contracts, generations) describe platform-wide
+// configuration shared by all tenants. Authorizing them against the caller's
+// own legal entity would let a tenant-scoped grant change what every other
+// tenant can search. The platform sentinel (tracker row 67) makes "this is a
+// platform-wide act" expressible to authorization-svc.
 func (h *Handler) requirePlatform(w http.ResponseWriter, r *http.Request, action string) (envelope.Envelope, bool) {
 	env := envelope.MustFromContext(r.Context())
 	if env.ActorSubjectID == "" {
@@ -47,6 +52,32 @@ func (h *Handler) requirePlatform(w http.ResponseWriter, r *http.Request, action
 		// invisible to a check made against another.
 		writeError(w, http.StatusInternalServerError, "platform_scope_not_configured",
 			"AUTHZ_PLATFORM_SCOPE_ID is not set; control-plane writes cannot be authorized")
+		return env, false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), env.ActorSubjectID, h.platformScopeID, action); err != nil {
+		h.metrics.AuthzDecision(action, outcomeOf(err))
+		h.writeAuthzError(w, err)
+		return env, false
+	}
+	h.metrics.AuthzDecision(action, "allowed")
+	return env, true
+}
+
+// requirePlatformRead authorizes a control-plane READ against platform scope.
+// Control-plane reads (sources, contracts, generations, checkpoints) describe
+// platform-wide configuration shared by all tenants. Authorizing them against
+// the caller's own legal entity would let a tenant-scoped grant see what every
+// other tenant can search — the same confusion the write path avoids.
+func (h *Handler) requirePlatformRead(w http.ResponseWriter, r *http.Request, action string) (envelope.Envelope, bool) {
+	env := envelope.MustFromContext(r.Context())
+	if env.ActorSubjectID == "" {
+		writeError(w, http.StatusUnauthorized, "principal_required",
+			"a control-plane read requires a verified principal")
+		return env, false
+	}
+	if h.platformScopeID == "" {
+		writeError(w, http.StatusInternalServerError, "platform_scope_not_configured",
+			"AUTHZ_PLATFORM_SCOPE_ID is not set; control-plane reads cannot be authorized")
 		return env, false
 	}
 	if err := h.authz.CheckAllowed(r.Context(), env.ActorSubjectID, h.platformScopeID, action); err != nil {
@@ -143,6 +174,10 @@ func (h *Handler) CreateSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListSources(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePlatformRead(w, r, ActionSourceRegister)
+	if !ok {
+		return
+	}
 	out, err := h.store.ListSources(r.Context())
 	if err != nil {
 		h.internal(w, r, "list sources", err)
@@ -364,6 +399,10 @@ func (h *Handler) validateFields(reqFields []contractFieldRequest, src *domain.S
 }
 
 func (h *Handler) GetContract(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePlatformRead(w, r, ActionContractCreate)
+	if !ok {
+		return
+	}
 	contractID, ok := uuidParam(w, r, "contractID")
 	if !ok {
 		return
@@ -381,6 +420,10 @@ func (h *Handler) GetContract(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListContracts(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePlatformRead(w, r, ActionContractCreate)
+	if !ok {
+		return
+	}
 	out, err := h.store.ListContracts(r.Context(), r.URL.Query().Get("scope"))
 	if err != nil {
 		h.internal(w, r, "list contracts", err)
@@ -528,6 +571,10 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListGenerations(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePlatformRead(w, r, ActionGenerationCreate)
+	if !ok {
+		return
+	}
 	out, err := h.store.ListGenerations(r.Context(), r.URL.Query().Get("scope"))
 	if err != nil {
 		h.internal(w, r, "list generations", err)
@@ -737,6 +784,10 @@ func (h *Handler) findGenerationByIndex(ctx context.Context, scope, physicalInde
 
 // ListCheckpoints reports index freshness and population (§11.1).
 func (h *Handler) ListCheckpoints(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePlatformRead(w, r, ActionGenerationCreate)
+	if !ok {
+		return
+	}
 	out, err := h.store.ListCheckpoints(r.Context(), r.URL.Query().Get("scope"))
 	if err != nil {
 		h.internal(w, r, "list checkpoints", err)

@@ -273,11 +273,63 @@ difference when deciding how hard to escalate.
 
 ---
 
+## 4.7 Break-glass, the exception register, and lease verification
+
+This service's normal path never returns material. When an incident genuinely
+requires it, the documented override is:
+
+1. Register a time-boxed, evidence-backed exception:
+   ```
+   POST /v1/shared-secret-exceptions
+   { "secret_path": "<path>", "reason": "...", "evidence_reference": "<ticket>",
+     "expires_at": "<future>" }
+   ```
+   Requires `SECRET_EXCEPTION_CREATE`. An already-`ACTIVE` exception for the
+   same path returns `200` with the existing record (idempotent); a conflicting
+   one answers `409`.
+2. Retrieve the material:
+   ```
+   POST /v1/secret-policies/{id}/emergency-retrieval
+   { "request_id": "...", "reason": "..." }
+   ```
+   Requires `SECRET_EMERGENCY_RETRIEVAL` **and** the exception from step 1 —
+   no exception is a `403 no_active_exception`, and the vault is never touched.
+   The response is the raw secret, base64. Handle it like the credential it is.
+3. Close the door when done: `POST /v1/shared-secret-exceptions/{id}/revoke`
+   (`SECRET_EXCEPTION_REVOKE`), or let the exception expire — an expired or
+   revoked exception blocks retrieval exactly as though none existed.
+
+Every retrieval writes an `EMERGENCY_RETRIEVAL` audit row naming the actor and
+the authorizing exception id, so after the incident the register shows who
+opened the door, against what evidence, and when.
+
+Separately, a workload holding a `lease_token` (and a load balancer/edge that
+terminates TLS and forwards headers) can ask whether a token is still good:
+
+```
+POST /v1/secrets/leases/{lease_id}/verify   { "lease_token": "..." }
+```
+
+This is the surface that makes the lease's two controls reachable end-to-end:
+expiry is refused by the token itself (no database read) and revocation by the
+lease register (`200 valid:false reason=lease_revoked`). A `valid:true` answer
+also proves the token and the lease agree on the secret path and the tenant.
+
+---
+
 ## 5. Configuration that changes behaviour
 
 | Variable | Effect if wrong |
 |---|---|
-| `VAULT_MASTER_KEY_HEX` | 32 bytes hex (AES-256). No default — the service refuses to start without one. Change it and every previously written secret becomes permanently unreadable. |
+| `VAULT_MASTER_KEY_FILE` | (**Preferred** key source.) Path to a file holding 32 bytes hex (AES-256). The file must be owner-only (0600) on POSIX platforms or the service refuses to start. Used in preference to `VAULT_MASTER_KEY_HEX`. Losing the file, like losing the raw key, permanently unreadable for everything written under it. |
+| `VAULT_MASTER_KEY_HEX` | 32 bytes hex (AES-256). No default — the service refuses to start without a key of some kind. **Refused outright when `ENV` is production or staging**, because a literal key in environment is the very long-lived plaintext configuration the doctrine forbids; supply `VAULT_MASTER_KEY_FILE` there instead, or set `ALLOW_PLAINTEXT_MASTER_KEY=true` as an explicit, logged exception. Change it and every previously written secret becomes permanently unreadable. |
+| `ALLOW_PLAINTEXT_MASTER_KEY` | Default false. `true` lifts the production/staging refusal on `VAULT_MASTER_KEY_HEX`. Every local stopgap; the startup log loudly states when it is set. |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | Server certificate and key. When set, the service terminates TLS on its own port (plain HTTP refused in production/staging unless `ALLOW_INSECURE_INBOUND=true`). Omitted in front of the gateway, which terminates TLS and forwards mTLS-verified headers. |
+| `TLS_CLIENT_CA_FILE` | CA bundle trusted for client certificates. When set, inbound connections must present one (`RequireAndVerifyClientCert`). |
+| `MTLS_IDENTITY_CHECK` | Default false. `true` re-validates on every request (not just at the TLS handshake) that the gateway-verified `X-Workload-Id`/`X-Principal-Id` matches the presented client certificate — the identity-spoofing control that closes the "broker trusts a header alone" gap. Refuses 401/403 rather than trusting a header alone. Requires client-cert-enabled ingress. |
+| `ROTATION_SWEEP_INTERVAL` | Default unset (0) — the rotation sweeper is off. Set e.g. `1m` to run the automated-rotation loop on that cadence; any version created with `rotation_interval_seconds` is then rotated on schedule and its live leases mass-revoked at each rotation. See 4.5 for the alert that makes this visible. |
+| `ROTATION_SWEEP_ACTOR` | Principal id stamped on sweeper-driven rotations and their audit rows. Default `system:rotation-sweeper`. |
+| `ALLOW_INSECURE_INBOUND` | Default false. `true` lets the service bind plain HTTP in production/staging (TLS absent). A deliberately loud escape hatch, not a deployment option. |
 | `VAULT_LOCAL_STORE_PATH` | Where encrypted material lives. On an ephemeral path, every restart silently loses every seeded secret and presents as 4.3. |
 | `AUTHZ_SERVICE_URL` | Empty switches to a **permit-all stub**. Confirm the startup log says `using HTTP authorization client`, not `using PERMIT-ALL authorization stub`. |
 | `AUTHZ_PLATFORM_SCOPE_ID` | Role assignments granting the `SECRET_*` actions must use this as `legal_entity_id`; authorization-svc rejects an empty one. Wrong value means every mutation is a correct-looking 403. |
@@ -321,6 +373,13 @@ the script reports a working service as broken.
   guarantee that makes it evidence.
 - **Do not work around a fail-closed refusal** by emptying `AUTHZ_SERVICE_URL`
   (section 4.4) or by widening `allowed_workload_ids` (section 4.1).
+- **Do not register a shared-secret exception to make a refusal go quiet.**
+  The exception register exists for genuine break-glass, and every entry names
+  its evidence and author. An exception to bypass 4.1 or 4.3 is an incident
+  record, not a fix — revoke it the moment the real fix lands.
+- **Do not paste emergency-retrieval material into a ticket or chat.** It is
+  the one value this API hands back raw; the `request_id` in the `EMERGENCY_RETRIEVAL`
+  audit row is the safe reference for the follow-up.
 - **Do not point the store test suite at a live database.** Its last test drops
   all four tables on purpose to prove the error path, and does not restore them.
   `scripts/audit.sh` uses a scratch database for exactly this reason.

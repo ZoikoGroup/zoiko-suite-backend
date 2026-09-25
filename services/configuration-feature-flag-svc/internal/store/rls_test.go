@@ -56,6 +56,7 @@ func TestRLS_ConfigEntry_TenantIsolatedAtDatabaseLayer(t *testing.T) {
 	tenantB := "22222222-2222-2222-2222-222222222222"
 
 	s := store.New(appPool, zap.NewNop())
+	seedConfig(t, admin, "payroll.batch_size")
 	if _, _, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{
 		Key: "payroll.batch_size", Environment: "prod", TenantID: strPtr(tenantA),
 		Value: []byte(`100`), CreatedByPrincipalID: "admin-1",
@@ -129,6 +130,7 @@ func TestRLS_FeatureFlag_TenantIsolatedAtDatabaseLayer(t *testing.T) {
 	tenantB := "22222222-2222-2222-2222-222222222222"
 
 	s := store.New(appPool, zap.NewNop())
+	seedFlag(t, admin, "new-payroll-ui")
 	if _, _, err := s.UpsertFeatureFlag(ctx, domain.UpsertFeatureFlagParams{
 		Key: "new-payroll-ui", Environment: "prod", TenantID: strPtr(tenantA),
 		Enabled: true, CreatedByPrincipalID: "admin-1",

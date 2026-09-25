@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
@@ -28,6 +29,9 @@ type Store interface {
 	FindStrandedDeliveries(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error)
 	ReviveStranded(ctx context.Context, id, tenantID string, staleBefore, nextAttemptAt time.Time) (bool, error)
 	GetNotification(ctx context.Context, id string) (*domain.Notification, error)
+	GetAttempts(ctx context.Context, notificationID string) ([]domain.DeliveryAttempt, error)
+	CreateAttempt(ctx context.Context, a *domain.DeliveryAttempt) error
+	UpdateAttempt(ctx context.Context, attemptID, status, failureReason, providerResponse string, concludedAt *time.Time) error
 	// CompleteDelivery concludes a delivery AND enqueues the event describing
 	// that conclusion, in one transaction. The worker used to publish to Kafka
 	// after this returned, with the error logged and discarded — so a broker
@@ -353,6 +357,15 @@ func (w *Worker) attempt(ctx context.Context, d domain.DueRetry) bool {
 		return false
 	}
 
+	// §3.4 RECONCILIATION: Before re-attempting, check if a previous attempt
+	// actually succeeded but its outcome was never recorded (e.g. the process
+	// crashed after the provider accepted but before CompleteDelivery ran).
+	// If we find a PROVIDER_ACCEPTED or later attempt that has no corresponding
+	// notification event, we advance the notification instead of re-sending.
+	if w.reconcileIfProviderAccepted(tctx, n) {
+		return true
+	}
+
 	// A first attempt that failed because identity-context-svc was unreachable
 	// left no address on the record. Re-attempting the transport with an empty
 	// To would fail forever, so the resolution is retried first — it is the
@@ -368,6 +381,84 @@ func (w *Worker) attempt(ctx context.Context, d domain.DueRetry) bool {
 	w.observeAttempt(n.Channel, outcome.Delivered, attemptStarted)
 	w.conclude(tctx, n, outcome)
 	return true
+}
+
+// reconcileIfProviderAccepted checks attempt records for a prior attempt that
+// was accepted by the provider but whose outcome was lost. If found, advances
+// the notification to that status instead of re-sending — this is the §3.4
+// fix for "Timeout after submit becomes UNKNOWN, not FAILED; reconcile before
+// re-attempting".
+func (w *Worker) reconcileIfProviderAccepted(ctx context.Context, n *domain.Notification) bool {
+	attempts, err := w.store.GetAttempts(ctx, n.NotificationID)
+	if err != nil || len(attempts) == 0 {
+		return false
+	}
+
+	// Look for the most recent attempt that reached PROVIDER_ACCEPTED or
+	// beyond but whose notification status is still PENDING/UNKNOWN.
+	// This indicates the provider accepted but the handler crashed before
+	// recording the conclusion.
+	for i := len(attempts) - 1; i >= 0; i-- {
+		a := attempts[i]
+		switch a.Status {
+		case domain.AttemptStatusProviderAccepted, domain.AttemptStatusDelivered,
+			domain.AttemptStatusRead, domain.AttemptStatusServed:
+			// Found a provider-accepted attempt that never concluded.
+			// Advance the notification to match.
+			w.log.Warn("retry worker: reconciling prior provider-accepted attempt",
+				zap.String("notification_id", n.NotificationID),
+				zap.String("attempt_id", a.AttemptID),
+				zap.String("attempt_status", a.Status))
+
+			n.Status = a.Status
+			n.ProviderResponse = a.ProviderResponse
+			n.SentAt = a.ConcludedAt
+			n.DeliveryAttempts = a.AttemptNumber
+			n.LastAttemptAt = a.ConcludedAt
+
+			// Seal the conclusion event
+			ev, err := w.sealConclusionFromAttempt(n, &a)
+			if err != nil {
+				w.log.Error("retry worker: reconciliation could not seal event",
+					zap.String("notification_id", n.NotificationID), zap.Error(err))
+				return false
+			}
+
+			if err := w.store.CompleteDelivery(ctx, n.NotificationID,
+				a.Status, a.FailureReason, a.ProviderResponse, a.ConcludedAt, ev); err != nil {
+				w.log.Error("retry worker: reconciliation could not record conclusion",
+					zap.String("notification_id", n.NotificationID), zap.Error(err))
+				return false
+			}
+
+			if w.metrics != nil {
+				w.metrics.ObserveConclusion(n.Channel, a.Status)
+			}
+			return true
+		case domain.AttemptStatusFailed:
+			// This attempt failed, keep looking at earlier ones
+			continue
+		case domain.AttemptStatusUnknown:
+			// In flight — don't reconcile, let the stranded sweep handle it
+			return false
+		}
+	}
+	return false
+}
+
+// sealConclusionFromAttempt builds an Outbound event from a reconciled attempt.
+func (w *Worker) sealConclusionFromAttempt(n *domain.Notification, a *domain.DeliveryAttempt) (events.Outbound, error) {
+	// Reconstruct a DeliveryOutcome from the attempt record
+	outcome := domain.DeliveryOutcome{
+		Delivered:        a.Status != domain.AttemptStatusFailed,
+		ProviderResponse: a.ProviderResponse,
+		Reason:           a.FailureReason,
+		Retryable:        a.Retryable,
+	}
+	if outcome.Delivered {
+		return events.Sent(n.CorrelationID, *n)
+	}
+	return events.Failed(n.CorrelationID, *n, a.FailureReason)
 }
 
 // observeAttempt records one re-attempt against the provider.
@@ -427,19 +518,41 @@ func (w *Worker) reresolve(ctx context.Context, n *domain.Notification) bool {
 func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome domain.DeliveryOutcome) {
 	now := time.Now().UTC()
 
+	// Create attempt record for this re-attempt
+	attempt := &domain.DeliveryAttempt{
+		AttemptID:        uuid.NewString(),
+		NotificationID:   n.NotificationID,
+		AttemptNumber:    n.DeliveryAttempts + 1,
+		Channel:          n.Channel,
+		Provider:         "smtp",
+		Status:           domain.AttemptStatusUnknown,
+		ProviderResponse: outcome.ProviderResponse,
+		FailureReason:    outcome.Reason,
+		Retryable:        outcome.Retryable,
+		ResendReason:     domain.ResendReasonRetry,
+		CreatedAt:        now,
+	}
+	if err := w.store.CreateAttempt(ctx, attempt); err != nil {
+		w.log.Error("retry worker: failed to create attempt record", zap.Error(err))
+	}
+
 	if outcome.Delivered {
-		// The record is brought up to date BEFORE the event is sealed, because
-		// the event is built from it. Sealing first would announce a
-		// notification.sent carrying status PENDING and no sent_at — describing
-		// the row as it was before the transition the event exists to report.
-		//
-		// DeliveryAttempts is incremented here too, and only here in memory:
-		// the column is incremented by CompleteDelivery itself, so the struct
-		// would otherwise carry a count one behind the row it describes and the
-		// event would understate how much work the delivery took.
-		n.Status, n.SentAt, n.ProviderResponse = "SENT", &now, outcome.ProviderResponse
+		// Provider accepted — mark as PROVIDER_ACCEPTED, not SENT.
+		// The reconciliation worker will later confirm delivery and advance
+		// to DELIVERED/READ/SERVED as appropriate.
+		n.Status = domain.StatusProviderAccepted
+		n.ProviderResponse = outcome.ProviderResponse
+		n.SentAt = &now
 		n.FailureReason = ""
-		n.DeliveryAttempts++
+		n.DeliveryAttempts = attempt.AttemptNumber
+		n.LastAttemptAt = &now
+
+		// Update attempt record
+		attempt.Status = domain.AttemptStatusProviderAccepted
+		attempt.ConcludedAt = &now
+		if err := w.store.UpdateAttempt(ctx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &now); err != nil {
+			w.log.Error("retry worker: failed to update attempt record", zap.Error(err))
+		}
 
 		ev, err := events.Sent(n.CorrelationID, *n)
 		if err != nil {
@@ -447,11 +560,9 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 				zap.String("notification_id", n.NotificationID), zap.Error(err))
 			return
 		}
-		// One transaction. The worker used to call CompleteDelivery and then
-		// PublishSent, so a broker outage during a successful re-attempt sent
-		// the notice, recorded it, and told no consumer — permanently, with
-		// nothing but a log line to show for it.
-		if err := w.store.CompleteDelivery(ctx, n.NotificationID, "SENT", "", outcome.ProviderResponse, &now, ev); err != nil {
+		// One transaction.
+		if err := w.store.CompleteDelivery(ctx, n.NotificationID,
+			domain.StatusProviderAccepted, "", outcome.ProviderResponse, &now, ev); err != nil {
 			w.log.Error("retry worker: delivered but could not record it",
 				zap.String("notification_id", n.NotificationID), zap.Error(err))
 			return
@@ -460,15 +571,12 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 			zap.String("notification_id", n.NotificationID),
 			zap.Int("attempt", n.DeliveryAttempts))
 		if w.metrics != nil {
-			w.metrics.ObserveConclusion(n.Channel, "SENT")
+			w.metrics.ObserveConclusion(n.Channel, domain.StatusProviderAccepted)
 		}
 		return
 	}
 
-	// attemptsMade counts the attempt just concluded: the column has not been
-	// incremented yet — ScheduleRetry and CompleteDelivery both do that — so
-	// the value the policy needs is the stored count plus this one.
-	attemptsMade := n.DeliveryAttempts + 1
+	attemptsMade := attempt.AttemptNumber
 
 	// Recorded before the reason string is appended to, because the appended
 	// text is how the register explains the difference and the metric should
@@ -481,6 +589,13 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 				w.log.Error("retry worker: could not reschedule",
 					zap.String("notification_id", n.NotificationID), zap.Error(err))
 			}
+			// Update attempt record as FAILED (retryable)
+			attempt.Status = domain.AttemptStatusFailed
+			attempt.ConcludedAt = &now
+			if err := w.store.UpdateAttempt(ctx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &now); err != nil {
+				w.log.Error("retry worker: failed to update attempt record", zap.Error(err))
+			}
+
 			w.log.Warn("retry worker: delivery failed, rescheduled",
 				zap.String("notification_id", n.NotificationID),
 				zap.Int("attempt", attemptsMade),
@@ -489,22 +604,26 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 			if w.metrics != nil {
 				w.metrics.ObserveRetryScheduled(n.Channel)
 			}
-			// No notification.failed event, and nothing enqueued. The delivery
-			// has not concluded, and emitting a failure that a later attempt
-			// reverses would have consumers reacting to an outcome that did not
-			// happen. This is why ScheduleRetry takes no event while
-			// CompleteDelivery requires one.
 			return
 		}
-		// Exhausted. The reason records that, so the register does not read as
-		// though a mailbox was rejected when in fact the platform gave up.
+		// Exhausted.
 		exhausted = true
 		outcome.Reason = outcome.Reason + " (no further attempts: exhausted after " +
 			itoa(attemptsMade) + " of " + itoa(w.policy.MaxAttempts) + ")"
 	}
 
-	n.Status, n.SentAt, n.FailureReason = "FAILED", &now, outcome.Reason
+	// Terminal failure
+	n.Status = domain.StatusFailed
+	n.SentAt = &now
+	n.FailureReason = outcome.Reason
 	n.DeliveryAttempts = attemptsMade
+	n.LastAttemptAt = &now
+
+	attempt.Status = domain.AttemptStatusFailed
+	attempt.ConcludedAt = &now
+	if err := w.store.UpdateAttempt(ctx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &now); err != nil {
+		w.log.Error("retry worker: failed to update attempt record", zap.Error(err))
+	}
 
 	ev, err := events.Failed(n.CorrelationID, *n, outcome.Reason)
 	if err != nil {
@@ -512,7 +631,7 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 			zap.String("notification_id", n.NotificationID), zap.Error(err))
 		return
 	}
-	if err := w.store.CompleteDelivery(ctx, n.NotificationID, "FAILED", outcome.Reason, "", &now, ev); err != nil {
+	if err := w.store.CompleteDelivery(ctx, n.NotificationID, domain.StatusFailed, outcome.Reason, "", &now, ev); err != nil {
 		w.log.Error("retry worker: could not record terminal failure",
 			zap.String("notification_id", n.NotificationID), zap.Error(err))
 		return
@@ -522,7 +641,7 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 		zap.Int("attempts", attemptsMade),
 		zap.String("reason", outcome.Reason))
 	if w.metrics != nil {
-		w.metrics.ObserveConclusion(n.Channel, "FAILED")
+		w.metrics.ObserveConclusion(n.Channel, domain.StatusFailed)
 	}
 	if exhausted && w.exhausted != nil {
 		w.exhausted.Inc()

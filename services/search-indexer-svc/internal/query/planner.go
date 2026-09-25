@@ -20,6 +20,7 @@
 package query
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -33,6 +34,7 @@ import (
 
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/domain"
+	"zoiko.io/search-indexer-svc/internal/store"
 )
 
 // Request is the §6.1 canonical request envelope, minus the parts that come
@@ -154,13 +156,14 @@ func DefaultLimits() Limits {
 
 // Planner compiles requests against published contracts.
 type Planner struct {
-	limits Limits
+	limits  Limits
+	store   store.Store
 	// cursorKey signs and verifies pagination tokens.
 	cursorKey []byte
 }
 
-func NewPlanner(limits Limits, cursorKey []byte) *Planner {
-	return &Planner{limits: limits, cursorKey: cursorKey}
+func NewPlanner(limits Limits, store store.Store, cursorKey []byte) *Planner {
+	return &Planner{limits: limits, store: store, cursorKey: cursorKey}
 }
 
 // Compile turns a request plus trusted context plus a published contract into
@@ -170,7 +173,7 @@ func NewPlanner(limits Limits, cursorKey []byte) *Planner {
 // identity, then purpose, then scope, then partitions, then filters, then
 // budget. A request that fails an earlier check never reaches a later one, so
 // a caller cannot learn from a complexity refusal that a scope exists.
-func (p *Planner) Compile(req Request, tc Context, contract *domain.IndexContract, generation *domain.IndexGeneration) (*Plan, error) {
+func (p *Planner) Compile(ctx context.Context, req Request, tc Context, contract *domain.IndexContract, generation *domain.IndexGeneration) (*Plan, error) {
 	// 1. Trusted actor/tenant.
 	if tc.TenantID == "" {
 		return nil, refuse(domain.ReasonTenantContextMissing,
@@ -204,6 +207,26 @@ func (p *Planner) Compile(req Request, tc Context, contract *domain.IndexContrac
 	if generation == nil {
 		return nil, refuse(domain.ReasonGenerationNotActive,
 			"scope %q has no active index generation", req.Scope)
+	}
+
+	// 3b. Freshness check (ESR-012). A scope whose latest checkpoint reports
+	// STALE must not be queried — the index cannot be trusted as a current
+	// view of the source. §5.3: "STALE is never represented as CURRENT".
+	// UNKNOWN is also a refusal: an unmeasured index is not a safe index.
+	if p.store != nil {
+		cp, err := p.store.GetLatestCheckpoint(ctx, contract.ScopeName)
+		if err == nil && cp != nil {
+			switch cp.Freshness {
+			case domain.FreshnessStale:
+				return nil, refuse(domain.ReasonIndexStaleForScope,
+					"scope %q has stale index (checkpoint freshness=STALE, lag=%dms, watermark=%d)",
+					contract.ScopeName, cp.LagMS, cp.Watermark)
+			case domain.FreshnessUnknown:
+				return nil, refuse(domain.ReasonIndexStaleForScope,
+					"scope %q has unmeasured index (checkpoint freshness=UNKNOWN)",
+					contract.ScopeName)
+			}
+		}
 	}
 
 	fields := indexFields(contract)

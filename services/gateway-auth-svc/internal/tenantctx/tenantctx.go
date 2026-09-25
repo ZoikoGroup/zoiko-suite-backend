@@ -29,6 +29,7 @@ package tenantctx
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"time"
 
@@ -94,6 +95,21 @@ func New(registryBaseURL string, ttl, staleGrace time.Duration) *Resolver {
 	}
 	return &Resolver{
 		inner:      envelope.NewResolver(registryBaseURL),
+		ttl:        ttl,
+		staleGrace: staleGrace,
+		cache:      make(map[string]entry),
+	}
+}
+
+// NewWithHTTPClient builds a Resolver with a custom *http.Client for the
+// inner envelope.Resolver (e.g. one provisioned for mTLS). The caller owns
+// the client's lifetime. Returns nil if registryBaseURL is empty.
+func NewWithHTTPClient(registryBaseURL string, ttl, staleGrace time.Duration, httpClient *http.Client) *Resolver {
+	if registryBaseURL == "" {
+		return nil
+	}
+	return &Resolver{
+		inner:      envelope.NewResolverWithHTTPClient(registryBaseURL, httpClient),
 		ttl:        ttl,
 		staleGrace: staleGrace,
 		cache:      make(map[string]entry),

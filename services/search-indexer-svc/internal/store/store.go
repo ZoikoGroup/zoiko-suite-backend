@@ -56,6 +56,7 @@ type Store interface {
 
 	UpsertCheckpoint(ctx context.Context, cp domain.IndexCheckpoint) error
 	ListCheckpoints(ctx context.Context, scopeName string) ([]domain.IndexCheckpoint, error)
+	GetLatestCheckpoint(ctx context.Context, scopeName string) (*domain.IndexCheckpoint, error)
 
 	// ── ESR-02 (tenant-scoped) ───────────────────────────────────────────
 	GetProjectionRecord(ctx context.Context, tenantID, scope, sourceType, sourceID string) (*domain.ProjectionRecord, error)
@@ -637,6 +638,28 @@ func (s *PgStore) ListCheckpoints(ctx context.Context, scopeName string) ([]doma
 		return rows.Err()
 	})
 	return out, err
+}
+
+// GetLatestCheckpoint returns the most recent checkpoint for a scope.
+// Used by the query planner to enforce ESR-012 (INDEX_STALE_FOR_SCOPE).
+func (s *PgStore) GetLatestCheckpoint(ctx context.Context, scopeName string) (*domain.IndexCheckpoint, error) {
+	var cp domain.IndexCheckpoint
+	var freshness string
+	err := s.withPool(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT scope_name, source_partition, watermark, committed_at, observed_at,
+			       lag_ms, freshness, indexed_live, indexed_tombstoned
+			FROM index_checkpoints
+			WHERE scope_name = $1
+			ORDER BY observed_at DESC LIMIT 1`, scopeName).Scan(
+			&cp.ScopeName, &cp.SourcePartition, &cp.Watermark, &cp.CommittedAt,
+			&cp.ObservedAt, &cp.LagMS, &freshness, &cp.IndexedLive, &cp.IndexedTombstoned)
+	})
+	if err != nil {
+		return nil, err
+	}
+	cp.Freshness = domain.Freshness(freshness)
+	return &cp, nil
 }
 
 // ── ESR-02: projection ledger ────────────────────────────────────────────────

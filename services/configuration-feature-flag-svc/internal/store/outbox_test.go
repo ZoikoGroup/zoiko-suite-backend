@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/configuration-feature-flag-svc/internal/domain"
@@ -21,14 +22,18 @@ import (
 // recorded and every consumer still reading the one it superseded. That stale
 // value is valid data, so nothing downstream could detect it either.
 
-func outboxCount(t *testing.T, s *store.PgStore, eventType string) int {
-	t.Helper()
-	pending, _, err := s.OutboxDepth(context.Background())
-	if err != nil {
-		t.Fatalf("outbox depth: %v", err)
+// pendingByType counts the unpublished events of one type. The suite's real
+// transitions now enqueue two events each — the updated event plus the
+// snapshot.published the AA-001 write path mints — so a total depth count
+// cannot express "exactly one update event", only a per-type count can.
+func pendingByType(ctx context.Context, pool *pgxpool.Pool, eventType string) int {
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM event_outbox WHERE published_at IS NULL AND event_type = $1`,
+		eventType).Scan(&n); err != nil {
+		return -1
 	}
-	_ = eventType
-	return int(pending)
+	return n
 }
 
 // The central rule. A real transition enqueues exactly one event; re-asserting
@@ -37,6 +42,7 @@ func TestUpsert_EnqueuesOnlyOnRealTransition(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedConfig(t, pool, "payroll.batch_size")
 
 	params := domain.UpsertConfigEntryParams{
 		Key: "payroll.batch_size", Value: []byte(`100`), Environment: "staging",
@@ -48,8 +54,8 @@ func TestUpsert_EnqueuesOnlyOnRealTransition(t *testing.T) {
 	if _, created, err := s.UpsertConfigEntry(ctx, params); err != nil || !created {
 		t.Fatalf("first write: created=%v err=%v", created, err)
 	}
-	if got := outboxCount(t, s, "config.updated"); got != 1 {
-		t.Fatalf("first write must enqueue exactly one event, got %d", got)
+	if got := pendingByType(ctx, pool, "config.updated"); got != 1 {
+		t.Fatalf("first write must enqueue exactly one config.updated, got %d", got)
 	}
 
 	// 2. The same value again — the idempotent path. Nothing was written, so
@@ -58,7 +64,7 @@ func TestUpsert_EnqueuesOnlyOnRealTransition(t *testing.T) {
 	if _, created, err := s.UpsertConfigEntry(ctx, params); err != nil || created {
 		t.Fatalf("idempotent repeat: created=%v err=%v", created, err)
 	}
-	if got := outboxCount(t, s, "config.updated"); got != 1 {
+	if got := pendingByType(ctx, pool, "config.updated"); got != 1 {
 		t.Fatalf("an idempotent repeat must enqueue nothing, backlog went to %d", got)
 	}
 
@@ -68,8 +74,8 @@ func TestUpsert_EnqueuesOnlyOnRealTransition(t *testing.T) {
 	if _, created, err := s.UpsertConfigEntry(ctx, changed); err != nil || !created {
 		t.Fatalf("changed write: created=%v err=%v", created, err)
 	}
-	if got := outboxCount(t, s, "config.updated"); got != 2 {
-		t.Fatalf("a changed value must enqueue a second event, got %d", got)
+	if got := pendingByType(ctx, pool, "config.updated"); got != 2 {
+		t.Fatalf("a changed value must enqueue a second config.updated, got %d", got)
 	}
 }
 
@@ -77,6 +83,7 @@ func TestUpsertFeatureFlag_EnqueuesOnlyOnRealTransition(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedFlag(t, pool, "new_ui")
 
 	params := domain.UpsertFeatureFlagParams{
 		Key: "new_ui", Enabled: true, Environment: "staging", RolloutPercentage: 50,
@@ -88,8 +95,8 @@ func TestUpsertFeatureFlag_EnqueuesOnlyOnRealTransition(t *testing.T) {
 	if _, created, err := s.UpsertFeatureFlag(ctx, params); err != nil || created {
 		t.Fatalf("idempotent repeat: created=%v err=%v", created, err)
 	}
-	if got := outboxCount(t, s, "feature_flag.updated"); got != 1 {
-		t.Fatalf("expected exactly one enqueued event, got %d", got)
+	if got := pendingByType(ctx, pool, "feature_flag.updated"); got != 1 {
+		t.Fatalf("expected exactly one enqueued feature_flag.updated, got %d", got)
 	}
 }
 
@@ -102,6 +109,7 @@ func TestUpsert_GlobalScopeWriteStillEnqueues(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedConfig(t, pool, "cutoff.hour")
 
 	if _, created, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{
 		Key: "cutoff.hour", Value: []byte(`17`), Environment: "prod",
@@ -111,12 +119,8 @@ func TestUpsert_GlobalScopeWriteStillEnqueues(t *testing.T) {
 		t.Fatalf("global write: created=%v err=%v", created, err)
 	}
 
-	pending, _, err := s.OutboxDepth(ctx)
-	if err != nil {
-		t.Fatalf("outbox depth: %v", err)
-	}
-	if pending != 1 {
-		t.Fatalf("a global write must enqueue its event too, backlog=%d", pending)
+	if got := pendingByType(ctx, pool, "config.updated"); got != 1 {
+		t.Fatalf("a global write must enqueue its config.updated too, got %d", got)
 	}
 
 	var owner string
@@ -152,6 +156,7 @@ func TestClaimOutbox_MarksPublishedOnlyWhenTheHandlerSucceeds(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedConfig(t, pool, "k")
 
 	if _, _, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{
 		Key: "k", Value: []byte(`1`), Environment: "staging",
@@ -160,24 +165,20 @@ func TestClaimOutbox_MarksPublishedOnlyWhenTheHandlerSucceeds(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	// A failing publish must leave the row claimable. Marking it published here
-	// is the exact loss the outbox removes.
+	// A failing publish must leave the rows claimable. Marking them published
+	// here is the exact loss the outbox removes.
 	sendErr := errors.New("broker unreachable")
 	if err := s.ClaimOutbox(ctx, 10, func(recs []store.OutboxRecord) error {
-		if len(recs) != 1 {
-			t.Fatalf("expected 1 claimed record, got %d", len(recs))
+		if len(recs) != 2 {
+			t.Fatalf("expected 2 claimed records (config.updated + snapshot.published), got %d", len(recs))
 		}
 		return sendErr
 	}); !errors.Is(err, sendErr) {
 		t.Fatalf("expected the publish error to propagate, got %v", err)
 	}
 
-	pending, _, err := s.OutboxDepth(ctx)
-	if err != nil {
-		t.Fatalf("outbox depth: %v", err)
-	}
-	if pending != 1 {
-		t.Fatalf("a failed publish must leave the event unpublished, backlog=%d", pending)
+	if got := pendingByType(ctx, pool, "config.updated"); got != 1 {
+		t.Fatalf("a failed publish must leave the event unpublished, got %d", got)
 	}
 
 	// The attempt and the reason are recorded on the row, so a stuck event can
@@ -194,13 +195,13 @@ func TestClaimOutbox_MarksPublishedOnlyWhenTheHandlerSucceeds(t *testing.T) {
 		t.Error("a failed publish must record why on the row")
 	}
 
-	// And a successful one drains it.
+	// And a successful one drains them.
 	if err := s.ClaimOutbox(ctx, 10, func(recs []store.OutboxRecord) error {
-		if len(recs) != 1 {
-			t.Fatalf("the failed event must be claimable again, got %d", len(recs))
+		if len(recs) != 2 {
+			t.Fatalf("the failed events must be claimable again, got %d", len(recs))
 		}
 		if recs[0].EventType != "config.updated" {
-			t.Errorf("unexpected event type %q", recs[0].EventType)
+			t.Errorf("unexpected first event type %q", recs[0].EventType)
 		}
 		if len(recs[0].Body) == 0 {
 			t.Error("claimed record carries no envelope")
@@ -210,12 +211,8 @@ func TestClaimOutbox_MarksPublishedOnlyWhenTheHandlerSucceeds(t *testing.T) {
 		t.Fatalf("second drain: %v", err)
 	}
 
-	pending, _, err = s.OutboxDepth(ctx)
-	if err != nil {
-		t.Fatalf("outbox depth: %v", err)
-	}
-	if pending != 0 {
-		t.Fatalf("a successful publish must clear the backlog, got %d", pending)
+	if got := pendingByType(ctx, pool, "config.updated"); got != 0 {
+		t.Fatalf("a successful publish must clear the backlog, got %d", got)
 	}
 }
 
@@ -225,6 +222,7 @@ func TestOutboxDepth_ReportsAgeOfTheOldestUnpublishedEvent(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedConfig(t, pool, "k")
 
 	if pending, age, err := s.OutboxDepth(ctx); err != nil || pending != 0 || age != 0 {
 		t.Fatalf("empty outbox: pending=%d age=%v err=%v", pending, age, err)
@@ -241,8 +239,8 @@ func TestOutboxDepth_ReportsAgeOfTheOldestUnpublishedEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("outbox depth: %v", err)
 	}
-	if pending != 1 {
-		t.Fatalf("expected backlog of 1, got %d", pending)
+	if pending != 2 {
+		t.Fatalf("expected backlog of 2 (config.updated + snapshot.published), got %d", pending)
 	}
 	if age <= 0 || age > time.Minute {
 		t.Errorf("age of a just-written event should be small and positive, got %v", age)
@@ -258,6 +256,7 @@ func TestClaimOutbox_RelayCrossesTenants(t *testing.T) {
 	admin := openTestPool(t)
 	appPool := appRolePool(t, admin)
 	s := store.New(appPool, zap.NewNop())
+	seedConfig(t, admin, "k")
 
 	tenantA := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	tenantB := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -273,12 +272,16 @@ func TestClaimOutbox_RelayCrossesTenants(t *testing.T) {
 
 	claimed := 0
 	if err := s.ClaimOutbox(ctx, 10, func(recs []store.OutboxRecord) error {
-		claimed = len(recs)
+		for _, r := range recs {
+			if r.EventType == "config.updated" {
+				claimed++
+			}
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	if claimed != 2 {
-		t.Fatalf("the relay must see both tenants' events, claimed %d", claimed)
+		t.Fatalf("the relay must see both tenants' update events, claimed %d", claimed)
 	}
 }

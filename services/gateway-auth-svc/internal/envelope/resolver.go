@@ -103,6 +103,15 @@ func NewResolver(registryBaseURL string) *Resolver {
 	}
 }
 
+// NewResolverWithHTTPClient builds a Resolver with a custom *http.Client
+// (e.g. one provisioned for mTLS). The caller owns the client's lifetime.
+func NewResolverWithHTTPClient(registryBaseURL string, httpClient *http.Client) *Resolver {
+	return &Resolver{
+		registryBaseURL: registryBaseURL,
+		http:            httpClient,
+	}
+}
+
 // tenantView is the subset of tenant-entity-registry-svc's Tenant this package
 // reads. Declared narrowly so an unrelated change to that service's response
 // cannot break decoding here.

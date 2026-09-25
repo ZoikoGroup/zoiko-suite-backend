@@ -22,7 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -215,6 +215,10 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
+	if err := gateConfigWriteValue(ctx, tx, params.Key, params.TenantID, params.Value); err != nil {
+		return nil, false, err
+	}
+
 	const findCurrentQuery = `
 		SELECT ` + configColumns + `
 		FROM config_entries
@@ -234,6 +238,15 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 		}
 		if err := enqueueConfigUpdated(ctx, tx, params.CallerTenantID, *entry, params.CorrelationID); err != nil {
 			s.log.Error("pg UpsertConfigEntry: enqueue failed", zap.Error(err))
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		snap, mintErr := s.mintSnapshot(ctx, tx, params.Environment, params.CreatedByPrincipalID)
+		if mintErr != nil {
+			s.log.Error("pg UpsertConfigEntry: mint failed", zap.Error(mintErr))
+			return nil, false, mintErr
+		}
+		if err := enqueueSnapshotPublished(ctx, tx, params.CallerTenantID, params.CreatedByPrincipalID, params.CorrelationID, *snap); err != nil {
+			s.log.Error("pg UpsertConfigEntry: enqueue snapshot failed", zap.Error(err))
 			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -328,80 +341,81 @@ func jsonEqual(a, b []byte) bool {
 // FindCurrentConfigEntry looks up the currently-effective row for an
 // exact (key, environment, tenant_id) scope. No fallback to a global
 // default on a tenant-specific miss — see context.md §7.2.
+//
+// The lookup is served from the environment's newest snapshot imprint
+// (INV-12), never the live admin tables. A scope that has never been
+// written to has no snapshot and answers ErrConfigEntryNotFound, the same
+// 404 semantics the read path always carried.
 func (s *PgStore) FindCurrentConfigEntry(ctx context.Context, key, environment string, tenantID *string) (*domain.ConfigEntry, error) {
-	const query = `
-		SELECT ` + configColumns + `
-		FROM config_entries
-		WHERE key = $1
-		  AND environment = $2
-		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
-		  AND effective_to IS NULL;`
-
-	var entry *domain.ConfigEntry
-	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
-		var scanErr error
-		entry, scanErr = scanConfigEntry(tx.QueryRow(ctx, query, key, environment, tenantID))
-		return scanErr
-	})
+	snap, err := s.latestSnapshotRow(ctx, environment)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrConfigEntryNotFound
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrConfigEntryNotFound
-		}
-		s.log.Error("pg FindCurrentConfigEntry failed", zap.String("key", key), zap.Error(err))
+		s.log.Error("pg FindCurrentConfigEntry: read snapshot failed", zap.String("key", key), zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return entry, nil
+	entries, err := parseManifest(snap.Content)
+	if err != nil {
+		s.log.Error("pg FindCurrentConfigEntry: parse manifest failed", zap.String("key", key), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	e, ok := entries[domain.ManifestKey(key, tenantID)]
+	if !ok || e.Kind != domain.ManifestKindConfig {
+		return nil, domain.ErrConfigEntryNotFound
+	}
+	return configFromManifest(e), nil
 }
 
 // ListCurrentConfigEntries returns every currently-effective config entry,
 // optionally filtered by environment and/or tenant_id. An absent filter
 // dimension means "no filter" (not "global only") — e.g. omitting
 // tenant_id returns entries across all tenants, not just global ones.
+//
+// Each environment's newest snapshot imprint is the source; an environment
+// with no imprint contributes nothing. Missing imprints answer an empty
+// list, matching the list endpoint's 200-with-empty semantics.
 func (s *PgStore) ListCurrentConfigEntries(ctx context.Context, filter ListFilter) ([]*domain.ConfigEntry, error) {
-	args := []any{}
-	conditions := []string{"effective_to IS NULL"}
-	argIdx := 1
-
+	var snaps map[string]*domain.ConfigSnapshot
 	if filter.Environment != "" {
-		conditions = append(conditions, fmt.Sprintf("environment = $%d", argIdx))
-		args = append(args, filter.Environment)
-		argIdx++
+		snap, err := s.latestSnapshotRow(ctx, filter.Environment)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			s.log.Error("pg ListCurrentConfigEntries: read snapshot failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		snaps = map[string]*domain.ConfigSnapshot{snap.Environment: snap}
+	} else {
+		var err error
+		snaps, err = s.latestSnapshotsByEnv(ctx)
+		if err != nil {
+			s.log.Error("pg ListCurrentConfigEntries: list snapshots failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 	}
-	if cond := tenantCondition(filter, argIdx); cond != "" {
-		conditions = append(conditions, cond)
-		args = append(args, *filter.TenantID)
-		argIdx++
-	}
-
-	query := fmt.Sprintf(`
-		SELECT %s
-		FROM config_entries
-		WHERE %s
-		ORDER BY key, environment;`,
-		configColumns, strings.Join(conditions, " AND "),
-	)
 
 	var results []*domain.ConfigEntry
-	err := s.withRLS(ctx, derefOrEmpty(filter.TenantID), func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, query, args...)
+	for _, snap := range snaps {
+		entries, err := parseManifest(snap.Content)
 		if err != nil {
-			return err
+			s.log.Error("pg ListCurrentConfigEntries: parse manifest failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		defer rows.Close()
-
-		for rows.Next() {
-			c, scanErr := scanConfigEntry(rows)
-			if scanErr != nil {
-				return scanErr
+		for _, e := range entries {
+			if e.Kind != domain.ManifestKindConfig || !entryMatch(filter, e.TenantID) {
+				continue
 			}
-			results = append(results, c)
+			results = append(results, configFromManifest(e))
 		}
-		return rows.Err()
-	})
-	if err != nil {
-		s.log.Error("pg ListCurrentConfigEntries failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Key != results[j].Key {
+			return results[i].Key < results[j].Key
+		}
+		return results[i].Environment < results[j].Environment
+	})
 	return results, nil
 }
 
@@ -457,6 +471,10 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
+	if err := gateFlagWrite(ctx, tx, params.Key, params.TenantID, params.Enabled, params.RolloutPercentage); err != nil {
+		return nil, false, err
+	}
+
 	const findCurrentQuery = `
 		SELECT ` + flagColumns + `
 		FROM feature_flags
@@ -475,6 +493,15 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 		}
 		if err := enqueueFlagUpdated(ctx, tx, params.CallerTenantID, *flag, params.CorrelationID); err != nil {
 			s.log.Error("pg UpsertFeatureFlag: enqueue failed", zap.Error(err))
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		snap, mintErr := s.mintSnapshot(ctx, tx, params.Environment, params.CreatedByPrincipalID)
+		if mintErr != nil {
+			s.log.Error("pg UpsertFeatureFlag: mint failed", zap.Error(mintErr))
+			return nil, false, mintErr
+		}
+		if err := enqueueSnapshotPublished(ctx, tx, params.CallerTenantID, params.CreatedByPrincipalID, params.CorrelationID, *snap); err != nil {
+			s.log.Error("pg UpsertFeatureFlag: enqueue snapshot failed", zap.Error(err))
 			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -528,78 +555,72 @@ func insertFeatureFlag(ctx context.Context, tx pgx.Tx, params domain.UpsertFeatu
 	return flag, nil
 }
 
-// FindCurrentFeatureFlag is FindCurrentConfigEntry's counterpart.
+// FindCurrentFeatureFlag is FindCurrentConfigEntry's counterpart, served
+// from the environment's newest snapshot imprint.
 func (s *PgStore) FindCurrentFeatureFlag(ctx context.Context, key, environment string, tenantID *string) (*domain.FeatureFlag, error) {
-	const query = `
-		SELECT ` + flagColumns + `
-		FROM feature_flags
-		WHERE key = $1
-		  AND environment = $2
-		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
-		  AND effective_to IS NULL;`
-
-	var flag *domain.FeatureFlag
-	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
-		var scanErr error
-		flag, scanErr = scanFeatureFlag(tx.QueryRow(ctx, query, key, environment, tenantID))
-		return scanErr
-	})
+	snap, err := s.latestSnapshotRow(ctx, environment)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrFeatureFlagNotFound
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrFeatureFlagNotFound
-		}
-		s.log.Error("pg FindCurrentFeatureFlag failed", zap.String("key", key), zap.Error(err))
+		s.log.Error("pg FindCurrentFeatureFlag: read snapshot failed", zap.String("key", key), zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return flag, nil
+	entries, err := parseManifest(snap.Content)
+	if err != nil {
+		s.log.Error("pg FindCurrentFeatureFlag: parse manifest failed", zap.String("key", key), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	e, ok := entries[domain.ManifestKey(key, tenantID)]
+	if !ok || e.Kind != domain.ManifestKindFlag {
+		return nil, domain.ErrFeatureFlagNotFound
+	}
+	return flagFromManifest(e), nil
 }
 
-// ListCurrentFeatureFlags is ListCurrentConfigEntries's counterpart.
+// ListCurrentFeatureFlags is ListCurrentConfigEntries's counterpart: each
+// environment's newest snapshot imprint, filtered the same way.
 func (s *PgStore) ListCurrentFeatureFlags(ctx context.Context, filter ListFilter) ([]*domain.FeatureFlag, error) {
-	args := []any{}
-	conditions := []string{"effective_to IS NULL"}
-	argIdx := 1
-
+	var snaps map[string]*domain.ConfigSnapshot
 	if filter.Environment != "" {
-		conditions = append(conditions, fmt.Sprintf("environment = $%d", argIdx))
-		args = append(args, filter.Environment)
-		argIdx++
+		snap, err := s.latestSnapshotRow(ctx, filter.Environment)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			s.log.Error("pg ListCurrentFeatureFlags: read snapshot failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		snaps = map[string]*domain.ConfigSnapshot{snap.Environment: snap}
+	} else {
+		var err error
+		snaps, err = s.latestSnapshotsByEnv(ctx)
+		if err != nil {
+			s.log.Error("pg ListCurrentFeatureFlags: list snapshots failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 	}
-	if cond := tenantCondition(filter, argIdx); cond != "" {
-		conditions = append(conditions, cond)
-		args = append(args, *filter.TenantID)
-		argIdx++
-	}
-
-	query := fmt.Sprintf(`
-		SELECT %s
-		FROM feature_flags
-		WHERE %s
-		ORDER BY key, environment;`,
-		flagColumns, strings.Join(conditions, " AND "),
-	)
 
 	var results []*domain.FeatureFlag
-	err := s.withRLS(ctx, derefOrEmpty(filter.TenantID), func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, query, args...)
+	for _, snap := range snaps {
+		entries, err := parseManifest(snap.Content)
 		if err != nil {
-			return err
+			s.log.Error("pg ListCurrentFeatureFlags: parse manifest failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		defer rows.Close()
-
-		for rows.Next() {
-			f, scanErr := scanFeatureFlag(rows)
-			if scanErr != nil {
-				return scanErr
+		for _, e := range entries {
+			if e.Kind != domain.ManifestKindFlag || !entryMatch(filter, e.TenantID) {
+				continue
 			}
-			results = append(results, f)
+			results = append(results, flagFromManifest(e))
 		}
-		return rows.Err()
-	})
-	if err != nil {
-		s.log.Error("pg ListCurrentFeatureFlags failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Key != results[j].Key {
+			return results[i].Key < results[j].Key
+		}
+		return results[i].Environment < results[j].Environment
+	})
 	return results, nil
 }
 

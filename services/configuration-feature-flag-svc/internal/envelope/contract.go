@@ -4,6 +4,11 @@
 
 package envelope
 
+import (
+	"net/http"
+	"strings"
+)
+
 // ServicePolicy is this service's §4 conditional-field policy.
 //
 // The unconditionally mandatory fields — tenant_id, actor_subject_id,
@@ -21,5 +26,19 @@ func ServicePolicy() Policy {
 
 		// This service does not post to an accounting book.
 		BookID: NotRequired,
+
+		// POST endpoints that resolve or evaluate and change nothing get the
+		// full envelope except the idempotency_key, which the material-write
+		// gate would otherwise demand for a read. A resolve/evaluate can be
+		// repeated safely. Matches POST_READ in services/_contract/rollout.sh.
+		MaterialWrite: func(r *http.Request) bool {
+			switch {
+			case r.URL.Path == "/v1/config/resolve":
+				return false
+			case strings.HasPrefix(r.URL.Path, "/v1/flags/") && strings.HasSuffix(r.URL.Path, "/evaluate"):
+				return false
+			}
+			return defaultMaterialWrite(r)
+		},
 	}
 }

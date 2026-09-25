@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/mail"
 	"strconv"
@@ -35,6 +36,17 @@ type Store interface {
 	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error
 	MarkRead(ctx context.Context, id, recipientPrincipalID string, readAt time.Time) error
 	CountUnread(ctx context.Context, recipientPrincipalID string) (int, error)
+
+	// Attempt records — durable chain per §3.4
+	CreateAttempt(ctx context.Context, a *domain.DeliveryAttempt) error
+	UpdateAttempt(ctx context.Context, attemptID, status, failureReason, providerResponse string, concludedAt *time.Time) error
+	GetAttempts(ctx context.Context, notificationID string) ([]domain.DeliveryAttempt, error)
+
+	// Idempotency check by purpose-scoped key
+	GetByIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (*domain.Notification, error)
+
+	// Reconciliation: find notifications stuck in UNKNOWN (in flight) for too long
+	FindStuckInFlight(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error)
 }
 
 // RecipientResolver turns a principal into the contact endpoint a message is
@@ -257,9 +269,9 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.RecipientPrincipalID == "" || req.LegalEntityID == "" || req.Channel == "" ||
-		req.Subject == "" || req.CorrelationID == "" {
+		req.Subject == "" || req.CorrelationID == "" || req.PurposeContext == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields",
-			"recipient_principal_id, legal_entity_id, channel, correlation_id are required, plus either subject or template")
+			"recipient_principal_id, legal_entity_id, channel, correlation_id, purpose_context are required, plus either subject or template")
 		return
 	}
 
@@ -320,6 +332,25 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// employee has no email address on file.
 	address, addressSource, resolveErr := h.resolveRecipient(r.Context(), tenantID, principalID, req)
 
+	// Derive or use the provided idempotency key (purpose-scoped per §3.4)
+	idempotencyKey := req.IdempotencyKey
+	if idempotencyKey == "" {
+		idempotencyKey = fmt.Sprintf("%s|%s|%s|%s", tenantID, req.LegalEntityID, req.CorrelationID, req.PurposeContext)
+	}
+
+	// Check for existing notification by idempotency key BEFORE creating
+	existing, err := h.store.GetByIdempotencyKey(r.Context(), tenantID, idempotencyKey)
+	if err != nil {
+		h.log.Error("failed to check idempotency key", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if existing != nil {
+		// Replay: this idempotency key was already processed.
+		writeJSON(w, http.StatusOK, existing)
+		return
+	}
+
 	notification := &domain.Notification{
 		NotificationID:         uuid.NewString(),
 		TenantID:               tenantID,
@@ -330,12 +361,14 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		Channel:                req.Channel,
 		Subject:                req.Subject,
 		Body:                   req.Body,
-		Status:                 "PENDING",
+		Status:                 domain.StatusPending,
 		SourceEventType:        req.SourceEventType,
 		SourceReference:        req.SourceReference,
 		CorrelationID:          req.CorrelationID,
 		CreatedByPrincipalID:   principalID,
 		CreatedAt:              now,
+		IdempotencyKey:         idempotencyKey,
+		PurposeContext:         req.PurposeContext,
 	}
 
 	created, err := h.store.CreateNotification(r.Context(), notification)
@@ -346,7 +379,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !created {
-		// Replay: this correlation_id was already processed.
+		// Should not happen since we checked above, but defense in depth
 		writeJSON(w, http.StatusOK, notification)
 		return
 	}
@@ -365,6 +398,25 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	attemptedAt := time.Now().UTC()
+
+	// Create the first attempt record (durable attempt_id per §3.4)
+	attempt := &domain.DeliveryAttempt{
+		AttemptID:        uuid.NewString(),
+		NotificationID:   notification.NotificationID,
+		AttemptNumber:    1,
+		Channel:          notification.Channel,
+		Provider:         "smtp", // TODO: extract from deliverer
+		Status:           domain.AttemptStatusUnknown, // Start as UNKNOWN, reconcile later
+		ProviderResponse: outcome.ProviderResponse,
+		FailureReason:    outcome.Reason,
+		Retryable:        outcome.Retryable,
+		ResendReason:     domain.ResendReasonFirstTry,
+		CreatedAt:        attemptedAt,
+	}
+	if err := h.store.CreateAttempt(r.Context(), attempt); err != nil {
+		h.log.Error("failed to create attempt record", zap.Error(err))
+	}
+
 	// Recorded for every attempt, delivered or not — including the resolution
 	// failures above, which never reach a provider. Excluding those would make
 	// the attempt count disagree with delivery_attempts on the row, and an
@@ -405,11 +457,27 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		svcmiddleware.WithTenant(context.WithoutCancel(r.Context()), tenantID), 10*time.Second)
 	defer cancelOutcome()
 
-	// A failure worth re-attempting does not conclude the notification. It
-	// stays PENDING with a schedule on it, and internal/retry's worker picks
-	// it up — which is the whole difference between classifying a failure and
-	// doing something about it.
-	if !outcome.Delivered && outcome.Retryable {
+	// If the provider accepted the message, transition to PROVIDER_ACCEPTED
+	// (not SENT). If the outcome is a failure worth re-attempting, stay PENDING
+	// with a schedule. If it's a settled failure, conclude as FAILED.
+	if outcome.Delivered {
+		// Provider accepted — mark as PROVIDER_ACCEPTED (not SENT).
+		// The reconciliation worker will later confirm delivery and advance
+		// to DELIVERED/READ/SERVED as appropriate.
+		notification.Status = domain.StatusProviderAccepted
+		notification.ProviderResponse = outcome.ProviderResponse
+		notification.SentAt = &attemptedAt
+		notification.DeliveryAttempts = 1
+		notification.LastAttemptAt = &attemptedAt
+
+		// Update attempt record to PROVIDER_ACCEPTED
+		attempt.Status = domain.AttemptStatusProviderAccepted
+		attempt.ConcludedAt = &attemptedAt
+		if err := h.store.UpdateAttempt(outcomeCtx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &attemptedAt); err != nil {
+			h.log.Error("failed to update attempt record", zap.Error(err))
+		}
+	} else if outcome.Retryable {
+		// Failure worth re-attempting: schedule a retry, stay PENDING
 		if next, ok := h.retryPolicy.NextAttempt(attemptedAt, 1); ok {
 			if err := h.store.ScheduleRetry(outcomeCtx, notification.NotificationID,
 				tenantID, outcome.Reason, attemptedAt, next); err != nil {
@@ -417,11 +485,18 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 				return
 			}
-			notification.Status = "PENDING"
+			notification.Status = domain.StatusPending
 			notification.FailureReason = outcome.Reason
 			notification.DeliveryAttempts = 1
 			notification.LastAttemptAt = &attemptedAt
 			notification.NextAttemptAt = &next
+
+			// Update attempt record to FAILED (retryable)
+			attempt.Status = domain.AttemptStatusFailed
+			attempt.ConcludedAt = &attemptedAt
+			if err := h.store.UpdateAttempt(outcomeCtx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &attemptedAt); err != nil {
+				h.log.Error("failed to update attempt record", zap.Error(err))
+			}
 
 			h.log.Warn("delivery failed on first attempt, scheduled for retry",
 				zap.String("notification_id", notification.NotificationID),
@@ -435,42 +510,34 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 			// No notification.failed event, and nothing enqueued: nothing has
 			// failed yet. Emitting one here and a notification.sent two minutes
 			// later would have consumers act on an outcome that did not happen.
-			// This is also why ScheduleRetry takes no event while
-			// CompleteDelivery requires one — exactly one event per
-			// notification, at the conclusion.
 			writeJSON(w, http.StatusCreated, notification)
 			return
 		}
 		// MaxAttempts of 1 — retry disabled by configuration. Fall through and
-		// conclude, rather than sit PENDING with nothing scheduled to move it.
+		// conclude as FAILED, rather than sit PENDING with nothing scheduled.
 		outcome.Reason += " (retry is disabled by configuration)"
 	}
 
-	newStatus := "SENT"
-	if !outcome.Delivered {
-		newStatus = "FAILED"
+	// Terminal failure: conclude as FAILED
+	if notification.Status == domain.StatusPending {
+		notification.Status = domain.StatusFailed
+		notification.FailureReason = outcome.Reason
+		notification.ProviderResponse = outcome.ProviderResponse
+		notification.SentAt = &attemptedAt
+		notification.DeliveryAttempts = 1
+		notification.LastAttemptAt = &attemptedAt
+
+		attempt.Status = domain.AttemptStatusFailed
+		attempt.ConcludedAt = &attemptedAt
+		if err := h.store.UpdateAttempt(outcomeCtx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &attemptedAt); err != nil {
+			h.log.Error("failed to update attempt record", zap.Error(err))
+		}
 	}
 
-	// The in-memory record is brought up to date BEFORE the event is sealed,
-	// because the event is built from it. Sealing first would publish a
-	// notification.sent carrying status PENDING, no sent_at and no provider
-	// response — describing the row as it was before the transition the event
-	// exists to announce.
-	notification.Status = newStatus
-	notification.FailureReason = outcome.Reason
-	notification.ProviderResponse = outcome.ProviderResponse
-	notification.SentAt = &attemptedAt
-	notification.DeliveryAttempts = 1
-	notification.LastAttemptAt = &attemptedAt
+	newStatus := notification.Status
 
 	ev, err := sealConclusion(correlationID, *notification, outcome)
 	if err != nil {
-		// Unreachable short of a marshalling bug, and refused rather than
-		// logged anyway. The old code path logged a marshal failure inside the
-		// publisher and returned, so the notification concluded and the event
-		// vanished — the same silent loss as a broker outage, from a different
-		// cause. Refusing here leaves the row PENDING in flight, which the
-		// stranded sweep reclaims and re-attempts.
 		h.log.Error("failed to seal the delivery event", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "event_seal_failed", err.Error())
 		return

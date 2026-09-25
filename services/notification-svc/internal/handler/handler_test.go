@@ -148,6 +148,31 @@ func (s *stubStore) CountUnread(_ context.Context, recipientPrincipalID string) 
 	return count, nil
 }
 
+// --- New interface methods for §3.4 compliance ---
+
+func (s *stubStore) CreateAttempt(_ context.Context, a *domain.DeliveryAttempt) error {
+	// No-op for tests
+	return nil
+}
+
+func (s *stubStore) UpdateAttempt(_ context.Context, attemptID, status, failureReason, providerResponse string, concludedAt *time.Time) error {
+	// No-op for tests
+	return nil
+}
+
+func (s *stubStore) GetAttempts(_ context.Context, notificationID string) ([]domain.DeliveryAttempt, error) {
+	return nil, nil
+}
+
+func (s *stubStore) GetByIdempotencyKey(_ context.Context, tenantID, idempotencyKey string) (*domain.Notification, error) {
+	// Not used in these tests
+	return nil, nil
+}
+
+func (s *stubStore) FindStuckInFlight(_ context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error) {
+	return nil, nil
+}
+
 // eventCounts summarises what the store was asked to enqueue.
 //
 // It replaces a stubPublisher that counted PublishSent/PublishFailed calls.
@@ -285,6 +310,7 @@ func TestSendNotification_MissingPrincipal(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Approval needed",
 		"correlation_id":         "corr-1",
+		"purpose_context":        "TEST_PURPOSE",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -299,6 +325,7 @@ func TestSendNotification_AuthzDenied(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Approval needed",
 		"correlation_id":         "corr-1",
+		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d", rr.Code)
@@ -316,6 +343,7 @@ func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
 		"subject":                "Invoice approval required",
 		"body":                   "Invoice INV-100 needs your approval.",
 		"correlation_id":         "corr-sent",
+		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -325,8 +353,9 @@ func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&n); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if n.Status != "SENT" {
-		t.Errorf("expected SENT got %q", n.Status)
+	// Provider accepted is the new SENT - it means a provider took the message
+	if n.Status != domain.StatusProviderAccepted {
+		t.Errorf("expected PROVIDER_ACCEPTED got %q", n.Status)
 	}
 	if n.SentAt == nil {
 		t.Error("expected sent_at to be set")
@@ -350,6 +379,7 @@ func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelive
 		"channel":                "CARRIER_PIGEON",
 		"subject":                "Test",
 		"correlation_id":         "corr-bad-channel",
+		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	if rr.Code != http.StatusBadRequest {
@@ -377,6 +407,7 @@ func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T)
 		"channel":                "EMAIL",
 		"subject":                "Test",
 		"correlation_id":         "corr-failed",
+		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -415,6 +446,7 @@ func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T)
 		"channel":                "EMAIL",
 		"subject":                "Payslip available",
 		"correlation_id":         "corr-transient",
+		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -463,6 +495,7 @@ func TestSendNotification_SettledFailure_ConcludesImmediately(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Payslip available",
 		"correlation_id":         "corr-settled",
+		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	var n domain.Notification
@@ -492,6 +525,7 @@ func TestSendNotification_IdempotentReplay(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Reminder",
 		"correlation_id":         "corr-retry",
+		"purpose_context":        "TEST_PURPOSE",
 	}
 
 	rr1 := doReq(r, http.MethodPost, "/v1/notifications/", body, "principal-1")
@@ -599,6 +633,7 @@ func TestRequests_WithoutTenantScope_Are401NotServiceUnavailable(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Test",
 		"correlation_id":         "corr-no-tenant",
+		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("send: expected 401 got %d: %s", rr.Code, rr.Body.String())

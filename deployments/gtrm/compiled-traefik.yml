@@ -5,8 +5,8 @@
 #
 #   map_version:      47
 #   compiler_version: 0.1.0
-#   commit:           613b7b1
-#   generated_at:     2026-09-03T11:49:03Z
+#   commit:           unknown
+#   generated_at:     2026-09-25T09:23:07Z
 # ─────────────────────────────────────────────────────────────────────────────
 http:
     routers:
@@ -15,15 +15,23 @@ http:
             service: gtrm-svc-acme
             middlewares:
                 - gtrm-edge-strip
+                - gateway-auth
                 - gtrm-ctx-acme
             priority: 100
+            entryPoints:
+                - web
+                - websecure
         gtrm-atlas:
             rule: Host(`atlas.zoikosuite.dev.internal`)
             service: gtrm-svc-atlas
             middlewares:
                 - gtrm-edge-strip
+                - gateway-auth
                 - gtrm-ctx-atlas
             priority: 100
+            entryPoints:
+                - web
+                - websecure
         gtrm-catchall-safe:
             rule: HostRegexp(`^.+$`)
             service: gtrm-safe-endpoint
@@ -33,8 +41,12 @@ http:
             service: gtrm-svc-globex
             middlewares:
                 - gtrm-edge-strip
+                - gateway-auth
                 - gtrm-ctx-globex
             priority: 100
+            entryPoints:
+                - web
+                - websecure
     services:
         gtrm-safe-endpoint:
             loadBalancer:
@@ -53,6 +65,15 @@ http:
                 servers:
                     - url: http://us-pool:8080
     middlewares:
+        gateway-auth:
+            forwardAuth:
+                address: http://gateway-auth-svc:8092/verify
+                trustForwardHeader: true
+                authResponseHeaders:
+                    - X-Principal-Id
+                    - X-Tenant-Id
+                    - X-Workload-Id
+                    - X-Carta-Decision
         gtrm-ctx-acme:
             headers:
                 customRequestHeaders:
@@ -80,6 +101,16 @@ http:
         gtrm-edge-strip:
             headers:
                 customRequestHeaders:
+                    X-Approval-Reference: ""
+                    X-Book-Id: ""
+                    X-Causation-Id: ""
+                    X-Evidence-Refs: ""
+                    X-Expected-Version: ""
+                    X-Purpose-Context: ""
+                    X-Source-Channel: ""
+                    X-Support-Context-Id: ""
+                    X-Workflow-Instance-Id: ""
+                    X-Workload-Id: ""
                     X-Zoiko-GTRM-Map-Version: ""
                     X-Zoiko-GTRM-State: ""
                     X-Zoiko-Residency-Policy: ""

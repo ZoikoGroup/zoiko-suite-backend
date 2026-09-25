@@ -154,19 +154,32 @@ SPEC_OPS=$(Q openapi-methods openapi.yaml)
 for o in \
   "POST /v1/config" "GET /v1/config" "GET /v1/config/{key}" \
   "POST /v1/flags" "GET /v1/flags" "GET /v1/flags/{key}" \
+  "POST /v1/config/definitions" "GET /v1/config/definitions/{key}" \
+  "POST /v1/config/definitions/{key}/publish" "POST /v1/config/resolve" \
+  "PUT /v1/config/overrides/{scope}" "POST /v1/config/changes" \
+  "POST /v1/config/changes/{change_id}/approve" "POST /v1/config/changes/{change_id}/activate" \
+  "POST /v1/emergency-changes" "POST /v1/emergency-changes/{emergency_change_id}/activate" \
+  "POST /v1/runtime/attest" "POST /v1/flags/{key}/release-plans" \
+  "POST /v1/flags/{key}/evaluate" \
   "GET /healthz" "GET /readyz" "GET /metrics"; do
   hasf "openapi documents $o" "$SPEC_OPS" "$o"
 done
 # Anchored. Unanchored, r\.(Get|Post)\( also matches inside
 # r.Header.Get("X-Principal-Id") — "Heade" + "r.Get(" — and would report routes
-# that do not exist.
-CODE_ROUTES=$(grep -cE '^[[:space:]]*r\.(Get|Post|Patch|Delete)\("' internal/handler/handler.go)
-chk "handler registers 6 routes" "$CODE_ROUTES" "6"
+# that do not exist. Put included since ?v1/config/overrides/{scope} is a PUT.
+CODE_ROUTES=$(grep -cE '^[[:space:]]*r\.(Get|Post|Patch|Put|Delete)\("' internal/handler/handler.go)
+chk "handler registers 19 routes" "$CODE_ROUTES" "19"
 # Every error code the handler can emit must appear in the spec, or a client
-# branching on the code meets one the contract never mentioned.
+# branching on the code meets one the contract never mentioned. Two sources:
+# literal "error": "<code>" payloads, and the governedCodeStatus map whose keys
+# are the AA-001 refusal codes the governed routes emit dynamically.
 SPEC_CODES=$(Q openapi-error-codes openapi.yaml)
 MISSING=0
 for c in $(grep -oE '"error":[[:space:]]*"[a-z_]+"' internal/handler/handler.go | grep -oE '"[a-z_]+"$' | tr -d '"' | sort -u); do
+  echo "$SPEC_CODES" | grep -qx "$c" || { MISSING=$((MISSING+1)); echo "        undocumented: $c"; }
+done
+for c in $(grep -oE '"[a-z0-9_]+":[[:space:]]*http\.Status' internal/handler/handler.go \
+           | grep -oE '"[a-z0-9_]+"' | tr -d '"' | sort -u); do
   echo "$SPEC_CODES" | grep -qx "$c" || { MISSING=$((MISSING+1)); echo "        undocumented: $c"; }
 done
 chk "every emitted error code is in openapi" "$MISSING" "0"
@@ -342,8 +355,9 @@ echo "-- 12. Telemetry ---------------------------------------------------"
 M=$(body "$B/metrics")
 for s in configuration_config_writes_total configuration_flag_writes_total \
          configuration_authz_decisions_total configuration_global_scope_writes_total \
-         configuration_outbox_pending configuration_outbox_published_total \
-         configuration_outbox_failures_total configuration_outbox_oldest_age_seconds \
+         configuration_governed_writes_total configuration_outbox_pending \
+         configuration_outbox_published_total configuration_outbox_failures_total \
+         configuration_outbox_oldest_age_seconds \
          readiness_up; do
   hasf "exports $s" "$M" "$s"
 done
@@ -355,6 +369,7 @@ hasf "no_change outcome series exists" "$M" 'outcome="no_change"'
 hasf "forbidden outcome series exists" "$M" 'outcome="forbidden"'
 hasf "authz_unavailable outcome series exists" "$M" 'outcome="authz_unavailable"'
 hasf "the global-write action is labelled" "$M" 'action="CONFIGURATION_GLOBAL_WRITE"'
+hasf "the governed-writes counter is pre-created with both labels" "$M" 'configuration_governed_writes_total'
 chk "readiness gauge is 1" "$(echo "$M" | grep -E '^readiness_up' | awk '{print $2}')" "1"
 
 echo

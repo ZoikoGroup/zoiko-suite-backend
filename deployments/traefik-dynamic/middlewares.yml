@@ -1,0 +1,55 @@
+# Traefik middleware definitions for security hardening
+# Mounted alongside GTRM config and all-services.yml
+# This file provides global middlewares referenced by entrypoint config
+
+http:
+  middlewares:
+    # Global rate limiting: 1000 req/s sustained, 2000 burst
+    # Uses client IP as key (X-Forwarded-For aware)
+    ratelimit:
+      rateLimit:
+        average: 1000
+        burst: 2000
+        period: 1s
+        sourceCriterion:
+          ipStrategy:
+            depth: 0
+            excludedIPs: []
+
+    # Request buffering: limit body size, buffer to disk if needed
+    buffering:
+      buffering:
+        maxRequestBodyBytes: 10485760  # 10 MB
+        memRequestBodyBytes: 1048576   # 1 MB in memory, rest to disk
+        maxResponseBodyBytes: 10485760
+        memResponseBodyBytes: 1048576
+        retryExpression: "IsNetworkError() && Attempts() < 3"
+
+    # Security headers applied to all responses
+    security-headers:
+      headers:
+        customResponseHeaders:
+          X-Content-Type-Options: "nosniff"
+          X-Frame-Options: "DENY"
+          X-XSS-Protection: "1; mode=block"
+          Referrer-Policy: "strict-origin-when-cross-origin"
+          Content-Security-Policy: "default-src 'none'; frame-ancestors 'none'"
+          Permissions-Policy: "geolocation=(), microphone=(), camera=()"
+        forceSTSHeader: true
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+
+    # Compression for responses > 1KB
+    compress:
+      compress:
+        minResponseBodyBytes: 1024
+
+  # Per-service rate limit overrides can be added as additional middlewares
+  # Example (add to service's middlewares chain):
+  #   - api-rate-limit@file
+  # api-rate-limit:
+  #   rateLimit:
+  #     average: 100
+  #     burst: 200
+  #     period: 1s

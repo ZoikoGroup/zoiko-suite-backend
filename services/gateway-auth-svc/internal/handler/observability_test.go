@@ -331,28 +331,42 @@ func TestBearerSchemeIsCaseInsensitive(t *testing.T) {
 	}
 }
 
-// TestVerify_CartaAllowIsStillCounted — ALLOW and STEP_UP_MFA do not block, so
-// before this they left no trace anywhere. STEP_UP_MFA in particular is
-// deliberately unenforced (there is no step-up flow to redirect to), which
-// makes the counter the only place that signal exists at all.
+// TestVerify_CartaAllowIsStillCounted — ALLOW does not block, so
+// before this it left no trace anywhere. STEP_UP_MFA is now blocked
+// (returns 403) because there is no step-up flow downstream, and letting
+// it pass silently defeats the risk engine's intent.
 func TestVerify_CartaAllowIsStillCounted(t *testing.T) {
-	for _, decision := range []string{"ALLOW", "STEP_UP_MFA"} {
-		t.Run(decision, func(t *testing.T) {
-			h, key, _ := newTestEnvWithCartaDecision(t, decision)
-			m := &recordingMetrics{}
-			h.UseMetrics(m)
+	h, key, _ := newTestEnvWithCartaDecision(t, "ALLOW")
+	m := &recordingMetrics{}
+	h.UseMetrics(m)
 
-			req := httptest.NewRequest(http.MethodGet, "/verify", nil)
-			req.Header.Set("Authorization", "Bearer "+mintEnvelope(t, key, testKid, validClaims()))
-			rec := httptest.NewRecorder()
-			h.Verify(rec, req)
+	req := httptest.NewRequest(http.MethodGet, "/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+mintEnvelope(t, key, testKid, validClaims()))
+	rec := httptest.NewRecorder()
+	h.Verify(rec, req)
 
-			assert.Equal(t, http.StatusOK, rec.Code, "neither decision blocks")
-			_, _, _, decisions := m.snapshot()
-			require.Len(t, decisions, 1)
-			assert.Equal(t, decision, decisions[0])
-		})
-	}
+	assert.Equal(t, http.StatusOK, rec.Code, "ALLOW does not block")
+	_, _, _, decisions := m.snapshot()
+	require.Len(t, decisions, 1)
+	assert.Equal(t, "ALLOW", decisions[0])
+}
+
+// TestVerify_CartaStepUpMFA_Returns403AndCounted proves STEP_UP_MFA is
+// blocked and still counted in the metrics.
+func TestVerify_CartaStepUpMFA_Returns403AndCounted(t *testing.T) {
+	h, key, _ := newTestEnvWithCartaDecision(t, "STEP_UP_MFA")
+	m := &recordingMetrics{}
+	h.UseMetrics(m)
+
+	req := httptest.NewRequest(http.MethodGet, "/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+mintEnvelope(t, key, testKid, validClaims()))
+	rec := httptest.NewRecorder()
+	h.Verify(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code, "STEP_UP_MFA now blocks")
+	_, _, _, decisions := m.snapshot()
+	require.Len(t, decisions, 1)
+	assert.Equal(t, "STEP_UP_MFA", decisions[0])
 }
 
 // TestOutcomeConstantsMatchTelemetry stops the handler's private copy of the

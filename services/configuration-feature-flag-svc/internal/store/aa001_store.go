@@ -46,7 +46,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"go.uber.org/zap"
 
 	"zoiko.io/configuration-feature-flag-svc/internal/domain"
 	"zoiko.io/configuration-feature-flag-svc/internal/events"
@@ -110,13 +109,17 @@ func scanSnapshot(row pgx.Row) (*domain.ConfigSnapshot, error) {
 	return s, nil
 }
 
-func (s *PgStore) latestSnapshotRow(ctx context.Context, environment string) (*domain.ConfigSnapshot, error) {
-	return scanSnapshot(s.pool.QueryRow(ctx, `
+func latestSnapshotRowQ(ctx context.Context, q queryer, environment string) (*domain.ConfigSnapshot, error) {
+	return scanSnapshot(q.QueryRow(ctx, `
 		SELECT `+snapshotColumns+`
 		FROM config_snapshots
 		WHERE environment = $1
 		ORDER BY epoch DESC
 		LIMIT 1`, environment))
+}
+
+func (s *PgStore) latestSnapshotRow(ctx context.Context, environment string) (*domain.ConfigSnapshot, error) {
+	return latestSnapshotRowQ(ctx, s.pool, environment)
 }
 
 // latestSnapshotsByEnv returns the newest imprint for every environment that
@@ -345,6 +348,182 @@ func mapWriteInsertError(err error, table string) error {
 		return domain.ErrScopeRaceConflict
 	}
 	return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+}
+
+// isFlagKey reports whether key is a feature flag — its published definition
+// declares a flag_class — as opposed to a plain config key. The change
+// lifecycle and the emergency paths use it to pick the flag vs config gate
+// and write path.
+func isFlagKey(ctx context.Context, q queryer, key string) (bool, error) {
+	def, err := publishedDefinition(ctx, q, key)
+	if err != nil {
+		return false, err
+	}
+	return def.FlagClass != nil, nil
+}
+
+// gateFlagWrite runs the flag half of the INV-05/08/20 gate: the key must be a
+// declared feature flag, the scope must be admitted by its definition, and the
+// rollout must stay within 0–100 (the same bound the feature_flags CHECK
+// backstops).
+func gateFlagWrite(ctx context.Context, q queryer, key string, tenantID *string, enabled bool, rollout int) error {
+	def, err := publishedDefinition(ctx, q, key)
+	if err != nil {
+		return err
+	}
+	if def.FlagClass == nil {
+		return domain.ErrValueConstraintFailed
+	}
+	scope := domain.ScopeEnvironment
+	if tenantID != nil {
+		scope = domain.ScopeTenant
+	}
+	if err := domain.ValidateScope(def, scope); err != nil {
+		return err
+	}
+	if rollout < 0 || rollout > 100 {
+		return domain.ErrValueConstraintFailed
+	}
+	return nil
+}
+
+// gateConfigWriteValue is gateConfigWrite plus the definition lookup: load the
+// immutable published definition for key, then refuse a scope or value it does
+// not admit (INV-05/08/09).
+func gateConfigWriteValue(ctx context.Context, q queryer, key string, tenantID *string, value json.RawMessage) error {
+	def, err := publishedDefinition(ctx, q, key)
+	if err != nil {
+		return err
+	}
+	return gateConfigWrite(ctx, q, def, key, tenantID, value)
+}
+
+// decodeFlagEnvelope decodes the {enabled, rollout_percentage?} JSON a flag
+// write carries (change parts carry them as separate fields; emergency
+// changes and values carry them inside new_value). Enabled is required — a
+// flag write that does not say whether the flag is on is refused rather than
+// guessed.
+func decodeFlagEnvelope(raw json.RawMessage) (bool, int, error) {
+	var v struct {
+		Enabled           *bool `json:"enabled"`
+		RolloutPercentage *int  `json:"rollout_percentage"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil || v.Enabled == nil {
+		return false, 0, domain.ErrValueConstraintFailed
+	}
+	rollout := 100
+	if v.RolloutPercentage != nil {
+		rollout = *v.RolloutPercentage
+	}
+	return *v.Enabled, rollout, nil
+}
+
+// flagPartValue extracts the effective (enabled, rollout) pair a change part
+// carries for a flag write, defaulting rollout to 100 when omitted.
+func flagPartValue(p domain.ChangePart) (bool, int) {
+	enabled := p.NewEnabled != nil && *p.NewEnabled
+	rollout := 100
+	if p.RolloutPercentage != nil {
+		rollout = *p.RolloutPercentage
+	}
+	return enabled, rollout
+}
+
+// upsertConfig writes a config value at the exact (key, environment, tenant)
+// scope: end-dates the row currently effective there, if any, and inserts the
+// replacement, in the caller's transaction. It is the append-only write the
+// change lifecycle and emergency paths share with ActivateOverride — one
+// concurrent effective row per scope is the DB backstop.
+func upsertConfig(ctx context.Context, tx pgx.Tx, key, environment string, tenantID *string, value json.RawMessage, actor string) (*domain.ConfigEntry, error) {
+	const findCurrentQuery = `
+		SELECT ` + configColumns + `
+		FROM config_entries
+		WHERE key = $1
+		  AND environment = $2
+		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
+		  AND effective_to IS NULL
+		FOR UPDATE;`
+	current, err := scanConfigEntry(tx.QueryRow(ctx, findCurrentQuery, key, environment, tenantID))
+	if err == nil {
+		if _, err := tx.Exec(ctx, `UPDATE config_entries SET effective_to = NOW() WHERE config_id = $1`, current.ConfigID); err != nil {
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	entry, err := scanConfigEntry(tx.QueryRow(ctx, `
+		INSERT INTO config_entries (key, value, environment, tenant_id, created_by_principal_id)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING `+configColumns,
+		key, value, environment, tenantID, actor))
+	if err != nil {
+		return nil, mapWriteInsertError(err, "config_entries")
+	}
+	return entry, nil
+}
+
+// upsertFlag is upsertConfig's counterpart for feature_flags, writing
+// (enabled, rollout_percentage) instead of a JSON value.
+func upsertFlag(ctx context.Context, tx pgx.Tx, key, environment string, tenantID *string, enabled bool, rollout int, actor string) (*domain.FeatureFlag, error) {
+	const findCurrentQuery = `
+		SELECT ` + flagColumns + `
+		FROM feature_flags
+		WHERE key = $1
+		  AND environment = $2
+		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
+		  AND effective_to IS NULL
+		FOR UPDATE;`
+	current, err := scanFeatureFlag(tx.QueryRow(ctx, findCurrentQuery, key, environment, tenantID))
+	if err == nil {
+		if _, err := tx.Exec(ctx, `UPDATE feature_flags SET effective_to = NOW() WHERE flag_id = $1`, current.FlagID); err != nil {
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	flag, err := scanFeatureFlag(tx.QueryRow(ctx, `
+		INSERT INTO feature_flags (key, enabled, environment, tenant_id, rollout_percentage, created_by_principal_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING `+flagColumns,
+		key, enabled, environment, tenantID, rollout, actor))
+	if err != nil {
+		return nil, mapWriteInsertError(err, "feature_flags")
+	}
+	return flag, nil
+}
+
+// changeColumns is the full config_changes row the change lifecycle scans.
+const changeColumns = `
+	change_id,
+	change_class,
+	environment,
+	tenant_id,
+	before_snapshot_id,
+	proposed_snapshot_id,
+	parts,
+	status,
+	approval,
+	approval_required,
+	planned_effective_at,
+	activated_at,
+	verified_at,
+	rollback_change_id,
+	created_by_principal_id,
+	created_at,
+	updated_at`
+
+func scanChange(row pgx.Row) (*domain.ConfigChange, error) {
+	c := &domain.ConfigChange{}
+	err := row.Scan(
+		&c.ChangeID, &c.ChangeClass, &c.Environment, &c.TenantID,
+		&c.BeforeSnapshotID, &c.ProposedSnapshotID, &c.Parts, &c.Status,
+		&c.Approval, &c.ApprovalRequired, &c.PlannedEffectiveAt,
+		&c.ActivatedAt, &c.VerifiedAt, &c.RollbackChangeID,
+		&c.CreatedByPrincipalID, &c.CreatedAt, &c.UpdatedAt,
+	)
+	return c, err
 }
 
 // ── the configuration-key registry (INV-05/06, Table 11) ──────────────────────
@@ -629,7 +808,8 @@ func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDe
 		// config.version.published is enqueued in the same transaction that
 		// produced the version: a resolver that misses it would keep reading
 		// the previous invention forever.
-		if err := enqueueEvent(ctx, tx, "", events.VersionPublished(*v, working.Key, params.ActorPrincipalID, params.CorrelationID)); err != nil {
+		outEv, evErr := events.VersionPublished(*v, working.Key, params.ActorPrincipalID, params.CorrelationID)
+		if err := enqueueEvent(ctx, tx, "", outEv, evErr); err != nil {
 			return err
 		}
 		out = v
@@ -736,7 +916,8 @@ func (s *PgStore) CreateKillSwitch(ctx context.Context, params domain.CreateKill
 		}
 
 		out = k
-		return enqueueEvent(ctx, tx, params.CallerTenantID, events.KillSwitchActivated(*k, params.CorrelationID))
+		outEv, evErr := events.KillSwitchActivated(*k, params.CorrelationID)
+		return enqueueEvent(ctx, tx, params.CallerTenantID, outEv, evErr)
 	})
 	if err != nil {
 		return nil, err
@@ -838,7 +1019,8 @@ func (s *PgStore) ActivateOverride(ctx context.Context, params domain.ActivateOv
 		if err != nil {
 			return err
 		}
-		if err := enqueueEvent(ctx, tx, params.CallerTenantID, events.OverrideActivated(params, entry.EffectiveFrom)); err != nil {
+		outEv, evErr := events.OverrideActivated(params, entry.EffectiveFrom)
+		if err := enqueueEvent(ctx, tx, params.CallerTenantID, outEv, evErr); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		if err := enqueueSnapshotPublished(ctx, tx, params.CallerTenantID, params.ActorPrincipalID, params.CorrelationID, *snap); err != nil {
@@ -1035,7 +1217,8 @@ func (s *PgStore) CreateReleasePlan(ctx context.Context, params domain.CreateRel
 			return mapWriteInsertError(err, "release_plans")
 		}
 		out = plan
-		return enqueueEvent(ctx, tx, params.CallerTenantID, events.ReleaseActivated(*plan, params.CorrelationID))
+		outEv, evErr := events.ReleaseActivated(*plan, params.CorrelationID)
+		return enqueueEvent(ctx, tx, params.CallerTenantID, outEv, evErr)
 	})
 	if err != nil {
 		return nil, err
@@ -1327,7 +1510,7 @@ func (s *PgStore) EvaluateFlag(ctx context.Context, params domain.EvaluateFlagPa
 		}
 	}
 	if variant != "" {
-		outcome = domain.OutcomeVariant
+		outcome = domain.OutcomeValue
 	}
 	return s.evaluation(params, entry, *snap, plan, ks, enabled, rollout, outcome, reason, &bucket), nil
 }
@@ -1437,7 +1620,7 @@ func (s *PgStore) CreateChange(ctx context.Context, params domain.CreateChangePa
 		Environment:          params.Environment,
 		TenantID:             params.TenantID,
 		ApprovalRequired:     params.ApprovalRequired,
-		PlannedEffectiveAt:   timePtr(params.PlannedEffectiveAt),
+		PlannedEffectiveAt:   params.PlannedEffectiveAt,
 		RollbackChangeID:     params.RollbackChangeID,
 		CreatedByPrincipalID: params.ActorPrincipalID,
 	}
@@ -1465,8 +1648,8 @@ func (s *PgStore) CreateChange(ctx context.Context, params domain.CreateChangePa
 
 func (s *PgStore) doCreateChange(ctx context.Context, callerTenantID string, change *domain.ConfigChange, partsJSON []byte) (*domain.ConfigChange, error) {
 	var out *domain.ConfigChange
-	err := s.pool.BeginTxFunc(ctx, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		snap, err := s.latestSnapshotRowTx(ctx, tx, change.Environment)
+	err := s.withTenantTx(ctx, callerTenantID, func(tx pgx.Tx) error {
+		snap, err := latestSnapshotRowQ(ctx, tx, change.Environment)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrNoAttestedSnapshot
 		}
@@ -1477,18 +1660,19 @@ func (s *PgStore) doCreateChange(ctx context.Context, callerTenantID string, cha
 
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO config_changes
-				(change_class, environment, tenant_id, status, before_snapshot_id, proposed_content,
+				(change_class, environment, tenant_id, status, before_snapshot_id, parts,
 				 approval_required, planned_effective_at, rollback_change_id, created_by_principal_id)
-			VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9)
-			RETURNING change_id, proposed_snapshot_id, created_at, updated_at`,
-			change.ChangeClass, change.Environment, change.TenantID,
-			*snap.SnapshotID, partsJSON, change.ApprovalRequired,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			RETURNING change_id, created_at, updated_at`,
+			change.ChangeClass, change.Environment, change.TenantID, domain.ChangeStatusProposed,
+			snap.SnapshotID, partsJSON, change.ApprovalRequired,
 			change.PlannedEffectiveAt, change.RollbackChangeID, change.CreatedByPrincipalID,
-		).Scan(&change.ChangeID, &change.ProposedSnapshotID, &change.CreatedAt, &change.UpdatedAt); err != nil {
+		).Scan(&change.ChangeID, &change.CreatedAt, &change.UpdatedAt); err != nil {
 			return mapWriteInsertError(err, "config_changes")
 		}
+		change.Status = domain.ChangeStatusProposed
 		out = change
-		return enqueue(ctx, tx, callerTenantID, events.ChangeProposed(*change, change.CreatedByPrincipalID, ""))
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -1503,51 +1687,50 @@ func (s *PgStore) ApproveChange(ctx context.Context, changeID string, approval d
 	if callerTenantID == "" {
 		return nil, domain.ErrCallerTenantMissing
 	}
-	if approval.ApproverPrincipalID == "" {
-		return nil, domain.ErrValueConstraintFailed
-	}
-	if approval.Decision != domain.ApprovalApproved && approval.Decision != domain.ApprovalRejected {
+	if approval.ByPrincipalID == "" {
 		return nil, domain.ErrValueConstraintFailed
 	}
 
 	var out *domain.ConfigChange
 	err := s.withOps(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT change_id, status FROM config_changes WHERE `+
-			bloomByID("change_id", changeID))
+		change, err := scanChange(tx.QueryRow(ctx, `
+			SELECT `+changeColumns+` FROM config_changes
+			WHERE change_id = $1 FOR UPDATE`, changeID))
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrChangeNotFound
+			}
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		// The approval record lives in config_changes.approval as {approved,
+		// by_principal_id, approved_at, wfc_reference?} (000006) — not in a
+		// separate approval table. A rejected approval keeps the change's
+		// PROPOSED status; there is no REJECTED lifecycle state in the CHECK.
+		approvalJSON, err := json.Marshal(map[string]any{
+			"approved":        approval.Approved,
+			"by_principal_id": approval.ByPrincipalID,
+			"approved_at":     approval.ApprovedAt,
+			"wfc_reference":   approval.WFCReference,
+		})
 		if err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		defer rows.Close()
-		if rows.Err() != nil {
-			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, rows.Err())
+		status := domain.ChangeStatusProposed
+		if approval.Approved {
+			status = domain.ChangeStatusApproved
 		}
-		if !rows.Next() {
-			return domain.ErrNotFound
-		}
-		rows.Close()
-
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO change_approvals (change_id, decision, approver_principal_id, comment)
-			VALUES ($1, $2, $3, $4)`,
-			changeID, approval.Decision, approval.ApproverPrincipalID, clampJSON(approval.Comment)); err != nil {
-			return mapWriteInsertError(err, "change_approvals")
-		}
-
-		status := "approved"
-		if approval.Decision == domain.ApprovalRejected {
-			status = "rejected"
-		}
-		var planned any
-		where := `change_id = $1`
-		if _, err := tx.Exec(ctx, `UPDATE config_changes SET status = $2, updated_at = NOW() WHERE `+bloomByID("change_id", changeID), status, changeID); err != nil {
+			UPDATE config_changes
+			SET status = $2, approval = $3, updated_at = NOW()
+			WHERE change_id = $1`, changeID, status, approvalJSON); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		_ = planned
-		_ = where
 
-		c := &domain.ConfigChange{ChangeID: changeID}
-		out = c
-		return enqueue(ctx, tx, callerTenantID, events.ChangeApproved(c, approval.ApproverPrincipalID, ""))
+		change.Status = status
+		change.Approval = approvalJSON
+		out = change
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -1565,17 +1748,17 @@ func (s *PgStore) ActivateChange(ctx context.Context, changeID, callerTenantID, 
 
 	var out *domain.ConfigChange
 	err := s.withOps(ctx, func(tx pgx.Tx) error {
-		change, err := s.scanChange(tx.QueryRow(ctx, `
+		change, err := scanChange(tx.QueryRow(ctx, `
 			SELECT `+changeColumns+` FROM config_changes
-			WHERE `+bloomByID("change_id", changeID)+` FOR UPDATE`))
+			WHERE change_id = $1 FOR UPDATE`, changeID))
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrNotFound
+				return domain.ErrChangeNotFound
 			}
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		if change.Status != "approved" {
-			return domain.ErrChangeNotApproved
+		if change.Status != domain.ChangeStatusApproved {
+			return domain.ErrChangeApprovalRequired
 		}
 
 		var parts []domain.ChangePart
@@ -1586,24 +1769,27 @@ func (s *PgStore) ActivateChange(ctx context.Context, changeID, callerTenantID, 
 		// Gate the proposed snapshot before applying: the parts must still be
 		// permitted + written at the caller's scope, or the change is stale.
 		seen := map[string]struct{}{}
+		flagByKey := map[string]bool{}
 		for _, p := range parts {
 			key := p.Key + "|" + deref(p.Scope.TenantID)
 			if _, dup := seen[key]; dup {
 				return domain.ErrValueConstraintFailed
 			}
 			seen[key] = struct{}{}
-			if p.Scope.TenantID != nil && *p.Scope.TenantID != callerTenantID && callerTenantID != "" {
+			if p.Scope.TenantID != nil && callerTenantID != "" && *p.Scope.TenantID != callerTenantID {
 				return domain.ErrScopeNotAllowed
 			}
-			flag, err := s.isFlag(ctx, tx, p.Key)
+			flag, err := isFlagKey(ctx, tx, p.Key)
 			if err != nil {
 				return err
 			}
+			flagByKey[p.Key] = flag
 			if flag {
-				if err := gateFlagWrite(ctx, tx, p.Key, p.Scope.TenantID, p.Value); err != nil {
+				enabled, rollout := flagPartValue(p)
+				if err := gateFlagWrite(ctx, tx, p.Key, p.Scope.TenantID, enabled, rollout); err != nil {
 					return err
 				}
-			} else if err := gateConfigWrite(ctx, tx, p.Key, p.Scope.TenantID, p.Value); err != nil {
+			} else if err := gateConfigWriteValue(ctx, tx, p.Key, p.Scope.TenantID, p.NewValue); err != nil {
 				return err
 			}
 		}
@@ -1612,41 +1798,42 @@ func (s *PgStore) ActivateChange(ctx context.Context, changeID, callerTenantID, 
 		// proposed snapshot, so "proposed" and "applied" can be compared by
 		// hash at verification time.
 		for _, p := range parts {
-			flag, err := s.isFlag(ctx, tx, p.Key)
-			if err != nil {
-				return err
-			}
-			if flag {
-				if _, err := s.upsertFlag(ctx, tx, p.Key, p.Environment, p.Scope.TenantID, p.Value); err != nil {
+			if flagByKey[p.Key] {
+				enabled, rollout := flagPartValue(p)
+				if _, err := upsertFlag(ctx, tx, p.Key, p.Scope.Environment, p.Scope.TenantID, enabled, rollout, actor); err != nil {
 					return err
 				}
-			} else if _, err := s.upsertConfig(ctx, tx, p.Key, p.Environment, p.Scope.TenantID, p.Value); err != nil {
+			} else if _, err := upsertConfig(ctx, tx, p.Key, p.Scope.Environment, p.Scope.TenantID, p.NewValue, actor); err != nil {
 				return err
 			}
 		}
 
-		before := change.BeforeSnapshotID
-		now := time.Now()
-		if err := tx.QueryRow(ctx, `
-			UPDATE config_changes
-			SET status = 'verified', activated_at = $2, verified_at = IGNITE($2), before_snapshot_id = $3,
-			    proposed_snapshot_id = $4, updated_at = NOW()
-			WHERE change_id = $1
-			RETURNING verified_at`,
-			changeID, now, before, change.ProposedSnapshotID,
-		).Scan(&change.VerifiedAt); err != nil {
-			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-		change.Status = "verified"
-		change.ActivatedAt = &now
-
 		// Mint the snapshot AFTER the parts are visible so the next attest
-		// sees the post-change state atomically.
+		// sees the post-change state atomically; the change then points at the
+		// before imprint it pinned at creation and the after imprint it just
+		// produced (TC-01).
 		snap, err := s.mintSnapshot(ctx, tx, change.Environment, actor)
 		if err != nil {
 			return err
 		}
-		if err := enqueue(ctx, tx, callerTenantID, events.ChangeVerified(change, actor, "")); err != nil {
+		before := change.BeforeSnapshotID
+		now := time.Now()
+		if err := tx.QueryRow(ctx, `
+			UPDATE config_changes
+			SET status = $2, activated_at = $3, verified_at = $3,
+			    before_snapshot_id = $4, proposed_snapshot_id = $5, updated_at = NOW()
+			WHERE change_id = $1
+			RETURNING verified_at`,
+			changeID, domain.ChangeStatusVerified, now, before, snap.SnapshotID,
+		).Scan(&change.VerifiedAt); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		change.Status = domain.ChangeStatusVerified
+		change.ActivatedAt = &now
+		change.ProposedSnapshotID = &snap.SnapshotID
+
+		outEv, evErr := events.ChangeVerified(*change, actor, "")
+		if err := enqueueEvent(ctx, tx, callerTenantID, outEv, evErr); err != nil {
 			return err
 		}
 		if err := enqueueSnapshotPublished(ctx, tx, callerTenantID, actor, "", *snap); err != nil {
@@ -1675,51 +1862,55 @@ func (s *PgStore) CreateEmergencyChange(ctx context.Context, params domain.Creat
 	if params.TenantID != nil && *params.TenantID != params.CallerTenantID {
 		return nil, domain.ErrScopeNotAllowed
 	}
-	if params.SendGuinnessAt.IsZero() {
-		return nil, domain.ErrValueConstraintFailed
+	if params.ExpiresAt.IsZero() {
+		return nil, domain.ErrEmergencyChangeNoExpiry
 	}
 
 	var out *domain.EmergencyChange
 	err := s.withTenantTx(ctx, params.CallerTenantID, func(tx pgx.Tx) error {
-		flag, err := s.isFlag(ctx, tx, params.Key)
+		flag, err := isFlagKey(ctx, tx, params.Key)
 		if err != nil {
 			return err
 		}
 		if flag {
-			if err := gateFlagWrite(ctx, tx, params.Key, params.TenantID, params.Value); err != nil {
+			enabled, rollout, err := decodeFlagEnvelope(params.NewValue)
+			if err != nil {
 				return err
 			}
-		} else if err := gateConfigWrite(ctx, tx, params.Key, params.TenantID, params.Value); err != nil {
+			if err := gateFlagWrite(ctx, tx, params.Key, params.TenantID, enabled, rollout); err != nil {
+				return err
+			}
+		} else if err := gateConfigWriteValue(ctx, tx, params.Key, params.TenantID, params.NewValue); err != nil {
 			return err
 		}
 
 		e := &domain.EmergencyChange{
-			Key:                  params.Key,
-			Value:                params.Value,
-			Environment:          params.Environment,
-			TenantID:             params.TenantID,
-			Reason:               params.Reason,
-			IncidentID:           params.IncidentID,
-			Status:               domain.StatusEmergencyOpen,
-			CreatedByPrincipalID: params.ActorPrincipalID,
-			ExpiresAt:            params.SendGuinnessAt,
+			Key:              params.Key,
+			NewValue:         params.NewValue,
+			Environment:      params.Environment,
+			TenantID:         params.TenantID,
+			Reason:           params.Reason,
+			IncidentID:       params.IncidentID,
+			Status:           domain.EmergencyStatusOpen,
+			ActorPrincipalID: params.ActorPrincipalID,
+			ExpiresAt:        params.ExpiresAt,
 		}
 		if e.Reason == "" || e.IncidentID == "" {
 			return domain.ErrValueConstraintFailed
 		}
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO emergency_changes
-				(key, value, environment, tenant_id, reason, incident_id, guinness_at, created_by_principal_id)
+				(key, environment, tenant_id, new_value, reason, incident_id, actor_principal_id, expires_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			RETURNING emergency_change_id, created_at, status`,
-			e.Key, e.Value, e.Environment, e.TenantID, e.Reason, e.IncidentID,
-			e.ExpiresAt, e.CreatedByPrincipalID,
-		).Scan(&e.EmergencyChangeID, &e.CreatedAt, &e.Status); err != nil {
+			RETURNING emergency_change_id, created_at`,
+			e.Key, e.Environment, e.TenantID, e.NewValue, e.Reason, e.IncidentID,
+			e.ActorPrincipalID, e.ExpiresAt,
+		).Scan(&e.EmergencyChangeID, &e.CreatedAt); err != nil {
 			return mapWriteInsertError(err, "emergency_changes")
 		}
 
 		out = e
-		return enqueue(ctx, tx, params.CallerTenantID, events.EmergencyActivated(*e, params.CallerTenantID, params.ActorPrincipalID, params.CorrelationID))
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -1739,11 +1930,11 @@ func (s *PgStore) ActivateEmergencyChange(ctx context.Context, emergencyChangeID
 	err := s.withOps(ctx, func(tx pgx.Tx) error {
 		e := &domain.EmergencyChange{EmergencyChangeID: emergencyChangeID}
 		if err := tx.QueryRow(ctx, `
-			SELECT key, value, environment, tenant_id FROM emergency_changes
+			SELECT key, new_value, environment, tenant_id FROM emergency_changes
 			WHERE emergency_change_id = $1 FOR UPDATE`, emergencyChangeID).
-			Scan(&e.Key, &e.Value, &e.Environment, &e.TenantID); err != nil {
+			Scan(&e.Key, &e.NewValue, &e.Environment, &e.TenantID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrNotFound
+				return domain.ErrChangeNotFound
 			}
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
@@ -1751,23 +1942,27 @@ func (s *PgStore) ActivateEmergencyChange(ctx context.Context, emergencyChangeID
 			return domain.ErrScopeNotAllowed
 		}
 
-		flag, err := s.isFlag(ctx, tx, e.Key)
+		flag, err := isFlagKey(ctx, tx, e.Key)
 		if err != nil {
 			return err
 		}
 		if flag {
-			if _, err := s.upsertFlag(ctx, tx, e.Key, e.Environment, e.TenantID, e.Value); err != nil {
+			enabled, rollout, err := decodeFlagEnvelope(e.NewValue)
+			if err != nil {
 				return err
 			}
-		} else if _, err := s.upsertConfig(ctx, tx, e.Key, e.Environment, e.TenantID, e.Value); err != nil {
+			if _, err := upsertFlag(ctx, tx, e.Key, e.Environment, e.TenantID, enabled, rollout, actor); err != nil {
+				return err
+			}
+		} else if _, err := upsertConfig(ctx, tx, e.Key, e.Environment, e.TenantID, e.NewValue, actor); err != nil {
 			return err
 		}
 
 		if err := tx.QueryRow(ctx, `
 			UPDATE emergency_changes
-			SET status = 'active', applied_at = NOW(), applied_by_principal_id = $2, updated_at = NOW()
+			SET status = $2
 			WHERE emergency_change_id = $1
-			RETURNING status`, emergencyChangeID, actor).Scan(&e.Status); err != nil {
+			RETURNING status`, emergencyChangeID, domain.EmergencyStatusActive).Scan(&e.Status); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 
@@ -1797,34 +1992,35 @@ func (s *PgStore) RecordAttestation(ctx context.Context, params domain.RecordAtt
 	if params.CallerTenantID == "" {
 		return nil, domain.ErrCallerTenantMissing
 	}
-	if params.FlagKey == "" || params.Environment == "" {
+	if params.RuntimeID == "" || params.AttestKey == "" || params.Environment == "" {
 		return nil, domain.ErrValueConstraintFailed
+	}
+	if params.TenantID != nil && *params.TenantID != params.CallerTenantID {
+		return nil, domain.ErrScopeNotAllowed
 	}
 
 	att := &domain.RuntimeAttestation{
-		FlagKey:                params.FlagKey,
-		Environment:            params.Environment,
-		ObservedSnapshotID:     params.ObservedSnapshotID,
-		ObservedCreatedAt:      params.ObservedCreatedAt,
-		RuntimeDigest:          params.RuntimeDigest,
-		AttestedByPrincipalID:  params.ActorPrincipalID,
-		ReplayCollisionSeen:    false,
+		RuntimeID:          params.RuntimeID,
+		AttestKey:          params.AttestKey,
+		Environment:        params.Environment,
+		TenantID:           params.TenantID,
+		ObservedSnapshotID: params.ObservedSnapshotID,
+		ObservedEpoch:      params.ObservedEpoch,
+		ObservedDigest:     params.ObservedDigest,
+		ObservedVersions:   params.ObservedVersions,
 	}
 	var out *domain.RuntimeAttestation
 	err := s.withTenantTx(ctx, params.CallerTenantID, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO runtime_attestations
-			(flag_key, environment, observed_snapshot_id, observed_created_at, runtime_digest, attested_by_principal_id)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			att.FlagKey, att.Environment, att.ObservedSnapshotID, att.ObservedCreatedAt,
-			att.RuntimeDigest, att.AttestedByPrincipalID); err != nil {
-			return mapWriteInsertError(err, "runtime_attestations")
-		}
-		_ = err
 		if err := tx.QueryRow(ctx, `
-			SELECT attestation_id, attested_at FROM runtime_attestations
-			WHERE flag_key = $1 AND environment = $2 AND attested_at = (SELECT MAX(attested_at) FROM runtime_attestations WHERE flag_key = $1 AND environment = $2)`,
-			att.FlagKey, att.Environment).Scan(&att.AttestationID, &att.AttestedAt); err != nil {
-			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			INSERT INTO runtime_attestations
+				(runtime_id, attest_key, environment, tenant_id, observed_snapshot_id,
+				 observed_epoch, observed_digest, observed_versions)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			RETURNING attestation_id, reported_at, freshness_deadline`,
+			att.RuntimeID, att.AttestKey, att.Environment, att.TenantID,
+			att.ObservedSnapshotID, att.ObservedEpoch, att.ObservedDigest, att.ObservedVersions,
+		).Scan(&att.AttestationID, &att.ReportedAt, &att.FreshnessDeadline); err != nil {
+			return mapWriteInsertError(err, "runtime_attestations")
 		}
 		out = att
 		return nil
@@ -1864,27 +2060,28 @@ func (s *PgStore) SweepExpired(ctx context.Context, environment string) (SweepRe
 
 func (s *PgStore) sweepEmergency(ctx context.Context, tx pgx.Tx, environment string, result *SweepResult) error {
 	rows, err := tx.Query(ctx, `
-		SELECT emergency_change_id, key, value, environment, tenant_id
+		SELECT emergency_change_id, key, new_value, environment, tenant_id
 		FROM emergency_changes
-		WHERE environment = $1 AND status = 'OPEN' AND expires_at <= NOW()
+		WHERE environment = $1 AND status = $2 AND expires_at <= NOW()
 		ORDER BY emergency_change_id
-		FOR UPDATE SKIP LOCKED`, environment)
+		FOR UPDATE SKIP LOCKED`, environment, domain.EmergencyStatusOpen)
 	if err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		e := &domain.EmergencyChange{}
-		if err := rows.Scan(&e.EmergencyChangeID, &e.Key, &e.Value, &e.Environment, &e.TenantID); err != nil {
+		e := &domain.EmergencyChange{Status: domain.EmergencyStatusExpired}
+		if err := rows.Scan(&e.EmergencyChangeID, &e.Key, &e.NewValue, &e.Environment, &e.TenantID); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		if _, err := tx.Exec(ctx, `
-			UPDATE emergency_changes SET status = 'expired', updated_at = NOW()
-			WHERE emergency_change_id = $1`, e.EmergencyChangeID); err != nil {
+			UPDATE emergency_changes SET status = $2
+			WHERE emergency_change_id = $1`, e.EmergencyChangeID, domain.EmergencyStatusExpired); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		result.ExpiredEmergencyChanges++
-		if err := enqueueEvent(ctx, tx, "", events.EmergencyExpired(*e, "")); err != nil {
+		outEv, evErr := events.EmergencyExpired(*e, "")
+		if err := enqueueEvent(ctx, tx, "", outEv, evErr); err != nil {
 			return err
 		}
 	}

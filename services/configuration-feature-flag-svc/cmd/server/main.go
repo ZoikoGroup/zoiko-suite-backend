@@ -189,6 +189,18 @@ func main() {
 	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
 	go relay.Run(relayCtx)
 
+	// ── 7c. Expiry sweep ──────────────────────────────────────────────────────
+	//
+	// Kill switches and emergency changes are time-boxed by construction; this
+	// loop flips the ones whose box ran out, emits config.emergency.expired,
+	// and re-pins a snapshot so the next attestation either sees the expiry or
+	// fails closed (see internal/store aa001 SweepExpired). Runs on its own
+	// context so a hard stop cannot strand an object past its expiry — the
+	// same "lead by example" reasoning as the relay above.
+	sweepCtx, stopSweep := context.WithCancel(context.Background())
+	defer stopSweep()
+	go runExpirySweep(sweepCtx, pgStore, cfg.SweepEnvironments, cfg.SweepInterval, log)
+
 	// ── 8. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
 	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
@@ -229,6 +241,52 @@ func main() {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
 	log.Info("server stopped")
+}
+
+// runExpirySweep drives SweepExpired across the configured environments on a
+// fixed interval until ctx is cancelled.
+//
+// A failed pass is logged and retried on the next tick — a sweep that cannot
+// complete is precisely the state that readies an outage, so it must neither
+// crash the process nor be silently skipped. The first pass runs immediately
+// so a pod restart catches anything that aged out while it was down.
+func runExpirySweep(ctx context.Context, s *store.PgStore, environments []string, interval time.Duration, log *zap.Logger) {
+	if interval <= 0 {
+		log.Warn("expiry sweep disabled (interval is zero)")
+		return
+	}
+	first := time.NewTimer(0)
+	defer first.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	sweep := func() {
+		for _, env := range environments {
+			res, err := s.SweepExpired(ctx, env)
+			if err != nil {
+				log.Error("expiry sweep failed", zap.String("environment", env), zap.Error(err))
+				continue
+			}
+			if res.ExpiredKillSwitches > 0 || res.ExpiredEmergencyChanges > 0 {
+				log.Info("expiry sweep matured objects",
+					zap.String("environment", env),
+					zap.Int("kill_switches", res.ExpiredKillSwitches),
+					zap.Int("emergency_changes", res.ExpiredEmergencyChanges),
+				)
+			}
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-first.C:
+			sweep()
+		case <-ticker.C:
+			sweep()
+		}
+	}
 }
 
 // authzReachable probes authorization-svc for the readiness check.

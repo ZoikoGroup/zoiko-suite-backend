@@ -38,8 +38,24 @@ info:
     5. `POST /v1/secrets/broker` resolves the active version for the path and
        scope, checks the caller against `allowed_workload_ids`, and grants or
        denies.
-    6. `POST /v1/secret-policies/{id}/rotate` replaces the material and revokes
-       every live lease on the path in the same transaction.
+    6. `POST /v1/secrets/leases/{id}/verify` redeems a `lease_token` - expiry
+       is refused by the token itself, revocation by the register. This is the
+       surface that made the lease's two controls effective end-to-end.
+    7. `POST /v1/secret-policies/{id}/rotate` replaces the material and revokes
+       every live lease on the path in the same transaction. A version created
+       with `rotation_interval_seconds` is instead rotated automatically by the
+       internal sweeper on that cadence.
+
+    ## Break-glass
+
+    Ordinary retrieval never returns raw material. When an incident justifies
+    it, an evidence-backed shared-secret exception (register under
+    `/v1/shared-secret-exceptions`) opens a time-boxed window for
+    `POST /v1/secret-policies/{id}/emergency-retrieval`, which is the ONE
+    endpoint in this API that hands back a secret value. It is gated twice -
+    by `SECRET_EMERGENCY_RETRIEVAL` and by the exception itself - and every
+    retrieval is an audit record naming the actor and the authorizing
+    exception.
 
     ## Deny by absence
 
@@ -99,6 +115,8 @@ tags:
     description: Reading and ending grants.
   - name: Audit
     description: The append-only evidence log.
+  - name: Shared secret exceptions
+    description: The evidence-backed register that makes break-glass retrieval possible and audit.
 
 paths:
   /healthz:
@@ -446,6 +464,76 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /v1/secret-policies/{secret_policy_id}/emergency-retrieval:
+    post:
+      tags: [Policy administration]
+      summary: Break-glass retrieval of raw material
+      operationId: emergencyRetrieval
+      description: |
+        Returns the RAW secret material - the one endpoint in this service that
+        does. Every other path surfaces a `lease_token` or metadata; this one is
+        the documented override for incident recovery, and it is gated twice:
+
+        1. Requires the `SECRET_EMERGENCY_RETRIEVAL` action (authorization-svc).
+        2. An `ACTIVE`, not-yet-expired shared-secret exception must exist for
+           the policy's `secret_path` - `403 no_active_exception` otherwise. The
+           vault is never consulted (and never can be) without a registered
+           exception, so break-glass is evidence-backed, time-boxed, and
+           revocable: revoking the exception closes the door until the next
+           authorized record restores it.
+
+        Every retrieval writes an `EMERGENCY_RETRIEVAL` audit entry naming the
+        actor and the exception that authorized it.
+
+        Requires the `SECRET_EMERGENCY_RETRIEVAL` action.
+      parameters:
+        - $ref: "#/components/parameters/SecretPolicyId"
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id]
+              properties:
+                request_id:
+                  type: string
+                  description: Identifies this retrieval in the audit trail.
+                reason:
+                  type: string
+                  description: The incident/monitoring justification, recorded verbatim.
+      responses:
+        "200":
+          description: "The raw material, as `material_base64`. Handle like the credential it is."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EmergencyRetrievalResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403":
+          description: |
+            `no_active_exception` - no ACTIVE, unexpired shared-secret exception
+            unlocks this path. Fail safely: the material stays in the vault.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: "`secret_policy_not_found`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: "`store_unavailable` or `vault_backend_unavailable`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /v1/secret-policies/{secret_policy_id}/rotate:
     post:
       tags: [Policy administration]
@@ -560,9 +648,20 @@ paths:
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403":
           description: |
+            Two distinct reasons, both carrying a `DENIED` audit row.
+
             `access_denied` - a policy IS active for this path and scope, and it
-            does not list this caller in `allowed_workload_ids`. A `DENIED`
-            audit row is written, carrying the resolved `secret_class`.
+            does not list this caller in `allowed_workload_ids`. The row carries
+            the resolved `secret_class`.
+
+            `workload_identity_mismatch` - the body's
+            `requested_by_principal_id` does not match the gateway-verified
+            envelope identity the caller presented (`X-Principal-Id`, falling
+            back to `X-Workload-Id`). The broker never trusts a body-supplied
+            identity alone: it is the platform's credential-issuing endpoint.
+            On this reason the `DENIED` row's subject is the claimed
+            `requested_by_principal_id` and its actor is the verified caller,
+            so the evidence does not vouch for the impersonated name.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -623,6 +722,59 @@ paths:
           description: |
             `lease_not_found`. Returned identically for a lease that does not
             exist and one belonging to another tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/secrets/leases/{lease_id}/verify:
+    post:
+      tags: [Leases]
+      summary: Present a lease token and get a real answer
+      operationId: verifyLease
+      description: |
+        The redemption surface for `lease_token`. A token is signed (HMAC under
+        the service's master key), bound to its secret path and to the lease's
+        own expiry, and - once presented here - cross-checked against the lease
+        register:
+
+        - **Expired**: refused by the token itself, no database read.
+        - **Revoked**: the token signature is still valid (revocation does not
+          re-sign or destroy tokens), so the register is the second gate and
+          answers `lease_revoked`.
+        - **Good**: answers `valid: true` for a `GRANTED`, unexpired lease whose
+          token matches its secret path and tenant.
+
+        A malformed or mis-bound token is a caller fault and answers `400`
+        (`invalid_lease_token`, `lease_token_mismatch`). A negative verdict is
+        `200` with `valid: false` and a machine-readable `reason` - the caller
+        asked "is this still good" and the honest answer is "no", with why.
+      parameters:
+        - $ref: "#/components/parameters/LeaseId"
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VerifyLeaseRequest" }
+      responses:
+        "200":
+          description: |
+            The verdict. `valid: true` only when the token is unexpired, signed
+            for this path and tenant, and its lease still reads `GRANTED`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VerifyLeaseResult" }
+        "400":
+          description: "`missing_field` (`lease_token`), `invalid_lease_token`, or `lease_token_mismatch`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "404":
+          description: "`lease_not_found`, including another tenant's lease."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -781,6 +933,127 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/shared-secret-exceptions:
+    post:
+      tags: [Shared secret exceptions]
+      summary: Register a time-boxed, evidence-backed break-glass override
+      operationId: createSharedSecretException
+      description: |
+        Opens a documented window during which emergency retrieval of the
+        named secret path is possible. The register exists so the override
+        itself is auditable: who approved it, against which evidence
+        (`evidence_reference`), until when, and who closed it.
+
+        **Idempotent.** Re-registering the same `secret_path` while an
+        `ACTIVE` exception already exists returns the existing exception with
+        `200`. A conflicting registration answers `409`.
+
+        Requires the `SECRET_EXCEPTION_CREATE` action.
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSharedSecretExceptionRequest" }
+      responses:
+        "201":
+          description: A new exception was created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SharedSecretException" }
+        "200":
+          description: Replay - an ACTIVE or terminal exception for this path already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SharedSecretException" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403":
+          description: "`tenant_scope_mismatch` if a `tenant_id` names another tenant."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`shared_secret_exception_conflict` - an exception for this path with a different payload already exists."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+    get:
+      tags: [Shared secret exceptions]
+      summary: List the exception register
+      operationId: listSharedSecretExceptions
+      description: |
+        The full register, optionally filtered by `status` and `secret_path`.
+        Requires the `SECRET_EXCEPTION_LIST` action.
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/CorrelationId"
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/ExceptionStatus" }
+        - name: secret_path
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Exceptions. Empty array when none match.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SharedSecretException" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/shared-secret-exceptions/{exception_id}/revoke:
+    post:
+      tags: [Shared secret exceptions]
+      summary: Close an exception before its expiry
+      operationId: revokeSharedSecretException
+      description: |
+        Ends an `ACTIVE` exception early, shutting the emergency-retrieval door
+        ahead of schedule. Idempotent: revoking an already-revoked exception is
+        `200` with `status: already_revoked`. An `EXPIRED` exception cannot be
+        revoked - `409`.
+
+        Requires the `SECRET_EXCEPTION_REVOKE` action.
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+        - name: exception_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: "The exception, now REVOKED - or `{status: already_revoked}` on replay."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SharedSecretException" }
+        "400": { $ref: "#/components/responses/InvalidPathParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "409":
+          description: "`invalid_transition` - the exception is EXPIRED."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
 components:
@@ -983,7 +1256,7 @@ components:
 
     AuditEventType:
       type: string
-      enum: [REQUESTED, GRANTED, DENIED, REVOKED, ROTATED]
+      enum: [REQUESTED, GRANTED, DENIED, REVOKED, ROTATED, EMERGENCY_RETRIEVAL]
 
     CreateSecretPolicyRequest:
       type: object
@@ -1040,6 +1313,13 @@ components:
           type: integer
           minimum: 1
           description: How long a granted lease lives.
+        rotation_interval_seconds:
+          type: integer
+          minimum: 1
+          description: |
+            When set (> 0), this version joins the automated rotation sweeper:
+            material is rotated on this cadence and every live lease revoked at
+            each rotation. A value <= 0 or absent opts out of the schedule.
         effective_from: { type: string, format: date-time }
         effective_to: { type: [string, "null"], format: date-time }
         created_by_principal_id: { type: string }
@@ -1055,6 +1335,7 @@ components:
           type: array
           items: { type: string }
         max_lease_duration_seconds: { type: integer }
+        rotation_interval_seconds: { type: integer }
         effective_from: { type: string, format: date-time }
         effective_to: { type: [string, "null"], format: date-time }
         version_status: { $ref: "#/components/schemas/VersionStatus" }
@@ -1125,7 +1406,89 @@ components:
             reach the material. Never log it, never store it, never render it in
             a UI. Re-minted on every call, including an idempotent replay that
             returns an existing `lease_id`.
+
+            Signed (HMAC-SHA256 under the service master key) and bound to its
+            secret path and `expires_at`, so it can be presented at
+            `POST /v1/secrets/leases/{lease_id}/verify` for a real answer. An
+            expired token refuses itself - no database read needed.
         expires_at: { type: string, format: date-time }
+
+    VerifyLeaseRequest:
+      type: object
+      required: [lease_token]
+      properties:
+        lease_token:
+          type: string
+          description: The signed token to validate against this lease.
+
+    VerifyLeaseResult:
+      type: object
+      properties:
+        valid:
+          type: boolean
+          description: true only for an unexpired, path- and tenant-matching token over a GRANTED lease.
+        lease_id: { type: string, format: uuid }
+        secret_path: { type: string }
+        status:
+          type: string
+          enum: [GRANTED, EXPIRED, REVOKED]
+        expires_at: { type: string, format: date-time }
+        reason:
+          type: string
+          description: |
+            Present only when `valid` is false. `token_expired`,
+            `lease_revoked`, `lease_expired`, or `lease_<status>`.
+
+    EmergencyRetrievalResult:
+      type: object
+      properties:
+        secret_policy_id: { type: string, format: uuid }
+        secret_path: { type: string }
+        material_base64:
+          type: string
+          format: byte
+          description: |
+            The RAW secret material - the one place this API hands it back.
+            Handle like the credential it is; it is logged nowhere.
+
+    CreateSharedSecretExceptionRequest:
+      type: object
+      required: [secret_path, reason, evidence_reference, expires_at]
+      properties:
+        secret_path: { type: string }
+        reason:
+          type: string
+          description: The short justification - an auditor reads this verbatim.
+        evidence_reference:
+          type: string
+          description: The ticket/incident/document that authorizes this override. Required.
+        tenant_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            null (the default) makes the exception GLOBAL - every tenant's
+            emergency retrieval may use it. A value scopes it to that tenant and
+            must match the caller's verified scope.
+        expires_at: { type: string, format: date-time }
+
+    ExceptionStatus:
+      type: string
+      enum: [ACTIVE, REVOKED, EXPIRED]
+
+    SharedSecretException:
+      type: object
+      properties:
+        exception_id: { type: string, format: uuid }
+        secret_path: { type: string }
+        reason: { type: string }
+        evidence_reference: { type: string }
+        approved_by_principal_id: { type: string }
+        tenant_id: { type: [string, "null"], format: uuid }
+        expires_at: { type: string, format: date-time }
+        status: { $ref: "#/components/schemas/ExceptionStatus" }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: [string, "null"], format: date-time }
+        revoked_by: { type: [string, "null"] }
 
     SecretLease:
       type: object

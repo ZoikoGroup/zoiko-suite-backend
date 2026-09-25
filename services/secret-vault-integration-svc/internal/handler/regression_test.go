@@ -399,7 +399,7 @@ var errAuthzUnavailable = authz.ErrUnavailable
 func meteredRouter(s *stubStore, v *stubVault, p *stubPublisher, m handler.DomainMetrics) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, v, p, testAuthz(), testAuthzScopeID, zap.NewNop()).UseMetrics(m)
+	h := handler.New(s, v, p, testAuthz(), testAuthzScopeID, 0, zap.NewNop()).UseMetrics(m)
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -409,7 +409,7 @@ func meteredRouter(s *stubStore, v *stubVault, p *stubPublisher, m handler.Domai
 func meteredRouterWithAuthz(s *stubStore, az *stubAuthz, m handler.DomainMetrics) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, &stubVault{}, &stubPublisher{}, az, testAuthzScopeID, zap.NewNop()).UseMetrics(m)
+	h := handler.New(s, &stubVault{}, &stubPublisher{}, az, testAuthzScopeID, 0, zap.NewNop()).UseMetrics(m)
 	handler.RegisterRoutes(r, h)
 	return r
 }

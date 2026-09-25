@@ -19,29 +19,67 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
+	"time"
 )
 
 // ErrSecretMaterialNotFound is returned by Get/Rotate when no material
 // has ever been Put for the given secretPath.
 var ErrSecretMaterialNotFound = errors.New("secret material not found in vault backend")
 
+// ErrLeaseTokenInvalid is returned by Verify when a token cannot be
+// trusted: wrong prefix, undecodable payload, bad signature, or a
+// secret_path that does not match the one it was minted for.
+var ErrLeaseTokenInvalid = errors.New("vault: lease token is invalid")
+
+// ErrLeaseTokenExpired is returned by Verify when the token was otherwise
+// valid but its embedded expiry has passed. This is the "real" expiry the
+// audit gap demanded: the token itself stops being valid, not just a row
+// in a database.
+var ErrLeaseTokenExpired = errors.New("vault: lease token has expired")
+
 // Backend is the narrow interface every caller in this service depends
 // on. Get returns an opaque lease token — never the raw secret value —
 // so the "no service may store long-lived sensitive credentials" and
 // "never return the raw secret value" constraints (context.md §1, §7.2)
 // hold regardless of which implementation is behind this interface.
+//
+// Since the audit, the lease token is no longer an opaque random string:
+// it is bound to the secret path and carries the lease's own expiry,
+// HMAC-signed with the backend key. An expired token is rejected by
+// Verify with zero database reads, and the service-side verify path
+// additionally refuses tokens whose lease has been revoked.
 type Backend interface {
-	// Get verifies material exists for secretPath and mints a fresh
-	// opaque lease token. It does not return the secret value itself.
-	Get(ctx context.Context, secretPath string) (leaseToken string, err error)
+	// Get verifies material exists for secretPath and mints a fresh lease
+	// token bound to that path and to expiresAt. It does not return the
+	// secret value itself.
+	Get(ctx context.Context, secretPath string, expiresAt time.Time) (leaseToken string, err error)
+
+	// Verify checks a lease token's signature, binding and embedded expiry.
+	// It returns the claims an offline verifier needs: the secret path and
+	// the expiry the token was minted for. It deliberately does not check
+	// lease state — who may use the token and whether the lease still
+	// exists is the caller's (service-side) decision against the lease
+	// register.
+	Verify(ctx context.Context, leaseToken string) (LeaseTokenInfo, error)
+
+	// GetMaterial decrypts and returns the raw secret material for
+	// secretPath. Used ONLY by the emergency retention pathway (§13 break
+	// glass) — every ordinary path in this service returns a lease token,
+	// never material. Named distinctly from Get so the broker path can
+	// never accidentally receive plaintext.
+	GetMaterial(ctx context.Context, secretPath string) ([]byte, error)
 
 	// Put stores material for secretPath, encrypted at rest. Only ever
 	// called by administrative/seeding paths, never by the broker flow.
@@ -53,6 +91,14 @@ type Backend interface {
 	// invalidating any leases that referenced the old material —
 	// Rotate itself only touches the backend, not lease state.
 	Rotate(ctx context.Context, secretPath string) error
+}
+
+// LeaseTokenInfo is what Verify vouches for. ExpiresAt is the lease's own
+// expiration carried inside the token, so a holder of an expired token is
+// rejected before any lease state is consulted.
+type LeaseTokenInfo struct {
+	SecretPath string
+	ExpiresAt  time.Time
 }
 
 // record is the on-disk shape for one secret's encrypted material.
@@ -69,6 +115,12 @@ type LocalFileVaultBackend struct {
 	mu       sync.Mutex
 	filePath string
 	gcm      cipher.AEAD
+	// key is the raw 32-byte AES-256 key, kept for HMAC lease-token
+	// signing. The master key now doubles as the token signing key: any
+	// process that can mint a token can also decrypt the store, so no
+	// extra keys to manage. A real vault backend would issue its own
+	// time-bound tokens instead of deriving them here.
+	key []byte
 }
 
 // NewLocalFileVaultBackend constructs a LocalFileVaultBackend.
@@ -96,7 +148,41 @@ func NewLocalFileVaultBackend(filePath, masterKeyHex string) (*LocalFileVaultBac
 		return nil, fmt.Errorf("vault: failed to construct GCM mode: %w", err)
 	}
 
-	return &LocalFileVaultBackend{filePath: filePath, gcm: gcm}, nil
+	return &LocalFileVaultBackend{filePath: filePath, gcm: gcm, key: key}, nil
+}
+
+// NewLocalFileVaultBackendFromFile constructs a LocalFileVaultBackend with
+// the AES-256 key read from a dedicated key file rather than an env var —
+// the delegated-key pattern that satisfies SEC-INV-07's "master key
+// isolated from application workloads" as far as this v1 local backend can,
+// the same file-key posture identity-context-svc's
+// JWT_SIGNING_PRIVATE_KEY_PATH already uses. The file must be readable by
+// the owner only (0600); a group- or world-readable key file is refused,
+// not tolerated, because a key with looser permissions is a key already
+// exposed.
+func NewLocalFileVaultBackendFromFile(storePath, keyPath string) (*LocalFileVaultBackend, error) {
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("vault: cannot read key file: %w", err)
+	}
+	// 0600 owner-only enforcement is meaningful on POSIX file permissions.
+	// On Windows the mode bits are not enforced by the OS and the file's
+	// ACL governs access, so the check is refused there (Go reports 0666
+	// for every new file regardless); key-file protection on a Windows
+	// deployment is the deployment's ACL responsibility.
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("vault: key file %s is not owner-only (mode %o) — refusing to run with an exposed key", keyPath, info.Mode().Perm())
+	}
+	raw, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("vault: cannot read key file: %w", err)
+	}
+	masterKeyHex := strings.TrimSpace(string(raw))
+	b, err := NewLocalFileVaultBackend(storePath, masterKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("vault: key file did not yield a usable AES-256 key: %w", err)
+	}
+	return b, nil
 }
 
 func (b *LocalFileVaultBackend) loadAll() (map[string]record, error) {
@@ -159,10 +245,11 @@ func (b *LocalFileVaultBackend) decrypt(rec record) ([]byte, error) {
 }
 
 // Get verifies material exists and can actually be decrypted (a real
-// integrity check, not a no-op), then mints a fresh random opaque lease
-// token unrelated to the material's own bytes — in production this
-// would be a real Vault/KMS-issued lease token, not derived locally.
-func (b *LocalFileVaultBackend) Get(_ context.Context, secretPath string) (string, error) {
+// integrity check, not a no-op), then mints a lease token bound to the
+// secret path and to the lease's expiry. An expired lease's token is
+// rejected by Verify with no database read, and the token carries its own
+// path so it can never be presented against another secret.
+func (b *LocalFileVaultBackend) Get(_ context.Context, secretPath string, expiresAt time.Time) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -178,11 +265,92 @@ func (b *LocalFileVaultBackend) Get(_ context.Context, secretPath string) (strin
 		return "", err
 	}
 
-	tokenBytes := make([]byte, 24)
-	if _, err := rand.Read(tokenBytes); err != nil {
-		return "", fmt.Errorf("vault: failed to generate lease token: %w", err)
+	return b.mintLeaseToken(secretPath, expiresAt)
+}
+
+// leaseTokenPrefix is the versioned lead-in for the signed token format,
+// so an old random opaque token (or a token from a future format) can
+// never be mistaken for a valid current one.
+const leaseTokenPrefix = "ltk:v2:"
+
+// tokenPayload is the signed body of a lease token. Kept private — the
+// whole point of the signature is that a holder cannot forge or alter the
+// binding.
+type tokenPayload struct {
+	SecretPath string    `json:"secret_path"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+func (b *LocalFileVaultBackend) mintLeaseToken(secretPath string, expiresAt time.Time) (string, error) {
+	payload, err := json.Marshal(tokenPayload{SecretPath: secretPath, ExpiresAt: expiresAt.UTC()})
+	if err != nil {
+		return "", fmt.Errorf("vault: failed to encode lease token payload: %w", err)
 	}
-	return "local-lease:" + base64.RawURLEncoding.EncodeToString(tokenBytes), nil
+	mac := hmac.New(sha256.New, b.key)
+	if _, err := mac.Write(payload); err != nil {
+		return "", fmt.Errorf("vault: failed to sign lease token: %w", err)
+	}
+	return leaseTokenPrefix + base64.RawURLEncoding.EncodeToString(payload) + "." + hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+// Verify checks a lease token's signature, format and embedded expiry.
+// It returns the claims the service needs to pair the token with a live
+// lease: the secret path it was minted for and the expiry it carries.
+func (b *LocalFileVaultBackend) Verify(_ context.Context, leaseToken string) (LeaseTokenInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.verifyLeaseToken(leaseToken)
+}
+
+func (b *LocalFileVaultBackend) verifyLeaseToken(leaseToken string) (LeaseTokenInfo, error) {
+	if !strings.HasPrefix(leaseToken, leaseTokenPrefix) {
+		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
+	}
+	rest := strings.TrimPrefix(leaseToken, leaseTokenPrefix)
+	dot := strings.LastIndexByte(rest, '.')
+	if dot < 0 {
+		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
+	}
+	payloadB64, sigHex := rest[:dot], rest[dot+1:]
+	payload, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if err != nil {
+		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
+	}
+	mac := hmac.New(sha256.New, b.key)
+	if _, err := mac.Write(payload); err != nil {
+		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
+	}
+	want := hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(want), []byte(sigHex)) {
+		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
+	}
+	var tp tokenPayload
+	if err := json.Unmarshal(payload, &tp); err != nil || tp.SecretPath == "" || tp.ExpiresAt.IsZero() {
+		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
+	}
+	if !tp.ExpiresAt.After(time.Now().UTC()) {
+		return LeaseTokenInfo{}, ErrLeaseTokenExpired
+	}
+	return LeaseTokenInfo{SecretPath: tp.SecretPath, ExpiresAt: tp.ExpiresAt}, nil
+}
+
+// GetMaterial decrypts and returns the raw secret material for secretPath.
+// Used only by the §13 emergency retention pathway (break glass): ordinary
+// use returns a lease token, never material, and this method split from
+// Get is what keeps that separation mechanical rather than a discipline.
+func (b *LocalFileVaultBackend) GetMaterial(_ context.Context, secretPath string) ([]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	records, err := b.loadAll()
+	if err != nil {
+		return nil, err
+	}
+	rec, ok := records[secretPath]
+	if !ok {
+		return nil, ErrSecretMaterialNotFound
+	}
+	return b.decrypt(rec)
 }
 
 // Put stores material for secretPath, encrypted at rest, overwriting

@@ -44,6 +44,15 @@ type Domain struct {
 	// the HTTP series it is a 201 identical to a write affecting one tenant.
 	GlobalScopeWrites *prometheus.CounterVec
 
+	// GovernedWrites counts the AA-001 governed write tiers — definition
+	// registration/publish, override activation, change and emergency change
+	// lifecycle, release-plan publication and attestation — by action and
+	// outcome. Kept apart from ConfigWrites/FlagWrites because those two
+	// describe POST /v1/config and POST /v1/flags specifically, and a governed
+	// write is a different act: it is gated on a definition and lands in
+	// snapshot history with its own event family.
+	GovernedWrites *prometheus.CounterVec
+
 	// OutboxPending is the depth of the unpublished event backlog.
 	OutboxPending prometheus.Gauge
 	// OutboxPublished counts events the relay handed to Kafka, by type.
@@ -189,6 +198,11 @@ func NewDomainWith(reg prometheus.Registerer, serviceName string) *Domain {
 			Help:        "Writes targeting the environment-wide default rather than one tenant.",
 			ConstLabels: labels,
 		}, []string{"resource", "outcome"}),
+		GovernedWrites: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "configuration_governed_writes_total",
+			Help:        "AA-001 governed writes by action and outcome.",
+			ConstLabels: labels,
+		}, []string{"action", "outcome"}),
 		OutboxPending: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name:        "configuration_outbox_pending",
 			Help:        "Unpublished events in the transactional outbox.",
@@ -213,6 +227,7 @@ func NewDomainWith(reg prometheus.Registerer, serviceName string) *Domain {
 
 	reg.MustRegister(
 		d.ConfigWrites, d.FlagWrites, d.AuthZDecisions, d.GlobalScopeWrites,
+		d.GovernedWrites,
 		d.OutboxPending, d.OutboxPublished, d.OutboxFailures, d.OutboxOldestAgeSeconds,
 	)
 
@@ -234,6 +249,17 @@ func NewDomainWith(reg prometheus.Registerer, serviceName string) *Domain {
 	for _, res := range []string{"config", "flag"} {
 		for _, o := range []string{WriteCreated, WriteNoChange, WriteForbidden} {
 			d.GlobalScopeWrites.WithLabelValues(res, o)
+		}
+	}
+	for _, a := range []string{
+		ActionConfigWrite, ActionConfigGlobalWrite, ActionFlagWrite, ActionFlagGlobalWrite,
+	} {
+		for _, o := range []string{
+			WriteCreated, WriteNoChange, WriteInvalidRequest, WriteTooLarge,
+			WriteForbidden, WriteConflict, WriteAuthzUnavailable,
+			WriteStoreUnavailable, WriteIdentityMissing, WriteTenantMismatch,
+		} {
+			d.GovernedWrites.WithLabelValues(a, o)
 		}
 	}
 	for _, t := range allEventTypes {

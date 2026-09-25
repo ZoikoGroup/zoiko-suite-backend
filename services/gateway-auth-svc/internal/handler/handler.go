@@ -236,9 +236,6 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 
 	if assessment != nil {
 		// Counted before the branch, so ALLOW and STEP_UP_MFA are visible too.
-		// STEP_UP_MFA in particular is deliberately not enforced — there is no
-		// step-up flow to redirect to — so this counter is the only place that
-		// signal exists at all.
 		h.metrics.CartaDecision(string(assessment.Decision))
 	}
 
@@ -254,14 +251,13 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			severityFor(assessment.Decision),
 			"CARTA flagged principal "+claims.Principal.PrincipalID+": "+string(assessment.Decision))
 
-		// ISOLATE/DENY are hard-blocked: they represent risk high enough
-		// that this platform has no automated remediation for it. STEP_UP_MFA
-		// is intentionally NOT blocked here — there is no step-up-MFA
-		// challenge flow anywhere downstream to redirect to yet, and hard-
-		// blocking with no path to recover would just be a silent lockout
-		// wearing a different name. It is still logged and streamed to SIEM
-		// above so the signal isn't lost, just not yet enforced.
-		if assessment.Decision == carta.DecisionIsolate || assessment.Decision == carta.DecisionDeny {
+		// ISOLATE/DENY/STEP_UP_MFA are hard-blocked: they represent risk high
+		// enough that this platform has no automated remediation for them.
+		// STEP_UP_MFA was previously allowed through because there was no
+		// step-up challenge flow downstream, but letting it pass silently
+		// defeats the risk engine's intent — a request that needs step-up
+		// must not proceed as if it were ALLOW.
+		if assessment.Decision == carta.DecisionIsolate || assessment.Decision == carta.DecisionDeny || assessment.Decision == carta.DecisionStepUpMFA {
 			h.metrics.VerifyDecision(outcomeCartaBlocked)
 			h.denyCarta(w, "access denied by continuous risk assessment", string(assessment.Decision))
 			return

@@ -128,6 +128,7 @@ func (f *fakeStore) UpsertCheckpoint(context.Context, domain.IndexCheckpoint) er
 func (f *fakeStore) ListCheckpoints(context.Context, string) ([]domain.IndexCheckpoint, error) {
 	return []domain.IndexCheckpoint{}, nil
 }
+func (f *fakeStore) GetLatestCheckpoint(context.Context, string) (*domain.IndexCheckpoint, error) { return nil, nil }
 func (f *fakeStore) GetProjectionRecord(context.Context, string, string, string, string) (*domain.ProjectionRecord, error) {
 	return nil, nil
 }
@@ -270,7 +271,7 @@ func newHarness(t *testing.T, az *stubAuthz) *harness {
 	eng := &fakeEngine{result: searchclient.Result{Total: 0, Relation: "eq"}}
 
 	metrics := testMetrics()
-	planner := query.NewPlanner(query.DefaultLimits(), testKey)
+	planner := query.NewPlanner(query.DefaultLimits(), st, testKey)
 	retriever := retrieval.New(eng, az, nil, metrics, zap.NewNop(), time.Second)
 	ix := indexer.New(st, eng, nil, metrics, zap.NewNop())
 

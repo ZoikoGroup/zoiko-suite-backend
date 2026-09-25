@@ -296,6 +296,496 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
+  /v1/config/definitions:
+    post:
+      tags: [config]
+      operationId: createConfigDefinition
+      summary: Register a configuration key declaration
+      description: |
+        Records a *working* declaration for a key (ZS-SVC-AA-001 Table 11).
+        The declaration is editable while unpublished; publishing copies it,
+        immutably, into a `ConfigDefinitionVersion` and every write and read is
+        gated against the published versions from then on (INV-04/05/06).
+
+        Authorized as `CONFIGURATION_WRITE`; the verified `X-Principal-Id` is
+        recorded as the author — there is intentionally no body field for it.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateDefinitionRequest' }
+      responses:
+        '201':
+          description: The working definition was registered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigDefinition' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/config/definitions/{key}:
+    get:
+      tags: [config]
+      operationId: findConfigDefinition
+      summary: Read a key's working declaration
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+      responses:
+        '200':
+          description: The working declaration.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigDefinition' }
+        '404':
+          description: '`key_not_registered` — the key was never declared. A `404`, not a `400`: the request is fine, the registry has no such key.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/config/definitions/{key}/publish:
+    post:
+      tags: [config]
+      operationId: publishConfigDefinition
+      summary: Publish (or deprecate/retire) a key declaration
+      description: |
+        Copies the working declaration into an immutable `ConfigDefinitionVersion`
+        (INV-04) and advances the working row's lifecycle. Publishing changes
+        what every future write and read is gated against, so it is authorized as
+        `CONFIGURATION_GLOBAL_WRITE` and records the verified principal as the
+        publisher.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishDefinitionRequest' }
+      responses:
+        '201':
+          description: The immutable published version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigDefinitionVersion' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404':
+          description: '`key_not_registered` — there is no declaration to publish.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/config/resolve:
+    post:
+      tags: [config]
+      operationId: resolveConfig
+      summary: Resolve a scope against the pinned snapshot
+      description: |
+        Returns the snapshot-pinned resolution for this scope (ZS-SVC-AA-001
+        Table 6/14): each key's `hasf` value, outcome and reason, plus the
+        snapshot's `issed_at`/`freshness_deadline`.
+
+        A body-carrying read. The envelope policy classifies
+        `/v1/config/resolve` as a **non-write**, so no `Idempotency-Key` is
+        demanded. It requires `X-Tenant-Id` and never leaks a foreign tenant's
+        resolution.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResolveRequest' }
+      responses:
+        '200':
+          description: The resolved snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResolvedConfigSnapshot' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404':
+          description: '`no_attested_snapshot` — nothing is pinned in this environment yet; failing closed rather than guessing.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/StaleSnapshot' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/config/overrides/{scope}:
+    put:
+      tags: [config]
+      operationId: activateOverride
+      summary: Set a value at an INV-07 precedence layer
+      description: |
+        Records an override at one of the five precedence layers of INV-07. The
+        `{scope}` path names the layer — `tenant` or `environment` — and the
+        declaration's `allowed_scopes` is an allowlist: a key whose definition
+        does not name the requested layer is refused (`scope_not_allowed`,
+        INV-08).
+
+        A tenant-layer override belongs to the caller and requires the same
+        grant an ordinary `POST /v1/config` tenant write would; the environment
+        layer is the environment-wide default and requires
+        `CONFIGURATION_GLOBAL_WRITE`.
+      parameters:
+        - name: scope
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [tenant, environment]
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActivateOverrideRequest' }
+      responses:
+        '200':
+          description: The config entry now effective at this layer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/GovernedConflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/config/changes:
+    post:
+      tags: [config]
+      operationId: createChange
+      summary: Record a governed change set
+      description: |
+        Records an ordered ChangeSet (ZS-SVC-AA-001 Table 7/21). Each part is
+        gated against the key's definition and the caller's scope at creation
+        time and re-gated at activation, so a change written against
+        yesterday's registry cannot apply today. `C2`/`C3` classes bind an
+        approval before activation (TC-04); the response's
+        `approval_required` tells the caller whether theirs is one of them.
+
+        Authorized on the scope-decided config action — tenant change set, or
+        `CONFIGURATION_GLOBAL_WRITE` for an environment-wide one.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateChangeRequest' }
+      responses:
+        '201':
+          description: The recorded change.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigChange' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/GovernedConflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/config/changes/{change_id}/approve:
+    post:
+      tags: [config]
+      operationId: approveChange
+      summary: Bind (or record the rejection of) a change approval
+      description: |
+        Binds an approval to a change, or records its rejection. A rejected
+        approval keeps the change `PROPOSED` — there is no REJECTED state —
+        and the approver remains the verified principal: there is no
+        body-supplied approver field.
+      parameters:
+        - name: change_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApproveChangeRequest' }
+      responses:
+        '200':
+          description: The change with its updated status (APPROVED, or PROPOSED when rejected).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigChange' }
+        '404':
+          description: '`change_not_found` — no such change id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/config/changes/{change_id}/activate:
+    post:
+      tags: [config]
+      operationId: activateChange
+      summary: Apply an approved change set
+      description: |
+        Applies the parts of an `APPROVED` change to the live value tables,
+        mints the after snapshot and marks the change `VERIFIED` with both
+        imprints (INV-25/26). A change that never cleared approval is refused
+        (TC-04), and the parts are re-gated at activation.
+      parameters:
+        - name: change_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The verified change.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigChange' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`change_not_found` — no such change id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409': { $ref: '#/components/responses/GovernedConflict' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/emergency-changes:
+    post:
+      tags: [config]
+      operationId: createEmergencyChange
+      summary: Record a break-glass emergency change
+      description: |
+        Records a time-boxed break-glass mutation (INV-15, NP-42/43). Break-glass
+        still records an approval and a quarantine until the emergent value is
+        attested inside its own window. Expiry is mandatory — a permanent
+        break-glass override is not break-glass (`emergency_change_no_expiry`).
+        The key must be in the break-glass allowlist (`emergency_scope_denied`).
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateEmergencyChangeRequest' }
+      responses:
+        '201':
+          description: The recorded emergency change (status `OPEN`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmergencyChange' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/GovernedConflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/emergency-changes/{emergency_change_id}/activate:
+    post:
+      tags: [config]
+      operationId: activateEmergencyChange
+      summary: Apply an emergency change immediately
+      description: |
+        Applies an `OPEN` emergency change and pins it into a snapshot so the
+        next attestation either sees it or is visible as missing.
+      parameters:
+        - name: emergency_change_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The active emergency change.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmergencyChange' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`change_not_found` — no such emergency change id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/runtime/attest:
+    post:
+      tags: [config]
+      operationId: recordAttestation
+      summary: Record a workload's snapshot claim
+      description: |
+        Records a workload's claim about which snapshot it serves (TC-07, Table
+        22). The `(runtime_id, attest_key)` pair is single-use: a captured
+        attestation cannot be replayed (NP-26).
+
+        Authorized as `CONFIGURATION_WRITE`, tenant-scoped by the verified
+        header.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordAttestationRequest' }
+      responses:
+        '201':
+          description: The recorded attestation, with its freshness deadline.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuntimeAttestation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/GovernedConflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/flags/{key}/release-plans:
+    post:
+      tags: [flags]
+      operationId: createReleasePlan
+      summary: Publish a flag rollout/targeting plan
+      description: |
+        Publishes an immutable rollout plan for this flag (INV-04/07/19, Table
+        16/17). `ALL_OR_NOTHING` is the only legal strategy for
+        regulated/rights-affecting outcomes (INV-19). Authorized on the flag
+        action family — `FEATURE_FLAG_WRITE` for a tenant plan,
+        `FEATURE_FLAG_GLOBAL_WRITE` for an environment-wide one.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateReleasePlanRequest' }
+      responses:
+        '201':
+          description: The published plan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReleasePlan' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/GovernedConflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/flags/{key}/evaluate:
+    post:
+      tags: [flags]
+      operationId: evaluateFlag
+      summary: Evaluate a flag for one subject
+      description: |
+        Evaluates a flag for one subject against the pinned snapshot
+        (INV-12): the enabled decision, the rollout applied, the reason, and
+        the exact snapshot content that produced it, so a past evaluation is
+        reproducible from the response alone.
+
+        A body-carrying read — classified as a **non-write** by the envelope
+        policy, so no `Idempotency-Key` is demanded.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, example: payroll.new_ui }
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EvaluateRequest' }
+      responses:
+        '200':
+          description: The evaluation, pinned to the snapshot that produced it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlagEvaluation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/StaleSnapshot' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
   /healthz:
     get:
       tags: [operations]
@@ -485,6 +975,376 @@ components:
           default: 100
         created_by_principal_id: { type: string }
 
+    ConfigDefinition:
+      type: object
+      required: [definition_id, key, value_type, safety_class, fallback_policy]
+      description: |
+        The *working* declaration of a key. Editable until published; the
+        published versions are the immutable gate (INV-04/05/06).
+      properties:
+        definition_id: { type: string, format: uuid }
+        key: { type: string, example: payroll.release.batch_size }
+        owner: { type: string }
+        value_type: { type: string }
+        safety_class: { type: string }
+        allowed_scopes:
+          type: array
+          items: { type: string }
+          description: Order-significant allowlist for INV-07 override layers.
+        default_value: { type: object, nullable: true }
+        fallback_policy: { type: string }
+        sensitivity: { type: string }
+        validation: { type: object, nullable: true }
+        effective_model: { type: string }
+        lifecycle: { type: string }
+        deprecation: { type: object, nullable: true }
+        flag_class: { type: string, nullable: true }
+        retirement_deadline: { type: string, format: date-time, nullable: true }
+        created_by_principal_id: { type: string }
+        updated_by_principal_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ConfigDefinitionVersion:
+      type: object
+      description: An immutable published snapshot of a declaration (INV-04).
+      required: [version_id, version, digest, lifecycle]
+      properties:
+        version_id: { type: string, format: uuid }
+        definition_id: { type: string, format: uuid }
+        version: { type: integer }
+        digest: { type: string }
+        definition: { type: object }
+        lifecycle: { type: string }
+        published_by_principal_id: { type: string }
+        published_at: { type: string, format: date-time }
+
+    CreateDefinitionRequest:
+      type: object
+      required: [key, owner, value_type, safety_class, fallback_policy, sensitivity]
+      properties:
+        key: { type: string }
+        owner: { type: string }
+        value_type: { type: string }
+        safety_class: { type: string }
+        allowed_scopes:
+          type: array
+          items: { type: string }
+          description: Optional; defaults to the safety class' inherent scope set.
+        default_value: { type: object, nullable: true }
+        fallback_policy: { type: string }
+        sensitivity: { type: string }
+        validation: { type: object, nullable: true }
+        effective_model: { type: string }
+        flag_class: { type: string, nullable: true }
+        retirement_deadline: { type: string, format: date-time, nullable: true }
+      additionalProperties: false
+
+    PublishDefinitionRequest:
+      type: object
+      required: [lifecycle]
+      description: |
+        `lifecycle` names the transition, e.g. `draft`, `published`,
+        `deprecated`, `retired`.
+      properties:
+        lifecycle: { type: string }
+      additionalProperties: false
+
+    ResolveRequest:
+      type: object
+      description: |
+        Resolve the pinned snapshot for this scope. An empty `keys` list means
+        "every key in the snapshot issed for this environment".
+      required: [environment]
+      properties:
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        keys:
+          type: array
+          items: { type: string }
+      additionalProperties: false
+
+    ResolvedConfigSnapshot:
+      type: object
+      required: [snapshot_id, environment, epoch, digest, issued_at, freshness_deadline, values]
+      properties:
+        snapshot_id: { type: string, format: uuid }
+        environment: { type: string }
+        epoch: { type: integer, format: int64 }
+        digest: { type: string }
+        issued_at: { type: string, format: date-time }
+        freshness_deadline: { type: string, format: date-time }
+        values:
+          type: array
+          items: { $ref: '#/components/schemas/ResolvedValue' }
+
+    ResolvedValue:
+      type: object
+      required: [key, environment, outcome, reason, layer]
+      properties:
+        key: { type: string }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        value: { type: object, nullable: true }
+        outcome: { type: string, example: ALLOW }
+        reason: { type: string }
+        layer: { type: string, description: The INV-07 precedence layer that provided the value.' }
+        effective_from: { type: string, format: date-time, nullable: true }
+        safety_class: { type: string }
+        fallback_policy: { type: string }
+
+    ActivateOverrideRequest:
+      type: object
+      required: [key, environment, value]
+      properties:
+        key: { type: string }
+        environment: { type: string }
+        value:
+          description: Any JSON value.
+        scope_id:
+          type: string
+          description: |
+            Required for the `tenant` layer (the caller's tenant). Refused for
+            the `environment` layer, which has no scope id.
+      additionalProperties: false
+
+    CreateChangeRequest:
+      type: object
+      required: [change_class, environment, parts]
+      properties:
+        change_class: { type: string, example: C2 }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        parts:
+          type: array
+          items: { $ref: '#/components/schemas/ChangePartRequest' }
+        approval_required: { type: boolean, default: false }
+        planned_effective_at: { type: string, format: date-time, nullable: true }
+        rollback_change_id: { type: string, format: uuid, nullable: true }
+      additionalProperties: false
+
+    ChangePartRequest:
+      type: object
+      required: [kind, key, scope]
+      properties:
+        kind: { type: string, description: 'e.g. `config_set`, `flag_enable`' }
+        key: { type: string }
+        scope:
+          $ref: '#/components/schemas/ChangePartScopeRequest'
+        new_value: { type: object, nullable: true }
+        new_enabled: { type: boolean, nullable: true }
+        rollout_percentage: { type: integer, minimum: 0, maximum: 100, nullable: true }
+        expected_before_hash: { type: string, nullable: true }
+      additionalProperties: false
+
+    ChangePartScopeRequest:
+      type: object
+      required: [environment]
+      properties:
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+      additionalProperties: false
+
+    ConfigChange:
+      type: object
+      required: [change_id, change_class, environment, status, approval_required]
+      properties:
+        change_id: { type: string, format: uuid }
+        change_class: { type: string }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        before_snapshot_id: { type: string, format: uuid, nullable: true }
+        proposed_snapshot_id: { type: string, format: uuid, nullable: true }
+        parts:
+          type: array
+          items: { $ref: '#/components/schemas/ChangePartRequest' }
+        status: { type: string, enum: [PROPOSED, APPROVED, REJECTED, VERIFIED] }
+        approval:
+          $ref: '#/components/schemas/ChangeApproval'
+        approval_required: { type: boolean }
+        planned_effective_at: { type: string, format: date-time, nullable: true }
+        activated_at: { type: string, format: date-time, nullable: true }
+        verified_at: { type: string, format: date-time, nullable: true }
+        rollback_change_id: { type: string, format: uuid, nullable: true }
+        created_by_principal_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ChangeApproval:
+      type: object
+      required: [approved, by_principal_id, approved_at]
+      properties:
+        approved: { type: boolean }
+        by_principal_id: { type: string }
+        approved_at: { type: string, format: date-time }
+        wfc_reference: { type: string, nullable: true }
+
+    ApproveChangeRequest:
+      type: object
+      properties:
+        approved: { type: boolean, default: true }
+        approved_at: { type: string, format: date-time }
+        wfc_reference: { type: string }
+      additionalProperties: false
+
+    CreateEmergencyChangeRequest:
+      type: object
+      required: [key, environment, new_value, reason, incident_id, expires_at]
+      properties:
+        key: { type: string }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        new_value:
+          description: Any JSON value.
+        reason: { type: string }
+        incident_id: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+          description: Mandatory — a break-glass value without an expiry is not break-glass.
+      additionalProperties: false
+
+    EmergencyChange:
+      type: object
+      required: [emergency_change_id, key, environment, new_value, actor_principal_id, expires_at, status]
+      properties:
+        emergency_change_id: { type: string, format: uuid }
+        key: { type: string }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        new_value: { type: object }
+        reason: { type: string }
+        incident_id: { type: string }
+        actor_principal_id: { type: string }
+        expires_at: { type: string, format: date-time }
+        activated_config_entry_id: { type: string, format: uuid, nullable: true }
+        prior_config_entry_id: { type: string, format: uuid, nullable: true }
+        reverted_to_prior: { type: boolean }
+        status: { type: string, enum: [OPEN, ACTIVE, EXPIRED, REVERTED] }
+        retrospective_due_at: { type: string, format: date-time, nullable: true }
+        retrospective_closed_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    RecordAttestationRequest:
+      type: object
+      required: [runtime_id, attest_key, environment, observed_digest]
+      properties:
+        runtime_id: { type: string }
+        attest_key: { type: string, description: Single-use; a captured attestation cannot be replayed (NP-26).' }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        observed_snapshot_id: { type: string, format: uuid, nullable: true }
+        observed_epoch: { type: integer, format: int64 }
+        observed_digest: { type: string }
+        observed_versions: { type: object, nullable: true }
+      additionalProperties: false
+
+    RuntimeAttestation:
+      type: object
+      required: [attestation_id, runtime_id, environment, observed_digest, reported_at, freshness_deadline]
+      properties:
+        attestation_id: { type: string, format: uuid }
+        runtime_id: { type: string }
+        attest_key: { type: string }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        observed_snapshot_id: { type: string, format: uuid, nullable: true }
+        observed_epoch: { type: integer, format: int64 }
+        observed_digest: { type: string }
+        observed_versions: { type: object, nullable: true }
+        reported_at: { type: string, format: date-time }
+        freshness_deadline: { type: string, format: date-time }
+
+    CreateReleasePlanRequest:
+      type: object
+      required: [environment, strategy]
+      properties:
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        strategy:
+          type: string
+          description: |
+            `ALL_OR_NOTHING` is the only legal strategy for
+            regulated/rights-affecting outcomes (INV-19).
+        salt: { type: string }
+        bucket_count: { type: integer, minimum: 2, maximum: 10000, default: 20 }
+        targeting_rules: { type: object, nullable: true }
+      additionalProperties: false
+
+    ReleasePlan:
+      type: object
+      required: [release_plan_id, flag_key, environment, strategy, version, published_at]
+      properties:
+        release_plan_id: { type: string, format: uuid }
+        flag_key: { type: string }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        strategy: { type: string }
+        salt: { type: string }
+        bucket_count: { type: integer }
+        targeting_hash: { type: string }
+        targeting_rules: { type: object }
+        version: { type: integer }
+        published_at: { type: string, format: date-time }
+        published_by_principal_id: { type: string }
+
+    EvaluateRequest:
+      type: object
+      required: [environment, subject_key]
+      description: |
+        Evaluate one subject against the pinned snapshot. `context` carries the
+        targeting-rule attributes (INV-12).
+      properties:
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        subject_key: { type: string }
+        context:
+          type: object
+          additionalProperties: true
+      additionalProperties: false
+
+    FlagEvaluation:
+      type: object
+      required: [key, environment, flag_id, enabled, rollout_percentage, outcome, reason, snapshot_id, epoch, digest]
+      properties:
+        key: { type: string }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        flag_id: { type: string, format: uuid }
+        enabled: { type: boolean }
+        rollout_percentage: { type: integer }
+        outcome: { type: string }
+        reason: { type: string }
+        snapshot_id: { type: string, format: uuid }
+        epoch: { type: integer, format: int64 }
+        digest: { type: string }
+        release_plan: { $ref: '#/components/schemas/ReleasePlanManifest' }
+        kill_switch: { $ref: '#/components/schemas/KillSwitchManifest' }
+        bucket: { type: integer, nullable: true }
+        variant: { type: string }
+
+    ReleasePlanManifest:
+      type: object
+      required: [release_plan_id, version, strategy, targeting_hash]
+      properties:
+        release_plan_id: { type: string, format: uuid }
+        version: { type: integer }
+        strategy: { type: string }
+        salt: { type: string }
+        bucket_count: { type: integer }
+        targeting_hash: { type: string }
+        targeting_rules: { type: object }
+
+    KillSwitchManifest:
+      type: object
+      required: [kill_switch_id, safe_behavior, expires_at]
+      properties:
+        kill_switch_id: { type: string, format: uuid }
+        safe_behavior: { type: string }
+        reason: { type: string }
+        incident_id: { type: string }
+        expires_at: { type: string, format: date-time }
+
     Readiness:
       type: object
       properties:
@@ -516,6 +1376,13 @@ components:
         `missing_field` — a required field was absent.
         `invalid_field` — `rollout_percentage` outside 0–100.
         `invalid_json` — the body could not be parsed.
+        `key_not_registered` — the key has no declaration in the registry.
+        `type_mismatch` — the value does not match the key's declared `value_type`.
+        `value_constraint_failed` — the value fails the key's declared validation.
+        `secret_value_prohibited` — a secret-class value cannot be read back.
+        `environment_boundary_violation` — the value crosses its environment's boundary rule.
+        `emergency_change_no_expiry` — a break-glass change must carry `expires_at`.
+        `context_incomplete` — the evaluation context lacked a required attribute.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -532,6 +1399,11 @@ components:
         `authorization_denied` — the caller holds no grant for the named action.
         `tenant_scope_mismatch` — the request named a tenant other than the
         caller's verified one.
+        `scope_not_allowed` — the scope is not in the declaration's `allowed_scopes`.
+        `targeting_not_permitted` — the caller's targeting rules are not privileged for this flag.
+        `entitlement_denied` — the caller is not entitled to act on this safety class.
+        `policy_or_privacy_denied` — a privacy/regulatory rule refused the action.
+        `emergency_scope_denied` — the key is not in the break-glass allowlist.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -540,6 +1412,11 @@ components:
         `config_entry_not_found` / `feature_flag_not_found` — nothing is
         effective for that **exact** tuple. A global default may still exist;
         this lookup does not go looking for one.
+        `key_not_registered` — no declaration exists for this key (GET
+        `/v1/config/definitions/{key}` and publish).
+        `no_attested_snapshot` — nothing is pinned in this environment yet;
+        failing closed rather than guessing.
+        `change_not_found` — no such change id.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -549,6 +1426,33 @@ components:
         Nothing is wrong with the request or the database; retrying now takes
         the ordinary compare-and-update path. This used to answer `503`, which
         said the opposite.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    GovernedConflict:
+      description: |
+        `override_conflict` — another layer or race already set this key.
+        `version_immutable` — the published version cannot be modified.
+        `snapshot_rollback_rejected` — the pinned snapshot cannot roll back.
+        `change_approval_required` — a C2/C3 change must clear approval before activation.
+        `drift_detected` — the expected-before hash does not match the pinned snapshot.
+        `consumer_incompatible` — a consumer pinned to an older version blocks this.
+        `flag_key_retired` — the flag was retired.
+        `change_not_found` — no such change or emergency change id (404).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    StaleSnapshot:
+      description: |
+        `snapshot_stale` — the pinned snapshot has expired its freshness
+        deadline; a new attestation is required before acting.
+        `safe_fallback_active` — a kill-switch safe-fallback value is being
+        served instead of the emergent one.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    GovernedServerError:
+      description: '`snapshot_invalid` — the snapshot could not be minted or re-read; internal state is inconsistent.'
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }

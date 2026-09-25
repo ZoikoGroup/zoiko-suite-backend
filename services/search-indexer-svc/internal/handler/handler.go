@@ -164,7 +164,7 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plan, err := h.planner.Compile(req, tc, contract, generation)
+	plan, err := h.planner.Compile(r.Context(), req, tc, contract, generation)
 	if err != nil {
 		var qerr *query.Error
 		if errors.As(err, &qerr) {
@@ -297,7 +297,7 @@ func (h *Handler) Retrieve(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, searchclient.ProjectionDocID(tc.TenantID, sourceType, ref.SourceID))
 	}
 
-	plan, err := h.planner.Compile(query.Request{
+	plan, err := h.planner.Compile(r.Context(), query.Request{
 		Scope: req.Scope,
 		Size:  len(ids),
 	}, tc, contract, generation)

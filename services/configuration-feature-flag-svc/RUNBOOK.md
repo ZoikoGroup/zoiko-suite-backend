@@ -278,6 +278,8 @@ SELECT key, environment, COALESCE(tenant_id, '00000000-0000-0000-0000-0000000000
 | `AUTHZ_PLATFORM_SCOPE_ID` | *(none)* | **Required outside `local`.** See 4.3. |
 | `KAFKA_BROKERS` | `localhost:9092` | Empty is allowed in `local` only; fatal in staging/production, because a deployment silently publishing nothing is the failure events exist to prevent. |
 | `KAFKA_EVENTS_TOPIC` | `zoiko.configuration.events` | |
+| `SWEEP_INTERVAL` | `1m` | Cadence of the kill-switch/emergency-change expiry sweep. Zero disables it (local runs only). |
+| `SWEEP_ENVIRONMENTS` | `staging,production` | Environments the expiry sweep covers, comma-separated. |
 | `ZS_ENVELOPE_ENFORCEMENT` | write-strict | ZS-ARCH-SVC-001 §4. |
 
 ---

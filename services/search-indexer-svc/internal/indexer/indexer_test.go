@@ -155,6 +155,7 @@ func (f *fakeStore) UpsertCheckpoint(context.Context, domain.IndexCheckpoint) er
 func (f *fakeStore) ListCheckpoints(context.Context, string) ([]domain.IndexCheckpoint, error) {
 	return nil, nil
 }
+func (f *fakeStore) GetLatestCheckpoint(context.Context, string) (*domain.IndexCheckpoint, error) { return nil, nil }
 func (f *fakeStore) CountProjections(context.Context, string) (int64, int64, error) { return 0, 0, nil }
 func (f *fakeStore) ListTombstones(context.Context, string, string, int) ([]domain.RestrictionTombstone, error) {
 	return nil, nil

@@ -17,6 +17,19 @@ func emailTo(recipient, correlationID string) map[string]any {
 		"subject":                "Your payslip is available",
 		"body":                   "<p>August</p>",
 		"correlation_id":         correlationID,
+		"purpose_context":        "TEST_PURPOSE",
+	}
+}
+
+func inAppTo(recipient, correlationID string) map[string]any {
+	return map[string]any{
+		"recipient_principal_id": recipient,
+		"legal_entity_id":        "le-us",
+		"channel":                "IN_APP",
+		"subject":                "You have a new message",
+		"body":                   "<p>Hello</p>",
+		"correlation_id":         correlationID,
+		"purpose_context":        "TEST_PURPOSE",
 	}
 }
 
@@ -40,7 +53,7 @@ func TestSend_EmailResolvesTheRecipientAddress(t *testing.T) {
 	if n.RecipientAddressSource != domain.AddressSourceIdentityContext {
 		t.Errorf("provenance = %q, want %q", n.RecipientAddressSource, domain.AddressSourceIdentityContext)
 	}
-	if n.Status != "SENT" || n.ProviderResponse == "" {
+	if n.Status != domain.StatusProviderAccepted || n.ProviderResponse == "" {
 		t.Errorf("status = %q, provider_response = %q — acceptance evidence was not recorded",
 			n.Status, n.ProviderResponse)
 	}

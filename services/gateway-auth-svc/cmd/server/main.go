@@ -19,6 +19,7 @@ import (
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/handler"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
+	"zoiko.io/gateway-auth-svc/internal/mtls"
 	"zoiko.io/gateway-auth-svc/internal/router"
 	"zoiko.io/gateway-auth-svc/internal/siem"
 	"zoiko.io/gateway-auth-svc/internal/telemetry"
@@ -55,7 +56,33 @@ func main() {
 
 	metrics := telemetry.NewMetrics("gateway-auth-svc")
 
-	jwksClient := jwks.NewClient(cfg.JWKSURL, cfg.JWKSCacheTTL)
+	// mTLS for upstream calls to identity-context-svc (JWKS) and
+	// tenant-entity-registry-svc. Disabled by default — plain HTTP is used
+	// unless the corresponding MTLS_ENABLED env var is set to "true".
+	var jwksHTTPClient, tenantRegistryHTTPClient *http.Client
+	if cfg.IdentityJWKSMTLSEnabled {
+		// The platform scope ID is the same one used by other services for
+		// mTLS provisioning. It is the synthetic platform-scope legal entity
+		// that owns platform-wide reference data.
+		const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+		client, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "gateway-auth-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity for JWKS", zap.Error(err))
+		}
+		jwksHTTPClient = client
+		log.Info("mTLS enabled for identity-context-svc JWKS calls", zap.String("url", cfg.IdentityJWKSMTLSURL))
+	}
+	if cfg.TenantRegistryMTLSEnabled {
+		const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+		client, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "gateway-auth-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity for tenant registry", zap.Error(err))
+		}
+		tenantRegistryHTTPClient = client
+		log.Info("mTLS enabled for tenant-entity-registry-svc calls", zap.String("url", cfg.TenantRegistryMTLSURL))
+	}
+
+	jwksClient := jwks.NewClientWithHTTPClient(cfg.JWKSURL, cfg.JWKSCacheTTL, jwksHTTPClient)
 	cartaClient := carta.New(cfg.CartaServiceURL, log)
 	siemClient := siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log)
 
@@ -66,7 +93,7 @@ func main() {
 	// GOV-01 tenant context resolution against tenant-entity-registry-svc.
 	// nil when TENANT_REGISTRY_URL is unset, which leaves the gateway behaving
 	// exactly as before rather than failing closed on an unconfigured dependency.
-	tenantResolver := tenantctx.New(cfg.TenantRegistryURL, cfg.TenantContextTTL, cfg.TenantContextStaleGrace)
+	tenantResolver := tenantctx.NewWithHTTPClient(cfg.TenantRegistryURL, cfg.TenantContextTTL, cfg.TenantContextStaleGrace, tenantRegistryHTTPClient)
 	if tenantResolver.Enabled() {
 		log.Info("tenant context resolution enabled",
 			zap.String("registry", cfg.TenantRegistryURL),

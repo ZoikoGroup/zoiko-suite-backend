@@ -46,6 +46,17 @@ func NewClient(url string, ttl time.Duration) *Client {
 	}
 }
 
+// NewClientWithHTTPClient constructs a Client with a custom *http.Client
+// (e.g. one provisioned for mTLS). The caller owns the client's lifetime.
+func NewClientWithHTTPClient(url string, ttl time.Duration, httpClient *http.Client) *Client {
+	return &Client{
+		url:        url,
+		ttl:        ttl,
+		httpClient: httpClient,
+		byKid:      make(map[string]*rsa.PublicKey),
+	}
+}
+
 // PublicKey returns the RSA public key for kid, refreshing the cached JWKS
 // document if it's stale or the kid is unknown.
 // The two ways PublicKey can fail, as sentinels rather than bare strings.

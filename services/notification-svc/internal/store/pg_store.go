@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -48,7 +49,8 @@ const notificationColumns = `
 	COALESCE(source_event_type, ''), COALESCE(source_reference, ''),
 	correlation_id, COALESCE(failure_reason, ''), COALESCE(provider_response, ''),
 	created_by_principal_id, created_at, sent_at, read_at,
-	delivery_attempts, next_attempt_at, last_attempt_at`
+	delivery_attempts, next_attempt_at, last_attempt_at,
+	COALESCE(idempotency_key, ''), COALESCE(purpose_context, '')`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface{ Scan(dest ...any) error }
@@ -62,6 +64,7 @@ func scanNotification(s scannable, n *domain.Notification) error {
 		&n.CorrelationID, &n.FailureReason, &n.ProviderResponse,
 		&n.CreatedByPrincipalID, &n.CreatedAt, &n.SentAt, &n.ReadAt,
 		&n.DeliveryAttempts, &n.NextAttemptAt, &n.LastAttemptAt,
+		&n.IdempotencyKey, &n.PurposeContext,
 	)
 }
 
@@ -97,12 +100,20 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 }
 
 // CreateNotification inserts a new notification in PENDING status, idempotent
-// on (tenant_id, correlation_id): a retry finds the existing row instead of
-// sending a second notification for the same request.
+// on (tenant_id, idempotency_key): a retry replays the original delivery
+// outcome rather than sending a second notification for the same request.
+// The idempotency key is purpose-scoped — two different communications
+// sharing a correlation_id but with different purposes MUST NOT collide
+// (ZS-SVC-Y-001 §3.4).
 func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return false, domain.ErrIdentityMissing
+	}
+
+	// If no idempotency key provided, derive one from the purpose-scoped components
+	if n.IdempotencyKey == "" {
+		n.IdempotencyKey = fmt.Sprintf("%s|%s|%s|%s", tenantID, n.LegalEntityID, n.CorrelationID, n.PurposeContext)
 	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -111,13 +122,15 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 				notification_id, tenant_id, legal_entity_id, recipient_principal_id,
 				recipient_address, recipient_address_source,
 				channel, subject, body, status, source_event_type, source_reference,
-				correlation_id, created_by_principal_id, created_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-			ON CONFLICT (tenant_id, correlation_id) DO NOTHING
+				correlation_id, created_by_principal_id, created_at,
+				idempotency_key, purpose_context
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
 		`, n.NotificationID, tenantID, n.LegalEntityID, n.RecipientPrincipalID,
 			nullIfEmpty(n.RecipientAddress), nullIfEmpty(n.RecipientAddressSource),
 			n.Channel, n.Subject, n.Body, n.Status, n.SourceEventType, n.SourceReference,
-			n.CorrelationID, n.CreatedByPrincipalID, n.CreatedAt)
+			n.CorrelationID, n.CreatedByPrincipalID, n.CreatedAt,
+			n.IdempotencyKey, n.PurposeContext)
 		if err != nil {
 			return err
 		}
@@ -126,13 +139,13 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 			return nil
 		}
 
-		// Conflict: a notification for this (tenant_id, correlation_id)
+		// Conflict: a notification for this (tenant_id, idempotency_key)
 		// already exists — fetch it so the caller replays the original
 		// send outcome instead of sending a second, divergent one.
 		row := tx.QueryRow(ctx, `
 			SELECT `+notificationColumns+`
-			FROM notifications WHERE tenant_id = $1 AND correlation_id = $2
-		`, tenantID, n.CorrelationID)
+			FROM notifications WHERE tenant_id = $1 AND idempotency_key = $2
+		`, tenantID, n.IdempotencyKey)
 		return scanNotification(row, n)
 	})
 	if err != nil {
@@ -865,6 +878,148 @@ func (s *PgStore) OutboxDepth(ctx context.Context) (pending int64, oldestAge tim
 		return nil
 	})
 	return pending, oldestAge, err
+}
+
+// GetByIdempotencyKey returns the notification for a given purpose-scoped
+// idempotency key, or nil if not found. Used by the handler to replay
+// the original outcome instead of sending a duplicate.
+func (s *PgStore) GetByIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (*domain.Notification, error) {
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var n domain.Notification
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanNotification(tx.QueryRow(ctx, `
+			SELECT `+notificationColumns+`
+			FROM notifications
+			WHERE tenant_id = $1 AND idempotency_key = $2
+		`, tenantID, idempotencyKey), &n)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &n, nil
+}
+
+// CreateAttempt records a durable attempt record per §3.4.
+func (s *PgStore) CreateAttempt(ctx context.Context, a *domain.DeliveryAttempt) error {
+	if a.AttemptID == "" {
+		a.AttemptID = uuid.NewString()
+	}
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO delivery_attempts (
+				attempt_id, notification_id, attempt_number, channel, provider,
+				status, provider_response, failure_reason, retryable, resend_reason, created_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		`, a.AttemptID, a.NotificationID, a.AttemptNumber, a.Channel, a.Provider,
+			a.Status, nullIfEmpty(a.ProviderResponse), nullIfEmpty(a.FailureReason),
+			a.Retryable, nullIfEmpty(a.ResendReason), a.CreatedAt)
+		return err
+	})
+}
+
+// UpdateAttempt updates an attempt record with its conclusion.
+func (s *PgStore) UpdateAttempt(ctx context.Context, attemptID, status, failureReason, providerResponse string, concludedAt *time.Time) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE delivery_attempts
+			SET status = $1, failure_reason = $2, provider_response = $3, concluded_at = $4
+			WHERE attempt_id = $5
+		`, status, nullIfEmpty(failureReason), nullIfEmpty(providerResponse), concludedAt, attemptID)
+		return err
+	})
+}
+
+// GetAttempts returns all attempt records for a notification, ordered by attempt number.
+func (s *PgStore) GetAttempts(ctx context.Context, notificationID string) ([]domain.DeliveryAttempt, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var attempts []domain.DeliveryAttempt
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT attempt_id, notification_id, attempt_number, channel, provider,
+			       status, provider_response, failure_reason, retryable, resend_reason, created_at, concluded_at
+			FROM delivery_attempts
+			WHERE notification_id = $1
+			ORDER BY attempt_number
+		`, notificationID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a domain.DeliveryAttempt
+			if err := rows.Scan(&a.AttemptID, &a.NotificationID, &a.AttemptNumber, &a.Channel, &a.Provider,
+				&a.Status, &a.ProviderResponse, &a.FailureReason, &a.Retryable, &a.ResendReason,
+				&a.CreatedAt, &a.ConcludedAt); err != nil {
+				return err
+			}
+			attempts = append(attempts, a)
+		}
+		return rows.Err()
+	})
+	return attempts, err
+}
+
+// FindStuckInFlight finds notifications that are in flight (PENDING with no
+// next_attempt_at) for longer than the threshold. This is the reconciliation
+// step before re-attempting — ZS-SVC-Y-001 §3.4: "Timeout after submit
+// becomes UNKNOWN, not FAILED; reconcile before re-attempting".
+func (s *PgStore) FindStuckInFlight(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
+		return nil, fmt.Errorf("set platform scope: %w", err)
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT notification_id, tenant_id
+		FROM notifications
+		WHERE status = 'PENDING'
+		  AND next_attempt_at IS NULL
+		  AND COALESCE(last_attempt_at, created_at) <= $1
+		ORDER BY COALESCE(last_attempt_at, created_at)
+		LIMIT $2
+	`, staleBefore, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	var stuck []domain.DueRetry
+	for rows.Next() {
+		var d domain.DueRetry
+		if err := rows.Scan(&d.NotificationID, &d.TenantID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		stuck = append(stuck, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+	return stuck, nil
 }
 
 // nullIfEmpty writes SQL NULL for an empty optional string.

@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -13,6 +14,41 @@ import (
 )
 
 var testKey = []byte("a-test-key-at-least-thirty-two-bytes-long")
+
+// fakeStore implements store.Store for planner tests.
+type fakeStore struct{}
+
+func (f *fakeStore) CreateSource(ctx context.Context, s domain.SearchSource) error                   { return nil }
+func (f *fakeStore) GetSource(ctx context.Context, sourceID string) (*domain.SearchSource, error)   { return nil, domain.ErrNotFound }
+func (f *fakeStore) GetSourceByType(ctx context.Context, sourceType string) (*domain.SearchSource, error) { return nil, domain.ErrNotFound }
+func (f *fakeStore) ListSources(ctx context.Context) ([]domain.SearchSource, error)                { return nil, nil }
+func (f *fakeStore) CreateContract(ctx context.Context, c domain.IndexContract) error              { return nil }
+func (f *fakeStore) GetContract(ctx context.Context, contractID string) (*domain.IndexContract, error) { return nil, domain.ErrNotFound }
+func (f *fakeStore) GetPublishedContract(ctx context.Context, scopeName string) (*domain.IndexContract, error) { return nil, domain.ErrNotFound }
+func (f *fakeStore) ListContracts(ctx context.Context, scopeName string) ([]domain.IndexContract, error) { return nil, nil }
+func (f *fakeStore) TransitionContract(ctx context.Context, contractID string, from, to domain.ContractState) error { return nil }
+func (f *fakeStore) NextContractVersion(ctx context.Context, scopeName string) (int, error)          { return 1, nil }
+func (f *fakeStore) CreateGeneration(ctx context.Context, g domain.IndexGeneration) error           { return nil }
+func (f *fakeStore) GetGeneration(ctx context.Context, generationID string) (*domain.IndexGeneration, error) { return nil, domain.ErrNotFound }
+func (f *fakeStore) ListGenerations(ctx context.Context, scopeName string) ([]domain.IndexGeneration, error) { return nil, nil }
+func (f *fakeStore) GetActiveGeneration(ctx context.Context, scopeName string) (*domain.IndexGeneration, error) { return nil, domain.ErrNotFound }
+func (f *fakeStore) TransitionGeneration(ctx context.Context, generationID string, from, to domain.GenerationState, digest, note string) error { return nil }
+func (f *fakeStore) UpsertCheckpoint(ctx context.Context, cp domain.IndexCheckpoint) error          { return nil }
+func (f *fakeStore) ListCheckpoints(ctx context.Context, scopeName string) ([]domain.IndexCheckpoint, error) { return nil, nil }
+func (f *fakeStore) GetLatestCheckpoint(ctx context.Context, scopeName string) (*domain.IndexCheckpoint, error) { return nil, nil }
+func (f *fakeStore) GetProjectionRecord(ctx context.Context, tenantID, scope, sourceType, sourceID string) (*domain.ProjectionRecord, error) { return nil, nil }
+func (f *fakeStore) UpsertProjectionRecord(ctx context.Context, r domain.ProjectionRecord) (bool, error) { return true, nil }
+func (f *fakeStore) CountProjections(ctx context.Context, scopeName string) (int64, int64, error)    { return 0, 0, nil }
+func (f *fakeStore) UpsertTombstone(ctx context.Context, t domain.RestrictionTombstone, tombstoneID string) (bool, error) { return true, nil }
+func (f *fakeStore) MarkTombstoneState(ctx context.Context, tenantID, sourceType, sourceID, sourceEventID string, state domain.PropagationState, reason string) error { return nil }
+func (f *fakeStore) ListPendingVerification(ctx context.Context, limit int) ([]domain.RestrictionTombstone, error) { return nil, nil }
+func (f *fakeStore) ListTombstones(ctx context.Context, tenantID, scopeName string, limit int) ([]domain.RestrictionTombstone, error) { return nil, nil }
+func (f *fakeStore) RecordEvidence(ctx context.Context, e domain.SearchEvidence) error              { return nil }
+func (f *fakeStore) ListEvidence(ctx context.Context, tenantID, scopeName string, limit int) ([]domain.SearchEvidence, error) { return nil, nil }
+func (f *fakeStore) Ping(ctx context.Context) error                                                 { return nil }
+func (f *fakeStore) Close()                                                                        {}
+
+func planner() *Planner { return NewPlanner(DefaultLimits(), &fakeStore{}, testKey) }
 
 func contract() *domain.IndexContract {
 	return &domain.IndexContract{
@@ -58,8 +94,6 @@ func validContext() Context {
 	}
 }
 
-func planner() *Planner { return NewPlanner(DefaultLimits(), testKey) }
-
 func codeOf(t *testing.T, err error) domain.ReasonCode {
 	t.Helper()
 	require.Error(t, err)
@@ -74,7 +108,7 @@ func codeOf(t *testing.T, err error) domain.ReasonCode {
 // Request would make this fail to compile in spirit, so instead we prove the
 // compiled filter comes from context.
 func TestCompile_TenantFilterComesFromTrustedContextOnly(t *testing.T) {
-	plan, err := planner().Compile(Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
+	plan, err := planner().Compile(context.Background(), Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
 	require.NoError(t, err)
 
 	var tenantFilter *searchclient.TermFilter
@@ -96,7 +130,7 @@ func TestCompile_TenantFilterComesFromTrustedContextOnly(t *testing.T) {
 func TestCompile_RefusesWithoutTenant(t *testing.T) {
 	tc := validContext()
 	tc.TenantID = ""
-	_, err := planner().Compile(Request{Scope: "obligation"}, tc, contract(), generation())
+	_, err := planner().Compile(context.Background(), Request{Scope: "obligation"}, tc, contract(), generation())
 	assert.Equal(t, domain.ReasonTenantContextMissing, codeOf(t, err))
 }
 
@@ -105,7 +139,7 @@ func TestCompile_RefusesWithoutTenant(t *testing.T) {
 func TestCompile_RefusesWithoutPurpose(t *testing.T) {
 	tc := validContext()
 	tc.Purpose = ""
-	_, err := planner().Compile(Request{Scope: "obligation"}, tc, contract(), generation())
+	_, err := planner().Compile(context.Background(), Request{Scope: "obligation"}, tc, contract(), generation())
 	assert.Equal(t, domain.ReasonPrivacyPurposeBlocked, codeOf(t, err))
 }
 
@@ -118,7 +152,7 @@ func TestCompile_RefusesBareWorkloadWithNoPrincipal(t *testing.T) {
 		WorkloadID: "workload-rag-1",
 		Purpose:    "AI_ASSISTANT",
 	}
-	_, err := planner().Compile(Request{Scope: "obligation"}, tc, contract(), generation())
+	_, err := planner().Compile(context.Background(), Request{Scope: "obligation"}, tc, contract(), generation())
 	assert.Equal(t, domain.ReasonPartitionNotAuthorized, codeOf(t, err))
 }
 
@@ -129,16 +163,16 @@ func TestCompile_AllowsWorkloadActingForANamedPrincipal(t *testing.T) {
 		OnBehalfOf: "principal-1",
 		Purpose:    "AI_ASSISTANT",
 	}
-	_, err := planner().Compile(Request{Scope: "obligation"}, tc, contract(), generation())
+	_, err := planner().Compile(context.Background(), Request{Scope: "obligation"}, tc, contract(), generation())
 	require.NoError(t, err)
 }
 
 // ESR-002 / ESR-011.
 func TestCompile_RefusesUnregisteredScopeAndInactiveGeneration(t *testing.T) {
-	_, err := planner().Compile(Request{Scope: "nope"}, validContext(), nil, generation())
+	_, err := planner().Compile(context.Background(), Request{Scope: "nope"}, validContext(), nil, generation())
 	assert.Equal(t, domain.ReasonScopeNotRegistered, codeOf(t, err))
 
-	_, err = planner().Compile(Request{Scope: "obligation"}, validContext(), contract(), nil)
+	_, err = planner().Compile(context.Background(), Request{Scope: "obligation"}, validContext(), contract(), nil)
 	assert.Equal(t, domain.ReasonGenerationNotActive, codeOf(t, err))
 }
 
@@ -146,7 +180,7 @@ func TestCompile_RefusesUnregisteredScopeAndInactiveGeneration(t *testing.T) {
 // omitted — a caller that got a result without the field it asked for would
 // reasonably conclude the field was empty.
 func TestCompile_RefusesNonReturnableField(t *testing.T) {
-	_, err := planner().Compile(Request{
+	_, err := planner().Compile(context.Background(), Request{
 		Scope:           "obligation",
 		RequestedFields: []string{"obligation_code", "internal_risk_score"},
 	}, validContext(), contract(), generation())
@@ -159,19 +193,19 @@ func TestCompile_ProhibitedFieldIsIndistinguishableFromNonexistent(t *testing.T)
 	p := planner()
 	base := validContext()
 
-	prohibited := codeOf(t, mustErr(p.Compile(Request{
+	prohibited := codeOf(t, mustErr(p.Compile(context.Background(), Request{
 		Scope: "obligation", RequestedFields: []string{"api_secret"}}, base, contract(), generation())))
-	nonexistent := codeOf(t, mustErr(p.Compile(Request{
+	nonexistent := codeOf(t, mustErr(p.Compile(context.Background(), Request{
 		Scope: "obligation", RequestedFields: []string{"no_such_field_at_all"}}, base, contract(), generation())))
 	assert.Equal(t, nonexistent, prohibited)
 
-	prohibitedSort := codeOf(t, mustErr(p.Compile(Request{
+	prohibitedSort := codeOf(t, mustErr(p.Compile(context.Background(), Request{
 		Scope: "obligation", Sort: []SortRequest{{Field: "api_secret"}}}, base, contract(), generation())))
-	nonexistentSort := codeOf(t, mustErr(p.Compile(Request{
+	nonexistentSort := codeOf(t, mustErr(p.Compile(context.Background(), Request{
 		Scope: "obligation", Sort: []SortRequest{{Field: "no_such_field_at_all"}}}, base, contract(), generation())))
 	assert.Equal(t, nonexistentSort, prohibitedSort)
 
-	prohibitedFilter := codeOf(t, mustErr(p.Compile(Request{
+	prohibitedFilter := codeOf(t, mustErr(p.Compile(context.Background(), Request{
 		Scope: "obligation", Filters: map[string]string{"api_secret": "x"}}, base, contract(), generation())))
 	assert.Equal(t, domain.ReasonFieldNotSearchable, prohibitedFilter)
 }
@@ -179,7 +213,7 @@ func TestCompile_ProhibitedFieldIsIndistinguishableFromNonexistent(t *testing.T)
 // NP-53. A field that exists and is returnable but is NOT sortable is still
 // refused, and with the same code as a field that does not exist.
 func TestCompile_RefusesUnregisteredSortKey(t *testing.T) {
-	_, err := planner().Compile(Request{
+	_, err := planner().Compile(context.Background(), Request{
 		Scope: "obligation", Sort: []SortRequest{{Field: "obligation_code", Desc: true}},
 	}, validContext(), contract(), generation())
 	// obligation_code is searchable and returnable but not sortable.
@@ -191,7 +225,7 @@ func TestCompile_RefusesUnregisteredSortKey(t *testing.T) {
 func TestCompile_RefusesForbiddenOperators(t *testing.T) {
 	for _, text := range []string{"GST*", "GS?", "GST~2", "/GST.*/"} {
 		t.Run(text, func(t *testing.T) {
-			_, err := planner().Compile(Request{Scope: "obligation", Text: text},
+			_, err := planner().Compile(context.Background(), Request{Scope: "obligation", Text: text},
 				validContext(), contract(), generation())
 			assert.Equal(t, domain.ReasonQueryOperatorForbidden, codeOf(t, err))
 		})
@@ -200,7 +234,7 @@ func TestCompile_RefusesForbiddenOperators(t *testing.T) {
 
 // NP-54. A one-character query enumerates rather than searches.
 func TestCompile_RefusesQueryShorterThanMinimum(t *testing.T) {
-	_, err := planner().Compile(Request{Scope: "obligation", Text: "A"},
+	_, err := planner().Compile(context.Background(), Request{Scope: "obligation", Text: "A"},
 		validContext(), contract(), generation())
 	assert.Equal(t, domain.ReasonQueryComplexityExceeded, codeOf(t, err))
 }
@@ -210,21 +244,21 @@ func TestCompile_RefusesQueryShorterThanMinimum(t *testing.T) {
 // combining mark.
 func TestCompile_NormalisesUnicodeBeforeLengthCheck(t *testing.T) {
 	// "e" + combining acute is two runes but one character after NFKC.
-	_, err := planner().Compile(Request{Scope: "obligation", Text: "é"},
+	_, err := planner().Compile(context.Background(), Request{Scope: "obligation", Text: "é"},
 		validContext(), contract(), generation())
 	assert.Equal(t, domain.ReasonQueryComplexityExceeded, codeOf(t, err),
 		"a decomposed single character must not pass the minimum-length check")
 }
 
 func TestCompile_RefusesControlCharacters(t *testing.T) {
-	_, err := planner().Compile(Request{Scope: "obligation", Text: "GST\x00filing"},
+	_, err := planner().Compile(context.Background(), Request{Scope: "obligation", Text: "GST\x00filing"},
 		validContext(), contract(), generation())
 	assert.Equal(t, domain.ReasonQueryOperatorForbidden, codeOf(t, err))
 }
 
 // ESR-015 / NP-21.
 func TestCompile_RefusesOversizedPage(t *testing.T) {
-	_, err := planner().Compile(Request{Scope: "obligation", Size: 5000},
+	_, err := planner().Compile(context.Background(), Request{Scope: "obligation", Size: 5000},
 		validContext(), contract(), generation())
 	assert.Equal(t, domain.ReasonResultWindowExceeded, codeOf(t, err))
 }
@@ -233,9 +267,9 @@ func TestCompile_RefusesOversizedPage(t *testing.T) {
 func TestCompile_RefusesPlanOverComplexityBudget(t *testing.T) {
 	limits := DefaultLimits()
 	limits.MaxComplexityScore = 15
-	p := NewPlanner(limits, testKey)
+	p := NewPlanner(limits, &fakeStore{}, testKey)
 
-	_, err := p.Compile(Request{
+	_, err := p.Compile(context.Background(), Request{
 		Scope: "obligation", Text: "GST",
 		Facets: []string{"obligation_status", "obligation_status", "obligation_status"},
 	}, validContext(), contract(), generation())
@@ -246,7 +280,7 @@ func TestCompile_RefusesPlanOverComplexityBudget(t *testing.T) {
 // to express their negation — a user filter lands in a separate slice that is
 // ANDed alongside, never ORed with, and never subtracted from.
 func TestCompile_UserFiltersCanOnlyNarrow(t *testing.T) {
-	plan, err := planner().Compile(Request{
+	plan, err := planner().Compile(context.Background(), Request{
 		Scope:   "obligation",
 		Filters: map[string]string{"obligation_status": "OPEN"},
 	}, validContext(), contract(), generation())
@@ -265,7 +299,7 @@ func TestCompile_UserFiltersCanOnlyNarrow(t *testing.T) {
 
 // INV-18's query-side half: a tombstoned projection is never a candidate.
 func TestCompile_AlwaysExcludesTombstonedDocuments(t *testing.T) {
-	plan, err := planner().Compile(Request{Scope: "obligation"}, validContext(), contract(), generation())
+	plan, err := planner().Compile(context.Background(), Request{Scope: "obligation"}, validContext(), contract(), generation())
 	require.NoError(t, err)
 	require.Len(t, plan.Execution.MandatoryMustNot, 1)
 	assert.Equal(t, "tombstoned", plan.Execution.MandatoryMustNot[0].Field)
@@ -274,7 +308,7 @@ func TestCompile_AlwaysExcludesTombstonedDocuments(t *testing.T) {
 
 // NP-16. Residency comes from trusted context and narrows the partition set.
 func TestCompile_AppliesResidencyFilterFromContext(t *testing.T) {
-	plan, err := planner().Compile(Request{Scope: "obligation"}, validContext(), contract(), generation())
+	plan, err := planner().Compile(context.Background(), Request{Scope: "obligation"}, validContext(), contract(), generation())
 	require.NoError(t, err)
 
 	var residency *searchclient.TermFilter
@@ -291,7 +325,7 @@ func TestCompile_AppliesResidencyFilterFromContext(t *testing.T) {
 // §6.1's deny-by-default projection: with nothing requested, only fields the
 // contract marked returnable come back, plus governance lineage.
 func TestCompile_DefaultProjectionIsReturnableFieldsOnly(t *testing.T) {
-	plan, err := planner().Compile(Request{Scope: "obligation"}, validContext(), contract(), generation())
+	plan, err := planner().Compile(context.Background(), Request{Scope: "obligation"}, validContext(), contract(), generation())
 	require.NoError(t, err)
 
 	includes := strings.Join(plan.Execution.SourceIncludes, ",")
@@ -305,7 +339,7 @@ func TestCompile_DefaultProjectionIsReturnableFieldsOnly(t *testing.T) {
 // returnable AND searchable; a field that is only matchable contributes to
 // ranking without contributing a fragment.
 func TestCompile_SnippetsOnlyFromSnippetAllowedFields(t *testing.T) {
-	plan, err := planner().Compile(Request{
+	plan, err := planner().Compile(context.Background(), Request{
 		Scope: "obligation", Text: "GST", IncludeSnippets: true,
 	}, validContext(), contract(), generation())
 	require.NoError(t, err)
@@ -318,7 +352,7 @@ func TestCompile_SnippetsOnlyFromSnippetAllowedFields(t *testing.T) {
 // A TEXT field filtered on must use its keyword sub-field, or the "filter"
 // matches a token rather than the value.
 func TestCompile_TextFilterUsesKeywordSubfield(t *testing.T) {
-	plan, err := planner().Compile(Request{
+	plan, err := planner().Compile(context.Background(), Request{
 		Scope: "obligation", Filters: map[string]string{"obligation_code": "GST-Q4-2026"},
 	}, validContext(), contract(), generation())
 	require.NoError(t, err)
@@ -334,7 +368,7 @@ func TestCompile_TextOnScopeWithNoSearchableFieldIsRefused(t *testing.T) {
 	for i := range c.Fields {
 		c.Fields[i].Searchable = false
 	}
-	_, err := planner().Compile(Request{Scope: "obligation", Text: "anything"},
+	_, err := planner().Compile(context.Background(), Request{Scope: "obligation", Text: "anything"},
 		validContext(), c, generation())
 	assert.Equal(t, domain.ReasonFieldNotSearchable, codeOf(t, err))
 }
@@ -343,9 +377,9 @@ func TestCompile_TextOnScopeWithNoSearchableFieldIsRefused(t *testing.T) {
 // cursor to the query that produced it (NP-56).
 func TestCompile_PlanDigestChangesWithFilters(t *testing.T) {
 	p := planner()
-	a, err := p.Compile(Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
+	a, err := p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
 	require.NoError(t, err)
-	b, err := p.Compile(Request{Scope: "obligation", Text: "GST",
+	b, err := p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST",
 		Filters: map[string]string{"obligation_status": "OPEN"}}, validContext(), contract(), generation())
 	require.NoError(t, err)
 	assert.NotEqual(t, a.PlanDigest, b.PlanDigest)
@@ -353,7 +387,7 @@ func TestCompile_PlanDigestChangesWithFilters(t *testing.T) {
 
 // INV-17. The evidence carries a digest of the query, never the query.
 func TestCompile_QueryDigestIsNotTheQueryText(t *testing.T) {
-	plan, err := planner().Compile(Request{
+	plan, err := planner().Compile(context.Background(), Request{
 		Scope: "obligation", Text: "termination of Jane Doe misconduct",
 	}, validContext(), contract(), generation())
 	require.NoError(t, err)
@@ -365,7 +399,7 @@ func TestCompile_QueryDigestIsNotTheQueryText(t *testing.T) {
 // NP-57. A cursor edited to name a different tenant does not verify.
 func TestCompile_RejectsCursorForAnotherTenant(t *testing.T) {
 	p := planner()
-	plan, err := p.Compile(Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
+	plan, err := p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
 	require.NoError(t, err)
 
 	// A cursor legitimately minted for another tenant, with a valid signature.
@@ -375,7 +409,7 @@ func TestCompile_RejectsCursorForAnotherTenant(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = p.Compile(Request{Scope: "obligation", Text: "GST", Cursor: foreign},
+	_, err = p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST", Cursor: foreign},
 		validContext(), contract(), generation())
 	assert.Equal(t, domain.ReasonResultWindowExceeded, codeOf(t, err))
 }
@@ -383,13 +417,13 @@ func TestCompile_RejectsCursorForAnotherTenant(t *testing.T) {
 // NP-56. A cursor from a different filter set does not carry over.
 func TestCompile_RejectsCursorFromADifferentPlan(t *testing.T) {
 	p := planner()
-	narrow, err := p.Compile(Request{Scope: "obligation", Text: "GST",
+	narrow, err := p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST",
 		Filters: map[string]string{"obligation_status": "OPEN"}}, validContext(), contract(), generation())
 	require.NoError(t, err)
 	cursor, err := p.NextCursor(narrow, "tenant-a", []any{1.0})
 	require.NoError(t, err)
 
-	_, err = p.Compile(Request{Scope: "obligation", Text: "GST", Cursor: cursor},
+	_, err = p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST", Cursor: cursor},
 		validContext(), contract(), generation())
 	assert.Equal(t, domain.ReasonResultWindowExceeded, codeOf(t, err),
 		"a cursor must not survive a change to the query it paged")
@@ -399,13 +433,13 @@ func TestCompile_RejectsCursorFromADifferentPlan(t *testing.T) {
 // search_after rather than as an offset.
 func TestCompile_AcceptsItsOwnCursor(t *testing.T) {
 	p := planner()
-	plan, err := p.Compile(Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
+	plan, err := p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
 	require.NoError(t, err)
 	cursor, err := p.NextCursor(plan, "tenant-a", []any{2.5, "ob-9"})
 	require.NoError(t, err)
 	require.NotEmpty(t, cursor)
 
-	next, err := p.Compile(Request{Scope: "obligation", Text: "GST", Cursor: cursor},
+	next, err := p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST", Cursor: cursor},
 		validContext(), contract(), generation())
 	require.NoError(t, err)
 	assert.Equal(t, []any{2.5, "ob-9"}, next.Execution.SearchAfter)
@@ -416,9 +450,9 @@ func TestCompile_AcceptsItsOwnCursor(t *testing.T) {
 func TestCompile_RefusesCursorPastThePageLimit(t *testing.T) {
 	limits := DefaultLimits()
 	limits.MaxPages = 3
-	p := NewPlanner(limits, testKey)
+	p := NewPlanner(limits, &fakeStore{}, testKey)
 
-	plan, err := p.Compile(Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
+	plan, err := p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST"}, validContext(), contract(), generation())
 	require.NoError(t, err)
 	exhausted, err := EncodeCursor(testKey, Cursor{
 		TenantID: "tenant-a", Scope: "obligation", PlanDigest: plan.PlanDigest,
@@ -426,7 +460,7 @@ func TestCompile_RefusesCursorPastThePageLimit(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = p.Compile(Request{Scope: "obligation", Text: "GST", Cursor: exhausted},
+	_, err = p.Compile(context.Background(), Request{Scope: "obligation", Text: "GST", Cursor: exhausted},
 		validContext(), contract(), generation())
 	assert.Equal(t, domain.ReasonResultWindowExceeded, codeOf(t, err))
 }
@@ -457,7 +491,7 @@ func TestCompile_EngineIdentifiersMatchOnWordBoundariesOnly(t *testing.T) {
 	}
 	for _, text := range allowed {
 		t.Run("allowed/"+text, func(t *testing.T) {
-			_, err := planner().Compile(Request{Scope: "obligation", Text: text},
+			_, err := planner().Compile(context.Background(), Request{Scope: "obligation", Text: text},
 				validContext(), contract(), generation())
 			require.NoError(t, err, "a legitimate business term must not be refused")
 		})
@@ -466,7 +500,7 @@ func TestCompile_EngineIdentifiersMatchOnWordBoundariesOnly(t *testing.T) {
 	refused := []string{"script", "SCRIPT", "a script here", "painless", "_index", "_source", "_score"}
 	for _, text := range refused {
 		t.Run("refused/"+text, func(t *testing.T) {
-			_, err := planner().Compile(Request{Scope: "obligation", Text: text},
+			_, err := planner().Compile(context.Background(), Request{Scope: "obligation", Text: text},
 				validContext(), contract(), generation())
 			assert.Equal(t, domain.ReasonQueryOperatorForbidden, codeOf(t, err))
 		})

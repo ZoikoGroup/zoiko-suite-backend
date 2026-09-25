@@ -18,8 +18,10 @@ import (
 	"zoiko.io/secret-vault-integration-svc/internal/authz"
 	"zoiko.io/secret-vault-integration-svc/internal/classification"
 	"zoiko.io/secret-vault-integration-svc/internal/domain"
+	svcenvelope "zoiko.io/secret-vault-integration-svc/internal/envelope"
 	svcmiddleware "zoiko.io/secret-vault-integration-svc/internal/middleware"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
+	"zoiko.io/secret-vault-integration-svc/internal/vault"
 )
 
 // SecretVaultStore is the narrow interface the handler depends on.
@@ -45,6 +47,11 @@ type SecretVaultStore interface {
 	RecordAuditEntry(ctx context.Context, params domain.RecordAuditEntryParams) (*domain.SecretAccessAuditLog, error)
 	FindAuditEntryByRotationRequestID(ctx context.Context, requestID string) (*domain.SecretAccessAuditLog, error)
 	ListAuditLog(ctx context.Context, filter store.AuditListFilter) ([]*domain.SecretAccessAuditLog, error)
+
+	CreateSharedSecretException(ctx context.Context, params domain.SharedSecretException) (*domain.SharedSecretException, bool, error)
+	FindSharedSecretExceptionByID(ctx context.Context, exceptionID, tenantID string) (*domain.SharedSecretException, error)
+	ListSharedSecretExceptions(ctx context.Context, filter domain.ListSharedSecretExceptionsFilter) ([]*domain.SharedSecretException, error)
+	RevokeSharedSecretException(ctx context.Context, exceptionID, tenantID, actorID string) (*domain.SharedSecretException, bool, error)
 }
 
 // VaultBackend is the narrow interface the handler depends on for the
@@ -56,7 +63,9 @@ type SecretVaultStore interface {
 // — the grant path was completely unreachable end to end). Administrative
 // seeding, never called from the broker flow itself.
 type VaultBackend interface {
-	Get(ctx context.Context, secretPath string) (leaseToken string, err error)
+	Get(ctx context.Context, secretPath string, expiresAt time.Time) (leaseToken string, err error)
+	Verify(ctx context.Context, leaseToken string) (info vault.LeaseTokenInfo, err error)
+	GetMaterial(ctx context.Context, secretPath string) ([]byte, error)
 	Put(ctx context.Context, secretPath string, material []byte) error
 	Rotate(ctx context.Context, secretPath string) error
 }
@@ -81,6 +90,10 @@ type Handler struct {
 	// administration, which is platform-scoped rather than entity-scoped.
 	// authorization-svc rejects an empty legal_entity_id.
 	authzPlatformScopeID string
+
+	// maxLeaseDurationCeiling is the platform-wide ceiling for
+	// max_lease_duration_seconds on secret policy versions. 0 means no ceiling.
+	maxLeaseDurationCeiling int
 
 	// metrics is never nil -- New installs nopMetrics.
 	metrics DomainMetrics
@@ -119,15 +132,16 @@ func (nopMetrics) AuthzDecision(string, string) {}
 func (nopMetrics) VaultBackendError(string)     {}
 
 // New constructs a Handler.
-func New(store SecretVaultStore, vault VaultBackend, publisher EventPublisher, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
+func New(store SecretVaultStore, vault VaultBackend, publisher EventPublisher, authzClient authz.Client, authzPlatformScopeID string, maxLeaseDurationCeiling int, log *zap.Logger) *Handler {
 	return &Handler{
-		store:                store,
-		vault:                vault,
-		publisher:            publisher,
-		authz:                authzClient,
-		authzPlatformScopeID: authzPlatformScopeID,
-		log:                  log,
-		metrics:              nopMetrics{},
+		store:                    store,
+		vault:                    vault,
+		publisher:                publisher,
+		authz:                    authzClient,
+		authzPlatformScopeID:     authzPlatformScopeID,
+		maxLeaseDurationCeiling:  maxLeaseDurationCeiling,
+		log:                      log,
+		metrics:                  nopMetrics{},
 	}
 }
 
@@ -151,12 +165,20 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/secret-policies/{secret_policy_id}/versions", h.ListVersionHistory)
 	r.Post("/v1/secret-policies/{secret_policy_id}/rotate", h.Rotate)
 	r.Post("/v1/secret-policies/{secret_policy_id}/material", h.PutSecretMaterial)
+	r.Post("/v1/secret-policies/{secret_policy_id}/emergency-retrieval", h.EmergencyRetrieval)
 
 	r.Post("/v1/secrets/broker", h.Broker)
 	r.Get("/v1/secrets/leases/{lease_id}", h.GetLease)
+	r.Post("/v1/secrets/leases/{lease_id}/verify", h.VerifyLease)
 	r.Get("/v1/secrets/leases", h.ListLeases)
 	r.Post("/v1/secrets/leases/{lease_id}/revoke", h.RevokeLease)
 	r.Get("/v1/secrets/audit", h.ListAuditLog)
+
+	// §13 controls: shared-secret exception register (break-glass evidence
+	// must be answerable from inside this service, not from a runbook).
+	r.Post("/v1/shared-secret-exceptions", h.CreateSharedSecretException)
+	r.Get("/v1/shared-secret-exceptions", h.ListSharedSecretExceptions)
+	r.Post("/v1/shared-secret-exceptions/{exception_id}/revoke", h.RevokeSharedSecretException)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -256,6 +278,9 @@ type createSecretPolicyVersionRequest struct {
 	EffectiveFrom           time.Time       `json:"effective_from"`
 	EffectiveTo             *time.Time      `json:"effective_to,omitempty"`
 	CreatedByPrincipalID    string          `json:"created_by_principal_id"`
+	// RotationIntervalSeconds, when > 0, schedules automated material
+	// rotation for this version (compliance-close §13).
+	RotationIntervalSeconds int `json:"rotation_interval_seconds,omitempty"`
 }
 
 func (req createSecretPolicyVersionRequest) missingField() string {
@@ -267,6 +292,13 @@ func (req createSecretPolicyVersionRequest) missingField() string {
 	default:
 		return ""
 	}
+}
+
+func (req createSecretPolicyVersionRequest) rotationInterval() int {
+	if req.RotationIntervalSeconds < 0 {
+		return 0
+	}
+	return req.RotationIntervalSeconds
 }
 
 // CreateSecretPolicyVersion handles
@@ -298,6 +330,14 @@ func (h *Handler) CreateSecretPolicyVersion(w http.ResponseWriter, r *http.Reque
 	if req.MaxLeaseDurationSeconds <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "invalid_field", "field": "max_lease_duration_seconds", "message": "must be greater than 0",
+		})
+		return
+	}
+	if h.maxLeaseDurationCeiling > 0 && req.MaxLeaseDurationSeconds > h.maxLeaseDurationCeiling {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_field",
+			"field":   "max_lease_duration_seconds",
+			"message": fmt.Sprintf("exceeds platform maximum of %d seconds", h.maxLeaseDurationCeiling),
 		})
 		return
 	}
@@ -333,6 +373,7 @@ func (h *Handler) CreateSecretPolicyVersion(w http.ResponseWriter, r *http.Reque
 		EffectiveFrom:           req.EffectiveFrom,
 		EffectiveTo:             req.EffectiveTo,
 		CreatedByPrincipalID:    req.CreatedByPrincipalID,
+		RotationIntervalSeconds: req.rotationInterval(),
 	})
 	if err != nil {
 		switch {
@@ -549,6 +590,14 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretPolicyVersionList) {
+		return
+	}
+
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
 		return
@@ -585,6 +634,15 @@ func (h *Handler) ListApplicableSecretPolicyVersions(w http.ResponseWriter, r *h
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "secret_class"})
 		return
 	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretPolicyList) {
+		return
+	}
+
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
 		return
@@ -692,27 +750,43 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		correlationID = req.CorrelationID
 	}
 
+	// The authorization input for the allowlist gate is the gateway-verified
+	// envelope identity, never the body. §9 "the receiving service revalidates
+	// forwarded context": this is the credential-issuing endpoint of the
+	// platform, so a requested_by_principal_id that disagrees with the verified
+	// actor is an identity the caller could not prove. Before, any caller
+	// inside the right tenant who knew a name from allowed_workload_ids got a
+	// lease — and the audit trail recorded that guessed name as both requester
+	// and actor, so the evidence vouched for the impersonation.
+	//
+	// Actor() prefers X-Principal-Id — the one header the gateway overwrites
+	// from the verified token — over X-Workload-Id. FromContext is the
+	// middleware-entered envelope (main.go mounts it); the Parse fallback
+	// covers a handler built without it, the same direct-header path
+	// requirePrincipal and requireTenant already take.
+	env, ok := svcenvelope.FromContext(r.Context())
+	if !ok {
+		env = svcenvelope.Parse(r)
+	}
+	if req.RequestedByPrincipalID != env.Actor() {
+		// REQUESTED is recorded regardless of outcome; then a DENIED entry
+		// whose SUBJECT is the claimed identity and whose ACTOR is the
+		// verified caller — deliberately two different names, so the audit is
+		// not wrong in exactly the case it must be right.
+		h.recordRequested(r.Context(), req, correlationID)
+		h.recordDenial(r.Context(), req, "", nil,
+			"requested_by_principal_id does not match the gateway-verified envelope identity (X-Principal-Id / X-Workload-Id)",
+			correlationID, env.Actor())
+		h.metrics.BrokerDecision("denied")
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":       "workload_identity_mismatch",
+			"secret_path": req.SecretPath,
+		})
+		return
+	}
+
 	// Step 1: REQUESTED is recorded regardless of outcome.
-	if err := h.publisher.PublishAccessRequested(r.Context(), req.SecretPath, req.RequestedByPrincipalID, correlationID); err != nil {
-		h.log.Error("Broker: failed to publish secret.access.requested", zap.String("correlation_id", correlationID), zap.Error(err))
-	}
-	if _, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
-		EventType:              "REQUESTED",
-		SecretClass:            "",
-		SecretPath:             req.SecretPath,
-		RequestedByPrincipalID: req.RequestedByPrincipalID,
-		// On the broker path the workload asks for its own access, so
-		// actor and subject are the same principal. Recorded anyway
-		// rather than left NULL: "who did this" must be answerable by
-		// one predicate across all five event types, without the reader
-		// having to know which ones happen to coincide.
-		ActedByPrincipalID: &req.RequestedByPrincipalID,
-		TenantID:           req.TenantID,
-		LegalEntityID:          req.LegalEntityID,
-		CorrelationID:          correlationID,
-	}); err != nil {
-		h.log.Error("Broker: failed to record REQUESTED audit entry", zap.String("correlation_id", correlationID), zap.Error(err))
-	}
+	h.recordRequested(r.Context(), req, correlationID)
 
 	// Step 2: resolve the applicable policy version by secret_path.
 	applicable, err := h.store.FindApplicableVersionByPath(r.Context(), req.SecretPath, req.TenantID, req.LegalEntityID)
@@ -722,7 +796,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 			// Step 3: deny-by-absence — no policy, or none ACTIVE for this
 			// scope. secret_class is genuinely unknown here — no policy
 			// was ever resolved to read it from.
-			h.recordDenial(r.Context(), req, "", nil, "no applicable secret policy for this path/scope", correlationID)
+			h.recordDenial(r.Context(), req, "", nil, "no applicable secret policy for this path/scope", correlationID, req.RequestedByPrincipalID)
 			h.metrics.BrokerDecision("no_policy")
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no_applicable_secret_policy", "secret_path": req.SecretPath})
 		default:
@@ -745,7 +819,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		// secret_class IS known here — a policy was resolved, it just
 		// didn't authorize this caller. Recording it keeps this DENIED
 		// entry as complete evidence as a GRANTED one (context.md §5).
-		h.recordDenial(r.Context(), req, applicable.SecretClass, &applicable.SecretPolicyVersionID, "requesting principal not in allowed_workload_ids", correlationID)
+		h.recordDenial(r.Context(), req, applicable.SecretClass, &applicable.SecretPolicyVersionID, "requesting principal not in allowed_workload_ids", correlationID, req.RequestedByPrincipalID)
 		h.metrics.BrokerDecision("denied")
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied", "secret_path": req.SecretPath})
 		return
@@ -753,7 +827,11 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 
 	// Step 5: grant. Vault call happens before the durable write so a
 	// vault failure never leaves a lease row with no token ever issued.
-	leaseToken, err := h.vault.Get(r.Context(), req.SecretPath)
+	// The expiry is fixed up front and signed into the lease token: since
+	// the audit, a token is bound to the lease's own expiry, so an expired
+	// (or later revoked) lease no longer vouches for access on paper.
+	expiresAt := time.Now().UTC().Add(time.Duration(applicable.MaxLeaseDurationSeconds) * time.Second)
+	leaseToken, err := h.vault.Get(r.Context(), req.SecretPath, expiresAt)
 	if err != nil {
 		h.log.Error("Broker: vault backend unavailable", zap.String("secret_path", req.SecretPath), zap.Error(err))
 		h.metrics.VaultBackendError("get")
@@ -762,7 +840,6 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expiresAt := time.Now().UTC().Add(time.Duration(applicable.MaxLeaseDurationSeconds) * time.Second)
 	lease, created, err := h.store.CreateLease(r.Context(), domain.CreateLeaseParams{
 		RequestID:              req.RequestID,
 		SecretPolicyVersionID:  applicable.SecretPolicyVersionID,
@@ -811,13 +888,38 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) recordDenial(ctx context.Context, req brokerRequest, secretClass string, secretPolicyVersionID *string, detail, correlationID string) {
+// recordRequested records the REQUESTED fact every broker attempt produces,
+// before any decision is taken.
+func (h *Handler) recordRequested(ctx context.Context, req brokerRequest, correlationID string) {
+	if err := h.publisher.PublishAccessRequested(ctx, req.SecretPath, req.RequestedByPrincipalID, correlationID); err != nil {
+		h.log.Error("Broker: failed to publish secret.access.requested", zap.String("correlation_id", correlationID), zap.Error(err))
+	}
+	if _, err := h.store.RecordAuditEntry(ctx, domain.RecordAuditEntryParams{
+		EventType:              "REQUESTED",
+		SecretClass:            "",
+		SecretPath:             req.SecretPath,
+		RequestedByPrincipalID: req.RequestedByPrincipalID,
+		// On the broker path the workload asks for its own access, so
+		// actor and subject are the same principal. Recorded anyway
+		// rather than left NULL: "who did this" must be answerable by
+		// one predicate across all five event types, without the reader
+		// having to know which ones happen to coincide.
+		ActedByPrincipalID: &req.RequestedByPrincipalID,
+		TenantID:           req.TenantID,
+		LegalEntityID:      req.LegalEntityID,
+		CorrelationID:      correlationID,
+	}); err != nil {
+		h.log.Error("Broker: failed to record REQUESTED audit entry", zap.String("correlation_id", correlationID), zap.Error(err))
+	}
+}
+
+func (h *Handler) recordDenial(ctx context.Context, req brokerRequest, secretClass string, secretPolicyVersionID *string, detail, correlationID, actedBy string) {
 	if _, err := h.store.RecordAuditEntry(ctx, domain.RecordAuditEntryParams{
 		EventType:              "DENIED",
 		SecretClass:            secretClass,
 		SecretPath:             req.SecretPath,
 		RequestedByPrincipalID: req.RequestedByPrincipalID,
-		ActedByPrincipalID:     &req.RequestedByPrincipalID,
+		ActedByPrincipalID:     &actedBy,
 		TenantID:               req.TenantID,
 		LegalEntityID:          req.LegalEntityID,
 		SecretPolicyVersionID:  secretPolicyVersionID,
@@ -846,6 +948,14 @@ func (h *Handler) GetLease(w http.ResponseWriter, r *http.Request) {
 	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretLeaseRead) {
+		return
+	}
+
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
 		return
@@ -871,11 +981,131 @@ func (h *Handler) GetLease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, lease)
 }
 
+// ── POST /v1/secrets/leases/{lease_id}/verify ────────────────────────────────
+
+// VerifyLease is the redemption surface the audit said did not exist:
+// "nothing consumes the token, so neither control [expiry, revoke] has
+// effect." A lease token is now signed, bound to its secret path and to the
+// lease's own expiry, and a holder can present it here and get a real
+// answer. Expiry is rejected with no database read (the token itself
+// refuses); revocation requires consulting the lease register the token
+// is bound to — an expired token was real invalidation but a revoked lease
+// still held a still-valid signature, so the register is the second gate.
+//
+// A malformed or mis-binding token answers 400 (a client fault). An
+// expired or revoked lease answers 200 with valid=false: the caller asked
+// "is this still good" and the honest answer is "no", with the reason.
+func (h *Handler) VerifyLease(w http.ResponseWriter, r *http.Request) {
+	leaseID, ok := requireUUIDParam(w, r, "lease_id")
+	if !ok {
+		return
+	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req verifyLeaseRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LeaseToken == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "lease_token"})
+		return
+	}
+
+	info, err := h.vault.Verify(r.Context(), req.LeaseToken)
+	if err != nil {
+		// Expired tokens ARE validly signed; they are just past their
+		// bound. Everything else is a client fault.
+		if errors.Is(err, vault.ErrLeaseTokenExpired) {
+			writeJSON(w, http.StatusOK, verifyLeaseResponse{
+				Valid:     false,
+				LeaseID:   leaseID,
+				ExpiresAt: info.ExpiresAt,
+				Reason:    "token_expired",
+			})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_lease_token"})
+		return
+	}
+
+	lease, err := h.store.FindLeaseByID(r.Context(), leaseID, tenantScope)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrLeaseNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "lease_not_found", "lease_id": leaseID})
+		default:
+			h.log.Error("VerifyLease: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+	if h.refuseForeignRow(w, lease.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
+		return
+	}
+	if lease.SecretPath != info.SecretPath {
+		h.log.Warn("VerifyLease refused: token bound to a different secret path",
+			zap.String("lease_id", leaseID),
+			zap.String("token_secret_path", info.SecretPath),
+			zap.String("lease_secret_path", lease.SecretPath),
+			zap.String("correlation_id", correlationID),
+		)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "lease_token_mismatch"})
+		return
+	}
+
+	resp := verifyLeaseResponse{
+		Valid:      true,
+		LeaseID:    lease.LeaseID,
+		SecretPath: lease.SecretPath,
+		Status:     lease.Status,
+		ExpiresAt:  info.ExpiresAt,
+	}
+	switch lease.Status {
+	case "REVOKED":
+		resp.Valid, resp.Reason = false, "lease_revoked"
+	case "EXPIRED":
+		resp.Valid, resp.Reason = false, "lease_expired"
+	case "GRANTED":
+		// Still within the token's bound (the backend already refused an
+		// expired token), and the lease register says GRANTED: this is the
+		// only path that answers true.
+	default:
+		resp.Valid, resp.Reason = false, "lease_"+lease.Status
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type verifyLeaseRequest struct {
+	LeaseToken string `json:"lease_token"`
+}
+
+type verifyLeaseResponse struct {
+	Valid      bool      `json:"valid"`
+	LeaseID    string    `json:"lease_id"`
+	SecretPath string    `json:"secret_path,omitempty"`
+	Status     string    `json:"status,omitempty"`
+	ExpiresAt  time.Time `json:"expires_at,omitempty"`
+	Reason     string    `json:"reason,omitempty"`
+}
+
 // ── GET /v1/secrets/leases ───────────────────────────────────────────────────
 
 func (h *Handler) ListLeases(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretLeaseRead) {
+		return
+	}
 
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
@@ -1128,7 +1358,7 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	policy, err := h.store.FindSecretPolicyByID(r.Context(), secretPolicyID)
+	secretPath, revokedLeases, rotatedAt, err := h.PerformRotation(r.Context(), secretPolicyID, req.RotatedByPrincipalID, &tenantScope, req.RequestID, correlationID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound):
@@ -1140,23 +1370,47 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.vault.Rotate(r.Context(), policy.SecretPath); err != nil {
-		h.log.Error("Rotate: vault backend rotate failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
-		h.metrics.VaultBackendError("rotate")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
-		return
+	writeJSON(w, http.StatusOK, rotateResponse{
+		SecretPolicyID:    secretPolicyID,
+		SecretPath:        secretPath,
+		RevokedLeaseCount: revokedLeases,
+		RotatedAt:         rotatedAt,
+	})
+}
+
+// PerformRotation is the shared core of POST /v1/secret-policies/{id}/rotate
+// and the automated rotation sweeper (§13): rotate the vault material, mass
+// revoke every GRANTED lease across every tenant, then record REVOKED and
+// ROTATED audit evidence and publish secret.rotation.completed. Returns the
+// policy's secret path, the number of leases revoked, and the rotation
+// timestamp.
+//
+// rotatedByPrincipalID names the human/operator driving the rotation;
+// correlationID ties it to the caller. For sweeper-driven rotations the
+// actor is the sweeper's own system identity. The idempotency check on
+// request_id is the caller's responsibility — PerformRotation is only ever
+// called after a confirmed-new rotation request id.
+func (h *Handler) PerformRotation(ctx context.Context, secretPolicyID, rotatedByPrincipalID string, tenantScope *string, requestID, correlationID string) (string, int, time.Time, error) {
+	policy, err := h.store.FindSecretPolicyByID(ctx, secretPolicyID)
+	if err != nil {
+		return "", 0, time.Time{}, err
 	}
 
-	revokedLeases, err := h.store.RevokeLeasesBySecretPath(r.Context(), policy.SecretPath)
+	if err := h.vault.Rotate(ctx, policy.SecretPath); err != nil {
+		h.log.Error("PerformRotation: vault backend rotate failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
+		h.metrics.VaultBackendError("rotate")
+		return "", 0, time.Time{}, fmt.Errorf("vault rotate: %w", err)
+	}
+
+	revokedLeases, err := h.store.RevokeLeasesBySecretPath(ctx, policy.SecretPath)
 	if err != nil {
-		h.log.Error("Rotate: failed to revoke leases", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		return
+		h.log.Error("PerformRotation: failed to revoke leases", zap.String("correlation_id", correlationID), zap.Error(err))
+		return "", 0, time.Time{}, err
 	}
 	for _, lease := range revokedLeases {
 		spv := lease.SecretPolicyVersionID
 		lid := lease.LeaseID
-		if _, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
+		if _, err := h.store.RecordAuditEntry(ctx, domain.RecordAuditEntryParams{
 			EventType:   "REVOKED",
 			SecretClass: lease.SecretClass,
 			SecretPath:  lease.SecretPath,
@@ -1166,7 +1420,7 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 			// the rotator's, so without the actor column a tenant could
 			// see that its lease died and not who did it.
 			RequestedByPrincipalID: lease.RequestedByPrincipalID,
-			ActedByPrincipalID:     &req.RotatedByPrincipalID,
+			ActedByPrincipalID:     &rotatedByPrincipalID,
 			TenantID:               lease.TenantID,
 			LegalEntityID:          lease.LegalEntityID,
 			LeaseID:                &lid,
@@ -1174,7 +1428,7 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 			OutcomeDetail:          "revoked as a side effect of secret rotation",
 			CorrelationID:          correlationID,
 		}); err != nil {
-			h.log.Error("Rotate: failed to record REVOKED audit entry for lease", zap.String("lease_id", lease.LeaseID), zap.Error(err))
+			h.log.Error("PerformRotation: failed to record REVOKED audit entry for lease", zap.String("lease_id", lease.LeaseID), zap.Error(err))
 		}
 	}
 
@@ -1192,7 +1446,7 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// rotator are not left without evidence — the mass revocation above
 	// writes each of them a REVOKED row in their own scope, carrying
 	// "revoked as a side effect of secret rotation".
-	rotatedEntry, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
+	rotatedEntry, err := h.store.RecordAuditEntry(ctx, domain.RecordAuditEntryParams{
 		EventType:   "ROTATED",
 		SecretClass: policy.SecretClass,
 		SecretPath:  policy.SecretPath,
@@ -1200,30 +1454,24 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 		// material — so the rotator occupies both columns. Filling the
 		// actor column keeps the "everything this principal did" query
 		// complete rather than silently missing rotations.
-		RequestedByPrincipalID: req.RotatedByPrincipalID,
-		ActedByPrincipalID:     &req.RotatedByPrincipalID,
-		TenantID:               &tenantScope,
-		RequestID:              &req.RequestID,
+		RequestedByPrincipalID: rotatedByPrincipalID,
+		ActedByPrincipalID:     &rotatedByPrincipalID,
+		TenantID:               tenantScope,
+		RequestID:              &requestID,
 		OutcomeDetail:          rotationOutcomeDetail(len(revokedLeases)),
 		CorrelationID:          correlationID,
 	})
 	if err != nil {
-		h.log.Error("Rotate: failed to record ROTATED audit entry", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		return
+		h.log.Error("PerformRotation: failed to record ROTATED audit entry", zap.String("correlation_id", correlationID), zap.Error(err))
+		return "", 0, time.Time{}, err
 	}
 
-	if err := h.publisher.PublishRotationCompleted(r.Context(), secretPolicyID, policy.SecretPath, req.RotatedByPrincipalID, len(revokedLeases), correlationID); err != nil {
-		h.log.Error("Rotate: failed to publish secret.rotation.completed", zap.Error(err))
+	if err := h.publisher.PublishRotationCompleted(ctx, secretPolicyID, policy.SecretPath, rotatedByPrincipalID, len(revokedLeases), correlationID); err != nil {
+		h.log.Error("PerformRotation: failed to publish secret.rotation.completed", zap.Error(err))
 	}
 
 	h.metrics.SecretRotated(len(revokedLeases))
-	writeJSON(w, http.StatusOK, rotateResponse{
-		SecretPolicyID:    secretPolicyID,
-		SecretPath:        policy.SecretPath,
-		RevokedLeaseCount: len(revokedLeases),
-		RotatedAt:         rotatedEntry.RecordedAt,
-	})
+	return policy.SecretPath, len(revokedLeases), rotatedEntry.RecordedAt, nil
 }
 
 // rotationOutcomeDetail renders the number of leases a rotation revoked into
@@ -1265,6 +1513,14 @@ func revokedCountFromOutcomeDetail(detail string) int {
 func (h *Handler) ListAuditLog(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretAuditRead) {
+		return
+	}
 
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
@@ -1357,6 +1613,263 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	}
 }
 
+// ── emergency material retrieval ─────────────────────────────────────────────
+
+type emergencyRetrievalRequest struct {
+	RequestID string `json:"request_id"`
+	Reason    string `json:"reason"`
+}
+
+// emergencyRetrievalResponse returns the material itself, base64-encoded.
+//
+// This endpoint is the one place in the service the raw secret value can
+// legitimately leave — a controlled break-glass path, gated on
+// ActionSecretEmergencyRetrieval (a platform-scoped action, unlike
+// everything else that touches material), recorded to the audit log as
+// EMERGENCY_RETRIEVAL so the exception's own evidence trail is complete.
+// Only ever reachable with a registered shared-secret exception (an
+// override with reason + evidence reference) — without that combination
+// the request is refused before the vault is ever asked.
+func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
+	secretPolicyID, ok := requireUUIDParam(w, r, "secret_policy_id")
+	if !ok {
+		return
+	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretEmergencyRetrieval) {
+		return
+	}
+
+	var req emergencyRetrievalRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.RequestID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "request_id"})
+		return
+	}
+
+	policy, err := h.store.FindSecretPolicyByID(r.Context(), secretPolicyID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrSecretPolicyNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "secret_policy_not_found", "secret_policy_id": secretPolicyID})
+		default:
+			h.log.Error("EmergencyRetrieval: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	// Break-glass gate: an ACTIVE shared-secret exception must exist for this
+	// path before the material may leave the vault. This is the register's
+	// whole reason to exist — it is the documented, evidence-backed override
+	// that lets a vault still fail safely (403) when an incident driver is
+	// asking for something no one has authorized.
+	exceptions, err := h.store.ListSharedSecretExceptions(r.Context(), domain.ListSharedSecretExceptionsFilter{
+		SecretPath: policy.SecretPath,
+		Status:     "ACTIVE",
+		TenantID:   nil,
+	})
+	if err != nil {
+		h.log.Error("EmergencyRetrieval: exception lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	var activeException *domain.SharedSecretException
+	for _, e := range exceptions {
+		if !e.ExpiresAt.Before(time.Now()) {
+			activeException = e
+			break
+		}
+	}
+	if activeException == nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "no_active_exception"})
+		return
+	}
+
+	material, err := h.vault.GetMaterial(r.Context(), policy.SecretPath)
+	if err != nil {
+		h.log.Error("EmergencyRetrieval: vault backend get failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
+		h.metrics.VaultBackendError("get_material")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+		return
+	}
+
+	if _, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
+		EventType:   "EMERGENCY_RETRIEVAL",
+		SecretClass: policy.SecretClass,
+		SecretPath:  policy.SecretPath,
+		// The emergency actor requests and retrieves in the same act.
+		RequestedByPrincipalID: principalID,
+		ActedByPrincipalID:     &principalID,
+		RequestID:              &req.RequestID,
+		OutcomeDetail:          fmt.Sprintf("exception_id=%s reason=%q", activeException.ExceptionID, req.Reason),
+		CorrelationID:          correlationID,
+	}); err != nil {
+		h.log.Error("EmergencyRetrieval: failed to record audit entry", zap.String("correlation_id", correlationID), zap.Error(err))
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"secret_policy_id": secretPolicyID,
+		"secret_path":      policy.SecretPath,
+		"material_base64":  base64.StdEncoding.EncodeToString(material),
+	})
+}
+
+// ── shared-secret exception register ─────────────────────────────────────────
+
+type createSharedSecretExceptionRequest struct {
+	SecretPath        string `json:"secret_path"`
+	Reason            string `json:"reason"`
+	EvidenceReference string `json:"evidence_reference"`
+	TenantID          *string `json:"tenant_id,omitempty"`
+	ExpiresAt         time.Time `json:"expires_at"`
+}
+
+func (req createSharedSecretExceptionRequest) missingField() string {
+	switch {
+	case req.SecretPath == "":
+		return "secret_path"
+	case req.Reason == "":
+		return "reason"
+	case req.EvidenceReference == "":
+		return "evidence_reference"
+	case req.ExpiresAt.IsZero():
+		return "expires_at"
+	default:
+		return ""
+	}
+}
+
+// CreateSharedSecretException registers one evidence-backed override.
+// Requires SECRET_EXCEPTION_CREATE (platform-scoped), an evidence
+// reference, and a time-boxed expiry that is still in the future.
+func (h *Handler) CreateSharedSecretException(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretExceptionCreate) {
+		return
+	}
+
+	var req createSharedSecretExceptionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if missing := req.missingField(); missing != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		return
+	}
+	if !req.ExpiresAt.After(time.Now()) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "expires_at", "message": "must be in the future"})
+		return
+	}
+
+	e, created, err := h.store.CreateSharedSecretException(r.Context(), domain.SharedSecretException{
+		ExceptionID:          uuid.NewString(),
+		SecretPath:           req.SecretPath,
+		Reason:               req.Reason,
+		EvidenceReference:    req.EvidenceReference,
+		ApprovedByPrincipalID: principalID,
+		TenantID:             req.TenantID,
+		ExpiresAt:            req.ExpiresAt,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrConflict):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "shared_secret_exception_conflict"})
+		default:
+			h.log.Error("CreateSharedSecretException: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, e)
+}
+
+// ListSharedSecretExceptions answers the register, optionally filtered by
+// status and secret_path. Requires SECRET_EXCEPTION_LIST.
+func (h *Handler) ListSharedSecretExceptions(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretExceptionList) {
+		return
+	}
+
+	q := r.URL.Query()
+	results, err := h.store.ListSharedSecretExceptions(r.Context(), domain.ListSharedSecretExceptionsFilter{
+		Status:     q.Get("status"),
+		SecretPath: q.Get("secret_path"),
+	})
+	if err != nil {
+		h.log.Error("ListSharedSecretExceptions: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if results == nil {
+		results = []*domain.SharedSecretException{}
+	}
+	writeJSON(w, http.StatusOK, results)
+}
+
+// RevokeSharedSecretException closes an ACTIVE exception early (before its
+// expiry) with an audit trail of who revoked it. Requires
+// SECRET_EXCEPTION_REVOKE.
+func (h *Handler) RevokeSharedSecretException(w http.ResponseWriter, r *http.Request) {
+	exceptionID, ok := requireUUIDParam(w, r, "exception_id")
+	if !ok {
+		return
+	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretExceptionRevoke) {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	e, changed, err := h.store.RevokeSharedSecretException(r.Context(), exceptionID, tenantScope, principalID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrInvalidTransition):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "except_id": exceptionID})
+		default:
+			h.log.Error("RevokeSharedSecretException: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+	if !changed {
+		writeJSON(w, http.StatusOK, map[string]string{"exception_id": exceptionID, "status": "already_revoked"})
+		return
+	}
+	writeJSON(w, http.StatusOK, e)
+}
+
 // ── authorization ────────────────────────────────────────────────────────────
 
 // Action types this service asks authorization-svc about.
@@ -1366,6 +1879,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // evaluates the active secret policy for the requested path and issues a
 // scoped, expiring lease — and putting a second, coarser RBAC check in front
 // of it would obscure which decision actually refused an access.
+//
+// Read operations on policies, leases, and the audit log are also
+// authorization-gated so that §5's "restricted data access remains
+// authorization-required under masking" is enforced.
 const (
 	ActionSecretPolicyCreate          = "SECRET_POLICY_CREATE"
 	ActionSecretPolicyVersionCreate   = "SECRET_POLICY_VERSION_CREATE"
@@ -1373,6 +1890,16 @@ const (
 	ActionSecretMaterialWrite         = "SECRET_MATERIAL_WRITE"
 	ActionSecretLeaseRevoke           = "SECRET_LEASE_REVOKE"
 	ActionSecretRotate                = "SECRET_ROTATE"
+	ActionSecretEmergencyRetrieval    = "SECRET_EMERGENCY_RETRIEVAL"
+	ActionSecretExceptionCreate       = "SECRET_EXCEPTION_CREATE"
+	ActionSecretExceptionList         = "SECRET_EXCEPTION_LIST"
+	ActionSecretExceptionRevoke       = "SECRET_EXCEPTION_REVOKE"
+
+	// Read actions
+	ActionSecretPolicyList          = "SECRET_POLICY_LIST"
+	ActionSecretPolicyVersionList   = "SECRET_POLICY_VERSION_LIST"
+	ActionSecretLeaseRead           = "SECRET_LEASE_READ"
+	ActionSecretAuditRead           = "SECRET_AUDIT_READ"
 )
 
 // requirePrincipal resolves the acting principal from the gateway-verified

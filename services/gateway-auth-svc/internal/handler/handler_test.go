@@ -257,11 +257,11 @@ func TestVerify_CartaAllow_Returns200(t *testing.T) {
 	assert.Equal(t, "principal-xyz", rec.Header().Get("X-Principal-Id"))
 }
 
-// TestVerify_CartaStepUpMFA_StillReturns200 proves STEP_UP_MFA is logged/
-// streamed but deliberately not blocking, since there is no step-up
-// challenge flow downstream to redirect to yet (see the doc comment in
-// handler.go on denyWithReason's call site).
-func TestVerify_CartaStepUpMFA_StillReturns200(t *testing.T) {
+// TestVerify_CartaStepUpMFA_Returns403 proves STEP_UP_MFA is now blocked.
+// Previously it was allowed through because there was no step-up challenge
+// flow downstream, but letting it pass silently defeats the risk engine's
+// intent — a request that needs step-up must not proceed as if it were ALLOW.
+func TestVerify_CartaStepUpMFA_Returns403(t *testing.T) {
 	h, key, _ := newTestEnvWithCartaDecision(t, "STEP_UP_MFA")
 	tok := mintEnvelope(t, key, testKid, validClaims())
 
@@ -271,7 +271,8 @@ func TestVerify_CartaStepUpMFA_StillReturns200(t *testing.T) {
 
 	h.Verify(rec, req)
 
-	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Equal(t, "STEP_UP_MFA", rec.Header().Get("X-Carta-Decision"))
 }
 
 // TestVerify_CartaIsolate_Returns403 and TestVerify_CartaDeny_Returns403
