@@ -1,4 +1,4 @@
--- 000007_webhook_dlq_and_housekeeping.down.sql
+-- 000009_webhook_dlq_and_housekeeping.down.sql
 -- Revert Webhook DLQ and Housekeeping Policies
 
 DROP INDEX IF EXISTS idx_delivery_attempts_provider_msg;

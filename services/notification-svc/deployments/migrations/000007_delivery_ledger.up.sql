@@ -1,4 +1,4 @@
--- 000005_delivery_ledger.up.sql
+-- 000007_delivery_ledger.up.sql
 -- Canonical Delivery Ledger for ZoikoSuite Email Communications System (ZS-COMMS-EMAIL-001 v2.0 §3)
 
 -- 1. message_intents: records the immutable communication intent for an event and recipient

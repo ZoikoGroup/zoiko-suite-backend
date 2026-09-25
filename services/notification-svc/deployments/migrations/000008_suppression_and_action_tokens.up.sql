@@ -1,4 +1,4 @@
--- 000006_suppression_and_action_tokens.up.sql
+-- 000008_suppression_and_action_tokens.up.sql
 -- Suppression and Link-Scanner Safe Action Tokens for ZoikoSuite Email Communications System (ZS-COMMS-EMAIL-001 v2.0 §4, §6)
 
 -- 1. email_suppressions: tracks hard bounces, spam complaints, user unsubscribes, and administrative suppressions
