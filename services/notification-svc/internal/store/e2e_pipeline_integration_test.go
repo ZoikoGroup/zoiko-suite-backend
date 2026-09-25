@@ -139,7 +139,7 @@ func TestE2E_DeliveryPipeline_CompleteFlow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, res.MessageIntentID, lookup.MessageIntentID)
 	assert.Equal(t, tenantID, lookup.TenantID)
-	assert.Equal(t, ledger.StreamTransactional, lookup.SenderStream)
+	assert.Equal(t, string(ledger.StreamTransactional), lookup.SenderStream)
 	assert.Equal(t, "alice@example.com", lookup.RecipientAddress)
 
 	// ── SCENARIO 2: Webhook Delivery Outcome Ingestion ─────────────────────────
