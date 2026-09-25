@@ -36,6 +36,17 @@ type Config struct {
 	MTLSManagementServiceURL string
 
 	OTELExporterEndpoint string
+
+	// ActionTokenSecret is the HMAC-SHA256 signing key for action link tokens
+	// (ZS-COMMS-EMAIL-001 §6). Must be at least 16 bytes.
+	// Sourced from ACTION_TOKEN_SECRET. An empty value disables the action
+	// gateway — tokens cannot be generated or verified without it.
+	ActionTokenSecret string
+
+	// SecondaryEmail is an optional failover SMTP provider. When configured,
+	// the router fails over to it after a transient primary failure (§13 P1-12).
+	// All secondary vars default to empty (disabled).
+	SecondaryEmail EmailConfig
 }
 
 type DBConfig struct {
@@ -156,6 +167,14 @@ type EmailConfig struct {
 // Configured reports whether a mail provider is set up.
 func (e EmailConfig) Configured() bool { return e.Provider != "" }
 
+// ActionLinkBaseURL returns the externally-reachable base URL for the action
+// link gateway. Set ACTION_LINK_BASE_URL explicitly when the service is behind
+// a reverse proxy with a different hostname than its listen address.
+// If unset, an empty string is returned and the Signer generates relative URLs.
+func (c *Config) ActionLinkBaseURL() string {
+	return env("ACTION_LINK_BASE_URL", "")
+}
+
 func Load() (*Config, error) {
 	cfg := &Config{
 		Env:  env("ENV", "local"),
@@ -213,6 +232,20 @@ func Load() (*Config, error) {
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+
+		ActionTokenSecret: env("ACTION_TOKEN_SECRET", ""),
+
+		SecondaryEmail: EmailConfig{
+			Provider:       env("SMTP_SECONDARY_PROVIDER", ""),
+			Host:           env("SMTP_SECONDARY_HOST", ""),
+			Port:           envInt("SMTP_SECONDARY_PORT", 587),
+			Username:       env("SMTP_SECONDARY_USERNAME", ""),
+			Password:       env("SMTP_SECONDARY_PASSWORD", ""),
+			From:           env("SMTP_SECONDARY_FROM", ""),
+			TLSMode:        env("SMTP_SECONDARY_TLS_MODE", "starttls"),
+			AllowCleartext: env("SMTP_SECONDARY_ALLOW_CLEARTEXT", "false") == "true",
+			VerifyOnStart:  env("SMTP_SECONDARY_VERIFY_ON_START", "true") == "true",
+		},
 	}
 
 	// Load returned a nil error unconditionally, so every default above was

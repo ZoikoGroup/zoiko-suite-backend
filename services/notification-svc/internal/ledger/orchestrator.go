@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -327,7 +328,7 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 	headers := make(map[string]string)
 	if tmplDef.SenderStream == StreamMarketing {
 		// RFC 8058 One-Click List-Unsubscribe
-		headers["List-Unsubscribe"] = fmt.Sprintf("<https://notify.zoiko.com/v1/notifications/unsubscribe?tenant_id=%s>, <mailto:unsubscribe@news.zoikosuite.com?subject=unsubscribe>", tenantID)
+		headers["List-Unsubscribe"] = fmt.Sprintf("<https://notify.zoiko.com/v1/notifications/unsubscribe?tenant_id=%s&email=%s>, <mailto:unsubscribe@news.zoikosuite.com?subject=unsubscribe>", tenantID, url.QueryEscape(recipientEmail))
 		headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
 	}
 

@@ -52,6 +52,15 @@ type Store interface {
 	ListLocales(ctx context.Context, templateID string) ([]domain.LocaleSummary, error)
 }
 
+// SuppressionStore is the persistence boundary for the email suppression list.
+// Satisfied by *store.PgStore.
+type SuppressionStore interface {
+	AddSuppression(ctx context.Context, supp *ledger.EmailSuppression) error
+	IsEmailSuppressed(ctx context.Context, tenantID, recipientEmail string, stream ledger.SenderStream, commClass ledger.CommunicationClass) (bool, string, error)
+	RemoveSuppression(ctx context.Context, tenantID, recipientEmail, stream string) error
+	ListSuppressions(ctx context.Context, tenantID string, limit, offset int) ([]*ledger.EmailSuppression, error)
+}
+
 // RecipientResolver turns a principal into the contact endpoint a message is
 // delivered to. Satisfied by internal/identity.Client.
 type RecipientResolver interface {
@@ -94,6 +103,11 @@ const (
 	// reconciliation/operator action against a record that already
 	// exists, not an act of originating a new notification.
 	actionResolveOutcome = "NOTIFICATION_RESOLVE_OUTCOME"
+
+	// actionSuppressionManage gates the admin suppression endpoints. A
+	// platform operator editing the suppression list needs a more
+	// privileged action than a regular NOTIFICATION_VIEW reader.
+	actionSuppressionManage = "NOTIFICATION_SUPPRESS"
 )
 
 var supportedChannels = map[string]bool{
@@ -144,6 +158,7 @@ type Handler struct {
 	orchestrator   *ledger.Orchestrator
 	ledgerStore    ledger.LedgerStore
 	webhookHandler *webhook.Handler
+	suppressions   SuppressionStore
 
 	// retryPolicy decides whether a first-attempt failure is scheduled for
 	// another try. The same policy the worker uses, so the schedule a send
@@ -168,6 +183,7 @@ type Deps struct {
 	Orchestrator   *ledger.Orchestrator
 	LedgerStore    ledger.LedgerStore
 	WebhookHandler *webhook.Handler
+	Suppressions   SuppressionStore
 	Log            *zap.Logger
 }
 
@@ -182,6 +198,7 @@ func New(d Deps) *Handler {
 		orchestrator:   d.Orchestrator,
 		ledgerStore:    d.LedgerStore,
 		webhookHandler: d.WebhookHandler,
+		suppressions:   d.Suppressions,
 		log:            d.Log,
 	}
 }
@@ -205,6 +222,23 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		if h.webhookHandler != nil {
 			r.Post("/webhooks/{provider}", h.webhookHandler.HandleWebhook)
 		}
+
+		// Phase 3: Admin suppression management
+		// POST   /v1/notifications/suppression         — add or update a suppression entry
+		// GET    /v1/notifications/suppression         — list active suppressions
+		// DELETE /v1/notifications/suppression/{email} — remove a specific suppression
+		r.Route("/suppression", func(r chi.Router) {
+			r.Post("/", h.AddSuppression)
+			r.Get("/", h.ListSuppressions)
+			r.Delete("/{email}", h.RemoveSuppression)
+		})
+
+		// Phase 3: RFC 8058 one-click unsubscribe receiver.
+		// This route is exempted from the envelope middleware in main.go because
+		// the request originates from a mail client, not a ZoikoSuite service,
+		// and carries no X-Principal-Id / X-Tenant-Id headers.
+		// The action token in the body provides the identity and tenant context.
+		r.Post("/unsubscribe", h.HandleUnsubscribe)
 
 		r.Get("/{id}", h.GetNotification)
 		r.Post("/{id}/read", h.MarkRead)
