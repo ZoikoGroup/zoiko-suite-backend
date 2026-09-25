@@ -72,6 +72,7 @@ type planOpts struct {
 	base      string // default 49.00
 	interval  string // default MONTH
 	extra     []domain.PriceComponent
+	caps      []domain.PlanCapability
 }
 
 var termsHash = strings.Repeat("cd", 32)
@@ -108,6 +109,9 @@ func (f *subFixture) publishPlan(code string, o planOpts) *domain.PriceVersion {
 	}
 	for _, c := range o.extra {
 		v = f.put(v, c)
+	}
+	if o.caps != nil {
+		v = f.ok(f.s.SetCapabilities(f.ctx, v.PriceVersionID, v.RowVersion, o.caps, maker, f.claim(maker, "SetPlanCapabilities", v.PriceVersionID)))
 	}
 	v = f.ok(f.s.SetCommercialTerms(f.ctx, v.PriceVersionID, v.RowVersion, &domain.CommercialTerms{
 		TermsDocumentRef: "legal/terms/" + code, TermsDocumentSHA256: termsHash, AutoRenew: o.autoRenew,

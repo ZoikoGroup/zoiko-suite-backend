@@ -51,6 +51,8 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS commercial_restrictions, entitlement_policy_versions CASCADE;
+		DROP FUNCTION IF EXISTS enforce_restriction_lift_only(), reject_immutable_row() CASCADE;
 		DROP TABLE IF EXISTS subscription_boundary_queue, subscription_discounts, price_migration_offer_targets,
 			price_migration_offers CASCADE;
 		DROP FUNCTION IF EXISTS enqueue_version_boundary(), enqueue_term_boundary(), enforce_discount_lifecycle(),
