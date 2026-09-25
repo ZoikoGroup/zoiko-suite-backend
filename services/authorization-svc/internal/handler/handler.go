@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -94,6 +95,12 @@ type AuthorizationStore interface {
 	// service and that one disagree about who is suspended. Only
 	// internal/events.LifecycleConsumer holds the writing interface.
 	FindPrincipalStatus(ctx context.Context, principalID, tenantID string) (string, error)
+
+	// Privileged Access Management (JIT Elevation - ZS-IAM-001 §13 & §21).
+	CreatePrivilegedSession(ctx context.Context, params domain.CreatePrivilegedSessionParams) (*domain.PrivilegedSession, error)
+	FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error)
+	ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error)
+	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on.
@@ -153,6 +160,14 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/admin/abac-rules", h.ListABACRules)
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/retire", h.RetireABACRule)
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/reactivate", h.ReactivateABACRule)
+
+	// Privileged Access Management (ZS-IAM-001 §13 & §21)
+	r.Post("/admin/v1/privileged-sessions", h.CreatePrivilegedSession)
+	r.Get("/admin/v1/privileged-sessions", h.ListPrivilegedSessions)
+	r.Post("/admin/v1/privileged-sessions/{session_id}/revoke", h.RevokePrivilegedSession)
+	r.Post("/v1/admin/privileged-sessions", h.CreatePrivilegedSession)
+	r.Get("/v1/admin/privileged-sessions", h.ListPrivilegedSessions)
+	r.Post("/v1/admin/privileged-sessions/{session_id}/revoke", h.RevokePrivilegedSession)
 
 	r.Post(AuthorizePath, h.Authorize)
 
@@ -1537,6 +1552,11 @@ type authorizeRequest struct {
 	// internal/abac.compare), so "10000" orders as a number, and a caller does
 	// not have to know which of its attributes a rule will treat as ordered.
 	Attributes map[string]string `json:"attributes,omitempty"`
+
+	// PrivilegedSessionID is optional: a Just-in-Time elevated session ID (ZS-IAM-001 §13 & §21).
+	// If the principal does not hold a standing grant or delegation, an active JIT session
+	// with matching requested action grants elevation while preserving ticket reference and basis.
+	PrivilegedSessionID string `json:"privileged_session_id,omitempty"`
 }
 
 // PlatformScopeSentinel is the legal_entity_id a caller sends to have a
@@ -1790,6 +1810,33 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		if contains(delegatedActions, req.ActionType) {
 			granted = true
 			basis = delegatedBasis
+		}
+	}
+
+	// Layer 3 — Privileged Access Management (JIT Elevation - ZS-IAM-001 §13 & §21).
+	// When standing RBAC and delegation do not grant the action, a valid time-bound
+	// JIT privileged session can provide elevation for requested actions.
+	if !granted && req.PrivilegedSessionID != "" {
+		ps, err := h.store.FindPrivilegedSessionByID(r.Context(), req.PrivilegedSessionID, tenantScope)
+		if err != nil {
+			if errors.Is(err, domain.ErrPrivilegedSessionNotFound) {
+				h.log.Warn("Authorize: privileged session not found or outside tenant scope",
+					zap.String("privileged_session_id", req.PrivilegedSessionID),
+					zap.String("correlation_id", correlationID))
+			} else {
+				h.log.Error("Authorize: store unavailable (privileged session lookup)",
+					zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return
+			}
+		} else if ps != nil {
+			if ps.PrincipalID == req.PrincipalID && ps.Status == domain.PrivilegedSessionStatusActive && time.Now().UTC().Before(ps.ExpiresAt) {
+				if contains(ps.RequestedActions, req.ActionType) || contains(ps.RequestedActions, "*") {
+					granted = true
+					basis = fmt.Sprintf("pam:session=%s:ticket=%s", ps.SessionID, ps.TicketRef)
+					allHeldActions = append(allHeldActions, req.ActionType)
+				}
+			}
 		}
 	}
 
@@ -2259,4 +2306,132 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		_ = err
 	}
+}
+
+// ── Privileged Access Management Handlers (ZS-IAM-001 §13 & §21) ───────────
+
+type createPrivilegedSessionRequest struct {
+	TenantID         string   `json:"tenant_id,omitempty"`
+	PrincipalID      string   `json:"principal_id,omitempty"`
+	RequestedActions []string `json:"requested_actions"`
+	TicketRef        string   `json:"ticket_ref"`
+	Reason           string   `json:"reason"`
+	DurationSeconds  int      `json:"duration_seconds"`
+}
+
+func (h *Handler) CreatePrivilegedSession(w http.ResponseWriter, r *http.Request) {
+	callerPrincipalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	var req createPrivilegedSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+		return
+	}
+
+	targetPrincipal := req.PrincipalID
+	if targetPrincipal == "" {
+		targetPrincipal = callerPrincipalID
+	}
+	if req.TicketRef == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "ticket_ref"})
+		return
+	}
+	if req.Reason == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason"})
+		return
+	}
+	if len(req.RequestedActions) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "requested_actions"})
+		return
+	}
+
+	ps, err := h.store.CreatePrivilegedSession(r.Context(), domain.CreatePrivilegedSessionParams{
+		TenantID:         tenantScope,
+		PrincipalID:      targetPrincipal,
+		RequestedActions: req.RequestedActions,
+		TicketRef:        req.TicketRef,
+		Reason:           req.Reason,
+		DurationSeconds:  req.DurationSeconds,
+	})
+	if err != nil {
+		h.log.Error("CreatePrivilegedSession: store failed", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	h.log.Info("privileged session created",
+		zap.String("session_id", ps.SessionID),
+		zap.String("principal_id", ps.PrincipalID),
+		zap.String("ticket_ref", ps.TicketRef),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusCreated, ps)
+}
+
+func (h *Handler) ListPrivilegedSessions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	principalID := r.URL.Query().Get("principal_id")
+	activeOnly := r.URL.Query().Get("active_only") == "true"
+
+	sessions, err := h.store.ListPrivilegedSessions(r.Context(), tenantScope, principalID, activeOnly)
+	if err != nil {
+		h.log.Error("ListPrivilegedSessions: store failed", zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
+func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request) {
+	callerPrincipalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_session_id"})
+		return
+	}
+
+	ps, err := h.store.RevokePrivilegedSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrPrivilegedSessionNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "privileged_session_not_found", "session_id": sessionID})
+		case errors.Is(err, domain.ErrInvalidTransition):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "message": err.Error()})
+		default:
+			h.log.Error("RevokePrivilegedSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ps)
 }

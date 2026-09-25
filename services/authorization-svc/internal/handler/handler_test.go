@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -170,6 +171,14 @@ type stubStore struct {
 	principalStatusErr       error
 	gotPrincipalStatusArgs   []string
 	principalStatusCallCount int
+
+	privilegedSession       *domain.PrivilegedSession
+	privilegedSessionErr    error
+	createdPrivilegedParam  domain.CreatePrivilegedSessionParams
+	listPrivilegedSessions  []domain.PrivilegedSession
+	listPrivilegedErr       error
+	revokePrivilegedSession *domain.PrivilegedSession
+	revokePrivilegedErr     error
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -340,6 +349,62 @@ func (s *stubStore) FindPrincipalStatus(_ context.Context, principalID, tenantID
 		return domain.PrincipalStatusActive, nil
 	}
 	return s.principalStatus, nil
+}
+
+func (s *stubStore) CreatePrivilegedSession(_ context.Context, params domain.CreatePrivilegedSessionParams) (*domain.PrivilegedSession, error) {
+	s.createdPrivilegedParam = params
+	if s.privilegedSessionErr != nil {
+		return nil, s.privilegedSessionErr
+	}
+	if s.privilegedSession != nil {
+		return s.privilegedSession, nil
+	}
+	return &domain.PrivilegedSession{
+		SessionID:        "00000000-0000-0000-0000-000000000001",
+		TenantID:         params.TenantID,
+		PrincipalID:      params.PrincipalID,
+		RequestedActions: params.RequestedActions,
+		TicketRef:        params.TicketRef,
+		Reason:           params.Reason,
+		Status:           domain.PrivilegedSessionStatusActive,
+		DurationSeconds:  params.DurationSeconds,
+		ExpiresAt:        time.Now().UTC().Add(time.Hour),
+		CreatedAt:        time.Now().UTC(),
+	}, nil
+}
+
+func (s *stubStore) FindPrivilegedSessionByID(_ context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error) {
+	if s.privilegedSessionErr != nil {
+		return nil, s.privilegedSessionErr
+	}
+	if s.privilegedSession != nil {
+		return s.privilegedSession, nil
+	}
+	return nil, domain.ErrPrivilegedSessionNotFound
+}
+
+func (s *stubStore) ListPrivilegedSessions(_ context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error) {
+	if s.listPrivilegedErr != nil {
+		return nil, s.listPrivilegedErr
+	}
+	return s.listPrivilegedSessions, nil
+}
+
+func (s *stubStore) RevokePrivilegedSession(_ context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error) {
+	if s.revokePrivilegedErr != nil {
+		return nil, s.revokePrivilegedErr
+	}
+	if s.revokePrivilegedSession != nil {
+		return s.revokePrivilegedSession, nil
+	}
+	now := time.Now().UTC()
+	return &domain.PrivilegedSession{
+		SessionID: sessionID,
+		TenantID:  tenantID,
+		Status:    domain.PrivilegedSessionStatusRevoked,
+		RevokedAt: &now,
+		RevokedBy: &revokedBy,
+	}, nil
 }
 
 // ── stub publisher ───────────────────────────────────────────────────────────

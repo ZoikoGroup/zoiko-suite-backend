@@ -348,6 +348,40 @@ type ProjectPrincipalStatusParams struct {
 	StatusChangedAt *time.Time
 }
 
+// PrivilegedSessionStatus represents the lifecycle state of a JIT privileged session (ZS-IAM-001 §13 & §21).
+const (
+	PrivilegedSessionStatusActive  = "ACTIVE"
+	PrivilegedSessionStatusRevoked = "REVOKED"
+	PrivilegedSessionStatusExpired = "EXPIRED"
+)
+
+// PrivilegedSession records a time-bound Just-In-Time elevation grant (ZS-IAM-001 §13 & §21).
+// Provides elevated actions for a specific principal, tied to an audit ticket and reason.
+type PrivilegedSession struct {
+	SessionID        string     `json:"session_id"`
+	TenantID         string     `json:"tenant_id"`
+	PrincipalID      string     `json:"principal_id"`
+	RequestedActions []string   `json:"requested_actions"`
+	TicketRef        string     `json:"ticket_ref"`
+	Reason           string     `json:"reason"`
+	Status           string     `json:"status"`
+	DurationSeconds  int        `json:"duration_seconds"`
+	ExpiresAt        time.Time  `json:"expires_at"`
+	CreatedAt        time.Time  `json:"created_at"`
+	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy        *string    `json:"revoked_by,omitempty"`
+}
+
+// CreatePrivilegedSessionParams holds the parameters to issue a new JIT privileged session.
+type CreatePrivilegedSessionParams struct {
+	TenantID         string
+	PrincipalID      string
+	RequestedActions []string
+	TicketRef        string
+	Reason           string
+	DurationSeconds  int
+}
+
 // ── params ───────────────────────────────────────────────────────────────────
 
 type CreateRoleParams struct {
@@ -680,6 +714,10 @@ var ErrABACOperandRequired = errorString("this abac operator requires attribute_
 // There is no third, safe interpretation of an unknown effect on a deny-only
 // layer, so it is refused at creation.
 var ErrUnsupportedABACEffect = errorString("unsupported abac effect: expected REQUIRE or FORBID")
+var ErrPrivilegedSessionNotFound = errorString("privileged session not found")
+var ErrPrivilegedSessionExpired = errorString("privileged session has expired")
+var ErrPrivilegedSessionInactive = errorString("privileged session is not active")
+var ErrPrivilegedSessionIncomplete = errorString("privileged session requires principal_id, ticket_ref, and reason")
 var ErrInvalidTransition = errorString("invalid revocation status transition")
 var ErrConflict = errorString("conflict: record already exists with differing attributes")
 var ErrStoreUnavailable = errorString("authorization store unavailable")
