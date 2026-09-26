@@ -43,7 +43,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS delivery_events, delivery_attempts, message_renders, message_intents, template_versions, template_definitions, notifications CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS webhook_dlq, action_tokens, email_suppressions, delivery_events, delivery_attempts, message_renders, message_intents, template_versions, template_definitions, notifications CASCADE;`)
 
 	// Every migration, in order — discovered, not listed.
 	//
@@ -335,6 +335,135 @@ func TestPgStore_CompleteDelivery_IsTenantScoped(t *testing.T) {
 	}
 	if got.Status != "SENT" || got.SentAt == nil {
 		t.Fatalf("delivery outcome not recorded: status=%q sent_at=%v", got.Status, got.SentAt)
+	}
+}
+
+// TestPgStore_MarkOutcomeUnknown_ThenResolveToSent proves the full
+// PENDING_UNKNOWN round trip against the real schema and constraints
+// added by migration 000006.
+func TestPgStore_MarkOutcomeUnknown_ThenResolveToSent(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	n := newNotification("tenant-a", "le-us", "principal-2", "corr-unknown-1")
+	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	attemptedAt := time.Now().UTC()
+	if err := s.MarkOutcomeUnknown(tenantCtx("tenant-a"), n.NotificationID, "tenant-a", "connection dropped at verdict", attemptedAt); err != nil {
+		t.Fatalf("MarkOutcomeUnknown: %v", err)
+	}
+
+	got, err := s.GetNotification(tenantCtx("tenant-a"), n.NotificationID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got.Status != domain.StatusPendingUnknown {
+		t.Fatalf("status = %q, want PENDING_UNKNOWN", got.Status)
+	}
+	if got.UnknownAt == nil || got.SentAt == nil {
+		t.Fatalf("unknown_at/sent_at not recorded: unknown_at=%v sent_at=%v", got.UnknownAt, got.SentAt)
+	}
+	if got.NextAttemptAt != nil {
+		t.Fatal("next_attempt_at must be nil — the ordinary retry worker (status = 'PENDING' only) must never touch this row")
+	}
+
+	resolvedAt := time.Now().UTC()
+	err = s.ResolveDeliveryOutcome(tenantCtx("tenant-a"), domain.ResolveDeliveryOutcomeParams{
+		NotificationID: n.NotificationID, TenantID: "tenant-a", ActorPrincipalID: "ops-1",
+		ResolvedStatus: domain.StatusSent, ResolutionNote: "provider support confirmed acceptance",
+		ProviderResponse: "smtp; confirmed by provider support",
+	}, resolvedAt)
+	if err != nil {
+		t.Fatalf("ResolveDeliveryOutcome: %v", err)
+	}
+
+	resolved, err := s.GetNotification(tenantCtx("tenant-a"), n.NotificationID)
+	if err != nil {
+		t.Fatalf("read back after resolve: %v", err)
+	}
+	if resolved.Status != "SENT" {
+		t.Fatalf("status = %q, want SENT", resolved.Status)
+	}
+	if resolved.ResolvedByPrincipalID != "ops-1" || resolved.ResolvedAt == nil {
+		t.Fatalf("resolution evidence not recorded: resolved_by=%q resolved_at=%v", resolved.ResolvedByPrincipalID, resolved.ResolvedAt)
+	}
+	if resolved.ProviderResponse != "smtp; confirmed by provider support" {
+		t.Fatalf("provider_response = %q, not the resolver's own evidence", resolved.ProviderResponse)
+	}
+}
+
+// TestPgStore_ResolveDeliveryOutcome_NotPendingUnknown_ReturnsNotFound is
+// the negative control on ResolveDeliveryOutcome's own CAS guard — a
+// notification not actually PENDING_UNKNOWN has nothing to resolve.
+func TestPgStore_ResolveDeliveryOutcome_NotPendingUnknown_ReturnsNotFound(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	n := newNotification("tenant-a", "le-us", "principal-2", "corr-unknown-2")
+	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sentAt := time.Now().UTC()
+	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "receipt", &sentAt); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	err := s.ResolveDeliveryOutcome(tenantCtx("tenant-a"), domain.ResolveDeliveryOutcomeParams{
+		NotificationID: n.NotificationID, TenantID: "tenant-a", ActorPrincipalID: "ops-1",
+		ResolvedStatus: domain.StatusSent, ResolutionNote: "irrelevant",
+	}, time.Now().UTC())
+	if !errors.Is(err, domain.ErrNotificationNotFound) {
+		t.Fatalf("resolving an already-SENT notification returned %v, want ErrNotificationNotFound", err)
+	}
+}
+
+// TestPgStore_MarkOutcomeUnknown_IsTenantScoped mirrors
+// TestPgStore_CompleteDelivery_IsTenantScoped for the new method.
+func TestPgStore_MarkOutcomeUnknown_IsTenantScoped(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	n := newNotification("tenant-a", "le-us", "principal-2", "corr-unknown-3")
+	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if err := s.MarkOutcomeUnknown(tenantCtx("tenant-b"), n.NotificationID, "tenant-b", "reason", time.Now().UTC()); !errors.Is(err, domain.ErrNotificationNotFound) {
+		t.Fatalf("cross-tenant MarkOutcomeUnknown returned %v, want ErrNotificationNotFound", err)
+	}
+}
+
+// TestPgStore_PendingUnknownRequiresAReason is the negative control on
+// migration 000006's own check constraint, mirroring the existing FAILED
+// constraint's coverage — a raw UPDATE that tries to bypass the store
+// and leave a PENDING_UNKNOWN row with no reason is refused at the
+// database itself, not only by the Go layer.
+func TestPgStore_PendingUnknownRequiresAReason(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	n := newNotification("tenant-a", "le-us", "principal-2", "corr-unknown-4")
+	if _, err := s.CreateNotification(tenantCtx("tenant-a"), n); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	conn, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(context.Background(), `SELECT set_config('app.tenant_id', 'tenant-a', false)`); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	// Validate the constraint before relying on it — NOT VALID constraints
+	// (this migration's own convention) do not check existing rows, but a
+	// new UPDATE is still checked by the CHECK clause itself regardless of
+	// validation state.
+	_, err = conn.Exec(context.Background(), `UPDATE notifications SET status = 'PENDING_UNKNOWN', failure_reason = NULL WHERE notification_id = $1`, n.NotificationID)
+	if err == nil {
+		t.Fatal("expected the notifications_pending_unknown_reason constraint to reject a NULL reason")
 	}
 }
 

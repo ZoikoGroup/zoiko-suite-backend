@@ -89,6 +89,21 @@ func (p *Publisher) PublishFailed(ctx context.Context, correlationID string, n d
 	})
 }
 
+// PublishOutcomeUnknown backs BIZ-10's own NotificationOutcomeUnknown
+// event — fired when a delivery attempt's outcome is genuinely
+// ambiguous. See domain.DeliveryOutcome.Unknown's own doc comment.
+func (p *Publisher) PublishOutcomeUnknown(ctx context.Context, correlationID string, n domain.Notification, reason string) {
+	p.emit(ctx, "notification.outcome_unknown", correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+		"notification_id":        n.NotificationID,
+		"tenant_id":              n.TenantID,
+		"legal_entity_id":        n.LegalEntityID,
+		"recipient_principal_id": n.RecipientPrincipalID,
+		"channel":                n.Channel,
+		"reason":                 reason,
+		"unknown_at":             n.UnknownAt,
+	})
+}
+
 // PublishTemplateCreated backs BIZ-03's TemplateCreated event.
 func (p *Publisher) PublishTemplateCreated(ctx context.Context, correlationID string, d domain.TemplateDefinition) {
 	p.emit(ctx, "template.created", correlationID, d.TenantID, d.LegalEntityID, d.OwnerPrincipalID, d.TemplateID, map[string]any{

@@ -46,6 +46,14 @@ import (
 	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
 )
 
+// isLiveSubscriptionConflict reports that the account already holds a live
+// subscription: in this table (unique index, 23505) or in the COM-02 model
+// (migration 000007's mutual-exclusion trigger, CP003).
+func isLiveSubscriptionConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "23505" || pgErr.Code == "CP003")
+}
+
 // isUniqueViolation returns true when err is a Postgres unique constraint
 // violation (SQLSTATE 23505).
 func isUniqueViolation(err error) bool {

@@ -57,9 +57,11 @@ type Provider interface {
 // header, and providers are assembled from strings, so escaping and
 // header-injection defence belong at the transport boundary, not here.
 type Message struct {
-	To       string
-	Subject  string
-	HTMLBody string
+	From          string
+	Headers       map[string]string
+	To            string
+	Subject       string
+	HTMLBody      string
 
 	// CorrelationID travels into the message headers so a delivered mail can
 	// be tied back to the send that produced it without matching on subject.
@@ -83,11 +85,33 @@ func isRetryable(err error) bool {
 	return errors.As(err, &r)
 }
 
+// UnknownError marks a provider failure whose outcome is genuinely
+// ambiguous — not "try again" and not "this failed", because the message
+// may already have reached the provider. A provider wraps a failure in
+// this only at the one moment retrying or failing it outright would both
+// risk being wrong: see smtp.go's own use at the DATA-close step, the
+// exact point a provider's accept-or-reject verdict arrives.
+type UnknownError struct{ Err error }
+
+func (e UnknownError) Error() string { return e.Err.Error() }
+func (e UnknownError) Unwrap() error { return e.Err }
+
+// Unknown wraps err as an ambiguous outcome.
+func Unknown(err error) error { return UnknownError{Err: err} }
+
+// isUnknown reports whether a provider error asked to be treated as
+// ambiguous.
+func isUnknown(err error) bool {
+	var u UnknownError
+	return errors.As(err, &u)
+}
+
 // Router dispatches a notification to the transport for its channel. It
 // implements handler.Deliverer.
 type Router struct {
-	email Provider
-	log   *zap.Logger
+	email     Provider
+	secondary Provider
+	log       *zap.Logger
 }
 
 // NewRouter builds a Router. email may be nil, which is how a deployment says
@@ -95,6 +119,13 @@ type Router struct {
 // reason rather than being silently reported as sent.
 func NewRouter(email Provider, log *zap.Logger) *Router {
 	return &Router{email: email, log: log}
+}
+
+// NewFailoverRouter builds a Router with a primary and secondary email provider.
+// If the primary provider fails with a transient (retryable) error, the router
+// fails over to the secondary provider per ZS-COMMS-EMAIL-001 §13 P1-12.
+func NewFailoverRouter(primary, secondary Provider, log *zap.Logger) *Router {
+	return &Router{email: primary, secondary: secondary, log: log}
 }
 
 func (r *Router) Deliver(ctx context.Context, n domain.Notification) domain.DeliveryOutcome {
@@ -149,6 +180,7 @@ func (r *Router) deliverInApp(n domain.Notification) domain.DeliveryOutcome {
 	return domain.DeliveryOutcome{
 		Delivered:        true,
 		ProviderResponse: "in-app; readable from the recipient's notification register",
+		ProviderName:     "in-app",
 	}
 }
 
@@ -157,7 +189,8 @@ func (r *Router) deliverEmail(ctx context.Context, n domain.Notification) domain
 		return domain.DeliveryOutcome{
 			Reason: "no email provider is configured (NOTIFICATION_EMAIL_PROVIDER unset); " +
 				"the notification is recorded but was not transmitted",
-			Retryable: false,
+			Retryable:    false,
+			ProviderName: "none",
 		}
 	}
 	if n.RecipientAddress == "" {
@@ -166,35 +199,84 @@ func (r *Router) deliverEmail(ctx context.Context, n domain.Notification) domain
 		// the point: an empty To would otherwise become an SMTP error at the
 		// far end, reported as a provider failure for what is our own bug.
 		return domain.DeliveryOutcome{
-			Reason:    "no recipient address resolved for an EMAIL notification",
-			Retryable: false,
+			Reason:       "no recipient address resolved for an EMAIL notification",
+			Retryable:    false,
+			ProviderName: r.email.Name(),
 		}
 	}
 
-	receipt, err := r.email.Send(ctx, Message{
+	msg := Message{
+		From:          n.From,
+		Headers:       n.Headers,
 		To:            n.RecipientAddress,
 		Subject:       n.Subject,
 		HTMLBody:      n.Body,
 		CorrelationID: n.CorrelationID,
-	})
+	}
+
+	receipt, err := r.email.Send(ctx, msg)
+	primaryName := r.email.Name()
 	if err != nil {
-		retry := isRetryable(err)
-		r.log.Warn("email delivery failed",
+		// unknown is checked first so a genuinely ambiguous outcome — the
+		// message may already have reached the provider — never sets retry
+		// true and therefore never reaches the failover block below either:
+		// failing over to a second provider on an ambiguous primary attempt
+		// risks sending the same notice twice just as much as a blind retry
+		// would.
+		unknown := isUnknown(err)
+		retry := !unknown && isRetryable(err)
+		r.log.Warn("primary email delivery failed",
 			zap.String("notification_id", n.NotificationID),
-			zap.String("provider", r.email.Name()),
+			zap.String("provider", primaryName),
 			zap.Bool("retryable", retry),
+			zap.Bool("unknown", unknown),
 			// The address is not logged. It is PII, it is already on the
 			// notification row under RLS, and a log line is the one place it
 			// would sit outside the tenant boundary.
 			zap.Error(err))
+
+		// If transient failure and secondary provider is configured, attempt automatic failover per §13 P1-12
+		if retry && r.secondary != nil {
+			secondaryName := r.secondary.Name()
+			r.log.Info("initiating secondary email provider failover",
+				zap.String("notification_id", n.NotificationID),
+				zap.String("primary_provider", primaryName),
+				zap.String("secondary_provider", secondaryName))
+
+			secReceipt, secErr := r.secondary.Send(ctx, msg)
+			if secErr == nil {
+				return domain.DeliveryOutcome{
+					Delivered:        true,
+					ProviderResponse: secReceipt,
+					ProviderName:     secondaryName,
+				}
+			}
+
+			secRetry := isRetryable(secErr)
+			r.log.Warn("secondary email delivery failed",
+				zap.String("notification_id", n.NotificationID),
+				zap.String("secondary_provider", secondaryName),
+				zap.Bool("retryable", secRetry),
+				zap.Error(secErr))
+
+			return domain.DeliveryOutcome{
+				Reason:       fmt.Sprintf("%s failover failed: %s (primary: %s)", secondaryName, secErr.Error(), err.Error()),
+				Retryable:    secRetry,
+				ProviderName: secondaryName,
+			}
+		}
+
 		return domain.DeliveryOutcome{
-			Reason:    fmt.Sprintf("%s: %s", r.email.Name(), err.Error()),
-			Retryable: retry,
+			Reason:       fmt.Sprintf("%s: %s", primaryName, err.Error()),
+			Retryable:    retry,
+			Unknown:      unknown,
+			ProviderName: primaryName,
 		}
 	}
 
 	return domain.DeliveryOutcome{
 		Delivered:        true,
 		ProviderResponse: receipt,
+		ProviderName:     primaryName,
 	}
 }

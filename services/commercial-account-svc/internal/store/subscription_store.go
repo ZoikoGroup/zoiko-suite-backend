@@ -161,7 +161,7 @@ func (s *PgStore) CreateSubscription(ctx context.Context, sub *domain.Commercial
 		sub.CreatedAt, sub.UpdatedAt, sub.CreatedByPrincipalID, string(billingSource),
 	)
 	if err != nil {
-		if isUniqueViolation(err) {
+		if isLiveSubscriptionConflict(err) {
 			return fmt.Errorf("%w: commercial_account_id %s", domain.ErrActiveSubscriptionExists, sub.CommercialAccountID)
 		}
 		return fmt.Errorf("insert subscription: %w", err)
@@ -335,7 +335,7 @@ func (s *PgStore) CreateBillingSourceTransfer(ctx context.Context, transfer *dom
 			newSub.CreatedAt, newSub.UpdatedAt, newSub.CreatedByPrincipalID, string(billingSource),
 		)
 		if err != nil {
-			if isUniqueViolation(err) {
+			if isLiveSubscriptionConflict(err) {
 				return fmt.Errorf("%w: commercial_account_id %s", domain.ErrActiveSubscriptionExists, newSub.CommercialAccountID)
 			}
 			return fmt.Errorf("insert new subscription: %w", err)

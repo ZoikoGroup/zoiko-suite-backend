@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,13 +27,16 @@ import (
 	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/health"
+	"zoiko.io/notification-svc/internal/housekeeping"
 	"zoiko.io/notification-svc/internal/identity"
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
+	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
+	"zoiko.io/notification-svc/internal/webhook"
 )
 
 // platformScopeID mirrors authorization-svc's own constant of the same
@@ -246,7 +250,8 @@ func main() {
 		}
 	}
 	killSwitch := ledger.NewKillSwitchManager(log)
-	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log)
+	policyEngine := policy.NewPrecedenceEngine(pgStore, log)
+	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log).WithPolicyResolver(policyEngine)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -264,23 +269,37 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	envelopePolicy := svcenvelope.ServicePolicy()
+	envelopePolicy.Exempt = func(req *http.Request) bool {
+		if req.URL.Path == "/healthz" || req.URL.Path == "/readyz" || req.URL.Path == "/health" {
+			return true
+		}
+		if strings.HasPrefix(req.URL.Path, "/v1/notifications/webhooks/") || strings.HasPrefix(req.URL.Path, "/v1/notifications/actions/") {
+			return true
+		}
+		return false
+	}
+	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
+
+	webhookProcessor := webhook.NewProcessor(pgStore, log)
+	webhookHandler := webhook.NewHandler(webhookProcessor, log)
 
 	h := handler.New(handler.Deps{
-		Store:        pgStore,
-		Publisher:    publisher,
-		AuthZ:        authzClient,
-		Deliverer:    deliverer,
-		Recipient:    identityClient,
-		RetryPolicy:  retryPolicy,
-		Orchestrator: orchestrator,
-		LedgerStore:  pgStore,
-		Log:          log,
+		Store:          pgStore,
+		Publisher:      publisher,
+		AuthZ:          authzClient,
+		Deliverer:      deliverer,
+		Recipient:      identityClient,
+		RetryPolicy:    retryPolicy,
+		Orchestrator:   orchestrator,
+		LedgerStore:    pgStore,
+		WebhookHandler: webhookHandler,
+		Log:            log,
 	})
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
-	// â”€â”€ 6a. Delivery retry worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	// ── 6a. Delivery retry worker ─────────────────────────────────────────────
 	//
 	// Started even when retry is disabled, deliberately. Turning the policy off
 	// stops new schedules being written; it does not un-schedule the
@@ -299,6 +318,20 @@ func main() {
 			StrandedAfter: cfg.Retry.StrandedAfter,
 		}, log)
 	go retryWorker.Start(workerCtx)
+
+	// ── 6b. Delivery Ledger Housekeeping Worker ──────────────────────────────
+	housekeepingWorker := housekeeping.NewWorker(
+		pgStore,
+		housekeeping.Options{
+			Interval:             10 * time.Minute,
+			BatchSize:            50,
+			TokenRetention:       30 * 24 * time.Hour,
+			LedgerRetention:      90 * 24 * time.Hour,
+			StaleIntentThreshold: 24 * time.Hour,
+		},
+		log,
+	)
+	go housekeepingWorker.Start(workerCtx)
 
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)

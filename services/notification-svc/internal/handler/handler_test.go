@@ -122,6 +122,43 @@ func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string
 	return nil
 }
 
+func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, attemptedAt time.Time) error {
+	n, ok := s.byID[id]
+	if !ok {
+		return domain.ErrNotificationNotFound
+	}
+	n.Status = domain.StatusPendingUnknown
+	n.FailureReason = reason
+	n.DeliveryAttempts++
+	n.LastAttemptAt = &attemptedAt
+	n.SentAt = &attemptedAt
+	n.UnknownAt = &attemptedAt
+	return nil
+}
+
+func (s *stubStore) ResolveDeliveryOutcome(_ context.Context, p domain.ResolveDeliveryOutcomeParams, resolvedAt time.Time) error {
+	n, ok := s.byID[p.NotificationID]
+	if !ok {
+		return domain.ErrNotificationNotFound
+	}
+	if n.Status != domain.StatusPendingUnknown {
+		return domain.ErrNotificationNotFound
+	}
+	n.Status = p.ResolvedStatus
+	if p.ResolvedStatus == domain.StatusFailed {
+		n.FailureReason = p.ResolutionNote
+	} else {
+		n.FailureReason = ""
+	}
+	if p.ProviderResponse != "" {
+		n.ProviderResponse = p.ProviderResponse
+	}
+	n.ResolvedAt = &resolvedAt
+	n.ResolvedByPrincipalID = p.ActorPrincipalID
+	n.ResolutionNote = p.ResolutionNote
+	return nil
+}
+
 func (s *stubStore) MarkRead(_ context.Context, id, recipientPrincipalID string, readAt time.Time) error {
 	n, ok := s.byID[id]
 	if !ok || n.RecipientPrincipalID != recipientPrincipalID || n.Channel != domain.ChannelInApp {
@@ -343,13 +380,16 @@ func (s *stubStore) ListLocales(_ context.Context, templateID string) ([]domain.
 }
 
 type stubPublisher struct {
-	sent, failed                                                          int
+	sent, failed, outcomeUnknown                                          int
 	templateCreated, templateApproved, templatePublished, templateRetired int
 }
 
 func (p *stubPublisher) PublishSent(_ context.Context, _ string, _ domain.Notification) { p.sent++ }
 func (p *stubPublisher) PublishFailed(_ context.Context, _ string, _ domain.Notification, _ string) {
 	p.failed++
+}
+func (p *stubPublisher) PublishOutcomeUnknown(_ context.Context, _ string, _ domain.Notification, _ string) {
+	p.outcomeUnknown++
 }
 
 func (p *stubPublisher) PublishTemplateCreated(_ context.Context, _ string, _ domain.TemplateDefinition) {
@@ -386,6 +426,10 @@ type stubDeliverer struct {
 	// schedule rather than conclude.
 	retryable bool
 
+	// unknown makes the refusal an ambiguous one — see
+	// domain.DeliveryOutcome.Unknown's own doc comment.
+	unknown bool
+
 	// seen records the notification handed over, so a test can assert what the
 	// transport was actually given â€” the resolved address in particular, which
 	// is the difference between a message addressed to somebody and one the
@@ -395,6 +439,9 @@ type stubDeliverer struct {
 
 func (d *stubDeliverer) Deliver(_ context.Context, n domain.Notification) domain.DeliveryOutcome {
 	d.seen = &n
+	if d.unknown {
+		return domain.DeliveryOutcome{Reason: d.reason, Unknown: true}
+	}
 	if !d.delivered {
 		return domain.DeliveryOutcome{Reason: d.reason, Retryable: d.retryable}
 	}
@@ -640,6 +687,51 @@ func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T)
 	if pub.sent != 0 || pub.failed != 0 {
 		t.Errorf("published sent=%d failed=%d, want nothing published while a retry is pending",
 			pub.sent, pub.failed)
+	}
+}
+
+// TestSendNotification_AmbiguousOutcome_IsPendingUnknownNotRetried proves
+// an ambiguous first-attempt outcome lands in PENDING_UNKNOWN, is never
+// silently retried, and publishes only notification.outcome_unknown —
+// never sent or failed, since neither is actually known yet.
+func TestSendNotification_AmbiguousOutcome_IsPendingUnknownNotRetried(t *testing.T) {
+	store := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouterWith(store, pub, &stubAuthZ{},
+		&stubDeliverer{unknown: true, reason: "connection dropped at verdict"},
+		"tenant-abc")
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
+		"recipient_principal_id": "principal-2",
+		"legal_entity_id":        "le-us",
+		"channel":                "EMAIL",
+		"subject":                "Payslip available",
+		"correlation_id":         "corr-unknown",
+	}, "principal-1")
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var n domain.Notification
+	_ = json.NewDecoder(rr.Body).Decode(&n)
+
+	if n.Status != domain.StatusPendingUnknown {
+		t.Errorf("status = %q, want PENDING_UNKNOWN", n.Status)
+	}
+	if n.UnknownAt == nil {
+		t.Error("unknown_at is nil")
+	}
+	if n.SentAt == nil {
+		t.Error("sent_at should still be set — the attempt did happen, only its outcome is unknown")
+	}
+	if len(store.scheduled) != 0 {
+		t.Errorf("store.scheduled = %v, want nothing rescheduled — an ambiguous outcome must never be silently retried", store.scheduled)
+	}
+	if pub.sent != 0 || pub.failed != 0 {
+		t.Errorf("published sent=%d failed=%d, want neither for an ambiguous outcome", pub.sent, pub.failed)
+	}
+	if pub.outcomeUnknown != 1 {
+		t.Errorf("published outcome_unknown=%d, want 1", pub.outcomeUnknown)
 	}
 }
 
@@ -1156,5 +1248,191 @@ func TestListNotifications_PagingIsValidated(t *testing.T) {
 	}
 	if store.lastFilter.Limit != 100 {
 		t.Errorf("expected a bounded default limit of 100, got %d", store.lastFilter.Limit)
+	}
+}
+
+// ── GetDeliveryStatus / ResolveDeliveryOutcome tests ────────────────────────
+
+func seedPendingUnknown(store *stubStore, id, legalEntityID string) *domain.Notification {
+	now := time.Now().UTC()
+	n := &domain.Notification{
+		NotificationID: id, TenantID: "tenant-abc", LegalEntityID: legalEntityID,
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Subject: "s", Body: "b",
+		Status: domain.StatusPendingUnknown, CorrelationID: "corr-" + id,
+		CreatedByPrincipalID: "principal-1", CreatedAt: now,
+		FailureReason: "connection dropped at verdict", SentAt: &now, UnknownAt: &now,
+	}
+	store.byID[id] = n
+	return n
+}
+
+func TestGetDeliveryStatus_PendingUnknown_CarriesErrorCode(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodGet, "/v1/notifications/n1/delivery-status", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Status    string `json:"status"`
+		ErrorCode string `json:"error_code"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Status != domain.StatusPendingUnknown {
+		t.Errorf("status = %q, want PENDING_UNKNOWN", resp.Status)
+	}
+	if resp.ErrorCode != "DELIVERY_OUTCOME_UNKNOWN" {
+		t.Errorf("error_code = %q, want DELIVERY_OUTCOME_UNKNOWN", resp.ErrorCode)
+	}
+}
+
+func TestGetDeliveryStatus_Sent_CarriesNoErrorCode(t *testing.T) {
+	store := newStubStore()
+	now := time.Now().UTC()
+	store.byID["n1"] = &domain.Notification{
+		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "SENT", SentAt: &now,
+	}
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodGet, "/v1/notifications/n1/delivery-status", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rr.Code)
+	}
+	var resp struct {
+		ErrorCode string `json:"error_code"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.ErrorCode != "" {
+		t.Errorf("error_code = %q, want empty for a concluded SENT notification", resp.ErrorCode)
+	}
+}
+
+func TestGetDeliveryStatus_NotFound(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/notifications/nope/delivery-status", nil, "principal-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
+func TestResolveDeliveryOutcome_ToSent_PublishesSent(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "SENT", "resolution_note": "provider support confirmed acceptance",
+		"provider_response": "smtp; confirmed by provider support",
+	}, "ops-1")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var n domain.Notification
+	_ = json.NewDecoder(rr.Body).Decode(&n)
+	if n.Status != "SENT" {
+		t.Errorf("status = %q, want SENT", n.Status)
+	}
+	if n.ResolvedByPrincipalID != "ops-1" {
+		t.Errorf("resolved_by_principal_id = %q, want ops-1", n.ResolvedByPrincipalID)
+	}
+	if n.ResolutionNote == "" {
+		t.Error("resolution_note should be recorded")
+	}
+	if pub.sent != 1 || pub.failed != 0 {
+		t.Errorf("published sent=%d failed=%d, want 1/0", pub.sent, pub.failed)
+	}
+}
+
+func TestResolveDeliveryOutcome_ToFailed_PublishesFailed(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "FAILED", "resolution_note": "provider confirmed the message was never queued",
+	}, "ops-1")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var n domain.Notification
+	_ = json.NewDecoder(rr.Body).Decode(&n)
+	if n.Status != "FAILED" {
+		t.Errorf("status = %q, want FAILED", n.Status)
+	}
+	if pub.sent != 0 || pub.failed != 1 {
+		t.Errorf("published sent=%d failed=%d, want 0/1", pub.sent, pub.failed)
+	}
+}
+
+// TestResolveDeliveryOutcome_NotPendingUnknown_Returns409 is the negative
+// control — only a genuinely ambiguous notification has something to
+// resolve.
+func TestResolveDeliveryOutcome_NotPendingUnknown_Returns409(t *testing.T) {
+	store := newStubStore()
+	now := time.Now().UTC()
+	store.byID["n1"] = &domain.Notification{
+		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "SENT", SentAt: &now,
+	}
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "SENT", "resolution_note": "irrelevant",
+	}, "ops-1")
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestResolveDeliveryOutcome_InvalidResolvedStatus_Returns400(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "PENDING", "resolution_note": "x",
+	}, "ops-1")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestResolveDeliveryOutcome_MissingResolutionNote_Returns400(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "SENT",
+	}, "ops-1")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestResolveDeliveryOutcome_AuthzDenied_Returns403(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "SENT", "resolution_note": "x",
+	}, "ops-1")
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if store.byID["n1"].Status != domain.StatusPendingUnknown {
+		t.Error("expected the notification to remain untouched on authorization denial")
 	}
 }
