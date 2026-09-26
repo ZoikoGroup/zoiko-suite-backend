@@ -179,6 +179,25 @@ type stubStore struct {
 	listPrivilegedErr       error
 	revokePrivilegedSession *domain.PrivilegedSession
 	revokePrivilegedErr     error
+
+	breakGlassSession       *domain.BreakGlassSession
+	breakGlassSessionErr    error
+	createdBreakGlassParam  domain.CreateBreakGlassSessionParams
+	listBreakGlassSessions  []domain.BreakGlassSession
+	listBreakGlassErr       error
+	revokeBreakGlassSession *domain.BreakGlassSession
+	revokeBreakGlassErr     error
+
+	supportSession       *domain.SupportSession
+	supportSessionErr    error
+	createdSupportParam  domain.CreateSupportSessionParams
+	listSupportSessions  []domain.SupportSession
+	listSupportErr       error
+	revokeSupportSession *domain.SupportSession
+	revokeSupportErr     error
+
+	authorityLimits    []domain.AuthorityLimit
+	authorityLimitsErr error
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -276,7 +295,15 @@ func (s *stubStore) FindGrantedActions(_ context.Context, _, _, tenantID string)
 	s.grantedTenantArg = tenantID
 	return s.rbacActions, s.rbacBasis, s.rbacErr
 }
+func (s *stubStore) FindGrantedActionsScoped(_ context.Context, _, _, tenantID, bookID, orgUnitID string) ([]string, string, error) {
+	s.grantedTenantArg = tenantID
+	return s.rbacActions, s.rbacBasis, s.rbacErr
+}
 func (s *stubStore) FindDelegatedActions(_ context.Context, _, _, tenantID string) ([]string, string, error) {
+	s.delegatedTenantArg = tenantID
+	return s.delegatedActions, s.delegatedBasis, s.delegatedErr
+}
+func (s *stubStore) FindDelegatedActionsScoped(_ context.Context, _, _, tenantID, bookID, orgUnitID string) ([]string, string, error) {
 	s.delegatedTenantArg = tenantID
 	return s.delegatedActions, s.delegatedBasis, s.delegatedErr
 }
@@ -407,6 +434,136 @@ func (s *stubStore) RevokePrivilegedSession(_ context.Context, sessionID, tenant
 	}, nil
 }
 
+func (s *stubStore) CreateBreakGlassSession(_ context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error) {
+	s.createdBreakGlassParam = params
+	if s.breakGlassSessionErr != nil {
+		return nil, s.breakGlassSessionErr
+	}
+	if s.breakGlassSession != nil {
+		return s.breakGlassSession, nil
+	}
+	return &domain.BreakGlassSession{
+		SessionID:        "00000000-0000-0000-0000-000000000002",
+		TenantID:         params.TenantID,
+		PrincipalID:      params.PrincipalID,
+		IncidentID:       params.IncidentID,
+		Reason:           params.Reason,
+		RequestedActions: params.RequestedActions,
+		Status:           domain.BreakGlassSessionStatusActive,
+		DurationSeconds:  params.DurationSeconds,
+		ExpiresAt:        time.Now().UTC().Add(30 * time.Minute),
+		CreatedAt:        time.Now().UTC(),
+	}, nil
+}
+
+func (s *stubStore) FindBreakGlassSessionByID(_ context.Context, sessionID, tenantID string) (*domain.BreakGlassSession, error) {
+	if s.breakGlassSessionErr != nil {
+		return nil, s.breakGlassSessionErr
+	}
+	if s.breakGlassSession != nil {
+		return s.breakGlassSession, nil
+	}
+	return nil, domain.ErrBreakGlassSessionNotFound
+}
+
+func (s *stubStore) ListBreakGlassSessions(_ context.Context, tenantID, principalID string, activeOnly bool) ([]domain.BreakGlassSession, error) {
+	if s.listBreakGlassErr != nil {
+		return nil, s.listBreakGlassErr
+	}
+	return s.listBreakGlassSessions, nil
+}
+
+func (s *stubStore) RevokeBreakGlassSession(_ context.Context, sessionID, tenantID, revokedBy string) (*domain.BreakGlassSession, error) {
+	if s.revokeBreakGlassErr != nil {
+		return nil, s.revokeBreakGlassErr
+	}
+	if s.revokeBreakGlassSession != nil {
+		return s.revokeBreakGlassSession, nil
+	}
+	now := time.Now().UTC()
+	return &domain.BreakGlassSession{
+		SessionID: sessionID,
+		TenantID:  tenantID,
+		Status:    domain.BreakGlassSessionStatusRevoked,
+		RevokedAt: &now,
+		RevokedBy: &revokedBy,
+	}, nil
+}
+
+func (s *stubStore) CreateSupportSession(_ context.Context, params domain.CreateSupportSessionParams) (*domain.SupportSession, error) {
+	s.createdSupportParam = params
+	if s.supportSessionErr != nil {
+		return nil, s.supportSessionErr
+	}
+	if s.supportSession != nil {
+		return s.supportSession, nil
+	}
+	return &domain.SupportSession{
+		SessionID:             "00000000-0000-0000-0000-000000000003",
+		TenantID:              params.TenantID,
+		SupportOperatorID:     params.SupportOperatorID,
+		TicketRef:             params.TicketRef,
+		Purpose:               params.Purpose,
+		ReadOnly:              params.ReadOnly,
+		AllowBulkExport:       params.AllowBulkExport,
+		AllowedActions:        params.AllowedActions,
+		Status:                domain.SupportSessionStatusActive,
+		DurationSeconds:       params.DurationSeconds,
+		ExpiresAt:             time.Now().UTC().Add(time.Hour),
+		TenantConsentObtained: params.TenantConsentObtained,
+		CreatedAt:             time.Now().UTC(),
+	}, nil
+}
+
+func (s *stubStore) FindSupportSessionByID(_ context.Context, sessionID, tenantID string) (*domain.SupportSession, error) {
+	if s.supportSessionErr != nil {
+		return nil, s.supportSessionErr
+	}
+	if s.supportSession != nil {
+		return s.supportSession, nil
+	}
+	return nil, domain.ErrSupportSessionNotFound
+}
+
+func (s *stubStore) ListSupportSessions(_ context.Context, tenantID string, activeOnly bool) ([]domain.SupportSession, error) {
+	if s.listSupportErr != nil {
+		return nil, s.listSupportErr
+	}
+	return s.listSupportSessions, nil
+}
+
+func (s *stubStore) RevokeSupportSession(_ context.Context, sessionID, tenantID, revokedBy string) (*domain.SupportSession, error) {
+	if s.revokeSupportErr != nil {
+		return nil, s.revokeSupportErr
+	}
+	if s.revokeSupportSession != nil {
+		return s.revokeSupportSession, nil
+	}
+	now := time.Now().UTC()
+	return &domain.SupportSession{
+		SessionID: sessionID,
+		TenantID:  tenantID,
+		Status:    domain.SupportSessionStatusRevoked,
+		RevokedAt: &now,
+		RevokedBy: &revokedBy,
+	}, nil
+}
+
+func (s *stubStore) CreateAuthorityLimit(_ context.Context, _ domain.CreateAuthorityLimitParams) (*domain.AuthorityLimit, error) {
+	return &domain.AuthorityLimit{}, nil
+}
+
+func (s *stubStore) FindAuthorityLimitByID(_ context.Context, _, _ string) (*domain.AuthorityLimit, error) {
+	return &domain.AuthorityLimit{}, nil
+}
+
+func (s *stubStore) ListAuthorityLimits(_ context.Context, _, _, _, _ string) ([]domain.AuthorityLimit, error) {
+	if s.authorityLimitsErr != nil {
+		return nil, s.authorityLimitsErr
+	}
+	return s.authorityLimits, nil
+}
+
 // ── stub publisher ───────────────────────────────────────────────────────────
 
 type stubPublisher struct {
@@ -425,6 +582,18 @@ func (p *stubPublisher) PublishAuthorizationDenied(_ context.Context, _ domain.A
 }
 func (p *stubPublisher) PublishSoDViolationDetected(_ context.Context, _ domain.AccessDecisionLog, _ string) error {
 	p.sodCalls++
+	return nil
+}
+func (p *stubPublisher) PublishBreakGlassStarted(_ context.Context, _ domain.BreakGlassSession) error {
+	return nil
+}
+func (p *stubPublisher) PublishBreakGlassEnded(_ context.Context, _ domain.BreakGlassSession) error {
+	return nil
+}
+func (p *stubPublisher) PublishSupportSessionStarted(_ context.Context, _ domain.SupportSession) error {
+	return nil
+}
+func (p *stubPublisher) PublishSupportSessionEnded(_ context.Context, _ domain.SupportSession) error {
 	return nil
 }
 

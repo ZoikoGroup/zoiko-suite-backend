@@ -50,7 +50,7 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	// for the same reason: 000009 creates them, and CREATE OR REPLACE FUNCTION
 	// cannot change a function's return type, so a stale definition from an
 	// earlier schema version fails the migration rather than being replaced.
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS privileged_sessions, principal_status_projection, abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS authority_limits, support_sessions, break_glass_sessions, privileged_sessions, principal_status_projection, abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
 	_, _ = pool.Exec(ctx, "DROP VIEW IF EXISTS access_decision_log_retention_status;")
 	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS detach_access_decision_log_partitions_before(DATE);")
 	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS create_access_decision_log_partition(DATE);")
@@ -99,9 +99,13 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		// GET /v1/access-decisions relies on. 000013 adds
 		// principal_status_projection, layer 0 of the evaluation.
 		// 000014 adds privileged_sessions for PAM JIT elevation.
+		// 000015 adds break_glass_sessions and support_sessions.
+		// 000016 adds scope dimensions (book_id, org_unit_id) and authority_limits.
 		"000012_index_access_decision_log_for_query.up.sql",
 		"000013_add_principal_status_projection.up.sql",
 		"000014_add_privileged_sessions.up.sql",
+		"000015_add_break_glass_and_support_sessions.up.sql",
+		"000016_add_scope_dimensions_and_authority_limits.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + name)
 		if err != nil {

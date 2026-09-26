@@ -57,6 +57,8 @@ type PrincipalRoleAssignment struct {
 	PrincipalID   string  `json:"principal_id"`
 	RoleID        string  `json:"role_id"`
 	LegalEntityID *string `json:"legal_entity_id"`
+	BookID        *string `json:"book_id,omitempty"`
+	OrgUnitID     *string `json:"org_unit_id,omitempty"`
 
 	EffectiveFrom time.Time  `json:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to"`
@@ -85,6 +87,8 @@ type DelegatedAuthority struct {
 	// LegalEntityID is nil when the delegation applies across the whole
 	// tenant rather than one entity.
 	LegalEntityID *string `json:"legal_entity_id"`
+	BookID        *string `json:"book_id,omitempty"`
+	OrgUnitID     *string `json:"org_unit_id,omitempty"`
 
 	// AuthorityLimitType/AuthorityLimitValue are optional (e.g. "AMOUNT_CAP" / "5000").
 	AuthorityLimitType  *string `json:"authority_limit_type"`
@@ -382,6 +386,76 @@ type CreatePrivilegedSessionParams struct {
 	DurationSeconds  int
 }
 
+// BreakGlassSessionStatus represents the lifecycle state of an emergency break-glass session (ZS-IAM-001 §14 & §21).
+const (
+	BreakGlassSessionStatusActive  = "ACTIVE"
+	BreakGlassSessionStatusRevoked = "REVOKED"
+	BreakGlassSessionStatusExpired = "EXPIRED"
+)
+
+// BreakGlassSession records an emergency time-bound access grant tied to a declared incident (ZS-IAM-001 §14 & §21).
+type BreakGlassSession struct {
+	SessionID        string     `json:"session_id"`
+	TenantID         string     `json:"tenant_id"`
+	PrincipalID      string     `json:"principal_id"`
+	IncidentID       string     `json:"incident_id"`
+	Reason           string     `json:"reason"`
+	RequestedActions []string   `json:"requested_actions"`
+	Status           string     `json:"status"`
+	DurationSeconds  int        `json:"duration_seconds"`
+	ExpiresAt        time.Time  `json:"expires_at"`
+	CreatedAt        time.Time  `json:"created_at"`
+	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy        *string    `json:"revoked_by,omitempty"`
+}
+
+type CreateBreakGlassSessionParams struct {
+	TenantID         string
+	PrincipalID      string
+	IncidentID       string
+	Reason           string
+	RequestedActions []string
+	DurationSeconds  int
+}
+
+// SupportSessionStatus represents the lifecycle state of a tenant support session (ZS-IAM-001 §15 & §21).
+const (
+	SupportSessionStatusActive  = "ACTIVE"
+	SupportSessionStatusRevoked = "REVOKED"
+	SupportSessionStatusExpired = "EXPIRED"
+)
+
+// SupportSession records a purpose-bound tenant support / diagnostic access session (ZS-IAM-001 §15 & §21).
+type SupportSession struct {
+	SessionID              string     `json:"session_id"`
+	TenantID               string     `json:"tenant_id"`
+	SupportOperatorID      string     `json:"support_operator_id"`
+	TicketRef              string     `json:"ticket_ref"`
+	Purpose                string     `json:"purpose"`
+	ReadOnly               bool       `json:"read_only"`
+	AllowBulkExport        bool       `json:"allow_bulk_export"`
+	AllowedActions         []string   `json:"allowed_actions"`
+	Status                 string     `json:"status"`
+	DurationSeconds        int        `json:"duration_seconds"`
+	ExpiresAt              time.Time  `json:"expires_at"`
+	TenantConsentObtained  bool       `json:"tenant_consent_obtained"`
+	CreatedAt              time.Time  `json:"created_at"`
+	RevokedAt              *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy              *string    `json:"revoked_by,omitempty"`
+}
+
+type CreateSupportSessionParams struct {
+	TenantID              string
+	SupportOperatorID     string
+	TicketRef             string
+	Purpose               string
+	ReadOnly              bool
+	AllowBulkExport       bool
+	AllowedActions        []string
+	DurationSeconds       int
+	TenantConsentObtained bool
+}
+
 // ── params ───────────────────────────────────────────────────────────────────
 
 type CreateRoleParams struct {
@@ -408,6 +482,8 @@ type CreateRoleAssignmentParams struct {
 	// when the target role's RoleScopeType is "TENANT"; see
 	// Store.CreateRoleAssignment.
 	LegalEntityID *string
+	BookID        *string
+	OrgUnitID     *string
 	EffectiveFrom time.Time
 	AssignedBy    string
 }
@@ -423,6 +499,8 @@ type CreateDelegatedAuthorityParams struct {
 	ScopeType            string
 	// LegalEntityID is nil for a tenant-wide delegation.
 	LegalEntityID       *string
+	BookID              *string
+	OrgUnitID           *string
 	AuthorityLimitType  *string
 	AuthorityLimitValue *string
 	// DelegatedActions is the subset conferred. Nil means the delegator's
@@ -451,6 +529,8 @@ type ProjectDelegationParams struct {
 	DelegatePrincipalID  string
 	// LegalEntityID is nil for a tenant-wide delegation.
 	LegalEntityID *string
+	BookID        *string
+	OrgUnitID     *string
 	// DelegatedActions is the action set the upstream event named. Upstream
 	// delegates ONE action per grant, so this normally holds exactly one —
 	// which is precisely the subset case that had no representation in this
@@ -718,11 +798,163 @@ var ErrPrivilegedSessionNotFound = errorString("privileged session not found")
 var ErrPrivilegedSessionExpired = errorString("privileged session has expired")
 var ErrPrivilegedSessionInactive = errorString("privileged session is not active")
 var ErrPrivilegedSessionIncomplete = errorString("privileged session requires principal_id, ticket_ref, and reason")
+var ErrBreakGlassSessionNotFound = errorString("break-glass session not found")
+var ErrBreakGlassSessionExpired = errorString("break-glass session has expired")
+var ErrBreakGlassSessionInactive = errorString("break-glass session is not active")
+var ErrBreakGlassSessionIncomplete = errorString("break-glass session requires principal_id, incident_id, and reason")
+var ErrBreakGlassIncidentRequired = errorString("break-glass session requires a declared incident_id (Scenario A16)")
+var ErrSupportSessionNotFound = errorString("support session not found")
+var ErrSupportSessionExpired = errorString("support session has expired")
+var ErrSupportSessionInactive = errorString("support session is not active")
+var ErrSupportSessionIncomplete = errorString("support session requires support_operator_id, ticket_ref, and purpose")
+var ErrSupportBulkExportForbidden = errorString("bulk export forbidden in support session (Scenario A14)")
+var ErrSupportReadOnlyViolation = errorString("write operations forbidden in read-only support session")
 var ErrInvalidTransition = errorString("invalid revocation status transition")
 var ErrConflict = errorString("conflict: record already exists with differing attributes")
 var ErrStoreUnavailable = errorString("authorization store unavailable")
 var ErrJurisdictionNotFound = errorString("jurisdiction not found")
 var ErrJurisdictionServiceUnavailable = errorString("jurisdiction-rules-svc unavailable")
+var ErrAuthorityLimitNotFound = errorString("authority limit not found")
+var ErrAuthorityLimitTargetRequired = errorString("authority limit requires at least one of principal_id or role_id")
+
+// AuthorityLimit defines the foundational approval and signing limit for a principal
+// or role within an optional legal entity, book, or org-unit scope (ZS-IAM-001 §12, §21, §22).
+type AuthorityLimit struct {
+	AuthorityLimitID string     `json:"authority_limit_id"`
+	TenantID         string     `json:"tenant_id"`
+	PrincipalID      *string    `json:"principal_id,omitempty"`
+	RoleID           *string    `json:"role_id,omitempty"`
+	AuthorityType    string     `json:"authority_type"`
+	LegalEntityID    *string    `json:"legal_entity_id,omitempty"`
+	BookID           *string    `json:"book_id,omitempty"`
+	OrgUnitID        *string    `json:"org_unit_id,omitempty"`
+	Currency         string     `json:"currency"`
+	LowerLimit       string     `json:"lower_limit"`
+	UpperLimit       string     `json:"upper_limit"`
+	EffectiveFrom    time.Time  `json:"effective_from"`
+	EffectiveTo      *time.Time `json:"effective_to,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+}
+
+type CreateAuthorityLimitParams struct {
+	AuthorityLimitID string
+	TenantID         string
+	PrincipalID      *string
+	RoleID           *string
+	AuthorityType    string
+	LegalEntityID    *string
+	BookID           *string
+	OrgUnitID        *string
+	Currency         string
+	LowerLimit       string
+	UpperLimit       string
+	EffectiveFrom    time.Time
+	EffectiveTo      *time.Time
+}
+
+// ── Canonical Authorization API Contract & Dynamic SoD (ZS-IAM-001 §7, §8, §10.2, §21) ──
+
+const (
+	OutcomeGranted = "GRANTED"
+	OutcomeDenied  = "DENIED"
+	OutcomeStepUp  = "STEP_UP"
+
+	CanonicalDecisionAllow  = "ALLOW"
+	CanonicalDecisionPermit = "PERMIT"
+	CanonicalDecisionDeny   = "DENY"
+	CanonicalDecisionStepUp = "STEP_UP"
+
+	DefaultPolicySetVersion = "2026.08.24.4"
+)
+
+// EnvironmentContext captures contextual environment attributes including authentication age,
+// assurance level, and operational risk (ZS-IAM-001 §8.1).
+type EnvironmentContext struct {
+	AuthnAgeSeconds int    `json:"authn_age_seconds,omitempty"`
+	Assurance       string `json:"assurance,omitempty"`
+	Risk            string `json:"risk,omitempty"`
+}
+
+// StepUpRequirement details the required assurance and authentication freshness needed
+// when an operation returns STEP_UP (ZS-IAM-001 §7 Stage 7, §8.2, Scenario A26).
+type StepUpRequirement struct {
+	RequiredAssurance  string `json:"required_assurance"`
+	MaxAuthnAgeSeconds int    `json:"max_authn_age_seconds"`
+	Reason             string `json:"reason"`
+}
+
+// CanonicalDecisionRequest matches ZS-IAM-001 §8.1 for POST /internal/authorization/decisions.
+type CanonicalDecisionRequest struct {
+	SubjectID          string             `json:"subject_id"`
+	PrincipalType      string             `json:"principal_type,omitempty"`
+	SessionID          string             `json:"session_id,omitempty"`
+	TenantID           string             `json:"tenant_id,omitempty"`
+	LegalEntityID      string             `json:"legal_entity_id,omitempty"`
+	BookID             string             `json:"book_id,omitempty"`
+	OrgUnitID          string             `json:"org_unit_id,omitempty"`
+	ResourceType       string             `json:"resource_type,omitempty"`
+	ResourceID         string             `json:"resource_id,omitempty"`
+	Action             string             `json:"action"`
+	ResourceVersion    int                `json:"resource_version,omitempty"`
+	ResourceAttributes map[string]string  `json:"resource_attributes,omitempty"`
+	Environment        EnvironmentContext `json:"environment,omitempty"`
+	DelegationID       *string            `json:"delegation_id,omitempty"`
+	CorrelationID      string             `json:"correlation_id,omitempty"`
+}
+
+// CanonicalDecisionResponse matches ZS-IAM-001 §8.2 for POST /internal/authorization/decisions.
+type CanonicalDecisionResponse struct {
+	Decision             string                 `json:"decision"`
+	DecisionID           string                 `json:"decision_id"`
+	PolicySetVersion     string                 `json:"policy_set_version"`
+	MatchedGrants        []string               `json:"matched_grants"`
+	NegativeControls     []string               `json:"negative_controls"`
+	Obligations          []string               `json:"obligations"`
+	ExpiresAt            string                 `json:"expires_at,omitempty"`
+	ReasonCodes          []string               `json:"reason_codes"`
+	AvailableActions     []string               `json:"available_actions,omitempty"`
+	StepUp               *StepUpRequirement     `json:"step_up,omitempty"`
+	AuthorizationContext map[string]interface{} `json:"authorization_context,omitempty"`
+	Reason               string                 `json:"reason,omitempty"`
+	Basis                string                 `json:"basis,omitempty"`
+}
+
+// DeniedActionInfo explains why a particular candidate action is not available.
+type DeniedActionInfo struct {
+	Action     string `json:"action"`
+	ReasonCode string `json:"reason_code"`
+	Basis      string `json:"basis"`
+}
+
+// StepUpActionInfo describes an action that is available contingent on step-up authentication.
+type StepUpActionInfo struct {
+	Action             string `json:"action"`
+	RequiredAssurance  string `json:"required_assurance"`
+	MaxAuthnAgeSeconds int    `json:"max_authn_age_seconds"`
+	Reason             string `json:"reason"`
+}
+
+// AvailableActionsResponse matches ZS-IAM-001 §21 GET /v1/{resource}/{id}/available-actions.
+type AvailableActionsResponse struct {
+	ResourceType     string             `json:"resource_type"`
+	ResourceID       string             `json:"resource_id"`
+	PrincipalID      string             `json:"principal_id"`
+	AvailableActions []string           `json:"available_actions"`
+	DeniedActions    []DeniedActionInfo `json:"denied_actions,omitempty"`
+	StepUpActions    []StepUpActionInfo `json:"step_up_actions,omitempty"`
+}
+
+// CapabilitiesResponse matches ZS-IAM-001 §21 GET /v1/me/capabilities.
+type CapabilitiesResponse struct {
+	PrincipalID   string          `json:"principal_id"`
+	TenantID      string          `json:"tenant_id"`
+	LegalEntityID string          `json:"legal_entity_id,omitempty"`
+	BookID        string          `json:"book_id,omitempty"`
+	OrgUnitID     string          `json:"org_unit_id,omitempty"`
+	Permissions   []string        `json:"permissions"`
+	Modules       []string        `json:"modules"`
+	Features      map[string]bool `json:"features"`
+}
 
 type errorString string
 

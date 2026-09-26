@@ -98,6 +98,63 @@ func (p *Publisher) PublishSoDViolationDetected(ctx context.Context, d domain.Ac
 	})
 }
 
+// PublishBreakGlassStarted publishes security.break_glass.started (ZS-IAM-001 §23).
+func (p *Publisher) PublishBreakGlassStarted(ctx context.Context, session domain.BreakGlassSession) error {
+	return p.emit(ctx, "security.break_glass.started", "", "", session.PrincipalID, session.SessionID, map[string]any{
+		"session_id":        session.SessionID,
+		"tenant_id":         session.TenantID,
+		"principal_id":      session.PrincipalID,
+		"incident_id":       session.IncidentID,
+		"reason":            session.Reason,
+		"requested_actions": session.RequestedActions,
+		"status":            session.Status,
+		"expires_at":        session.ExpiresAt,
+	})
+}
+
+// PublishBreakGlassEnded publishes security.break_glass.ended (ZS-IAM-001 §23).
+func (p *Publisher) PublishBreakGlassEnded(ctx context.Context, session domain.BreakGlassSession) error {
+	return p.emit(ctx, "security.break_glass.ended", "", "", session.PrincipalID, session.SessionID, map[string]any{
+		"session_id":   session.SessionID,
+		"tenant_id":    session.TenantID,
+		"principal_id": session.PrincipalID,
+		"incident_id":  session.IncidentID,
+		"status":       session.Status,
+		"revoked_at":   session.RevokedAt,
+		"revoked_by":   session.RevokedBy,
+	})
+}
+
+// PublishSupportSessionStarted publishes support.session.started (ZS-IAM-001 §23).
+func (p *Publisher) PublishSupportSessionStarted(ctx context.Context, session domain.SupportSession) error {
+	return p.emit(ctx, "support.session.started", "", "", session.SupportOperatorID, session.SessionID, map[string]any{
+		"session_id":              session.SessionID,
+		"tenant_id":               session.TenantID,
+		"support_operator_id":     session.SupportOperatorID,
+		"ticket_ref":              session.TicketRef,
+		"purpose":                 session.Purpose,
+		"read_only":               session.ReadOnly,
+		"allow_bulk_export":       session.AllowBulkExport,
+		"allowed_actions":         session.AllowedActions,
+		"status":                  session.Status,
+		"expires_at":              session.ExpiresAt,
+		"tenant_consent_obtained": session.TenantConsentObtained,
+	})
+}
+
+// PublishSupportSessionEnded publishes support.session.ended (ZS-IAM-001 §23).
+func (p *Publisher) PublishSupportSessionEnded(ctx context.Context, session domain.SupportSession) error {
+	return p.emit(ctx, "support.session.ended", "", "", session.SupportOperatorID, session.SessionID, map[string]any{
+		"session_id":          session.SessionID,
+		"tenant_id":           session.TenantID,
+		"support_operator_id": session.SupportOperatorID,
+		"ticket_ref":          session.TicketRef,
+		"status":              session.Status,
+		"revoked_at":          session.RevokedAt,
+		"revoked_by":          session.RevokedBy,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, legalEntityID, actorID, key string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {

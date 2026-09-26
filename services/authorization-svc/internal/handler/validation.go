@@ -318,6 +318,10 @@ type sodValidateResponse struct {
 	// is reported because somebody assigning the role should know the action
 	// will be refused when the holder is also the preparer.
 	OwnObjectRestricted []string `json:"own_object_restricted,omitempty"`
+
+	// DynamicRestricted lists candidate actions subject to runtime dynamic SoD
+	// rules (e.g. cooling windows, self-approvals, access elevation guards).
+	DynamicRestricted []string `json:"dynamic_restricted,omitempty"`
 }
 
 // maxCandidateActions bounds one request. The conflict check is O(candidates ×
@@ -473,6 +477,10 @@ func (h *Handler) ValidateSoDConflicts(w http.ResponseWriter, r *http.Request) {
 		}
 		if ownObject {
 			resp.OwnObjectRestricted = append(resp.OwnObjectRestricted, candidate)
+		}
+
+		if isReleaseAction(candidate) || isApprovalAction(candidate) || isGrantAction(candidate) {
+			resp.DynamicRestricted = append(resp.DynamicRestricted, candidate)
 		}
 	}
 

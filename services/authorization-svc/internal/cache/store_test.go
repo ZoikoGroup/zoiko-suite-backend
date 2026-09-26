@@ -46,7 +46,19 @@ func (c *countingStore) FindGrantedActions(_ context.Context, _, _, _ string) ([
 	}
 	return c.actions, c.basis, nil
 }
+func (c *countingStore) FindGrantedActionsScoped(_ context.Context, _, _, _, _, _ string) ([]string, string, error) {
+	c.grantCalls++
+	if c.failGrantsOnce {
+		c.failGrantsOnce = false
+		return nil, "", domain.ErrStoreUnavailable
+	}
+	return c.actions, c.basis, nil
+}
 func (c *countingStore) FindDelegatedActions(_ context.Context, _, _, _ string) ([]string, string, error) {
+	c.delegateCalls++
+	return c.actions, c.basis, nil
+}
+func (c *countingStore) FindDelegatedActionsScoped(_ context.Context, _, _, _, _, _ string) ([]string, string, error) {
 	c.delegateCalls++
 	return c.actions, c.basis, nil
 }
@@ -177,6 +189,64 @@ func (c *countingStore) ListPrivilegedSessions(_ context.Context, _, _ string, _
 	return nil, nil
 }
 func (c *countingStore) RevokePrivilegedSession(_ context.Context, _, _, _ string) (*domain.PrivilegedSession, error) {
+	return nil, nil
+}
+func (c *countingStore) CreateBreakGlassSession(_ context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error) {
+	return &domain.BreakGlassSession{
+		SessionID:        "bg-stub",
+		TenantID:         params.TenantID,
+		PrincipalID:      params.PrincipalID,
+		IncidentID:       params.IncidentID,
+		Reason:           params.Reason,
+		RequestedActions: params.RequestedActions,
+		Status:           domain.BreakGlassSessionStatusActive,
+		DurationSeconds:  params.DurationSeconds,
+		ExpiresAt:        time.Now().Add(time.Hour),
+		CreatedAt:        time.Now(),
+	}, nil
+}
+func (c *countingStore) FindBreakGlassSessionByID(_ context.Context, _, _ string) (*domain.BreakGlassSession, error) {
+	return nil, domain.ErrBreakGlassSessionNotFound
+}
+func (c *countingStore) ListBreakGlassSessions(_ context.Context, _, _ string, _ bool) ([]domain.BreakGlassSession, error) {
+	return nil, nil
+}
+func (c *countingStore) RevokeBreakGlassSession(_ context.Context, _, _, _ string) (*domain.BreakGlassSession, error) {
+	return nil, nil
+}
+func (c *countingStore) CreateSupportSession(_ context.Context, params domain.CreateSupportSessionParams) (*domain.SupportSession, error) {
+	return &domain.SupportSession{
+		SessionID:             "ss-stub",
+		TenantID:              params.TenantID,
+		SupportOperatorID:     params.SupportOperatorID,
+		TicketRef:             params.TicketRef,
+		Purpose:               params.Purpose,
+		ReadOnly:              params.ReadOnly,
+		AllowBulkExport:       params.AllowBulkExport,
+		AllowedActions:        params.AllowedActions,
+		Status:                domain.SupportSessionStatusActive,
+		DurationSeconds:       params.DurationSeconds,
+		ExpiresAt:             time.Now().Add(time.Hour),
+		TenantConsentObtained: params.TenantConsentObtained,
+		CreatedAt:             time.Now(),
+	}, nil
+}
+func (c *countingStore) FindSupportSessionByID(_ context.Context, _, _ string) (*domain.SupportSession, error) {
+	return nil, domain.ErrSupportSessionNotFound
+}
+func (c *countingStore) ListSupportSessions(_ context.Context, _ string, _ bool) ([]domain.SupportSession, error) {
+	return nil, nil
+}
+func (c *countingStore) RevokeSupportSession(_ context.Context, _, _, _ string) (*domain.SupportSession, error) {
+	return nil, nil
+}
+func (c *countingStore) CreateAuthorityLimit(_ context.Context, _ domain.CreateAuthorityLimitParams) (*domain.AuthorityLimit, error) {
+	return &domain.AuthorityLimit{}, nil
+}
+func (c *countingStore) FindAuthorityLimitByID(_ context.Context, _, _ string) (*domain.AuthorityLimit, error) {
+	return &domain.AuthorityLimit{}, nil
+}
+func (c *countingStore) ListAuthorityLimits(_ context.Context, _, _, _, _ string) ([]domain.AuthorityLimit, error) {
 	return nil, nil
 }
 
