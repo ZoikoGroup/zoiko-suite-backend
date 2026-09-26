@@ -41,6 +41,7 @@ type evalContext struct {
 	BreakGlassSessionID string
 	SupportSessionID    string
 	CorrelationID       string
+	InitiatingSubjectID string
 }
 
 type evalResult struct {
@@ -72,6 +73,64 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		DeniedActions:    make([]domain.DeniedActionInfo, 0),
 		StepUpActions:    make([]domain.StepUpActionInfo, 0),
 		AllHeldActions:   make([]string, 0),
+	}
+
+	// ── Layer 0.0: Workload Identity Validation (ZS-IAM-001 §16, Scenarios A18 & A19) ─
+	isWorkload := strings.EqualFold(in.PrincipalType, "WORKLOAD") ||
+		(in.Attributes != nil && strings.EqualFold(in.Attributes["principal_type"], "WORKLOAD")) ||
+		(in.Attributes != nil && in.Attributes["workload_id"] != "")
+
+	if isWorkload {
+		workloadID := in.PrincipalID
+		if in.Attributes != nil && in.Attributes["workload_id"] != "" {
+			workloadID = in.Attributes["workload_id"]
+		}
+
+		binding, err := h.store.FindWorkloadBinding(ctx, workloadID, in.TenantID)
+		if err != nil || binding == nil {
+			// Scenario A19: Workload attempts to invent or widen tenant context outside its trusted binding.
+			res.Decision = domain.CanonicalDecisionDeny
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = "workload:tenant_context_unbound"
+			res.Reason = "UNBOUND_TENANT_CONTEXT"
+			res.ReasonCodes = []string{"UNBOUND_TENANT_CONTEXT"}
+			res.NegativeControls = []string{"workload:tenant_context_unbound"}
+			// High-severity SIEM/security event
+			h.siem.Stream(ctx, in.TenantID, "security.workload.unbound_tenant", siem.SeverityHigh,
+				fmt.Sprintf("Workload %s attempted access with unbound tenant %s", workloadID, in.TenantID))
+			return res, nil
+		}
+
+		if !binding.ActiveFlag {
+			res.Decision = domain.CanonicalDecisionDeny
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = "workload:inactive_binding"
+			res.Reason = "WORKLOAD_BINDING_INACTIVE"
+			res.ReasonCodes = []string{"WORKLOAD_BINDING_INACTIVE"}
+			res.NegativeControls = []string{"workload:inactive_binding"}
+			return res, nil
+		}
+
+		aud := in.Environment.Audience
+		if aud == "" && in.Attributes != nil {
+			aud = in.Attributes["audience"]
+			if aud == "" {
+				aud = in.Attributes["aud"]
+			}
+		}
+
+		if binding.AllowedAudience != "" && binding.AllowedAudience != "*" {
+			if aud == "" || aud != binding.AllowedAudience {
+				// Scenario A18: Workload presents a valid credential but the audience is incorrect.
+				res.Decision = domain.CanonicalDecisionDeny
+				res.Outcome = domain.OutcomeDenied
+				res.Basis = "workload:audience_mismatch"
+				res.Reason = "TOKEN_AUDIENCE_MISMATCH"
+				res.ReasonCodes = []string{"TOKEN_AUDIENCE_MISMATCH"}
+				res.NegativeControls = []string{"workload:audience_mismatch"}
+				return res, nil
+			}
+		}
 	}
 
 	// ── Layer 0: Principal Status ─────────────────────────────────────────────
@@ -647,21 +706,56 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	initiatingSubjectID := req.InitiatingSubjectID
+	if initiatingSubjectID == "" && req.ResourceAttributes != nil {
+		initiatingSubjectID = req.ResourceAttributes["initiating_subject_id"]
+		if initiatingSubjectID == "" {
+			initiatingSubjectID = req.ResourceAttributes["initiating_principal_id"]
+			if initiatingSubjectID == "" {
+				initiatingSubjectID = req.ResourceAttributes["on_behalf_of"]
+			}
+		}
+	}
+	if initiatingSubjectID == "" {
+		initiatingSubjectID = r.Header.Get("X-Initiating-Subject-Id")
+		if initiatingSubjectID == "" {
+			initiatingSubjectID = r.Header.Get("X-On-Behalf-Of")
+		}
+	}
+
+	if req.Environment.Audience == "" {
+		aud := ""
+		if req.ResourceAttributes != nil {
+			aud = req.ResourceAttributes["audience"]
+			if aud == "" {
+				aud = req.ResourceAttributes["aud"]
+			}
+		}
+		if aud == "" {
+			aud = r.Header.Get("X-Audience")
+			if aud == "" {
+				aud = r.Header.Get("X-Token-Audience")
+			}
+		}
+		req.Environment.Audience = aud
+	}
+
 	in := evalContext{
-		PrincipalID:        subjectID,
-		PrincipalType:      req.PrincipalType,
-		TenantID:           tenantScope,
-		LegalEntityID:      legalEntityID,
-		BookID:             bookID,
-		OrgUnitID:          orgUnitID,
-		ResourceType:       req.ResourceType,
-		ResourceID:         req.ResourceID,
-		ActionType:         req.Action,
-		ResourceOwnerID:    resourceOwnerID,
-		Attributes:         req.ResourceAttributes,
-		Environment:        req.Environment,
-		PrivilegedSessionID: req.SessionID,
-		CorrelationID:      correlationID,
+		PrincipalID:         subjectID,
+		PrincipalType:       req.PrincipalType,
+		TenantID:            tenantScope,
+		LegalEntityID:       legalEntityID,
+		BookID:              bookID,
+		OrgUnitID:           orgUnitID,
+		ResourceType:        req.ResourceType,
+		ResourceID:          req.ResourceID,
+		ActionType:          req.Action,
+		ResourceOwnerID:     resourceOwnerID,
+		Attributes:          req.ResourceAttributes,
+		Environment:         req.Environment,
+		PrivilegedSessionID:  req.SessionID,
+		CorrelationID:       correlationID,
+		InitiatingSubjectID: initiatingSubjectID,
 	}
 
 	evalRes, err := h.evaluateCore(r.Context(), in, evaluationEntityID)
@@ -714,6 +808,17 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 			"resource_id":     req.ResourceID,
 			"principal_type":  req.PrincipalType,
 		},
+	}
+
+	if initiatingSubjectID != "" {
+		resp.AuthorizationContext["initiating_subject_id"] = initiatingSubjectID
+		resp.AuthorizationContext["initiating_principal_id"] = initiatingSubjectID
+	}
+	if correlationID != "" {
+		resp.AuthorizationContext["correlation_id"] = correlationID
+	}
+	if strings.EqualFold(req.PrincipalType, "WORKLOAD") || (req.ResourceAttributes != nil && req.ResourceAttributes["workload_id"] != "") {
+		resp.AuthorizationContext["workload_id"] = subjectID
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -861,7 +966,8 @@ func (h *Handler) emitDecisionTelemetry(
 
 		severity := siem.SeverityMedium
 		isSoD := strings.HasPrefix(evalRes.Basis, "sod:")
-		if isSoD || strings.HasPrefix(evalRes.Basis, principalStatusBasisPrefix) {
+		isWorkloadUnbound := evalRes.Basis == "workload:tenant_context_unbound"
+		if isSoD || strings.HasPrefix(evalRes.Basis, principalStatusBasisPrefix) || isWorkloadUnbound {
 			severity = siem.SeverityHigh
 		}
 		if evalRes.Outcome == domain.OutcomeStepUp {
@@ -870,6 +976,10 @@ func (h *Handler) emitDecisionTelemetry(
 
 		h.siem.Stream(ctx, tenantScope, "authorization.denied", severity,
 			fmt.Sprintf("Authorization decision for principal %s, action %s: %s (%s)", principalID, actionType, evalRes.Outcome, evalRes.Basis))
+		if isWorkloadUnbound {
+			h.siem.Stream(ctx, tenantScope, "security.workload.unbound_tenant", siem.SeverityHigh,
+				fmt.Sprintf("Workload %s attempted access with unbound tenant %s", principalID, tenantScope))
+		}
 
 		if isSoD {
 			conflictingAction := actionType

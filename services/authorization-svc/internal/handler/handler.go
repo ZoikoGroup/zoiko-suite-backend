@@ -119,6 +119,16 @@ type AuthorizationStore interface {
 	FindSupportSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.SupportSession, error)
 	ListSupportSessions(ctx context.Context, tenantID string, activeOnly bool) ([]domain.SupportSession, error)
 	RevokeSupportSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.SupportSession, error)
+
+	// Workload Identity (ZS-IAM-001 §16)
+	FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error)
+	CreateWorkloadBinding(ctx context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error)
+
+	// Access Reviews & Continuous Access Certification (ZS-IAM-001 §21, §24)
+	CreateAccessReview(ctx context.Context, review domain.AccessReview) (*domain.AccessReview, error)
+	GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error)
+	ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error)
+	RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on.
@@ -130,6 +140,13 @@ type EventPublisher interface {
 	PublishBreakGlassEnded(ctx context.Context, session domain.BreakGlassSession) error
 	PublishSupportSessionStarted(ctx context.Context, session domain.SupportSession) error
 	PublishSupportSessionEnded(ctx context.Context, session domain.SupportSession) error
+	PublishAccessReviewStarted(ctx context.Context, review domain.AccessReview) error
+	PublishAccessReviewCompleted(ctx context.Context, review domain.AccessReview) error
+	PublishPrivilegedSessionStarted(ctx context.Context, session domain.PrivilegedSession) error
+	PublishPrivilegedSessionEnded(ctx context.Context, session domain.PrivilegedSession) error
+	PublishAuthorityLimitChanged(ctx context.Context, limit domain.AuthorityLimit, action string) error
+	PublishSoDPolicyPublished(ctx context.Context, rule domain.SoDRule) error
+	PublishPolicySetPublished(ctx context.Context, version, tenantID, publishedBy string) error
 }
 
 type Handler struct {
@@ -211,6 +228,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 	// Canonical Authorization Decision API (ZS-IAM-001 §8.1, §8.2, §21)
 	r.Post("/internal/authorization/decisions", h.HandleCanonicalDecision)
+
+	// Access Reviews & Continuous Access Certification (ZS-IAM-001 §21, §24)
+	r.Get("/v1/iam/access-reviews", h.ListAccessReviews)
+	r.Post("/v1/iam/access-reviews/{id}:decide", h.DecideAccessReview)
+	r.Post("/v1/iam/access-reviews/{id}/decide", h.DecideAccessReview)
 
 	// Available Actions (ZS-IAM-001 §21, ZS-STATE-001)
 	r.Get("/v1/{resource}/{id}/available-actions", h.GetAvailableActions)
@@ -1635,6 +1657,11 @@ type authorizeRequest struct {
 	// SupportSessionID is optional: tenant support access session ID (ZS-IAM-001 §15 & §21).
 	// Purpose-bound diagnostic / support access with operator attribution.
 	SupportSessionID string `json:"support_session_id,omitempty"`
+
+	// Workload Identity (ZS-IAM-001 §16)
+	PrincipalType       string `json:"principal_type,omitempty"`
+	Audience            string `json:"audience,omitempty"`
+	InitiatingSubjectID string `json:"initiating_subject_id,omitempty"`
 }
 
 // PlatformScopeSentinel is the legal_entity_id a caller sends to have a
@@ -1684,6 +1711,7 @@ type authorizeResponse struct {
 	DecisionOutcome  string `json:"decision_outcome"`
 	DecisionBasis    string `json:"decision_basis"`
 	AccessDecisionID string `json:"access_decision_id"`
+	Reason           string `json:"reason,omitempty"`
 }
 
 // Authorize handles POST /v1/authorize — the core evaluation endpoint.
@@ -1835,6 +1863,57 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	tenantScope, ok := h.resolveTenantScope(w, r, req.TenantID)
 	if !ok {
 		return
+	}
+
+	// ── Workload Identity Validation (ZS-IAM-001 §16, Scenarios A18 & A19) ───
+	isWorkload := strings.EqualFold(req.PrincipalType, "WORKLOAD") ||
+		(req.Attributes != nil && strings.EqualFold(req.Attributes["principal_type"], "WORKLOAD")) ||
+		(req.Attributes != nil && req.Attributes["workload_id"] != "")
+
+	if isWorkload {
+		workloadID := req.PrincipalID
+		if req.Attributes != nil && req.Attributes["workload_id"] != "" {
+			workloadID = req.Attributes["workload_id"]
+		}
+
+		binding, err := h.store.FindWorkloadBinding(r.Context(), workloadID, tenantScope)
+		if err != nil || binding == nil {
+			// Scenario A19: Workload attempts to invent or widen tenant context outside its trusted binding.
+			h.siem.Stream(r.Context(), tenantScope, "security.workload.unbound_tenant", siem.SeverityHigh,
+				fmt.Sprintf("Workload %s attempted access with unbound tenant %s", workloadID, tenantScope))
+			h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID,
+				"DENIED", "workload:tenant_context_unbound", "UNBOUND_TENANT_CONTEXT")
+			return
+		}
+
+		if !binding.ActiveFlag {
+			h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID,
+				"DENIED", "workload:inactive_binding", "WORKLOAD_BINDING_INACTIVE")
+			return
+		}
+
+		aud := req.Audience
+		if aud == "" && req.Attributes != nil {
+			aud = req.Attributes["audience"]
+			if aud == "" {
+				aud = req.Attributes["aud"]
+			}
+		}
+		if aud == "" {
+			aud = r.Header.Get("X-Audience")
+			if aud == "" {
+				aud = r.Header.Get("X-Token-Audience")
+			}
+		}
+
+		if binding.AllowedAudience != "" && binding.AllowedAudience != "*" {
+			if aud == "" || aud != binding.AllowedAudience {
+				// Scenario A18: Workload presents a valid credential but the audience is incorrect.
+				h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID,
+					"DENIED", "workload:audience_mismatch", "TOKEN_AUDIENCE_MISMATCH")
+				return
+			}
+		}
 	}
 
 	// ── layer 0: is this still an active principal? ─────────────────────────
@@ -2260,6 +2339,16 @@ func (h *Handler) recordAndAnswer(
 	evaluationEntityID, tenantScope, correlationID string,
 	outcome, basis string,
 ) {
+	h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID, outcome, basis, "")
+}
+
+func (h *Handler) recordAndAnswerWithReason(
+	w http.ResponseWriter,
+	r *http.Request,
+	req authorizeRequest,
+	evaluationEntityID, tenantScope, correlationID string,
+	outcome, basis, reason string,
+) {
 	decision, err := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
 		PrincipalID: req.PrincipalID,
 		// The RESOLVED entity, not the sentinel the caller may have sent.
@@ -2307,11 +2396,15 @@ func (h *Handler) recordAndAnswer(
 		// is still acting as it. Same elevation as an SoD violation, and
 		// deliberately not folded into the sod: prefix, because it publishes
 		// no sod.violation.detected: nothing here is a duty conflict.
-		if strings.HasPrefix(basis, principalStatusBasisPrefix) {
+		if strings.HasPrefix(basis, principalStatusBasisPrefix) || basis == "workload:tenant_context_unbound" {
 			severity = siem.SeverityHigh
 		}
 		h.siem.Stream(r.Context(), tenantScope, "authorization.denied", severity,
 			"Authorization denied for principal "+req.PrincipalID+", action "+req.ActionType+": "+basis)
+		if basis == "workload:tenant_context_unbound" {
+			h.siem.Stream(r.Context(), tenantScope, "security.workload.unbound_tenant", siem.SeverityHigh,
+				fmt.Sprintf("Workload %s attempted access with unbound tenant %s", req.PrincipalID, tenantScope))
+		}
 		if isSoD {
 			// conflict_with= names the other held action; an own-object
 			// denial has no "other action" — the conflict is the action
@@ -2333,7 +2426,12 @@ func (h *Handler) recordAndAnswer(
 		zap.String("basis", basis),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, authorizeResponse{DecisionOutcome: outcome, DecisionBasis: basis, AccessDecisionID: decision.AccessDecisionID})
+	writeJSON(w, http.StatusOK, authorizeResponse{
+		DecisionOutcome:  outcome,
+		DecisionBasis:    basis,
+		AccessDecisionID: decision.AccessDecisionID,
+		Reason:           reason,
+	})
 }
 
 // ── GET /v1/admin/role-assignments ──────────────────────────────────────────

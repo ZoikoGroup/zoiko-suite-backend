@@ -157,6 +157,26 @@ type Store interface {
 	FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error)
 	ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error)
 	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
+
+	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21).
+	CreateBreakGlassSession(ctx context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error)
+	FindBreakGlassSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.BreakGlassSession, error)
+	ListBreakGlassSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.BreakGlassSession, error)
+	RevokeBreakGlassSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.BreakGlassSession, error)
+
+	// Tenant Support Sessions (ZS-IAM-001 §15 & §21).
+	CreateSupportSession(ctx context.Context, params domain.CreateSupportSessionParams) (*domain.SupportSession, error)
+	FindSupportSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.SupportSession, error)
+	ListSupportSessions(ctx context.Context, tenantID string, activeOnly bool) ([]domain.SupportSession, error)
+	RevokeSupportSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.SupportSession, error)
+
+	// Phase 5: Workload Identity & Access Reviews (ZS-IAM-001 §16, §21, §24).
+	FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error)
+	CreateWorkloadBinding(ctx context.Context, wb domain.WorkloadBinding) (*domain.WorkloadBinding, error)
+	ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error)
+	GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error)
+	RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, reason, decidedBy string) (*domain.AccessReview, error)
+	CreateAccessReview(ctx context.Context, r domain.AccessReview) (*domain.AccessReview, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -2920,4 +2940,245 @@ func (s *PgStore) ListAuthorityLimits(ctx context.Context, tenantID string, prin
 		list = []domain.AuthorityLimit{}
 	}
 	return list, nil
+}
+
+// ── Phase 5: Workload Identity & Access Reviews ──────────────────────────────
+
+func (s *PgStore) FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error) {
+	const query = `
+		SELECT workload_id, tenant_id, allowed_audience, allowed_actions, active_flag, created_at
+		FROM workload_bindings
+		WHERE workload_id = $1
+		  AND (tenant_id = NULLIF($2, '')::uuid OR tenant_id IS NULL)
+		  AND active_flag = TRUE
+		LIMIT 1;`
+
+	var wb domain.WorkloadBinding
+	var tid uuid.UUID
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, query, workloadID, tenantID)
+		return row.Scan(&wb.WorkloadID, &tid, &wb.AllowedAudience, &wb.AllowedActions, &wb.ActiveFlag, &wb.CreatedAt)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || isUndefinedTable(err) {
+			return nil, domain.ErrWorkloadBindingNotFound
+		}
+		s.log.Error("pg FindWorkloadBinding failed", zap.String("workload_id", workloadID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	wb.TenantID = tid.String()
+	return &wb, nil
+}
+
+func (s *PgStore) CreateWorkloadBinding(ctx context.Context, wb domain.WorkloadBinding) (*domain.WorkloadBinding, error) {
+	const query = `
+		INSERT INTO workload_bindings (workload_id, tenant_id, allowed_audience, allowed_actions, active_flag, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (workload_id, tenant_id) DO UPDATE
+		SET allowed_audience = EXCLUDED.allowed_audience,
+		    allowed_actions = EXCLUDED.allowed_actions,
+		    active_flag = EXCLUDED.active_flag;`
+
+	tUUID, err := uuid.Parse(wb.TenantID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tenant_id: %w", err)
+	}
+
+	createdAt := wb.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+
+	err = s.withRLS(ctx, wb.TenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, query, wb.WorkloadID, tUUID, wb.AllowedAudience, wb.AllowedActions, wb.ActiveFlag, createdAt)
+		return err
+	})
+	if err != nil {
+		s.log.Error("pg CreateWorkloadBinding failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return &wb, nil
+}
+
+func (s *PgStore) ListAccessReviews(ctx context.Context, tenantID, reviewerID, status string) ([]domain.AccessReview, error) {
+	query := `
+		SELECT review_id, tenant_id, campaign_id, campaign_name, reviewer_principal_id,
+		       target_principal_id, role_id, legal_entity_id, book_id, org_unit_id,
+		       review_type, status, decision, decision_reason, decided_at, decided_by,
+		       due_at, created_at
+		FROM access_reviews
+		WHERE reviewer_principal_id = $1
+		  AND tenant_id = NULLIF($2, '')::uuid`
+	args := []any{reviewerID, tenantID}
+
+	if status != "" {
+		query += ` AND status = $3`
+		args = append(args, strings.ToUpper(status))
+	}
+	query += ` ORDER BY due_at ASC;`
+
+	var results []domain.AccessReview
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var r domain.AccessReview
+			var rID, tID, cID, leID uuid.UUID
+			if err := rows.Scan(
+				&rID, &tID, &cID, &r.CampaignName, &r.ReviewerPrincipalID,
+				&r.TargetPrincipalID, &r.RoleID, &leID, &r.BookID, &r.OrgUnitID,
+				&r.ReviewType, &r.Status, &r.Decision, &r.DecisionReason, &r.DecidedAt, &r.DecidedBy,
+				&r.DueAt, &r.CreatedAt,
+			); err != nil {
+				return err
+			}
+			r.ReviewID = rID.String()
+			r.TenantID = tID.String()
+			r.CampaignID = cID.String()
+			r.LegalEntityID = leID.String()
+			results = append(results, r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		if isUndefinedTable(err) {
+			return []domain.AccessReview{}, nil
+		}
+		s.log.Error("pg ListAccessReviews failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if results == nil {
+		results = []domain.AccessReview{}
+	}
+	return results, nil
+}
+
+func (s *PgStore) GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error) {
+	const query = `
+		SELECT review_id, tenant_id, campaign_id, campaign_name, reviewer_principal_id,
+		       target_principal_id, role_id, legal_entity_id, book_id, org_unit_id,
+		       review_type, status, decision, decision_reason, decided_at, decided_by,
+		       due_at, created_at
+		FROM access_reviews
+		WHERE review_id = $1
+		  AND tenant_id = NULLIF($2, '')::uuid
+		LIMIT 1;`
+
+	var r domain.AccessReview
+	var rID, tID, cID, leID uuid.UUID
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, query, reviewID, tenantID)
+		return row.Scan(
+			&rID, &tID, &cID, &r.CampaignName, &r.ReviewerPrincipalID,
+			&r.TargetPrincipalID, &r.RoleID, &leID, &r.BookID, &r.OrgUnitID,
+			&r.ReviewType, &r.Status, &r.Decision, &r.DecisionReason, &r.DecidedAt, &r.DecidedBy,
+			&r.DueAt, &r.CreatedAt,
+		)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || isUndefinedTable(err) {
+			return nil, domain.ErrAccessReviewNotFound
+		}
+		s.log.Error("pg GetAccessReview failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	r.ReviewID = rID.String()
+	r.TenantID = tID.String()
+	r.CampaignID = cID.String()
+	r.LegalEntityID = leID.String()
+	return &r, nil
+}
+
+func (s *PgStore) RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, reason, decidedBy string) (*domain.AccessReview, error) {
+	const query = `
+		UPDATE access_reviews
+		SET status = CASE WHEN $3 = 'ESCALATE' THEN 'ESCALATED' ELSE 'COMPLETED' END,
+		    decision = $3,
+		    decision_reason = $4,
+		    decided_at = NOW(),
+		    decided_by = $5
+		WHERE review_id = $1
+		  AND tenant_id = NULLIF($2, '')::uuid
+		  AND status = 'OPEN'
+		RETURNING review_id, tenant_id, campaign_id, campaign_name, reviewer_principal_id,
+		          target_principal_id, role_id, legal_entity_id, book_id, org_unit_id,
+		          review_type, status, decision, decision_reason, decided_at, decided_by,
+		          due_at, created_at;`
+
+	var r domain.AccessReview
+	var rID, tID, cID, leID uuid.UUID
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, query, reviewID, tenantID, decision, reason, decidedBy)
+		return row.Scan(
+			&rID, &tID, &cID, &r.CampaignName, &r.ReviewerPrincipalID,
+			&r.TargetPrincipalID, &r.RoleID, &leID, &r.BookID, &r.OrgUnitID,
+			&r.ReviewType, &r.Status, &r.Decision, &r.DecisionReason, &r.DecidedAt, &r.DecidedBy,
+			&r.DueAt, &r.CreatedAt,
+		)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || isUndefinedTable(err) {
+			return nil, domain.ErrAccessReviewNotFound
+		}
+		s.log.Error("pg RecordAccessReviewDecision failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	r.ReviewID = rID.String()
+	r.TenantID = tID.String()
+	r.CampaignID = cID.String()
+	r.LegalEntityID = leID.String()
+	return &r, nil
+}
+
+func (s *PgStore) CreateAccessReview(ctx context.Context, r domain.AccessReview) (*domain.AccessReview, error) {
+	const query = `
+		INSERT INTO access_reviews (
+			review_id, tenant_id, campaign_id, campaign_name, reviewer_principal_id,
+			target_principal_id, role_id, legal_entity_id, book_id, org_unit_id,
+			review_type, status, due_at, created_at
+		) VALUES (
+			COALESCE(NULLIF($1, '')::uuid, gen_random_uuid()), $2, $3, $4, $5,
+			$6, $7, $8, $9, $10,
+			$11, $12, $13, $14
+		);`
+
+	tUUID, err := uuid.Parse(r.TenantID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tenant_id: %w", err)
+	}
+	cUUID, err := uuid.Parse(r.CampaignID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid campaign_id: %w", err)
+	}
+	leUUID, err := uuid.Parse(r.LegalEntityID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid legal_entity_id: %w", err)
+	}
+
+	createdAt := r.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	status := r.Status
+	if status == "" {
+		status = domain.ReviewStatusOpen
+	}
+
+	err = s.withRLS(ctx, r.TenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, query,
+			r.ReviewID, tUUID, cUUID, r.CampaignName, r.ReviewerPrincipalID,
+			r.TargetPrincipalID, r.RoleID, leUUID, r.BookID, r.OrgUnitID,
+			r.ReviewType, status, r.DueAt, createdAt,
+		)
+		return err
+	})
+	if err != nil {
+		s.log.Error("pg CreateAccessReview failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return &r, nil
 }

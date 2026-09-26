@@ -249,6 +249,24 @@ func (c *countingStore) FindAuthorityLimitByID(_ context.Context, _, _ string) (
 func (c *countingStore) ListAuthorityLimits(_ context.Context, _, _, _, _ string) ([]domain.AuthorityLimit, error) {
 	return nil, nil
 }
+func (c *countingStore) FindWorkloadBinding(_ context.Context, _, _ string) (*domain.WorkloadBinding, error) {
+	return nil, nil
+}
+func (c *countingStore) CreateWorkloadBinding(_ context.Context, wb domain.WorkloadBinding) (*domain.WorkloadBinding, error) {
+	return &wb, nil
+}
+func (c *countingStore) CreateAccessReview(_ context.Context, r domain.AccessReview) (*domain.AccessReview, error) {
+	return &r, nil
+}
+func (c *countingStore) GetAccessReview(_ context.Context, _, _ string) (*domain.AccessReview, error) {
+	return nil, nil
+}
+func (c *countingStore) ListAccessReviews(_ context.Context, _, _, _ string) ([]domain.AccessReview, error) {
+	return nil, nil
+}
+func (c *countingStore) RecordAccessReviewDecision(_ context.Context, _, _, _, _, _ string) (*domain.AccessReview, error) {
+	return nil, nil
+}
 
 const (
 	tenantA = "tenant-a"

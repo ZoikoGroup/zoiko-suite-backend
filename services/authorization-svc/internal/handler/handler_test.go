@@ -198,6 +198,22 @@ type stubStore struct {
 
 	authorityLimits    []domain.AuthorityLimit
 	authorityLimitsErr error
+
+	workloadBinding          *domain.WorkloadBinding
+	findWorkloadBindingErr   error
+	createdWorkloadBinding   *domain.WorkloadBinding
+	createWorkloadBindingErr error
+
+	accessReview                  *domain.AccessReview
+	getAccessReviewErr            error
+	createdAccessReview           *domain.AccessReview
+	createAccessReviewErr         error
+	accessReviews                 []domain.AccessReview
+	listAccessReviewsErr          error
+	gotAccessReviewTenant         string
+	gotAccessReviewReviewer       string
+	gotAccessReviewStatus         string
+	recordAccessReviewDecisionErr error
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -564,6 +580,73 @@ func (s *stubStore) ListAuthorityLimits(_ context.Context, _, _, _, _ string) ([
 	return s.authorityLimits, nil
 }
 
+func (s *stubStore) FindWorkloadBinding(_ context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error) {
+	if s.findWorkloadBindingErr != nil {
+		return nil, s.findWorkloadBindingErr
+	}
+	if s.workloadBinding != nil {
+		return s.workloadBinding, nil
+	}
+	return nil, domain.ErrWorkloadBindingNotFound
+}
+
+func (s *stubStore) CreateWorkloadBinding(_ context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error) {
+	s.createdWorkloadBinding = &binding
+	if s.createWorkloadBindingErr != nil {
+		return nil, s.createWorkloadBindingErr
+	}
+	return &binding, nil
+}
+
+func (s *stubStore) CreateAccessReview(_ context.Context, review domain.AccessReview) (*domain.AccessReview, error) {
+	s.createdAccessReview = &review
+	if s.createAccessReviewErr != nil {
+		return nil, s.createAccessReviewErr
+	}
+	return &review, nil
+}
+
+func (s *stubStore) GetAccessReview(_ context.Context, reviewID, tenantID string) (*domain.AccessReview, error) {
+	if s.getAccessReviewErr != nil {
+		return nil, s.getAccessReviewErr
+	}
+	if s.accessReview != nil {
+		return s.accessReview, nil
+	}
+	return nil, domain.ErrAccessReviewNotFound
+}
+
+func (s *stubStore) ListAccessReviews(_ context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error) {
+	s.gotAccessReviewTenant = tenantID
+	s.gotAccessReviewReviewer = reviewerPrincipalID
+	s.gotAccessReviewStatus = status
+	if s.listAccessReviewsErr != nil {
+		return nil, s.listAccessReviewsErr
+	}
+	return s.accessReviews, nil
+}
+
+func (s *stubStore) RecordAccessReviewDecision(_ context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error) {
+	if s.recordAccessReviewDecisionErr != nil {
+		return nil, s.recordAccessReviewDecisionErr
+	}
+	now := time.Now().UTC()
+	st := domain.ReviewStatusCompleted
+	if decision == domain.ReviewDecisionEscalate {
+		st = domain.ReviewStatusEscalated
+	}
+	return &domain.AccessReview{
+		ReviewID:            reviewID,
+		TenantID:            tenantID,
+		ReviewerPrincipalID: decidedBy,
+		Decision:            &decision,
+		DecisionReason:      &decisionReason,
+		DecidedAt:           &now,
+		DecidedBy:           &decidedBy,
+		Status:              st,
+	}, nil
+}
+
 // ── stub publisher ───────────────────────────────────────────────────────────
 
 type stubPublisher struct {
@@ -594,6 +677,27 @@ func (p *stubPublisher) PublishSupportSessionStarted(_ context.Context, _ domain
 	return nil
 }
 func (p *stubPublisher) PublishSupportSessionEnded(_ context.Context, _ domain.SupportSession) error {
+	return nil
+}
+func (p *stubPublisher) PublishAccessReviewStarted(_ context.Context, _ domain.AccessReview) error {
+	return nil
+}
+func (p *stubPublisher) PublishAccessReviewCompleted(_ context.Context, _ domain.AccessReview) error {
+	return nil
+}
+func (p *stubPublisher) PublishPrivilegedSessionStarted(_ context.Context, _ domain.PrivilegedSession) error {
+	return nil
+}
+func (p *stubPublisher) PublishPrivilegedSessionEnded(_ context.Context, _ domain.PrivilegedSession) error {
+	return nil
+}
+func (p *stubPublisher) PublishAuthorityLimitChanged(_ context.Context, _ domain.AuthorityLimit, _ string) error {
+	return nil
+}
+func (p *stubPublisher) PublishSoDPolicyPublished(_ context.Context, _ domain.SoDRule) error {
+	return nil
+}
+func (p *stubPublisher) PublishPolicySetPublished(_ context.Context, _, _, _ string) error {
 	return nil
 }
 

@@ -816,6 +816,9 @@ var ErrJurisdictionNotFound = errorString("jurisdiction not found")
 var ErrJurisdictionServiceUnavailable = errorString("jurisdiction-rules-svc unavailable")
 var ErrAuthorityLimitNotFound = errorString("authority limit not found")
 var ErrAuthorityLimitTargetRequired = errorString("authority limit requires at least one of principal_id or role_id")
+var ErrWorkloadBindingNotFound = errorString("workload binding not found")
+var ErrAccessReviewNotFound = errorString("access review not found")
+var ErrAccessReviewAlreadyCompleted = errorString("access review is already completed")
 
 // AuthorityLimit defines the foundational approval and signing limit for a principal
 // or role within an optional legal entity, book, or org-unit scope (ZS-IAM-001 §12, §21, §22).
@@ -868,11 +871,12 @@ const (
 )
 
 // EnvironmentContext captures contextual environment attributes including authentication age,
-// assurance level, and operational risk (ZS-IAM-001 §8.1).
+// assurance level, operational risk, and audience (ZS-IAM-001 §8.1, §16).
 type EnvironmentContext struct {
 	AuthnAgeSeconds int    `json:"authn_age_seconds,omitempty"`
 	Assurance       string `json:"assurance,omitempty"`
 	Risk            string `json:"risk,omitempty"`
+	Audience        string `json:"audience,omitempty"`
 }
 
 // StepUpRequirement details the required assurance and authentication freshness needed
@@ -885,21 +889,22 @@ type StepUpRequirement struct {
 
 // CanonicalDecisionRequest matches ZS-IAM-001 §8.1 for POST /internal/authorization/decisions.
 type CanonicalDecisionRequest struct {
-	SubjectID          string             `json:"subject_id"`
-	PrincipalType      string             `json:"principal_type,omitempty"`
-	SessionID          string             `json:"session_id,omitempty"`
-	TenantID           string             `json:"tenant_id,omitempty"`
-	LegalEntityID      string             `json:"legal_entity_id,omitempty"`
-	BookID             string             `json:"book_id,omitempty"`
-	OrgUnitID          string             `json:"org_unit_id,omitempty"`
-	ResourceType       string             `json:"resource_type,omitempty"`
-	ResourceID         string             `json:"resource_id,omitempty"`
-	Action             string             `json:"action"`
-	ResourceVersion    int                `json:"resource_version,omitempty"`
-	ResourceAttributes map[string]string  `json:"resource_attributes,omitempty"`
-	Environment        EnvironmentContext `json:"environment,omitempty"`
-	DelegationID       *string            `json:"delegation_id,omitempty"`
-	CorrelationID      string             `json:"correlation_id,omitempty"`
+	SubjectID           string             `json:"subject_id"`
+	PrincipalType       string             `json:"principal_type,omitempty"`
+	SessionID           string             `json:"session_id,omitempty"`
+	TenantID            string             `json:"tenant_id,omitempty"`
+	LegalEntityID       string             `json:"legal_entity_id,omitempty"`
+	BookID              string             `json:"book_id,omitempty"`
+	OrgUnitID           string             `json:"org_unit_id,omitempty"`
+	ResourceType        string             `json:"resource_type,omitempty"`
+	ResourceID          string             `json:"resource_id,omitempty"`
+	Action              string             `json:"action"`
+	ResourceVersion     int                `json:"resource_version,omitempty"`
+	ResourceAttributes  map[string]string  `json:"resource_attributes,omitempty"`
+	Environment         EnvironmentContext `json:"environment,omitempty"`
+	DelegationID        *string            `json:"delegation_id,omitempty"`
+	CorrelationID       string             `json:"correlation_id,omitempty"`
+	InitiatingSubjectID string             `json:"initiating_subject_id,omitempty"`
 }
 
 // CanonicalDecisionResponse matches ZS-IAM-001 §8.2 for POST /internal/authorization/decisions.
@@ -954,6 +959,61 @@ type CapabilitiesResponse struct {
 	Permissions   []string        `json:"permissions"`
 	Modules       []string        `json:"modules"`
 	Features      map[string]bool `json:"features"`
+}
+
+// Phase 5: Access Reviews & Continuous Governance (ZS-IAM-001 §21, §24)
+const (
+	ReviewTypePeriodic       = "PERIODIC"
+	ReviewTypeEventTriggered = "EVENT_TRIGGERED"
+	ReviewTypePrivileged     = "PRIVILEGED"
+
+	ReviewStatusOpen      = "OPEN"
+	ReviewStatusCompleted = "COMPLETED"
+	ReviewStatusEscalated = "ESCALATED"
+	ReviewStatusExpired   = "EXPIRED"
+
+	ReviewDecisionKeep     = "KEEP"
+	ReviewDecisionRevoke   = "REVOKE"
+	ReviewDecisionModify   = "MODIFY"
+	ReviewDecisionEscalate = "ESCALATE"
+)
+
+// AccessReview matches ZS-IAM-001 §21, §22, §24 access_reviews table and API.
+type AccessReview struct {
+	ReviewID            string     `json:"review_id"`
+	TenantID            string     `json:"tenant_id"`
+	CampaignID          string     `json:"campaign_id"`
+	CampaignName        string     `json:"campaign_name"`
+	ReviewerPrincipalID string     `json:"reviewer_principal_id"`
+	TargetPrincipalID   string     `json:"target_principal_id"`
+	RoleID              string     `json:"role_id"`
+	LegalEntityID       string     `json:"legal_entity_id"`
+	BookID              *string    `json:"book_id,omitempty"`
+	OrgUnitID           *string    `json:"org_unit_id,omitempty"`
+	ReviewType          string     `json:"review_type"`
+	Status              string     `json:"status"`
+	Decision            *string    `json:"decision,omitempty"`
+	DecisionReason      *string    `json:"decision_reason,omitempty"`
+	DecidedAt           *time.Time `json:"decided_at,omitempty"`
+	DecidedBy           *string    `json:"decided_by,omitempty"`
+	DueAt               time.Time  `json:"due_at"`
+	CreatedAt           time.Time  `json:"created_at"`
+}
+
+// AccessReviewDecideRequest matches POST /v1/iam/access-reviews/{id}:decide body.
+type AccessReviewDecideRequest struct {
+	Decision string `json:"decision"`
+	Reason   string `json:"reason"`
+}
+
+// WorkloadBinding matches ZS-IAM-001 §16 workload_bindings table.
+type WorkloadBinding struct {
+	WorkloadID      string    `json:"workload_id"`
+	TenantID        string    `json:"tenant_id"`
+	AllowedAudience string    `json:"allowed_audience"`
+	AllowedActions  []string  `json:"allowed_actions"`
+	ActiveFlag      bool      `json:"active_flag"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type errorString string

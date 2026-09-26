@@ -120,6 +120,16 @@ type Inner interface {
 	FindSupportSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.SupportSession, error)
 	ListSupportSessions(ctx context.Context, tenantID string, activeOnly bool) ([]domain.SupportSession, error)
 	RevokeSupportSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.SupportSession, error)
+
+	// Workload Identity (ZS-IAM-001 §16)
+	FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error)
+	CreateWorkloadBinding(ctx context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error)
+
+	// Access Reviews & Continuous Access Certification (ZS-IAM-001 §21, §24)
+	CreateAccessReview(ctx context.Context, review domain.AccessReview) (*domain.AccessReview, error)
+	GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error)
+	ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error)
+	RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error)
 }
 
 // The cache namespaces. A write invalidates whole namespaces for a tenant
@@ -749,6 +759,34 @@ func (s *Store) FindAuthorityLimitByID(ctx context.Context, limitID, tenantID st
 
 func (s *Store) ListAuthorityLimits(ctx context.Context, tenantID string, principalID, roleID, authorityType string) ([]domain.AuthorityLimit, error) {
 	return s.inner.ListAuthorityLimits(ctx, tenantID, principalID, roleID, authorityType)
+}
+
+func (s *Store) FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error) {
+	return s.inner.FindWorkloadBinding(ctx, workloadID, tenantID)
+}
+
+func (s *Store) CreateWorkloadBinding(ctx context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error) {
+	return s.inner.CreateWorkloadBinding(ctx, binding)
+}
+
+func (s *Store) CreateAccessReview(ctx context.Context, review domain.AccessReview) (*domain.AccessReview, error) {
+	return s.inner.CreateAccessReview(ctx, review)
+}
+
+func (s *Store) GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error) {
+	return s.inner.GetAccessReview(ctx, reviewID, tenantID)
+}
+
+func (s *Store) ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error) {
+	return s.inner.ListAccessReviews(ctx, tenantID, reviewerPrincipalID, status)
+}
+
+func (s *Store) RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error) {
+	rev, err := s.inner.RecordAccessReviewDecision(ctx, reviewID, tenantID, decision, decisionReason, decidedBy)
+	if err == nil && decision == domain.ReviewDecisionRevoke {
+		s.invalidateGrantSources(tenantID)
+	}
+	return rev, err
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
