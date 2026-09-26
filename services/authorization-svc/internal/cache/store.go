@@ -97,6 +97,12 @@ type Inner interface {
 	ListAccessDecisions(ctx context.Context, tenantID string, params domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error)
 	ProjectPrincipalStatus(ctx context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error)
 	FindPrincipalStatus(ctx context.Context, principalID, tenantID string) (string, error)
+
+	// Privileged Access Management (JIT Elevation - ZS-IAM-001 §13 & §21).
+	CreatePrivilegedSession(ctx context.Context, params domain.CreatePrivilegedSessionParams) (*domain.PrivilegedSession, error)
+	FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error)
+	ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error)
+	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
 }
 
 // The cache namespaces. A write invalidates whole namespaces for a tenant
@@ -658,6 +664,22 @@ func (s *Store) FindAccessDecisionByID(ctx context.Context, accessDecisionID, te
 // so page one changes on essentially every request and would never hit anyway.
 func (s *Store) ListAccessDecisions(ctx context.Context, tenantID string, params domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error) {
 	return s.inner.ListAccessDecisions(ctx, tenantID, params)
+}
+
+func (s *Store) CreatePrivilegedSession(ctx context.Context, params domain.CreatePrivilegedSessionParams) (*domain.PrivilegedSession, error) {
+	return s.inner.CreatePrivilegedSession(ctx, params)
+}
+
+func (s *Store) FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error) {
+	return s.inner.FindPrivilegedSessionByID(ctx, sessionID, tenantID)
+}
+
+func (s *Store) ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error) {
+	return s.inner.ListPrivilegedSessions(ctx, tenantID, principalID, activeOnly)
+}
+
+func (s *Store) RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error) {
+	return s.inner.RevokePrivilegedSession(ctx, sessionID, tenantID, revokedBy)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

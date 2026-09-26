@@ -1,4 +1,4 @@
--- 000006_suppression_and_action_tokens.down.sql
+-- 000008_suppression_and_action_tokens.down.sql
 -- Revert Suppression and Action Tokens tables
 
 DROP TABLE IF EXISTS action_tokens CASCADE;

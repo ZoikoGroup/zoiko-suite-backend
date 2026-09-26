@@ -156,6 +156,29 @@ func (c *countingStore) FindPrincipalStatus(_ context.Context, _, _ string) (str
 	}
 	return c.principalStatus, nil
 }
+func (c *countingStore) CreatePrivilegedSession(_ context.Context, params domain.CreatePrivilegedSessionParams) (*domain.PrivilegedSession, error) {
+	return &domain.PrivilegedSession{
+		SessionID:        "ps-stub",
+		TenantID:         params.TenantID,
+		PrincipalID:      params.PrincipalID,
+		RequestedActions: params.RequestedActions,
+		TicketRef:        params.TicketRef,
+		Reason:           params.Reason,
+		Status:           domain.PrivilegedSessionStatusActive,
+		DurationSeconds:  params.DurationSeconds,
+		ExpiresAt:        time.Now().Add(time.Hour),
+		CreatedAt:        time.Now(),
+	}, nil
+}
+func (c *countingStore) FindPrivilegedSessionByID(_ context.Context, _, _ string) (*domain.PrivilegedSession, error) {
+	return nil, domain.ErrPrivilegedSessionNotFound
+}
+func (c *countingStore) ListPrivilegedSessions(_ context.Context, _, _ string, _ bool) ([]domain.PrivilegedSession, error) {
+	return nil, nil
+}
+func (c *countingStore) RevokePrivilegedSession(_ context.Context, _, _, _ string) (*domain.PrivilegedSession, error) {
+	return nil, nil
+}
 
 const (
 	tenantA = "tenant-a"

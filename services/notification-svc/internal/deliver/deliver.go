@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -106,12 +107,23 @@ func isUnknown(err error) bool {
 	return errors.As(err, &u)
 }
 
+// MetricsRecorder records delivery transport outcomes and latencies.
+type MetricsRecorder interface {
+	ObserveDelivery(stream, provider, status string, durationSec float64)
+}
+
 // Router dispatches a notification to the transport for its channel. It
 // implements handler.Deliverer.
 type Router struct {
 	email     Provider
 	secondary Provider
+	metrics   MetricsRecorder
 	log       *zap.Logger
+}
+
+// SetMetrics configures optional metrics instrumentation on the Router.
+func (r *Router) SetMetrics(m MetricsRecorder) {
+	r.metrics = m
 }
 
 // NewRouter builds a Router. email may be nil, which is how a deployment says
@@ -214,9 +226,15 @@ func (r *Router) deliverEmail(ctx context.Context, n domain.Notification) domain
 		CorrelationID: n.CorrelationID,
 	}
 
+	start := time.Now()
 	receipt, err := r.email.Send(ctx, msg)
 	primaryName := r.email.Name()
 	if err != nil {
+		duration := time.Since(start).Seconds()
+		if r.metrics != nil {
+			r.metrics.ObserveDelivery("EMAIL", primaryName, "failed", duration)
+		}
+
 		// unknown is checked first so a genuinely ambiguous outcome — the
 		// message may already have reached the provider — never sets retry
 		// true and therefore never reaches the failover block below either:
@@ -243,13 +261,22 @@ func (r *Router) deliverEmail(ctx context.Context, n domain.Notification) domain
 				zap.String("primary_provider", primaryName),
 				zap.String("secondary_provider", secondaryName))
 
+			secStart := time.Now()
 			secReceipt, secErr := r.secondary.Send(ctx, msg)
+			secDuration := time.Since(secStart).Seconds()
 			if secErr == nil {
+				if r.metrics != nil {
+					r.metrics.ObserveDelivery("EMAIL", secondaryName, "delivered", secDuration)
+				}
 				return domain.DeliveryOutcome{
 					Delivered:        true,
 					ProviderResponse: secReceipt,
 					ProviderName:     secondaryName,
 				}
+			}
+
+			if r.metrics != nil {
+				r.metrics.ObserveDelivery("EMAIL", secondaryName, "failed", secDuration)
 			}
 
 			secRetry := isRetryable(secErr)
@@ -272,6 +299,11 @@ func (r *Router) deliverEmail(ctx context.Context, n domain.Notification) domain
 			Unknown:      unknown,
 			ProviderName: primaryName,
 		}
+	}
+
+	duration := time.Since(start).Seconds()
+	if r.metrics != nil {
+		r.metrics.ObserveDelivery("EMAIL", primaryName, "delivered", duration)
 	}
 
 	return domain.DeliveryOutcome{

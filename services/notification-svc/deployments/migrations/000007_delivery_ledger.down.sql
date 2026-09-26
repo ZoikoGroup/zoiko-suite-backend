@@ -1,4 +1,4 @@
--- 000005_delivery_ledger.down.sql
+-- 000007_delivery_ledger.down.sql
 -- Revert Canonical Delivery Ledger tables
 
 DROP TABLE IF EXISTS delivery_events CASCADE;

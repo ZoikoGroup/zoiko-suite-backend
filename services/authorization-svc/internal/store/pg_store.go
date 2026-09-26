@@ -145,6 +145,12 @@ type Store interface {
 	// the projection ships empty and the layer must be inert until a status
 	// event arrives.
 	FindPrincipalStatus(ctx context.Context, principalID, tenantID string) (string, error)
+
+	// Privileged Access Management (JIT Elevation - ZS-IAM-001 §13 & §21).
+	CreatePrivilegedSession(ctx context.Context, params domain.CreatePrivilegedSessionParams) (*domain.PrivilegedSession, error)
+	FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error)
+	ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error)
+	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -2191,4 +2197,207 @@ func (s *PgStore) FindPrincipalStatus(ctx context.Context, principalID, tenantID
 func isUndefinedTable(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
+}
+
+// ── Privileged Access Management (ZS-IAM-001 §13 & §21) ─────────────────────
+
+const privilegedSessionColumns = `session_id, tenant_id, principal_id, requested_actions, ticket_ref, reason, status, duration_seconds, expires_at, created_at, revoked_at, revoked_by`
+
+func scanPrivilegedSession(row pgx.Row) (*domain.PrivilegedSession, error) {
+	var ps domain.PrivilegedSession
+	var tenantUUID, sessionUUID uuid.UUID
+	err := row.Scan(
+		&sessionUUID,
+		&tenantUUID,
+		&ps.PrincipalID,
+		&ps.RequestedActions,
+		&ps.TicketRef,
+		&ps.Reason,
+		&ps.Status,
+		&ps.DurationSeconds,
+		&ps.ExpiresAt,
+		&ps.CreatedAt,
+		&ps.RevokedAt,
+		&ps.RevokedBy,
+	)
+	if err != nil {
+		return nil, err
+	}
+	ps.SessionID = sessionUUID.String()
+	ps.TenantID = tenantUUID.String()
+	return &ps, nil
+}
+
+func (s *PgStore) CreatePrivilegedSession(ctx context.Context, params domain.CreatePrivilegedSessionParams) (*domain.PrivilegedSession, error) {
+	if params.TenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+	if params.PrincipalID == "" || params.TicketRef == "" || params.Reason == "" {
+		return nil, domain.ErrPrivilegedSessionIncomplete
+	}
+
+	durationSec := params.DurationSeconds
+	if durationSec <= 0 {
+		durationSec = 3600 // default 1 hour
+	} else if durationSec > 86400 {
+		durationSec = 86400 // max 24 hours
+	}
+
+	expiresAt := time.Now().UTC().Add(time.Duration(durationSec) * time.Second)
+
+	actions := params.RequestedActions
+	if actions == nil {
+		actions = []string{}
+	}
+
+	const query = `
+		INSERT INTO privileged_sessions (
+			tenant_id, principal_id, requested_actions, ticket_ref, reason, status, duration_seconds, expires_at
+		) VALUES (
+			$1::uuid, $2, $3, $4, $5, 'ACTIVE', $6, $7
+		) RETURNING ` + privilegedSessionColumns + `;`
+
+	var ps *domain.PrivilegedSession
+	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		ps, scanErr = scanPrivilegedSession(tx.QueryRow(ctx, query,
+			params.TenantID, params.PrincipalID, actions, params.TicketRef, params.Reason, durationSec, expiresAt,
+		))
+		return scanErr
+	})
+	if err != nil {
+		s.log.Error("pg CreatePrivilegedSession failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return ps, nil
+}
+
+func (s *PgStore) FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error) {
+	if sessionID == "" {
+		return nil, domain.ErrPrivilegedSessionNotFound
+	}
+
+	const scopedQuery = `SELECT ` + privilegedSessionColumns + ` FROM privileged_sessions WHERE session_id = $1::uuid AND tenant_id = $2::uuid;`
+	const unscopedQuery = `SELECT ` + privilegedSessionColumns + ` FROM privileged_sessions WHERE session_id = $1::uuid;`
+
+	var ps *domain.PrivilegedSession
+	var err error
+	if tenantID != "" {
+		err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+			var scanErr error
+			ps, scanErr = scanPrivilegedSession(tx.QueryRow(ctx, scopedQuery, sessionID, tenantID))
+			return scanErr
+		})
+	} else {
+		err = s.withPlatformScope(ctx, func(tx pgx.Tx) error {
+			var scanErr error
+			ps, scanErr = scanPrivilegedSession(tx.QueryRow(ctx, unscopedQuery, sessionID))
+			return scanErr
+		})
+	}
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) || isUndefinedTable(err) {
+			return nil, domain.ErrPrivilegedSessionNotFound
+		}
+		s.log.Error("pg FindPrivilegedSessionByID failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	// Dynamic expiry check: if active in DB but past expires_at, treat as EXPIRED
+	if ps.Status == domain.PrivilegedSessionStatusActive && time.Now().UTC().After(ps.ExpiresAt) {
+		ps.Status = domain.PrivilegedSessionStatusExpired
+	}
+
+	return ps, nil
+}
+
+func (s *PgStore) ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+
+	query := `SELECT ` + privilegedSessionColumns + ` FROM privileged_sessions WHERE tenant_id = $1::uuid`
+	args := []any{tenantID}
+
+	if principalID != "" {
+		args = append(args, principalID)
+		query += fmt.Sprintf(" AND principal_id = $%d", len(args))
+	}
+
+	if activeOnly {
+		query += " AND status = 'ACTIVE' AND expires_at > NOW()"
+	}
+
+	query += " ORDER BY created_at DESC;"
+
+	var list []domain.PrivilegedSession
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, args...)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			ps, scanErr := scanPrivilegedSession(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			list = append(list, *ps)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		if isUndefinedTable(err) {
+			return []domain.PrivilegedSession{}, nil
+		}
+		s.log.Error("pg ListPrivilegedSessions failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if list == nil {
+		list = []domain.PrivilegedSession{}
+	}
+	return list, nil
+}
+
+func (s *PgStore) RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+	if sessionID == "" {
+		return nil, domain.ErrPrivilegedSessionNotFound
+	}
+
+	const query = `
+		UPDATE privileged_sessions
+		   SET status = 'REVOKED',
+		       revoked_at = NOW(),
+		       revoked_by = $3
+		 WHERE session_id = $1::uuid
+		   AND tenant_id = $2::uuid
+		   AND status = 'ACTIVE'
+		RETURNING ` + privilegedSessionColumns + `;`
+
+	var ps *domain.PrivilegedSession
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		ps, scanErr = scanPrivilegedSession(tx.QueryRow(ctx, query, sessionID, tenantID, revokedBy))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			existing, findErr := s.FindPrivilegedSessionByID(ctx, sessionID, tenantID)
+			if findErr != nil {
+				return nil, findErr
+			}
+			if existing.Status != domain.PrivilegedSessionStatusActive {
+				return nil, fmt.Errorf("%w: session status is %s", domain.ErrInvalidTransition, existing.Status)
+			}
+			return nil, domain.ErrPrivilegedSessionNotFound
+		}
+		s.log.Error("pg RevokePrivilegedSession failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return ps, nil
 }
