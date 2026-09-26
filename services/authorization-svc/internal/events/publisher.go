@@ -98,6 +98,166 @@ func (p *Publisher) PublishSoDViolationDetected(ctx context.Context, d domain.Ac
 	})
 }
 
+// PublishBreakGlassStarted publishes security.break_glass.started (ZS-IAM-001 §23).
+func (p *Publisher) PublishBreakGlassStarted(ctx context.Context, session domain.BreakGlassSession) error {
+	return p.emit(ctx, "security.break_glass.started", "", "", session.PrincipalID, session.SessionID, map[string]any{
+		"session_id":        session.SessionID,
+		"tenant_id":         session.TenantID,
+		"principal_id":      session.PrincipalID,
+		"incident_id":       session.IncidentID,
+		"reason":            session.Reason,
+		"requested_actions": session.RequestedActions,
+		"status":            session.Status,
+		"expires_at":        session.ExpiresAt,
+	})
+}
+
+// PublishBreakGlassEnded publishes security.break_glass.ended (ZS-IAM-001 §23).
+func (p *Publisher) PublishBreakGlassEnded(ctx context.Context, session domain.BreakGlassSession) error {
+	return p.emit(ctx, "security.break_glass.ended", "", "", session.PrincipalID, session.SessionID, map[string]any{
+		"session_id":   session.SessionID,
+		"tenant_id":    session.TenantID,
+		"principal_id": session.PrincipalID,
+		"incident_id":  session.IncidentID,
+		"status":       session.Status,
+		"revoked_at":   session.RevokedAt,
+		"revoked_by":   session.RevokedBy,
+	})
+}
+
+// PublishSupportSessionStarted publishes support.session.started (ZS-IAM-001 §23).
+func (p *Publisher) PublishSupportSessionStarted(ctx context.Context, session domain.SupportSession) error {
+	return p.emit(ctx, "support.session.started", "", "", session.SupportOperatorID, session.SessionID, map[string]any{
+		"session_id":              session.SessionID,
+		"tenant_id":               session.TenantID,
+		"support_operator_id":     session.SupportOperatorID,
+		"ticket_ref":              session.TicketRef,
+		"purpose":                 session.Purpose,
+		"read_only":               session.ReadOnly,
+		"allow_bulk_export":       session.AllowBulkExport,
+		"allowed_actions":         session.AllowedActions,
+		"status":                  session.Status,
+		"expires_at":              session.ExpiresAt,
+		"tenant_consent_obtained": session.TenantConsentObtained,
+	})
+}
+
+// PublishSupportSessionEnded publishes support.session.ended (ZS-IAM-001 §23).
+func (p *Publisher) PublishSupportSessionEnded(ctx context.Context, session domain.SupportSession) error {
+	return p.emit(ctx, "support.session.ended", "", "", session.SupportOperatorID, session.SessionID, map[string]any{
+		"session_id":          session.SessionID,
+		"tenant_id":           session.TenantID,
+		"support_operator_id": session.SupportOperatorID,
+		"ticket_ref":          session.TicketRef,
+		"status":              session.Status,
+		"revoked_at":          session.RevokedAt,
+		"revoked_by":          session.RevokedBy,
+	})
+}
+
+// PublishAccessReviewStarted publishes iam.access_review.started (ZS-IAM-001 §23).
+func (p *Publisher) PublishAccessReviewStarted(ctx context.Context, r domain.AccessReview) error {
+	return p.emit(ctx, "iam.access_review.started", "", r.LegalEntityID, r.ReviewerPrincipalID, r.ReviewID, map[string]any{
+		"review_id":              r.ReviewID,
+		"tenant_id":              r.TenantID,
+		"campaign_id":            r.CampaignID,
+		"campaign_name":          r.CampaignName,
+		"reviewer_principal_id":  r.ReviewerPrincipalID,
+		"target_principal_id":    r.TargetPrincipalID,
+		"role_id":                r.RoleID,
+		"legal_entity_id":        r.LegalEntityID,
+		"review_type":            r.ReviewType,
+		"status":                 r.Status,
+		"due_at":                 r.DueAt,
+	})
+}
+
+// PublishAccessReviewCompleted publishes iam.access_review.completed (ZS-IAM-001 §23).
+func (p *Publisher) PublishAccessReviewCompleted(ctx context.Context, r domain.AccessReview) error {
+	return p.emit(ctx, "iam.access_review.completed", "", r.LegalEntityID, r.ReviewerPrincipalID, r.ReviewID, map[string]any{
+		"review_id":              r.ReviewID,
+		"tenant_id":              r.TenantID,
+		"campaign_id":            r.CampaignID,
+		"reviewer_principal_id":  r.ReviewerPrincipalID,
+		"target_principal_id":    r.TargetPrincipalID,
+		"role_id":                r.RoleID,
+		"status":                 r.Status,
+		"decision":               r.Decision,
+		"decision_reason":        r.DecisionReason,
+		"decided_at":             r.DecidedAt,
+		"decided_by":             r.DecidedBy,
+	})
+}
+
+// PublishPrivilegedSessionStarted publishes security.privileged_session.started (ZS-IAM-001 §23).
+func (p *Publisher) PublishPrivilegedSessionStarted(ctx context.Context, s domain.PrivilegedSession) error {
+	return p.emit(ctx, "security.privileged_session.started", "", "", s.PrincipalID, s.SessionID, map[string]any{
+		"session_id":        s.SessionID,
+		"tenant_id":         s.TenantID,
+		"principal_id":      s.PrincipalID,
+		"ticket_ref":        s.TicketRef,
+		"reason":            s.Reason,
+		"requested_actions": s.RequestedActions,
+		"status":            s.Status,
+		"expires_at":        s.ExpiresAt,
+	})
+}
+
+// PublishPrivilegedSessionEnded publishes security.privileged_session.ended (ZS-IAM-001 §23).
+func (p *Publisher) PublishPrivilegedSessionEnded(ctx context.Context, s domain.PrivilegedSession) error {
+	return p.emit(ctx, "security.privileged_session.ended", "", "", s.PrincipalID, s.SessionID, map[string]any{
+		"session_id":   s.SessionID,
+		"tenant_id":    s.TenantID,
+		"principal_id": s.PrincipalID,
+		"ticket_ref":   s.TicketRef,
+		"status":       s.Status,
+		"revoked_at":   s.RevokedAt,
+		"revoked_by":   s.RevokedBy,
+	})
+}
+
+// PublishAuthorityLimitChanged publishes iam.authority_limit.changed (ZS-IAM-001 §23).
+func (p *Publisher) PublishAuthorityLimitChanged(ctx context.Context, l domain.AuthorityLimit, changeType string) error {
+	return p.emit(ctx, "iam.authority_limit.changed", "", ptrToString(l.LegalEntityID), ptrToString(l.PrincipalID), l.AuthorityLimitID, map[string]any{
+		"authority_limit_id": l.AuthorityLimitID,
+		"tenant_id":          l.TenantID,
+		"authority_type":     l.AuthorityType,
+		"change_type":        changeType,
+		"upper_limit":        l.UpperLimit,
+		"currency":           l.Currency,
+	})
+}
+
+// PublishSoDPolicyPublished publishes iam.sod_policy.published (ZS-IAM-001 §23).
+func (p *Publisher) PublishSoDPolicyPublished(ctx context.Context, rule domain.SoDRule) error {
+	return p.emit(ctx, "iam.sod_policy.published", "", "", "", rule.SoDRuleID, map[string]any{
+		"sod_rule_id":   rule.SoDRuleID,
+		"tenant_id":     rule.TenantID,
+		"domain_code":   rule.DomainCode,
+		"action_a":      rule.ActionA,
+		"action_b":      rule.ActionB,
+		"conflict_type": rule.ConflictType,
+		"active_flag":   rule.ActiveFlag,
+	})
+}
+
+// PublishPolicySetPublished publishes iam.policy_set.published (ZS-IAM-001 §23).
+func (p *Publisher) PublishPolicySetPublished(ctx context.Context, version, tenantID, publishedBy string) error {
+	return p.emit(ctx, "iam.policy_set.published", "", "", publishedBy, version, map[string]any{
+		"policy_set_version": version,
+		"tenant_id":          tenantID,
+		"published_by":       publishedBy,
+		"published_at":       time.Now().UTC(),
+	})
+}
+
+func ptrToString(ptr *string) string {
+	if ptr == nil {
+		return ""
+	}
+	return *ptr
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, legalEntityID, actorID, key string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {

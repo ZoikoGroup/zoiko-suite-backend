@@ -89,7 +89,12 @@ type Inner interface {
 	ListABACRules(ctx context.Context, tenantID, actionType string) ([]domain.ABACRule, error)
 	FindABACRules(ctx context.Context, actionType, tenantID string) ([]domain.ABACRule, error)
 	FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
+	FindGrantedActionsScoped(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID string) ([]string, string, error)
 	FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
+	FindDelegatedActionsScoped(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID string) ([]string, string, error)
+	CreateAuthorityLimit(ctx context.Context, params domain.CreateAuthorityLimitParams) (*domain.AuthorityLimit, error)
+	FindAuthorityLimitByID(ctx context.Context, limitID, tenantID string) (*domain.AuthorityLimit, error)
+	ListAuthorityLimits(ctx context.Context, tenantID string, principalID, roleID, authorityType string) ([]domain.AuthorityLimit, error)
 	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
 	CheckOwnObjectSoD(ctx context.Context, actionType, tenantID string) (bool, error)
 	RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error)
@@ -103,6 +108,28 @@ type Inner interface {
 	FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error)
 	ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error)
 	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
+
+	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21).
+	CreateBreakGlassSession(ctx context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error)
+	FindBreakGlassSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.BreakGlassSession, error)
+	ListBreakGlassSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.BreakGlassSession, error)
+	RevokeBreakGlassSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.BreakGlassSession, error)
+
+	// Tenant Support Sessions (ZS-IAM-001 §15 & §21).
+	CreateSupportSession(ctx context.Context, params domain.CreateSupportSessionParams) (*domain.SupportSession, error)
+	FindSupportSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.SupportSession, error)
+	ListSupportSessions(ctx context.Context, tenantID string, activeOnly bool) ([]domain.SupportSession, error)
+	RevokeSupportSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.SupportSession, error)
+
+	// Workload Identity (ZS-IAM-001 §16)
+	FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error)
+	CreateWorkloadBinding(ctx context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error)
+
+	// Access Reviews & Continuous Access Certification (ZS-IAM-001 §21, §24)
+	CreateAccessReview(ctx context.Context, review domain.AccessReview) (*domain.AccessReview, error)
+	GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error)
+	ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error)
+	RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error)
 }
 
 // The cache namespaces. A write invalidates whole namespaces for a tenant
@@ -289,12 +316,16 @@ type grantResult struct {
 // a shared slice's spare capacity would let one request's evaluation mutate
 // what the next one reads.
 func (s *Store) FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error) {
-	k := s.key(nsGrants, tenantID, principalID, legalEntityID)
+	return s.FindGrantedActionsScoped(ctx, principalID, legalEntityID, tenantID, "", "")
+}
+
+func (s *Store) FindGrantedActionsScoped(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID string) ([]string, string, error) {
+	k := s.key(nsGrants, tenantID, principalID, legalEntityID, bookID, orgUnitID)
 	if v, ok := s.load(k); ok {
 		r := v.(grantResult)
 		return copyOf(r.actions), r.basis, nil
 	}
-	actions, basis, err := s.inner.FindGrantedActions(ctx, principalID, legalEntityID, tenantID)
+	actions, basis, err := s.inner.FindGrantedActionsScoped(ctx, principalID, legalEntityID, tenantID, bookID, orgUnitID)
 	if err != nil {
 		// Errors are never cached. A store outage is transient and caching it
 		// would turn a blip into a fail-closed window of TTL length on every
@@ -307,12 +338,16 @@ func (s *Store) FindGrantedActions(ctx context.Context, principalID, legalEntity
 
 // FindDelegatedActions caches per (tenant, principal, entity), same shape.
 func (s *Store) FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error) {
-	k := s.key(nsDelegation, tenantID, principalID, legalEntityID)
+	return s.FindDelegatedActionsScoped(ctx, principalID, legalEntityID, tenantID, "", "")
+}
+
+func (s *Store) FindDelegatedActionsScoped(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID string) ([]string, string, error) {
+	k := s.key(nsDelegation, tenantID, principalID, legalEntityID, bookID, orgUnitID)
 	if v, ok := s.load(k); ok {
 		r := v.(grantResult)
 		return copyOf(r.actions), r.basis, nil
 	}
-	actions, basis, err := s.inner.FindDelegatedActions(ctx, principalID, legalEntityID, tenantID)
+	actions, basis, err := s.inner.FindDelegatedActionsScoped(ctx, principalID, legalEntityID, tenantID, bookID, orgUnitID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -680,6 +715,78 @@ func (s *Store) ListPrivilegedSessions(ctx context.Context, tenantID, principalI
 
 func (s *Store) RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error) {
 	return s.inner.RevokePrivilegedSession(ctx, sessionID, tenantID, revokedBy)
+}
+
+func (s *Store) CreateBreakGlassSession(ctx context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error) {
+	return s.inner.CreateBreakGlassSession(ctx, params)
+}
+
+func (s *Store) FindBreakGlassSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.BreakGlassSession, error) {
+	return s.inner.FindBreakGlassSessionByID(ctx, sessionID, tenantID)
+}
+
+func (s *Store) ListBreakGlassSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.BreakGlassSession, error) {
+	return s.inner.ListBreakGlassSessions(ctx, tenantID, principalID, activeOnly)
+}
+
+func (s *Store) RevokeBreakGlassSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.BreakGlassSession, error) {
+	return s.inner.RevokeBreakGlassSession(ctx, sessionID, tenantID, revokedBy)
+}
+
+func (s *Store) CreateSupportSession(ctx context.Context, params domain.CreateSupportSessionParams) (*domain.SupportSession, error) {
+	return s.inner.CreateSupportSession(ctx, params)
+}
+
+func (s *Store) FindSupportSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.SupportSession, error) {
+	return s.inner.FindSupportSessionByID(ctx, sessionID, tenantID)
+}
+
+func (s *Store) ListSupportSessions(ctx context.Context, tenantID string, activeOnly bool) ([]domain.SupportSession, error) {
+	return s.inner.ListSupportSessions(ctx, tenantID, activeOnly)
+}
+
+func (s *Store) RevokeSupportSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.SupportSession, error) {
+	return s.inner.RevokeSupportSession(ctx, sessionID, tenantID, revokedBy)
+}
+
+func (s *Store) CreateAuthorityLimit(ctx context.Context, params domain.CreateAuthorityLimitParams) (*domain.AuthorityLimit, error) {
+	return s.inner.CreateAuthorityLimit(ctx, params)
+}
+
+func (s *Store) FindAuthorityLimitByID(ctx context.Context, limitID, tenantID string) (*domain.AuthorityLimit, error) {
+	return s.inner.FindAuthorityLimitByID(ctx, limitID, tenantID)
+}
+
+func (s *Store) ListAuthorityLimits(ctx context.Context, tenantID string, principalID, roleID, authorityType string) ([]domain.AuthorityLimit, error) {
+	return s.inner.ListAuthorityLimits(ctx, tenantID, principalID, roleID, authorityType)
+}
+
+func (s *Store) FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error) {
+	return s.inner.FindWorkloadBinding(ctx, workloadID, tenantID)
+}
+
+func (s *Store) CreateWorkloadBinding(ctx context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error) {
+	return s.inner.CreateWorkloadBinding(ctx, binding)
+}
+
+func (s *Store) CreateAccessReview(ctx context.Context, review domain.AccessReview) (*domain.AccessReview, error) {
+	return s.inner.CreateAccessReview(ctx, review)
+}
+
+func (s *Store) GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error) {
+	return s.inner.GetAccessReview(ctx, reviewID, tenantID)
+}
+
+func (s *Store) ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error) {
+	return s.inner.ListAccessReviews(ctx, tenantID, reviewerPrincipalID, status)
+}
+
+func (s *Store) RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error) {
+	rev, err := s.inner.RecordAccessReviewDecision(ctx, reviewID, tenantID, decision, decisionReason, decidedBy)
+	if err == nil && decision == domain.ReviewDecisionRevoke {
+		s.invalidateGrantSources(tenantID)
+	}
+	return rev, err
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

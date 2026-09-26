@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,7 +66,12 @@ type AuthorizationStore interface {
 	FindABACRules(ctx context.Context, actionType, tenantID string) ([]domain.ABACRule, error)
 
 	FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
+	FindGrantedActionsScoped(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID string) ([]string, string, error)
 	FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
+	FindDelegatedActionsScoped(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID string) ([]string, string, error)
+	CreateAuthorityLimit(ctx context.Context, params domain.CreateAuthorityLimitParams) (*domain.AuthorityLimit, error)
+	FindAuthorityLimitByID(ctx context.Context, limitID, tenantID string) (*domain.AuthorityLimit, error)
+	ListAuthorityLimits(ctx context.Context, tenantID string, principalID, roleID, authorityType string) ([]domain.AuthorityLimit, error)
 	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
 	// Satya's own-object Segregation-of-Duties check (ef4cc2c), kept as-is.
 	CheckOwnObjectSoD(ctx context.Context, actionType, tenantID string) (bool, error)
@@ -101,6 +107,28 @@ type AuthorizationStore interface {
 	FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error)
 	ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error)
 	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
+
+	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21).
+	CreateBreakGlassSession(ctx context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error)
+	FindBreakGlassSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.BreakGlassSession, error)
+	ListBreakGlassSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.BreakGlassSession, error)
+	RevokeBreakGlassSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.BreakGlassSession, error)
+
+	// Tenant Support Sessions (ZS-IAM-001 §15 & §21).
+	CreateSupportSession(ctx context.Context, params domain.CreateSupportSessionParams) (*domain.SupportSession, error)
+	FindSupportSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.SupportSession, error)
+	ListSupportSessions(ctx context.Context, tenantID string, activeOnly bool) ([]domain.SupportSession, error)
+	RevokeSupportSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.SupportSession, error)
+
+	// Workload Identity (ZS-IAM-001 §16)
+	FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error)
+	CreateWorkloadBinding(ctx context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error)
+
+	// Access Reviews & Continuous Access Certification (ZS-IAM-001 §21, §24)
+	CreateAccessReview(ctx context.Context, review domain.AccessReview) (*domain.AccessReview, error)
+	GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error)
+	ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error)
+	RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on.
@@ -108,6 +136,17 @@ type EventPublisher interface {
 	PublishAuthorizationGranted(ctx context.Context, d domain.AccessDecisionLog) error
 	PublishAuthorizationDenied(ctx context.Context, d domain.AccessDecisionLog) error
 	PublishSoDViolationDetected(ctx context.Context, d domain.AccessDecisionLog, conflictingAction string) error
+	PublishBreakGlassStarted(ctx context.Context, session domain.BreakGlassSession) error
+	PublishBreakGlassEnded(ctx context.Context, session domain.BreakGlassSession) error
+	PublishSupportSessionStarted(ctx context.Context, session domain.SupportSession) error
+	PublishSupportSessionEnded(ctx context.Context, session domain.SupportSession) error
+	PublishAccessReviewStarted(ctx context.Context, review domain.AccessReview) error
+	PublishAccessReviewCompleted(ctx context.Context, review domain.AccessReview) error
+	PublishPrivilegedSessionStarted(ctx context.Context, session domain.PrivilegedSession) error
+	PublishPrivilegedSessionEnded(ctx context.Context, session domain.PrivilegedSession) error
+	PublishAuthorityLimitChanged(ctx context.Context, limit domain.AuthorityLimit, action string) error
+	PublishSoDPolicyPublished(ctx context.Context, rule domain.SoDRule) error
+	PublishPolicySetPublished(ctx context.Context, version, tenantID, publishedBy string) error
 }
 
 type Handler struct {
@@ -169,7 +208,36 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/admin/privileged-sessions", h.ListPrivilegedSessions)
 	r.Post("/v1/admin/privileged-sessions/{session_id}/revoke", h.RevokePrivilegedSession)
 
+	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21)
+	r.Post("/admin/v1/break-glass-sessions", h.CreateBreakGlassSession)
+	r.Get("/admin/v1/break-glass-sessions", h.ListBreakGlassSessions)
+	r.Get("/admin/v1/break-glass-sessions/{session_id}", h.GetBreakGlassSession)
+	r.Post("/admin/v1/break-glass-sessions/{session_id}/revoke", h.RevokeBreakGlassSession)
+	r.Post("/v1/admin/break-glass-sessions", h.CreateBreakGlassSession)
+	r.Get("/v1/admin/break-glass-sessions", h.ListBreakGlassSessions)
+	r.Get("/v1/admin/break-glass-sessions/{session_id}", h.GetBreakGlassSession)
+	r.Post("/v1/admin/break-glass-sessions/{session_id}/revoke", h.RevokeBreakGlassSession)
+
+	// Tenant Support Sessions (ZS-IAM-001 §15 & §21)
+	r.Post("/v1/support/sessions", h.CreateSupportSession)
+	r.Get("/v1/support/sessions", h.ListSupportSessions)
+	r.Get("/v1/support/sessions/{session_id}", h.GetSupportSession)
+	r.Post("/v1/support/sessions/{session_id}/revoke", h.RevokeSupportSession)
+
 	r.Post(AuthorizePath, h.Authorize)
+
+	// Canonical Authorization Decision API (ZS-IAM-001 §8.1, §8.2, §21)
+	r.Post("/internal/authorization/decisions", h.HandleCanonicalDecision)
+
+	// Access Reviews & Continuous Access Certification (ZS-IAM-001 §21, §24)
+	r.Get("/v1/iam/access-reviews", h.ListAccessReviews)
+	r.Post("/v1/iam/access-reviews/{id}:decide", h.DecideAccessReview)
+	r.Post("/v1/iam/access-reviews/{id}/decide", h.DecideAccessReview)
+
+	// Available Actions (ZS-IAM-001 §21, ZS-STATE-001)
+	r.Get("/v1/{resource}/{id}/available-actions", h.GetAvailableActions)
+	r.Get("/v1/{resource_type}/{resource_id}/available-actions", h.GetAvailableActions)
+	r.Get("/v1/me/capabilities", h.GetMyCapabilities)
 
 	// The other three inbound APIs Doc 03 §8.3 names. Folded into
 	// /v1/authorize as internal layers until now, which left three questions
@@ -766,6 +834,8 @@ type createAssignmentRequest struct {
 	// (only accepted if the role's scope_type is TENANT — see
 	// domain.ErrLegalEntityRequiredForRoleScope).
 	LegalEntityID string    `json:"legal_entity_id,omitempty"`
+	BookID        string    `json:"book_id,omitempty"`
+	OrgUnitID     string    `json:"org_unit_id,omitempty"`
 	EffectiveFrom time.Time `json:"effective_from"`
 }
 
@@ -830,11 +900,19 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	if req.LegalEntityID != "" {
 		legalEntityID = &req.LegalEntityID
 	}
+	var bookID *string
+	if req.BookID != "" {
+		bookID = &req.BookID
+	}
+	var orgUnitID *string
+	if req.OrgUnitID != "" {
+		orgUnitID = &req.OrgUnitID
+	}
 
 	assignment, err := h.store.CreateRoleAssignment(r.Context(), domain.CreateRoleAssignmentParams{
 		// assigned_by is always the verified caller, never the request body.
 		PrincipalRoleAssignmentID: req.PrincipalRoleAssignmentID, PrincipalID: req.PrincipalID, RoleID: req.RoleID,
-		LegalEntityID: legalEntityID, EffectiveFrom: req.EffectiveFrom, AssignedBy: principalID,
+		LegalEntityID: legalEntityID, BookID: bookID, OrgUnitID: orgUnitID, EffectiveFrom: req.EffectiveFrom, AssignedBy: principalID,
 	})
 	if err != nil {
 		switch {
@@ -893,6 +971,8 @@ type createDelegationRequest struct {
 	// LegalEntityID is optional: omit it for a delegation that applies
 	// across the whole tenant rather than one entity.
 	LegalEntityID       string  `json:"legal_entity_id,omitempty"`
+	BookID              string  `json:"book_id,omitempty"`
+	OrgUnitID           string  `json:"org_unit_id,omitempty"`
 	AuthorityLimitType  *string `json:"authority_limit_type,omitempty"`
 	AuthorityLimitValue *string `json:"authority_limit_value,omitempty"`
 	// DelegatedActions is the subset of the delegator's authority to confer.
@@ -994,11 +1074,20 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 	if req.LegalEntityID != "" {
 		legalEntityID = &req.LegalEntityID
 	}
+	var bookID *string
+	if req.BookID != "" {
+		bookID = &req.BookID
+	}
+	var orgUnitID *string
+	if req.OrgUnitID != "" {
+		orgUnitID = &req.OrgUnitID
+	}
 
 	d, err := h.store.CreateDelegatedAuthority(r.Context(), domain.CreateDelegatedAuthorityParams{
 		TenantID:             tenantScope,
 		DelegatedAuthorityID: req.DelegatedAuthorityID, DelegatorPrincipalID: req.DelegatorPrincipalID,
 		DelegatePrincipalID: req.DelegatePrincipalID, ScopeType: req.ScopeType, LegalEntityID: legalEntityID,
+		BookID: bookID, OrgUnitID: orgUnitID,
 		AuthorityLimitType: req.AuthorityLimitType, AuthorityLimitValue: req.AuthorityLimitValue,
 		DelegatedActions: req.DelegatedActions,
 		EffectiveFrom:    req.EffectiveFrom, EffectiveTo: req.EffectiveTo,
@@ -1527,6 +1616,9 @@ type authorizeRequest struct {
 	// callers that do not forward X-Tenant-Id yet. See resolveTenantScope:
 	// the header wins, and a body that disagrees with it is refused.
 	TenantID string `json:"tenant_id,omitempty"`
+	// BookID and OrgUnitID provide hierarchical scope dimensions (ZS-IAM-001 §4, Scenario A03).
+	BookID    string `json:"book_id,omitempty"`
+	OrgUnitID string `json:"org_unit_id,omitempty"`
 	// ResourceOwnerPrincipalID is optional: the principal who prepared or
 	// created the specific object action_type is being performed against
 	// (e.g. an invoice's preparer), supplied by the calling service. Until
@@ -1557,6 +1649,19 @@ type authorizeRequest struct {
 	// If the principal does not hold a standing grant or delegation, an active JIT session
 	// with matching requested action grants elevation while preserving ticket reference and basis.
 	PrivilegedSessionID string `json:"privileged_session_id,omitempty"`
+
+	// BreakGlassSessionID is optional: emergency break-glass session ID (ZS-IAM-001 §14 & §21).
+	// Exception elevation for declared incidents.
+	BreakGlassSessionID string `json:"break_glass_session_id,omitempty"`
+
+	// SupportSessionID is optional: tenant support access session ID (ZS-IAM-001 §15 & §21).
+	// Purpose-bound diagnostic / support access with operator attribution.
+	SupportSessionID string `json:"support_session_id,omitempty"`
+
+	// Workload Identity (ZS-IAM-001 §16)
+	PrincipalType       string `json:"principal_type,omitempty"`
+	Audience            string `json:"audience,omitempty"`
+	InitiatingSubjectID string `json:"initiating_subject_id,omitempty"`
 }
 
 // PlatformScopeSentinel is the legal_entity_id a caller sends to have a
@@ -1606,6 +1711,7 @@ type authorizeResponse struct {
 	DecisionOutcome  string `json:"decision_outcome"`
 	DecisionBasis    string `json:"decision_basis"`
 	AccessDecisionID string `json:"access_decision_id"`
+	Reason           string `json:"reason,omitempty"`
 }
 
 // Authorize handles POST /v1/authorize — the core evaluation endpoint.
@@ -1759,6 +1865,57 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ── Workload Identity Validation (ZS-IAM-001 §16, Scenarios A18 & A19) ───
+	isWorkload := strings.EqualFold(req.PrincipalType, "WORKLOAD") ||
+		(req.Attributes != nil && strings.EqualFold(req.Attributes["principal_type"], "WORKLOAD")) ||
+		(req.Attributes != nil && req.Attributes["workload_id"] != "")
+
+	if isWorkload {
+		workloadID := req.PrincipalID
+		if req.Attributes != nil && req.Attributes["workload_id"] != "" {
+			workloadID = req.Attributes["workload_id"]
+		}
+
+		binding, err := h.store.FindWorkloadBinding(r.Context(), workloadID, tenantScope)
+		if err != nil || binding == nil {
+			// Scenario A19: Workload attempts to invent or widen tenant context outside its trusted binding.
+			h.siem.Stream(r.Context(), tenantScope, "security.workload.unbound_tenant", siem.SeverityHigh,
+				fmt.Sprintf("Workload %s attempted access with unbound tenant %s", workloadID, tenantScope))
+			h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID,
+				"DENIED", "workload:tenant_context_unbound", "UNBOUND_TENANT_CONTEXT")
+			return
+		}
+
+		if !binding.ActiveFlag {
+			h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID,
+				"DENIED", "workload:inactive_binding", "WORKLOAD_BINDING_INACTIVE")
+			return
+		}
+
+		aud := req.Audience
+		if aud == "" && req.Attributes != nil {
+			aud = req.Attributes["audience"]
+			if aud == "" {
+				aud = req.Attributes["aud"]
+			}
+		}
+		if aud == "" {
+			aud = r.Header.Get("X-Audience")
+			if aud == "" {
+				aud = r.Header.Get("X-Token-Audience")
+			}
+		}
+
+		if binding.AllowedAudience != "" && binding.AllowedAudience != "*" {
+			if aud == "" || aud != binding.AllowedAudience {
+				// Scenario A18: Workload presents a valid credential but the audience is incorrect.
+				h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID,
+					"DENIED", "workload:audience_mismatch", "TOKEN_AUDIENCE_MISMATCH")
+				return
+			}
+		}
+	}
+
 	// ── layer 0: is this still an active principal? ─────────────────────────
 	//
 	// Before RBAC, because no grant can be exercised by a principal
@@ -1783,7 +1940,14 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rbacActions, rbacBasis, err := h.store.FindGrantedActions(r.Context(), req.PrincipalID, evaluationEntityID, tenantScope)
+	if req.BookID == "" {
+		req.BookID = r.Header.Get("X-Book-Id")
+	}
+	if req.OrgUnitID == "" {
+		req.OrgUnitID = r.Header.Get("X-Org-Unit-Id")
+	}
+
+	rbacActions, rbacBasis, err := h.store.FindGrantedActionsScoped(r.Context(), req.PrincipalID, evaluationEntityID, tenantScope, req.BookID, req.OrgUnitID)
 	if err != nil {
 		// Fail-closed: the store is unreachable, so no decision can be made
 		// or recorded. Returning 503 here (rather than a recorded DENIED)
@@ -1800,7 +1964,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	allHeldActions := append([]string{}, rbacActions...)
 
 	if !granted {
-		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActions(r.Context(), req.PrincipalID, evaluationEntityID, tenantScope)
+		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActionsScoped(r.Context(), req.PrincipalID, evaluationEntityID, tenantScope, req.BookID, req.OrgUnitID)
 		if err != nil {
 			h.log.Error("Authorize: store unavailable (delegation lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -1835,6 +1999,81 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 					granted = true
 					basis = fmt.Sprintf("pam:session=%s:ticket=%s", ps.SessionID, ps.TicketRef)
 					allHeldActions = append(allHeldActions, req.ActionType)
+				}
+			}
+		}
+	}
+
+	// Layer 3.1 — Break-Glass Emergency Elevation (ZS-IAM-001 §14 & §21).
+	// Exception elevation for declared incidents.
+	if !granted && req.BreakGlassSessionID != "" {
+		bg, err := h.store.FindBreakGlassSessionByID(r.Context(), req.BreakGlassSessionID, tenantScope)
+		if err != nil {
+			if errors.Is(err, domain.ErrBreakGlassSessionNotFound) {
+				h.log.Warn("Authorize: break-glass session not found or outside tenant scope",
+					zap.String("break_glass_session_id", req.BreakGlassSessionID),
+					zap.String("correlation_id", correlationID))
+			} else {
+				h.log.Error("Authorize: store unavailable (break-glass session lookup)",
+					zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return
+			}
+		} else if bg != nil {
+			// Scenario A17: session must be ACTIVE and not expired mid-operation
+			if bg.Status == domain.BreakGlassSessionStatusActive && time.Now().UTC().Before(bg.ExpiresAt) {
+				if bg.PrincipalID == req.PrincipalID && bg.IncidentID != "" {
+					if contains(bg.RequestedActions, req.ActionType) || contains(bg.RequestedActions, "*") {
+						granted = true
+						basis = fmt.Sprintf("break_glass:session=%s:incident=%s", bg.SessionID, bg.IncidentID)
+						allHeldActions = append(allHeldActions, req.ActionType)
+					}
+				}
+			}
+		}
+	}
+
+	// Layer 3.2 — Tenant Support Session (ZS-IAM-001 §15 & §21).
+	// Purpose-bound diagnostic / support access with operator attribution.
+	if !granted && req.SupportSessionID != "" {
+		ss, err := h.store.FindSupportSessionByID(r.Context(), req.SupportSessionID, tenantScope)
+		if err != nil {
+			if errors.Is(err, domain.ErrSupportSessionNotFound) {
+				h.log.Warn("Authorize: support session not found or outside tenant scope",
+					zap.String("support_session_id", req.SupportSessionID),
+					zap.String("correlation_id", correlationID))
+			} else {
+				h.log.Error("Authorize: store unavailable (support session lookup)",
+					zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return
+			}
+		} else if ss != nil {
+			if ss.Status == domain.SupportSessionStatusActive && time.Now().UTC().Before(ss.ExpiresAt) {
+				// Operator attribution: principal must be the authorized support operator
+				if ss.SupportOperatorID == req.PrincipalID {
+					isExportAction := strings.HasSuffix(req.ActionType, ".export") || req.ActionType == "export" || strings.Contains(req.ActionType, "export")
+					isMutationAction := strings.HasSuffix(req.ActionType, ".create") || strings.HasSuffix(req.ActionType, ".edit") || strings.HasSuffix(req.ActionType, ".post") || strings.HasSuffix(req.ActionType, ".delete") || strings.HasSuffix(req.ActionType, ".release") || strings.HasSuffix(req.ActionType, ".revoke")
+
+					// Scenario A14: Support user bulk export is DENIED by default unless explicitly granted
+					if isExportAction && !ss.AllowBulkExport && !contains(ss.AllowedActions, req.ActionType) {
+						h.recordAndAnswer(w, r, req, evaluationEntityID, tenantScope, correlationID,
+							"DENIED", "support:bulk_export_prohibited")
+						return
+					}
+
+					// Read-only violation check
+					if ss.ReadOnly && isMutationAction && !contains(ss.AllowedActions, req.ActionType) {
+						h.recordAndAnswer(w, r, req, evaluationEntityID, tenantScope, correlationID,
+							"DENIED", "support:read_only_session")
+						return
+					}
+
+					if contains(ss.AllowedActions, req.ActionType) || contains(ss.AllowedActions, "*") || (!ss.ReadOnly && len(ss.AllowedActions) == 0) || (ss.ReadOnly && !isMutationAction) {
+						granted = true
+						basis = fmt.Sprintf("support:session=%s:operator=%s:ticket=%s", ss.SessionID, ss.SupportOperatorID, ss.TicketRef)
+						allHeldActions = append(allHeldActions, req.ActionType)
+					}
 				}
 			}
 		}
@@ -1889,6 +2128,79 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Dynamic SoD — Supplier bank change proximity (Scenario A06, §10.2)
+		if outcome == "GRANTED" && isReleaseAction(req.ActionType) && req.Attributes != nil {
+			bankChangedBy := req.Attributes["supplier_bank_changed_by"]
+			if bankChangedBy == "" {
+				bankChangedBy = req.Attributes["bank_account_changed_by"]
+			}
+			coolingViolation := req.Attributes["cooling_window_violation"] == "true" ||
+				req.Attributes["supplier_bank_cooling_window_active"] == "true" ||
+				req.Attributes["cooling_window_conflict"] == "true" ||
+				req.Attributes["supplier_bank_cooling_active"] == "true" ||
+				req.Attributes["cooling_window_active"] == "true"
+
+			if !coolingViolation && req.Attributes["supplier_bank_changed_at"] != "" {
+				coolingViolation = checkCoolingWindowActive(req.Attributes["supplier_bank_changed_at"])
+			}
+
+			if (bankChangedBy == req.PrincipalID && coolingViolation) || req.Attributes["cooling_window_conflict"] == "true" {
+				outcome = "DENIED"
+				basis = "sod:cooling_window_conflict"
+			}
+		}
+
+		// Dynamic SoD — Requestor self-approval (§10.2)
+		if outcome == "GRANTED" && isApprovalAction(req.ActionType) && req.Attributes != nil {
+			requestorID := req.Attributes["requestor_id"]
+			if requestorID == "" {
+				requestorID = req.Attributes["expense.requestor_id"]
+			}
+			if requestorID != "" && requestorID == req.PrincipalID {
+				outcome = "DENIED"
+				basis = "sod:requestor_self_approval"
+			}
+		}
+
+		// Dynamic SoD — Own access elevation (§10.2)
+		if outcome == "GRANTED" && isGrantAction(req.ActionType) && req.Attributes != nil {
+			targetSubjectID := req.Attributes["target_subject_id"]
+			if targetSubjectID == "" {
+				targetSubjectID = req.Attributes["target_principal_id"]
+			}
+			if targetSubjectID != "" && targetSubjectID == req.PrincipalID {
+				outcome = "DENIED"
+				basis = "sod:own_access_elevation"
+			}
+		}
+
+		// Dynamic SoD — Prior rejected reviewer (§10.2 Pattern 5)
+		if outcome == "GRANTED" && isApprovalAction(req.ActionType) && req.Attributes != nil {
+			priorRejectedBy := req.Attributes["prior_rejected_by"]
+			if priorRejectedBy == "" {
+				priorRejectedBy = req.Attributes["rejected_by"]
+			}
+			isResubmission := req.Attributes["is_resubmission"] == "true" || req.Attributes["resubmitted"] == "true" || priorRejectedBy != ""
+			if priorRejectedBy != "" && priorRejectedBy == req.PrincipalID && isResubmission {
+				outcome = "DENIED"
+				basis = "sod:prior_rejected_reviewer"
+			}
+		}
+
+		// Dynamic SoD — Related-party conflict (§10.2 Pattern 6)
+		if outcome == "GRANTED" && req.Attributes != nil {
+			relatedPartySubject := req.Attributes["related_party_subject_id"]
+			if relatedPartySubject == "" {
+				relatedPartySubject = req.Attributes["vendor_related_party_subject_id"]
+			}
+			isRelatedParty := req.Attributes["is_related_party"] == "true" || req.Attributes["related_party_conflict"] == "true" ||
+				(relatedPartySubject != "" && relatedPartySubject == req.PrincipalID)
+			if isRelatedParty {
+				outcome = "DENIED"
+				basis = "sod:related_party_conflict"
+			}
+		}
+
 		// Layer 5 — ABAC. Attribute conditions declared in abac_rules, only
 		// reachable once every earlier layer has already granted, and
 		// DENY-ONLY: a rule can take away what RBAC or delegation conferred,
@@ -1922,6 +2234,89 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+
+		// Layer 6.0 — Monetary Authority Limits & FX Conversion (Phase 3.6 & 3.7, Scenario A09)
+		if outcome == "GRANTED" {
+			evalCtx := evalContext{
+				PrincipalID:   req.PrincipalID,
+				TenantID:      tenantScope,
+				LegalEntityID: evaluationEntityID,
+				BookID:        req.BookID,
+				OrgUnitID:     req.OrgUnitID,
+				ActionType:    req.ActionType,
+				Attributes:    req.Attributes,
+				CorrelationID: correlationID,
+			}
+			limitDenied, limitBasis, _, _, _, err := h.evaluateAuthorityLimits(r.Context(), evalCtx, evaluationEntityID)
+			if err != nil {
+				h.log.Error("Authorize: store unavailable (authority limit check)", zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return
+			}
+			if limitDenied {
+				outcome = "DENIED"
+				basis = limitBasis
+			}
+		}
+
+		// Layer 6.1 — Quorum / Dual Approval (Phase 3.8)
+		if outcome == "GRANTED" {
+			evalCtx := evalContext{
+				PrincipalID:   req.PrincipalID,
+				TenantID:      tenantScope,
+				LegalEntityID: evaluationEntityID,
+				ActionType:    req.ActionType,
+				Attributes:    req.Attributes,
+				CorrelationID: correlationID,
+			}
+			if qDenied, qBasis, _, _, _ := h.evaluateQuorum(evalCtx); qDenied {
+				outcome = "DENIED"
+				basis = qBasis
+			}
+		}
+
+		// Layer 6.2 — Execution-Time Fact-Hash Revalidation (Phase 3.9, Scenario A10)
+		if outcome == "GRANTED" {
+			evalCtx := evalContext{
+				PrincipalID:   req.PrincipalID,
+				TenantID:      tenantScope,
+				LegalEntityID: evaluationEntityID,
+				ActionType:    req.ActionType,
+				Attributes:    req.Attributes,
+				CorrelationID: correlationID,
+			}
+			if rDenied, rBasis, _, _, _ := h.evaluateExecutionRevalidation(evalCtx); rDenied {
+				outcome = "DENIED"
+				basis = rBasis
+			}
+		}
+
+		// Layer 7 — Stage 7 Assurance / Step-Up (Scenario A26, ZS-IAM-001 §7 Stage 7, §8.2)
+		if outcome == "GRANTED" {
+			authnAge := 0
+			if req.Attributes != nil && req.Attributes["authn_age_seconds"] != "" {
+				authnAge, _ = strconv.Atoi(req.Attributes["authn_age_seconds"])
+			} else if rawAge := r.Header.Get("X-Authn-Age-Seconds"); rawAge != "" {
+				authnAge, _ = strconv.Atoi(rawAge)
+			}
+			env := domain.EnvironmentContext{
+				AuthnAgeSeconds: authnAge,
+				Assurance:       r.Header.Get("X-Assurance-Level"),
+			}
+			if isStepUpRequired(req.ActionType, req.Attributes, env) {
+				outcome = domain.OutcomeStepUp
+				basis = "assurance:recent_authn_required"
+			}
+		}
+
+		// Layer 8 — Domain Guards: Resource Lifecycle State (ZS-STATE-001)
+		if outcome == "GRANTED" && req.Attributes != nil {
+			status := getResourceLifecycleStatus(req.Attributes)
+			if isTerminalLifecycleState(status) && isMutationOrApprovalAction(req.ActionType) {
+				outcome = "DENIED"
+				basis = "state:terminal_status=" + status
+			}
+		}
 	}
 
 	h.recordAndAnswer(w, r, req, evaluationEntityID, tenantScope, correlationID, outcome, basis)
@@ -1943,6 +2338,16 @@ func (h *Handler) recordAndAnswer(
 	req authorizeRequest,
 	evaluationEntityID, tenantScope, correlationID string,
 	outcome, basis string,
+) {
+	h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID, outcome, basis, "")
+}
+
+func (h *Handler) recordAndAnswerWithReason(
+	w http.ResponseWriter,
+	r *http.Request,
+	req authorizeRequest,
+	evaluationEntityID, tenantScope, correlationID string,
+	outcome, basis, reason string,
 ) {
 	decision, err := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
 		PrincipalID: req.PrincipalID,
@@ -1991,11 +2396,15 @@ func (h *Handler) recordAndAnswer(
 		// is still acting as it. Same elevation as an SoD violation, and
 		// deliberately not folded into the sod: prefix, because it publishes
 		// no sod.violation.detected: nothing here is a duty conflict.
-		if strings.HasPrefix(basis, principalStatusBasisPrefix) {
+		if strings.HasPrefix(basis, principalStatusBasisPrefix) || basis == "workload:tenant_context_unbound" {
 			severity = siem.SeverityHigh
 		}
 		h.siem.Stream(r.Context(), tenantScope, "authorization.denied", severity,
 			"Authorization denied for principal "+req.PrincipalID+", action "+req.ActionType+": "+basis)
+		if basis == "workload:tenant_context_unbound" {
+			h.siem.Stream(r.Context(), tenantScope, "security.workload.unbound_tenant", siem.SeverityHigh,
+				fmt.Sprintf("Workload %s attempted access with unbound tenant %s", req.PrincipalID, tenantScope))
+		}
 		if isSoD {
 			// conflict_with= names the other held action; an own-object
 			// denial has no "other action" — the conflict is the action
@@ -2017,7 +2426,12 @@ func (h *Handler) recordAndAnswer(
 		zap.String("basis", basis),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, authorizeResponse{DecisionOutcome: outcome, DecisionBasis: basis, AccessDecisionID: decision.AccessDecisionID})
+	writeJSON(w, http.StatusOK, authorizeResponse{
+		DecisionOutcome:  outcome,
+		DecisionBasis:    basis,
+		AccessDecisionID: decision.AccessDecisionID,
+		Reason:           reason,
+	})
 }
 
 // ── GET /v1/admin/role-assignments ──────────────────────────────────────────
@@ -2434,4 +2848,352 @@ func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, ps)
+}
+
+// ── Break-Glass Emergency Session Handlers (ZS-IAM-001 §14 & §21) ───────────
+
+type createBreakGlassRequest struct {
+	TenantID         string   `json:"tenant_id,omitempty"`
+	PrincipalID      string   `json:"principal_id,omitempty"`
+	IncidentID       string   `json:"incident_id"`
+	Reason           string   `json:"reason"`
+	RequestedActions []string `json:"requested_actions"`
+	DurationSeconds  int      `json:"duration_seconds"`
+}
+
+func (h *Handler) CreateBreakGlassSession(w http.ResponseWriter, r *http.Request) {
+	callerPrincipalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	var req createBreakGlassRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+		return
+	}
+
+	targetPrincipal := req.PrincipalID
+	if targetPrincipal == "" {
+		targetPrincipal = callerPrincipalID
+	}
+
+	// Scenario A16: Break-glass without declared incident is strictly prohibited
+	if req.IncidentID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "missing_field",
+			"field":   "incident_id",
+			"message": "break-glass requires a declared incident reference (Scenario A16)",
+		})
+		return
+	}
+
+	if req.Reason == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason"})
+		return
+	}
+	if len(req.RequestedActions) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "requested_actions"})
+		return
+	}
+
+	bg, err := h.store.CreateBreakGlassSession(r.Context(), domain.CreateBreakGlassSessionParams{
+		TenantID:         tenantScope,
+		PrincipalID:      targetPrincipal,
+		IncidentID:       req.IncidentID,
+		Reason:           req.Reason,
+		RequestedActions: req.RequestedActions,
+		DurationSeconds:  req.DurationSeconds,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrBreakGlassIncidentRequired) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "missing_incident_id",
+				"message": err.Error(),
+			})
+			return
+		}
+		h.log.Error("CreateBreakGlassSession: store failed", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	_ = h.publisher.PublishBreakGlassStarted(r.Context(), *bg)
+
+	h.log.Warn("break-glass emergency session created",
+		zap.String("session_id", bg.SessionID),
+		zap.String("principal_id", bg.PrincipalID),
+		zap.String("incident_id", bg.IncidentID),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusCreated, bg)
+}
+
+func (h *Handler) GetBreakGlassSession(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_session_id"})
+		return
+	}
+
+	bg, err := h.store.FindBreakGlassSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrBreakGlassSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "break_glass_session_not_found", "session_id": sessionID})
+			return
+		}
+		h.log.Error("GetBreakGlassSession: store failed", zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, bg)
+}
+
+func (h *Handler) ListBreakGlassSessions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	principalID := r.URL.Query().Get("principal_id")
+	activeOnly := r.URL.Query().Get("active_only") == "true"
+
+	sessions, err := h.store.ListBreakGlassSessions(r.Context(), tenantScope, principalID, activeOnly)
+	if err != nil {
+		h.log.Error("ListBreakGlassSessions: store failed", zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
+func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request) {
+	callerPrincipalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_session_id"})
+		return
+	}
+
+	bg, err := h.store.RevokeBreakGlassSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrBreakGlassSessionNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "break_glass_session_not_found", "session_id": sessionID})
+		case errors.Is(err, domain.ErrInvalidTransition):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "message": err.Error()})
+		default:
+			h.log.Error("RevokeBreakGlassSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	_ = h.publisher.PublishBreakGlassEnded(r.Context(), *bg)
+	writeJSON(w, http.StatusOK, bg)
+}
+
+// ── Tenant Support Session Handlers (ZS-IAM-001 §15 & §21) ──────────────────
+
+type createSupportSessionRequest struct {
+	TenantID              string   `json:"tenant_id,omitempty"`
+	SupportOperatorID     string   `json:"support_operator_id,omitempty"`
+	TicketRef             string   `json:"ticket_ref"`
+	Purpose               string   `json:"purpose"`
+	ReadOnly              *bool    `json:"read_only,omitempty"`
+	AllowBulkExport       bool     `json:"allow_bulk_export"`
+	AllowedActions        []string `json:"allowed_actions"`
+	DurationSeconds       int      `json:"duration_seconds"`
+	TenantConsentObtained *bool    `json:"tenant_consent_obtained,omitempty"`
+}
+
+func (h *Handler) CreateSupportSession(w http.ResponseWriter, r *http.Request) {
+	callerPrincipalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	var req createSupportSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+		return
+	}
+
+	targetOperator := req.SupportOperatorID
+	if targetOperator == "" {
+		targetOperator = callerPrincipalID
+	}
+
+	if req.TicketRef == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "ticket_ref"})
+		return
+	}
+	if req.Purpose == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "purpose"})
+		return
+	}
+
+	readOnly := true
+	if req.ReadOnly != nil {
+		readOnly = *req.ReadOnly
+	}
+
+	consent := true
+	if req.TenantConsentObtained != nil {
+		consent = *req.TenantConsentObtained
+	}
+
+	ss, err := h.store.CreateSupportSession(r.Context(), domain.CreateSupportSessionParams{
+		TenantID:              tenantScope,
+		SupportOperatorID:     targetOperator,
+		TicketRef:             req.TicketRef,
+		Purpose:               req.Purpose,
+		ReadOnly:              readOnly,
+		AllowBulkExport:       req.AllowBulkExport,
+		AllowedActions:        req.AllowedActions,
+		DurationSeconds:       req.DurationSeconds,
+		TenantConsentObtained: consent,
+	})
+	if err != nil {
+		h.log.Error("CreateSupportSession: store failed", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	_ = h.publisher.PublishSupportSessionStarted(r.Context(), *ss)
+
+	h.log.Info("support session created",
+		zap.String("session_id", ss.SessionID),
+		zap.String("operator_id", ss.SupportOperatorID),
+		zap.String("ticket_ref", ss.TicketRef),
+		zap.Bool("read_only", ss.ReadOnly),
+		zap.Bool("allow_bulk_export", ss.AllowBulkExport),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusCreated, ss)
+}
+
+func (h *Handler) GetSupportSession(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_session_id"})
+		return
+	}
+
+	ss, err := h.store.FindSupportSessionByID(r.Context(), sessionID, tenantScope)
+	if err != nil {
+		if errors.Is(err, domain.ErrSupportSessionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
+			return
+		}
+		h.log.Error("GetSupportSession: store failed", zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ss)
+}
+
+func (h *Handler) ListSupportSessions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	activeOnly := r.URL.Query().Get("active_only") == "true"
+
+	sessions, err := h.store.ListSupportSessions(r.Context(), tenantScope, activeOnly)
+	if err != nil {
+		h.log.Error("ListSupportSessions: store failed", zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
+func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
+	callerPrincipalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	sessionID := chi.URLParam(r, "session_id")
+	if sessionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_session_id"})
+		return
+	}
+
+	ss, err := h.store.RevokeSupportSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrSupportSessionNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
+		case errors.Is(err, domain.ErrInvalidTransition):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "message": err.Error()})
+		default:
+			h.log.Error("RevokeSupportSession: store failed", zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	_ = h.publisher.PublishSupportSessionEnded(r.Context(), *ss)
+	writeJSON(w, http.StatusOK, ss)
 }
