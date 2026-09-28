@@ -408,16 +408,21 @@ func checkTiers(tiers []PriceTier, minorUnits int) error {
 
 // ── Lifecycle gates ──────────────────────────────────────────────────────────
 
+// RegisteredMeterKey is the map key CheckSubmittable expects for a
+// registered, non-retired meter version: meter_key + "/" + meter_version.
+func RegisteredMeterKey(meterKey string, version int) string {
+	return meterKey + "/" + strconv.Itoa(version)
+}
+
 // CheckSubmittable is the SubmitForApproval gate. Missing currency, unit or
 // term version blocks publication (§4.1 failure semantics), and it is checked
 // here, before anyone spends an approval on a version that could never
-// publish.
-func CheckSubmittable(v *PriceVersion, cur CommercialCurrency, now time.Time) error {
-	for _, c := range v.Components {
-		if c.ComponentType == ComponentMetered {
-			return ErrMeterNotRegistered
-		}
-	}
+// publish. registeredMeters is the set of meter_key/version pairs COM-04
+// currently has registered and not retired (RegisteredMeterKey); a METERED
+// component referencing anything outside that set blocks submission with a
+// named reason, same as every other blocker here — never a silent guess at
+// whether the meter exists.
+func CheckSubmittable(v *PriceVersion, cur CommercialCurrency, now time.Time, registeredMeters map[string]bool) error {
 	var reasons []string
 	if v.Terms == nil {
 		reasons = append(reasons, "commercial terms are not set")
@@ -436,6 +441,11 @@ func CheckSubmittable(v *PriceVersion, cur CommercialCurrency, now time.Time) er
 		}
 		if err := ValidateComponent(c, cur); err != nil {
 			reasons = append(reasons, "component "+c.ComponentKey+": "+err.Error())
+		}
+		if c.ComponentType == ComponentMetered && c.MeterKey != nil && c.MeterVersion != nil &&
+			!registeredMeters[RegisteredMeterKey(*c.MeterKey, *c.MeterVersion)] {
+			reasons = append(reasons, fmt.Sprintf("component %s: %s (%s/%d)",
+				c.ComponentKey, ErrMeterNotRegistered.Error(), *c.MeterKey, *c.MeterVersion))
 		}
 	}
 	if chargeable == 0 {

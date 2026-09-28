@@ -626,9 +626,20 @@ func processBoundary(ctx context.Context, tx pgx.Tx, it boundaryItem, now time.T
 				term = &a.terms[i]
 			}
 		}
-		switch {
-		case term == nil:
+		if term == nil {
 			return "", fmt.Errorf("term %d not found on %s", *it.termNo, it.subID)
+		}
+		if term.VoidedAt == nil {
+			// A term that genuinely ran freezes and certifies its usage
+			// windows regardless of whether the subscription itself renews:
+			// the window scope is one usage window per subscription term
+			// (COM-04), and a term ending is what closes it, cancellation
+			// or non-renewal notwithstanding.
+			if err := freezeAndCertifyTermUsage(ctx, tx, it.subID, *it.termNo, boundaryWorkerActor, now); err != nil {
+				return "", fmt.Errorf("freeze/certify usage for term %d: %w", *it.termNo, err)
+			}
+		}
+		switch {
 		case term.VoidedAt != nil:
 			return "SKIPPED_VOIDED", nil
 		case !term.AutoRenew:

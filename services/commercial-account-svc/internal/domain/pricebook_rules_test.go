@@ -223,7 +223,7 @@ func TestCheckSubmittable_ListsEveryBlocker(t *testing.T) {
 	disabled := usd
 	disabled.SaleEnabled = false
 
-	err := domain.CheckSubmittable(v, disabled, now)
+	err := domain.CheckSubmittable(v, disabled, now, nil)
 	var blocked *domain.PublicationBlockedError
 	if !errors.As(err, &blocked) {
 		t.Fatalf("got %v, want PublicationBlockedError", err)
@@ -233,14 +233,27 @@ func TestCheckSubmittable_ListsEveryBlocker(t *testing.T) {
 	}
 }
 
-// Metered pricing waits for the COM-04 meter registry: blocked, not assumed.
-func TestCheckSubmittable_MeteredComponentIsBlockedUntilMetersExist(t *testing.T) {
+// A METERED component is blocked unless its meter_key/version is in the
+// registered set; registering it (as COM-04 now allows) unblocks submission.
+func TestCheckSubmittable_MeteredComponentNeedsARegisteredMeter(t *testing.T) {
 	v := sampleVersion()
 	v.Components = append(v.Components, domain.PriceComponent{ComponentKey: "calls", ComponentType: domain.ComponentMetered,
 		MeterKey: sp("api.calls"), MeterVersion: ip(1), AggregationMethod: sp("SUM"), IncludedQuantity: sp("0"),
 		BillingTiming: sp("IN_ARREARS"), Amount: sp("0.01")})
-	if err := domain.CheckSubmittable(v, usd, v.EffectiveFrom.Add(-time.Hour)); !errors.Is(err, domain.ErrMeterNotRegistered) {
-		t.Fatalf("got %v, want ErrMeterNotRegistered", err)
+	past := v.EffectiveFrom.Add(-time.Hour)
+
+	err := domain.CheckSubmittable(v, usd, past, nil)
+	var blocked *domain.PublicationBlockedError
+	if !errors.As(err, &blocked) || len(blocked.Reasons) != 1 {
+		t.Fatalf("an unregistered meter: got %v, want one PublicationBlockedError reason", err)
+	}
+	registered := map[string]bool{domain.RegisteredMeterKey("api.calls", 1): true}
+	if err := domain.CheckSubmittable(v, usd, past, registered); err != nil {
+		t.Fatalf("a registered meter still blocked submission: %v", err)
+	}
+	wrongVersion := map[string]bool{domain.RegisteredMeterKey("api.calls", 2): true}
+	if err := domain.CheckSubmittable(v, usd, past, wrongVersion); !errors.As(err, &blocked) {
+		t.Fatalf("a different meter version was accepted as a match: %v", err)
 	}
 }
 

@@ -710,8 +710,9 @@ func TestPriceBook_SubmissionAndPublicationGates(t *testing.T) {
 		MeterKey: strp("api.calls"), MeterVersion: intp(1), AggregationMethod: strp("SUM"), IncludedQuantity: strp("1000"),
 		BillingTiming: strp("IN_ARREARS"), Amount: strp("0.0015")})
 	v = f.terms(v, false)
-	if _, err := f.submit(v, maker, t0); !errors.Is(err, domain.ErrMeterNotRegistered) {
-		t.Fatalf("a metered price was submitted before any meter registry exists: %v", err)
+	var blockedByMeter *domain.PublicationBlockedError
+	if _, err := f.submit(v, maker, t0); !errors.As(err, &blockedByMeter) {
+		t.Fatalf("a metered price referencing an unregistered meter was submitted: %v", err)
 	}
 	v, err := f.s.RemovePriceComponent(f.ctx, v.PriceVersionID, v.RowVersion, "api_calls", maker,
 		f.claim(maker, "RemovePriceComponent", v.PriceVersionID))
