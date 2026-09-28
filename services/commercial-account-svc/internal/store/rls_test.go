@@ -51,6 +51,10 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS commercial_reconciliations CASCADE;
+		DROP TABLE IF EXISTS dunning_cases CASCADE;
+		DROP FUNCTION IF EXISTS enforce_dunning_case_lifecycle() CASCADE;
+		DROP TABLE IF EXISTS dunning_policy_versions CASCADE;
 		DROP TABLE IF EXISTS refund_requests CASCADE;
 		DROP FUNCTION IF EXISTS enforce_refund_request_lifecycle() CASCADE;
 		DROP TABLE IF EXISTS write_offs, credit_notes CASCADE;
