@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -83,6 +84,18 @@ func (s *PgStore) catalogTx(ctx context.Context, seller bool, fn func(pgx.Tx) er
 	return mapPriceBookErr(tx.Commit(ctx))
 }
 
+// priceBookImmutableTables is CP001's disambiguator. catalogTx (and so
+// withSellerPlane) is shared by every wave's seller-plane transactions —
+// COM-02's transition rules and migration offers, COM-03's restrictions and
+// entitlement policy, COM-04's meters and usage statements all run through
+// it too, and every one of them raises the same CP001 for its own
+// immutability triggers. Rewrapping CP001 into ErrPriceVersionImmutable
+// unconditionally would swallow the pgconn.PgError those other stores' own
+// mapXxxErr functions need to see (they type-assert on it after this
+// runs) — so this only rewraps when the trigger's message names an actual
+// price-book table; anything else passes through with pgErr intact.
+var priceBookImmutableTables = []string{"price version", "commercial product", "commercial currency"}
+
 func mapPriceBookErr(err error) error {
 	var pgErr *pgconn.PgError
 	if err == nil || !errors.As(err, &pgErr) {
@@ -90,7 +103,12 @@ func mapPriceBookErr(err error) error {
 	}
 	switch pgErr.Code {
 	case "CP001":
-		return fmt.Errorf("%w: %s", domain.ErrPriceVersionImmutable, pgErr.Message)
+		for _, t := range priceBookImmutableTables {
+			if strings.Contains(pgErr.Message, t) {
+				return fmt.Errorf("%w: %s", domain.ErrPriceVersionImmutable, pgErr.Message)
+			}
+		}
+		return err
 	case "23505":
 		switch pgErr.ConstraintName {
 		case "commercial_products_product_code_key":
@@ -951,7 +969,11 @@ func (s *PgStore) SubmitForApproval(ctx context.Context, versionID string, expec
 		if err != nil {
 			return err
 		}
-		if err := domain.CheckSubmittable(v, *cur, now); err != nil {
+		registeredMeters, err := loadRegisteredMeters(ctx, tx, v.Components)
+		if err != nil {
+			return err
+		}
+		if err := domain.CheckSubmittable(v, *cur, now, registeredMeters); err != nil {
 			return err
 		}
 		hash := domain.ContentHash(v)

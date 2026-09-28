@@ -289,6 +289,10 @@ func writeFailure(w http.ResponseWriter, r *http.Request, logger *zap.Logger, er
 			writeProblem(w, r, Problem{Status: status, Code: code, Detail: err.Error()})
 			return
 		}
+		if status, code, ok := usageFailure(err); ok {
+			writeProblem(w, r, Problem{Status: status, Code: code, Detail: err.Error()})
+			return
+		}
 		logger.Error("commercial request failed", zap.String("path", r.URL.Path), zap.Error(err))
 		writeProblem(w, r, Problem{Status: http.StatusInternalServerError, Code: CodeInternal, Detail: "internal error"})
 	}
