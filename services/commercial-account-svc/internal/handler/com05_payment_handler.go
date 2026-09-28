@@ -100,18 +100,26 @@ func (h *PaymentHandler) sellerPrincipal(w http.ResponseWriter, r *http.Request,
 	return principal, h.authorizeAt(w, r, principal, platformScopeID, action)
 }
 
+// readScope resolves who a read is about. orgFromQuery only means "an
+// operator naming another organization" when it actually differs from the
+// caller's own verified tenant — a client that defensively echoes its own
+// org id as a query parameter is still doing a self-read.
 func (h *PaymentHandler) readScope(w http.ResponseWriter, r *http.Request, orgFromQuery string) (string, bool) {
 	principal, ok := h.principal(w, r)
 	if !ok {
 		return "", false
 	}
-	if orgFromQuery != "" {
+	callerOrg := svcmiddleware.TenantFromContext(r.Context())
+	if orgFromQuery != "" && orgFromQuery != callerOrg {
 		if !h.authorizeAt(w, r, principal, platformScopeID, ActionInvoiceRead) {
 			return "", false
 		}
 		return orgFromQuery, true
 	}
-	org := svcmiddleware.TenantFromContext(r.Context())
+	org := orgFromQuery
+	if org == "" {
+		org = callerOrg
+	}
 	if org == "" {
 		writeProblem(w, r, Problem{Status: http.StatusUnauthorized, Code: CodeUnauthenticated, Detail: "X-Tenant-Id is required"})
 		return "", false

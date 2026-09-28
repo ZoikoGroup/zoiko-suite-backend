@@ -51,6 +51,9 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS refund_requests CASCADE;
+		DROP FUNCTION IF EXISTS enforce_refund_request_lifecycle() CASCADE;
+		DROP TABLE IF EXISTS write_offs, credit_notes CASCADE;
 		DROP TABLE IF EXISTS payment_attempts CASCADE;
 		DROP FUNCTION IF EXISTS enforce_payment_attempt_lifecycle() CASCADE;
 		DROP TABLE IF EXISTS invoice_lines, invoice_candidate_lines, platform_commercial_invoices,

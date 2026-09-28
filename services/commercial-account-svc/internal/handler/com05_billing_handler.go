@@ -141,18 +141,28 @@ func (h *BillingHandler) sellerPrincipal(w http.ResponseWriter, r *http.Request,
 // readScope resolves who an invoice/billing-account read is about: an
 // operator naming an organization (needs the platform read grant), or the
 // caller's own verified tenant.
+// readScope resolves who a read is about. orgFromPath is only "an operator
+// naming another organization" when it actually names a DIFFERENT
+// organization than the caller's own verified tenant — naming your own
+// organization in the URL (or omitting it) is still a self-read, and must
+// not be forced through the platform-wide grant a plain tenant will never
+// hold. Only a genuine cross-organization read requires it.
 func (h *BillingHandler) readScope(w http.ResponseWriter, r *http.Request, orgFromPath string) (string, bool) {
 	principal, ok := h.principal(w, r)
 	if !ok {
 		return "", false
 	}
-	if orgFromPath != "" {
+	callerOrg := svcmiddleware.TenantFromContext(r.Context())
+	if orgFromPath != "" && orgFromPath != callerOrg {
 		if !h.authorizeAt(w, r, principal, platformScopeID, ActionInvoiceRead) {
 			return "", false
 		}
 		return orgFromPath, true
 	}
-	org := svcmiddleware.TenantFromContext(r.Context())
+	org := orgFromPath
+	if org == "" {
+		org = callerOrg
+	}
 	if org == "" {
 		writeProblem(w, r, Problem{Status: http.StatusUnauthorized, Code: CodeUnauthenticated, Detail: "X-Tenant-Id is required"})
 		return "", false
