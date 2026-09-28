@@ -51,6 +51,25 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS commercial_restrictions, entitlement_policy_versions CASCADE;
+		DROP FUNCTION IF EXISTS enforce_restriction_lift_only(), reject_immutable_row() CASCADE;
+		DROP TABLE IF EXISTS subscription_boundary_queue, subscription_discounts, price_migration_offer_targets,
+			price_migration_offers CASCADE;
+		DROP FUNCTION IF EXISTS enqueue_version_boundary(), enqueue_term_boundary(), enforce_discount_lifecycle(),
+			enforce_migration_offer_lifecycle(), enforce_migration_target_draft_only() CASCADE;
+		DROP TABLE IF EXISTS subscription_changes, plan_transition_rules CASCADE;
+		DROP FUNCTION IF EXISTS enforce_transition_rule_retire_only() CASCADE;
+		DROP TABLE IF EXISTS subscription_item_quantities, subscription_items, subscription_terms,
+			subscription_versions, subscriptions CASCADE;
+		DROP FUNCTION IF EXISTS enforce_subscription_insert(), enforce_subscription_update(),
+			reject_legacy_subscription_over_com02(), enforce_void_only_update(),
+			reject_subscription_row_mutation() CASCADE;
+		DROP TABLE IF EXISTS commercial_idempotency_keys, price_version_capabilities,
+			price_component_tiers, price_components, product_price_versions,
+			commercial_products, commercial_currencies CASCADE;
+		DROP FUNCTION IF EXISTS reject_idempotency_key_update(), enforce_price_child_draft_only(),
+			enforce_price_version_lifecycle(), reject_commercial_product_mutation(),
+			enforce_commercial_currency_immutability() CASCADE;
 		DROP TABLE IF EXISTS outbox_events, subscription_status_events, billing_source_transfers,
 			subscription_change_requests, commercial_usage_meter_events,
 			contract_entitlement_overlays, evaluation_programs, commercial_subscriptions,

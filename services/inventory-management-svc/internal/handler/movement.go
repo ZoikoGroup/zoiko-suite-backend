@@ -279,11 +279,28 @@ func (h *Handler) CommitMovement(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	if !h.checkPeriodOpen(w, r, tenantID, m.LegalEntityID, m.FiscalPeriod) {
+	correlationID := getCorrelationID(r)
+	if h.periodChecker != nil {
+		if err := h.periodChecker.CheckPeriodOpen(r.Context(), tenantID, m.LegalEntityID, m.FiscalPeriod); err != nil {
+			if errors.Is(err, domain.ErrPeriodLocked) {
+				h.publisher.PublishInventoryMovementExceptionRaised(r.Context(), correlationID, principalID, tenantID, m.LegalEntityID, id, "period_locked")
+				writeError(w, http.StatusUnprocessableEntity, "period_locked", err.Error())
+				return
+			}
+			h.log.Error("period check failed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "period_check_unavailable", err.Error())
+			return
+		}
+	} else {
+		h.log.Error("period checker not configured")
+		writeError(w, http.StatusServiceUnavailable, "period_checker_not_configured", "")
 		return
 	}
 	now := time.Now().UTC()
 	if err := h.store.CommitMovement(r.Context(), id, principalID, now); err != nil {
+		if reasonCode, exception := movementExceptionReasonCode(err); exception {
+			h.publisher.PublishInventoryMovementExceptionRaised(r.Context(), correlationID, principalID, tenantID, m.LegalEntityID, id, reasonCode)
+		}
 		h.writeMovementErr(w, err)
 		return
 	}
@@ -292,7 +309,6 @@ func (h *Handler) CommitMovement(w http.ResponseWriter, r *http.Request) {
 		h.writeMovementErr(w, err)
 		return
 	}
-	correlationID := getCorrelationID(r)
 	h.publisher.PublishInventoryMovementCommitted(r.Context(), correlationID, principalID, *updated)
 	switch updated.MovementType {
 	case domain.MovementTypeReceipt:
@@ -357,6 +373,66 @@ func (h *Handler) correctMovement(w http.ResponseWriter, r *http.Request, isSupe
 	}
 	h.publisher.PublishInventoryMovementReversed(r.Context(), getCorrelationID(r), principalID, *correction)
 	writeJSON(w, http.StatusCreated, correction)
+}
+
+// GetMovementLineage backs the spec's own query of the same name — id
+// itself plus every movement that reverses or supersedes it, transitively.
+// See internal/store/movement_store.go's own doc comment.
+func (h *Handler) GetMovementLineage(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	m, err := h.store.GetMovement(r.Context(), id)
+	if err != nil {
+		h.writeMovementErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, m.LegalEntityID, actionInventoryMovementCreate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	lineage, err := h.store.GetMovementLineage(r.Context(), id)
+	if err != nil {
+		h.writeMovementErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, lineage)
+}
+
+// GetMovementChain backs the spec's own query of the same name — the full
+// bidirectional correction web reachable from id: its own lineage plus,
+// when id is itself a correction, the original it traces back to and
+// every other correction hanging off that same original. See
+// internal/store/movement_store.go's own doc comment.
+func (h *Handler) GetMovementChain(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	m, err := h.store.GetMovement(r.Context(), id)
+	if err != nil {
+		h.writeMovementErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, m.LegalEntityID, actionInventoryMovementCreate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	chain, err := h.store.GetMovementChain(r.Context(), id)
+	if err != nil {
+		h.writeMovementErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, chain)
 }
 
 // ── GET /v1/on-hand/negative-count ────────────────────────────────────────────
@@ -464,6 +540,22 @@ func (h *Handler) checkPeriodOpen(w http.ResponseWriter, r *http.Request, tenant
 		return false
 	}
 	return true
+}
+
+// movementExceptionReasonCode maps a CommitMovement store error to the
+// reason_code carried on an InventoryMovementExceptionRaised event (INV-03).
+// Only the negative-path conditions the domain spec calls out as exceptions
+// are reported here — a not-found or a bad transition is a client mistake,
+// not an operational exception worth raising for reconciliation/monitoring.
+func movementExceptionReasonCode(err error) (string, bool) {
+	switch {
+	case errors.Is(err, domain.ErrNegativeStockNotAllowed):
+		return "negative_stock_not_allowed", true
+	case errors.Is(err, domain.ErrSerialAlreadyResident), errors.Is(err, domain.ErrSerialNotAtSourceLocation):
+		return "serial_duplication", true
+	default:
+		return "", false
+	}
 }
 
 func (h *Handler) writeMovementErr(w http.ResponseWriter, err error) {

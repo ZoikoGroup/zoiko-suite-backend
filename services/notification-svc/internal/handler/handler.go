@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,9 +17,12 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/identity"
+	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/retry"
+	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/templates"
+	"zoiko.io/notification-svc/internal/webhook"
 )
 
 type Store interface {
@@ -26,8 +31,34 @@ type Store interface {
 	ListNotifications(ctx context.Context, f domain.ListFilter) ([]domain.Notification, error)
 	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error
 	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error
+	// MarkOutcomeUnknown/ResolveDeliveryOutcome back BIZ-10's own
+	// PENDING_UNKNOWN handling — see their own doc comments in pg_store.go.
+	MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time) error
+	ResolveDeliveryOutcome(ctx context.Context, p domain.ResolveDeliveryOutcomeParams, resolvedAt time.Time) error
 	MarkRead(ctx context.Context, id, recipientPrincipalID string, readAt time.Time) error
 	CountUnread(ctx context.Context, recipientPrincipalID string) (int, error)
+
+	CreateTemplate(ctx context.Context, p domain.CreateTemplateParams) (*domain.TemplateDefinition, error)
+	GetTemplate(ctx context.Context, templateID string) (*domain.TemplateDefinition, error)
+	CreateVersion(ctx context.Context, p domain.CreateVersionParams) (*domain.TemplateVersion, error)
+	GetTemplateVersion(ctx context.Context, versionID string) (*domain.TemplateVersion, error)
+	ValidateTemplate(ctx context.Context, versionID string) (*domain.TemplateVersion, error)
+	ApproveTemplate(ctx context.Context, p domain.ApproveVersionParams) (*domain.TemplateVersion, error)
+	PublishTemplate(ctx context.Context, p domain.PublishVersionParams) (*domain.TemplateVersion, error)
+	GetPublishedVersion(ctx context.Context, templateID, locale string) (*domain.TemplateVersion, error)
+	RetireTemplate(ctx context.Context, p domain.RetireTemplateParams) (*domain.TemplateDefinition, error)
+	RenderPreview(ctx context.Context, p domain.RenderPreviewParams) (*domain.RenderPreviewResult, error)
+	CompareVersions(ctx context.Context, versionIDA, versionIDB string) (*domain.CompareVersionsResult, error)
+	ListLocales(ctx context.Context, templateID string) ([]domain.LocaleSummary, error)
+}
+
+// SuppressionStore is the persistence boundary for the email suppression list.
+// Satisfied by *store.PgStore.
+type SuppressionStore interface {
+	AddSuppression(ctx context.Context, supp *ledger.EmailSuppression) error
+	IsEmailSuppressed(ctx context.Context, tenantID, recipientEmail string, stream ledger.SenderStream, commClass ledger.CommunicationClass) (bool, string, error)
+	RemoveSuppression(ctx context.Context, tenantID, recipientEmail, stream string) error
+	ListSuppressions(ctx context.Context, tenantID string, limit, offset int) ([]*ledger.EmailSuppression, error)
 }
 
 // RecipientResolver turns a principal into the contact endpoint a message is
@@ -39,6 +70,15 @@ type RecipientResolver interface {
 type Publisher interface {
 	PublishSent(ctx context.Context, correlationID string, n domain.Notification)
 	PublishFailed(ctx context.Context, correlationID string, n domain.Notification, reason string)
+	// PublishOutcomeUnknown backs BIZ-10's own NotificationOutcomeUnknown
+	// event — fired when a delivery attempt's outcome is genuinely
+	// ambiguous. See domain.DeliveryOutcome.Unknown's own doc comment.
+	PublishOutcomeUnknown(ctx context.Context, correlationID string, n domain.Notification, reason string)
+
+	PublishTemplateCreated(ctx context.Context, correlationID string, d domain.TemplateDefinition)
+	PublishTemplateVersionApproved(ctx context.Context, correlationID string, v domain.TemplateVersion)
+	PublishTemplatePublished(ctx context.Context, correlationID string, v domain.TemplateVersion)
+	PublishTemplateRetired(ctx context.Context, correlationID string, d domain.TemplateDefinition)
 }
 
 type AuthZClient interface {
@@ -48,6 +88,26 @@ type AuthZClient interface {
 const (
 	actionSend = "NOTIFICATION_SEND"
 	actionView = "NOTIFICATION_VIEW"
+
+	// actionTemplateManage gates authorship: CreateTemplate, CreateVersion,
+	// ValidateTemplate. actionTemplateApprove gates the separate
+	// governance actor's actions: ApproveTemplate, PublishTemplate,
+	// RetireTemplate — the doc names two roles ("content owner" and
+	// "policy/domain approver"), and every post-authorship lifecycle
+	// transition belongs to the second one.
+	actionTemplateManage  = "TEMPLATE_MANAGE"
+	actionTemplateApprove = "TEMPLATE_APPROVE"
+
+	// actionResolveOutcome gates ResolveDeliveryOutcome — deliberately
+	// distinct from actionSend. Resolving an ambiguous attempt is a
+	// reconciliation/operator action against a record that already
+	// exists, not an act of originating a new notification.
+	actionResolveOutcome = "NOTIFICATION_RESOLVE_OUTCOME"
+
+	// actionSuppressionManage gates the admin suppression endpoints. A
+	// platform operator editing the suppression list needs a more
+	// privileged action than a regular NOTIFICATION_VIEW reader.
+	actionSuppressionManage = "NOTIFICATION_SUPPRESS"
 )
 
 var supportedChannels = map[string]bool{
@@ -89,12 +149,16 @@ type Deliverer interface {
 }
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	deliverer Deliverer
-	recipient RecipientResolver
-	log       *zap.Logger
+	store          Store
+	publisher      Publisher
+	authz          AuthZClient
+	deliverer      Deliverer
+	recipient      RecipientResolver
+	log            *zap.Logger
+	orchestrator   *ledger.Orchestrator
+	ledgerStore    ledger.LedgerStore
+	webhookHandler *webhook.Handler
+	suppressions   SuppressionStore
 
 	// retryPolicy decides whether a first-attempt failure is scheduled for
 	// another try. The same policy the worker uses, so the schedule a send
@@ -110,24 +174,32 @@ type Handler struct {
 // position. Transposing two arguments there compiles and fails at runtime,
 // which is the same reason domain.ListFilter exists.
 type Deps struct {
-	Store       Store
-	Publisher   Publisher
-	AuthZ       AuthZClient
-	Deliverer   Deliverer
-	Recipient   RecipientResolver
-	RetryPolicy retry.Policy
-	Log         *zap.Logger
+	Store          Store
+	Publisher      Publisher
+	AuthZ          AuthZClient
+	Deliverer      Deliverer
+	Recipient      RecipientResolver
+	RetryPolicy    retry.Policy
+	Orchestrator   *ledger.Orchestrator
+	LedgerStore    ledger.LedgerStore
+	WebhookHandler *webhook.Handler
+	Suppressions   SuppressionStore
+	Log            *zap.Logger
 }
 
 func New(d Deps) *Handler {
 	return &Handler{
-		store:       d.Store,
-		publisher:   d.Publisher,
-		authz:       d.AuthZ,
-		deliverer:   d.Deliverer,
-		recipient:   d.Recipient,
-		retryPolicy: d.RetryPolicy.Normalize(),
-		log:         d.Log,
+		store:          d.Store,
+		publisher:      d.Publisher,
+		authz:          d.AuthZ,
+		deliverer:      d.Deliverer,
+		recipient:      d.Recipient,
+		retryPolicy:    d.RetryPolicy.Normalize(),
+		orchestrator:   d.Orchestrator,
+		ledgerStore:    d.LedgerStore,
+		webhookHandler: d.WebhookHandler,
+		suppressions:   d.Suppressions,
+		log:            d.Log,
 	}
 }
 
@@ -142,8 +214,50 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/unread-count", h.UnreadCount)
 		r.Get("/templates", h.ListTemplates)
 
+		// Phase 1 Delivery Ledger & Event Ingestion routes
+		r.Post("/events/ingest", h.IngestEvent)
+		r.Get("/intents/{id}", h.GetIntent)
+
+		// Phase 2 Step 5 Webhook routes
+		if h.webhookHandler != nil {
+			r.Post("/webhooks/{provider}", h.webhookHandler.HandleWebhook)
+		}
+
+		// Phase 3: Admin suppression management
+		// POST   /v1/notifications/suppression         — add or update a suppression entry
+		// GET    /v1/notifications/suppression         — list active suppressions
+		// DELETE /v1/notifications/suppression/{email} — remove a specific suppression
+		r.Route("/suppression", func(r chi.Router) {
+			r.Post("/", h.AddSuppression)
+			r.Get("/", h.ListSuppressions)
+			r.Delete("/{email}", h.RemoveSuppression)
+		})
+
+		// Phase 3: RFC 8058 one-click unsubscribe receiver.
+		// This route is exempted from the envelope middleware in main.go because
+		// the request originates from a mail client, not a ZoikoSuite service,
+		// and carries no X-Principal-Id / X-Tenant-Id headers.
+		// The action token in the body provides the identity and tenant context.
+		r.Post("/unsubscribe", h.HandleUnsubscribe)
+
 		r.Get("/{id}", h.GetNotification)
 		r.Post("/{id}/read", h.MarkRead)
+		r.Get("/{id}/delivery-status", h.GetDeliveryStatus)
+		r.Post("/{id}/resolve-delivery-outcome", h.ResolveDeliveryOutcome)
+	})
+
+	r.Route("/v1/document-templates", func(r chi.Router) {
+		r.Post("/", h.CreateTemplate)
+		r.Get("/{templateID}", h.GetTemplate)
+		r.Post("/{templateID}/versions", h.CreateVersion)
+		r.Get("/{templateID}/published", h.GetPublishedVersion)
+		r.Post("/{templateID}/retire", h.RetireTemplate)
+		r.Get("/{templateID}/locales", h.ListLocales)
+		r.Get("/{templateID}/compare", h.CompareVersions)
+		r.Post("/versions/{versionID}/validate", h.ValidateTemplate)
+		r.Post("/versions/{versionID}/approve", h.ApproveTemplate)
+		r.Post("/versions/{versionID}/publish", h.PublishTemplate)
+		r.Post("/versions/{versionID}/preview", h.RenderPreview)
 	})
 }
 
@@ -186,15 +300,25 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A template renders subject and body; supplying both forms would leave it
-	// ambiguous which one the recipient actually got.
-	if req.Template != "" && (req.Subject != "" || req.Body != "") {
+	// A template (static catalogue OR governed BIZ-03 template) renders
+	// the body; supplying free-text alongside one would leave it
+	// ambiguous which content the recipient actually got. TemplateID and
+	// the static Template catalogue are themselves mutually exclusive for
+	// the same reason.
+	usingStaticTemplate := req.Template != ""
+	usingGovernedTemplate := req.TemplateID != ""
+	if usingStaticTemplate && usingGovernedTemplate {
 		writeError(w, http.StatusBadRequest, "conflicting_content",
-			"supply either template (with variables) or subject and body, not both")
+			"supply either template or template_id, not both")
+		return
+	}
+	if (usingStaticTemplate || usingGovernedTemplate) && req.Body != "" {
+		writeError(w, http.StatusBadRequest, "conflicting_content",
+			"supply either a template (with variables) or subject and body, not both")
 		return
 	}
 
-	if req.Template != "" {
+	if usingStaticTemplate {
 		subject, body, err := templates.Render(req.Template, req.Variables)
 		switch e := err.(type) {
 		case nil:
@@ -213,6 +337,17 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "template_render_failed", e.Error())
 			return
 		}
+	}
+
+	// A governed BIZ-03 template renders only the BODY — templates carry
+	// no subject field (a document/form template has no notion of one),
+	// so Subject is still required from the caller in this path, checked
+	// below alongside every other required field. The actual fetch+render
+	// happens further down, AFTER authorization — see that block's own
+	// comment on why it cannot happen here.
+	if usingGovernedTemplate && req.Locale == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "locale is required when template_id is set")
+		return
 	}
 
 	if req.RecipientPrincipalID == "" || req.LegalEntityID == "" || req.Channel == "" ||
@@ -264,6 +399,46 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The governed-template fetch happens here, not earlier: GetPublishedVersion
+	// and RenderPreview touch real tenant data (a template's content is itself
+	// something a legal entity may not want disclosed to a caller who is not
+	// authorized to send for it), so it must not run before the actionSend
+	// authorization check above. This is the same fetch-then-authorize-then-use
+	// discipline as every mutating handler in this platform, applied to a read
+	// that also needs gating.
+	// templateVersionID/renderedHash carry BIZ-10's own evidence/lineage
+	// requirement ("template/version, rendered hash") onto the notification
+	// row — empty for free-text/static-catalogue sends, which cite no
+	// governed version.
+	var templateVersionID, renderedHash string
+	if usingGovernedTemplate {
+		published, err := h.store.GetPublishedVersion(r.Context(), req.TemplateID, req.Locale)
+		if err != nil {
+			h.handleTemplateError(w, err)
+			return
+		}
+		// A template published for a different legal entity than the one this
+		// notification is being sent under is refused rather than used — using
+		// it anyway would let a caller borrow another entity's approved wording
+		// under this send's own legal_entity_id.
+		if published.LegalEntityID != req.LegalEntityID {
+			writeError(w, http.StatusBadRequest, "template_legal_entity_mismatch",
+				"the published template belongs to a different legal_entity_id than this notification is being sent under")
+			return
+		}
+		rendered, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{
+			VersionID: published.VersionID, Variables: req.Variables,
+		})
+		if err != nil {
+			h.handleTemplateError(w, err)
+			return
+		}
+		req.Body = rendered.RenderedContent
+		templateVersionID = published.VersionID
+		sum := sha256.Sum256([]byte(rendered.RenderedContent))
+		renderedHash = hex.EncodeToString(sum[:])
+	}
+
 	correlationID := getCorrelationID(r)
 	now := time.Now().UTC()
 
@@ -295,6 +470,9 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:          req.CorrelationID,
 		CreatedByPrincipalID:   principalID,
 		CreatedAt:              now,
+		TemplateID:             req.TemplateID,
+		TemplateVersionID:      templateVersionID,
+		RenderedContentHash:    renderedHash,
 	}
 
 	created, err := h.store.CreateNotification(r.Context(), notification)
@@ -349,6 +527,35 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	outcomeCtx, cancelOutcome := context.WithTimeout(
 		svcmiddleware.WithTenant(context.WithoutCancel(r.Context()), tenantID), 10*time.Second)
 	defer cancelOutcome()
+
+	// An ambiguous outcome is neither a success nor a settled failure — see
+	// domain.DeliveryOutcome.Unknown's own doc comment. It is checked
+	// before Retryable so an outcome that is genuinely unknown can never
+	// also be silently retried (which risks a duplicate if the message did
+	// go out). Recorded on outcomeCtx for the same reason as every other
+	// post-delivery write in this function — see that context's own doc
+	// comment immediately above.
+	if outcome.Unknown {
+		if err := h.store.MarkOutcomeUnknown(outcomeCtx, notification.NotificationID, tenantID, outcome.Reason, attemptedAt); err != nil {
+			h.log.Error("failed to record ambiguous delivery outcome", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+			return
+		}
+		notification.Status = domain.StatusPendingUnknown
+		notification.FailureReason = outcome.Reason
+		notification.DeliveryAttempts = 1
+		notification.LastAttemptAt = &attemptedAt
+		notification.SentAt = &attemptedAt
+		notification.UnknownAt = &attemptedAt
+
+		h.log.Warn("delivery outcome ambiguous on first attempt",
+			zap.String("notification_id", notification.NotificationID),
+			zap.String("reason", outcome.Reason))
+
+		h.publisher.PublishOutcomeUnknown(outcomeCtx, correlationID, *notification, outcome.Reason)
+		writeJSON(w, http.StatusCreated, notification)
+		return
+	}
 
 	// A failure worth re-attempting does not conclude the notification. It
 	// stays PENDING with a schedule on it, and internal/retry's worker picks
@@ -622,6 +829,156 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated)
 }
 
+// deliveryStatusResponse is GetDeliveryStatus's own response shape — the
+// doc's own query, a narrower view than the full notification record.
+// ErrorCode surfaces the doc's own named stable error,
+// DELIVERY_OUTCOME_UNKNOWN, describing the notification's own state — a
+// 200 response, not a request failure.
+type deliveryStatusResponse struct {
+	NotificationID string     `json:"notification_id"`
+	Status         string     `json:"status"`
+	ErrorCode      string     `json:"error_code,omitempty"`
+	FailureReason  string     `json:"failure_reason,omitempty"`
+	SentAt         *time.Time `json:"sent_at,omitempty"`
+	ResolvedAt     *time.Time `json:"resolved_at,omitempty"`
+}
+
+// GetDeliveryStatus — BIZ-10's own GetDeliveryStatus query.
+// GET /v1/notifications/{id}/delivery-status
+func (h *Handler) GetDeliveryStatus(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	notification, err := h.store.GetNotification(r.Context(), id)
+	if errors.Is(err, domain.ErrNotificationNotFound) {
+		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch notification", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, notification.LegalEntityID, actionView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	resp := deliveryStatusResponse{
+		NotificationID: notification.NotificationID, Status: notification.Status,
+		FailureReason: notification.FailureReason, SentAt: notification.SentAt, ResolvedAt: notification.ResolvedAt,
+	}
+	if notification.Status == domain.StatusPendingUnknown {
+		resp.ErrorCode = "DELIVERY_OUTCOME_UNKNOWN"
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type resolveDeliveryOutcomeRequest struct {
+	ResolvedStatus    string `json:"resolved_status"`
+	ResolutionNote    string `json:"resolution_note"`
+	ProviderResponse  string `json:"provider_response,omitempty"`
+}
+
+// ResolveDeliveryOutcome — BIZ-10's own ResolveDeliveryOutcome command.
+// POST /v1/notifications/{id}/resolve-delivery-outcome
+//
+// Gated on actionResolveOutcome, not actionSend — see that constant's own
+// doc comment. Fetched first so a wrong-status target gets its own
+// distinguishable error rather than the store's generic "no row
+// changed" — same discipline as MarkRead above.
+func (h *Handler) ResolveDeliveryOutcome(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	var req resolveDeliveryOutcomeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.ResolvedStatus != domain.StatusSent && req.ResolvedStatus != domain.StatusFailed {
+		writeError(w, http.StatusBadRequest, "invalid_resolved_status", domain.ErrInvalidResolvedStatus.Error())
+		return
+	}
+	if req.ResolutionNote == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", domain.ErrResolutionNoteRequired.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	notification, err := h.store.GetNotification(r.Context(), id)
+	if errors.Is(err, domain.ErrNotificationNotFound) {
+		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch notification", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, notification.LegalEntityID, actionResolveOutcome); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if notification.Status != domain.StatusPendingUnknown {
+		writeError(w, http.StatusConflict, "not_pending_unknown", domain.ErrNotPendingUnknown.Error())
+		return
+	}
+
+	resolvedAt := time.Now().UTC()
+	err = h.store.ResolveDeliveryOutcome(r.Context(), domain.ResolveDeliveryOutcomeParams{
+		NotificationID: id, TenantID: tenantID, ActorPrincipalID: principalID,
+		ResolvedStatus: req.ResolvedStatus, ResolutionNote: req.ResolutionNote, ProviderResponse: req.ProviderResponse,
+	}, resolvedAt)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotificationNotFound) {
+			// A race: the row moved (or vanished under a replay) between
+			// the fetch above and this call. 409 rather than 404 — the
+			// notification exists, it just stopped being PENDING_UNKNOWN.
+			writeError(w, http.StatusConflict, "not_pending_unknown", domain.ErrNotPendingUnknown.Error())
+			return
+		}
+		h.log.Error("failed to resolve delivery outcome", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	updated, err := h.store.GetNotification(r.Context(), id)
+	if err != nil {
+		h.log.Error("failed to re-read notification after resolving outcome", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// The event that would have fired at the original attempt, now fired
+	// at resolution time — the doc names no separate "resolved" event,
+	// only "resolve the original attempt".
+	correlationID := getCorrelationID(r)
+	if req.ResolvedStatus == domain.StatusSent {
+		h.publisher.PublishSent(r.Context(), correlationID, *updated)
+	} else {
+		h.publisher.PublishFailed(r.Context(), correlationID, *updated, req.ResolutionNote)
+	}
+
+	writeJSON(w, http.StatusOK, updated)
+}
+
 // UnreadCount answers how many in-app notices the calling principal has not
 // opened — the number on the bell.
 // GET /v1/notifications/unread-count
@@ -654,6 +1011,421 @@ func (h *Handler) UnreadCount(w http.ResponseWriter, r *http.Request) {
 		// observe, which is in-app notices nobody has opened.
 		"channel": domain.ChannelInApp,
 	})
+}
+
+// ── BIZ-03 Template ──────────────────────────────────────────────────────────
+
+type createTemplateRequest struct {
+	LegalEntityID   string `json:"legal_entity_id"`
+	Name            string `json:"name"`
+	BusinessPurpose string `json:"business_purpose"`
+}
+
+// CreateTemplate creates a new template definition — BIZ-03's own
+// CreateTemplate command. The caller becomes the owner.
+func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	var req createTemplateRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LegalEntityID == "" || req.Name == "" || req.BusinessPurpose == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, name and business_purpose are required")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	tmpl, err := h.store.CreateTemplate(r.Context(), domain.CreateTemplateParams{
+		LegalEntityID: req.LegalEntityID, Name: req.Name, BusinessPurpose: req.BusinessPurpose, OwnerPrincipalID: principalID,
+	})
+	if err != nil {
+		h.log.Error("failed to create template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	h.publisher.PublishTemplateCreated(r.Context(), getCorrelationID(r), *tmpl)
+	writeJSON(w, http.StatusCreated, tmpl)
+}
+
+// GetTemplate — BIZ-03's own GetTemplate query.
+func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tmpl)
+}
+
+type createVersionRequest struct {
+	Locale                string   `json:"locale"`
+	Content               string   `json:"content"`
+	VariableSchema        []string `json:"variable_schema,omitempty"`
+	BrandingMetadata      string   `json:"branding_metadata,omitempty"`
+	AccessibilityMetadata string   `json:"accessibility_metadata,omitempty"`
+}
+
+// CreateVersion — BIZ-03's own CreateVersion command. Lands DRAFT;
+// requires ValidateTemplate then ApproveTemplate then PublishTemplate
+// before it governs anything a caller can render.
+func (h *Handler) CreateVersion(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	var req createVersionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Locale == "" || req.Content == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "locale and content are required")
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.CreateVersion(r.Context(), domain.CreateVersionParams{
+		TemplateID: templateID, Locale: req.Locale, Content: req.Content, VariableSchema: req.VariableSchema,
+		BrandingMetadata: req.BrandingMetadata, AccessibilityMetadata: req.AccessibilityMetadata,
+		CreatedByPrincipalID: principalID,
+	})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, version)
+}
+
+// ValidateTemplate — BIZ-03's own ValidateTemplate command. Moves a
+// DRAFT version to REVIEW once its content parses and a variable schema
+// is present.
+func (h *Handler) ValidateTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	versionID := chi.URLParam(r, "versionID")
+	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.ValidateTemplate(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, version)
+}
+
+// ApproveTemplate — BIZ-03's own ApproveTemplate command. Fetched
+// (read-only) BEFORE authorization and BEFORE the mutation, same
+// fetch-then-authorize-then-mutate discipline as every other handler in
+// this platform, so a denied caller can never cause the approval to
+// actually run before being refused.
+func (h *Handler) ApproveTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	versionID := chi.URLParam(r, "versionID")
+	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateApprove); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.ApproveTemplate(r.Context(), domain.ApproveVersionParams{
+		VersionID: versionID, ApprovedByPrincipalID: principalID,
+	})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	h.publisher.PublishTemplateVersionApproved(r.Context(), getCorrelationID(r), *version)
+	writeJSON(w, http.StatusOK, version)
+}
+
+// PublishTemplate — BIZ-03's own PublishTemplate command.
+func (h *Handler) PublishTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	versionID := chi.URLParam(r, "versionID")
+	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateApprove); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.PublishTemplate(r.Context(), domain.PublishVersionParams{
+		VersionID: versionID, PublishedByPrincipalID: principalID,
+	})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	h.publisher.PublishTemplatePublished(r.Context(), getCorrelationID(r), *version)
+	writeJSON(w, http.StatusOK, version)
+}
+
+// GetPublishedVersion — BIZ-03's own GetPublishedVersion query.
+func (h *Handler) GetPublishedVersion(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	locale := r.URL.Query().Get("locale")
+	if locale == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "locale query parameter is required")
+		return
+	}
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.GetPublishedVersion(r.Context(), templateID, locale)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, version)
+}
+
+// RetireTemplate — BIZ-03's own RetireTemplate command.
+func (h *Handler) RetireTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateApprove); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	retired, err := h.store.RetireTemplate(r.Context(), domain.RetireTemplateParams{
+		TemplateID: templateID, RetiredByPrincipalID: principalID,
+	})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	h.publisher.PublishTemplateRetired(r.Context(), getCorrelationID(r), *retired)
+	writeJSON(w, http.StatusOK, retired)
+}
+
+type renderPreviewRequest struct {
+	Variables map[string]string `json:"variables,omitempty"`
+}
+
+// RenderPreview — BIZ-03's own RenderPreview query. Renders any
+// version's content, regardless of status, so a reviewer can see a
+// DRAFT/REVIEW version before it is ever published.
+func (h *Handler) RenderPreview(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	var req renderPreviewRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	versionID := chi.URLParam(r, "versionID")
+	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	result, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{VersionID: versionID, Variables: req.Variables})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// CompareVersions — BIZ-03's own CompareVersions query. Both version ids
+// are query parameters, not path segments — this reads two versions,
+// neither of which "owns" the comparison route.
+func (h *Handler) CompareVersions(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	versionA := r.URL.Query().Get("version_a")
+	versionB := r.URL.Query().Get("version_b")
+	if versionA == "" || versionB == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "version_a and version_b query parameters are required")
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	result, err := h.store.CompareVersions(r.Context(), versionA, versionB)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// ListLocales — BIZ-03's own ListLocales query.
+func (h *Handler) ListLocales(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	locales, err := h.store.ListLocales(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if locales == nil {
+		locales = []domain.LocaleSummary{}
+	}
+	writeJSON(w, http.StatusOK, locales)
+}
+
+func (h *Handler) handleTemplateError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrTemplateNotFound):
+		writeError(w, http.StatusNotFound, "template_not_found", "")
+	case errors.Is(err, domain.ErrTemplateVersionNotFound):
+		writeError(w, http.StatusNotFound, "template_version_not_found", "")
+	case errors.Is(err, domain.ErrTemplateRetired):
+		writeError(w, http.StatusConflict, "template_retired", err.Error())
+	case errors.Is(err, domain.ErrTemplateAlreadyRetired):
+		writeError(w, http.StatusConflict, "already_retired", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionNotDraft):
+		writeError(w, http.StatusConflict, "not_draft", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionNotReview):
+		writeError(w, http.StatusConflict, "not_review", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionNotApproved):
+		writeError(w, http.StatusConflict, "not_approved", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionSelfApproval):
+		writeError(w, http.StatusForbidden, "self_approval_forbidden", err.Error())
+	case errors.Is(err, domain.ErrTemplateContentInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_content", err.Error())
+	case errors.Is(err, domain.ErrTemplateLocaleRequired):
+		writeError(w, http.StatusBadRequest, "missing_fields", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionsBelongToDifferentTemplates):
+		writeError(w, http.StatusBadRequest, "version_template_mismatch", err.Error())
+	default:
+		var missing domain.ErrTemplateVariablesMissing
+		if errors.As(err, &missing) {
+			writeError(w, http.StatusBadRequest, "missing_variables", missing.Error())
+			return
+		}
+		h.log.Error("template store error", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+	}
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -766,4 +1538,146 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// ── POST /v1/notifications/events/ingest ────────────────────────────────────
+
+// IngestEvent ingests a business domain event and coordinates the Phase 1 communications
+// pipeline: deduplication, recipient resolution, kill-switch check, template integrity,
+// deterministic render, ledger recording, and delivery dispatch.
+func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
+	if h.orchestrator == nil {
+		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "orchestrator not configured")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req ledger.EventIngestRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	// Default correlation and causation from request envelope headers if omitted from body
+	if req.CorrelationID == "" {
+		req.CorrelationID = getCorrelationID(r)
+	}
+	if req.CausationID == nil {
+		if cid := r.Header.Get("X-Causation-Id"); cid != "" {
+			req.CausationID = &cid
+		}
+	}
+	if req.LegalEntityID == "" {
+		req.LegalEntityID = r.Header.Get("X-Legal-Entity-Id")
+	}
+
+	// Strictly validate mandatory request attributes
+	if req.EventID == "" || req.EventType == "" || req.RecipientPrincipalID == "" ||
+		req.TemplateKey == "" || req.LegalEntityID == "" || req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields",
+			"event_id, event_type, recipient_principal_id, template_key, legal_entity_id, correlation_id are required")
+		return
+	}
+
+	// Authorization check
+	if h.authz != nil {
+		if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSend); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+
+	res, err := h.orchestrator.IngestEvent(r.Context(), req, principalID)
+	if err != nil {
+		switch {
+		case errors.Is(err, ledger.ErrMissingTenantContext):
+			writeError(w, http.StatusUnauthorized, "tenant_missing", err.Error())
+		case errors.Is(err, ledger.ErrInvalidIngestRequest):
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		case errors.Is(err, ledger.ErrTemplateNotFound):
+			writeError(w, http.StatusBadRequest, "unknown_template", err.Error())
+		case errors.Is(err, ledger.ErrMissingVariables):
+			writeError(w, http.StatusBadRequest, "missing_template_variables", err.Error())
+		case errors.Is(err, ledger.ErrHashMismatch):
+			h.log.Error("template integrity verification failed", zap.String("template_key", req.TemplateKey), zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "template_integrity_failure", "template hash integrity check failed")
+		case errors.Is(err, ledger.ErrRecipientEmailUnresolved):
+			writeError(w, http.StatusUnprocessableEntity, "recipient_unresolved", err.Error())
+		default:
+			h.log.Error("event orchestration failed", zap.String("event_id", req.EventID), zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "orchestration_failed", err.Error())
+		}
+		return
+	}
+
+	status := http.StatusCreated
+	if res.IsReplay {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, res)
+}
+
+// ── GET /v1/notifications/intents/{id} ──────────────────────────────────────
+
+type IntentDetailResponse struct {
+	*ledger.MessageIntent
+	Render *ledger.MessageRender `json:"render,omitempty"`
+}
+
+// GetIntent retrieves a message intent and associated render under strict tenant RLS.
+func (h *Handler) GetIntent(w http.ResponseWriter, r *http.Request) {
+	if h.ledgerStore == nil {
+		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "ledger store not configured")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	if _, err := uuid.Parse(id); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_id", "id must be a valid UUID")
+		return
+	}
+
+	intent, err := h.ledgerStore.GetMessageIntent(r.Context(), tenantID, id)
+	if err != nil {
+		if errors.Is(err, store.ErrIntentNotFound) {
+			writeError(w, http.StatusNotFound, "intent_not_found", "message intent not found")
+			return
+		}
+		h.log.Error("failed to get message intent", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if h.authz != nil && intent.LegalEntityID != "" {
+		if err := h.authz.CheckAllowed(r.Context(), principalID, intent.LegalEntityID, actionView); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+
+	render, rErr := h.ledgerStore.GetRenderByIntent(r.Context(), tenantID, id)
+	if rErr != nil && !errors.Is(rErr, store.ErrRenderNotFound) {
+		h.log.Warn("failed to fetch render for intent", zap.String("intent_id", id), zap.Error(rErr))
+	}
+
+	writeJSON(w, http.StatusOK, IntentDetailResponse{
+		MessageIntent: intent,
+		Render:        render,
+	})
 }

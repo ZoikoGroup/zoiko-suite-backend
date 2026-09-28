@@ -104,6 +104,7 @@ type stubStore struct {
 	completed []string // "id:STATUS"
 	scheduled []string // "id:reason"
 	addresses map[string]string
+	unknown   []string // "id:reason"
 
 	claimFails  bool
 	tenantsSeen []string
@@ -204,6 +205,15 @@ func (s *stubStore) SetRecipientAddress(_ context.Context, id, _, address, _ str
 	return nil
 }
 
+func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, attemptedAt time.Time) error {
+	s.unknown = append(s.unknown, id+":"+reason)
+	if n, ok := s.byID[id]; ok {
+		n.Status = "PENDING_UNKNOWN"
+		n.UnknownAt = &attemptedAt
+	}
+	return nil
+}
+
 type stubDeliverer struct {
 	outcome domain.DeliveryOutcome
 	calls   int
@@ -216,11 +226,14 @@ func (d *stubDeliverer) Deliver(_ context.Context, n domain.Notification) domain
 	return d.outcome
 }
 
-type stubPublisher struct{ sent, failed int }
+type stubPublisher struct{ sent, failed, unknown int }
 
 func (p *stubPublisher) PublishSent(context.Context, string, domain.Notification) { p.sent++ }
 func (p *stubPublisher) PublishFailed(context.Context, string, domain.Notification, string) {
 	p.failed++
+}
+func (p *stubPublisher) PublishOutcomeUnknown(context.Context, string, domain.Notification, string) {
+	p.unknown++
 }
 
 type stubResolver struct {
@@ -291,6 +304,39 @@ func TestWorkerReschedulesTransientFailureWithoutPublishing(t *testing.T) {
 	}
 	if p.sent != 0 || p.failed != 0 {
 		t.Fatalf("published sent=%d failed=%d, want nothing published for a pending retry", p.sent, p.failed)
+	}
+}
+
+// TestWorkerMarksOutcomeUnknownWithoutRetryingOrPublishingSentOrFailed
+// proves an ambiguous re-attempt is never silently retried (which risks
+// a duplicate send if the message did go out) and never reported as a
+// settled sent/failed outcome — only PublishOutcomeUnknown fires.
+func TestWorkerMarksOutcomeUnknownWithoutRetryingOrPublishingSentOrFailed(t *testing.T) {
+	s := newStubStore()
+	seed(s, "n1", "tenant-a", 1)
+	d := &stubDeliverer{outcome: domain.DeliveryOutcome{Reason: "connection dropped at verdict", Unknown: true, Retryable: true}}
+	p := &stubPublisher{}
+
+	newWorker(s, d, p, nil, retry.Policy{MaxAttempts: 5, BaseDelay: time.Second, MaxDelay: time.Minute}).
+		RunOnce(context.Background())
+
+	if len(s.unknown) != 1 {
+		t.Fatalf("unknown = %v, want one entry", s.unknown)
+	}
+	if len(s.scheduled) != 0 {
+		t.Fatalf("scheduled = %v, want nothing rescheduled — Unknown must never be silently retried", s.scheduled)
+	}
+	if len(s.completed) != 0 {
+		t.Fatalf("completed = %v, want nothing concluded SENT/FAILED", s.completed)
+	}
+	if p.sent != 0 || p.failed != 0 {
+		t.Fatalf("published sent=%d failed=%d, want neither for an ambiguous outcome", p.sent, p.failed)
+	}
+	if p.unknown != 1 {
+		t.Fatalf("published unknown=%d, want 1", p.unknown)
+	}
+	if n := s.byID["n1"]; n.Status != "PENDING_UNKNOWN" {
+		t.Fatalf("notification status = %q, want PENDING_UNKNOWN", n.Status)
 	}
 }
 

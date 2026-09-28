@@ -29,6 +29,7 @@ import (
 
 	"zoiko.io/accounts-payable-svc/internal/domain"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
+	"zoiko.io/accounts-payable-svc/internal/outbox"
 )
 
 // invoiceColumns is the single source of truth for the read shape.
@@ -318,6 +319,37 @@ func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.VendorInvoice) 
 
 		inv.CreatedAt = now
 		created = true
+
+		env, envErr := outbox.NewVariantAEnvelope(
+			"vendor.invoice.received",
+			inv.CorrelationID,
+			inv.TenantID,
+			inv.LegalEntityID,
+			inv.CreatedByPrincipalID,
+			map[string]any{
+				"invoice_id":      inv.InvoiceID,
+				"tenant_id":       inv.TenantID,
+				"legal_entity_id": inv.LegalEntityID,
+				"vendor_id":       inv.VendorID,
+			},
+		)
+		if envErr != nil {
+			return fmt.Errorf("build outbox envelope: %w", envErr)
+		}
+		actorID := inv.CreatedByPrincipalID
+		if err := outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: "VENDOR_INVOICE",
+			AggregateID:   inv.InvoiceID,
+			EventType:     "vendor.invoice.received",
+			TenantID:      inv.TenantID,
+			LegalEntityID: inv.LegalEntityID,
+			ActorID:       &actorID,
+			CorrelationID: inv.CorrelationID,
+			Payload:       env,
+		}); err != nil {
+			return fmt.Errorf("outbox insert: %w", err)
+		}
+
 		return nil
 	})
 	return created, err
@@ -445,15 +477,43 @@ func (s *PgStore) TransitionInvoice(ctx context.Context, tenantID, invoiceID str
 		UPDATE vendor_invoices
 		SET status = $1, %s = $2, %s = $3
 		WHERE invoice_id = $4 AND status = $5 AND tenant_id = $6
+		RETURNING legal_entity_id, correlation_id, amount, currency_code
 	`, actorColumn, timeColumn)
 
-	var affected int64
+	var found bool
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, query, string(toStatus), actorPrincipalID, time.Now().UTC(), invoiceID, string(fromStatus), tenantID)
-		if err != nil {
+		var legalEntityID, correlationID, currencyCode string
+		var amount float64
+		row := tx.QueryRow(ctx, query, string(toStatus), actorPrincipalID, time.Now().UTC(), invoiceID, string(fromStatus), tenantID)
+		if err := row.Scan(&legalEntityID, &correlationID, &amount, &currencyCode); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				found = false
+				return nil
+			}
 			return mapPgError(err)
 		}
-		affected = tag.RowsAffected()
+		found = true
+
+		eventType, payload := transitionEventDetails(toStatus, invoiceID, amount, currencyCode)
+		if eventType != "" {
+			env, envErr := outbox.NewVariantAEnvelope(eventType, correlationID, tenantID, legalEntityID, actorPrincipalID, payload)
+			if envErr != nil {
+				return fmt.Errorf("build outbox envelope: %w", envErr)
+			}
+			actor := actorPrincipalID
+			if err := outbox.Insert(ctx, tx, outbox.Event{
+				AggregateType: "VENDOR_INVOICE",
+				AggregateID:   invoiceID,
+				EventType:     eventType,
+				TenantID:      tenantID,
+				LegalEntityID: legalEntityID,
+				ActorID:       &actor,
+				CorrelationID: correlationID,
+				Payload:       env,
+			}); err != nil {
+				return fmt.Errorf("outbox insert: %w", err)
+			}
+		}
 		return nil
 	})
 	// A malformed id names no row, so this is the same answer as an unknown one:
@@ -464,10 +524,31 @@ func (s *PgStore) TransitionInvoice(ctx context.Context, tenantID, invoiceID str
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
+	if !found {
 		return domain.ErrInvalidTransition
 	}
 	return nil
+}
+
+func transitionEventDetails(to domain.InvoiceStatus, invoiceID string, amount float64, currencyCode string) (string, any) {
+	switch to {
+	case domain.InvoiceStatusValidated:
+		return "vendor.invoice.validated", map[string]any{
+			"invoice_id": invoiceID,
+		}
+	case domain.InvoiceStatusApproved:
+		return "vendor.invoice.approved", map[string]any{
+			"invoice_id": invoiceID,
+		}
+	case domain.InvoiceStatusPaymentRequested:
+		return "payment.requested", map[string]any{
+			"invoice_id":    invoiceID,
+			"amount":        amount,
+			"currency_code": currencyCode,
+		}
+	default:
+		return "", nil
+	}
 }
 
 func transitionColumns(to domain.InvoiceStatus) (actorColumn, timeColumn string) {

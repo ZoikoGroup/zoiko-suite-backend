@@ -35,6 +35,13 @@ type Authorization struct {
 	NetAmount       float64 `json:"NetAmount"`
 	Currency        string  `json:"Currency"`
 	Status          string  `json:"Status"`
+	// ProposalFingerprint is AP-10's own real, service-computed hash of
+	// the approved subject (sourced from payment-proposal-svc's
+	// GetFingerprint) — captured here so it can be carried through to
+	// BNK-06's PrepareAttempt for independent re-verification (Wave 11a),
+	// rather than BNK-06 trusting a caller-supplied value with nothing
+	// behind it.
+	ProposalFingerprint string `json:"ProposalFingerprint"`
 	// PayeeRef is populated from the first entry of AP-10's own
 	// payee_snapshots, when present — informational/audit only, empty for
 	// an authorization with no AP_INVOICE-sourced items.

@@ -317,8 +317,8 @@ func TestCreateInvoice_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t *testi
 	if retryInv.InvoiceID != firstInv.InvoiceID {
 		t.Fatalf("retried call resolved to a different invoice_id (%s) than the original (%s)", retryInv.InvoiceID, firstInv.InvoiceID)
 	}
-	if pub.issued != 1 {
-		t.Fatalf("expected exactly 1 PublishInvoiceIssued call, got %d — replay must not re-publish", pub.issued)
+	if pub.issued != 0 {
+		t.Fatalf("expected 0 synchronous PublishInvoiceIssued calls (transactional outbox used), got %d", pub.issued)
 	}
 }
 
@@ -353,8 +353,8 @@ func TestSendInvoice_Success(t *testing.T) {
 	if s.invoices["i1"].Status != domain.InvoiceStatusSent {
 		t.Fatalf("expected status SENT, got %s", s.invoices["i1"].Status)
 	}
-	if pub.sent != 1 {
-		t.Fatalf("expected invoice.sent to be published, got %d", pub.sent)
+	if pub.sent != 0 {
+		t.Fatalf("expected 0 synchronous invoice.sent publish calls (transactional outbox used), got %d", pub.sent)
 	}
 }
 
@@ -440,8 +440,8 @@ func TestReceivePayment_MatchingAmount_Succeeds(t *testing.T) {
 	if s.invoices["i1"].Status != domain.InvoiceStatusPaid {
 		t.Fatalf("expected status PAID, got %s", s.invoices["i1"].Status)
 	}
-	if pub.paymentReceived != 1 {
-		t.Fatalf("expected payment.received to be published once, got %d", pub.paymentReceived)
+	if pub.paymentReceived != 0 {
+		t.Fatalf("expected 0 synchronous payment.received publish calls (transactional outbox used), got %d", pub.paymentReceived)
 	}
 }
 
@@ -861,8 +861,8 @@ func TestMarkOverdue_AfterDueDate_Succeeds(t *testing.T) {
 	if s.invoices["i1"].Status != domain.InvoiceStatusOverdue {
 		t.Fatalf("expected status OVERDUE, got %s", s.invoices["i1"].Status)
 	}
-	if pub.overdue != 1 {
-		t.Fatalf("expected receivable.overdue to be published once, got %d", pub.overdue)
+	if pub.overdue != 0 {
+		t.Fatalf("expected 0 synchronous receivable.overdue publish calls (transactional outbox used), got %d", pub.overdue)
 	}
 }
 
@@ -1134,5 +1134,67 @@ func TestListInvoices_MalformedLegalEntityFilter_Returns400(t *testing.T) {
 	}
 	if s.lastFilter.LegalEntityID != valid {
 		t.Fatalf("the valid filter did not reach the store: %q", s.lastFilter.LegalEntityID)
+	}
+}
+
+// TestHandler_ZeroSynchronousPublishCalls_AllOperations proves that all 4 domain endpoints
+// rely strictly on transactional outbox insertion and make ZERO synchronous h.publisher calls,
+// complying with ZS-STATE-001 Invariant I-13.
+func TestHandler_ZeroSynchronousPublishCalls_AllOperations(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	dueDate := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	createReq := validCreateReq()
+	createReq.Amount = 1500.0
+	createReq.DueDate = dueDate
+
+	r := newRouterAtTime(s, pub, &stubAuthZ{}, "", dueDate.AddDate(0, 0, 2))
+
+	// 1. CreateInvoice
+	recCreate := doRequest(r, http.MethodPost, "/v1/invoices/", createReq, "principal-1")
+	if recCreate.Code != http.StatusCreated {
+		t.Fatalf("create failed: %d: %s", recCreate.Code, recCreate.Body.String())
+	}
+	if pub.issued != 0 {
+		t.Fatalf("expected 0 synchronous PublishInvoiceIssued calls, got %d", pub.issued)
+	}
+
+	var createdInv domain.CustomerInvoice
+	if err := json.NewDecoder(recCreate.Body).Decode(&createdInv); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	invoiceID := createdInv.InvoiceID
+
+	gl := fakeLedger(t,
+		[]map[string]any{journalFor("j-zero", invoiceID, "FINALIZED", 1500.0)},
+		map[string]map[string]any{"j-zero": journalFor("j-zero", invoiceID, "FINALIZED", 1500.0)},
+	)
+	r = newRouterAtTime(s, pub, &stubAuthZ{}, gl.URL, dueDate.AddDate(0, 0, 2))
+
+	// 2. SendInvoice
+	recSend := doRequest(r, http.MethodPost, "/v1/invoices/"+invoiceID+"/send", nil, "principal-1")
+	if recSend.Code != http.StatusOK {
+		t.Fatalf("send failed: %d: %s", recSend.Code, recSend.Body.String())
+	}
+	if pub.sent != 0 {
+		t.Fatalf("expected 0 synchronous PublishInvoiceSent calls, got %d", pub.sent)
+	}
+
+	// 3. MarkOverdue
+	recOverdue := doRequest(r, http.MethodPost, "/v1/invoices/"+invoiceID+"/overdue", nil, "principal-1")
+	if recOverdue.Code != http.StatusOK {
+		t.Fatalf("overdue failed: %d: %s", recOverdue.Code, recOverdue.Body.String())
+	}
+	if pub.overdue != 0 {
+		t.Fatalf("expected 0 synchronous PublishReceivableOverdue calls, got %d", pub.overdue)
+	}
+
+	// 4. ReceivePayment
+	recPay := doRequest(r, http.MethodPost, "/v1/invoices/"+invoiceID+"/pay", nil, "principal-1")
+	if recPay.Code != http.StatusOK {
+		t.Fatalf("pay failed: %d: %s", recPay.Code, recPay.Body.String())
+	}
+	if pub.paymentReceived != 0 {
+		t.Fatalf("expected 0 synchronous PublishPaymentReceived calls, got %d", pub.paymentReceived)
 	}
 }

@@ -26,6 +26,34 @@ type Store interface {
 	FinalizeFailed(ctx context.Context, manifestID, reason string) (*domain.EvidenceManifest, error)
 	FindManifestByID(ctx context.Context, manifestID string) (*domain.EvidenceManifest, error)
 	ListRecords(ctx context.Context, manifestID string) ([]domain.ManifestRecord, error)
+
+	// AUD-03 Audit Population — see internal/store/population_store.go's
+	// own doc comments for the enforcement mechanisms.
+	DefinePopulation(ctx context.Context, params domain.DefinePopulationParams) (*domain.AuditPopulation, bool, error)
+	GetAuditPopulation(ctx context.Context, tenantID, populationID string) (*domain.AuditPopulation, error)
+	ListAuditPopulationsByEngagement(ctx context.Context, tenantID, engagementID string) ([]*domain.AuditPopulation, error)
+	BuildPopulation(ctx context.Context, params domain.BuildPopulationParams) (*domain.AuditPopulation, bool, error)
+	ValidatePopulation(ctx context.Context, params domain.ValidatePopulationParams) (*domain.AuditPopulation, bool, error)
+	FreezePopulation(ctx context.Context, params domain.FreezePopulationParams) (*domain.AuditPopulation, bool, error)
+	SupersedePopulation(ctx context.Context, params domain.SupersedePopulationParams) (*domain.AuditPopulation, bool, error)
+	QuarantinePopulation(ctx context.Context, params domain.QuarantinePopulationParams) (*domain.AuditPopulation, bool, error)
+	AddControlledDelta(ctx context.Context, params domain.AddControlledDeltaParams) (*domain.AuditPopulation, bool, error)
+	GetControlTotals(ctx context.Context, tenantID, populationID string) ([]*domain.PopulationControlTotal, error)
+
+	// AUD-04 Sampling — see internal/store/sampling_store.go's own doc
+	// comments for the enforcement mechanisms.
+	CreateSamplingParameterSet(ctx context.Context, params domain.CreateSamplingParameterSetParams) (*domain.SamplingParameterSet, error)
+	CreateSampleDesign(ctx context.Context, params domain.CreateSampleDesignParams) (*domain.SampleDesign, bool, error)
+	GetSampleDesign(ctx context.Context, tenantID, designID string) (*domain.SampleDesign, error)
+	ApproveSampleDesign(ctx context.Context, params domain.ApproveSampleDesignParams) (*domain.SampleDesign, bool, error)
+	SelectSample(ctx context.Context, params domain.SelectSampleParams) (*domain.SampleSelection, []*domain.SampleItem, bool, error)
+	ReproduceSelection(ctx context.Context, tenantID, selectionID string) (bool, error)
+	GetItemResults(ctx context.Context, tenantID, designID string) ([]*domain.SampleItem, error)
+	RecordItemResult(ctx context.Context, params domain.RecordItemResultParams) (*domain.SampleItem, bool, error)
+	RecordNonresponse(ctx context.Context, params domain.RecordNonresponseParams) (*domain.SampleItem, bool, error)
+	AddAlternativeProcedure(ctx context.Context, params domain.AddAlternativeProcedureParams) (*domain.SampleItem, bool, error)
+	EvaluateSample(ctx context.Context, params domain.EvaluateSampleParams) (*domain.SampleEvaluation, bool, error)
+	SupersedeSample(ctx context.Context, params domain.SupersedeSampleParams) (*domain.SampleDesign, bool, error)
 }
 
 type Publisher interface {
@@ -129,6 +157,36 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.GenerateManifest)
 		r.Get("/{manifestID}", h.GetManifest)
 		r.Get("/{manifestID}/records", h.ListRecords)
+	})
+	r.Route("/v1/audit-populations", func(r chi.Router) {
+		r.Post("/", h.DefinePopulation)
+		r.Get("/{population_id}", h.GetAuditPopulation)
+		r.Post("/{population_id}/build", h.BuildPopulation)
+		r.Post("/{population_id}/validate", h.ValidatePopulation)
+		r.Post("/{population_id}/freeze", h.FreezePopulation)
+		r.Post("/{population_id}/supersede", h.SupersedePopulation)
+		r.Post("/{population_id}/quarantine", h.QuarantinePopulation)
+		r.Post("/{population_id}/delta", h.AddControlledDelta)
+		r.Get("/{population_id}/control-totals", h.GetControlTotals)
+	})
+	r.Get("/v1/audit/engagements/{engagement_id}/populations", h.ListAuditPopulations)
+	r.Route("/v1/sampling-parameter-sets", func(r chi.Router) {
+		r.Post("/", h.CreateSamplingParameterSet)
+	})
+	r.Route("/v1/sample-designs", func(r chi.Router) {
+		r.Post("/", h.CreateSampleDesign)
+		r.Get("/{design_id}", h.GetSampleDesign)
+		r.Post("/{design_id}/approve", h.ApproveSampleDesign)
+		r.Post("/{design_id}/select", h.SelectSample)
+		r.Get("/{design_id}/items", h.GetItemResults)
+		r.Post("/{design_id}/evaluate", h.EvaluateSample)
+		r.Post("/{design_id}/supersede", h.SupersedeSample)
+		r.Get("/{design_id}/selections/{selection_id}/reproduce", h.GetSelectionMethod)
+	})
+	r.Route("/v1/sample-items", func(r chi.Router) {
+		r.Post("/{item_id}/result", h.RecordItemResult)
+		r.Post("/{item_id}/nonresponse", h.RecordNonresponse)
+		r.Post("/{item_id}/alternative-procedure", h.AddAlternativeProcedure)
 	})
 }
 

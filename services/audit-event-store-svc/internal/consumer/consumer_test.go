@@ -268,6 +268,49 @@ func TestEntityStatusChangedStored(t *testing.T) {
 	assert.Equal(t, "entity-xyz", stored.LegalEntityID)
 }
 
+func TestAuditEngagementEventStoredWithAuditableScope(t *testing.T) {
+	s := store.NewFakeStore()
+	c := newConsumer(t, s)
+	payload := map[string]string{
+		"engagement_id": "eng-1", "tenant_id": "tenant-abc", "legal_entity_id": "entity-xyz", "actor_principal_id": "manager-1",
+	}
+	rawPayload, err := json.Marshal(payload)
+	require.NoError(t, err)
+	msg, err := json.Marshal(map[string]interface{}{
+		"event_type": "audit.engagement.created", "emitted_at": "2026-09-11T10:00:00Z", "schema_version": "1.0",
+		"source_service": "workflow-svc", "correlation_id": "corr-audit-1", "tenant_id": "tenant-abc",
+		"legal_entity_id": "entity-xyz", "actor_id": "manager-1", "payload": json.RawMessage(rawPayload),
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, c.Handle(context.Background(), "evt-audit-001", msg))
+	stored, ok := s.Get("evt-audit-001")
+	require.True(t, ok)
+	assert.Equal(t, "audit.engagement.created", stored.EventType)
+	assert.Equal(t, "tenant-abc", stored.TenantID)
+	assert.Equal(t, "entity-xyz", stored.LegalEntityID)
+	assert.Equal(t, "manager-1", stored.PrincipalID)
+	assert.Equal(t, "corr-audit-1", stored.CorrelationID)
+}
+
+func TestAuditEngagementEventRejectsScopeMismatch(t *testing.T) {
+	s := store.NewFakeStore()
+	c := newConsumer(t, s)
+	rawPayload, err := json.Marshal(map[string]string{
+		"engagement_id": "eng-1", "tenant_id": "tenant-abc", "legal_entity_id": "entity-xyz", "actor_principal_id": "manager-1",
+	})
+	require.NoError(t, err)
+	msg, err := json.Marshal(map[string]interface{}{
+		"event_type": "audit.engagement.created", "emitted_at": "2026-09-11T10:00:00Z", "schema_version": "1.0",
+		"source_service": "workflow-svc", "correlation_id": "corr-audit-1", "tenant_id": "other-tenant",
+		"legal_entity_id": "entity-xyz", "actor_id": "manager-1", "payload": json.RawMessage(rawPayload),
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, c.Handle(context.Background(), "evt-audit-mismatch", msg))
+	assert.Equal(t, 0, s.Count())
+}
+
 // ─── Test 5: valid ContextResolved is stored with correct fields ─────────────
 
 // TestContextResolvedStoredCorrectly verifies that a well-formed

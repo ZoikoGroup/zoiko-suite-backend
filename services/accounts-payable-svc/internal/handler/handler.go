@@ -254,7 +254,6 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishVendorInvoiceReceived(r.Context(), *inv)
 	writeJSON(w, http.StatusCreated, inv)
 }
 
@@ -395,7 +394,6 @@ func (h *Handler) ValidateInvoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	h.publisher.PublishVendorInvoiceValidated(r.Context(), *inv)
 	writeJSON(w, http.StatusOK, inv)
 }
 
@@ -457,8 +455,6 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	h.publisher.PublishVendorInvoiceApproved(r.Context(), *inv)
-
 	if payable, err := h.payables.CreatePayableFromApprovedSource(r.Context(), inv.TenantID, principalID, payableopenitem.CreatePayableRequest{
 		LegalEntityID: inv.LegalEntityID, SourceType: payableopenitem.SourceSupplierInvoice, SourceReference: inv.InvoiceID,
 		PayeeRef: inv.VendorID, OriginalAmount: inv.Amount, Currency: inv.CurrencyCode, DueDate: inv.DueDate,
@@ -537,7 +533,6 @@ func (h *Handler) RequestPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	h.publisher.PublishPaymentRequested(r.Context(), *inv)
 	writeJSON(w, http.StatusOK, inv)
 }
 

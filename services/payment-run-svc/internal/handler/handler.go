@@ -169,7 +169,8 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		instructions = append(instructions, domain.RunInstruction{
-			AuthorizationID: a.AuthorizationID, PayeeRef: a.PayeeRef, NetAmount: a.NetAmount, Currency: a.Currency,
+			AuthorizationID: a.AuthorizationID, AuthorizationFingerprint: a.ProposalFingerprint,
+			PayeeRef: a.PayeeRef, NetAmount: a.NetAmount, Currency: a.Currency,
 		})
 	}
 
@@ -358,6 +359,12 @@ func (h *Handler) submitInstructionToBanking(ctx context.Context, tenantID, prin
 		Amount:          ins.NetAmount,
 		Currency:        ins.Currency,
 		ExecutionDate:   run.ValueDate,
+		// Wave 11a: the real fingerprint captured from payment-authorization-svc
+		// at CreateRun time, plus which service BNK-06 should re-verify it
+		// against — never a caller-invented value.
+		AuthorizationID:          ins.AuthorizationID,
+		AuthorizationFingerprint: ins.AuthorizationFingerprint,
+		AuthorizationSource:      "PAYMENT_AUTHORIZATION_SVC",
 		// AP-09/AP-10 already treat the paying bank account reference as
 		// opaque (no real account-status source exists anywhere in this
 		// codebase) — this asserts the same caller-attestation gate BNK-06

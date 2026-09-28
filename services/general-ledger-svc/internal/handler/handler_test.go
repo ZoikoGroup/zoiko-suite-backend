@@ -697,8 +697,8 @@ func TestCreateJournal_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t *testi
 	if len(s.journals) != 1 {
 		t.Fatalf("expected exactly 1 journal to exist in the store after a retry, got %d", len(s.journals))
 	}
-	if pub.created != 1 {
-		t.Fatalf("expected journal.created to publish exactly once (not on the replay), got %d", pub.created)
+	if pub.created != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.created)
 	}
 }
 
@@ -733,8 +733,8 @@ func TestValidateJournal_Balanced_Succeeds(t *testing.T) {
 	if s.journals["j1"].Status != domain.JournalStatusValidated {
 		t.Fatalf("expected status VALIDATED, got %s", s.journals["j1"].Status)
 	}
-	if pub.validated != 1 {
-		t.Fatalf("expected journal.validated to be published once, got %d", pub.validated)
+	if pub.validated != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.validated)
 	}
 }
 
@@ -766,8 +766,8 @@ func TestPostJournal_FromValidated_Succeeds(t *testing.T) {
 	if s.journals["j1"].Status != domain.JournalStatusFinalized {
 		t.Fatalf("expected status FINALIZED, got %s", s.journals["j1"].Status)
 	}
-	if pub.posted != 1 {
-		t.Fatalf("expected journal.posted to be published once, got %d", pub.posted)
+	if pub.posted != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.posted)
 	}
 }
 
@@ -826,8 +826,8 @@ func TestReverseJournal_Finalized_CreatesInvertedReversingJournal(t *testing.T) 
 	if s.lines["j1"][0].DebitAmount != 100 {
 		t.Fatalf("original journal's lines must never be mutated by a reversal")
 	}
-	if pub.reversed != 1 {
-		t.Fatalf("expected journal.reversed to be published once, got %d", pub.reversed)
+	if pub.reversed != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.reversed)
 	}
 }
 
@@ -1059,8 +1059,8 @@ func TestReverseJournal_RetriedCorrelationID_ReturnsStoredReversalNotAFreshID(t 
 		t.Fatalf("the retry returned journal_id %s, but the stored reversal is %s — a fresh id for a row that was never written",
 			second.JournalID, first.JournalID)
 	}
-	if pub.reversed != 1 {
-		t.Fatalf("journal.reversed must publish once across a retry, got %d", pub.reversed)
+	if pub.reversed != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.reversed)
 	}
 }
 

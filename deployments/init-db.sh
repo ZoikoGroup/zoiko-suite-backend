@@ -73,6 +73,7 @@ capability_registry:capability-registry
 ai_governance:ai-governance
 kill_switch_registry:kill-switch-registry
 retention_registry:retention-registry
+comments_collaboration:comments-collaboration
 privacy_purpose_registry:privacy-purpose-registry
 privacy_consent:privacy-consent
 privacy_decision:privacy-decision

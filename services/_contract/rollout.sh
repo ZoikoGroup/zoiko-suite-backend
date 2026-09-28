@@ -26,7 +26,7 @@ SERVICES_DIR="$PWD/.."
 # built, not an aspiration.
 ENTITY_SCOPED="access-control-svc accounts-payable-svc accounts-receivable-svc \
 anomaly-detection-svc asset-management-svc authorization-svc bank-reconciliation-svc banking-connector-svc \
-benefits-svc board-resolutions-svc carta-svc clause-template-svc commercial-account-svc \
+benefits-svc board-resolutions-svc carta-svc clause-template-svc comments-collaboration-svc commercial-account-svc \
 compensation-svc compliance-risk-scoring-svc compliance-status-svc \
 connectivity-api-bridge-svc consolidation-svc contract-lifecycle-svc \
 corporate-actions-svc corporate-tax-svc counterparty-management-svc decision-support-svc \
@@ -62,7 +62,7 @@ vat-gst-svc vendor-due-diligence-svc withholding-tax-svc workflow-svc workforce-
 # §4 requires purpose_context "for governed sensitive access", and §15 (INV-15)
 # forbids emitting that content into telemetry — capturing WHY it was accessed is
 # what makes the access reviewable afterwards.
-SENSITIVE="document-vault-svc employee-master-svc compensation-svc benefits-svc \
+SENSITIVE="document-vault-svc comments-collaboration-svc employee-master-svc compensation-svc benefits-svc \
 payroll-run-svc payroll-tax-svc payroll-exceptions-svc offboarding-severance-svc \
 leave-absence-svc performance-review-svc employment-contracts-svc carta-svc \
 key-management-svc secret-vault-integration-svc mtls-management-svc \
@@ -153,7 +153,8 @@ for svc in "${targets[@]}"; do
 		continue
 	fi
 	mkdir -p "$dest"
-	cp "$SRC/envelope.go" "$SRC/policy.go" "$SRC/middleware.go" "$SRC/resolver.go" "$SRC/reporter.go" "$dest/"
+	cp "$SRC/envelope.go" "$SRC/policy.go" "$SRC/middleware.go" "$SRC/resolver.go" "$SRC/reporter.go" \
+		"$SRC/reason.go" "$SRC/fingerprint.go" "$SRC/transition.go" "$dest/"
 
 	legal_entity="NotRequired"
 	in_list "$svc" "$ENTITY_SCOPED" && legal_entity="RequiredOnWrite"

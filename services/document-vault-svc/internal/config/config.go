@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type DBConfig struct {
@@ -39,6 +40,22 @@ type Config struct {
 	// field: this service performed no authorization at all, on any route,
 	// including the one that returns document bytes.
 	AuthZServiceURL string
+
+	Kafka KafkaConfig
+}
+
+// KafkaConfig mirrors every other producer in this platform's shape
+// exactly (see accounts-payable-svc/internal/config's own KafkaConfig).
+// No hard startup validation is added here — this service had none before
+// this field existed, and adding a new production-startup failure mode
+// for a config surface that previously didn't exist is a bigger behavior
+// change than BIZ-01's event gap calls for. An empty broker list selects
+// the log-only publisher in cmd/server, same as everywhere else on this
+// platform.
+type KafkaConfig struct {
+	Brokers []string
+	GroupID string
+	Topic   string
 }
 
 func Load() (*Config, error) {
@@ -65,7 +82,25 @@ func Load() (*Config, error) {
 		StorageMasterKeyHex: strEnv("DOCUMENT_VAULT_MASTER_KEY_HEX", ""),
 		TenantRegistryURL:   strEnv("TENANT_REGISTRY_URL", "http://tenant-svc:8081"),
 		AuthZServiceURL:     strEnv("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		Kafka: KafkaConfig{
+			Brokers: splitBrokers(strEnv("KAFKA_BROKERS", "localhost:9092")),
+			GroupID: strEnv("KAFKA_GROUP_ID", "document-vault-svc"),
+			Topic:   strEnv("KAFKA_EVENTS_TOPIC", "zoiko.document-vault.events"),
+		},
 	}, nil
+}
+
+// splitBrokers turns a comma-separated list into addresses, dropping
+// blanks — see accounts-payable-svc/internal/config's identical helper
+// for why an empty string must never become one address.
+func splitBrokers(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func strEnv(key, def string) string {

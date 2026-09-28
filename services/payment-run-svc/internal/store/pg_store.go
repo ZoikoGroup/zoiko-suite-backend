@@ -115,12 +115,12 @@ func scanRun(row pgx.Row) (*domain.PaymentRun, error) {
 }
 
 const instructionColumns = `
-	instruction_id, tenant_id, run_id, authorization_id, payee_ref, net_amount, currency, status, consumed_at,
+	instruction_id, tenant_id, run_id, authorization_id, authorization_fingerprint, payee_ref, net_amount, currency, status, consumed_at,
 	provider_attempt_id, bnk07_payment_id, created_at`
 
 func scanInstruction(row pgx.Row) (*domain.RunInstruction, error) {
 	i := &domain.RunInstruction{}
-	err := row.Scan(&i.InstructionID, &i.TenantID, &i.RunID, &i.AuthorizationID, &i.PayeeRef, &i.NetAmount,
+	err := row.Scan(&i.InstructionID, &i.TenantID, &i.RunID, &i.AuthorizationID, &i.AuthorizationFingerprint, &i.PayeeRef, &i.NetAmount,
 		&i.Currency, &i.Status, &i.ConsumedAt, &i.ProviderAttemptID, &i.Bnk07PaymentID, &i.CreatedAt)
 	if err != nil {
 		return nil, err
@@ -150,9 +150,9 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID string, req domain.Cre
 			id := uuid.New().String()
 			created, err := scanInstruction(tx.QueryRow(ctx, `
 				INSERT INTO run_instructions (`+instructionColumns+`)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', NULL, '', '', NOW())
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', NULL, '', '', NOW())
 				RETURNING `+instructionColumns,
-				id, run.TenantID, runID, ins.AuthorizationID, ins.PayeeRef, ins.NetAmount, ins.Currency,
+				id, run.TenantID, runID, ins.AuthorizationID, ins.AuthorizationFingerprint, ins.PayeeRef, ins.NetAmount, ins.Currency,
 			))
 			if err != nil {
 				return err

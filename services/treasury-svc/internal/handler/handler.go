@@ -17,7 +17,7 @@ import (
 
 // Store defines persistence contract for treasury service.
 type Store interface {
-	CreateBankAccount(ctx context.Context, acct *domain.BankAccount) error
+	CreateBankAccount(ctx context.Context, acct *domain.BankAccount) (created bool, err error)
 	GetBankAccount(ctx context.Context, bankAccountID string) (*domain.BankAccount, error)
 	ListBankAccounts(ctx context.Context, legalEntityID string) ([]domain.BankAccount, error)
 	UpdateBankAccountStatus(ctx context.Context, bankAccountID, status string) error
@@ -25,7 +25,58 @@ type Store interface {
 	GetLatestCashBalance(ctx context.Context, bankAccountID string) (*domain.CashBalance, error)
 	SetLiquidityThreshold(ctx context.Context, threshold *domain.LiquidityThreshold) error
 	GetLiquidityThreshold(ctx context.Context, legalEntityID, currencyCode string) (*domain.LiquidityThreshold, error)
-	ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) (created bool, err error)
+
+	// BNK-09 — see internal/store/bnk09_store.go's own doc comments. The
+	// old ExecuteTransfer (two internal cash_balances rows, no external
+	// consequence) is removed and replaced wholesale by this real
+	// maker-checker flow.
+	CreateTreasuryTransfer(ctx context.Context, p domain.CreateTreasuryTransferParams) (*domain.TreasuryTransfer, bool, error)
+	GetTreasuryTransfer(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error)
+	ListTransfers(ctx context.Context, p domain.ListTransfersParams) ([]domain.TreasuryTransfer, error)
+	ApproveTreasuryTransfer(ctx context.Context, p domain.ApproveTreasuryTransferParams) (*domain.TreasuryTransfer, error)
+	AuthorizeTreasuryTransfer(ctx context.Context, p domain.AuthorizeTreasuryTransferParams) (*domain.TreasuryTransfer, error)
+	RejectTreasuryTransfer(ctx context.Context, p domain.RejectTreasuryTransferParams) (*domain.TreasuryTransfer, error)
+	MarkTransferSubmitted(ctx context.Context, tenantID, transferID, paymentAttemptID string) (*domain.TreasuryTransfer, error)
+	MarkTransferLedgerPosted(ctx context.Context, tenantID, transferID, sourceJournalID string) (*domain.TreasuryTransfer, error)
+	MarkTransferIntercompanyPaired(ctx context.Context, tenantID, transferID, intercompanyEntryID string) (*domain.TreasuryTransfer, error)
+	MarkTransferCompleted(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error)
+	AmendTreasuryTransfer(ctx context.Context, p domain.AmendTreasuryTransferParams) (*domain.TreasuryTransfer, error)
+	SubmitTransferForApproval(ctx context.Context, p domain.SubmitTransferForApprovalParams) (*domain.TreasuryTransfer, error)
+	CancelBeforeSubmission(ctx context.Context, p domain.CancelBeforeSubmissionParams) (*domain.TreasuryTransfer, error)
+	MarkTransferReturned(ctx context.Context, p domain.MarkTransferReturnedParams) (*domain.TreasuryTransfer, error)
+	ResolveTreasuryTransfer(ctx context.Context, p domain.ResolveTreasuryTransferParams) (*domain.TreasuryTransfer, error)
+
+	// BNK-10 — see internal/store/bnk10_store.go's own doc comments.
+	RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error)
+	GetLatestFXRate(ctx context.Context, tenantID, currencyPair string) (*domain.FXRate, error)
+	CreateFXExposureSnapshot(ctx context.Context, p domain.CalculateFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error)
+	GetFXExposureSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.FXExposureSnapshot, error)
+	GetLatestFXExposure(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string) (*domain.FXExposureSnapshot, error)
+	GetFXExposureAsOf(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, asOf time.Time) (*domain.FXExposureSnapshot, error)
+	PublishFXExposureSnapshot(ctx context.Context, p domain.PublishFXExposureParams) (*domain.FXExposureSnapshot, error)
+	SupersedeFXExposureSnapshot(ctx context.Context, p domain.SupersedeFXExposureParams) (*domain.FXExposureSnapshot, error)
+	ListFXCurrencyBreakdown(ctx context.Context, tenantID, legalEntityID string) ([]domain.FXExposureSnapshot, error)
+
+	// BNK-08 — see internal/store/bnk08_store.go's own doc comments.
+	CreateCashPositionSnapshot(ctx context.Context, p domain.CalculateCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error)
+	GetCashPositionSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.CashPositionSnapshot, error)
+	GetLatestCashPosition(ctx context.Context, tenantID, legalEntityID, reportingCurrency string) (*domain.CashPositionSnapshot, error)
+	GetCashPositionAsOf(ctx context.Context, tenantID, legalEntityID, reportingCurrency string, asOf time.Time) (*domain.CashPositionSnapshot, error)
+	ListCurrencyBreakdown(ctx context.Context, tenantID, legalEntityID string) ([]domain.CashPositionSnapshot, error)
+	PublishCashPositionSnapshot(ctx context.Context, p domain.PublishCashPositionParams) (*domain.CashPositionSnapshot, error)
+	SupersedeCashPositionSnapshot(ctx context.Context, p domain.SupersedeCashPositionParams) (*domain.CashPositionSnapshot, error)
+
+	// BNK-01 — see internal/store/bnk01_store.go's own doc comments.
+	VerifyBankAccountOwnership(ctx context.Context, p domain.VerifyOwnershipParams) (*domain.OwnershipEvidence, error)
+	ListOwnershipEvidence(ctx context.Context, tenantID, bankAccountID string) ([]domain.OwnershipEvidence, error)
+	IsOwnershipVerified(ctx context.Context, tenantID, bankAccountID string) (bool, error)
+	AmendBankAccountMetadata(ctx context.Context, p domain.AmendBankAccountMetadataParams) (*domain.BankAccount, error)
+	ChangeOperationalUse(ctx context.Context, p domain.ChangeOperationalUseParams) (*domain.BankAccount, error)
+	SuspendBankAccount(ctx context.Context, p domain.SuspendAccountParams) (*domain.BankAccount, error)
+	ReactivateBankAccount(ctx context.Context, p domain.ReactivateAccountParams) (*domain.BankAccount, error)
+	CloseBankAccount(ctx context.Context, p domain.CloseAccountParams) (*domain.BankAccount, error)
+	RotateAccountIdentifierToken(ctx context.Context, p domain.RotateAccountTokenParams) (*domain.BankAccount, error)
+	GetBankAccountAsOf(ctx context.Context, tenantID, bankAccountID string, asOf time.Time) (*domain.AccountHistoryEntry, error)
 }
 
 // Publisher defines Kafka event publication contract.
@@ -33,6 +84,41 @@ type Publisher interface {
 	PublishCashPositionUpdated(ctx context.Context, correlationID, legalEntityID, actorID string, balance domain.CashBalance)
 	PublishEffectiveCashUpdated(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse)
 	PublishLiquidityThresholdBreached(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse)
+
+	// BNK-01 domain events — see internal/events/publisher.go's own doc
+	// comments. Previously this service published nothing at all for the
+	// bank-account lifecycle.
+	PublishBankAccountCreated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountOwnershipVerified(ctx context.Context, correlationID, actorID string, acct domain.BankAccount, evidence domain.OwnershipEvidence)
+	PublishBankAccountMetadataAmended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountOperationalUseChanged(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountSuspended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountReactivated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountClosed(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountTokenRotated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+
+	// BNK-09 events — see internal/events/publisher.go's own doc comments.
+	// Every doc-named TreasuryTransfer* event is now covered, plus the
+	// non-doc-listed Cancelled (a documented spec-inconsistency judgment
+	// call, not a silent guess — see PublishTreasuryTransferCancelled).
+	PublishTreasuryTransferCreated(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferApproved(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferAuthorized(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferSubmitted(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferSettled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferRejected(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferReturned(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferCancelled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+
+	// BNK-08 events — see internal/events/publisher.go's own doc comments.
+	PublishCashPositionCalculated(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot)
+	PublishCashPositionPublished(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot)
+	PublishCashPositionBecameStale(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot)
+
+	// BNK-10 events — see internal/events/publisher.go's own doc comments.
+	PublishFXExposureCalculated(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot)
+	PublishFXExposurePublished(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot)
+	PublishFXExposureBecameStale(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot)
 }
 
 // AuthZClient defines authorization plane contract.
@@ -48,28 +134,73 @@ type Clients interface {
 	GetLiquidityForecastData(ctx context.Context, tenantID, legalEntityID, currencyCode string) ([]domain.ExpectedCashFlow, []domain.ExpectedCashFlow, error)
 }
 
+// TransferClients defines BNK-09's outbound calls to
+// payment-initiation-adapter-svc, general-ledger-svc and
+// intercompany-accounting-svc — see internal/clients/bnk09_clients.go.
+type TransferClients interface {
+	SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef, fingerprint string, amount float64, currency string) (string, error)
+	PostTreasuryTransferJournal(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, fiscalPeriod, transferID string, amount float64) (string, error)
+	PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount float64, currencyCode string) (string, error)
+}
+
+// BankingConnector is BNK-01's read-only dependency on banking-connector-svc
+// for ListConnectionOptions (Wave 10d) — optional (nil is a valid value,
+// same convention as bank-reconciliation-svc's own optional banking
+// client): a deployment that hasn't wired banking-connector-svc's URL yet
+// simply can't serve this one query, not a startup failure.
+type BankingConnector interface {
+	ListConnectionOptions(ctx context.Context, tenantID, legalEntityID, bankAccountID, correlationID string) ([]domain.ConnectionOption, error)
+}
+
 const (
 	actionRegisterAccount  = "TREASURY_ACCOUNT_REGISTER"
 	actionSetThreshold     = "TREASURY_THRESHOLD_SET"
 	actionInitiateTransfer = "TREASURY_TRANSFER_INITIATE"
+	actionApproveTransfer  = "TREASURY_TRANSFER_APPROVE"
+	// actionAuthorizeTransfer gates AuthorizeTreasuryTransfer — the doc's
+	// "treasury.transfer.authorize" permission, distinct from approve.
+	actionAuthorizeTransfer = "TREASURY_TRANSFER_AUTHORIZE"
+	actionExecuteTransfer  = "TREASURY_TRANSFER_EXECUTE"
+	// actionModifyTransfer gates Amend/SubmitForApproval/CancelBeforeSubmission
+	// — the maker-only commands over a not-yet-approved transfer.
+	// actionResolveTransfer gates MarkTransferReturned/ResolveTreasuryTransfer
+	// — operator-facing, post-submission recovery actions.
+	actionModifyTransfer  = "TREASURY_TRANSFER_MODIFY"
+	actionResolveTransfer = "TREASURY_TRANSFER_RESOLVE"
 	actionViewPositions    = "TREASURY_POSITIONS_VIEW"
+	// actionCalculateCashPosition gates Calculate/RefreshCashPosition —
+	// the doc's own "cash.position.calculate"-equivalent permission.
+	// actionPublishCashPosition gates PublishCashPositionSnapshot only —
+	// the doc lists cash.position.publish as a distinct permission from
+	// calculate/read.
+	actionCalculateCashPosition = "TREASURY_CASH_POSITION_CALCULATE"
+	actionPublishCashPosition   = "TREASURY_CASH_POSITION_PUBLISH"
+	// actionCalculateFXExposure/actionPublishFXExposure mirror the
+	// cash-position pair above — the doc lists fx.exposure.calculate and
+	// fx.exposure.publish as distinct permissions.
+	actionCalculateFXExposure = "TREASURY_FX_EXPOSURE_CALCULATE"
+	actionPublishFXExposure   = "TREASURY_FX_EXPOSURE_PUBLISH"
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	clients   Clients
-	log       *zap.Logger
+	store           Store
+	publisher       Publisher
+	authz           AuthZClient
+	clients         Clients
+	transferClients TransferClients
+	banking         BankingConnector
+	log             *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, log *zap.Logger) *Handler {
+func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, transferClients TransferClients, banking BankingConnector, log *zap.Logger) *Handler {
 	return &Handler{
-		store:     store,
-		publisher: publisher,
-		authz:     authz,
-		clients:   clients,
-		log:       log,
+		store:           store,
+		publisher:       publisher,
+		authz:           authz,
+		clients:         clients,
+		transferClients: transferClients,
+		banking:         banking,
+		log:             log,
 	}
 }
 
@@ -77,11 +208,82 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/treasury", func(r chi.Router) {
 		r.Post("/accounts", h.RegisterBankAccount)
 		r.Get("/accounts", h.ListBankAccounts)
+		r.Get("/accounts/{accountID}", h.GetBankAccountByID)
 		r.Get("/positions", h.GetCashPositions)
 		r.Post("/thresholds", h.SetLiquidityThreshold)
 		r.Get("/effective-cash", h.GetEffectiveCash)
 		r.Get("/forecasts", h.GetForecasts)
-		r.Post("/transfers", h.InitiateTransfer)
+
+		// BNK-09 — see internal/handler/bnk09_handler.go.
+		r.Post("/transfers", h.CreateTreasuryTransfer)
+		r.Get("/transfers", h.ListTransfers)
+		r.Get("/transfers/{transferID}", h.GetTreasuryTransfer)
+		r.Get("/transfers/{transferID}/approval", h.GetTransferApproval)
+		r.Get("/transfers/{transferID}/execution", h.GetTransferExecution)
+		r.Get("/transfers/{transferID}/available-actions", h.GetTransferAvailableActions)
+		r.Post("/transfers/{transferID}/approve", h.ApproveTreasuryTransfer)
+		r.Post("/transfers/{transferID}/authorize", h.AuthorizeTreasuryTransfer)
+		r.Post("/transfers/{transferID}/reject", h.RejectTreasuryTransfer)
+		r.Post("/transfers/{transferID}/execute", h.ExecuteTreasuryTransfer)
+		// InitiateTreasuryTransfer is the doc's own name for this same
+		// step — an additive route alias to the identical handler, not a
+		// second implementation to keep in sync.
+		r.Post("/transfers/{transferID}/initiate", h.ExecuteTreasuryTransfer)
+		r.Post("/transfers/{transferID}/amend", h.AmendTreasuryTransfer)
+		r.Post("/transfers/{transferID}/submit-for-approval", h.SubmitTransferForApproval)
+		r.Post("/transfers/{transferID}/cancel", h.CancelBeforeSubmission)
+		r.Post("/transfers/{transferID}/mark-returned", h.MarkTransferReturned)
+		r.Post("/transfers/{transferID}/resolve", h.ResolveTreasuryTransfer)
+		// Wave 11b — the live fingerprint payment-initiation-adapter-svc
+		// re-fetches to verify a BNK-09-originated PrepareAttempt, same
+		// idiom as payment-authorization-svc's own GET /authorizations/{id}.
+		r.Get("/transfers/{transferID}/fingerprint", h.GetTreasuryTransferFingerprint)
+
+		// BNK-10 — see internal/handler/bnk10_handler.go.
+		r.Post("/fx/rates", h.RecordFXRate)
+		r.Get("/fx/exposure", h.GetFXExposure)
+		r.Post("/fx/scenario", h.RunFXScenario)
+		r.Post("/fx/exposure-snapshot/calculate", h.CalculateFXExposure)
+		r.Post("/fx/exposure-snapshot/refresh", h.RefreshFXExposure)
+		r.Post("/fx/exposure-snapshot/{snapshotID}/publish", h.PublishFXExposureSnapshot)
+		r.Post("/fx/exposure-snapshot/{snapshotID}/supersede", h.SupersedeFXExposureSnapshot)
+		r.Get("/fx/exposure-snapshot", h.GetFXExposureSnapshotLatest)
+		r.Get("/fx/exposure-snapshot/as-of", h.GetFXExposureSnapshotAsOf)
+		r.Get("/fx/exposure-snapshot/currency-breakdown", h.GetFXCurrencyBreakdown)
+		r.Get("/fx/exposure-snapshot/maturity-profile", h.GetMaturityProfile)
+		r.Get("/fx/exposure-snapshot/{snapshotID}/lineage", h.GetSourceLineage)
+		// GetScenario (doc query): no separate route exists — RunFXScenario
+		// (POST /fx/scenario) already returns the full computed scenario
+		// response synchronously, and scenario outputs are explicitly never
+		// persisted ("scenario outputs remain analytical and separate from
+		// approved treasury actions"). There is nothing stored to GET
+		// later; inventing a persisted-scenario retrieval would contradict
+		// that explicit doc constraint rather than fill a real gap.
+
+		// BNK-01 — see internal/handler/bnk01_handler.go.
+		r.Post("/accounts/{accountID}/verify-ownership", h.VerifyBankAccountOwnership)
+		r.Get("/accounts/{accountID}/ownership-evidence", h.GetOwnershipEvidence)
+		r.Post("/accounts/{accountID}/amend-metadata", h.AmendBankAccountMetadata)
+		r.Post("/accounts/{accountID}/change-operational-use", h.ChangeOperationalUse)
+		r.Post("/accounts/{accountID}/suspend", h.SuspendBankAccount)
+		r.Post("/accounts/{accountID}/reactivate", h.ReactivateBankAccount)
+		r.Post("/accounts/{accountID}/close", h.CloseBankAccount)
+		r.Post("/accounts/{accountID}/rotate-token", h.RotateAccountIdentifierToken)
+		r.Get("/accounts/{accountID}/as-of", h.GetBankAccountAsOf)
+		r.Get("/accounts/{accountID}/masked", h.GetBankAccountMasked)
+		r.Get("/accounts/{accountID}/available-actions", h.GetAvailableActions)
+		r.Get("/accounts/{accountID}/connection-options", h.ListConnectionOptions)
+
+		// BNK-08 — see internal/handler/bnk08_handler.go.
+		r.Post("/cash-position/calculate", h.CalculateCashPosition)
+		r.Post("/cash-position/refresh", h.RefreshCashPosition)
+		r.Post("/cash-position/{snapshotID}/publish", h.PublishCashPositionSnapshot)
+		r.Post("/cash-position/{snapshotID}/supersede", h.SupersedeCashPositionSnapshot)
+		r.Get("/cash-position", h.GetCashPosition)
+		r.Get("/cash-position/as-of", h.GetCashPositionAsOf)
+		r.Get("/cash-position/{snapshotID}/freshness", h.GetSourceFreshness)
+		r.Get("/cash-position/{snapshotID}/drilldown", h.GetAccountDrilldown)
+		r.Get("/cash-position/currency-breakdown", h.GetCurrencyBreakdown)
 	})
 }
 
@@ -111,19 +313,32 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	acct := &domain.BankAccount{
-		BankAccountID:       uuid.New().String(),
-		TenantID:            tenantID,
-		LegalEntityID:       req.LegalEntityID,
-		AccountName:         req.AccountName,
-		MaskedAccountNumber: req.MaskedAccountNumber,
-		BankIdentifier:      req.BankIdentifier,
-		CurrencyCode:        req.CurrencyCode,
-		AccountStatus:       "ACTIVE",
+		BankAccountID:           uuid.New().String(),
+		TenantID:                tenantID,
+		LegalEntityID:           req.LegalEntityID,
+		AccountName:             req.AccountName,
+		MaskedAccountNumber:     req.MaskedAccountNumber,
+		BankIdentifier:          req.BankIdentifier,
+		CurrencyCode:            req.CurrencyCode,
+		AccountStatus:           "ACTIVE",
+		BranchRef:               req.BranchRef,
+		Country:                 req.Country,
+		AccountType:             req.AccountType,
+		RequestedOperationalUse: req.RequestedOperationalUse,
+		CorrelationID:           req.CorrelationID,
+		CreatedByPrincipalID:    principalID,
 	}
 
-	if err := h.store.CreateBankAccount(r.Context(), acct); err != nil {
+	created, err := h.store.CreateBankAccount(r.Context(), acct)
+	if err != nil {
 		h.log.Error("failed to create bank account", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+		return
+	}
+	if !created {
+		// Replay of a prior request with the same correlation_id — return
+		// the original account, don't re-initialize its balance trace.
+		writeJSON(w, http.StatusOK, acct)
 		return
 	}
 
@@ -139,6 +354,7 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = h.store.CreateCashBalance(r.Context(), bal)
 
+	h.publisher.PublishBankAccountCreated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *acct)
 	writeJSON(w, http.StatusCreated, acct)
 }
 
@@ -280,14 +496,34 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// oldestBankBalanceAsOf tracks the LEAST recent as_of_timestamp across
+	// every account composed into bankSum — the position as a whole is
+	// only as fresh as its stalest contributing account, so a single
+	// out-of-date account is enough to flag the composed figure.
 	var bankSum float64
+	var oldestBankBalanceAsOf time.Time
+	var haveBankBalance bool
 	for _, acct := range accts {
 		if acct.CurrencyCode == currencyCode && acct.AccountStatus == "ACTIVE" {
 			bal, err := h.store.GetLatestCashBalance(r.Context(), acct.BankAccountID)
 			if err == nil && bal != nil {
 				bankSum += bal.AvailableBalance
+				if !haveBankBalance || bal.AsOfTimestamp.Before(oldestBankBalanceAsOf) {
+					oldestBankBalanceAsOf = bal.AsOfTimestamp
+				}
+				haveBankBalance = true
 			}
 		}
+	}
+	// Flagged, not blocked: unlike AP/obligations being fully unreachable
+	// (nothing to show at all, so this handler fails closed), a stale
+	// bank balance is real data that's merely old — the doc's rule is
+	// "never show it AS CURRENT," which HasStaleComponent/IsStale below
+	// satisfies by labeling it, not by withholding the whole response.
+	bankBalanceStale := haveBankBalance && time.Since(oldestBankBalanceAsOf) > domain.BankBalanceStalenessThreshold
+	if bankBalanceStale {
+		h.log.Warn("effective cash: bank balance component is stale",
+			zap.String("legal_entity_id", legalEntityID), zap.Time("oldest_as_of", oldestBankBalanceAsOf))
 	}
 
 	// 2. Pending AP Commitments — fail closed: if AP is unavailable the figure is
@@ -322,6 +558,17 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	now := time.Now().UTC()
+	components := []domain.ComponentFreshness{
+		{Component: "current_bank_balance", AsOfTimestamp: oldestBankBalanceAsOf, StalenessThresholdSeconds: int(domain.BankBalanceStalenessThreshold.Seconds()), IsStale: bankBalanceStale},
+		// AP/obligations are synchronous live queries — see
+		// domain.ComponentFreshness's own doc comment on why they are
+		// always as-of-now and never stale.
+		{Component: "pending_ap_commitments", AsOfTimestamp: now, StalenessThresholdSeconds: 0, IsStale: false},
+		{Component: "payroll_obligations", AsOfTimestamp: now, StalenessThresholdSeconds: 0, IsStale: false},
+		{Component: "tax_liabilities", AsOfTimestamp: now, StalenessThresholdSeconds: 0, IsStale: false},
+	}
+
 	resp := domain.EffectiveCashResponse{
 		TenantID:                 tenantID,
 		LegalEntityID:            legalEntityID,
@@ -332,8 +579,10 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		TaxLiabilities:           taxSum,
 		ReservedPendingApprovals: 0.0,
 		EffectiveAvailableCash:   effectiveCash,
-		AsOfTimestamp:            time.Now().UTC(),
+		AsOfTimestamp:            now,
 		ThresholdDetails:         details,
+		Components:               components,
+		HasStaleComponent:        bankBalanceStale,
 	}
 
 	if details != nil && details.IsBreached {
@@ -345,112 +594,11 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// ── POST /v1/treasury/transfers ──────────────────────────────────────────────────
-
-func (h *Handler) InitiateTransfer(w http.ResponseWriter, r *http.Request) {
-	var req domain.InitiateTransferRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
-		return
-	}
-
-	// BLOCKING FIX #1: Reject non-positive amounts before any account or balance
-	// lookup. A negative amount reverses the transfer direction — draining the
-	// target and crediting the source — bypassing the insufficient-funds check
-	// entirely (srcBal < negativeAmount is trivially false). Zero-amount transfers
-	// are a no-op that must not produce balance records.
-	if req.Amount <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_amount", string(domain.ErrInvalidAmount))
-		return
-	}
-	correlationID := r.Header.Get("X-Correlation-ID")
-	if req.CorrelationID != "" {
-		correlationID = req.CorrelationID
-	}
-	if correlationID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	srcAcct, err := h.store.GetBankAccount(r.Context(), req.SourceBankAccountID)
-	if err != nil || srcAcct == nil {
-		writeError(w, http.StatusNotFound, "source_account_not_found", "")
-		return
-	}
-
-	// Authorize against the source account's legal entity.
-	if err := h.authz.CheckAllowed(r.Context(), principalID, srcAcct.LegalEntityID, actionInitiateTransfer); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-
-	// FIX #3: Also authorize against the TARGET account's legal entity.
-	// A principal authorized over entity A must not be able to move funds into
-	// (or out of, via negative amounts) an entity B account without authorization.
-	tgtAcct, err := h.store.GetBankAccount(r.Context(), req.TargetBankAccountID)
-	if err != nil || tgtAcct == nil {
-		writeError(w, http.StatusNotFound, "target_account_not_found", "")
-		return
-	}
-	if tgtAcct.LegalEntityID != srcAcct.LegalEntityID {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, tgtAcct.LegalEntityID, actionInitiateTransfer); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
-	}
-
-	// FIX #2: Fail CLOSED on liquidity threshold errors (not open).
-	// Every other cross-service check in this codebase fails closed on store error.
-	// If we cannot read the balance or threshold, block the transfer — do not silently
-	// skip the check and allow the transfer to proceed unguarded.
-	bal, balErr := h.store.GetLatestCashBalance(r.Context(), req.SourceBankAccountID)
-	if balErr != nil {
-		h.log.Error("failed to read cash balance for threshold check — failing closed", zap.Error(balErr))
-		writeError(w, http.StatusServiceUnavailable, "balance_check_failed", "cannot verify balance before transfer")
-		return
-	}
-	if bal != nil {
-		threshold, threshErr := h.store.GetLiquidityThreshold(r.Context(), srcAcct.LegalEntityID, req.CurrencyCode)
-		if threshErr != nil {
-			h.log.Error("failed to read liquidity threshold — failing closed", zap.Error(threshErr))
-			writeError(w, http.StatusServiceUnavailable, "threshold_check_failed", "cannot verify liquidity threshold before transfer")
-			return
-		}
-		if threshold != nil && bal.AvailableBalance-req.Amount < threshold.MinimumRequiredBalance {
-			h.log.Warn("transfer blocked: threshold breach on source account", zap.String("account_id", req.SourceBankAccountID))
-			writeError(w, http.StatusPreconditionFailed, "minimum_balance_breach", string(domain.ErrMinimumBalanceBreach))
-			return
-		}
-	}
-
-	created, err := h.store.ExecuteTransfer(r.Context(), req.SourceBankAccountID, req.TargetBankAccountID, req.Amount, req.CurrencyCode, correlationID)
-	if err != nil {
-		h.log.Error("transfer execution failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "transfer_failed", err.Error())
-		return
-	}
-	if !created {
-		// Replay of a prior request with the same correlation_id — the
-		// transfer already happened, do not execute it a second time.
-		writeJSON(w, http.StatusOK, map[string]string{"status": "already_transferred", "correlation_id": correlationID})
-		return
-	}
-
-	// Publish updated balances
-	if balSrc, err := h.store.GetLatestCashBalance(r.Context(), req.SourceBankAccountID); err == nil && balSrc != nil {
-		h.publisher.PublishCashPositionUpdated(r.Context(), correlationID, srcAcct.LegalEntityID, principalID, *balSrc)
-	}
-	if balTgt, err := h.store.GetLatestCashBalance(r.Context(), req.TargetBankAccountID); err == nil && balTgt != nil {
-		h.publisher.PublishCashPositionUpdated(r.Context(), correlationID, tgtAcct.LegalEntityID, principalID, *balTgt)
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "transferred", "correlation_id": correlationID})
-}
+// BNK-09 treasury transfer handlers (CreateTreasuryTransfer,
+// GetTreasuryTransfer, ApproveTreasuryTransfer, RejectTreasuryTransfer,
+// ExecuteTreasuryTransfer) live in internal/handler/bnk09_handler.go —
+// see that file for the real maker-checker flow that replaces the old
+// InitiateTransfer wholesale.
 
 // ── GET /v1/treasury/forecasts ───────────────────────────────────────────────────
 

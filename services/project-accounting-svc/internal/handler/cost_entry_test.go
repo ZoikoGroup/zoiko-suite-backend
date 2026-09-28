@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -37,6 +38,28 @@ func TestCaptureProjectCost_MissingSourceType_Returns400(t *testing.T) {
 	rr := doReq(r, http.MethodPost, "/v1/cost-entries/", req, "capturer-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestCaptureProjectCost_ClosedProject_Returns422 is the real proof of
+// domain-wide negative-path scenario #40, "Closed project accepts new
+// cost without controlled reopen."
+func TestCaptureProjectCost_ClosedProject_Returns422(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createActiveProject(t, r, "le-1", "PRJ-C-CLOSED")
+
+	closeRR := doReq(r, http.MethodPost, "/v1/projects/"+id+"/close", domain.CloseProjectRequest{Reason: "done"}, "manager-1")
+	if closeRR.Code != http.StatusOK {
+		t.Fatalf("close failed: %d %s", closeRR.Code, closeRR.Body.String())
+	}
+
+	req := domain.CaptureProjectCostRequest{
+		ProjectID: id, SourceType: domain.CostSourceTypeAP, SourceReference: "AP-CLOSED-1", Amount: 100, Currency: "USD",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/cost-entries/", req, "capturer-1")
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 project_not_active, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -243,5 +266,81 @@ func TestCertifyCostPopulation_ExcludesReversedEntries(t *testing.T) {
 	}
 	if cert.EntryCount != 2 {
 		t.Fatalf("expected entry_count=2 (AP-12a + the reversal entry; the REVERSED original excluded), got %d", cert.EntryCount)
+	}
+}
+
+// ── GetCostSourceLineage / GetUnallocatedCostExceptions / GetProjectCostAsOf ─
+
+// TestGetCostSourceLineage_ReclassifyOfAReversal proves the recursive walk
+// goes past a single hop, mirroring inventory-management-svc's own
+// GetMovementLineage proof: original -> reversal -> reclassification of
+// the reversal is a real chain of length 3.
+func TestGetCostSourceLineage_ReclassifyOfAReversal(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createActiveProject(t, r, "le-1", "PRJ-C13")
+	original := captureAPCost(t, r, id, "AP-13", 100)
+
+	rev := doReq(r, http.MethodPost, "/v1/cost-entries/"+original.EntryID+"/reverse", domain.ReverseProjectCostRequest{Reason: "wrong amount"}, "reviewer-2")
+	if rev.Code != http.StatusCreated {
+		t.Fatalf("reverse failed: %d %s", rev.Code, rev.Body.String())
+	}
+	var reversal domain.CostEntry
+	_ = json.NewDecoder(rev.Body).Decode(&reversal)
+
+	reclass := doReq(r, http.MethodPost, "/v1/cost-entries/"+reversal.EntryID+"/reclassify", domain.ReclassifyProjectCostRequest{Reason: "correcting category on the reversal", CostCategory: "Travel"}, "reviewer-3")
+	if reclass.Code != http.StatusCreated {
+		t.Fatalf("reclassify failed: %d %s", reclass.Code, reclass.Body.String())
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/cost-entries/"+original.EntryID+"/source-lineage", nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var lineage []domain.CostEntry
+	_ = json.NewDecoder(rr.Body).Decode(&lineage)
+	if len(lineage) != 3 {
+		t.Fatalf("expected lineage of 3 (original, reversal, reclassification), got %d: %+v", len(lineage), lineage)
+	}
+}
+
+func TestGetUnallocatedCostExceptions_OnlyReturnsCaptured(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createActiveProject(t, r, "le-1", "PRJ-C14")
+	captureAPCost(t, r, id, "AP-14a", 100) // stays CAPTURED
+	validated := captureAPCost(t, r, id, "AP-14b", 200)
+	doReq(r, http.MethodPost, "/v1/cost-entries/"+validated.EntryID+"/validate", nil, "reviewer-2")
+
+	rr := doReq(r, http.MethodGet, "/v1/cost-entries/unallocated-exceptions?legal_entity_id=le-1", nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var exceptions []domain.CostEntry
+	_ = json.NewDecoder(rr.Body).Decode(&exceptions)
+	if len(exceptions) != 1 || exceptions[0].SourceReference != "AP-14a" {
+		t.Fatalf("expected only the still-CAPTURED entry, got %+v", exceptions)
+	}
+}
+
+func TestGetProjectCostAsOf_BeforeSecondCapture_ExcludesIt(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createActiveProject(t, r, "le-1", "PRJ-C15")
+	captureAPCost(t, r, id, "AP-15a", 100)
+	cutoff := time.Now().UTC()
+	time.Sleep(10 * time.Millisecond)
+	captureAPCost(t, r, id, "AP-15b", 200)
+
+	rr := doReq(r, http.MethodGet, "/v1/cost-entries/as-of?project_id="+id+"&at="+cutoff.Format(time.RFC3339Nano), nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Entries []domain.CostEntry `json:"entries"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if len(resp.Entries) != 1 || resp.Entries[0].SourceReference != "AP-15a" {
+		t.Fatalf("expected only the entry captured before cutoff, got %+v", resp.Entries)
 	}
 }

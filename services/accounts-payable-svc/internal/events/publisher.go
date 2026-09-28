@@ -110,6 +110,29 @@ func (p *Publisher) PublishPaymentRequested(ctx context.Context, inv domain.Vend
 		})
 }
 
+// PublishOutbox sends a pre-serialized outbox event payload to Kafka with the aggregateID
+// as the message key and X-Event-ID as a header. Kafka errors are returned for retry tracking.
+func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	msg := kafka.Message{
+		Topic: p.topic,
+		Key:   []byte(aggregateID),
+		Value: payload,
+		Headers: []kafka.Header{
+			{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+		},
+	}
+	if err := p.producer.WriteMessages(ctx, msg); err != nil {
+		p.log.Error("failed to publish outbox event to kafka",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.String("topic", p.topic),
+			zap.Error(err),
+		)
+		return fmt.Errorf("kafka write: %w", err)
+	}
+	return nil
+}
+
 // LogOnlyPublisher satisfies the handler's Publisher contract without a broker.
 //
 // Selected only when KAFKA_BROKERS is explicitly empty, which config.validate
@@ -145,6 +168,14 @@ func (p *LogOnlyPublisher) PublishVendorInvoiceApproved(_ context.Context, inv d
 
 func (p *LogOnlyPublisher) PublishPaymentRequested(_ context.Context, inv domain.VendorInvoice) {
 	p.record("payment.requested", inv)
+}
+
+func (p *LogOnlyPublisher) PublishOutbox(_ context.Context, outboxEventID, aggregateID string, _ []byte) error {
+	p.log.Info("outbox event not published (no broker configured)",
+		zap.String("outbox_event_id", outboxEventID),
+		zap.String("aggregate_id", aggregateID),
+	)
+	return nil
 }
 
 func (p *LogOnlyPublisher) record(eventType string, inv domain.VendorInvoice) {

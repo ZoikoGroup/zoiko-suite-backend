@@ -47,6 +47,10 @@ type Store interface {
 	GetAncestorChain(ctx context.Context, locationID string) ([]string, error)
 	ReparentLocation(ctx context.Context, locationID, newParentLocationID, principalID string, at time.Time) error
 	GetParentAsOf(ctx context.Context, locationID string, at time.Time) (*string, error)
+	// GetLocationInventorySummary backs the spec's own
+	// GetLocationInventorySummary query — see
+	// internal/store/movement_store.go's own doc comment.
+	GetLocationInventorySummary(ctx context.Context, locationID string) ([]domain.LocationInventorySummaryLine, error)
 
 	// INV-03 (Inventory Movement) — see internal/store/movement_store.go's
 	// own doc comments for the authority boundary these implement.
@@ -58,6 +62,11 @@ type Store interface {
 	GetOnHand(ctx context.Context, itemID, locationID string) (float64, error)
 	GetOnHandAsOf(ctx context.Context, itemID, locationID string, at time.Time) (float64, error)
 	CreateCorrectionMovement(ctx context.Context, originalMovementID, principalID, reason string, isSupersede bool, newMovementID string, at time.Time) (*domain.InventoryMovement, error)
+	// GetMovementLineage and GetMovementChain back the spec's own queries
+	// of the same names — see internal/store/movement_store.go's own doc
+	// comments.
+	GetMovementLineage(ctx context.Context, movementID string) ([]domain.InventoryMovement, error)
+	GetMovementChain(ctx context.Context, movementID string) ([]domain.InventoryMovement, error)
 	// GetNegativeOnHandCount backs GET /v1/on-hand/negative-count — see
 	// internal/store/movement_store.go's own doc comment. Serves the
 	// AST/INV/PRJ domain spec's own §9 "Inventory quantity" assertion.
@@ -65,7 +74,7 @@ type Store interface {
 
 	// INV-04 (Inventory Valuation) — see internal/store/valuation_store.go's
 	// own doc comments for the authority boundary these implement.
-	ValueMovement(ctx context.Context, movementID, principalID string, unitCost *float64, at time.Time) (*domain.ValuationEntry, error)
+	ValueMovement(ctx context.Context, movementID, principalID string, unitCost *float64, at time.Time) (*domain.ValuationEntry, *domain.CostLayer, error)
 	GetValuationEntry(ctx context.Context, entryID string) (*domain.ValuationEntry, error)
 	GetInventoryValue(ctx context.Context, itemID, locationID string) (float64, error)
 	// GetInventoryValueTotal backs GET /v1/valuation/inventory-value-total
@@ -74,6 +83,11 @@ type Store interface {
 	// assertion.
 	GetInventoryValueTotal(ctx context.Context, legalEntityID string) (float64, error)
 	GetCostLayers(ctx context.Context, itemID, locationID string) ([]domain.CostLayer, error)
+	// GetLayerConsumptions and GetInventoryValueAsOf back the spec's own
+	// GetCOGSAssignment and GetInventoryValueAsOf queries — see
+	// internal/store/valuation_store.go's own doc comments.
+	GetLayerConsumptions(ctx context.Context, valuationEntryID string) ([]domain.LayerConsumption, error)
+	GetInventoryValueAsOf(ctx context.Context, itemID, locationID string, asOf time.Time) (float64, error)
 	CreateValuationRun(ctx context.Context, r *domain.ValuationRun) (frozenCount int, err error)
 	GetValuationRun(ctx context.Context, runID string) (*domain.ValuationRun, error)
 	MarkValuationRunEmitted(ctx context.Context, runID, principalID, journalID string, at time.Time) error
@@ -100,6 +114,24 @@ type Store interface {
 	// AST/INV/PRJ domain spec's own §9 "Stock count" assertion.
 	GetUnapprovedVarianceCount(ctx context.Context, legalEntityID, fiscalPeriod string) (int, error)
 	CancelStockCount(ctx context.Context, countID, principalID, reason string, at time.Time) error
+
+	// BIZ-07 (Product & Service Catalog) — see
+	// internal/store/catalog_store.go's own doc comments for the
+	// authority boundary these implement.
+	CreateOffering(ctx context.Context, o *domain.Offering, v *domain.OfferingVersion, variants []domain.CatalogVariantInput) error
+	GetOffering(ctx context.Context, offeringID string) (*domain.Offering, error)
+	GetOfferingVersion(ctx context.Context, versionID string) (*domain.OfferingVersion, error)
+	GetCurrentOfferingVersion(ctx context.Context, offeringID string) (*domain.OfferingVersion, error)
+	CreateVersion(ctx context.Context, v *domain.OfferingVersion, variants []domain.CatalogVariantInput) error
+	ApproveOfferingVersion(ctx context.Context, versionID, principalID string, at time.Time) error
+	ActivateOfferingVersion(ctx context.Context, offeringID, versionID, principalID string, at time.Time) (supersededVersionID *string, err error)
+	SuspendOfferingVersion(ctx context.Context, versionID, principalID, reason string, at time.Time) error
+	RetireOfferingVersion(ctx context.Context, versionID, principalID, reason string, at time.Time) error
+	GetVersionAsOf(ctx context.Context, offeringID string, at time.Time) (*domain.OfferingVersion, error)
+	SearchCatalog(ctx context.Context, legalEntityID, category string) ([]domain.Offering, error)
+	ListVariants(ctx context.Context, versionID string) ([]domain.CatalogVariant, error)
+	LinkMapping(ctx context.Context, m *domain.CatalogMapping) error
+	GetMappings(ctx context.Context, versionID string) ([]domain.CatalogMapping, error)
 }
 
 // InventoryLedgerClient is INV-04's own real "ACC-04" dependency — see
@@ -143,26 +175,37 @@ type Publisher interface {
 	PublishInventoryTransferred(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
 	PublishInventoryReceived(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
 	PublishInventoryIssued(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
+	PublishInventoryMovementExceptionRaised(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, movementID, reasonCode string)
 
-	// INV-04 (Inventory Valuation) — the spec's own named Events (a
-	// subset — "CostLayerCreated" is not wired in; stated honestly in the
-	// findings doc): "InventoryValued; InventoryWriteDownRecorded;
-	// InventoryWriteDownReversed; InventoryAccountingEventEmitted."
+	// INV-04 (Inventory Valuation) — the spec's own named Events:
+	// "InventoryValued; InventoryWriteDownRecorded;
+	// InventoryWriteDownReversed; InventoryAccountingEventEmitted;
+	// CostLayerCreated."
 	PublishInventoryValued(ctx context.Context, correlationID, actorID, tenantID string, e domain.ValuationEntry)
 	PublishInventoryWriteDownRecorded(ctx context.Context, correlationID, actorID, tenantID string, w domain.WriteDown)
 	PublishInventoryWriteDownReversed(ctx context.Context, correlationID, actorID, tenantID string, w domain.WriteDown)
 	PublishInventoryAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID, journalID string)
+	PublishCostLayerCreated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, l domain.CostLayer)
 
-	// INV-05 (Stock Count) — the spec's own named Events (a subset —
-	// "StockCountVarianceDetected" is not wired in; stated honestly in
-	// the findings doc): "StockCountStarted; StockCountPopulationFrozen;
-	// StockCountVarianceApproved; StockCountAdjustmentRequested;
-	// StockCountCertified."
+	// INV-05 (Stock Count) — the spec's own named Events: "StockCountStarted;
+	// StockCountPopulationFrozen; StockCountVarianceApproved;
+	// StockCountAdjustmentRequested; StockCountCertified;
+	// StockCountVarianceDetected."
 	PublishStockCountStarted(ctx context.Context, correlationID, actorID, tenantID string, sc domain.StockCount)
 	PublishStockCountPopulationFrozen(ctx context.Context, correlationID, actorID, tenantID, countID string, frozenCount int)
 	PublishStockCountVarianceApproved(ctx context.Context, correlationID, actorID, tenantID, lineID string)
 	PublishStockCountAdjustmentRequested(ctx context.Context, correlationID, actorID, tenantID, lineID, movementID string)
 	PublishStockCountCertified(ctx context.Context, correlationID, actorID, tenantID string, sc domain.StockCount)
+	PublishStockCountVarianceDetected(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, lineID string, systemQuantity, observedQuantity float64)
+
+	// BIZ-07 (Product & Service Catalog) — the spec's own named Events:
+	// "OfferingCreated; OfferingActivated; OfferingSuspended;
+	// OfferingRetired; OfferingVersionSuperseded."
+	PublishOfferingCreated(ctx context.Context, correlationID, actorID string, o domain.Offering, v domain.OfferingVersion)
+	PublishOfferingActivated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
+	PublishOfferingSuspended(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
+	PublishOfferingRetired(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion)
+	PublishOfferingVersionSuperseded(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, offeringID, versionID string)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -219,6 +262,19 @@ const (
 	actionInventoryCountRecord  = "INVENTORY_COUNT_RECORD"
 	actionInventoryCountApprove = "INVENTORY_COUNT_APPROVE"
 	actionInventoryCountCertify = "INVENTORY_COUNT_CERTIFY"
+
+	// BIZ-07 (Product & Service Catalog) actions — no dedicated
+	// Permissions field is quoted verbatim in the doc's BIZ-07 section, so
+	// this platform's own CATALOG_* namespace convention is used, mirroring
+	// the shape every other domain in this service already follows.
+	// actionCatalogMappingLink is deliberately distinct from
+	// actionCatalogManage — the doc's own authorization note: "Product/
+	// business owner + specialist review for tax/accounting/legal
+	// mappings."
+	actionCatalogRead        = "CATALOG_READ"
+	actionCatalogManage      = "CATALOG_MANAGE"
+	actionCatalogApprove     = "CATALOG_APPROVE"
+	actionCatalogMappingLink = "CATALOG_MAPPING_LINK"
 )
 
 type Handler struct {
@@ -282,6 +338,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/retire", h.RetireLocation)
 		r.Get("/{id}/hierarchy", h.GetLocationHierarchy)
 		r.Get("/{id}/as-of", h.GetLocationAsOf)
+		r.Get("/{id}/inventory-summary", h.GetLocationInventorySummary)
 	})
 	r.Route("/v1/movements", func(r chi.Router) {
 		r.Post("/", h.CreateInventoryMovement)
@@ -295,14 +352,19 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/commit", h.CommitMovement)
 		r.Post("/{id}/reverse", h.ReverseMovement)
 		r.Post("/{id}/supersede", h.SupersedeMovement)
+		r.Get("/{id}/lineage", h.GetMovementLineage)
+		r.Get("/{id}/chain", h.GetMovementChain)
 	})
 	r.Get("/v1/on-hand", h.GetOnHand)
 	r.Get("/v1/on-hand/negative-count", h.GetNegativeOnHandCount)
 	r.Route("/v1/valuation", func(r chi.Router) {
 		r.Post("/movements/{movementID}/value", h.ValueMovement)
 		r.Get("/entries/{id}", h.GetValuationEntry)
+		r.Get("/entries/{id}/cogs-assignment", h.GetCOGSAssignment)
+		r.Get("/entries/{id}/evidence", h.GetValuationEvidence)
 		r.Get("/inventory-value", h.GetInventoryValue)
 		r.Get("/inventory-value-total", h.GetInventoryValueTotal)
+		r.Get("/inventory-value-as-of", h.GetInventoryValueAsOf)
 		r.Get("/cost-layers", h.GetCostLayers)
 		r.Route("/runs", func(r chi.Router) {
 			r.Post("/", h.CreateValuationRun)
@@ -319,16 +381,37 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.CreateStockCount)
 		r.Get("/unapproved-variance-count", h.GetUnapprovedVarianceCount)
 		r.Get("/{id}", h.GetStockCount)
+		r.Get("/{id}/variance-report", h.GetVarianceReport)
+		r.Get("/{id}/snapshot", h.GetCountSnapshot)
+		r.Get("/{id}/adjustment-status", h.GetAdjustmentStatus)
 		r.Post("/{id}/freeze", h.FreezeCountPopulation)
 		r.Post("/{id}/certify", h.CertifyStockCount)
 		r.Post("/{id}/cancel", h.CancelStockCount)
 		r.Post("/{id}/generate-adjustments", h.GenerateAdjustmentMovements)
 		r.Route("/lines/{lineID}", func(r chi.Router) {
 			r.Get("/", h.GetCountLine)
+			r.Get("/evidence", h.GetCountEvidence)
 			r.Post("/assign-counter", h.AssignCounter)
 			r.Post("/record-count", h.RecordBlindCount)
 			r.Post("/request-recount", h.RequestRecount)
 			r.Post("/approve-variance", h.ApproveCountVariance)
+		})
+	})
+	r.Route("/v1/catalog/offerings", func(r chi.Router) {
+		r.Post("/", h.CreateOffering)
+		r.Get("/", h.SearchCatalog)
+		r.Get("/{id}", h.GetOffering)
+		r.Get("/{id}/version-as-of", h.GetVersionAsOf)
+		r.Post("/{id}/versions", h.CreateCatalogVersion)
+		r.Route("/{id}/versions/{versionID}", func(r chi.Router) {
+			r.Get("/", h.GetOfferingVersion)
+			r.Get("/variants", h.ListVariants)
+			r.Get("/mappings", h.GetMappings)
+			r.Post("/approve", h.ApproveOffering)
+			r.Post("/activate", h.ActivateOffering)
+			r.Post("/suspend", h.SuspendOfferingVersion)
+			r.Post("/retire", h.RetireOfferingVersion)
+			r.Post("/mappings", h.LinkMapping)
 		})
 	})
 }

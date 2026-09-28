@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/notification-svc/internal/actionlink"
 	"zoiko.io/notification-svc/internal/authz"
 	"zoiko.io/notification-svc/internal/config"
 	"zoiko.io/notification-svc/internal/deliver"
@@ -26,12 +28,16 @@ import (
 	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/health"
+	"zoiko.io/notification-svc/internal/housekeeping"
 	"zoiko.io/notification-svc/internal/identity"
+	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
+	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
+	"zoiko.io/notification-svc/internal/webhook"
 )
 
 // platformScopeID mirrors authorization-svc's own constant of the same
@@ -217,9 +223,38 @@ func main() {
 			zap.String("supported", "smtp"))
 	}
 
-	deliverer := deliver.NewRouter(emailProvider, log)
+	// Secondary SMTP provider for failover (optional).
+	// When SMTP_SECONDARY_PROVIDER is set, the router fails over to it after
+	// a transient primary failure (ZS-COMMS-EMAIL-001 §13 P1-12).
+	var secondaryEmailProvider deliver.Provider
+	if cfg.SecondaryEmail.Configured() && cfg.SecondaryEmail.Provider == "smtp" {
+		sp, err := deliver.NewSMTPProvider(deliver.SMTPConfig{
+			Host:           cfg.SecondaryEmail.Host,
+			Port:           cfg.SecondaryEmail.Port,
+			Username:       cfg.SecondaryEmail.Username,
+			Password:       cfg.SecondaryEmail.Password,
+			From:           cfg.SecondaryEmail.From,
+			TLSMode:        deliver.TLSMode(cfg.SecondaryEmail.TLSMode),
+			AllowCleartext: cfg.SecondaryEmail.AllowCleartext,
+		})
+		if err != nil {
+			log.Fatal("secondary email provider configuration is invalid", zap.Error(err))
+		}
+		secondaryEmailProvider = sp
+		log.Info("secondary smtp failover provider configured",
+			zap.String("host", cfg.SecondaryEmail.Host),
+			zap.Int("port", cfg.SecondaryEmail.Port))
+	}
 
-	// â”€â”€ 4b. Retry policy and worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	var deliverer *deliver.Router
+	if secondaryEmailProvider != nil {
+		deliverer = deliver.NewFailoverRouter(emailProvider, secondaryEmailProvider, log)
+	} else {
+		deliverer = deliver.NewRouter(emailProvider, log)
+	}
+	deliverer.SetMetrics(metrics)
+
+	// ── 4b. Retry policy and worker ──────────────────────────────────────────
 	//
 	// One policy, shared. The handler writes the first schedule when a send
 	// fails transiently and the worker extends it from there, so they cannot
@@ -237,6 +272,19 @@ func main() {
 	}
 	retryPolicy = retryPolicy.Normalize()
 
+	// ── 4c. Phase 1 Delivery Ledger & Template Compiler ───────────────────────
+	compiler := ledger.NewCompiler()
+	for _, seed := range ledger.DefaultSeedDefinitions() {
+		if err := compiler.Register(seed); err != nil {
+			log.Fatal("failed to register seed template", zap.String("key", seed.TemplateKey), zap.Error(err))
+		}
+	}
+	killSwitch := ledger.NewKillSwitchManager(log)
+	policyEngine := policy.NewPrecedenceEngine(pgStore, log)
+	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log).
+		WithPolicyResolver(policyEngine).
+		WithMetrics(metrics)
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -253,21 +301,73 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	envelopePolicy := svcenvelope.ServicePolicy()
+	envelopePolicy.Exempt = func(req *http.Request) bool {
+		if req.URL.Path == "/healthz" || req.URL.Path == "/readyz" || req.URL.Path == "/health" {
+			return true
+		}
+		if strings.HasPrefix(req.URL.Path, "/v1/notifications/webhooks/") || strings.HasPrefix(req.URL.Path, "/v1/notifications/actions/") {
+			return true
+		}
+		// RFC 8058 one-click unsubscribe: originates from mail clients with no
+		// ZoikoSuite auth headers. The action token in the body is the anchor.
+		if req.URL.Path == "/v1/notifications/unsubscribe" {
+			return true
+		}
+		return false
+	}
+	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
+
+	webhookProcessor := webhook.NewProcessor(pgStore, log)
+	webhookProcessor.SetMetrics(metrics)
+	webhookHandler := webhook.NewHandler(webhookProcessor, log)
+
+	// ── 4d. Action Link Gateway (optional) ──────────────────────────────────────────
+	//
+	// The gateway is only constructed when ACTION_TOKEN_SECRET is set.
+	// An empty secret means tokens cannot be signed or verified, so the gateway
+	// would refuse every request — better to log a warning and leave it disabled.
+	var actionGateway *actionlink.Gateway
+	if cfg.ActionTokenSecret != "" {
+		signer, err := actionlink.NewSigner([]byte(cfg.ActionTokenSecret), cfg.ActionLinkBaseURL())
+		if err != nil {
+			log.Fatal("action link signer initialization failed", zap.Error(err))
+		}
+		gw, err := actionlink.NewGateway(pgStore, signer, log)
+		if err != nil {
+			log.Fatal("action link gateway initialization failed", zap.Error(err))
+		}
+		actionGateway = gw
+		log.Info("action link gateway enabled")
+	} else {
+		log.Warn("ACTION_TOKEN_SECRET not set — action link gateway disabled; " +
+			"set ACTION_TOKEN_SECRET to enable single-use action links")
+	}
 
 	h := handler.New(handler.Deps{
-		Store:       pgStore,
-		Publisher:   publisher,
-		AuthZ:       authzClient,
-		Deliverer:   deliverer,
-		Recipient:   identityClient,
-		RetryPolicy: retryPolicy,
-		Log:         log,
+		Store:          pgStore,
+		Publisher:      publisher,
+		AuthZ:          authzClient,
+		Deliverer:      deliverer,
+		Recipient:      identityClient,
+		RetryPolicy:    retryPolicy,
+		Orchestrator:   orchestrator,
+		LedgerStore:    pgStore,
+		WebhookHandler: webhookHandler,
+		Suppressions:   pgStore,
+		Log:            log,
 	})
 	handler.RegisterRoutes(r, h)
 
+	// Register action gateway routes if configured. These are exempt from the
+	// envelope middleware (set above) because they serve end-user browsers
+	// and mail clients, not internal ZoikoSuite services.
+	if actionGateway != nil {
+		actionGateway.RegisterRoutes(r)
+	}
+
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
-	// â”€â”€ 6a. Delivery retry worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	// ── 6a. Delivery retry worker ─────────────────────────────────────────────
 	//
 	// Started even when retry is disabled, deliberately. Turning the policy off
 	// stops new schedules being written; it does not un-schedule the
@@ -286,6 +386,33 @@ func main() {
 			StrandedAfter: cfg.Retry.StrandedAfter,
 		}, log)
 	go retryWorker.Start(workerCtx)
+
+	// ── 6b. Delivery Ledger Housekeeping Worker ──────────────────────────────
+	housekeepingWorker := housekeeping.NewWorker(
+		pgStore,
+		housekeeping.Options{
+			Interval:             10 * time.Minute,
+			BatchSize:            50,
+			TokenRetention:       30 * 24 * time.Hour,
+			LedgerRetention:      90 * 24 * time.Hour,
+			StaleIntentThreshold: 24 * time.Hour,
+		},
+		log,
+	)
+	go housekeepingWorker.Start(workerCtx)
+
+	// ── 6c. Webhook DLQ Reprocessor Worker ───────────────────────────────────
+	if cfg.WebhookDLQ.Enabled {
+		dlqWorker := webhook.NewDLQWorker(
+			webhookProcessor,
+			webhook.DLQWorkerOptions{
+				Interval:  cfg.WebhookDLQ.Interval,
+				BatchSize: cfg.WebhookDLQ.BatchSize,
+			},
+			log,
+		)
+		go dlqWorker.Start(workerCtx)
+	}
 
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)

@@ -47,7 +47,9 @@ const notificationColumns = `
 	COALESCE(source_event_type, ''), COALESCE(source_reference, ''),
 	correlation_id, COALESCE(failure_reason, ''), COALESCE(provider_response, ''),
 	created_by_principal_id, created_at, sent_at, read_at,
-	delivery_attempts, next_attempt_at, last_attempt_at`
+	delivery_attempts, next_attempt_at, last_attempt_at,
+	unknown_at, resolved_at, COALESCE(resolved_by_principal_id, ''), COALESCE(resolution_note, ''),
+	COALESCE(template_id, ''), COALESCE(template_version_id, ''), COALESCE(rendered_content_hash, '')`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface{ Scan(dest ...any) error }
@@ -61,6 +63,8 @@ func scanNotification(s scannable, n *domain.Notification) error {
 		&n.CorrelationID, &n.FailureReason, &n.ProviderResponse,
 		&n.CreatedByPrincipalID, &n.CreatedAt, &n.SentAt, &n.ReadAt,
 		&n.DeliveryAttempts, &n.NextAttemptAt, &n.LastAttemptAt,
+		&n.UnknownAt, &n.ResolvedAt, &n.ResolvedByPrincipalID, &n.ResolutionNote,
+		&n.TemplateID, &n.TemplateVersionID, &n.RenderedContentHash,
 	)
 }
 
@@ -110,13 +114,15 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 				notification_id, tenant_id, legal_entity_id, recipient_principal_id,
 				recipient_address, recipient_address_source,
 				channel, subject, body, status, source_event_type, source_reference,
-				correlation_id, created_by_principal_id, created_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+				correlation_id, created_by_principal_id, created_at,
+				template_id, template_version_id, rendered_content_hash
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 			ON CONFLICT (tenant_id, correlation_id) DO NOTHING
 		`, n.NotificationID, tenantID, n.LegalEntityID, n.RecipientPrincipalID,
 			nullIfEmpty(n.RecipientAddress), nullIfEmpty(n.RecipientAddressSource),
 			n.Channel, n.Subject, n.Body, n.Status, n.SourceEventType, n.SourceReference,
-			n.CorrelationID, n.CreatedByPrincipalID, n.CreatedAt)
+			n.CorrelationID, n.CreatedByPrincipalID, n.CreatedAt,
+			nullIfEmpty(n.TemplateID), nullIfEmpty(n.TemplateVersionID), nullIfEmpty(n.RenderedContentHash))
 		if err != nil {
 			return err
 		}
@@ -269,6 +275,81 @@ func (s *PgStore) CompleteDelivery(ctx context.Context, id, newStatus, failureRe
 		}
 		return nil
 	})
+}
+
+// MarkOutcomeUnknown records a delivery attempt whose outcome is
+// genuinely ambiguous — see domain.DeliveryOutcome.Unknown's own doc
+// comment. Guarded on status = 'PENDING' like CompleteDelivery: a
+// notification that concluded (or already went ambiguous) while this
+// attempt was in flight must not be overwritten. sentAt is set exactly
+// like a concluded attempt — the attempt DID happen, only its outcome is
+// unknown — and next_attempt_at is cleared so the ordinary retry worker
+// (which only ever claims status = 'PENDING' rows) never touches this
+// row again automatically; only ResolveDeliveryOutcome moves it further.
+func (s *PgStore) MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time) error {
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			UPDATE notifications
+			SET status            = 'PENDING_UNKNOWN',
+			    failure_reason    = $1,
+			    sent_at           = $2,
+			    unknown_at        = $2,
+			    delivery_attempts = delivery_attempts + 1,
+			    last_attempt_at   = $2,
+			    next_attempt_at   = NULL
+			WHERE notification_id = $3 AND tenant_id = $4 AND status = 'PENDING'
+		`, nullIfEmpty(reason), attemptedAt, id, tenantID)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrNotificationNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	return nil
+}
+
+// ResolveDeliveryOutcome settles a PENDING_UNKNOWN notification to its
+// real conclusion — the doc's own "original notification attempt must be
+// resolved." Guarded on status = 'PENDING_UNKNOWN': only a genuinely
+// ambiguous attempt has something to resolve. sent_at is left exactly as
+// it was set when the attempt was made — resolving later clarifies what
+// happened, it does not change when the attempt occurred.
+func (s *PgStore) ResolveDeliveryOutcome(ctx context.Context, p domain.ResolveDeliveryOutcomeParams, resolvedAt time.Time) error {
+	if p.TenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			UPDATE notifications
+			SET status                   = $1::text,
+			    failure_reason           = CASE WHEN $1::text = 'FAILED' THEN $2 ELSE '' END,
+			    provider_response        = COALESCE(NULLIF($3, ''), provider_response),
+			    resolved_at              = $4,
+			    resolved_by_principal_id = $5,
+			    resolution_note          = $2
+			WHERE notification_id = $6 AND tenant_id = $7 AND status = 'PENDING_UNKNOWN'
+		`, p.ResolvedStatus, p.ResolutionNote, nullIfEmpty(p.ProviderResponse), resolvedAt,
+			p.ActorPrincipalID, p.NotificationID, p.TenantID)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrNotificationNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	return nil
 }
 
 // ScheduleRetry records a failed attempt that is worth making again.

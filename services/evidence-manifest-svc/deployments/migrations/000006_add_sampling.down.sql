@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS sample_evaluations;
+DROP TABLE IF EXISTS sample_executions;
+DROP TABLE IF EXISTS sample_items;
+DROP TABLE IF EXISTS sample_selections;
+DROP TABLE IF EXISTS sample_designs;
+DROP TABLE IF EXISTS sampling_parameter_sets;
+DROP FUNCTION IF EXISTS reject_sampling_fact_mutation();
+DROP FUNCTION IF EXISTS reject_sample_item_replacement();
+DROP FUNCTION IF EXISTS reject_sample_item_delete();

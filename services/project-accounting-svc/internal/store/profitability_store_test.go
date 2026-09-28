@@ -240,3 +240,80 @@ func TestPgStore_ProfitabilitySnapshot_FullLifecycle(t *testing.T) {
 		t.Fatalf("expected ErrInvalidSnapshotTransition on re-certify, got %v", err)
 	}
 }
+
+// TestPgStore_GetLatestCertifiedSnapshot_ExcludesReconciledOnly is the
+// real proof of PRJ-04's own GetMarginBridge query — a merely RECONCILED
+// (not yet certified) snapshot must never be surfaced as the certified
+// baseline.
+func TestPgStore_GetLatestCertifiedSnapshot_ExcludesReconciledOnly(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	projectID := newActiveTestProject(t, s, ctx, tenantID, legalEntityID, "PRJ-PROF-8")
+
+	if _, err := s.RefreshProfitabilityProjection(ctx, projectID, "preparer-1", time.Now().UTC()); err != nil {
+		t.Fatalf("RefreshProfitabilityProjection failed: %v", err)
+	}
+	snap, err := s.BuildProfitabilitySnapshot(ctx, projectID, "preparer-1", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("BuildProfitabilitySnapshot failed: %v", err)
+	}
+
+	if _, err := s.GetLatestCertifiedSnapshot(ctx, projectID); err != domain.ErrSnapshotNotFound {
+		t.Fatalf("expected ErrSnapshotNotFound before certification, got %v", err)
+	}
+
+	if _, err := s.CertifyProfitabilitySnapshot(ctx, snap.SnapshotID, "certifier-1", time.Now().UTC()); err != nil {
+		t.Fatalf("CertifyProfitabilitySnapshot failed: %v", err)
+	}
+
+	latest, err := s.GetLatestCertifiedSnapshot(ctx, projectID)
+	if err != nil {
+		t.Fatalf("GetLatestCertifiedSnapshot failed: %v", err)
+	}
+	if latest.SnapshotID != snap.SnapshotID {
+		t.Fatalf("expected the now-certified snapshot, got %+v", latest)
+	}
+}
+
+// TestPgStore_GetProfitabilitySnapshotAsOf_ReconstructsHistoricalState is
+// the real proof of PRJ-04's own GetProfitabilityAsOf query — as of a
+// cutoff before certification, no certified answer yet exists.
+func TestPgStore_GetProfitabilitySnapshotAsOf_ReconstructsHistoricalState(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	projectID := newActiveTestProject(t, s, ctx, tenantID, legalEntityID, "PRJ-PROF-9")
+
+	if _, err := s.RefreshProfitabilityProjection(ctx, projectID, "preparer-1", time.Now().UTC()); err != nil {
+		t.Fatalf("RefreshProfitabilityProjection failed: %v", err)
+	}
+	snap, err := s.BuildProfitabilitySnapshot(ctx, projectID, "preparer-1", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("BuildProfitabilitySnapshot failed: %v", err)
+	}
+	cutoff := time.Now().UTC()
+	time.Sleep(10 * time.Millisecond)
+
+	if _, err := s.CertifyProfitabilitySnapshot(ctx, snap.SnapshotID, "certifier-1", time.Now().UTC()); err != nil {
+		t.Fatalf("CertifyProfitabilitySnapshot failed: %v", err)
+	}
+
+	if _, err := s.GetProfitabilitySnapshotAsOf(ctx, projectID, cutoff); err != domain.ErrSnapshotNotFound {
+		t.Fatalf("expected ErrSnapshotNotFound as of before certification, got %v", err)
+	}
+
+	asOfNow, err := s.GetProfitabilitySnapshotAsOf(ctx, projectID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GetProfitabilitySnapshotAsOf (now) failed: %v", err)
+	}
+	if asOfNow.SnapshotID != snap.SnapshotID {
+		t.Fatalf("expected the certified snapshot as of now, got %+v", asOfNow)
+	}
+}
