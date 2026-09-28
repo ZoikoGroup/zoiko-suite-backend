@@ -188,14 +188,24 @@ func TestResolve_EnvelopeFactsReachTheDecisionEvidence(t *testing.T) {
 
 	require.Len(t, f.sessions.storedCtx, 1)
 	for _, sc := range f.sessions.storedCtx {
+		// activePrincipal is HUMAN. "api" is a channel a human can arrive on,
+		// so it is recorded — marked as a checked assertion, not a server fact.
 		assert.Equal(t, "api", sc.SourceChannel)
-		assert.Equal(t, "workload-7", sc.WorkloadID)
+		assert.Equal(t, domain.BasisAssertedConsistent, sc.SourceChannelBasis)
+
+		// A workload id on a HUMAN session cannot be attested here. Until
+		// 2026-09-28 it was recorded verbatim; it is now discarded, and the
+		// basis says so. See TestResolve_SourceInputsAreResolvedNotCopied.
+		assert.Empty(t, sc.WorkloadID)
+		assert.Equal(t, domain.BasisUnverifiableDiscarded, sc.WorkloadIDBasis)
+
 		assert.Equal(t, "01HXXXCAUSATION", sc.CausationID)
 
 		// Named in §4, resolvable by nothing in the estate. Asserted nil so a
 		// future placeholder cannot creep in unnoticed — "we never resolved
 		// this" must stay distinct from "we resolved it to nothing".
 		assert.Nil(t, sc.EntitlementContextRef)
+		assert.Equal(t, domain.EntitlementUpstreamNotConfigured, sc.EntitlementContextStatus)
 	}
 }
 

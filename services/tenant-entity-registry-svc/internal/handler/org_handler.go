@@ -37,6 +37,7 @@ type ORGService interface {
 	ListTenantLifecycleHistory(ctx context.Context, tenantID string) ([]*domain.TenantLifecycleEvent, error)
 	GetTenantDefaults(ctx context.Context, tenantID string) (*domain.TenantDefaults, error)
 	BindTenantHost(ctx context.Context, tenantID string, req domain.BindTenantHostRequest) (*domain.TenantHostBinding, error)
+	ChangeHomeRegion(ctx context.Context, tenantID string, req domain.ChangeHomeRegionRequest) error
 	ListTenantHostBindings(ctx context.Context, tenantID string) ([]*domain.TenantHostBinding, error)
 	ResolveTenantByHost(ctx context.Context, hostname string) (*domain.ResolvedTenantByHost, error)
 	VerifyHostTenant(ctx context.Context, hostname, claimedTenantID string) error
@@ -80,6 +81,8 @@ func registerORGRoutes(r chi.Router, h *Handler) {
 		// ── ORG-02: tenant named commands ───────────────────────────────────
 		r.Post("/tenants/{tenantID}/commands/{command}", h.ExecuteTenantCommand)
 		r.Post("/tenants/{tenantID}/defaults", h.ChangeDefaultLocale)
+		// §4.2 home-region change: platform authority, always maker-checker.
+		r.Post("/tenants/{tenantID}/home-region", h.ChangeHomeRegion)
 
 		// ── ORG-02: tenant read surfaces ────────────────────────────────────
 		r.Get("/tenants/{tenantID}/lifecycle-history", h.ListTenantLifecycleHistory)
@@ -469,6 +472,20 @@ func (h *Handler) RequestEntityVerification(w http.ResponseWriter, r *http.Reque
 		req.CorrelationID = correlationID(r)
 	}
 	writeFiled(w, r, h, h.svc.RequestEntityVerification(r.Context(), chi.URLParam(r, "entityID"), req))
+}
+
+// ChangeHomeRegion files ORG-02's ChangeHomeRegion for independent approval
+// (202). A different verified principal releases it through
+// /v1/approval-requests/{id}/approve.
+func (h *Handler) ChangeHomeRegion(w http.ResponseWriter, r *http.Request) {
+	var req domain.ChangeHomeRegionRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
+	writeFiled(w, r, h, h.svc.ChangeHomeRegion(r.Context(), chi.URLParam(r, "tenantID"), req))
 }
 
 // ActivateLegalEntity moves a VERIFIED entity to ACTIVE.

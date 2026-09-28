@@ -393,7 +393,7 @@ func (h *Handler) ReviewSupportContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.support.MarkReviewed(r.Context(), supportContextID, tenantID, callerPrincipalID); err != nil {
+	if err := h.support.MarkReviewed(r.Context(), supportContextID, tenantID, callerPrincipalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.log.Error("support context review failed", zap.Error(err))
 		writeCoded(w, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
 			"could not record the review")

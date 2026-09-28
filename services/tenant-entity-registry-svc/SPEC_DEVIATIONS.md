@@ -10,29 +10,25 @@ not. Each item was decided by the service owner on 24 Sep 2026.
 
 ## Proposed doc corrections (code unchanged)
 
-### Home-region change maker-checker is unimplementable as written
-§4.2's SoD row requires maker-checker for "home-region changes", but the command is named only
-there — not in §4.2 "Named commands" — and the tenant's home region is anchored by the default
-residency-policy pointer, a hard isolation identifier the same section says a tenant admin cannot
-change. There is no write a tenant admin could make to a home region, and no command name this
-service could evidence, so the control as written cannot be implemented without another decision.
+### Home-region change: the command §4.2 does not name (implemented 28 Sep 2026)
+§4.2's SoD row requires maker-checker for "home-region changes" but names no
+command. Implemented as `ChangeHomeRegion` (`POST /v1/tenants/{id}/home-region`,
+migration 000012): platform-scope authority (`TENANT_HOME_REGION_CHANGE`), always
+filed for independent approval (`..._APPROVE`), `home_region_decision_ref`
+required, the default residency policy's region re-pointed, a lineage row
+(`tlh_home_region_evidenced` refuses one without evidence or approver), and
+`tenant.home_region.changed`.
 
-**Proposed wording:** name the command (e.g. `ChangeHomeRegion`) in §4.2 "Named commands" and
-state the authority that may invoke it (platform scope, like a host-binding change). Until the doc
-does, the control stays set aside (see "Not addressed"); the audit ❌ stands as a doc gap, not a
-code defect.
+**Proposed wording:** add `ChangeHomeRegion` to §4.2 "Named commands" with that
+authority, so the next revision of the spec names what the code does.
 
-### expected_version is optional on the wire, never optional in effect
-§4.2: "lifecycle commands use expected_version". §4.3: "commands use UUID and
-expected_version".
-
-**Proposed wording:** "Lifecycle and profile commands are compare-and-swap on
-the record's version. A caller MAY supply `expected_version`; when it does, a
-mismatch is refused (409). When it does not, the service substitutes the version
-it read, so the write is still guarded against a concurrent change."
-
-**Why:** making it mandatory would break every current caller for no change in
-safety — the guard runs either way.
+### expected_version is required (reversed 28 Sep 2026)
+The earlier reading — optional on the wire, substituted with the version just
+read — is withdrawn. Substitution guards a race inside one request but not a
+caller acting on a stale view, which is what §3 "All material master updates
+require optimistic concurrency" is for. Every named command now refuses a
+missing `expected_version` (400 `VALIDATION_FAILED`) outside local development
+(`EXPECTED_VERSION_OPTIONAL`, dev-only).
 
 ### Routes outside ORG-02 / ORG-03
 The service also serves workspaces, entity hierarchies, entity–jurisdiction
@@ -65,9 +61,39 @@ Only the isolation-identifier and sensitive-identifier guards below touch them.
 | §4.3 "sensitive identifier access scoped" | Tax identity bundles classified RESTRICTED/CONFIDENTIAL need `ENTITY_SENSITIVE_IDENTIFIER_READ` **and** `X-Purpose-Context`. Registry numbers and LEIs are public-registry data and stay unmasked. Note: this service stores no tax *numbers* (TAX-01 owns them), so scoping gates the bundle headers. |
 | ORG-03 control "store LEI as an external organizational identifier with source/status" | LEI on the effective-dated profile version with `lei_source` and GLEIF `lei_status`; ISO 17442 MOD 97-10 validated; changing it is an independently approved identity change. LEI de-duplication is not implemented (registry number + jurisdiction remains the dedup signal, per §4.3). |
 
-## Not addressed (set aside by the owner)
-- **Maker-checker on home-region changes.** No home-region change command exists;
-  whether to add `ChangeHomeRegion` is pending a decision.
+### Added 28 Sep 2026 (re-audit)
+
+| Spec text | Reading implemented |
+|---|---|
+| §4.3 "profile versions effective-dated" — an amendment effective **before the entity's first version** | It becomes history, not the present: it ends exactly where version 1 begins, and the current name stays version 1's. Business time is the axis; the first version is a later fact. Before 28 Sep such an amendment stayed open-ended alongside version 1, and as-of "now" disagreed with `GetEntity`. |
+| §4.3 — two amendments effective at the **same instant** | The second corrects the first: the first is superseded in record time (`superseded_at`) and keeps its business interval; the as-of tie-break (higher `version_number`) gives the interval to the correction. Nothing is deleted. Before 28 Sep this answered 500. |
+| §3 "Idempotency: replays return the original material result" | Per (tenant, method + concrete path, key), fingerprinted on principal + body. A retry is answered from the stored response with `X-Idempotent-Replay: true`. 4xx answers are recorded (a refusal is a terminal result); 5xx are not. 7-day retention. Provisioning is keyed in the caller's scope; `external_customer_key` remains the business-level dedupe for tenant creation. |
+
+### Added 28 Sep 2026 (gap closure)
+
+| Spec text | Reading implemented |
+|---|---|
+| §3 "stable typed errors: CONTEXT_INVALID, …" | Every error body has `error_code`. The nine §3 codes are used where they fit; the list names no code for not-found, malformed input, authorization, idempotency reuse, a policy refusal at provisioning or a server fault, so these extend it: `NOT_FOUND`, `VALIDATION_FAILED`, `AUTHORIZATION_DENIED`, `IDEMPOTENCY_MISMATCH`, `IDEMPOTENCY_IN_FLIGHT`, `JURISDICTION_RESTRICTED`, `NOT_ENTITLED`, `INTERNAL_ERROR`. `RULE_AMBIGUOUS` is used for the one resolution this service performs (a tenant's residency region). |
+| §4.2 "Required source inputs … primary jurisdiction … residency preference; onboarding evidence" | `primary_jurisdiction_id`, `residency_region_id`, `onboarding_request_ref` required at CreateTenant (000013). The residency preference becomes the default residency policy's region — the home region from birth. |
+| §4.2 "Server-resolved context: available regions; plan entitlement; … restricted-jurisdiction checks" | Region must exist and be active; `subscription_id` checked with commercial-account-svc (ACTIVE or EVALUATION may provision); the primary jurisdiction's code is refused if on `RESTRICTED_JURISDICTION_CODES`, a compliance-owned list (config, required in staging/production; `NONE` states no restrictions). All fail closed. |
+| §4.3 "Legal-form mapping may use ISO 20275/ELF code … preserving local legal-form text/source" | An ELF code must be four alphanumeric characters and needs `legal_form_source` and `legal_form_local_text`. Validation against the ELF list itself waits on §11's pre-production decision on authoritative code-list sources. |
+| §4.3 "permitted calendar/currency references" | `fiscal_calendar_id` must be a UUID. REF-04 Fiscal Calendar does not exist in the estate, so the reference cannot be resolved against its owner — a dependency gap, not a service choice. |
+| §3 "purpose limitation" | Registry-conflict quarantine rows (which hold a rejected claimant's payload) need `ENTITY_REGISTRY_CONFLICT_READ`; approval requests need `APPROVAL_REQUEST_READ` to list or read (deciding implies reading). |
+
+### Contract changes a client must adopt (oasdiff, `scripts/contract_gate.sh`)
+14 deliberate breaking changes against the 24 Sep contract:
+`expected_version` required on every command body; `primary_jurisdiction_id`,
+`residency_region_id`, `subscription_id` new required and
+`onboarding_request_ref` now required on `POST /v1/tenants`; `ChangeHomeRegion`
+added to `command_name`. The Next.js console sends none of the provisioning
+fields and no `external_customer_key` (it has been unable to create tenants
+since 24 Sep); locally, `LEGACY_PROVISIONING_INPUTS=true` and
+`EXPECTED_VERSION_OPTIONAL=true` keep it working until it is migrated.
+
+## Not addressed
+Nothing set aside. Outside this service: REF-04 Fiscal Calendar (above);
+dependent services' own integration controls (§9.2 gate 6); production
+certification of recovery (§9.2 gate 7 — see SLO.md).
 
 ## Dev-only compatibility flags
 All refused at boot in staging and production.
@@ -77,3 +103,5 @@ All refused at boot in staging and production.
 | `MAKER_CHECKER_LEGACY_BODY_APPROVER` | body-supplied approver (pre-000007) |
 | `LEGACY_ENTITY_CREATE_ACTIVE` | entities created straight into ACTIVE |
 | `ONBOARDING_KEY_OPTIONAL` | provisioning without `external_customer_key` |
+| `LEGACY_PROVISIONING_INPUTS` | provisioning without the §4.2 inputs (000013) |
+| `EXPECTED_VERSION_OPTIONAL` | substitution of the read version for a missing `expected_version` |

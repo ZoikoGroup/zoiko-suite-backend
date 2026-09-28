@@ -237,7 +237,10 @@ func (c *IngressChecker) Evaluate(ctx context.Context, ingress, claimedTenantID 
 		if c.policy == IngressPolicyStrict {
 			return IngressDecision{}, domain.ErrIngressTenantMismatch
 		}
-		return IngressDecision{}, nil
+		// Admitted under observe, but the decision says WHY no binding version
+		// backs it. No SourceVersion: an invalidated binding confirms nothing,
+		// and recording its version would imply it did.
+		return IngressDecision{Freshness: domain.CacheInvalidated}, nil
 	case domain.CacheStale:
 		// Permitted: §4 allows a stale entry to be read within a bounded TTL
 		// for non-material reads, and resolution is a query. Logged so the

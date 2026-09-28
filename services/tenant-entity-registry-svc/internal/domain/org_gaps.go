@@ -31,8 +31,14 @@ func ProvisioningFingerprint(req ProvisionTenantRequest) string {
 		PrimaryTimezone      string `json:"primary_timezone"`
 		PrimaryLocale        string `json:"primary_locale"`
 		OnboardingRequestRef string `json:"onboarding_request_ref"`
+		// omitempty: a request without the 000013 inputs hashes exactly as it
+		// did before them, so onboarding keys issued earlier still replay.
+		PrimaryJurisdictionID string `json:"primary_jurisdiction_id,omitempty"`
+		ResidencyRegionID     string `json:"residency_region_id,omitempty"`
+		SubscriptionID        string `json:"subscription_id,omitempty"`
 	}{req.TenantCode, req.LegalName, req.TradingName, req.DefaultCurrencyCode,
-		req.PrimaryTimezone, req.PrimaryLocale, req.OnboardingRequestRef})
+		req.PrimaryTimezone, req.PrimaryLocale, req.OnboardingRequestRef,
+		req.PrimaryJurisdictionID, req.ResidencyRegionID, req.SubscriptionID})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }

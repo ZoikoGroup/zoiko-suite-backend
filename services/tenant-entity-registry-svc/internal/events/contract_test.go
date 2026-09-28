@@ -84,6 +84,14 @@ func codeEventNames() []string {
 		events.EventLegalEntityNameChanged,
 		events.EventRegistryConflictQuarantined,
 		events.EventRegistryConflictResolved,
+		events.EventTenantHomeRegionChanged,
+		// Formerly direct-published, on the outbox since 28 Sep 2026.
+		events.EventLegalEntityUpdated,
+		events.EventEntityHierarchyChanged,
+		events.EventEntityJurisdictionChanged,
+		events.EventWorkspaceCreated,
+		events.EventWorkspaceUpdated,
+		events.EventWorkspaceStatusChanged,
 	}
 }
 
@@ -189,6 +197,7 @@ func TestAsyncAPI_CommandEventMappingMatchesTheCode(t *testing.T) {
 		"InitiateTermination": events.EventTenantTerminationInitiated,
 		"CompleteTermination": events.EventTenantTerminated,
 		"ChangeDefaultLocale": events.EventTenantDefaultsChanged,
+		"ChangeHomeRegion":    events.EventTenantHomeRegionChanged,
 	} {
 		got := events.TenantCommandEvent(command)
 		if got != want {
@@ -205,43 +214,18 @@ func TestAsyncAPI_CommandEventMappingMatchesTheCode(t *testing.T) {
 	}
 }
 
-// TestAsyncAPI_OutboxDeliveryIsClaimedOnlyWhereItIsTrue guards the delivery
+// TestAsyncAPI_EveryEventIsDeliveredThroughTheOutbox guards the delivery
 // annotation.
 //
 // x-delivery: outbox is a promise that the event and the fact it attests commit
-// together. Every ORG-02/ORG-03 command path makes that promise good; the
-// pre-existing paths do not and are annotated `direct`. Claiming `outbox` for a
-// direct path would tell a consumer it can rely on a guarantee that is not
-// there.
-func TestAsyncAPI_OutboxDeliveryIsClaimedOnlyWhereItIsTrue(t *testing.T) {
+// together. Since 28 Sep 2026 there is no other path — the direct Kafka
+// publisher was removed — so every message must say outbox, and a `direct`
+// annotation would describe code that no longer exists.
+func TestAsyncAPI_EveryEventIsDeliveredThroughTheOutbox(t *testing.T) {
 	doc := loadAsyncAPI(t)
-
-	transactional := map[string]bool{
-		events.EventTenantActivated:            true,
-		events.EventTenantSuspended:            true,
-		events.EventTenantResumed:              true,
-		events.EventTenantTerminationInitiated: true,
-		events.EventTenantTerminated:           true,
-		events.EventTenantDefaultsChanged:      true,
-		events.EventLegalEntityProfileAmended:  true,
-		events.EventLegalEntityNameChanged:     true,
-		events.EventRegisteredOfficeChanged:    true,
-	}
-
 	for _, m := range doc.Components.Messages {
-		if m.Delivery == "" {
-			t.Errorf("%s: no x-delivery annotation", m.Name)
-			continue
-		}
-		if m.Delivery != "outbox" && m.Delivery != "direct" {
-			t.Errorf("%s: unknown x-delivery %q", m.Name, m.Delivery)
-			continue
-		}
-		if m.Delivery == "outbox" && !transactional[m.Name] {
-			t.Errorf("%s claims transactional outbox delivery, but is not published from an outbox path", m.Name)
-		}
-		if m.Delivery == "direct" && transactional[m.Name] {
-			t.Errorf("%s is published through the outbox but claims direct delivery", m.Name)
+		if m.Delivery != "outbox" {
+			t.Errorf("%s: x-delivery %q; every event is written through event_outbox", m.Name, m.Delivery)
 		}
 	}
 }

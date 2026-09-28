@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -44,6 +45,10 @@ type Store interface {
 	GetBundle(ctx context.Context, roleDefinitionID, bundleID string) (*domain.PermissionBundleDef, error)
 	UpdateBundle(ctx context.Context, roleDefinitionID, bundleID string, permittedActions []string, activeFlag *bool, updatedByPrincipalID string) (*domain.PermissionBundleDef, error)
 	ListAllBundles(ctx context.Context, filter domain.BundleListFilter) ([]domain.PermissionBundleDef, error)
+
+	// RecordRefusedEscalation writes a durable record of a pre-provisioning refusal.
+	// Per Doc 04 §20: "denials are as important as grants".
+	RecordRefusedEscalation(ctx context.Context, r *domain.RefusedEscalation) error
 }
 
 type AuthZClient interface {
@@ -63,6 +68,16 @@ type AuthzAdmin interface {
 	// SetPermissionBundleActive retires or reactivates the bundle with
 	// bundleCode by resolving it against authorization-svc's own id space.
 	SetPermissionBundleActive(ctx context.Context, roleID, bundleCode string, active bool, s clients.Scope) error
+}
+
+// SoDClient checks segregation-of-duties conflicts before a role/bundle is provisioned.
+type SoDClient interface {
+	CheckConflict(ctx context.Context, req domain.SoDCheckRequest) error
+}
+
+// ProtectedActionsClient provides the list of active protected platform-admin actions.
+type ProtectedActionsClient interface {
+	ListActive(ctx context.Context) ([]string, error)
 }
 
 // actionRoleManage is the action every write on this service is authorized
@@ -96,15 +111,28 @@ type AuthzAdmin interface {
 const actionRoleManage = telemetry.ActionRoleManage
 
 type Handler struct {
-	store      Store
-	authz      AuthZClient
-	authzAdmin AuthzAdmin
-	metrics    *telemetry.Domain
-	log        *zap.Logger
+	store                 Store
+	authz                 AuthZClient
+	authzAdmin            AuthzAdmin
+	sod                   SoDClient
+	protectedActions      ProtectedActionsClient
+	protectedActionsCache []string
+	protectedActionsMu    sync.RWMutex
+	protectedActionsTTL   time.Time
+	metrics               *telemetry.Domain
+	log                   *zap.Logger
 }
 
-func New(store Store, authz AuthZClient, authzAdmin AuthzAdmin, metrics *telemetry.Domain, log *zap.Logger) *Handler {
-	return &Handler{store: store, authz: authz, authzAdmin: authzAdmin, metrics: metrics, log: log}
+func New(store Store, authz AuthZClient, authzAdmin AuthzAdmin, sod SoDClient, protectedActions ProtectedActionsClient, metrics *telemetry.Domain, log *zap.Logger) *Handler {
+	return &Handler{
+		store:            store,
+		authz:            authz,
+		authzAdmin:       authzAdmin,
+		sod:              sod,
+		protectedActions: protectedActions,
+		metrics:          metrics,
+		log:              log,
+	}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -144,16 +172,19 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateRoleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.roleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), "", req.LegalEntityID, "", req.CorrelationID, "CREATE_ROLE", "invalid_json", "invalid_json", err.Error(), req)
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
 	if req.LegalEntityID == "" || req.RoleCode == "" || req.RoleName == "" || req.RoleScopeType == "" || req.CorrelationID == "" {
 		h.roleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), "", req.LegalEntityID, "", req.CorrelationID, "CREATE_ROLE", "missing_fields", "missing_fields", "legal_entity_id, role_code, role_name, role_scope_type, correlation_id are required", req)
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, role_code, role_name, role_scope_type, correlation_id are required")
 		return
 	}
 	if req.RoleScopeType != "LEGAL_ENTITY" && req.RoleScopeType != "TENANT" {
 		h.roleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), "", req.LegalEntityID, "", req.CorrelationID, "CREATE_ROLE", "invalid_scope_type", "invalid_scope_type", "role_scope_type must be LEGAL_ENTITY or TENANT", req)
 		writeError(w, http.StatusBadRequest, "invalid_scope_type", "role_scope_type must be LEGAL_ENTITY or TENANT")
 		return
 	}
@@ -168,6 +199,17 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.checkAllowed(r.Context(), principalID, req.LegalEntityID); err != nil {
 		h.writeAuthzErr(w, err, h.metrics.RoleWrites)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_ROLE", "forbidden", "forbidden", err.Error(), req)
+		return
+	}
+
+	// SoD check: validate the role_code against existing assignments.
+	// The role itself has no actions yet, but its code may imply a role
+	// archetype that conflicts with the caller's existing assignments.
+	if err := h.checkSoDConflict(r.Context(), tenantID, req.LegalEntityID, principalID, req.RoleCode, "", nil, req.CorrelationID); err != nil {
+		h.roleWrite(telemetry.WriteForbidden)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_ROLE", "sod_conflict", "sod_conflict", err.Error(), req)
+		writeError(w, http.StatusForbidden, "sod_conflict", err.Error())
 		return
 	}
 
@@ -180,11 +222,13 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.log.Error("failed to check role_code uniqueness", zap.Error(err))
 		h.roleWrite(telemetry.WriteStoreUnavailable)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_ROLE", "store_unavailable", "store_unavailable", err.Error(), req)
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if exists {
 		h.roleWrite(telemetry.WriteConflict)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_ROLE", "role_code_exists", "role_code_exists", string(domain.ErrRoleCodeExists), req)
 		writeError(w, http.StatusConflict, "role_code_exists", string(domain.ErrRoleCodeExists))
 		return
 	}
@@ -201,6 +245,7 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateRole, telemetry.AdminUnavailable).Inc()
 		h.log.Error("failed to provision role in authorization-svc", zap.Error(err))
 		h.roleWrite(telemetry.WriteAuthzAdminUnavail)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_ROLE", "authz_admin_unavailable", "authz_admin_unavailable", err.Error(), req)
 		writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
 		return
 	}
@@ -425,11 +470,13 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateBundleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.bundleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), "", req.LegalEntityID, "", req.CorrelationID, "CREATE_BUNDLE", "invalid_json", "invalid_json", err.Error(), req)
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
 	if req.BundleCode == "" || len(req.PermittedActions) == 0 || req.CorrelationID == "" {
 		h.bundleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), "", req.LegalEntityID, "", req.CorrelationID, "CREATE_BUNDLE", "missing_fields", "missing_fields", "bundle_code, permitted_actions, correlation_id are required", req)
 		writeError(w, http.StatusBadRequest, "missing_fields", "bundle_code, permitted_actions, correlation_id are required")
 		return
 	}
@@ -444,11 +491,31 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.checkAllowed(r.Context(), principalID, req.LegalEntityID); err != nil {
 		h.writeAuthzErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "forbidden", "forbidden", err.Error(), req)
 		return
 	}
 
-	if _, err := h.store.GetRole(r.Context(), roleDefinitionID); err != nil {
+	// Protected actions check: tenant bundles may not include platform-admin actions.
+	if err := h.checkProtectedActions(req.PermittedActions); err != nil {
+		h.bundleWrite(telemetry.WriteForbidden)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "protected_action", "protected_action", err.Error(), req)
+		writeError(w, http.StatusForbidden, "protected_action", err.Error())
+		return
+	}
+
+	// Get the role to find its role_code for SoD check.
+	role, err := h.store.GetRole(r.Context(), roleDefinitionID)
+	if err != nil {
 		h.writeStoreErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "role_not_found", "not_found", err.Error(), req)
+		return
+	}
+
+	// SoD check: validate the bundle's actions against existing assignments.
+	if err := h.checkSoDConflict(r.Context(), bundleTenantID, req.LegalEntityID, principalID, role.RoleCode, req.BundleCode, req.PermittedActions, req.CorrelationID); err != nil {
+		h.bundleWrite(telemetry.WriteForbidden)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "sod_conflict", "sod_conflict", err.Error(), req)
+		writeError(w, http.StatusForbidden, "sod_conflict", err.Error())
 		return
 	}
 
@@ -460,11 +527,13 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.log.Error("failed to check bundle_code uniqueness", zap.Error(err))
 		h.bundleWrite(telemetry.WriteStoreUnavailable)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "store_unavailable", "store_unavailable", err.Error(), req)
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 	if exists {
 		h.bundleWrite(telemetry.WriteConflict)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "bundle_code_exists", "bundle_code_exists", string(domain.ErrBundleCodeExists), req)
 		writeError(w, http.StatusConflict, "bundle_code_exists", string(domain.ErrBundleCodeExists))
 		return
 	}
@@ -478,6 +547,7 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateBundle, telemetry.AdminUnavailable).Inc()
 		h.log.Error("failed to provision permission bundle in authorization-svc", zap.Error(err))
 		h.bundleWrite(telemetry.WriteAuthzAdminUnavail)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "authz_admin_unavailable", "authz_admin_unavailable", err.Error(), req)
 		writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
 		return
 	}
@@ -586,6 +656,7 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 	var req domain.UpdateBundleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.bundleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), "", req.LegalEntityID, "", req.CorrelationID, "UPDATE_BUNDLE", "invalid_json", "invalid_json", err.Error(), req)
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
@@ -603,6 +674,7 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.checkAllowed(r.Context(), principalID, req.LegalEntityID); err != nil {
 		h.writeAuthzErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "forbidden", "forbidden", err.Error(), req)
 		return
 	}
 
@@ -612,11 +684,13 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 	// replay — a genuine replay sends the same values and is handled below.
 	if req.PermittedActions == nil && req.ActiveFlag == nil {
 		h.bundleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "nothing_to_update", "nothing_to_update", "supply permitted_actions and/or active_flag", req)
 		writeError(w, http.StatusBadRequest, "nothing_to_update", "supply permitted_actions and/or active_flag")
 		return
 	}
 	if req.PermittedActions != nil && len(req.PermittedActions) == 0 {
 		h.bundleWrite(telemetry.WriteInvalidRequest)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "empty_actions", "empty_actions", "a bundle must permit at least one action; set active_flag to withdraw the bundle instead", req)
 		writeError(w, http.StatusBadRequest, "empty_actions", "a bundle must permit at least one action; set active_flag to withdraw the bundle instead")
 		return
 	}
@@ -624,6 +698,7 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 	current, err := h.store.GetBundle(r.Context(), roleDefinitionID, bundleID)
 	if err != nil {
 		h.writeStoreErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "bundle_not_found", "not_found", err.Error(), req)
 		return
 	}
 
@@ -633,6 +708,34 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 		h.bundleWrite(telemetry.WriteNoChange)
 		writeJSON(w, http.StatusOK, current)
 		return
+	}
+
+	// Protected actions check: tenant bundles may not include platform-admin actions.
+	if actionsChanged {
+		if err := h.checkProtectedActions(req.PermittedActions); err != nil {
+			h.bundleWrite(telemetry.WriteForbidden)
+			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "protected_action", "protected_action", err.Error(), req)
+			writeError(w, http.StatusForbidden, "protected_action", err.Error())
+			return
+		}
+	}
+
+	// Get the role to find its role_code for SoD check.
+	role, err := h.store.GetRole(r.Context(), roleDefinitionID)
+	if err != nil {
+		h.writeStoreErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "role_not_found", "not_found", err.Error(), req)
+		return
+	}
+
+	// SoD check: validate the bundle's actions against existing assignments.
+	if actionsChanged {
+		if err := h.checkSoDConflict(r.Context(), tenantID, req.LegalEntityID, principalID, role.RoleCode, current.BundleCode, req.PermittedActions, req.CorrelationID); err != nil {
+			h.bundleWrite(telemetry.WriteForbidden)
+			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "sod_conflict", "sod_conflict", err.Error(), req)
+			writeError(w, http.StatusForbidden, "sod_conflict", err.Error())
+			return
+		}
 	}
 
 	scope := clients.Scope{
@@ -649,6 +752,7 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 			h.log.Error("failed to propagate permission bundle actions to authorization-svc",
 				zap.String("bundle_id", bundleID), zap.Error(err))
 			h.bundleWrite(telemetry.WriteAuthzAdminUnavail)
+			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "authz_admin_unavailable", "authz_admin_unavailable", err.Error(), req)
 			writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
 			return
 		}
@@ -660,6 +764,7 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 			h.log.Error("failed to propagate permission bundle active state to authorization-svc",
 				zap.String("bundle_id", bundleID), zap.Error(err))
 			h.bundleWrite(telemetry.WriteAuthzAdminUnavail)
+			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "authz_admin_unavailable", "authz_admin_unavailable", err.Error(), req)
 			writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
 			return
 		}
@@ -865,6 +970,96 @@ func count(c *prometheus.CounterVec, outcome string) {
 
 func (h *Handler) roleWrite(outcome string)   { h.metrics.RoleWrites.WithLabelValues(outcome).Inc() }
 func (h *Handler) bundleWrite(outcome string) { h.metrics.BundleWrites.WithLabelValues(outcome).Inc() }
+
+// getProtectedActions returns the cached list of protected actions, refreshing
+// if the TTL has expired (30 seconds). Returns empty slice on error (fail-open
+// for availability, but metrics will show the failure).
+func (h *Handler) getProtectedActions(ctx context.Context) []string {
+	h.protectedActionsMu.RLock()
+	if time.Now().Before(h.protectedActionsTTL) && len(h.protectedActionsCache) > 0 {
+		cached := h.protectedActionsCache
+		h.protectedActionsMu.RUnlock()
+		return cached
+	}
+	h.protectedActionsMu.RUnlock()
+
+	h.protectedActionsMu.Lock()
+	defer h.protectedActionsMu.Unlock()
+	// Double-check after acquiring write lock
+	if time.Now().Before(h.protectedActionsTTL) && len(h.protectedActionsCache) > 0 {
+		return h.protectedActionsCache
+	}
+
+	actions, err := h.protectedActions.ListActive(ctx)
+	if err != nil {
+		h.log.Error("failed to fetch protected actions", zap.Error(err))
+		h.metrics.AuthzAdminCalls.WithLabelValues("list_protected_actions", telemetry.AdminUnavailable).Inc()
+		return h.protectedActionsCache // return stale cache on error
+	}
+	h.protectedActionsCache = actions
+	h.protectedActionsTTL = time.Now().Add(30 * time.Second)
+	h.metrics.AuthzAdminCalls.WithLabelValues("list_protected_actions", telemetry.AdminOK).Inc()
+	return actions
+}
+
+// checkProtectedActions validates that none of the requested actions are
+// protected platform-admin actions. Returns ErrProtectedAction if any match.
+func (h *Handler) checkProtectedActions(actions []string) error {
+	protected := h.getProtectedActions(context.Background()) // cached, no context needed
+	if len(protected) == 0 {
+		return nil // no protected list configured, skip check
+	}
+	protectedSet := make(map[string]struct{}, len(protected))
+	for _, a := range protected {
+		protectedSet[a] = struct{}{}
+	}
+	for _, a := range actions {
+		if _, ok := protectedSet[a]; ok {
+			return domain.ErrProtectedAction
+		}
+	}
+	return nil
+}
+
+// checkSoDConflict consults authorization-svc's SoD engine before provisioning.
+func (h *Handler) checkSoDConflict(ctx context.Context, tenantID, legalEntityID, principalID, roleCode, bundleCode string, actions []string, correlationID string) error {
+	req := domain.SoDCheckRequest{
+		TenantID:         tenantID,
+		LegalEntityID:    legalEntityID,
+		PrincipalID:      principalID,
+		RoleCode:         roleCode,
+		BundleCode:       bundleCode,
+		PermittedActions: actions,
+		CorrelationID:    correlationID,
+	}
+	if err := h.sod.CheckConflict(ctx, req); err != nil {
+		h.metrics.AuthZDecisions.WithLabelValues("sod_check", telemetry.AuthZDenied).Inc()
+		return err
+	}
+	h.metrics.AuthZDecisions.WithLabelValues("sod_check", telemetry.AuthZGranted).Inc()
+	return nil
+}
+
+// recordRefusal writes a durable refused_escalations row for evidence/audit.
+// Called for every pre-provisioning refusal (409, 400, 403, etc.).
+func (h *Handler) recordRefusal(ctx context.Context, tenantID, legalEntityID, principalID, correlationID, actionType, refusalReason, errorCode, errorMessage string, requestedPayload any) {
+	payloadBytes, _ := json.Marshal(requestedPayload)
+	refusal := &domain.RefusedEscalation{
+		TenantID:         tenantID,
+		LegalEntityID:    legalEntityID,
+		PrincipalID:      principalID,
+		CorrelationID:    correlationID,
+		ActionType:       actionType,
+		RefusalReason:    refusalReason,
+		RequestedPayload: payloadBytes,
+		ErrorCode:        errorCode,
+		ErrorMessage:     errorMessage,
+		CreatedAt:        time.Now().UTC(),
+	}
+	if err := h.store.RecordRefusedEscalation(ctx, refusal); err != nil {
+		h.log.Error("failed to record refused escalation", zap.Error(err))
+	}
+}
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request, counter *prometheus.CounterVec) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")

@@ -21,7 +21,10 @@
 // where they are.
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type RoleStatus string
 
@@ -62,6 +65,32 @@ type PermissionBundleDef struct {
 	CreatedAt            time.Time `json:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at"`
 	UpdatedByPrincipalID string    `json:"updated_by_principal_id,omitempty"`
+}
+
+// ProtectedPermission is a platform-admin action that tenant roles may not include.
+type ProtectedPermission struct {
+	ActionName  string    `json:"action_name"`
+	Description string    `json:"description"`
+	Category    string    `json:"category"`
+	ActiveFlag  bool      `json:"active_flag"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// RefusedEscalation records a pre-provisioning refusal for evidence/audit.
+// Per Doc 04 §20: "denials are as important as grants".
+type RefusedEscalation struct {
+	RefusedEscalationID string          `json:"refused_escalation_id"`
+	TenantID            string          `json:"tenant_id"`
+	LegalEntityID       string          `json:"legal_entity_id"`
+	PrincipalID         string          `json:"principal_id"`
+	CorrelationID       string          `json:"correlation_id"`
+	ActionType          string          `json:"action_type"`
+	RefusalReason       string          `json:"refusal_reason"`
+	RequestedPayload    json.RawMessage `json:"requested_payload"`
+	ErrorCode           string          `json:"error_code"`
+	ErrorMessage        string          `json:"error_message"`
+	CreatedAt           time.Time       `json:"created_at"`
 }
 
 // ── wire types ───────────────────────────────────────────────────────────────
@@ -120,6 +149,23 @@ type BundleListFilter struct {
 	Query      string
 	Limit      int
 	Offset     int
+}
+
+// SoDCheckRequest represents a request to check SoD conflicts for a role/bundle.
+type SoDCheckRequest struct {
+	TenantID            string   `json:"tenant_id"`
+	LegalEntityID       string   `json:"legal_entity_id"`
+	PrincipalID         string   `json:"principal_id"`
+	RoleCode            string   `json:"role_code,omitempty"`
+	BundleCode          string   `json:"bundle_code,omitempty"`
+	PermittedActions    []string `json:"permitted_actions,omitempty"`
+	CorrelationID       string   `json:"correlation_id"`
+}
+
+// SoDCheckResponse represents the result of an SoD check.
+type SoDCheckResponse struct {
+	Conflict bool     `json:"conflict"`
+	Rules    []string `json:"rules,omitempty"` // names of conflicting rules
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -184,4 +230,12 @@ var (
 	// remote bundle both of them pointed at. The register then showed an
 	// ACTIVE bundle granting nothing.
 	ErrBundleCodeExists = errorString("a permission bundle with that bundle_code is already attached to this role")
+
+	// ErrProtectedAction is returned when a role or bundle includes an action
+	// that is reserved for platform-admin roles (per Authorization Standard §9).
+	ErrProtectedAction = errorString("permitted_actions includes protected platform-admin action(s); tenant roles may not include these")
+
+	// ErrSoDConflict is returned when a role or bundle would create a
+	// segregation-of-duties violation (Authorization Standard §10.1).
+	ErrSoDConflict = errorString("segregation of duties conflict: the requested actions conflict with existing assignments")
 )

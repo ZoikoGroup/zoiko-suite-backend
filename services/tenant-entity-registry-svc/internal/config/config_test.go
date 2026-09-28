@@ -72,3 +72,59 @@ func TestLoad_RefusesThe000008CompatibilityFlagsInProduction(t *testing.T) {
 		})
 	}
 }
+
+// prodEnv is a complete, valid production configuration.
+func prodEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("ENV", "production")
+	t.Setenv("DB_PASSWORD", "x")
+	t.Setenv("DB_SSLMODE", "require")
+	t.Setenv("AUTHZ_PLATFORM_SCOPE_ID", "platform-scope")
+	t.Setenv("JURISDICTION_RULES_URL", "http://jurisdiction-svc:8082")
+	t.Setenv("COMMERCIAL_ACCOUNT_URL", "http://commercial-account-svc:8144")
+	t.Setenv("RESTRICTED_JURISDICTION_CODES", "KP, ir")
+}
+
+func TestLoad_ACompleteProductionConfigStarts(t *testing.T) {
+	prodEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if got := strings.Join(cfg.RestrictedJurisdictionCodes, ","); got != "KP,IR" {
+		t.Fatalf("restricted codes = %q, want KP,IR (trimmed, upper-cased)", got)
+	}
+}
+
+// Each §4.2 provisioning dependency must be real in production: the stubs
+// accept every jurisdiction and every subscription.
+func TestLoad_RefusesProvisioningStubsInProduction(t *testing.T) {
+	for name, tc := range map[string]struct{ key, value, want string }{
+		"jurisdiction stub (default url)": {"JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc", "JURISDICTION_RULES_URL"},
+		"no entitlement service":          {"COMMERCIAL_ACCOUNT_URL", "", "COMMERCIAL_ACCOUNT_URL"},
+		"restricted list unset":           {"RESTRICTED_JURISDICTION_CODES", "", "RESTRICTED_JURISDICTION_CODES"},
+		"legacy provisioning inputs":      {"LEGACY_PROVISIONING_INPUTS", "true", "LEGACY_PROVISIONING_INPUTS"},
+		"optional expected_version":       {"EXPECTED_VERSION_OPTIONAL", "true", "EXPECTED_VERSION_OPTIONAL"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			prodEnv(t)
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load() = %v, want refusal naming %s", err, tc.want)
+			}
+		})
+	}
+}
+
+// NONE is how production states, explicitly, that nothing is restricted.
+func TestLoad_RestrictedNoneIsAnExplicitEmptyList(t *testing.T) {
+	prodEnv(t)
+	t.Setenv("RESTRICTED_JURISDICTION_CODES", "NONE")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if len(cfg.RestrictedJurisdictionCodes) != 0 {
+		t.Fatalf("NONE must mean no codes, got %v", cfg.RestrictedJurisdictionCodes)
+	}
+}

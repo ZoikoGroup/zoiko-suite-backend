@@ -17,6 +17,15 @@ info:
     - jurisdiction_id references on EntityJurisdictionAssignment and TaxIdentityBundle are
       validated synchronously against the Jurisdiction Rules Service (fail-closed).
     - Entity status transitions publish `entity.status.changed` on the event backbone.
+    - **Replay protection (migration 000010).** Every material write's `Idempotency-Key`
+      is honoured per (tenant, method + path): a retry with the same key, principal and
+      body is answered with the first response and `X-Idempotent-Replay: true`, without
+      running the command again. The same key with a different body or principal is
+      `409`. A `5xx` is not recorded, so a retry after one genuinely retries. Records
+      are kept for 7 days.
+    - **Host isolation (§8 NP3).** On every `/v1` route, a request arriving on a hostname
+      bound to one tenant while `X-Tenant-Id` names another is refused `403` before any
+      data is read.
 
 servers:
   - url: http://localhost:8081
@@ -89,8 +98,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Tenant"
-        "409": { description: external_customer_key already used for a different onboarding request, or tenant_code taken }
-        "422": { description: external_customer_key is required }
+        "409": { description: "external_customer_key already used for a different onboarding request, or tenant_code taken" }
+        "422": { description: "external_customer_key is required" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
@@ -136,7 +145,7 @@ paths:
             schema:
               $ref: "#/components/schemas/TransitionTenantLifecycleRequest"
       responses:
-        "204": { description: Transition applied }
+        "204": { description: "Transition applied" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -278,7 +287,7 @@ paths:
             schema:
               $ref: "#/components/schemas/TransitionEntityStatusRequest"
       responses:
-        "204": { description: Transition applied (or idempotent no-op) }
+        "204": { description: "Transition applied (or idempotent no-op)" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -352,7 +361,7 @@ paths:
             type: string
             format: date-time
       responses:
-        "204": { description: Hierarchy end-dated }
+        "204": { description: "Hierarchy end-dated" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -430,7 +439,7 @@ paths:
             type: string
             format: date-time
       responses:
-        "204": { description: Assignment end-dated }
+        "204": { description: "Assignment end-dated" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
@@ -597,7 +606,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TaxIdentityBundle"
-        "403": { description: Sensitive bundle without the scoped-access permission and purpose }
+        "403": { description: "Sensitive bundle without the scoped-access permission and purpose" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /v1/tax-identity-bundles/{bundleID}/status:
@@ -624,7 +633,7 @@ paths:
             schema:
               $ref: "#/components/schemas/TransitionTaxIdentityBundleStatusRequest"
       responses:
-        "204": { description: Status transitioned }
+        "204": { description: "Status transitioned" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
@@ -660,7 +669,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ResolvedTenantRegion"
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: The tenant's residency policy has no region assigned }
+        "409": { description: "The tenant's residency policy has no region assigned" }
 
   # ── ORG-02 §4.2: tenant named commands ─────────────────────────────────────
 
@@ -728,9 +737,9 @@ paths:
                 $ref: "#/components/schemas/PendingApproval"
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { description: Tenant not found, or the command is not an ORG-02 command }
-        "409": { description: expected_version is stale, the tenant moved first, or an approval is already pending for this tenant }
-        "422": { description: Command not reachable from the current state, creation not yet approved, or approved_by_principal_id supplied }
+        "404": { description: "Tenant not found, or the command is not an ORG-02 command" }
+        "409": { description: "expected_version is stale, the tenant moved first, or an approval is already pending for this tenant" }
+        "422": { description: "Command not reachable from the current state, creation not yet approved, or approved_by_principal_id supplied" }
 
   /v1/tenants/{tenantID}/defaults:
     get:
@@ -778,7 +787,46 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: expected_version is stale, or the tenant may not transact }
+        "409": { description: "expected_version is stale, or the tenant may not transact" }
+
+  /v1/tenants/{tenantID}/home-region:
+    post:
+      operationId: changeHomeRegion
+      summary: ORG-02 ChangeHomeRegion (maker-checker)
+      description: |
+        §4.2 "home-region changes require maker-checker". Re-points the tenant's
+        home region — the region of its default residency policy — which is a
+        hard isolation identifier, so the command is authorized in the platform
+        scope (`TENANT_HOME_REGION_CHANGE`) and never applied directly: it is
+        filed (202) and a different verified principal holding
+        `TENANT_HOME_REGION_CHANGE_APPROVE` releases it through
+        `POST /v1/approval-requests/{id}/approve`. On approval the region, the
+        tenant's version, a lineage row carrying `home_region_decision_ref`, and
+        `tenant.home_region.changed` commit together.
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangeHomeRegionRequest"
+      responses:
+        "202":
+          description: Filed for independent approval
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingApproval"
+        "400": { description: "residency_region_id is not a UUID (VALIDATION_FAILED), or home_region_decision_ref is missing (SOURCE_UNVERIFIED)" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "expected_version is stale (VERSION_CONFLICT), or a change is already pending (DUPLICATE_CANDIDATE)" }
+        "422": { description: "the tenant is OFFBOARDING or TERMINATED (INVALID_TRANSITION)" }
 
   /v1/tenants/{tenantID}/lifecycle-history:
     get:
@@ -850,7 +898,7 @@ paths:
                 $ref: "#/components/schemas/TenantHostBinding"
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { description: Hostname already bound, or the tenant already has a primary hostname }
+        "409": { description: "Hostname already bound, or the tenant already has a primary hostname" }
 
   /v1/resolve-tenant:
     get:
@@ -878,7 +926,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ResolvedTenantByHost"
         "400": { $ref: "#/components/responses/BadRequest" }
-        "404": { description: Hostname is not bound to any tenant }
+        "404": { description: "Hostname is not bound to any tenant" }
 
   # ── ORG-03 §4.3: profile amendment commands ────────────────────────────────
 
@@ -934,8 +982,8 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: expected_version is stale, the tenant may not transact, the registry identity is already claimed and has been quarantined, or an approval is already pending }
-        "422": { description: approved_by_principal_id supplied }
+        "409": { description: "expected_version is stale, the tenant may not transact, the registry identity is already claimed and has been quarantined, or an approval is already pending" }
+        "422": { description: "approved_by_principal_id supplied" }
 
   /v1/entities/{entityID}/legal-name:
     post:
@@ -976,8 +1024,8 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: expected_version is stale, the tenant may not transact, or an approval is already pending }
-        "422": { description: approved_by_principal_id supplied }
+        "409": { description: "expected_version is stale, the tenant may not transact, or an approval is already pending" }
+        "422": { description: "approved_by_principal_id supplied" }
 
   /v1/entities/{entityID}/registered-office:
     post:
@@ -1010,7 +1058,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: expected_version is stale or the tenant may not transact }
+        "409": { description: "expected_version is stale or the tenant may not transact" }
 
   # ── ORG-03 §4.3: Draft → Verified → Active, MergeDuplicateCandidate ───────
 
@@ -1043,8 +1091,8 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Stale expected_version, tenant may not transact, or a verification is already pending }
-        "422": { description: Entity is not DRAFT }
+        "409": { description: "Stale expected_version, tenant may not transact, or a verification is already pending" }
+        "422": { description: "Entity is not DRAFT" }
 
   /v1/entities/{entityID}/activation:
     post:
@@ -1071,8 +1119,8 @@ paths:
                 $ref: "#/components/schemas/LegalEntity"
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Stale expected_version or the tenant may not transact }
-        "422": { description: Entity is not VERIFIED }
+        "409": { description: "Stale expected_version or the tenant may not transact" }
+        "422": { description: "Entity is not VERIFIED" }
 
   /v1/entities/{entityID}/merge:
     post:
@@ -1105,8 +1153,8 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Already merged, survivor not ACTIVE/unmerged, stale version, or a merge already pending }
-        "422": { description: Entity status cannot be merged }
+        "409": { description: "Already merged, survivor not ACTIVE/unmerged, stale version, or a merge already pending" }
+        "422": { description: "Entity status cannot be merged" }
 
   /v1/entities/{entityID}/unmerge:
     post:
@@ -1134,7 +1182,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Entity is not merged, or stale version }
+        "409": { description: "Entity is not merged, or stale version" }
 
   /v1/entities/{entityID}/merge-records:
     get:
@@ -1309,7 +1357,7 @@ paths:
             schema:
               $ref: "#/components/schemas/ResolveRegistryConflictRequest"
       responses:
-        "204": { description: Resolution recorded (legacy mode only) }
+        "204": { description: "Resolution recorded (legacy mode only)" }
         "202":
           description: |
             Filed for independent approval, not executed. A different verified
@@ -1321,7 +1369,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Already resolved, or a resolution is already pending approval }
+        "409": { description: "Already resolved, or a resolution is already pending approval" }
 
   # ── Verified maker-checker (ORG-02 §4.2, ORG-03 §4.3) ─────────────────────
   #
@@ -1403,9 +1451,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApprovalOutcome"
         "400": { $ref: "#/components/responses/BadRequest" }
-        "403": { description: The caller is the maker (or the quarantined claimant), or lacks the approve permission }
+        "403": { description: "The caller is the maker (or the quarantined claimant), or lacks the approve permission" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Not pending, expired, fingerprint mismatch, or the subject changed since the proposal }
+        "409": { description: "Not pending, expired, fingerprint mismatch, or the subject changed since the proposal" }
 
   /v1/approval-requests/{approvalRequestID}/reject:
     post:
@@ -1431,9 +1479,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApprovalRequest"
         "400": { $ref: "#/components/responses/BadRequest" }
-        "403": { description: The caller is the maker, or lacks the approve permission }
+        "403": { description: "The caller is the maker, or lacks the approve permission" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Not pending, or expired }
+        "409": { description: "Not pending, or expired" }
 
   # ── Workspaces ─────────────────────────────────────────────────────────────
   #
@@ -1470,7 +1518,7 @@ paths:
                 $ref: "#/components/schemas/Workspace"
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { description: Tenant may not transact }
+        "409": { description: "Tenant may not transact" }
 
   /v1/tenants/{tenantID}/workspaces:
     get:
@@ -1534,7 +1582,7 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Tenant may not transact }
+        "409": { description: "Tenant may not transact" }
 
   /v1/workspaces/{workspaceID}/status:
     post:
@@ -1553,7 +1601,7 @@ paths:
             schema:
               $ref: "#/components/schemas/TransitionWorkspaceStatusRequest"
       responses:
-        "204": { description: Transition applied }
+        "204": { description: "Transition applied" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "422": { $ref: "#/components/responses/UnprocessableEntity" }
@@ -1645,6 +1693,8 @@ components:
     Tenant:
       type: object
       properties:
+        primary_jurisdiction_id: { type: string, format: uuid, nullable: true, description: "Provisioning lineage (§4.2 source input)." }
+        subscription_id:         { type: string, nullable: true, description: "The subscription whose plan entitlement was checked at provisioning." }
         tenant_id:           { type: string }
         tenant_code:         { type: string }
         legal_name:          { type: string }
@@ -1672,8 +1722,22 @@ components:
 
     ProvisionTenantRequest:
       type: object
-      required: [tenant_code, legal_name, default_currency_code, primary_timezone, primary_locale, external_customer_key]
+      description: |
+        ORG-02 §4.2 required source inputs. primary_jurisdiction_id,
+        residency_region_id, onboarding_request_ref and subscription_id are
+        required outside local development (LEGACY_PROVISIONING_INPUTS relaxes
+        them there only). Server-resolved: jurisdiction validity and the
+        restricted list (JURISDICTION_RESTRICTED), region availability
+        (REFERENCE_RETIRED), plan entitlement (NOT_ENTITLED).
+      required: [tenant_code, legal_name, default_currency_code, primary_timezone, primary_locale, external_customer_key,
+                 primary_jurisdiction_id, residency_region_id, onboarding_request_ref, subscription_id]
       properties:
+        primary_jurisdiction_id: { type: string, format: uuid }
+        residency_region_id:
+          type: string
+          format: uuid
+          description: The residency preference; becomes the default residency policy's region — the home region.
+        subscription_id: { type: string, description: "commercial-account-svc subscription checked for plan entitlement." }
         external_customer_key:
           type: string
           description: The approved onboarding correlation / external customer key. The idempotency key for tenant creation.
@@ -1796,6 +1860,7 @@ components:
     EntityHierarchy:
       type: object
       properties:
+        record_version: { type: integer, format: int64, description: "Optimistic-concurrency version (migration 000011); carried as object_version on its events." }
         hierarchy_id:           { type: string }
         tenant_id:              { type: string }
         parent_legal_entity_id: { type: string }
@@ -1820,6 +1885,7 @@ components:
     EntityJurisdictionAssignment:
       type: object
       properties:
+        record_version: { type: integer, format: int64, description: "Optimistic-concurrency version (migration 000011); carried as object_version on its events." }
         assignment_id:   { type: string }
         legal_entity_id: { type: string }
         jurisdiction_id: { type: string }
@@ -1933,8 +1999,21 @@ components:
 
     ErrorResponse:
       type: object
+      required: [error, error_code]
       properties:
-        error:          { type: string }
+        error:
+          type: string
+          description: Human-readable; may change. Branch on error_code.
+        error_code:
+          type: string
+          description: |
+            Stable typed code (ORG §3). The nine §3 codes, plus extensions for
+            cases §3 does not name.
+          enum: [CONTEXT_INVALID, VERSION_CONFLICT, DUPLICATE_CANDIDATE, INVALID_TRANSITION,
+                 RULE_AMBIGUOUS, SOURCE_UNVERIFIED, SOD_DENIED, REFERENCE_RETIRED,
+                 DEPENDENCY_UNAVAILABLE, NOT_FOUND, VALIDATION_FAILED, AUTHORIZATION_DENIED,
+                 IDEMPOTENCY_MISMATCH, IDEMPOTENCY_IN_FLIGHT, JURISDICTION_RESTRICTED,
+                 NOT_ENTITLED, INTERNAL_ERROR]
         correlation_id: { type: string }
 
     ResolvedTenantRegion:
@@ -1948,7 +2027,7 @@ components:
 
     RequestEntityVerificationRequest:
       type: object
-      required: [verification_evidence_ref]
+      required: [verification_evidence_ref, expected_version]
       properties:
         verification_evidence_ref: { type: string }
         reason:                    { type: string }
@@ -1957,6 +2036,7 @@ components:
 
     ActivateLegalEntityRequest:
       type: object
+      required: [expected_version]
       properties:
         reason:           { type: string }
         expected_version: { type: integer, format: int64 }
@@ -1964,7 +2044,7 @@ components:
 
     MergeDuplicateCandidateRequest:
       type: object
-      required: [survivor_legal_entity_id, reason]
+      required: [survivor_legal_entity_id, reason, expected_version]
       properties:
         survivor_legal_entity_id: { type: string, format: uuid }
         reason:                   { type: string }
@@ -1974,7 +2054,7 @@ components:
 
     UnmergeEntityRequest:
       type: object
-      required: [reason]
+      required: [reason, expected_version]
       properties:
         reason:           { type: string }
         expected_version: { type: integer, format: int64 }
@@ -2002,6 +2082,7 @@ components:
 
     ApprovalRequest:
       type: object
+      required: [expected_version]
       properties:
         approval_request_id: { type: string, format: uuid }
         tenant_id:           { type: string, format: uuid }
@@ -2064,7 +2145,7 @@ components:
 
     ExecuteTenantCommandRequest:
       type: object
-      required: [reason]
+      required: [reason, expected_version]
       properties:
         reason:
           type: string
@@ -2099,9 +2180,21 @@ components:
         record_version: { type: integer, format: int64 }
         status:         { type: string, enum: [ACTIVE, SUSPENDED, ARCHIVED] }
 
+    ChangeHomeRegionRequest:
+      type: object
+      required: [residency_region_id, home_region_decision_ref, reason, expected_version]
+      properties:
+        residency_region_id: { type: string, format: uuid, description: The new home region (a residency region). }
+        home_region_decision_ref:
+          type: string
+          description: §4.2 evidence — the residency decision this change implements.
+        reason: { type: string }
+        expected_version: { type: integer, format: int64 }
+        correlation_id: { type: string }
+
     ChangeDefaultLocaleRequest:
       type: object
-      required: [reason]
+      required: [reason, expected_version]
       properties:
         primary_locale:   { type: string }
         primary_timezone: { type: string }
@@ -2122,6 +2215,9 @@ components:
     TenantLifecycleEvent:
       type: object
       properties:
+        home_region_decision_ref: { type: string, nullable: true, description: "ChangeHomeRegion rows: the residency decision (§4.2 evidence)." }
+        from_region_id:           { type: string, format: uuid, nullable: true }
+        to_region_id:             { type: string, format: uuid, nullable: true }
         lifecycle_event_id: { type: string, format: uuid }
         tenant_id:          { type: string, format: uuid }
         from_state:         { type: string, nullable: true }
@@ -2133,7 +2229,7 @@ components:
             than inferred from the state pair: SuspendTenant followed by
             ResumeTenant is otherwise indistinguishable from the correction of
             a mistaken suspension.
-          enum: [CreateTenant, ActivateTenant, SuspendTenant, ResumeTenant, InitiateTermination, CompleteTermination, ChangeDefaultLocale, RetryProvisioning, AbandonProvisioning]
+          enum: [CreateTenant, ActivateTenant, SuspendTenant, ResumeTenant, InitiateTermination, CompleteTermination, ChangeDefaultLocale, RetryProvisioning, AbandonProvisioning, ChangeHomeRegion]
         reason:                   { type: string }
         actor_principal_id:       { type: string }
         approved_by_principal_id: { type: string, nullable: true }
@@ -2245,6 +2341,7 @@ components:
 
     AmendLegalProfileRequest:
       type: object
+      required: [expected_version]
       description: |
         Every profile field is optional. An omitted field is CARRIED FORWARD
         from the version in force at effective_from — which is what makes this
@@ -2289,7 +2386,7 @@ components:
 
     ChangeLegalNameRequest:
       type: object
-      required: [legal_name]
+      required: [legal_name, expected_version]
       properties:
         legal_name:               { type: string }
         effective_from:           { type: string, format: date-time }
@@ -2307,7 +2404,7 @@ components:
 
     ChangeRegisteredOfficeRequest:
       type: object
-      required: [registered_office]
+      required: [registered_office, expected_version]
       properties:
         registered_office:        { type: string }
         effective_from:           { type: string, format: date-time }
@@ -2395,6 +2492,7 @@ components:
     Workspace:
       type: object
       properties:
+        record_version: { type: integer, format: int64, description: "Optimistic-concurrency version (migration 000011); carried as object_version on its events." }
         workspace_id:    { type: string, format: uuid }
         tenant_id:       { type: string, format: uuid }
         legal_entity_id: { type: string, format: uuid, nullable: true }

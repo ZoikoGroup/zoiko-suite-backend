@@ -7,7 +7,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -38,7 +40,13 @@ func (f *fakeStore) ClaimIdempotencyKey(_ context.Context, tenantID, endpoint, k
 	defer f.mu.Unlock()
 	existing, ok := f.records[key(tenantID, endpoint, k)]
 	if !ok {
-		f.records[key(tenantID, endpoint, k)] = &store.IdempotencyRecord{RequestFingerprint: fingerprint}
+		f.records[key(tenantID, endpoint, k)] = &store.IdempotencyRecord{RequestFingerprint: fingerprint, CreatedAt: time.Now()}
+		return nil, nil
+	}
+	// Mirrors the ON CONFLICT ... DO UPDATE takeover of an abandoned claim.
+	if existing.ResponseStatus == 0 && existing.RequestFingerprint == fingerprint &&
+		time.Since(existing.CreatedAt) > store.IdempotencyInFlightLease {
+		existing.CreatedAt = time.Now()
 		return nil, nil
 	}
 	if existing.RequestFingerprint != fingerprint {
@@ -226,10 +234,98 @@ func TestConcurrentFirstAttemptIsToldToRetry(t *testing.T) {
 
 	// Claim without completing, as an in-flight request would leave it.
 	_, err := s.ClaimIdempotencyKey(context.Background(), "tenant-a",
-		"POST /v1/context/support", "retry-1", fingerprintOf(`{}`))
+		"POST /v1/context/support", "retry-1", fingerprintOf("", `{}`))
 	require.NoError(t, err)
 
 	w := serve(s, h, request("/v1/context/support", "retry-1", `{}`))
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.Contains(t, w.Body.String(), "IDEMPOTENCY_IN_FLIGHT")
+	assert.Zero(t, h.calls)
+}
+
+// ── Replay is bound to the principal (2026-09-28) ────────────────────────────
+
+func asPrincipal(r *http.Request, principal string) *http.Request {
+	r.Header.Set("X-Principal-Id", principal)
+	return r
+}
+
+// A replay is answered before the handler, so before authorization. Keyed on
+// the body alone, a second principal holding the first one's key and body was
+// handed the first one's stored response — justification included.
+func TestReplayIsNotServedToADifferentPrincipal(t *testing.T) {
+	s := newFakeStore()
+	h := &countingHandler{body: `{"support_context_id":"sc-1","justification":"customer outage"}`}
+
+	serve(s, h, asPrincipal(request("/v1/context/support", "k", `{"x":1}`), "alice"))
+	w := serve(s, h, asPrincipal(request("/v1/context/support", "k", `{"x":1}`), "mallory"))
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.Contains(t, w.Body.String(), "IDEMPOTENCY_MISMATCH")
+	assert.NotContains(t, w.Body.String(), "customer outage", "another principal's stored response must never be replayed")
+	assert.Empty(t, w.Header().Get("X-Idempotent-Replay"))
+	assert.Equal(t, 1, h.calls)
+}
+
+func TestReplayIsStillServedToTheSamePrincipal(t *testing.T) {
+	s := newFakeStore()
+	h := &countingHandler{body: `{"support_context_id":"sc-1"}`}
+
+	serve(s, h, asPrincipal(request("/v1/context/support", "k", `{"x":1}`), "alice"))
+	w := serve(s, h, asPrincipal(request("/v1/context/support", "k", `{"x":1}`), "alice"))
+
+	assert.Equal(t, http.StatusCreated, w.Code)
+	assert.Equal(t, "true", w.Header().Get("X-Idempotent-Replay"))
+	assert.Equal(t, 1, h.calls)
+}
+
+// ── A claim is never stranded in flight (2026-09-28) ─────────────────────────
+
+// chi's Recoverer sits OUTSIDE this middleware in cmd/server. A panicking
+// handler never returned to it, so the claim stayed at status 0 and every retry
+// got IDEMPOTENCY_IN_FLIGHT until the 7-day retention purge.
+func TestPanicReleasesTheClaimSoARetryExecutes(t *testing.T) {
+	s := newFakeStore()
+	panicky := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
+	chain := middleware.Recoverer(Middleware(s, zap.NewNop())(panicky))
+
+	w1 := httptest.NewRecorder()
+	chain.ServeHTTP(w1, request("/v1/context/support", "k", `{"x":1}`))
+	require.Equal(t, http.StatusInternalServerError, w1.Code, "Recoverer must still see the panic")
+
+	ok := &countingHandler{body: `{"ok":true}`}
+	w2 := serve(s, ok, request("/v1/context/support", "k", `{"x":1}`))
+	assert.Equal(t, http.StatusCreated, w2.Code)
+	assert.Equal(t, 1, ok.calls, "the retry must execute, not be told the dead attempt is in flight")
+}
+
+// A process that dies mid-command releases nothing. Its claim is taken over by
+// an identical retry once the lease has passed.
+func TestAbandonedClaimIsTakenOverAfterTheLease(t *testing.T) {
+	s := newFakeStore()
+	fp := fingerprintOf("", `{"x":1}`)
+	s.records[key("tenant-a", "POST /v1/context/support", "k")] = &store.IdempotencyRecord{
+		RequestFingerprint: fp, CreatedAt: time.Now().Add(-store.IdempotencyInFlightLease - time.Minute),
+	}
+
+	h := &countingHandler{body: `{"ok":true}`}
+	w := serve(s, h, request("/v1/context/support", "k", `{"x":1}`))
+
+	assert.Equal(t, http.StatusCreated, w.Code)
+	assert.Equal(t, 1, h.calls)
+}
+
+// Inside the lease the claim may belong to a live command — still in flight.
+func TestLiveClaimInsideTheLeaseIsStillInFlight(t *testing.T) {
+	s := newFakeStore()
+	fp := fingerprintOf("", `{"x":1}`)
+	s.records[key("tenant-a", "POST /v1/context/support", "k")] = &store.IdempotencyRecord{
+		RequestFingerprint: fp, CreatedAt: time.Now().Add(-10 * time.Second),
+	}
+
+	h := &countingHandler{}
+	w := serve(s, h, request("/v1/context/support", "k", `{"x":1}`))
 
 	assert.Equal(t, http.StatusConflict, w.Code)
 	assert.Contains(t, w.Body.String(), "IDEMPOTENCY_IN_FLIGHT")

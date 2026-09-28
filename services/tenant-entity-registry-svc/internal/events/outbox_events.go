@@ -35,6 +35,7 @@ const (
 	EventTenantTerminationInitiated = "tenant.termination.initiated" // TenantTerminationInitiated
 	EventTenantTerminated           = "tenant.terminated"            // TenantTerminated
 	EventTenantDefaultsChanged      = "tenant.defaults.changed"      // (ChangeDefaultLocale)
+	EventTenantHomeRegionChanged    = "tenant.home_region.changed"   // (ChangeHomeRegion; §4.2 names no event)
 
 	// ORG-03 §4.3 — Events produced.
 	EventLegalEntityCreated        = "entity.created"                   // LegalEntityCreated
@@ -69,8 +70,37 @@ func TenantCommandEvent(command string) string {
 		return EventTenantTerminated
 	case "ChangeDefaultLocale":
 		return EventTenantDefaultsChanged
+	case "ChangeHomeRegion":
+		return EventTenantHomeRegionChanged
 	}
 	return ""
+}
+
+// envelope is this platform's event contract (Doc 03 §19) plus the ORG §7
+// minimum payload: tenant_id; object_id; object_version; effective_at;
+// recorded_at; actor; correlation_id; evidence_ref where material.
+//
+// Before 28 Sep 2026 the envelope carried no object identity or version at
+// all — a consumer could not pin the version it had been told about, which is
+// the thing §3 "Historical use" requires it to persist.
+type envelope struct {
+	EventID       string          `json:"event_id"`
+	EventType     string          `json:"event_type"`
+	EventVersion  string          `json:"event_version"`
+	EmittedAt     time.Time       `json:"emitted_at"`
+	SchemaVersion string          `json:"schema_version"`
+	SourceService string          `json:"source_service"`
+	TenantID      string          `json:"tenant_id,omitempty"`
+	LegalEntityID string          `json:"legal_entity_id,omitempty"`
+	Jurisdiction  string          `json:"jurisdiction,omitempty"`
+	ActorID       string          `json:"actor_id,omitempty"`
+	CorrelationID string          `json:"correlation_id"`
+	ObjectID      string          `json:"object_id"`
+	ObjectVersion int64           `json:"object_version"`
+	EffectiveAt   time.Time       `json:"effective_at"`
+	RecordedAt    time.Time       `json:"recorded_at"`
+	EvidenceRef   string          `json:"evidence_ref,omitempty"`
+	Payload       json.RawMessage `json:"payload"`
 }
 
 // RecordSpec is the caller-supplied half of an outbox record.
@@ -81,6 +111,16 @@ type RecordSpec struct {
 	Jurisdiction  string
 	ActorID       string
 	CorrelationID string
+	// ObjectID and ObjectVersion identify the aggregate and the version this
+	// event attests — the version a consumer pins. Both required.
+	ObjectID      string
+	ObjectVersion int64
+	// EffectiveAt is business time; RecordedAt is when the fact was recorded.
+	// RecordedAt defaults to now, EffectiveAt to RecordedAt.
+	EffectiveAt time.Time
+	RecordedAt  time.Time
+	// EvidenceRef is the source evidence for a material change.
+	EvidenceRef string
 	// PartitionKey orders events for one aggregate. Kafka guarantees ordering
 	// only within a partition, so every event about one tenant or one entity
 	// must carry the same key — otherwise a consumer can see an entity's
@@ -95,15 +135,27 @@ type RecordSpec struct {
 // Returns an error rather than swallowing one: this record is about to be
 // written inside a business transaction, and a payload that will not marshal
 // must abort that transaction rather than commit the fact with no event. That
-// is the whole point of the outbox, and it is the one respect in which this
-// path must NOT behave like Publisher.emit, which logs and moves on.
+// is the whole point of the outbox.
 func BuildRecord(spec RecordSpec) (*outbox.Record, error) {
 	if spec.EventType == "" {
 		return nil, fmt.Errorf("events: event type is required")
 	}
+	if spec.ObjectID == "" || spec.ObjectVersion < 1 {
+		return nil, fmt.Errorf("events: %s needs object_id and a positive object_version (ORG §7)", spec.EventType)
+	}
 	raw, err := json.Marshal(spec.Payload)
 	if err != nil {
 		return nil, fmt.Errorf("events: marshal payload for %s: %w", spec.EventType, err)
+	}
+
+	now := time.Now().UTC()
+	recorded := spec.RecordedAt
+	if recorded.IsZero() {
+		recorded = now
+	}
+	effective := spec.EffectiveAt
+	if effective.IsZero() {
+		effective = recorded
 	}
 
 	eventID := "evt-" + uuid.New().String()
@@ -111,14 +163,19 @@ func BuildRecord(spec RecordSpec) (*outbox.Record, error) {
 		EventID:       eventID,
 		EventType:     spec.EventType,
 		EventVersion:  "1.0",
-		EmittedAt:     time.Now().UTC(),
-		SchemaVersion: "1.0",
+		EmittedAt:     now,
+		SchemaVersion: "1.1",
 		SourceService: "tenant-entity-registry-svc",
 		TenantID:      spec.TenantID,
 		LegalEntityID: spec.LegalEntityID,
 		Jurisdiction:  spec.Jurisdiction,
 		ActorID:       spec.ActorID,
 		CorrelationID: spec.CorrelationID,
+		ObjectID:      spec.ObjectID,
+		ObjectVersion: spec.ObjectVersion,
+		EffectiveAt:   effective.UTC(),
+		RecordedAt:    recorded.UTC(),
+		EvidenceRef:   spec.EvidenceRef,
 		Payload:       json.RawMessage(raw),
 	}
 	data, err := json.Marshal(env)
@@ -142,4 +199,39 @@ func BuildRecord(spec RecordSpec) (*outbox.Record, error) {
 		PartitionKey: key,
 		Payload:      data,
 	}, nil
+}
+
+// StampVersion sets a record's object_version once the write that produced it
+// knows it — for a profile amendment the entity's version moves only when the
+// amendment is in force now, which the store decides inside the transaction.
+// extra fields are merged into the payload.
+func StampVersion(rec *outbox.Record, objectVersion int64, extra map[string]any) error {
+	if rec == nil {
+		return nil
+	}
+	var env envelope
+	if err := json.Unmarshal(rec.Payload, &env); err != nil {
+		return fmt.Errorf("events: stamp version: %w", err)
+	}
+	env.ObjectVersion = objectVersion
+	if len(extra) > 0 {
+		payload := map[string]any{}
+		if err := json.Unmarshal(env.Payload, &payload); err != nil {
+			return fmt.Errorf("events: stamp version payload: %w", err)
+		}
+		for k, v := range extra {
+			payload[k] = v
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		env.Payload = raw
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	rec.Payload = data
+	return nil
 }

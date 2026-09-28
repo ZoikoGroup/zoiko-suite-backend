@@ -190,6 +190,7 @@ func (r *Router) deliverEmail(ctx context.Context, n domain.Notification) domain
 		return domain.DeliveryOutcome{
 			Reason:    fmt.Sprintf("%s: %s", r.email.Name(), err.Error()),
 			Retryable: retry,
+			Err:       err,
 		}
 	}
 

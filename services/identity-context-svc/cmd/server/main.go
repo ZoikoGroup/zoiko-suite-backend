@@ -208,16 +208,32 @@ func main() {
 
 	kafkaReader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: cfg.Kafka.Brokers,
-		Topic:   cfg.Kafka.Topic,
-		GroupID: cfg.Kafka.GroupID,
-		// Errors are surfaced through ReadMessage rather than kafka-go's own
-		// logger, so the consumer decides the level. Without this a missing
-		// broker prints to stderr once per dial attempt, outside zap.
+		// GroupTopics, not Topic. The reader used to be pointed at this
+		// service's OWN publish topic, while every revocation it handles is
+		// published by another service on that service's topic — so
+		// authority.revoked, role.updated and entity.updated never arrived.
+		// Topic and GroupTopics are mutually exclusive in kafka-go.
+		GroupTopics: cfg.Kafka.ConsumeTopics,
+		GroupID:     cfg.Kafka.GroupID,
+		// kafka-go defaults this to false, so a member assigned zero partitions
+		// at join never re-checks and blocks in ReadMessage forever while the
+		// group reports Stable — a dead consumer that looks idle.
+		WatchPartitionChanges: true,
+		// WARN, not DEBUG. This logger is the only place consumer-group
+		// failures (JoinGroup, coordinator moves, empty metadata) surface —
+		// ReadMessage does not return them — and zap.NewProduction drops DEBUG,
+		// so at DEBUG a consumer that never joined produced no output at all.
 		ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
-			log.Debug("kafka reader: " + fmt.Sprintf(msg, args...))
+			log.Warn("kafka reader: " + fmt.Sprintf(msg, args...))
 		}),
 	})
-	consumer := events.NewConsumer(log, sessionCache, principalRepo, riskCache, principalRepo, events.NewRedisDeduper(rdb))
+	consumer := events.NewConsumer(log, sessionCache, principalRepo, riskCache, principalRepo, events.NewRedisDeduper(rdb)).
+		// A session lives at most the envelope TTL, so a revocation older than
+		// that cannot reach a live session issued before it. Without this the
+		// first deploy after subscribing to the producer topics above would
+		// replay their whole history against today's sessions. One minute of
+		// clock-skew allowance between producer and consumer.
+		WithRevocationHorizon(time.Duration(cfg.EnvelopeJWTTTLSeconds)*time.Second + time.Minute)
 	go consumer.Run(consumerCtx, kafkaReader)
 	upstreamRegistry := upstream.NewRegistryClient(cfg, log)
 
@@ -329,7 +345,9 @@ func main() {
 			principalRepo,
 			identityctx.IngressPolicy(cfg.IngressPolicy),
 			log,
-		)).
+		// Without a TTL every binding reads FRESH forever, so §4's STALE state
+		// was unreachable in any deployment. Labels only — STALE is admitted.
+		).WithBindingTTL(time.Duration(cfg.IngressBindingTTLSeconds) * time.Second)).
 		// Residency has been recorded on every session since migration 000005
 		// and never enforced. Empty allow-list keeps enforcement off.
 		WithResidencyPolicy(identityctx.NewResidencyPolicy(

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -975,51 +976,1719 @@ func (s *PgStore) GetAttempts(ctx context.Context, notificationID string) ([]dom
 	return attempts, err
 }
 
-// FindStuckInFlight finds notifications that are in flight (PENDING with no
-// next_attempt_at) for longer than the threshold. This is the reconciliation
-// step before re-attempting — ZS-SVC-Y-001 §3.4: "Timeout after submit
-// becomes UNKNOWN, not FAILED; reconcile before re-attempting".
-func (s *PgStore) FindStuckInFlight(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error) {
-	tx, err := s.pool.Begin(ctx)
+// FindStuckInFlight finds notifications that are in flight (PENDING or UNKNOWN
+ // with no next_attempt_at) for longer than the threshold. This is the reconciliation
+ // step before re-attempting — ZS-SVC-Y-001 §3.4: "Timeout after submit
+ // becomes UNKNOWN, not FAILED; reconcile before re-attempting".
+ func (s *PgStore) FindStuckInFlight(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error) {
+ 	tx, err := s.pool.Begin(ctx)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("begin transaction: %w", err)
+ 	}
+ 	defer func() { _ = tx.Rollback(ctx) }()
+
+ 	if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
+ 		return nil, fmt.Errorf("set platform scope: %w", err)
+ 	}
+
+ 	rows, err := tx.Query(ctx, `
+ 		SELECT notification_id, tenant_id
+ 		FROM notifications
+ 		WHERE status IN ('PENDING', 'UNKNOWN')
+ 		  AND next_attempt_at IS NULL
+ 		  AND COALESCE(last_attempt_at, created_at) <= $1
+ 		ORDER BY COALESCE(last_attempt_at, created_at)
+ 		LIMIT $2
+ 	`, staleBefore, limit)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+
+ 	var stuck []domain.DueRetry
+ 	for rows.Next() {
+ 		var d domain.DueRetry
+ 		if err := rows.Scan(&d.NotificationID, &d.TenantID); err != nil {
+ 			rows.Close()
+ 			return nil, err
+ 		}
+ 		stuck = append(stuck, d)
+ 	}
+ 	rows.Close()
+ 	if err := rows.Err(); err != nil {
+ 		return nil, err
+ 	}
+ 	if err := tx.Commit(ctx); err != nil {
+ 		return nil, fmt.Errorf("commit transaction: %w", err)
+ 	}
+return stuck, nil
+}
+
+// ── NCD-02: Suppression ───────────────────────────────────────────────────────
+
+const suppressionColumns = `
+	suppression_id, tenant_id, principal_id, channel, reason,
+	created_by, created_at, expires_at`
+
+func scanSuppression(s scannable, sp *domain.Suppression) error {
+	return s.Scan(
+		&sp.SuppressionID, &sp.TenantID, &sp.PrincipalID, &sp.Channel,
+		&sp.Reason, &sp.CreatedBy, &sp.CreatedAt, &sp.ExpiresAt,
+	)
+}
+
+func (s *PgStore) CreateSuppression(ctx context.Context, sp *domain.Suppression) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if sp.SuppressionID == "" {
+		sp.SuppressionID = uuid.NewString()
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO suppressions (suppression_id, tenant_id, principal_id, channel, reason, created_by, created_at, expires_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		`, sp.SuppressionID, tenantID, sp.PrincipalID, sp.Channel, sp.Reason, sp.CreatedBy, sp.CreatedAt, sp.ExpiresAt)
+		return err
+	})
+}
+
+func (s *PgStore) GetSuppression(ctx context.Context, id string) (*domain.Suppression, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var sp domain.Suppression
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanSuppression(tx.QueryRow(ctx, `
+			SELECT `+suppressionColumns+`
+			FROM suppressions
+			WHERE suppression_id = $1 AND tenant_id = $2
+		`, id, tenantID), &sp)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrSuppressionNotFound
+	}
 	if err != nil {
-		return nil, fmt.Errorf("begin transaction: %w", err)
+		return nil, mapPgError(err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	return &sp, nil
+}
 
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
-		return nil, fmt.Errorf("set platform scope: %w", err)
-	}
-
-	rows, err := tx.Query(ctx, `
-		SELECT notification_id, tenant_id
-		FROM notifications
-		WHERE status = 'PENDING'
-		  AND next_attempt_at IS NULL
-		  AND COALESCE(last_attempt_at, created_at) <= $1
-		ORDER BY COALESCE(last_attempt_at, created_at)
-		LIMIT $2
-	`, staleBefore, limit)
-	if err != nil {
-		return nil, err
+func (s *PgStore) ListSuppressions(ctx context.Context, f domain.SuppressionFilter) ([]domain.Suppression, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
 	}
 
-	var stuck []domain.DueRetry
-	for rows.Next() {
-		var d domain.DueRetry
-		if err := rows.Scan(&d.NotificationID, &d.TenantID); err != nil {
-			rows.Close()
-			return nil, err
+	var out []domain.Suppression
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + suppressionColumns + ` FROM suppressions WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.PrincipalID != "" {
+			args = append(args, f.PrincipalID)
+			query += fmt.Sprintf(" AND principal_id = $%d", len(args))
 		}
-		stuck = append(stuck, d)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		if f.Channel != "" {
+			args = append(args, f.Channel)
+			query += fmt.Sprintf(" AND channel = $%d", len(args))
+		}
+		if f.Reason != "" {
+			args = append(args, f.Reason)
+			query += fmt.Sprintf(" AND reason = $%d", len(args))
+		}
+		if f.ActiveOnly {
+			query += " AND (expires_at IS NULL OR expires_at > now())"
+		}
+
+		query += " ORDER BY created_at DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var sp domain.Suppression
+			if err := scanSuppression(rows, &sp); err != nil {
+				return err
+			}
+			out = append(out, sp)
+		}
+		return rows.Err()
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit transaction: %w", err)
+	return out, nil
+}
+
+func (s *PgStore) DeleteSuppression(ctx context.Context, id string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
 	}
-	return stuck, nil
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			DELETE FROM suppressions WHERE suppression_id = $1 AND tenant_id = $2
+		`, id, tenantID)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrSuppressionNotFound
+		}
+		return nil
+	})
+}
+
+// ── NCD-02: Preference ────────────────────────────────────────────────────────
+
+const preferenceColumns = `
+	preference_id, tenant_id, principal_id, channel, enabled,
+	quiet_hours_start, quiet_hours_end, timezone, created_at, updated_at`
+
+func scanPreference(s scannable, p *domain.Preference) error {
+	return s.Scan(
+		&p.PreferenceID, &p.TenantID, &p.PrincipalID, &p.Channel,
+		&p.Enabled, &p.QuietHoursStart, &p.QuietHoursEnd, &p.Timezone,
+		&p.CreatedAt, &p.UpdatedAt,
+	)
+}
+
+func (s *PgStore) UpsertPreference(ctx context.Context, p *domain.Preference) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if p.PreferenceID == "" {
+		p.PreferenceID = uuid.NewString()
+	}
+	p.UpdatedAt = time.Now().UTC()
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO preferences (preference_id, tenant_id, principal_id, channel, enabled, quiet_hours_start, quiet_hours_end, timezone, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+			ON CONFLICT (tenant_id, principal_id, channel) DO UPDATE SET
+				enabled = EXCLUDED.enabled,
+				quiet_hours_start = EXCLUDED.quiet_hours_start,
+				quiet_hours_end = EXCLUDED.quiet_hours_end,
+				timezone = EXCLUDED.timezone,
+				updated_at = EXCLUDED.updated_at
+		`, p.PreferenceID, tenantID, p.PrincipalID, p.Channel, p.Enabled,
+			p.QuietHoursStart, p.QuietHoursEnd, p.Timezone,
+			p.CreatedAt, p.UpdatedAt)
+		return err
+	})
+}
+
+func (s *PgStore) GetPreference(ctx context.Context, tenantID, principalID, channel string) (*domain.Preference, error) {
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var p domain.Preference
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanPreference(tx.QueryRow(ctx, `
+			SELECT `+preferenceColumns+`
+			FROM preferences
+			WHERE tenant_id = $1 AND principal_id = $2 AND channel = $3
+		`, tenantID, principalID, channel), &p)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrPreferenceNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &p, nil
+}
+
+func (s *PgStore) ListPreferences(ctx context.Context, f domain.PreferenceFilter) ([]domain.Preference, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.Preference
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + preferenceColumns + ` FROM preferences WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.PrincipalID != "" {
+			args = append(args, f.PrincipalID)
+			query += fmt.Sprintf(" AND principal_id = $%d", len(args))
+		}
+		if f.Channel != "" {
+			args = append(args, f.Channel)
+			query += fmt.Sprintf(" AND channel = $%d", len(args))
+		}
+		if f.EnabledOnly {
+			query += " AND enabled = true"
+		}
+
+		query += " ORDER BY created_at DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var p domain.Preference
+			if err := scanPreference(rows, &p); err != nil {
+				return err
+			}
+			out = append(out, p)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PgStore) DeletePreference(ctx context.Context, tenantID, principalID, channel string) error {
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			DELETE FROM preferences WHERE tenant_id = $1 AND principal_id = $2 AND channel = $3
+		`, tenantID, principalID, channel)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrPreferenceNotFound
+		}
+		return nil
+	})
+}
+
+// ── NCD-02: Channel Decision ──────────────────────────────────────────────────
+
+const channelDecisionColumns = `
+	decision_id, tenant_id, principal_id, channel, decision,
+	suppression_id, preference_id, permission_grant, evaluated_at`
+
+func scanChannelDecision(s scannable, cd *domain.ChannelDecision) error {
+	return s.Scan(
+		&cd.DecisionID, &cd.TenantID, &cd.PrincipalID, &cd.Channel,
+		&cd.Decision, &cd.SuppressionID, &cd.PreferenceID, &cd.PermissionGrant,
+		&cd.EvaluatedAt,
+	)
+}
+
+// EvaluateChannel checks suppression, preference, quiet hours, and permission.
+// Returns the decision result and records it for audit.
+// Precedence per §5.4: suppression > quiet hours > preference > permission.
+func (s *PgStore) EvaluateChannel(ctx context.Context, tenantID, principalID, channel, permissionGrant string) (*domain.ChannelDecisionResult, error) {
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	// We need to run this with the tenant context but also read suppressions/preferences
+	// which are tenant-scoped. The logic is:
+	// 1. Check active suppression for this channel
+	// 2. Check quiet hours (from preference)
+	// 3. Check preference enabled
+	// 4. Check permission grant (passed in)
+
+	var result domain.ChannelDecisionResult
+	result.Decision = domain.ChannelDecisionNoPermission // default if no permission grant
+
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
+
+		// 1. Check suppression (highest precedence)
+		var sup domain.Suppression
+		err := scanSuppression(tx.QueryRow(ctx, `
+			SELECT `+suppressionColumns+`
+			FROM suppressions
+			WHERE tenant_id = $1 AND principal_id = $2 AND channel = $3
+			  AND (expires_at IS NULL OR expires_at > $4)
+			LIMIT 1
+		`, tenantID, principalID, channel, now), &sup)
+		if err == nil {
+			// Suppression found
+			result.Allowed = false
+			result.Decision = domain.ChannelDecisionSuppressed
+			result.SuppressionID = &sup.SuppressionID
+			return s.recordDecision(ctx, tx, tenantID, principalID, channel, result, permissionGrant)
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		// 2. Check preference for quiet hours
+		var pref domain.Preference
+		err = scanPreference(tx.QueryRow(ctx, `
+			SELECT `+preferenceColumns+`
+			FROM preferences
+			WHERE tenant_id = $1 AND principal_id = $2 AND channel = $3
+		`, tenantID, principalID, channel), &pref)
+		if err == nil {
+			// Check quiet hours
+			if pref.QuietHoursStart != nil && pref.QuietHoursEnd != nil && pref.Timezone != "" {
+				loc, tzErr := time.LoadLocation(pref.Timezone)
+				if tzErr == nil {
+					localNow := now.In(loc)
+					start, _ := time.ParseInLocation("15:04:05", *pref.QuietHoursStart, loc)
+					end, _ := time.ParseInLocation("15:04:05", *pref.QuietHoursEnd, loc)
+
+					// Compare just the time portion
+					localTime := time.Date(1, 1, 1, localNow.Hour(), localNow.Minute(), localNow.Second(), 0, loc)
+					startTime := time.Date(1, 1, 1, start.Hour(), start.Minute(), start.Second(), 0, loc)
+					endTime := time.Date(1, 1, 1, end.Hour(), end.Minute(), end.Second(), 0, loc)
+
+					inQuietHours := false
+					if startTime.Before(endTime) {
+						// Same day (e.g., 09:00-17:00)
+						inQuietHours = !localTime.Before(startTime) && localTime.Before(endTime)
+					} else {
+						// Crosses midnight (e.g., 22:00-08:00)
+						inQuietHours = !localTime.Before(startTime) || localTime.Before(endTime)
+					}
+
+					if inQuietHours && pref.Enabled {
+						result.Allowed = false
+						result.Decision = domain.ChannelDecisionQuietHours
+						result.PreferenceID = &pref.PreferenceID
+						return s.recordDecision(ctx, tx, tenantID, principalID, channel, result, permissionGrant)
+					}
+				}
+			}
+
+			// 3. Check preference enabled
+			if !pref.Enabled {
+				result.Allowed = false
+				result.Decision = domain.ChannelDecisionNoPreference
+				result.PreferenceID = &pref.PreferenceID
+				return s.recordDecision(ctx, tx, tenantID, principalID, channel, result, permissionGrant)
+			}
+
+			result.PreferenceID = &pref.PreferenceID
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		// 4. Check permission grant (provided by caller)
+		if permissionGrant != "" {
+			result.Allowed = true
+			result.Decision = domain.ChannelDecisionAllowed
+			result.PermissionGrant = &permissionGrant
+		} else {
+			result.Allowed = false
+			result.Decision = domain.ChannelDecisionNoPermission
+		}
+
+		return s.recordDecision(ctx, tx, tenantID, principalID, channel, result, permissionGrant)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (s *PgStore) recordDecision(ctx context.Context, tx pgx.Tx, tenantID, principalID, channel string, result domain.ChannelDecisionResult, permissionGrant string) error {
+	decisionID := uuid.NewString()
+	_, err := tx.Exec(ctx, `
+		INSERT INTO channel_decisions (decision_id, tenant_id, principal_id, channel, decision, suppression_id, preference_id, permission_grant, evaluated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+	`, decisionID, tenantID, principalID, channel, result.Decision,
+		result.SuppressionID, result.PreferenceID, result.PermissionGrant, time.Now().UTC())
+	return err
+}
+
+func (s *PgStore) ListChannelDecisions(ctx context.Context, f domain.ChannelDecisionFilter) ([]domain.ChannelDecision, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.ChannelDecision
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + channelDecisionColumns + ` FROM channel_decisions WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.PrincipalID != "" {
+			args = append(args, f.PrincipalID)
+			query += fmt.Sprintf(" AND principal_id = $%d", len(args))
+		}
+		if f.Channel != "" {
+			args = append(args, f.Channel)
+			query += fmt.Sprintf(" AND channel = $%d", len(args))
+		}
+		if f.Decision != "" {
+			args = append(args, f.Decision)
+			query += fmt.Sprintf(" AND decision = $%d", len(args))
+		}
+
+		query += " ORDER BY evaluated_at DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var cd domain.ChannelDecision
+			if err := scanChannelDecision(rows, &cd); err != nil {
+				return err
+			}
+			out = append(out, cd)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ── NCD-04: Bounce ────────────────────────────────────────────────────────────
+
+const bounceEventColumns = `
+	bounce_id, tenant_id, notification_id, provider, bounce_type,
+	bounce_subtype, diagnostic_code, recipient_address, received_at,
+	processed_at, action_taken, suppression_id`
+
+func scanBounceEvent(s scannable, b *domain.BounceEvent) error {
+	return s.Scan(
+		&b.BounceID, &b.TenantID, &b.NotificationID, &b.Provider,
+		&b.BounceType, &b.BounceSubtype, &b.DiagnosticCode,
+		&b.RecipientAddress, &b.ReceivedAt, &b.ProcessedAt,
+		&b.ActionTaken, &b.SuppressionID,
+	)
+}
+
+func (s *PgStore) CreateBounceEvent(ctx context.Context, b *domain.BounceEvent) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if b.BounceID == "" {
+		b.BounceID = uuid.NewString()
+	}
+	if b.ReceivedAt.IsZero() {
+		b.ReceivedAt = time.Now().UTC()
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO bounce_events (bounce_id, tenant_id, notification_id, provider, bounce_type, bounce_subtype, diagnostic_code, recipient_address, received_at, processed_at, action_taken, suppression_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		`, b.BounceID, tenantID, b.NotificationID, b.Provider, b.BounceType, b.BounceSubtype,
+			b.DiagnosticCode, b.RecipientAddress, b.ReceivedAt, b.ProcessedAt, b.ActionTaken, b.SuppressionID)
+		return err
+	})
+}
+
+func (s *PgStore) GetBounceEvent(ctx context.Context, id string) (*domain.BounceEvent, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var b domain.BounceEvent
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanBounceEvent(tx.QueryRow(ctx, `
+			SELECT `+bounceEventColumns+`
+			FROM bounce_events
+			WHERE bounce_id = $1 AND tenant_id = $2
+		`, id, tenantID), &b)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrBounceNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &b, nil
+}
+
+func (s *PgStore) ListBounceEvents(ctx context.Context, f domain.BounceEventFilter) ([]domain.BounceEvent, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.BounceEvent
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + bounceEventColumns + ` FROM bounce_events WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.NotificationID != "" {
+			args = append(args, f.NotificationID)
+			query += fmt.Sprintf(" AND notification_id = $%d", len(args))
+		}
+		if f.RecipientAddr != "" {
+			args = append(args, f.RecipientAddr)
+			query += fmt.Sprintf(" AND recipient_address = $%d", len(args))
+		}
+		if f.BounceType != "" {
+			args = append(args, f.BounceType)
+			query += fmt.Sprintf(" AND bounce_type = $%d", len(args))
+		}
+
+		query += " ORDER BY received_at DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var b domain.BounceEvent
+			if err := scanBounceEvent(rows, &b); err != nil {
+				return err
+			}
+			out = append(out, b)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ── NCD-04: Complaint ─────────────────────────────────────────────────────────
+
+const complaintEventColumns = `
+	complaint_id, tenant_id, notification_id, provider, complaint_type,
+	recipient_address, received_at, processed_at, action_taken, suppression_id`
+
+func scanComplaintEvent(s scannable, c *domain.ComplaintEvent) error {
+	return s.Scan(
+		&c.ComplaintID, &c.TenantID, &c.NotificationID, &c.Provider,
+		&c.ComplaintType, &c.RecipientAddress, &c.ReceivedAt,
+		&c.ProcessedAt, &c.ActionTaken, &c.SuppressionID,
+	)
+}
+
+func (s *PgStore) CreateComplaintEvent(ctx context.Context, c *domain.ComplaintEvent) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if c.ComplaintID == "" {
+		c.ComplaintID = uuid.NewString()
+	}
+	if c.ReceivedAt.IsZero() {
+		c.ReceivedAt = time.Now().UTC()
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO complaint_events (complaint_id, tenant_id, notification_id, provider, complaint_type, recipient_address, received_at, processed_at, action_taken, suppression_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		`, c.ComplaintID, tenantID, c.NotificationID, c.Provider, c.ComplaintType,
+			c.RecipientAddress, c.ReceivedAt, c.ProcessedAt, c.ActionTaken, c.SuppressionID)
+		return err
+	})
+}
+
+func (s *PgStore) GetComplaintEvent(ctx context.Context, id string) (*domain.ComplaintEvent, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var c domain.ComplaintEvent
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanComplaintEvent(tx.QueryRow(ctx, `
+			SELECT `+complaintEventColumns+`
+			FROM complaint_events
+			WHERE complaint_id = $1 AND tenant_id = $2
+		`, id, tenantID), &c)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrComplaintNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &c, nil
+}
+
+func (s *PgStore) ListComplaintEvents(ctx context.Context, f domain.ComplaintEventFilter) ([]domain.ComplaintEvent, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.ComplaintEvent
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + complaintEventColumns + ` FROM complaint_events WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.NotificationID != "" {
+			args = append(args, f.NotificationID)
+			query += fmt.Sprintf(" AND notification_id = $%d", len(args))
+		}
+		if f.RecipientAddr != "" {
+			args = append(args, f.RecipientAddr)
+			query += fmt.Sprintf(" AND recipient_address = $%d", len(args))
+		}
+		if f.ComplaintType != "" {
+			args = append(args, f.ComplaintType)
+			query += fmt.Sprintf(" AND complaint_type = $%d", len(args))
+		}
+
+		query += " ORDER BY received_at DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var c domain.ComplaintEvent
+			if err := scanComplaintEvent(rows, &c); err != nil {
+				return err
+			}
+			out = append(out, c)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ── NCD-04: Channel Reputation ────────────────────────────────────────────────
+
+const channelReputationColumns = `
+	reputation_id, tenant_id, channel, provider, window_start, window_end,
+	sent_count, accepted_count, bounced_count, complained_count,
+	delivered_count, read_count, reputation_score, created_at, updated_at`
+
+func scanChannelReputation(s scannable, r *domain.ChannelReputation) error {
+	return s.Scan(
+		&r.ReputationID, &r.TenantID, &r.Channel, &r.Provider,
+		&r.WindowStart, &r.WindowEnd, &r.SentCount, &r.AcceptedCount,
+		&r.BouncedCount, &r.ComplainedCount, &r.DeliveredCount, &r.ReadCount,
+		&r.ReputationScore, &r.CreatedAt, &r.UpdatedAt,
+	)
+}
+
+func (s *PgStore) UpsertChannelReputation(ctx context.Context, r *domain.ChannelReputation) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if r.ReputationID == "" {
+		r.ReputationID = uuid.NewString()
+	}
+	r.UpdatedAt = time.Now().UTC()
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO channel_reputation (reputation_id, tenant_id, channel, provider, window_start, window_end,
+				sent_count, accepted_count, bounced_count, complained_count, delivered_count, read_count,
+				reputation_score, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			ON CONFLICT (tenant_id, channel, provider, window_start) DO UPDATE SET
+				window_end = EXCLUDED.window_end,
+				sent_count = channel_reputation.sent_count + EXCLUDED.sent_count,
+				accepted_count = channel_reputation.accepted_count + EXCLUDED.accepted_count,
+				bounced_count = channel_reputation.bounced_count + EXCLUDED.bounced_count,
+				complained_count = channel_reputation.complained_count + EXCLUDED.complained_count,
+				delivered_count = channel_reputation.delivered_count + EXCLUDED.delivered_count,
+				read_count = channel_reputation.read_count + EXCLUDED.read_count,
+				reputation_score = EXCLUDED.reputation_score,
+				updated_at = EXCLUDED.updated_at
+		`, r.ReputationID, tenantID, r.Channel, r.Provider, r.WindowStart, r.WindowEnd,
+			r.SentCount, r.AcceptedCount, r.BouncedCount, r.ComplainedCount,
+			r.DeliveredCount, r.ReadCount, r.ReputationScore, r.CreatedAt, r.UpdatedAt)
+		return err
+	})
+}
+
+func (s *PgStore) ListChannelReputations(ctx context.Context, f domain.ChannelReputationFilter) ([]domain.ChannelReputation, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.ChannelReputation
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + channelReputationColumns + ` FROM channel_reputation WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.Channel != "" {
+			args = append(args, f.Channel)
+			query += fmt.Sprintf(" AND channel = $%d", len(args))
+		}
+		if f.Provider != "" {
+			args = append(args, f.Provider)
+			query += fmt.Sprintf(" AND provider = $%d", len(args))
+		}
+		if !f.Since.IsZero() {
+			args = append(args, f.Since)
+			query += fmt.Sprintf(" AND window_start >= $%d", len(args))
+		}
+		if !f.Until.IsZero() {
+			args = append(args, f.Until)
+			query += fmt.Sprintf(" AND window_start <= $%d", len(args))
+		}
+
+		query += " ORDER BY window_start DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var r domain.ChannelReputation
+			if err := scanChannelReputation(rows, &r); err != nil {
+				return err
+			}
+			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ── NCD-01: Communication Intent ──────────────────────────────────────────────
+
+const communicationIntentColumns = `
+	intent_id, tenant_id, legal_entity_id, name, description, category, channels, created_by, created_at, updated_at`
+
+func scanCommunicationIntent(s scannable, i *domain.CommunicationIntent) error {
+	return s.Scan(
+		&i.IntentID, &i.TenantID, &i.LegalEntityID, &i.Name, &i.Description,
+		&i.Category, &i.Channels, &i.CreatedBy, &i.CreatedAt, &i.UpdatedAt,
+	)
+}
+
+func (s *PgStore) CreateCommunicationIntent(ctx context.Context, i *domain.CommunicationIntent) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if i.IntentID == "" {
+		i.IntentID = uuid.NewString()
+	}
+	if i.CreatedAt.IsZero() {
+		i.CreatedAt = time.Now().UTC()
+	}
+	if i.UpdatedAt.IsZero() {
+		i.UpdatedAt = time.Now().UTC()
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO communication_intents (intent_id, tenant_id, legal_entity_id, name, description, category, channels, created_by, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		`, i.IntentID, tenantID, i.LegalEntityID, i.Name, i.Description, i.Category, i.Channels, i.CreatedBy, i.CreatedAt, i.UpdatedAt)
+		return err
+	})
+}
+
+func (s *PgStore) GetCommunicationIntent(ctx context.Context, id string) (*domain.CommunicationIntent, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var i domain.CommunicationIntent
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanCommunicationIntent(tx.QueryRow(ctx, `
+			SELECT `+communicationIntentColumns+`
+			FROM communication_intents
+			WHERE intent_id = $1 AND tenant_id = $2
+		`, id, tenantID), &i)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrIntentNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &i, nil
+}
+
+func (s *PgStore) ListCommunicationIntents(ctx context.Context, f domain.CommunicationIntentFilter) ([]domain.CommunicationIntent, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.CommunicationIntent
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + communicationIntentColumns + ` FROM communication_intents WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.LegalEntityID != "" {
+			args = append(args, f.LegalEntityID)
+			query += fmt.Sprintf(" AND legal_entity_id = $%d", len(args))
+		}
+		if f.Name != "" {
+			args = append(args, f.Name)
+			query += fmt.Sprintf(" AND name = $%d", len(args))
+		}
+		if f.Category != "" {
+			args = append(args, f.Category)
+			query += fmt.Sprintf(" AND category = $%d", len(args))
+		}
+
+		query += " ORDER BY created_at DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var i domain.CommunicationIntent
+			if err := scanCommunicationIntent(rows, &i); err != nil {
+				return err
+			}
+			out = append(out, i)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PgStore) UpdateCommunicationIntent(ctx context.Context, i *domain.CommunicationIntent) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	i.UpdatedAt = time.Now().UTC()
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE communication_intents
+			SET name = $1, description = $2, category = $3, channels = $4, updated_at = $5
+			WHERE intent_id = $6 AND tenant_id = $7
+		`, i.Name, i.Description, i.Category, i.Channels, i.UpdatedAt, i.IntentID, tenantID)
+		return err
+	})
+}
+
+func (s *PgStore) DeleteCommunicationIntent(ctx context.Context, id string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			DELETE FROM communication_intents WHERE intent_id = $1 AND tenant_id = $2
+		`, id, tenantID)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrIntentNotFound
+		}
+		return nil
+	})
+}
+
+// ── NCD-01: Template ──────────────────────────────────────────────────────────
+
+const templateColumns = `
+	template_id, intent_id, tenant_id, legal_entity_id, locale, version,
+	subject_template, body_template, variables, status,
+	approved_by, approved_at, published_at, effective_from, effective_to,
+	created_by, created_at, updated_at`
+
+func scanTemplate(s scannable, t *domain.Template) error {
+	var varsJSON []byte
+	err := s.Scan(
+		&t.TemplateID, &t.IntentID, &t.TenantID, &t.LegalEntityID, &t.Locale, &t.Version,
+		&t.SubjectTemplate, &t.BodyTemplate, &varsJSON, &t.Status,
+		&t.ApprovedBy, &t.ApprovedAt, &t.PublishedAt, &t.EffectiveFrom, &t.EffectiveTo,
+		&t.CreatedBy, &t.CreatedAt, &t.UpdatedAt,
+	)
+	if err != nil {
+		return err
+	}
+	if varsJSON != nil {
+		_ = json.Unmarshal(varsJSON, &t.Variables)
+	}
+	return nil
+}
+
+func (s *PgStore) CreateTemplate(ctx context.Context, t *domain.Template) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if t.TemplateID == "" {
+		t.TemplateID = uuid.NewString()
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now().UTC()
+	}
+	if t.UpdatedAt.IsZero() {
+		t.UpdatedAt = time.Now().UTC()
+	}
+	varsJSON, _ := json.Marshal(t.Variables)
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO templates (template_id, intent_id, tenant_id, legal_entity_id, locale, version,
+				subject_template, body_template, variables, status,
+				approved_by, approved_at, published_at, effective_from, effective_to,
+				created_by, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+		`, t.TemplateID, t.IntentID, tenantID, t.LegalEntityID, t.Locale, t.Version,
+			t.SubjectTemplate, t.BodyTemplate, varsJSON, t.Status,
+			t.ApprovedBy, t.ApprovedAt, t.PublishedAt, t.EffectiveFrom, t.EffectiveTo,
+			t.CreatedBy, t.CreatedAt, t.UpdatedAt)
+		return err
+	})
+}
+
+func (s *PgStore) GetTemplate(ctx context.Context, id string) (*domain.Template, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var t domain.Template
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanTemplate(tx.QueryRow(ctx, `
+			SELECT `+templateColumns+`
+			FROM templates
+			WHERE template_id = $1 AND tenant_id = $2
+		`, id, tenantID), &t)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTemplateNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &t, nil
+}
+
+func (s *PgStore) GetTemplateByIntent(ctx context.Context, intentID, locale string, version int) (*domain.Template, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var t domain.Template
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanTemplate(tx.QueryRow(ctx, `
+			SELECT `+templateColumns+`
+			FROM templates
+			WHERE intent_id = $1 AND tenant_id = $2 AND locale = $3 AND version = $4
+		`, intentID, tenantID, locale, version), &t)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTemplateNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &t, nil
+}
+
+func (s *PgStore) GetEffectiveTemplate(ctx context.Context, tenantID, intentID, locale string, at time.Time) (*domain.Template, error) {
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var t domain.Template
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanTemplate(tx.QueryRow(ctx, `
+			SELECT `+templateColumns+`
+			FROM templates
+			WHERE intent_id = $1 AND tenant_id = $2 AND locale = $3
+			  AND status = 'published'
+			  AND (effective_from IS NULL OR effective_from <= $4)
+			  AND (effective_to IS NULL OR effective_to > $4)
+			ORDER BY version DESC
+			LIMIT 1
+		`, intentID, tenantID, locale, at), &t)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTemplateNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &t, nil
+}
+
+func (s *PgStore) ListTemplates(ctx context.Context, f domain.TemplateFilter) ([]domain.Template, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.Template
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + templateColumns + ` FROM templates WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.LegalEntityID != "" {
+			args = append(args, f.LegalEntityID)
+			query += fmt.Sprintf(" AND legal_entity_id = $%d", len(args))
+		}
+		if f.IntentID != "" {
+			args = append(args, f.IntentID)
+			query += fmt.Sprintf(" AND intent_id = $%d", len(args))
+		}
+		if f.Locale != "" {
+			args = append(args, f.Locale)
+			query += fmt.Sprintf(" AND locale = $%d", len(args))
+		}
+		if f.Status != "" {
+			args = append(args, f.Status)
+			query += fmt.Sprintf(" AND status = $%d", len(args))
+		}
+
+		query += " ORDER BY created_at DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var t domain.Template
+			if err := scanTemplate(rows, &t); err != nil {
+				return err
+			}
+			out = append(out, t)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PgStore) UpdateTemplate(ctx context.Context, t *domain.Template) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	t.UpdatedAt = time.Now().UTC()
+	varsJSON, _ := json.Marshal(t.Variables)
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE templates
+			SET subject_template = $1, body_template = $2, variables = $3, status = $4,
+			    approved_by = $5, approved_at = $6, published_at = $7,
+			    effective_from = $8, effective_to = $9, updated_at = $10
+			WHERE template_id = $11 AND tenant_id = $12
+		`, t.SubjectTemplate, t.BodyTemplate, varsJSON, t.Status,
+			t.ApprovedBy, t.ApprovedAt, t.PublishedAt, t.EffectiveFrom, t.EffectiveTo,
+			t.UpdatedAt, t.TemplateID, tenantID)
+		return err
+	})
+}
+
+func (s *PgStore) DeleteTemplate(ctx context.Context, id string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			DELETE FROM templates WHERE template_id = $1 AND tenant_id = $2
+		`, id, tenantID)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrTemplateNotFound
+		}
+		return nil
+	})
+}
+
+// ── NCD-01: Template Approval ─────────────────────────────────────────────────
+
+const templateApprovalColumns = `
+	approval_id, template_id, tenant_id, requested_by, approved_by,
+	status, reason, requested_at, decided_at`
+
+func scanTemplateApproval(s scannable, a *domain.TemplateApproval) error {
+	return s.Scan(
+		&a.ApprovalID, &a.TemplateID, &a.TenantID, &a.RequestedBy,
+		&a.ApprovedBy, &a.Status, &a.Reason, &a.RequestedAt, &a.DecidedAt,
+	)
+}
+
+func (s *PgStore) CreateTemplateApproval(ctx context.Context, a *domain.TemplateApproval) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if a.ApprovalID == "" {
+		a.ApprovalID = uuid.NewString()
+	}
+	if a.RequestedAt.IsZero() {
+		a.RequestedAt = time.Now().UTC()
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO template_approvals (approval_id, template_id, tenant_id, requested_by, approved_by, status, reason, requested_at, decided_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		`, a.ApprovalID, a.TemplateID, tenantID, a.RequestedBy, a.ApprovedBy, a.Status, a.Reason, a.RequestedAt, a.DecidedAt)
+		return err
+	})
+}
+
+func (s *PgStore) GetTemplateApproval(ctx context.Context, id string) (*domain.TemplateApproval, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var a domain.TemplateApproval
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanTemplateApproval(tx.QueryRow(ctx, `
+			SELECT `+templateApprovalColumns+`
+			FROM template_approvals
+			WHERE approval_id = $1 AND tenant_id = $2
+		`, id, tenantID), &a)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrApprovalNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &a, nil
+}
+
+func (s *PgStore) ListTemplateApprovals(ctx context.Context, f domain.TemplateApprovalFilter) ([]domain.TemplateApproval, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.TemplateApproval
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + templateApprovalColumns + ` FROM template_approvals WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.TemplateID != "" {
+			args = append(args, f.TemplateID)
+			query += fmt.Sprintf(" AND template_id = $%d", len(args))
+		}
+		if f.Status != "" {
+			args = append(args, f.Status)
+			query += fmt.Sprintf(" AND status = $%d", len(args))
+		}
+
+		query += " ORDER BY requested_at DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var a domain.TemplateApproval
+			if err := scanTemplateApproval(rows, &a); err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PgStore) DecideTemplateApproval(ctx context.Context, approvalID, approverID, status, reason string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	now := time.Now().UTC()
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			UPDATE template_approvals
+			SET status = $1, approved_by = $2, reason = $3, decided_at = $4
+			WHERE approval_id = $5 AND tenant_id = $6 AND status = 'pending'
+		`, status, approverID, reason, now, approvalID, tenantID)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrApprovalNotFound
+		}
+		return nil
+	})
+}
+
+// ── NCD-01: Template Render ───────────────────────────────────────────────────
+
+const templateRenderColumns = `
+	render_id, template_id, tenant_id, variables, rendered_subject, rendered_body, error, created_by, created_at`
+
+func scanTemplateRender(s scannable, r *domain.TemplateRender) error {
+	var varsJSON []byte
+	err := s.Scan(
+		&r.RenderID, &r.TemplateID, &r.TenantID, &varsJSON,
+		&r.RenderedSubject, &r.RenderedBody, &r.Error,
+		&r.CreatedBy, &r.CreatedAt,
+	)
+	if err != nil {
+		return err
+	}
+	if varsJSON != nil {
+		_ = json.Unmarshal(varsJSON, &r.Variables)
+	}
+	return nil
+}
+
+func (s *PgStore) CreateTemplateRender(ctx context.Context, r *domain.TemplateRender) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if r.RenderID == "" {
+		r.RenderID = uuid.NewString()
+	}
+	if r.CreatedAt.IsZero() {
+		r.CreatedAt = time.Now().UTC()
+	}
+	varsJSON, _ := json.Marshal(r.Variables)
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO template_renders (render_id, template_id, tenant_id, variables, rendered_subject, rendered_body, error, created_by, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		`, r.RenderID, r.TemplateID, tenantID, varsJSON, r.RenderedSubject, r.RenderedBody, r.Error, r.CreatedBy, r.CreatedAt)
+		return err
+	})
+}
+
+func (s *PgStore) GetTemplateRender(ctx context.Context, id string) (*domain.TemplateRender, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var r domain.TemplateRender
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanTemplateRender(tx.QueryRow(ctx, `
+			SELECT `+templateRenderColumns+`
+			FROM template_renders
+			WHERE render_id = $1 AND tenant_id = $2
+		`, id, tenantID), &r)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTemplateNotFound // reusing error
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &r, nil
+}
+
+func (s *PgStore) ListTemplateRenders(ctx context.Context, templateID string, limit, offset int) ([]domain.TemplateRender, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.TemplateRender
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+templateRenderColumns+`
+			FROM template_renders
+			WHERE template_id = $1 AND tenant_id = $2
+			ORDER BY created_at DESC
+			LIMIT $3 OFFSET $4
+		`, templateID, tenantID, limit, offset)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var r domain.TemplateRender
+			if err := scanTemplateRender(rows, &r); err != nil {
+				return err
+			}
+			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ── NCD-05: Regulated Notice ──────────────────────────────────────────────────
+
+const regulatedNoticeColumns = `
+	regulated_notice_id, tenant_id, legal_entity_id, intent_id, template_id,
+	recipient_principal_id, recipient_address, subject, body, variables,
+	channel, status, priority, expires_at, acknowledged_at, acknowledged_by,
+	acknowledgment_method, acknowledgment_chain, created_by, created_at, updated_at`
+
+func scanRegulatedNotice(s scannable, n *domain.RegulatedNotice) error {
+	var varsJSON, chainJSON []byte
+	err := s.Scan(
+		&n.RegulatedNoticeID, &n.TenantID, &n.LegalEntityID, &n.IntentID, &n.TemplateID,
+		&n.RecipientPrincipalID, &n.RecipientAddress, &n.Subject, &n.Body, &varsJSON,
+		&n.Channel, &n.Status, &n.Priority, &n.ExpiresAt, &n.AcknowledgedAt, &n.AcknowledgedBy,
+		&n.AcknowledgmentMethod, &chainJSON, &n.CreatedBy, &n.CreatedAt, &n.UpdatedAt,
+	)
+	if err != nil {
+		return err
+	}
+	if varsJSON != nil {
+		_ = json.Unmarshal(varsJSON, &n.Variables)
+	}
+	if chainJSON != nil {
+		_ = json.Unmarshal(chainJSON, &n.AcknowledgmentChain)
+	}
+	return nil
+}
+
+func (s *PgStore) CreateRegulatedNotice(ctx context.Context, n *domain.RegulatedNotice) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if n.RegulatedNoticeID == "" {
+		n.RegulatedNoticeID = uuid.NewString()
+	}
+	if n.CreatedAt.IsZero() {
+		n.CreatedAt = time.Now().UTC()
+	}
+	if n.UpdatedAt.IsZero() {
+		n.UpdatedAt = time.Now().UTC()
+	}
+	varsJSON, _ := json.Marshal(n.Variables)
+	chainJSON, _ := json.Marshal(n.AcknowledgmentChain)
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO regulated_notices (regulated_notice_id, tenant_id, legal_entity_id, intent_id, template_id,
+				recipient_principal_id, recipient_address, subject, body, variables,
+				channel, status, priority, expires_at, acknowledged_at, acknowledged_by,
+				acknowledgment_method, acknowledgment_chain, created_by, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+		`, n.RegulatedNoticeID, tenantID, n.LegalEntityID, n.IntentID, n.TemplateID,
+			n.RecipientPrincipalID, n.RecipientAddress, n.Subject, n.Body, varsJSON,
+			n.Channel, n.Status, n.Priority, n.ExpiresAt, n.AcknowledgedAt, n.AcknowledgedBy,
+			n.AcknowledgmentMethod, chainJSON, n.CreatedBy, n.CreatedAt, n.UpdatedAt)
+		return err
+	})
+}
+
+func (s *PgStore) GetRegulatedNotice(ctx context.Context, id string) (*domain.RegulatedNotice, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var n domain.RegulatedNotice
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return scanRegulatedNotice(tx.QueryRow(ctx, `
+			SELECT `+regulatedNoticeColumns+`
+			FROM regulated_notices
+			WHERE regulated_notice_id = $1 AND tenant_id = $2
+		`, id, tenantID), &n)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrRegulatedNoticeNotFound
+	}
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return &n, nil
+}
+
+func (s *PgStore) ListRegulatedNotices(ctx context.Context, f domain.RegulatedNoticeFilter) ([]domain.RegulatedNotice, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.RegulatedNotice
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := `SELECT ` + regulatedNoticeColumns + ` FROM regulated_notices WHERE tenant_id = $1`
+		args := []any{tenantID}
+
+		if f.LegalEntityID != "" {
+			args = append(args, f.LegalEntityID)
+			query += fmt.Sprintf(" AND legal_entity_id = $%d", len(args))
+		}
+		if f.RecipientPrincipalID != "" {
+			args = append(args, f.RecipientPrincipalID)
+			query += fmt.Sprintf(" AND recipient_principal_id = $%d", len(args))
+		}
+		if f.Status != "" {
+			args = append(args, f.Status)
+			query += fmt.Sprintf(" AND status = $%d", len(args))
+		}
+		if f.Priority != "" {
+			args = append(args, f.Priority)
+			query += fmt.Sprintf(" AND priority = $%d", len(args))
+		}
+
+		query += " ORDER BY created_at DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var n domain.RegulatedNotice
+			if err := scanRegulatedNotice(rows, &n); err != nil {
+				return err
+			}
+			out = append(out, n)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PgStore) UpdateRegulatedNotice(ctx context.Context, n *domain.RegulatedNotice) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	n.UpdatedAt = time.Now().UTC()
+	varsJSON, _ := json.Marshal(n.Variables)
+	chainJSON, _ := json.Marshal(n.AcknowledgmentChain)
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE regulated_notices
+			SET subject = $1, body = $2, variables = $3, status = $4, priority = $5,
+			    expires_at = $6, acknowledged_at = $7, acknowledged_by = $8,
+			    acknowledgment_method = $9, acknowledgment_chain = $10, updated_at = $11
+			WHERE regulated_notice_id = $12 AND tenant_id = $13
+		`, n.Subject, n.Body, varsJSON, n.Status, n.Priority,
+			n.ExpiresAt, n.AcknowledgedAt, n.AcknowledgedBy,
+			n.AcknowledgmentMethod, chainJSON, n.UpdatedAt, n.RegulatedNoticeID, tenantID)
+		return err
+	})
+}
+
+// ── NCD-05: Acknowledgment Chain ──────────────────────────────────────────────
+
+const acknowledgmentChainColumns = `
+	chain_id, regulated_notice_id, tenant_id, step_number, action, actor, method, evidence, metadata, created_at`
+
+func scanAcknowledgmentChainStep(s scannable, c *domain.AcknowledgmentChainStep) error {
+	var evidenceJSON, metadataJSON []byte
+	err := s.Scan(
+		&c.ChainID, &c.RegulatedNoticeID, &c.TenantID, &c.StepNumber, &c.Action,
+		&c.Actor, &c.Method, &evidenceJSON, &metadataJSON, &c.CreatedAt,
+	)
+	if err != nil {
+		return err
+	}
+	if evidenceJSON != nil {
+		_ = json.Unmarshal(evidenceJSON, &c.Evidence)
+	}
+	if metadataJSON != nil {
+		_ = json.Unmarshal(metadataJSON, &c.Metadata)
+	}
+	return nil
+}
+
+func (s *PgStore) CreateAcknowledgmentChainStep(ctx context.Context, c *domain.AcknowledgmentChainStep) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if c.ChainID == "" {
+		c.ChainID = uuid.NewString()
+	}
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = time.Now().UTC()
+	}
+	evidenceJSON, _ := json.Marshal(c.Evidence)
+	metadataJSON, _ := json.Marshal(c.Metadata)
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO acknowledgment_chain (chain_id, regulated_notice_id, tenant_id, step_number, action, actor, method, evidence, metadata, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		`, c.ChainID, c.RegulatedNoticeID, tenantID, c.StepNumber, c.Action, c.Actor, c.Method, evidenceJSON, metadataJSON, c.CreatedAt)
+		return err
+	})
+}
+
+func (s *PgStore) GetAcknowledgmentChain(ctx context.Context, regulatedNoticeID string) ([]domain.AcknowledgmentChainStep, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.AcknowledgmentChainStep
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+acknowledgmentChainColumns+`
+			FROM acknowledgment_chain
+			WHERE regulated_notice_id = $1 AND tenant_id = $2
+			ORDER BY step_number
+		`, regulatedNoticeID, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var c domain.AcknowledgmentChainStep
+			if err := scanAcknowledgmentChainStep(rows, &c); err != nil {
+				return err
+			}
+			out = append(out, c)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PgStore) AcknowledgeRegulatedNotice(ctx context.Context, req *domain.AcknowledgeRequest, actorID string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// Get current notice
+		var n domain.RegulatedNotice
+		err := scanRegulatedNotice(tx.QueryRow(ctx, `
+			SELECT `+regulatedNoticeColumns+`
+			FROM regulated_notices
+			WHERE regulated_notice_id = $1 AND tenant_id = $2
+			FOR UPDATE
+		`, req.RegulatedNoticeID, tenantID), &n)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrRegulatedNoticeNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		if n.Status == domain.RegulatedNoticeStatusAcknowledged {
+			return domain.ErrAlreadyAcknowledged
+		}
+		if n.ExpiresAt != nil && time.Now().UTC().After(*n.ExpiresAt) {
+			return domain.ErrNoticeExpired
+		}
+
+		now := time.Now().UTC()
+		n.Status = domain.RegulatedNoticeStatusAcknowledged
+		n.AcknowledgedAt = &now
+		n.AcknowledgedBy = actorID
+		n.AcknowledgmentMethod = req.Method
+		n.UpdatedAt = now
+
+		evidence := req.Evidence
+		if evidence == nil {
+			evidence = make(map[string]any)
+		}
+		if req.WitnessPrincipalID != "" {
+			evidence["witness"] = req.WitnessPrincipalID
+		}
+		if req.DigitalSignature != "" {
+			evidence["digital_signature"] = req.DigitalSignature
+		}
+
+		chain := n.AcknowledgmentChain
+		if chain == nil {
+			chain = make(map[string]any)
+		}
+		chain[fmt.Sprintf("step_%d", len(chain)+1)] = map[string]any{
+			"action":      "acknowledged",
+			"actor":       actorID,
+			"method":      req.Method,
+			"evidence":    evidence,
+			"timestamp":   now,
+		}
+		n.AcknowledgmentChain = chain
+
+		chainJSON, _ := json.Marshal(n.AcknowledgmentChain)
+		evidenceJSON, _ := json.Marshal(evidence)
+
+		_, err = tx.Exec(ctx, `
+			UPDATE regulated_notices
+			SET status = $1, acknowledged_at = $2, acknowledged_by = $3,
+			    acknowledgment_method = $4, acknowledgment_chain = $5, updated_at = $6
+			WHERE regulated_notice_id = $7 AND tenant_id = $8
+		`, n.Status, n.AcknowledgedAt, n.AcknowledgedBy, n.AcknowledgmentMethod, chainJSON, n.UpdatedAt, n.RegulatedNoticeID, tenantID)
+		if err != nil {
+			return err
+		}
+
+		// Add chain step
+		stepNumber := len(chain) + 1
+		_, err = tx.Exec(ctx, `
+			INSERT INTO acknowledgment_chain (chain_id, regulated_notice_id, tenant_id, step_number, action, actor, method, evidence, metadata, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		`, uuid.NewString(), n.RegulatedNoticeID, tenantID, stepNumber, "acknowledged", actorID, req.Method,
+			evidenceJSON, nil, now)
+		return err
+	})
 }
 
 // nullIfEmpty writes SQL NULL for an empty optional string.

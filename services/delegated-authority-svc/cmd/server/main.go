@@ -242,6 +242,62 @@ func (a *httpAuthzClient) Ping(ctx context.Context) error {
 	return nil
 }
 
+// httpSoDClient calls authorization-svc's SoD engine to check whether a
+// proposed delegation would create a segregation-of-duties conflict.
+// ORG-06 §4.6: "Cannot delegate around SoD" — authorization alone cannot see
+// a duties conflict.
+type httpSoDClient struct {
+	baseURL string
+	client  *http.Client
+	log     *zap.Logger
+}
+
+// CheckConflict implements handler.SoDClient.
+func (s *httpSoDClient) CheckConflict(ctx context.Context, tenantID, legalEntityID, delegatorPrincipalID, delegatePrincipalID, actionType string) error {
+	reqBody, _ := json.Marshal(map[string]string{
+		"tenant_id":              tenantID,
+		"legal_entity_id":        legalEntityID,
+		"delegator_principal_id": delegatorPrincipalID,
+		"delegate_principal_id":  delegatePrincipalID,
+		"action_type":            actionType,
+	})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/v1/sod/check", bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// authorization-svc validates the canonical envelope contract.
+	// The values are the CALLER's (the delegator in this case).
+	req.Header.Set("X-Principal-Id", delegatorPrincipalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		s.log.Error("failed to call authorization-svc SoD check", zap.Error(err))
+		return domain.ErrAuthzServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		s.log.Error("authorization-svc SoD check returned non-200", zap.Int("status", resp.StatusCode))
+		return domain.ErrAuthzServiceUnavailable
+	}
+
+	var res struct {
+		Conflict bool `json:"conflict"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return err
+	}
+	if res.Conflict {
+		return domain.ErrSODConflict
+	}
+	return nil
+}
+
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
 	cfg, err := config.Load()
@@ -347,6 +403,8 @@ func main() {
 		httpClientForAuthz = &http.Client{Timeout: 5 * time.Second}
 	}
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
+	// SoD client reuses the same HTTP client and base URL as the authz client.
+	sodClient := &httpSoDClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log}
 
 	// ── 4b. Outbox relay ──────────────────────────────────────────────────────
 	//
@@ -398,7 +456,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, authzClient, log, domainMetrics)
+	h := handler.New(pgStore, authzClient, sodClient, log, domainMetrics)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

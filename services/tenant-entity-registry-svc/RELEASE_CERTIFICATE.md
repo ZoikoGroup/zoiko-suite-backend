@@ -10,6 +10,116 @@ was **not**. A certificate that lists only successes certifies nothing.
 
 ---
 
+## Gap closure — 28 September 2026 (second pass)
+
+Supersedes the re-certification below. Every open item from it was worked; what
+remains open is outside this service and is named at the end.
+
+```
+go build ./... && go vet ./...   clean
+go test ./...                    11 packages, 253 top-level tests pass, 0 fail
+                                 (TEST_DATABASE_URL → throwaway Postgres 16; 1 skip = the
+                                  live schema test, run separately against :8081 — passes)
+scripts/audit.sh                 66 live checks, 66 passing (was 58)
+scripts/backup_restore_drill.sh  22/22, restore 3 s, after migrations 000011–000013
+scripts/contract_gate.sh         14 breaking changes vs 24 Sep, all deliberate (SPEC_DEVIATIONS.md)
+govulncheck ./...                no reachable vulnerabilities (5 fixed by upgrading
+                                 chi 5.3.0, grpc 1.83.1, x/text 0.39.0)
+promtool check rules             6 alert rules valid
+```
+
+**Score:** ORG-02 + ORG-03, **47 of 48 fully met — 98%**, weighted **99%**.
+Whole document (§3, §4.2, §4.3, §8, §9.2): **66 of 69 — 96%**, weighted **98%**.
+
+**Closed in this pass**
+
+| Gap | How | Proof |
+|---|---|---|
+| §3 typed errors | `error_code` on every error body (the nine §3 codes + 8 extensions) | handler test over 25 sentinels; live |
+| §7 event minimum payload | `object_id`, `object_version`, `effective_at`, `recorded_at`, `evidence_ref`; `BuildRecord` refuses a record without id and version | events tests; asyncapi Envelope parity test; live outbox and Kafka |
+| §9.2 gate 2 — direct publishes | the direct publisher is removed; all 10 legacy write paths and the registry-conflict events write through the outbox in their own transaction | store tests on Postgres; audit §15 |
+| §4.2 home-region maker-checker | `ChangeHomeRegion` (000012), platform authority, independent approval, decision evidence enforced by a constraint | registry, store and live tests |
+| §4.2 required inputs + server-resolved context | jurisdiction (real service, retired refused), restricted list, active region → home region at birth, plan entitlement (commercial-account-svc), onboarding evidence (000013) | provisioning tests; live |
+| §4.2/§4.3 expected_version | required on every named command | versions tests; live |
+| §4.3 legal form | ELF code format + source + local text | controls tests; live |
+| §3 purpose limitation | conflict quarantine and approval reads permissioned | controls tests; live |
+| §9.2 gate 1 | spec validated by kin-openapi; every route's status checked; live bodies validated against schemas; breaking-change gate | handler tests; `contract_gate.sh` |
+| §9.2 gate 7 | RUNBOOK.md, SLO.md, 6 alert rules, outbox delivery gauges, backup/restore drill | promtool; drill |
+| §9.2 gate 8 | vulnerability scan clean; this evidence | govulncheck |
+
+**Defects found in this pass, all fixed**
+
+1. The registry-conflict quarantine event was rendered, logged and never sent; the resolution event was declared and never emitted.
+2. The jurisdiction validator treated any 200 as valid, so a retired or deactivated jurisdiction was accepted.
+3. The stub jurisdiction validator (accepts everything) was selected silently in any environment whose URL was unset or default — including production.
+4. `CreateEntity` wrote profile version 1 as a second write whose failure was only logged.
+5. The generic entity status route did not bump `record_version` and sent `previous_status: ""`.
+6. End-dating a hierarchy or jurisdiction assignment that did not exist, or was already closed, answered 204 and emitted an event.
+7. Five legacy write handlers dropped the envelope correlation id, so their events could not be traced (seen in identity-context-svc's log).
+8. openapi.yaml was not a valid OpenAPI document: unquoted commas in 36 flow-style descriptions parsed as stray fields; the `command_name` enum lacked a served value.
+9. A stale version was reported as "conflict: resource already exists".
+
+**Downstream consumption, live:** identity-context-svc consumed an outbox-delivered
+`entity.updated` (object_version 7) and acted on it; consumer lag on
+`zoiko.entity.events` 0.
+
+**Still open — outside this service**
+
+- §4.3 fiscal-calendar reference validity: REF-04 Fiscal Calendar does not exist in the estate; the id is format-checked only.
+- §9.2 gate 6: accounting/tax/payment/reporting services must pin the versions this service now publishes; one consumer (identity-context-svc) verified.
+- §9.2 gate 7: RPO/RTO must be re-measured on the production database (SLO.md).
+- Plan entitlement was exercised against a real HTTP server in tests, not against a running commercial-account-svc.
+- The Next.js console must send the new required fields (SPEC_DEVIATIONS.md).
+
+---
+
+## Re-certification — 28 September 2026
+
+Supersedes the scores below; the 18 Sep record is kept as history. The full
+item-by-item re-audit (48 items against §4.2/§4.3, plus §3, §8 and §9.2) is in
+`docs/audit_files/Identity, Scope & Foundation-audit-2026-09-23.md`, section 2/9,
+"Re-audit — 28 September 2026".
+
+```
+go build ./... && go vet ./...   clean
+go test ./...                    9 packages pass, 214 top-level tests, 0 skipped
+                                 (TEST_DATABASE_URL → a throwaway Postgres 16 database;
+                                  the store suite wipes its target — never point it at a live one)
+scripts/audit.sh                 58 checks, 58 passing (was 37)
+```
+
+**Live**, against :8081 with a real authorization-svc (temporary maker and checker
+grants, revoked afterwards) and a real jurisdiction-rules-svc: every ORG-02 command,
+the creation/termination/verification/rename/LEI/merge/unmerge/conflict approval
+chains including every self-approval refusal, NP3–NP6, sensitive-identifier
+scoping, and Idempotency-Key replay.
+
+**Score:** ORG-02 + ORG-03, 40 of 48 fully met — **83%**, weighted **91%** (was 75% /
+80%). Whole document including §3, §8, §9.2: 53 of 69 — **77%**, weighted **86%**.
+
+**Six defects found live and fixed**, none visible to the previous test run (in-memory
+store, tenantless context, database tests skipped):
+
+1. `POST /v1/tenants` answered 500 for every caller with a full envelope — RLS scoped to
+   the caller's tenant, not the new one.
+2. Provisioning was authorized in the caller's tenant scope instead of the platform scope.
+3. An amendment effective before the first version left two open profile versions; as-of
+   "now" disagreed with `GetEntity` (NP6).
+4. A same-instant amendment answered 500 (`lepv_interval_ordered`).
+5. Every direct Kafka publish used the request context and was usually cancelled — events
+   silently dropped.
+6. NP3 host/tenant check ran on 2 of 46 routes.
+
+**Closed:** Idempotency-Key replay protection (migration 000010, `internal/idempotency/`).
+Migration 000010 must be applied to existing databases by hand — the compose stack only
+runs migrations when Postgres first initialises.
+
+**Still open:** typed error codes (§3); event payloads missing new object version and
+`recorded_at` (§7); older write paths still publish outside the transaction; home-region
+maker-checker (doc decision); §9.2 gates 6 and 7.
+
+---
+
 ## Verification performed
 
 ```
@@ -239,6 +349,10 @@ through the `tenants` policy at all.
 ## Not done
 
 Stated plainly, because the sections above would otherwise read as completeness.
+
+> *28 Sep 2026: `MergeDuplicateCandidate` has since been implemented non-destructively
+> (000008, see SPEC_DEVIATIONS.md) and Idempotency-Key deduplication added (000010). The
+> two bullets below are the 18 Sep position.*
 
 - **`MergeDuplicateCandidate` (ORG-03 §4.3).** Not implemented. §1 is explicit
   that "destructive merge is prohibited" and that "Party merge/split SHALL

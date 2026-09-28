@@ -23,7 +23,10 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/classification"
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/entitlement"
+	"zoiko.io/tenant-entity-registry-svc/internal/events"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
+	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 )
 
 // Sentinel errors returned by the service layer.
@@ -41,7 +44,7 @@ var (
 	ErrInvalidInput       = errors.New("invalid input")
 	// ErrConflict is returned when a unique constraint is violated (e.g. duplicate
 	// tenant_code). Handlers should map this to HTTP 409 Conflict.
-	ErrConflict = errors.New("conflict: resource already exists")
+	ErrConflict = errors.New("conflict")
 	// ErrRegionUnresolved is returned by ResolveTenantRegion when the
 	// tenant exists but its active residency policy has no
 	// ResidencyRegionID assigned yet — a real, expected state for
@@ -55,7 +58,6 @@ var (
 // It owns no HTTP concerns — those belong to internal/handler.
 type Service struct {
 	store  Store
-	events EventPublisher
 	authz  AuthorizationClient
 	jurisd JurisdictionValidator
 
@@ -74,13 +76,20 @@ type Service struct {
 	legacyEntityCreateActive bool
 	onboardingKeyOptional    bool
 
+	// §4.2 provisioning context — see ConfigureProvisioning.
+	entitlement              entitlement.Checker
+	restrictedJurisdictions  map[string]bool
+	legacyProvisioningInputs bool
+
+	// expectedVersionOptional — dev-only, see ConfigureConcurrency.
+	expectedVersionOptional bool
+
 	log *zap.Logger
 }
 
 // NewService constructs a Service with all required dependencies.
 func NewService(
 	store Store,
-	events EventPublisher,
 	authz AuthorizationClient,
 	jurisd JurisdictionValidator,
 	platformScopeID string,
@@ -88,7 +97,6 @@ func NewService(
 ) *Service {
 	return &Service{
 		store:           store,
-		events:          events,
 		authz:           authz,
 		jurisd:          jurisd,
 		platformScopeID: platformScopeID,
@@ -117,7 +125,12 @@ func (s *Service) ProvisionTenant(
 	req domain.ProvisionTenantRequest,
 	correlationID string,
 ) (*domain.Tenant, error) {
-	if err := s.authorize(ctx, "tenant", "provision"); err != nil {
+	// Platform scope explicitly, not the caller's tenant: §4.2 makes this a
+	// platform provisioning permission. The envelope always carries an
+	// X-Tenant-Id, so authorize() would have evaluated it in the operator's
+	// own tenant, and a tenant admin granted TENANT_PROVISION there could
+	// create tenants.
+	if err := s.authorizeIn(ctx, s.platformScopeID, "tenant", "provision"); err != nil {
 		return nil, err
 	}
 
@@ -127,6 +140,10 @@ func (s *Service) ProvisionTenant(
 	req.ExternalCustomerKey = strings.TrimSpace(req.ExternalCustomerKey)
 	if req.ExternalCustomerKey == "" && !s.onboardingKeyOptional {
 		return nil, ErrOnboardingKeyRequired
+	}
+	homeRegion, err := s.resolveProvisioningContext(ctx, &req)
+	if err != nil {
+		return nil, err
 	}
 	fingerprint := domain.ProvisioningFingerprint(req)
 
@@ -152,6 +169,8 @@ func (s *Service) ProvisionTenant(
 		ExternalCustomerKey:          nullableString(req.ExternalCustomerKey),
 		OnboardingRequestRef:         nullableString(strings.TrimSpace(req.OnboardingRequestRef)),
 		ProvisioningFingerprint:      fingerprint,
+		PrimaryJurisdictionID:        nullableString(req.PrimaryJurisdictionID),
+		SubscriptionID:               nullableString(req.SubscriptionID),
 	}
 
 	defaultPolicy := &domain.DataResidencyPolicy{
@@ -161,12 +180,21 @@ func (s *Service) ProvisionTenant(
 		PolicyCode:             req.TenantCode + "-DEFAULT",
 		ResidencyMode:          domain.ResidencyModePreferredRegion,
 		ConflictResolutionMode: domain.ConflictResolutionFailClosed,
-		ActiveFlag:             true,
-		CreatedAt:              now,
-		CreatedByPrincipalID:   actor,
+		// The residency preference, resolved against the available regions:
+		// the home region from birth (it used to start unassigned).
+		ResidencyRegionID:    homeRegion,
+		ActiveFlag:           true,
+		CreatedAt:            now,
+		CreatedByPrincipalID: actor,
 	}
 
-	if err := s.store.CreateTenantWithDefaultResidencyPolicy(ctx, t, defaultPolicy); err != nil {
+	// Scoped to the tenant being created. The store scopes RLS to the
+	// request's tenant when there is one, and here that is the caller's
+	// (operator/platform) tenant, not the new row's: the tenants WITH CHECK
+	// then refused every creation made with a full envelope. The follow-on
+	// step and the replay already re-scope; this call did not.
+	tctx := domain.WithTenant(ctx, tenantID)
+	if err := s.store.CreateTenantWithDefaultResidencyPolicy(tctx, t, defaultPolicy); err != nil {
 		if errors.Is(err, ErrOnboardingKeyExists) {
 			return s.replayProvisioning(ctx, req, fingerprint)
 		}
@@ -319,6 +347,9 @@ func (s *Service) CreateEntity(
 	if err := s.assertTenantMayTransact(ctx, req.TenantID); err != nil {
 		return nil, err
 	}
+	if err := validateFiscalCalendarRef(req.FiscalCalendarID); err != nil {
+		return nil, err
+	}
 
 	// Synchronous jurisdiction validation — fail-closed per Q2 resolution.
 	if err := s.jurisd.ValidateExists(ctx, req.PrimaryJurisdictionID); err != nil {
@@ -373,18 +404,10 @@ func (s *Service) CreateEntity(
 		CreatedByPrincipalID:  domain.PrincipalFromContext(ctx),
 	}
 
-	if err := s.store.CreateEntity(ctx, e); err != nil {
-		s.log.Error("create entity failed", zap.Error(err), zap.String("correlation_id", req.CorrelationID))
-		return nil, fmt.Errorf("store.CreateEntity: %w", err)
-	}
-
-	// ORG-03 version 1. Written after the entity because of the foreign key,
-	// and NOT fatal if it fails: the entity itself is already durable and
-	// refusing to return it would leave the caller believing a create failed
-	// that did not. A missing version 1 degrades as-of reads for this entity
-	// only, is visible in the log, and AmendLegalProfile reseeds from the
-	// entity's own identity when it finds no prior version.
-	initial := &domain.LegalEntityProfileVersion{
+	// ORG-03 profile version 1, written in the entity's own transaction.
+	// It used to be a second write whose failure was only logged, leaving an
+	// entity whose as-of reads all answered "no profile".
+	e.InitialProfile = &domain.LegalEntityProfileVersion{
 		ProfileVersionID:            newID(),
 		TenantID:                    e.TenantID,
 		LegalEntityID:               e.LegalEntityID,
@@ -401,13 +424,17 @@ func (s *Service) CreateEntity(
 		LEISource:                   leiSource,
 		LEIStatus:                   leiStatus,
 	}
-	if err := s.store.CreateInitialProfileVersion(ctx, initial); err != nil {
-		s.log.Error("initial profile version write failed; as-of reads for this entity will be incomplete",
-			zap.String("legal_entity_id", e.LegalEntityID),
-			zap.Error(err))
-	}
 
-	go s.events.PublishEntityCreated(ctx, e, req.CorrelationID)
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if created, ok := res.(*domain.LegalEntity); ok {
+			return events.EntityCreatedRecord(created, req.CorrelationID)
+		}
+		return nil, nil
+	})
+	if err := s.store.CreateEntity(ctx, e); err != nil {
+		s.log.Error("create entity failed", zap.Error(err), zap.String("correlation_id", req.CorrelationID))
+		return nil, fmt.Errorf("store.CreateEntity: %w", err)
+	}
 
 	s.log.Info("entity created",
 		zap.String("legal_entity_id", e.LegalEntityID),
@@ -464,12 +491,16 @@ func (s *Service) CreateWorkspace(
 		CreatedByPrincipalID:  domain.PrincipalFromContext(ctx),
 	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if created, ok := res.(*domain.Workspace); ok {
+			return events.WorkspaceCreatedRecord(created, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.CreateWorkspace(ctx, w); err != nil {
 		s.log.Error("create workspace failed", zap.Error(err), zap.String("correlation_id", req.CorrelationID))
 		return nil, fmt.Errorf("store.CreateWorkspace: %w", err)
 	}
-
-	go s.events.PublishWorkspaceCreated(ctx, w, req.CorrelationID)
 
 	s.log.Info("workspace created",
 		zap.String("workspace_id", w.WorkspaceID),
@@ -522,6 +553,12 @@ func (s *Service) UpdateWorkspace(
 
 	req.ActorPrincipalID = domain.PrincipalFromContext(ctx)
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if updated, ok := res.(*domain.Workspace); ok {
+			return events.WorkspaceUpdatedRecord(updated, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	w, err := s.store.UpdateWorkspace(ctx, workspaceID, req)
 	if err != nil {
 		return nil, fmt.Errorf("store.UpdateWorkspace: %w", err)
@@ -529,8 +566,6 @@ func (s *Service) UpdateWorkspace(
 	if w == nil {
 		return nil, ErrNotFound
 	}
-
-	go s.events.PublishWorkspaceUpdated(ctx, w, req.CorrelationID)
 
 	s.log.Info("workspace updated",
 		zap.String("workspace_id", w.WorkspaceID),
@@ -578,6 +613,12 @@ func (s *Service) TransitionWorkspaceStatus(
 	}
 
 	actor := domain.PrincipalFromContext(ctx)
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if c, ok := res.(events.StatusChange); ok {
+			return events.WorkspaceStatusChangedRecord(c, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	affected, previous, err := s.store.TransitionWorkspaceStatus(
 		ctx, workspaceID, req.NewStatus, allowedPriors, actor, req.CorrelationID,
 	)
@@ -588,10 +629,6 @@ func (s *Service) TransitionWorkspaceStatus(
 		return fmt.Errorf("%w: workspace %s cannot transition to %s from its current state",
 			ErrInvalidTransition, workspaceID, req.NewStatus)
 	}
-
-	go s.events.PublishWorkspaceStatusChanged(
-		ctx, domain.TenantFromContext(ctx), workspaceID, actor, previous, req.NewStatus, req.CorrelationID,
-	)
 
 	s.log.Info("workspace status transitioned",
 		zap.String("workspace_id", workspaceID),
@@ -690,12 +727,16 @@ func (s *Service) UpdateEntity(
 	// verified by the Authorization Service before this service is called.
 	req.ActorPrincipalID = domain.PrincipalFromContext(ctx)
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if updated, ok := res.(*domain.LegalEntity); ok {
+			return events.EntityUpdatedRecord(updated, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	e, err := s.store.UpdateEntity(ctx, legalEntityID, req)
 	if err != nil {
 		return nil, fmt.Errorf("store.UpdateEntity: %w", err)
 	}
-
-	go s.events.PublishEntityUpdated(ctx, e, req.CorrelationID)
 	return e, nil
 }
 
@@ -766,7 +807,13 @@ func (s *Service) TransitionEntityStatus(
 	// succeeds with 0 rows affected and is treated as a no-op below.
 	allowedPriors = append(allowedPriors, req.NewStatus)
 
-	affected, tenantID, err := s.store.TransitionEntityStatus(
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if c, ok := res.(events.StatusChange); ok {
+			return events.EntityStatusChangedRecord(c, req.CorrelationID)
+		}
+		return nil, nil
+	})
+	affected, _, err := s.store.TransitionEntityStatus(
 		ctx, legalEntityID, req.NewStatus, allowedPriors,
 		domain.PrincipalFromContext(ctx), req.CorrelationID,
 	)
@@ -782,18 +829,6 @@ func (s *Service) TransitionEntityStatus(
 		return fmt.Errorf("%w: entity %s cannot transition to %s from its current state",
 			ErrInvalidTransition, legalEntityID, req.NewStatus)
 	}
-
-	// Publish entity.status.changed — approved event name per Q4 resolution.
-	// tenantID is returned by the store from the updated row (RETURNING clause).
-	go s.events.PublishEntityStatusChanged(
-		ctx,
-		tenantID,
-		legalEntityID,
-		domain.PrincipalFromContext(ctx),
-		domain.EntityStatus(""), // previous state not known without a read — omit
-		req.NewStatus,
-		req.CorrelationID,
-	)
 
 	s.log.Info("entity status transitioned",
 		zap.String("legal_entity_id", legalEntityID),
@@ -839,11 +874,15 @@ func (s *Service) CreateHierarchy(
 		CreatedByPrincipalID: domain.PrincipalFromContext(ctx),
 	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if created, ok := res.(*domain.EntityHierarchy); ok {
+			return events.HierarchyChangedRecord(created, events.HierarchyChangeCreated, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.CreateHierarchy(ctx, h); err != nil {
 		return nil, fmt.Errorf("store.CreateHierarchy: %w", err)
 	}
-
-	go s.events.PublishEntityHierarchyChanged(ctx, h, "CREATED", req.CorrelationID)
 	return h, nil
 }
 
@@ -865,12 +904,15 @@ func (s *Service) EndDateHierarchy(
 		return err
 	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if ended, ok := res.(*domain.EntityHierarchy); ok {
+			return events.HierarchyChangedRecord(ended, events.HierarchyChangeEndDated, correlationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.EndDateHierarchy(ctx, hierarchyID, endDate, domain.PrincipalFromContext(ctx), correlationID); err != nil {
 		return fmt.Errorf("store.EndDateHierarchy: %w", err)
 	}
-
-	// Emit a synthetic hierarchy object for the event; store provides full record if needed.
-	go s.events.PublishEntityHierarchyChanged(ctx, &domain.EntityHierarchy{HierarchyID: hierarchyID, EffectiveTo: &endDate}, "END_DATED", correlationID)
 	return nil
 }
 
@@ -921,11 +963,15 @@ func (s *Service) AssignJurisdiction(
 		CreatedByPrincipalID: domain.PrincipalFromContext(ctx),
 	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if created, ok := res.(*domain.EntityJurisdictionAssignment); ok {
+			return events.JurisdictionChangedRecord(created, events.JurisdictionChangeAssigned, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.CreateJurisdictionAssignment(ctx, a); err != nil {
 		return nil, fmt.Errorf("store.CreateJurisdictionAssignment: %w", err)
 	}
-
-	go s.events.PublishEntityJurisdictionChanged(ctx, a, "ASSIGNED", req.CorrelationID)
 	return a, nil
 }
 
@@ -952,16 +998,16 @@ func (s *Service) EndDateJurisdictionAssignment(
 		return err
 	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if ended, ok := res.(*domain.EntityJurisdictionAssignment); ok {
+			return events.JurisdictionChangedRecord(ended, events.JurisdictionChangeEndDated, correlationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.EndDateJurisdictionAssignment(ctx, assignmentID, endDate, domain.PrincipalFromContext(ctx), correlationID); err != nil {
 		return fmt.Errorf("store.EndDateJurisdictionAssignment: %w", err)
 	}
 
-	go s.events.PublishEntityJurisdictionChanged(
-		ctx,
-		&domain.EntityJurisdictionAssignment{AssignmentID: assignmentID, EffectiveTo: &endDate},
-		"END_DATED",
-		correlationID,
-	)
 	return nil
 }
 
@@ -1276,7 +1322,9 @@ func (s *Service) authorizeAs(ctx context.Context, principalID, scopeID, resourc
 func (s *Service) mapJurisdictionErr(err error, jurisdictionID string) error {
 	switch {
 	case errors.Is(err, jurisdiction.ErrJurisdictionNotFound):
-		return fmt.Errorf("%w: jurisdiction_id %s not found in Jurisdiction Rules Service", ErrInvalidInput, jurisdictionID)
+		return fmt.Errorf("%w: jurisdiction_id %s not found in Jurisdiction Rules Service", ErrReferenceInvalid, jurisdictionID)
+	case errors.Is(err, jurisdiction.ErrJurisdictionRetired):
+		return fmt.Errorf("%w: jurisdiction_id %s is retired or inactive", ErrReferenceInvalid, jurisdictionID)
 	case errors.Is(err, jurisdiction.ErrValidatorUnavailable):
 		s.log.Error("jurisdiction rules service unavailable — rejecting assignment (fail-closed)",
 			zap.String("jurisdiction_id", jurisdictionID),

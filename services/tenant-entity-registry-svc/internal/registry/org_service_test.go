@@ -115,7 +115,7 @@ func TestNP4_SuspendedTenantCannotCreateEntity(t *testing.T) {
 		LegalName:             "Should Not Exist",
 		EntityType:            domain.EntityTypeSubsidiary,
 		DefaultCurrencyCode:   "USD",
-		FiscalCalendarID:      "fc-1",
+		FiscalCalendarID:      "0f000000-0000-4000-8000-000000000001",
 		PrimaryJurisdictionID: "JUR-US",
 		DataResidencyPolicyID: "drp-1",
 	})
@@ -135,7 +135,7 @@ func TestNP4_TerminatedAndOffboardingTenantsAlsoRefused(t *testing.T) {
 			_, err := svc.CreateEntity(tenantCtx(orgTenant), domain.CreateEntityRequest{
 				TenantID: orgTenant, EntityCode: "E", LegalName: "N",
 				EntityType: domain.EntityTypeSubsidiary, DefaultCurrencyCode: "USD",
-				FiscalCalendarID: "fc", PrimaryJurisdictionID: "JUR-US",
+				FiscalCalendarID: "0f000000-0000-4000-8000-000000000001", PrimaryJurisdictionID: "JUR-US",
 				DataResidencyPolicyID: "drp",
 			})
 			require.ErrorIs(t, err, registry.ErrTenantNotTransactable)
@@ -166,7 +166,7 @@ func TestNP4_OnboardingTenantMayStillTransact(t *testing.T) {
 	_, err := svc.CreateEntity(tenantCtx(orgTenant), domain.CreateEntityRequest{
 		TenantID: orgTenant, EntityCode: "E-ONB", LegalName: "Onboarding Co",
 		EntityType: domain.EntityTypeSubsidiary, DefaultCurrencyCode: "USD",
-		FiscalCalendarID: "fc", PrimaryJurisdictionID: "JUR-US",
+		FiscalCalendarID: "0f000000-0000-4000-8000-000000000001", PrimaryJurisdictionID: "JUR-US",
 		DataResidencyPolicyID: "drp",
 	})
 	require.NoError(t, err)
@@ -202,7 +202,7 @@ func TestNP5_DuplicateRegistryNumberIsQuarantinedAndEntityNotCreated(t *testing.
 		RegistrationNumber:    "RC-12345",
 		EntityType:            domain.EntityTypeSubsidiary,
 		DefaultCurrencyCode:   "USD",
-		FiscalCalendarID:      "fc",
+		FiscalCalendarID:      "0f000000-0000-4000-8000-000000000001",
 		PrimaryJurisdictionID: "JUR-US",
 		DataResidencyPolicyID: "drp",
 		CorrelationID:         "corr-np5",
@@ -232,7 +232,7 @@ func TestNP5_SameNumberInADifferentJurisdictionIsNotAConflict(t *testing.T) {
 	_, err := svc.CreateEntity(tenantCtx(orgTenant), domain.CreateEntityRequest{
 		TenantID: orgTenant, EntityCode: "E-GB", LegalName: "Same Number GB Ltd",
 		RegistrationNumber: "RC-12345", EntityType: domain.EntityTypeSubsidiary,
-		DefaultCurrencyCode: "GBP", FiscalCalendarID: "fc",
+		DefaultCurrencyCode: "GBP", FiscalCalendarID: "0f000000-0000-4000-8000-000000000001",
 		PrimaryJurisdictionID: "JUR-GB", DataResidencyPolicyID: "drp",
 	})
 	require.NoError(t, err)
@@ -249,7 +249,7 @@ func TestNP5_DissolvedIncumbentDoesNotBlockReRegistration(t *testing.T) {
 	_, err := svc.CreateEntity(tenantCtx(orgTenant), domain.CreateEntityRequest{
 		TenantID: orgTenant, EntityCode: "E-NEW", LegalName: "Successor Ltd",
 		RegistrationNumber: "RC-999", EntityType: domain.EntityTypeSubsidiary,
-		DefaultCurrencyCode: "USD", FiscalCalendarID: "fc",
+		DefaultCurrencyCode: "USD", FiscalCalendarID: "0f000000-0000-4000-8000-000000000001",
 		PrimaryJurisdictionID: "JUR-US", DataResidencyPolicyID: "drp",
 	})
 	require.NoError(t, err)

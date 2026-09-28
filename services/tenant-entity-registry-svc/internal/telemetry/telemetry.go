@@ -57,6 +57,14 @@ type Metrics struct {
 	HTTPRequestsTotal   *prometheus.CounterVec
 	HTTPRequestDuration *prometheus.HistogramVec
 	ReadinessUp         prometheus.Gauge
+
+	// Event delivery (RUNBOOK.md, SLO.md). Every event goes through
+	// event_outbox, so these are the whole delivery picture: a service can
+	// look healthy on HTTP while events pile up unseen.
+	OutboxPending    prometheus.Gauge
+	OutboxDeadLetter prometheus.Gauge
+	OutboxPublished  prometheus.Gauge
+	OutboxFailed     prometheus.Gauge
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -78,7 +86,17 @@ func NewMetrics(serviceName string) *Metrics {
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
 	}
-	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp)
+	gauge := func(name, help string) prometheus.Gauge {
+		return prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: name, Help: help, ConstLabels: prometheus.Labels{"service": serviceName},
+		})
+	}
+	m.OutboxPending = gauge("outbox_pending_events", "Events written to event_outbox and not yet published.")
+	m.OutboxDeadLetter = gauge("outbox_dead_letter_events", "Events that exhausted their publish attempts.")
+	m.OutboxPublished = gauge("outbox_published_events", "Events published by this process since start.")
+	m.OutboxFailed = gauge("outbox_publish_failures", "Failed publish attempts by this process since start.")
+	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp,
+		m.OutboxPending, m.OutboxDeadLetter, m.OutboxPublished, m.OutboxFailed)
 	return m
 }
 

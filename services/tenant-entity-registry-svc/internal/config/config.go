@@ -55,6 +55,27 @@ type Config struct {
 	// external_customer_key. Migration aid only: refused in staging and
 	// production, where a keyless provision is a potential duplicate tenant.
 	OnboardingKeyOptional bool
+
+	// CommercialAccountURL is commercial-account-svc, the authority for
+	// ORG-02 §4.2's "plan entitlement". Empty selects a permissive stub —
+	// refused in staging and production.
+	CommercialAccountURL string
+
+	// RestrictedJurisdictionCodes is §4.2's "restricted-jurisdiction checks":
+	// jurisdiction codes a tenant may not be provisioned in. A compliance
+	// decision, so it is configuration, not code; staging and production must
+	// set it explicitly (the literal NONE states "no restrictions").
+	RestrictedJurisdictionCodes []string
+	restrictedSet               bool
+
+	// LegacyProvisioningInputs lets ProvisionTenant run without §4.2's
+	// required inputs (primary jurisdiction, residency preference, onboarding
+	// evidence, subscription). Dev-only, for callers not yet migrated.
+	LegacyProvisioningInputs bool
+
+	// ExpectedVersionOptional restores the pre-28 Sep substitution of the
+	// version just read for a missing expected_version. Dev-only.
+	ExpectedVersionOptional bool
 }
 
 type DBConfig struct {
@@ -184,6 +205,19 @@ func Load() (*Config, error) {
 		ApprovalTTLHours:               envInt("APPROVAL_TTL_HOURS", 168),
 		LegacyEntityCreateActive:       strings.EqualFold(env("LEGACY_ENTITY_CREATE_ACTIVE", "false"), "true"),
 		OnboardingKeyOptional:          strings.EqualFold(env("ONBOARDING_KEY_OPTIONAL", "false"), "true"),
+		CommercialAccountURL:           env("COMMERCIAL_ACCOUNT_URL", ""),
+		LegacyProvisioningInputs:       strings.EqualFold(env("LEGACY_PROVISIONING_INPUTS", "false"), "true"),
+		ExpectedVersionOptional:        strings.EqualFold(env("EXPECTED_VERSION_OPTIONAL", "false"), "true"),
+	}
+	if raw, ok := os.LookupEnv("RESTRICTED_JURISDICTION_CODES"); ok && strings.TrimSpace(raw) != "" {
+		cfg.restrictedSet = true
+		if !strings.EqualFold(strings.TrimSpace(raw), "NONE") {
+			for _, c := range strings.Split(raw, ",") {
+				if c = strings.ToUpper(strings.TrimSpace(c)); c != "" {
+					cfg.RestrictedJurisdictionCodes = append(cfg.RestrictedJurisdictionCodes, c)
+				}
+			}
+		}
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -220,6 +254,24 @@ func (c *Config) validate() error {
 	}
 	if c.OnboardingKeyOptional {
 		return fmt.Errorf("ONBOARDING_KEY_OPTIONAL is not permitted in %s environment", c.Env)
+	}
+	if c.ExpectedVersionOptional {
+		return fmt.Errorf("EXPECTED_VERSION_OPTIONAL is not permitted in %s environment", c.Env)
+	}
+	if c.LegacyProvisioningInputs {
+		return fmt.Errorf("LEGACY_PROVISIONING_INPUTS is not permitted in %s environment", c.Env)
+	}
+	// The stub validator accepts every jurisdiction id. main.go selected it
+	// whenever the URL was unset or left at its default — in every
+	// environment, so a production deployment validated nothing.
+	if !c.JurisdictionValidatorIsReal() {
+		return fmt.Errorf("JURISDICTION_RULES_URL must point at the Jurisdiction Rules Service in %s environment (the stub accepts every jurisdiction)", c.Env)
+	}
+	if c.CommercialAccountURL == "" {
+		return fmt.Errorf("COMMERCIAL_ACCOUNT_URL must be set in %s environment (plan entitlement is a §4.2 server-resolved check)", c.Env)
+	}
+	if !c.restrictedSet {
+		return fmt.Errorf("RESTRICTED_JURISDICTION_CODES must be set in %s environment (a comma list of codes, or NONE)", c.Env)
 	}
 
 	if c.DB.Password == "" {
@@ -275,4 +327,10 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// JurisdictionValidatorIsReal reports whether the HTTP validator will be used
+// rather than the accept-everything stub.
+func (c *Config) JurisdictionValidatorIsReal() bool {
+	return c.JurisdictionRulesURL != "" && c.JurisdictionRulesURL != "http://jurisdiction-rules-svc"
 }

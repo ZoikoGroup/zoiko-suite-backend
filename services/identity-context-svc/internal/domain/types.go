@@ -137,8 +137,15 @@ type SessionContext struct {
 	// SourceChannel is the channel the request arrived on.
 	SourceChannel string `json:"source_channel,omitempty"`
 
-	// WorkloadID is the calling workload identity, where one was presented.
+	// SourceChannelBasis records how SourceChannel was established.
+	SourceChannelBasis SourceInputBasis `json:"source_channel_basis,omitempty"`
+
+	// WorkloadID is the calling workload identity: the verified principal for
+	// a service account or API client, empty for a human (see WorkloadIDBasis).
 	WorkloadID string `json:"workload_id,omitempty"`
+
+	// WorkloadIDBasis records how WorkloadID was established.
+	WorkloadIDBasis SourceInputBasis `json:"workload_id_basis,omitempty"`
 
 	// CausationID completes §4's "correlation/causation IDs". Correlation says
 	// these records belong to one story; causation says this one happened
@@ -157,14 +164,21 @@ type SessionContext struct {
 	// EntitlementContextRef is §4's server-resolved "entitlement context
 	// reference".
 	//
-	// Always nil today, and deliberately so. §4 names a "commercial entitlement
-	// read model" as the dependency that resolves it, and no service in this
-	// estate exposes one — commercial-account-svc serves accounts, memberships
-	// and price catalogs, not entitlement resolution. The field exists so the
-	// evidence row has a home for the reference the moment an upstream does,
-	// and so that "we never resolved this" stays visibly distinct from "we
-	// resolved it to nothing".
+	// Nil in every deployment today, and deliberately so. §4 names a
+	// "commercial entitlement read model" as the dependency that resolves it;
+	// its owner, COM-03 Entitlement, is not implemented anywhere in the
+	// estate. Resolved through Resolver.WithEntitlementResolver the moment one
+	// is wired. EntitlementContextStatus keeps "never resolved" visibly
+	// distinct from "resolved to nothing".
 	EntitlementContextRef *string `json:"entitlement_context_ref,omitempty"`
+
+	// EntitlementContextStatus says whether EntitlementContextRef was resolved,
+	// not configured, or unavailable.
+	EntitlementContextStatus EntitlementContextStatus `json:"entitlement_context_status,omitempty"`
+
+	// IngressCacheState is §4's FRESH / STALE / INVALIDATED as it applied to
+	// the ingress binding this decision was checked against.
+	IngressCacheState CacheFreshness `json:"ingress_cache_state,omitempty"`
 
 	// ── Retention (GOV-09) ───────────────────────────────────────────────────
 

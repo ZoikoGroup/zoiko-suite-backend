@@ -413,3 +413,84 @@ func TestLeadingBOMIsTolerated(t *testing.T) {
 	require.Len(t, h.sessions.principals, 1, "a BOM-prefixed event must still be acted on")
 	assert.Equal(t, "p-42", h.sessions.principals[0].id)
 }
+
+// ── Revocation horizon (2026-09-28) ──────────────────────────────────────────
+//
+// The reader now subscribes to the producer topics it never read. Under the
+// existing group those start from the first offset, so without a horizon the
+// first deploy replays their whole history against today's sessions.
+
+func stampedEvent(t *testing.T, eventType, eventID string, emittedAt time.Time, payload map[string]any) []byte {
+	t.Helper()
+	body := map[string]any{
+		"event_id":       eventID,
+		"event_type":     eventType,
+		"tenant_id":      "tenant-1",
+		"correlation_id": "corr-1",
+		"actor_id":       "the-revoker",
+		"payload":        payload,
+	}
+	if !emittedAt.IsZero() {
+		body["emitted_at"] = emittedAt
+	}
+	raw, err := json.Marshal(body)
+	require.NoError(t, err)
+	return raw
+}
+
+func TestRevocationOlderThanAnyLiveSessionIsSkipped(t *testing.T) {
+	h := newHarness()
+	h.consumer.WithRevocationHorizon(6 * time.Minute)
+	h.roles.byRole["role-1"] = []string{"p-1"}
+	old := time.Now().Add(-90 * 24 * time.Hour)
+
+	h.consumer.Handle(context.Background(), stampedEvent(t, "authority.revoked", "a", old, map[string]any{"delegate_principal_id": "p-42"}))
+	h.consumer.Handle(context.Background(), stampedEvent(t, "role.updated", "r", old, map[string]any{"role_id": "role-1"}))
+	h.consumer.Handle(context.Background(), stampedEvent(t, "entity.updated", "e", old, map[string]any{"legal_entity_id": "le-1"}))
+
+	assert.Empty(t, h.sessions.principals, "a 90-day-old revocation must not log out a session issued today")
+	assert.Empty(t, h.sessions.entities)
+}
+
+func TestRevocationInsideTheHorizonIsActedOn(t *testing.T) {
+	h := newHarness()
+	h.consumer.WithRevocationHorizon(6 * time.Minute)
+
+	h.consumer.Handle(context.Background(), stampedEvent(t, "authority.revoked", "a", time.Now().Add(-time.Minute),
+		map[string]any{"delegate_principal_id": "p-42"}))
+
+	require.Len(t, h.sessions.principals, 1)
+	assert.Equal(t, "p-42", h.sessions.principals[0].id)
+}
+
+// Fail safe: a producer that omits emitted_at still gets its revocation honoured.
+func TestRevocationWithNoTimestampIsActedOn(t *testing.T) {
+	h := newHarness()
+	h.consumer.WithRevocationHorizon(6 * time.Minute)
+
+	h.consumer.Handle(context.Background(), stampedEvent(t, "authority.revoked", "a", time.Time{},
+		map[string]any{"delegate_principal_id": "p-42"}))
+
+	assert.Len(t, h.sessions.principals, 1)
+}
+
+// A hold is state, not a one-shot command. An old hold is still a hold.
+func TestHorizonDoesNotApplyToLegalHolds(t *testing.T) {
+	h := newHarness()
+	h.consumer.WithRevocationHorizon(6 * time.Minute)
+
+	h.consumer.Handle(context.Background(), stampedEvent(t, "legal.hold.issued", "lh", time.Now().Add(-365*24*time.Hour),
+		map[string]any{"hold_id": "hold-1", "matter_ref": "M-1"}))
+
+	assert.Len(t, h.holds.upserted, 1)
+}
+
+// On authority.revoked the actor is the person who revoked. Falling back to it
+// logged out the enforcer and left the delegate's sessions alive.
+func TestAuthorityEventWithNoDelegateNeverRevokesTheActor(t *testing.T) {
+	h := newHarness()
+
+	h.consumer.Handle(context.Background(), stampedEvent(t, "authority.revoked", "a", time.Time{}, map[string]any{}))
+
+	assert.Empty(t, h.sessions.principals, "the revoker's sessions must never be the ones revoked")
+}

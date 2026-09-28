@@ -328,3 +328,83 @@ func TestSupportReconcilerHatch_ReadsAcrossTenantsButCannotWrite(t *testing.T) {
 		t.Fatalf("the reconciler hatch granted UPDATE on %d rows; it must be SELECT-only", tag.RowsAffected())
 	}
 }
+
+// backdateClaim ages a claim, under the tenant's own RLS scope.
+func backdateClaim(t *testing.T, pool *pgxpool.Pool, tenantID, key string, age time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	tag, err := tx.Exec(ctx, `UPDATE idempotency_keys SET created_at = NOW() - make_interval(secs => $1)
+		WHERE tenant_id = $2 AND idempotency_key = $3`, age.Seconds(), tenantID, key)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("backdate: rows=%d err=%v", tag.RowsAffected(), err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+// A process that died mid-command left status 0 behind, and before
+// 2026-09-28 every retry was told IDEMPOTENCY_IN_FLIGHT until the 7-day purge.
+// Past the lease, an IDENTICAL request takes the claim over in the same
+// INSERT ... ON CONFLICT statement.
+func TestClaimIdempotencyKey_AbandonedClaimIsTakenOver(t *testing.T) {
+	s, pool := idemStore(t)
+	ctx := context.Background()
+
+	if _, err := s.ClaimIdempotencyKey(ctx, idemTenantA, idemEndpoint, "abandoned", "fp-a"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	backdateClaim(t, pool, idemTenantA, "abandoned", store.IdempotencyInFlightLease+time.Minute)
+
+	rec, err := s.ClaimIdempotencyKey(ctx, idemTenantA, idemEndpoint, "abandoned", "fp-a")
+	if err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("an abandoned claim must be taken over (nil record), got %+v", rec)
+	}
+
+	// The takeover refreshed the lease: a second retry right now is in flight.
+	again, err := s.ClaimIdempotencyKey(ctx, idemTenantA, idemEndpoint, "abandoned", "fp-a")
+	if err != nil {
+		t.Fatalf("second retry: %v", err)
+	}
+	if again == nil || again.ResponseStatus != 0 {
+		t.Fatalf("a freshly taken-over claim must read as in flight, got %+v", again)
+	}
+}
+
+// The lease never lets a DIFFERENT request take over, and never touches a
+// completed answer.
+func TestClaimIdempotencyKey_TakeoverIsNarrow(t *testing.T) {
+	s, pool := idemStore(t)
+	ctx := context.Background()
+
+	if _, err := s.ClaimIdempotencyKey(ctx, idemTenantA, idemEndpoint, "stale-other", "fp-a"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	backdateClaim(t, pool, idemTenantA, "stale-other", store.IdempotencyInFlightLease+time.Minute)
+	if _, err := s.ClaimIdempotencyKey(ctx, idemTenantA, idemEndpoint, "stale-other", "fp-b"); !errors.Is(err, store.ErrIdempotencyFingerprintMismatch) {
+		t.Fatalf("a different request must still be a mismatch, got %v", err)
+	}
+
+	if _, err := s.ClaimIdempotencyKey(ctx, idemTenantA, idemEndpoint, "done", "fp-a"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := s.CompleteIdempotencyKey(ctx, idemTenantA, idemEndpoint, "done", 201, []byte(`{"ok":true}`)); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	backdateClaim(t, pool, idemTenantA, "done", store.IdempotencyInFlightLease+time.Minute)
+	rec, err := s.ClaimIdempotencyKey(ctx, idemTenantA, idemEndpoint, "done", "fp-a")
+	if err != nil || rec == nil || rec.ResponseStatus != 201 {
+		t.Fatalf("an old COMPLETED key must replay, never re-execute: rec=%+v err=%v", rec, err)
+	}
+}

@@ -385,7 +385,9 @@ func TestSupportContext_ReconciliationFindsEndedAndUnreviewed(t *testing.T) {
 	require.Len(t, pending, 1)
 	assert.Equal(t, "sup-6", pending[0].SupportContextID)
 
-	require.NoError(t, s.MarkSupportContextReviewed(ctx, "sup-6", "tenant-a", "security-1", now))
+	changed, err := s.MarkSupportContextReviewedWithEvent(ctx, "sup-6", "tenant-a", "security-1", now, outbox.Record{})
+	require.NoError(t, err)
+	assert.True(t, changed)
 
 	after, err := s.FindUnreviewedExpiredSupportContexts(ctx, "tenant-a", now, 10)
 	require.NoError(t, err)
@@ -617,4 +619,101 @@ func TestPurgePublishedOutbox_LeavesUndeliveredRows(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx, `
 		SELECT count(*) FROM event_outbox WHERE event_id IN ('recent','pending')`).Scan(&remaining))
 	assert.Equal(t, 2, remaining, "an undelivered event must never be purged")
+}
+
+// ── Source-input provenance (migration 000009) ───────────────────────────────
+
+// Every §4 source input round-trips with its basis. Before 000009 the 000008
+// columns were written and never read back, so explain could not show them.
+func TestSessionContext_SourceInputProvenanceRoundTrips(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := store.New(pool, zap.NewNop())
+
+	insertPrincipal(t, ctx, pool, "p-1", "tenant-a", "idp|1", "ACTIVE")
+	sc := sessionFor("sc-prov", "p-1", "tenant-a")
+	sc.SourceChannel = "system"
+	sc.SourceChannelBasis = domain.BasisServerDerived
+	sc.WorkloadID = "p-1"
+	sc.WorkloadIDBasis = domain.BasisVerifiedPrincipal
+	sc.CausationID = "cause-1"
+	sc.IngressBindingVersion = "registry-v42"
+	sc.IngressCacheState = domain.CacheStale
+	sc.EntitlementContextStatus = domain.EntitlementUpstreamNotConfigured
+	require.NoError(t, s.InsertSessionContext(ctx, sc))
+
+	got, err := s.FindSessionContext(ctx, "sc-prov", "tenant-a")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "system", got.SourceChannel)
+	assert.Equal(t, domain.BasisServerDerived, got.SourceChannelBasis)
+	assert.Equal(t, "p-1", got.WorkloadID)
+	assert.Equal(t, domain.BasisVerifiedPrincipal, got.WorkloadIDBasis)
+	assert.Equal(t, "cause-1", got.CausationID)
+	assert.Equal(t, "registry-v42", got.IngressBindingVersion)
+	assert.Equal(t, domain.CacheStale, got.IngressCacheState)
+	assert.Nil(t, got.EntitlementContextRef)
+	assert.Equal(t, domain.EntitlementUpstreamNotConfigured, got.EntitlementContextStatus)
+}
+
+// The invariant the provenance change rests on — a rejected or discarded
+// assertion is never on the row — is enforced by the schema, not only by the
+// resolver, so a future code path cannot forget it.
+func TestSessionContext_SchemaRefusesARecordedRejectedAssertion(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := store.New(pool, zap.NewNop())
+	insertPrincipal(t, ctx, pool, "p-1", "tenant-a", "idp|1", "ACTIVE")
+
+	bad := sessionFor("sc-bad-ch", "p-1", "tenant-a")
+	bad.SourceChannel = "system"
+	bad.SourceChannelBasis = domain.BasisRejectedInconsistent
+	assert.Error(t, s.InsertSessionContext(ctx, bad), "a rejected channel must not be storable")
+
+	bad2 := sessionFor("sc-bad-wl", "p-1", "tenant-a")
+	bad2.WorkloadID = "bff-7"
+	bad2.WorkloadIDBasis = domain.BasisUnverifiableDiscarded
+	assert.Error(t, s.InsertSessionContext(ctx, bad2), "a discarded workload must not be storable")
+
+	unknown := sessionFor("sc-bad-basis", "p-1", "tenant-a")
+	unknown.SourceChannelBasis = "MADE_UP"
+	assert.Error(t, s.InsertSessionContext(ctx, unknown), "an undocumented basis must not reach the audit record")
+}
+
+
+// The review and its event commit together or not at all, and a repeat review
+// writes neither a second review nor a second event.
+func TestSupportContext_ReviewAndItsEventAreAtomicAndOnce(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := store.New(pool, zap.NewNop())
+	now := time.Now().UTC()
+
+	sc := supportFor("sup-rev", "tenant-a", "eng-1", "lead-9", time.Hour)
+	require.NoError(t, s.InsertSupportContextWithEvent(ctx, sc, outbox.Record{}))
+
+	rec := outbox.Record{
+		EventID: "evt-rev-1", EventType: "identity.support_context.reviewed",
+		TenantID: "tenant-a", PartitionKey: "sup-rev", Payload: []byte(`{"support_context_id":"sup-rev"}`),
+	}
+	changed, err := s.MarkSupportContextReviewedWithEvent(ctx, "sup-rev", "tenant-a", "security-1", now, rec)
+	require.NoError(t, err)
+	assert.True(t, changed)
+
+	var n int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE event_type='identity.support_context.reviewed'`).Scan(&n))
+	assert.Equal(t, 1, n, "the review event must be enqueued with the review")
+
+	rec2 := rec
+	rec2.EventID = "evt-rev-2"
+	changed, err = s.MarkSupportContextReviewedWithEvent(ctx, "sup-rev", "tenant-a", "someone-else", now, rec2)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM event_outbox WHERE event_type='identity.support_context.reviewed'`).Scan(&n))
+	assert.Equal(t, 1, n, "a repeat review must not enqueue a second event")
+
+	got, err := s.FindSupportContext(ctx, "sup-rev", "tenant-a")
+	require.NoError(t, err)
+	require.NotNil(t, got.ReviewedBy)
+	assert.Equal(t, "security-1", *got.ReviewedBy, "the first reviewer stands")
 }

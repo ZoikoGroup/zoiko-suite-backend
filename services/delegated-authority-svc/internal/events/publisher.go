@@ -18,6 +18,7 @@ const (
 	EventDelegated = "authority.delegated"
 	EventRevoked   = "authority.revoked"
 	EventExpired   = "authority.expired"
+	EventExtended  = "authority.extended"
 )
 
 // envelope is this platform's event contract (Doc 03 §19): every published
@@ -58,13 +59,16 @@ func Build(eventType string, d domain.DelegationGrant) (key string, body []byte,
 	case EventDelegated:
 		actorID = d.CreatedByPrincipalID
 		payload = map[string]any{
-			"delegation_id":          d.DelegationID,
-			"legal_entity_id":        d.LegalEntityID,
-			"delegator_principal_id": d.DelegatorPrincipalID,
-			"delegate_principal_id":  d.DelegatePrincipalID,
-			"action_type":            d.ActionType,
-			"effective_from":         d.EffectiveFrom,
-			"effective_to":           d.EffectiveTo,
+			"delegation_id":             d.DelegationID,
+			"legal_entity_id":           d.LegalEntityID,
+			"delegator_principal_id":    d.DelegatorPrincipalID,
+			"delegate_principal_id":     d.DelegatePrincipalID,
+			"action_type":               d.ActionType,
+			"effective_from":            d.EffectiveFrom,
+			"effective_to":              d.EffectiveTo,
+			"authority_limit_cents":     d.AuthorityLimitCents,
+			"authority_limit_currency":  d.AuthorityLimitCurrency,
+			"authority_limit_quantity":  d.AuthorityLimitQuantity,
 		}
 	case EventRevoked:
 		actorID = deref(d.RevokedByPrincipalID)
@@ -89,6 +93,17 @@ func Build(eventType string, d domain.DelegationGrant) (key string, body []byte,
 			"delegate_principal_id":  d.DelegatePrincipalID,
 			"action_type":            d.ActionType,
 			"effective_to":           d.EffectiveTo,
+		}
+	case EventExtended:
+		actorID = d.CreatedByPrincipalID // who extended it
+		payload = map[string]any{
+			"delegation_id":          d.DelegationID,
+			"legal_entity_id":        d.LegalEntityID,
+			"delegator_principal_id": d.DelegatorPrincipalID,
+			"delegate_principal_id":  d.DelegatePrincipalID,
+			"action_type":            d.ActionType,
+			"effective_from":         d.EffectiveFrom,
+			"effective_to":           d.EffectiveTo, // the NEW effective_to
 		}
 	default:
 		return "", nil, fmt.Errorf("events: unknown event type %q", eventType)

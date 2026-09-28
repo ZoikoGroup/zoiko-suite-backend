@@ -23,7 +23,7 @@ import (
 func TestCreate_ReplayAnswers200NotCreated(t *testing.T) {
 	correlationID := uuid.NewString()
 	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{}, nil)
 	body := delegationBody("delegator-1", correlationID, time.Now(), time.Now().Add(24*time.Hour))
 
 	first := doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1")
@@ -50,7 +50,7 @@ func TestCreate_ReplayAnswers200NotCreated(t *testing.T) {
 func TestCreate_ReplayEmitsNoSecondEvent(t *testing.T) {
 	correlationID := uuid.NewString()
 	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{}, nil)
 	body := delegationBody("delegator-1", correlationID, time.Now(), time.Now().Add(24*time.Hour))
 
 	_ = doReq(r, http.MethodPost, "/v1/delegations/", body, "delegator-1")
@@ -73,7 +73,7 @@ func TestCreate_ReplayEmitsNoSecondEvent(t *testing.T) {
 // After the sweep the row reads EXPIRED and the revoke correctly answers 409.
 func TestRevoke_SweepsExpiryFirstSoALapsedGrantIsNotRecordedAsRevoked(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{}, nil)
 
 	past := time.Now().Add(-48 * time.Hour)
 	created := doReq(r, http.MethodPost, "/v1/delegations/",
@@ -100,7 +100,7 @@ func TestRevoke_SweepsExpiryFirstSoALapsedGrantIsNotRecordedAsRevoked(t *testing
 // sweep added to this path must not disturb it.
 func TestRevoke_InWindowGrantStillRevokes(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{}, nil)
 	d := createActiveDelegation(t, r)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", nil, "admin-1")

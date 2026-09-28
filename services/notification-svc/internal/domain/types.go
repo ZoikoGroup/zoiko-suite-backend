@@ -213,33 +213,37 @@ type ListFilter struct {
 }
 
 // DeliveryOutcome is what one delivery attempt actually achieved.
-//
-// It replaced a (bool, string) pair. The pair could say "it worked" or "it did
-// not and here is why", and could not say the two things that matter most
-// here: what the provider gave back as evidence of acceptance, and whether a
-// refusal is worth attempting again. Both were therefore unrecorded — a
-// greylisted message and a nonexistent mailbox concluded identically.
-type DeliveryOutcome struct {
-	// Delivered means a provider accepted the message. It does NOT mean the
-	// recipient received, read or was legally served with it — ZS-SVC-Y-001
-	// §0.4 forbids conflating those, and the notification's SENT status
-	// carries exactly this weaker claim.
-	Delivered bool
+ //
+ // It replaced a (bool, string) pair. The pair could say "it worked" or "it did
+ // not and here is why", and could not say the two things that matter most
+ // here: what the provider gave back as evidence of acceptance, and whether a
+ // refusal is worth attempting again. Both were therefore unrecorded — a
+ // greylisted message and a nonexistent mailbox concluded identically.
+ type DeliveryOutcome struct {
+ 	// Delivered means a provider accepted the message. It does NOT mean the
+ 	// recipient received, read or was legally served with it — ZS-SVC-Y-001
+ 	// §0.4 forbids conflating those, and the notification's SENT status
+ 	// carries exactly this weaker claim.
+ 	Delivered bool
 
-	// ProviderResponse is the acceptance evidence: which provider took it and
-	// under what identifier, so a message can be traced into provider logs or
-	// matched against the headers the recipient received.
-	ProviderResponse string
+ 	// ProviderResponse is the acceptance evidence: which provider took it and
+ 	// under what identifier, so a message can be traced into provider logs or
+ 	// matched against the headers the recipient received.
+ 	ProviderResponse string
 
-	// Reason explains a refusal, and is written to failure_reason.
-	Reason string
+ 	// Reason explains a refusal, and is written to failure_reason.
+ 	Reason string
 
-	// Retryable distinguishes "the provider says never" (unknown mailbox,
-	// malformed address) from "not now" (connection refused, greylisting, an
-	// SMTP 4xx). Nothing re-attempts on it yet; recording it is what makes a
-	// retry worker possible without re-litigating every historical failure.
-	Retryable bool
-}
+ 	// Retryable distinguishes "the provider says never" (unknown mailbox,
+ 	// malformed address) from "not now" (connection refused, greylisting, an
+ 	// SMTP 4xx). Nothing re-attempts on it yet; recording it is what makes a
+ 	// retry worker possible without re-litigating every historical failure.
+ 	Retryable bool
+
+ 	// Err preserves the original error for classification (e.g., timeout
+ 	// detection per §3.4). Not serialized — only used in-process.
+ 	Err error
+ }
 
 // DeliveryAttempt is one provider submission with its outcome and evidence.
 // This replaces the simple counter (delivery_attempts) with a durable,
@@ -336,4 +340,456 @@ var (
 	// says which of the two happened, and so a retry worker can tell a
 	// notification worth re-attempting from one that never will be.
 	ErrIdentityServiceUnavailable = errorString("identity-context-svc unavailable")
+
+	// Suppression/Preference errors
+	ErrSuppressionNotFound   = errorString("suppression not found")
+	ErrPreferenceNotFound    = errorString("preference not found")
+	ErrChannelDecisionFailed = errorString("channel decision evaluation failed")
+)
+
+// ── NCD-02: Suppression ───────────────────────────────────────────────────────
+
+// SuppressionReason enumerates why a channel is suppressed for a recipient.
+type SuppressionReason string
+
+const (
+	SuppressionReasonUnsubscribe   SuppressionReason = "unsubscribe"
+	SuppressionReasonBounce        SuppressionReason = "bounce"
+	SuppressionReasonComplaint     SuppressionReason = "complaint"
+	SuppressionReasonManual        SuppressionReason = "manual"
+	SuppressionReasonLegalHold     SuppressionReason = "legal_hold"
+)
+
+// Suppression is a hard stop: the channel is blocked regardless of preference
+// or permission. Per §5.4, suppression has highest precedence.
+type Suppression struct {
+	SuppressionID string             `json:"suppression_id"`
+	TenantID      string             `json:"tenant_id"`
+	PrincipalID   string             `json:"principal_id"`
+	Channel       string             `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
+	Reason        SuppressionReason  `json:"reason"`
+	CreatedBy     string             `json:"created_by"` // principal who created it
+	CreatedAt     time.Time          `json:"created_at"`
+	ExpiresAt     *time.Time         `json:"expires_at,omitempty"` // optional: temporary suppression
+}
+
+// SuppressionFilter for listing suppressions.
+type SuppressionFilter struct {
+	TenantID     string
+	PrincipalID  string
+	Channel      string
+	Reason       string
+	ActiveOnly   bool
+	Limit        int
+	Offset       int
+}
+
+// ── NCD-02: Preference ────────────────────────────────────────────────────────
+
+// Preference is what the recipient wants (not a hard block like suppression).
+// Per §5.3, preference is distinct from permission (legal basis / consent).
+type Preference struct {
+	PreferenceID     string     `json:"preference_id"`
+	TenantID         string     `json:"tenant_id"`
+	PrincipalID      string     `json:"principal_id"`
+	Channel          string     `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
+	Enabled          bool       `json:"enabled"`
+	QuietHoursStart  *string    `json:"quiet_hours_start,omitempty"`  // HH:MM:SS format
+	QuietHoursEnd    *string    `json:"quiet_hours_end,omitempty"`    // HH:MM:SS format
+	Timezone         string     `json:"timezone,omitempty"`           // IANA timezone
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+// PreferenceFilter for listing preferences.
+type PreferenceFilter struct {
+	TenantID    string
+	PrincipalID string
+	Channel     string
+	EnabledOnly bool
+	Limit       int
+	Offset      int
+}
+
+// ── NCD-02: Channel Decision ──────────────────────────────────────────────────
+
+// ChannelDecision records the outcome of a channel evaluation for audit.
+type ChannelDecision struct {
+	DecisionID     string     `json:"decision_id"`
+	TenantID       string     `json:"tenant_id"`
+	PrincipalID    string     `json:"principal_id"`
+	Channel        string     `json:"channel"`
+	Decision       string     `json:"decision"` // allowed, suppressed, quiet_hours, no_preference, no_permission
+	SuppressionID  *string    `json:"suppression_id,omitempty"`
+	PreferenceID   *string    `json:"preference_id,omitempty"`
+	PermissionGrant string    `json:"permission_grant,omitempty"` // legal basis reference
+	EvaluatedAt    time.Time  `json:"evaluated_at"`
+}
+
+// ChannelDecisionFilter for listing decisions.
+type ChannelDecisionFilter struct {
+	TenantID    string
+	PrincipalID string
+	Channel     string
+	Decision    string
+	Limit       int
+	Offset      int
+}
+
+// ChannelDecisionResult is the outcome of evaluating a channel for a recipient.
+type ChannelDecisionResult struct {
+	Allowed          bool      `json:"allowed"`
+	Decision         string    `json:"decision"` // allowed, suppressed, quiet_hours, no_preference, no_permission
+	SuppressionID    *string   `json:"suppression_id,omitempty"`
+	PreferenceID     *string   `json:"preference_id,omitempty"`
+	PermissionGrant  *string   `json:"permission_grant,omitempty"`
+}
+
+// SuppressionReason values
+const (
+	ChannelDecisionAllowed         = "allowed"
+	ChannelDecisionSuppressed      = "suppressed"
+	ChannelDecisionQuietHours      = "quiet_hours"
+	ChannelDecisionNoPreference    = "no_preference"
+	ChannelDecisionNoPermission    = "no_permission"
+)
+
+// ── NCD-04: Bounce ────────────────────────────────────────────────────────────
+
+type BounceType string
+
+const (
+	BounceTypeHard      BounceType = "hard"
+	BounceTypeSoft      BounceType = "soft"
+	BounceTypeTransient BounceType = "transient"
+)
+
+type BounceAction string
+
+const (
+	BounceActionSuppressionCreated BounceAction = "suppression_created"
+	BounceActionRetryScheduled     BounceAction = "retry_scheduled"
+	BounceActionIgnored            BounceAction = "ignored"
+)
+
+type BounceEvent struct {
+	BounceID         string       `json:"bounce_id"`
+	TenantID         string       `json:"tenant_id"`
+	NotificationID   string       `json:"notification_id"`
+	Provider         string       `json:"provider"`
+	BounceType       BounceType   `json:"bounce_type"`
+	BounceSubtype    string       `json:"bounce_subtype,omitempty"`
+	DiagnosticCode   string       `json:"diagnostic_code,omitempty"`
+	RecipientAddress string       `json:"recipient_address"`
+	ReceivedAt       time.Time    `json:"received_at"`
+	ProcessedAt      *time.Time   `json:"processed_at,omitempty"`
+	ActionTaken      BounceAction `json:"action_taken,omitempty"`
+	SuppressionID    *string      `json:"suppression_id,omitempty"`
+}
+
+type BounceEventFilter struct {
+	TenantID       string
+	NotificationID string
+	RecipientAddr  string
+	BounceType     string
+	Limit          int
+	Offset         int
+}
+
+// ── NCD-04: Complaint ─────────────────────────────────────────────────────────
+
+type ComplaintAction string
+
+const (
+	ComplaintActionSuppressionCreated ComplaintAction = "suppression_created"
+	ComplaintActionIgnored            ComplaintAction = "ignored"
+)
+
+type ComplaintEvent struct {
+	ComplaintID      string           `json:"complaint_id"`
+	TenantID         string           `json:"tenant_id"`
+	NotificationID   *string          `json:"notification_id,omitempty"`
+	Provider         string           `json:"provider"`
+	ComplaintType    string           `json:"complaint_type"` // abuse, spam, unsubscribe_request
+	RecipientAddress string           `json:"recipient_address"`
+	ReceivedAt       time.Time        `json:"received_at"`
+	ProcessedAt      *time.Time       `json:"processed_at,omitempty"`
+	ActionTaken      ComplaintAction  `json:"action_taken,omitempty"`
+	SuppressionID    *string          `json:"suppression_id,omitempty"`
+}
+
+type ComplaintEventFilter struct {
+	TenantID       string
+	NotificationID string
+	RecipientAddr  string
+	ComplaintType  string
+	Limit          int
+	Offset         int
+}
+
+// ── NCD-04: Channel Reputation ────────────────────────────────────────────────
+
+type ChannelReputation struct {
+	ReputationID    string     `json:"reputation_id"`
+	TenantID        string     `json:"tenant_id"`
+	Channel         string     `json:"channel"`
+	Provider        string     `json:"provider"`
+	WindowStart     time.Time  `json:"window_start"`
+	WindowEnd       time.Time  `json:"window_end"`
+	SentCount       int64      `json:"sent_count"`
+	AcceptedCount   int64      `json:"accepted_count"`
+	BouncedCount    int64      `json:"bounced_count"`
+	ComplainedCount int64      `json:"complained_count"`
+	DeliveredCount  int64      `json:"delivered_count"`
+	ReadCount       int64      `json:"read_count"`
+	ReputationScore *float64   `json:"reputation_score,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+type ChannelReputationFilter struct {
+	TenantID  string
+	Channel   string
+	Provider  string
+	Since     time.Time
+	Until     time.Time
+	Limit     int
+	Offset    int
+}
+
+// Errors for NCD-04
+var (
+	ErrBounceNotFound     = errorString("bounce event not found")
+	ErrComplaintNotFound  = errorString("complaint event not found")
+	ErrReputationNotFound = errorString("channel reputation not found")
+)
+
+// ── NCD-01: Communication Intent ──────────────────────────────────────────────
+
+type IntentCategory string
+
+const (
+	IntentCategoryTransactional IntentCategory = "transactional"
+	IntentCategoryMarketing     IntentCategory = "marketing"
+	IntentCategoryRegulatory    IntentCategory = "regulatory"
+	IntentCategorySecurity      IntentCategory = "security"
+)
+
+type CommunicationIntent struct {
+	IntentID       string         `json:"intent_id"`
+	TenantID       string         `json:"tenant_id"`
+	LegalEntityID  string         `json:"legal_entity_id"`
+	Name           string         `json:"name"`
+	Description    string         `json:"description,omitempty"`
+	Category       IntentCategory `json:"category"`
+	Channels       string         `json:"channels"` // comma-separated
+	CreatedBy      string         `json:"created_by"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+}
+
+type CommunicationIntentFilter struct {
+	TenantID      string
+	LegalEntityID string
+	Name          string
+	Category      string
+	Limit         int
+	Offset        int
+}
+
+// ── NCD-01: Template ──────────────────────────────────────────────────────────
+
+type TemplateStatus string
+
+const (
+	TemplateStatusDraft           TemplateStatus = "draft"
+	TemplateStatusPendingApproval TemplateStatus = "pending_approval"
+	TemplateStatusApproved        TemplateStatus = "approved"
+	TemplateStatusPublished       TemplateStatus = "published"
+	TemplateStatusArchived        TemplateStatus = "archived"
+)
+
+type Template struct {
+	TemplateID      string         `json:"template_id"`
+	IntentID        string         `json:"intent_id"`
+	TenantID        string         `json:"tenant_id"`
+	LegalEntityID   string         `json:"legal_entity_id"`
+	Locale          string         `json:"locale"`
+	Version         int            `json:"version"`
+	SubjectTemplate string         `json:"subject_template"`
+	BodyTemplate    string         `json:"body_template"`
+	Variables       []string       `json:"variables"` // required variable names
+	Status          TemplateStatus `json:"status"`
+	ApprovedBy      string         `json:"approved_by,omitempty"`
+	ApprovedAt      *time.Time     `json:"approved_at,omitempty"`
+	PublishedAt     *time.Time     `json:"published_at,omitempty"`
+	EffectiveFrom   *time.Time     `json:"effective_from,omitempty"`
+	EffectiveTo     *time.Time     `json:"effective_to,omitempty"`
+	CreatedBy       string         `json:"created_by"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+}
+
+type TemplateFilter struct {
+	TenantID      string
+	LegalEntityID string
+	IntentID      string
+	Locale        string
+	Status        string
+	Limit         int
+	Offset        int
+}
+
+// TemplateApproval for SoD workflow
+type TemplateApproval struct {
+	ApprovalID   string     `json:"approval_id"`
+	TemplateID   string     `json:"template_id"`
+	TenantID     string     `json:"tenant_id"`
+	RequestedBy  string     `json:"requested_by"`
+	ApprovedBy   string     `json:"approved_by,omitempty"`
+	Status       string     `json:"status"` // pending, approved, rejected
+	Reason       string     `json:"reason,omitempty"`
+	RequestedAt  time.Time  `json:"requested_at"`
+	DecidedAt    *time.Time `json:"decided_at,omitempty"`
+}
+
+type TemplateApprovalFilter struct {
+	TenantID   string
+	TemplateID string
+	Status     string
+	Limit      int
+	Offset     int
+}
+
+// TemplateRender for preview
+type TemplateRender struct {
+	RenderID       string     `json:"render_id"`
+	TemplateID     string     `json:"template_id"`
+	TenantID       string     `json:"tenant_id"`
+	Variables      map[string]string `json:"variables"`
+	RenderedSubject string    `json:"rendered_subject,omitempty"`
+	RenderedBody   string     `json:"rendered_body,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	CreatedBy      string     `json:"created_by"`
+	CreatedAt      time.Time  `json:"created_at"`
+}
+
+// TemplatePreviewRequest for render-previews endpoint
+type TemplatePreviewRequest struct {
+	TemplateID string            `json:"template_id,omitempty"`
+	IntentID   string            `json:"intent_id,omitempty"`
+	Locale     string            `json:"locale,omitempty"`
+	Version    int               `json:"version,omitempty"`
+	Variables  map[string]string `json:"variables"`
+}
+
+// Errors for NCD-01
+var (
+	ErrIntentNotFound      = errorString("communication intent not found")
+	ErrTemplateNotFound    = errorString("template not found")
+	ErrApprovalNotFound    = errorString("template approval not found")
+	ErrSelfApproval        = errorString("creator cannot approve their own template")
+	ErrInvalidTemplateVars = errorString("template variables validation failed")
+)
+
+// ── NCD-05: Regulated Notice ──────────────────────────────────────────────────
+
+type RegulatedNoticeStatus string
+
+const (
+	RegulatedNoticeStatusPending       RegulatedNoticeStatus = "pending"
+	RegulatedNoticeStatusSent          RegulatedNoticeStatus = "sent"
+	RegulatedNoticeStatusAcknowledged  RegulatedNoticeStatus = "acknowledged"
+	RegulatedNoticeStatusExpired       RegulatedNoticeStatus = "expired"
+	RegulatedNoticeStatusFailed        RegulatedNoticeStatus = "failed"
+)
+
+type RegulatedNoticePriority string
+
+const (
+	RegulatedNoticePriorityNormal  RegulatedNoticePriority = "normal"
+	RegulatedNoticePriorityHigh    RegulatedNoticePriority = "high"
+	RegulatedNoticePriorityCritical RegulatedNoticePriority = "critical"
+)
+
+type AcknowledgmentMethod string
+
+const (
+	AcknowledgmentMethodClick            AcknowledgmentMethod = "click"
+	AcknowledgmentMethodDigitalSignature AcknowledgmentMethod = "digital_signature"
+	AcknowledgmentMethodWitness          AcknowledgmentMethod = "witness"
+	AcknowledgmentMethodAPI              AcknowledgmentMethod = "api"
+)
+
+type RegulatedNotice struct {
+	RegulatedNoticeID    string                 `json:"regulated_notice_id"`
+	TenantID             string                 `json:"tenant_id"`
+	LegalEntityID        string                 `json:"legal_entity_id"`
+	IntentID             string                 `json:"intent_id,omitempty"`
+	TemplateID           string                 `json:"template_id,omitempty"`
+	RecipientPrincipalID string                 `json:"recipient_principal_id"`
+	RecipientAddress     string                 `json:"recipient_address,omitempty"`
+	Subject              string                 `json:"subject"`
+	Body                 string                 `json:"body"`
+	Variables            map[string]string      `json:"variables"`
+	Channel              string                 `json:"channel"`
+	Status               RegulatedNoticeStatus  `json:"status"`
+	Priority             RegulatedNoticePriority `json:"priority"`
+	ExpiresAt            *time.Time             `json:"expires_at,omitempty"`
+	AcknowledgedAt       *time.Time             `json:"acknowledged_at,omitempty"`
+	AcknowledgedBy       string                 `json:"acknowledged_by,omitempty"`
+	AcknowledgmentMethod AcknowledgmentMethod   `json:"acknowledgment_method,omitempty"`
+	AcknowledgmentChain  map[string]any         `json:"acknowledgment_chain,omitempty"`
+	CreatedBy            string                 `json:"created_by"`
+	CreatedAt            time.Time              `json:"created_at"`
+	UpdatedAt            time.Time              `json:"updated_at"`
+}
+
+type RegulatedNoticeFilter struct {
+	TenantID             string
+	LegalEntityID        string
+	RecipientPrincipalID string
+	Status               string
+	Priority             string
+	Limit                int
+	Offset               int
+}
+
+// AcknowledgmentChainStep records one step in the acknowledgment chain.
+type AcknowledgmentChainStep struct {
+	ChainID             string         `json:"chain_id"`
+	RegulatedNoticeID   string         `json:"regulated_notice_id"`
+	TenantID            string         `json:"tenant_id"`
+	StepNumber          int            `json:"step_number"`
+	Action              string         `json:"action"` // created, sent, delivered, opened, acknowledged, expired, failed
+	Actor               string         `json:"actor,omitempty"`
+	Method              string         `json:"method,omitempty"`
+	Evidence            map[string]any `json:"evidence,omitempty"`
+	Metadata            map[string]any `json:"metadata,omitempty"`
+	CreatedAt           time.Time      `json:"created_at"`
+}
+
+type AcknowledgmentChainFilter struct {
+	TenantID            string
+	RegulatedNoticeID   string
+	Action              string
+	Limit               int
+	Offset              int
+}
+
+// AcknowledgeRequest for POST /acknowledgements
+type AcknowledgeRequest struct {
+	RegulatedNoticeID   string               `json:"regulated_notice_id"`
+	Method              AcknowledgmentMethod `json:"method"`
+	Evidence            map[string]any       `json:"evidence,omitempty"`
+	WitnessPrincipalID  string               `json:"witness_principal_id,omitempty"`
+	DigitalSignature    string               `json:"digital_signature,omitempty"`
+}
+
+// Errors for NCD-05
+var (
+	ErrRegulatedNoticeNotFound = errorString("regulated notice not found")
+	ErrChainStepNotFound       = errorString("acknowledgment chain step not found")
+	ErrAlreadyAcknowledged     = errorString("notice already acknowledged")
+	ErrNoticeExpired           = errorString("notice has expired")
 )

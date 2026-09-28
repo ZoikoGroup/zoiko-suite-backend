@@ -275,7 +275,7 @@ func TestCrossTenantIsolation(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, list, "tenant B's register must not include tenant A's grants")
 
-	_, err = s.RevokeDelegation(ctxB, d.DelegationID, principalOther)
+	_, err = s.RevokeDelegation(ctxB, d.DelegationID, principalOther, 0)
 	require.ErrorIs(t, err, domain.ErrDelegationNotFound,
 		"tenant B must not be able to transition tenant A's grant")
 
@@ -299,7 +299,7 @@ func TestStoreRefusesUnscopedContext(t *testing.T) {
 	_, err = s.ListDelegations(bare, domain.ListDelegationsFilter{})
 	require.ErrorIs(t, err, domain.ErrTenantMissing)
 
-	_, err = s.RevokeDelegation(bare, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa00a4", principalOther)
+	_, err = s.RevokeDelegation(bare, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa00a4", principalOther, 0)
 	require.ErrorIs(t, err, domain.ErrTenantMissing)
 
 	_, err = s.ExpireDue(bare)
@@ -354,7 +354,7 @@ func TestListDelegationsStatusFilterAndUnknownStatus(t *testing.T) {
 	d := grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa00c1", "corr-c1", testEntityA, principalSelf, principalOther, now, now.Add(24*time.Hour))
 	_, err := s.CreateDelegation(ctx, d)
 	require.NoError(t, err)
-	_, err = s.RevokeDelegation(ctx, d.DelegationID, principalOther)
+	_, err = s.RevokeDelegation(ctx, d.DelegationID, principalOther, 0)
 	require.NoError(t, err)
 
 	active, err := s.ListDelegations(ctx, domain.ListDelegationsFilter{Status: string(domain.DelegationStatusActive)})
@@ -417,7 +417,7 @@ func TestRevokeDelegationTransitionsAndEnqueuesRevoked(t *testing.T) {
 	_, err := s.CreateDelegation(ctx, d)
 	require.NoError(t, err)
 
-	revoked, err := s.RevokeDelegation(ctx, d.DelegationID, principalOther)
+	revoked, err := s.RevokeDelegation(ctx, d.DelegationID, principalOther, 0)
 	require.NoError(t, err)
 	require.Equal(t, domain.DelegationStatusRevoked, revoked.Status)
 	require.Equal(t, principalOther, *revoked.RevokedByPrincipalID)
@@ -429,7 +429,7 @@ func TestRevokeDelegationTransitionsAndEnqueuesRevoked(t *testing.T) {
 
 	// A terminal grant cannot be revoked again — the second attempt is a 409,
 	// not a silent no-op and not a fresh state.
-	_, err = s.RevokeDelegation(ctx, d.DelegationID, principalOther)
+	_, err = s.RevokeDelegation(ctx, d.DelegationID, principalOther, 0)
 	require.ErrorIs(t, err, domain.ErrInvalidTransition)
 	require.True(t, errors.Is(err, domain.ErrInvalidTransition))
 

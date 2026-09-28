@@ -27,15 +27,22 @@ info:
 
     ## Delivery
 
-    Events produced by the ORG-02/ORG-03 named commands are written to the
-    `event_outbox` table inside the SAME transaction as the fact they attest
-    (migration 000006), and delivered by a relay. Delivery is therefore
-    AT-LEAST-ONCE: every consumer must dedupe on `event_id`.
+    Every event is written to the `event_outbox` table inside the SAME
+    transaction as the fact it attests, and delivered by a relay. Delivery is
+    therefore AT-LEAST-ONCE: every consumer must dedupe on `event_id`.
 
-    The pre-existing write paths still publish directly to Kafka after commit
-    and retain the crash window the outbox closes. Both paths emit the identical
-    envelope to the identical topic, so a consumer cannot tell them apart and
-    should not try to.
+    Until 28 Sep 2026 the pre-existing write paths (entity create/update/status,
+    workspaces, hierarchies, jurisdiction assignments) published directly to
+    Kafka after commit. That path lost an event on any crash between commit and
+    publish and, because it ran on the request context, most events outright.
+    It has been removed; there is no direct path.
+
+    ## Versions (ORG §7)
+
+    Every envelope carries `object_id`, `object_version`, `effective_at` and
+    `recorded_at`. `object_version` is the aggregate version the write left
+    behind — the value `GET` returns as `record_version` — so a consumer can pin
+    exactly the version it was told about. Schema version 1.1.
 
 defaultContentType: application/json
 
@@ -67,6 +74,7 @@ channels:
           - $ref: "#/components/messages/TenantTerminationInitiated"
           - $ref: "#/components/messages/TenantTerminated"
           - $ref: "#/components/messages/TenantDefaultsChanged"
+          - $ref: "#/components/messages/TenantHomeRegionChanged"
           # ── ORG-03 §4.3 ──────────────────────────────────────────────────
           - $ref: "#/components/messages/LegalEntityCreated"
           - $ref: "#/components/messages/LegalEntityUpdated"
@@ -91,7 +99,7 @@ components:
       name: tenant.created
       title: A tenant was provisioned
       x-spec-event: TenantCreated
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -155,11 +163,24 @@ components:
       payload:
         $ref: "#/components/schemas/Envelope"
 
+    TenantHomeRegionChanged:
+      name: tenant.home_region.changed
+      title: An approved ChangeHomeRegion re-pointed the tenant's home region
+      description: |
+        No spec name — §4.2 requires maker-checker on home-region changes but
+        lists no event. Published because every consumer that routes data by
+        region must learn of the move. Payload carries from_region_id,
+        to_region_id and the home_region_decision_ref.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
     LegalEntityCreated:
       name: entity.created
       title: A legal entity was created
       x-spec-event: LegalEntityCreated
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -171,7 +192,7 @@ components:
         identity or jurisdiction produces entity.profile.amended (or one of its
         narrowings) instead, because those are effective-dated.
       x-spec-event: null
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -212,7 +233,7 @@ components:
       name: entity.status.changed
       title: An entity moved through its status state machine
       x-spec-event: LegalEntityStatusChanged
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -220,7 +241,7 @@ components:
       name: entity.hierarchy.changed
       title: A parent/child relationship was created or end-dated
       x-spec-event: null
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -228,7 +249,7 @@ components:
       name: entity.jurisdiction.changed
       title: A jurisdiction assignment was created or end-dated
       x-spec-event: null
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -242,7 +263,7 @@ components:
         The entity named in the payload as `existing_legal_entity_id` is the
         incumbent. The rejected claim was NOT written and has no id.
       x-spec-event: null
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -254,7 +275,7 @@ components:
         merged — §1 prohibits destructive merge, so acting on the conclusion is
         a separate governed operation.
       x-spec-event: null
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -262,7 +283,7 @@ components:
       name: workspace.created
       title: A workspace was created beneath a tenant
       x-spec-event: null
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -270,7 +291,7 @@ components:
       name: workspace.updated
       title: A workspace was reclassified or renamed
       x-spec-event: null
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -278,7 +299,7 @@ components:
       name: workspace.status.changed
       title: A workspace was archived or restored
       x-spec-event: null
-      x-delivery: direct
+      x-delivery: outbox
       payload:
         $ref: "#/components/schemas/Envelope"
 
@@ -286,10 +307,10 @@ components:
     Envelope:
       type: object
       description: |
-        The platform event envelope (Doc 03 §19). Identical on both delivery
-        paths — an event that travelled through the outbox is byte-for-byte the
-        same shape as one published directly.
-      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, correlation_id, payload]
+        The platform event envelope (Doc 03 §19) plus the ORG §7 minimum
+        payload: tenant, object identity and version, business and record time,
+        actor, correlation and — for material changes — evidence.
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, correlation_id, object_id, object_version, effective_at, recorded_at, payload]
       properties:
         event_id:
           type: string
@@ -313,6 +334,24 @@ components:
             supplied — an unverified actor would make the audit trail name
             whoever the caller claimed to be.
         correlation_id:  { type: string }
+        object_id:
+          type: string
+          description: The aggregate this event attests (tenant, entity, workspace, hierarchy, assignment or conflict id).
+        object_version:
+          type: integer
+          minimum: 1
+          description: The aggregate's record_version after the write. Consumers persist it to reconstruct outcomes (ORG §3 "Historical use").
+        effective_at:
+          type: string
+          format: date-time
+          description: Business time — when the fact takes effect, which for a backdated amendment is in the past.
+        recorded_at:
+          type: string
+          format: date-time
+          description: Record time — when this service recorded the fact.
+        evidence_ref:
+          type: string
+          description: Source evidence for a material change (registry extract, onboarding request, approval request). Omitted when not material.
         payload:
           type: object
           additionalProperties: true

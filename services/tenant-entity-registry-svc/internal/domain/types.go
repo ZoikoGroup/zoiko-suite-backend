@@ -47,6 +47,10 @@ type Tenant struct {
 	// IdempotentReplay is set on a ProvisionTenant response that returned an
 	// existing tenant for a repeated onboarding key (answered 200, not 201).
 	IdempotentReplay bool `json:"idempotent_replay,omitempty"`
+	// Provisioning lineage (000013): the primary jurisdiction and the
+	// subscription whose entitlement was checked.
+	PrimaryJurisdictionID *string `json:"primary_jurisdiction_id,omitempty"`
+	SubscriptionID        *string `json:"subscription_id,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +92,12 @@ type LegalEntity struct {
 	// Non-destructive merge: a merged duplicate is DORMANT and points here.
 	MergedIntoLegalEntityID *string    `json:"merged_into_legal_entity_id"`
 	MergedAt                *time.Time `json:"merged_at"`
+	// InitialProfile is version 1 of the entity's legal profile, written in
+	// the same transaction as the entity. Never serialized. Before 28 Sep 2026
+	// it was a second, separate write whose failure was only logged — an
+	// entity could exist with no profile, and every as-of read of it returned
+	// nothing.
+	InitialProfile *LegalEntityProfileVersion `json:"-"`
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +122,9 @@ type Workspace struct {
 	UpdatedAt             time.Time             `json:"updated_at"`
 	CreatedByPrincipalID  string                `json:"created_by_principal_id"`
 	UpdatedByPrincipalID  string                `json:"updated_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency version (migration 000011);
+	// events carry it as object_version (ORG §7).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +144,9 @@ type EntityHierarchy struct {
 	UpdatedAt            time.Time                 `json:"updated_at"`
 	CreatedByPrincipalID string                    `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string                    `json:"updated_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency version (migration 000011);
+	// events carry it as object_version (ORG §7).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +167,9 @@ type EntityJurisdictionAssignment struct {
 	UpdatedAt            time.Time                  `json:"updated_at"`
 	CreatedByPrincipalID string                     `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string                     `json:"updated_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency version (migration 000011);
+	// events carry it as object_version (ORG §7).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -243,8 +262,18 @@ type ProvisionTenantRequest struct {
 	// it already created rather than creating a second one.
 	ExternalCustomerKey string `json:"external_customer_key"`
 	// OnboardingRequestRef is §4.2 evidence: the onboarding request this
-	// tenant was created from.
+	// tenant was created from. Required (§4.2 "onboarding evidence").
 	OnboardingRequestRef string `json:"onboarding_request_ref,omitempty"`
+
+	// §4.2 required source inputs and server-resolved context (000013).
+	// PrimaryJurisdictionID is validated against the Jurisdiction Rules
+	// Service and the restricted-jurisdiction list. ResidencyRegionID is the
+	// residency preference: an active region, which becomes the default
+	// residency policy's region (the home region). SubscriptionID is checked
+	// for plan entitlement with commercial-account-svc.
+	PrimaryJurisdictionID string `json:"primary_jurisdiction_id,omitempty"`
+	ResidencyRegionID     string `json:"residency_region_id,omitempty"`
+	SubscriptionID        string `json:"subscription_id,omitempty"`
 }
 
 type TransitionTenantLifecycleRequest struct {

@@ -61,6 +61,7 @@ channels:
           - $ref: '#/components/messages/AuthorityDelegated'
           - $ref: '#/components/messages/AuthorityRevoked'
           - $ref: '#/components/messages/AuthorityExpired'
+          - $ref: '#/components/messages/AuthorityExtended'
 
 components:
   messages:
@@ -129,6 +130,24 @@ components:
                   rather than filled with whoever observed it.
               payload: { $ref: '#/components/schemas/ExpiredPayload' }
 
+    AuthorityExtended:
+      name: authority.extended
+      title: A delegation was extended
+      description: |
+        A delegation's effective_to was extended to a later date by the
+        delegator or an administrator. The new effective_to is in the payload.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: authority.extended }
+              actor_id:
+                type: string
+                description: The principal that performed the extension.
+              payload: { $ref: '#/components/schemas/ExtendedPayload' }
+
   schemas:
     Envelope:
       type: object
@@ -151,7 +170,7 @@ components:
           example: evt-2f8c1f22-0b1e-4a43-9a2f-3d4c6e7a8b90
         event_type:
           type: string
-          enum: [authority.delegated, authority.revoked, authority.expired]
+          enum: [authority.delegated, authority.revoked, authority.expired, authority.extended]
         event_version: { type: string, example: "1.0" }
         emitted_at:
           type: string
@@ -198,6 +217,17 @@ components:
         action_type: { type: string }
         effective_from: { type: string, format: date-time }
         effective_to: { type: string, format: date-time }
+        authority_limit_cents:
+          type: integer
+          format: int64
+          description: Optional monetary ceiling in minor units (cents)
+        authority_limit_currency:
+          type: string
+          description: ISO 4217 currency code when monetary limit is set
+        authority_limit_quantity:
+          type: integer
+          format: int64
+          description: Optional quantitative ceiling (max count of actions)
 
     RevokedPayload:
       type: object
@@ -236,3 +266,23 @@ components:
             When the authority ended — the authoritative timestamp for this
             event. The row's `expired_at` is set to this same value, not to the
             moment the sweep ran.
+
+    ExtendedPayload:
+      type: object
+      required:
+        - delegation_id
+        - legal_entity_id
+        - delegator_principal_id
+        - delegate_principal_id
+        - action_type
+        - effective_from
+        - effective_to
+      properties:
+        delegation_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
+        delegator_principal_id: { type: string }
+        delegate_principal_id: { type: string }
+        action_type: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        description: The new effective_to after extension

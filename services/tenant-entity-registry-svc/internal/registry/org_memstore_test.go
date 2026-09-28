@@ -410,3 +410,25 @@ func approvalRef(d *domain.ApprovalDecision) *string {
 	id := d.ApprovalRequestID
 	return &id
 }
+
+// ChangeHomeRegion mirrors the store: approval decided in the same
+// "transaction", version-guarded, lineage recorded with its evidence.
+func (m *memStore) ChangeHomeRegion(_ context.Context, p registry.HomeRegionChange, _ *outbox.Record) (*registry.HomeRegionChangeResult, error) {
+	t, ok := m.tenants[p.TenantID]
+	if !ok || t.RecordVersion != p.ExpectedVersion {
+		return nil, registry.ErrVersionConflict
+	}
+	if err := m.decide(p.Approval, domain.ApprovalApproved); err != nil {
+		return nil, err
+	}
+	t.RecordVersion++
+	state := t.LifecycleState
+	ref, to, approver := p.DecisionRef, p.ResidencyRegionID, p.Approval.DecidedByPrincipalID
+	m.org().lifecycle[p.TenantID] = append(m.org().lifecycle[p.TenantID], &domain.TenantLifecycleEvent{
+		TenantID: p.TenantID, FromState: &state, ToState: state,
+		CommandName: domain.TenantCommandChangeHomeRegion, Reason: p.Reason,
+		ActorPrincipalID: p.ActorID, ApprovedByPrincipalID: &approver,
+		HomeRegionDecisionRef: &ref, ToRegionID: &to,
+	})
+	return &registry.HomeRegionChangeResult{ToRegionID: to, NewVersion: t.RecordVersion}, nil
+}

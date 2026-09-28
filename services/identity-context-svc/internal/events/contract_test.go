@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"zoiko.io/identity-context-svc/internal/config"
 	"zoiko.io/identity-context-svc/internal/events"
 )
 
@@ -87,6 +88,7 @@ func producedEventTypes() []string {
 		events.EventTenantContextInvalidated,
 		events.EventSupportContextAttached,
 		events.EventSupportContextRevoked,
+		events.EventSupportContextReviewed,
 		events.EventDispositionExecuted,
 		events.EventDispositionBlocked,
 	}
@@ -195,4 +197,22 @@ func TestSourceServiceNameMatchesTheSelfGuard(t *testing.T) {
 	// the publisher stamps it. If the two ever diverge the guard silently
 	// stops working and the service resumes consuming its own events.
 	assert.Equal(t, "identity-context-svc", events.SourceServiceName)
+}
+
+// The reader's default topics and the document's subscribed channels must be
+// the same set. They were once both wrong in the same way — every consumed
+// event filed under this service's own topic — so neither caught the other.
+func TestConsumedChannelsMatchTheReaderTopics(t *testing.T) {
+	doc := loadAsyncAPI(t)
+	var documented []string
+	for name, ch := range doc.Channels {
+		if len(ch.Subscribe.Message.OneOf) > 0 {
+			documented = append(documented, name)
+		}
+	}
+	reader := append([]string(nil), config.DefaultConsumeTopics...)
+	sort.Strings(documented)
+	sort.Strings(reader)
+	assert.Equal(t, documented, reader,
+		"asyncapi.yaml subscribe channels and config.DefaultConsumeTopics have drifted apart")
 }

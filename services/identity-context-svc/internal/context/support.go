@@ -30,7 +30,7 @@ type SupportContextStore interface {
 	// reconciler. A sweep has no tenant to be scoped to, and a per-tenant
 	// sweep would only ever cover tenants somebody thought to ask about.
 	FindUnreviewedExpiredSupportContextsAllTenants(ctx context.Context, before time.Time, limit int) ([]domain.SupportContext, error)
-	MarkSupportContextReviewed(ctx context.Context, supportContextID, tenantID, reviewer string, at time.Time) error
+	MarkSupportContextReviewedWithEvent(ctx context.Context, supportContextID, tenantID, reviewer string, at time.Time, rec outbox.Record) (bool, error)
 }
 
 // SupportPolicy bounds what a support elevation may be.
@@ -459,12 +459,59 @@ func (s *SupportService) RunReconciler(ctx context.Context, interval time.Durati
 	}
 }
 
-// MarkReviewed records that a human reconciled a grant.
-func (s *SupportService) MarkReviewed(ctx context.Context, supportContextID, tenantID, reviewer string) error {
+// MarkReviewed records that a human reconciled a grant, with its event.
+//
+// §1 requires break-glass to be "fully evidenced and followed by
+// reconciliation/review". The attach and revoke halves always emitted events;
+// the review — the step that CLOSES the loop — wrote two columns and nothing
+// else, so the governance stream showed every elevation as permanently
+// unreviewed and a consumer could not tell a reconciled grant from an ignored
+// one. The event is written atomically with the review via the outbox.
+//
+// A repeat is a no-op, like a repeat revoke: the first reviewer stands and no
+// second event is written.
+func (s *SupportService) MarkReviewed(ctx context.Context, supportContextID, tenantID, reviewer, correlationID string) error {
 	if reviewer == "" {
 		return fmt.Errorf("%w: reviewer is required", ErrRequestInvalid)
 	}
-	return s.store.MarkSupportContextReviewed(ctx, supportContextID, tenantID, reviewer, time.Now().UTC())
+	existing, err := s.store.FindSupportContext(ctx, supportContextID, tenantID)
+	if err != nil {
+		return fmt.Errorf("read support context: %w", err)
+	}
+	if existing == nil {
+		return domain.ErrSupportContextNotFound
+	}
+
+	now := time.Now().UTC()
+	rec, err := events.Render(
+		events.EventSupportContextReviewed,
+		tenantID, "", reviewer, correlationID, supportContextID,
+		map[string]any{
+			"support_context_id":    supportContextID,
+			"tenant_id":             tenantID,
+			"support_principal_id":  existing.SupportPrincipalID,
+			"approver_principal_id": existing.ApproverPrincipalID,
+			"reviewed_by":           reviewer,
+			"reviewed_at":           now,
+			"granted_at":            existing.GrantedAt,
+			"expires_at":            existing.ExpiresAt,
+			"revoked":               existing.RevokedAt != nil,
+			"ticket_ref":            existing.TicketRef,
+			"correlation_id":        correlationID,
+		})
+	if err != nil {
+		return fmt.Errorf("render support reviewed event: %w", err)
+	}
+
+	changed, err := s.store.MarkSupportContextReviewedWithEvent(ctx, supportContextID, tenantID, reviewer, now, rec)
+	if err != nil {
+		return fmt.Errorf("record support context review: %w", err)
+	}
+	if !changed {
+		s.log.Debug("support context already reviewed — no-op",
+			zap.String("support_context_id", supportContextID))
+	}
+	return nil
 }
 
 func supportAttachedPayload(sc domain.SupportContext) map[string]any {

@@ -31,6 +31,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/events"
 	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 )
@@ -50,6 +51,22 @@ func (s *PgStore) enqueue(ctx context.Context, tx pgx.Tx, ev *outbox.Record) err
 		return nil
 	}
 	return s.outbox.EnqueueTx(ctx, tx, *ev)
+}
+
+// enqueueFor renders the event the service attached to ctx for this write
+// (registry.WithEvent) from the write's own result, and enqueues it inside
+// the same transaction. A render failure aborts the write: committing a fact
+// whose event cannot be produced is what the outbox exists to prevent.
+func (s *PgStore) enqueueFor(ctx context.Context, tx pgx.Tx, result any) error {
+	build := registry.EventFor(ctx)
+	if build == nil {
+		return nil
+	}
+	rec, err := build(result)
+	if err != nil {
+		return fmt.Errorf("render event: %w", err)
+	}
+	return s.enqueue(ctx, tx, rec)
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +154,7 @@ func (s *PgStore) ExecuteTenantCommand(ctx context.Context, p registry.TenantCom
 			p.TenantID, tid, p.ExpectedVersion, allowed,
 		).Scan(&fromState, &res.NewVersion, &res.Status, &onboardRef, &extKey)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return registry.ErrConflict
+			return registry.ErrVersionConflict
 		}
 		if err != nil {
 			return fmt.Errorf("tenant command update: %w", err)
@@ -215,7 +232,7 @@ func (s *PgStore) ChangeDefaultLocale(ctx context.Context, tenantID, locale, tim
 			&t.CreatedByPrincipalID, &t.UpdatedByPrincipalID,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return registry.ErrConflict
+			return registry.ErrVersionConflict
 		}
 		if err != nil {
 			return fmt.Errorf("change default locale: %w", err)
@@ -251,7 +268,8 @@ func (s *PgStore) ListTenantLifecycleHistory(ctx context.Context, tenantID strin
 			SELECT lifecycle_event_id, tenant_id, from_state, to_state,
 			       command_name, reason, actor_principal_id,
 			       approved_by_principal_id, correlation_id, occurred_at,
-			       approval_request_id, onboarding_request_ref, external_customer_key
+			       approval_request_id, onboarding_request_ref, external_customer_key,
+			       home_region_decision_ref, from_region_id::text, to_region_id::text
 			  FROM tenant_lifecycle_history
 			 WHERE tenant_id = $1
 			 ORDER BY occurred_at DESC, lifecycle_event_id DESC`, tid)
@@ -268,6 +286,7 @@ func (s *PgStore) ListTenantLifecycleHistory(ctx context.Context, tenantID strin
 				&e.CommandName, &e.Reason, &e.ActorPrincipalID,
 				&e.ApprovedByPrincipalID, &e.CorrelationID, &e.OccurredAt,
 				&e.ApprovalRequestID, &e.OnboardingRequestRef, &e.ExternalCustomerKey,
+				&e.HomeRegionDecisionRef, &e.FromRegionID, &e.ToRegionID,
 			); err != nil {
 				return err
 			}
@@ -473,25 +492,30 @@ func scanProfileVersion(row pgx.Row) (*domain.LegalEntityProfileVersion, error) 
 // break all of them for no gain.
 func (s *PgStore) CreateInitialProfileVersion(ctx context.Context, v *domain.LegalEntityProfileVersion) error {
 	tid := tenantFromCtxOrFallback(ctx, v.TenantID)
-
 	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO legal_entity_profile_versions (
-				profile_version_id, tenant_id, legal_entity_id, version_number,
-				legal_name, trading_name, registration_number,
-				incorporation_jurisdiction_id, default_currency_code,
-				effective_from, recorded_at, change_reason, created_by_principal_id,
-				lei, lei_source, lei_status, lei_verified_at
-			) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-			v.ProfileVersionID, v.TenantID, v.LegalEntityID,
-			v.LegalName, v.TradingName, v.RegistrationNumber,
-			v.IncorporationJurisdictionID, v.DefaultCurrencyCode,
-			v.EffectiveFrom, time.Now().UTC(),
-			string(domain.ProfileChangeInitial), v.CreatedByPrincipalID,
-			v.LEI, v.LEISource, v.LEIStatus, v.LEIVerifiedAt,
-		)
-		return err
+		return insertInitialProfileVersionTx(ctx, tx, v)
 	})
+}
+
+// insertInitialProfileVersionTx writes profile version 1 inside tx — shared
+// by CreateEntity, which now writes it in the entity's own transaction.
+func insertInitialProfileVersionTx(ctx context.Context, tx pgx.Tx, v *domain.LegalEntityProfileVersion) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO legal_entity_profile_versions (
+			profile_version_id, tenant_id, legal_entity_id, version_number,
+			legal_name, trading_name, registration_number,
+			incorporation_jurisdiction_id, default_currency_code,
+			effective_from, recorded_at, change_reason, created_by_principal_id,
+			lei, lei_source, lei_status, lei_verified_at
+		) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+		v.ProfileVersionID, v.TenantID, v.LegalEntityID,
+		v.LegalName, v.TradingName, v.RegistrationNumber,
+		v.IncorporationJurisdictionID, v.DefaultCurrencyCode,
+		v.EffectiveFrom, time.Now().UTC(),
+		string(domain.ProfileChangeInitial), v.CreatedByPrincipalID,
+		v.LEI, v.LEISource, v.LEIStatus, v.LEIVerifiedAt,
+	)
+	return err
 }
 
 // AmendLegalProfile creates the next effective-dated profile version.
@@ -538,16 +562,17 @@ func (s *PgStore) AmendLegalProfile(
 		// necessarily the latest.
 		var prevID string
 		var prevNum int
+		var prevEffFrom time.Time
 		var prevEffTo *time.Time
 		err := tx.QueryRow(ctx, `
-			SELECT profile_version_id, version_number, effective_to
+			SELECT profile_version_id, version_number, effective_from, effective_to
 			  FROM legal_entity_profile_versions
 			 WHERE legal_entity_id = $1 AND tenant_id = $2
 			   AND effective_from <= $3
 			   AND (effective_to IS NULL OR effective_to > $3)
 			 ORDER BY effective_from DESC, version_number DESC
 			 LIMIT 1`, legalEntityID, tid, next.EffectiveFrom).
-			Scan(&prevID, &prevNum, &prevEffTo)
+			Scan(&prevID, &prevNum, &prevEffFrom, &prevEffTo)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read version in force: %w", err)
 		}
@@ -566,7 +591,23 @@ func (s *PgStore) AmendLegalProfile(
 		}
 		next.VersionNumber = maxNum + 1
 
-		if hasPrev {
+		switch {
+		case hasPrev && prevEffFrom.Equal(next.EffectiveFrom):
+			// Same business instant: a correction of the version in force, not
+			// a new interval. Closing it at its own start would leave an empty
+			// interval (lepv_interval_ordered refused it — a 500, found live on
+			// 28 Sep 2026). It is superseded in RECORD time only and keeps its
+			// business interval; the as-of read's version_number tie-break
+			// gives that interval to the new row, which covers the same span.
+			if _, err := tx.Exec(ctx, `
+				UPDATE legal_entity_profile_versions
+				   SET superseded_at = $1
+				 WHERE profile_version_id = $2 AND tenant_id = $3`,
+				now, prevID, tid); err != nil {
+				return fmt.Errorf("supersede prior version: %w", err)
+			}
+			next.EffectiveTo = prevEffTo
+		case hasPrev:
 			// Close the superseded version at the instant the new one starts.
 			// superseded_at is RECORD time and effective_to is BUSINESS time;
 			// both are set because they answer different questions, and a
@@ -584,6 +625,23 @@ func (s *PgStore) AmendLegalProfile(
 			if prevEffTo != nil {
 				next.EffectiveTo = prevEffTo
 			}
+		default:
+			// Nothing in force at the new instant: it predates every version.
+			// It must still end where the earliest later version begins, or it
+			// stays open-ended alongside that version and as-of "now" returns
+			// the OLDER name while GetEntity shows the newer one (found live
+			// on 28 Sep 2026: a rename effective before the entity's first
+			// version left two open versions).
+			var nextStart *time.Time
+			if err := tx.QueryRow(ctx, `
+				SELECT MIN(effective_from)
+				  FROM legal_entity_profile_versions
+				 WHERE legal_entity_id = $1 AND tenant_id = $2
+				   AND effective_from > $3`,
+				legalEntityID, tid, next.EffectiveFrom).Scan(&nextStart); err != nil {
+				return fmt.Errorf("read next version start: %w", err)
+			}
+			next.EffectiveTo = nextStart
 		}
 
 		row := tx.QueryRow(ctx, `
@@ -636,10 +694,22 @@ func (s *PgStore) AmendLegalProfile(
 				return fmt.Errorf("project onto legal_entities: %w", err)
 			}
 			if ct.RowsAffected() == 0 {
-				return registry.ErrConflict
+				return registry.ErrVersionConflict
 			}
 		}
 
+		// The event attests the entity version this write leaves behind: one
+		// more when the amendment is in force now, unchanged when it is
+		// backdated history — only this transaction knows which.
+		entityVersion := expectedVersion
+		if inForce {
+			entityVersion++
+		}
+		if err := events.StampVersion(ev, entityVersion, map[string]any{
+			"profile_version": created.VersionNumber,
+		}); err != nil {
+			return err
+		}
 		return s.enqueue(ctx, tx, ev)
 	})
 	if err != nil {
@@ -866,7 +936,12 @@ func (s *PgStore) RecordRegistryConflict(ctx context.Context, c *domain.EntityRe
 			c.ExistingLegalEntityID, payload, time.Now().UTC(),
 			c.DetectedByPrincipalID, nullableString(derefString(c.CorrelationID)),
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		// entity.registry_conflict.quarantined, in the quarantine's own
+		// transaction. It used to be rendered, logged and never sent.
+		return s.enqueueFor(ctx, tx, c)
 	})
 }
 
@@ -942,9 +1017,12 @@ func (s *PgStore) ResolveRegistryConflict(ctx context.Context, conflictID string
 			return err
 		}
 		if ct.RowsAffected() == 0 {
-			return registry.ErrConflict
+			return registry.ErrStateConflict
 		}
-		return nil
+		return s.enqueueFor(ctx, tx, events.ConflictResolution{
+			TenantID: tid, ConflictID: conflictID, Status: string(status),
+			Note: note, ResolvedBy: actorID, At: time.Now().UTC(),
+		})
 	})
 }
 

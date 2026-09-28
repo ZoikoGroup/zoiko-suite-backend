@@ -41,6 +41,13 @@ docker exec -i zoiko-postgres psql -U postgres -d identity_context -v ON_ERROR_S
 
 docker exec zoiko-postgres psql -U postgres -d identity_context \
   -c "GRANT SELECT, INSERT, UPDATE, DELETE ON idempotency_keys TO zoiko_app;"
+
+# 000009 (2026-09-28): source-input provenance columns on session_contexts.
+# Apply BEFORE rolling out a binary built after that date. The columns are
+# nullable and additive, so the old binary is unaffected by them — but the new
+# binary writes them, and without the migration every resolve fails on insert.
+docker exec -i zoiko-postgres psql -U postgres -d identity_context -v ON_ERROR_STOP=1 \
+  < ../services/identity-context-svc/deployments/migrations/000009_source_input_provenance.up.sql
 ```
 
 **Why this matters:** `init-db.sh` only applies migrations to a *brand-new* Postgres volume.

@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/events"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 )
 
@@ -227,8 +228,12 @@ func (s *PgStore) ResolveRegistryConflictApproved(ctx context.Context, conflictI
 			return err
 		}
 		if ct.RowsAffected() == 0 {
-			return registry.ErrConflict
+			return registry.ErrStateConflict
 		}
-		return nil
+		return s.enqueueFor(ctx, tx, events.ConflictResolution{
+			TenantID: tid, ConflictID: conflictID, Status: string(status),
+			Note: note, ResolvedBy: resolvedBy, ApprovedBy: d.DecidedByPrincipalID,
+			At: time.Now().UTC(),
+		})
 	})
 }

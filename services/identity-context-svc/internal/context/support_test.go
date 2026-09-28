@@ -2,6 +2,7 @@ package context_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -113,12 +114,17 @@ func (f *fakeSupportStore) FindUnreviewedExpiredSupportContexts(_ context.Contex
 	return out, nil
 }
 
-func (f *fakeSupportStore) MarkSupportContextReviewed(_ context.Context, id, tenantID, reviewer string, at time.Time) error {
-	if sc, ok := f.contexts[id]; ok && sc.TenantID == tenantID {
-		sc.ReviewedAt = &at
-		sc.ReviewedBy = &reviewer
+// Mirrors the store: append-only, and the event is recorded only when the
+// review is, so a repeat cannot add a second event.
+func (f *fakeSupportStore) MarkSupportContextReviewedWithEvent(_ context.Context, id, tenantID, reviewer string, at time.Time, rec outbox.Record) (bool, error) {
+	sc, ok := f.contexts[id]
+	if !ok || sc.TenantID != tenantID || sc.ReviewedAt != nil {
+		return false, nil
 	}
-	return nil
+	sc.ReviewedAt = &at
+	sc.ReviewedBy = &reviewer
+	f.events = append(f.events, rec)
+	return true, nil
 }
 
 // conflictingSoD always reports a conflict.
@@ -431,7 +437,7 @@ func TestReconcile_DoesNotAutoApprove(t *testing.T) {
 	// An automatic review is not a review. Reconcile reports; a human marks.
 	assert.Nil(t, f.store.contexts[sc.SupportContextID].ReviewedAt)
 
-	require.NoError(t, svc.MarkReviewed(context.Background(), sc.SupportContextID, "tenant-a", "security-lead-3"))
+	require.NoError(t, svc.MarkReviewed(context.Background(), sc.SupportContextID, "tenant-a", "security-lead-3", "corr-review"))
 	require.NotNil(t, f.store.contexts[sc.SupportContextID].ReviewedAt)
 	assert.Equal(t, "security-lead-3", *f.store.contexts[sc.SupportContextID].ReviewedBy)
 
@@ -504,4 +510,63 @@ func TestSupportJustificationIsTrimmedNotPadded(t *testing.T) {
 	// Whitespace must not be able to satisfy the minimum length.
 	_, err := f.build().Attach(context.Background(), req, "support-lead-9")
 	require.Error(t, err)
+}
+
+
+// ── The review is evidenced (2026-09-28) ─────────────────────────────────────
+//
+// Attach and revoke always emitted events; the review — the step that closes
+// the break-glass loop — wrote two columns and nothing else.
+
+func TestMarkReviewed_EmitsExactlyOneReviewedEvent(t *testing.T) {
+	f := newSupportFixture()
+	svc := f.build()
+	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	require.NoError(t, err)
+	before := len(f.store.events)
+
+	require.NoError(t, svc.MarkReviewed(context.Background(), sc.SupportContextID, "tenant-a", "security-lead-3", "corr-review"))
+
+	require.Len(t, f.store.events, before+1, "a review must leave an event in the governance stream")
+	rec := f.store.events[len(f.store.events)-1]
+	assert.Equal(t, events.EventSupportContextReviewed, rec.EventType)
+	assert.Equal(t, "tenant-a", rec.TenantID)
+
+	var env struct {
+		ActorID       string         `json:"actor_id"`
+		CorrelationID string         `json:"correlation_id"`
+		Payload       map[string]any `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Payload, &env))
+	assert.Equal(t, "security-lead-3", env.ActorID)
+	assert.Equal(t, "corr-review", env.CorrelationID)
+	assert.Equal(t, sc.SupportContextID, env.Payload["support_context_id"])
+	assert.Equal(t, "security-lead-3", env.Payload["reviewed_by"])
+	assert.Equal(t, sc.SupportPrincipalID, env.Payload["support_principal_id"])
+	assert.Equal(t, sc.ApproverPrincipalID, env.Payload["approver_principal_id"])
+}
+
+// Append-only: the first reviewer stands, and a repeat writes no second event.
+func TestMarkReviewed_RepeatIsANoOpWithNoSecondEvent(t *testing.T) {
+	f := newSupportFixture()
+	svc := f.build()
+	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	require.NoError(t, err)
+
+	require.NoError(t, svc.MarkReviewed(context.Background(), sc.SupportContextID, "tenant-a", "security-lead-3", "c1"))
+	after := len(f.store.events)
+	require.NoError(t, svc.MarkReviewed(context.Background(), sc.SupportContextID, "tenant-a", "someone-else", "c2"))
+
+	assert.Len(t, f.store.events, after, "a repeat review must not add a second event")
+	assert.Equal(t, "security-lead-3", *f.store.contexts[sc.SupportContextID].ReviewedBy)
+}
+
+func TestMarkReviewed_UnknownOrForeignGrantIsNotFound(t *testing.T) {
+	f := newSupportFixture()
+	svc := f.build()
+	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	require.NoError(t, err)
+
+	assert.ErrorIs(t, svc.MarkReviewed(context.Background(), "no-such-grant", "tenant-a", "r", "c"), domain.ErrSupportContextNotFound)
+	assert.ErrorIs(t, svc.MarkReviewed(context.Background(), sc.SupportContextID, "tenant-b", "r", "c"), domain.ErrSupportContextNotFound)
 }

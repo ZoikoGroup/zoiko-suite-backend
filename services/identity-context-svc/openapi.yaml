@@ -259,6 +259,55 @@ components:
         detail:
           type: string
 
+    SourceInputBasis:
+      type: string
+      enum:
+        - SERVER_DERIVED
+        - VERIFIED_PRINCIPAL
+        - CLIENT_ASSERTED_CONSISTENT
+        - REJECTED_INCONSISTENT
+        - UNVERIFIABLE_DISCARDED
+        - NOT_PRESENTED
+      description: |
+        How a §4 source input was established. Channel and workload arrive as
+        client headers the edge does not strip, so each is resolved against the
+        verified principal's type. REJECTED_INCONSISTENT and
+        UNVERIFIABLE_DISCARDED mean the client's assertion was NOT recorded.
+        Absent on decisions recorded before 2026-09-28.
+
+    SourceInputs:
+      type: object
+      description: |
+        ZS-SVC-A-001 §4 server-resolved context and required source inputs, as
+        the decision recorded them.
+      properties:
+        source_channel:
+          type: string
+          enum: [web, mobile, api, import, integration, scheduled_job, system]
+        source_channel_basis:
+          $ref: "#/components/schemas/SourceInputBasis"
+        workload_id:
+          type: string
+          description: The verified principal for a service account or API client; absent for a human.
+        workload_id_basis:
+          $ref: "#/components/schemas/SourceInputBasis"
+        causation_id:
+          type: string
+        ingress_binding_version:
+          type: string
+        ingress_cache_state:
+          type: string
+          enum: [FRESH, STALE, INVALIDATED]
+          description: §4 cache state of the ingress binding consulted. Absent when none was.
+        entitlement_context_ref:
+          type: string
+        entitlement_context_status:
+          type: string
+          enum: [RESOLVED, UPSTREAM_NOT_CONFIGURED, UPSTREAM_UNAVAILABLE]
+          description: |
+            UPSTREAM_NOT_CONFIGURED in every deployment until COM-03
+            Entitlement exists in the estate.
+
     ContextExplanation:
       type: object
       description: |
@@ -294,6 +343,8 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DimensionOutcome"
+        source_inputs:
+          $ref: "#/components/schemas/SourceInputs"
         issued_at:
           type: string
           format: date-time

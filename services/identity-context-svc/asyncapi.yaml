@@ -51,8 +51,17 @@ servers:
 channels:
   zoiko.identity.events:
     description: |
-      One topic per service. Both the publisher and the consumer are bound to
-      it, which is why the self-source guard exists.
+      This service's own topic. Everything it produces goes here. The reader is
+      also subscribed to it, which is why the self-source guard exists.
+
+      The events it CONSUMES from other services are published on each
+      producer's own topic, listed as the channels below. Until 2026-09-28 the
+      reader was bound to this topic alone and this document listed every
+      consumed event under it — the same wrong assumption in both places, so
+      neither caught the other, and authority.revoked, role.updated and
+      entity.updated never reached the consumer. The reader's topic list is
+      KAFKA_CONSUME_TOPICS (default config.DefaultConsumeTopics); a contract
+      test holds it equal to the channels in this document.
     publish:
       summary: Events identity-context-svc produces
       message:
@@ -68,18 +77,40 @@ channels:
           - $ref: "#/components/messages/TenantContextInvalidated"
           - $ref: "#/components/messages/SupportContextAttached"
           - $ref: "#/components/messages/SupportContextRevoked"
+          - $ref: "#/components/messages/SupportContextReviewed"
           - $ref: "#/components/messages/DispositionExecuted"
           - $ref: "#/components/messages/DispositionBlocked"
     subscribe:
       summary: Events identity-context-svc consumes
       message:
         oneOf:
-          - $ref: "#/components/messages/AuthorityEnded"
-          - $ref: "#/components/messages/RoleUpdated"
-          - $ref: "#/components/messages/EntityUpdated"
           - $ref: "#/components/messages/RiskSignalChanged"
           - $ref: "#/components/messages/LegalHoldIssued"
           - $ref: "#/components/messages/LegalHoldReleased"
+
+  zoiko.delegated-authority.events:
+    description: Owned by delegated-authority-svc. Consumed only.
+    subscribe:
+      summary: Delegation lifecycle — an ended delegation revokes the delegate's sessions
+      message:
+        oneOf:
+          - $ref: "#/components/messages/AuthorityEnded"
+
+  zoiko.access-control.events:
+    description: Owned by access-control-svc. Consumed only.
+    subscribe:
+      summary: Role changes — every holder's sessions are revoked
+      message:
+        oneOf:
+          - $ref: "#/components/messages/RoleUpdated"
+
+  zoiko.entity.events:
+    description: Owned by tenant-entity-registry-svc. Consumed only.
+    subscribe:
+      summary: Legal-entity changes — sessions scoped to the entity are revoked
+      message:
+        oneOf:
+          - $ref: "#/components/messages/EntityUpdated"
 
 components:
   schemas:
@@ -340,6 +371,20 @@ components:
           - $ref: "#/components/schemas/Envelope"
           - type: object
 
+    SupportContextReviewed:
+      name: identity.support_context.reviewed
+      title: A break-glass grant was reconciled by a human
+      summary: |
+        The "followed by reconciliation/review" half of §1 and invariant 8.
+        Emitted once per grant, atomically with the review, by a reviewer who
+        is neither the grantee nor the approver. A repeat review writes
+        nothing. Until 2026-09-28 a review left no event, so the stream showed
+        every elevation as permanently unreviewed.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
     DispositionExecuted:
       name: identity.retention.disposition_executed
       title: A retention sweep completed, with its certificate
@@ -392,7 +437,10 @@ components:
       title: A delegated authority was revoked or expired
       summary: |
         Also matches `authority.expired` — an expired authority grants nothing,
-        so the response is identical. Revokes EVERY session the delegate holds:
+        so the response is identical. Events older than the envelope TTL plus
+        one minute are skipped — no live session can predate them. The
+        delegate is read from `payload.delegate_principal_id`, never from
+        `actor_id`, which on a revocation is the revoker. Revokes EVERY session the delegate holds:
         an active session must stop carrying a delegation that no longer
         exists, and it must stop now rather than at envelope expiry.
       payload:

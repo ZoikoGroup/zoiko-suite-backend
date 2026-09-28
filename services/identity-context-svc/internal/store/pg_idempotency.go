@@ -27,6 +27,13 @@ type IdempotencyRecord struct {
 // on every material write and nothing ever read one.
 var ErrIdempotencyFingerprintMismatch = errors.New("idempotency key reused with a different request")
 
+// IdempotencyInFlightLease is how long an in-flight claim is honoured before it
+// is treated as abandoned. It must comfortably exceed the longest command: the
+// HTTP server's WriteTimeout is 15s, and every dependency call is bounded well
+// inside that. A lease shorter than a live command would let a retry execute
+// alongside it — the duplicate this table exists to prevent.
+const IdempotencyInFlightLease = 5 * time.Minute
+
 // ClaimIdempotencyKey attempts to reserve (tenant, endpoint, key) for a
 // request with this fingerprint.
 //
@@ -37,10 +44,18 @@ var ErrIdempotencyFingerprintMismatch = errors.New("idempotency key reused with 
 // ErrIdempotencyFingerprintMismatch when the key has been seen with a
 // different fingerprint.
 //
-// The claim is an INSERT ... ON CONFLICT DO NOTHING followed by a read of the
-// conflicting row, so two concurrent first attempts cannot both execute: one
-// inserts, the other sees the winner's row. The loser's row carries status 0
-// until the winner finishes, which the caller reads as "in flight".
+// The claim is an INSERT ... ON CONFLICT followed by a read of the conflicting
+// row, so two concurrent first attempts cannot both execute: one inserts, the
+// other sees the winner's row. The loser's row carries status 0 until the
+// winner finishes, which the caller reads as "in flight".
+//
+// An in-flight claim older than IdempotencyInFlightLease is ABANDONED — its
+// process died mid-command, so nothing will ever complete or release it — and
+// an identical request takes it over in the same statement. Before 2026-09-28
+// such a claim answered IDEMPOTENCY_IN_FLIGHT to every retry until the 7-day
+// retention purge, so one crash locked the caller out of that command for a
+// week. Only the SAME fingerprint may take over; anything else is still a
+// mismatch.
 func (s *PgStore) ClaimIdempotencyKey(
 	ctx context.Context,
 	tenantID, endpoint, key, fingerprint string,
@@ -56,13 +71,18 @@ func (s *PgStore) ClaimIdempotencyKey(
 				(tenant_id, endpoint, idempotency_key, request_fingerprint,
 				 response_status, response_body)
 			VALUES ($1,$2,$3,$4,0,'null'::jsonb)
-			ON CONFLICT (tenant_id, endpoint, idempotency_key) DO NOTHING`,
-			tenantID, endpoint, key, fingerprint)
+			ON CONFLICT (tenant_id, endpoint, idempotency_key) DO UPDATE
+			   SET created_at = NOW()
+			 WHERE idempotency_keys.response_status = 0
+			   AND idempotency_keys.created_at < NOW() - make_interval(secs => $5)
+			   AND idempotency_keys.request_fingerprint = EXCLUDED.request_fingerprint`,
+			tenantID, endpoint, key, fingerprint, IdempotencyInFlightLease.Seconds())
 		if err != nil {
 			return fmt.Errorf("claim idempotency key: %w", err)
 		}
 		if tag.RowsAffected() == 1 {
-			// We hold the claim. Execute.
+			// We hold the claim — freshly inserted, or taken over from an
+			// abandoned one. Execute.
 			return nil
 		}
 

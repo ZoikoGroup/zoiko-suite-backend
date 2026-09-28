@@ -53,6 +53,12 @@ func (s *stubSvc) BindTenantHost(_ context.Context, id string, req domain.BindTe
 	return &domain.TenantHostBinding{TenantID: id, Hostname: req.Hostname}, s.err
 }
 
+func (s *stubSvc) ChangeHomeRegion(_ context.Context, id string, req domain.ChangeHomeRegionRequest) error {
+	s.gotID = id
+	s.gotCorrID = req.CorrelationID
+	return s.err
+}
+
 func (s *stubSvc) ListTenantHostBindings(_ context.Context, id string) ([]*domain.TenantHostBinding, error) {
 	s.gotID = id
 	return []*domain.TenantHostBinding{{TenantID: id}}, s.err

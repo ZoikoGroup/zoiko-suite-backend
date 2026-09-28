@@ -72,7 +72,7 @@ func tenantInjector(tenantID string) func(http.Handler) http.Handler {
 func newRouterAuthz(s *stubStore, authz handler.AuthZClient) chi.Router {
 	r := chi.NewRouter()
 	r.Use(tenantInjector("tenant-abc"))
-	h := handler.New(s, authz, zap.NewNop(), nil)
+	h := handler.New(s, authz, nil, zap.NewNop(), nil)
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -81,7 +81,7 @@ func newRouterAuthz(s *stubStore, authz handler.AuthZClient) chi.Router {
 // reached the service without X-Tenant-Id.
 func newRouterNoTenant(s *stubStore) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, &stubAuthZ{}, zap.NewNop(), nil)
+	h := handler.New(s, &stubAuthZ{}, nil, zap.NewNop(), nil)
 	handler.RegisterRoutes(r, h)
 	return r
 }

@@ -64,6 +64,12 @@ const (
 	// them; the event does not, because a consumer's response is the same.
 	EventSupportContextRevoked = "identity.support_context.revoked"
 
+	// EventSupportContextReviewed records the human reconciliation §1 and
+	// invariant 8 require after a break-glass grant. Until 2026-09-28 a review
+	// wrote two columns and nothing else, so the one step that closes the
+	// break-glass loop was the one step missing from the governance stream.
+	EventSupportContextReviewed = "identity.support_context.reviewed"
+
 	// EventTenantContextInvalidated reports a tenant-wide session revocation.
 	EventTenantContextInvalidated = "identity.context.tenant_invalidated"
 

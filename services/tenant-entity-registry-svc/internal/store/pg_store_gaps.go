@@ -79,7 +79,7 @@ func (s *PgStore) CompleteProvisioning(ctx context.Context, p registry.Provision
 				RETURNING onboarding_request_ref, external_customer_key`,
 				now, p.ActorID, p.TenantID, tid, p.ExpectedVersion).Scan(&onboardRef, &extKey)
 			if errors.Is(err, pgx.ErrNoRows) {
-				return registry.ErrConflict
+				return registry.ErrVersionConflict
 			}
 			if err != nil {
 				return fmt.Errorf("retry provisioning update: %w", err)
@@ -119,7 +119,7 @@ func (s *PgStore) MarkProvisioningFailed(ctx context.Context, tenantID, reason, 
 			RETURNING onboarding_request_ref, external_customer_key`,
 			reason, now, tenantID, tid).Scan(&onboardRef, &extKey)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return registry.ErrConflict
+			return registry.ErrStateConflict
 		}
 		if err != nil {
 			return fmt.Errorf("mark provisioning failed: %w", err)
@@ -176,7 +176,7 @@ func (s *PgStore) VerifyLegalEntity(ctx context.Context, v registry.EntityVerifi
 			return fmt.Errorf("verify entity: %w", err)
 		}
 		if ct.RowsAffected() == 0 {
-			return registry.ErrConflict
+			return registry.ErrVersionConflict
 		}
 		return s.enqueue(ctx, tx, ev)
 	})
@@ -197,7 +197,7 @@ func (s *PgStore) ActivateLegalEntity(ctx context.Context, legalEntityID, actorI
 			return fmt.Errorf("activate entity: %w", err)
 		}
 		if ct.RowsAffected() == 0 {
-			return registry.ErrConflict
+			return registry.ErrVersionConflict
 		}
 		return s.enqueue(ctx, tx, ev)
 	})
@@ -248,7 +248,7 @@ func (s *PgStore) MergeEntities(ctx context.Context, m *domain.EntityMergeRecord
 			m.SurvivorLegalEntityID, now, m.MergedByPrincipalID,
 			m.DuplicateLegalEntityID, tid, expectedVersion).Scan(&prior)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return registry.ErrConflict
+			return registry.ErrVersionConflict
 		}
 		if err != nil {
 			return fmt.Errorf("merge duplicate: %w", err)
@@ -302,7 +302,7 @@ func (s *PgStore) UnmergeEntity(ctx context.Context, duplicateID, unmergedBy, re
 			return fmt.Errorf("unmerge entity: %w", err)
 		}
 		if ct.RowsAffected() == 0 {
-			return registry.ErrConflict
+			return registry.ErrVersionConflict
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE entity_merge_records

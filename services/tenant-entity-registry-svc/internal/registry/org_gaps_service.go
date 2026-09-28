@@ -72,7 +72,7 @@ func (s *Service) replayProvisioning(ctx context.Context, req domain.ProvisionTe
 	}
 	if storedFP != fingerprint {
 		return nil, fmt.Errorf("%w: external_customer_key %q was already used for a different onboarding request",
-			ErrConflict, req.ExternalCustomerKey)
+			ErrOnboardingKeyMismatch, req.ExternalCustomerKey)
 	}
 	tctx := domain.WithTenant(ctx, tenantID)
 	t, err := s.store.GetTenantByID(tctx, tenantID)
@@ -93,12 +93,19 @@ func (s *Service) replayProvisioning(ctx context.Context, req domain.ProvisionTe
 
 // tenantCreatedEvent is tenant.created, now enqueued transactionally with the
 // creation approval instead of fired and forgotten after commit.
-func tenantCreatedEvent(t *domain.Tenant, correlationID string) (*outbox.Record, error) {
+//
+// version is the tenant version the enclosing write leaves behind: 1 on first
+// provisioning, expected+1 on RetryProvisioning.
+func tenantCreatedEvent(t *domain.Tenant, correlationID string, version int64) (*outbox.Record, error) {
 	return events.BuildRecord(events.RecordSpec{
 		EventType:     events.EventTenantCreated,
 		TenantID:      t.TenantID,
 		ActorID:       t.CreatedByPrincipalID,
 		CorrelationID: correlationID,
+		ObjectID:      t.TenantID,
+		ObjectVersion: version,
+		EffectiveAt:   t.CreatedAt,
+		EvidenceRef:   derefStr(t.OnboardingRequestRef),
 		PartitionKey:  t.TenantID,
 		Payload: map[string]any{
 			"tenant_id":              t.TenantID,
@@ -144,7 +151,7 @@ func (s *Service) completeProvisioning(ctx context.Context, t *domain.Tenant, co
 	}
 	var ev *outbox.Record
 	if stepErr == nil {
-		ev, stepErr = tenantCreatedEvent(t, correlationID)
+		ev, stepErr = tenantCreatedEvent(t, correlationID, t.RecordVersion)
 	}
 	if stepErr == nil {
 		stepErr = s.store.CompleteProvisioning(ctx, ProvisioningCompletion{
@@ -184,7 +191,7 @@ func (s *Service) retryProvisioning(ctx context.Context, t *domain.Tenant, expec
 			return nil, err
 		}
 	}
-	ev, err := tenantCreatedEvent(t, req.CorrelationID)
+	ev, err := tenantCreatedEvent(t, req.CorrelationID, expected+1)
 	if err != nil {
 		return nil, err
 	}
@@ -249,17 +256,6 @@ func (s *Service) assertEntityOperational(ctx context.Context, legalEntityID str
 	return nil
 }
 
-func entityExpectedVersion(e *domain.LegalEntity, supplied int64) (int64, error) {
-	if supplied == 0 {
-		return e.RecordVersion, nil
-	}
-	if supplied != e.RecordVersion {
-		return 0, fmt.Errorf("%w: you supplied expected_version %d but this entity is at %d — reload and retry",
-			ErrVersionConflict, supplied, e.RecordVersion)
-	}
-	return supplied, nil
-}
-
 func entityStatusEvent(e *domain.LegalEntity, actor, correlationID string, from, to domain.EntityStatus, extra map[string]any) (*outbox.Record, error) {
 	payload := map[string]any{
 		"legal_entity_id": e.LegalEntityID,
@@ -270,6 +266,12 @@ func entityStatusEvent(e *domain.LegalEntity, actor, correlationID string, from,
 	for k, v := range extra {
 		payload[k] = v
 	}
+	evidence, _ := extra["verification_evidence_ref"].(string)
+	if ref, ok := extra["evidence_ref"].(string); ok && ref != "" {
+		evidence = ref
+	}
+	// Every caller's write is guarded on e.RecordVersion, so the version it
+	// produces is exactly one more.
 	return events.BuildRecord(events.RecordSpec{
 		EventType:     events.EventLegalEntityStatusChanged,
 		TenantID:      e.TenantID,
@@ -277,6 +279,9 @@ func entityStatusEvent(e *domain.LegalEntity, actor, correlationID string, from,
 		Jurisdiction:  e.PrimaryJurisdictionID,
 		ActorID:       actor,
 		CorrelationID: correlationID,
+		ObjectID:      e.LegalEntityID,
+		ObjectVersion: e.RecordVersion + 1,
+		EvidenceRef:   evidence,
 		PartitionKey:  e.LegalEntityID,
 		Payload:       payload,
 	})
@@ -288,7 +293,7 @@ func (s *Service) RequestEntityVerification(ctx context.Context, legalEntityID s
 		return err
 	}
 	if strings.TrimSpace(req.VerificationEvidenceRef) == "" {
-		return fmt.Errorf("%w: verification_evidence_ref is required", ErrInvalidInput)
+		return fmt.Errorf("%w: verification_evidence_ref is required", ErrSourceUnverified)
 	}
 	e, err := s.GetEntity(ctx, legalEntityID)
 	if err != nil {
@@ -300,7 +305,7 @@ func (s *Service) RequestEntityVerification(ctx context.Context, legalEntityID s
 	if e.EntityStatus != domain.EntityStatusDraft {
 		return fmt.Errorf("%w: only a DRAFT entity can be verified; this one is %s", ErrInvalidTransition, e.EntityStatus)
 	}
-	expected, err := entityExpectedVersion(e, req.ExpectedVersion)
+	expected, err := s.checkExpected(req.ExpectedVersion, e.RecordVersion, "entity")
 	if err != nil {
 		return err
 	}
@@ -371,7 +376,7 @@ func (s *Service) ActivateLegalEntity(ctx context.Context, legalEntityID string,
 	if e.EntityStatus != domain.EntityStatusVerified {
 		return nil, fmt.Errorf("%w: only a VERIFIED entity can be activated; this one is %s", ErrInvalidTransition, e.EntityStatus)
 	}
-	expected, err := entityExpectedVersion(e, req.ExpectedVersion)
+	expected, err := s.checkExpected(req.ExpectedVersion, e.RecordVersion, "entity")
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +413,7 @@ func (s *Service) MergeDuplicateCandidate(ctx context.Context, duplicateID strin
 	if err := s.assertTenantMayTransact(ctx, dup.TenantID); err != nil {
 		return err
 	}
-	expected, err := entityExpectedVersion(dup, req.ExpectedVersion)
+	expected, err := s.checkExpected(req.ExpectedVersion, dup.RecordVersion, "entity")
 	if err != nil {
 		return err
 	}
@@ -501,7 +506,7 @@ func (s *Service) UnmergeEntity(ctx context.Context, duplicateID string, req dom
 	if e.MergedIntoLegalEntityID == nil {
 		return fmt.Errorf("%w: entity is not merged", ErrConflict)
 	}
-	expected, err := entityExpectedVersion(e, req.ExpectedVersion)
+	expected, err := s.checkExpected(req.ExpectedVersion, e.RecordVersion, "entity")
 	if err != nil {
 		return err
 	}

@@ -807,3 +807,23 @@ func (s *PgStore) OutboxDepth(ctx context.Context) (pending int64, oldestAge tim
 	})
 	return pending, oldestAge, err
 }
+
+// RecordRefusedEscalation writes a durable record of a pre-provisioning refusal.
+// Per Doc 04 §20: "denials are as important as grants".
+func (s *PgStore) RecordRefusedEscalation(ctx context.Context, r *domain.RefusedEscalation) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO refused_escalations (
+				tenant_id, legal_entity_id, principal_id, correlation_id,
+				action_type, refusal_reason, requested_payload, error_code, error_message, created_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		`, r.TenantID, r.LegalEntityID, r.PrincipalID, r.CorrelationID,
+			r.ActionType, r.RefusalReason, r.RequestedPayload, r.ErrorCode, r.ErrorMessage, r.CreatedAt)
+		return err
+	})
+}

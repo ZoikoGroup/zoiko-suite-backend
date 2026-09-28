@@ -116,8 +116,10 @@ func insertSessionContextTx(ctx context.Context, tx pgx.Tx, sc domain.SessionCon
 			ingress_source, environment, evidence_id, support_context_id,
 			retention_class, disposition_due_at,
 			source_channel, workload_id, causation_id, entitlement_context_ref,
-			ingress_binding_version)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+			ingress_binding_version,
+			source_channel_basis, workload_id_basis, ingress_cache_state,
+			entitlement_context_status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
 		ON CONFLICT (session_context_id) DO NOTHING`,
 		sc.SessionContextID, sc.PrincipalID, sc.TenantID, legalEntityID,
 		sc.CorrelationID, string(sc.TrustPosture), sc.MFAVerified, sc.DeviceTrustScore,
@@ -129,6 +131,8 @@ func insertSessionContextTx(ctx context.Context, tx pgx.Tx, sc domain.SessionCon
 		nullIfEmpty(sc.SourceChannel), nullIfEmpty(sc.WorkloadID),
 		nullIfEmpty(sc.CausationID), sc.EntitlementContextRef,
 		nullIfEmpty(sc.IngressBindingVersion),
+		nullIfEmpty(string(sc.SourceChannelBasis)), nullIfEmpty(string(sc.WorkloadIDBasis)),
+		nullIfEmpty(string(sc.IngressCacheState)), nullIfEmpty(string(sc.EntitlementContextStatus)),
 	)
 	if err != nil {
 		return fmt.Errorf("insert session_context: %w", err)
@@ -527,17 +531,23 @@ func (s *PgStore) FindUnreviewedExpiredSupportContextsAllTenants(
 	return out, tx.Commit(ctx)
 }
 
-// MarkSupportContextReviewed records the reconciliation.
-func (s *PgStore) MarkSupportContextReviewed(
+// MarkSupportContextReviewedWithEvent records the reconciliation and its
+// identity.support_context.reviewed event in ONE transaction, like the attach
+// and revoke paths. Reports whether a review was recorded: false means the
+// grant was already reviewed (append-only — the first reviewer stands) and no
+// event is written, so a repeat cannot put a second review into the stream.
+func (s *PgStore) MarkSupportContextReviewedWithEvent(
 	ctx context.Context,
 	supportContextID, tenantID, reviewer string,
 	at time.Time,
-) error {
+	rec outbox.Record,
+) (bool, error) {
 	if tenantID == "" || reviewer == "" {
-		return errors.New("MarkSupportContextReviewed: tenant_id and reviewer are required")
+		return false, errors.New("MarkSupportContextReviewedWithEvent: tenant_id and reviewer are required")
 	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	var changed bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			UPDATE support_contexts
 			   SET reviewed_at = $1, reviewed_by = $2
 			 WHERE support_context_id = $3 AND tenant_id = $4 AND reviewed_at IS NULL`,
@@ -545,8 +555,16 @@ func (s *PgStore) MarkSupportContextReviewed(
 		if err != nil {
 			return fmt.Errorf("mark support_context reviewed: %w", err)
 		}
-		return nil
+		changed = tag.RowsAffected() > 0
+		if !changed || rec.EventID == "" {
+			return nil
+		}
+		return s.outboxEnqueueTx(ctx, tx, rec)
 	})
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
 }
 
 // supportContextColumns is the shared SELECT list. One constant so the column

@@ -111,6 +111,11 @@ type Resolver struct {
 	// would reappear.
 	support SupportContextVerifier
 
+	// entitlements resolves §4's entitlement context reference. Nil means no
+	// entitlement read model is wired — true of every deployment until COM-03
+	// exists — and is recorded as UPSTREAM_NOT_CONFIGURED, never as a failure.
+	entitlements EntitlementResolver
+
 	// retention decides disposition_due_at for the session evidence row.
 	retention time.Duration
 
@@ -516,6 +521,23 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		return nil, fmt.Errorf("envelope signing failed: %w", err)
 	}
 
+	// ── Source inputs (§4 server-resolved context) ──────────────────────────
+	sourceChannel, sourceChannelBasis := resolveSourceChannel(principal, req.SourceChannel)
+	workloadID, workloadBasis := resolveWorkloadID(principal, req.WorkloadID)
+	if sourceChannelBasis == domain.BasisRejectedInconsistent || workloadBasis == domain.BasisRejectedInconsistent {
+		// Not a refusal: the session is still the verified principal's own.
+		// The contradicted assertion is simply not recorded. Logged at WARN
+		// because a client asserting what its principal cannot be is either
+		// misconfigured or probing.
+		r.log.Warn("source input contradicts the verified principal — not recorded",
+			zap.String("principal_id", principal.PrincipalID),
+			zap.String("principal_type", string(principal.PrincipalType)),
+			zap.String("asserted_source_channel", req.SourceChannel),
+			zap.String("asserted_workload_id", req.WorkloadID),
+			zap.String("correlation_id", req.CorrelationID))
+	}
+	entitlementRef, entitlementStatus := r.resolveEntitlement(ctx, principal.TenantID, req.LegalEntityID)
+
 	// ── Persist SessionContext (append-only evidence obligation) ─────────────
 	sc := domain.SessionContext{
 		SessionContextID: sessionContextID,
@@ -550,13 +572,16 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		RetentionClass:   domain.RetentionClassSessionEvidence,
 		DispositionDueAt: r.dispositionDue(now),
 
-		// §4 server-resolved context and required source inputs. These were
-		// parsed off the canonical envelope by the middleware and then
-		// discarded, so a decision could not afterwards be explained by the
-		// channel it arrived on or the workload that made it.
-		SourceChannel: req.SourceChannel,
-		WorkloadID:    req.WorkloadID,
-		CausationID:   req.CausationID,
+		// §4 server-resolved context and required source inputs. Channel and
+		// workload are RESOLVED against the verified principal's type rather
+		// than copied from the client's headers, and the basis records how —
+		// see resolveSourceChannel / resolveWorkloadID. Causation is lineage,
+		// not an identity claim, and is recorded as presented.
+		SourceChannel:      sourceChannel,
+		SourceChannelBasis: sourceChannelBasis,
+		WorkloadID:         workloadID,
+		WorkloadIDBasis:    workloadBasis,
+		CausationID:        req.CausationID,
 
 		// §4 evidence/lineage: "policy/version references". Which revision of
 		// the routing truth this decision was made against — the difference
@@ -564,10 +589,17 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		// reproduced.
 		IngressBindingVersion: ingressDecision.SourceVersion,
 
-		// EntitlementContextRef stays nil: §4 names it, and no service in the
-		// estate resolves one. Left explicitly unset rather than filled with a
-		// placeholder — see the field's own comment.
-		EntitlementContextRef: nil,
+		// §4's cache state model — FRESH / STALE / INVALIDATED — as it applied
+		// to THIS decision. The ingress check always computed it and then
+		// dropped it, so an auditor could not tell a decision made against a
+		// stale routing fact from one made against a fresh one. Empty when no
+		// binding was consulted.
+		IngressCacheState: ingressDecision.Freshness,
+
+		// Resolved through the entitlement read model when one is wired; the
+		// status says what happened either way. See resolveEntitlement.
+		EntitlementContextRef:    entitlementRef,
+		EntitlementContextStatus: entitlementStatus,
 	}
 
 	// ── Evidence, atomically ────────────────────────────────────────────────

@@ -536,7 +536,11 @@ services:
       REDIS_TLS_ENABLED: "${REDIS_TLS_ENABLED:-false}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "identity-context-svc"
+      # PUBLISH topic only. The reader subscribes to the topics the events it
+      # handles are actually published on — it used to read this one alone, so
+      # authority.revoked, role.updated and entity.updated never ended a session.
       KAFKA_EVENTS_TOPIC: "zoiko.identity.events"
+      KAFKA_CONSUME_TOPICS: "zoiko.identity.events,zoiko.delegated-authority.events,zoiko.access-control.events,zoiko.entity.events"
       JWT_SIGNING_SECRET: "local-dev-jwt-signing-secret-key-32-chars-long"
       JWT_SIGNING_PRIVATE_KEY_PATH: "/keys/envelope_signing_key.pem"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"

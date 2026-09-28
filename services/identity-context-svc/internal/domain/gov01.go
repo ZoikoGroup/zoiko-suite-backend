@@ -429,6 +429,10 @@ type ContextExplanation struct {
 	// to, and from which source. This is the part an auditor reads.
 	Dimensions []DimensionOutcome `json:"dimensions"`
 
+	// SourceInputs is §4's server-resolved context and source inputs as the
+	// decision recorded them, each with how it was established.
+	SourceInputs SourceInputs `json:"source_inputs"`
+
 	IssuedAt           time.Time  `json:"issued_at"`
 	ExpiresAt          time.Time  `json:"expires_at"`
 	InvalidatedAt      *time.Time `json:"invalidated_at,omitempty"`

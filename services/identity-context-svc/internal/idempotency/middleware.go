@@ -39,6 +39,10 @@ const (
 	headerKey    = "Idempotency-Key"
 	headerTenant = "X-Tenant-Id"
 
+	// headerPrincipal is the identity the handlers authorize against, set by
+	// the gateway from a verified envelope. See fingerprintOf.
+	headerPrincipal = "X-Principal-Id"
+
 	// headerReplayed tells a caller its answer came from the record rather
 	// than from doing the work again. Without it a retry is indistinguishable
 	// from a first attempt, and "did my command actually run twice?" is the
@@ -95,7 +99,7 @@ func Middleware(s Store, log *zap.Logger) func(http.Handler) http.Handler {
 			// resource. The concrete path is also available before chi has
 			// matched a route, which the pattern is not.
 			endpoint := r.Method + " " + r.URL.Path
-			fingerprint := fingerprintOf(string(body))
+			fingerprint := fingerprintOf(r.Header.Get(headerPrincipal), string(body))
 
 			rec, err := s.ClaimIdempotencyKey(r.Context(), tenantID, endpoint, key, fingerprint)
 			switch {
@@ -128,6 +132,20 @@ func Middleware(s Store, log *zap.Logger) func(http.Handler) http.Handler {
 			}
 
 			rw := &recorder{ResponseWriter: w, status: http.StatusOK}
+
+			// A panicking handler never returns here, so without this the claim
+			// stayed at status 0 and every retry was told IDEMPOTENCY_IN_FLIGHT
+			// until the 7-day retention purge. Recoverer sits OUTSIDE this
+			// middleware in cmd/server, so it cannot release the claim; this
+			// must. Re-panic afterwards so Recoverer still logs and answers 500.
+			defer func() {
+				if p := recover(); p != nil {
+					if err := s.ReleaseIdempotencyKey(r.Context(), tenantID, endpoint, key); err != nil {
+						log.Error("idempotency release after panic failed", zap.Error(err), zap.String("endpoint", endpoint))
+					}
+					panic(p)
+				}
+			}()
 			next.ServeHTTP(rw, r)
 
 			// 5xx is not a terminal answer. Release the claim so a retry can
@@ -148,11 +166,22 @@ func Middleware(s Store, log *zap.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// fingerprintOf hashes a request body. A hash, not the body: a support-context
-// request carries a justification and a ticket reference, and the replay table
-// must not become a second copy of them.
-func fingerprintOf(body string) string {
-	sum := sha256.Sum256([]byte(body))
+// fingerprintOf hashes the acting principal and the request body. A hash, not
+// the body: a support-context request carries a justification and a ticket
+// reference, and the replay table must not become a second copy of them.
+//
+// The principal is part of the request. A replay is answered BEFORE the
+// handler runs, so before its authorization check; keyed on the body alone, a
+// second principal in the same tenant presenting the first one's key and body
+// was handed the first one's stored response — justification and ticket
+// included — without ever being authorized. With the principal folded in, that
+// request is a different request and gets IDEMPOTENCY_MISMATCH, which reveals
+// nothing but that the key is taken.
+//
+// Folded into the fingerprint rather than the primary key so no migration is
+// needed. The NUL separator keeps ("ab","c") and ("a","bc") distinct.
+func fingerprintOf(principalID, body string) string {
+	sum := sha256.Sum256([]byte(principalID + "\x00" + body))
 	return hex.EncodeToString(sum[:])
 }
 

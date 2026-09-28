@@ -21,6 +21,8 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/events"
+	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 )
 
 // DefaultApprovalTTL is how long a proposal waits for a decision.
@@ -29,7 +31,7 @@ const DefaultApprovalTTL = 7 * 24 * time.Hour
 var (
 	// ErrApprovalPending — the subject already has a live proposal. Wraps
 	// ErrConflict so it is a 409 wherever conflicts are.
-	ErrApprovalPending = fmt.Errorf("%w: an approval request is already pending for this subject", ErrConflict)
+	ErrApprovalPending error = &kindError{"an approval request is already pending for this subject", ErrConflict}
 
 	// ErrApprovalNotPending — the request was already decided, went stale or
 	// expired. Deliberately NOT wrapping ErrConflict: callers of the approval
@@ -222,6 +224,11 @@ func (s *Service) ListApprovalRequests(ctx context.Context, pendingOnly bool) ([
 	if domain.TenantFromContext(ctx) == "" {
 		return nil, ErrNotFound
 	}
+	// Purpose limitation: proposals carry the command payload (evidence refs,
+	// names, decisions) and are for the principals who decide them.
+	if err := s.authorize(ctx, "approval-request", "read"); err != nil {
+		return nil, err
+	}
 	return s.store.ListApprovalRequests(ctx, pendingOnly)
 }
 
@@ -230,6 +237,16 @@ func (s *Service) GetApprovalRequest(ctx context.Context, id string) (*domain.Ap
 	if domain.TenantFromContext(ctx) == "" {
 		return nil, ErrNotFound
 	}
+	if err := s.authorize(ctx, "approval-request", "read"); err != nil {
+		return nil, err
+	}
+	return s.loadApproval(ctx, id)
+}
+
+// loadApproval reads one request in the caller's tenant. The decision path
+// uses it directly: the .approve / .reject permission it checks already
+// implies reading what is being decided.
+func (s *Service) loadApproval(ctx context.Context, id string) (*domain.ApprovalRequest, error) {
 	a, err := s.store.GetApprovalRequest(ctx, id)
 	if err != nil {
 		return nil, err
@@ -267,6 +284,9 @@ func (s *Service) approvalAuthz(ctx context.Context, a *domain.ApprovalRequest) 
 		return s.authorize(ctx, "entity", "merge.approve")
 	case domain.ApprovalSubjectLegalEntityUnmerge:
 		return s.authorize(ctx, "entity", "unmerge.approve")
+	case domain.ApprovalSubjectTenantHomeRegion:
+		// Platform authority, like the proposal: a hard isolation identifier.
+		return s.authorizeIn(ctx, s.platformScopeID, "tenant", domain.TenantCommandChangeHomeRegion.AuthzAction()+".approve")
 	}
 	return fmt.Errorf("%w: unknown approval subject %q", ErrInvalidInput, a.SubjectType)
 }
@@ -279,7 +299,10 @@ func (s *Service) loadDecidable(ctx context.Context, id string) (*domain.Approva
 	if decider == "" {
 		return nil, "", ErrUnauthenticated
 	}
-	a, err := s.GetApprovalRequest(ctx, id)
+	if domain.TenantFromContext(ctx) == "" {
+		return nil, "", ErrNotFound
+	}
+	a, err := s.loadApproval(ctx, id)
 	if err != nil {
 		return nil, "", err
 	}
@@ -363,6 +386,8 @@ func (s *Service) ApproveRequest(ctx context.Context, id string, body domain.App
 		result, err = s.approveMerge(ctx, a, d)
 	case domain.ApprovalSubjectLegalEntityUnmerge:
 		result, err = s.approveUnmerge(ctx, a, d)
+	case domain.ApprovalSubjectTenantHomeRegion:
+		result, err = s.approveHomeRegion(ctx, a, d)
 	default:
 		err = fmt.Errorf("%w: unknown approval subject %q", ErrInvalidInput, a.SubjectType)
 	}
@@ -507,6 +532,13 @@ func (s *Service) approveRegistryConflictResolution(ctx context.Context, a *doma
 	if c.Status != domain.RegistryConflictOpen {
 		return fmt.Errorf("%w: conflict is already %s", ErrConflict, c.Status)
 	}
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if r, ok := res.(events.ConflictResolution); ok {
+			r.CorrelationID = req.CorrelationID
+			return events.RegistryConflictResolvedRecord(r)
+		}
+		return nil, nil
+	})
 	return s.store.ResolveRegistryConflictApproved(ctx, c.ConflictID, req.Status, req.ResolutionNote,
 		a.RequestedByPrincipalID, d)
 }

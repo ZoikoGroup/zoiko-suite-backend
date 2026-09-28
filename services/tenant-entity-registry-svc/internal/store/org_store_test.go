@@ -275,6 +275,67 @@ func TestAmendLegalProfile_BackdatedAmendmentDoesNotChangeTheCurrentName(t *test
 	assert.Equal(t, "Name We Learned About Late Ltd", then.Profile.LegalName)
 }
 
+// An amendment effective BEFORE the first version has nothing in force to
+// close. It used to stay open-ended alongside version 1, and as-of "now" then
+// answered with whichever started later — the older name — while GetEntity
+// showed the newer one. Found live on 28 Sep 2026.
+func TestAmendLegalProfile_PredatingEveryVersionEndsWhereTheFirstBegins(t *testing.T) {
+	f := newORGFixture(t)
+
+	early := time.Now().UTC().Add(-2 * 8760 * time.Hour) // before the fixture's incorporation
+	_, err := f.s.AmendLegalProfile(f.ctx, f.entityID, &domain.LegalEntityProfileVersion{
+		ProfileVersionID: uuid.New().String(), TenantID: f.tenantID,
+		LegalEntityID: f.entityID, LegalName: "Pre-Incorporation Name Ltd",
+		EffectiveFrom: early, ChangeReason: domain.ProfileChangeCorrection,
+		CreatedByPrincipalID: "p",
+	}, 1, nil)
+	require.NoError(t, err)
+
+	versions, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID)
+	require.NoError(t, err)
+	require.Len(t, versions, 2)
+	require.NotNil(t, versions[0].EffectiveTo, "the new version must not stay open-ended")
+	assert.True(t, versions[0].EffectiveTo.Equal(versions[1].EffectiveFrom),
+		"it ends exactly where version 1 begins")
+
+	now, err := f.s.GetEntityProfileAsOf(f.ctx, f.entityID, time.Now().UTC())
+	require.NoError(t, err)
+	e, err := f.s.GetEntityByID(f.ctx, f.entityID)
+	require.NoError(t, err)
+	assert.Equal(t, e.LegalName, now.Profile.LegalName, "as-of now and the current projection must agree")
+
+	then, err := f.s.GetEntityProfileAsOf(f.ctx, f.entityID, early.Add(time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, "Pre-Incorporation Name Ltd", then.Profile.LegalName)
+}
+
+// Two amendments effective at the same instant: the second corrects the
+// first. Closing the first at its own start would be an empty interval, which
+// lepv_interval_ordered refuses — a 500, found live on 28 Sep 2026.
+func TestAmendLegalProfile_SameInstantAmendmentSupersedesInRecordTime(t *testing.T) {
+	f := newORGFixture(t)
+
+	at := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Microsecond)
+	for i, name := range []string{"First Rename Ltd", "Corrected Rename Ltd"} {
+		_, err := f.s.AmendLegalProfile(f.ctx, f.entityID, &domain.LegalEntityProfileVersion{
+			ProfileVersionID: uuid.New().String(), TenantID: f.tenantID,
+			LegalEntityID: f.entityID, LegalName: name,
+			EffectiveFrom: at, ChangeReason: domain.ProfileChangeLegalNameChange,
+			CreatedByPrincipalID: "p",
+		}, int64(i+1), nil)
+		require.NoError(t, err, "amendment %d", i+1)
+	}
+
+	now, err := f.s.GetEntityProfileAsOf(f.ctx, f.entityID, time.Now().UTC())
+	require.NoError(t, err)
+	assert.Equal(t, "Corrected Rename Ltd", now.Profile.LegalName, "the later correction wins the shared interval")
+
+	versions, err := f.s.ListEntityProfileVersions(f.ctx, f.entityID)
+	require.NoError(t, err)
+	require.Len(t, versions, 3, "the corrected version is kept, not deleted")
+	assert.NotNil(t, versions[1].SupersededAt, "and marked superseded in record time")
+}
+
 func TestGetEntityProfileAsOf_BeforeIncorporationReturnsNoProfile(t *testing.T) {
 	f := newORGFixture(t)
 

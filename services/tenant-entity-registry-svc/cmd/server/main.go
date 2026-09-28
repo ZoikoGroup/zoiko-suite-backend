@@ -31,10 +31,11 @@ import (
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/config"
+	"zoiko.io/tenant-entity-registry-svc/internal/entitlement"
 	svcenvelope "zoiko.io/tenant-entity-registry-svc/internal/envelope"
-	"zoiko.io/tenant-entity-registry-svc/internal/events"
 	"zoiko.io/tenant-entity-registry-svc/internal/handler"
 	"zoiko.io/tenant-entity-registry-svc/internal/health"
+	"zoiko.io/tenant-entity-registry-svc/internal/idempotency"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
 	svcmiddleware "zoiko.io/tenant-entity-registry-svc/internal/middleware"
 	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
@@ -130,7 +131,11 @@ func main() {
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
-	eventPublisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+	// There is no direct publisher any more: since 28 Sep 2026 every event is
+	// written into event_outbox inside its write's transaction and delivered
+	// by the relay below — the direct path lost events on a crash after
+	// commit, and (because it ran on the request context) most events
+	// outright.
 
 	// ── Transactional outbox (ORG §9.2) ──────────────────────────────────────
 	//
@@ -163,10 +168,11 @@ func main() {
 		log.Fatal("authz client construction failed", zap.Error(err))
 	}
 
-	// Jurisdiction validator.
-	// Switch to jurisdiction.NewHTTPValidator when the Jurisdiction Rules Service ships.
+	// Jurisdiction validator. The stub accepts every id; config.validate
+	// refuses to start staging or production with it (it used to be selected
+	// silently in any environment whose URL was unset or left at default).
 	var jurisdValidator jurisdiction.JurisdictionValidator = jurisdiction.NewStubValidator(log)
-	if cfg.JurisdictionRulesURL != "" && cfg.JurisdictionRulesURL != "http://jurisdiction-rules-svc" {
+	if cfg.JurisdictionValidatorIsReal() {
 		jurisdValidator = jurisdiction.NewHTTPValidator(cfg.JurisdictionRulesURL, log)
 		log.Info("using HTTP jurisdiction validator", zap.String("url", cfg.JurisdictionRulesURL))
 	} else {
@@ -174,9 +180,21 @@ func main() {
 	}
 
 	// ── 5. Service ───────────────────────────────────────────────────────────
-	svc := registry.NewService(pgStore, eventPublisher, authzClient, jurisdValidator, cfg.AuthZPlatformScopeID, log)
+	svc := registry.NewService(pgStore, authzClient, jurisdValidator, cfg.AuthZPlatformScopeID, log)
 	svc.ConfigureMakerChecker(cfg.MakerCheckerLegacyBodyApprover, time.Duration(cfg.ApprovalTTLHours)*time.Hour)
 	svc.ConfigureCompatibility(cfg.LegacyEntityCreateActive, cfg.OnboardingKeyOptional)
+
+	// ORG-02 §4.2 server-resolved provisioning context: plan entitlement from
+	// commercial-account-svc and the restricted-jurisdiction list.
+	var entitlementChecker entitlement.Checker = entitlement.NewStubChecker(log)
+	if cfg.CommercialAccountURL != "" {
+		entitlementChecker = entitlement.NewHTTPChecker(cfg.CommercialAccountURL, log)
+		log.Info("using HTTP entitlement checker", zap.String("url", cfg.CommercialAccountURL))
+	} else {
+		log.Warn("using STUB entitlement checker — local only; refused in staging/production")
+	}
+	svc.ConfigureProvisioning(entitlementChecker, cfg.RestrictedJurisdictionCodes, cfg.LegacyProvisioningInputs)
+	svc.ConfigureConcurrency(cfg.ExpectedVersionOptional)
 
 	// ── 6. HTTP router ───────────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -202,7 +220,11 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(svc, log)
-	handler.RegisterRoutes(r, h)
+	// Idempotency-Key replay protection (migration 000010) — ORG shared
+	// contract §3, §9.2 DoD gates 2 and 4.
+	handler.RegisterRoutes(r, h, idempotency.Middleware(pgStore, log))
+	go purgeIdempotencyKeys(relayCtx, pgStore, log)
+	go watchOutbox(relayCtx, relay, metrics, log)
 
 	// ── 7. Health probes (separate path, no auth) ────────────────────────────
 	healthH := health.New(pool, log)
@@ -291,4 +313,53 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+// idempotencyRetention is how long a recorded command response answers a
+// retry. A week covers any realistic client retry window.
+const idempotencyRetention = 7 * 24 * time.Hour
+
+// purgeIdempotencyKeys drops expired replay records hourly, so the table
+// migration 000010 added does not grow without bound. Stops with the relay.
+func purgeIdempotencyKeys(ctx context.Context, s *store.PgStore, log *zap.Logger) {
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		n, err := s.PurgeIdempotencyKeysBefore(ctx, time.Now().UTC().Add(-idempotencyRetention))
+		if err != nil && ctx.Err() == nil {
+			log.Error("idempotency key purge failed", zap.Error(err))
+		} else if n > 0 {
+			log.Info("idempotency keys purged", zap.Int64("rows", n))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// watchOutbox exports event-delivery gauges every 15s (SLO.md "event
+// delivery"). The relay already knew these numbers; nothing exported them.
+func watchOutbox(ctx context.Context, relay *outbox.Relay, m *telemetry.Metrics, log *zap.Logger) {
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for {
+		if n, err := relay.PendingCount(ctx); err == nil {
+			m.OutboxPending.Set(float64(n))
+		} else if ctx.Err() == nil {
+			log.Warn("outbox pending count failed", zap.Error(err))
+		}
+		if n, err := relay.DeadLetterCount(ctx); err == nil {
+			m.OutboxDeadLetter.Set(float64(n))
+		}
+		published, failed := relay.Stats()
+		m.OutboxPublished.Set(float64(published))
+		m.OutboxFailed.Set(float64(failed))
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }

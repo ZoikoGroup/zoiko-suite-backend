@@ -114,6 +114,11 @@ type Consumer struct {
 	risk     RiskSignalWriter
 	holds    LegalHoldProjector
 	dedupe   Deduper
+
+	// revocationHorizon is how old a revocation event may be and still be
+	// acted on. Zero disables the check. See WithRevocationHorizon.
+	revocationHorizon time.Duration
+	now               func() time.Time
 }
 
 func NewConsumer(
@@ -124,7 +129,51 @@ func NewConsumer(
 	holds LegalHoldProjector,
 	dedupe Deduper,
 ) *Consumer {
-	return &Consumer{log: log, sessions: sessions, roles: roles, risk: risk, holds: holds, dedupe: dedupe}
+	return &Consumer{log: log, sessions: sessions, roles: roles, risk: risk, holds: holds, dedupe: dedupe,
+		now: func() time.Time { return time.Now().UTC() }}
+}
+
+// WithRevocationHorizon drops revocation events older than horizon.
+//
+// This is what makes it safe to subscribe to the producing topics at all. Until
+// 2026-09-28 the reader was pointed at zoiko.identity.events alone, so
+// authority.revoked, role.updated and entity.updated — each published on its
+// producer's own topic — never arrived. Subscribing to those topics under the
+// existing group starts them from the FIRST offset, and without a horizon the
+// first deploy would replay months of revocations against today's sessions:
+// every principal who ever lost a delegation, held a since-edited role or sat
+// in a since-edited entity would be logged out at once.
+//
+// The horizon is not a heuristic. A session lives at most the envelope TTL, so
+// an event older than that cannot target any live session issued before it —
+// every such session has already expired. Dropping it loses nothing. Set it to
+// the envelope TTL plus a clock-skew allowance.
+//
+// It applies to the three REVOCATION handlers only. Legal holds and risk
+// signals are projections of state, not one-shot commands against sessions, and
+// an old hold is still a hold.
+func (c *Consumer) WithRevocationHorizon(horizon time.Duration) *Consumer {
+	c.revocationHorizon = horizon
+	return c
+}
+
+// stale reports whether a revocation event is too old to affect a live session.
+//
+// A missing emitted_at is treated as fresh. Acting on a revocation twice costs a
+// re-login; skipping a real one leaves revoked authority working.
+func (c *Consumer) stale(ev inbound) bool {
+	if c.revocationHorizon <= 0 || ev.EmittedAt.IsZero() {
+		return false
+	}
+	if age := c.now().Sub(ev.EmittedAt); age > c.revocationHorizon {
+		c.log.Info("revocation event older than any live session — skipped",
+			zap.String("event_type", ev.EventType),
+			zap.String("event_id", ev.EventID),
+			zap.Duration("age", age),
+			zap.Duration("horizon", c.revocationHorizon))
+		return true
+	}
+	return false
 }
 
 // inbound is the read side of the platform event contract the publisher emits.
@@ -164,6 +213,7 @@ func (c *Consumer) Run(ctx context.Context, reader *kafka.Reader) {
 	c.log.Info("event consumer started",
 		zap.Strings("brokers", reader.Config().Brokers),
 		zap.String("topic", reader.Config().Topic),
+		zap.Strings("group_topics", reader.Config().GroupTopics),
 		zap.String("group_id", reader.Config().GroupID),
 	)
 
@@ -258,6 +308,13 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 	}
 
 	switch ev.EventType {
+	case "authority.revoked", "authority.expired", "role.updated", "entity.updated":
+		if c.stale(ev) {
+			return
+		}
+	}
+
+	switch ev.EventType {
 	case "authority.revoked", "authority.expired":
 		c.handleAuthorityEnded(ctx, ev)
 	case "authority.delegated":
@@ -295,7 +352,11 @@ func (c *Consumer) handleAuthorityEnded(ctx context.Context, ev inbound) {
 	}
 	_ = json.Unmarshal(ev.Payload, &p)
 
-	principalID := firstNonEmpty(p.DelegatePrincipalID, p.PrincipalID, ev.ActorID)
+	// Never ev.ActorID. On authority.revoked the actor is whoever REVOKED the
+	// delegation — usually the delegator or an administrator — so falling back
+	// to it would log out the person enforcing the revocation and leave the
+	// delegate's sessions untouched. A payload with no delegate is refused.
+	principalID := firstNonEmpty(p.DelegatePrincipalID, p.PrincipalID)
 	if principalID == "" {
 		c.log.Error("authority event names no delegate — cannot revoke",
 			zap.String("event_id", ev.EventID), zap.String("event_type", ev.EventType))

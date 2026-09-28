@@ -124,7 +124,8 @@ func (s *stubStore) ListDelegations(_ context.Context, f domain.ListDelegationsF
 	return out, nil
 }
 
-func (s *stubStore) RevokeDelegation(_ context.Context, delegationID, revokedByPrincipalID string) (*domain.DelegationGrant, error) {
+// RevokeDelegation with expected_version for optimistic locking
+func (s *stubStore) RevokeDelegation(_ context.Context, delegationID, revokedByPrincipalID string, expectedVersion int64) (*domain.DelegationGrant, error) {
 	d, ok := s.byID[delegationID]
 	if !ok {
 		return nil, domain.ErrDelegationNotFound
@@ -132,14 +133,62 @@ func (s *stubStore) RevokeDelegation(_ context.Context, delegationID, revokedByP
 	if d.Status != domain.DelegationStatusActive {
 		return nil, domain.ErrInvalidTransition
 	}
+	if expectedVersion > 0 && d.Version != expectedVersion {
+		return nil, domain.ErrVersionMismatch
+	}
 	now := time.Now().UTC()
 	d.Status = domain.DelegationStatusRevoked
 	d.RevokedByPrincipalID = &revokedByPrincipalID
 	d.RevokedAt = &now
 	d.UpdatedAt = now
+	d.Version++
 	cp := *d
 	s.events = append(s.events, events.EventRevoked)
 	return &cp, nil
+}
+
+func (s *stubStore) ExtendDelegation(_ context.Context, delegationID, extendedByPrincipalID string, newEffectiveTo time.Time, expectedVersion int64) (*domain.DelegationGrant, error) {
+	d, ok := s.byID[delegationID]
+	if !ok {
+		return nil, domain.ErrDelegationNotFound
+	}
+	if d.Status != domain.DelegationStatusActive {
+		return nil, domain.ErrCannotExtend
+	}
+	if !newEffectiveTo.After(d.EffectiveTo) {
+		return nil, domain.ErrCannotExtend
+	}
+	if expectedVersion > 0 && d.Version != expectedVersion {
+		return nil, domain.ErrVersionMismatch
+	}
+	d.EffectiveTo = newEffectiveTo
+	d.UpdatedAt = time.Now().UTC()
+	d.Version++
+	cp := *d
+	s.events = append(s.events, events.EventDelegated)
+	return &cp, nil
+}
+
+func (s *stubStore) RecordRefusedEscalation(_ context.Context, r *domain.RefusedEscalation) error {
+	return nil
+}
+
+func (s *stubStore) ExplainDelegationChain(_ context.Context, _, _, _, _, _ string) ([]domain.DelegationChainStep, error) {
+	return nil, nil
+}
+
+func (s *stubStore) CheckOverlap(_ context.Context, _, _, delegatePrincipalID, actionType string, effectiveFrom, effectiveTo time.Time, correlationID string) error {
+	for _, d := range s.byID {
+		if d.Status == domain.DelegationStatusActive &&
+			d.DelegatePrincipalID == delegatePrincipalID &&
+			d.ActionType == actionType &&
+			d.EffectiveFrom.Before(effectiveTo) &&
+			d.EffectiveTo.After(effectiveFrom) &&
+			d.CorrelationID != correlationID {
+			return domain.ErrOverlapConflict
+		}
+	}
+	return nil
 }
 
 // stubAuthZ grants everything except when delegatorDenied is set — that
@@ -156,9 +205,31 @@ func (a *stubAuthZ) CheckAllowed(_ context.Context, principalID, _, _ string) er
 	return nil
 }
 
+// stubSoD always allows unless denied is set to a specific delegate|action
+// combination. The key is "delegatePrincipalID|actionType".
+type stubSoD struct {
+	denied map[string]bool
+}
+
+func newStubSoD(deny ...string) *stubSoD {
+	m := make(map[string]bool, len(deny))
+	for _, d := range deny {
+		m[d] = true
+	}
+	return &stubSoD{denied: m}
+}
+
+func (s *stubSoD) CheckConflict(_ context.Context, _, _, _, delegatePrincipalID, actionType string) error {
+	key := delegatePrincipalID + "|" + actionType
+	if s.denied[key] {
+		return domain.ErrSODConflict
+	}
+	return nil
+}
+
 // ── router factory ─────────────────────────────────────────────────────────────
 
-func newRouter(s *stubStore, authz *stubAuthZ) chi.Router {
+func newRouter(s *stubStore, authz *stubAuthZ, sod handler.SoDClient) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -169,7 +240,7 @@ func newRouter(s *stubStore, authz *stubAuthZ) chi.Router {
 	// nil metrics: the handler's count* helpers tolerate it, and registering a
 	// real Domain here would panic on the second test binary to call
 	// prometheus.MustRegister with the same collector names.
-	h := handler.New(s, authz, zap.NewNop(), nil)
+	h := handler.New(s, authz, sod, zap.NewNop(), nil)
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -204,7 +275,7 @@ func delegationBody(delegator, correlationID string, from, to time.Time) map[str
 // ── CreateDelegation tests ─────────────────────────────────────────────────────
 
 func TestCreateDelegation_MissingPrincipal(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -212,7 +283,7 @@ func TestCreateDelegation_MissingPrincipal(t *testing.T) {
 }
 
 func TestCreateDelegation_InvalidTimeWindow(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 	now := time.Now()
 	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), now, now), "caller-1")
 	if rr.Code != http.StatusBadRequest {
@@ -221,7 +292,7 @@ func TestCreateDelegation_InvalidTimeWindow(t *testing.T) {
 }
 
 func TestCreateDelegation_DelegatorLacksAuthority(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{delegatorDenied: "delegator-1"})
+	r := newRouter(newStubStore(), &stubAuthZ{delegatorDenied: "delegator-1"}, nil)
 	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
@@ -230,7 +301,7 @@ func TestCreateDelegation_DelegatorLacksAuthority(t *testing.T) {
 
 func TestCreateDelegation_HappyPath(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{}, nil)
 	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
@@ -247,7 +318,7 @@ func TestCreateDelegation_HappyPath(t *testing.T) {
 
 func TestCreateDelegation_IdempotentReplay(t *testing.T) {
 	correlationID := uuid.NewString()
-	r := newRouter(newStubStore(), &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 
 	rr1 := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", correlationID, time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
 	var d1 domain.DelegationGrant
@@ -276,7 +347,7 @@ func createActiveDelegation(t *testing.T, r chi.Router) domain.DelegationGrant {
 
 func TestRevokeDelegation_HappyPath(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{}, nil)
 	d := createActiveDelegation(t, r)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", nil, "admin-1")
@@ -294,7 +365,7 @@ func TestRevokeDelegation_HappyPath(t *testing.T) {
 }
 
 func TestRevokeDelegation_AlreadyRevoked(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 	d := createActiveDelegation(t, r)
 	_ = doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", nil, "admin-1")
 
@@ -308,7 +379,7 @@ func TestRevokeDelegation_AlreadyRevoked(t *testing.T) {
 
 func TestListDelegations_LazilyExpiresDueGrants(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{}, nil)
 	past := time.Now().Add(-48 * time.Hour)
 	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), past, past.Add(1*time.Hour)), "caller-1")
 	if rr.Code != http.StatusCreated {

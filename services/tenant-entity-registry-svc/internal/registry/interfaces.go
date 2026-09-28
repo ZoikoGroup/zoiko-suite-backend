@@ -102,26 +102,6 @@ type Store interface {
 }
 
 // ---------------------------------------------------------------------------
-// EventPublisher — append-only domain event publishing contract.
-// ---------------------------------------------------------------------------
-
-// EventPublisher emits append-only domain events to the event backbone.
-// All publish calls are fire-and-forget from the service's perspective.
-// DB writes are NOT rolled back on publish failure — an outbox pattern
-// handles redelivery.
-type EventPublisher interface {
-	PublishTenantCreated(ctx context.Context, tenant *domain.Tenant, correlationID string)
-	PublishEntityCreated(ctx context.Context, entity *domain.LegalEntity, correlationID string)
-	PublishEntityUpdated(ctx context.Context, entity *domain.LegalEntity, correlationID string)
-	PublishEntityStatusChanged(ctx context.Context, tenantID, legalEntityID, actorID string, previousStatus, newStatus domain.EntityStatus, correlationID string)
-	PublishEntityHierarchyChanged(ctx context.Context, hierarchy *domain.EntityHierarchy, changeType string, correlationID string)
-	PublishEntityJurisdictionChanged(ctx context.Context, assignment *domain.EntityJurisdictionAssignment, changeType string, correlationID string)
-	PublishWorkspaceCreated(ctx context.Context, workspace *domain.Workspace, correlationID string)
-	PublishWorkspaceUpdated(ctx context.Context, workspace *domain.Workspace, correlationID string)
-	PublishWorkspaceStatusChanged(ctx context.Context, tenantID, workspaceID, actorID string, previousStatus, newStatus domain.WorkspaceStatus, correlationID string)
-}
-
-// ---------------------------------------------------------------------------
 // AuthorizationClient — governance plane dependency.
 //
 // Per doctrine: no domain service self-authorizes a material action.
@@ -169,6 +149,25 @@ type JurisdictionValidator interface {
 // ---------------------------------------------------------------------------
 
 // TenantCommandParams is one named ORG-02 lifecycle command, ready to apply.
+// HomeRegionChange is an approved ChangeHomeRegion, as the store applies it.
+type HomeRegionChange struct {
+	TenantID          string
+	ResidencyRegionID string
+	DecisionRef       string
+	Reason            string
+	ActorID           string
+	ExpectedVersion   int64
+	CorrelationID     string
+	Approval          domain.ApprovalDecision
+}
+
+// HomeRegionChangeResult is what the store reports back.
+type HomeRegionChangeResult struct {
+	FromRegionID *string `json:"from_region_id"`
+	ToRegionID   string  `json:"to_region_id"`
+	NewVersion   int64   `json:"record_version"`
+}
+
 type TenantCommandParams struct {
 	TenantID    string
 	Command     domain.TenantCommand
@@ -214,6 +213,10 @@ type ORGStore interface {
 	// ── ORG-02: named commands ──────────────────────────────────────────────
 
 	ExecuteTenantCommand(ctx context.Context, p TenantCommandParams, ev *outbox.Record) (*TenantCommandResult, error)
+	// ChangeHomeRegion applies an approved ChangeHomeRegion atomically: the
+	// approval decision, the default residency policy's region, the tenant's
+	// version, the lineage row and the event.
+	ChangeHomeRegion(ctx context.Context, p HomeRegionChange, ev *outbox.Record) (*HomeRegionChangeResult, error)
 	ChangeDefaultLocale(ctx context.Context, tenantID, locale, timezone, reason, actorID, correlationID string, expectedVersion int64, ev *outbox.Record) (*domain.Tenant, error)
 
 	// ── ORG-02: read surfaces ───────────────────────────────────────────────

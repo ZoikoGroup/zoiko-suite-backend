@@ -57,7 +57,7 @@ var (
 	// "resource already exists" and a caller reading that after an optimistic
 	// concurrency failure will go looking for a duplicate that does not exist.
 	// Nothing was created; something moved.
-	ErrVersionConflict = fmt.Errorf("%w: record was modified by someone else", ErrConflict)
+	ErrVersionConflict error = &kindError{"version conflict: record was modified by someone else", ErrConflict}
 )
 
 // ---------------------------------------------------------------------------
@@ -311,12 +311,9 @@ func (s *Service) ExecuteTenantCommand(
 		return nil, fmt.Errorf("%w: %s cannot be invoked from %s", ErrInvalidTransition, command, t.LifecycleState)
 	}
 
-	expected := req.ExpectedVersion
-	if expected == 0 {
-		expected = t.RecordVersion
-	} else if expected != t.RecordVersion {
-		return nil, fmt.Errorf("%w: you supplied expected_version %d but this tenant is at %d — reload and retry",
-			ErrVersionConflict, expected, t.RecordVersion)
+	expected, err := s.checkExpected(req.ExpectedVersion, t.RecordVersion, "tenant")
+	if err != nil {
+		return nil, err
 	}
 
 	// RetryProvisioning re-runs the failed provisioning step rather than
@@ -445,11 +442,15 @@ func (s *Service) tenantCommandEvent(
 	if t.ExternalCustomerKey != nil {
 		payload["external_customer_key"] = *t.ExternalCustomerKey
 	}
+	// The command's write is guarded on t.RecordVersion.
 	return events.BuildRecord(events.RecordSpec{
 		EventType:     eventType,
 		TenantID:      t.TenantID,
 		ActorID:       maker,
 		CorrelationID: req.CorrelationID,
+		ObjectID:      t.TenantID,
+		ObjectVersion: t.RecordVersion + 1,
+		EvidenceRef:   approvalID,
 		PartitionKey:  t.TenantID,
 		Payload:       payload,
 	})
@@ -481,12 +482,9 @@ func (s *Service) ChangeDefaultLocale(
 	if err != nil {
 		return nil, err
 	}
-	expected := req.ExpectedVersion
-	if expected == 0 {
-		expected = t.RecordVersion
-	} else if expected != t.RecordVersion {
-		return nil, fmt.Errorf("%w: you supplied expected_version %d but this tenant is at %d — reload and retry",
-			ErrVersionConflict, expected, t.RecordVersion)
+	expected, err := s.checkExpected(req.ExpectedVersion, t.RecordVersion, "tenant")
+	if err != nil {
+		return nil, err
 	}
 
 	ev, err := events.BuildRecord(events.RecordSpec{
@@ -494,6 +492,8 @@ func (s *Service) ChangeDefaultLocale(
 		TenantID:      tenantID,
 		ActorID:       domain.PrincipalFromContext(ctx),
 		CorrelationID: req.CorrelationID,
+		ObjectID:      tenantID,
+		ObjectVersion: expected + 1,
 		PartitionKey:  tenantID,
 		Payload: map[string]any{
 			"tenant_id":         tenantID,
@@ -573,6 +573,9 @@ func (s *Service) AmendLegalProfile(
 	if !domain.ValidProfileChangeReason(req.ChangeReason) {
 		return nil, fmt.Errorf("%w: unknown change_reason %q", ErrInvalidInput, req.ChangeReason)
 	}
+	if err := validateLegalForm(req.LegalFormCode, req.LegalFormSource, req.LegalFormLocalText); err != nil {
+		return nil, err
+	}
 	// INITIAL and INITIAL_BACKFILL describe how a version came into being and
 	// are written by this service, never chosen by a caller. Accepting them
 	// here would let an amendment disguise itself as an entity's original
@@ -619,12 +622,9 @@ func (s *Service) AmendLegalProfile(
 // proposal that could never apply is refused (and quarantined) before anyone
 // is asked to review it.
 func (s *Service) proposeAmendment(ctx context.Context, e *domain.LegalEntity, req domain.AmendLegalProfileRequest) error {
-	expected := req.ExpectedVersion
-	if expected == 0 {
-		expected = e.RecordVersion
-	} else if expected != e.RecordVersion {
-		return fmt.Errorf("%w: you supplied expected_version %d but this entity is at %d — reload and retry",
-			ErrVersionConflict, expected, e.RecordVersion)
+	expected, err := s.checkExpected(req.ExpectedVersion, e.RecordVersion, "entity")
+	if err != nil {
+		return err
 	}
 	if err := s.checkAmendmentRegistry(ctx, e, req); err != nil {
 		return err
@@ -769,12 +769,9 @@ func (s *Service) executeAmendment(
 
 	applyAmendment(next, req)
 
-	expected := req.ExpectedVersion
-	if expected == 0 {
-		expected = e.RecordVersion
-	} else if expected != e.RecordVersion {
-		return nil, fmt.Errorf("%w: you supplied expected_version %d but this entity is at %d — reload and retry",
-			ErrVersionConflict, expected, e.RecordVersion)
+	expected, err := s.checkExpected(req.ExpectedVersion, e.RecordVersion, "entity")
+	if err != nil {
+		return nil, err
 	}
 
 	eventType := events.EventLegalEntityProfileAmended
@@ -792,6 +789,13 @@ func (s *Service) executeAmendment(
 		Jurisdiction:  e.PrimaryJurisdictionID,
 		ActorID:       maker,
 		CorrelationID: req.CorrelationID,
+		ObjectID:      legalEntityID,
+		// Provisional: the store stamps the real version inside the
+		// transaction (events.StampVersion), because a backdated amendment
+		// does not move the entity's current version.
+		ObjectVersion: e.RecordVersion,
+		EffectiveAt:   req.EffectiveFrom,
+		EvidenceRef:   req.SourceEvidenceRef,
 		PartitionKey:  legalEntityID,
 		Payload: map[string]any{
 			"legal_entity_id":  legalEntityID,
@@ -1006,6 +1010,15 @@ func (s *Service) quarantineRegistryConflict(
 		DetectedByPrincipalID: domain.PrincipalFromContext(ctx),
 		CorrelationID:         nullableString(correlationID),
 	}
+	// entity.registry_conflict.quarantined, enqueued in the quarantine's own
+	// transaction. Before 28 Sep 2026 it was rendered here, logged, and never
+	// sent — a quarantine nobody was told about.
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if q, ok := res.(*domain.EntityRegistryConflict); ok {
+			return events.RegistryConflictQuarantinedRecord(q)
+		}
+		return nil, nil
+	})
 	if err := s.store.RecordRegistryConflict(ctx, c); err != nil {
 		s.log.Error("failed to quarantine registry conflict",
 			zap.String("registration_number", registrationNumber),
@@ -1020,26 +1033,6 @@ func (s *Service) quarantineRegistryConflict(
 		zap.String("existing_legal_entity_id", existingEntityID),
 	)
 
-	// Fire-and-forget: the quarantine is already durable, so a publish failure
-	// must not undo it. This is the one place in this file where that is the
-	// right trade — everywhere else the event attests a fact that the same
-	// transaction created.
-	if ev, err := events.BuildRecord(events.RecordSpec{
-		EventType:     events.EventRegistryConflictQuarantined,
-		TenantID:      tenantID,
-		Jurisdiction:  jurisdictionID,
-		ActorID:       domain.PrincipalFromContext(ctx),
-		CorrelationID: correlationID,
-		PartitionKey:  tenantID,
-		Payload: map[string]any{
-			"conflict_id":              c.ConflictID,
-			"registration_number":      registrationNumber,
-			"jurisdiction_id":          jurisdictionID,
-			"existing_legal_entity_id": existingEntityID,
-		},
-	}); err == nil && ev != nil {
-		s.log.Info("registry conflict event rendered", zap.String("event_id", ev.EventID))
-	}
 	return nil
 }
 
@@ -1047,6 +1040,12 @@ func (s *Service) quarantineRegistryConflict(
 func (s *Service) ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error) {
 	if domain.TenantFromContext(ctx) == "" {
 		return nil, ErrNotFound
+	}
+	// Purpose limitation (ORG §3, ZS-SEC-001): a quarantine row carries the
+	// REJECTED claimant's submitted payload. Tenant membership alone used to
+	// be enough to read it; now it takes the resolver's read permission.
+	if err := s.authorize(ctx, "entity.registry-conflict", "read"); err != nil {
+		return nil, err
 	}
 	return s.store.ListRegistryConflicts(ctx, openOnly)
 }
@@ -1069,6 +1068,13 @@ func (s *Service) ResolveRegistryConflict(ctx context.Context, conflictID string
 		return fmt.Errorf("%w: resolution_note is required", ErrInvalidInput)
 	}
 	if s.legacyBodyApprover {
+		ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+			if r, ok := res.(events.ConflictResolution); ok {
+				r.CorrelationID = req.CorrelationID
+				return events.RegistryConflictResolvedRecord(r)
+			}
+			return nil, nil
+		})
 		return s.store.ResolveRegistryConflict(ctx, conflictID, req.Status,
 			req.ResolutionNote, domain.PrincipalFromContext(ctx))
 	}

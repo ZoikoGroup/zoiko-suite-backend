@@ -98,15 +98,20 @@ unforced=$(psql_q "
   SELECT count(*) FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
    WHERE n.nspname='public' AND c.relkind='r'
-     AND c.relname NOT IN ('residency_regions','tenant_host_bindings','schema_migrations')
+     AND c.relname NOT IN ('residency_regions','tenant_host_bindings','tenant_onboarding_keys','schema_migrations')
      AND NOT c.relforcerowsecurity;")
 ok "every tenant-scoped table has FORCE row-level security (unforced: ${unforced:-?})" \
    "$([ "$unforced" = "0" ] && echo 0 || echo 1)"
 
-# The two exemptions are deliberate and documented in migration 000006.
+# The exemptions are deliberate: residency_regions and tenant_host_bindings in
+# 000006, tenant_onboarding_keys in 000008 (read before a tenant is known —
+# a retried onboarding does not know the tenant id it is asking about).
 hb=$(psql_q "SELECT relrowsecurity FROM pg_class WHERE relname='tenant_host_bindings';")
 ok "tenant_host_bindings is deliberately exempt (read before a tenant is known)" \
    "$([ "$hb" = "f" ] && echo 0 || echo 1)"
+ok_keys=$(psql_q "SELECT relrowsecurity FROM pg_class WHERE relname='tenant_onboarding_keys';")
+ok "tenant_onboarding_keys is deliberately exempt (000008: read before a tenant is known)" \
+   "$([ "$ok_keys" = "f" ] && echo 0 || echo 1)"
 
 # Every policy must have a WITH CHECK half, or an UPDATE can move a row to
 # another tenant's id even though USING made it visible.
@@ -273,6 +278,144 @@ fi
 
 # The parity between these files and the code is asserted by Go tests, which is
 # where it belongs — this only checks the files are present and non-trivial.
+
+# ---------------------------------------------------------------------------
+section '11. Schema — migrations 000007–000010 (the 24 and 28 Sep gap closures)'
+# ---------------------------------------------------------------------------
+
+for t in approval_requests tenant_onboarding_keys entity_merge_records idempotency_keys; do
+  n=$(psql_q "SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename='$t';")
+  ok "table $t exists" "$([ "$n" = "1" ] && echo 0 || echo 1)"
+done
+for t in approval_requests entity_merge_records idempotency_keys; do
+  f=$(psql_q "SELECT relforcerowsecurity FROM pg_class WHERE relname='$t';")
+  ok "$t carries FORCE row-level security" "$([ "$f" = "t" ] && echo 0 || echo 1)"
+done
+
+# Maker-checker in the database, not only the service: the decider can never
+# be the requester, whatever calls the store.
+sod=$(psql_q "SELECT count(*) FROM pg_constraint WHERE conname='ar_no_self_decision';")
+ok "constraint ar_no_self_decision is present" "$([ "$sod" = "1" ] && echo 0 || echo 1)"
+
+cols=$(psql_q "SELECT count(*) FROM information_schema.columns WHERE
+  (table_name='legal_entity_profile_versions' AND column_name IN ('lei','lei_source','lei_status'))
+  OR (table_name='tenants' AND column_name IN ('external_customer_key','onboarding_request_ref','provisioning_failure_reason'))
+  OR (table_name='legal_entities' AND column_name IN ('merged_into_legal_entity_id','verified_by_principal_id'))
+  OR (table_name='tenant_lifecycle_history' AND column_name IN ('onboarding_request_ref','approval_request_id'));")
+ok "LEI, onboarding, provisioning-failure, merge, verification and approval-chain columns exist (found $cols of 10)" \
+   "$([ "$cols" = "10" ] && echo 0 || echo 1)"
+
+# ---------------------------------------------------------------------------
+section '12. Maker-checker, Draft/Verified/Active, merge — routed'
+# ---------------------------------------------------------------------------
+
+E0=00000000-0000-0000-0000-000000000001
+probe_route 'GET  /v1/approval-requests' GET "/v1/approval-requests"
+probe_route 'POST /v1/approval-requests/{id}/approve' POST "/v1/approval-requests/$E0/approve" '{}'
+probe_route 'POST /v1/approval-requests/{id}/reject' POST "/v1/approval-requests/$E0/reject" '{}'
+probe_route 'POST /v1/entities/{id}/verification' POST "/v1/entities/$E0/verification" '{}'
+probe_route 'POST /v1/entities/{id}/activation' POST "/v1/entities/$E0/activation" '{}'
+probe_route 'POST /v1/entities/{id}/merge' POST "/v1/entities/$E0/merge" '{}'
+probe_route 'POST /v1/entities/{id}/unmerge' POST "/v1/entities/$E0/unmerge" '{}'
+probe_route 'GET  /v1/entities/{id}/merge-records' GET "/v1/entities/$E0/merge-records"
+
+# ---------------------------------------------------------------------------
+section '13. §8 NP6 / §4.3 — profile history is coherent'
+# ---------------------------------------------------------------------------
+
+# Two open-ended versions starting at DIFFERENT instants mean as-of "now" and
+# GetEntity can disagree about the entity's name. A same-instant correction
+# (superseded in record time, same start) is legitimate and not counted.
+# Before 28 Sep 2026 an amendment effective before an entity's first version
+# produced exactly this.
+overlap=$(psql_q "SELECT count(*) FROM (
+  SELECT legal_entity_id FROM legal_entity_profile_versions
+   WHERE effective_to IS NULL
+   GROUP BY legal_entity_id HAVING count(DISTINCT effective_from) > 1) x;")
+ok "no entity has two open-ended profile versions (entities affected: ${overlap:-?})" \
+   "$([ "$overlap" = "0" ] && echo 0 || echo 1)"
+
+# ---------------------------------------------------------------------------
+section '14. Replay protection and NP3 on every route (live, no grants needed)'
+# ---------------------------------------------------------------------------
+
+# A refused write is still a terminal answer and is recorded, so replay is
+# provable without any authorization grant: the second send with the same key
+# must come back marked as a replay rather than evaluated again.
+AUD_TENANT="${AUDIT_TENANT_ID:-11111111-1111-1111-1111-111111111111}"
+AUD_KEY="audit-$(date +%s)-$RANDOM"
+replay_hdr() {
+  curl -s -D - -o /dev/null -X POST "$BASE_URL/v1/tenants/$AUD_TENANT/defaults" \
+    -H 'Content-Type: application/json' -H "X-Tenant-Id: $AUD_TENANT" \
+    -H 'X-Principal-Id: audit-probe' -H "X-Request-Id: $AUD_KEY-$1" \
+    -H 'X-Correlation-ID: audit' -H 'X-Source-Channel: api' \
+    -H "Idempotency-Key: $AUD_KEY" -d '{"primary_locale":"en-GB","reason":"audit replay probe"}' \
+    | tr -d '\r' | grep -i '^x-idempotent-replay:' | awk '{print $2}'
+}
+first=$(replay_hdr 1); second=$(replay_hdr 2)
+ok "a repeated Idempotency-Key is answered from the record (first: ${first:-none}, second: ${second:-none})" \
+   "$([ -z "$first" ] && [ "$second" = "true" ] && echo 0 || echo 1)"
+
+# NP3 beyond the command routes: a request on a bound host claiming a
+# different tenant is refused on a plain read. Needs one bound host.
+bound=$(psql_q "SELECT hostname||'|'||tenant_id FROM tenant_host_bindings LIMIT 1;")
+if [ -z "$bound" ]; then
+  skip "NP3 on GET /v1/tenants/{id} — no host binding exists to probe with"
+else
+  host="${bound%%|*}"; host_tenant="${bound##*|}"
+  other=$(psql_q "SELECT tenant_id FROM tenants WHERE tenant_id <> '$host_tenant' LIMIT 1;")
+  if [ -z "$other" ]; then
+    skip "NP3 on GET /v1/tenants/{id} — needs a second tenant"
+  else
+    np3=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/v1/tenants/$other" \
+      -H "Host: $host" -H "X-Tenant-Id: $other" -H 'X-Principal-Id: audit-probe' \
+      -H 'X-Request-Id: audit-np3' -H 'X-Correlation-ID: audit' -H 'X-Source-Channel: api')
+    ok "NP3: host bound to one tenant, request claiming another, plain read → 403 (got $np3)" \
+       "$([ "$np3" = "403" ] && echo 0 || echo 1)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+section '15. 28 Sep gap closure — typed errors, §7 events, home region, inputs'
+# ---------------------------------------------------------------------------
+
+# ORG §3 stable typed errors: a refusal carries error_code, not only prose.
+ec=$(curl -s -X POST "$BASE_URL/v1/tenants/$AUD_TENANT/defaults" \
+  -H 'Content-Type: application/json' -H "X-Tenant-Id: $AUD_TENANT" \
+  -H 'X-Principal-Id: audit-probe' -H "X-Request-Id: audit-ec-$RANDOM" \
+  -H 'X-Correlation-ID: audit' -H 'X-Source-Channel: api' \
+  -H "Idempotency-Key: audit-ec-$(date +%s)-$RANDOM" -d '{"primary_locale":"en-GB","reason":"audit"}' \
+  | grep -o '"error_code":"[A-Z_]*"' | cut -d'"' -f4)
+ok "a refused write carries a stable error_code (got ${ec:-none})" "$([ -n "$ec" ] && echo 0 || echo 1)"
+env_ec=$(curl -s -X POST "$BASE_URL/v1/tenants" -H 'Content-Type: application/json' -d '{}' \
+  | grep -o '"error_code":"[A-Z_]*"' | cut -d'"' -f4)
+ok "an envelope refusal is CONTEXT_INVALID (got ${env_ec:-none})" "$([ "$env_ec" = "CONTEXT_INVALID" ] && echo 0 || echo 1)"
+
+# ORG §7: every event written since versioned envelopes shipped carries
+# object_id / object_version / effective_at / recorded_at.
+unversioned=$(psql_q "SELECT count(*) FROM event_outbox
+  WHERE created_at >= (SELECT coalesce(min(created_at), now()) FROM event_outbox WHERE payload ? 'object_version')
+    AND NOT (payload ? 'object_id' AND payload ? 'object_version' AND payload ? 'effective_at' AND payload ? 'recorded_at');")
+ok "every event since the §7 envelope carries object id, version, effective and recorded time (missing: ${unversioned:-?})" \
+   "$([ "$unversioned" = "0" ] && echo 0 || echo 1)"
+
+# §9.2 gate 2: no event path bypasses the outbox — the direct publisher is gone,
+# so nothing in the log may say a direct publish failed.
+direct=$(docker logs tenant-entity-registry-svc 2>&1 | grep -c '"event publish failed"')
+ok "no direct Kafka publish attempts in the service log (found: ${direct:-?})" "$([ "$direct" = "0" ] && echo 0 || echo 1)"
+
+# Event delivery is observable.
+m=$(curl -s "$BASE_URL/metrics" | grep -cE '^outbox_(pending|dead_letter)_events')
+ok "outbox delivery gauges are exported (found $m of 2)" "$([ "$m" = "2" ] && echo 0 || echo 1)"
+
+# §4.2 ChangeHomeRegion (000012) and provisioning inputs (000013).
+probe_route 'POST /v1/tenants/{id}/home-region' POST "/v1/tenants/$E0/home-region" '{}'
+hr=$(psql_q "SELECT count(*) FROM pg_constraint WHERE conname='tlh_home_region_evidenced';")
+ok "constraint tlh_home_region_evidenced is present (no home-region change without evidence)" "$([ "$hr" = "1" ] && echo 0 || echo 1)"
+pc=$(psql_q "SELECT count(*) FROM information_schema.columns WHERE
+  (table_name='tenants' AND column_name IN ('primary_jurisdiction_id','subscription_id','home_region_decision_ref'))
+  OR (table_name IN ('workspaces','entity_hierarchies','entity_jurisdiction_assignments') AND column_name='record_version');")
+ok "provisioning-lineage, home-region and record_version columns exist (found $pc of 6)" "$([ "$pc" = "6" ] && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 printf '\n\033[1mResult:\033[0m %s passed, %s failed, %s skipped\n' \

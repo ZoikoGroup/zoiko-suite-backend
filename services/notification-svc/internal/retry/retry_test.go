@@ -253,6 +253,10 @@ func (s *stubStore) UpdateAttempt(_ context.Context, attemptID, status, failureR
 	return nil
 }
 
+func (s *stubStore) FindStuckInFlight(_ context.Context, _ time.Time, _ int) ([]domain.DueRetry, error) {
+	return nil, nil
+}
+
 type stubDeliverer struct {
 	outcome domain.DeliveryOutcome
 	calls   int

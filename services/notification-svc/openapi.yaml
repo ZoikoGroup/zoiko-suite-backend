@@ -233,7 +233,7 @@ paths:
           schema: { type: string, format: uuid }
         - name: status
           in: query
-          schema: { type: string, enum: [PENDING, SENT, FAILED] }
+          schema: { type: string, enum: [PENDING, UNKNOWN, PROVIDER_ACCEPTED, DELIVERED, READ, SERVED, FAILED] }
         - name: unread_only
           in: query
           schema: { type: string, enum: ["true"] }
@@ -758,16 +758,29 @@ components:
         body: { type: string }
         status:
           type: string
-          enum: [PENDING, SENT, FAILED]
+          enum: [PENDING, UNKNOWN, PROVIDER_ACCEPTED, DELIVERED, READ, SERVED, FAILED]
           description: |
             `PENDING` has TWO meanings and `next_attempt_at` separates them:
             set means a transient failure is scheduled to be re-attempted,
             absent means an attempt is in flight right now.
 
-            `SENT` means a provider accepted it — for IN_APP, that the row
-            exists, which IS the delivery. Never that anyone read it.
+            `UNKNOWN` means the provider call timed out — we do not know if
+            the message was accepted. Reconciliation will resolve it to
+            PROVIDER_ACCEPTED/DELIVERED/READ/SERVED or FAILED.
 
-            `FAILED` is terminal.
+            `PROVIDER_ACCEPTED` means the provider accepted the message
+            (SMTP 250 / queue id). This is NOT proof of delivery or receipt.
+
+            `DELIVERED` means the provider confirmed delivery to the mailbox
+            (DSN success). Only available via provider callback or tracking.
+
+            `READ` means the recipient opened the message (IN_APP only,
+            or via read receipt where supported).
+
+            `SERVED` means legal service confirmed (acknowledgement chain
+            complete). For regulated notices.
+
+            `FAILED` is terminal — no further attempts will be made.
         source_event_type: { type: string }
         source_reference: { type: string }
         correlation_id: { type: string }
@@ -795,7 +808,9 @@ components:
         sent_at:
           type: string
           format: date-time
-          description: When delivery CONCLUDED — set on FAILED as well as on SENT.
+          description: |
+            When delivery CONCLUDED — set on all non-PENDING/UNKNOWN states
+            (PROVIDER_ACCEPTED, DELIVERED, READ, SERVED, FAILED).
         read_at:
           type: string
           format: date-time

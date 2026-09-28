@@ -185,12 +185,15 @@ type Domain struct {
 	OutboxPublished *prometheus.CounterVec
 	// OutboxFailures counts relay drain attempts that failed.
 	OutboxFailures prometheus.Counter
-	// OutboxOldestAgeSeconds is the age of the oldest unpublished event. Depth
-	// alone cannot distinguish a busy moment from a stalled relay: a backlog of
-	// ten that is three seconds old is healthy, and a backlog of ten that is an
-	// hour old means authority.revoked has not reached the consumer that ends
-	// the delegate's session.
+// OutboxOldestAgeSeconds is the age of the oldest unpublished event. Depth
+// alone cannot distinguish a busy moment from a stalled relay: a backlog of
+// ten that is three seconds old is healthy, and a backlog of ten that is an
+// hour old means authority.revoked has not reached the consumer that ends
+// the delegate's session.
 	OutboxOldestAgeSeconds prometheus.Gauge
+	// RefusedEscalations counts refused escalation attempts by reason.
+	// ORG-06 §4.2: "Every refused escalation attempt leaves durable evidence."
+	RefusedEscalations *prometheus.CounterVec
 }
 
 // Grant outcomes. Every one of these is a label value that must exist from
@@ -205,10 +208,24 @@ const (
 	GrantDelegatorMismatch   = "delegator_mismatch"
 	GrantSelfDealing         = "self_dealing"
 	GrantDelegatorLacksAuth  = "delegator_lacks_authority"
+	GrantSODConflict         = "sod_conflict"
+	GrantOverlapConflict     = "overlap_conflict"
+	GrantExtended            = "extended"
 	GrantAuthzUnavailable    = "authz_unavailable"
 	GrantStoreUnavailable    = "store_unavailable"
 	GrantIdentityMissing     = "identity_missing"
 	GrantTenantMissing       = "tenant_missing"
+)
+
+// Refused escalation reasons (for telemetry).
+const (
+	RefusedSelfDealing          = "self_dealing"
+	RefusedDelegatorMismatch    = "delegator_mismatch"
+	RefusedDelegatorLacksAuth   = "delegator_lacks_authority"
+	RefusedSODConflict          = "sod_conflict"
+	RefusedOverlapConflict      = "overlap_conflict"
+	RefusedInvalidWindow        = "invalid_window"
+	RefusedNoCreateGrant        = "no_create_grant"
 )
 
 // Revocation outcomes.
@@ -330,21 +347,33 @@ func NewDomainWith(reg prometheus.Registerer, serviceName string) *Domain {
 			Help:        "Age of the oldest unpublished outbox event, in seconds.",
 			ConstLabels: labels,
 		}),
+		RefusedEscalations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "delegated_authority_refused_escalations_total",
+			Help:        "Refused escalation attempts by reason.",
+			ConstLabels: labels,
+		}, []string{"reason"}),
 	}
 	reg.MustRegister(
 		d.Grants, d.Revocations, d.RegisterReads, d.AuthZDecisions, d.Expiries,
 		d.ExpiryLatenessSeconds, d.ExpiryDuePending, d.ExpiryOldestOverdueSeconds,
 		d.ExpirySweepFailures,
 		d.OutboxPending, d.OutboxPublished, d.OutboxFailures, d.OutboxOldestAgeSeconds,
+		d.RefusedEscalations,
 	)
 
 	for _, o := range []string{
 		GrantCreated, GrantReplayed, GrantInvalidRequest, GrantDelegateIsDelegator,
 		GrantInvalidWindow, GrantNoCreateGrant, GrantDelegatorMismatch, GrantSelfDealing,
-		GrantDelegatorLacksAuth, GrantAuthzUnavailable, GrantStoreUnavailable,
+		GrantDelegatorLacksAuth, GrantSODConflict, GrantOverlapConflict, GrantExtended, GrantAuthzUnavailable, GrantStoreUnavailable,
 		GrantIdentityMissing, GrantTenantMissing,
 	} {
 		d.Grants.WithLabelValues(o)
+	}
+	for _, r := range []string{
+		RefusedSelfDealing, RefusedDelegatorMismatch, RefusedDelegatorLacksAuth,
+		RefusedSODConflict, RefusedOverlapConflict, RefusedInvalidWindow, RefusedNoCreateGrant,
+	} {
+		d.RefusedEscalations.WithLabelValues(r)
 	}
 	for _, o := range []string{RevokeRevoked, RevokeAlreadyTerminal, RevokeForbidden, RevokeNotFound, RevokeUnavailable} {
 		d.Revocations.WithLabelValues(o)
@@ -357,7 +386,7 @@ func NewDomainWith(reg prometheus.Registerer, serviceName string) *Domain {
 			d.AuthZDecisions.WithLabelValues(a, o)
 		}
 	}
-	for _, e := range []string{"authority.delegated", "authority.revoked", "authority.expired"} {
+	for _, e := range []string{"authority.delegated", "authority.revoked", "authority.expired", "authority.extended"} {
 		d.OutboxPublished.WithLabelValues(e)
 	}
 	return d

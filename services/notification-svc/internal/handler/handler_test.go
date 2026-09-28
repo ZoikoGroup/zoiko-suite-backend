@@ -173,6 +173,207 @@ func (s *stubStore) FindStuckInFlight(_ context.Context, staleBefore time.Time, 
 	return nil, nil
 }
 
+// --- NCD-02: Suppression stubs ---
+
+func (s *stubStore) CreateSuppression(_ context.Context, sp *domain.Suppression) error {
+	return nil
+}
+
+func (s *stubStore) GetSuppression(_ context.Context, id string) (*domain.Suppression, error) {
+	return nil, domain.ErrSuppressionNotFound
+}
+
+func (s *stubStore) ListSuppressions(_ context.Context, f domain.SuppressionFilter) ([]domain.Suppression, error) {
+	return nil, nil
+}
+
+func (s *stubStore) DeleteSuppression(_ context.Context, id string) error {
+	return nil
+}
+
+// --- NCD-02: Preference stubs ---
+
+func (s *stubStore) UpsertPreference(_ context.Context, p *domain.Preference) error {
+	return nil
+}
+
+func (s *stubStore) GetPreference(_ context.Context, tenantID, principalID, channel string) (*domain.Preference, error) {
+	return nil, domain.ErrPreferenceNotFound
+}
+
+func (s *stubStore) ListPreferences(_ context.Context, f domain.PreferenceFilter) ([]domain.Preference, error) {
+	return nil, nil
+}
+
+func (s *stubStore) DeletePreference(_ context.Context, tenantID, principalID, channel string) error {
+	return nil
+}
+
+// --- NCD-02: Channel Decision stubs ---
+
+func (s *stubStore) EvaluateChannel(_ context.Context, tenantID, principalID, channel, permissionGrant string) (*domain.ChannelDecisionResult, error) {
+	return &domain.ChannelDecisionResult{
+		Allowed:  true,
+		Decision: domain.ChannelDecisionAllowed,
+	}, nil
+}
+
+func (s *stubStore) ListChannelDecisions(_ context.Context, f domain.ChannelDecisionFilter) ([]domain.ChannelDecision, error) {
+	return nil, nil
+}
+
+// --- NCD-04: Bounce stubs ---
+
+func (s *stubStore) CreateBounceEvent(_ context.Context, b *domain.BounceEvent) error {
+	return nil
+}
+
+func (s *stubStore) GetBounceEvent(_ context.Context, id string) (*domain.BounceEvent, error) {
+	return nil, domain.ErrBounceNotFound
+}
+
+func (s *stubStore) ListBounceEvents(_ context.Context, f domain.BounceEventFilter) ([]domain.BounceEvent, error) {
+	return nil, nil
+}
+
+// --- NCD-04: Complaint stubs ---
+
+func (s *stubStore) CreateComplaintEvent(_ context.Context, c *domain.ComplaintEvent) error {
+	return nil
+}
+
+func (s *stubStore) GetComplaintEvent(_ context.Context, id string) (*domain.ComplaintEvent, error) {
+	return nil, domain.ErrComplaintNotFound
+}
+
+func (s *stubStore) ListComplaintEvents(_ context.Context, f domain.ComplaintEventFilter) ([]domain.ComplaintEvent, error) {
+	return nil, nil
+}
+
+// --- NCD-04: Channel Reputation stubs ---
+
+func (s *stubStore) UpsertChannelReputation(_ context.Context, r *domain.ChannelReputation) error {
+	return nil
+}
+
+func (s *stubStore) ListChannelReputations(_ context.Context, f domain.ChannelReputationFilter) ([]domain.ChannelReputation, error) {
+	return nil, nil
+}
+
+// --- NCD-01: Communication Intent stubs ---
+
+func (s *stubStore) CreateCommunicationIntent(_ context.Context, i *domain.CommunicationIntent) error {
+	return nil
+}
+
+func (s *stubStore) GetCommunicationIntent(_ context.Context, id string) (*domain.CommunicationIntent, error) {
+	return nil, domain.ErrIntentNotFound
+}
+
+func (s *stubStore) ListCommunicationIntents(_ context.Context, f domain.CommunicationIntentFilter) ([]domain.CommunicationIntent, error) {
+	return nil, nil
+}
+
+func (s *stubStore) UpdateCommunicationIntent(_ context.Context, i *domain.CommunicationIntent) error {
+	return nil
+}
+
+func (s *stubStore) DeleteCommunicationIntent(_ context.Context, id string) error {
+	return nil
+}
+
+// --- NCD-01: Template stubs ---
+
+func (s *stubStore) CreateTemplate(_ context.Context, t *domain.Template) error {
+	return nil
+}
+
+func (s *stubStore) GetTemplate(_ context.Context, id string) (*domain.Template, error) {
+	return nil, domain.ErrTemplateNotFound
+}
+
+func (s *stubStore) GetTemplateByIntent(_ context.Context, intentID, locale string, version int) (*domain.Template, error) {
+	return nil, domain.ErrTemplateNotFound
+}
+
+func (s *stubStore) GetEffectiveTemplate(_ context.Context, tenantID, intentID, locale string, at time.Time) (*domain.Template, error) {
+	return nil, domain.ErrTemplateNotFound
+}
+
+func (s *stubStore) ListTemplates(_ context.Context, f domain.TemplateFilter) ([]domain.Template, error) {
+	return nil, nil
+}
+
+func (s *stubStore) UpdateTemplate(_ context.Context, t *domain.Template) error {
+	return nil
+}
+
+func (s *stubStore) DeleteTemplate(_ context.Context, id string) error {
+	return nil
+}
+
+// --- NCD-01: Template Approval stubs ---
+
+func (s *stubStore) CreateTemplateApproval(_ context.Context, a *domain.TemplateApproval) error {
+	return nil
+}
+
+func (s *stubStore) GetTemplateApproval(_ context.Context, id string) (*domain.TemplateApproval, error) {
+	return nil, domain.ErrApprovalNotFound
+}
+
+func (s *stubStore) ListTemplateApprovals(_ context.Context, f domain.TemplateApprovalFilter) ([]domain.TemplateApproval, error) {
+	return nil, nil
+}
+
+func (s *stubStore) DecideTemplateApproval(_ context.Context, approvalID, approverID, status, reason string) error {
+	return nil
+}
+
+// --- NCD-01: Template Render stubs ---
+
+func (s *stubStore) CreateTemplateRender(_ context.Context, r *domain.TemplateRender) error {
+	return nil
+}
+
+func (s *stubStore) GetTemplateRender(_ context.Context, id string) (*domain.TemplateRender, error) {
+	return nil, domain.ErrTemplateNotFound
+}
+
+func (s *stubStore) ListTemplateRenders(_ context.Context, templateID string, limit, offset int) ([]domain.TemplateRender, error) {
+	return nil, nil
+}
+
+// --- NCD-05: Regulated Notice & Acknowledgment stubs ---
+
+func (s *stubStore) CreateRegulatedNotice(_ context.Context, n *domain.RegulatedNotice) error {
+	return nil
+}
+
+func (s *stubStore) GetRegulatedNotice(_ context.Context, id string) (*domain.RegulatedNotice, error) {
+	return nil, domain.ErrRegulatedNoticeNotFound
+}
+
+func (s *stubStore) ListRegulatedNotices(_ context.Context, f domain.RegulatedNoticeFilter) ([]domain.RegulatedNotice, error) {
+	return nil, nil
+}
+
+func (s *stubStore) UpdateRegulatedNotice(_ context.Context, n *domain.RegulatedNotice) error {
+	return nil
+}
+
+func (s *stubStore) CreateAcknowledgmentChainStep(_ context.Context, step *domain.AcknowledgmentChainStep) error {
+	return nil
+}
+
+func (s *stubStore) GetAcknowledgmentChain(_ context.Context, regulatedNoticeID string) ([]domain.AcknowledgmentChainStep, error) {
+	return nil, nil
+}
+
+func (s *stubStore) AcknowledgeRegulatedNotice(_ context.Context, req *domain.AcknowledgeRequest, actorID string) error {
+	return nil
+}
+
 // eventCounts summarises what the store was asked to enqueue.
 //
 // It replaces a stubPublisher that counted PublishSent/PublishFailed calls.

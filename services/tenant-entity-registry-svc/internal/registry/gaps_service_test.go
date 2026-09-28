@@ -127,7 +127,7 @@ func TestFailedProvisioning_PartialFailureIsNeverOnboardingOrActive(t *testing.T
 	// Not transactable.
 	_, err = svc.CreateEntity(tenantCtx(tn.TenantID), domain.CreateEntityRequest{
 		TenantID: tn.TenantID, EntityCode: "E", LegalName: "X", EntityType: domain.EntityTypeSubsidiary,
-		DefaultCurrencyCode: "GBP", FiscalCalendarID: "fc", PrimaryJurisdictionID: "JUR-UK", DataResidencyPolicyID: "p",
+		DefaultCurrencyCode: "GBP", FiscalCalendarID: "0f000000-0000-4000-8000-000000000001", PrimaryJurisdictionID: "JUR-UK", DataResidencyPolicyID: "p",
 	})
 	require.ErrorIs(t, err, registry.ErrTenantNotTransactable)
 }
@@ -181,7 +181,7 @@ func TestLEI_ValidationAndStorage(t *testing.T) {
 	svc, ms := baseSvc(t)
 	base := domain.CreateEntityRequest{
 		TenantID: gapsTenant, EntityCode: "L1", LegalName: "LEI Co", EntityType: domain.EntityTypeSubsidiary,
-		DefaultCurrencyCode: "USD", FiscalCalendarID: "fc", PrimaryJurisdictionID: "JUR-US", DataResidencyPolicyID: "p",
+		DefaultCurrencyCode: "USD", FiscalCalendarID: "0f000000-0000-4000-8000-000000000001", PrimaryJurisdictionID: "JUR-US", DataResidencyPolicyID: "p",
 	}
 	for name, mut := range map[string]func(r *domain.CreateEntityRequest){
 		"bad checksum":   func(r *domain.CreateEntityRequest) { r.LEI, r.LEISource, r.LEIStatus = badLEI, "GLEIF", "ISSUED" },
@@ -235,7 +235,7 @@ func draftEntity(t *testing.T, svc *registry.Service, code string) *domain.Legal
 	t.Helper()
 	e, err := svc.CreateEntity(tenantCtx(gapsTenant), domain.CreateEntityRequest{
 		TenantID: gapsTenant, EntityCode: code, LegalName: code + " Ltd", EntityType: domain.EntityTypeSubsidiary,
-		DefaultCurrencyCode: "USD", FiscalCalendarID: "fc", PrimaryJurisdictionID: "JUR-US", DataResidencyPolicyID: "p",
+		DefaultCurrencyCode: "USD", FiscalCalendarID: "0f000000-0000-4000-8000-000000000001", PrimaryJurisdictionID: "JUR-US", DataResidencyPolicyID: "p",
 		RegistrationNumber: "RC-" + code,
 	})
 	require.NoError(t, err)
@@ -273,7 +273,7 @@ func TestDraftEntity_CannotBeTransactedAgainstOrActivatedUnverified(t *testing.T
 	// A draft is a registry claim: a second entity for the same number is quarantined.
 	_, err = svc.CreateEntity(ctx, domain.CreateEntityRequest{
 		TenantID: gapsTenant, EntityCode: "D1b", LegalName: "Dup", EntityType: domain.EntityTypeSubsidiary,
-		DefaultCurrencyCode: "USD", FiscalCalendarID: "fc", PrimaryJurisdictionID: "JUR-US", DataResidencyPolicyID: "p",
+		DefaultCurrencyCode: "USD", FiscalCalendarID: "0f000000-0000-4000-8000-000000000001", PrimaryJurisdictionID: "JUR-US", DataResidencyPolicyID: "p",
 		RegistrationNumber: "RC-D1",
 	})
 	require.ErrorIs(t, err, registry.ErrRegistryConflict)
@@ -332,7 +332,7 @@ func TestLegacyEntityCreateActive_OnlyWhenConfigured(t *testing.T) {
 	svc.ConfigureCompatibility(true, false)
 	e, err := svc.CreateEntity(tenantCtx(gapsTenant), domain.CreateEntityRequest{
 		TenantID: gapsTenant, EntityCode: "LG", LegalName: "Legacy", EntityType: domain.EntityTypeSubsidiary,
-		DefaultCurrencyCode: "USD", FiscalCalendarID: "fc", PrimaryJurisdictionID: "JUR-US", DataResidencyPolicyID: "p",
+		DefaultCurrencyCode: "USD", FiscalCalendarID: "0f000000-0000-4000-8000-000000000001", PrimaryJurisdictionID: "JUR-US", DataResidencyPolicyID: "p",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, domain.EntityStatusActive, e.EntityStatus)

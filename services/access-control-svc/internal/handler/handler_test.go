@@ -195,6 +195,10 @@ func (s *stubStore) ListAllBundles(_ context.Context, filter domain.BundleListFi
 	return out, nil
 }
 
+func (s *stubStore) RecordRefusedEscalation(_ context.Context, r *domain.RefusedEscalation) error {
+	return nil
+}
+
 // stubPublisher counts the events the store enqueued.
 //
 // It is no longer a handler collaborator — the handler has no publisher any
@@ -257,6 +261,19 @@ func (a *stubAuthzAdmin) SetPermissionBundleActive(_ context.Context, roleID, bu
 	return a.setBundleActiveErr
 }
 
+type stubSoD struct{ err error }
+
+func (s *stubSoD) CheckConflict(_ context.Context, _ domain.SoDCheckRequest) error { return s.err }
+
+type stubProtectedActions struct {
+	actions []string
+	err     error
+}
+
+func (s *stubProtectedActions) ListActive(_ context.Context) ([]string, error) {
+	return s.actions, s.err
+}
+
 // ── router factory ─────────────────────────────────────────────────────────────
 
 // newRouter wires a handler over the stubs.
@@ -270,7 +287,7 @@ func (a *stubAuthzAdmin) SetPermissionBundleActive(_ context.Context, roleID, bu
 // panics on a duplicate collector name, so routers sharing the default registry
 // would panic on the second one built in a package run — and a test that shared
 // one would be asserting on whatever ran before it.
-func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, admin *stubAuthzAdmin) chi.Router {
+func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, admin *stubAuthzAdmin, sod *stubSoD, prot *stubProtectedActions) chi.Router {
 	if pub != nil {
 		s.events = pub
 	}
@@ -282,7 +299,7 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, admin *stubAu
 		})
 	})
 	metrics := telemetry.NewDomainWith(telemetry.NewRegistry(), "access-control-svc")
-	h := handler.New(s, authz, admin, metrics, zap.NewNop())
+	h := handler.New(s, authz, admin, sod, prot, metrics, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -323,7 +340,7 @@ func roleBody(correlationID string) map[string]any {
 // ── CreateRole tests ──────────────────────────────────────────────────────────
 
 func TestCreateRole_MissingPrincipal(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	rr := doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(uuid.NewString()), "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -331,7 +348,7 @@ func TestCreateRole_MissingPrincipal(t *testing.T) {
 }
 
 func TestCreateRole_AuthzAdminUnavailable(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{createRoleErr: domain.ErrAuthzAdminUnavailable})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{createRoleErr: domain.ErrAuthzAdminUnavailable}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	rr := doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(uuid.NewString()), "admin-1")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 got %d: %s", rr.Code, rr.Body.String())
@@ -340,7 +357,7 @@ func TestCreateRole_AuthzAdminUnavailable(t *testing.T) {
 
 func TestCreateRole_HappyPath(t *testing.T) {
 	pub := &stubPublisher{}
-	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	rr := doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(uuid.NewString()), "admin-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
@@ -357,7 +374,7 @@ func TestCreateRole_HappyPath(t *testing.T) {
 
 func TestCreateRole_IdempotentReplay(t *testing.T) {
 	correlationID := uuid.NewString()
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 
 	rr1 := doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(correlationID), "admin-1")
 	var role1 domain.RoleDefinition
@@ -396,7 +413,7 @@ func bundleBody(correlationID string) map[string]any {
 }
 
 func TestCreateBundle_RoleNotFound(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	rr := doReq(r, http.MethodPost, "/v1/role-definitions/nonexistent-role/permission-bundles", bundleBody(uuid.NewString()), "admin-1")
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 got %d: %s", rr.Code, rr.Body.String())
@@ -405,7 +422,7 @@ func TestCreateBundle_RoleNotFound(t *testing.T) {
 
 func TestCreateBundle_HappyPath(t *testing.T) {
 	pub := &stubPublisher{}
-	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r)
 
 	rr := doReq(r, http.MethodPost, "/v1/role-definitions/"+role.RoleDefinitionID+"/permission-bundles", bundleBody(uuid.NewString()), "admin-1")
@@ -423,7 +440,7 @@ func TestCreateBundle_HappyPath(t *testing.T) {
 }
 
 func TestCreateBundle_AuthzAdminUnavailable(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{createBundleErr: domain.ErrAuthzAdminUnavailable})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{createBundleErr: domain.ErrAuthzAdminUnavailable}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r)
 
 	rr := doReq(r, http.MethodPost, "/v1/role-definitions/"+role.RoleDefinitionID+"/permission-bundles", bundleBody(uuid.NewString()), "admin-1")
@@ -436,7 +453,7 @@ func TestCreateBundle_AuthzAdminUnavailable(t *testing.T) {
 
 func TestUpdateRole_HappyPath(t *testing.T) {
 	pub := &stubPublisher{}
-	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r)
 
 	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID, map[string]any{"legal_entity_id": "le-us", "status": "RETIRED"}, "admin-1")
@@ -464,7 +481,7 @@ func TestUpdateRole_HappyPath(t *testing.T) {
 // not have caught that -- the 200 was always there.
 func TestUpdateRole_RetirementReachesAuthorizationSvc(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r)
 
 	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
@@ -482,7 +499,7 @@ func TestUpdateRole_RetirementReachesAuthorizationSvc(t *testing.T) {
 
 func TestUpdateRole_ReactivationAsksForActiveTrue(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r)
 
 	// ACTIVE -> RETIRED -> ACTIVE. The second transition must ask for true.
@@ -508,7 +525,7 @@ func TestUpdateRole_AuthzAdminDown_RefusesTheStatusChange(t *testing.T) {
 	admin := &stubAuthzAdmin{}
 	store := newStubStore()
 	pub := &stubPublisher{}
-	r := newRouter(store, pub, &stubAuthZ{}, admin)
+	r := newRouter(store, pub, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r)
 
 	admin.setRoleActiveErr = errors.New("authorization-svc admin API unreachable")
@@ -531,7 +548,7 @@ func TestUpdateRole_AuthzAdminDown_RefusesTheStatusChange(t *testing.T) {
 // enforcement, so it must not make a remote call that could fail and block it.
 func TestUpdateRole_RenameOnlyDoesNotTouchAuthorizationSvc(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r)
 
 	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
@@ -548,7 +565,7 @@ func TestUpdateRole_RenameOnlyDoesNotTouchAuthorizationSvc(t *testing.T) {
 // already has changes nothing to enforce.
 func TestUpdateRole_NoOpStatusIsNotPropagated(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r) // created ACTIVE
 
 	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
@@ -566,7 +583,7 @@ func TestUpdateRole_NoOpStatusIsNotPropagated(t *testing.T) {
 // neither ACTIVE nor RETIRED.
 func TestUpdateRole_UnknownStatusRejected(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r)
 
 	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
@@ -593,7 +610,7 @@ func createBundle(t *testing.T, r chi.Router) domain.PermissionBundleDef {
 }
 
 func TestGetBundle_HappyPath(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 
 	rr := doReq(r, http.MethodGet, "/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID, nil, "admin-1")
@@ -609,7 +626,7 @@ func TestGetBundle_HappyPath(t *testing.T) {
 
 func TestGetBundle_NotOwnedByRole(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 
 	// Two roles so a bundle can be addressed under a role that does not own it.
 	var roleID1, roleID2 string
@@ -640,7 +657,7 @@ func TestUpdateBundle_EditActionsHappyPath(t *testing.T) {
 	pub := &stubPublisher{}
 	admin := &stubAuthzAdmin{}
 	store := newStubStore()
-	r := newRouter(store, pub, &stubAuthZ{}, admin)
+	r := newRouter(store, pub, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 	admin.gotScopes = nil // drop the create-time scopes
 	pub.bundleUpdated = 0
@@ -680,7 +697,7 @@ func TestUpdateBundle_EditActionsHappyPath(t *testing.T) {
 // record a withdrawal the platform still enforces.
 func TestUpdateBundle_ActiveFlagFalseClearsEnforcement(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 	admin.gotScopes = nil
 
@@ -710,7 +727,7 @@ func TestUpdateBundle_ActiveFlagFalseClearsEnforcement(t *testing.T) {
 func TestUpdateBundle_NoOpReplayReturnsCurrent(t *testing.T) {
 	admin := &stubAuthzAdmin{}
 	pub := &stubPublisher{}
-	r := newRouter(newStubStore(), pub, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 	admin.gotScopes = nil
 	pub.bundleUpdated = 0
@@ -731,7 +748,7 @@ func TestUpdateBundle_NoOpReplayReturnsCurrent(t *testing.T) {
 
 func TestUpdateBundle_EmptyActionsRejected(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 	admin.gotScopes = nil
 
@@ -748,7 +765,7 @@ func TestUpdateBundle_EmptyActionsRejected(t *testing.T) {
 
 func TestUpdateBundle_NothingToUpdateRejected(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 	admin.gotScopes = nil
 
@@ -769,7 +786,7 @@ func TestUpdateBundle_NothingToUpdateRejected(t *testing.T) {
 func TestUpdateBundle_AuthzAdminDown_RefusesTheEdit(t *testing.T) {
 	admin := &stubAuthzAdmin{}
 	store := newStubStore()
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 
 	admin.createBundleErr = errors.New("authorization-svc admin API unreachable")
@@ -789,7 +806,7 @@ func TestUpdateBundle_AuthzAdminDown_RefusesTheEdit(t *testing.T) {
 
 func TestDetachBundle_HappyPath(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 	admin.gotScopes = nil
 
@@ -814,7 +831,7 @@ func TestDetachBundle_HappyPath(t *testing.T) {
 
 func TestDetachBundle_AlreadyDetachedIsIdempotent(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 	admin.gotScopes = nil
 
@@ -838,7 +855,7 @@ func TestDetachBundle_AlreadyDetachedIsIdempotent(t *testing.T) {
 func TestDetachBundle_RemoteDown_Refuses(t *testing.T) {
 	admin := &stubAuthzAdmin{}
 	store := newStubStore()
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 
 	admin.setBundleActiveErr = errors.New("authorization-svc admin API unreachable")
@@ -857,7 +874,7 @@ func TestDetachBundle_RemoteDown_Refuses(t *testing.T) {
 // ── ListAllBundles tests ──────────────────────────────────────────────────────
 
 func TestListAllBundles_FlatCatalogue(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	createBundle(t, r)
 	createBundle(t, r)
 
@@ -874,7 +891,7 @@ func TestListAllBundles_FlatCatalogue(t *testing.T) {
 
 func TestListAllBundles_FiltersByActiveFlag(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	bundle := createBundle(t, r)
 
 	// Detach it, then the active=true read must be empty.
@@ -900,7 +917,7 @@ func TestListAllBundles_FiltersByActiveFlag(t *testing.T) {
 // ── ListRoles filter tests ────────────────────────────────────────────────────
 
 func TestListRoles_InvalidStatusRejected(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	rr := doReq(r, http.MethodGet, "/v1/role-definitions/?status=BANANA", nil, "admin-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for an unknown status filter, got %d: %s", rr.Code, rr.Body.String())
@@ -908,7 +925,7 @@ func TestListRoles_InvalidStatusRejected(t *testing.T) {
 }
 
 func TestListRoles_InvalidScopeTypeRejected(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	rr := doReq(r, http.MethodGet, "/v1/role-definitions/?scope_type=PLANET", nil, "admin-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for an unknown scope_type filter, got %d: %s", rr.Code, rr.Body.String())
@@ -916,7 +933,7 @@ func TestListRoles_InvalidScopeTypeRejected(t *testing.T) {
 }
 
 func TestListRoles_InvalidLimitRejected(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	rr := doReq(r, http.MethodGet, "/v1/role-definitions/?limit=-1", nil, "admin-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a negative limit, got %d: %s", rr.Code, rr.Body.String())
@@ -924,7 +941,7 @@ func TestListRoles_InvalidLimitRejected(t *testing.T) {
 }
 
 func TestListRoles_SearchNarrowsResults(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 
 	req := roleBody(uuid.NewString())
 	req["role_code"] = "AP_VENDOR_MANAGER"
@@ -981,7 +998,7 @@ func TestWritesAuthorizeAgainstROLE_MANAGE(t *testing.T) {
 // look at a healthy database.
 func TestDuplicateRoleCodeIs409NotAnOutage(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 
 	first := roleBody(uuid.NewString())
 	if rr := doReq(r, http.MethodPost, "/v1/role-definitions/", first, "admin-1"); rr.Code != http.StatusCreated {
@@ -1007,7 +1024,7 @@ func TestDuplicateRoleCodeIs409NotAnOutage(t *testing.T) {
 func TestDuplicateRoleCodeDoesNotProvisionAnOrphan(t *testing.T) {
 	s := newStubStore()
 	admin := &stubAuthzAdmin{}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 
 	first := roleBody(uuid.NewString())
 	if rr := doReq(r, http.MethodPost, "/v1/role-definitions/", first, "admin-1"); rr.Code != http.StatusCreated {
@@ -1030,7 +1047,7 @@ func TestDuplicateRoleCodeDoesNotProvisionAnOrphan(t *testing.T) {
 // upsert-replace on (role_id, bundle_code).
 func TestDuplicateBundleCodeIs409(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	role := createRole(t, r)
 
 	first := bundleBody(uuid.NewString())
@@ -1056,7 +1073,7 @@ func TestDuplicateBundleCodeIs409(t *testing.T) {
 // idempotency key.
 func TestCreateRole_ReplayAnswers200NotCreated(t *testing.T) {
 	correlationID := uuid.NewString()
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 
 	if rr := doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(correlationID), "admin-1"); rr.Code != http.StatusCreated {
 		t.Fatalf("first create: expected 201 got %d: %s", rr.Code, rr.Body.String())
@@ -1072,7 +1089,7 @@ func TestCreateRole_ReplayAnswers200NotCreated(t *testing.T) {
 func TestCreateRole_ReplayEnqueuesNoSecondEvent(t *testing.T) {
 	correlationID := uuid.NewString()
 	pub := &stubPublisher{}
-	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 
 	doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(correlationID), "admin-1")
 	doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(correlationID), "admin-1")
@@ -1083,7 +1100,7 @@ func TestCreateRole_ReplayEnqueuesNoSecondEvent(t *testing.T) {
 }
 
 func TestCreateRole_UnknownScopeTypeRejected(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 	body := roleBody(uuid.NewString())
 	body["role_scope_type"] = "GALAXY"
 	rr := doReq(r, http.MethodPost, "/v1/role-definitions/", body, "admin-1")
@@ -1110,6 +1127,6 @@ func newRouterWithAuthz(s *stubStore, authz *recordingAuthZ) chi.Router {
 		})
 	})
 	metrics := telemetry.NewDomainWith(telemetry.NewRegistry(), "access-control-svc")
-	handler.RegisterRoutes(r, handler.New(s, authz, &stubAuthzAdmin{}, metrics, zap.NewNop()))
+	handler.RegisterRoutes(r, handler.New(s, authz, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}}, metrics, zap.NewNop()))
 	return r
 }

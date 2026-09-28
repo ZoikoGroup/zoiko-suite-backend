@@ -768,6 +768,9 @@ components:
         # Conflicts.
         - role_code_exists
         - bundle_code_exists
+        # SoD and protected actions (Authorization Standard §9, §10.1).
+        - sod_conflict              # segregation of duties conflict with existing assignments
+        - protected_action          # tenant role/bundle includes platform-admin action(s)
         # Request validation.
         - invalid_json
         - missing_fields

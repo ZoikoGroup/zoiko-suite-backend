@@ -130,6 +130,14 @@ type Config struct {
 	// ever be done deliberately: an unreviewed break-glass is the control's
 	// most common silent failure.
 	SupportReviewIntervalMinutes int
+
+	// IngressBindingTTLSeconds is the FRESH/STALE boundary of §4's cache state
+	// model for ingress bindings. IngressChecker.WithBindingTTL has existed
+	// since the model was named and nothing called it, so no binding could ever
+	// be STALE. A stale binding is still admitted — §4 permits bounded-TTL
+	// reads for non-material queries — so this default labels, it does not
+	// refuse. Zero disables staleness.
+	IngressBindingTTLSeconds int
 }
 
 type DBConfig struct {
@@ -249,7 +257,25 @@ type RedisConfig struct {
 type KafkaConfig struct {
 	Brokers []string
 	GroupID string
-	Topic   string
+	// Topic is where this service PUBLISHES (via the outbox relay).
+	Topic string
+	// ConsumeTopics is where it READS. Separate from Topic because the events
+	// it acts on are published by other services on their own topics: until
+	// 2026-09-28 the reader was pointed at Topic alone, so authority.revoked,
+	// role.updated and entity.updated never arrived and no revocation ended a
+	// session. See DefaultConsumeTopics.
+	ConsumeTopics []string
+}
+
+// DefaultConsumeTopics are the topics carrying the events internal/events
+// handles, named by the producer that owns each one. A topic is added here when
+// a producer of a handled event is found — grep the producer's config, never
+// the spec, for the wire name.
+var DefaultConsumeTopics = []string{
+	"zoiko.identity.events",            // principal lifecycle; own events are dropped by the self-source guard
+	"zoiko.delegated-authority.events", // authority.revoked / authority.expired / authority.delegated
+	"zoiko.access-control.events",      // role.updated
+	"zoiko.entity.events",              // entity.updated (tenant-entity-registry-svc)
 }
 
 // Load reads configuration from environment variables with safe defaults.
@@ -302,6 +328,10 @@ func Load() (*Config, error) {
 			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
 			GroupID: env("KAFKA_GROUP_ID", "identity-context-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.identity.events"),
+			// envList returns nil for unset or blank, so the default applies.
+			// There is deliberately no "off" value: a consumer reading nothing
+			// is the defect being fixed.
+			ConsumeTopics: envList("KAFKA_CONSUME_TOPICS"),
 		},
 		TenantRegistryURL:    env("TENANT_REGISTRY_URL", "http://tenant-registry-svc"),
 		AccessControlURL:     env("ACCESS_CONTROL_URL", "http://access-control-svc"),
@@ -325,6 +355,7 @@ func Load() (*Config, error) {
 		OutboxRelayBatchSize:          envInt("OUTBOX_RELAY_BATCH_SIZE", 100),
 		OutboxRelayPollMillis:         envInt("OUTBOX_RELAY_POLL_MILLIS", 1000),
 		SupportReviewIntervalMinutes:  envInt("SUPPORT_REVIEW_INTERVAL_MINUTES", 60),
+		IngressBindingTTLSeconds:      envInt("INGRESS_BINDING_TTL_SECONDS", 24*60*60),
 	}
 
 	// JWT_SIGNING_SECRET is mandatory and must be at least 32 bytes for HS256.
@@ -411,6 +442,10 @@ func Load() (*Config, error) {
 				"SOD_SERVICE_URL is required in %s: without it segregation of duties is not enforced on privileged commands",
 				cfg.Environment)
 		}
+	}
+
+	if len(cfg.Kafka.ConsumeTopics) == 0 {
+		cfg.Kafka.ConsumeTopics = append([]string(nil), DefaultConsumeTopics...)
 	}
 
 	return cfg, nil

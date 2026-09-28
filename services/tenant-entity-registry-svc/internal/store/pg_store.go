@@ -36,6 +36,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/events"
 	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 )
@@ -195,8 +196,9 @@ func (s *PgStore) CreateTenantWithDefaultResidencyPolicy(ctx context.Context, t 
 				default_currency_code, primary_timezone, primary_locale,
 				default_data_residency_policy_id, lifecycle_state,
 				created_at, updated_at, created_by_principal_id, updated_by_principal_id,
-				external_customer_key, onboarding_request_ref
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+				external_customer_key, onboarding_request_ref,
+				primary_jurisdiction_id, subscription_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		`
 		if _, err := tx.Exec(ctx, tenantQuery,
 			t.TenantID, t.TenantCode, t.LegalName, t.TradingName, string(t.Status),
@@ -204,6 +206,7 @@ func (s *PgStore) CreateTenantWithDefaultResidencyPolicy(ctx context.Context, t 
 			t.DefaultDataResidencyPolicyID, string(t.LifecycleState),
 			t.CreatedAt, now, t.CreatedByPrincipalID, t.CreatedByPrincipalID,
 			t.ExternalCustomerKey, t.OnboardingRequestRef,
+			t.PrimaryJurisdictionID, t.SubscriptionID,
 		); err != nil {
 			if isUniqueViolation(err) {
 				return fmt.Errorf("%w: tenant_code %s", registry.ErrConflict, t.TenantCode)
@@ -244,7 +247,8 @@ func (s *PgStore) GetTenantByID(ctx context.Context, tenantID string) (*domain.T
 			       default_data_residency_policy_id, lifecycle_state, record_version,
 			       created_at, updated_at, created_by_principal_id, updated_by_principal_id,
 			       external_customer_key, onboarding_request_ref,
-			       provisioning_failure_reason, provisioning_failed_at
+			       provisioning_failure_reason, provisioning_failed_at,
+			       primary_jurisdiction_id::text, subscription_id
 			FROM tenants WHERE tenant_id = $1 AND tenant_id = $2
 		`
 		return tx.QueryRow(ctx, query, tenantID, tid).Scan(
@@ -254,6 +258,7 @@ func (s *PgStore) GetTenantByID(ctx context.Context, tenantID string) (*domain.T
 			&t.CreatedAt, &t.UpdatedAt, &t.CreatedByPrincipalID, &t.UpdatedByPrincipalID,
 			&t.ExternalCustomerKey, &t.OnboardingRequestRef,
 			&t.ProvisioningFailureReason, &t.ProvisioningFailedAt,
+			&t.PrimaryJurisdictionID, &t.SubscriptionID,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -314,7 +319,14 @@ func (s *PgStore) CreateEntity(ctx context.Context, e *domain.LegalEntity) error
 			}
 			return err
 		}
-		return nil
+		// ORG-03 profile version 1, in the same transaction: an entity with
+		// no profile version answers every as-of read with nothing.
+		if e.InitialProfile != nil {
+			if err := insertInitialProfileVersionTx(ctx, tx, e.InitialProfile); err != nil {
+				return fmt.Errorf("initial profile version: %w", err)
+			}
+		}
+		return s.enqueueFor(ctx, tx, e)
 	})
 }
 
@@ -403,6 +415,9 @@ func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string) ([]
 func (s *PgStore) CreateWorkspace(ctx context.Context, w *domain.Workspace) error {
 	s.log.Debug("store.CreateWorkspace", zap.String("workspace_id", w.WorkspaceID))
 	tid := tenantFromCtxOrFallback(ctx, w.TenantID)
+	if w.RecordVersion < 1 {
+		w.RecordVersion = 1
+	}
 
 	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
@@ -413,12 +428,14 @@ func (s *PgStore) CreateWorkspace(ctx context.Context, w *domain.Workspace) erro
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		`
 		now := time.Now().UTC()
-		_, err := tx.Exec(ctx, query,
+		if _, err := tx.Exec(ctx, query,
 			w.WorkspaceID, w.TenantID, w.LegalEntityID, w.Name, w.BusinessUnit,
 			string(w.BillingClassification), string(w.BillingSource), w.CommercialAccountID, string(w.Status),
 			w.CreatedAt, now, w.CreatedByPrincipalID, w.CreatedByPrincipalID,
-		)
-		return err
+		); err != nil {
+			return err
+		}
+		return s.enqueueFor(ctx, tx, w)
 	})
 }
 
@@ -432,13 +449,15 @@ func (s *PgStore) GetWorkspaceByID(ctx context.Context, workspaceID string) (*do
 		query := `
 			SELECT workspace_id, tenant_id, legal_entity_id, name, business_unit,
 			       billing_classification, billing_source, commercial_account_id, status,
-			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			       created_at, updated_at, created_by_principal_id, updated_by_principal_id,
+			       record_version
 			FROM workspaces WHERE workspace_id = $1 AND tenant_id = $2
 		`
 		return tx.QueryRow(ctx, query, workspaceID, tid).Scan(
 			&w.WorkspaceID, &w.TenantID, &w.LegalEntityID, &w.Name, &w.BusinessUnit,
 			&w.BillingClassification, &w.BillingSource, &w.CommercialAccountID, &w.Status,
 			&w.CreatedAt, &w.UpdatedAt, &w.CreatedByPrincipalID, &w.UpdatedByPrincipalID,
+			&w.RecordVersion,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -468,14 +487,16 @@ func (s *PgStore) UpdateWorkspace(ctx context.Context, workspaceID string, req d
 				billing_classification  = COALESCE($3, billing_classification),
 				billing_source          = COALESCE($4, billing_source),
 				commercial_account_id   = COALESCE($5, commercial_account_id),
+				record_version          = record_version + 1,
 				updated_at              = $6,
 				updated_by_principal_id = $7
 			WHERE workspace_id = $8 AND tenant_id = $9
 			RETURNING workspace_id, tenant_id, legal_entity_id, name, business_unit,
 			          billing_classification, billing_source, commercial_account_id, status,
-			          created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			          created_at, updated_at, created_by_principal_id, updated_by_principal_id,
+			          record_version
 		`
-		return tx.QueryRow(ctx, query,
+		if err := tx.QueryRow(ctx, query,
 			req.Name, req.BusinessUnit, req.BillingClassification,
 			req.BillingSource, req.CommercialAccountID,
 			time.Now().UTC(), req.ActorPrincipalID,
@@ -487,7 +508,11 @@ func (s *PgStore) UpdateWorkspace(ctx context.Context, workspaceID string, req d
 			&updated.CommercialAccountID, &updated.Status,
 			&updated.CreatedAt, &updated.UpdatedAt,
 			&updated.CreatedByPrincipalID, &updated.UpdatedByPrincipalID,
-		)
+			&updated.RecordVersion,
+		); err != nil {
+			return err
+		}
+		return s.enqueueFor(ctx, tx, &updated)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -532,17 +557,22 @@ func (s *PgStore) TransitionWorkspaceStatus(
 				FOR UPDATE
 			)
 			UPDATE workspaces w
-			SET status = $1, updated_at = $2, updated_by_principal_id = $3
+			SET status = $1::text, updated_at = $2, updated_by_principal_id = $3,
+			    record_version = CASE WHEN prev.status::text = $1::text
+			                          THEN w.record_version ELSE w.record_version + 1 END
 			FROM prev
 			WHERE w.workspace_id = prev.workspace_id
 			  AND prev.status = ANY($5::text[])
-			RETURNING prev.status
+			RETURNING prev.status, w.record_version, w.legal_entity_id
 		`
+		at := time.Now().UTC()
+		var version int64
+		var legalEntityID *string
 		row := tx.QueryRow(ctx, query,
-			string(newStatus), time.Now().UTC(), actorID,
+			string(newStatus), at, actorID,
 			workspaceID, priors, tid,
 		)
-		if err := row.Scan(&previous); err != nil {
+		if err := row.Scan(&previous, &version, &legalEntityID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				rowsAffected = 0
 				return nil // caller distinguishes via rowsAffected
@@ -550,7 +580,18 @@ func (s *PgStore) TransitionWorkspaceStatus(
 			return err
 		}
 		rowsAffected = 1
-		return nil
+		if previous == string(newStatus) {
+			return nil // idempotent re-apply: no version, no event
+		}
+		le := ""
+		if legalEntityID != nil {
+			le = *legalEntityID
+		}
+		return s.enqueueFor(ctx, tx, events.StatusChange{
+			TenantID: tid, ObjectID: workspaceID, LegalEntityID: le,
+			Previous: previous, New: string(newStatus),
+			RecordVersion: version, ActorID: actorID, At: at,
+		})
 	})
 	if err != nil {
 		return 0, "", err
@@ -567,7 +608,8 @@ func (s *PgStore) ListWorkspacesByTenant(ctx context.Context, tenantID string) (
 		query := `
 			SELECT workspace_id, tenant_id, legal_entity_id, name, business_unit,
 			       billing_classification, billing_source, commercial_account_id, status,
-			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			       created_at, updated_at, created_by_principal_id, updated_by_principal_id,
+			       record_version
 			FROM workspaces WHERE tenant_id = $1
 		`
 		rows, err := tx.Query(ctx, query, tenantID)
@@ -582,6 +624,7 @@ func (s *PgStore) ListWorkspacesByTenant(ctx context.Context, tenantID string) (
 				&w.WorkspaceID, &w.TenantID, &w.LegalEntityID, &w.Name, &w.BusinessUnit,
 				&w.BillingClassification, &w.BillingSource, &w.CommercialAccountID, &w.Status,
 				&w.CreatedAt, &w.UpdatedAt, &w.CreatedByPrincipalID, &w.UpdatedByPrincipalID,
+				&w.RecordVersion,
 			); err != nil {
 				return err
 			}
@@ -626,7 +669,7 @@ func (s *PgStore) UpdateEntity(ctx context.Context, legalEntityID string, req do
 			          created_by_principal_id, updated_by_principal_id
 		`
 		now := time.Now().UTC()
-		return tx.QueryRow(ctx, query,
+		if err := tx.QueryRow(ctx, query,
 			req.LegalName, req.TradingName, req.DefaultCurrencyCode,
 			now, req.ActorPrincipalID,
 			legalEntityID, tid,
@@ -638,7 +681,10 @@ func (s *PgStore) UpdateEntity(ctx context.Context, legalEntityID string, req do
 			&updated.ParentLegalEntityID, &updated.EntityStatus, &updated.PrimaryJurisdictionID,
 			&updated.DataResidencyPolicyID, &updated.RecordVersion, &updated.CreatedAt, &updated.UpdatedAt,
 			&updated.CreatedByPrincipalID, &updated.UpdatedByPrincipalID,
-		)
+		); err != nil {
+			return err
+		}
+		return s.enqueueFor(ctx, tx, &updated)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -673,17 +719,34 @@ func (s *PgStore) TransitionEntityStatus(
 	var tenantID string
 
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		// The CTE reads the prior status under FOR UPDATE, as the workspace
+		// transition does, so the event can name what the entity moved away
+		// from (it used to send previous_status ""). record_version is bumped:
+		// a status change is a material change an expected_version must see.
 		query := `
-			UPDATE legal_entities
-			SET entity_status = $1, updated_at = $2, updated_by_principal_id = $3
-			WHERE legal_entity_id = $4 AND entity_status = ANY($5::text[]) AND tenant_id = $6
-			RETURNING tenant_id
+			WITH prev AS (
+				SELECT legal_entity_id, entity_status
+				FROM legal_entities
+				WHERE legal_entity_id = $4 AND tenant_id = $6
+				FOR UPDATE
+			)
+			UPDATE legal_entities e
+			SET entity_status = $1::text, updated_at = $2, updated_by_principal_id = $3,
+			    record_version = CASE WHEN prev.entity_status::text = $1::text
+			                          THEN e.record_version ELSE e.record_version + 1 END
+			FROM prev
+			WHERE e.legal_entity_id = prev.legal_entity_id
+			  AND prev.entity_status = ANY($5::text[])
+			RETURNING e.tenant_id, prev.entity_status, e.record_version
 		`
+		at := time.Now().UTC()
+		var previous string
+		var version int64
 		row := tx.QueryRow(ctx, query,
-			string(newStatus), time.Now().UTC(), actorID,
+			string(newStatus), at, actorID,
 			legalEntityID, priors, tid,
 		)
-		if err := row.Scan(&tenantID); err != nil {
+		if err := row.Scan(&tenantID, &previous, &version); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				rowsAffected = 0
 				tenantID = ""
@@ -692,7 +755,15 @@ func (s *PgStore) TransitionEntityStatus(
 			return err
 		}
 		rowsAffected = 1
-		return nil
+		if previous == string(newStatus) {
+			// An idempotent re-apply: nothing changed, so no version and no event.
+			return nil
+		}
+		return s.enqueueFor(ctx, tx, events.StatusChange{
+			TenantID: tenantID, ObjectID: legalEntityID, LegalEntityID: legalEntityID,
+			Previous: previous, New: string(newStatus),
+			RecordVersion: version, ActorID: actorID, At: at,
+		})
 	})
 	return rowsAffected, tenantID, err
 }
@@ -721,6 +792,9 @@ func (s *PgStore) GetEntityStatus(ctx context.Context, legalEntityID string) (*d
 func (s *PgStore) CreateHierarchy(ctx context.Context, h *domain.EntityHierarchy) error {
 	s.log.Debug("store.CreateHierarchy", zap.String("hierarchy_id", h.HierarchyID))
 	tid := tenantFromCtxOrFallback(ctx, h.TenantID)
+	if h.RecordVersion < 1 {
+		h.RecordVersion = 1
+	}
 
 	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
@@ -731,27 +805,45 @@ func (s *PgStore) CreateHierarchy(ctx context.Context, h *domain.EntityHierarchy
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		`
 		now := time.Now().UTC()
-		_, err := tx.Exec(ctx, query,
+		if _, err := tx.Exec(ctx, query,
 			h.HierarchyID, h.TenantID, h.ParentLegalEntityID, h.ChildLegalEntityID,
 			string(h.RelationshipType), h.EffectiveFrom, h.EffectiveTo,
 			h.CreatedAt, now, h.CreatedByPrincipalID, h.CreatedByPrincipalID,
-		)
-		return err
+		); err != nil {
+			return err
+		}
+		return s.enqueueFor(ctx, tx, h)
 	})
 }
 
+// EndDateHierarchy closes a hierarchy relationship. Zero rows used to be
+// reported as success (204, plus an event) whether the id did not exist or
+// was already closed; both are now refused.
 func (s *PgStore) EndDateHierarchy(ctx context.Context, hierarchyID string, endDate time.Time, actorID, correlationID string) error {
 	s.log.Debug("store.EndDateHierarchy", zap.String("hierarchy_id", hierarchyID))
 	tid := domain.TenantFromContext(ctx) // must be set by middleware for mutating ops
 
 	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
-		query := `
+		var h domain.EntityHierarchy
+		err := tx.QueryRow(ctx, `
 			UPDATE entity_hierarchies
-			SET effective_to = $1, updated_at = $2, updated_by_principal_id = $3
+			SET effective_to = $1, updated_at = $2, updated_by_principal_id = $3,
+			    record_version = record_version + 1
 			WHERE hierarchy_id = $4 AND effective_to IS NULL AND tenant_id = $5
-		`
-		_, err := tx.Exec(ctx, query, endDate, time.Now().UTC(), actorID, hierarchyID, tid)
-		return err
+			RETURNING hierarchy_id, tenant_id, parent_legal_entity_id, child_legal_entity_id,
+			          relationship_type, effective_from, effective_to, created_at, updated_at,
+			          created_by_principal_id, updated_by_principal_id, record_version`,
+			endDate, time.Now().UTC(), actorID, hierarchyID, tid).Scan(
+			&h.HierarchyID, &h.TenantID, &h.ParentLegalEntityID, &h.ChildLegalEntityID,
+			&h.RelationshipType, &h.EffectiveFrom, &h.EffectiveTo, &h.CreatedAt, &h.UpdatedAt,
+			&h.CreatedByPrincipalID, &h.UpdatedByPrincipalID, &h.RecordVersion)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return rowMissingOrClosed(ctx, tx, "entity_hierarchies", "hierarchy_id", hierarchyID, tid)
+		}
+		if err != nil {
+			return err
+		}
+		return s.enqueueFor(ctx, tx, &h)
 	})
 }
 
@@ -764,7 +856,7 @@ func (s *PgStore) ListHierarchiesByEntity(ctx context.Context, legalEntityID str
 		query := `
 			SELECT hierarchy_id, tenant_id, parent_legal_entity_id, child_legal_entity_id,
 			       relationship_type, effective_from, effective_to, created_at, updated_at,
-			       created_by_principal_id, updated_by_principal_id
+			       created_by_principal_id, updated_by_principal_id, record_version
 			FROM entity_hierarchies
 			WHERE (parent_legal_entity_id = $1 OR child_legal_entity_id = $1) AND tenant_id = $2
 		`
@@ -779,7 +871,7 @@ func (s *PgStore) ListHierarchiesByEntity(ctx context.Context, legalEntityID str
 			if err := rows.Scan(
 				&h.HierarchyID, &h.TenantID, &h.ParentLegalEntityID, &h.ChildLegalEntityID,
 				&h.RelationshipType, &h.EffectiveFrom, &h.EffectiveTo, &h.CreatedAt, &h.UpdatedAt,
-				&h.CreatedByPrincipalID, &h.UpdatedByPrincipalID,
+				&h.CreatedByPrincipalID, &h.UpdatedByPrincipalID, &h.RecordVersion,
 			); err != nil {
 				return err
 			}
@@ -799,6 +891,9 @@ func (s *PgStore) ListHierarchiesByEntity(ctx context.Context, legalEntityID str
 func (s *PgStore) CreateJurisdictionAssignment(ctx context.Context, a *domain.EntityJurisdictionAssignment) error {
 	s.log.Debug("store.CreateJurisdictionAssignment", zap.String("assignment_id", a.AssignmentID))
 	tid := tenantFromCtxOrFallback(ctx, a.TenantID)
+	if a.RecordVersion < 1 {
+		a.RecordVersion = 1
+	}
 
 	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
@@ -809,12 +904,14 @@ func (s *PgStore) CreateJurisdictionAssignment(ctx context.Context, a *domain.En
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		`
 		now := time.Now().UTC()
-		_, err := tx.Exec(ctx, query,
+		if _, err := tx.Exec(ctx, query,
 			a.AssignmentID, a.TenantID, a.LegalEntityID, a.JurisdictionID, string(a.AssignmentType),
 			a.EffectiveFrom, a.EffectiveTo, a.SourceBasis,
 			a.CreatedAt, now, a.CreatedByPrincipalID, a.CreatedByPrincipalID,
-		)
-		return err
+		); err != nil {
+			return err
+		}
+		return s.enqueueFor(ctx, tx, a)
 	})
 }
 
@@ -827,7 +924,7 @@ func (s *PgStore) ListJurisdictionAssignments(ctx context.Context, legalEntityID
 		query := `
 			SELECT assignment_id, tenant_id, legal_entity_id, jurisdiction_id, assignment_type,
 			       effective_from, effective_to, source_basis, created_at, updated_at,
-			       created_by_principal_id, updated_by_principal_id
+			       created_by_principal_id, updated_by_principal_id, record_version
 			FROM entity_jurisdiction_assignments WHERE legal_entity_id = $1 AND tenant_id = $2
 		`
 		rows, err := tx.Query(ctx, query, legalEntityID, tid)
@@ -841,7 +938,7 @@ func (s *PgStore) ListJurisdictionAssignments(ctx context.Context, legalEntityID
 			if err := rows.Scan(
 				&a.AssignmentID, &a.TenantID, &a.LegalEntityID, &a.JurisdictionID, &a.AssignmentType,
 				&a.EffectiveFrom, &a.EffectiveTo, &a.SourceBasis, &a.CreatedAt, &a.UpdatedAt,
-				&a.CreatedByPrincipalID, &a.UpdatedByPrincipalID,
+				&a.CreatedByPrincipalID, &a.UpdatedByPrincipalID, &a.RecordVersion,
 			); err != nil {
 				return err
 			}
@@ -852,18 +949,33 @@ func (s *PgStore) ListJurisdictionAssignments(ctx context.Context, legalEntityID
 	return results, err
 }
 
+// EndDateJurisdictionAssignment closes an assignment. As EndDateHierarchy,
+// zero rows is now refused rather than reported as success.
 func (s *PgStore) EndDateJurisdictionAssignment(ctx context.Context, assignmentID string, endDate time.Time, actorID, correlationID string) error {
 	s.log.Debug("store.EndDateJurisdictionAssignment", zap.String("assignment_id", assignmentID))
 	tid := domain.TenantFromContext(ctx)
 
 	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
-		query := `
+		var a domain.EntityJurisdictionAssignment
+		err := tx.QueryRow(ctx, `
 			UPDATE entity_jurisdiction_assignments
-			SET effective_to = $1, updated_at = $2, updated_by_principal_id = $3
+			SET effective_to = $1, updated_at = $2, updated_by_principal_id = $3,
+			    record_version = record_version + 1
 			WHERE assignment_id = $4 AND effective_to IS NULL AND tenant_id = $5
-		`
-		_, err := tx.Exec(ctx, query, endDate, time.Now().UTC(), actorID, assignmentID, tid)
-		return err
+			RETURNING assignment_id, tenant_id, legal_entity_id, jurisdiction_id, assignment_type,
+			          effective_from, effective_to, source_basis, created_at, updated_at,
+			          created_by_principal_id, updated_by_principal_id, record_version`,
+			endDate, time.Now().UTC(), actorID, assignmentID, tid).Scan(
+			&a.AssignmentID, &a.TenantID, &a.LegalEntityID, &a.JurisdictionID, &a.AssignmentType,
+			&a.EffectiveFrom, &a.EffectiveTo, &a.SourceBasis, &a.CreatedAt, &a.UpdatedAt,
+			&a.CreatedByPrincipalID, &a.UpdatedByPrincipalID, &a.RecordVersion)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return rowMissingOrClosed(ctx, tx, "entity_jurisdiction_assignments", "assignment_id", assignmentID, tid)
+		}
+		if err != nil {
+			return err
+		}
+		return s.enqueueFor(ctx, tx, &a)
 	})
 }
 
@@ -1085,4 +1197,20 @@ func (s *PgStore) TransitionTaxIdentityBundleStatus(ctx context.Context, bundleI
 		_, err := tx.Exec(ctx, query, string(newStatus), time.Now().UTC(), actorID, bundleID, tid)
 		return err
 	})
+}
+
+// rowMissingOrClosed explains an end-date that matched no open row: the row
+// does not exist in this tenant (not found), or it is already closed (state
+// conflict). The table and column names are compile-time constants.
+func rowMissingOrClosed(ctx context.Context, tx pgx.Tx, table, idColumn, id, tenantID string) error {
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM "+table+" WHERE "+idColumn+" = $1 AND tenant_id = $2)",
+		id, tenantID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return registry.ErrNotFound
+	}
+	return fmt.Errorf("%w: %s is already end-dated", registry.ErrStateConflict, id)
 }

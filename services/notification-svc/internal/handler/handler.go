@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/mail"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -47,6 +49,74 @@ type Store interface {
 
 	// Reconciliation: find notifications stuck in UNKNOWN (in flight) for too long
 	FindStuckInFlight(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error)
+
+	// ── NCD-02: Suppression ───────────────────────────────────────────────────
+	CreateSuppression(ctx context.Context, s *domain.Suppression) error
+	GetSuppression(ctx context.Context, id string) (*domain.Suppression, error)
+	ListSuppressions(ctx context.Context, f domain.SuppressionFilter) ([]domain.Suppression, error)
+	DeleteSuppression(ctx context.Context, id string) error
+
+	// ── NCD-02: Preference ────────────────────────────────────────────────────
+	UpsertPreference(ctx context.Context, p *domain.Preference) error
+	GetPreference(ctx context.Context, tenantID, principalID, channel string) (*domain.Preference, error)
+	ListPreferences(ctx context.Context, f domain.PreferenceFilter) ([]domain.Preference, error)
+	DeletePreference(ctx context.Context, tenantID, principalID, channel string) error
+
+	// ── NCD-02: Channel Decision ──────────────────────────────────────────────
+	// EvaluateChannel checks suppression, preference, quiet hours, and permission.
+	// Returns the decision result and records it for audit.
+	EvaluateChannel(ctx context.Context, tenantID, principalID, channel, permissionGrant string) (*domain.ChannelDecisionResult, error)
+	ListChannelDecisions(ctx context.Context, f domain.ChannelDecisionFilter) ([]domain.ChannelDecision, error)
+
+	// ── NCD-04: Bounce ─────────────────────────────────────────────────────────
+	CreateBounceEvent(ctx context.Context, b *domain.BounceEvent) error
+	GetBounceEvent(ctx context.Context, id string) (*domain.BounceEvent, error)
+	ListBounceEvents(ctx context.Context, f domain.BounceEventFilter) ([]domain.BounceEvent, error)
+
+	// ── NCD-04: Complaint ──────────────────────────────────────────────────────
+	CreateComplaintEvent(ctx context.Context, c *domain.ComplaintEvent) error
+	GetComplaintEvent(ctx context.Context, id string) (*domain.ComplaintEvent, error)
+	ListComplaintEvents(ctx context.Context, f domain.ComplaintEventFilter) ([]domain.ComplaintEvent, error)
+
+	// ── NCD-04: Channel Reputation ─────────────────────────────────────────────
+	UpsertChannelReputation(ctx context.Context, r *domain.ChannelReputation) error
+	ListChannelReputations(ctx context.Context, f domain.ChannelReputationFilter) ([]domain.ChannelReputation, error)
+
+	// ── NCD-01: Communication Intent ──────────────────────────────────────────
+	CreateCommunicationIntent(ctx context.Context, i *domain.CommunicationIntent) error
+	GetCommunicationIntent(ctx context.Context, id string) (*domain.CommunicationIntent, error)
+	ListCommunicationIntents(ctx context.Context, f domain.CommunicationIntentFilter) ([]domain.CommunicationIntent, error)
+	UpdateCommunicationIntent(ctx context.Context, i *domain.CommunicationIntent) error
+	DeleteCommunicationIntent(ctx context.Context, id string) error
+
+	// ── NCD-01: Template ──────────────────────────────────────────────────────
+	CreateTemplate(ctx context.Context, t *domain.Template) error
+	GetTemplate(ctx context.Context, id string) (*domain.Template, error)
+	GetTemplateByIntent(ctx context.Context, intentID, locale string, version int) (*domain.Template, error)
+	GetEffectiveTemplate(ctx context.Context, tenantID, intentID, locale string, at time.Time) (*domain.Template, error)
+	ListTemplates(ctx context.Context, f domain.TemplateFilter) ([]domain.Template, error)
+	UpdateTemplate(ctx context.Context, t *domain.Template) error
+	DeleteTemplate(ctx context.Context, id string) error
+
+	// ── NCD-01: Template Approval (SoD) ───────────────────────────────────────
+	CreateTemplateApproval(ctx context.Context, a *domain.TemplateApproval) error
+	GetTemplateApproval(ctx context.Context, id string) (*domain.TemplateApproval, error)
+	ListTemplateApprovals(ctx context.Context, f domain.TemplateApprovalFilter) ([]domain.TemplateApproval, error)
+	DecideTemplateApproval(ctx context.Context, approvalID, approverID, status, reason string) error
+
+	// ── NCD-01: Template Render/Preview ───────────────────────────────────────
+	CreateTemplateRender(ctx context.Context, r *domain.TemplateRender) error
+	GetTemplateRender(ctx context.Context, id string) (*domain.TemplateRender, error)
+	ListTemplateRenders(ctx context.Context, templateID string, limit, offset int) ([]domain.TemplateRender, error)
+
+	// ── NCD-05: Regulated Notice & Acknowledgment ─────────────────────────────
+	CreateRegulatedNotice(ctx context.Context, n *domain.RegulatedNotice) error
+	GetRegulatedNotice(ctx context.Context, id string) (*domain.RegulatedNotice, error)
+	ListRegulatedNotices(ctx context.Context, f domain.RegulatedNoticeFilter) ([]domain.RegulatedNotice, error)
+	UpdateRegulatedNotice(ctx context.Context, n *domain.RegulatedNotice) error
+	CreateAcknowledgmentChainStep(ctx context.Context, step *domain.AcknowledgmentChainStep) error
+	GetAcknowledgmentChain(ctx context.Context, regulatedNoticeID string) ([]domain.AcknowledgmentChainStep, error)
+	AcknowledgeRegulatedNotice(ctx context.Context, req *domain.AcknowledgeRequest, actorID string) error
 }
 
 // RecipientResolver turns a principal into the contact endpoint a message is
@@ -174,6 +244,90 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 		r.Get("/{id}", h.GetNotification)
 		r.Post("/{id}/read", h.MarkRead)
+	})
+
+	// ── NCD-02: Suppression ───────────────────────────────────────────────────
+	r.Route("/v1/suppressions", func(r chi.Router) {
+		r.Post("/", h.CreateSuppression)
+		r.Get("/", h.ListSuppressions)
+		r.Get("/{id}", h.GetSuppression)
+		r.Delete("/{id}", h.DeleteSuppression)
+	})
+
+	// ── NCD-02: Preference ────────────────────────────────────────────────────
+	r.Route("/v1/preferences", func(r chi.Router) {
+		r.Post("/", h.UpsertPreference)
+		r.Get("/", h.ListPreferences)
+		r.Get("/{principal_id}/{channel}", h.GetPreference)
+		r.Delete("/{principal_id}/{channel}", h.DeletePreference)
+	})
+
+	// ── NCD-02: Channel Decision ──────────────────────────────────────────────
+	r.Route("/v1/channel-decision", func(r chi.Router) {
+		r.Post("/evaluate", h.EvaluateChannel)
+		r.Get("/", h.ListChannelDecisions)
+	})
+
+	// ── NCD-04: Bounce ─────────────────────────────────────────────────────────
+	r.Route("/v1/bounces", func(r chi.Router) {
+		r.Post("/", h.CreateBounceEvent)
+		r.Get("/", h.ListBounceEvents)
+		r.Get("/{id}", h.GetBounceEvent)
+	})
+
+	// ── NCD-04: Complaint ──────────────────────────────────────────────────────
+	r.Route("/v1/complaints", func(r chi.Router) {
+		r.Post("/", h.CreateComplaintEvent)
+		r.Get("/", h.ListComplaintEvents)
+		r.Get("/{id}", h.GetComplaintEvent)
+	})
+
+	// ── NCD-04: Channel Reputation ─────────────────────────────────────────────
+	r.Route("/v1/reputation", func(r chi.Router) {
+		r.Post("/", h.UpsertChannelReputation)
+		r.Get("/", h.ListChannelReputations)
+	})
+
+	// ── NCD-01: Communication Intent ───────────────────────────────────────────
+	r.Route("/v1/communication-intents", func(r chi.Router) {
+		r.Post("/", h.CreateCommunicationIntent)
+		r.Get("/", h.ListCommunicationIntents)
+		r.Get("/{id}", h.GetCommunicationIntent)
+		r.Patch("/{id}", h.UpdateCommunicationIntent)
+		r.Delete("/{id}", h.DeleteCommunicationIntent)
+	})
+
+	// ── NCD-01: Template ───────────────────────────────────────────────────────
+	r.Route("/v1/templates", func(r chi.Router) {
+		r.Post("/", h.CreateTemplate)
+		r.Get("/", h.ListTemplatesRegistry)
+		r.Get("/effective", h.GetEffectiveTemplate)
+		r.Post("/preview", h.RenderTemplatePreview)
+		r.Get("/{id}", h.GetTemplate)
+		r.Patch("/{id}", h.UpdateTemplate)
+		r.Delete("/{id}", h.DeleteTemplate)
+		r.Post("/{id}/validate", h.ValidateTemplate)
+		r.Post("/{id}/approve", h.RequestTemplateApproval)
+		r.Post("/{id}/publish", h.PublishTemplate)
+	})
+
+	// ── NCD-01: Template Approvals ─────────────────────────────────────────────
+	r.Route("/v1/template-approvals", func(r chi.Router) {
+		r.Get("/", h.ListTemplateApprovals)
+		r.Get("/{id}", h.GetTemplateApproval)
+		r.Post("/{id}/decide", h.DecideTemplateApproval)
+	})
+
+	// ── NCD-05: Regulated Notice & Acknowledgment ─────────────────────────────
+	r.Route("/v1/regulated-notices", func(r chi.Router) {
+		r.Post("/", h.CreateRegulatedNotice)
+		r.Get("/", h.ListRegulatedNotices)
+		r.Get("/{id}", h.GetRegulatedNotice)
+		r.Patch("/{id}", h.UpdateRegulatedNotice)
+	})
+	r.Route("/v1/acknowledgements", func(r chi.Router) {
+		r.Post("/", h.AcknowledgeRegulatedNotice)
+		r.Get("/", h.ListAcknowledgements)
 	})
 }
 
@@ -457,9 +611,28 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		svcmiddleware.WithTenant(context.WithoutCancel(r.Context()), tenantID), 10*time.Second)
 	defer cancelOutcome()
 
+	// Check if the failure was a post-submit timeout (context deadline exceeded).
+	// Per ZS-SVC-Y-001 §3.4: "Timeout after submit becomes UNKNOWN, not FAILED;
+	// reconcile before re-attempting". We detect this by checking if the error
+	// is a context deadline exceeded, which means the provider call timed out
+	// but we don't know if it actually accepted the message.
+	isTimeout := false
+	if !outcome.Delivered && outcome.Retryable && outcome.Err != nil {
+		// The deliverer preserves the original error in outcome.Err
+		if errors.Is(outcome.Err, context.DeadlineExceeded) {
+			isTimeout = true
+		}
+		// Also check for timeout via the Timeout() method (for net.Error)
+		var timeoutErr interface{ Timeout() bool }
+		if !isTimeout && errors.As(outcome.Err, &timeoutErr) && timeoutErr.Timeout() {
+			isTimeout = true
+		}
+	}
+
 	// If the provider accepted the message, transition to PROVIDER_ACCEPTED
-	// (not SENT). If the outcome is a failure worth re-attempting, stay PENDING
-	// with a schedule. If it's a settled failure, conclude as FAILED.
+	// (not SENT). If the outcome is a post-submit timeout, mark as UNKNOWN.
+	// If the outcome is a failure worth re-attempting, stay PENDING with a
+	// schedule. If it's a settled failure, conclude as FAILED.
 	if outcome.Delivered {
 		// Provider accepted — mark as PROVIDER_ACCEPTED (not SENT).
 		// The reconciliation worker will later confirm delivery and advance
@@ -476,6 +649,26 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		if err := h.store.UpdateAttempt(outcomeCtx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &attemptedAt); err != nil {
 			h.log.Error("failed to update attempt record", zap.Error(err))
 		}
+	} else if isTimeout {
+		// Post-submit timeout: mark as UNKNOWN per §3.4.
+		// Do not schedule a retry; the reconciliation worker will check
+		// attempt records and advance to PROVIDER_ACCEPTED/DELIVERED/FAILED.
+		notification.Status = domain.StatusUnknown
+		notification.FailureReason = outcome.Reason
+		notification.DeliveryAttempts = 1
+		notification.LastAttemptAt = &attemptedAt
+		// NextAttemptAt remains nil — this is "in flight" (UNKNOWN)
+
+		// Update attempt record to UNKNOWN
+		attempt.Status = domain.AttemptStatusUnknown
+		// ConcludedAt stays nil — not concluded, awaiting reconciliation
+		if err := h.store.UpdateAttempt(outcomeCtx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, nil); err != nil {
+			h.log.Error("failed to update attempt record", zap.Error(err))
+		}
+
+		h.log.Warn("delivery timed out after submit, marked UNKNOWN for reconciliation",
+			zap.String("notification_id", notification.NotificationID),
+			zap.String("reason", outcome.Reason))
 	} else if outcome.Retryable {
 		// Failure worth re-attempting: schedule a retry, stay PENDING
 		if next, ok := h.retryPolicy.NextAttempt(attemptedAt, 1); ok {
@@ -820,6 +1013,1727 @@ func (h *Handler) UnreadCount(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ── NCD-02: Suppression ───────────────────────────────────────────────────────
+
+// CreateSuppression records a new suppression for a principal/channel.
+// POST /v1/suppressions
+func (h *Handler) CreateSuppression(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		PrincipalID string             `json:"principal_id"`
+		Channel     string             `json:"channel"`
+		Reason      domain.SuppressionReason `json:"reason"`
+		ExpiresAt   *time.Time         `json:"expires_at,omitempty"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.PrincipalID == "" || req.Channel == "" || req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "principal_id, channel, reason are required")
+		return
+	}
+
+	// Only the recipient themselves or an admin with NOTIFICATION_VIEW on the entity can create a suppression
+	// For now, allow any authenticated principal to suppress themselves
+	if req.PrincipalID != principalID {
+		// Would need NOTIFICATION_VIEW grant to suppress another principal
+		writeError(w, http.StatusForbidden, "forbidden", "cannot create suppression for another principal without NOTIFICATION_VIEW")
+		return
+	}
+
+	sup := &domain.Suppression{
+		SuppressionID: uuid.NewString(),
+		TenantID:      tenantID,
+		PrincipalID:   req.PrincipalID,
+		Channel:       req.Channel,
+		Reason:        req.Reason,
+		CreatedBy:     principalID,
+		CreatedAt:     time.Now().UTC(),
+		ExpiresAt:     req.ExpiresAt,
+	}
+
+	if err := h.store.CreateSuppression(r.Context(), sup); err != nil {
+		h.log.Error("failed to create suppression", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, sup)
+}
+
+// GetSuppression returns a suppression by id.
+// GET /v1/suppressions/{id}
+func (h *Handler) GetSuppression(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	sup, err := h.store.GetSuppression(r.Context(), id)
+	if errors.Is(err, domain.ErrSuppressionNotFound) {
+		writeError(w, http.StatusNotFound, "suppression_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get suppression", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, sup)
+}
+
+// ListSuppressions returns suppressions for the tenant.
+// GET /v1/suppressions
+func (h *Handler) ListSuppressions(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	filter := domain.SuppressionFilter{
+		TenantID:    tenantID,
+		PrincipalID: r.URL.Query().Get("principal_id"),
+		Channel:     r.URL.Query().Get("channel"),
+		Reason:      r.URL.Query().Get("reason"),
+		ActiveOnly:  r.URL.Query().Get("active_only") == "true",
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListSuppressions(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list suppressions", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.Suppression{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// DeleteSuppression removes a suppression.
+// DELETE /v1/suppressions/{id}
+func (h *Handler) DeleteSuppression(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	if err := h.store.DeleteSuppression(r.Context(), id); err != nil {
+		if errors.Is(err, domain.ErrSuppressionNotFound) {
+			writeError(w, http.StatusNotFound, "suppression_not_found", "")
+			return
+		}
+		h.log.Error("failed to delete suppression", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ── NCD-02: Preference ────────────────────────────────────────────────────────
+
+// UpsertPreference creates or updates a preference.
+// POST /v1/preferences
+func (h *Handler) UpsertPreference(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.Preference
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.PrincipalID == "" || req.Channel == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "principal_id, channel are required")
+		return
+	}
+
+	// Only the recipient themselves can set their preferences
+	if req.PrincipalID != principalID {
+		writeError(w, http.StatusForbidden, "forbidden", "cannot set preference for another principal")
+		return
+	}
+
+	req.TenantID = tenantID
+	if req.PreferenceID == "" {
+		req.PreferenceID = uuid.NewString()
+	}
+	req.CreatedAt = time.Now().UTC()
+	req.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.UpsertPreference(r.Context(), &req); err != nil {
+		h.log.Error("failed to upsert preference", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, req)
+}
+
+// GetPreference returns a preference for a principal/channel.
+// GET /v1/preferences/{principal_id}/{channel}
+func (h *Handler) GetPreference(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	targetPrincipalID := chi.URLParam(r, "principal_id")
+	channel := chi.URLParam(r, "channel")
+
+	// Only the recipient themselves can read their preferences
+	if targetPrincipalID != principalID {
+		writeError(w, http.StatusForbidden, "forbidden", "cannot read preference for another principal")
+		return
+	}
+
+	pref, err := h.store.GetPreference(r.Context(), tenantID, targetPrincipalID, channel)
+	if errors.Is(err, domain.ErrPreferenceNotFound) {
+		writeError(w, http.StatusNotFound, "preference_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get preference", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, pref)
+}
+
+// ListPreferences returns preferences for the tenant.
+// GET /v1/preferences
+func (h *Handler) ListPreferences(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	filter := domain.PreferenceFilter{
+		TenantID:    tenantID,
+		PrincipalID: r.URL.Query().Get("principal_id"),
+		Channel:     r.URL.Query().Get("channel"),
+		EnabledOnly: r.URL.Query().Get("enabled_only") == "true",
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListPreferences(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list preferences", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.Preference{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// DeletePreference removes a preference.
+// DELETE /v1/preferences/{principal_id}/{channel}
+func (h *Handler) DeletePreference(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	targetPrincipalID := chi.URLParam(r, "principal_id")
+	channel := chi.URLParam(r, "channel")
+
+	// Only the recipient themselves can delete their preferences
+	if targetPrincipalID != principalID {
+		writeError(w, http.StatusForbidden, "forbidden", "cannot delete preference for another principal")
+		return
+	}
+
+	if err := h.store.DeletePreference(r.Context(), tenantID, targetPrincipalID, channel); err != nil {
+		if errors.Is(err, domain.ErrPreferenceNotFound) {
+			writeError(w, http.StatusNotFound, "preference_not_found", "")
+			return
+		}
+		h.log.Error("failed to delete preference", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ── NCD-02: Channel Decision ──────────────────────────────────────────────────
+
+// EvaluateChannel evaluates whether a channel is allowed for a principal.
+// POST /v1/channel-decision/evaluate
+func (h *Handler) EvaluateChannel(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		PrincipalID     string `json:"principal_id"`
+		Channel         string `json:"channel"`
+		PermissionGrant string `json:"permission_grant,omitempty"` // legal basis reference
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.PrincipalID == "" || req.Channel == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "principal_id, channel are required")
+		return
+	}
+
+	// Only the recipient themselves or an admin can evaluate
+	if req.PrincipalID != principalID {
+		writeError(w, http.StatusForbidden, "forbidden", "cannot evaluate channel for another principal without NOTIFICATION_VIEW")
+		return
+	}
+
+	result, err := h.store.EvaluateChannel(r.Context(), tenantID, req.PrincipalID, req.Channel, req.PermissionGrant)
+	if err != nil {
+		h.log.Error("failed to evaluate channel", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// ListChannelDecisions returns the channel decision audit log.
+// GET /v1/channel-decision
+func (h *Handler) ListChannelDecisions(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	filter := domain.ChannelDecisionFilter{
+		TenantID:    tenantID,
+		PrincipalID: r.URL.Query().Get("principal_id"),
+		Channel:     r.URL.Query().Get("channel"),
+		Decision:    r.URL.Query().Get("decision"),
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListChannelDecisions(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list channel decisions", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.ChannelDecision{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// ── NCD-04: Bounce ────────────────────────────────────────────────────────────
+
+// CreateBounceEvent records a bounce event from a provider webhook.
+// POST /v1/bounces
+func (h *Handler) CreateBounceEvent(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.BounceEvent
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.NotificationID == "" || req.Provider == "" || req.BounceType == "" || req.RecipientAddress == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "notification_id, provider, bounce_type, recipient_address are required")
+		return
+	}
+
+	req.TenantID = tenantID
+	if req.BounceID == "" {
+		req.BounceID = uuid.NewString()
+	}
+	if req.ReceivedAt.IsZero() {
+		req.ReceivedAt = time.Now().UTC()
+	}
+
+	if err := h.store.CreateBounceEvent(r.Context(), &req); err != nil {
+		h.log.Error("failed to create bounce event", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// Auto-create suppression for hard bounces
+	if req.BounceType == domain.BounceTypeHard {
+		sup := &domain.Suppression{
+			SuppressionID: uuid.NewString(),
+			TenantID:      tenantID,
+			PrincipalID:   "", // Would need to resolve from address
+			Channel:       domain.ChannelEmail,
+			Reason:        domain.SuppressionReasonBounce,
+			CreatedBy:     "system",
+			CreatedAt:     time.Now().UTC(),
+		}
+		// Note: In production, you'd resolve the principal from the address
+		// For now we just record the bounce
+		_ = sup
+	}
+
+	writeJSON(w, http.StatusCreated, req)
+}
+
+// GetBounceEvent returns a bounce event by id.
+// GET /v1/bounces/{id}
+func (h *Handler) GetBounceEvent(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	b, err := h.store.GetBounceEvent(r.Context(), id)
+	if errors.Is(err, domain.ErrBounceNotFound) {
+		writeError(w, http.StatusNotFound, "bounce_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get bounce event", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, b)
+}
+
+// ListBounceEvents returns bounce events for the tenant.
+// GET /v1/bounces
+func (h *Handler) ListBounceEvents(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	filter := domain.BounceEventFilter{
+		TenantID:       tenantID,
+		NotificationID: r.URL.Query().Get("notification_id"),
+		RecipientAddr:  r.URL.Query().Get("recipient_address"),
+		BounceType:     r.URL.Query().Get("bounce_type"),
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListBounceEvents(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list bounce events", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.BounceEvent{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// ── NCD-04: Complaint ─────────────────────────────────────────────────────────
+
+// CreateComplaintEvent records a complaint event from a provider feedback loop.
+// POST /v1/complaints
+func (h *Handler) CreateComplaintEvent(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.ComplaintEvent
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.Provider == "" || req.ComplaintType == "" || req.RecipientAddress == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "provider, complaint_type, recipient_address are required")
+		return
+	}
+
+	req.TenantID = tenantID
+	if req.ComplaintID == "" {
+		req.ComplaintID = uuid.NewString()
+	}
+	if req.ReceivedAt.IsZero() {
+		req.ReceivedAt = time.Now().UTC()
+	}
+
+	if err := h.store.CreateComplaintEvent(r.Context(), &req); err != nil {
+		h.log.Error("failed to create complaint event", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, req)
+}
+
+// GetComplaintEvent returns a complaint event by id.
+// GET /v1/complaints/{id}
+func (h *Handler) GetComplaintEvent(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	c, err := h.store.GetComplaintEvent(r.Context(), id)
+	if errors.Is(err, domain.ErrComplaintNotFound) {
+		writeError(w, http.StatusNotFound, "complaint_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get complaint event", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, c)
+}
+
+// ListComplaintEvents returns complaint events for the tenant.
+// GET /v1/complaints
+func (h *Handler) ListComplaintEvents(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	filter := domain.ComplaintEventFilter{
+		TenantID:       tenantID,
+		NotificationID: r.URL.Query().Get("notification_id"),
+		RecipientAddr:  r.URL.Query().Get("recipient_address"),
+		ComplaintType:  r.URL.Query().Get("complaint_type"),
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListComplaintEvents(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list complaint events", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.ComplaintEvent{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// ── NCD-04: Channel Reputation ────────────────────────────────────────────────
+
+// UpsertChannelReputation creates or updates a channel reputation window.
+// POST /v1/reputation
+func (h *Handler) UpsertChannelReputation(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.ChannelReputation
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.Channel == "" || req.Provider == "" || req.WindowStart.IsZero() || req.WindowEnd.IsZero() {
+		writeError(w, http.StatusBadRequest, "missing_fields", "channel, provider, window_start, window_end are required")
+		return
+	}
+
+	req.TenantID = tenantID
+	if req.ReputationID == "" {
+		req.ReputationID = uuid.NewString()
+	}
+	req.CreatedAt = time.Now().UTC()
+	req.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.UpsertChannelReputation(r.Context(), &req); err != nil {
+		h.log.Error("failed to upsert channel reputation", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, req)
+}
+
+// ListChannelReputations returns channel reputation for the tenant.
+// GET /v1/reputation
+func (h *Handler) ListChannelReputations(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var since, until time.Time
+	if s := r.URL.Query().Get("since"); s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			since = t
+		}
+	}
+	if u := r.URL.Query().Get("until"); u != "" {
+		if t, err := time.Parse(time.RFC3339, u); err == nil {
+			until = t
+		}
+	}
+
+	filter := domain.ChannelReputationFilter{
+		TenantID: tenantID,
+		Channel:  r.URL.Query().Get("channel"),
+		Provider: r.URL.Query().Get("provider"),
+		Since:    since,
+		Until:    until,
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListChannelReputations(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list channel reputations", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.ChannelReputation{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// ── NCD-01: Communication Intent ──────────────────────────────────────────────
+
+// CreateCommunicationIntent creates a new communication intent.
+// POST /v1/communication-intents
+func (h *Handler) CreateCommunicationIntent(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.CommunicationIntent
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.Name == "" || req.Category == "" || req.Channels == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "name, category, channels are required")
+		return
+	}
+
+	req.TenantID = tenantID
+	req.LegalEntityID = r.URL.Query().Get("legal_entity_id")
+	if req.LegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id query parameter is required")
+		return
+	}
+	req.IntentID = uuid.NewString()
+	req.CreatedBy = principalID
+	req.CreatedAt = time.Now().UTC()
+	req.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.CreateCommunicationIntent(r.Context(), &req); err != nil {
+		h.log.Error("failed to create communication intent", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, req)
+}
+
+// GetCommunicationIntent returns a communication intent by id.
+// GET /v1/communication-intents/{id}
+func (h *Handler) GetCommunicationIntent(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	intent, err := h.store.GetCommunicationIntent(r.Context(), id)
+	if errors.Is(err, domain.ErrIntentNotFound) {
+		writeError(w, http.StatusNotFound, "intent_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get communication intent", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, intent)
+}
+
+// ListCommunicationIntents returns communication intents for the tenant.
+// GET /v1/communication-intents
+func (h *Handler) ListCommunicationIntents(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	filter := domain.CommunicationIntentFilter{
+		TenantID:      tenantID,
+		LegalEntityID: r.URL.Query().Get("legal_entity_id"),
+		Name:          r.URL.Query().Get("name"),
+		Category:      r.URL.Query().Get("category"),
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListCommunicationIntents(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list communication intents", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.CommunicationIntent{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// UpdateCommunicationIntent updates a communication intent.
+// PATCH /v1/communication-intents/{id}
+func (h *Handler) UpdateCommunicationIntent(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	var req domain.CommunicationIntent
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	req.TenantID = tenantID
+	req.IntentID = id
+	req.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.UpdateCommunicationIntent(r.Context(), &req); err != nil {
+		h.log.Error("failed to update communication intent", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, req)
+}
+
+// DeleteCommunicationIntent deletes a communication intent.
+// DELETE /v1/communication-intents/{id}
+func (h *Handler) DeleteCommunicationIntent(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	if err := h.store.DeleteCommunicationIntent(r.Context(), id); err != nil {
+		h.log.Error("failed to delete communication intent", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ── NCD-01: Template ──────────────────────────────────────────────────────────
+
+// CreateTemplate creates a new template version (draft).
+// POST /v1/templates
+func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.Template
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.IntentID == "" || req.SubjectTemplate == "" || req.BodyTemplate == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "intent_id, subject_template, body_template are required")
+		return
+	}
+
+	req.TenantID = tenantID
+	req.LegalEntityID = r.URL.Query().Get("legal_entity_id")
+	if req.LegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id query parameter is required")
+		return
+	}
+	if req.Locale == "" {
+		req.Locale = "en"
+	}
+	req.TemplateID = uuid.NewString()
+	req.Version = 1
+	req.Status = domain.TemplateStatusDraft
+	req.CreatedBy = principalID
+	req.CreatedAt = time.Now().UTC()
+	req.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.CreateTemplate(r.Context(), &req); err != nil {
+		h.log.Error("failed to create template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, req)
+}
+
+// GetTemplate returns a template by id.
+// GET /v1/templates/{id}
+func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	t, err := h.store.GetTemplate(r.Context(), id)
+	if errors.Is(err, domain.ErrTemplateNotFound) {
+		writeError(w, http.StatusNotFound, "template_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, t)
+}
+
+// ListTemplatesRegistry returns templates for the tenant (registry view, not the catalogue).
+// GET /v1/templates
+func (h *Handler) ListTemplatesRegistry(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	filter := domain.TemplateFilter{
+		TenantID:      tenantID,
+		LegalEntityID: r.URL.Query().Get("legal_entity_id"),
+		IntentID:      r.URL.Query().Get("intent_id"),
+		Locale:        r.URL.Query().Get("locale"),
+		Status:        r.URL.Query().Get("status"),
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListTemplates(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list templates", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.Template{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// GetEffectiveTemplate returns the effective template for an intent/locale at a given time.
+// GET /v1/templates/effective?intent_id=...&locale=...&at=...
+func (h *Handler) GetEffectiveTemplate(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	intentID := r.URL.Query().Get("intent_id")
+	locale := r.URL.Query().Get("locale")
+	atStr := r.URL.Query().Get("at")
+
+	if intentID == "" || locale == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "intent_id, locale are required")
+		return
+	}
+
+	var at time.Time
+	if atStr != "" {
+		if t, err := time.Parse(time.RFC3339, atStr); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_time", "at must be RFC3339 format")
+			return
+		} else {
+			at = t
+		}
+	} else {
+		at = time.Now().UTC()
+	}
+
+	t, err := h.store.GetEffectiveTemplate(r.Context(), tenantID, intentID, locale, at)
+	if errors.Is(err, domain.ErrTemplateNotFound) {
+		writeError(w, http.StatusNotFound, "template_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get effective template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, t)
+}
+
+// RenderTemplatePreview renders a template preview with provided variables.
+// POST /v1/templates/preview
+func (h *Handler) RenderTemplatePreview(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.TemplatePreviewRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if len(req.Variables) == 0 {
+		writeError(w, http.StatusBadRequest, "missing_fields", "variables are required")
+		return
+	}
+
+	// Resolve template: either by template_id, or by intent_id + locale + version
+	var t *domain.Template
+	var err error
+
+	if req.TemplateID != "" {
+		t, err = h.store.GetTemplate(r.Context(), req.TemplateID)
+	} else if req.IntentID != "" {
+		if req.Version > 0 {
+			t, err = h.store.GetTemplateByIntent(r.Context(), req.IntentID, req.Locale, req.Version)
+		} else {
+			at := time.Now().UTC()
+			t, err = h.store.GetEffectiveTemplate(r.Context(), tenantID, req.IntentID, req.Locale, at)
+		}
+	} else {
+		writeError(w, http.StatusBadRequest, "missing_fields", "template_id or intent_id is required")
+		return
+	}
+
+	if errors.Is(err, domain.ErrTemplateNotFound) {
+		writeError(w, http.StatusNotFound, "template_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to resolve template for preview", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// Render using the existing template engine
+	subject, body, err := templates.Render("custom", req.Variables)
+	_ = subject // custom template not in catalogue
+	_ = body
+	// For preview, we render the template's own subject/body templates
+	renderedSubject, err := renderTemplate(t.SubjectTemplate, req.Variables)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "render_failed", err.Error())
+		return
+	}
+	renderedBody, err := renderTemplate(t.BodyTemplate, req.Variables)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "render_failed", err.Error())
+		return
+	}
+
+	render := &domain.TemplateRender{
+		RenderID:        uuid.NewString(),
+		TemplateID:      t.TemplateID,
+		TenantID:        tenantID,
+		Variables:       req.Variables,
+		RenderedSubject: renderedSubject,
+		RenderedBody:    renderedBody,
+		CreatedBy:       principalID,
+		CreatedAt:       time.Now().UTC(),
+	}
+
+	if err := h.store.CreateTemplateRender(r.Context(), render); err != nil {
+		h.log.Error("failed to save template render", zap.Error(err))
+	}
+
+	resp := map[string]any{
+		"template_id":       t.TemplateID,
+		"rendered_subject":  renderedSubject,
+		"rendered_body":     renderedBody,
+		"missing_variables": findMissingVars(t.Variables, req.Variables),
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// UpdateTemplate updates a template (creates new version if published).
+// PATCH /v1/templates/{id}
+func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	var req domain.Template
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	req.TenantID = tenantID
+	req.TemplateID = id
+	req.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.UpdateTemplate(r.Context(), &req); err != nil {
+		h.log.Error("failed to update template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, req)
+}
+
+// DeleteTemplate deletes a template.
+// DELETE /v1/templates/{id}
+func (h *Handler) DeleteTemplate(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	if err := h.store.DeleteTemplate(r.Context(), id); err != nil {
+		h.log.Error("failed to delete template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ValidateTemplate validates a template's variables.
+// POST /v1/templates/{id}/validate
+func (h *Handler) ValidateTemplate(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	t, err := h.store.GetTemplate(r.Context(), id)
+	if errors.Is(err, domain.ErrTemplateNotFound) {
+		writeError(w, http.StatusNotFound, "template_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// Validation: check that required variables are present in body/subject
+	missing := findMissingVarsInTemplate(t.SubjectTemplate, t.BodyTemplate, t.Variables)
+	if len(missing) > 0 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"valid":              false,
+			"missing_variables":  missing,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"valid": true})
+}
+
+// RequestTemplateApproval requests approval for a template (SoD: creator cannot approve).
+// POST /v1/templates/{id}/approve
+func (h *Handler) RequestTemplateApproval(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	t, err := h.store.GetTemplate(r.Context(), id)
+	if errors.Is(err, domain.ErrTemplateNotFound) {
+		writeError(w, http.StatusNotFound, "template_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if t.Status != domain.TemplateStatusDraft {
+		writeError(w, http.StatusBadRequest, "invalid_status", "only draft templates can be submitted for approval")
+		return
+	}
+
+	approval := &domain.TemplateApproval{
+		ApprovalID:  uuid.NewString(),
+		TemplateID:  id,
+		TenantID:    tenantID,
+		RequestedBy: principalID,
+		Status:      "pending",
+		RequestedAt: time.Now().UTC(),
+	}
+
+	if err := h.store.CreateTemplateApproval(r.Context(), approval); err != nil {
+		h.log.Error("failed to create template approval", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// Update template status to pending_approval
+	t.Status = domain.TemplateStatusPendingApproval
+	t.UpdatedAt = time.Now().UTC()
+	if err := h.store.UpdateTemplate(r.Context(), t); err != nil {
+		h.log.Error("failed to update template status", zap.Error(err))
+	}
+
+	writeJSON(w, http.StatusCreated, approval)
+}
+
+// PublishTemplate publishes an approved template with effective dates.
+// POST /v1/templates/{id}/publish
+func (h *Handler) PublishTemplate(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	t, err := h.store.GetTemplate(r.Context(), id)
+	if errors.Is(err, domain.ErrTemplateNotFound) {
+		writeError(w, http.StatusNotFound, "template_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if t.Status != domain.TemplateStatusApproved {
+		writeError(w, http.StatusBadRequest, "invalid_status", "only approved templates can be published")
+		return
+	}
+
+	var req struct {
+		EffectiveFrom *time.Time `json:"effective_from,omitempty"`
+		EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	now := time.Now().UTC()
+	t.Status = domain.TemplateStatusPublished
+	t.PublishedAt = &now
+	t.EffectiveFrom = req.EffectiveFrom
+	t.EffectiveTo = req.EffectiveTo
+	t.UpdatedAt = now
+
+	if err := h.store.UpdateTemplate(r.Context(), t); err != nil {
+		h.log.Error("failed to publish template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, t)
+}
+
+// ── NCD-01: Template Approvals ────────────────────────────────────────────────
+
+// ListTemplateApprovals returns template approvals for the tenant.
+// GET /v1/template-approvals
+func (h *Handler) ListTemplateApprovals(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	filter := domain.TemplateApprovalFilter{
+		TenantID:   tenantID,
+		TemplateID: r.URL.Query().Get("template_id"),
+		Status:     r.URL.Query().Get("status"),
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListTemplateApprovals(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list template approvals", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.TemplateApproval{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// GetTemplateApproval returns a template approval by id.
+// GET /v1/template-approvals/{id}
+func (h *Handler) GetTemplateApproval(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	a, err := h.store.GetTemplateApproval(r.Context(), id)
+	if errors.Is(err, domain.ErrApprovalNotFound) {
+		writeError(w, http.StatusNotFound, "approval_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get template approval", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, a)
+}
+
+// DecideTemplateApproval decides (approves/rejects) a template approval.
+// POST /v1/template-approvals/{id}/decide
+func (h *Handler) DecideTemplateApproval(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	var req struct {
+		Status string `json:"status"` // approved, rejected
+		Reason string `json:"reason,omitempty"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.Status != "approved" && req.Status != "rejected" {
+		writeError(w, http.StatusBadRequest, "invalid_status", "status must be approved or rejected")
+		return
+	}
+
+	// SoD check: approver cannot be the requester
+	approval, err := h.store.GetTemplateApproval(r.Context(), id)
+	if errors.Is(err, domain.ErrApprovalNotFound) {
+		writeError(w, http.StatusNotFound, "approval_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get template approval", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if approval.RequestedBy == principalID {
+		writeError(w, http.StatusForbidden, "self_approval", string(domain.ErrSelfApproval))
+		return
+	}
+
+	if err := h.store.DecideTemplateApproval(r.Context(), id, principalID, req.Status, req.Reason); err != nil {
+		h.log.Error("failed to decide template approval", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// If approved, update template status
+	if req.Status == "approved" {
+		t, err := h.store.GetTemplate(r.Context(), approval.TemplateID)
+		if err == nil {
+			now := time.Now().UTC()
+			t.Status = domain.TemplateStatusApproved
+			t.ApprovedBy = principalID
+			t.ApprovedAt = &now
+			t.UpdatedAt = now
+			_ = h.store.UpdateTemplate(r.Context(), t)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"approval_id": id,
+		"status":      req.Status,
+		"decided_by":  principalID,
+		"decided_at":  time.Now().UTC(),
+	})
+}
+
+// ── NCD-05: Regulated Notice & Acknowledgment ──────────────────────────────────
+
+// CreateRegulatedNotice creates a new regulated notice.
+// POST /v1/regulated-notices
+func (h *Handler) CreateRegulatedNotice(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.RegulatedNotice
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.RecipientPrincipalID == "" || req.Subject == "" || req.Body == "" || req.Channel == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "recipient_principal_id, subject, body, channel are required")
+		return
+	}
+
+	req.TenantID = tenantID
+	req.LegalEntityID = r.URL.Query().Get("legal_entity_id")
+	if req.LegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id query parameter is required")
+		return
+	}
+	if req.RegulatedNoticeID == "" {
+		req.RegulatedNoticeID = uuid.NewString()
+	}
+	if req.Status == "" {
+		req.Status = domain.RegulatedNoticeStatusPending
+	}
+	if req.Priority == "" {
+		req.Priority = domain.RegulatedNoticePriorityNormal
+	}
+	req.CreatedBy = principalID
+	req.CreatedAt = time.Now().UTC()
+	req.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.CreateRegulatedNotice(r.Context(), &req); err != nil {
+		h.log.Error("failed to create regulated notice", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// Add initial chain step
+	chainStep := &domain.AcknowledgmentChainStep{
+		ChainID:           uuid.NewString(),
+		RegulatedNoticeID: req.RegulatedNoticeID,
+		TenantID:          tenantID,
+		StepNumber:        1,
+		Action:            "created",
+		Actor:             principalID,
+		Metadata:          map[string]any{"intent_id": req.IntentID, "template_id": req.TemplateID},
+		CreatedAt:         time.Now().UTC(),
+	}
+	_ = h.store.CreateAcknowledgmentChainStep(r.Context(), chainStep)
+
+	writeJSON(w, http.StatusCreated, req)
+}
+
+// GetRegulatedNotice returns a regulated notice by id.
+// GET /v1/regulated-notices/{id}
+func (h *Handler) GetRegulatedNotice(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	notice, err := h.store.GetRegulatedNotice(r.Context(), id)
+	if errors.Is(err, domain.ErrRegulatedNoticeNotFound) {
+		writeError(w, http.StatusNotFound, "regulated_notice_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get regulated notice", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, notice)
+}
+
+// ListRegulatedNotices returns regulated notices for the tenant.
+// GET /v1/regulated-notices
+func (h *Handler) ListRegulatedNotices(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	filter := domain.RegulatedNoticeFilter{
+		TenantID:             tenantID,
+		LegalEntityID:        r.URL.Query().Get("legal_entity_id"),
+		RecipientPrincipalID: r.URL.Query().Get("recipient_principal_id"),
+		Status:               r.URL.Query().Get("status"),
+		Priority:             r.URL.Query().Get("priority"),
+	}
+	filter.Limit, filter.Offset, ok = parsePaging(w, r)
+	if !ok {
+		return
+	}
+
+	list, err := h.store.ListRegulatedNotices(r.Context(), filter)
+	if err != nil {
+		h.log.Error("failed to list regulated notices", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.RegulatedNotice{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// UpdateRegulatedNotice updates a regulated notice.
+// PATCH /v1/regulated-notices/{id}
+func (h *Handler) UpdateRegulatedNotice(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	var req domain.RegulatedNotice
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	req.TenantID = tenantID
+	req.RegulatedNoticeID = id
+	req.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.UpdateRegulatedNotice(r.Context(), &req); err != nil {
+		h.log.Error("failed to update regulated notice", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, req)
+}
+
+// AcknowledgeRegulatedNotice records an acknowledgment for a regulated notice.
+// POST /v1/acknowledgements
+func (h *Handler) AcknowledgeRegulatedNotice(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.AcknowledgeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.RegulatedNoticeID == "" || req.Method == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "regulated_notice_id, method are required")
+		return
+	}
+
+	// Verify notice exists and is not already acknowledged
+	notice, err := h.store.GetRegulatedNotice(r.Context(), req.RegulatedNoticeID)
+	if errors.Is(err, domain.ErrRegulatedNoticeNotFound) {
+		writeError(w, http.StatusNotFound, "regulated_notice_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to get regulated notice", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if notice.Status == domain.RegulatedNoticeStatusAcknowledged {
+		writeError(w, http.StatusConflict, "already_acknowledged", string(domain.ErrAlreadyAcknowledged))
+		return
+	}
+
+	if notice.ExpiresAt != nil && time.Now().UTC().After(*notice.ExpiresAt) {
+		writeError(w, http.StatusConflict, "notice_expired", string(domain.ErrNoticeExpired))
+		return
+	}
+
+	// Update notice status
+	now := time.Now().UTC()
+	notice.Status = domain.RegulatedNoticeStatusAcknowledged
+	notice.AcknowledgedAt = &now
+	notice.AcknowledgedBy = principalID
+	notice.AcknowledgmentMethod = req.Method
+	notice.UpdatedAt = now
+
+	// Build acknowledgment chain evidence
+	evidence := req.Evidence
+	if evidence == nil {
+		evidence = make(map[string]any)
+	}
+	evidence["ip"] = r.RemoteAddr
+	evidence["user_agent"] = r.UserAgent()
+	if req.WitnessPrincipalID != "" {
+		evidence["witness"] = req.WitnessPrincipalID
+	}
+	if req.DigitalSignature != "" {
+		evidence["digital_signature"] = req.DigitalSignature
+	}
+
+	// Add to acknowledgment chain
+	chain := notice.AcknowledgmentChain
+	if chain == nil {
+		chain = make(map[string]any)
+	}
+	chain[fmt.Sprintf("step_%d", len(chain)+1)] = map[string]any{
+		"action":      "acknowledged",
+		"actor":       principalID,
+		"method":      req.Method,
+		"evidence":    evidence,
+		"timestamp":   now,
+	}
+	notice.AcknowledgmentChain = chain
+
+	if err := h.store.UpdateRegulatedNotice(r.Context(), notice); err != nil {
+		h.log.Error("failed to update regulated notice after acknowledgment", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// Add chain step
+	chainStep := &domain.AcknowledgmentChainStep{
+		ChainID:           uuid.NewString(),
+		RegulatedNoticeID: req.RegulatedNoticeID,
+		TenantID:          tenantID,
+		StepNumber:        len(chain) + 1,
+		Action:            "acknowledged",
+		Actor:             principalID,
+		Method:            string(req.Method),
+		Evidence:          evidence,
+		CreatedAt:         now,
+	}
+	_ = h.store.CreateAcknowledgmentChainStep(r.Context(), chainStep)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"regulated_notice_id": req.RegulatedNoticeID,
+		"status":              notice.Status,
+		"acknowledged_at":     notice.AcknowledgedAt,
+		"acknowledged_by":     notice.AcknowledgedBy,
+		"method":              notice.AcknowledgmentMethod,
+	})
+}
+
+// ListAcknowledgements returns acknowledgment chain for a notice.
+// GET /v1/acknowledgements?notice_id=...
+func (h *Handler) ListAcknowledgements(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	noticeID := r.URL.Query().Get("notice_id")
+	if noticeID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "notice_id query parameter is required")
+		return
+	}
+
+	chain, err := h.store.GetAcknowledgmentChain(r.Context(), noticeID)
+	if err != nil {
+		h.log.Error("failed to get acknowledgment chain", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if chain == nil {
+		chain = []domain.AcknowledgmentChainStep{}
+	}
+	writeJSON(w, http.StatusOK, chain)
+}
+
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
@@ -930,4 +2844,48 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// renderTemplate performs simple variable substitution in a template string.
+// Variables are in {{variable_name}} format.
+func renderTemplate(tmpl string, vars map[string]string) (string, error) {
+	result := tmpl
+	for key, value := range vars {
+		placeholder := "{{" + key + "}}"
+		result = strings.ReplaceAll(result, placeholder, value)
+	}
+	return result, nil
+}
+
+// findMissingVars returns variables that are in required but not in provided.
+func findMissingVars(required []string, provided map[string]string) []string {
+	var missing []string
+	for _, req := range required {
+		if _, ok := provided[req]; !ok {
+			missing = append(missing, req)
+		}
+	}
+	return missing
+}
+
+// findMissingVarsInTemplate finds variables used in template but not declared.
+func findMissingVarsInTemplate(subject, body string, declared []string) []string {
+	declaredSet := make(map[string]bool)
+	for _, v := range declared {
+		declaredSet[v] = true
+	}
+
+	var missing []string
+	// Find {{variable}} patterns
+	re := regexp.MustCompile(`\{\{(\w+)\}\}`)
+	matches := re.FindAllStringSubmatch(subject+" "+body, -1)
+	for _, match := range matches {
+		if len(match) > 1 {
+			v := match[1]
+			if !declaredSet[v] {
+				missing = append(missing, v)
+			}
+		}
+	}
+	return missing
 }

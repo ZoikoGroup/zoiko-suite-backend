@@ -22,7 +22,25 @@ type Store interface {
 	ExpireDue(ctx context.Context) ([]domain.DelegationGrant, error)
 	GetDelegation(ctx context.Context, delegationID string) (*domain.DelegationGrant, error)
 	ListDelegations(ctx context.Context, f domain.ListDelegationsFilter) ([]domain.DelegationGrant, error)
-	RevokeDelegation(ctx context.Context, delegationID, revokedByPrincipalID string) (*domain.DelegationGrant, error)
+	RevokeDelegation(ctx context.Context, delegationID, revokedByPrincipalID string, expectedVersion int64) (*domain.DelegationGrant, error)
+	ExtendDelegation(ctx context.Context, delegationID, extendedByPrincipalID string, newEffectiveTo time.Time, expectedVersion int64) (*domain.DelegationGrant, error)
+
+	// CheckOverlap returns an error if an ACTIVE delegation already exists
+	// for the same (tenant, legal_entity, delegate, action_type) with an
+	// overlapping time window. Used for pre-insert validation to give a
+	// clear 409 rather than a raw DB error.
+	// correlationID is excluded from the check (for idempotent replays).
+	CheckOverlap(ctx context.Context, tenantID, legalEntityID, delegatePrincipalID, actionType string, effectiveFrom, effectiveTo time.Time, correlationID string) error
+
+// RecordRefusedEscalation records a refused escalation attempt for audit.
+// ORG-06 §4.2: "Every refused escalation attempt leaves durable evidence."
+	RecordRefusedEscalation(ctx context.Context, r *domain.RefusedEscalation) error
+
+	// ExplainDelegationChain returns the chain of delegations from a starting
+	// principal to a target principal for a specific action_type on a legal
+	// entity. Each step shows who delegated to whom, the action type, and the
+	// time window. Used for audit and debugging.
+	ExplainDelegationChain(ctx context.Context, tenantID, legalEntityID, startPrincipalID, targetPrincipalID, actionType string) ([]domain.DelegationChainStep, error)
 }
 
 // AuthZClient is used twice, for two different purposes: (1) the normal
@@ -31,6 +49,17 @@ type Store interface {
 // holds the authority being delegated.
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+// SoDClient checks whether a proposed delegation would create a
+// segregation-of-duties conflict. This is the ORG-06 §4.6 invariant
+// "Cannot delegate around SoD" — authorization alone cannot see a duties
+// conflict, so we must consult the SoD engine in authorization-svc.
+type SoDClient interface {
+	// CheckConflict returns an error if the proposed delegation (delegator
+	// granting action_type to delegate) would create a SoD conflict, given
+	// the delegate's existing grants. The legal_entity_id scopes the check.
+	CheckConflict(ctx context.Context, tenantID, legalEntityID, delegatorPrincipalID, delegatePrincipalID, actionType string) error
 }
 
 const (
@@ -61,6 +90,7 @@ const (
 type Handler struct {
 	store   Store
 	authz   AuthZClient
+	sod     SoDClient
 	log     *zap.Logger
 	metrics *telemetry.Domain
 }
@@ -77,8 +107,8 @@ type Handler struct {
 // below, which tolerate it. The counters describe DECISIONS rather than status
 // codes, because almost everything interesting this service does is a
 // well-formed 403 that no error-rate alert will ever see.
-func New(store Store, authz AuthZClient, log *zap.Logger, metrics *telemetry.Domain) *Handler {
-	return &Handler{store: store, authz: authz, log: log, metrics: metrics}
+func New(store Store, authz AuthZClient, sod SoDClient, log *zap.Logger, metrics *telemetry.Domain) *Handler {
+	return &Handler{store: store, authz: authz, sod: sod, log: log, metrics: metrics}
 }
 
 func (h *Handler) countGrant(outcome string) {
@@ -134,6 +164,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/", h.ListDelegations)
 		r.Get("/{delegation_id}", h.GetDelegation)
 		r.Post("/{delegation_id}/revoke", h.RevokeDelegation)
+		r.Post("/{delegation_id}/extend", h.ExtendDelegation)
+		r.Get("/explain", h.ExplainDelegationChain)
 	})
 }
 
@@ -152,6 +184,10 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 		h.countGrant(telemetry.GrantTenantMissing)
 		return
 	}
+	// Extract envelope headers for audit logging
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	requestID := r.Header.Get("X-Request-Id")
+	sourceChannel := r.Header.Get("X-Source-Channel")
 	var req domain.CreateDelegationRequest
 	if !decodeJSON(w, r, &req) {
 		h.countGrant(telemetry.GrantInvalidRequest)
@@ -164,11 +200,13 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.DelegatorPrincipalID == req.DelegatePrincipalID {
 		h.countGrant(telemetry.GrantDelegateIsDelegator)
+		h.recordRefusedEscalation(r.Context(), "invalid_window", &req, "", idempotencyKey, requestID, sourceChannel)
 		writeError(w, http.StatusBadRequest, "delegate_is_delegator", string(domain.ErrDelegateIsDelegator))
 		return
 	}
 	if !req.EffectiveTo.After(req.EffectiveFrom) {
 		h.countGrant(telemetry.GrantInvalidWindow)
+		h.recordRefusedEscalation(r.Context(), "invalid_window", &req, "", idempotencyKey, requestID, sourceChannel)
 		writeError(w, http.StatusBadRequest, "invalid_time_window", string(domain.ErrInvalidTimeWindow))
 		return
 	}
@@ -181,6 +219,7 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 	if err := h.checkAllowed(r.Context(), principalID, req.LegalEntityID, actionDelegationCreate); err != nil {
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
 			h.countGrant(telemetry.GrantNoCreateGrant)
+			h.recordRefusedEscalation(r.Context(), "no_create_grant", &req, principalID, idempotencyKey, requestID, sourceChannel)
 		} else {
 			h.countGrant(telemetry.GrantAuthzUnavailable)
 		}
@@ -212,12 +251,14 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 			// alone. Both answer 403, so nothing downstream of the status code
 			// can tell them apart.
 			h.countGrant(telemetry.GrantSelfDealing)
+			h.recordRefusedEscalation(r.Context(), "self_dealing", &req, principalID, idempotencyKey, requestID, sourceChannel)
 			writeError(w, http.StatusForbidden, "self_dealing", string(domain.ErrSelfDealing))
 			return
 		}
 		if err := h.checkAllowed(r.Context(), principalID, req.LegalEntityID, actionDelegationAdminister); err != nil {
 			if errors.Is(err, domain.ErrAuthorizationDenied) {
 				h.countGrant(telemetry.GrantDelegatorMismatch)
+				h.recordRefusedEscalation(r.Context(), "delegator_mismatch", &req, principalID, idempotencyKey, requestID, sourceChannel)
 				writeError(w, http.StatusForbidden, "delegator_mismatch", string(domain.ErrDelegatorMismatch))
 				return
 			}
@@ -239,6 +280,7 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 		h.countAuthz("DELEGATED_ACTION", err)
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
 			h.countGrant(telemetry.GrantDelegatorLacksAuth)
+			h.recordRefusedEscalation(r.Context(), "delegator_lacks_authority", &req, principalID, idempotencyKey, requestID, sourceChannel)
 			writeError(w, http.StatusForbidden, "delegator_lacks_authority", string(domain.ErrDelegatorLacksAuthority))
 			return
 		}
@@ -248,21 +290,64 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	h.countAuthz("DELEGATED_ACTION", nil)
 
+	// ORG-06 §4.6 "Cannot delegate around SoD": consult the SoD engine in
+	// authorization-svc. The delegator holding the authority is necessary but
+	// not sufficient — the delegate must not already hold a conflicting duty
+	// (e.g., PAYMENT_RELEASE when delegating PAYMENT_APPROVE). The SoD engine
+	// evaluates the static conflict matrix and the delegate's current grants.
+	if h.sod != nil {
+		tenantID := svcmiddleware.TenantFromContext(r.Context())
+		if err := h.sod.CheckConflict(r.Context(), tenantID, req.LegalEntityID, req.DelegatorPrincipalID, req.DelegatePrincipalID, req.ActionType); err != nil {
+			if errors.Is(err, domain.ErrSODConflict) {
+				h.countGrant(telemetry.GrantSODConflict)
+				h.recordRefusedEscalation(r.Context(), "sod_conflict", &req, principalID, idempotencyKey, requestID, sourceChannel)
+				writeError(w, http.StatusForbidden, "sod_conflict", err.Error())
+				return
+			}
+			// SoD engine unavailable — fail closed per platform pattern
+			h.countGrant(telemetry.GrantAuthzUnavailable)
+			h.log.Error("sod check unavailable", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "sod_unavailable", err.Error())
+			return
+		}
+	}
+
+	// ORG-06 §4.4: Check for overlapping delegations for the same delegate,
+	// action_type on the same entity. An application-level check before the
+	// DB EXCLUDE constraint provides a clear 409 with context.
+	// Exclude the correlation_id so an idempotent replay doesn't conflict
+	// with its own original grant.
+	if err := h.store.CheckOverlap(r.Context(), svcmiddleware.TenantFromContext(r.Context()), req.LegalEntityID, req.DelegatePrincipalID, req.ActionType, req.EffectiveFrom, req.EffectiveTo, req.CorrelationID); err != nil {
+		if errors.Is(err, domain.ErrOverlapConflict) {
+			h.countGrant(telemetry.GrantOverlapConflict)
+			h.recordRefusedEscalation(r.Context(), "overlap_conflict", &req, principalID, idempotencyKey, requestID, sourceChannel)
+			writeError(w, http.StatusConflict, "overlap_conflict", err.Error())
+			return
+		}
+		h.countGrant(telemetry.GrantStoreUnavailable)
+		h.log.Error("overlap check failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
 	now := time.Now().UTC()
 	d := &domain.DelegationGrant{
-		DelegationID:         uuid.NewString(),
-		TenantID:             svcmiddleware.TenantFromContext(r.Context()),
-		LegalEntityID:        req.LegalEntityID,
-		DelegatorPrincipalID: req.DelegatorPrincipalID,
-		DelegatePrincipalID:  req.DelegatePrincipalID,
-		ActionType:           req.ActionType,
-		EffectiveFrom:        req.EffectiveFrom,
-		EffectiveTo:          req.EffectiveTo,
-		Status:               domain.DelegationStatusActive,
-		CreatedByPrincipalID: principalID,
-		CorrelationID:        req.CorrelationID,
-		CreatedAt:            now,
-		UpdatedAt:            now,
+		DelegationID:             uuid.NewString(),
+		TenantID:                 svcmiddleware.TenantFromContext(r.Context()),
+		LegalEntityID:            req.LegalEntityID,
+		DelegatorPrincipalID:     req.DelegatorPrincipalID,
+		DelegatePrincipalID:      req.DelegatePrincipalID,
+		ActionType:               req.ActionType,
+		EffectiveFrom:            req.EffectiveFrom,
+		EffectiveTo:              req.EffectiveTo,
+		Status:                   domain.DelegationStatusActive,
+		CreatedByPrincipalID:     principalID,
+		CorrelationID:            req.CorrelationID,
+		CreatedAt:                now,
+		UpdatedAt:                now,
+		AuthorityLimitCents:      req.AuthorityLimitCents,
+		AuthorityLimitCurrency:   req.AuthorityLimitCurrency,
+		AuthorityLimitQuantity:   req.AuthorityLimitQuantity,
 	}
 
 	created, err := h.store.CreateDelegation(r.Context(), d)
@@ -409,6 +494,14 @@ func (h *Handler) RevokeDelegation(w http.ResponseWriter, r *http.Request) {
 	}
 	delegationID := chi.URLParam(r, "delegation_id")
 
+	// Parse optional expected_version for optimistic locking
+	var expectedVersion int64
+	if v := r.URL.Query().Get("expected_version"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			expectedVersion = parsed
+		}
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		h.countRevoke(telemetry.RevokeUnavailable)
@@ -447,7 +540,7 @@ func (h *Handler) RevokeDelegation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.RevokeDelegation(r.Context(), delegationID, principalID)
+	updated, err := h.store.RevokeDelegation(r.Context(), delegationID, principalID, expectedVersion)
 	if err != nil {
 		h.countRevokeStoreErr(err)
 		h.writeStoreErr(w, err)
@@ -475,6 +568,156 @@ func (h *Handler) countRevokeStoreErr(err error) {
 	}
 }
 
+// ── POST /v1/delegations/{delegation_id}/extend ────────────────────────────────
+
+// ExtendDelegation extends an ACTIVE delegation's effective_to to a later date.
+// Only the delegator or an administrator with DELEGATION_ADMINISTER can extend.
+// ExtendDelegation extends an ACTIVE delegation's effective_to to a later date.
+// POST /v1/delegations/{delegation_id}/extend
+// The new effective_to must be strictly after the current effective_to.
+// ORG-06 §4.3: "ExtendDelegation exists for the legitimate case where a
+// delegation needs to run longer than originally approved."
+// Supports optimistic locking via expected_version query parameter.
+func (h *Handler) ExtendDelegation(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	delegationID := chi.URLParam(r, "delegation_id")
+
+	// Parse optional expected_version for optimistic locking
+	var expectedVersion int64
+	if v := r.URL.Query().Get("expected_version"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			expectedVersion = parsed
+		}
+	}
+
+	var req domain.ExtendDelegationRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.DelegationID == "" {
+		req.DelegationID = delegationID
+	}
+	if req.NewEffectiveTo.IsZero() || req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "new_effective_to, correlation_id are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	// Get current delegation
+	d, err := h.store.GetDelegation(r.Context(), delegationID)
+	if err != nil {
+		h.writeStoreErr(w, err)
+		return
+	}
+
+	// Check authorization - delegator or admin can extend
+	if d.DelegatorPrincipalID != principalID {
+		if err := h.checkAllowed(r.Context(), principalID, d.LegalEntityID, actionDelegationAdminister); err != nil {
+			if errors.Is(err, domain.ErrAuthorizationDenied) {
+				writeError(w, http.StatusForbidden, "forbidden", "only the delegator or an administrator may extend a delegation")
+			} else {
+				h.writeAuthzErr(w, err)
+			}
+			return
+		}
+	}
+
+	// Validate state: must be ACTIVE to extend
+	if d.Status != domain.DelegationStatusActive {
+		writeError(w, http.StatusConflict, "cannot_extend", string(domain.ErrCannotExtend))
+		return
+	}
+
+	// Validate new effective_to is after current effective_to
+	if !req.NewEffectiveTo.After(d.EffectiveTo) {
+		writeError(w, http.StatusBadRequest, "invalid_time_window", "new_effective_to must be after current effective_to")
+		return
+	}
+
+	// Check for overlap with the new extended window
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if err := h.store.CheckOverlap(r.Context(), tenantID, d.LegalEntityID, d.DelegatePrincipalID, d.ActionType, d.EffectiveFrom, req.NewEffectiveTo, req.CorrelationID); err != nil {
+		if errors.Is(err, domain.ErrOverlapConflict) {
+			writeError(w, http.StatusConflict, "overlap_conflict", err.Error())
+			return
+		}
+		h.writeStoreErr(w, err)
+		return
+	}
+
+	// Extend the delegation with optimistic locking
+	updated, err := h.store.ExtendDelegation(r.Context(), delegationID, principalID, req.NewEffectiveTo, expectedVersion)
+	if err != nil {
+		if errors.Is(err, domain.ErrCannotExtend) {
+			writeError(w, http.StatusConflict, "cannot_extend", err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrVersionMismatch) {
+			writeError(w, http.StatusConflict, "version_mismatch", string(domain.ErrVersionMismatch))
+			return
+		}
+		h.writeStoreErr(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ExplainDelegationChain returns the delegation chain from a start principal
+// to a target principal for a specific action_type on a legal entity.
+// GET /v1/delegations/explain?legal_entity_id=...&start_principal_id=...&target_principal_id=...&action_type=...
+func (h *Handler) ExplainDelegationChain(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	startPrincipalID := r.URL.Query().Get("start_principal_id")
+	targetPrincipalID := r.URL.Query().Get("target_principal_id")
+	actionType := r.URL.Query().Get("action_type")
+
+	if legalEntityID == "" || startPrincipalID == "" || targetPrincipalID == "" || actionType == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, start_principal_id, target_principal_id, action_type are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	// Check authorization - requires DELEGATION_VIEW on the entity
+	if err := h.checkAllowed(r.Context(), principalID, legalEntityID, actionDelegationView); err != nil {
+		if errors.Is(err, domain.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "forbidden", "DELEGATION_VIEW required")
+		} else {
+			h.writeAuthzErr(w, err)
+		}
+		return
+	}
+
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	chain, err := h.store.ExplainDelegationChain(r.Context(), tenantID, legalEntityID, startPrincipalID, targetPrincipalID, actionType)
+	if err != nil {
+		h.writeStoreErr(w, err)
+		return
+	}
+
+	if chain == nil {
+		chain = []domain.DelegationChainStep{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"chain": chain,
+		"found": len(chain) > 0,
+	})
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 // sweepExpired lazily flips any due delegations to EXPIRED. Errors are logged,
@@ -492,6 +735,53 @@ func (h *Handler) sweepExpired(ctx context.Context) {
 	}
 	if h.metrics != nil && len(expired) > 0 {
 		h.metrics.Expiries.Add(float64(len(expired)))
+	}
+}
+
+// recordRefusedEscalation records a refused escalation attempt for audit.
+// ORG-06 §4.2: "Every refused escalation attempt leaves durable evidence."
+func (h *Handler) recordRefusedEscalation(ctx context.Context, reason string, req *domain.CreateDelegationRequest, principalID, idempotencyKey, requestID, sourceChannel string) {
+	if h.store == nil {
+		return
+	}
+	refusal := &domain.RefusedEscalation{
+		RefusedID:            uuid.NewString(),
+		TenantID:             svcmiddleware.TenantFromContext(ctx),
+		LegalEntityID:        req.LegalEntityID,
+		CallerPrincipalID:    principalID,
+		DelegatorPrincipalID: req.DelegatorPrincipalID,
+		DelegatePrincipalID:  req.DelegatePrincipalID,
+		ActionType:           req.ActionType,
+		EffectiveFrom:        req.EffectiveFrom,
+		EffectiveTo:          req.EffectiveTo,
+		RefusalReason:        reason,
+		CorrelationID:        req.CorrelationID,
+		IdempotencyKey:       idempotencyKey,
+		RequestID:            requestID,
+		SourceChannel:        sourceChannel,
+		RefusedAt:            time.Now().UTC(),
+	}
+	// Fire and forget - we don't block the response on this
+	if err := h.store.RecordRefusedEscalation(ctx, refusal); err != nil {
+		h.log.Error("failed to record refused escalation", zap.Error(err), zap.String("reason", reason))
+	}
+	if h.metrics != nil {
+		switch reason {
+		case "self_dealing":
+			h.metrics.RefusedEscalations.WithLabelValues(telemetry.RefusedSelfDealing).Inc()
+		case "delegator_mismatch":
+			h.metrics.RefusedEscalations.WithLabelValues(telemetry.RefusedDelegatorMismatch).Inc()
+		case "delegator_lacks_authority":
+			h.metrics.RefusedEscalations.WithLabelValues(telemetry.RefusedDelegatorLacksAuth).Inc()
+		case "sod_conflict":
+			h.metrics.RefusedEscalations.WithLabelValues(telemetry.RefusedSODConflict).Inc()
+		case "overlap_conflict":
+			h.metrics.RefusedEscalations.WithLabelValues(telemetry.RefusedOverlapConflict).Inc()
+		case "invalid_window":
+			h.metrics.RefusedEscalations.WithLabelValues(telemetry.RefusedInvalidWindow).Inc()
+		case "no_create_grant":
+			h.metrics.RefusedEscalations.WithLabelValues(telemetry.RefusedNoCreateGrant).Inc()
+		}
 	}
 }
 

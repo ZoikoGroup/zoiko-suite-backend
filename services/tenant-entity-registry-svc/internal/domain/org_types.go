@@ -131,6 +131,23 @@ type TenantLifecycleEvent struct {
 	// "onboarding request" reference the 23 Sep 2026 audit found absent here).
 	OnboardingRequestRef *string `json:"onboarding_request_ref"`
 	ExternalCustomerKey  *string `json:"external_customer_key"`
+
+	// Home-region decision evidence (§4.2), set on ChangeHomeRegion rows.
+	HomeRegionDecisionRef *string `json:"home_region_decision_ref,omitempty"`
+	FromRegionID          *string `json:"from_region_id,omitempty"`
+	ToRegionID            *string `json:"to_region_id,omitempty"`
+}
+
+// ChangeHomeRegionRequest is the body of POST /v1/tenants/{id}/home-region.
+type ChangeHomeRegionRequest struct {
+	// ResidencyRegionID is the new home region (a residency_regions row).
+	ResidencyRegionID string `json:"residency_region_id"`
+	// HomeRegionDecisionRef is §4.2's "home-region decision" evidence: the
+	// residency decision this change implements. Required.
+	HomeRegionDecisionRef string `json:"home_region_decision_ref"`
+	Reason                string `json:"reason"`
+	ExpectedVersion       int64  `json:"expected_version"`
+	CorrelationID         string `json:"correlation_id"`
 }
 
 // TenantCommand is an ORG-02 §4.2 named command.
@@ -158,6 +175,11 @@ const (
 	// residency policies are deactivated and the tenant is TERMINATED. Rows
 	// are retained. Maker-checker, like any other termination.
 	TenantCommandAbandonProvisioning TenantCommand = "AbandonProvisioning"
+	// ChangeHomeRegion re-points the tenant's home region (the region of its
+	// default residency policy). Not a lifecycle transition: it has its own
+	// route (POST /v1/tenants/{id}/home-region), platform authority and
+	// maker-checker — §4.2 "home-region changes require maker-checker".
+	TenantCommandChangeHomeRegion TenantCommand = "ChangeHomeRegion"
 )
 
 // TargetState returns the lifecycle state this command moves a tenant to, and
@@ -228,6 +250,8 @@ func (c TenantCommand) AuthzAction() string {
 		return "provisioning.retry"
 	case TenantCommandAbandonProvisioning:
 		return "provisioning.abandon"
+	case TenantCommandChangeHomeRegion:
+		return "home-region.change"
 	}
 	// An unknown command never reaches authorization — TargetState() refuses it
 	// first — but returning the raw name rather than "" means that if one ever

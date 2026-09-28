@@ -41,6 +41,9 @@ const (
 	// and its reversal ("no self-approval of merge").
 	ApprovalSubjectLegalEntityMerge   ApprovalSubjectType = "LEGAL_ENTITY_MERGE"
 	ApprovalSubjectLegalEntityUnmerge ApprovalSubjectType = "LEGAL_ENTITY_UNMERGE"
+	// ApprovalSubjectTenantHomeRegion — §4.2 "home-region changes require
+	// maker-checker" (migration 000012).
+	ApprovalSubjectTenantHomeRegion ApprovalSubjectType = "TENANT_HOME_REGION"
 )
 
 // ApprovalStatus is the state of an approval request.

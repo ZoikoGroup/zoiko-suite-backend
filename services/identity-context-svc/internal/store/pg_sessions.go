@@ -81,6 +81,10 @@ func (s *PgStore) FindSessionContext(
 	var legalEntityID *string
 	var reason *string
 	var environment string
+	// The §4 source inputs are nullable: NULL is a row written before the
+	// column existed, or an input that was not presented.
+	var sourceChannel, sourceChannelBasis, workloadID, workloadBasis *string
+	var causationID, ingressVersion, ingressCacheState, entitlementStatus *string
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
@@ -90,7 +94,10 @@ func (s *PgStore) FindSessionContext(
 			       issued_at, expires_at, invalidated_at, invalidation_reason,
 			       data_residency_policy_id, source_service, schema_version,
 			       ingress_source, environment, evidence_id, support_context_id,
-			       retention_class, disposition_due_at, disposed_at
+			       retention_class, disposition_due_at, disposed_at,
+			       source_channel, source_channel_basis, workload_id, workload_id_basis,
+			       causation_id, ingress_binding_version, ingress_cache_state,
+			       entitlement_context_ref, entitlement_context_status
 			  FROM session_contexts
 			 WHERE session_context_id = $1 AND tenant_id = $2`,
 			sessionContextID, tenantID,
@@ -102,6 +109,9 @@ func (s *PgStore) FindSessionContext(
 			&sc.DataResidencyPolicyID, &sc.SourceService, &sc.SchemaVersion,
 			&sc.IngressSource, &environment, &sc.EvidenceID, &sc.SupportContextID,
 			&sc.RetentionClass, &sc.DispositionDueAt, &sc.DisposedAt,
+			&sourceChannel, &sourceChannelBasis, &workloadID, &workloadBasis,
+			&causationID, &ingressVersion, &ingressCacheState,
+			&sc.EntitlementContextRef, &entitlementStatus,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -119,6 +129,14 @@ func (s *PgStore) FindSessionContext(
 		sc.InvalidationReason = &r
 	}
 	sc.Environment = domain.Environment(environment)
+	sc.SourceChannel = deref(sourceChannel)
+	sc.SourceChannelBasis = domain.SourceInputBasis(deref(sourceChannelBasis))
+	sc.WorkloadID = deref(workloadID)
+	sc.WorkloadIDBasis = domain.SourceInputBasis(deref(workloadBasis))
+	sc.CausationID = deref(causationID)
+	sc.IngressBindingVersion = deref(ingressVersion)
+	sc.IngressCacheState = domain.CacheFreshness(deref(ingressCacheState))
+	sc.EntitlementContextStatus = domain.EntitlementContextStatus(deref(entitlementStatus))
 	return &sc, nil
 }
 
