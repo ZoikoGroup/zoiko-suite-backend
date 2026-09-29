@@ -106,6 +106,15 @@ type stubStore struct {
 	addresses map[string]string
 	unknown   []string // "id:reason"
 
+	// events records what the real store would enqueue in event_outbox with
+	// each transition (migration 000010). The worker no longer publishes, so
+	// "one event per conclusion" is now a property of the store transition.
+	events *stubPublisher
+
+	submitted          []string
+	beginSubmissionErr error
+	markedUnknown      []string
+
 	claimFails  bool
 	tenantsSeen []string
 
@@ -180,15 +189,22 @@ func (s *stubStore) GetNotification(_ context.Context, id string) (*domain.Notif
 	return n, nil
 }
 
-func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, _, _ string, _ *time.Time) error {
+func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, _, _ string, _ *time.Time, _ string, _ domain.AttemptMeta) error {
 	s.completed = append(s.completed, id+":"+newStatus)
 	if n, ok := s.byID[id]; ok {
 		n.Status = newStatus
 	}
+	if s.events != nil {
+		if newStatus == "SENT" {
+			s.events.sent++
+		} else {
+			s.events.failed++
+		}
+	}
 	return nil
 }
 
-func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, _, next time.Time) error {
+func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, _, next time.Time, _ domain.AttemptMeta) error {
 	s.scheduled = append(s.scheduled, id+":"+failureReason)
 	if n, ok := s.byID[id]; ok {
 		n.DeliveryAttempts++
@@ -205,11 +221,14 @@ func (s *stubStore) SetRecipientAddress(_ context.Context, id, _, address, _ str
 	return nil
 }
 
-func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, attemptedAt time.Time) error {
+func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, attemptedAt time.Time, _ string, _ domain.AttemptMeta) error {
 	s.unknown = append(s.unknown, id+":"+reason)
 	if n, ok := s.byID[id]; ok {
 		n.Status = "PENDING_UNKNOWN"
 		n.UnknownAt = &attemptedAt
+	}
+	if s.events != nil {
+		s.events.unknown++
 	}
 	return nil
 }
@@ -226,15 +245,9 @@ func (d *stubDeliverer) Deliver(_ context.Context, n domain.Notification) domain
 	return d.outcome
 }
 
+// stubPublisher counts the events the stub store enqueues, by type.
 type stubPublisher struct{ sent, failed, unknown int }
 
-func (p *stubPublisher) PublishSent(context.Context, string, domain.Notification) { p.sent++ }
-func (p *stubPublisher) PublishFailed(context.Context, string, domain.Notification, string) {
-	p.failed++
-}
-func (p *stubPublisher) PublishOutcomeUnknown(context.Context, string, domain.Notification, string) {
-	p.unknown++
-}
 
 type stubResolver struct {
 	email string
@@ -249,7 +262,8 @@ func newWorker(s *stubStore, d *stubDeliverer, p *stubPublisher, res retry.Recip
 	settled := func(err error) bool {
 		return errors.Is(err, domain.ErrPrincipalNotFound) || errors.Is(err, domain.ErrPrincipalHasNoAddress)
 	}
-	return retry.NewWorker(s, d, p, res, settled, retry.Options{Policy: pol}, zap.NewNop())
+	s.events = p
+	return retry.NewWorker(s, d, nil, res, settled, retry.Options{Policy: pol}, zap.NewNop())
 }
 
 func seed(s *stubStore, id, tenant string, attempts int) {
@@ -461,4 +475,26 @@ func TestWorkerSkipsWhatItCannotClaim(t *testing.T) {
 	if len(s.completed) != 0 {
 		t.Fatalf("completed = %v, want nothing", s.completed)
 	}
+}
+
+func (s *stubStore) BeginSubmission(_ context.Context, id, _ string, _ time.Time) error {
+	if s.beginSubmissionErr != nil {
+		return s.beginSubmissionErr
+	}
+	s.submitted = append(s.submitted, id)
+	return nil
+}
+
+func (s *stubStore) MarkStrandedUnknown(_ context.Context, id, _ string, _, at time.Time) (bool, error) {
+	n, ok := s.byID[id]
+	if !ok || n.Status != "PENDING" {
+		return false, nil
+	}
+	n.Status = "PENDING_UNKNOWN"
+	n.UnknownAt = &at
+	s.markedUnknown = append(s.markedUnknown, id)
+	if s.events != nil {
+		s.events.unknown++
+	}
+	return true, nil
 }

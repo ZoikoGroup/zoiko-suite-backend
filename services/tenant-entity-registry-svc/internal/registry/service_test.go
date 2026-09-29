@@ -12,6 +12,7 @@ import (
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/entitlement"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 )
@@ -27,25 +28,57 @@ type memStore struct {
 	bundles           map[string]*domain.TaxIdentityBundle
 	residencyPolicies map[string]*domain.DataResidencyPolicy
 	lastUpdateActor   string // records ActorPrincipalID from the last UpdateEntity call
+	lastCreateScope   string // the context tenant CreateTenantWithDefaultResidencyPolicy ran in
+	regions           map[string]*domain.ResidencyRegion
+	lastPolicy        *domain.DataResidencyPolicy // the default policy the last provisioning wrote
+	// orgs holds the ORG-02/ORG-03 state. Lazily built by memStore.org() so
+	// the existing newMemStore() stays as it was; see org_memstore_test.go.
+	orgs *orgState
 	// Minimal set — add more maps as tests require.
 }
 
 func newMemStore() *memStore {
-	return &memStore{
+	m := &memStore{
 		tenants:           make(map[string]*domain.Tenant),
 		entities:          make(map[string]*domain.LegalEntity),
 		workspaces:        make(map[string]*domain.Workspace),
 		bundles:           make(map[string]*domain.TaxIdentityBundle),
 		residencyPolicies: make(map[string]*domain.DataResidencyPolicy),
 	}
+	// Seed the fixture tenants in ACTIVE lifecycle state.
+	//
+	// Needed since the ORG §8 NP4 guard: every protected write now reads its
+	// tenant and refuses one whose lifecycle state forbids transacting. A test
+	// creating an entity under a tenant that was never provisioned used to
+	// succeed and now correctly gets "not found" — which is the guard working,
+	// not a regression, but it is not what those tests are about. Seeding here
+	// keeps each test asserting the thing it was written to assert.
+	//
+	// Tests that DO exercise the guard override the lifecycle state on one of
+	// these, or seed a tenant of their own; see org_service_test.go.
+	for _, id := range fixtureTenants {
+		seedActiveTenant(m, id)
+	}
+	return m
 }
 
 func (m *memStore) CreateTenant(_ context.Context, t *domain.Tenant) error {
 	m.tenants[t.TenantID] = t
 	return nil
 }
-func (m *memStore) CreateTenantWithDefaultResidencyPolicy(_ context.Context, t *domain.Tenant, p *domain.DataResidencyPolicy) error {
-	m.tenants[t.TenantID] = t
+func (m *memStore) CreateTenantWithDefaultResidencyPolicy(ctx context.Context, t *domain.Tenant, p *domain.DataResidencyPolicy) error {
+	m.lastCreateScope = domain.TenantFromContext(ctx)
+	m.lastPolicy = p
+	// Mirrors the store: the onboarding key is claimed first, and a
+	// repeated key aborts the whole create.
+	if t.ExternalCustomerKey != nil {
+		if _, used := m.gaps().onboardingKeys[*t.ExternalCustomerKey]; used {
+			return registry.ErrOnboardingKeyExists
+		}
+		m.gaps().onboardingKeys[*t.ExternalCustomerKey] = onboardingKey{t.TenantID, t.ProvisioningFingerprint}
+	}
+	cp := *t
+	m.tenants[t.TenantID] = &cp
 	m.residencyPolicies[p.DataResidencyPolicyID] = p
 	return nil
 }
@@ -62,8 +95,12 @@ func (m *memStore) TransitionTenantLifecycle(_ context.Context, id string, state
 	}
 	return nil
 }
-func (m *memStore) CreateEntity(_ context.Context, e *domain.LegalEntity) error {
+func (m *memStore) CreateEntity(ctx context.Context, e *domain.LegalEntity) error {
 	m.entities[e.LegalEntityID] = e
+	// Mirrors the store: version 1 of the profile lands with the entity.
+	if e.InitialProfile != nil {
+		_ = m.CreateInitialProfileVersion(ctx, e.InitialProfile)
+	}
 	return nil
 }
 func (m *memStore) GetEntityByID(_ context.Context, id string) (*domain.LegalEntity, error) {
@@ -214,7 +251,10 @@ func (m *memStore) GetResidencyPolicyByID(_ context.Context, id string) (*domain
 	}
 	return p, nil
 }
-func (m *memStore) GetResidencyRegionByID(_ context.Context, _ string) (*domain.ResidencyRegion, error) {
+func (m *memStore) GetResidencyRegionByID(_ context.Context, id string) (*domain.ResidencyRegion, error) {
+	if r, ok := m.regions[id]; ok {
+		return r, nil
+	}
 	return nil, nil
 }
 func (m *memStore) ListResidencyRegions(_ context.Context) ([]*domain.ResidencyRegion, error) {
@@ -231,8 +271,14 @@ func (m *memStore) GetTaxIdentityBundleByID(_ context.Context, id string) (*doma
 	}
 	return b, nil
 }
-func (m *memStore) ListTaxIdentityBundlesByEntity(_ context.Context, _ string) ([]*domain.TaxIdentityBundle, error) {
-	return []*domain.TaxIdentityBundle{}, nil
+func (m *memStore) ListTaxIdentityBundlesByEntity(_ context.Context, id string) ([]*domain.TaxIdentityBundle, error) {
+	out := []*domain.TaxIdentityBundle{}
+	for _, b := range m.bundles {
+		if b.LegalEntityID == id {
+			out = append(out, b)
+		}
+	}
+	return out, nil
 }
 func (m *memStore) TransitionTaxIdentityBundleStatus(_ context.Context, id string, status domain.TaxIdentityBundleStatus, _, _ string) error {
 	if b, ok := m.bundles[id]; ok {
@@ -244,22 +290,6 @@ func (m *memStore) TransitionTaxIdentityBundleStatus(_ context.Context, id strin
 // ---------------------------------------------------------------------------
 // No-op event publisher
 // ---------------------------------------------------------------------------
-
-type noopPublisher struct{}
-
-func (noopPublisher) PublishTenantCreated(_ context.Context, _ *domain.Tenant, _ string)       {}
-func (noopPublisher) PublishEntityCreated(_ context.Context, _ *domain.LegalEntity, _ string)  {}
-func (noopPublisher) PublishEntityUpdated(_ context.Context, _ *domain.LegalEntity, _ string)  {}
-func (noopPublisher) PublishWorkspaceCreated(_ context.Context, _ *domain.Workspace, _ string) {}
-func (noopPublisher) PublishWorkspaceUpdated(_ context.Context, _ *domain.Workspace, _ string) {}
-func (noopPublisher) PublishWorkspaceStatusChanged(_ context.Context, _, _, _ string, _, _ domain.WorkspaceStatus, _ string) {
-}
-func (noopPublisher) PublishEntityStatusChanged(_ context.Context, _, _, _ string, _, _ domain.EntityStatus, _ string) {
-}
-func (noopPublisher) PublishEntityHierarchyChanged(_ context.Context, _ *domain.EntityHierarchy, _ string, _ string) {
-}
-func (noopPublisher) PublishEntityJurisdictionChanged(_ context.Context, _ *domain.EntityJurisdictionAssignment, _ string, _ string) {
-}
 
 // ---------------------------------------------------------------------------
 // Authz stubs
@@ -331,7 +361,13 @@ func tenantCtx(tenantID string) context.Context {
 func newSvc(t *testing.T, store registry.Store, authzC registry.AuthorizationClient, jv registry.JurisdictionValidator) *registry.Service {
 	t.Helper()
 	log := zap.NewNop()
-	return registry.NewService(store, noopPublisher{}, authzC, jv, testPlatformScope, log)
+	svc := registry.NewService(store, authzC, jv, testPlatformScope, log)
+	// Most of this suite is not about §4.2's provisioning inputs, so it runs
+	// in the dev-compatible mode; provisioning_context_test.go runs strict.
+	svc.ConfigureProvisioning(entitlement.NewStubChecker(log), nil, true)
+	// Likewise version substitution: versions_test.go runs strict.
+	svc.ConfigureConcurrency(true)
+	return svc
 }
 
 func baseSvc(t *testing.T) (*registry.Service, *memStore) {
@@ -339,6 +375,31 @@ func baseSvc(t *testing.T) (*registry.Service, *memStore) {
 	ms := newMemStore()
 	svc := newSvc(t, ms, permitAllAuthZ{}, acceptAllJurisd{})
 	return svc, ms
+}
+
+// fixtureTenants are the tenant ids this suite uses as scenery.
+var fixtureTenants = []string{
+	"tenant-1", "tenant-001", "tenant-a", "tenant-b", "ten-verified", "ten-001",
+}
+
+// seedActiveTenant puts a transactable tenant into the store.
+func seedActiveTenant(ms *memStore, id string) *domain.Tenant {
+	t := &domain.Tenant{
+		TenantID:                     id,
+		TenantCode:                   "CODE-" + id,
+		LegalName:                    "Fixture " + id,
+		Status:                       domain.TenantStatusActive,
+		DefaultCurrencyCode:          "USD",
+		PrimaryTimezone:              "UTC",
+		PrimaryLocale:                "en-US",
+		DefaultDataResidencyPolicyID: "drp-" + id,
+		LifecycleState:               domain.TenantLifecycleActive,
+		RecordVersion:                1,
+		CreatedAt:                    time.Now().UTC(),
+		CreatedByPrincipalID:         testPrincipal,
+	}
+	ms.tenants[id] = t
+	return t
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +411,7 @@ func TestProvisionTenant_Success(t *testing.T) {
 
 	req := domain.ProvisionTenantRequest{
 		TenantCode:                   "ACME",
+		ExternalCustomerKey:          "ck-ACME",
 		LegalName:                    "ACME Corp Ltd",
 		DefaultCurrencyCode:          "USD",
 		PrimaryTimezone:              "UTC",
@@ -391,6 +453,7 @@ func TestTransitionTenantLifecycle_ValidTransition(t *testing.T) {
 	// Create a tenant in ONBOARDING state
 	req := domain.ProvisionTenantRequest{
 		TenantCode:                   "T1",
+		ExternalCustomerKey:          "ck-T1",
 		LegalName:                    "Tenant One",
 		DefaultCurrencyCode:          "GBP",
 		PrimaryTimezone:              "Europe/London",
@@ -401,15 +464,23 @@ func TestTransitionTenantLifecycle_ValidTransition(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, domain.TenantLifecycleOnboarding, tenant.LifecycleState)
 
+	// ORG-02 maker-checker on creation: the generic route may not activate a
+	// tenant whose creation nobody independently approved.
+	transition := func() error {
+		return svc.TransitionTenantLifecycle(tenantCtx(tenant.TenantID), tenant.TenantID,
+			domain.TransitionTenantLifecycleRequest{
+				TargetState:   domain.TenantLifecycleActive,
+				CorrelationID: "corr-002",
+			})
+	}
+	require.ErrorIs(t, transition(), registry.ErrApprovalRequired)
+	require.NotNil(t, tenant.CreationApprovalRequestID)
+	approveByID(t, svc, tenant.TenantID, *tenant.CreationApprovalRequestID)
+
 	// Transition ONBOARDING → ACTIVE (valid). The caller's verified tenant must
 	// be the one being transitioned — reads and transitions are refused when
 	// the path tenant is not the caller's own.
-	err = svc.TransitionTenantLifecycle(tenantCtx(tenant.TenantID), tenant.TenantID,
-		domain.TransitionTenantLifecycleRequest{
-			TargetState:   domain.TenantLifecycleActive,
-			CorrelationID: "corr-002",
-		})
-	require.NoError(t, err)
+	require.NoError(t, transition())
 
 	stored, _ := ms.GetTenantByID(context.Background(), tenant.TenantID)
 	assert.Equal(t, domain.TenantLifecycleActive, stored.LifecycleState)
@@ -420,6 +491,7 @@ func TestTransitionTenantLifecycle_InvalidTransition(t *testing.T) {
 
 	req := domain.ProvisionTenantRequest{
 		TenantCode:                   "T2",
+		ExternalCustomerKey:          "ck-T2",
 		LegalName:                    "Tenant Two",
 		DefaultCurrencyCode:          "EUR",
 		PrimaryTimezone:              "UTC",
@@ -513,16 +585,17 @@ func TestCreateEntity_Success(t *testing.T) {
 		LegalName:             "Entity One Ltd",
 		EntityType:            domain.EntityTypeSubsidiary,
 		DefaultCurrencyCode:   "USD",
-		FiscalCalendarID:      "fc-001",
+		FiscalCalendarID:      "0f000000-0000-4000-8000-000000000001",
 		PrimaryJurisdictionID: "JUR-US",
 		DataResidencyPolicyID: "drp-001",
 		CorrelationID:         "corr-004",
 	}
 
-	entity, err := svc.CreateEntity(authCtx(), req)
+	entity, err := svc.CreateEntity(tenantCtx("tenant-001"), req)
 	require.NoError(t, err)
 	assert.NotEmpty(t, entity.LegalEntityID)
-	assert.Equal(t, domain.EntityStatusActive, entity.EntityStatus)
+	// ORG-03 §4.3: a new entity is DRAFT until independently verified.
+	assert.Equal(t, domain.EntityStatusDraft, entity.EntityStatus)
 
 	stored, _ := ms.GetEntityByID(context.Background(), entity.LegalEntityID)
 	require.NotNil(t, stored)
@@ -539,13 +612,13 @@ func TestCreateEntity_JurisdictionNotFound_FailsClosed(t *testing.T) {
 		LegalName:             "Entity Two",
 		EntityType:            domain.EntityTypeOperational,
 		DefaultCurrencyCode:   "GBP",
-		FiscalCalendarID:      "fc-001",
+		FiscalCalendarID:      "0f000000-0000-4000-8000-000000000001",
 		PrimaryJurisdictionID: "JUR-INVALID",
 		DataResidencyPolicyID: "drp-001",
 		CorrelationID:         "corr-005",
 	}
 
-	_, err := svc.CreateEntity(authCtx(), req)
+	_, err := svc.CreateEntity(tenantCtx("tenant-001"), req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -559,13 +632,13 @@ func TestCreateEntity_JurisdictionServiceUnavailable_FailsClosed(t *testing.T) {
 		LegalName:             "Entity Three",
 		EntityType:            domain.EntityTypeOperational,
 		DefaultCurrencyCode:   "EUR",
-		FiscalCalendarID:      "fc-001",
+		FiscalCalendarID:      "0f000000-0000-4000-8000-000000000001",
 		PrimaryJurisdictionID: "JUR-US",
 		DataResidencyPolicyID: "drp-001",
 		CorrelationID:         "corr-006",
 	}
 
-	_, err := svc.CreateEntity(authCtx(), req)
+	_, err := svc.CreateEntity(tenantCtx("tenant-001"), req)
 	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
 }
 
@@ -609,7 +682,7 @@ func TestTransitionEntityStatus_ValidTransition(t *testing.T) {
 		EntityStatus:  domain.EntityStatusActive,
 	}
 
-	err := svc.TransitionEntityStatus(authCtx(), "ent-001",
+	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "ent-001",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusDormant,
 			CorrelationID: "corr-007",
@@ -628,7 +701,7 @@ func TestTransitionEntityStatus_Idempotent_SameStatus(t *testing.T) {
 	}
 
 	// Applying the same status must be a no-op (idempotent)
-	err := svc.TransitionEntityStatus(authCtx(), "ent-002",
+	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "ent-002",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusDormant,
 			CorrelationID: "corr-008",
@@ -647,7 +720,7 @@ func TestTransitionEntityStatus_InvalidTransition_Rejected(t *testing.T) {
 		EntityStatus:  domain.EntityStatusDissolved, // terminal state
 	}
 
-	err := svc.TransitionEntityStatus(authCtx(), "ent-003",
+	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "ent-003",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusActive,
 			CorrelationID: "corr-009",
@@ -674,7 +747,7 @@ func TestCreateTaxIdentityBundle_Success(t *testing.T) {
 		CorrelationID:  "corr-010",
 	}
 
-	bundle, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
+	bundle, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
 	require.NoError(t, err)
 	assert.NotEmpty(t, bundle.TaxIdentityBundleID)
 	assert.Equal(t, "ent-100", bundle.LegalEntityID)
@@ -704,7 +777,7 @@ func TestCreateTaxIdentityBundle_InvalidDataClassification_Fails(t *testing.T) {
 		DataClassification: "INVALID_CLASSIFICATION",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -712,13 +785,17 @@ func TestCreateTaxIdentityBundle_InvalidJurisdiction_FailsClosed(t *testing.T) {
 	ms := newMemStore()
 	svc := newSvc(t, ms, permitAllAuthZ{}, rejectJurisd{})
 
+	// The bundle needs an operational entity; the jurisdiction check is
+	// what is under test.
+	seedEntityFor(ms, "ent-100", "tenant-001", "", "JUR-US")
+
 	req := domain.CreateTaxIdentityBundleRequest{
 		JurisdictionID: "JUR-INVALID",
 		EffectiveFrom:  time.Now().UTC(),
 		CorrelationID:  "corr-011",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -726,13 +803,17 @@ func TestCreateTaxIdentityBundle_JurisdictionUnavailable_FailsClosed(t *testing.
 	ms := newMemStore()
 	svc := newSvc(t, ms, permitAllAuthZ{}, unavailableJurisd{})
 
+	// The bundle needs an operational entity; the jurisdiction check is
+	// what is under test.
+	seedEntityFor(ms, "ent-100", "tenant-001", "", "JUR-US")
+
 	req := domain.CreateTaxIdentityBundleRequest{
 		JurisdictionID: "JUR-US",
 		EffectiveFrom:  time.Now().UTC(),
 		CorrelationID:  "corr-012",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
 }
 
@@ -764,9 +845,11 @@ func TestUpdateEntity_WritesVerifiedActorPrincipalID(t *testing.T) {
 	entityID := "ent-actor-test"
 	seedEntity(ms, entityID)
 
+	// trading_name, not legal_name: legal_name is under ORG-03 SoD and is
+	// refused on this route (see TestUpdateEntity_LegalNameIsNotPatchable).
 	newName := "Updated Name"
-	_, err := svc.UpdateEntity(authCtx(), entityID, domain.UpdateEntityRequest{
-		LegalName:     &newName,
+	_, err := svc.UpdateEntity(tenantCtx("tenant-001"), entityID, domain.UpdateEntityRequest{
+		TradingName:   &newName,
 		CorrelationID: "corr-actor-test",
 	})
 	require.NoError(t, err)
@@ -901,7 +984,7 @@ func TestAuthorizeReceivesVerifiedPrincipalAndTenantScope(t *testing.T) {
 
 	ctx := domain.WithTenant(authCtx(), "ten-verified")
 	newName := "Updated"
-	_, err := svc.UpdateEntity(ctx, entityID, domain.UpdateEntityRequest{LegalName: &newName})
+	_, err := svc.UpdateEntity(ctx, entityID, domain.UpdateEntityRequest{TradingName: &newName})
 	require.NoError(t, err)
 
 	require.Equal(t, 1, rec.calls)
@@ -920,6 +1003,7 @@ func TestProvisionTenantUsesPlatformScope(t *testing.T) {
 
 	_, err := svc.ProvisionTenant(authCtx(), domain.ProvisionTenantRequest{
 		TenantCode:          "ACME",
+		ExternalCustomerKey: "ck-ACME",
 		LegalName:           "Acme Ltd",
 		DefaultCurrencyCode: "GBP",
 		PrimaryTimezone:     "Europe/London",
@@ -930,6 +1014,34 @@ func TestProvisionTenantUsesPlatformScope(t *testing.T) {
 	assert.Equal(t, testPlatformScope, rec.scopeID,
 		"ProvisionTenant has no tenant yet and must use the configured platform scope")
 	assert.Equal(t, testPrincipal, rec.principalID)
+}
+
+// TestProvisionTenant_WithACallerTenant is the live case the test above
+// missed: the envelope always carries X-Tenant-Id, so the caller has a tenant
+// of its own. Authorization must still be the platform scope, and the insert
+// must run in the NEW tenant's scope — in the caller's, the tenants RLS
+// WITH CHECK refused every creation (found live on 28 Sep 2026: 500 on
+// every POST /v1/tenants).
+func TestProvisionTenant_WithACallerTenant(t *testing.T) {
+	ms := newMemStore()
+	rec := &recordingAuthZ{}
+	svc := newSvc(t, ms, rec, acceptAllJurisd{})
+
+	ctx := domain.WithTenant(authCtx(), fixtureTenants[0])
+	created, err := svc.ProvisionTenant(ctx, domain.ProvisionTenantRequest{
+		TenantCode:          "ACME2",
+		ExternalCustomerKey: "ck-ACME2",
+		LegalName:           "Acme Two Ltd",
+		DefaultCurrencyCode: "GBP",
+		PrimaryTimezone:     "Europe/London",
+		PrimaryLocale:       "en-GB",
+	}, "corr")
+	require.NoError(t, err)
+
+	assert.Equal(t, testPlatformScope, rec.scopeID,
+		"provisioning is a platform permission, not one the caller's own tenant can grant")
+	assert.Equal(t, created.TenantID, ms.lastCreateScope,
+		"the new tenant row must be written in its own scope, not the caller's")
 }
 
 // TestUpdateEntity_RefusesWhenNoVerifiedPrincipal replaces a test that

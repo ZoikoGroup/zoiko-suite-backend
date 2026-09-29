@@ -90,11 +90,21 @@ func (p *Publisher) PublishReceivableOverdue(ctx context.Context, inv domain.Cus
 
 // PublishPaymentReceived publishes payment.received event.
 func (p *Publisher) PublishPaymentReceived(ctx context.Context, inv domain.CustomerInvoice) {
-	p.emit(ctx, "payment.received", inv.CorrelationID, inv.TenantID, inv.LegalEntityID, deref(inv.PaymentReceivedByPrincipalID), inv.InvoiceID, map[string]any{
+	payload := map[string]any{
 		"invoice_id":    inv.InvoiceID,
 		"amount":        inv.Amount,
 		"currency_code": inv.CurrencyCode,
-	})
+		"payment_received_by_principal_id": deref(inv.PaymentReceivedByPrincipalID),
+	}
+	// AR-08 cash application rides on the event so a consumer can reconcile the
+	// customer's remittance without re-reading the receivable.
+	if inv.PaymentDate != nil {
+		payload["payment_date"] = inv.PaymentDate.Time
+	}
+	if inv.PaymentReference != nil {
+		payload["payment_reference"] = *inv.PaymentReference
+	}
+	p.emit(ctx, "payment.received", inv.CorrelationID, inv.TenantID, inv.LegalEntityID, deref(inv.PaymentReceivedByPrincipalID), inv.InvoiceID, payload)
 }
 
 // PublishOutbox publishes a pre-serialized outbox event envelope to Kafka with X-Event-ID header.

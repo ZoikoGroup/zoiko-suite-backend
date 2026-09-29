@@ -43,7 +43,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS webhook_dlq, action_tokens, email_suppressions, delivery_events, delivery_attempts, message_renders, message_intents, template_versions, template_definitions, notifications CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS notification_delivery_attempts, event_outbox, webhook_dlq, action_tokens, email_suppressions, delivery_events, delivery_attempts, message_renders, message_intents, template_versions, template_definitions, notifications CASCADE;`)
 
 	// Every migration, in order — discovered, not listed.
 	//
@@ -322,11 +322,11 @@ func TestPgStore_CompleteDelivery_IsTenantScoped(t *testing.T) {
 	}
 
 	sentAt := time.Now().UTC()
-	if err := s.CompleteDelivery(tenantCtx("tenant-b"), n.NotificationID, "SENT", "", "stub receipt", &sentAt); !errors.Is(err, domain.ErrNotificationNotFound) {
+	if err := s.CompleteDelivery(tenantCtx("tenant-b"), n.NotificationID, "SENT", "", "stub receipt", &sentAt, "corr-test", domain.AttemptMeta{}); !errors.Is(err, domain.ErrNotificationNotFound) {
 		t.Fatalf("cross-tenant complete returned %v, want ErrNotificationNotFound", err)
 	}
 
-	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "stub receipt", &sentAt); err != nil {
+	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "stub receipt", &sentAt, "corr-test", domain.AttemptMeta{}); err != nil {
 		t.Fatalf("own-tenant complete: %v", err)
 	}
 	got, err := s.GetNotification(tenantCtx("tenant-a"), n.NotificationID)
@@ -351,7 +351,7 @@ func TestPgStore_MarkOutcomeUnknown_ThenResolveToSent(t *testing.T) {
 	}
 
 	attemptedAt := time.Now().UTC()
-	if err := s.MarkOutcomeUnknown(tenantCtx("tenant-a"), n.NotificationID, "tenant-a", "connection dropped at verdict", attemptedAt); err != nil {
+	if err := s.MarkOutcomeUnknown(tenantCtx("tenant-a"), n.NotificationID, "tenant-a", "connection dropped at verdict", attemptedAt, "corr-test", domain.AttemptMeta{}); err != nil {
 		t.Fatalf("MarkOutcomeUnknown: %v", err)
 	}
 
@@ -406,7 +406,7 @@ func TestPgStore_ResolveDeliveryOutcome_NotPendingUnknown_ReturnsNotFound(t *tes
 		t.Fatalf("create: %v", err)
 	}
 	sentAt := time.Now().UTC()
-	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "receipt", &sentAt); err != nil {
+	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "receipt", &sentAt, "corr-test", domain.AttemptMeta{}); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 
@@ -430,7 +430,7 @@ func TestPgStore_MarkOutcomeUnknown_IsTenantScoped(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if err := s.MarkOutcomeUnknown(tenantCtx("tenant-b"), n.NotificationID, "tenant-b", "reason", time.Now().UTC()); !errors.Is(err, domain.ErrNotificationNotFound) {
+	if err := s.MarkOutcomeUnknown(tenantCtx("tenant-b"), n.NotificationID, "tenant-b", "reason", time.Now().UTC(), "corr-test", domain.AttemptMeta{}); !errors.Is(err, domain.ErrNotificationNotFound) {
 		t.Fatalf("cross-tenant MarkOutcomeUnknown returned %v, want ErrNotificationNotFound", err)
 	}
 }

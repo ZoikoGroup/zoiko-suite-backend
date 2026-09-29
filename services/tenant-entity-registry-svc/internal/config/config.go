@@ -37,6 +37,45 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// MakerCheckerLegacyBodyApprover restores the pre-000007 maker-checker, in
+	// which the maker names their own approver in the request body. A
+	// migration aid for the frontend only: refused in staging and production.
+	MakerCheckerLegacyBodyApprover bool
+
+	// ApprovalTTLHours is how long an approval request waits for a decision.
+	ApprovalTTLHours int
+
+	// LegacyEntityCreateActive creates legal entities straight into ACTIVE,
+	// skipping ORG-03's Draft → Verified gate. Frontend migration aid only:
+	// refused in staging and production.
+	LegacyEntityCreateActive bool
+
+	// OnboardingKeyOptional lets ProvisionTenant run without an
+	// external_customer_key. Migration aid only: refused in staging and
+	// production, where a keyless provision is a potential duplicate tenant.
+	OnboardingKeyOptional bool
+
+	// CommercialAccountURL is commercial-account-svc, the authority for
+	// ORG-02 §4.2's "plan entitlement". Empty selects a permissive stub —
+	// refused in staging and production.
+	CommercialAccountURL string
+
+	// RestrictedJurisdictionCodes is §4.2's "restricted-jurisdiction checks":
+	// jurisdiction codes a tenant may not be provisioned in. A compliance
+	// decision, so it is configuration, not code; staging and production must
+	// set it explicitly (the literal NONE states "no restrictions").
+	RestrictedJurisdictionCodes []string
+	restrictedSet               bool
+
+	// LegacyProvisioningInputs lets ProvisionTenant run without §4.2's
+	// required inputs (primary jurisdiction, residency preference, onboarding
+	// evidence, subscription). Dev-only, for callers not yet migrated.
+	LegacyProvisioningInputs bool
+
+	// ExpectedVersionOptional restores the pre-28 Sep substitution of the
+	// version just read for a missing expected_version. Dev-only.
+	ExpectedVersionOptional bool
 }
 
 type DBConfig struct {
@@ -161,6 +200,24 @@ func Load() (*Config, error) {
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+
+		MakerCheckerLegacyBodyApprover: strings.EqualFold(env("MAKER_CHECKER_LEGACY_BODY_APPROVER", "false"), "true"),
+		ApprovalTTLHours:               envInt("APPROVAL_TTL_HOURS", 168),
+		LegacyEntityCreateActive:       strings.EqualFold(env("LEGACY_ENTITY_CREATE_ACTIVE", "false"), "true"),
+		OnboardingKeyOptional:          strings.EqualFold(env("ONBOARDING_KEY_OPTIONAL", "false"), "true"),
+		CommercialAccountURL:           env("COMMERCIAL_ACCOUNT_URL", ""),
+		LegacyProvisioningInputs:       strings.EqualFold(env("LEGACY_PROVISIONING_INPUTS", "false"), "true"),
+		ExpectedVersionOptional:        strings.EqualFold(env("EXPECTED_VERSION_OPTIONAL", "false"), "true"),
+	}
+	if raw, ok := os.LookupEnv("RESTRICTED_JURISDICTION_CODES"); ok && strings.TrimSpace(raw) != "" {
+		cfg.restrictedSet = true
+		if !strings.EqualFold(strings.TrimSpace(raw), "NONE") {
+			for _, c := range strings.Split(raw, ",") {
+				if c = strings.ToUpper(strings.TrimSpace(c)); c != "" {
+					cfg.RestrictedJurisdictionCodes = append(cfg.RestrictedJurisdictionCodes, c)
+				}
+			}
+		}
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -178,9 +235,43 @@ func (c *Config) validate() error {
 		return fmt.Errorf("PORT must be between 1 and 65535, got %d", c.Port)
 	}
 
+	if c.ApprovalTTLHours <= 0 {
+		return fmt.Errorf("APPROVAL_TTL_HOURS must be positive, got %d", c.ApprovalTTLHours)
+	}
+
 	isProdOrStaging := strings.EqualFold(c.Env, "production") || strings.EqualFold(c.Env, "staging")
 	if !isProdOrStaging {
 		return nil
+	}
+
+	// A self-asserted approver is exactly the defect 000007 fixes. Never in
+	// an environment where maker-checker has to mean something.
+	if c.MakerCheckerLegacyBodyApprover {
+		return fmt.Errorf("MAKER_CHECKER_LEGACY_BODY_APPROVER is not permitted in %s environment", c.Env)
+	}
+	if c.LegacyEntityCreateActive {
+		return fmt.Errorf("LEGACY_ENTITY_CREATE_ACTIVE is not permitted in %s environment", c.Env)
+	}
+	if c.OnboardingKeyOptional {
+		return fmt.Errorf("ONBOARDING_KEY_OPTIONAL is not permitted in %s environment", c.Env)
+	}
+	if c.ExpectedVersionOptional {
+		return fmt.Errorf("EXPECTED_VERSION_OPTIONAL is not permitted in %s environment", c.Env)
+	}
+	if c.LegacyProvisioningInputs {
+		return fmt.Errorf("LEGACY_PROVISIONING_INPUTS is not permitted in %s environment", c.Env)
+	}
+	// The stub validator accepts every jurisdiction id. main.go selected it
+	// whenever the URL was unset or left at its default — in every
+	// environment, so a production deployment validated nothing.
+	if !c.JurisdictionValidatorIsReal() {
+		return fmt.Errorf("JURISDICTION_RULES_URL must point at the Jurisdiction Rules Service in %s environment (the stub accepts every jurisdiction)", c.Env)
+	}
+	if c.CommercialAccountURL == "" {
+		return fmt.Errorf("COMMERCIAL_ACCOUNT_URL must be set in %s environment (plan entitlement is a §4.2 server-resolved check)", c.Env)
+	}
+	if !c.restrictedSet {
+		return fmt.Errorf("RESTRICTED_JURISDICTION_CODES must be set in %s environment (a comma list of codes, or NONE)", c.Env)
 	}
 
 	if c.DB.Password == "" {
@@ -236,4 +327,10 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// JurisdictionValidatorIsReal reports whether the HTTP validator will be used
+// rather than the accept-everything stub.
+func (c *Config) JurisdictionValidatorIsReal() bool {
+	return c.JurisdictionRulesURL != "" && c.JurisdictionRulesURL != "http://jurisdiction-rules-svc"
 }

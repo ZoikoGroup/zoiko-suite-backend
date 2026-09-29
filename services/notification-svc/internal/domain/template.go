@@ -66,6 +66,8 @@ type CreateTemplateParams struct {
 	Name             string
 	BusinessPurpose  string
 	OwnerPrincipalID string
+	// CorrelationID is carried onto the template.created event.
+	CorrelationID string
 }
 
 // CreateVersionParams is CreateVersion's input — a new DRAFT version for
@@ -84,12 +86,14 @@ type CreateVersionParams struct {
 type ApproveVersionParams struct {
 	VersionID             string
 	ApprovedByPrincipalID string
+	CorrelationID         string
 }
 
 // PublishVersionParams is PublishTemplate's input.
 type PublishVersionParams struct {
 	VersionID              string
 	PublishedByPrincipalID string
+	CorrelationID          string
 }
 
 // RetireTemplateParams is RetireTemplate's input — retires the whole
@@ -98,6 +102,7 @@ type PublishVersionParams struct {
 type RetireTemplateParams struct {
 	TemplateID           string
 	RetiredByPrincipalID string
+	CorrelationID        string
 }
 
 // RenderPreviewParams is RenderPreview's input — renders a version's

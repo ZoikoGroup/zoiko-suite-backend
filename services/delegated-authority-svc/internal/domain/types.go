@@ -10,6 +10,10 @@
 // request body. This service does not itself decide whether the delegator
 // holds the authority; authorization-svc remains the single source of
 // truth for that.
+//
+// Additionally, per ORG-06 §4.6, "Cannot delegate around SoD" — a delegation
+// must not create a segregation-of-duties conflict. This is enforced by
+// consulting authorization-svc's SoD engine before creating the delegation.
 package domain
 
 import "time"
@@ -17,35 +21,59 @@ import "time"
 // DelegationStatus is a linear chain: ACTIVE -> REVOKED (explicit action)
 // or ACTIVE -> EXPIRED (lazy, on read, once EffectiveTo has passed). Both
 // are terminal.
+//
+// PROPOSED: awaiting approval from the delegator (or an approver).
+// SUSPENDED: temporarily inactive, can be reactivated.
+// These states add a review step before a delegation becomes ACTIVE, and
+// allow temporary removal without revocation.
 type DelegationStatus string
 
 const (
-	DelegationStatusActive  DelegationStatus = "ACTIVE"
-	DelegationStatusRevoked DelegationStatus = "REVOKED"
-	DelegationStatusExpired DelegationStatus = "EXPIRED"
+	DelegationStatusProposed  DelegationStatus = "PROPOSED"
+	DelegationStatusActive    DelegationStatus = "ACTIVE"
+	DelegationStatusSuspended DelegationStatus = "SUSPENDED"
+	DelegationStatusRevoked   DelegationStatus = "REVOKED"
+	DelegationStatusExpired   DelegationStatus = "EXPIRED"
 )
 
 // DelegationGrant is one delegated-authority chain: DelegatorPrincipalID
 // grants DelegatePrincipalID the ability to act as if authorized for
 // ActionType, within EffectiveFrom/EffectiveTo, scoped to LegalEntityID.
 // Entity-bound, never hard-deleted.
+//
+// ORG-06 §4.5: AuthorityLimit adds a monetary/quantitative ceiling to the
+// delegation — e.g., "approve payments up to 50,000 cents (500.00 USD)" or
+// "issue up to 10 purchase orders". Both limits are optional; an absent limit
+// means no ceiling (subject to the delegator's own limits).
 type DelegationGrant struct {
-	DelegationID         string           `json:"delegation_id"`
-	TenantID             string           `json:"tenant_id"`
-	LegalEntityID        string           `json:"legal_entity_id"`
-	DelegatorPrincipalID string           `json:"delegator_principal_id"`
-	DelegatePrincipalID  string           `json:"delegate_principal_id"`
-	ActionType           string           `json:"action_type"`
-	EffectiveFrom        time.Time        `json:"effective_from"`
-	EffectiveTo          time.Time        `json:"effective_to"`
-	Status               DelegationStatus `json:"status"`
-	CreatedByPrincipalID string           `json:"created_by_principal_id"`
-	CorrelationID        string           `json:"correlation_id"`
-	CreatedAt            time.Time        `json:"created_at"`
-	UpdatedAt            time.Time        `json:"updated_at"`
-	RevokedByPrincipalID *string          `json:"revoked_by_principal_id,omitempty"`
-	RevokedAt            *time.Time       `json:"revoked_at,omitempty"`
-	ExpiredAt            *time.Time       `json:"expired_at,omitempty"`
+	DelegationID          string           `json:"delegation_id"`
+	TenantID              string           `json:"tenant_id"`
+	LegalEntityID         string           `json:"legal_entity_id"`
+	DelegatorPrincipalID  string           `json:"delegator_principal_id"`
+	DelegatePrincipalID   string           `json:"delegate_principal_id"`
+	ActionType            string           `json:"action_type"`
+	EffectiveFrom         time.Time        `json:"effective_from"`
+	EffectiveTo           time.Time        `json:"effective_to"`
+	Status                DelegationStatus `json:"status"`
+	CreatedByPrincipalID  string           `json:"created_by_principal_id"`
+	CorrelationID         string           `json:"correlation_id"`
+	CreatedAt             time.Time        `json:"created_at"`
+	UpdatedAt             time.Time        `json:"updated_at"`
+	RevokedByPrincipalID  *string          `json:"revoked_by_principal_id,omitempty"`
+	RevokedAt             *time.Time       `json:"revoked_at,omitempty"`
+	ExpiredAt             *time.Time       `json:"expired_at,omitempty"`
+
+	// AuthorityLimit: optional monetary ceiling in minor units (cents) + ISO 4217 currency.
+	AuthorityLimitCents    *int64  `json:"authority_limit_cents,omitempty"`
+	AuthorityLimitCurrency *string `json:"authority_limit_currency,omitempty"`
+
+	// AuthorityLimitQuantity: optional quantitative ceiling (e.g., max count of actions).
+	AuthorityLimitQuantity *int64 `json:"authority_limit_quantity,omitempty"`
+
+	// Version is the optimistic locking version. Incremented on every update.
+	// Clients should provide expected_version on protected mutations (revoke,
+	// extend) to prevent lost updates.
+	Version int64 `json:"version"`
 }
 
 // ── wire types ───────────────────────────────────────────────────────────────
@@ -72,13 +100,72 @@ type ListDelegationsFilter struct {
 }
 
 type CreateDelegationRequest struct {
-	LegalEntityID        string    `json:"legal_entity_id"`
+	LegalEntityID            string  `json:"legal_entity_id"`
+	DelegatorPrincipalID     string  `json:"delegator_principal_id"`
+	DelegatePrincipalID      string  `json:"delegate_principal_id"`
+	ActionType               string  `json:"action_type"`
+	EffectiveFrom            time.Time `json:"effective_from"`
+	EffectiveTo              time.Time `json:"effective_to"`
+	CorrelationID            string  `json:"correlation_id"`
+
+	// AuthorityLimit: optional monetary ceiling in minor units (cents) + ISO 4217 currency.
+	AuthorityLimitCents    *int64  `json:"authority_limit_cents,omitempty"`
+	AuthorityLimitCurrency *string `json:"authority_limit_currency,omitempty"`
+
+	// AuthorityLimitQuantity: optional quantitative ceiling (e.g., max count of actions).
+	AuthorityLimitQuantity *int64 `json:"authority_limit_quantity,omitempty"`
+}
+
+// ExtendDelegationRequest extends an ACTIVE delegation's effective_to.
+type ExtendDelegationRequest struct {
+	DelegationID string    `json:"delegation_id"`
+	NewEffectiveTo time.Time `json:"new_effective_to"`
+	CorrelationID  string    `json:"correlation_id"`
+}
+
+// RefusedEscalation records a refused escalation attempt for audit.
+// ORG-06 §4.2: "Every refused escalation attempt leaves durable evidence."
+type RefusedEscalation struct {
+	RefusedID              string    `json:"refused_id"`
+	TenantID               string    `json:"tenant_id"`
+	LegalEntityID          string    `json:"legal_entity_id"`
+	CallerPrincipalID      string    `json:"caller_principal_id"`
+	DelegatorPrincipalID   string    `json:"delegator_principal_id"`
+	DelegatePrincipalID    string    `json:"delegate_principal_id"`
+	ActionType             string    `json:"action_type"`
+	EffectiveFrom          time.Time `json:"effective_from"`
+	EffectiveTo            time.Time `json:"effective_to"`
+	RefusalReason          string    `json:"refusal_reason"` // self_dealing, delegator_mismatch, delegator_lacks_authority, sod_conflict, overlap_conflict, invalid_window, no_create_grant
+	CorrelationID          string    `json:"correlation_id,omitempty"`
+	IdempotencyKey         string    `json:"idempotency_key,omitempty"`
+	RequestID              string    `json:"request_id,omitempty"`
+	SourceChannel          string    `json:"source_channel,omitempty"`
+	RefusedAt              time.Time `json:"refused_at"`
+}
+
+// RefusedEscalationFilter for listing refused escalations.
+type RefusedEscalationFilter struct {
+	TenantID            string
+	LegalEntityID       string
+	CallerPrincipalID   string
+	DelegatorPrincipalID string
+	DelegatePrincipalID  string
+	RefusalReason       string
+	Limit               int
+	Offset              int
+}
+
+// DelegationChainStep represents one step in a delegation chain.
+// Each step shows a delegator granting authority to a delegate.
+type DelegationChainStep struct {
+	StepNumber          int       `json:"step_number"`
 	DelegatorPrincipalID string    `json:"delegator_principal_id"`
 	DelegatePrincipalID  string    `json:"delegate_principal_id"`
 	ActionType           string    `json:"action_type"`
 	EffectiveFrom        time.Time `json:"effective_from"`
 	EffectiveTo          time.Time `json:"effective_to"`
-	CorrelationID        string    `json:"correlation_id"`
+	Status               DelegationStatus `json:"status"`
+	DelegationID         string    `json:"delegation_id"`
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -130,14 +217,35 @@ var (
 	// same principal -- not a delegation chain, a no-op that reads as one.
 	ErrDelegateIsDelegator = errorString("delegate_principal_id must differ from delegator_principal_id")
 
-	// ErrUnknownStatus is returned for a status filter outside the domain
-	// vocabulary. Silently returning no rows for a typo is a dangerous answer
-	// on a governance register: "no delegations" and "you misspelled the
-	// filter" must not look identical.
-	ErrUnknownStatus = errorString("status must be one of ACTIVE, REVOKED, EXPIRED")
+// ErrUnknownStatus is returned for a status filter outside the domain
+// vocabulary. Silently returning no rows for a typo is a dangerous answer
+// on a governance register: "no delegations" and "you misspelled the
+// filter" must not look identical.
+ErrUnknownStatus = errorString("status must be one of PROPOSED, ACTIVE, SUSPENDED, REVOKED, EXPIRED")
 
-	// ErrInvalidPaging is returned for an out-of-range limit or offset.
-	ErrInvalidPaging = errorString("limit must be between 1 and 500 and offset must not be negative")
+// ErrVersionMismatch is returned when the expected_version provided on a
+// protected mutation (revoke, extend) does not match the current version
+// in the store — preventing lost updates via optimistic locking.
+ErrVersionMismatch = errorString("expected_version does not match current version")
+
+// ErrSODConflict is returned when the delegation would create a
+// segregation-of-duties conflict — e.g., delegating PAYMENT_APPROVE to a
+// principal who already holds PAYMENT_RELEASE, which the static conflict
+// matrix forbids.
+ErrSODConflict = errorString("delegation would create a segregation-of-duties conflict")
+
+// ErrOverlapConflict is returned when the delegation would create an
+// overlapping time window for the same (delegate, action_type) on the
+// same entity — ORG-06 §4.4 forbids a delegate from holding two ACTIVE
+// delegations for the same action on the same entity at the same time.
+ErrOverlapConflict = errorString("delegation would create an overlapping active delegation for the same action")
+
+// ErrInvalidPaging is returned for an out-of-range limit or offset.
+ErrInvalidPaging = errorString("limit must be between 1 and 500 and offset must not be negative")
+
+// ErrCannotExtend is returned when a delegation cannot be extended —
+// e.g., it's not ACTIVE or the new effective_to is not after the current one.
+ErrCannotExtend = errorString("delegation cannot be extended from its current state")
 
 	// ErrTenantMissing is returned when a request carries no X-Tenant-Id.
 	// Distinct from ErrIdentityMissing so a forgotten tenant header is not

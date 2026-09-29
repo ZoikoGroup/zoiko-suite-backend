@@ -86,7 +86,6 @@ func newSuppressionHandler(t *testing.T, ss *stubSuppressionStore) http.Handler 
 	t.Helper()
 	h := handler.New(handler.Deps{
 		Store:        &stubStore{byID: make(map[string]*domain.Notification), templates: make(map[string]*domain.TemplateDefinition), versions: make(map[string]*domain.TemplateVersion)},
-		Publisher:    &stubPublisher{},
 		AuthZ:        &stubAuthZ{},
 		Deliverer:    &stubDeliverer{delivered: true},
 		RetryPolicy:  retry.DefaultPolicy,

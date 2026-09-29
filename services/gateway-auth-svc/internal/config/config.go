@@ -12,6 +12,12 @@ import (
 // message broker here — this service is a stateless JWT verifier called by
 // Traefik's ForwardAuth middleware on every gated request.
 type Config struct {
+	// OTELExporterEndpoint is the OTLP/HTTP collector traces are shipped to.
+	// Tracing failing to initialise is logged and the service starts anyway —
+	// a collector outage must not take down the gateway every request depends
+	// on.
+	OTELExporterEndpoint string
+
 	Port int
 
 	// JWKSURL is identity-context-svc's public key endpoint. Envelope JWTs
@@ -37,6 +43,22 @@ type Config struct {
 	// no configured exporter is normal, not an error), so its absence must
 	// never affect whether a request is let through.
 	SIEMServiceURL string
+
+	// IdentityJWKSMTLSEnabled/IdentityJWKSMTLSURL wire the JWKS client into
+	// the mTLS pilot for calling identity-context-svc. Disabled by default —
+	// plain HTTP JWKSURL keeps being used unless explicitly turned on.
+	IdentityJWKSMTLSEnabled bool
+	IdentityJWKSMTLSURL     string
+
+	// TenantRegistryMTLSEnabled/TenantRegistryMTLSURL wire the tenant context
+	// resolver into the mTLS pilot for calling tenant-entity-registry-svc.
+	// Disabled by default.
+	TenantRegistryMTLSEnabled bool
+	TenantRegistryMTLSURL     string
+
+	// MTLSManagementServiceURL is the mtls-management-svc endpoint used to
+	// provision this service's client identity for mTLS calls.
+	MTLSManagementServiceURL string
 
 	// TenantRegistryURL is tenant-entity-registry-svc — the tenant and legal
 	// entity master GOV-01 resolves context against. Empty disables resolution
@@ -88,7 +110,13 @@ func Load() (*Config, error) {
 		ExpectedAudience:        strEnv("EXPECTED_AUDIENCE", "zoiko-internal"),
 		CartaServiceURL:         strEnv("CARTA_SERVICE_URL", ""),
 		SIEMServiceURL:          strEnv("SIEM_SERVICE_URL", ""),
+		IdentityJWKSMTLSEnabled: strEnv("IDENTITY_JWKS_MTLS_ENABLED", "false") == "true",
+		IdentityJWKSMTLSURL:     strEnv("IDENTITY_JWKS_MTLS_URL", "https://identity-svc:8449/.well-known/jwks.json"),
+		TenantRegistryMTLSEnabled: strEnv("TENANT_REGISTRY_MTLS_ENABLED", "false") == "true",
+		TenantRegistryMTLSURL:     strEnv("TENANT_REGISTRY_MTLS_URL", "https://tenant-entity-registry-svc:8449"),
+		MTLSManagementServiceURL:  strEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		TenantRegistryURL:       strEnv("TENANT_REGISTRY_URL", ""),
+		OTELExporterEndpoint:    strEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		TenantContextTTL:        time.Duration(ctxTTL) * time.Second,
 		TenantContextStaleGrace: time.Duration(ctxGrace) * time.Second,
 	}, nil

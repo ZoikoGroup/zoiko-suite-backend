@@ -26,7 +26,7 @@ import (
 // was no sweep. These tests exist so that cannot be true again.
 
 func newSweepWorker(s *stubStore, strandedAfter time.Duration) *retry.Worker {
-	return retry.NewWorker(s, &stubDeliverer{}, &stubPublisher{}, &stubResolver{},
+	return retry.NewWorker(s, &stubDeliverer{}, nil, &stubResolver{},
 		func(error) bool { return true },
 		retry.Options{
 			Policy:        retry.Policy{MaxAttempts: 5, BaseDelay: time.Second, MaxDelay: time.Minute},

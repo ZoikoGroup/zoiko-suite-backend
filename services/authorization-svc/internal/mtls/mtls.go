@@ -81,24 +81,36 @@ func ProvisionServerIdentity(ctx context.Context, mtlsServiceURL, serviceName, p
 	if err != nil {
 		return nil, fmt.Errorf("build provision request: %w", err)
 	}
-	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4).
-	// mtls-management-svc's envelope middleware validates these headers
-	// before the request reaches the bootstrap token check — missing
-	// tenant_id or actor_subject_id causes a 401 via StatusFor(), which
-	// short-circuits the handler and prevents the bootstrap path from
-	// ever running. All mandatory fields are supplied here so the
-	// middleware passes through; the bootstrap token check then bypasses
-	// the normal principal/authorize flow on the other side.
-	requestID := uuid.New().String()
 	req.Header.Set("Content-Type", "application/json")
+
+	// THE CANONICAL INPUT CONTRACT APPLIES TO THIS CALL TOO.
+	//
+	// mtls-management-svc enforces the estate envelope on every route, and
+	// this request carried only Content-Type and a tenant header. It was
+	// refused 401 envelope_incomplete before the bootstrap-token branch was
+	// ever reached — so authorization-svc could not provision its identity,
+	// called log.Fatal, and crash-looped. The symptom
+	// ("mtls-management-svc returned 401") reads like a rejected credential,
+	// which is why it was mistaken for one: the token was correct all along
+	// and was never looked at.
+	//
+	// actor_subject_id is X-Workload-Id, not X-Principal-Id. This is a
+	// service provisioning its own certificate during startup; there is no
+	// human subject, and inventing one would put a fictional principal into
+	// mtls-management-svc's evidence.
 	req.Header.Set("X-Tenant-Id", platformScopeID)
-	req.Header.Set("X-Workload-Id", serviceName) // workload identity, not a human subject
 	req.Header.Set("X-Legal-Entity-Id", platformScopeID)
-	req.Header.Set("X-Request-Id", requestID)
-	req.Header.Set("X-Correlation-ID", requestID)
+	req.Header.Set("X-Workload-Id", serviceName)
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Correlation-ID", uuid.NewString())
 	req.Header.Set("X-Source-Channel", "system")
-	req.Header.Set("X-Purpose-Context", "system")
-	req.Header.Set("Idempotency-Key", "mtls-bootstrap:"+serviceName)
+	req.Header.Set("X-Purpose-Context", "service_identity_provisioning")
+	// Issuing a certificate is a material state change, so the contract wants
+	// an idempotency key. A fresh one per attempt is correct here: a retry
+	// after a failed provision must be allowed to mint a new leaf, not replay
+	// the answer to a call whose result never arrived.
+	req.Header.Set("Idempotency-Key", uuid.NewString())
+
 	if bootstrapToken != "" {
 		req.Header.Set("X-Mtls-Bootstrap-Token", bootstrapToken)
 	}
