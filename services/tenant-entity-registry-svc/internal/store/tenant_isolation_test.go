@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,8 +132,33 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// A reused CI fallback database may still hold the previous run's tables.
-	_, _ = testPool.Exec(ctx, `DROP TABLE IF EXISTS workspaces, tax_identity_bundles, entity_jurisdiction_assignments, entity_hierarchies, legal_entities, data_residency_policies, tenants, residency_regions CASCADE;`)
+	// A reused database (CI runs the race-test step against the same testdb
+	// first) still holds every table the migrations create. A hand-written
+	// DROP list only covered the first five migrations' tables, so 000006 then
+	// failed with "already exists". Every table in the schema is dropped
+	// instead — and only on a database whose name marks it as disposable.
+	if !isThrowawayDatabase(ctx, testPool) {
+		fmt.Println("refusing to reset: the target database's name does not contain \"test\"")
+		testPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+	if _, err := testPool.Exec(ctx, `DO $$
+		DECLARE t record;
+		BEGIN
+			FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+				EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', t.tablename);
+			END LOOP;
+		END $$;`); err != nil {
+		fmt.Printf("failed to reset test schema: %v\n", err)
+		testPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
 
 	// Run migrations. Discovered from the directory, NOT listed inline: a
 	// hand-written list silently skips the migration added after it was
@@ -585,4 +611,15 @@ func TestPgStore_TenantIsolation_TransitionTenantLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, tenant)
 	assert.Equal(t, domain.TenantLifecycleOnboarding, tenant.LifecycleState, "ISOLATION FAILURE: tenant B transitioned tenant A's lifecycle state")
+}
+
+// isThrowawayDatabase reports whether the connected database is recognisably
+// disposable. The reset above drops every table, so it must never run against
+// a database that holds real tenants.
+func isThrowawayDatabase(ctx context.Context, pool *pgxpool.Pool) bool {
+	var name string
+	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&name); err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(name), "test")
 }
