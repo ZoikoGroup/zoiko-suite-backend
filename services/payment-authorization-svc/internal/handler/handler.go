@@ -203,10 +203,6 @@ func (h *Handler) RequestPaymentAuthorization(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventAuthorizationRequested, EntityID: created.AuthorizationID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: created,
-	})
 	writeJSON(w, http.StatusCreated, created)
 }
 
@@ -355,10 +351,6 @@ func (h *Handler) ApprovePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPaymentAuthorized, EntityID: updated.AuthorizationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -450,10 +442,6 @@ func (h *Handler) ConsumePaymentAuthorization(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventAuthorizationConsumed, EntityID: updated.AuthorizationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 

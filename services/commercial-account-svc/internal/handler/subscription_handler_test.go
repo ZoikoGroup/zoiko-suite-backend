@@ -1,12 +1,16 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
 	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
@@ -20,44 +24,51 @@ func newSubscriptionTestRouter(h *Handler) *chi.Mux {
 	return r
 }
 
-func createTestCatalogAndPlan(t *testing.T, r *chi.Mux, orgID string) (catalogID, planID string) {
+// createTestCatalogAndPlan seeds a doc7 catalog and plan through the store.
+// The HTTP catalog write routes are retired (410); existing doc7 plans are
+// still what the doc7 subscription endpoints under test bind to.
+func createTestCatalogAndPlan(t *testing.T, h *Handler, orgID string) (catalogID, planID string) {
 	t.Helper()
-	wCat := httptest.NewRecorder()
-	r.ServeHTTP(wCat, buildRequest(http.MethodPost, "/v1/price-catalogs", domain.CreatePriceCatalogRequest{
-		CatalogCode:   "2026-Q1-" + orgID,
-		EffectiveFrom: "2026-01-01T00:00:00Z",
-	}))
-	if wCat.Code != http.StatusCreated {
-		t.Fatalf("expected 201 creating catalog, got %d — %s", wCat.Code, wCat.Body.String())
-	}
-	var catalog domain.PriceCatalog
-	_ = json.NewDecoder(wCat.Body).Decode(&catalog)
+	return seedLegacyPlan(t, h, "2026-Q1-"+orgID, "GROWTH", 499, true)
+}
 
-	wPlan := httptest.NewRecorder()
-	r.ServeHTTP(wPlan, buildRequest(http.MethodPost, "/v1/plans", domain.CreatePlanRequest{
-		CatalogVersionID:      catalog.CatalogVersionID,
-		PlanCode:              "GROWTH",
-		DisplayName:           "Growth",
-		BillingInterval:       "MONTHLY",
-		BasePriceAmount:       499,
-		BasePriceCurrencyCode: "USD",
-	}))
-	if wPlan.Code != http.StatusCreated {
-		t.Fatalf("expected 201 creating plan, got %d — %s", wPlan.Code, wPlan.Body.String())
+func seedLegacyPlan(t *testing.T, h *Handler, catalogCode, planCode string, amount float64, withLimit bool) (catalogID, planID string) {
+	t.Helper()
+	ctx := context.Background()
+	c := &domain.PriceCatalog{CatalogVersionID: uuid.NewString(), CatalogCode: catalogCode, Status: domain.CatalogStatusPublished,
+		EffectiveFrom: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "seed"}
+	if err := h.store.CreatePriceCatalog(ctx, c); err != nil {
+		t.Fatalf("seed catalog: %v", err)
 	}
-	var plan domain.Plan
-	_ = json.NewDecoder(wPlan.Body).Decode(&plan)
-
-	wLimit := httptest.NewRecorder()
-	r.ServeHTTP(wLimit, buildRequest(http.MethodPut, "/v1/plans/"+plan.PlanID+"/entitlement-limits", domain.SetEntitlementLimitRequest{
-		MetricType: "USERS",
-		LimitValue: int64Ptr(10),
-	}))
-	if wLimit.Code != http.StatusOK {
-		t.Fatalf("expected 200 setting entitlement limit, got %d — %s", wLimit.Code, wLimit.Body.String())
+	p := &domain.Plan{PlanID: uuid.NewString(), CatalogVersionID: c.CatalogVersionID, PlanCode: planCode, DisplayName: planCode,
+		BillingInterval: "MONTHLY", BasePriceAmount: amount, BasePriceCurrencyCode: "USD", CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "seed"}
+	if err := h.store.CreatePlan(ctx, p); err != nil {
+		t.Fatalf("seed plan: %v", err)
 	}
+	if withLimit {
+		if err := h.store.SetEntitlementLimit(ctx, &domain.EntitlementLimit{EntitlementLimitID: uuid.NewString(), PlanID: p.PlanID,
+			MetricType: "USERS", LimitValue: int64Ptr(10)}); err != nil {
+			t.Fatalf("seed entitlement limit: %v", err)
+		}
+	}
+	return c.CatalogVersionID, p.PlanID
+}
 
-	return catalog.CatalogVersionID, plan.PlanID
+// The doc7 catalog write routes published prices with no maker-checker and
+// stored them as floats. They now refuse with 410 and point at COM-01.
+func TestLegacyCatalogWrites_AreRetired(t *testing.T) {
+	r := newSubscriptionTestRouter(newTestHandler())
+	for _, rq := range []struct{ method, path string }{
+		{http.MethodPost, "/v1/price-catalogs"},
+		{http.MethodPost, "/v1/plans"},
+		{http.MethodPut, "/v1/plans/" + uuid.NewString() + "/entitlement-limits"},
+	} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, buildRequest(rq.method, rq.path, map[string]any{"catalog_code": "x"}))
+		if w.Code != http.StatusGone || !strings.Contains(w.Body.String(), CodeEndpointRetired) {
+			t.Errorf("%s %s: HTTP %d %s, want 410 %s", rq.method, rq.path, w.Code, w.Body.String(), CodeEndpointRetired)
+		}
+	}
 }
 
 func int64Ptr(v int64) *int64 { return &v }
@@ -66,7 +77,7 @@ func TestResolveEntitlement_PlanLimitWithNoOverlay(t *testing.T) {
 	h := newTestHandler()
 	r := newSubscriptionTestRouter(h)
 
-	_, planID := createTestCatalogAndPlan(t, r, "org-ent-1")
+	_, planID := createTestCatalogAndPlan(t, h, "org-ent-1")
 
 	wSub := httptest.NewRecorder()
 	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
@@ -95,7 +106,7 @@ func TestResolveEntitlement_OverlayOverridesPlan(t *testing.T) {
 	h := newTestHandler()
 	r := newSubscriptionTestRouter(h)
 
-	_, planID := createTestCatalogAndPlan(t, r, "org-ent-2")
+	_, planID := createTestCatalogAndPlan(t, h, "org-ent-2")
 
 	wSub := httptest.NewRecorder()
 	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
@@ -130,7 +141,7 @@ func TestRecordUsageEvent_DedupesRetry(t *testing.T) {
 	h := newTestHandler()
 	r := newSubscriptionTestRouter(h)
 
-	_, planID := createTestCatalogAndPlan(t, r, "org-usage-1")
+	_, planID := createTestCatalogAndPlan(t, h, "org-usage-1")
 	wSub := httptest.NewRecorder()
 	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
 		CommercialAccountID: "ca-usage-1",
@@ -164,7 +175,7 @@ func TestSubscriptionChange_PreviewThenConfirm_SecondConfirmFails(t *testing.T) 
 	h := newTestHandler()
 	r := newSubscriptionTestRouter(h)
 
-	_, planID := createTestCatalogAndPlan(t, r, "org-change-1")
+	_, planID := createTestCatalogAndPlan(t, h, "org-change-1")
 	wSub := httptest.NewRecorder()
 	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
 		CommercialAccountID: "ca-change-1",
@@ -174,29 +185,12 @@ func TestSubscriptionChange_PreviewThenConfirm_SecondConfirmFails(t *testing.T) 
 	_ = json.NewDecoder(wSub.Body).Decode(&sub)
 
 	// Second plan to upgrade to.
-	wCat2 := httptest.NewRecorder()
-	r.ServeHTTP(wCat2, buildRequest(http.MethodPost, "/v1/price-catalogs", domain.CreatePriceCatalogRequest{
-		CatalogCode:   "2026-Q2-change-1",
-		EffectiveFrom: "2026-04-01T00:00:00Z",
-	}))
-	var catalog2 domain.PriceCatalog
-	_ = json.NewDecoder(wCat2.Body).Decode(&catalog2)
-	wPlan2 := httptest.NewRecorder()
-	r.ServeHTTP(wPlan2, buildRequest(http.MethodPost, "/v1/plans", domain.CreatePlanRequest{
-		CatalogVersionID:      catalog2.CatalogVersionID,
-		PlanCode:              "ENTERPRISE",
-		DisplayName:           "Enterprise",
-		BillingInterval:       "MONTHLY",
-		BasePriceAmount:       1999,
-		BasePriceCurrencyCode: "USD",
-	}))
-	var plan2 domain.Plan
-	_ = json.NewDecoder(wPlan2.Body).Decode(&plan2)
+	_, plan2ID := seedLegacyPlan(t, h, "2026-Q2-change-1", "ENTERPRISE", 1999, false)
 
 	wPreview := httptest.NewRecorder()
 	r.ServeHTTP(wPreview, buildRequest(http.MethodPost, "/v1/subscription-change-requests", domain.PreviewChangeRequest{
 		SubscriptionID: sub.SubscriptionID,
-		TargetPlanID:   plan2.PlanID,
+		TargetPlanID:   plan2ID,
 	}))
 	if wPreview.Code != http.StatusCreated {
 		t.Fatalf("expected 201 previewing change, got %d — %s", wPreview.Code, wPreview.Body.String())
@@ -211,7 +205,7 @@ func TestSubscriptionChange_PreviewThenConfirm_SecondConfirmFails(t *testing.T) 
 	}
 	var updated domain.CommercialSubscription
 	_ = json.NewDecoder(wConfirm.Body).Decode(&updated)
-	if updated.PlanID != plan2.PlanID {
+	if updated.PlanID != plan2ID {
 		t.Fatalf("expected subscription repointed to plan2, got plan_id=%s", updated.PlanID)
 	}
 
@@ -233,7 +227,7 @@ func TestDunning_EscalatesThenRecoversIdempotently(t *testing.T) {
 	h := newTestHandler()
 	r := newSubscriptionTestRouter(h)
 
-	_, planID := createTestCatalogAndPlan(t, r, "org-dun-1")
+	_, planID := createTestCatalogAndPlan(t, h, "org-dun-1")
 	wSub := httptest.NewRecorder()
 	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
 		CommercialAccountID: "ca-dun-1",
@@ -295,7 +289,7 @@ func TestDunning_RejectsInvalidTransition(t *testing.T) {
 	h := newTestHandler()
 	r := newSubscriptionTestRouter(h)
 
-	_, planID := createTestCatalogAndPlan(t, r, "org-dun-2")
+	_, planID := createTestCatalogAndPlan(t, h, "org-dun-2")
 	wSub := httptest.NewRecorder()
 	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
 		CommercialAccountID: "ca-dun-2",
@@ -330,7 +324,7 @@ func TestBillingSourceTransfer_CancelsOldAndPreventsDoubleBilling(t *testing.T) 
 	h := newTestHandler()
 	r := newSubscriptionTestRouter(h)
 
-	_, planID := createTestCatalogAndPlan(t, r, "org-transfer-1")
+	_, planID := createTestCatalogAndPlan(t, h, "org-transfer-1")
 	wSub := httptest.NewRecorder()
 	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
 		CommercialAccountID: "ca-transfer-1",

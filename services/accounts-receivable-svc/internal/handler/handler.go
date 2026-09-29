@@ -261,7 +261,6 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishInvoiceIssued(r.Context(), *inv)
 	writeJSON(w, http.StatusCreated, inv)
 }
 
@@ -413,7 +412,6 @@ func (h *Handler) SendInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishInvoiceSent(r.Context(), *sent)
 	writeJSON(w, http.StatusOK, sent)
 }
 
@@ -462,7 +460,6 @@ func (h *Handler) MarkOverdue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishReceivableOverdue(r.Context(), *overdue)
 	writeJSON(w, http.StatusOK, overdue)
 }
 
@@ -552,7 +549,6 @@ func (h *Handler) ReceivePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishPaymentReceived(r.Context(), *paid)
 	writeJSON(w, http.StatusOK, paid)
 }
 

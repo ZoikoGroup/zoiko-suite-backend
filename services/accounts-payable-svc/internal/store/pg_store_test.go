@@ -52,6 +52,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS vendor_invoices CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox_events CASCADE;`)
 
 	// Every *.up.sql, sorted, rather than a list written out here.
 	//
@@ -483,5 +484,127 @@ func TestPgStore_ListInvoices_TenantScoped(t *testing.T) {
 	}
 	if len(listB) != 0 {
 		t.Fatalf("expected 0 invoices for tenant B, got %d", len(listB))
+	}
+}
+
+func TestPgStore_CreateInvoice_OutboxAtomicity(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	inv := newTestInvoice(tenantID)
+	created, err := s.CreateInvoice(ctx, inv)
+	if err != nil {
+		t.Fatalf("CreateInvoice failed: %v", err)
+	}
+	if !created {
+		t.Fatal("expected created=true for new invoice")
+	}
+
+	var count int
+	var eventType, aggregateID, correlationID string
+	err = pool.QueryRow(ctx, `
+		SELECT count(*), event_type, aggregate_id, correlation_id
+		FROM outbox_events
+		WHERE aggregate_id = $1
+		GROUP BY event_type, aggregate_id, correlation_id
+	`, inv.InvoiceID).Scan(&count, &eventType, &aggregateID, &correlationID)
+	if err != nil {
+		t.Fatalf("query outbox failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 outbox event, got %d", count)
+	}
+	if eventType != "vendor.invoice.received" {
+		t.Fatalf("expected event_type=vendor.invoice.received, got %s", eventType)
+	}
+	if aggregateID != inv.InvoiceID {
+		t.Fatalf("expected aggregate_id=%s, got %s", inv.InvoiceID, aggregateID)
+	}
+}
+
+func TestPgStore_CreateInvoice_IdempotentReplay_NoOutboxDuplicate(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	inv := newTestInvoice(tenantID)
+	created1, err := s.CreateInvoice(ctx, inv)
+	if err != nil || !created1 {
+		t.Fatalf("first CreateInvoice failed: %v", err)
+	}
+
+	replayInv := *inv
+	replayInv.InvoiceID = uuid.New().String()
+	created2, err := s.CreateInvoice(ctx, &replayInv)
+	if err != nil {
+		t.Fatalf("retried CreateInvoice failed: %v", err)
+	}
+	if created2 {
+		t.Fatal("expected created=false on replay")
+	}
+
+	var totalOutbox int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE correlation_id = $1", inv.CorrelationID).Scan(&totalOutbox); err != nil {
+		t.Fatalf("query outbox failed: %v", err)
+	}
+	if totalOutbox != 1 {
+		t.Fatalf("expected exactly 1 outbox row across create + replay, got %d", totalOutbox)
+	}
+}
+
+func TestPgStore_TransitionInvoice_OutboxAtomicity(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	inv := newTestInvoice(tenantID)
+	if _, err := s.CreateInvoice(ctx, inv); err != nil {
+		t.Fatalf("CreateInvoice failed: %v", err)
+	}
+
+	// Transition 1: RECEIVED -> VALIDATED
+	if err := s.TransitionInvoice(ctx, tenantID, inv.InvoiceID, domain.InvoiceStatusReceived, domain.InvoiceStatusValidated, "validator-1"); err != nil {
+		t.Fatalf("TransitionInvoice to VALIDATED failed: %v", err)
+	}
+
+	var validatedCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'vendor.invoice.validated'", inv.InvoiceID).Scan(&validatedCount); err != nil {
+		t.Fatalf("query validated outbox failed: %v", err)
+	}
+	if validatedCount != 1 {
+		t.Fatalf("expected 1 validated outbox event, got %d", validatedCount)
+	}
+
+	// Transition 2: VALIDATED -> APPROVED
+	if err := s.TransitionInvoice(ctx, tenantID, inv.InvoiceID, domain.InvoiceStatusValidated, domain.InvoiceStatusApproved, "approver-1"); err != nil {
+		t.Fatalf("TransitionInvoice to APPROVED failed: %v", err)
+	}
+
+	var approvedCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'vendor.invoice.approved'", inv.InvoiceID).Scan(&approvedCount); err != nil {
+		t.Fatalf("query approved outbox failed: %v", err)
+	}
+	if approvedCount != 1 {
+		t.Fatalf("expected 1 approved outbox event, got %d", approvedCount)
+	}
+
+	// Transition 3: APPROVED -> PAYMENT_REQUESTED
+	if err := s.TransitionInvoice(ctx, tenantID, inv.InvoiceID, domain.InvoiceStatusApproved, domain.InvoiceStatusPaymentRequested, "payer-1"); err != nil {
+		t.Fatalf("TransitionInvoice to PAYMENT_REQUESTED failed: %v", err)
+	}
+
+	var paymentCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'payment.requested'", inv.InvoiceID).Scan(&paymentCount); err != nil {
+		t.Fatalf("query payment.requested outbox failed: %v", err)
+	}
+	if paymentCount != 1 {
+		t.Fatalf("expected 1 payment.requested outbox event, got %d", paymentCount)
 	}
 }

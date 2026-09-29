@@ -131,7 +131,7 @@ func TestPgStore_FindStranded_IgnoresConcludedRows(t *testing.T) {
 			t.Fatalf("create %s: %v", tc.corr, err)
 		}
 		concluded := time.Now().UTC().Add(-90 * time.Minute)
-		if err := s.CompleteDelivery(ctx, n.NotificationID, tc.status, tc.reason, "", &concluded, sentEvent(n)); err != nil {
+		if err := s.CompleteDelivery(ctx, n.NotificationID, tc.status, tc.reason, "", &concluded, "corr-test", domain.AttemptMeta{}); err != nil {
 			t.Fatalf("complete %s: %v", tc.corr, err)
 		}
 
@@ -161,7 +161,7 @@ func TestPgStore_FindStranded_IgnoresRowsAlreadyScheduled(t *testing.T) {
 	}
 	attemptedAt := time.Now().UTC().Add(-time.Hour)
 	next := time.Now().UTC().Add(-30 * time.Minute) // due, and in the past
-	if err := s.ScheduleRetry(ctx, n.NotificationID, "tenant-a", "smtp timeout", attemptedAt, next); err != nil {
+	if err := s.ScheduleRetry(ctx, n.NotificationID, "tenant-a", "smtp timeout", attemptedAt, next, domain.AttemptMeta{}); err != nil {
 		t.Fatalf("schedule: %v", err)
 	}
 
@@ -225,7 +225,7 @@ func TestPgStore_ReviveStranded_KeepsTheAttemptCount(t *testing.T) {
 	// One failed attempt, then claimed and abandoned: attempts = 1, no schedule.
 	attemptedAt := time.Now().UTC().Add(-time.Hour)
 	if err := s.ScheduleRetry(ctx, n.NotificationID, "tenant-a", "smtp timeout",
-		attemptedAt, time.Now().UTC().Add(-45*time.Minute)); err != nil {
+		attemptedAt, time.Now().UTC().Add(-45*time.Minute), domain.AttemptMeta{}); err != nil {
 		t.Fatalf("schedule: %v", err)
 	}
 	if _, err := s.ClaimRetry(ctx, n.NotificationID, "tenant-a"); err != nil {

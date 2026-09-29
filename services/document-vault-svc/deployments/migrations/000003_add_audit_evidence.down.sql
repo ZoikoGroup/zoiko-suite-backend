@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS custody_entries;
+DROP TABLE IF EXISTS evidence_contradictions;
+DROP TABLE IF EXISTS evidence_procedure_links;
+DROP TABLE IF EXISTS evidence_reliability_assessments;
+DROP TABLE IF EXISTS evidence_versions;
+DROP TABLE IF EXISTS audit_evidence;
+DROP FUNCTION IF EXISTS reject_evidence_reliability_mutation();
+DROP FUNCTION IF EXISTS reject_evidence_procedure_link_mutation();
+DROP FUNCTION IF EXISTS reject_evidence_contradiction_mutation();
+DROP FUNCTION IF EXISTS reject_custody_entry_mutation();
+DROP FUNCTION IF EXISTS reject_evidence_version_mutation();

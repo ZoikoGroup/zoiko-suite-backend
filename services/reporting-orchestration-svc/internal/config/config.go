@@ -10,6 +10,11 @@ type Config struct {
 	AuthzURL     string
 	LogLevel     string
 
+	// AUD-10 export/redact/deliver dependencies — see
+	// internal/archivestore and internal/retention's own package docs.
+	AuditEventStoreURL   string
+	RetentionRegistryURL string
+
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
 	// Disabled by default — AuthzURL (plain HTTP) keeps being used unless
@@ -27,6 +32,9 @@ func Load() *Config {
 		KafkaTopic:   getEnv("KAFKA_TOPIC", "zoiko.reporting-orchestration.events"),
 		AuthzURL:     getEnv("AUTHZ_SERVICE_URL", "http://localhost:8089"),
 		LogLevel:     getEnv("LOG_LEVEL", "info"),
+
+		AuditEventStoreURL:   getEnv("AUDIT_EVENT_STORE_SERVICE_URL", "http://audit-event-store-svc:8080"),
+		RetentionRegistryURL: getEnv("RETENTION_REGISTRY_SERVICE_URL", "http://retention-registry-svc:8148"),
 
 		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

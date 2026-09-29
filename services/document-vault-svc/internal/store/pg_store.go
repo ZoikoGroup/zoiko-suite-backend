@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -29,6 +30,7 @@ import (
 
 	"zoiko.io/document-vault-svc/internal/domain"
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
+	"zoiko.io/document-vault-svc/internal/outbox"
 )
 
 type PgStore struct {
@@ -103,13 +105,19 @@ func (s *PgStore) withTenant(ctx context.Context, fn func(tx pgx.Tx, tenantID st
 
 const documentColumns = `
 	document_id, tenant_id, legal_entity_id, title, classification, retention_policy,
-	residency_region_code, current_version, status, created_by_principal_id, created_at, updated_at
+	residency_region_code, current_version, status, created_by_principal_id, created_at, updated_at,
+	declared_version, declared_at, declared_by_principal_id, superseded_by_document_id,
+	archived_at, archived_by_principal_id, archive_reason,
+	disposition_requested_at, disposition_requested_by_principal_id, disposition_reason
 `
 
 func scanDocument(row pgx.Row, d *domain.Document) error {
 	return row.Scan(&d.DocumentID, &d.TenantID, &d.LegalEntityID, &d.Title, &d.Classification,
 		&d.RetentionPolicy, &d.ResidencyRegionCode, &d.CurrentVersion, &d.Status,
-		&d.CreatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt)
+		&d.CreatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt,
+		&d.DeclaredVersion, &d.DeclaredAt, &d.DeclaredByPrincipalID, &d.SupersededByDocumentID,
+		&d.ArchivedAt, &d.ArchivedByPrincipalID, &d.ArchiveReason,
+		&d.DispositionRequestedAt, &d.DispositionRequestedByPrincipalID, &d.DispositionReason)
 }
 
 const versionColumns = `
@@ -129,7 +137,7 @@ func scanVersion(row pgx.Row, v *domain.DocumentVersion) error {
 // The tenant is taken from the caller's context, not from doc.TenantID. A
 // document may only be written into the tenant the request is scoped to, and
 // the WITH CHECK half of the policy enforces the same thing at the database.
-func (s *PgStore) CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion) error {
+func (s *PgStore) CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion, correlationID string) error {
 	return s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
 		doc.TenantID = tenantID
 		err := tx.QueryRow(ctx, `
@@ -159,14 +167,80 @@ func (s *PgStore) CreateDocument(ctx context.Context, doc *domain.Document, firs
 		if err != nil {
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
 		}
-		return nil
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.uploaded", doc.DocumentID, tenantID,
+			doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
+				"document_id":     doc.DocumentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": doc.LegalEntityID,
+				"title":           doc.Title,
+				"classification":  string(doc.Classification),
+				"version":         firstVersion.Version,
+				"checksum_sha256": firstVersion.ChecksumSHA256,
+			}); err != nil {
+			return err
+		}
+
+		// BIZ-02: the uploader's classification choice is seeded as the
+		// document's first CANDIDATE proposal, not trusted as final —
+		// see internal/domain/classification.go's own doc comment. It
+		// still requires ConfirmClassification (by a DIFFERENT
+		// principal) before it's a governed fact; documents.classification
+		// above is populated immediately for backward-compatible reads,
+		// but record_classifications is the real source of truth.
+		var classificationID string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO record_classifications (document_id, tenant_id, legal_entity_id, classification_value, source, proposed_by_principal_id, correlation_id)
+			VALUES ($1, $2, $3, $4, 'HUMAN', $5, $6)
+			RETURNING classification_id
+		`, doc.DocumentID, tenantID, doc.LegalEntityID, string(doc.Classification), doc.CreatedByPrincipalID, nullableString(correlationID),
+		).Scan(&classificationID); err != nil {
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		return s.insertDocumentOutboxEvent(ctx, tx, "classification.proposed", doc.DocumentID, tenantID,
+			doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
+				"classification_id":    classificationID,
+				"document_id":          doc.DocumentID,
+				"tenant_id":            tenantID,
+				"legal_entity_id":      doc.LegalEntityID,
+				"classification_value": string(doc.Classification),
+				"source":               "HUMAN",
+			})
 	})
+}
+
+// insertDocumentOutboxEvent is the shared outbox-insert call site for
+// every document-vault-svc event — see internal/outbox's own package doc
+// for why the insert happens here, inside the same transaction as the
+// business mutation, rather than as a separate publish call.
+func (s *PgStore) insertDocumentOutboxEvent(ctx context.Context, tx pgx.Tx, eventType, documentID, tenantID, legalEntityID, actorID, correlationID string, payload map[string]any) error {
+	if correlationID == "" {
+		correlationID = documentID
+	}
+	env, err := outbox.NewVariantAEnvelope(eventType, correlationID, tenantID, legalEntityID, actorID, payload)
+	if err != nil {
+		return fmt.Errorf("build outbox envelope: %w", err)
+	}
+	actor := actorID
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "DOCUMENT",
+		AggregateID:   documentID,
+		EventType:     eventType,
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		ActorID:       &actor,
+		CorrelationID: correlationID,
+		Payload:       env,
+	}); err != nil {
+		return fmt.Errorf("outbox insert: %w", err)
+	}
+	return nil
 }
 
 // AddVersion appends a new immutable version row and bumps
 // documents.current_version — the ONLY mutation ever applied to the documents
 // row post-creation.
-func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion) (*domain.Document, error) {
+func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, error) {
 	var out domain.Document
 	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
 		var nextVersion int
@@ -208,12 +282,284 @@ func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.D
 		if err := scanDocument(row, &out); err != nil {
 			return fmt.Errorf("document store unavailable: %w", err)
 		}
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.version_created", documentID, tenantID,
+			out.LegalEntityID, v.CreatedByPrincipalID, correlationID, map[string]any{
+				"document_id":     documentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": out.LegalEntityID,
+				"version":         v.Version,
+				"checksum_sha256": v.ChecksumSHA256,
+			}); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// DeclareRecord marks the document's CURRENT version (as of this call) the
+// authoritative declared record — BIZ-01's own central concept ("record
+// declaration tracked separately"). The CAS predicate
+// (status='ACTIVE' AND declared_at IS NULL) is the real guard; migration
+// 000005's trigger is the second line of defense against a raw UPDATE
+// bypassing it.
+func (s *PgStore) DeclareRecord(ctx context.Context, p domain.DeclareRecordParams, correlationID string) (*domain.Document, error) {
+	var out domain.Document
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE documents
+			SET declared_version = current_version, declared_at = now(), declared_by_principal_id = $3, updated_at = now()
+			WHERE document_id = $1 AND tenant_id = $2::uuid AND status = 'ACTIVE' AND declared_at IS NULL
+			RETURNING `+documentColumns,
+			p.DocumentID, tenantID, p.DeclaredByPrincipalID,
+		)
+		if err := scanDocument(row, &out); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return s.classifyDeclareRecordFailure(ctx, tx, tenantID, p.DocumentID)
+			}
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+
+		declaredVersion := 0
+		if out.DeclaredVersion != nil {
+			declaredVersion = *out.DeclaredVersion
+		}
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.record_declared", p.DocumentID, tenantID,
+			out.LegalEntityID, p.DeclaredByPrincipalID, correlationID, map[string]any{
+				"document_id":      p.DocumentID,
+				"tenant_id":        tenantID,
+				"legal_entity_id":  out.LegalEntityID,
+				"declared_version": declaredVersion,
+			}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// classifyDeclareRecordFailure runs when DeclareRecord's CAS UPDATE
+// touched zero rows, to tell "document not found" apart from "found but
+// not eligible" (already declared, or not ACTIVE) — same not-found-vs-
+// invalid-transition split used throughout this codebase (e.g. BNK-09's
+// notFoundOrInvalidTransfer).
+func (s *PgStore) classifyDeclareRecordFailure(ctx context.Context, tx pgx.Tx, tenantID, documentID string) error {
+	var d domain.Document
+	row := tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
+	if err := scanDocument(row, &d); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDocumentNotFound
+		}
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	if d.DeclaredAt != nil {
+		return domain.ErrDocumentAlreadyDeclared
+	}
+	return domain.ErrDocumentNotActive
+}
+
+// SupersedeDocument marks documentID as superseded by an already-existing
+// document — mirrors AUD-06's SupersedeEvidence exactly: a forward link
+// set once, never an in-place content change.
+func (s *PgStore) SupersedeDocument(ctx context.Context, p domain.SupersedeDocumentParams, correlationID string) (*domain.Document, error) {
+	if p.DocumentID == p.SupersededByDocumentID {
+		return nil, domain.ErrCannotSupersedeSelf
+	}
+	var out domain.Document
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid)`,
+			p.SupersededByDocumentID, tenantID).Scan(&exists); err != nil {
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		if !exists {
+			return domain.ErrSupersedingDocumentNotFound
+		}
+
+		row := tx.QueryRow(ctx, `
+			UPDATE documents
+			SET status = 'SUPERSEDED', superseded_by_document_id = $3, updated_at = now()
+			WHERE document_id = $1 AND tenant_id = $2::uuid AND superseded_by_document_id IS NULL
+			RETURNING `+documentColumns,
+			p.DocumentID, tenantID, p.SupersededByDocumentID,
+		)
+		if err := scanDocument(row, &out); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return s.classifySupersedeFailure(ctx, tx, tenantID, p.DocumentID)
+			}
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.superseded", p.DocumentID, tenantID,
+			out.LegalEntityID, p.ActorPrincipalID, correlationID, map[string]any{
+				"document_id":               p.DocumentID,
+				"tenant_id":                 tenantID,
+				"legal_entity_id":           out.LegalEntityID,
+				"superseded_by_document_id": p.SupersededByDocumentID,
+			}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *PgStore) classifySupersedeFailure(ctx context.Context, tx pgx.Tx, tenantID, documentID string) error {
+	var d domain.Document
+	row := tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
+	if err := scanDocument(row, &d); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDocumentNotFound
+		}
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	return domain.ErrDocumentAlreadySuperseded
+}
+
+// MoveToArchive marks the document ARCHIVED — ends its active life the
+// same way SupersedeDocument does, just without a replacement document.
+func (s *PgStore) MoveToArchive(ctx context.Context, p domain.MoveToArchiveParams, correlationID string) (*domain.Document, error) {
+	var out domain.Document
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE documents
+			SET status = 'ARCHIVED', archived_at = now(), archived_by_principal_id = $3, archive_reason = $4, updated_at = now()
+			WHERE document_id = $1 AND tenant_id = $2::uuid AND status IN ('ACTIVE', 'SUPERSEDED')
+			RETURNING `+documentColumns,
+			p.DocumentID, tenantID, p.ArchivedByPrincipalID, nullableString(p.Reason),
+		)
+		if err := scanDocument(row, &out); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return s.classifyArchiveFailure(ctx, tx, tenantID, p.DocumentID)
+			}
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.archived", p.DocumentID, tenantID,
+			out.LegalEntityID, p.ArchivedByPrincipalID, correlationID, map[string]any{
+				"document_id":     p.DocumentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": out.LegalEntityID,
+			}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *PgStore) classifyArchiveFailure(ctx context.Context, tx pgx.Tx, tenantID, documentID string) error {
+	var d domain.Document
+	row := tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
+	if err := scanDocument(row, &d); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDocumentNotFound
+		}
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	return domain.ErrDocumentNotArchivable
+}
+
+// RequestDisposition records a disposition request (-> PURGE_PENDING) and
+// nothing more — see domain.Document.DispositionRequestedAt's own doc
+// comment on why this service does not itself purge anything.
+func (s *PgStore) RequestDisposition(ctx context.Context, p domain.RequestDispositionParams, correlationID string) (*domain.Document, error) {
+	var out domain.Document
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE documents
+			SET status = 'PURGE_PENDING', disposition_requested_at = now(), disposition_requested_by_principal_id = $3, disposition_reason = $4, updated_at = now()
+			WHERE document_id = $1 AND tenant_id = $2::uuid AND disposition_requested_at IS NULL
+			RETURNING `+documentColumns,
+			p.DocumentID, tenantID, p.RequestedByPrincipalID, nullableString(p.Reason),
+		)
+		if err := scanDocument(row, &out); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return s.classifyDispositionFailure(ctx, tx, tenantID, p.DocumentID)
+			}
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.disposition_requested", p.DocumentID, tenantID,
+			out.LegalEntityID, p.RequestedByPrincipalID, correlationID, map[string]any{
+				"document_id":     p.DocumentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": out.LegalEntityID,
+			}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *PgStore) classifyDispositionFailure(ctx context.Context, tx pgx.Tx, tenantID, documentID string) error {
+	var d domain.Document
+	row := tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
+	if err := scanDocument(row, &d); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDocumentNotFound
+		}
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	return domain.ErrDispositionAlreadyRequested
+}
+
+// nullableString turns an empty caller-supplied string into a real SQL
+// NULL rather than an empty string — archive_reason/disposition_reason
+// are optional free text, and "" and "not given" should not be
+// indistinguishable in the column.
+func nullableString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// GetAsOfDocument reconstructs which version was CURRENT as of asOf, from
+// document_versions' own immutable, timestamped lineage — real data, a
+// real answer. It does NOT reconstruct historical status/declaration/
+// supersession state: there is no history table backing those mutable
+// fields on the documents row (unlike BNK-01/BNK-08's own AsOf queries,
+// which are backed by a dedicated history table) — see this service's
+// own Wave 3 commit message for why that's a real, separate build, not
+// silently faked here.
+func (s *PgStore) GetAsOfDocument(ctx context.Context, documentID string, asOf time.Time) (*domain.Document, *domain.DocumentVersion, error) {
+	doc, err := s.FindDocumentByID(ctx, documentID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var v domain.DocumentVersion
+	err = s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		row := tx.QueryRow(ctx, `
+			SELECT `+versionColumns+` FROM document_versions
+			WHERE document_id = $1 AND created_at <= $2
+			ORDER BY version DESC LIMIT 1`, documentID, asOf)
+		return scanVersion(row, &v)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, domain.ErrDocumentVersionNotFound
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("document store unavailable: %w", err)
+	}
+	return doc, &v, nil
 }
 
 // FindDocumentByID looks up a document, scoped to the caller's tenant. A
@@ -391,6 +737,98 @@ func (s *PgStore) ListAccessLog(ctx context.Context, documentID string, limit, o
 				return fmt.Errorf("document store unavailable: %w", err)
 			}
 			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// LinkDocument records a link to another business object — BIZ-01's
+// GetLinkedObjects data source (migration 000007). Append-only; the
+// document_document_links_document_id_linked_object_type_linked_object_id_key
+// unique constraint (checked via 23505 here rather than a SELECT-then-INSERT
+// race) makes a duplicate link a real error, not a silent second row.
+// RecordQuarantinedVersionUpload publishes document.version_upload_quarantined
+// for an upload AddVersion rejected before it ever reached storage or a
+// document_versions row — see internal/scan's own package doc. There is
+// no business mutation here (the point is that nothing was persisted);
+// the event itself is the record that this happened, still written
+// through the same outbox mechanism as every other event so it is not
+// silently lost.
+func (s *PgStore) RecordQuarantinedVersionUpload(ctx context.Context, documentID, attemptedByPrincipalID, reason, correlationID string) error {
+	return s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		if err := ensureDocument(ctx, tx, documentID, tenantID); err != nil {
+			return err
+		}
+		var legalEntityID string
+		if err := tx.QueryRow(ctx, `SELECT legal_entity_id::text FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`,
+			documentID, tenantID).Scan(&legalEntityID); err != nil {
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		return s.insertDocumentOutboxEvent(ctx, tx, "document.version_upload_quarantined", documentID, tenantID,
+			legalEntityID, attemptedByPrincipalID, correlationID, map[string]any{
+				"document_id":     documentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": legalEntityID,
+				"reason":          reason,
+			})
+	})
+}
+
+func (s *PgStore) LinkDocument(ctx context.Context, p domain.LinkDocumentParams) (*domain.DocumentLink, error) {
+	var out domain.DocumentLink
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		if err := ensureDocument(ctx, tx, p.DocumentID, tenantID); err != nil {
+			return err
+		}
+		row := tx.QueryRow(ctx, `
+			INSERT INTO document_links (document_id, linked_object_type, linked_object_id, linked_by_principal_id, correlation_id)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING link_id, document_id, linked_object_type, linked_object_id, linked_by_principal_id, correlation_id, created_at
+		`, p.DocumentID, p.LinkedObjectType, p.LinkedObjectID, p.LinkedByPrincipalID, nullableString(p.CorrelationID))
+		if err := row.Scan(&out.LinkID, &out.DocumentID, &out.LinkedObjectType, &out.LinkedObjectID,
+			&out.LinkedByPrincipalID, &out.CorrelationID, &out.CreatedAt); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.ErrDuplicateLink
+			}
+			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListDocumentLinks is GetLinkedObjects' real query — every object this
+// document has ever been linked to, newest first.
+func (s *PgStore) ListDocumentLinks(ctx context.Context, documentID string) ([]domain.DocumentLink, error) {
+	var out []domain.DocumentLink
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		if err := ensureDocument(ctx, tx, documentID, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT link_id, document_id, linked_object_type, linked_object_id, linked_by_principal_id, correlation_id, created_at
+			FROM document_links WHERE document_id = $1
+			ORDER BY created_at DESC, link_id DESC
+		`, documentID)
+		if err != nil {
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var l domain.DocumentLink
+			if err := rows.Scan(&l.LinkID, &l.DocumentID, &l.LinkedObjectType, &l.LinkedObjectID,
+				&l.LinkedByPrincipalID, &l.CorrelationID, &l.CreatedAt); err != nil {
+				return fmt.Errorf("document store unavailable: %w", err)
+			}
+			out = append(out, l)
 		}
 		return rows.Err()
 	})

@@ -16,8 +16,6 @@ import (
 )
 
 const (
-	PriceCatalogCreate        = "PRICE_CATALOG_CREATE"
-	PlanCreate                = "PLAN_CREATE"
 	SubscriptionCreate        = "SUBSCRIPTION_CREATE"
 	EvaluationProgramCreate   = "EVALUATION_PROGRAM_CREATE"
 	OverlayCreate             = "CONTRACT_OVERLAY_CREATE"
@@ -27,15 +25,26 @@ const (
 	BillingSourceTransferSet  = "BILLING_SOURCE_TRANSFER_CREATE"
 )
 
+// retiredCatalogWrite answers the doc7 catalog write routes. They published
+// a catalog the moment it was created — no review, no maker-checker — and
+// stored prices as floats, both of which ZS-SVC-Q-001 forbids (COM-CTRL-002,
+// -004; negative path #46). Prices are now created through the COM-01 price
+// book. The routes answer 410 rather than 404 so an old client learns why.
+// The read routes stay: existing doc7 subscriptions still reference plans.
+func retiredCatalogWrite(w http.ResponseWriter, r *http.Request) {
+	writeProblem(w, r, Problem{Status: http.StatusGone, Code: CodeEndpointRetired,
+		Detail: "catalog and plan writes moved to the COM-01 price book: POST /v1/commercial/products and /v1/commercial/price-versions"})
+}
+
 func RegisterSubscriptionRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/price-catalogs", func(r chi.Router) {
-		r.Post("/", h.CreatePriceCatalog)
+		r.Post("/", retiredCatalogWrite)
 		r.Get("/{id}", h.GetPriceCatalog)
 	})
 	r.Route("/v1/plans", func(r chi.Router) {
-		r.Post("/", h.CreatePlan)
+		r.Post("/", retiredCatalogWrite)
 		r.Get("/{id}", h.GetPlan)
-		r.Put("/{id}/entitlement-limits", h.SetEntitlementLimit)
+		r.Put("/{id}/entitlement-limits", retiredCatalogWrite)
 	})
 	r.Route("/v1/subscriptions", func(r chi.Router) {
 		r.Post("/", h.CreateSubscription)
@@ -54,50 +63,6 @@ func RegisterSubscriptionRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/billing-source-transfers", h.TransferBillingSource)
 }
 
-func (h *Handler) CreatePriceCatalog(w http.ResponseWriter, r *http.Request) {
-	var req domain.CreatePriceCatalogRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.CatalogCode == "" || req.EffectiveFrom == "" {
-		writeError(w, http.StatusBadRequest, "catalog_code and effective_from are required")
-		return
-	}
-	effectiveFrom, err := time.Parse(time.RFC3339, req.EffectiveFrom)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "effective_from must be RFC3339")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, platformScopeID, PriceCatalogCreate) {
-		return
-	}
-
-	c := &domain.PriceCatalog{
-		CatalogVersionID:     uuid.NewString(),
-		CatalogCode:          req.CatalogCode,
-		Status:               domain.CatalogStatusPublished,
-		EffectiveFrom:        effectiveFrom,
-		CreatedAt:            time.Now().UTC(),
-		CreatedByPrincipalID: principalID,
-	}
-	if err := h.store.CreatePriceCatalog(r.Context(), c); err != nil {
-		if errors.Is(err, domain.ErrConflict) {
-			writeError(w, http.StatusConflict, "catalog_code already exists")
-			return
-		}
-		h.logger.Error("create price catalog failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to create price catalog")
-		return
-	}
-	writeJSON(w, http.StatusCreated, c)
-}
-
 func (h *Handler) GetPriceCatalog(w http.ResponseWriter, r *http.Request) {
 	c, err := h.store.GetPriceCatalog(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
@@ -111,47 +76,6 @@ func (h *Handler) GetPriceCatalog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, c)
 }
 
-func (h *Handler) CreatePlan(w http.ResponseWriter, r *http.Request) {
-	var req domain.CreatePlanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.CatalogVersionID == "" || req.PlanCode == "" || req.DisplayName == "" || req.BillingInterval == "" || req.BasePriceCurrencyCode == "" {
-		writeError(w, http.StatusBadRequest, "catalog_version_id, plan_code, display_name, billing_interval, and base_price_currency_code are required")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, platformScopeID, PlanCreate) {
-		return
-	}
-
-	p := &domain.Plan{
-		PlanID:                uuid.NewString(),
-		CatalogVersionID:      req.CatalogVersionID,
-		PlanCode:              req.PlanCode,
-		DisplayName:           req.DisplayName,
-		BillingInterval:       req.BillingInterval,
-		BasePriceAmount:       req.BasePriceAmount,
-		BasePriceCurrencyCode: req.BasePriceCurrencyCode,
-		CreatedAt:             time.Now().UTC(),
-		CreatedByPrincipalID:  principalID,
-	}
-	if req.MarketScope != "" {
-		p.MarketScope = &req.MarketScope
-	}
-	if err := h.store.CreatePlan(r.Context(), p); err != nil {
-		h.logger.Error("create plan failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to create plan")
-		return
-	}
-	writeJSON(w, http.StatusCreated, p)
-}
-
 func (h *Handler) GetPlan(w http.ResponseWriter, r *http.Request) {
 	p, err := h.store.GetPlan(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
@@ -163,40 +87,6 @@ func (h *Handler) GetPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
-}
-
-func (h *Handler) SetEntitlementLimit(w http.ResponseWriter, r *http.Request) {
-	planID := chi.URLParam(r, "id")
-	var req domain.SetEntitlementLimitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.MetricType == "" {
-		writeError(w, http.StatusBadRequest, "metric_type is required")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if !h.authorize(w, r, principalID, platformScopeID, PlanCreate) {
-		return
-	}
-
-	l := &domain.EntitlementLimit{
-		EntitlementLimitID: uuid.NewString(),
-		PlanID:             planID,
-		MetricType:         req.MetricType,
-		LimitValue:         req.LimitValue,
-	}
-	if err := h.store.SetEntitlementLimit(r.Context(), l); err != nil {
-		h.logger.Error("set entitlement limit failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to set entitlement limit")
-		return
-	}
-	writeJSON(w, http.StatusOK, l)
 }
 
 func (h *Handler) CreateSubscription(w http.ResponseWriter, r *http.Request) {

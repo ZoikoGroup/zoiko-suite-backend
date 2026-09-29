@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/bank-reconciliation-svc/internal/close"
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
 	"zoiko.io/bank-reconciliation-svc/internal/handler"
 	"zoiko.io/bank-reconciliation-svc/internal/ledger"
@@ -30,9 +31,37 @@ type stubStore struct {
 	listErr        error
 	transitionErr  error
 	countUnmatched int
+	countMatched   int
 	countErr       error
 	legalEntities  []string
 	entitiesErr    error
+
+	certificates map[string]*domain.ReconciliationCertificate
+	certifyErr   error
+
+	// BNK-05 backlog: run/policy/conflict error injection. Each defaults
+	// to nil (success), and a test that needs a specific failure sets the
+	// matching field before dispatching the request.
+	startRunErr         error
+	getRunErr           error
+	freezeErr           error
+	getPopulationErr    error
+	certifyRunErr       error
+	reperformErr        error
+	bindPolicyErr       error
+	createPolicyErr     error
+	getCurrentPolicyErr error
+	raiseConflictErr    error
+	getConflictErr      error
+	listConflictsErr    error
+	resolveConflictErr  error
+
+	// RunAutomaticMatching: the set of lines ListUnmatchedLinesInPopulation
+	// returns, an error to inject in its place, and the population_id
+	// GetRun's stubbed run reports as frozen (nil unless a test sets it).
+	unmatchedInPopulation []domain.StatementLine
+	listUnmatchedErr      error
+	runPopulationID       *string
 
 	// lastListFilter records what ListStatementLines was actually asked for,
 	// so a test can assert the tenant came from the verified header rather
@@ -109,11 +138,101 @@ func (s *stubStore) FlagException(_ context.Context, _, statementLineID, reason,
 	return nil
 }
 
+func (s *stubStore) UnmatchWithReason(_ context.Context, _, statementLineID, reason, _ string) error {
+	if s.transitionErr != nil {
+		return s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok || l.Status != domain.StatementLineStatusMatched {
+		return domain.ErrInvalidTransition
+	}
+	l.Status = domain.StatementLineStatusException
+	l.ExceptionReason = &reason
+	return nil
+}
+
 func (s *stubStore) CountUnmatched(_ context.Context, _, _, _ string) (int, error) {
 	if s.countErr != nil {
 		return 0, s.countErr
 	}
 	return s.countUnmatched, nil
+}
+
+func (s *stubStore) CountMatched(_ context.Context, _, _, _ string) (int, error) {
+	if s.countErr != nil {
+		return 0, s.countErr
+	}
+	return s.countMatched, nil
+}
+
+func (s *stubStore) CertifyStatement(_ context.Context, tenantID, legalEntityID, bankAccountID, statementDate, certifiedByPrincipalID, correlationID string, matchedLineCount int) (*domain.ReconciliationCertificate, bool, error) {
+	if s.certifyErr != nil {
+		return nil, false, s.certifyErr
+	}
+	key := tenantID + "|" + bankAccountID + "|" + statementDate
+	if s.certificates == nil {
+		s.certificates = map[string]*domain.ReconciliationCertificate{}
+	}
+	if existing, ok := s.certificates[key]; ok {
+		return existing, false, nil
+	}
+	c := &domain.ReconciliationCertificate{
+		CertificateID: "cert-" + key, TenantID: tenantID, LegalEntityID: legalEntityID, BankAccountID: bankAccountID,
+		StatementDate: statementDate, MatchedLineCount: matchedLineCount, CertifiedByPrincipalID: certifiedByPrincipalID,
+		CertifiedAt: time.Now().UTC(), CorrelationID: correlationID,
+	}
+	s.certificates[key] = c
+	return c, true, nil
+}
+
+func (s *stubStore) ProposeMatch(_ context.Context, _, statementLineID, journalID, proposedByPrincipalID string) error {
+	if s.transitionErr != nil {
+		return s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok || (l.Status != domain.StatementLineStatusUnmatched && l.Status != domain.StatementLineStatusException) {
+		return domain.ErrInvalidTransition
+	}
+	l.Status = domain.StatementLineStatusPendingConfirmation
+	l.ProposedJournalID = &journalID
+	l.ProposedByPrincipalID = &proposedByPrincipalID
+	return nil
+}
+
+func (s *stubStore) ConfirmMatch(_ context.Context, _, statementLineID, confirmingPrincipalID string) (*domain.StatementLine, error) {
+	if s.transitionErr != nil {
+		return nil, s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok {
+		return nil, domain.ErrStatementLineNotFound
+	}
+	if l.Status != domain.StatementLineStatusPendingConfirmation {
+		return nil, domain.ErrInvalidTransition
+	}
+	if l.ProposedByPrincipalID != nil && *l.ProposedByPrincipalID == confirmingPrincipalID {
+		return nil, domain.ErrMatchSelfConfirmation
+	}
+	l.Status = domain.StatementLineStatusMatched
+	l.MatchedJournalID = l.ProposedJournalID
+	l.MatchedByPrincipalID = &confirmingPrincipalID
+	return l, nil
+}
+
+func (s *stubStore) RejectProposedMatch(_ context.Context, _, statementLineID, reason, actorPrincipalID string) error {
+	if s.transitionErr != nil {
+		return s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok || l.Status != domain.StatementLineStatusPendingConfirmation {
+		return domain.ErrInvalidTransition
+	}
+	l.Status = domain.StatementLineStatusException
+	l.ExceptionReason = &reason
+	l.FlaggedByPrincipalID = &actorPrincipalID
+	l.ProposedJournalID = nil
+	l.ProposedByPrincipalID = nil
+	return nil
 }
 
 func (s *stubStore) StatementLegalEntities(_ context.Context, _, _, _ string) ([]string, error) {
@@ -128,6 +247,137 @@ func (s *stubStore) StatementLegalEntities(_ context.Context, _, _, _ string) ([
 	return s.legalEntities, nil
 }
 
+// ── stubStore: new BNK-05 backlog methods ────────────────────────────────────
+// All return zero-values / nil errors — tests that need specific behaviour
+// can add fields to stubStore and specialise these methods.
+
+func (s *stubStore) MatchStatementLineWithCanonical(_ context.Context, _, statementLineID, transactionID, _ string) error {
+	if s.transitionErr != nil {
+		return s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok {
+		return domain.ErrInvalidTransition
+	}
+	l.Status = domain.StatementLineStatusMatched
+	l.MatchedTransactionID = &transactionID
+	return nil
+}
+
+func (s *stubStore) ProposeMatchWithCanonical(_ context.Context, _, statementLineID, transactionID, proposedBy string) error {
+	if s.transitionErr != nil {
+		return s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok {
+		return domain.ErrInvalidTransition
+	}
+	l.Status = domain.StatementLineStatusPendingConfirmation
+	l.ProposedTransactionID = &transactionID
+	l.ProposedByPrincipalID = &proposedBy
+	return nil
+}
+
+// Reconciliation run lifecycle stubs.
+func (s *stubStore) StartRun(_ context.Context, _ string, req domain.StartRunRequest, _ string) (*domain.ReconciliationRun, bool, error) {
+	if s.startRunErr != nil {
+		return nil, false, s.startRunErr
+	}
+	return &domain.ReconciliationRun{RunID: "run-1", TenantID: req.TenantID, LegalEntityID: req.LegalEntityID,
+		BankAccountID: req.BankAccountID, StatementDate: req.StatementDate, Status: domain.RunStatusDraft}, true, nil
+}
+func (s *stubStore) GetRun(_ context.Context, _, _ string) (*domain.ReconciliationRun, error) {
+	if s.getRunErr != nil {
+		return nil, s.getRunErr
+	}
+	return &domain.ReconciliationRun{RunID: "run-1", Status: domain.RunStatusDraft, LegalEntityID: "e1", StatementDate: "2024-08-15", PopulationID: s.runPopulationID}, nil
+}
+func (s *stubStore) FreezePopulation(_ context.Context, _, _, _, _ string) (*domain.ReconciliationPopulation, bool, error) {
+	if s.freezeErr != nil {
+		return nil, false, s.freezeErr
+	}
+	return &domain.ReconciliationPopulation{PopulationID: "pop-1"}, true, nil
+}
+func (s *stubStore) GetPopulation(_ context.Context, _, _ string) (*domain.ReconciliationPopulation, error) {
+	if s.getPopulationErr != nil {
+		return nil, s.getPopulationErr
+	}
+	return &domain.ReconciliationPopulation{PopulationID: "pop-1"}, nil
+}
+func (s *stubStore) AdvanceRunStatus(_ context.Context, _, _ string, _, _ domain.ReconciliationRunStatus) error {
+	return nil
+}
+func (s *stubStore) BindPolicy(_ context.Context, _, _, _ string) (*domain.ReconciliationRun, error) {
+	if s.bindPolicyErr != nil {
+		return nil, s.bindPolicyErr
+	}
+	return &domain.ReconciliationRun{RunID: "run-1", Status: domain.RunStatusDraft, LegalEntityID: "e1"}, nil
+}
+func (s *stubStore) CertifyRun(_ context.Context, _, _, _, _ string) (*domain.ReconciliationCertificate, bool, error) {
+	if s.certifyRunErr != nil {
+		return nil, false, s.certifyRunErr
+	}
+	return &domain.ReconciliationCertificate{CertificateID: "cert-1"}, true, nil
+}
+func (s *stubStore) SupersedeRun(_ context.Context, _, _, _, _ string) (*domain.ReconciliationRun, error) {
+	if s.reperformErr != nil {
+		return nil, s.reperformErr
+	}
+	return &domain.ReconciliationRun{RunID: "run-2", Status: domain.RunStatusDraft, LegalEntityID: "e1"}, nil
+}
+
+func (s *stubStore) ListUnmatchedLinesInPopulation(_ context.Context, _, _ string) ([]domain.StatementLine, error) {
+	if s.listUnmatchedErr != nil {
+		return nil, s.listUnmatchedErr
+	}
+	return s.unmatchedInPopulation, nil
+}
+
+// Policy stubs.
+func (s *stubStore) CreatePolicy(_ context.Context, _ string, req domain.CreatePolicyRequest, _ string) (*domain.ReconciliationPolicy, error) {
+	if s.createPolicyErr != nil {
+		return nil, s.createPolicyErr
+	}
+	return &domain.ReconciliationPolicy{PolicyID: "pol-1", TenantID: req.TenantID, LegalEntityID: req.LegalEntityID, PolicyVersion: 1}, nil
+}
+func (s *stubStore) GetCurrentPolicy(_ context.Context, _, _ string) (*domain.ReconciliationPolicy, error) {
+	if s.getCurrentPolicyErr != nil {
+		return nil, s.getCurrentPolicyErr
+	}
+	return &domain.ReconciliationPolicy{PolicyID: "pol-1", PolicyVersion: 1}, nil
+}
+func (s *stubStore) GetPolicy(_ context.Context, _, _ string) (*domain.ReconciliationPolicy, error) {
+	return &domain.ReconciliationPolicy{PolicyID: "pol-1", PolicyVersion: 1}, nil
+}
+
+// Evidence conflict stubs.
+func (s *stubStore) RaiseEvidenceConflict(_ context.Context, _ string, req domain.RaiseEvidenceConflictRequest) (*domain.EvidenceConflict, bool, error) {
+	if s.raiseConflictErr != nil {
+		return nil, false, s.raiseConflictErr
+	}
+	return &domain.EvidenceConflict{ConflictID: "c-1", TenantID: req.TenantID, StatementLineID: req.StatementLineID, PaymentID: req.PaymentID, ConflictStatus: "OPEN"}, true, nil
+}
+func (s *stubStore) GetEvidenceConflict(_ context.Context, _, _ string) (*domain.EvidenceConflict, error) {
+	if s.getConflictErr != nil {
+		return nil, s.getConflictErr
+	}
+	return &domain.EvidenceConflict{ConflictID: "c-1", ConflictStatus: "OPEN", LegalEntityID: "e1"}, nil
+}
+func (s *stubStore) ListOpenConflicts(_ context.Context, _ string, _ int) ([]domain.EvidenceConflict, error) {
+	if s.listConflictsErr != nil {
+		return nil, s.listConflictsErr
+	}
+	return []domain.EvidenceConflict{}, nil
+}
+func (s *stubStore) ResolveEvidenceConflict(_ context.Context, _, _, _, _ string) (*domain.EvidenceConflict, error) {
+	if s.resolveConflictErr != nil {
+		return nil, s.resolveConflictErr
+	}
+	return &domain.EvidenceConflict{ConflictID: "c-1", ConflictStatus: "RESOLVED"}, nil
+}
+func (s *stubStore) IsEventProcessed(_ context.Context, _, _ string) (bool, error) { return false, nil }
+func (s *stubStore) MarkEventProcessed(_ context.Context, _, _ string) error       { return nil }
+
 // cashAcct returns the ledger account code the tests treat as "the bank
 // account". A statement line without one cannot be matched at all, so every
 // seeded line needs it.
@@ -135,6 +385,7 @@ func cashAcct() *string { c := "1000"; return &c }
 
 type stubPublisher struct {
 	ingested, matched, exceptionRaised, completed int
+	reperformed, superseded                       int
 }
 
 func (p *stubPublisher) PublishStatementIngested(_ context.Context, _ domain.StatementLine, _ string) {
@@ -148,6 +399,18 @@ func (p *stubPublisher) PublishReconciliationExceptionRaised(_ context.Context, 
 }
 func (p *stubPublisher) PublishReconciliationCompleted(_ context.Context, _, _, _, _, _ string) {
 	p.completed++
+}
+func (p *stubPublisher) PublishReconciliationStarted(_ context.Context, _ domain.ReconciliationRun) {}
+func (p *stubPublisher) PublishReconciliationReperformed(_ context.Context, _ domain.ReconciliationRun, _ string) {
+	p.reperformed++
+}
+func (p *stubPublisher) PublishReconciliationSuperseded(_ context.Context, _ domain.ReconciliationRun, _ string) {
+	p.superseded++
+}
+func (p *stubPublisher) PublishReconciliationCertified(_ context.Context, _ domain.ReconciliationRun, _ domain.ReconciliationCertificate) {
+}
+func (p *stubPublisher) PublishEvidenceConflictRaised(_ context.Context, _ domain.EvidenceConflict) {}
+func (p *stubPublisher) PublishEvidenceConflictResolved(_ context.Context, _ domain.EvidenceConflict) {
 }
 
 type stubAuthZ struct {
@@ -165,6 +428,63 @@ type stubLedger struct {
 
 func (l *stubLedger) GetJournal(_ context.Context, _, _ string) (*ledger.Journal, error) {
 	return l.journal, l.err
+}
+
+// stubBanking is a no-op banking.Client that returns ErrTransactionNotFound by
+// default, so tests that don't care about canonical matching just get the
+// journal path. Assign txn/err to override.
+type stubBanking struct {
+	txn *bankingCanonical
+	err error
+}
+
+// bankingCanonical mirrors banking.CanonicalTransaction without importing it
+// (test package is external; we just need the interface).
+type bankingCanonical struct {
+	TransactionID string
+	TenantID      string
+	Amount        float64
+	Currency      string
+	Status        string
+}
+
+// GetCanonicalTransaction satisfies banking.Client.
+// We return nil / ErrTransactionNotFound by default so existing tests that
+// don't pass a transaction_id don't break.
+func (b *stubBanking) GetCanonicalTransaction(_ context.Context, _, _ string) (interface{}, error) {
+	return nil, nil // never called in existing tests
+}
+
+// stubClose is the Wave 13 test double for internal/close.Client — defaults
+// to "open" (nil error) so every pre-existing CertifyRun test, none of
+// which is about the closed-period check itself, keeps passing unchanged.
+// Tests that specifically exercise the check set err.
+type stubClose struct{ err error }
+
+func (c *stubClose) CheckPeriodOpen(_ context.Context, _, _, _ string) error { return c.err }
+
+// newRouter mirrors cmd/server/main.go's middleware stack. TenantContext was
+// previously absent here, so every test ran with no verified tenant scope at
+// all — which is precisely the condition the routes were getting wrong, and
+// the reason the whole class of tenant-scope defects went unnoticed by a
+// 24-test suite.
+func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ, l *stubLedger) chi.Router {
+	return newRouterWithClose(s, p, a, l, &stubClose{})
+}
+
+// closeClient takes the close.Client INTERFACE, not *stubClose — passing a
+// literal nil here is a true nil interface (the "not configured" case);
+// passing a nil *stubClose through a concrete-typed parameter would
+// instead produce a non-nil interface wrapping a nil pointer, which
+// panics on the first method call rather than exercising the intended
+// not-configured path.
+func newRouterWithClose(s *stubStore, p *stubPublisher, a *stubAuthZ, l *stubLedger, closeClient close.Client) chi.Router {
+	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
+	// Pass nil for banking client — existing tests all use journal_id path.
+	h := handler.New(s, p, a, l, nil, closeClient, zap.NewNop())
+	handler.RegisterRoutes(r, h)
+	return r
 }
 
 // finalizedJournal builds a journal that moves `amount` through the test's
@@ -190,19 +510,6 @@ func finalizedJournal(legalEntityID string, amount float64) *ledger.Journal {
 		Status:        "FINALIZED",
 		Lines:         []ledger.JournalLine{cash, contra},
 	}
-}
-
-// newRouter mirrors cmd/server/main.go's middleware stack. TenantContext was
-// previously absent here, so every test ran with no verified tenant scope at
-// all — which is precisely the condition the routes were getting wrong, and
-// the reason the whole class of tenant-scope defects went unnoticed by a
-// 24-test suite.
-func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ, l *stubLedger) chi.Router {
-	r := chi.NewRouter()
-	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, p, a, l, zap.NewNop())
-	handler.RegisterRoutes(r, h)
-	return r
 }
 
 const testTenant = "t1"
@@ -500,6 +807,54 @@ func TestFlagException_AlreadyMatched_Rejected(t *testing.T) {
 	}
 }
 
+// ── UnmatchWithReason ─────────────────────────────────────────────────────────
+
+func TestUnmatchWithReason_MissingReason_Returns400(t *testing.T) {
+	s := newStubStore()
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusMatched, GLCashAccountCode: cashAcct()}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/unmatch", domain.FlagExceptionRequest{}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unmatch with no reason, got %d", rec.Code)
+	}
+}
+
+func TestUnmatchWithReason_MatchedLine_RevertsToException(t *testing.T) {
+	s := newStubStore()
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusMatched, GLCashAccountCode: cashAcct()}
+
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/unmatch", domain.FlagExceptionRequest{Reason: "matched to the wrong journal"}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.lines["l1"].Status != domain.StatementLineStatusException {
+		t.Fatalf("expected status EXCEPTION, got %s", s.lines["l1"].Status)
+	}
+	if s.lines["l1"].ExceptionReason == nil || *s.lines["l1"].ExceptionReason != "matched to the wrong journal" {
+		t.Fatalf("expected the exception reason to be recorded, got %+v", s.lines["l1"].ExceptionReason)
+	}
+	if pub.exceptionRaised != 1 {
+		t.Errorf("expected PublishReconciliationExceptionRaised to be called once, got %d", pub.exceptionRaised)
+	}
+}
+
+// TestUnmatchWithReason_UnmatchedLine_Rejected is the negative control:
+// unmatch only ever applies to a MATCHED line — an already-UNMATCHED line
+// has nothing to revert.
+func TestUnmatchWithReason_UnmatchedLine_Rejected(t *testing.T) {
+	s := newStubStore()
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/unmatch", domain.FlagExceptionRequest{Reason: "no match to undo"}, "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 unmatching an UNMATCHED line, got %d", rec.Code)
+	}
+}
+
 // ── GetStatementLine / ListStatementLines ────────────────────────────────────
 
 func TestGetStatementLine_NotFound(t *testing.T) {
@@ -568,5 +923,410 @@ func TestCompleteStatement_RequiresLegalEntityID(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/bank-accounts/b1/statements/2026-07-01/complete?tenant_id=t1", nil, "principal-1")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 without legal_entity_id query param, got %d", rec.Code)
+	}
+}
+
+// ── BNK-05 backlog: reconciliation runs ─────────────────────────────────────
+
+func TestStartRun_Success_Returns201(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	body := map[string]string{"legal_entity_id": "e1", "bank_account_id": "b1", "statement_date": "2026-07-01", "correlation_id": "corr-1"}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs", body, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var run domain.ReconciliationRun
+	if err := json.Unmarshal(rec.Body.Bytes(), &run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != domain.RunStatusDraft {
+		t.Errorf("expected a new run to be DRAFT, got %q", run.Status)
+	}
+}
+
+func TestStartRun_MissingFields_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs", map[string]string{"legal_entity_id": "e1"}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no bank_account_id/statement_date, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStartRun_AlreadyExists_Returns409(t *testing.T) {
+	s := newStubStore()
+	s.startRunErr = domain.ErrRunAlreadyExists
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	body := map[string]string{"legal_entity_id": "e1", "bank_account_id": "b1", "statement_date": "2026-07-01", "correlation_id": "corr-1"}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs", body, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when a run already exists for a different correlation_id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetRun_NotFound_Returns404(t *testing.T) {
+	s := newStubStore()
+	s.getRunErr = domain.ErrRunNotFound
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodGet, "/v1/reconciliation-runs/does-not-exist", nil, "principal-1")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFreezePopulation_Success_Returns201(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/freeze", nil, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFreezePopulation_InvalidTransition_Returns409(t *testing.T) {
+	s := newStubStore()
+	s.freezeErr = domain.ErrRunInvalidTransition
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/freeze", nil, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 re-freezing a non-DRAFT run, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCertifyRun_Success_Returns201(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCertifyRun_MaterialResidualBlocked_Returns422(t *testing.T) {
+	s := newStubStore()
+	s.certifyRunErr = domain.ErrMaterialResidualBlocked
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when the unmatched residual exceeds the bound policy's threshold, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCertifyRun_PopulationNotFrozen_Returns409(t *testing.T) {
+	s := newStubStore()
+	s.certifyRunErr = domain.ErrRunPopulationNotFrozen
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 certifying a run whose population was never frozen, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── Wave 13: closed-period enforcement at certification ─────────────────────
+
+// TestCertifyRun_PeriodLocked_Returns409 is the real proof of the doc's
+// own SoD rule ("closed-period/control exceptions need authorized
+// remediation"): a CLOSED/LOCKED period blocks certification before the
+// store is ever called.
+func TestCertifyRun_PeriodLocked_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWithClose(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{}, &stubClose{err: domain.ErrPeriodLocked})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 certifying against a CLOSED/LOCKED period, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCertifyRun_CloseServiceUnavailable_FailsClosed proves an
+// unreachable/ambiguous financial-close-svc blocks certification rather
+// than defaulting to "assume open."
+func TestCertifyRun_CloseServiceUnavailable_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWithClose(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{}, &stubClose{err: domain.ErrCloseServiceUnavailable})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when financial-close-svc is unreachable, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCertifyRun_NotConfigured_FailsClosed proves a deployment that never
+// wired a close client fails closed rather than skipping the check.
+func TestCertifyRun_NotConfigured_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWithClose(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{}, nil)
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when no close client is configured, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCertifyRun_PeriodOpen_Succeeds is the positive control: an OPEN
+// period still lets certification proceed normally.
+func TestCertifyRun_PeriodOpen_Succeeds(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWithClose(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{}, &stubClose{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 certifying against an OPEN period, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestReperformRun_Success_Returns201(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/reperform", nil, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var run domain.ReconciliationRun
+	if err := json.Unmarshal(rec.Body.Bytes(), &run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.RunID == "run-1" {
+		t.Error("expected reperform to return a NEW run id, not the superseded one")
+	}
+	// Wave 8c: both the OLD run's own terminal event and the NEW run's
+	// start event must be published — previously only the latter existed,
+	// so a listener had no way to learn a run had ended vs merely that
+	// another one started.
+	if pub.superseded != 1 {
+		t.Errorf("expected PublishReconciliationSuperseded to be called once, got %d", pub.superseded)
+	}
+	if pub.reperformed != 1 {
+		t.Errorf("expected PublishReconciliationReperformed to be called once, got %d", pub.reperformed)
+	}
+}
+
+func TestReperformRun_AlreadySuperseded_Returns409(t *testing.T) {
+	s := newStubStore()
+	s.reperformErr = domain.ErrRunSuperseded
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/reperform", nil, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 reperforming an already-superseded run, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRunAutomaticMatching_VerifiedCandidate_Matches proves the real
+// batch-matching path: a candidate whose statement line is genuinely
+// UNMATCHED in the run's frozen population and whose journal
+// independently verifies (same verifyJournalMatches used by the manual
+// path) is matched directly, with no separate propose/confirm step.
+func TestRunAutomaticMatching_VerifiedCandidate_Matches(t *testing.T) {
+	s := newStubStore()
+	line := domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
+	s.lines["l1"] = &line
+	s.unmatchedInPopulation = []domain.StatementLine{line}
+	popID := "pop-1"
+	s.runPopulationID = &popID
+
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 1000)})
+	req := domain.RunAutomaticMatchingRequest{Candidates: []domain.AutoMatchCandidate{{StatementLineID: "l1", JournalID: "j1"}}}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/auto-match", req, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp domain.RunAutomaticMatchingResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.MatchedCount != 1 || resp.SkippedCount != 0 {
+		t.Fatalf("expected 1 matched, 0 skipped, got matched=%d skipped=%d: %+v", resp.MatchedCount, resp.SkippedCount, resp.Results)
+	}
+	if s.lines["l1"].Status != domain.StatementLineStatusMatched {
+		t.Fatalf("expected line to be MATCHED, got %s", s.lines["l1"].Status)
+	}
+	if pub.matched != 1 {
+		t.Errorf("expected PublishReconciliationMatched to be called once, got %d", pub.matched)
+	}
+}
+
+// TestRunAutomaticMatching_UnverifiedCandidate_IsSkippedNotMatched is the
+// negative control: a candidate whose journal fails independent
+// verification (wrong amount) is never matched — it is skipped with a
+// reason, and the batch still returns 200 rather than aborting.
+func TestRunAutomaticMatching_UnverifiedCandidate_IsSkippedNotMatched(t *testing.T) {
+	s := newStubStore()
+	line := domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
+	s.lines["l1"] = &line
+	s.unmatchedInPopulation = []domain.StatementLine{line}
+	popID := "pop-1"
+	s.runPopulationID = &popID
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 500)}) // amount mismatch
+	req := domain.RunAutomaticMatchingRequest{Candidates: []domain.AutoMatchCandidate{{StatementLineID: "l1", JournalID: "j1"}}}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/auto-match", req, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 even with a skipped candidate, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp domain.RunAutomaticMatchingResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.MatchedCount != 0 || resp.SkippedCount != 1 || len(resp.Results) != 1 || resp.Results[0].Matched {
+		t.Fatalf("expected 1 skipped with a reason, not matched: %+v", resp)
+	}
+	if resp.Results[0].Reason == "" {
+		t.Fatal("expected a non-empty skip reason")
+	}
+	if s.lines["l1"].Status != domain.StatementLineStatusUnmatched {
+		t.Fatalf("expected the line to remain UNMATCHED, got %s", s.lines["l1"].Status)
+	}
+}
+
+// TestRunAutomaticMatching_CandidateOutsidePopulation_IsSkipped proves a
+// candidate naming a statement_line_id that is not actually part of this
+// run's frozen population (even if UNMATCHED elsewhere) is never matched.
+func TestRunAutomaticMatching_CandidateOutsidePopulation_IsSkipped(t *testing.T) {
+	s := newStubStore()
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
+	s.unmatchedInPopulation = nil // l1 is NOT part of the frozen population's unmatched set
+	popID := "pop-1"
+	s.runPopulationID = &popID
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 1000)})
+	req := domain.RunAutomaticMatchingRequest{Candidates: []domain.AutoMatchCandidate{{StatementLineID: "l1", JournalID: "j1"}}}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/auto-match", req, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp domain.RunAutomaticMatchingResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.MatchedCount != 0 || resp.SkippedCount != 1 {
+		t.Fatalf("expected the out-of-population candidate to be skipped, got %+v", resp)
+	}
+	if s.lines["l1"].Status != domain.StatementLineStatusUnmatched {
+		t.Fatalf("expected the line to remain untouched, got %s", s.lines["l1"].Status)
+	}
+}
+
+// TestRunAutomaticMatching_PopulationNotFrozen_Returns409 proves the run
+// must have a frozen population before auto-matching can run at all.
+func TestRunAutomaticMatching_PopulationNotFrozen_Returns409(t *testing.T) {
+	s := newStubStore() // runPopulationID left nil
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	req := domain.RunAutomaticMatchingRequest{Candidates: []domain.AutoMatchCandidate{{StatementLineID: "l1", JournalID: "j1"}}}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/auto-match", req, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 with no frozen population, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBindPolicy_MissingPolicyID_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/bind-policy", map[string]string{}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no policy_id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBindPolicy_Success_Returns200(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/bind-policy", map[string]string{"policy_id": "pol-1"}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── BNK-05 backlog: reconciliation policies ─────────────────────────────────
+
+func TestCreatePolicy_MissingFields_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-policies", map[string]string{}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no legal_entity_id/effective_from, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreatePolicy_Success_Returns201(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	body := map[string]string{"legal_entity_id": "e1", "effective_from": "2026-07-01"}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-policies", body, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreatePolicy_WideningBlockedWhenRunActive_Returns409(t *testing.T) {
+	s := newStubStore()
+	s.createPolicyErr = domain.ErrPolicyWouldWidenActiveRun
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	body := map[string]string{"legal_entity_id": "e1", "effective_from": "2026-07-01"}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-policies", body, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 widening a policy while a run is bound to a stricter one, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetCurrentPolicy_MissingLegalEntityID_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodGet, "/v1/reconciliation-policies/current", nil, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no legal_entity_id query param, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetCurrentPolicy_NotFound_Returns404(t *testing.T) {
+	s := newStubStore()
+	s.getCurrentPolicyErr = domain.ErrPolicyNotFound
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodGet, "/v1/reconciliation-policies/current?legal_entity_id=e1", nil, "principal-1")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when no policy has ever been created for this entity, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── BNK-05 backlog: evidence conflicts ──────────────────────────────────────
+
+func TestRaiseConflict_MissingFields_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/evidence-conflicts", map[string]string{"legal_entity_id": "e1"}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no statement_line_id/payment_id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRaiseConflict_Success_Returns201(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	body := map[string]string{"legal_entity_id": "e1", "statement_line_id": "line-1", "payment_id": "pay-1"}
+	rec := doRequest(r, http.MethodPost, "/v1/evidence-conflicts", body, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestListConflicts_Success_Returns200(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodGet, "/v1/evidence-conflicts", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetConflict_NotFound_Returns404(t *testing.T) {
+	s := newStubStore()
+	s.getConflictErr = domain.ErrConflictNotFound
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodGet, "/v1/evidence-conflicts/does-not-exist", nil, "principal-1")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResolveConflict_Success_Returns200(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/evidence-conflicts/c-1/resolve", map[string]string{"resolution_note": "verified with bank"}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResolveConflict_AlreadyResolved_Returns409(t *testing.T) {
+	s := newStubStore()
+	s.resolveConflictErr = domain.ErrConflictAlreadyResolved
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/evidence-conflicts/c-1/resolve", map[string]string{"resolution_note": "n/a"}, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 resolving an already-resolved conflict, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

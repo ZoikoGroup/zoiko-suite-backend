@@ -36,6 +36,7 @@ import (
 	"zoiko.io/audit-event-store-svc/internal/config"
 	"zoiko.io/audit-event-store-svc/internal/consumer"
 	svcenvelope "zoiko.io/audit-event-store-svc/internal/envelope"
+	"zoiko.io/audit-event-store-svc/internal/handler"
 	"zoiko.io/audit-event-store-svc/internal/health"
 	kafkarunner "zoiko.io/audit-event-store-svc/internal/kafka"
 	"zoiko.io/audit-event-store-svc/internal/store"
@@ -147,6 +148,11 @@ func main() {
 	router.Get("/healthz", healthH.Liveness)
 	router.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
 	router.Handle("/metrics", metrics.MetricsHandler(healthH.Readiness, promhttp.Handler()))
+
+	// AUD-10 archive/verify API — this service's first business HTTP
+	// endpoint set (see internal/handler's own package doc).
+	archiveHandler := handler.New(pgStore, log)
+	handler.RegisterRoutes(router, archiveHandler)
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + itoa(cfg.Port)

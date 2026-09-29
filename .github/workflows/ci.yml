@@ -33,11 +33,12 @@ jobs:
         image: postgres:16-alpine
         env:
           POSTGRES_DB: testdb
+          POSTGRES_USER: postgres
           POSTGRES_PASSWORD: secretpassword
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres -d testdb"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -175,6 +176,8 @@ jobs:
       - name: Integration test — store isolation/pipeline (PgStore → DB)
         if: matrix.service == 'access-control-svc' || matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'evidence-requirements-svc'
         working-directory: services/${{ matrix.service }}
+        env:
+          TEST_DATABASE_URL: ${{ (matrix.service == 'financial-close-svc' || matrix.service == 'treasury-svc') && 'postgres://postgres:secretpassword@127.0.0.1:5432/testdb?sslmode=disable' || '' }}
         # Runs integration tests under internal/store to verify isolation or the consumer pipeline.
         # Uses embedded-postgres (downloads real Postgres binaries automatically).
         run: go test -v -tags=integration -count=1 -timeout=120s ./internal/store/

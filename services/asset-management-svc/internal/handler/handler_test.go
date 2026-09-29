@@ -293,6 +293,57 @@ func (s *stubStore) ListAssets(_ context.Context, legalEntityID string) ([]domai
 	return out, nil
 }
 
+func (s *stubStore) GetAssetComponents(_ context.Context, assetID string) ([]domain.AssetComponent, error) {
+	return s.components[assetID], nil
+}
+
+func (s *stubStore) GetAssetBookProfiles(_ context.Context, assetID string) ([]domain.AssetBookAssignment, error) {
+	return s.books[assetID], nil
+}
+
+func (s *stubStore) GetAssetAsOf(_ context.Context, assetID string, asOf time.Time) (*domain.FixedAsset, error) {
+	a, ok := s.assets[assetID]
+	if !ok {
+		return nil, domain.ErrAssetNotFound
+	}
+	cp := *a
+	status := domain.AssetStatusCandidate
+	if a.RegisteredAt != nil && !a.RegisteredAt.After(asOf) {
+		status = domain.AssetStatusRegistered
+	}
+	if a.CapitalizedAt != nil && !a.CapitalizedAt.After(asOf) {
+		status = domain.AssetStatusActive
+	}
+	if a.SuspendedAt != nil && !a.SuspendedAt.After(asOf) {
+		status = domain.AssetStatusSuspended
+	}
+	cp.Status = status
+	return &cp, nil
+}
+
+// GetAssetSourceLineage is a simplified stub: walks one level of
+// merged_into_asset_id/split_from_asset_id in either direction — real
+// multi-hop recursion is verified in internal/store's own Postgres test.
+func (s *stubStore) GetAssetSourceLineage(_ context.Context, assetID string) ([]domain.FixedAsset, error) {
+	root, ok := s.assets[assetID]
+	if !ok {
+		return nil, domain.ErrAssetNotFound
+	}
+	out := []domain.FixedAsset{*root}
+	for _, a := range s.assets {
+		if a.AssetID == assetID {
+			continue
+		}
+		if (root.SplitFromAssetID != nil && a.AssetID == *root.SplitFromAssetID) ||
+			(root.MergedIntoAssetID != nil && a.AssetID == *root.MergedIntoAssetID) ||
+			(a.SplitFromAssetID != nil && *a.SplitFromAssetID == assetID) ||
+			(a.MergedIntoAssetID != nil && *a.MergedIntoAssetID == assetID) {
+			out = append(out, *a)
+		}
+	}
+	return out, nil
+}
+
 // GetNetBookValueTotal is a simplified stub: sums CostBasis for ACTIVE
 // schedules in the given book, for ACTIVE assets — accumulated
 // depreciation isn't modeled in this in-memory stub (that math is
@@ -339,6 +390,76 @@ func (s *stubStore) GetDepreciationCompleteness(_ context.Context, legalEntityID
 	}
 	covered = len(coveredSchedules)
 	return covered, eligible, nil
+}
+
+// GetAccumulatedDepreciation is a simplified stub: takes the latest (by
+// CreatedAt) line's own AccumulatedDepreciationAfter for the given
+// schedule version, across every run. Real "latest line" ordering is
+// verified in internal/store's own Postgres test.
+func (s *stubStore) GetAccumulatedDepreciation(_ context.Context, scheduleVersionID string) (float64, error) {
+	var total float64
+	var latest time.Time
+	for _, run := range s.runs {
+		for _, line := range run.Lines {
+			if line.ScheduleVersionID == scheduleVersionID && line.CreatedAt.After(latest) {
+				latest, total = line.CreatedAt, line.AccumulatedDepreciationAfter
+			}
+		}
+	}
+	return total, nil
+}
+
+func (s *stubStore) GetDepreciationAsOf(_ context.Context, scheduleVersionID string, asOf time.Time) (float64, error) {
+	var total float64
+	var latest time.Time
+	for _, run := range s.runs {
+		for _, line := range run.Lines {
+			if line.ScheduleVersionID == scheduleVersionID && !line.CreatedAt.After(asOf) && line.CreatedAt.After(latest) {
+				latest, total = line.CreatedAt, line.AccumulatedDepreciationAfter
+			}
+		}
+	}
+	return total, nil
+}
+
+func (s *stubStore) ListRunExceptions(_ context.Context, legalEntityID, fiscalPeriod string) ([]domain.DepreciationSchedule, error) {
+	covered := make(map[string]bool)
+	for _, run := range s.runs {
+		if run.LegalEntityID != legalEntityID || run.FiscalPeriod != fiscalPeriod || run.Status == domain.DepreciationRunStatusSuperseded {
+			continue
+		}
+		for _, line := range run.Lines {
+			covered[line.ScheduleVersionID] = true
+		}
+	}
+	var out []domain.DepreciationSchedule
+	for _, sch := range s.schedules {
+		if sch.LegalEntityID != legalEntityID || sch.Status != domain.DepreciationScheduleStatusActive {
+			continue
+		}
+		a, ok := s.assets[sch.AssetID]
+		if !ok || a.Status != domain.AssetStatusActive {
+			continue
+		}
+		if !covered[sch.ScheduleVersionID] {
+			out = append(out, *sch)
+		}
+	}
+	return out, nil
+}
+
+// GetAssetBookStateAsOf is a simplified stub: returns the current
+// schedule for (asset, book) if it existed by asOf, ignoring superseded
+// versions — real effective-dated versioning is verified in
+// internal/store's own Postgres test.
+func (s *stubStore) GetAssetBookStateAsOf(_ context.Context, assetID, bookID string, asOf time.Time) (*domain.DepreciationSchedule, error) {
+	for _, sch := range s.schedules {
+		if sch.AssetID == assetID && sch.BookID == bookID && !sch.CreatedAt.After(asOf) {
+			cp := *sch
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrScheduleNotFound
 }
 
 func (s *stubStore) AddComponent(_ context.Context, c *domain.AssetComponent) error {
@@ -477,6 +598,40 @@ func (p *stubPublisher) PublishAssetMetadataChanged(_ context.Context, _, _ stri
 	p.calls++
 }
 func (p *stubPublisher) PublishAssetSuspended(_ context.Context, _, _ string, _ domain.FixedAsset) {
+	p.calls++
+}
+
+func (p *stubPublisher) PublishDepreciationScheduleBuilt(_ context.Context, _, _ string, _ domain.DepreciationSchedule) {
+	p.calls++
+}
+func (p *stubPublisher) PublishDepreciationRunCalculated(_ context.Context, _, _, _, _, _ string, _ int) {
+	p.calls++
+}
+func (p *stubPublisher) PublishDepreciationRunApproved(_ context.Context, _, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishDepreciationRunSuperseded(_ context.Context, _, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishAssetEventCreated(_ context.Context, _, _ string, _ domain.AssetEvent) {
+	p.calls++
+}
+func (p *stubPublisher) PublishAssetEventApproved(_ context.Context, _, _ string, _ domain.AssetEvent) {
+	p.calls++
+}
+func (p *stubPublisher) PublishAssetEventApplied(_ context.Context, _, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishAssetImpaired(_ context.Context, _, _, _, _, _, _ string, _ *float64) {
+	p.calls++
+}
+func (p *stubPublisher) PublishAssetRevalued(_ context.Context, _, _, _, _, _, _ string, _ *float64) {
+	p.calls++
+}
+func (p *stubPublisher) PublishAssetDisposed(_ context.Context, _, _, _, _, _, _ string, _ *float64) {
+	p.calls++
+}
+func (p *stubPublisher) PublishAssetEventReversed(_ context.Context, _, _, _, _, _, _ string) {
 	p.calls++
 }
 
@@ -804,6 +959,88 @@ func TestAmendNonFinancialMetadata_NeverChangesStatus(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// ── GetAssetAsOf / GetAssetComponents / GetAssetBookProfiles / GetAssetSourceLineage ──
+
+func TestGetAssetComponents_ReturnsAddedComponent(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createActiveAsset(t, s, r, "le-1")
+
+	addRR := doReq(r, http.MethodPost, "/v1/assets/"+id+"/components", domain.AddComponentRequest{Description: "Battery"}, "preparer-1")
+	if addRR.Code != http.StatusCreated {
+		t.Fatalf("add component failed: %d %s", addRR.Code, addRR.Body.String())
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/assets/"+id+"/components", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var list []domain.AssetComponent
+	_ = json.NewDecoder(rr.Body).Decode(&list)
+	if len(list) != 1 || list[0].Description != "Battery" {
+		t.Fatalf("expected 1 component (Battery), got %+v", list)
+	}
+}
+
+func TestGetAssetBookProfiles_ReturnsAssignedBook(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createActiveAsset(t, s, r, "le-1")
+
+	assignRR := doReq(r, http.MethodPost, "/v1/assets/"+id+"/book-profiles", domain.AssignAssetBookProfileRequest{BookID: "book-1"}, "preparer-1")
+	if assignRR.Code != http.StatusCreated {
+		t.Fatalf("assign book profile failed: %d %s", assignRR.Code, assignRR.Body.String())
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/assets/"+id+"/book-profiles", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var list []domain.AssetBookAssignment
+	_ = json.NewDecoder(rr.Body).Decode(&list)
+	if len(list) != 1 || list[0].BookID != "book-1" {
+		t.Fatalf("expected 1 book profile (book-1), got %+v", list)
+	}
+}
+
+func TestGetAssetAsOf_BeforeCapitalization_ReturnsRegistered(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createRegisteredAsset(t, s, r, "le-1") // REGISTERED, not yet ACTIVE
+
+	rr := doReq(r, http.MethodGet, "/v1/assets/"+id+"/as-of", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var a domain.FixedAsset
+	_ = json.NewDecoder(rr.Body).Decode(&a)
+	if a.Status != domain.AssetStatusRegistered {
+		t.Fatalf("expected REGISTERED as-of now, got %q", a.Status)
+	}
+}
+
+func TestGetAssetSourceLineage_AfterMerge_ReturnsBothAssets(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	source := createActiveAsset(t, s, r, "le-1")
+	target := createActiveAsset(t, s, r, "le-1")
+
+	mergeRR := doReq(r, http.MethodPost, "/v1/assets/"+source+"/merge", domain.MergeAssetRequest{TargetAssetID: target, Reason: "consolidating"}, "preparer-1")
+	if mergeRR.Code != http.StatusOK {
+		t.Fatalf("merge failed: %d %s", mergeRR.Code, mergeRR.Body.String())
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/assets/"+source+"/source-lineage", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var list []domain.FixedAsset
+	_ = json.NewDecoder(rr.Body).Decode(&list)
+	if len(list) != 2 {
+		t.Fatalf("expected the source and target both in the lineage, got %+v", list)
+	}
+}
 
 // ── Authorization ────────────────────────────────────────────────────────────
 

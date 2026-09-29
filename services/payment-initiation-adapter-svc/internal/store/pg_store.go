@@ -96,7 +96,7 @@ func (s *PgStore) recordEvent(ctx context.Context, tx pgx.Tx, tenantID *string, 
 }
 
 const attemptColumns = `
-	attempt_id, tenant_id, legal_entity_id, source_reference, authorization_fingerprint, payer_account_ref,
+	attempt_id, tenant_id, legal_entity_id, source_reference, authorization_fingerprint, authorization_id, authorization_source, payer_account_ref,
 	payee_ref, amount, currency, execution_date, payment_reference, payer_account_verified, idempotency_key,
 	status, provider_request_id, provider_response_ref, rejection_reason, quarantine_reason,
 	ambiguous_resolution_note, submitted_at, resolved_at, created_by_principal_id, created_at, updated_at`
@@ -104,6 +104,7 @@ const attemptColumns = `
 func scanAttempt(row pgx.Row) (*domain.PaymentInitiationAttempt, error) {
 	a := &domain.PaymentInitiationAttempt{}
 	err := row.Scan(&a.AttemptID, &a.TenantID, &a.LegalEntityID, &a.SourceReference, &a.AuthorizationFingerprint,
+		&nullString{&a.AuthorizationID}, &nullString{&a.AuthorizationSource},
 		&a.PayerAccountRef, &a.PayeeRef, &a.Amount, &a.Currency, &a.ExecutionDate, &nullString{&a.PaymentReference},
 		&a.PayerAccountVerified, &a.IdempotencyKey, &a.Status, &nullString{&a.ProviderRequestID},
 		&nullString{&a.ProviderResponseRef}, &nullString{&a.RejectionReason}, &nullString{&a.QuarantineReason},
@@ -123,20 +124,56 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 	id := uuid.New().String()
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		a, err = scanAttempt(tx.QueryRow(ctx, `
+		// Invariant #16: a source_reference with an attempt still unresolved
+		// OR already submitted must not get a second one, even under a
+		// brand-new idempotency_key — that's the scenario the unique index
+		// on idempotency_key alone doesn't catch. SUBMITTED is included
+		// deliberately: this service never transitions an attempt OUT of
+		// SUBMITTED (finality tracking is BNK-07/payment-status-svc's own
+		// concern), so from the money-movement-safety angle this invariant
+		// protects, SUBMITTED means "a payment for this source_reference
+		// was already sent to the provider" — permanently, as far as this
+		// service knows — and a second send for the same instruction must
+		// never happen regardless of whether the first later settles or
+		// fails downstream. A genuine retry after a real failure mints a
+		// NEW source_reference (a new instruction), the same way a
+		// caller-side retry already gets a new idempotency_key; it does
+		// not reuse the exhausted one. Only checked when the caller
+		// actually supplied a source_reference; an empty one has nothing
+		// to dedupe against.
+		if req.SourceReference != "" {
+			existing, err := scanAttempt(tx.QueryRow(ctx, `
+				SELECT `+attemptColumns+` FROM payment_initiation_attempts
+				WHERE source_reference = $1 AND status IN ('PREPARED', 'PENDING_UNKNOWN', 'SUBMITTED')
+				LIMIT 1
+			`, req.SourceReference))
+			if err == nil {
+				a = existing
+				return domain.ErrUnresolvedAttemptExists
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+
+		inserted, err := scanAttempt(tx.QueryRow(ctx, `
 			INSERT INTO payment_initiation_attempts (`+attemptColumns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'PREPARED', '', '', '', '', '', NULL, NULL, $14, NOW(), NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'PREPARED', '', '', '', '', '', NULL, NULL, $16, NOW(), NOW())
 			RETURNING `+attemptColumns,
 			id, nullableTenant(tenantID), req.LegalEntityID, req.SourceReference, req.AuthorizationFingerprint,
+			req.AuthorizationID, req.AuthorizationSource,
 			req.PayerAccountRef, req.PayeeRef, req.Amount, req.Currency, req.ExecutionDate, req.PaymentReference,
 			req.PayerAccountVerified, req.IdempotencyKey, principalID,
 		))
 		if err != nil {
 			return err
 		}
+		a = inserted
 		return s.recordEvent(ctx, tx, a.TenantID, id, domain.EventInitiationPrepared, "", principalID)
 	})
+	if errors.Is(err, domain.ErrUnresolvedAttemptExists) {
+		return a, domain.ErrUnresolvedAttemptExists
+	}
 	if isUniqueViolation(err) {
 		return nil, domain.ErrDuplicateIdempotencyKey
 	}

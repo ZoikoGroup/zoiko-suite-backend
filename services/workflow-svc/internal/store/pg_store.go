@@ -17,6 +17,7 @@ import (
 
 	"zoiko.io/workflow-svc/internal/domain"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
+	"zoiko.io/workflow-svc/internal/outbox"
 )
 
 // Store is the interface consumed by the handler.
@@ -37,6 +38,8 @@ type Store interface {
 
 	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
 	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
+	InvalidateWorkflow(ctx context.Context, params domain.InvalidateWorkflowParams) (*domain.WorkflowInstance, bool, error)
+	VerifyRelease(ctx context.Context, params domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -73,12 +76,14 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 
 // ── workflow_instances ───────────────────────────────────────────────────────
 
-const instanceColumns = `workflow_instance_id, tenant_id, legal_entity_id, workflow_type, workflow_status, current_stage, initiated_by, correlation_id, started_at, completed_at`
+const instanceColumns = `workflow_instance_id, tenant_id, legal_entity_id, workflow_type, workflow_status, current_stage, initiated_by, correlation_id, started_at, completed_at, subject_type, subject_id, subject_version, subject_fingerprint, invalidated_at, invalidation_reason_code, invalidation_narrative, invalidation_evidence_refs`
 
 func scanInstance(row pgx.Row) (*domain.WorkflowInstance, error) {
 	w := &domain.WorkflowInstance{}
 	err := row.Scan(&w.WorkflowInstanceID, &w.TenantID, &w.LegalEntityID, &w.WorkflowType, &w.WorkflowStatus,
-		&w.CurrentStage, &w.InitiatedBy, &w.CorrelationID, &w.StartedAt, &w.CompletedAt)
+		&w.CurrentStage, &w.InitiatedBy, &w.CorrelationID, &w.StartedAt, &w.CompletedAt,
+		&w.SubjectType, &w.SubjectID, &w.SubjectVersion, &w.SubjectFingerprint,
+		&w.InvalidatedAt, &w.InvalidationReasonCode, &w.InvalidationNarrative, &w.InvalidationEvidenceRefs)
 	return w, err
 }
 
@@ -213,11 +218,11 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 	// see migration 000003. ON CONFLICT DO NOTHING here returns zero rows
 	// rather than erroring, which is how the conflict is detected below.
 	const insertInstance = `
-		INSERT INTO workflow_instances (workflow_instance_id, tenant_id, legal_entity_id, workflow_type, initiated_by, correlation_id)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO workflow_instances (workflow_instance_id, tenant_id, legal_entity_id, workflow_type, initiated_by, correlation_id, subject_type, subject_id, subject_version, subject_fingerprint)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		RETURNING ` + instanceColumns + `;`
-	row := tx.QueryRow(ctx, insertInstance, params.WorkflowInstanceID, params.TenantID, params.LegalEntityID, params.WorkflowType, params.InitiatedBy, params.CorrelationID)
+	row := tx.QueryRow(ctx, insertInstance, params.WorkflowInstanceID, params.TenantID, params.LegalEntityID, params.WorkflowType, params.InitiatedBy, params.CorrelationID, params.SubjectType, params.SubjectID, params.SubjectVersion, params.SubjectFingerprint)
 	instance, err := scanInstance(row)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -252,6 +257,39 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 	}
 	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, "", "PENDING", params.InitiatedBy, nil, correlationID, nil); err != nil {
 		return nil, nil, false, err
+	}
+
+	startedPayload := map[string]any{
+		"workflow_instance_id": instance.WorkflowInstanceID,
+		"tenant_id":            instance.TenantID,
+		"legal_entity_id":      instance.LegalEntityID,
+		"workflow_type":        instance.WorkflowType,
+		"initiated_by":         instance.InitiatedBy,
+		"started_at":           instance.StartedAt,
+	}
+	if instance.SubjectType != nil {
+		startedPayload["subject_type"] = *instance.SubjectType
+	}
+	if instance.SubjectID != nil {
+		startedPayload["subject_id"] = *instance.SubjectID
+	}
+	if instance.SubjectVersion != nil {
+		startedPayload["subject_version"] = *instance.SubjectVersion
+	}
+	if instance.SubjectFingerprint != nil {
+		startedPayload["subject_fingerprint"] = *instance.SubjectFingerprint
+	}
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "workflow_instance",
+		AggregateID:   instance.WorkflowInstanceID,
+		EventType:     "workflow.started",
+		TenantID:      instance.TenantID,
+		LegalEntityID: instance.LegalEntityID,
+		ActorID:       &instance.InitiatedBy,
+		CorrelationID: correlationID,
+		Payload:       startedPayload,
+	}); err != nil {
+		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -402,6 +440,46 @@ func (s *PgStore) SubmitAction(ctx context.Context, params domain.SubmitActionPa
 		return nil, nil, false, err
 	}
 
+	stageEventType := "approval.granted"
+	if updatedStage.StageStatus == "REJECTED" {
+		stageEventType = "approval.rejected"
+	}
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "workflow_instance",
+		AggregateID:   params.WorkflowInstanceID,
+		EventType:     stageEventType,
+		TenantID:      updatedInstance.TenantID,
+		LegalEntityID: updatedInstance.LegalEntityID,
+		ActorID:       &params.ActorPrincipalID,
+		CorrelationID: instanceCorrelationID,
+		Payload: map[string]any{
+			"workflow_instance_id":  updatedInstance.WorkflowInstanceID,
+			"stage_order":           updatedStage.StageOrder,
+			"approver_principal_id": updatedStage.ApproverPrincipalID,
+		},
+	}); err != nil {
+		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	if updatedInstance.WorkflowStatus == "APPROVED" || updatedInstance.WorkflowStatus == "REJECTED" {
+		if err := outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: "workflow_instance",
+			AggregateID:   params.WorkflowInstanceID,
+			EventType:     "workflow.completed",
+			TenantID:      updatedInstance.TenantID,
+			LegalEntityID: updatedInstance.LegalEntityID,
+			ActorID:       &params.ActorPrincipalID,
+			CorrelationID: instanceCorrelationID,
+			Payload: map[string]any{
+				"workflow_instance_id": updatedInstance.WorkflowInstanceID,
+				"workflow_status":      updatedInstance.WorkflowStatus,
+				"completed_at":         updatedInstance.CompletedAt,
+			},
+		}); err != nil {
+			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		s.log.Error("pg SubmitAction: commit failed", zap.Error(err))
 		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -464,7 +542,7 @@ func (s *PgStore) transitionInstanceStatus(ctx context.Context, workflowInstance
 	const query = `
 		UPDATE workflow_instances
 		SET workflow_status = $1, current_stage = $2,
-		    completed_at = CASE WHEN $1::VARCHAR IN ('APPROVED','REJECTED','CANCELLED') THEN NOW() ELSE completed_at END
+		    completed_at = CASE WHEN $1::VARCHAR IN ('APPROVED','REJECTED','CANCELLED','INVALIDATED') THEN NOW() ELSE completed_at END
 		WHERE workflow_instance_id = $3
 		RETURNING ` + instanceColumns + `;`
 	row := tx.QueryRow(ctx, query, toState, newCurrentStage, workflowInstanceID)
@@ -482,9 +560,228 @@ func (s *PgStore) transitionInstanceStatus(ctx context.Context, workflowInstance
 		return nil, false, err
 	}
 
+	if toState == "ESCALATED" {
+		if err := outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: "workflow_instance",
+			AggregateID:   workflowInstanceID,
+			EventType:     "workflow.escalated",
+			TenantID:      updated.TenantID,
+			LegalEntityID: updated.LegalEntityID,
+			ActorID:       &actorPrincipalID,
+			CorrelationID: instanceCorrelationID,
+			Payload: map[string]any{
+				"workflow_instance_id": updated.WorkflowInstanceID,
+				"current_stage":        updated.CurrentStage,
+			},
+		}); err != nil {
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+	} else if toState == "CANCELLED" {
+		if err := outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: "workflow_instance",
+			AggregateID:   workflowInstanceID,
+			EventType:     "workflow.completed",
+			TenantID:      updated.TenantID,
+			LegalEntityID: updated.LegalEntityID,
+			ActorID:       &actorPrincipalID,
+			CorrelationID: instanceCorrelationID,
+			Payload: map[string]any{
+				"workflow_instance_id": updated.WorkflowInstanceID,
+				"workflow_status":      updated.WorkflowStatus,
+				"completed_at":         updated.CompletedAt,
+			},
+		}); err != nil {
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		s.log.Error("pg transitionInstanceStatus: commit failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return updated, true, nil
+}
+
+// InvalidateWorkflow transitions PENDING or APPROVED -> INVALIDATED per ZS-STATE-001 §6.1 / §7.
+//
+// Idempotency: if already INVALIDATED, returns current instance and transitioned=false.
+// Terminal rejection/cancellation: cannot be invalidated (ErrInvalidTransition).
+func (s *PgStore) InvalidateWorkflow(ctx context.Context, params domain.InvalidateWorkflowParams) (*domain.WorkflowInstance, bool, error) {
+	current, err := s.FindWorkflowByID(ctx, params.WorkflowInstanceID)
+	if err != nil {
+		return nil, false, err
+	}
+	if current.WorkflowStatus == domain.WorkflowStatusInvalidated {
+		return current, false, nil
+	}
+	if current.WorkflowStatus == domain.WorkflowStatusRejected || current.WorkflowStatus == domain.WorkflowStatusCancelled {
+		return nil, false, domain.ErrInvalidTransition
+	}
+	if current.WorkflowStatus != domain.WorkflowStatusPending && current.WorkflowStatus != domain.WorkflowStatusApproved && current.WorkflowStatus != domain.WorkflowStatusEscalated {
+		return nil, false, domain.ErrInvalidTransition
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		s.log.Error("pg InvalidateWorkflow: begin tx failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx)); err != nil {
+		return nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
+
+	const query = `
+		UPDATE workflow_instances
+		SET workflow_status = 'INVALIDATED',
+		    current_stage = 0,
+		    completed_at = COALESCE(completed_at, NOW()),
+		    invalidated_at = NOW(),
+		    invalidation_reason_code = $1,
+		    invalidation_narrative = $2,
+		    invalidation_evidence_refs = $3
+		WHERE workflow_instance_id = $4
+		RETURNING ` + instanceColumns + `;`
+
+	evidenceRefs := params.EvidenceRefs
+	if evidenceRefs == nil {
+		evidenceRefs = []string{}
+	}
+
+	row := tx.QueryRow(ctx, query, params.ReasonCode, params.Narrative, evidenceRefs, params.WorkflowInstanceID)
+	updated, err := scanInstance(row)
+	if err != nil {
+		s.log.Error("pg InvalidateWorkflow: update failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	var instanceCorrelationID *string
+	if updated.CorrelationID != "" {
+		instanceCorrelationID = &updated.CorrelationID
+	}
+	if params.CorrelationID != "" {
+		instanceCorrelationID = &params.CorrelationID
+	}
+
+	rationale := fmt.Sprintf("invalidated by %s: code=%s", params.ActorPrincipalID, params.ReasonCode)
+	if params.Narrative != nil && *params.Narrative != "" {
+		rationale += " narrative=" + *params.Narrative
+	}
+
+	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, current.WorkflowStatus, domain.WorkflowStatusInvalidated, params.ActorPrincipalID, &rationale, instanceCorrelationID, params.CausationID); err != nil {
+		return nil, false, err
+	}
+
+	invalidationPayload := map[string]any{
+		"workflow_instance_id":     updated.WorkflowInstanceID,
+		"workflow_status":          updated.WorkflowStatus,
+		"invalidated_at":           updated.InvalidatedAt,
+		"invalidation_reason_code": updated.InvalidationReasonCode,
+	}
+	if updated.SubjectType != nil {
+		invalidationPayload["subject_type"] = *updated.SubjectType
+	}
+	if updated.SubjectID != nil {
+		invalidationPayload["subject_id"] = *updated.SubjectID
+	}
+	if updated.SubjectVersion != nil {
+		invalidationPayload["subject_version"] = *updated.SubjectVersion
+	}
+	if updated.SubjectFingerprint != nil {
+		invalidationPayload["subject_fingerprint"] = *updated.SubjectFingerprint
+	}
+	if updated.InvalidationNarrative != nil {
+		invalidationPayload["invalidation_narrative"] = *updated.InvalidationNarrative
+	}
+	if len(updated.InvalidationEvidenceRefs) > 0 {
+		invalidationPayload["invalidation_evidence_refs"] = updated.InvalidationEvidenceRefs
+	}
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "workflow_instance",
+		AggregateID:   params.WorkflowInstanceID,
+		EventType:     "workflow.approval.invalidated",
+		TenantID:      updated.TenantID,
+		LegalEntityID: updated.LegalEntityID,
+		ActorID:       &params.ActorPrincipalID,
+		CorrelationID: instanceCorrelationID,
+		Payload:       invalidationPayload,
+	}); err != nil {
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		s.log.Error("pg InvalidateWorkflow: commit failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return updated, true, nil
+}
+
+// VerifyRelease evaluates whether an approved workflow remains valid to release against the current subject version and fingerprint.
+//
+// Enforces ZS-STATE-001 Critical Release Rule, I-06, I-07, T-02, T-04:
+// - Fails safely if the workflow has no bound subject fingerprint.
+// - Fails if the workflow is not in APPROVED status (or has been INVALIDATED).
+// - Fails if expected_subject_version is specified and does not match bound subject_version.
+// - Fails if current_subject_fingerprint does not match bound subject_fingerprint.
+func (s *PgStore) VerifyRelease(ctx context.Context, params domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error) {
+	current, err := s.FindWorkflowByID(ctx, params.WorkflowInstanceID)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &domain.ReleaseVerificationResult{
+		WorkflowInstanceID: current.WorkflowInstanceID,
+		WorkflowStatus:     current.WorkflowStatus,
+		SubjectFingerprint: current.SubjectFingerprint,
+	}
+
+	// 1. Check for unbound subject - fail safely
+	if current.SubjectFingerprint == nil || *current.SubjectFingerprint == "" {
+		reason := domain.ErrWorkflowUnboundSubject.Error()
+		res.CanRelease = false
+		res.Status = "INVALID"
+		res.Reason = &reason
+		return res, nil
+	}
+
+	// 2. Check workflow status
+	if current.WorkflowStatus == domain.WorkflowStatusInvalidated {
+		reason := domain.ErrWorkflowInvalidated.Error()
+		res.CanRelease = false
+		res.Status = "INVALID"
+		res.Reason = &reason
+		return res, nil
+	}
+	if current.WorkflowStatus != domain.WorkflowStatusApproved {
+		reason := domain.ErrWorkflowNotApproved.Error()
+		res.CanRelease = false
+		res.Status = "INVALID"
+		res.Reason = &reason
+		return res, nil
+	}
+
+	// 3. Check version match if expected version provided
+	if params.ExpectedSubjectVersion != nil {
+		if current.SubjectVersion == nil || *current.SubjectVersion != *params.ExpectedSubjectVersion {
+			reason := domain.ErrSubjectVersionMismatch.Error()
+			res.CanRelease = false
+			res.Status = "INVALID"
+			res.Reason = &reason
+			return res, nil
+		}
+	}
+
+	// 4. Check fingerprint match
+	if *current.SubjectFingerprint != params.CurrentSubjectFingerprint {
+		reason := domain.ErrSubjectFingerprintMismatch.Error()
+		res.CanRelease = false
+		res.Status = "INVALID"
+		res.Reason = &reason
+		return res, nil
+	}
+
+	res.CanRelease = true
+	res.Status = "VALID"
+	return res, nil
 }

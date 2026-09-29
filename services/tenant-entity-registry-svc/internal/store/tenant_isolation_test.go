@@ -48,38 +48,69 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	// Start embedded Postgres
-	dbPort := uint32(15701 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly — see the doc comment on
-			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
-			// main_integration_test.go for why: the unpinned default floats
-			// to whatever major the library calls "latest," and that patch
-			// build can stop resolving from the remote binary repo with no
-			// code change on our side (this is what broke PR #105's CI).
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database("ter_isolation_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
+	ctx := context.Background()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
+
+	if dsn == "" {
+		// Start embedded Postgres
+		dbPort := uint32(15701 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				// Version pinned explicitly — see the doc comment on
+				// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+				// main_integration_test.go for why: the unpinned default floats
+				// to whatever major the library calls "latest," and that patch
+				// build can stop resolving from the remote binary repo with no
+				// code change on our side (this is what broke PR #105's CI).
+				Version(embeddedpostgres.V16).
+				Port(dbPort).
+				Database("ter_isolation_test").
+				Username("postgres").
+				Password("postgres").
+				// Isolate runtime path so concurrent suites don't collide
+				RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-ter-%d", dbPort))),
+		)
+
+		var err error
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err = pg.Start(); err == nil {
+				break
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+
+		if err != nil {
+			// If embedded postgres fails to start (e.g. transient remote binary download rate-limiting in CI),
+			// fall back to the CI-provided Postgres container if reachable.
+			ciDSN := "postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable"
+			fallbackPool, pingErr := pgxpool.New(ctx, ciDSN)
+			if pingErr == nil && fallbackPool.Ping(ctx) == nil {
+				fallbackPool.Close()
+				dsn = ciDSN
+				pg = nil
+			} else {
+				if fallbackPool != nil {
+					fallbackPool.Close()
+				}
+				fmt.Printf("failed to start embedded postgres: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			dsn = fmt.Sprintf(
+				"host=localhost port=%d dbname=ter_isolation_test user=postgres password=postgres sslmode=disable",
+				dbPort,
+			)
+		}
 	}
 
-	dsn := fmt.Sprintf(
-		"host=localhost port=%d dbname=ter_isolation_test user=postgres password=postgres sslmode=disable",
-		dbPort,
-	)
-
-	ctx := context.Background()
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect to postgres: %v\n", err)
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -93,9 +124,14 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
+
+	// A reused CI fallback database may still hold the previous run's tables.
+	_, _ = testPool.Exec(ctx, `DROP TABLE IF EXISTS workspaces, tax_identity_bundles, entity_jurisdiction_assignments, entity_hierarchies, legal_entities, data_residency_policies, tenants, residency_regions CASCADE;`)
 
 	// Run migrations. Discovered from the directory, NOT listed inline: a
 	// hand-written list silently skips the migration added after it was
@@ -106,7 +142,9 @@ func TestMain(m *testing.M) {
 	if globErr != nil || len(migrations) == 0 {
 		fmt.Printf("no migrations found: %v\n", globErr)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 	sort.Strings(migrations)
@@ -115,13 +153,17 @@ func TestMain(m *testing.M) {
 		if readErr != nil {
 			fmt.Printf("failed to read migration %s: %v\n", mig, readErr)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
 			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(mig), err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 	}
@@ -131,7 +173,9 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	testPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 

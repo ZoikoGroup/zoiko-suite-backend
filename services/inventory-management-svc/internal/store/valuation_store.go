@@ -17,12 +17,18 @@ import (
 // a second attempt against the same movement — negative path #4, "Same
 // movement consumes two cost layers twice," enforced by the real
 // UNIQUE(tenant_id, movement_id) constraint on inventory_valuation_entries.
-func (s *PgStore) ValueMovement(ctx context.Context, movementID, principalID string, unitCost *float64, at time.Time) (*domain.ValuationEntry, error) {
+// ValueMovement's second return value is the cost layer it created —
+// populated only for an INBOUND entry (only valueInbound ever creates
+// one); nil for OUTBOUND, since consuming existing layers creates no
+// new one. Callers use this to publish CostLayerCreated only when a
+// layer genuinely was.
+func (s *PgStore) ValueMovement(ctx context.Context, movementID, principalID string, unitCost *float64, at time.Time) (*domain.ValuationEntry, *domain.CostLayer, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
+		return nil, nil, domain.ErrIdentityMissing
 	}
 	var result *domain.ValuationEntry
+	var createdLayer *domain.CostLayer
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var m struct {
 			itemID, legalEntityID, uom, fiscalPeriod, status string
@@ -58,7 +64,9 @@ func (s *PgStore) ValueMovement(ctx context.Context, movementID, principalID str
 		entryID := uuidNewString()
 		var entry *domain.ValuationEntry
 		if m.destLocID != nil {
-			entry, err = s.valueInbound(ctx, tx, tenantID, entryID, m.legalEntityID, m.itemID, *m.destLocID, movementID, m.quantity, valuationMethod, m.fiscalPeriod, unitCost, principalID, at)
+			var layer *domain.CostLayer
+			entry, layer, err = s.valueInbound(ctx, tx, tenantID, entryID, m.legalEntityID, m.itemID, *m.destLocID, movementID, m.quantity, valuationMethod, m.fiscalPeriod, unitCost, principalID, at)
+			createdLayer = layer
 		} else if m.sourceLocID != nil {
 			entry, err = s.valueOutbound(ctx, tx, tenantID, entryID, m.legalEntityID, m.itemID, *m.sourceLocID, movementID, m.quantity, valuationMethod, m.fiscalPeriod, unitCost, principalID, at)
 		} else {
@@ -71,23 +79,24 @@ func (s *PgStore) ValueMovement(ctx context.Context, movementID, principalID str
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return result, nil
+	return result, createdLayer, nil
 }
 
-func (s *PgStore) valueInbound(ctx context.Context, tx pgx.Tx, tenantID, entryID, legalEntityID, itemID, locationID, movementID string, quantity float64, valuationMethod, fiscalPeriod string, unitCost *float64, principalID string, at time.Time) (*domain.ValuationEntry, error) {
+func (s *PgStore) valueInbound(ctx context.Context, tx pgx.Tx, tenantID, entryID, legalEntityID, itemID, locationID, movementID string, quantity float64, valuationMethod, fiscalPeriod string, unitCost *float64, principalID string, at time.Time) (*domain.ValuationEntry, *domain.CostLayer, error) {
 	if unitCost == nil {
-		return nil, domain.ErrUnitCostRequired
+		return nil, nil, domain.ErrUnitCostRequired
 	}
 	value := roundCents(quantity * *unitCost)
 
+	layerID := uuidNewString()
 	_, err := tx.Exec(ctx, `
 		INSERT INTO inventory_cost_layers (
 			layer_id, tenant_id, legal_entity_id, item_id, location_id, source_movement_id,
 			original_quantity, remaining_quantity, unit_cost, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`, uuidNewString(), tenantID, legalEntityID, itemID, locationID, movementID, quantity, quantity, *unitCost, at)
+	`, layerID, tenantID, legalEntityID, itemID, locationID, movementID, quantity, quantity, *unitCost, at)
 	if err != nil {
 		if isUniqueViolation(err) {
 			// UNIQUE(tenant_id, source_movement_id) — this movement
@@ -95,9 +104,13 @@ func (s *PgStore) valueInbound(ctx context.Context, tx pgx.Tx, tenantID, entryID
 			// negative path (#4) as the entries-table UNIQUE violation
 			// insertValuationEntry maps below, just caught one insert
 			// earlier for an INBOUND movement.
-			return nil, domain.ErrMovementAlreadyValued
+			return nil, nil, domain.ErrMovementAlreadyValued
 		}
-		return nil, err
+		return nil, nil, err
+	}
+	layer := &domain.CostLayer{
+		LayerID: layerID, ItemID: itemID, LocationID: locationID, SourceMovementID: movementID,
+		OriginalQuantity: quantity, RemainingQuantity: quantity, UnitCost: *unitCost, CreatedAt: at,
 	}
 
 	entry := &domain.ValuationEntry{
@@ -106,9 +119,9 @@ func (s *PgStore) valueInbound(ctx context.Context, tx pgx.Tx, tenantID, entryID
 		FiscalPeriod: fiscalPeriod, CreatedAt: at, CreatedByPrincipalID: principalID,
 	}
 	if err := s.insertValuationEntry(ctx, tx, tenantID, entry); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return entry, nil
+	return entry, layer, nil
 }
 
 type consumableLayer struct {
@@ -350,6 +363,72 @@ func (s *PgStore) GetCostLayers(ctx context.Context, itemID, locationID string) 
 		return nil, err
 	}
 	return out, nil
+}
+
+// GetLayerConsumptions is INV-04's own GetCOGSAssignment query — every
+// inventory_layer_consumptions row an OUTBOUND valuation entry created,
+// i.e. exactly which cost layers (and at what rate) were drawn on to
+// price that consumption. Written once, at ValueMovement time, in
+// valueOutbound above — never mutated afterward.
+func (s *PgStore) GetLayerConsumptions(ctx context.Context, valuationEntryID string) ([]domain.LayerConsumption, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.LayerConsumption
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT consumption_id, valuation_entry_id, layer_id, quantity_consumed, unit_cost_at_consumption, created_at
+			FROM inventory_layer_consumptions WHERE tenant_id = $1 AND valuation_entry_id = $2 ORDER BY created_at
+		`, tenantID, valuationEntryID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var c domain.LayerConsumption
+			if err := rows.Scan(&c.ConsumptionID, &c.ValuationEntryID, &c.LayerID, &c.QuantityConsumed, &c.UnitCostAtConsumption, &c.CreatedAt); err != nil {
+				return err
+			}
+			out = append(out, c)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetInventoryValueAsOf is INV-04's own GetInventoryValueAsOf query — the
+// historical counterpart to GetInventoryValue. inventory_cost_layers'
+// remaining_quantity is a live running total (continuously decremented by
+// later consumptions), so it cannot answer "what was this worth on
+// <date>" directly; this reconstructs that instant from the same
+// append-only, never-mutated evidence GetInventoryValue itself trusts —
+// each layer's original_quantity minus only the consumptions that had
+// themselves happened by asOf, for layers that themselves existed by
+// asOf.
+func (s *PgStore) GetInventoryValueAsOf(ctx context.Context, itemID, locationID string, asOf time.Time) (float64, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, domain.ErrIdentityMissing
+	}
+	var value float64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(l.unit_cost * (l.original_quantity - COALESCE(consumed.qty, 0))), 0)
+			FROM inventory_cost_layers l
+			LEFT JOIN (
+				SELECT layer_id, SUM(quantity_consumed) AS qty
+				FROM inventory_layer_consumptions
+				WHERE tenant_id = $1 AND created_at <= $4
+				GROUP BY layer_id
+			) consumed ON consumed.layer_id = l.layer_id
+			WHERE l.tenant_id = $1 AND l.item_id = $2 AND l.location_id = $3 AND l.created_at <= $4
+		`, tenantID, itemID, locationID, asOf).Scan(&value)
+	})
+	return value, err
 }
 
 // ── Valuation runs ───────────────────────────────────────────────────────────

@@ -15,9 +15,9 @@ import (
 	"zoiko.io/notification-svc/internal/store"
 )
 
-// Integration tests for the transactional outbox (migration 000005).
+// Integration tests for the transactional outbox (migration 000010).
 //
-// WHAT THEY ARE FOR. Until 000005, notification.sent and notification.failed
+// WHAT THEY ARE FOR. Until 000010, every event (notification.* and template.*)
 // were written to Kafka from the handler and from the retry worker AFTER the
 // delivery transaction had committed, with the error logged and discarded. A
 // broker hiccup at the moment a notice concluded therefore left the delivery
@@ -30,25 +30,6 @@ import (
 // that now exists in between: a row in event_outbox, committed by the same
 // transaction as the status transition.
 
-// sentEvent and failedEvent seal an event the way the handler and the worker
-// do. Shared by every CompleteDelivery call site in this package, because the
-// argument is not optional and a test that passed a zero Outbound would be
-// asserting against a refusal rather than against a conclusion.
-func sentEvent(n *domain.Notification) events.Outbound {
-	out, err := events.Sent("corr-test", *n)
-	if err != nil {
-		panic(err)
-	}
-	return out
-}
-
-func failedEvent(n *domain.Notification, reason string) events.Outbound {
-	out, err := events.Failed("corr-test", *n, reason)
-	if err != nil {
-		panic(err)
-	}
-	return out
-}
 
 // The core property: concluding a delivery and recording the event that
 // announces it are ONE transaction.
@@ -59,7 +40,7 @@ func TestOutbox_ConcludingADeliveryEnqueuesItsEvent(t *testing.T) {
 
 	n := seedNotification(t, s, "tenant-a", "corr-outbox-1")
 	concluded := time.Now().UTC()
-	if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "250 queued as ABC", &concluded, sentEvent(n)); err != nil {
+	if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "250 queued as ABC", &concluded, "corr-test", domain.AttemptMeta{}); err != nil {
 		t.Fatalf("CompleteDelivery: %v", err)
 	}
 
@@ -83,34 +64,6 @@ func TestOutbox_ConcludingADeliveryEnqueuesItsEvent(t *testing.T) {
 	}
 }
 
-// A conclusion may not happen without an event. This is the structural half of
-// the fix: the old shape allowed "record the transition, then optionally tell
-// somebody", and the whole defect lived in the word optionally.
-func TestOutbox_ConcludingWithoutAnEventIsRefused(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool)
-	ctx := tenantCtx("tenant-a")
-
-	n := seedNotification(t, s, "tenant-a", "corr-outbox-noevent")
-	concluded := time.Now().UTC()
-
-	if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "", &concluded, events.Outbound{}); err == nil {
-		t.Fatal("CompleteDelivery accepted a conclusion with no event")
-	}
-
-	// And nothing was written: the refusal happens before the UPDATE, so the
-	// notification is still PENDING and still deliverable.
-	got, err := s.GetNotification(ctx, n.NotificationID)
-	if err != nil {
-		t.Fatalf("GetNotification: %v", err)
-	}
-	if got.Status != "PENDING" {
-		t.Errorf("status = %q, want PENDING — a refused conclusion must not half-apply", got.Status)
-	}
-	if len(readOutbox(t, pool)) != 0 {
-		t.Error("a refused conclusion must not leave an outbox row")
-	}
-}
 
 // A conclusion that does not happen must not emit an event. Two replicas can
 // race on the same notification, and the loser affects zero rows — if it
@@ -122,12 +75,12 @@ func TestOutbox_ARaceLoserEnqueuesNothing(t *testing.T) {
 
 	n := seedNotification(t, s, "tenant-a", "corr-outbox-race")
 	concluded := time.Now().UTC()
-	if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted", &concluded, sentEvent(n)); err != nil {
+	if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted", &concluded, "corr-test", domain.AttemptMeta{}); err != nil {
 		t.Fatalf("first conclusion: %v", err)
 	}
 
 	// The second conclusion matches no PENDING row and is refused.
-	err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted again", &concluded, sentEvent(n))
+	err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted again", &concluded, "corr-test", domain.AttemptMeta{})
 	if !errors.Is(err, domain.ErrNotificationNotFound) {
 		t.Fatalf("second conclusion = %v, want ErrNotificationNotFound", err)
 	}
@@ -148,7 +101,7 @@ func TestOutbox_StoredPayloadIsTheFinishedEnvelope(t *testing.T) {
 	n := seedNotification(t, s, "tenant-a", "corr-outbox-envelope")
 	concluded := time.Now().UTC()
 	if err := s.CompleteDelivery(ctx, n.NotificationID, "FAILED", "550 no such mailbox", "", &concluded,
-		failedEvent(n, "550 no such mailbox")); err != nil {
+		"corr-test", domain.AttemptMeta{}); err != nil {
 		t.Fatalf("CompleteDelivery: %v", err)
 	}
 
@@ -188,7 +141,7 @@ func TestOutbox_ClaimMarksPublishedOnlyWhenTheCallbackSucceeds(t *testing.T) {
 
 	n := seedNotification(t, s, "tenant-a", "corr-claim-1")
 	concluded := time.Now().UTC()
-	if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted", &concluded, sentEvent(n)); err != nil {
+	if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted", &concluded, "corr-test", domain.AttemptMeta{}); err != nil {
 		t.Fatalf("CompleteDelivery: %v", err)
 	}
 
@@ -196,8 +149,9 @@ func TestOutbox_ClaimMarksPublishedOnlyWhenTheCallbackSucceeds(t *testing.T) {
 	// event can be diagnosed from the table rather than from logs.
 	boom := errors.New("broker unreachable")
 	if err := s.ClaimOutbox(context.Background(), 10, func(recs []store.OutboxRecord) error {
-		if len(recs) != 1 {
-			t.Errorf("claimed %d records, want 1", len(recs))
+		// Two: notification.sent and its delivery.attempt.created (000014).
+		if len(recs) != 2 {
+			t.Errorf("claimed %d records, want 2", len(recs))
 		}
 		return boom
 	}); !errors.Is(err, boom) {
@@ -223,8 +177,8 @@ func TestOutbox_ClaimMarksPublishedOnlyWhenTheCallbackSucceeds(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("second ClaimOutbox: %v", err)
 	}
-	if claimed != 1 {
-		t.Fatalf("re-claimed %d records, want the unpublished one", claimed)
+	if claimed != 2 {
+		t.Fatalf("re-claimed %d records, want the two unpublished ones", claimed)
 	}
 	if readOutbox(t, pool)[0].PublishedAt == nil {
 		t.Error("a successful publish must mark the event published")
@@ -243,7 +197,7 @@ func TestOutbox_RelayDrainsEveryTenant(t *testing.T) {
 		ctx := tenantCtx(tenant)
 		n := seedNotification(t, s, tenant, "corr-multi-"+tenant)
 		concluded := time.Now().UTC()
-		if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted", &concluded, sentEvent(n)); err != nil {
+		if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted", &concluded, "corr-test", domain.AttemptMeta{}); err != nil {
 			t.Fatalf("CompleteDelivery for %s: %v", tenant, err)
 		}
 	}
@@ -281,7 +235,7 @@ func TestOutbox_DepthReportsBacklogAndAge(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		n := seedNotification(t, s, "tenant-a", "corr-depth-"+strconv.Itoa(i))
 		concluded := time.Now().UTC()
-		if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted", &concluded, sentEvent(n)); err != nil {
+		if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "accepted", &concluded, "corr-test", domain.AttemptMeta{}); err != nil {
 			t.Fatalf("CompleteDelivery: %v", err)
 		}
 	}
@@ -290,8 +244,9 @@ func TestOutbox_DepthReportsBacklogAndAge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OutboxDepth: %v", err)
 	}
-	if pending != 3 {
-		t.Errorf("pending = %d, want 3", pending)
+	// Six: each conclusion enqueues notification.sent and delivery.attempt.created.
+	if pending != 6 {
+		t.Errorf("pending = %d, want 6", pending)
 	}
 	if age <= 0 {
 		t.Error("a non-empty outbox must report the age of its oldest entry")
@@ -331,7 +286,12 @@ func readOutbox(t *testing.T, pool *pgxpool.Pool) []outboxRow {
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT tenant_id, event_type, aggregate_key, payload, published_at, attempts, last_error
-		FROM event_outbox ORDER BY outbox_id`)
+		FROM event_outbox
+		-- The per-attempt delivery.attempt.* events (migration 000014) ride
+		-- alongside every conclusion; these tests are about the notification
+		-- and template events, and attempt events have their own test.
+		WHERE event_type NOT LIKE 'delivery.attempt.%'
+		ORDER BY outbox_id`)
 	if err != nil {
 		t.Fatalf("read outbox: %v", err)
 	}
@@ -364,4 +324,238 @@ func seedNotification(t *testing.T, s *store.PgStore, tenantID, correlationID st
 		t.Fatalf("CreateNotification did not create %s", correlationID)
 	}
 	return n
+}
+
+// eventTypesFor returns the outbox event types enqueued for one aggregate, in
+// order.
+func eventTypesFor(t *testing.T, pool *pgxpool.Pool, aggregate string) []string {
+	t.Helper()
+	var out []string
+	for _, r := range readOutbox(t, pool) {
+		if r.AggregateKey == aggregate {
+			out = append(out, r.EventType)
+		}
+	}
+	return out
+}
+
+// The event is sealed by the store from the row its UPDATE returned, so what
+// goes on the wire is the committed state — delivery_attempts is 1 because
+// the database says so, not because a caller predicted it.
+func TestOutbox_EventCarriesTheCommittedRow(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	ctx := tenantCtx("tenant-a")
+
+	n := seedNotification(t, s, "tenant-a", "corr-outbox-committed")
+	concluded := time.Now().UTC()
+	if err := s.CompleteDelivery(ctx, n.NotificationID, "SENT", "", "250 queued as XYZ", &concluded, "corr-committed", domain.AttemptMeta{}); err != nil {
+		t.Fatalf("CompleteDelivery: %v", err)
+	}
+	rows := readOutbox(t, pool)
+	if len(rows) != 1 {
+		t.Fatalf("outbox rows = %d, want 1", len(rows))
+	}
+	var env struct {
+		CorrelationID string         `json:"correlation_id"`
+		Payload       map[string]any `json:"payload"`
+	}
+	if err := json.Unmarshal(rows[0].Payload, &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if env.CorrelationID != "corr-committed" {
+		t.Errorf("correlation_id = %q, want the one passed to the transition", env.CorrelationID)
+	}
+	if env.Payload["delivery_attempts"] != float64(1) {
+		t.Errorf("delivery_attempts = %v, want 1 (the committed count)", env.Payload["delivery_attempts"])
+	}
+	if env.Payload["provider_response"] != "250 queued as XYZ" {
+		t.Errorf("provider_response = %v", env.Payload["provider_response"])
+	}
+}
+
+// PENDING -> PENDING_UNKNOWN enqueues notification.outcome_unknown, and
+// resolving it enqueues the conclusion the original attempt would have had —
+// both in the transitions' own transactions.
+func TestOutbox_UnknownThenResolvedEnqueuesBoth(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	ctx := tenantCtx("tenant-a")
+
+	n := seedNotification(t, s, "tenant-a", "corr-outbox-unknown")
+	if err := s.MarkOutcomeUnknown(ctx, n.NotificationID, "tenant-a", "reset after DATA", time.Now().UTC(), "corr-u", domain.AttemptMeta{}); err != nil {
+		t.Fatalf("MarkOutcomeUnknown: %v", err)
+	}
+	if err := s.ResolveDeliveryOutcome(ctx, domain.ResolveDeliveryOutcomeParams{
+		NotificationID: n.NotificationID, TenantID: "tenant-a", ActorPrincipalID: "operator-1",
+		ResolvedStatus: domain.StatusSent, ResolutionNote: "provider confirmed delivery", CorrelationID: "corr-u",
+	}, time.Now().UTC()); err != nil {
+		t.Fatalf("ResolveDeliveryOutcome: %v", err)
+	}
+	got := eventTypesFor(t, pool, n.NotificationID)
+	want := []string{events.TypeOutcomeUnknown, events.TypeSent}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+
+	// A second resolution is refused and emits nothing.
+	if err := s.ResolveDeliveryOutcome(ctx, domain.ResolveDeliveryOutcomeParams{
+		NotificationID: n.NotificationID, TenantID: "tenant-a", ActorPrincipalID: "operator-1",
+		ResolvedStatus: domain.StatusFailed, ResolutionNote: "second opinion",
+	}, time.Now().UTC()); !errors.Is(err, domain.ErrNotificationNotFound) {
+		t.Fatalf("second resolve: want not-found, got %v", err)
+	}
+	if n := len(eventTypesFor(t, pool, n.NotificationID)); n != 2 {
+		t.Fatalf("a refused resolution enqueued an event: %d events", n)
+	}
+}
+
+// The four BIZ-03 lifecycle writes each enqueue their event, keyed on the
+// template, in their own transaction.
+func TestOutbox_TemplateLifecycleEnqueuesEachEvent(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	ctx := tenantCtx("tenant-a")
+
+	tmpl := newTestTemplate(t, s, ctx, "owner-1")
+	v, err := s.CreateVersion(ctx, domain.CreateVersionParams{
+		TemplateID: tmpl.TemplateID, Locale: "en-US", Content: "<p>hi {{.name}}</p>",
+		VariableSchema: []string{"name"}, CreatedByPrincipalID: "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+	if _, err := s.ValidateTemplate(ctx, v.VersionID); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if _, err := s.ApproveTemplate(ctx, domain.ApproveVersionParams{VersionID: v.VersionID, ApprovedByPrincipalID: "approver-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := s.PublishTemplate(ctx, domain.PublishVersionParams{VersionID: v.VersionID, PublishedByPrincipalID: "approver-1"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if _, err := s.RetireTemplate(ctx, domain.RetireTemplateParams{TemplateID: tmpl.TemplateID, RetiredByPrincipalID: "approver-1"}); err != nil {
+		t.Fatalf("retire: %v", err)
+	}
+
+	got := eventTypesFor(t, pool, tmpl.TemplateID)
+	want := []string{events.TypeTemplateCreated, events.TypeTemplateVersionApproved, events.TypeTemplatePublished, events.TypeTemplateRetired}
+	if len(got) != len(want) {
+		t.Fatalf("template events = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("template events = %v, want %v", got, want)
+		}
+	}
+}
+
+// Outside the relay hatch, event_outbox is tenant-isolated: tenant B cannot
+// see tenant A's event. Only meaningful when the suite does NOT connect as a
+// superuser, which bypasses row-level security even under FORCE.
+func TestOutbox_TenantIsolatedOutsideTheRelayHatch(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	var super bool
+	if err := pool.QueryRow(context.Background(), "SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&super); err != nil {
+		t.Fatalf("role check: %v", err)
+	}
+	if super {
+		t.Skip("connected as a superuser, which bypasses RLS; run as the owning non-superuser role to exercise this")
+	}
+
+	n := seedNotification(t, s, "tenant-a", "corr-outbox-rls")
+	concluded := time.Now().UTC()
+	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "ok", &concluded, "c", domain.AttemptMeta{}); err != nil {
+		t.Fatalf("CompleteDelivery: %v", err)
+	}
+
+	count := func(setting, value string) int {
+		ctx := context.Background()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, "SELECT set_config($1, $2, true)", setting, value); err != nil {
+			t.Fatalf("set %s: %v", setting, err)
+		}
+		var c int
+		if err := tx.QueryRow(ctx, "SELECT count(*) FROM event_outbox WHERE event_type NOT LIKE 'delivery.attempt.%'").Scan(&c); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return c
+	}
+	if got := count("app.tenant_id", "tenant-b"); got != 0 {
+		t.Errorf("tenant-b sees %d of tenant-a's outbox rows, want 0", got)
+	}
+	if got := count("app.tenant_id", "tenant-a"); got != 1 {
+		t.Errorf("tenant-a sees %d outbox rows, want 1", got)
+	}
+	if got := count("app.outbox_relay", "true"); got != 1 {
+		t.Errorf("the relay hatch sees %d rows, want 1", got)
+	}
+}
+
+// §10.2: every durable attempt enqueues delivery.attempt.created in the same
+// transaction as its row; an ambiguous one also enqueues delivery.attempt.unknown
+// with a resolution deadline and the spec's NCD-014.
+func TestOutbox_EveryAttemptEnqueuesItsAttemptEvent(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	ctx := tenantCtx("tenant-a")
+	n := seedNotification(t, s, "tenant-a", "corr-attempt-events")
+
+	at := time.Now().UTC()
+	if err := s.ScheduleRetry(ctx, n.NotificationID, "tenant-a", "421", at, at.Add(time.Minute), domain.AttemptMeta{}); err != nil {
+		t.Fatalf("ScheduleRetry: %v", err)
+	}
+	if err := s.MarkOutcomeUnknown(ctx, n.NotificationID, "tenant-a", "reset after DATA", time.Now().UTC(), "c", domain.AttemptMeta{}); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+
+	var types []string
+	var unknownPayload map[string]any
+	ctxb := context.Background()
+	tx, err := pool.Begin(ctxb)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctxb) }()
+	if _, err := tx.Exec(ctxb, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
+		t.Fatalf("relay scope: %v", err)
+	}
+	rows, err := tx.Query(ctxb, `SELECT event_type, payload FROM event_outbox
+		WHERE aggregate_key = $1 AND event_type LIKE 'delivery.attempt.%' ORDER BY outbox_id`, n.NotificationID)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	for rows.Next() {
+		var et string
+		var body []byte
+		if err := rows.Scan(&et, &body); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		types = append(types, et)
+		if et == "delivery.attempt.unknown" {
+			var env struct {
+				Payload map[string]any `json:"payload"`
+			}
+			_ = json.Unmarshal(body, &env)
+			unknownPayload = env.Payload
+		}
+	}
+	rows.Close()
+	want := []string{"delivery.attempt.created", "delivery.attempt.created", "delivery.attempt.unknown"}
+	if len(types) != len(want) {
+		t.Fatalf("attempt events = %v, want %v", types, want)
+	}
+	for i := range want {
+		if types[i] != want[i] {
+			t.Fatalf("attempt events = %v, want %v", types, want)
+		}
+	}
+	if unknownPayload["reason_code"] != "NCD-014" || unknownPayload["resolution_due_at"] == nil {
+		t.Fatalf("delivery.attempt.unknown payload = %v", unknownPayload)
+	}
 }

@@ -289,6 +289,68 @@ func (s *PgStore) GetProfitabilitySnapshot(ctx context.Context, snapshotID strin
 	return out, nil
 }
 
+// GetLatestCertifiedSnapshot is the certified-baseline read behind PRJ-04's
+// own GetMarginBridge query — the most recently certified snapshot for a
+// project, the last point this read model's own numbers were reconciled
+// and attested, never a RECONCILED-but-not-yet-CERTIFIED one.
+func (s *PgStore) GetLatestCertifiedSnapshot(ctx context.Context, projectID string) (*domain.ProfitabilitySnapshot, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.ProfitabilitySnapshot
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			SELECT `+profitabilitySnapshotColumns+` FROM project_profitability_snapshots
+			WHERE tenant_id = $1 AND project_id = $2 AND status = $3
+			ORDER BY certified_at DESC LIMIT 1`, tenantID, projectID, domain.ProfitabilitySnapshotStatusCertified)
+		snap, err := scanSnapshot(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrSnapshotNotFound
+		}
+		if err != nil {
+			return err
+		}
+		out = snap
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetProfitabilitySnapshotAsOf is PRJ-04's own GetProfitabilityAsOf query
+// — the most recently certified snapshot as of a past instant, the
+// certified read model's own answer to "what did we say profitability
+// was back then," never recomputed retroactively from live data.
+func (s *PgStore) GetProfitabilitySnapshotAsOf(ctx context.Context, projectID string, asOf time.Time) (*domain.ProfitabilitySnapshot, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.ProfitabilitySnapshot
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			SELECT `+profitabilitySnapshotColumns+` FROM project_profitability_snapshots
+			WHERE tenant_id = $1 AND project_id = $2 AND status = $3 AND certified_at <= $4
+			ORDER BY certified_at DESC LIMIT 1`, tenantID, projectID, domain.ProfitabilitySnapshotStatusCertified, asOf)
+		snap, err := scanSnapshot(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrSnapshotNotFound
+		}
+		if err != nil {
+			return err
+		}
+		out = snap
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CertifyProfitabilitySnapshot re-verifies the snapshot's own frozen
 // watermarks against LIVE source data before certifying — the real
 // enforcement of negative path #1 at certify time, not just at build

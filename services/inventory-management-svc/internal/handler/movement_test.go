@@ -164,7 +164,8 @@ func TestValidateMovement_RetiredLocation_Returns422(t *testing.T) {
 
 func TestCommitMovement_ReceiveDuplicateSerial_Returns422(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
 	itemID, _, locB := movementFixture(t, s, r)
 
 	receive := func(idemKey string) *http.Response {
@@ -195,9 +196,13 @@ func TestCommitMovement_ReceiveDuplicateSerial_Returns422(t *testing.T) {
 	if v2.Code != http.StatusOK {
 		t.Fatalf("validate 2 failed: %d %s", v2.Code, v2.Body.String())
 	}
+	callsBefore := pub.calls
 	c2 := doReq(r, http.MethodPost, "/v1/movements/"+secondM.MovementID+"/commit", nil, "preparer-1")
 	if c2.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 duplicate serial receipt, got %d: %s", c2.Code, c2.Body.String())
+	}
+	if pub.calls != callsBefore+1 {
+		t.Fatalf("expected exactly 1 new publish call (InventoryMovementExceptionRaised) for the rejected commit, got %d new", pub.calls-callsBefore)
 	}
 }
 
@@ -205,7 +210,8 @@ func TestCommitMovement_ReceiveDuplicateSerial_Returns422(t *testing.T) {
 
 func TestCommitMovement_IssueMoreThanOnHand_Returns422(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
 	itemID, locA, _ := movementFixture(t, s, r)
 	createAndCommitReceipt(t, r, itemID, locA, "idem-recv-1", 5)
 
@@ -221,9 +227,13 @@ func TestCommitMovement_IssueMoreThanOnHand_Returns422(t *testing.T) {
 		t.Fatalf("validate failed: %d %s", v.Code, v.Body.String())
 	}
 
+	callsBefore := pub.calls
 	rr := doReq(r, http.MethodPost, "/v1/movements/"+m.MovementID+"/commit", nil, "preparer-1")
 	if rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 negative stock, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if pub.calls != callsBefore+1 {
+		t.Fatalf("expected exactly 1 new publish call (InventoryMovementExceptionRaised) for the rejected commit, got %d new", pub.calls-callsBefore)
 	}
 }
 
@@ -231,7 +241,8 @@ func TestCommitMovement_IssueMoreThanOnHand_Returns422(t *testing.T) {
 
 func TestCommitMovement_PeriodLocked_Returns422(t *testing.T) {
 	s := newStubStore()
-	r := newRouterWithPeriodChecker(s, &stubPublisher{}, &stubAuthZ{}, &stubPeriodChecker{err: domain.ErrPeriodLocked})
+	pub := &stubPublisher{}
+	r := newRouterWithPeriodChecker(s, pub, &stubAuthZ{}, &stubPeriodChecker{err: domain.ErrPeriodLocked})
 	itemID, _, locB := movementFixture(t, s, r)
 
 	req := domain.CreateInventoryMovementRequest{
@@ -246,9 +257,13 @@ func TestCommitMovement_PeriodLocked_Returns422(t *testing.T) {
 		t.Fatalf("validate failed: %d %s", v.Code, v.Body.String())
 	}
 
+	callsBefore := pub.calls
 	rr := doReq(r, http.MethodPost, "/v1/movements/"+m.MovementID+"/commit", nil, "preparer-1")
 	if rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 period locked, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if pub.calls != callsBefore+1 {
+		t.Fatalf("expected exactly 1 new publish call (InventoryMovementExceptionRaised) for the period-locked commit, got %d new", pub.calls-callsBefore)
 	}
 }
 
@@ -301,6 +316,65 @@ func TestReverseMovement_MissingReason_Returns400(t *testing.T) {
 	rr := doReq(r, http.MethodPost, "/v1/movements/"+committed.MovementID+"/reverse", map[string]string{}, "preparer-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ── GetMovementLineage / GetMovementChain ────────────────────────────────────
+
+// TestMovementLineageAndChain_CorrectionOfACorrection proves the recursive
+// walk goes past a single hop: original -> reversal1 -> supersession2 is a
+// real chain of length 3 (nothing in CreateCorrectionMovement stops a
+// correction from itself being corrected), and GetMovementChain reaches
+// the same 3 movements no matter which one in the chain you start from.
+func TestMovementLineageAndChain_CorrectionOfACorrection(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, locA, _ := movementFixture(t, s, r)
+	original := createAndCommitReceipt(t, r, itemID, locA, "idem-chain-1", 20)
+
+	rev := doReq(r, http.MethodPost, "/v1/movements/"+original.MovementID+"/reverse", domain.ReverseMovementRequest{Reason: "wrong qty"}, "preparer-1")
+	if rev.Code != http.StatusCreated {
+		t.Fatalf("reverse failed: %d %s", rev.Code, rev.Body.String())
+	}
+	var reversal domain.InventoryMovement
+	_ = json.NewDecoder(rev.Body).Decode(&reversal)
+
+	sup := doReq(r, http.MethodPost, "/v1/movements/"+reversal.MovementID+"/supersede", domain.ReverseMovementRequest{Reason: "correcting the reversal itself"}, "preparer-1")
+	if sup.Code != http.StatusCreated {
+		t.Fatalf("supersede failed: %d %s", sup.Code, sup.Body.String())
+	}
+	var supersession domain.InventoryMovement
+	_ = json.NewDecoder(sup.Body).Decode(&supersession)
+
+	// Lineage from the original reaches all 3.
+	lineageRR := doReq(r, http.MethodGet, "/v1/movements/"+original.MovementID+"/lineage", nil, "preparer-1")
+	if lineageRR.Code != http.StatusOK {
+		t.Fatalf("lineage failed: %d %s", lineageRR.Code, lineageRR.Body.String())
+	}
+	var lineage []domain.InventoryMovement
+	_ = json.NewDecoder(lineageRR.Body).Decode(&lineage)
+	if len(lineage) != 3 {
+		t.Fatalf("expected lineage of 3 (original, reversal, supersession), got %d: %+v", len(lineage), lineage)
+	}
+
+	// Lineage from a leaf (the deepest correction) reaches only itself —
+	// forward-only, it never looks upward.
+	leafLineageRR := doReq(r, http.MethodGet, "/v1/movements/"+supersession.MovementID+"/lineage", nil, "preparer-1")
+	var leafLineage []domain.InventoryMovement
+	_ = json.NewDecoder(leafLineageRR.Body).Decode(&leafLineage)
+	if len(leafLineage) != 1 {
+		t.Fatalf("expected lineage of 1 from the leaf (forward-only), got %d: %+v", len(leafLineage), leafLineage)
+	}
+
+	// Chain from the leaf reaches all 3 (it walks up to the root first).
+	chainRR := doReq(r, http.MethodGet, "/v1/movements/"+supersession.MovementID+"/chain", nil, "preparer-1")
+	if chainRR.Code != http.StatusOK {
+		t.Fatalf("chain failed: %d %s", chainRR.Code, chainRR.Body.String())
+	}
+	var chain []domain.InventoryMovement
+	_ = json.NewDecoder(chainRR.Body).Decode(&chain)
+	if len(chain) != 3 {
+		t.Fatalf("expected chain of 3 starting from the leaf, got %d: %+v", len(chain), chain)
 	}
 }
 

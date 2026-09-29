@@ -237,6 +237,135 @@ func (s *PgStore) listBookAssignments(ctx context.Context, tx pgx.Tx, tenantID, 
 	return out, rows.Err()
 }
 
+// GetAssetComponents is a real, standalone query — the spec's own named
+// query — over the same data GetAsset already embeds, exposed as its
+// own read for callers that only need the component list.
+func (s *PgStore) GetAssetComponents(ctx context.Context, assetID string) ([]domain.AssetComponent, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.AssetComponent
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		out, err = s.listComponents(ctx, tx, tenantID, assetID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetAssetBookProfiles is the spec's own named query, same posture as
+// GetAssetComponents above.
+func (s *PgStore) GetAssetBookProfiles(ctx context.Context, assetID string) ([]domain.AssetBookAssignment, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.AssetBookAssignment
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		out, err = s.listBookAssignments(ctx, tx, tenantID, assetID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetAssetAsOf reconstructs the asset's own status as of a point in
+// time, from the same lifecycle timestamps already recorded on the row
+// (registered_at/capitalized_at/suspended_at) — there is no separate
+// history table, so "as of" means "which status-change timestamp was
+// the most recent one on/before asOf."
+func (s *PgStore) GetAssetAsOf(ctx context.Context, assetID string, asOf time.Time) (*domain.FixedAsset, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var a *domain.FixedAsset
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+fixedAssetColumns+` FROM fixed_assets WHERE asset_id = $1 AND tenant_id = $2`, assetID, tenantID)
+		var err error
+		a, err = scanFixedAsset(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrAssetNotFound
+		}
+		return mapPgError(err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Walk the status-change timestamps backward from most-recent,
+	// landing on the status that was actually in effect at asOf.
+	status := domain.AssetStatusCandidate
+	if a.RegisteredAt != nil && !a.RegisteredAt.After(asOf) {
+		status = domain.AssetStatusRegistered
+	}
+	if a.CapitalizedAt != nil && !a.CapitalizedAt.After(asOf) {
+		status = domain.AssetStatusActive
+	}
+	if a.SuspendedAt != nil && !a.SuspendedAt.After(asOf) {
+		status = domain.AssetStatusSuspended
+	}
+	a.Status = status
+	return a, nil
+}
+
+// GetAssetSourceLineage traces the full merge/split ancestry of an
+// asset — both directions of merged_into_asset_id (this asset was
+// merged INTO another) and split_from_asset_id (this asset was carved
+// OUT of another) — via a recursive CTE, returning every asset in that
+// same lineage chain.
+func (s *PgStore) GetAssetSourceLineage(ctx context.Context, assetID string) ([]domain.FixedAsset, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.FixedAsset
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			WITH RECURSIVE lineage AS (
+				SELECT `+fixedAssetColumns+` FROM fixed_assets WHERE asset_id = $1 AND tenant_id = $2
+				UNION
+				SELECT fa.asset_id, fa.tenant_id, fa.legal_entity_id, fa.asset_category, fa.tag_serial, fa.description,
+					fa.custodian_id, fa.location_id, fa.acquisition_source_ref, fa.acquisition_date, fa.in_service_date,
+					fa.status, fa.merged_into_asset_id, fa.split_from_asset_id,
+					fa.created_at, fa.created_by_principal_id,
+					fa.registered_at, fa.registered_by_principal_id,
+					fa.capitalized_at, fa.capitalized_by_principal_id,
+					fa.suspended_at, fa.suspended_by_principal_id, fa.suspension_reason
+				FROM fixed_assets fa
+				JOIN lineage l ON fa.asset_id = l.split_from_asset_id
+					OR fa.asset_id = l.merged_into_asset_id
+					OR fa.split_from_asset_id = l.asset_id
+					OR fa.merged_into_asset_id = l.asset_id
+				WHERE fa.tenant_id = $2
+			)
+			SELECT DISTINCT * FROM lineage ORDER BY created_at
+		`, assetID, tenantID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			a, err := scanFixedAsset(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AddComponent inserts a new component under assetID.
 func (s *PgStore) AddComponent(ctx context.Context, c *domain.AssetComponent) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)

@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/payment-authorization-svc/internal/domain"
 	"zoiko.io/payment-authorization-svc/internal/middleware"
+	"zoiko.io/payment-authorization-svc/internal/outbox"
 )
 
 func isInvalidUUID(err error) bool {
@@ -145,7 +146,35 @@ func (s *PgStore) RequestAuthorization(ctx context.Context, tenantID string, aut
 				return err
 			}
 		}
-		return s.recordEvent(ctx, tx, out.TenantID, id, domain.EventAuthorizationRequested, auth.ProposalID, auth.RequestedByPrincipalID)
+		if err := s.recordEvent(ctx, tx, out.TenantID, id, domain.EventAuthorizationRequested, auth.ProposalID, auth.RequestedByPrincipalID); err != nil {
+			return err
+		}
+		corr := middleware.CorrelationIDFromContext(ctx)
+		var corrPtr *string
+		if corr != "" {
+			corrPtr = &corr
+		}
+		outboxEventID := uuid.NewString()
+		env := outbox.NewVariantBEnvelope(
+			outboxEventID,
+			domain.EventAuthorizationRequested,
+			id,
+			out.TenantID,
+			&auth.RequestedByPrincipalID,
+			corrPtr,
+			out,
+		)
+		return outbox.Insert(ctx, tx, outbox.Event{
+			OutboxEventID: outboxEventID,
+			AggregateType: "payment_authorization",
+			AggregateID:   id,
+			EventType:     domain.EventAuthorizationRequested,
+			TenantID:      out.TenantID,
+			LegalEntityID: auth.LegalEntityID,
+			ActorID:       &auth.RequestedByPrincipalID,
+			CorrelationID: corrPtr,
+			Payload:       env,
+		})
 	})
 	if isUniqueViolation(err) {
 		return nil, domain.ErrProposalAlreadyRequested
@@ -219,7 +248,35 @@ func (s *PgStore) ApproveAuthorization(ctx context.Context, authorizationID, pol
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventPaymentAuthorized, "", principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventPaymentAuthorized, "", principalID); err != nil {
+			return err
+		}
+		corr := middleware.CorrelationIDFromContext(ctx)
+		var corrPtr *string
+		if corr != "" {
+			corrPtr = &corr
+		}
+		outboxEventID := uuid.NewString()
+		env := outbox.NewVariantBEnvelope(
+			outboxEventID,
+			domain.EventPaymentAuthorized,
+			a.AuthorizationID,
+			a.TenantID,
+			&principalID,
+			corrPtr,
+			a,
+		)
+		return outbox.Insert(ctx, tx, outbox.Event{
+			OutboxEventID: outboxEventID,
+			AggregateType: "payment_authorization",
+			AggregateID:   a.AuthorizationID,
+			EventType:     domain.EventPaymentAuthorized,
+			TenantID:      a.TenantID,
+			LegalEntityID: a.LegalEntityID,
+			ActorID:       &principalID,
+			CorrelationID: corrPtr,
+			Payload:       env,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -301,7 +358,35 @@ func (s *PgStore) ConsumeAuthorization(ctx context.Context, authorizationID, pri
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationConsumed, "", principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationConsumed, "", principalID); err != nil {
+			return err
+		}
+		corr := middleware.CorrelationIDFromContext(ctx)
+		var corrPtr *string
+		if corr != "" {
+			corrPtr = &corr
+		}
+		outboxEventID := uuid.NewString()
+		env := outbox.NewVariantBEnvelope(
+			outboxEventID,
+			domain.EventAuthorizationConsumed,
+			a.AuthorizationID,
+			a.TenantID,
+			&principalID,
+			corrPtr,
+			a,
+		)
+		return outbox.Insert(ctx, tx, outbox.Event{
+			OutboxEventID: outboxEventID,
+			AggregateType: "payment_authorization",
+			AggregateID:   a.AuthorizationID,
+			EventType:     domain.EventAuthorizationConsumed,
+			TenantID:      a.TenantID,
+			LegalEntityID: a.LegalEntityID,
+			ActorID:       &principalID,
+			CorrelationID: corrPtr,
+			Payload:       env,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition

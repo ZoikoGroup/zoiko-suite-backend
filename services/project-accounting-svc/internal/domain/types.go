@@ -295,6 +295,14 @@ var (
 
 	ErrSourceTypeRequired = errorString("source_type is required")
 
+	// ErrProjectNotActiveForCostCapture is the spec's own negative path
+	// (domain-wide scenario #40), "Closed project accepts new cost
+	// without controlled reopen." New cost capture is refused unless the
+	// project is ACTIVE — reclassify/reverse are corrections to an
+	// already-captured fact via linked entries, not new capture, and are
+	// deliberately NOT gated by this same check.
+	ErrProjectNotActiveForCostCapture = errorString("project must be ACTIVE to accept new cost capture")
+
 	// ErrSelfApprovalNotPermittedReclassify is the spec's own SoD, "Manual
 	// project-cost adjustment above threshold requires independent
 	// approval" — no materiality tiering exists in this platform, so

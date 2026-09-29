@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,6 +31,8 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/bank-reconciliation-svc/internal/authz"
+	"zoiko.io/bank-reconciliation-svc/internal/banking"
+	"zoiko.io/bank-reconciliation-svc/internal/close"
 	"zoiko.io/bank-reconciliation-svc/internal/config"
 	svcenvelope "zoiko.io/bank-reconciliation-svc/internal/envelope"
 	"zoiko.io/bank-reconciliation-svc/internal/events"
@@ -139,6 +142,27 @@ func main() {
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 
+	// Evidence-conflicts consumer: subscribes to payment-status-svc's own
+	// events topic (not ours) for PAYMENT_STATUS_CONFLICT_RAISED, and
+	// turns it into a real evidence_conflicts row via ConflictConsumer.
+	// Before this, POST /v1/evidence-conflicts existed but nothing ever
+	// called it automatically — payment-status-svc's published event had
+	// no subscriber. Same non-fatal-broker posture as every other
+	// consumer in this platform: reconciliation itself does not depend on
+	// this feed.
+	conflictConsumerCtx, stopConflictConsumer := context.WithCancel(context.Background())
+	defer stopConflictConsumer()
+	conflictReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: cfg.Kafka.Brokers,
+		Topic:   cfg.Kafka.PaymentStatusEventsTopic,
+		GroupID: cfg.Kafka.ConflictConsumerGroupID,
+		ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
+			log.Debug("evidence-conflict consumer kafka reader: " + fmt.Sprintf(msg, args...))
+		}),
+	})
+	conflictConsumer := events.NewConflictConsumer(log, pgStore)
+	go conflictConsumer.Run(conflictConsumerCtx, conflictReader)
+
 	var authzClient *authz.HTTPClient
 	if cfg.AuthzMTLSEnabled {
 		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "bank-reconciliation-svc", platformScopeID)
@@ -152,6 +176,9 @@ func main() {
 	}
 
 	ledgerClient := ledger.NewHTTPClient(cfg.LedgerServiceURL)
+
+	bankingClient := banking.NewHTTPClient(cfg.BankingConnectorURL)
+	closeClient := close.NewHTTPClient(cfg.CloseServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -175,7 +202,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, ledgerClient, log)
+	h := handler.New(pgStore, publisher, authzClient, ledgerClient, bankingClient, closeClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

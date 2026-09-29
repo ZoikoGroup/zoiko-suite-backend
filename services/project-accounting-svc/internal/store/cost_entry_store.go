@@ -129,6 +129,126 @@ func (s *PgStore) ListCostEntries(ctx context.Context, projectID, wbsID string) 
 	return out, nil
 }
 
+// costEntryColumnsCE is costEntryColumns qualified with the "ce." alias,
+// for GetCostSourceLineage's recursive CTE below.
+const costEntryColumnsCE = `
+	ce.entry_id, ce.legal_entity_id, ce.project_id, ce.wbs_id, ce.source_type, ce.source_reference,
+	ce.cost_category, ce.quantity, ce.amount, ce.currency, ce.transaction_date, ce.billable, ce.capitalizable, ce.status,
+	ce.reclassifies_entry_id, ce.reverses_entry_id, ce.reason,
+	ce.created_at, ce.created_by_principal_id, ce.validated_at, ce.approved_at, ce.approved_by_principal_id`
+
+// GetCostSourceLineage is PRJ-02's own GetCostSourceLineage query —
+// entryID itself plus every entry that reclassifies or reverses it,
+// directly or transitively (nothing in CreateLinkedCostEntry stops a
+// correction from itself being corrected). Ordered oldest first, the same
+// forward-only-descent shape as inventory-management-svc's own
+// GetMovementLineage over reverses_movement_id/supersedes_movement_id.
+func (s *PgStore) GetCostSourceLineage(ctx context.Context, entryID string) ([]domain.CostEntry, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.CostEntry
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			WITH RECURSIVE descendants AS (
+				SELECT `+costEntryColumns+` FROM project_cost_entries
+					WHERE entry_id = $2 AND tenant_id = $1
+				UNION ALL
+				SELECT `+costEntryColumnsCE+` FROM project_cost_entries ce
+					JOIN descendants d ON ce.reclassifies_entry_id = d.entry_id OR ce.reverses_entry_id = d.entry_id
+					WHERE ce.tenant_id = $1
+			)
+			SELECT * FROM descendants ORDER BY created_at`,
+			tenantID, entryID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		seen := map[string]bool{}
+		for rows.Next() {
+			e, err := scanCostEntry(rows)
+			if err != nil {
+				return err
+			}
+			if seen[e.EntryID] {
+				continue
+			}
+			seen[e.EntryID] = true
+			out = append(out, *e)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// GetUnallocatedCostExceptions is PRJ-02's own GetUnallocatedCostExceptions
+// query — every CAPTURED entry (source-linked cost that has not yet
+// reached ACCEPTED) still open for a legal entity, the population
+// ValidateProjectCost/CertifyCostPopulation still needs to work through.
+// "Unallocated" here means not-yet-accepted, not unassigned to a
+// project — every entry already carries its project_id/wbs_id at
+// capture time (CaptureProjectCostRequest requires it).
+func (s *PgStore) GetUnallocatedCostExceptions(ctx context.Context, legalEntityID string) ([]domain.CostEntry, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.CostEntry
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+costEntryColumns+` FROM project_cost_entries
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND status = $3
+			ORDER BY created_at`,
+			tenantID, legalEntityID, domain.CostEntryStatusCaptured)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			e, err := scanCostEntry(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *e)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// GetProjectCostAsOf is PRJ-02's own GetProjectCostAsOf query — every
+// cost entry captured for a project on or before asOf, the same "derived
+// from immutable events" answer ListCostEntries gives for the live
+// population, just bounded to an instant in the past.
+func (s *PgStore) GetProjectCostAsOf(ctx context.Context, projectID string, asOf time.Time) ([]domain.CostEntry, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.CostEntry
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+costEntryColumns+` FROM project_cost_entries
+			WHERE tenant_id = $1 AND project_id = $2 AND created_at <= $3
+			ORDER BY created_at`,
+			tenantID, projectID, asOf)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			e, err := scanCostEntry(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *e)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // ValidateProjectCost moves CAPTURED -> ACCEPTED directly — collapsing
 // the spec's own named Validated state, see migration 000002's doc
 // comment.

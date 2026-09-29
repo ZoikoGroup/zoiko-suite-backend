@@ -214,3 +214,58 @@ func TestNewPublisher_NilProducer_IsASuccessfulDryRun(t *testing.T) {
 	p := events.NewPublisher(zap.NewNop(), "zoiko.notification.events", nil)
 	require.NoError(t, p.Publish(context.Background(), []kafka.Message{{Key: []byte("n-1"), Value: []byte("{}")}}))
 }
+
+// ── BIZ-10 / BIZ-03 events, which main published directly and now seal for the
+// outbox like the two conclusion events ────────────────────────────────────────
+
+func TestOutcomeUnknown_CarriesReasonAndUnknownAt(t *testing.T) {
+	at := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	out, err := events.OutcomeUnknown("corr-u", domain.Notification{
+		NotificationID: "notif-u", TenantID: "tenant-1", LegalEntityID: "entity-1",
+		CreatedByPrincipalID: "sender-1", UnknownAt: &at,
+	}, "connection reset after DATA")
+	require.NoError(t, err)
+	assert.Equal(t, events.TypeOutcomeUnknown, out.EventType)
+	assert.Equal(t, "notif-u", out.Key, "keyed on the notification, like sent/failed")
+
+	env := decodeBody(t, out.Body)
+	assert.Equal(t, "sender-1", env.ActorID)
+	p := payloadOf(t, env)
+	assert.Equal(t, "connection reset after DATA", p["reason"])
+	assert.Equal(t, at.Format(time.RFC3339), p["unknown_at"])
+}
+
+// Every event about one template — created, a version approved, published,
+// retired — is keyed on the template id, so they share a partition and a
+// consumer sees them in the order they happened.
+func TestTemplateEvents_KeyedOnTemplateWithTheRightActor(t *testing.T) {
+	approver, retirer := "approver-1", "retirer-1"
+	def := domain.TemplateDefinition{TemplateID: "tpl-1", TenantID: "t", LegalEntityID: "le", Name: "Payslip", OwnerPrincipalID: "owner-1"}
+	ver := domain.TemplateVersion{VersionID: "ver-1", TemplateID: "tpl-1", TenantID: "t", LegalEntityID: "le", Locale: "en-GB", VersionNumber: 2, ApprovedByPrincipalID: &approver, ContentHash: "abc"}
+
+	created, err := events.TemplateCreated("c", def)
+	require.NoError(t, err)
+	approved, err := events.TemplateVersionApproved("c", ver)
+	require.NoError(t, err)
+	published, err := events.TemplatePublished("c", "publisher-1", ver)
+	require.NoError(t, err)
+	def.RetiredByPrincipalID = &retirer
+	retired, err := events.TemplateRetired("c", def)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		out       events.Outbound
+		eventType string
+		actor     string
+	}{
+		{created, events.TypeTemplateCreated, "owner-1"},
+		{approved, events.TypeTemplateVersionApproved, "approver-1"},
+		{published, events.TypeTemplatePublished, "publisher-1"},
+		{retired, events.TypeTemplateRetired, "retirer-1"},
+	} {
+		assert.Equal(t, tc.eventType, tc.out.EventType)
+		assert.Equal(t, "tpl-1", tc.out.Key, tc.eventType)
+		assert.Equal(t, tc.actor, decodeBody(t, tc.out.Body).ActorID, tc.eventType)
+	}
+	assert.Equal(t, "ver-1", payloadOf(t, decodeBody(t, published.Body))["version_id"])
+}

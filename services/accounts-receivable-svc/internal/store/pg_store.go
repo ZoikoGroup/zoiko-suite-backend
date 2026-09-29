@@ -26,6 +26,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/accounts-receivable-svc/internal/domain"
+	"zoiko.io/accounts-receivable-svc/internal/outbox"
 )
 
 // constraintCustomerInvoiceNumber is the UNIQUE (tenant_id, customer_id,
@@ -301,6 +302,45 @@ func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.CustomerInvoice
 
 		inv.CreatedAt = now
 		created = true
+
+		outboxID := uuid.New().String()
+		payload := map[string]any{
+			"invoice_id":      inv.InvoiceID,
+			"tenant_id":       inv.TenantID,
+			"legal_entity_id": inv.LegalEntityID,
+			"customer_id":     inv.CustomerID,
+		}
+		env, err := outbox.NewVariantBEnvelope(
+			outboxID,
+			"invoice.issued",
+			inv.CorrelationID,
+			inv.TenantID,
+			inv.LegalEntityID,
+			inv.CreatedByPrincipalID,
+			payload,
+		)
+		if err != nil {
+			return fmt.Errorf("marshal outbox envelope: %w", err)
+		}
+		var actorPtr *string
+		if inv.CreatedByPrincipalID != "" {
+			actorPtr = &inv.CreatedByPrincipalID
+		}
+		outboxEvt := outbox.Event{
+			OutboxEventID: outboxID,
+			AggregateType: "CUSTOMER_INVOICE",
+			AggregateID:   inv.InvoiceID,
+			EventType:     "invoice.issued",
+			TenantID:      inv.TenantID,
+			LegalEntityID: inv.LegalEntityID,
+			ActorID:       actorPtr,
+			CorrelationID: inv.CorrelationID,
+			Headers:       map[string]string{"X-Event-ID": outboxID},
+			Payload:       env,
+		}
+		if err := outbox.Insert(ctx, tx, outboxEvt); err != nil {
+			return fmt.Errorf("insert outbox event: %w", err)
+		}
 		return nil
 	})
 	return created, mapPgError(err)
@@ -475,6 +515,74 @@ func (s *PgStore) TransitionInvoice(
 			return err
 		}
 		inv.Lines = lines
+
+		var eventType string
+		var payload map[string]any
+
+		switch {
+		case fromStatus == domain.InvoiceStatusIssued && toStatus == domain.InvoiceStatusSent:
+			eventType = "invoice.sent"
+			payload = map[string]any{
+				"invoice_id": inv.InvoiceID,
+			}
+		case fromStatus == domain.InvoiceStatusSent && toStatus == domain.InvoiceStatusOverdue:
+			eventType = "receivable.overdue"
+			payload = map[string]any{
+				"invoice_id": inv.InvoiceID,
+			}
+		case (fromStatus == domain.InvoiceStatusSent || fromStatus == domain.InvoiceStatusOverdue) && toStatus == domain.InvoiceStatusPaid:
+			eventType = "payment.received"
+			payload = map[string]any{
+				"invoice_id":                       inv.InvoiceID,
+				"amount":                           inv.Amount,
+				"currency_code":                    inv.CurrencyCode,
+				"payment_received_by_principal_id": actorPrincipalID,
+			}
+			// AR-08 cash application rides on the event so a consumer can
+			// reconcile the customer's remittance without re-reading the
+			// receivable.
+			if inv.PaymentDate != nil {
+				payload["payment_date"] = inv.PaymentDate.Time
+			}
+			if inv.PaymentReference != nil {
+				payload["payment_reference"] = *inv.PaymentReference
+			}
+		}
+
+		if eventType != "" {
+			outboxID := uuid.New().String()
+			env, err := outbox.NewVariantBEnvelope(
+				outboxID,
+				eventType,
+				inv.CorrelationID,
+				inv.TenantID,
+				inv.LegalEntityID,
+				actorPrincipalID,
+				payload,
+			)
+			if err != nil {
+				return fmt.Errorf("marshal outbox envelope: %w", err)
+			}
+			var actorPtr *string
+			if actorPrincipalID != "" {
+				actorPtr = &actorPrincipalID
+			}
+			outboxEvt := outbox.Event{
+				OutboxEventID: outboxID,
+				AggregateType: "CUSTOMER_INVOICE",
+				AggregateID:   inv.InvoiceID,
+				EventType:     eventType,
+				TenantID:      inv.TenantID,
+				LegalEntityID: inv.LegalEntityID,
+				ActorID:       actorPtr,
+				CorrelationID: inv.CorrelationID,
+				Headers:       map[string]string{"X-Event-ID": outboxID},
+				Payload:       env,
+			}
+			if err := outbox.Insert(ctx, tx, outboxEvt); err != nil {
+				return fmt.Errorf("insert outbox event: %w", err)
+			}
+		}
 		return nil
 	})
 	// No rows means the WHERE did not match: wrong status, wrong tenant, or no such

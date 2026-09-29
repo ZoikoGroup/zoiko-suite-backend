@@ -32,6 +32,7 @@ import (
 
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
+	"zoiko.io/general-ledger-svc/internal/outbox"
 )
 
 // DefaultListLimit bounds ListJournals when the caller names no limit. A
@@ -318,7 +319,44 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var innerErr error
 		resultLines, created, innerErr = insertJournal(ctx, tx, tenantID, h, lines)
-		return innerErr
+		if innerErr != nil {
+			return innerErr
+		}
+		if !created {
+			return nil
+		}
+
+		env, envErr := outbox.NewVariantAEnvelope(
+			"journal.created",
+			h.CorrelationID,
+			h.TenantID,
+			h.LegalEntityID,
+			h.CreatedByPrincipalID,
+			map[string]any{
+				"journal_id":      h.JournalID,
+				"tenant_id":       h.TenantID,
+				"legal_entity_id": h.LegalEntityID,
+				"fiscal_period":   h.FiscalPeriod,
+			},
+		)
+		if envErr != nil {
+			return fmt.Errorf("build journal.created envelope: %w", envErr)
+		}
+		actorID := h.CreatedByPrincipalID
+		if err := outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: "JOURNAL",
+			AggregateID:   h.JournalID,
+			EventType:     "journal.created",
+			TenantID:      h.TenantID,
+			LegalEntityID: h.LegalEntityID,
+			ActorID:       &actorID,
+			CorrelationID: h.CorrelationID,
+			Payload:       env,
+		}); err != nil {
+			return fmt.Errorf("insert outbox event for journal.created: %w", err)
+		}
+
+		return nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -364,20 +402,58 @@ func (s *PgStore) ReverseJournal(
 			return nil
 		}
 
-		tag, err := tx.Exec(ctx, `
+		var origLegalEntityID, origCorrelationID string
+		err = tx.QueryRow(ctx, `
 			UPDATE journal_headers
 			SET status = $1, reversed_by_principal_id = $2, reversed_at = $3
 			WHERE journal_id = $4 AND status = $5 AND tenant_id = $6
+			RETURNING legal_entity_id::text, correlation_id
 		`, string(domain.JournalStatusReversed), actorPrincipalID, time.Now().UTC(),
-			originalJournalID, string(domain.JournalStatusFinalized), tenantID)
+			originalJournalID, string(domain.JournalStatusFinalized), tenantID).
+			Scan(&origLegalEntityID, &origCorrelationID)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// The original is not FINALIZED any more. Returning an error rolls
+				// the transaction back, taking the reversing journal with it.
+				return domain.ErrInvalidTransition
+			}
 			return mapPgError(err)
 		}
-		if tag.RowsAffected() == 0 {
-			// The original is not FINALIZED any more. Returning an error rolls
-			// the transaction back, taking the reversing journal with it.
-			return domain.ErrInvalidTransition
+
+		if origCorrelationID == "" {
+			origCorrelationID = reversing.CorrelationID
 		}
+		if origLegalEntityID == "" {
+			origLegalEntityID = reversing.LegalEntityID
+		}
+
+		env, envErr := outbox.NewVariantAEnvelope(
+			"journal.reversed",
+			origCorrelationID,
+			tenantID,
+			origLegalEntityID,
+			actorPrincipalID,
+			map[string]any{
+				"journal_id":           originalJournalID,
+				"reversing_journal_id": reversing.JournalID,
+			},
+		)
+		if envErr != nil {
+			return fmt.Errorf("build journal.reversed envelope: %w", envErr)
+		}
+		if err := outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: "JOURNAL",
+			AggregateID:   originalJournalID,
+			EventType:     "journal.reversed",
+			TenantID:      tenantID,
+			LegalEntityID: origLegalEntityID,
+			ActorID:       &actorPrincipalID,
+			CorrelationID: origCorrelationID,
+			Payload:       env,
+		}); err != nil {
+			return fmt.Errorf("insert outbox event for journal.reversed: %w", err)
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -538,16 +614,48 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 		UPDATE journal_headers
 		SET status = $1, %s = $2, %s = $3
 		WHERE journal_id = $4 AND status = $5 AND tenant_id = $6
+		RETURNING legal_entity_id::text, correlation_id
 	`, actorColumn, timeColumn)
 
-	var affected int64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, query, string(toStatus), actorPrincipalID, time.Now().UTC(), journalID, string(fromStatus), tenantID)
+		var legalEntityID, correlationID string
+		err := tx.QueryRow(ctx, query, string(toStatus), actorPrincipalID, time.Now().UTC(), journalID, string(fromStatus), tenantID).
+			Scan(&legalEntityID, &correlationID)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrInvalidTransition
+			}
 			return mapPgError(err)
 		}
-		affected = tag.RowsAffected()
-		if affected > 0 && toStatus == domain.JournalStatusFinalized {
+
+		if toStatus == domain.JournalStatusValidated {
+			env, envErr := outbox.NewVariantAEnvelope(
+				"journal.validated",
+				correlationID,
+				tenantID,
+				legalEntityID,
+				actorPrincipalID,
+				map[string]any{
+					"journal_id": journalID,
+				},
+			)
+			if envErr != nil {
+				return fmt.Errorf("build journal.validated envelope: %w", envErr)
+			}
+			actorID := actorPrincipalID
+			if err := outbox.Insert(ctx, tx, outbox.Event{
+				AggregateType: "JOURNAL",
+				AggregateID:   journalID,
+				EventType:     "journal.validated",
+				TenantID:      tenantID,
+				LegalEntityID: legalEntityID,
+				ActorID:       &actorID,
+				CorrelationID: correlationID,
+				Payload:       env,
+			}); err != nil {
+				return fmt.Errorf("insert outbox event for journal.validated: %w", err)
+			}
+		} else if toStatus == domain.JournalStatusFinalized {
 			// ACC-05: every journal that reaches FINALIZED appends its
 			// posted ledger entries in the SAME transaction as the status
 			// flip — never a second call a future call site could forget,
@@ -555,6 +663,33 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 			// MarkJournalPosted. See migration 000011's doc comment.
 			if err := appendLedgerEntries(ctx, tx, tenantID, journalID); err != nil {
 				return err
+			}
+
+			env, envErr := outbox.NewVariantAEnvelope(
+				"journal.posted",
+				correlationID,
+				tenantID,
+				legalEntityID,
+				actorPrincipalID,
+				map[string]any{
+					"journal_id": journalID,
+				},
+			)
+			if envErr != nil {
+				return fmt.Errorf("build journal.posted envelope: %w", envErr)
+			}
+			actorID := actorPrincipalID
+			if err := outbox.Insert(ctx, tx, outbox.Event{
+				AggregateType: "JOURNAL",
+				AggregateID:   journalID,
+				EventType:     "journal.posted",
+				TenantID:      tenantID,
+				LegalEntityID: legalEntityID,
+				ActorID:       &actorID,
+				CorrelationID: correlationID,
+				Payload:       env,
+			}); err != nil {
+				return fmt.Errorf("insert outbox event for journal.posted: %w", err)
 			}
 		}
 		return nil
@@ -566,9 +701,6 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 	}
 	if err != nil {
 		return err
-	}
-	if affected == 0 {
-		return domain.ErrInvalidTransition
 	}
 	return nil
 }

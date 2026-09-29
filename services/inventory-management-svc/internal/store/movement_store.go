@@ -18,6 +18,16 @@ const movementColumns = `
 	reverses_movement_id, supersedes_movement_id, reason,
 	created_at, created_by_principal_id, validated_at, committed_at, committed_by_principal_id`
 
+// movementColumnsM is movementColumns qualified with the "m." alias, for
+// the recursive CTEs below where inventory_movements is joined under that
+// alias.
+const movementColumnsM = `
+	m.movement_id, m.tenant_id, m.legal_entity_id, m.movement_type, m.status, m.item_id,
+	m.source_location_id, m.destination_location_id, m.quantity, m.uom, m.lot_number, m.serial_number,
+	m.source_reference, m.source_idempotency_key, m.business_date, m.fiscal_period,
+	m.reverses_movement_id, m.supersedes_movement_id, m.reason,
+	m.created_at, m.created_by_principal_id, m.validated_at, m.committed_at, m.committed_by_principal_id`
+
 func scanMovement(row pgx.Row) (*domain.InventoryMovement, error) {
 	var m domain.InventoryMovement
 	if err := row.Scan(
@@ -125,6 +135,105 @@ func (s *PgStore) ListMovements(ctx context.Context, itemID string) ([]domain.In
 		return nil, err
 	}
 	return out, nil
+}
+
+// scanMovementRows drains a *pgx.Rows of movementColumns-shaped rows into
+// a slice, deduplicated by movement_id — the recursive CTEs below can
+// legitimately reach the same row by more than one path.
+func scanMovementRows(rows pgx.Rows) ([]domain.InventoryMovement, error) {
+	seen := map[string]bool{}
+	var out []domain.InventoryMovement
+	for rows.Next() {
+		m, err := scanMovement(rows)
+		if err != nil {
+			return nil, err
+		}
+		if seen[m.MovementID] {
+			continue
+		}
+		seen[m.MovementID] = true
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+// GetMovementLineage is INV-03's own GetMovementLineage query —
+// forward-only descent: movementID itself plus every movement that
+// reverses or supersedes it, directly or transitively (a corrected
+// correction is itself correctable — nothing in CreateCorrectionMovement
+// stops a chain from growing past length 2). Ordered oldest first so the
+// response reads as the movement's own correction history.
+func (s *PgStore) GetMovementLineage(ctx context.Context, movementID string) ([]domain.InventoryMovement, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.InventoryMovement
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			WITH RECURSIVE descendants AS (
+				SELECT `+movementColumns+` FROM inventory_movements
+					WHERE movement_id = $2 AND tenant_id = $1
+				UNION ALL
+				SELECT `+movementColumnsM+` FROM inventory_movements m
+					JOIN descendants d ON m.reverses_movement_id = d.movement_id OR m.supersedes_movement_id = d.movement_id
+					WHERE m.tenant_id = $1
+			)
+			SELECT * FROM descendants ORDER BY created_at`,
+			tenantID, movementID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		out, err = scanMovementRows(rows)
+		return err
+	})
+	return out, err
+}
+
+// GetMovementChain is INV-03's own GetMovementChain query — the full
+// bidirectional web around movementID: its correction history (as
+// GetMovementLineage) plus, if movementID is itself a correction, the
+// original it traces back to and every other correction hanging off that
+// same original. Found by walking up to the root ancestor first, then
+// running the same descendant walk GetMovementLineage does from there.
+func (s *PgStore) GetMovementChain(ctx context.Context, movementID string) ([]domain.InventoryMovement, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.InventoryMovement
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			WITH RECURSIVE ancestors AS (
+				SELECT `+movementColumns+`, 0 AS depth FROM inventory_movements
+					WHERE movement_id = $2 AND tenant_id = $1
+				UNION ALL
+				SELECT `+movementColumnsM+`, a.depth + 1 FROM inventory_movements m
+					JOIN ancestors a ON m.movement_id = a.reverses_movement_id OR m.movement_id = a.supersedes_movement_id
+					WHERE m.tenant_id = $1
+			),
+			root AS (
+				SELECT movement_id FROM ancestors ORDER BY depth DESC LIMIT 1
+			),
+			descendants AS (
+				SELECT `+movementColumns+` FROM inventory_movements
+					WHERE movement_id = (SELECT movement_id FROM root) AND tenant_id = $1
+				UNION ALL
+				SELECT `+movementColumnsM+` FROM inventory_movements m
+					JOIN descendants d ON m.reverses_movement_id = d.movement_id OR m.supersedes_movement_id = d.movement_id
+					WHERE m.tenant_id = $1
+			)
+			SELECT * FROM descendants ORDER BY created_at`,
+			tenantID, movementID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		out, err = scanMovementRows(rows)
+		return err
+	})
+	return out, err
 }
 
 // ValidateMovement moves DRAFT -> VALIDATED. Checks whether this movement
@@ -384,6 +493,46 @@ func (s *PgStore) GetOnHand(ctx context.Context, itemID, locationID string) (flo
 		return err
 	})
 	return onHand, err
+}
+
+// GetLocationInventorySummary is INV-02's own GetLocationInventorySummary
+// query — every item with non-zero net on-hand quantity currently resident
+// at locationID, computed the same way liveOnHand computes a single item's
+// on-hand quantity (net of committed movements), just grouped by item
+// instead of filtered to one.
+func (s *PgStore) GetLocationInventorySummary(ctx context.Context, locationID string) ([]domain.LocationInventorySummaryLine, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var lines []domain.LocationInventorySummaryLine
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT item_id, SUM(delta) AS on_hand FROM (
+				SELECT item_id, quantity AS delta FROM inventory_movements
+					WHERE tenant_id = $1 AND destination_location_id = $2 AND status = $3
+				UNION ALL
+				SELECT item_id, -quantity AS delta FROM inventory_movements
+					WHERE tenant_id = $1 AND source_location_id = $2 AND status = $3
+			) net
+			GROUP BY item_id
+			HAVING SUM(delta) <> 0
+			ORDER BY item_id`,
+			tenantID, locationID, domain.MovementStatusCommitted)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var l domain.LocationInventorySummaryLine
+			if err := rows.Scan(&l.ItemID, &l.OnHandQuantity); err != nil {
+				return err
+			}
+			lines = append(lines, l)
+		}
+		return rows.Err()
+	})
+	return lines, err
 }
 
 func (s *PgStore) GetOnHandAsOf(ctx context.Context, itemID, locationID string, at time.Time) (float64, error) {

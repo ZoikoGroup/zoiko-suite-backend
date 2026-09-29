@@ -2,12 +2,10 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -51,7 +49,10 @@ const notificationColumns = `
 	correlation_id, COALESCE(failure_reason, ''), COALESCE(provider_response, ''),
 	created_by_principal_id, created_at, sent_at, read_at,
 	delivery_attempts, next_attempt_at, last_attempt_at,
-	COALESCE(idempotency_key, ''), COALESCE(purpose_context, '')`
+	unknown_at, resolved_at, COALESCE(resolved_by_principal_id, ''), COALESCE(resolution_note, ''),
+	COALESCE(template_id, ''), COALESCE(template_version_id, ''), COALESCE(rendered_content_hash, ''),
+	COALESCE(purpose_context, ''), COALESCE(idempotency_key, ''),
+	resend_count, COALESCE(last_resend_reason, ''), last_resent_at, COALESCE(last_resent_by_principal_id, '')`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface{ Scan(dest ...any) error }
@@ -65,7 +66,10 @@ func scanNotification(s scannable, n *domain.Notification) error {
 		&n.CorrelationID, &n.FailureReason, &n.ProviderResponse,
 		&n.CreatedByPrincipalID, &n.CreatedAt, &n.SentAt, &n.ReadAt,
 		&n.DeliveryAttempts, &n.NextAttemptAt, &n.LastAttemptAt,
-		&n.IdempotencyKey, &n.PurposeContext,
+		&n.UnknownAt, &n.ResolvedAt, &n.ResolvedByPrincipalID, &n.ResolutionNote,
+		&n.TemplateID, &n.TemplateVersionID, &n.RenderedContentHash,
+		&n.PurposeContext, &n.IdempotencyKey,
+		&n.ResendCount, &n.LastResendReason, &n.LastResentAt, &n.LastResentByPrincipalID,
 	)
 }
 
@@ -101,20 +105,34 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 }
 
 // CreateNotification inserts a new notification in PENDING status, idempotent
-// on (tenant_id, idempotency_key): a retry replays the original delivery
-// outcome rather than sending a second notification for the same request.
-// The idempotency key is purpose-scoped — two different communications
-// sharing a correlation_id but with different purposes MUST NOT collide
-// (ZS-SVC-Y-001 §3.4).
+// on its dedup key: a retry finds the existing row instead of sending a second
+// notification for the same communication.
+//
+// Two keys, by ruling (migration 000012):
+//   - n.IdempotencyKey set (a purpose-scoped send): unique on
+//     (tenant_id, idempotency_key). Two communications that share a
+//     correlation id but differ in purpose, recipient or channel stay distinct.
+//   - n.IdempotencyKey empty (no purpose named): unique on
+//     (tenant_id, correlation_id), exactly as before 000012.
+//
+// Each ON CONFLICT names its own partial unique index, so dedup is decided
+// atomically by the database. A check-then-insert would let two concurrent
+// requests both pass the check and both send.
 func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return false, domain.ErrIdentityMissing
 	}
 
-	// If no idempotency key provided, derive one from the purpose-scoped components
-	if n.IdempotencyKey == "" {
-		n.IdempotencyKey = fmt.Sprintf("%s|%s|%s|%s", tenantID, n.LegalEntityID, n.CorrelationID, n.PurposeContext)
+	conflict := `ON CONFLICT (tenant_id, correlation_id) WHERE idempotency_key IS NULL DO NOTHING`
+	replay := `SELECT ` + notificationColumns + ` FROM notifications
+		WHERE tenant_id = $1 AND correlation_id = $2 AND idempotency_key IS NULL`
+	replayKey := n.CorrelationID
+	if n.IdempotencyKey != "" {
+		conflict = `ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`
+		replay = `SELECT ` + notificationColumns + ` FROM notifications
+			WHERE tenant_id = $1 AND idempotency_key = $2`
+		replayKey = n.IdempotencyKey
 	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -124,14 +142,16 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 				recipient_address, recipient_address_source,
 				channel, subject, body, status, source_event_type, source_reference,
 				correlation_id, created_by_principal_id, created_at,
-				idempotency_key, purpose_context
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
-		`, n.NotificationID, tenantID, n.LegalEntityID, n.RecipientPrincipalID,
+				template_id, template_version_id, rendered_content_hash,
+				purpose_context, idempotency_key
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+			`+conflict,
+			n.NotificationID, tenantID, n.LegalEntityID, n.RecipientPrincipalID,
 			nullIfEmpty(n.RecipientAddress), nullIfEmpty(n.RecipientAddressSource),
 			n.Channel, n.Subject, n.Body, n.Status, n.SourceEventType, n.SourceReference,
 			n.CorrelationID, n.CreatedByPrincipalID, n.CreatedAt,
-			n.IdempotencyKey, n.PurposeContext)
+			nullIfEmpty(n.TemplateID), nullIfEmpty(n.TemplateVersionID), nullIfEmpty(n.RenderedContentHash),
+			nullIfEmpty(n.PurposeContext), nullIfEmpty(n.IdempotencyKey))
 		if err != nil {
 			return err
 		}
@@ -140,14 +160,10 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 			return nil
 		}
 
-		// Conflict: a notification for this (tenant_id, idempotency_key)
-		// already exists — fetch it so the caller replays the original
-		// send outcome instead of sending a second, divergent one.
-		row := tx.QueryRow(ctx, `
-			SELECT `+notificationColumns+`
-			FROM notifications WHERE tenant_id = $1 AND idempotency_key = $2
-		`, tenantID, n.IdempotencyKey)
-		return scanNotification(row, n)
+		// Conflict: this communication already exists — fetch it so the caller
+		// replays the original send outcome instead of sending a second,
+		// divergent one.
+		return scanNotification(tx.QueryRow(ctx, replay, tenantID, replayKey), n)
 	})
 	if err != nil {
 		return false, err
@@ -244,67 +260,43 @@ func (s *PgStore) ListNotifications(ctx context.Context, f domain.ListFilter) ([
 }
 
 // CompleteDelivery records the final SENT/FAILED status, the delivery
-// timestamp and whatever the provider offered as acceptance evidence, and
-// enqueues the domain event for that conclusion in the SAME transaction.
+// timestamp and whatever the provider offered as acceptance evidence, and —
+// in the same transaction — enqueues notification.sent or notification.failed
+// in event_outbox.
 //
-// It mirrors spend-controls-svc's CompleteCheck pattern: creation and
-// status-transition are separate operations.
+// The guard on status is what makes the transition one-way: a second attempt,
+// or a replay that slipped past the idempotency index, cannot move a concluded
+// notification back through SENT. A notification concludes once, and because
+// the event is enqueued only when the UPDATE matched, it emits once too.
 //
-// The guard on status is what makes the transition one-way. Without it a
-// second delivery attempt — or a replayed request that slipped past the
-// idempotency index — could move a concluded notification back through SENT,
-// rewriting sent_at and the evidence with a later attempt's. A notification
-// concludes once.
-//
-// ── Why the event is a parameter rather than something the caller does after ──
-//
-// Because it used to be something the caller did after, and that is the defect
-// migration 000005 exists to close. Both call sites ran
-//
-//	if err := store.CompleteDelivery(...); err != nil { ...503... }
-//	publisher.PublishSent(ctx, ...)   // logs on failure, returns, loses it
-//
-// so a broker outage at the moment a notice concluded produced a correctly
-// recorded delivery, a correct 201, and no consumer anywhere learning that the
-// notice went out or that it did not. Nothing reported the loss, because the
-// thing that would have reported it was the event that was lost.
-//
-// Taking the sealed envelope here makes the two atomic: a notification that
-// concluded always has its event, and an event that exists always has its
-// conclusion. Delivery to the broker becomes internal/outbox's problem, where
-// a failure is a retry.
-//
-// ev is REQUIRED, not optional. An Outbound with no EventType is refused
-// before the UPDATE runs, so "conclude a delivery and tell nobody" is not a
-// state a caller can reach by forgetting an argument — which is precisely how
-// the old shape failed.
+// The event is sealed here, from the row the UPDATE RETURNS, rather than by the
+// caller from what it expects the row to be — so delivery_attempts, sent_at and
+// the rest on the wire are the committed values, not a prediction of them.
 //
 // THE TRADE, STATED. Because the enqueue shares the transaction, a failure to
-// enqueue fails the whole conclusion — and by then the provider has already
-// accepted the message. The row stays PENDING in flight, SweepStranded
-// eventually reclaims it, and the recipient may get a second copy. That is the
-// worse-looking of the two outcomes and still the right one: the enqueue can
-// only fail if event_outbox is missing or its CHECK rejects the event type,
-// which are deploy faults that affect every send equally and want to be loud.
-// Committing the conclusion and dropping the event is the failure that is
-// silent, permanent, and indistinguishable from success.
-func (s *PgStore) CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, ev events.Outbound) error {
+// enqueue fails the conclusion, by which time the provider has already
+// accepted the message; the row stays PENDING in flight, the stranded sweep
+// eventually reclaims it, and the recipient may get a second copy. That is
+// still the right way round: the enqueue can only fail on a deploy fault
+// (event_outbox missing, or its CHECK rejecting the type), which affects every
+// send equally and should be loud. Committing the conclusion and dropping the
+// event is the failure that is silent and indistinguishable from success.
+func (s *PgStore) CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, correlationID string, meta domain.AttemptMeta) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
-	if ev.EventType == "" {
-		return fmt.Errorf("conclude %s: no event supplied — a delivery may not conclude without one", id)
-	}
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
+		var n domain.Notification
+		err := scanNotification(tx.QueryRow(ctx, `
 			UPDATE notifications
 			SET status            = $1,
 			    failure_reason    = $2,
 			    provider_response = $3,
 			    sent_at           = $4,
 			    delivery_attempts = delivery_attempts + 1,
+			    submitting_since  = NULL,
 			    last_attempt_at   = $4,
 			    -- Cleared unconditionally. A concluded notification with a
 			    -- retry still scheduled would have the worker re-send a message
@@ -313,19 +305,137 @@ func (s *PgStore) CompleteDelivery(ctx context.Context, id, newStatus, failureRe
 			    -- combination too; this is what keeps the schema satisfied.
 			    next_attempt_at   = NULL
 			WHERE notification_id = $5 AND tenant_id = $6 AND status = 'PENDING'
-		`, newStatus, nullIfEmpty(failureReason), nullIfEmpty(providerResponse), sentAt, id, tenantID)
+			RETURNING `+notificationColumns,
+			newStatus, nullIfEmpty(failureReason), nullIfEmpty(providerResponse), sentAt, id, tenantID), &n)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No transition happened, so no event describes one.
+			return domain.ErrNotificationNotFound
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			// No transition happened, so no event describes one. Returning
-			// before the enqueue is what keeps that true: a concluded
-			// notification re-concluded by a racing replica must not emit a
-			// second notification.sent for a delivery that happened once.
-			return domain.ErrNotificationNotFound
+		outcome := domain.AttemptOutcomeFailed
+		if n.Status == domain.StatusSent {
+			outcome = domain.AttemptOutcomeAccepted
+		}
+		attemptedAt := time.Now().UTC()
+		if sentAt != nil {
+			attemptedAt = *sentAt
+		}
+		if err := recordAttempt(ctx, tx, n, outcome, providerResponse, failureReason, attemptedAt, meta); err != nil {
+			return err
+		}
+		ev, err := concludedEvent(correlationID, n, failureReason)
+		if err != nil {
+			return err
 		}
 		return enqueue(ctx, tx, tenantID, ev)
 	})
+}
+
+// concludedEvent seals the event for a notification that has just reached
+// SENT or FAILED.
+func concludedEvent(correlationID string, n domain.Notification, failureReason string) (events.Outbound, error) {
+	if n.Status == domain.StatusSent {
+		return events.Sent(correlationID, n)
+	}
+	return events.Failed(correlationID, n, failureReason)
+}
+
+// MarkOutcomeUnknown records a delivery attempt whose outcome is
+// genuinely ambiguous — see domain.DeliveryOutcome.Unknown's own doc
+// comment — and enqueues notification.outcome_unknown in the same
+// transaction. Guarded on status = 'PENDING' like CompleteDelivery: a
+// notification that concluded (or already went ambiguous) while this
+// attempt was in flight must not be overwritten. sentAt is set exactly
+// like a concluded attempt — the attempt DID happen, only its outcome is
+// unknown — and next_attempt_at is cleared so the ordinary retry worker
+// (which only ever claims status = 'PENDING' rows) never touches this
+// row again automatically; only ResolveDeliveryOutcome moves it further.
+func (s *PgStore) MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time, correlationID string, meta domain.AttemptMeta) error {
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var n domain.Notification
+		err := scanNotification(tx.QueryRow(ctx, `
+			UPDATE notifications
+			SET status            = 'PENDING_UNKNOWN',
+			    failure_reason    = $1,
+			    sent_at           = $2,
+			    unknown_at        = $2,
+			    delivery_attempts = delivery_attempts + 1,
+			    submitting_since  = NULL,
+			    last_attempt_at   = $2,
+			    next_attempt_at   = NULL
+			WHERE notification_id = $3 AND tenant_id = $4 AND status = 'PENDING'
+			RETURNING `+notificationColumns,
+			nullIfEmpty(reason), attemptedAt, id, tenantID), &n)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotificationNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if err := recordAttempt(ctx, tx, n, domain.AttemptOutcomeUnknown, "", reason, attemptedAt, meta); err != nil {
+			return err
+		}
+		ev, err := events.OutcomeUnknown(correlationID, n, reason)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, tenantID, ev)
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	return nil
+}
+
+// ResolveDeliveryOutcome settles a PENDING_UNKNOWN notification to its
+// real conclusion — the doc's own "original notification attempt must be
+// resolved." Guarded on status = 'PENDING_UNKNOWN': only a genuinely
+// ambiguous attempt has something to resolve. sent_at is left exactly as
+// it was set when the attempt was made — resolving later clarifies what
+// happened, it does not change when the attempt occurred.
+//
+// Enqueues the event the original attempt would have emitted —
+// notification.sent or notification.failed, carrying resolved_at — in the same
+// transaction. The spec names no separate "resolved" event.
+func (s *PgStore) ResolveDeliveryOutcome(ctx context.Context, p domain.ResolveDeliveryOutcomeParams, resolvedAt time.Time) error {
+	if p.TenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		var n domain.Notification
+		err := scanNotification(tx.QueryRow(ctx, `
+			UPDATE notifications
+			SET status                   = $1::text,
+			    failure_reason           = CASE WHEN $1::text = 'FAILED' THEN $2 ELSE '' END,
+			    provider_response        = COALESCE(NULLIF($3, ''), provider_response),
+			    resolved_at              = $4,
+			    resolved_by_principal_id = $5,
+			    resolution_note          = $2
+			WHERE notification_id = $6 AND tenant_id = $7 AND status = 'PENDING_UNKNOWN'
+			RETURNING `+notificationColumns,
+			p.ResolvedStatus, p.ResolutionNote, nullIfEmpty(p.ProviderResponse), resolvedAt,
+			p.ActorPrincipalID, p.NotificationID, p.TenantID), &n)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotificationNotFound
+		}
+		if err != nil {
+			return err
+		}
+		ev, err := concludedEvent(p.CorrelationID, n, p.ResolutionNote)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, p.TenantID, ev)
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	return nil
 }
 
 // ScheduleRetry records a failed attempt that is worth making again.
@@ -337,27 +447,34 @@ func (s *PgStore) CompleteDelivery(ctx context.Context, id, newStatus, failureRe
 // Guarded on status = 'PENDING' like CompleteDelivery: a notification that
 // concluded while this attempt was in flight must not be dragged back into the
 // retry queue.
-func (s *PgStore) ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error {
+func (s *PgStore) ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time, meta domain.AttemptMeta) error {
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
+		var n domain.Notification
+		err := scanNotification(tx.QueryRow(ctx, `
 			UPDATE notifications
 			SET failure_reason    = $1,
 			    delivery_attempts = delivery_attempts + 1,
+			    submitting_since  = NULL,
 			    last_attempt_at   = $2,
 			    next_attempt_at   = $3
 			WHERE notification_id = $4 AND tenant_id = $5 AND status = 'PENDING'
-		`, nullIfEmpty(failureReason), attemptedAt, nextAttemptAt, id, tenantID)
+			RETURNING `+notificationColumns,
+			nullIfEmpty(failureReason), attemptedAt, nextAttemptAt, id, tenantID), &n)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotificationNotFound
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrNotificationNotFound
-		}
-		return nil
+		// The failed attempt is recorded even though the notification has not
+		// concluded: RETRYING is what that one submission achieved, and the
+		// next attempt's record must not overwrite it.
+		meta.Retryable = true
+		return recordAttempt(ctx, tx, n, domain.AttemptOutcomeRetrying, "", failureReason, attemptedAt, meta)
 	})
 	if err != nil {
 		return mapPgError(err)
@@ -481,12 +598,12 @@ func (s *PgStore) FindStrandedDeliveries(ctx context.Context, staleBefore time.T
 	}
 
 	rows, err := tx.Query(ctx, `
-		SELECT notification_id, tenant_id
+		SELECT notification_id, tenant_id, submitting_since IS NOT NULL
 		FROM notifications
 		WHERE status = 'PENDING'
 		  AND next_attempt_at IS NULL
-		  AND COALESCE(last_attempt_at, created_at) <= $1
-		ORDER BY COALESCE(last_attempt_at, created_at)
+		  AND COALESCE(submitting_since, last_attempt_at, created_at) <= $1
+		ORDER BY COALESCE(submitting_since, last_attempt_at, created_at)
 		LIMIT $2
 	`, staleBefore, limit)
 	if err != nil {
@@ -496,7 +613,7 @@ func (s *PgStore) FindStrandedDeliveries(ctx context.Context, staleBefore time.T
 	var stranded []domain.DueRetry
 	for rows.Next() {
 		var d domain.DueRetry
-		if err := rows.Scan(&d.NotificationID, &d.TenantID); err != nil {
+		if err := rows.Scan(&d.NotificationID, &d.TenantID, &d.Submitted); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -546,6 +663,9 @@ func (s *PgStore) ReviveStranded(ctx context.Context, id, tenantID string, stale
 			  AND tenant_id = $3
 			  AND status = 'PENDING'
 			  AND next_attempt_at IS NULL
+			  -- Never a row that was handed to a provider: that one is
+			  -- MarkStrandedUnknown's (migration 000013).
+			  AND submitting_since IS NULL
 			  AND COALESCE(last_attempt_at, created_at) <= $4
 		`, nextAttemptAt, id, tenantID, staleBefore)
 		if err != nil {
@@ -708,1987 +828,6 @@ func (s *PgStore) CountUnread(ctx context.Context, recipientPrincipalID string) 
 		return 0, err
 	}
 	return count, nil
-}
-
-// ── transactional outbox ─────────────────────────────────────────────────────
-
-// OutboxRecord is one claimed, unpublished event.
-type OutboxRecord struct {
-	OutboxID  int64
-	EventType string
-	Key       string
-	Body      []byte
-}
-
-// enqueue writes one sealed envelope into event_outbox on the caller's open
-// transaction.
-//
-// Sharing the transaction is the whole point — see CompleteDelivery, which is
-// the only caller, for what the alternative cost.
-//
-// It is unexported and takes a tx rather than a context, so there is no way to
-// enqueue an event OUTSIDE the transaction that records the fact it describes.
-// An exported EnqueueEvent(ctx, ...) would have re-created the original defect
-// with a table in the middle of it.
-func enqueue(ctx context.Context, tx pgx.Tx, tenantID string, out events.Outbound) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO event_outbox (tenant_id, event_type, aggregate_key, payload)
-		VALUES ($1, $2, $3, $4)
-	`, tenantID, out.EventType, out.Key, out.Body)
-	if err != nil {
-		return fmt.Errorf("enqueue %s: %w", out.EventType, err)
-	}
-	return nil
-}
-
-// withRelay runs fn with app.outbox_relay installed instead of a tenant.
-//
-// The relay is the one write path in this service that legitimately crosses
-// tenants: it drains every tenant's backlog from a single loop. Rather than
-// letting it run unscoped — which under FORCE ROW LEVEL SECURITY would simply
-// see nothing, and would present as a relay that publishes nothing while
-// reporting no error at all — it names itself, so migration 000005's policy
-// admits it by an explicit, auditable disjunct rather than by the absence of a
-// control.
-//
-// A DIFFERENT flag from app.platform_scope, which 000004 grants over
-// `notifications`. That hatch is SELECT-only and exists so the retry worker can
-// discover work; this one must also UPDATE, to mark a batch published. Reusing
-// one name would have silently widened the retry hatch from read to write
-// across every tenant's notification bodies.
-//
-// set_config(..., true) is transaction-local, so the flag cannot survive on a
-// pooled connection into somebody's request.
-func (s *PgStore) withRelay(ctx context.Context, fn func(tx pgx.Tx) error) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin relay transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
-		return fmt.Errorf("set relay context: %w", err)
-	}
-	if err := fn(tx); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit relay transaction: %w", err)
-	}
-	return nil
-}
-
-// ClaimOutbox takes up to limit unpublished events, oldest first, locking them
-// for the duration of the caller's drain.
-//
-// FOR UPDATE SKIP LOCKED is what makes more than one replica safe: a second
-// relay claims the next batch instead of blocking on, or duplicating, this one.
-func (s *PgStore) ClaimOutbox(ctx context.Context, limit int, fn func([]OutboxRecord) error) error {
-	return s.withRelay(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT outbox_id, event_type, aggregate_key, payload
-			FROM event_outbox
-			WHERE published_at IS NULL
-			ORDER BY created_at, outbox_id
-			LIMIT $1
-			FOR UPDATE SKIP LOCKED
-		`, limit)
-		if err != nil {
-			return fmt.Errorf("claim outbox: %w", err)
-		}
-		var claimed []OutboxRecord
-		for rows.Next() {
-			var r OutboxRecord
-			if err := rows.Scan(&r.OutboxID, &r.EventType, &r.Key, &r.Body); err != nil {
-				rows.Close()
-				return fmt.Errorf("scan outbox row: %w", err)
-			}
-			claimed = append(claimed, r)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("read outbox rows: %w", err)
-		}
-		if len(claimed) == 0 {
-			return nil
-		}
-
-		// fn publishes. It runs while the rows are still locked and BEFORE the
-		// marking commits, so a crash mid-publish rolls the marking back and
-		// the events are re-delivered rather than lost. At-least-once, chosen
-		// deliberately: a duplicate notification.sent makes a consumer
-		// re-handle an event it has already seen — which the event_id and the
-		// notification_id both let it detect — while a lost one leaves a
-		// governed notice whose issue nobody was ever told about.
-		if err := fn(claimed); err != nil {
-			ids := make([]int64, 0, len(claimed))
-			for _, r := range claimed {
-				ids = append(ids, r.OutboxID)
-			}
-			// Recorded on the rows themselves, so a stuck event can be
-			// diagnosed from the table without correlating against logs.
-			if _, uerr := tx.Exec(ctx, `
-				UPDATE event_outbox
-				SET attempts = attempts + 1, last_error = $2
-				WHERE outbox_id = ANY($1)
-			`, ids, err.Error()); uerr != nil {
-				return fmt.Errorf("record publish failure: %w (original: %v)", uerr, err)
-			}
-			// Committed: the attempt count and the error are worth keeping
-			// even though the publish failed. published_at is untouched, so
-			// the rows are claimed again on the next tick.
-			if cerr := tx.Commit(ctx); cerr != nil {
-				return fmt.Errorf("commit publish failure: %w (original: %v)", cerr, err)
-			}
-			return err
-		}
-
-		ids := make([]int64, 0, len(claimed))
-		for _, r := range claimed {
-			ids = append(ids, r.OutboxID)
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE event_outbox SET published_at = now() WHERE outbox_id = ANY($1)
-		`, ids); err != nil {
-			return fmt.Errorf("mark published: %w", err)
-		}
-		return nil
-	})
-}
-
-// OutboxDepth reports the unpublished backlog and the age of its oldest entry.
-//
-// Both, not just the depth. A backlog of ten that is three seconds old is a
-// service under load; a backlog of ten that is an hour old is a relay that has
-// stopped — and on this service that means an hour of governed notices whose
-// issue no consumer has been told about, while the register shows every one of
-// them concluded. Depth alone cannot tell those apart, which is why the alert
-// rule keys on the age.
-func (s *PgStore) OutboxDepth(ctx context.Context) (pending int64, oldestAge time.Duration, err error) {
-	err = s.withRelay(ctx, func(tx pgx.Tx) error {
-		var oldest *time.Time
-		row := tx.QueryRow(ctx, `
-			SELECT count(*), min(created_at) FROM event_outbox WHERE published_at IS NULL
-		`)
-		if err := row.Scan(&pending, &oldest); err != nil {
-			return fmt.Errorf("outbox depth: %w", err)
-		}
-		if oldest != nil {
-			oldestAge = time.Since(*oldest)
-		}
-		return nil
-	})
-	return pending, oldestAge, err
-}
-
-// GetByIdempotencyKey returns the notification for a given purpose-scoped
-// idempotency key, or nil if not found. Used by the handler to replay
-// the original outcome instead of sending a duplicate.
-func (s *PgStore) GetByIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (*domain.Notification, error) {
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var n domain.Notification
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanNotification(tx.QueryRow(ctx, `
-			SELECT `+notificationColumns+`
-			FROM notifications
-			WHERE tenant_id = $1 AND idempotency_key = $2
-		`, tenantID, idempotencyKey), &n)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &n, nil
-}
-
-// CreateAttempt records a durable attempt record per §3.4.
-func (s *PgStore) CreateAttempt(ctx context.Context, a *domain.DeliveryAttempt) error {
-	if a.AttemptID == "" {
-		a.AttemptID = uuid.NewString()
-	}
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO delivery_attempts (
-				attempt_id, notification_id, attempt_number, channel, provider,
-				status, provider_response, failure_reason, retryable, resend_reason, created_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-		`, a.AttemptID, a.NotificationID, a.AttemptNumber, a.Channel, a.Provider,
-			a.Status, nullIfEmpty(a.ProviderResponse), nullIfEmpty(a.FailureReason),
-			a.Retryable, nullIfEmpty(a.ResendReason), a.CreatedAt)
-		return err
-	})
-}
-
-// UpdateAttempt updates an attempt record with its conclusion.
-func (s *PgStore) UpdateAttempt(ctx context.Context, attemptID, status, failureReason, providerResponse string, concludedAt *time.Time) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			UPDATE delivery_attempts
-			SET status = $1, failure_reason = $2, provider_response = $3, concluded_at = $4
-			WHERE attempt_id = $5
-		`, status, nullIfEmpty(failureReason), nullIfEmpty(providerResponse), concludedAt, attemptID)
-		return err
-	})
-}
-
-// GetAttempts returns all attempt records for a notification, ordered by attempt number.
-func (s *PgStore) GetAttempts(ctx context.Context, notificationID string) ([]domain.DeliveryAttempt, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var attempts []domain.DeliveryAttempt
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT attempt_id, notification_id, attempt_number, channel, provider,
-			       status, provider_response, failure_reason, retryable, resend_reason, created_at, concluded_at
-			FROM delivery_attempts
-			WHERE notification_id = $1
-			ORDER BY attempt_number
-		`, notificationID)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var a domain.DeliveryAttempt
-			if err := rows.Scan(&a.AttemptID, &a.NotificationID, &a.AttemptNumber, &a.Channel, &a.Provider,
-				&a.Status, &a.ProviderResponse, &a.FailureReason, &a.Retryable, &a.ResendReason,
-				&a.CreatedAt, &a.ConcludedAt); err != nil {
-				return err
-			}
-			attempts = append(attempts, a)
-		}
-		return rows.Err()
-	})
-	return attempts, err
-}
-
-// FindStuckInFlight finds notifications that are in flight (PENDING or UNKNOWN
- // with no next_attempt_at) for longer than the threshold. This is the reconciliation
- // step before re-attempting — ZS-SVC-Y-001 §3.4: "Timeout after submit
- // becomes UNKNOWN, not FAILED; reconcile before re-attempting".
- func (s *PgStore) FindStuckInFlight(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error) {
- 	tx, err := s.pool.Begin(ctx)
- 	if err != nil {
- 		return nil, fmt.Errorf("begin transaction: %w", err)
- 	}
- 	defer func() { _ = tx.Rollback(ctx) }()
-
- 	if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
- 		return nil, fmt.Errorf("set platform scope: %w", err)
- 	}
-
- 	rows, err := tx.Query(ctx, `
- 		SELECT notification_id, tenant_id
- 		FROM notifications
- 		WHERE status IN ('PENDING', 'UNKNOWN')
- 		  AND next_attempt_at IS NULL
- 		  AND COALESCE(last_attempt_at, created_at) <= $1
- 		ORDER BY COALESCE(last_attempt_at, created_at)
- 		LIMIT $2
- 	`, staleBefore, limit)
- 	if err != nil {
- 		return nil, err
- 	}
-
- 	var stuck []domain.DueRetry
- 	for rows.Next() {
- 		var d domain.DueRetry
- 		if err := rows.Scan(&d.NotificationID, &d.TenantID); err != nil {
- 			rows.Close()
- 			return nil, err
- 		}
- 		stuck = append(stuck, d)
- 	}
- 	rows.Close()
- 	if err := rows.Err(); err != nil {
- 		return nil, err
- 	}
- 	if err := tx.Commit(ctx); err != nil {
- 		return nil, fmt.Errorf("commit transaction: %w", err)
- 	}
-return stuck, nil
-}
-
-// ── NCD-02: Suppression ───────────────────────────────────────────────────────
-
-const suppressionColumns = `
-	suppression_id, tenant_id, principal_id, channel, reason,
-	created_by, created_at, expires_at`
-
-func scanSuppression(s scannable, sp *domain.Suppression) error {
-	return s.Scan(
-		&sp.SuppressionID, &sp.TenantID, &sp.PrincipalID, &sp.Channel,
-		&sp.Reason, &sp.CreatedBy, &sp.CreatedAt, &sp.ExpiresAt,
-	)
-}
-
-func (s *PgStore) CreateSuppression(ctx context.Context, sp *domain.Suppression) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if sp.SuppressionID == "" {
-		sp.SuppressionID = uuid.NewString()
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO suppressions (suppression_id, tenant_id, principal_id, channel, reason, created_by, created_at, expires_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-		`, sp.SuppressionID, tenantID, sp.PrincipalID, sp.Channel, sp.Reason, sp.CreatedBy, sp.CreatedAt, sp.ExpiresAt)
-		return err
-	})
-}
-
-func (s *PgStore) GetSuppression(ctx context.Context, id string) (*domain.Suppression, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var sp domain.Suppression
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanSuppression(tx.QueryRow(ctx, `
-			SELECT `+suppressionColumns+`
-			FROM suppressions
-			WHERE suppression_id = $1 AND tenant_id = $2
-		`, id, tenantID), &sp)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrSuppressionNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &sp, nil
-}
-
-func (s *PgStore) ListSuppressions(ctx context.Context, f domain.SuppressionFilter) ([]domain.Suppression, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.Suppression
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + suppressionColumns + ` FROM suppressions WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.PrincipalID != "" {
-			args = append(args, f.PrincipalID)
-			query += fmt.Sprintf(" AND principal_id = $%d", len(args))
-		}
-		if f.Channel != "" {
-			args = append(args, f.Channel)
-			query += fmt.Sprintf(" AND channel = $%d", len(args))
-		}
-		if f.Reason != "" {
-			args = append(args, f.Reason)
-			query += fmt.Sprintf(" AND reason = $%d", len(args))
-		}
-		if f.ActiveOnly {
-			query += " AND (expires_at IS NULL OR expires_at > now())"
-		}
-
-		query += " ORDER BY created_at DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var sp domain.Suppression
-			if err := scanSuppression(rows, &sp); err != nil {
-				return err
-			}
-			out = append(out, sp)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (s *PgStore) DeleteSuppression(ctx context.Context, id string) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
-			DELETE FROM suppressions WHERE suppression_id = $1 AND tenant_id = $2
-		`, id, tenantID)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrSuppressionNotFound
-		}
-		return nil
-	})
-}
-
-// ── NCD-02: Preference ────────────────────────────────────────────────────────
-
-const preferenceColumns = `
-	preference_id, tenant_id, principal_id, channel, enabled,
-	quiet_hours_start, quiet_hours_end, timezone, created_at, updated_at`
-
-func scanPreference(s scannable, p *domain.Preference) error {
-	return s.Scan(
-		&p.PreferenceID, &p.TenantID, &p.PrincipalID, &p.Channel,
-		&p.Enabled, &p.QuietHoursStart, &p.QuietHoursEnd, &p.Timezone,
-		&p.CreatedAt, &p.UpdatedAt,
-	)
-}
-
-func (s *PgStore) UpsertPreference(ctx context.Context, p *domain.Preference) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if p.PreferenceID == "" {
-		p.PreferenceID = uuid.NewString()
-	}
-	p.UpdatedAt = time.Now().UTC()
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO preferences (preference_id, tenant_id, principal_id, channel, enabled, quiet_hours_start, quiet_hours_end, timezone, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-			ON CONFLICT (tenant_id, principal_id, channel) DO UPDATE SET
-				enabled = EXCLUDED.enabled,
-				quiet_hours_start = EXCLUDED.quiet_hours_start,
-				quiet_hours_end = EXCLUDED.quiet_hours_end,
-				timezone = EXCLUDED.timezone,
-				updated_at = EXCLUDED.updated_at
-		`, p.PreferenceID, tenantID, p.PrincipalID, p.Channel, p.Enabled,
-			p.QuietHoursStart, p.QuietHoursEnd, p.Timezone,
-			p.CreatedAt, p.UpdatedAt)
-		return err
-	})
-}
-
-func (s *PgStore) GetPreference(ctx context.Context, tenantID, principalID, channel string) (*domain.Preference, error) {
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var p domain.Preference
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanPreference(tx.QueryRow(ctx, `
-			SELECT `+preferenceColumns+`
-			FROM preferences
-			WHERE tenant_id = $1 AND principal_id = $2 AND channel = $3
-		`, tenantID, principalID, channel), &p)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrPreferenceNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &p, nil
-}
-
-func (s *PgStore) ListPreferences(ctx context.Context, f domain.PreferenceFilter) ([]domain.Preference, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.Preference
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + preferenceColumns + ` FROM preferences WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.PrincipalID != "" {
-			args = append(args, f.PrincipalID)
-			query += fmt.Sprintf(" AND principal_id = $%d", len(args))
-		}
-		if f.Channel != "" {
-			args = append(args, f.Channel)
-			query += fmt.Sprintf(" AND channel = $%d", len(args))
-		}
-		if f.EnabledOnly {
-			query += " AND enabled = true"
-		}
-
-		query += " ORDER BY created_at DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var p domain.Preference
-			if err := scanPreference(rows, &p); err != nil {
-				return err
-			}
-			out = append(out, p)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (s *PgStore) DeletePreference(ctx context.Context, tenantID, principalID, channel string) error {
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
-			DELETE FROM preferences WHERE tenant_id = $1 AND principal_id = $2 AND channel = $3
-		`, tenantID, principalID, channel)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrPreferenceNotFound
-		}
-		return nil
-	})
-}
-
-// ── NCD-02: Channel Decision ──────────────────────────────────────────────────
-
-const channelDecisionColumns = `
-	decision_id, tenant_id, principal_id, channel, decision,
-	suppression_id, preference_id, permission_grant, evaluated_at`
-
-func scanChannelDecision(s scannable, cd *domain.ChannelDecision) error {
-	return s.Scan(
-		&cd.DecisionID, &cd.TenantID, &cd.PrincipalID, &cd.Channel,
-		&cd.Decision, &cd.SuppressionID, &cd.PreferenceID, &cd.PermissionGrant,
-		&cd.EvaluatedAt,
-	)
-}
-
-// EvaluateChannel checks suppression, preference, quiet hours, and permission.
-// Returns the decision result and records it for audit.
-// Precedence per §5.4: suppression > quiet hours > preference > permission.
-func (s *PgStore) EvaluateChannel(ctx context.Context, tenantID, principalID, channel, permissionGrant string) (*domain.ChannelDecisionResult, error) {
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	// We need to run this with the tenant context but also read suppressions/preferences
-	// which are tenant-scoped. The logic is:
-	// 1. Check active suppression for this channel
-	// 2. Check quiet hours (from preference)
-	// 3. Check preference enabled
-	// 4. Check permission grant (passed in)
-
-	var result domain.ChannelDecisionResult
-	result.Decision = domain.ChannelDecisionNoPermission // default if no permission grant
-
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		now := time.Now().UTC()
-
-		// 1. Check suppression (highest precedence)
-		var sup domain.Suppression
-		err := scanSuppression(tx.QueryRow(ctx, `
-			SELECT `+suppressionColumns+`
-			FROM suppressions
-			WHERE tenant_id = $1 AND principal_id = $2 AND channel = $3
-			  AND (expires_at IS NULL OR expires_at > $4)
-			LIMIT 1
-		`, tenantID, principalID, channel, now), &sup)
-		if err == nil {
-			// Suppression found
-			result.Allowed = false
-			result.Decision = domain.ChannelDecisionSuppressed
-			result.SuppressionID = &sup.SuppressionID
-			return s.recordDecision(ctx, tx, tenantID, principalID, channel, result, permissionGrant)
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-
-		// 2. Check preference for quiet hours
-		var pref domain.Preference
-		err = scanPreference(tx.QueryRow(ctx, `
-			SELECT `+preferenceColumns+`
-			FROM preferences
-			WHERE tenant_id = $1 AND principal_id = $2 AND channel = $3
-		`, tenantID, principalID, channel), &pref)
-		if err == nil {
-			// Check quiet hours
-			if pref.QuietHoursStart != nil && pref.QuietHoursEnd != nil && pref.Timezone != "" {
-				loc, tzErr := time.LoadLocation(pref.Timezone)
-				if tzErr == nil {
-					localNow := now.In(loc)
-					start, _ := time.ParseInLocation("15:04:05", *pref.QuietHoursStart, loc)
-					end, _ := time.ParseInLocation("15:04:05", *pref.QuietHoursEnd, loc)
-
-					// Compare just the time portion
-					localTime := time.Date(1, 1, 1, localNow.Hour(), localNow.Minute(), localNow.Second(), 0, loc)
-					startTime := time.Date(1, 1, 1, start.Hour(), start.Minute(), start.Second(), 0, loc)
-					endTime := time.Date(1, 1, 1, end.Hour(), end.Minute(), end.Second(), 0, loc)
-
-					inQuietHours := false
-					if startTime.Before(endTime) {
-						// Same day (e.g., 09:00-17:00)
-						inQuietHours = !localTime.Before(startTime) && localTime.Before(endTime)
-					} else {
-						// Crosses midnight (e.g., 22:00-08:00)
-						inQuietHours = !localTime.Before(startTime) || localTime.Before(endTime)
-					}
-
-					if inQuietHours && pref.Enabled {
-						result.Allowed = false
-						result.Decision = domain.ChannelDecisionQuietHours
-						result.PreferenceID = &pref.PreferenceID
-						return s.recordDecision(ctx, tx, tenantID, principalID, channel, result, permissionGrant)
-					}
-				}
-			}
-
-			// 3. Check preference enabled
-			if !pref.Enabled {
-				result.Allowed = false
-				result.Decision = domain.ChannelDecisionNoPreference
-				result.PreferenceID = &pref.PreferenceID
-				return s.recordDecision(ctx, tx, tenantID, principalID, channel, result, permissionGrant)
-			}
-
-			result.PreferenceID = &pref.PreferenceID
-		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-
-		// 4. Check permission grant (provided by caller)
-		if permissionGrant != "" {
-			result.Allowed = true
-			result.Decision = domain.ChannelDecisionAllowed
-			result.PermissionGrant = &permissionGrant
-		} else {
-			result.Allowed = false
-			result.Decision = domain.ChannelDecisionNoPermission
-		}
-
-		return s.recordDecision(ctx, tx, tenantID, principalID, channel, result, permissionGrant)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
-func (s *PgStore) recordDecision(ctx context.Context, tx pgx.Tx, tenantID, principalID, channel string, result domain.ChannelDecisionResult, permissionGrant string) error {
-	decisionID := uuid.NewString()
-	_, err := tx.Exec(ctx, `
-		INSERT INTO channel_decisions (decision_id, tenant_id, principal_id, channel, decision, suppression_id, preference_id, permission_grant, evaluated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-	`, decisionID, tenantID, principalID, channel, result.Decision,
-		result.SuppressionID, result.PreferenceID, result.PermissionGrant, time.Now().UTC())
-	return err
-}
-
-func (s *PgStore) ListChannelDecisions(ctx context.Context, f domain.ChannelDecisionFilter) ([]domain.ChannelDecision, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.ChannelDecision
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + channelDecisionColumns + ` FROM channel_decisions WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.PrincipalID != "" {
-			args = append(args, f.PrincipalID)
-			query += fmt.Sprintf(" AND principal_id = $%d", len(args))
-		}
-		if f.Channel != "" {
-			args = append(args, f.Channel)
-			query += fmt.Sprintf(" AND channel = $%d", len(args))
-		}
-		if f.Decision != "" {
-			args = append(args, f.Decision)
-			query += fmt.Sprintf(" AND decision = $%d", len(args))
-		}
-
-		query += " ORDER BY evaluated_at DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var cd domain.ChannelDecision
-			if err := scanChannelDecision(rows, &cd); err != nil {
-				return err
-			}
-			out = append(out, cd)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// ── NCD-04: Bounce ────────────────────────────────────────────────────────────
-
-const bounceEventColumns = `
-	bounce_id, tenant_id, notification_id, provider, bounce_type,
-	bounce_subtype, diagnostic_code, recipient_address, received_at,
-	processed_at, action_taken, suppression_id`
-
-func scanBounceEvent(s scannable, b *domain.BounceEvent) error {
-	return s.Scan(
-		&b.BounceID, &b.TenantID, &b.NotificationID, &b.Provider,
-		&b.BounceType, &b.BounceSubtype, &b.DiagnosticCode,
-		&b.RecipientAddress, &b.ReceivedAt, &b.ProcessedAt,
-		&b.ActionTaken, &b.SuppressionID,
-	)
-}
-
-func (s *PgStore) CreateBounceEvent(ctx context.Context, b *domain.BounceEvent) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if b.BounceID == "" {
-		b.BounceID = uuid.NewString()
-	}
-	if b.ReceivedAt.IsZero() {
-		b.ReceivedAt = time.Now().UTC()
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO bounce_events (bounce_id, tenant_id, notification_id, provider, bounce_type, bounce_subtype, diagnostic_code, recipient_address, received_at, processed_at, action_taken, suppression_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-		`, b.BounceID, tenantID, b.NotificationID, b.Provider, b.BounceType, b.BounceSubtype,
-			b.DiagnosticCode, b.RecipientAddress, b.ReceivedAt, b.ProcessedAt, b.ActionTaken, b.SuppressionID)
-		return err
-	})
-}
-
-func (s *PgStore) GetBounceEvent(ctx context.Context, id string) (*domain.BounceEvent, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var b domain.BounceEvent
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanBounceEvent(tx.QueryRow(ctx, `
-			SELECT `+bounceEventColumns+`
-			FROM bounce_events
-			WHERE bounce_id = $1 AND tenant_id = $2
-		`, id, tenantID), &b)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrBounceNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &b, nil
-}
-
-func (s *PgStore) ListBounceEvents(ctx context.Context, f domain.BounceEventFilter) ([]domain.BounceEvent, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.BounceEvent
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + bounceEventColumns + ` FROM bounce_events WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.NotificationID != "" {
-			args = append(args, f.NotificationID)
-			query += fmt.Sprintf(" AND notification_id = $%d", len(args))
-		}
-		if f.RecipientAddr != "" {
-			args = append(args, f.RecipientAddr)
-			query += fmt.Sprintf(" AND recipient_address = $%d", len(args))
-		}
-		if f.BounceType != "" {
-			args = append(args, f.BounceType)
-			query += fmt.Sprintf(" AND bounce_type = $%d", len(args))
-		}
-
-		query += " ORDER BY received_at DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var b domain.BounceEvent
-			if err := scanBounceEvent(rows, &b); err != nil {
-				return err
-			}
-			out = append(out, b)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// ── NCD-04: Complaint ─────────────────────────────────────────────────────────
-
-const complaintEventColumns = `
-	complaint_id, tenant_id, notification_id, provider, complaint_type,
-	recipient_address, received_at, processed_at, action_taken, suppression_id`
-
-func scanComplaintEvent(s scannable, c *domain.ComplaintEvent) error {
-	return s.Scan(
-		&c.ComplaintID, &c.TenantID, &c.NotificationID, &c.Provider,
-		&c.ComplaintType, &c.RecipientAddress, &c.ReceivedAt,
-		&c.ProcessedAt, &c.ActionTaken, &c.SuppressionID,
-	)
-}
-
-func (s *PgStore) CreateComplaintEvent(ctx context.Context, c *domain.ComplaintEvent) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if c.ComplaintID == "" {
-		c.ComplaintID = uuid.NewString()
-	}
-	if c.ReceivedAt.IsZero() {
-		c.ReceivedAt = time.Now().UTC()
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO complaint_events (complaint_id, tenant_id, notification_id, provider, complaint_type, recipient_address, received_at, processed_at, action_taken, suppression_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		`, c.ComplaintID, tenantID, c.NotificationID, c.Provider, c.ComplaintType,
-			c.RecipientAddress, c.ReceivedAt, c.ProcessedAt, c.ActionTaken, c.SuppressionID)
-		return err
-	})
-}
-
-func (s *PgStore) GetComplaintEvent(ctx context.Context, id string) (*domain.ComplaintEvent, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var c domain.ComplaintEvent
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanComplaintEvent(tx.QueryRow(ctx, `
-			SELECT `+complaintEventColumns+`
-			FROM complaint_events
-			WHERE complaint_id = $1 AND tenant_id = $2
-		`, id, tenantID), &c)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrComplaintNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &c, nil
-}
-
-func (s *PgStore) ListComplaintEvents(ctx context.Context, f domain.ComplaintEventFilter) ([]domain.ComplaintEvent, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.ComplaintEvent
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + complaintEventColumns + ` FROM complaint_events WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.NotificationID != "" {
-			args = append(args, f.NotificationID)
-			query += fmt.Sprintf(" AND notification_id = $%d", len(args))
-		}
-		if f.RecipientAddr != "" {
-			args = append(args, f.RecipientAddr)
-			query += fmt.Sprintf(" AND recipient_address = $%d", len(args))
-		}
-		if f.ComplaintType != "" {
-			args = append(args, f.ComplaintType)
-			query += fmt.Sprintf(" AND complaint_type = $%d", len(args))
-		}
-
-		query += " ORDER BY received_at DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var c domain.ComplaintEvent
-			if err := scanComplaintEvent(rows, &c); err != nil {
-				return err
-			}
-			out = append(out, c)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// ── NCD-04: Channel Reputation ────────────────────────────────────────────────
-
-const channelReputationColumns = `
-	reputation_id, tenant_id, channel, provider, window_start, window_end,
-	sent_count, accepted_count, bounced_count, complained_count,
-	delivered_count, read_count, reputation_score, created_at, updated_at`
-
-func scanChannelReputation(s scannable, r *domain.ChannelReputation) error {
-	return s.Scan(
-		&r.ReputationID, &r.TenantID, &r.Channel, &r.Provider,
-		&r.WindowStart, &r.WindowEnd, &r.SentCount, &r.AcceptedCount,
-		&r.BouncedCount, &r.ComplainedCount, &r.DeliveredCount, &r.ReadCount,
-		&r.ReputationScore, &r.CreatedAt, &r.UpdatedAt,
-	)
-}
-
-func (s *PgStore) UpsertChannelReputation(ctx context.Context, r *domain.ChannelReputation) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if r.ReputationID == "" {
-		r.ReputationID = uuid.NewString()
-	}
-	r.UpdatedAt = time.Now().UTC()
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO channel_reputation (reputation_id, tenant_id, channel, provider, window_start, window_end,
-				sent_count, accepted_count, bounced_count, complained_count, delivered_count, read_count,
-				reputation_score, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-			ON CONFLICT (tenant_id, channel, provider, window_start) DO UPDATE SET
-				window_end = EXCLUDED.window_end,
-				sent_count = channel_reputation.sent_count + EXCLUDED.sent_count,
-				accepted_count = channel_reputation.accepted_count + EXCLUDED.accepted_count,
-				bounced_count = channel_reputation.bounced_count + EXCLUDED.bounced_count,
-				complained_count = channel_reputation.complained_count + EXCLUDED.complained_count,
-				delivered_count = channel_reputation.delivered_count + EXCLUDED.delivered_count,
-				read_count = channel_reputation.read_count + EXCLUDED.read_count,
-				reputation_score = EXCLUDED.reputation_score,
-				updated_at = EXCLUDED.updated_at
-		`, r.ReputationID, tenantID, r.Channel, r.Provider, r.WindowStart, r.WindowEnd,
-			r.SentCount, r.AcceptedCount, r.BouncedCount, r.ComplainedCount,
-			r.DeliveredCount, r.ReadCount, r.ReputationScore, r.CreatedAt, r.UpdatedAt)
-		return err
-	})
-}
-
-func (s *PgStore) ListChannelReputations(ctx context.Context, f domain.ChannelReputationFilter) ([]domain.ChannelReputation, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.ChannelReputation
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + channelReputationColumns + ` FROM channel_reputation WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.Channel != "" {
-			args = append(args, f.Channel)
-			query += fmt.Sprintf(" AND channel = $%d", len(args))
-		}
-		if f.Provider != "" {
-			args = append(args, f.Provider)
-			query += fmt.Sprintf(" AND provider = $%d", len(args))
-		}
-		if !f.Since.IsZero() {
-			args = append(args, f.Since)
-			query += fmt.Sprintf(" AND window_start >= $%d", len(args))
-		}
-		if !f.Until.IsZero() {
-			args = append(args, f.Until)
-			query += fmt.Sprintf(" AND window_start <= $%d", len(args))
-		}
-
-		query += " ORDER BY window_start DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var r domain.ChannelReputation
-			if err := scanChannelReputation(rows, &r); err != nil {
-				return err
-			}
-			out = append(out, r)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// ── NCD-01: Communication Intent ──────────────────────────────────────────────
-
-const communicationIntentColumns = `
-	intent_id, tenant_id, legal_entity_id, name, description, category, channels, created_by, created_at, updated_at`
-
-func scanCommunicationIntent(s scannable, i *domain.CommunicationIntent) error {
-	return s.Scan(
-		&i.IntentID, &i.TenantID, &i.LegalEntityID, &i.Name, &i.Description,
-		&i.Category, &i.Channels, &i.CreatedBy, &i.CreatedAt, &i.UpdatedAt,
-	)
-}
-
-func (s *PgStore) CreateCommunicationIntent(ctx context.Context, i *domain.CommunicationIntent) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if i.IntentID == "" {
-		i.IntentID = uuid.NewString()
-	}
-	if i.CreatedAt.IsZero() {
-		i.CreatedAt = time.Now().UTC()
-	}
-	if i.UpdatedAt.IsZero() {
-		i.UpdatedAt = time.Now().UTC()
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO communication_intents (intent_id, tenant_id, legal_entity_id, name, description, category, channels, created_by, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		`, i.IntentID, tenantID, i.LegalEntityID, i.Name, i.Description, i.Category, i.Channels, i.CreatedBy, i.CreatedAt, i.UpdatedAt)
-		return err
-	})
-}
-
-func (s *PgStore) GetCommunicationIntent(ctx context.Context, id string) (*domain.CommunicationIntent, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var i domain.CommunicationIntent
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanCommunicationIntent(tx.QueryRow(ctx, `
-			SELECT `+communicationIntentColumns+`
-			FROM communication_intents
-			WHERE intent_id = $1 AND tenant_id = $2
-		`, id, tenantID), &i)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrIntentNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &i, nil
-}
-
-func (s *PgStore) ListCommunicationIntents(ctx context.Context, f domain.CommunicationIntentFilter) ([]domain.CommunicationIntent, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.CommunicationIntent
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + communicationIntentColumns + ` FROM communication_intents WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.LegalEntityID != "" {
-			args = append(args, f.LegalEntityID)
-			query += fmt.Sprintf(" AND legal_entity_id = $%d", len(args))
-		}
-		if f.Name != "" {
-			args = append(args, f.Name)
-			query += fmt.Sprintf(" AND name = $%d", len(args))
-		}
-		if f.Category != "" {
-			args = append(args, f.Category)
-			query += fmt.Sprintf(" AND category = $%d", len(args))
-		}
-
-		query += " ORDER BY created_at DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var i domain.CommunicationIntent
-			if err := scanCommunicationIntent(rows, &i); err != nil {
-				return err
-			}
-			out = append(out, i)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (s *PgStore) UpdateCommunicationIntent(ctx context.Context, i *domain.CommunicationIntent) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	i.UpdatedAt = time.Now().UTC()
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			UPDATE communication_intents
-			SET name = $1, description = $2, category = $3, channels = $4, updated_at = $5
-			WHERE intent_id = $6 AND tenant_id = $7
-		`, i.Name, i.Description, i.Category, i.Channels, i.UpdatedAt, i.IntentID, tenantID)
-		return err
-	})
-}
-
-func (s *PgStore) DeleteCommunicationIntent(ctx context.Context, id string) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
-			DELETE FROM communication_intents WHERE intent_id = $1 AND tenant_id = $2
-		`, id, tenantID)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrIntentNotFound
-		}
-		return nil
-	})
-}
-
-// ── NCD-01: Template ──────────────────────────────────────────────────────────
-
-const templateColumns = `
-	template_id, intent_id, tenant_id, legal_entity_id, locale, version,
-	subject_template, body_template, variables, status,
-	approved_by, approved_at, published_at, effective_from, effective_to,
-	created_by, created_at, updated_at`
-
-func scanTemplate(s scannable, t *domain.Template) error {
-	var varsJSON []byte
-	err := s.Scan(
-		&t.TemplateID, &t.IntentID, &t.TenantID, &t.LegalEntityID, &t.Locale, &t.Version,
-		&t.SubjectTemplate, &t.BodyTemplate, &varsJSON, &t.Status,
-		&t.ApprovedBy, &t.ApprovedAt, &t.PublishedAt, &t.EffectiveFrom, &t.EffectiveTo,
-		&t.CreatedBy, &t.CreatedAt, &t.UpdatedAt,
-	)
-	if err != nil {
-		return err
-	}
-	if varsJSON != nil {
-		_ = json.Unmarshal(varsJSON, &t.Variables)
-	}
-	return nil
-}
-
-func (s *PgStore) CreateTemplate(ctx context.Context, t *domain.Template) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if t.TemplateID == "" {
-		t.TemplateID = uuid.NewString()
-	}
-	if t.CreatedAt.IsZero() {
-		t.CreatedAt = time.Now().UTC()
-	}
-	if t.UpdatedAt.IsZero() {
-		t.UpdatedAt = time.Now().UTC()
-	}
-	varsJSON, _ := json.Marshal(t.Variables)
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO templates (template_id, intent_id, tenant_id, legal_entity_id, locale, version,
-				subject_template, body_template, variables, status,
-				approved_by, approved_at, published_at, effective_from, effective_to,
-				created_by, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-		`, t.TemplateID, t.IntentID, tenantID, t.LegalEntityID, t.Locale, t.Version,
-			t.SubjectTemplate, t.BodyTemplate, varsJSON, t.Status,
-			t.ApprovedBy, t.ApprovedAt, t.PublishedAt, t.EffectiveFrom, t.EffectiveTo,
-			t.CreatedBy, t.CreatedAt, t.UpdatedAt)
-		return err
-	})
-}
-
-func (s *PgStore) GetTemplate(ctx context.Context, id string) (*domain.Template, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var t domain.Template
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanTemplate(tx.QueryRow(ctx, `
-			SELECT `+templateColumns+`
-			FROM templates
-			WHERE template_id = $1 AND tenant_id = $2
-		`, id, tenantID), &t)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrTemplateNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &t, nil
-}
-
-func (s *PgStore) GetTemplateByIntent(ctx context.Context, intentID, locale string, version int) (*domain.Template, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var t domain.Template
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanTemplate(tx.QueryRow(ctx, `
-			SELECT `+templateColumns+`
-			FROM templates
-			WHERE intent_id = $1 AND tenant_id = $2 AND locale = $3 AND version = $4
-		`, intentID, tenantID, locale, version), &t)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrTemplateNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &t, nil
-}
-
-func (s *PgStore) GetEffectiveTemplate(ctx context.Context, tenantID, intentID, locale string, at time.Time) (*domain.Template, error) {
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var t domain.Template
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanTemplate(tx.QueryRow(ctx, `
-			SELECT `+templateColumns+`
-			FROM templates
-			WHERE intent_id = $1 AND tenant_id = $2 AND locale = $3
-			  AND status = 'published'
-			  AND (effective_from IS NULL OR effective_from <= $4)
-			  AND (effective_to IS NULL OR effective_to > $4)
-			ORDER BY version DESC
-			LIMIT 1
-		`, intentID, tenantID, locale, at), &t)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrTemplateNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &t, nil
-}
-
-func (s *PgStore) ListTemplates(ctx context.Context, f domain.TemplateFilter) ([]domain.Template, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.Template
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + templateColumns + ` FROM templates WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.LegalEntityID != "" {
-			args = append(args, f.LegalEntityID)
-			query += fmt.Sprintf(" AND legal_entity_id = $%d", len(args))
-		}
-		if f.IntentID != "" {
-			args = append(args, f.IntentID)
-			query += fmt.Sprintf(" AND intent_id = $%d", len(args))
-		}
-		if f.Locale != "" {
-			args = append(args, f.Locale)
-			query += fmt.Sprintf(" AND locale = $%d", len(args))
-		}
-		if f.Status != "" {
-			args = append(args, f.Status)
-			query += fmt.Sprintf(" AND status = $%d", len(args))
-		}
-
-		query += " ORDER BY created_at DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var t domain.Template
-			if err := scanTemplate(rows, &t); err != nil {
-				return err
-			}
-			out = append(out, t)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (s *PgStore) UpdateTemplate(ctx context.Context, t *domain.Template) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	t.UpdatedAt = time.Now().UTC()
-	varsJSON, _ := json.Marshal(t.Variables)
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			UPDATE templates
-			SET subject_template = $1, body_template = $2, variables = $3, status = $4,
-			    approved_by = $5, approved_at = $6, published_at = $7,
-			    effective_from = $8, effective_to = $9, updated_at = $10
-			WHERE template_id = $11 AND tenant_id = $12
-		`, t.SubjectTemplate, t.BodyTemplate, varsJSON, t.Status,
-			t.ApprovedBy, t.ApprovedAt, t.PublishedAt, t.EffectiveFrom, t.EffectiveTo,
-			t.UpdatedAt, t.TemplateID, tenantID)
-		return err
-	})
-}
-
-func (s *PgStore) DeleteTemplate(ctx context.Context, id string) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
-			DELETE FROM templates WHERE template_id = $1 AND tenant_id = $2
-		`, id, tenantID)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrTemplateNotFound
-		}
-		return nil
-	})
-}
-
-// ── NCD-01: Template Approval ─────────────────────────────────────────────────
-
-const templateApprovalColumns = `
-	approval_id, template_id, tenant_id, requested_by, approved_by,
-	status, reason, requested_at, decided_at`
-
-func scanTemplateApproval(s scannable, a *domain.TemplateApproval) error {
-	return s.Scan(
-		&a.ApprovalID, &a.TemplateID, &a.TenantID, &a.RequestedBy,
-		&a.ApprovedBy, &a.Status, &a.Reason, &a.RequestedAt, &a.DecidedAt,
-	)
-}
-
-func (s *PgStore) CreateTemplateApproval(ctx context.Context, a *domain.TemplateApproval) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if a.ApprovalID == "" {
-		a.ApprovalID = uuid.NewString()
-	}
-	if a.RequestedAt.IsZero() {
-		a.RequestedAt = time.Now().UTC()
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO template_approvals (approval_id, template_id, tenant_id, requested_by, approved_by, status, reason, requested_at, decided_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		`, a.ApprovalID, a.TemplateID, tenantID, a.RequestedBy, a.ApprovedBy, a.Status, a.Reason, a.RequestedAt, a.DecidedAt)
-		return err
-	})
-}
-
-func (s *PgStore) GetTemplateApproval(ctx context.Context, id string) (*domain.TemplateApproval, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var a domain.TemplateApproval
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanTemplateApproval(tx.QueryRow(ctx, `
-			SELECT `+templateApprovalColumns+`
-			FROM template_approvals
-			WHERE approval_id = $1 AND tenant_id = $2
-		`, id, tenantID), &a)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrApprovalNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &a, nil
-}
-
-func (s *PgStore) ListTemplateApprovals(ctx context.Context, f domain.TemplateApprovalFilter) ([]domain.TemplateApproval, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.TemplateApproval
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + templateApprovalColumns + ` FROM template_approvals WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.TemplateID != "" {
-			args = append(args, f.TemplateID)
-			query += fmt.Sprintf(" AND template_id = $%d", len(args))
-		}
-		if f.Status != "" {
-			args = append(args, f.Status)
-			query += fmt.Sprintf(" AND status = $%d", len(args))
-		}
-
-		query += " ORDER BY requested_at DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var a domain.TemplateApproval
-			if err := scanTemplateApproval(rows, &a); err != nil {
-				return err
-			}
-			out = append(out, a)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (s *PgStore) DecideTemplateApproval(ctx context.Context, approvalID, approverID, status, reason string) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	now := time.Now().UTC()
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
-			UPDATE template_approvals
-			SET status = $1, approved_by = $2, reason = $3, decided_at = $4
-			WHERE approval_id = $5 AND tenant_id = $6 AND status = 'pending'
-		`, status, approverID, reason, now, approvalID, tenantID)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrApprovalNotFound
-		}
-		return nil
-	})
-}
-
-// ── NCD-01: Template Render ───────────────────────────────────────────────────
-
-const templateRenderColumns = `
-	render_id, template_id, tenant_id, variables, rendered_subject, rendered_body, error, created_by, created_at`
-
-func scanTemplateRender(s scannable, r *domain.TemplateRender) error {
-	var varsJSON []byte
-	err := s.Scan(
-		&r.RenderID, &r.TemplateID, &r.TenantID, &varsJSON,
-		&r.RenderedSubject, &r.RenderedBody, &r.Error,
-		&r.CreatedBy, &r.CreatedAt,
-	)
-	if err != nil {
-		return err
-	}
-	if varsJSON != nil {
-		_ = json.Unmarshal(varsJSON, &r.Variables)
-	}
-	return nil
-}
-
-func (s *PgStore) CreateTemplateRender(ctx context.Context, r *domain.TemplateRender) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if r.RenderID == "" {
-		r.RenderID = uuid.NewString()
-	}
-	if r.CreatedAt.IsZero() {
-		r.CreatedAt = time.Now().UTC()
-	}
-	varsJSON, _ := json.Marshal(r.Variables)
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO template_renders (render_id, template_id, tenant_id, variables, rendered_subject, rendered_body, error, created_by, created_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		`, r.RenderID, r.TemplateID, tenantID, varsJSON, r.RenderedSubject, r.RenderedBody, r.Error, r.CreatedBy, r.CreatedAt)
-		return err
-	})
-}
-
-func (s *PgStore) GetTemplateRender(ctx context.Context, id string) (*domain.TemplateRender, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var r domain.TemplateRender
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanTemplateRender(tx.QueryRow(ctx, `
-			SELECT `+templateRenderColumns+`
-			FROM template_renders
-			WHERE render_id = $1 AND tenant_id = $2
-		`, id, tenantID), &r)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrTemplateNotFound // reusing error
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &r, nil
-}
-
-func (s *PgStore) ListTemplateRenders(ctx context.Context, templateID string, limit, offset int) ([]domain.TemplateRender, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.TemplateRender
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT `+templateRenderColumns+`
-			FROM template_renders
-			WHERE template_id = $1 AND tenant_id = $2
-			ORDER BY created_at DESC
-			LIMIT $3 OFFSET $4
-		`, templateID, tenantID, limit, offset)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var r domain.TemplateRender
-			if err := scanTemplateRender(rows, &r); err != nil {
-				return err
-			}
-			out = append(out, r)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// ── NCD-05: Regulated Notice ──────────────────────────────────────────────────
-
-const regulatedNoticeColumns = `
-	regulated_notice_id, tenant_id, legal_entity_id, intent_id, template_id,
-	recipient_principal_id, recipient_address, subject, body, variables,
-	channel, status, priority, expires_at, acknowledged_at, acknowledged_by,
-	acknowledgment_method, acknowledgment_chain, created_by, created_at, updated_at`
-
-func scanRegulatedNotice(s scannable, n *domain.RegulatedNotice) error {
-	var varsJSON, chainJSON []byte
-	err := s.Scan(
-		&n.RegulatedNoticeID, &n.TenantID, &n.LegalEntityID, &n.IntentID, &n.TemplateID,
-		&n.RecipientPrincipalID, &n.RecipientAddress, &n.Subject, &n.Body, &varsJSON,
-		&n.Channel, &n.Status, &n.Priority, &n.ExpiresAt, &n.AcknowledgedAt, &n.AcknowledgedBy,
-		&n.AcknowledgmentMethod, &chainJSON, &n.CreatedBy, &n.CreatedAt, &n.UpdatedAt,
-	)
-	if err != nil {
-		return err
-	}
-	if varsJSON != nil {
-		_ = json.Unmarshal(varsJSON, &n.Variables)
-	}
-	if chainJSON != nil {
-		_ = json.Unmarshal(chainJSON, &n.AcknowledgmentChain)
-	}
-	return nil
-}
-
-func (s *PgStore) CreateRegulatedNotice(ctx context.Context, n *domain.RegulatedNotice) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if n.RegulatedNoticeID == "" {
-		n.RegulatedNoticeID = uuid.NewString()
-	}
-	if n.CreatedAt.IsZero() {
-		n.CreatedAt = time.Now().UTC()
-	}
-	if n.UpdatedAt.IsZero() {
-		n.UpdatedAt = time.Now().UTC()
-	}
-	varsJSON, _ := json.Marshal(n.Variables)
-	chainJSON, _ := json.Marshal(n.AcknowledgmentChain)
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO regulated_notices (regulated_notice_id, tenant_id, legal_entity_id, intent_id, template_id,
-				recipient_principal_id, recipient_address, subject, body, variables,
-				channel, status, priority, expires_at, acknowledged_at, acknowledged_by,
-				acknowledgment_method, acknowledgment_chain, created_by, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-		`, n.RegulatedNoticeID, tenantID, n.LegalEntityID, n.IntentID, n.TemplateID,
-			n.RecipientPrincipalID, n.RecipientAddress, n.Subject, n.Body, varsJSON,
-			n.Channel, n.Status, n.Priority, n.ExpiresAt, n.AcknowledgedAt, n.AcknowledgedBy,
-			n.AcknowledgmentMethod, chainJSON, n.CreatedBy, n.CreatedAt, n.UpdatedAt)
-		return err
-	})
-}
-
-func (s *PgStore) GetRegulatedNotice(ctx context.Context, id string) (*domain.RegulatedNotice, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-	var n domain.RegulatedNotice
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanRegulatedNotice(tx.QueryRow(ctx, `
-			SELECT `+regulatedNoticeColumns+`
-			FROM regulated_notices
-			WHERE regulated_notice_id = $1 AND tenant_id = $2
-		`, id, tenantID), &n)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.ErrRegulatedNoticeNotFound
-	}
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &n, nil
-}
-
-func (s *PgStore) ListRegulatedNotices(ctx context.Context, f domain.RegulatedNoticeFilter) ([]domain.RegulatedNotice, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.RegulatedNotice
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		query := `SELECT ` + regulatedNoticeColumns + ` FROM regulated_notices WHERE tenant_id = $1`
-		args := []any{tenantID}
-
-		if f.LegalEntityID != "" {
-			args = append(args, f.LegalEntityID)
-			query += fmt.Sprintf(" AND legal_entity_id = $%d", len(args))
-		}
-		if f.RecipientPrincipalID != "" {
-			args = append(args, f.RecipientPrincipalID)
-			query += fmt.Sprintf(" AND recipient_principal_id = $%d", len(args))
-		}
-		if f.Status != "" {
-			args = append(args, f.Status)
-			query += fmt.Sprintf(" AND status = $%d", len(args))
-		}
-		if f.Priority != "" {
-			args = append(args, f.Priority)
-			query += fmt.Sprintf(" AND priority = $%d", len(args))
-		}
-
-		query += " ORDER BY created_at DESC"
-		args = append(args, f.Limit)
-		query += fmt.Sprintf(" LIMIT $%d", len(args))
-		args = append(args, f.Offset)
-		query += fmt.Sprintf(" OFFSET $%d", len(args))
-
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var n domain.RegulatedNotice
-			if err := scanRegulatedNotice(rows, &n); err != nil {
-				return err
-			}
-			out = append(out, n)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (s *PgStore) UpdateRegulatedNotice(ctx context.Context, n *domain.RegulatedNotice) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	n.UpdatedAt = time.Now().UTC()
-	varsJSON, _ := json.Marshal(n.Variables)
-	chainJSON, _ := json.Marshal(n.AcknowledgmentChain)
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			UPDATE regulated_notices
-			SET subject = $1, body = $2, variables = $3, status = $4, priority = $5,
-			    expires_at = $6, acknowledged_at = $7, acknowledged_by = $8,
-			    acknowledgment_method = $9, acknowledgment_chain = $10, updated_at = $11
-			WHERE regulated_notice_id = $12 AND tenant_id = $13
-		`, n.Subject, n.Body, varsJSON, n.Status, n.Priority,
-			n.ExpiresAt, n.AcknowledgedAt, n.AcknowledgedBy,
-			n.AcknowledgmentMethod, chainJSON, n.UpdatedAt, n.RegulatedNoticeID, tenantID)
-		return err
-	})
-}
-
-// ── NCD-05: Acknowledgment Chain ──────────────────────────────────────────────
-
-const acknowledgmentChainColumns = `
-	chain_id, regulated_notice_id, tenant_id, step_number, action, actor, method, evidence, metadata, created_at`
-
-func scanAcknowledgmentChainStep(s scannable, c *domain.AcknowledgmentChainStep) error {
-	var evidenceJSON, metadataJSON []byte
-	err := s.Scan(
-		&c.ChainID, &c.RegulatedNoticeID, &c.TenantID, &c.StepNumber, &c.Action,
-		&c.Actor, &c.Method, &evidenceJSON, &metadataJSON, &c.CreatedAt,
-	)
-	if err != nil {
-		return err
-	}
-	if evidenceJSON != nil {
-		_ = json.Unmarshal(evidenceJSON, &c.Evidence)
-	}
-	if metadataJSON != nil {
-		_ = json.Unmarshal(metadataJSON, &c.Metadata)
-	}
-	return nil
-}
-
-func (s *PgStore) CreateAcknowledgmentChainStep(ctx context.Context, c *domain.AcknowledgmentChainStep) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-	if c.ChainID == "" {
-		c.ChainID = uuid.NewString()
-	}
-	if c.CreatedAt.IsZero() {
-		c.CreatedAt = time.Now().UTC()
-	}
-	evidenceJSON, _ := json.Marshal(c.Evidence)
-	metadataJSON, _ := json.Marshal(c.Metadata)
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO acknowledgment_chain (chain_id, regulated_notice_id, tenant_id, step_number, action, actor, method, evidence, metadata, created_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		`, c.ChainID, c.RegulatedNoticeID, tenantID, c.StepNumber, c.Action, c.Actor, c.Method, evidenceJSON, metadataJSON, c.CreatedAt)
-		return err
-	})
-}
-
-func (s *PgStore) GetAcknowledgmentChain(ctx context.Context, regulatedNoticeID string) ([]domain.AcknowledgmentChainStep, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var out []domain.AcknowledgmentChainStep
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT `+acknowledgmentChainColumns+`
-			FROM acknowledgment_chain
-			WHERE regulated_notice_id = $1 AND tenant_id = $2
-			ORDER BY step_number
-		`, regulatedNoticeID, tenantID)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var c domain.AcknowledgmentChainStep
-			if err := scanAcknowledgmentChainStep(rows, &c); err != nil {
-				return err
-			}
-			out = append(out, c)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (s *PgStore) AcknowledgeRegulatedNotice(ctx context.Context, req *domain.AcknowledgeRequest, actorID string) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
-	}
-
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		// Get current notice
-		var n domain.RegulatedNotice
-		err := scanRegulatedNotice(tx.QueryRow(ctx, `
-			SELECT `+regulatedNoticeColumns+`
-			FROM regulated_notices
-			WHERE regulated_notice_id = $1 AND tenant_id = $2
-			FOR UPDATE
-		`, req.RegulatedNoticeID, tenantID), &n)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrRegulatedNoticeNotFound
-		}
-		if err != nil {
-			return err
-		}
-
-		if n.Status == domain.RegulatedNoticeStatusAcknowledged {
-			return domain.ErrAlreadyAcknowledged
-		}
-		if n.ExpiresAt != nil && time.Now().UTC().After(*n.ExpiresAt) {
-			return domain.ErrNoticeExpired
-		}
-
-		now := time.Now().UTC()
-		n.Status = domain.RegulatedNoticeStatusAcknowledged
-		n.AcknowledgedAt = &now
-		n.AcknowledgedBy = actorID
-		n.AcknowledgmentMethod = req.Method
-		n.UpdatedAt = now
-
-		evidence := req.Evidence
-		if evidence == nil {
-			evidence = make(map[string]any)
-		}
-		if req.WitnessPrincipalID != "" {
-			evidence["witness"] = req.WitnessPrincipalID
-		}
-		if req.DigitalSignature != "" {
-			evidence["digital_signature"] = req.DigitalSignature
-		}
-
-		chain := n.AcknowledgmentChain
-		if chain == nil {
-			chain = make(map[string]any)
-		}
-		chain[fmt.Sprintf("step_%d", len(chain)+1)] = map[string]any{
-			"action":      "acknowledged",
-			"actor":       actorID,
-			"method":      req.Method,
-			"evidence":    evidence,
-			"timestamp":   now,
-		}
-		n.AcknowledgmentChain = chain
-
-		chainJSON, _ := json.Marshal(n.AcknowledgmentChain)
-		evidenceJSON, _ := json.Marshal(evidence)
-
-		_, err = tx.Exec(ctx, `
-			UPDATE regulated_notices
-			SET status = $1, acknowledged_at = $2, acknowledged_by = $3,
-			    acknowledgment_method = $4, acknowledgment_chain = $5, updated_at = $6
-			WHERE regulated_notice_id = $7 AND tenant_id = $8
-		`, n.Status, n.AcknowledgedAt, n.AcknowledgedBy, n.AcknowledgmentMethod, chainJSON, n.UpdatedAt, n.RegulatedNoticeID, tenantID)
-		if err != nil {
-			return err
-		}
-
-		// Add chain step
-		stepNumber := len(chain) + 1
-		_, err = tx.Exec(ctx, `
-			INSERT INTO acknowledgment_chain (chain_id, regulated_notice_id, tenant_id, step_number, action, actor, method, evidence, metadata, created_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-		`, uuid.NewString(), n.RegulatedNoticeID, tenantID, stepNumber, "acknowledged", actorID, req.Method,
-			evidenceJSON, nil, now)
-		return err
-	})
 }
 
 // nullIfEmpty writes SQL NULL for an empty optional string.

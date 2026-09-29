@@ -4,63 +4,48 @@ import (
 	"context"
 	"time"
 
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
-	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
 
 // Store is the slice of the register the worker touches.
- //
- // FindDueRetries is the only cross-tenant call. Everything after it is
- // tenant-scoped, which is why each method below takes a context the worker has
- // already installed a tenant on — the same context a request handler would
- // present, so these run under exactly the row-level security a user's read
- // does.
- type Store interface {
- 	FindDueRetries(ctx context.Context, now time.Time, limit int) ([]domain.DueRetry, error)
- 	ClaimRetry(ctx context.Context, id, tenantID string) (bool, error)
- 	// The stranded-delivery pair. A notification left in flight — PENDING
- 	// with nothing scheduled — is invisible to FindDueRetries and nothing
- 	// else in the service would ever touch it again.
- 	FindStrandedDeliveries(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error)
- 	ReviveStranded(ctx context.Context, id, tenantID string, staleBefore, nextAttemptAt time.Time) (bool, error)
- 	// Reconciliation: find notifications stuck in UNKNOWN (post-submit timeout)
- 	// for too long. Per ZS-SVC-Y-001 §3.4: "Timeout after submit becomes
- 	// UNKNOWN, not FAILED; reconcile before re-attempting".
- 	FindStuckInFlight(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error)
- 	GetNotification(ctx context.Context, id string) (*domain.Notification, error)
- 	GetAttempts(ctx context.Context, notificationID string) ([]domain.DeliveryAttempt, error)
- 	CreateAttempt(ctx context.Context, a *domain.DeliveryAttempt) error
- 	UpdateAttempt(ctx context.Context, attemptID, status, failureReason, providerResponse string, concludedAt *time.Time) error
- 	// CompleteDelivery concludes a delivery AND enqueues the event describing
- 	// that conclusion, in one transaction. The worker used to publish to Kafka
- 	// after this returned, with the error logged and discarded — so a broker
- 	// outage during a successful re-attempt delivered the notice and told
- 	// nobody. See migration 000005.
- 	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, ev events.Outbound) error
- 	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error
- 	SetRecipientAddress(ctx context.Context, id, tenantID, address, source string) error
- }
+//
+// FindDueRetries is the only cross-tenant call. Everything after it is
+// tenant-scoped, which is why each method below takes a context the worker has
+// already installed a tenant on — the same context a request handler would
+// present, so these run under exactly the row-level security a user's read
+// does.
+type Store interface {
+	FindDueRetries(ctx context.Context, now time.Time, limit int) ([]domain.DueRetry, error)
+	ClaimRetry(ctx context.Context, id, tenantID string) (bool, error)
+	// The stranded-delivery pair. A notification left in flight — PENDING
+	// with nothing scheduled — is invisible to FindDueRetries and nothing
+	// else in the service would ever touch it again.
+	FindStrandedDeliveries(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error)
+	ReviveStranded(ctx context.Context, id, tenantID string, staleBefore, nextAttemptAt time.Time) (bool, error)
+	// MarkStrandedUnknown handles a stranded row that WAS handed to a provider
+	// (migration 000013): PENDING_UNKNOWN, never a blind re-send (§6.2).
+	MarkStrandedUnknown(ctx context.Context, id, tenantID string, staleBefore, at time.Time) (bool, error)
+	// BeginSubmission marks a notification as being handed to a provider,
+	// committed before the call, so a lost outcome is recognisable.
+	BeginSubmission(ctx context.Context, id, tenantID string, at time.Time) error
+	GetNotification(ctx context.Context, id string) (*domain.Notification, error)
+	// CompleteDelivery and MarkOutcomeUnknown enqueue their event in the same
+	// transaction as the transition (migration 000010); the worker never
+	// publishes.
+	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, correlationID string, meta domain.AttemptMeta) error
+	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time, meta domain.AttemptMeta) error
+	SetRecipientAddress(ctx context.Context, id, tenantID, address, source string) error
+	// MarkOutcomeUnknown backs an ambiguous re-attempt — see conclude's own
+	// doc comment.
+	MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time, correlationID string, meta domain.AttemptMeta) error
+}
 
 type Deliverer interface {
 	Deliver(ctx context.Context, n domain.Notification) domain.DeliveryOutcome
-}
-
-// Metrics is the domain-metric surface the worker records against.
-//
-// It matters more here than on the request path, because nothing the worker
-// does produces an HTTP response at all: a notification delivered on its fourth
-// attempt, one that exhausted its budget, and one reclaimed from being stranded
-// are all invisible to every request metric this service has. A nil Metrics is
-// safe and means "do not record".
-type Metrics interface {
-	ObserveAttempt(channel, outcome, origin string, seconds float64)
-	ObserveConclusion(channel, status string)
-	ObserveRetryScheduled(channel string)
 }
 
 // RecipientResolver re-resolves an address the first attempt could not get.
@@ -84,9 +69,7 @@ type Settled func(error) bool
 type Worker struct {
 	store     Store
 	deliverer Deliverer
-	metrics   Metrics
-	stranded  Counter
-	exhausted Counter
+	metrics   *telemetry.Domain
 	recipient RecipientResolver
 	settled   Settled
 	policy    Policy
@@ -107,24 +90,10 @@ type Options struct {
 	// zero to disable the sweep — see Worker.SweepStranded for why the
 	// default is far larger than the longest possible attempt.
 	StrandedAfter time.Duration
-
-	// StrandedReclaimed and RetriesExhausted are optional counters. Nil means
-	// "do not record", so a test need not build a metrics registry to drive
-	// the worker.
-	StrandedReclaimed Counter
-	RetriesExhausted  Counter
 }
 
-// Counter is one unlabelled counter. Satisfied by prometheus.Counter.
-//
-// Kept out of Metrics because these two have no labels, and because they are
-// the numbers that should normally be ZERO rather than merely low: every
-// stranded reclaim is a notice the platform accepted and then lost track of,
-// and every exhaustion is a notice it gave up on after using its whole budget.
-// A dashboard treats "should be zero" differently from "watch the ratio".
-type Counter interface{ Inc() }
-
-func NewWorker(store Store, deliverer Deliverer, metrics Metrics, recipient RecipientResolver, settled Settled, opts Options, log *zap.Logger) *Worker {
+// metrics may be nil (tests); every observation is nil-safe.
+func NewWorker(store Store, deliverer Deliverer, metrics *telemetry.Domain, recipient RecipientResolver, settled Settled, opts Options, log *zap.Logger) *Worker {
 	if opts.Interval <= 0 {
 		opts.Interval = 10 * time.Second
 	}
@@ -141,8 +110,6 @@ func NewWorker(store Store, deliverer Deliverer, metrics Metrics, recipient Reci
 		store:         store,
 		deliverer:     deliverer,
 		metrics:       metrics,
-		stranded:      opts.StrandedReclaimed,
-		exhausted:     opts.RetriesExhausted,
 		recipient:     recipient,
 		settled:       settled,
 		policy:        opts.Policy.Normalize(),
@@ -174,45 +141,39 @@ func (w *Worker) Start(ctx context.Context) {
 }
 
 // RunOnce processes one batch and returns how many notifications it actually
- // attempted. Exported so a test can drive the worker deterministically instead
- // of waiting on a ticker.
- func (w *Worker) RunOnce(ctx context.Context) int {
- 	// The sweep runs FIRST, so anything it reclaims is picked up by the due
- 	// pass in this same tick rather than waiting a further interval. It only
- 	// sets a schedule; the delivery itself always goes through the ordinary
- 	// path below, so there is one code path that actually sends.
- 	w.SweepStranded(ctx)
+// attempted. Exported so a test can drive the worker deterministically instead
+// of waiting on a ticker.
+func (w *Worker) RunOnce(ctx context.Context) int {
+	// The sweep runs FIRST, so anything it reclaims is picked up by the due
+	// pass in this same tick rather than waiting a further interval. It only
+	// sets a schedule; the delivery itself always goes through the ordinary
+	// path below, so there is one code path that actually sends.
+	w.SweepStranded(ctx)
 
- 	// Reconcile UNKNOWN notifications (post-submit timeouts) per ZS-SVC-Y-001
- 	// §3.4: "Timeout after submit becomes UNKNOWN, not FAILED; reconcile
- 	// before re-attempting". This runs after the stranded sweep so that any
- 	// notification that was both stranded AND in UNKNOWN gets reconciled first.
- 	w.ReconcileUnknown(ctx)
+	due, err := w.store.FindDueRetries(ctx, time.Now().UTC(), w.batchSize)
+	if err != nil {
+		w.log.Error("retry worker: failed to poll for due deliveries", zap.Error(err))
+		return 0
+	}
 
- 	due, err := w.store.FindDueRetries(ctx, time.Now().UTC(), w.batchSize)
- 	if err != nil {
- 		w.log.Error("retry worker: failed to poll for due deliveries", zap.Error(err))
- 		return 0
- 	}
-
- 	attempted := 0
- 	for _, d := range due {
- 		select {
- 		case <-ctx.Done():
- 			// Shutting down. Unclaimed rows keep their schedule and the next
- 			// process to start picks them up; a claimed one is PENDING with
- 			// nothing scheduled, which SweepStranded reclaims — a sweep this
- 			// comment asserted before one existed, which is how five
- 			// notifications sat undelivered for six days.
- 			return attempted
- 		default:
- 		}
- 		if w.attempt(ctx, d) {
- 			attempted++
- 		}
- 	}
- 	return attempted
- }
+	attempted := 0
+	for _, d := range due {
+		select {
+		case <-ctx.Done():
+			// Shutting down. Unclaimed rows keep their schedule and the next
+			// process to start picks them up; a claimed one is PENDING with
+			// nothing scheduled, which SweepStranded reclaims — a sweep this
+			// comment asserted before one existed, which is how five
+			// notifications sat undelivered for six days.
+			return attempted
+		default:
+		}
+		if w.attempt(ctx, d) {
+			attempted++
+		}
+	}
+	return attempted
+}
 
 // SweepStranded puts abandoned in-flight notifications back on the retry
 // schedule, and returns how many it reclaimed.
@@ -229,21 +190,29 @@ func (w *Worker) Start(ctx context.Context) {
 // this. It did not exist. That is the whole of the defect: the failure mode
 // was understood and written down, and the remedy was never built.
 //
-// It only ever SCHEDULES. The delivery goes through the ordinary due path, so
-// there is one place that sends and one place that decides what an outcome
-// means. Reclaimed rows keep their attempt count, so a notification that had
-// already burned attempts does not get a fresh budget by being stranded — the
-// policy's ceiling still applies and the sweep cannot become an unbounded
-// resend loop.
+// It never sends. A reclaimed row goes through the ordinary due path, so there
+// is one place that sends and one place that decides what an outcome means.
+// Reclaimed rows keep their attempt count, so a notification that had already
+// burned attempts does not get a fresh budget by being stranded — the policy's
+// ceiling still applies and the sweep cannot become an unbounded resend loop.
 //
-// The duplicate-send hazard, stated plainly: a stranded row may or may not
-// have reached the provider before its attempt died, and nothing on the row
-// can distinguish those. Rescheduling therefore risks a second copy of a
-// notice; not rescheduling guarantees some governed notices are never sent at
-// all. The second is the worse failure for this service, so the sweep
-// reschedules — and the staleness threshold, which must exceed the longest
-// possible attempt, is what keeps the risk to the genuine-crash case. Rows
-// that recorded SENT are never touched.
+// The duplicate-send hazard, and how it is now closed. This used to say that a
+// stranded row "may or may not have reached the provider before its attempt
+// died, and nothing on the row can distinguish those", so the sweep
+// rescheduled every one and accepted the occasional second copy. Migration
+// 000013's submitting_since marker distinguishes them: it is committed before
+// the provider is called and cleared when the outcome is recorded. So
+//
+//   - a stranded row WITHOUT the marker never reached a provider, and is
+//     rescheduled — that can duplicate nothing;
+//   - a stranded row WITH the marker was handed to a provider and lost its
+//     outcome, and becomes PENDING_UNKNOWN (MarkStrandedUnknown) for a person
+//     to resolve — ZS-SVC-Y-001 §6.2: "UNKNOWN never authorizes an immediate
+//     blind second material send."
+//
+// The staleness threshold must still exceed the longest possible attempt, so a
+// row genuinely mid-SMTP on another replica is never taken. Rows that recorded
+// a conclusion are never touched.
 //
 // A zero threshold disables the sweep entirely rather than sweeping
 // everything, because "reclaim every in-flight notification immediately" is
@@ -281,7 +250,28 @@ func (w *Worker) SweepStranded(ctx context.Context) int {
 		// property that makes that hatch safe to have.
 		tctx := svcmiddleware.WithTenant(ctx, d.TenantID)
 
-		// Due immediately: it has already waited longer than any backoff this
+		// A row that was handed to a provider (submitting_since set,
+		// migration 000013) may already have been delivered. Re-sending it
+		// is the blind second material send §6.2 forbids, so it becomes
+		// PENDING_UNKNOWN for a person to resolve against the provider's
+		// records instead.
+		if d.Submitted {
+			marked, err := w.store.MarkStrandedUnknown(tctx, d.NotificationID, d.TenantID, staleBefore, now)
+			if err != nil {
+				w.log.Error("retry worker: could not mark a lost submission unknown",
+					zap.String("notification_id", d.NotificationID), zap.Error(err))
+				continue
+			}
+			if marked {
+				w.metrics.ObserveConclusion("stranded", domain.StatusPendingUnknown)
+				w.log.Warn("retry worker: a stranded delivery had already been submitted; marked PENDING_UNKNOWN, not re-sent",
+					zap.String("notification_id", d.NotificationID))
+			}
+			continue
+		}
+
+		// Never submitted, so reviving it cannot duplicate anything. Due
+		// immediately: it has already waited longer than any backoff this
 		// policy would impose, and the point is to stop it waiting.
 		ok, err := w.store.ReviveStranded(tctx, d.NotificationID, d.TenantID, staleBefore, now)
 		if err != nil {
@@ -298,9 +288,7 @@ func (w *Worker) SweepStranded(ctx context.Context) int {
 			continue
 		}
 		revived++
-		if w.stranded != nil {
-			w.stranded.Inc()
-		}
+		w.metrics.ObserveStrandedReclaimed()
 
 		// WARN, not Info. Every row here is a notification the platform
 		// accepted and then lost track of, so each one is a delivery that
@@ -316,205 +304,10 @@ func (w *Worker) SweepStranded(ctx context.Context) int {
 			zap.Int("count", revived),
 			zap.Int("found", len(stranded)))
 	}
-return revived
- }
-
-// ReconcileUnknown finds notifications stuck in UNKNOWN status (post-submit
-// timeout) and attempts to reconcile them per ZS-SVC-Y-001 §3.4: "Timeout
-// after submit becomes UNKNOWN, not FAILED; reconcile before re-attempting".
-//
-// It looks for attempt records with PROVIDER_ACCEPTED or beyond that never
-// concluded the notification. If found, advances the notification to match.
-// If the attempt failed, concludes as FAILED. If still UNKNOWN after the
-// staleness threshold, schedules a retry (with resend_reason = "reconcile").
-func (w *Worker) ReconcileUnknown(ctx context.Context) int {
-	if w.strandedAfter <= 0 {
-		return 0
-	}
-
-	now := time.Now().UTC()
-	staleBefore := now.Add(-w.strandedAfter)
-
-	stuck, err := w.store.FindStuckInFlight(ctx, staleBefore, w.batchSize)
-	if err != nil {
-		w.log.Error("retry worker: failed to find stuck in-flight notifications", zap.Error(err))
-		return 0
-	}
-	if len(stuck) == 0 {
-		return 0
-	}
-
-	reconciled := 0
-	for _, d := range stuck {
-		select {
-		case <-ctx.Done():
-			return reconciled
-		default:
-		}
-
-		tctx := svcmiddleware.WithTenant(ctx, d.TenantID)
-
-		// Try to reconcile using the same logic as the retry attempt
-		if w.reconcileIfProviderAccepted(tctx, d.NotificationID, d.TenantID) {
-			reconciled++
-			continue
-		}
-
-		// If reconciliation didn't resolve it, check if we should schedule a retry
-		// or conclude as FAILED. We need to read the notification to decide.
-		n, err := w.store.GetNotification(tctx, d.NotificationID)
-		if err != nil {
-			w.log.Error("retry worker: could not read UNKNOWN notification for reconciliation",
-				zap.String("notification_id", d.NotificationID), zap.Error(err))
-			continue
-		}
-
-		// If it's still UNKNOWN and has attempt records, check the latest attempt
-		attempts, err := w.store.GetAttempts(tctx, n.NotificationID)
-		if err != nil || len(attempts) == 0 {
-			continue
-		}
-
-		latest := attempts[len(attempts)-1]
-		if latest.Status == domain.AttemptStatusFailed && latest.Retryable {
-			// The attempt failed but was retryable — schedule a retry with resend_reason = "reconcile"
-			if next, ok := w.policy.NextAttempt(now, latest.AttemptNumber); ok {
-				if err := w.store.ScheduleRetry(tctx, n.NotificationID, n.TenantID,
-					"reconciled after timeout: "+latest.FailureReason, now, next); err != nil {
-					w.log.Error("retry worker: could not schedule retry after reconciliation",
-						zap.String("notification_id", n.NotificationID), zap.Error(err))
-					continue
-				}
-				// Update attempt record with resend_reason = "reconcile"
-				if err := w.store.UpdateAttempt(tctx, latest.AttemptID,
-					domain.AttemptStatusFailed, latest.FailureReason, latest.ProviderResponse, latest.ConcludedAt); err != nil {
-					w.log.Error("retry worker: failed to update attempt record after reconciliation",
-						zap.String("notification_id", n.NotificationID), zap.Error(err))
-				}
-				reconciled++
-				w.log.Info("retry worker: scheduled retry after timeout reconciliation",
-					zap.String("notification_id", n.NotificationID),
-					zap.Time("next_attempt_at", next))
-			}
-		} else if latest.Status == domain.AttemptStatusFailed && !latest.Retryable {
-			// Terminal failure — conclude the notification
-			w.concludeFromReconciliation(tctx, n, domain.DeliveryOutcome{
-				Delivered:        false,
-				Reason:           latest.FailureReason,
-				ProviderResponse: latest.ProviderResponse,
-				Retryable:        false,
-			})
-			reconciled++
-		}
-	}
-
-	if reconciled > 0 {
-		w.log.Info("retry worker: reconciled UNKNOWN notifications",
-			zap.Int("count", reconciled),
-			zap.Int("found", len(stuck)))
-	}
-	return reconciled
+	return revived
 }
 
-// reconcileIfProviderAccepted checks attempt records for a prior attempt that
-// was accepted by the provider but whose outcome was lost. If found, advances
-// the notification to that status instead of re-sending — this is the §3.4
-// fix for "Timeout after submit becomes UNKNOWN, not FAILED; reconcile before
-// re-attempting".
-func (w *Worker) reconcileIfProviderAccepted(ctx context.Context, notificationID, tenantID string) bool {
-	n, err := w.store.GetNotification(ctx, notificationID)
-	if err != nil || n == nil {
-		return false
-	}
-	return w.reconcileIfProviderAcceptedInternal(ctx, n)
-}
-
-// reconcileIfProviderAcceptedInternal is the internal implementation shared by
-// attempt() and ReconcileUnknown().
-func (w *Worker) reconcileIfProviderAcceptedInternal(ctx context.Context, n *domain.Notification) bool {
-	attempts, err := w.store.GetAttempts(ctx, n.NotificationID)
-	if err != nil || len(attempts) == 0 {
-		return false
-	}
-
-	// Look for the most recent attempt that reached PROVIDER_ACCEPTED or
-	// beyond but whose notification status is still PENDING/UNKNOWN.
-	// This indicates the provider accepted but the handler crashed before
-	// recording the conclusion.
-	for i := len(attempts) - 1; i >= 0; i-- {
-		a := attempts[i]
-		switch a.Status {
-		case domain.AttemptStatusProviderAccepted, domain.AttemptStatusDelivered,
-			domain.AttemptStatusRead, domain.AttemptStatusServed:
-			// Found a provider-accepted attempt that never concluded.
-			// Advance the notification to match.
-			w.log.Warn("retry worker: reconciling prior provider-accepted attempt",
-				zap.String("notification_id", n.NotificationID),
-				zap.String("attempt_id", a.AttemptID),
-				zap.String("attempt_status", a.Status))
-
-			n.Status = a.Status
-			n.ProviderResponse = a.ProviderResponse
-			n.SentAt = a.ConcludedAt
-			n.DeliveryAttempts = a.AttemptNumber
-			n.LastAttemptAt = a.ConcludedAt
-
-			// Seal the conclusion event
-			ev, err := w.sealConclusionFromAttempt(n, &a)
-			if err != nil {
-				w.log.Error("retry worker: reconciliation could not seal event",
-					zap.String("notification_id", n.NotificationID), zap.Error(err))
-				return false
-			}
-
-			if err := w.store.CompleteDelivery(ctx, n.NotificationID,
-				a.Status, a.FailureReason, a.ProviderResponse, a.ConcludedAt, ev); err != nil {
-				w.log.Error("retry worker: reconciliation could not record conclusion",
-					zap.String("notification_id", n.NotificationID), zap.Error(err))
-				return false
-			}
-
-			if w.metrics != nil {
-				w.metrics.ObserveConclusion(n.Channel, a.Status)
-			}
-			return true
-		case domain.AttemptStatusFailed:
-			// This attempt failed, keep looking at earlier ones
-			continue
-		case domain.AttemptStatusUnknown:
-			// In flight — don't reconcile, let the stranded sweep handle it
-			return false
-		}
-	}
-	return false
-}
-
-// concludeFromReconciliation records a terminal failure after reconciliation.
-func (w *Worker) concludeFromReconciliation(ctx context.Context, n *domain.Notification, outcome domain.DeliveryOutcome) {
-	now := time.Now().UTC()
-
-	n.Status = domain.StatusFailed
-	n.SentAt = &now
-	n.FailureReason = outcome.Reason
-	n.ProviderResponse = outcome.ProviderResponse
-	n.DeliveryAttempts = n.DeliveryAttempts // keep existing count
-	n.LastAttemptAt = &now
-
-	ev, err := events.Failed(n.CorrelationID, *n, outcome.Reason)
-	if err != nil {
-		w.log.Error("retry worker: could not seal the terminal-failure event",
-			zap.String("notification_id", n.NotificationID), zap.Error(err))
-		return
-	}
-	if err := w.store.CompleteDelivery(ctx, n.NotificationID, domain.StatusFailed, outcome.Reason, "", &now, ev); err != nil {
-		w.log.Error("retry worker: could not record terminal failure after reconciliation",
-			zap.String("notification_id", n.NotificationID), zap.Error(err))
-		return
-	}
-	if w.metrics != nil {
-		w.metrics.ObserveConclusion(n.Channel, domain.StatusFailed)
-	}
-}
+// attempt re-delivers one notification. Returns whether an attempt was made.
 func (w *Worker) attempt(ctx context.Context, d domain.DueRetry) bool {
 	// The tenant the notification belongs to, installed exactly as a request
 	// would install the caller's. Every store call below is therefore governed
@@ -550,7 +343,7 @@ func (w *Worker) attempt(ctx context.Context, d domain.DueRetry) bool {
 		if next, ok := w.policy.NextAttempt(time.Now().UTC(), 1); ok {
 			if reErr := w.store.ScheduleRetry(tctx, d.NotificationID, d.TenantID,
 				"could not read the notification to re-attempt it: "+err.Error(),
-				time.Now().UTC(), next); reErr != nil {
+				time.Now().UTC(), next, domain.AttemptMeta{Origin: domain.AttemptOriginRetry}); reErr != nil {
 				w.log.Error("retry worker: claimed a notification it can neither read nor reschedule — it is now stalled PENDING with no schedule",
 					zap.String("notification_id", d.NotificationID),
 					zap.NamedError("read_error", err), zap.NamedError("reschedule_error", reErr))
@@ -562,15 +355,6 @@ func (w *Worker) attempt(ctx context.Context, d domain.DueRetry) bool {
 		return false
 	}
 
-// §3.4 RECONCILIATION: Before re-attempting, check if a previous attempt
- 	// actually succeeded but its outcome was never recorded (e.g. the process
- 	// crashed after the provider accepted but before CompleteDelivery ran).
- 	// If we find a PROVIDER_ACCEPTED or later attempt that has no corresponding
- 	// notification event, we advance the notification instead of re-sending.
- 	if w.reconcileIfProviderAcceptedInternal(tctx, n) {
- 		return true
- 	}
-
 	// A first attempt that failed because identity-context-svc was unreachable
 	// left no address on the record. Re-attempting the transport with an empty
 	// To would fail forever, so the resolution is retried first — it is the
@@ -581,44 +365,32 @@ func (w *Worker) attempt(ctx context.Context, d domain.DueRetry) bool {
 		}
 	}
 
-	attemptStarted := time.Now()
+	// Marked, and committed, before the provider is called (migration 000013),
+	// so that if this process dies mid-attempt the sweep knows the provider may
+	// have the message and does not blindly send it again. If the mark cannot
+	// be written the provider is NOT called: the row is put back on the
+	// schedule, which never duplicates anything.
+	if n.Channel != domain.ChannelInApp {
+		if err := w.store.BeginSubmission(tctx, n.NotificationID, n.TenantID, time.Now().UTC()); err != nil {
+			w.log.Error("retry worker: could not mark the submission; not calling the provider",
+				zap.String("notification_id", n.NotificationID), zap.Error(err))
+			if next, ok := w.policy.NextAttempt(time.Now().UTC(), n.DeliveryAttempts+1); ok {
+				if reErr := w.store.ScheduleRetry(tctx, n.NotificationID, n.TenantID,
+					"could not record the submission before attempting it: "+err.Error(),
+					time.Now().UTC(), next, domain.AttemptMeta{Origin: domain.AttemptOriginRetry}); reErr != nil {
+					w.log.Error("retry worker: could not reschedule after a failed submission mark",
+						zap.String("notification_id", n.NotificationID), zap.Error(reErr))
+				}
+			}
+			return true
+		}
+	}
+
+	started := time.Now()
 	outcome := w.deliverer.Deliver(tctx, *n)
-	w.observeAttempt(n.Channel, outcome.Delivered, attemptStarted)
+	w.metrics.ObserveAttempt(n.Channel, attemptOutcome(outcome), telemetry.OriginRetry, time.Since(started).Seconds())
 	w.conclude(tctx, n, outcome)
 	return true
-}
-
-// sealConclusionFromAttempt builds an Outbound event from a reconciled attempt.
-func (w *Worker) sealConclusionFromAttempt(n *domain.Notification, a *domain.DeliveryAttempt) (events.Outbound, error) {
-	// Reconstruct a DeliveryOutcome from the attempt record
-	outcome := domain.DeliveryOutcome{
-		Delivered:        a.Status != domain.AttemptStatusFailed,
-		ProviderResponse: a.ProviderResponse,
-		Reason:           a.FailureReason,
-		Retryable:        a.Retryable,
-	}
-	if outcome.Delivered {
-		return events.Sent(n.CorrelationID, *n)
-	}
-	return events.Failed(n.CorrelationID, *n, a.FailureReason)
-}
-
-// observeAttempt records one re-attempt against the provider.
-//
-// Called only where a provider was actually reached. conclude's other entry
-// points — a missing resolver, a resolution failure, an address that could not
-// be recorded — never touch a provider, and counting them here would inflate
-// the attempt histogram with durations that measure identity-context-svc or
-// the local database instead of delivery.
-func (w *Worker) observeAttempt(channel string, delivered bool, started time.Time) {
-	if w.metrics == nil {
-		return
-	}
-	outcome := telemetry.OutcomeFailed
-	if delivered {
-		outcome = telemetry.OutcomeDelivered
-	}
-	w.metrics.ObserveAttempt(channel, outcome, telemetry.OriginRetry, time.Since(started).Seconds())
 }
 
 // reresolve fills in a recipient address the first attempt could not obtain.
@@ -660,134 +432,81 @@ func (w *Worker) reresolve(ctx context.Context, n *domain.Notification) bool {
 func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome domain.DeliveryOutcome) {
 	now := time.Now().UTC()
 
-	// Create attempt record for this re-attempt
-	attempt := &domain.DeliveryAttempt{
-		AttemptID:        uuid.NewString(),
-		NotificationID:   n.NotificationID,
-		AttemptNumber:    n.DeliveryAttempts + 1,
-		Channel:          n.Channel,
-		Provider:         "smtp",
-		Status:           domain.AttemptStatusUnknown,
-		ProviderResponse: outcome.ProviderResponse,
-		FailureReason:    outcome.Reason,
-		Retryable:        outcome.Retryable,
-		ResendReason:     domain.ResendReasonRetry,
-		CreatedAt:        now,
-	}
-	if err := w.store.CreateAttempt(ctx, attempt); err != nil {
-		w.log.Error("retry worker: failed to create attempt record", zap.Error(err))
-	}
-
 	if outcome.Delivered {
-		// Provider accepted — mark as PROVIDER_ACCEPTED, not SENT.
-		// The reconciliation worker will later confirm delivery and advance
-		// to DELIVERED/READ/SERVED as appropriate.
-		n.Status = domain.StatusProviderAccepted
-		n.ProviderResponse = outcome.ProviderResponse
-		n.SentAt = &now
-		n.FailureReason = ""
-		n.DeliveryAttempts = attempt.AttemptNumber
-		n.LastAttemptAt = &now
-
-		// Update attempt record
-		attempt.Status = domain.AttemptStatusProviderAccepted
-		attempt.ConcludedAt = &now
-		if err := w.store.UpdateAttempt(ctx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &now); err != nil {
-			w.log.Error("retry worker: failed to update attempt record", zap.Error(err))
-		}
-
-		ev, err := events.Sent(n.CorrelationID, *n)
-		if err != nil {
-			w.log.Error("retry worker: delivered but could not seal the event",
-				zap.String("notification_id", n.NotificationID), zap.Error(err))
-			return
-		}
-		// One transaction.
-		if err := w.store.CompleteDelivery(ctx, n.NotificationID,
-			domain.StatusProviderAccepted, "", outcome.ProviderResponse, &now, ev); err != nil {
+		if err := w.store.CompleteDelivery(ctx, n.NotificationID, "SENT", "", outcome.ProviderResponse, &now, n.CorrelationID, retryMeta(outcome)); err != nil {
 			w.log.Error("retry worker: delivered but could not record it",
 				zap.String("notification_id", n.NotificationID), zap.Error(err))
 			return
 		}
+		n.Status, n.SentAt, n.ProviderResponse = "SENT", &now, outcome.ProviderResponse
+		n.FailureReason = ""
 		w.log.Info("retry worker: delivery succeeded on re-attempt",
 			zap.String("notification_id", n.NotificationID),
-			zap.Int("attempt", n.DeliveryAttempts))
-		if w.metrics != nil {
-			w.metrics.ObserveConclusion(n.Channel, domain.StatusProviderAccepted)
-		}
+			zap.Int("attempt", n.DeliveryAttempts+1))
+		w.metrics.ObserveConclusion(n.Channel, domain.StatusSent)
 		return
 	}
 
-	attemptsMade := attempt.AttemptNumber
+	// attemptsMade counts the attempt just concluded: the column has not been
+	// incremented yet — ScheduleRetry and CompleteDelivery both do that — so
+	// the value the policy needs is the stored count plus this one.
+	attemptsMade := n.DeliveryAttempts + 1
 
-	// Recorded before the reason string is appended to, because the appended
-	// text is how the register explains the difference and the metric should
-	// not be parsed out of prose.
-	exhausted := false
+	// An ambiguous outcome on a retried attempt gets the same treatment as
+	// one on the first attempt (handler.SendNotification): it is checked
+	// before Retryable so it is never silently retried, which would risk
+	// a duplicate if the message did go out. See
+	// domain.DeliveryOutcome.Unknown's own doc comment.
+	if outcome.Unknown {
+		if err := w.store.MarkOutcomeUnknown(ctx, n.NotificationID, n.TenantID, outcome.Reason, now, n.CorrelationID, retryMeta(outcome)); err != nil {
+			w.log.Error("retry worker: could not record ambiguous delivery outcome",
+				zap.String("notification_id", n.NotificationID), zap.Error(err))
+			return
+		}
+		n.Status, n.SentAt, n.UnknownAt, n.FailureReason = "PENDING_UNKNOWN", &now, &now, outcome.Reason
+		w.log.Warn("retry worker: delivery outcome ambiguous on re-attempt",
+			zap.String("notification_id", n.NotificationID),
+			zap.Int("attempt", attemptsMade),
+			zap.String("reason", outcome.Reason))
+		w.metrics.ObserveConclusion(n.Channel, domain.StatusPendingUnknown)
+		return
+	}
 
 	if outcome.Retryable {
 		if next, ok := w.policy.NextAttempt(now, attemptsMade); ok {
-			if err := w.store.ScheduleRetry(ctx, n.NotificationID, n.TenantID, outcome.Reason, now, next); err != nil {
+			if err := w.store.ScheduleRetry(ctx, n.NotificationID, n.TenantID, outcome.Reason, now, next, retryMeta(outcome)); err != nil {
 				w.log.Error("retry worker: could not reschedule",
 					zap.String("notification_id", n.NotificationID), zap.Error(err))
 			}
-			// Update attempt record as FAILED (retryable)
-			attempt.Status = domain.AttemptStatusFailed
-			attempt.ConcludedAt = &now
-			if err := w.store.UpdateAttempt(ctx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &now); err != nil {
-				w.log.Error("retry worker: failed to update attempt record", zap.Error(err))
-			}
-
+			w.metrics.ObserveRetryScheduled(n.Channel)
 			w.log.Warn("retry worker: delivery failed, rescheduled",
 				zap.String("notification_id", n.NotificationID),
 				zap.Int("attempt", attemptsMade),
 				zap.Time("next_attempt_at", next),
 				zap.String("reason", outcome.Reason))
-			if w.metrics != nil {
-				w.metrics.ObserveRetryScheduled(n.Channel)
-			}
+			// No notification.failed event. The delivery has not concluded,
+			// and publishing a failure that a later attempt reverses would
+			// have consumers reacting to an outcome that did not happen.
 			return
 		}
-		// Exhausted.
-		exhausted = true
+		w.metrics.ObserveRetryExhausted()
+		// Exhausted. The reason records that, so the register does not read as
+		// though a mailbox was rejected when in fact the platform gave up.
 		outcome.Reason = outcome.Reason + " (no further attempts: exhausted after " +
 			itoa(attemptsMade) + " of " + itoa(w.policy.MaxAttempts) + ")"
 	}
 
-	// Terminal failure
-	n.Status = domain.StatusFailed
-	n.SentAt = &now
-	n.FailureReason = outcome.Reason
-	n.DeliveryAttempts = attemptsMade
-	n.LastAttemptAt = &now
-
-	attempt.Status = domain.AttemptStatusFailed
-	attempt.ConcludedAt = &now
-	if err := w.store.UpdateAttempt(ctx, attempt.AttemptID, attempt.Status, attempt.FailureReason, attempt.ProviderResponse, &now); err != nil {
-		w.log.Error("retry worker: failed to update attempt record", zap.Error(err))
-	}
-
-	ev, err := events.Failed(n.CorrelationID, *n, outcome.Reason)
-	if err != nil {
-		w.log.Error("retry worker: could not seal the terminal-failure event",
-			zap.String("notification_id", n.NotificationID), zap.Error(err))
-		return
-	}
-	if err := w.store.CompleteDelivery(ctx, n.NotificationID, domain.StatusFailed, outcome.Reason, "", &now, ev); err != nil {
+	if err := w.store.CompleteDelivery(ctx, n.NotificationID, "FAILED", outcome.Reason, "", &now, n.CorrelationID, retryMeta(outcome)); err != nil {
 		w.log.Error("retry worker: could not record terminal failure",
 			zap.String("notification_id", n.NotificationID), zap.Error(err))
 		return
 	}
+	n.Status, n.SentAt, n.FailureReason = "FAILED", &now, outcome.Reason
 	w.log.Warn("retry worker: delivery failed terminally",
 		zap.String("notification_id", n.NotificationID),
 		zap.Int("attempts", attemptsMade),
 		zap.String("reason", outcome.Reason))
-	if w.metrics != nil {
-		w.metrics.ObserveConclusion(n.Channel, domain.StatusFailed)
-	}
-	if exhausted && w.exhausted != nil {
-		w.exhausted.Inc()
-	}
+	w.metrics.ObserveConclusion(n.Channel, domain.StatusFailed)
 }
 
 // itoa avoids pulling strconv in for two call sites in a log-adjacent string.
@@ -803,4 +522,27 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// attemptOutcome maps one delivery outcome onto the attempt metric's outcome
+// label. Shared with the handler's first attempt, so the two origins sum.
+func attemptOutcome(o domain.DeliveryOutcome) string {
+	switch {
+	case o.Delivered:
+		return telemetry.OutcomeDelivered
+	case o.Unknown:
+		return telemetry.OutcomeUnknown
+	case o.Retryable:
+		return telemetry.OutcomeRetrying
+	default:
+		return telemetry.OutcomeFailed
+	}
+}
+
+// AttemptOutcome is attemptOutcome for the handler's first attempt.
+func AttemptOutcome(o domain.DeliveryOutcome) string { return attemptOutcome(o) }
+
+// retryMeta describes a worker attempt for its durable attempt row.
+func retryMeta(o domain.DeliveryOutcome) domain.AttemptMeta {
+	return domain.AttemptMeta{Origin: domain.AttemptOriginRetry, ProviderName: o.ProviderName, Retryable: o.Retryable}
 }

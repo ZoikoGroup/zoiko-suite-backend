@@ -31,9 +31,6 @@ func newSweepWorker(s *stubStore, strandedAfter time.Duration) *retry.Worker {
 		retry.Options{
 			Policy:        retry.Policy{MaxAttempts: 5, BaseDelay: time.Second, MaxDelay: time.Minute},
 			StrandedAfter: strandedAfter,
-			// StrandedReclaimed left nil: the sweep's behaviour must not depend
-			// on a counter being wired, and these tests assert the reclaim by
-			// what reached the store, not by a metric.
 		}, zap.NewNop())
 }
 

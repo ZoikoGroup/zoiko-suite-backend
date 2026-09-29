@@ -17,19 +17,6 @@ func emailTo(recipient, correlationID string) map[string]any {
 		"subject":                "Your payslip is available",
 		"body":                   "<p>August</p>",
 		"correlation_id":         correlationID,
-		"purpose_context":        "TEST_PURPOSE",
-	}
-}
-
-func inAppTo(recipient, correlationID string) map[string]any {
-	return map[string]any{
-		"recipient_principal_id": recipient,
-		"legal_entity_id":        "le-us",
-		"channel":                "IN_APP",
-		"subject":                "You have a new message",
-		"body":                   "<p>Hello</p>",
-		"correlation_id":         correlationID,
-		"purpose_context":        "TEST_PURPOSE",
 	}
 }
 
@@ -38,7 +25,7 @@ func inAppTo(recipient, correlationID string) map[string]any {
 func TestSend_EmailResolvesTheRecipientAddress(t *testing.T) {
 	del := &stubDeliverer{delivered: true, reason: "accepted"}
 	res := &stubResolver{email: "employee@example.com"}
-	r := newRouterFull(newStubStore(), &stubAuthZ{}, del, res, "tenant-abc")
+	r := newRouterFull(newStubStore(), &stubPublisher{}, &stubAuthZ{}, del, res, "tenant-abc")
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", emailTo("employee-9", "corr-1"), "sender-1")
 	if rr.Code != http.StatusCreated {
@@ -53,7 +40,7 @@ func TestSend_EmailResolvesTheRecipientAddress(t *testing.T) {
 	if n.RecipientAddressSource != domain.AddressSourceIdentityContext {
 		t.Errorf("provenance = %q, want %q", n.RecipientAddressSource, domain.AddressSourceIdentityContext)
 	}
-	if n.Status != domain.StatusProviderAccepted || n.ProviderResponse == "" {
+	if n.Status != "SENT" || n.ProviderResponse == "" {
 		t.Errorf("status = %q, provider_response = %q — acceptance evidence was not recorded",
 			n.Status, n.ProviderResponse)
 	}
@@ -67,7 +54,7 @@ func TestSend_EmailResolvesTheRecipientAddress(t *testing.T) {
 
 func TestSend_CallerSuppliedAddressIsUsedAndMarkedAsSuch(t *testing.T) {
 	res := &stubResolver{email: "stored@example.com"}
-	r := newRouterFull(newStubStore(), &stubAuthZ{},
+	r := newRouterFull(newStubStore(), &stubPublisher{}, &stubAuthZ{},
 		&stubDeliverer{delivered: true}, res, "tenant-abc")
 
 	body := emailTo("employee-9", "corr-1")
@@ -98,7 +85,7 @@ func TestSend_CallerSuppliedAddressIsUsedAndMarkedAsSuch(t *testing.T) {
 // a value nothing reads.
 func TestSend_InAppDoesNotResolveAnAddress(t *testing.T) {
 	res := &stubResolver{email: "employee@example.com"}
-	r := newRouterFull(newStubStore(), &stubAuthZ{},
+	r := newRouterFull(newStubStore(), &stubPublisher{}, &stubAuthZ{},
 		&stubDeliverer{delivered: true}, res, "tenant-abc")
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", inAppTo("employee-9", "corr-1"), "sender-1")
@@ -123,8 +110,8 @@ func TestSend_InAppDoesNotResolveAnAddress(t *testing.T) {
 func TestSend_UnresolvableRecipientIsRecordedNotRaised(t *testing.T) {
 	del := &stubDeliverer{delivered: true, reason: "should not be reached"}
 	res := &stubResolver{err: domain.ErrPrincipalHasNoAddress}
-	store := newStubStore()
-	r := newRouterFull(store, &stubAuthZ{}, del, res, "tenant-abc")
+	pub := &stubPublisher{}
+	r := newRouterFull(newStubStore(), pub, &stubAuthZ{}, del, res, "tenant-abc")
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", emailTo("employee-9", "corr-1"), "sender-1")
 	if rr.Code != http.StatusCreated {
@@ -144,8 +131,8 @@ func TestSend_UnresolvableRecipientIsRecordedNotRaised(t *testing.T) {
 		t.Error("a notification with no resolved address was handed to the transport; " +
 			"the resulting error would have blamed the mail server")
 	}
-	if store.eventCounts().failed != 1 {
-		t.Errorf("notification.failed events enqueued = %d, want 1", store.eventCounts().failed)
+	if pub.failed != 1 {
+		t.Errorf("notification.failed events published = %d, want 1", pub.failed)
 	}
 }
 
@@ -155,7 +142,7 @@ func TestSend_UnresolvableRecipientIsRecordedNotRaised(t *testing.T) {
 // blaming the mail server for a typo in the request.
 func TestSend_MalformedRequestAddressIsRefusedAtTheBoundary(t *testing.T) {
 	del := &stubDeliverer{delivered: true}
-	r := newRouterFull(newStubStore(), &stubAuthZ{},
+	r := newRouterFull(newStubStore(), &stubPublisher{}, &stubAuthZ{},
 		del, &stubResolver{email: "x@example.com"}, "tenant-abc")
 
 	body := emailTo("employee-9", "corr-1")
@@ -171,7 +158,7 @@ func TestSend_MalformedRequestAddressIsRefusedAtTheBoundary(t *testing.T) {
 }
 
 func TestSend_AddressOnAChannelThatHasNoEndpointIsRefused(t *testing.T) {
-	r := newRouterFull(newStubStore(), &stubAuthZ{},
+	r := newRouterFull(newStubStore(), &stubPublisher{}, &stubAuthZ{},
 		&stubDeliverer{delivered: true}, &stubResolver{}, "tenant-abc")
 
 	body := inAppTo("employee-9", "corr-1")
@@ -187,7 +174,7 @@ func TestSend_AddressOnAChannelThatHasNoEndpointIsRefused(t *testing.T) {
 // notification is still concluded — nothing retries yet — but the record must
 // say which of the two happened.
 func TestSend_IdentityOutageIsDistinguishableFromAMissingAddress(t *testing.T) {
-	r := newRouterFull(newStubStore(), &stubAuthZ{},
+	r := newRouterFull(newStubStore(), &stubPublisher{}, &stubAuthZ{},
 		&stubDeliverer{delivered: true},
 		&stubResolver{err: domain.ErrIdentityServiceUnavailable}, "tenant-abc")
 

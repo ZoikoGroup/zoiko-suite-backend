@@ -35,6 +35,7 @@ type PublishParams struct {
 
 type Publisher interface {
 	Publish(ctx context.Context, params PublishParams) error
+	PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error
 }
 
 type MessageWriter interface {
@@ -86,5 +87,31 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 	if err != nil {
 		p.logger.Warn("kafka publish failed — event dropped", zap.String("event_type", params.EventType), zap.Error(err))
 	}
+	return nil
+}
+
+// PublishOutbox publishes an event from the transactional outbox relay, preserving
+// the stable outboxEventID as the X-Event-ID Kafka header across all retries.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	msg := kafka.Message{
+		Key:   []byte(aggregateID),
+		Value: payload,
+		Headers: []kafka.Header{
+			{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+		},
+	}
+	if err := p.writer.WriteMessages(ctx, msg); err != nil {
+		p.logger.Warn("outbox kafka write failed",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.Error(err),
+		)
+		return err
+	}
+	p.logger.Info("outbox event published",
+		zap.String("outbox_event_id", outboxEventID),
+		zap.String("aggregate_id", aggregateID),
+		zap.String("topic", p.topic),
+	)
 	return nil
 }

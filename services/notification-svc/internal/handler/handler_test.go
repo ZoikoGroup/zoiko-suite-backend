@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
+	htmltemplate "html/template"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,7 +15,6 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
-	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/retry"
@@ -27,25 +27,49 @@ type stubStore struct {
 	byCorr     map[string]string // correlation_id -> notification_id
 	lastFilter domain.ListFilter
 	scheduled  []scheduledRetry
-	// events records what CompleteDelivery was asked to enqueue, in order.
-	// The store IS the event log now — see CompleteDelivery below.
-	events []events.Outbound
+
+	templates                map[string]*domain.TemplateDefinition
+	versions                 map[string]*domain.TemplateVersion
+	templateSeq              int
+	versionSeq               int
+	getPublishedVersionCalls int
+
+	// events counts what the real store enqueues in event_outbox with each
+	// transition (migration 000010). The handler no longer publishes, so "one
+	// event per conclusion" is a property of the store transition, asserted
+	// here through the same stubPublisher counters the tests already read.
+	events *stubPublisher
+
+	// attempts lets a test seed the chain GET /{id}/attempts returns.
+	attempts map[string][]domain.DeliveryAttempt
+
+	// submitted records BeginSubmission calls; beginSubmissionErr fails them.
+	submitted          []string
+	beginSubmissionErr error
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		byID:   make(map[string]*domain.Notification),
-		byCorr: make(map[string]string),
+		byID:      make(map[string]*domain.Notification),
+		byCorr:    make(map[string]string),
+		templates: make(map[string]*domain.TemplateDefinition),
+		versions:  make(map[string]*domain.TemplateVersion),
 	}
 }
 
 func (s *stubStore) CreateNotification(_ context.Context, n *domain.Notification) (bool, error) {
-	if id, ok := s.byCorr[n.CorrelationID]; ok {
+	// Keyed the way the real store is (migration 000012): on the purpose-scoped
+	// idempotency key when there is one, on the correlation id otherwise.
+	key := "corr:" + n.CorrelationID
+	if n.IdempotencyKey != "" {
+		key = "idem:" + n.IdempotencyKey
+	}
+	if id, ok := s.byCorr[key]; ok {
 		*n = *s.byID[id]
 		return false, nil
 	}
 	s.byID[n.NotificationID] = n
-	s.byCorr[n.CorrelationID] = n.NotificationID
+	s.byCorr[key] = n.NotificationID
 	return true, nil
 }
 
@@ -78,24 +102,20 @@ func (s *stubStore) ListNotifications(_ context.Context, f domain.ListFilter) ([
 	return out, nil
 }
 
-func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, ev events.Outbound) error {
+func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, _ string, _ domain.AttemptMeta) error {
 	n, ok := s.byID[id]
 	if !ok {
 		return domain.ErrNotificationNotFound
 	}
-	// The event is recorded HERE rather than by a separate publisher stub,
-	// because that is now the contract: a delivery concludes and its event is
-	// enqueued in one transaction. A stub that accepted the conclusion and
-	// discarded the event would let the very defect migration 000005 closed
-	// pass every test in this file.
-	if ev.EventType == "" {
-		return errors.New("CompleteDelivery called with no event")
-	}
-	s.events = append(s.events, ev)
 	n.Status = newStatus
 	n.FailureReason = failureReason
 	n.ProviderResponse = providerResponse
 	n.SentAt = sentAt
+	if newStatus == domain.StatusSent {
+		s.emit("notification.sent")
+	} else {
+		s.emit("notification.failed")
+	}
 	return nil
 }
 
@@ -108,7 +128,7 @@ type scheduledRetry struct {
 	nextAttemptAt time.Time
 }
 
-func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, attemptedAt, nextAttemptAt time.Time) error {
+func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, attemptedAt, nextAttemptAt time.Time, _ domain.AttemptMeta) error {
 	n, ok := s.byID[id]
 	if !ok {
 		return domain.ErrNotificationNotFound
@@ -123,6 +143,49 @@ func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string
 	n.LastAttemptAt = &attemptedAt
 	n.NextAttemptAt = &nextAttemptAt
 	s.scheduled = append(s.scheduled, scheduledRetry{reason: failureReason, nextAttemptAt: nextAttemptAt})
+	return nil
+}
+
+func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, attemptedAt time.Time, _ string, _ domain.AttemptMeta) error {
+	n, ok := s.byID[id]
+	if !ok {
+		return domain.ErrNotificationNotFound
+	}
+	n.Status = domain.StatusPendingUnknown
+	n.FailureReason = reason
+	n.DeliveryAttempts++
+	n.LastAttemptAt = &attemptedAt
+	n.SentAt = &attemptedAt
+	n.UnknownAt = &attemptedAt
+	s.emit("notification.outcome_unknown")
+	return nil
+}
+
+func (s *stubStore) ResolveDeliveryOutcome(_ context.Context, p domain.ResolveDeliveryOutcomeParams, resolvedAt time.Time) error {
+	n, ok := s.byID[p.NotificationID]
+	if !ok {
+		return domain.ErrNotificationNotFound
+	}
+	if n.Status != domain.StatusPendingUnknown {
+		return domain.ErrNotificationNotFound
+	}
+	n.Status = p.ResolvedStatus
+	if p.ResolvedStatus == domain.StatusFailed {
+		n.FailureReason = p.ResolutionNote
+	} else {
+		n.FailureReason = ""
+	}
+	if p.ProviderResponse != "" {
+		n.ProviderResponse = p.ProviderResponse
+	}
+	n.ResolvedAt = &resolvedAt
+	n.ResolvedByPrincipalID = p.ActorPrincipalID
+	n.ResolutionNote = p.ResolutionNote
+	if p.ResolvedStatus == domain.StatusSent {
+		s.emit("notification.sent")
+	} else {
+		s.emit("notification.failed")
+	}
 	return nil
 }
 
@@ -148,253 +211,215 @@ func (s *stubStore) CountUnread(_ context.Context, recipientPrincipalID string) 
 	return count, nil
 }
 
-// --- New interface methods for §3.4 compliance ---
+// ── stub template store ──────────────────────────────────────────────────────
 
-func (s *stubStore) CreateAttempt(_ context.Context, a *domain.DeliveryAttempt) error {
-	// No-op for tests
-	return nil
+func (s *stubStore) CreateTemplate(_ context.Context, p domain.CreateTemplateParams) (*domain.TemplateDefinition, error) {
+	s.templateSeq++
+	d := &domain.TemplateDefinition{
+		TemplateID: fmt.Sprintf("template-%d", s.templateSeq), TenantID: "tenant-abc",
+		LegalEntityID: p.LegalEntityID, Name: p.Name, BusinessPurpose: p.BusinessPurpose,
+		OwnerPrincipalID: p.OwnerPrincipalID, Status: "ACTIVE", CreatedAt: time.Now().UTC(),
+	}
+	s.templates[d.TemplateID] = d
+	s.emit("template.created")
+	return d, nil
 }
 
-func (s *stubStore) UpdateAttempt(_ context.Context, attemptID, status, failureReason, providerResponse string, concludedAt *time.Time) error {
-	// No-op for tests
-	return nil
+func (s *stubStore) GetTemplate(_ context.Context, templateID string) (*domain.TemplateDefinition, error) {
+	d, ok := s.templates[templateID]
+	if !ok {
+		return nil, domain.ErrTemplateNotFound
+	}
+	return d, nil
 }
 
-func (s *stubStore) GetAttempts(_ context.Context, notificationID string) ([]domain.DeliveryAttempt, error) {
-	return nil, nil
+func (s *stubStore) CreateVersion(_ context.Context, p domain.CreateVersionParams) (*domain.TemplateVersion, error) {
+	tmpl, ok := s.templates[p.TemplateID]
+	if !ok {
+		return nil, domain.ErrTemplateNotFound
+	}
+	if tmpl.Status == "RETIRED" {
+		return nil, domain.ErrTemplateRetired
+	}
+	if p.Locale == "" {
+		return nil, domain.ErrTemplateLocaleRequired
+	}
+	s.versionSeq++
+	v := &domain.TemplateVersion{
+		VersionID: fmt.Sprintf("version-%d", s.versionSeq), TemplateID: p.TemplateID,
+		TenantID: "tenant-abc", LegalEntityID: tmpl.LegalEntityID, VersionNumber: s.versionSeq, Locale: p.Locale,
+		Content: p.Content, VariableSchema: p.VariableSchema, Status: domain.TemplateVersionDraft,
+		CreatedByPrincipalID: p.CreatedByPrincipalID, CreatedAt: time.Now().UTC(),
+	}
+	s.versions[v.VersionID] = v
+	return v, nil
 }
 
-func (s *stubStore) GetByIdempotencyKey(_ context.Context, tenantID, idempotencyKey string) (*domain.Notification, error) {
-	// Not used in these tests
-	return nil, nil
+func (s *stubStore) GetTemplateVersion(_ context.Context, versionID string) (*domain.TemplateVersion, error) {
+	v, ok := s.versions[versionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	return v, nil
 }
 
-func (s *stubStore) FindStuckInFlight(_ context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error) {
-	return nil, nil
+func (s *stubStore) ValidateTemplate(_ context.Context, versionID string) (*domain.TemplateVersion, error) {
+	v, ok := s.versions[versionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	if v.Status != domain.TemplateVersionDraft {
+		return nil, domain.ErrTemplateVersionNotDraft
+	}
+	if v.Content == "" {
+		return nil, domain.ErrTemplateContentInvalid
+	}
+	now := time.Now().UTC()
+	v.Status = domain.TemplateVersionReview
+	v.ValidatedAt = &now
+	return v, nil
 }
 
-// --- NCD-02: Suppression stubs ---
-
-func (s *stubStore) CreateSuppression(_ context.Context, sp *domain.Suppression) error {
-	return nil
+func (s *stubStore) ApproveTemplate(_ context.Context, p domain.ApproveVersionParams) (*domain.TemplateVersion, error) {
+	v, ok := s.versions[p.VersionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	if v.CreatedByPrincipalID == p.ApprovedByPrincipalID {
+		return nil, domain.ErrTemplateVersionSelfApproval
+	}
+	if v.Status != domain.TemplateVersionReview {
+		return nil, domain.ErrTemplateVersionNotReview
+	}
+	now := time.Now().UTC()
+	v.Status = domain.TemplateVersionApproved
+	v.ApprovedByPrincipalID = &p.ApprovedByPrincipalID
+	v.ApprovedAt = &now
+	s.emit("template.version_approved")
+	return v, nil
 }
 
-func (s *stubStore) GetSuppression(_ context.Context, id string) (*domain.Suppression, error) {
-	return nil, domain.ErrSuppressionNotFound
-}
-
-func (s *stubStore) ListSuppressions(_ context.Context, f domain.SuppressionFilter) ([]domain.Suppression, error) {
-	return nil, nil
-}
-
-func (s *stubStore) DeleteSuppression(_ context.Context, id string) error {
-	return nil
-}
-
-// --- NCD-02: Preference stubs ---
-
-func (s *stubStore) UpsertPreference(_ context.Context, p *domain.Preference) error {
-	return nil
-}
-
-func (s *stubStore) GetPreference(_ context.Context, tenantID, principalID, channel string) (*domain.Preference, error) {
-	return nil, domain.ErrPreferenceNotFound
-}
-
-func (s *stubStore) ListPreferences(_ context.Context, f domain.PreferenceFilter) ([]domain.Preference, error) {
-	return nil, nil
-}
-
-func (s *stubStore) DeletePreference(_ context.Context, tenantID, principalID, channel string) error {
-	return nil
-}
-
-// --- NCD-02: Channel Decision stubs ---
-
-func (s *stubStore) EvaluateChannel(_ context.Context, tenantID, principalID, channel, permissionGrant string) (*domain.ChannelDecisionResult, error) {
-	return &domain.ChannelDecisionResult{
-		Allowed:  true,
-		Decision: domain.ChannelDecisionAllowed,
-	}, nil
-}
-
-func (s *stubStore) ListChannelDecisions(_ context.Context, f domain.ChannelDecisionFilter) ([]domain.ChannelDecision, error) {
-	return nil, nil
-}
-
-// --- NCD-04: Bounce stubs ---
-
-func (s *stubStore) CreateBounceEvent(_ context.Context, b *domain.BounceEvent) error {
-	return nil
-}
-
-func (s *stubStore) GetBounceEvent(_ context.Context, id string) (*domain.BounceEvent, error) {
-	return nil, domain.ErrBounceNotFound
-}
-
-func (s *stubStore) ListBounceEvents(_ context.Context, f domain.BounceEventFilter) ([]domain.BounceEvent, error) {
-	return nil, nil
-}
-
-// --- NCD-04: Complaint stubs ---
-
-func (s *stubStore) CreateComplaintEvent(_ context.Context, c *domain.ComplaintEvent) error {
-	return nil
-}
-
-func (s *stubStore) GetComplaintEvent(_ context.Context, id string) (*domain.ComplaintEvent, error) {
-	return nil, domain.ErrComplaintNotFound
-}
-
-func (s *stubStore) ListComplaintEvents(_ context.Context, f domain.ComplaintEventFilter) ([]domain.ComplaintEvent, error) {
-	return nil, nil
-}
-
-// --- NCD-04: Channel Reputation stubs ---
-
-func (s *stubStore) UpsertChannelReputation(_ context.Context, r *domain.ChannelReputation) error {
-	return nil
-}
-
-func (s *stubStore) ListChannelReputations(_ context.Context, f domain.ChannelReputationFilter) ([]domain.ChannelReputation, error) {
-	return nil, nil
-}
-
-// --- NCD-01: Communication Intent stubs ---
-
-func (s *stubStore) CreateCommunicationIntent(_ context.Context, i *domain.CommunicationIntent) error {
-	return nil
-}
-
-func (s *stubStore) GetCommunicationIntent(_ context.Context, id string) (*domain.CommunicationIntent, error) {
-	return nil, domain.ErrIntentNotFound
-}
-
-func (s *stubStore) ListCommunicationIntents(_ context.Context, f domain.CommunicationIntentFilter) ([]domain.CommunicationIntent, error) {
-	return nil, nil
-}
-
-func (s *stubStore) UpdateCommunicationIntent(_ context.Context, i *domain.CommunicationIntent) error {
-	return nil
-}
-
-func (s *stubStore) DeleteCommunicationIntent(_ context.Context, id string) error {
-	return nil
-}
-
-// --- NCD-01: Template stubs ---
-
-func (s *stubStore) CreateTemplate(_ context.Context, t *domain.Template) error {
-	return nil
-}
-
-func (s *stubStore) GetTemplate(_ context.Context, id string) (*domain.Template, error) {
-	return nil, domain.ErrTemplateNotFound
-}
-
-func (s *stubStore) GetTemplateByIntent(_ context.Context, intentID, locale string, version int) (*domain.Template, error) {
-	return nil, domain.ErrTemplateNotFound
-}
-
-func (s *stubStore) GetEffectiveTemplate(_ context.Context, tenantID, intentID, locale string, at time.Time) (*domain.Template, error) {
-	return nil, domain.ErrTemplateNotFound
-}
-
-func (s *stubStore) ListTemplates(_ context.Context, f domain.TemplateFilter) ([]domain.Template, error) {
-	return nil, nil
-}
-
-func (s *stubStore) UpdateTemplate(_ context.Context, t *domain.Template) error {
-	return nil
-}
-
-func (s *stubStore) DeleteTemplate(_ context.Context, id string) error {
-	return nil
-}
-
-// --- NCD-01: Template Approval stubs ---
-
-func (s *stubStore) CreateTemplateApproval(_ context.Context, a *domain.TemplateApproval) error {
-	return nil
-}
-
-func (s *stubStore) GetTemplateApproval(_ context.Context, id string) (*domain.TemplateApproval, error) {
-	return nil, domain.ErrApprovalNotFound
-}
-
-func (s *stubStore) ListTemplateApprovals(_ context.Context, f domain.TemplateApprovalFilter) ([]domain.TemplateApproval, error) {
-	return nil, nil
-}
-
-func (s *stubStore) DecideTemplateApproval(_ context.Context, approvalID, approverID, status, reason string) error {
-	return nil
-}
-
-// --- NCD-01: Template Render stubs ---
-
-func (s *stubStore) CreateTemplateRender(_ context.Context, r *domain.TemplateRender) error {
-	return nil
-}
-
-func (s *stubStore) GetTemplateRender(_ context.Context, id string) (*domain.TemplateRender, error) {
-	return nil, domain.ErrTemplateNotFound
-}
-
-func (s *stubStore) ListTemplateRenders(_ context.Context, templateID string, limit, offset int) ([]domain.TemplateRender, error) {
-	return nil, nil
-}
-
-// --- NCD-05: Regulated Notice & Acknowledgment stubs ---
-
-func (s *stubStore) CreateRegulatedNotice(_ context.Context, n *domain.RegulatedNotice) error {
-	return nil
-}
-
-func (s *stubStore) GetRegulatedNotice(_ context.Context, id string) (*domain.RegulatedNotice, error) {
-	return nil, domain.ErrRegulatedNoticeNotFound
-}
-
-func (s *stubStore) ListRegulatedNotices(_ context.Context, f domain.RegulatedNoticeFilter) ([]domain.RegulatedNotice, error) {
-	return nil, nil
-}
-
-func (s *stubStore) UpdateRegulatedNotice(_ context.Context, n *domain.RegulatedNotice) error {
-	return nil
-}
-
-func (s *stubStore) CreateAcknowledgmentChainStep(_ context.Context, step *domain.AcknowledgmentChainStep) error {
-	return nil
-}
-
-func (s *stubStore) GetAcknowledgmentChain(_ context.Context, regulatedNoticeID string) ([]domain.AcknowledgmentChainStep, error) {
-	return nil, nil
-}
-
-func (s *stubStore) AcknowledgeRegulatedNotice(_ context.Context, req *domain.AcknowledgeRequest, actorID string) error {
-	return nil
-}
-
-// eventCounts summarises what the store was asked to enqueue.
-//
-// It replaces a stubPublisher that counted PublishSent/PublishFailed calls.
-// Those methods no longer exist: publishing after the commit was the defect,
-// and the events are now sealed into the same transaction as the conclusion.
-// Counting them off the store is what keeps these assertions honest — they
-// measure the event the database would hold, not a call the handler made.
-type eventCounts struct{ sent, failed int }
-
-func (s *stubStore) eventCounts() eventCounts {
-	var c eventCounts
-	for _, ev := range s.events {
-		switch ev.EventType {
-		case events.TypeSent:
-			c.sent++
-		case events.TypeFailed:
-			c.failed++
+func (s *stubStore) PublishTemplate(_ context.Context, p domain.PublishVersionParams) (*domain.TemplateVersion, error) {
+	v, ok := s.versions[p.VersionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	if v.Status != domain.TemplateVersionApproved {
+		return nil, domain.ErrTemplateVersionNotApproved
+	}
+	now := time.Now().UTC()
+	v.Status = domain.TemplateVersionPublished
+	v.PublishedAt = &now
+	for _, other := range s.versions {
+		if other.VersionID != v.VersionID && other.TemplateID == v.TemplateID &&
+			other.Locale == v.Locale && other.Status == domain.TemplateVersionPublished {
+			other.Status = domain.TemplateVersionSuperseded
+			id := v.VersionID
+			other.SupersededByVersionID = &id
 		}
 	}
-	return c
+	s.emit("template.published")
+	return v, nil
 }
+
+func (s *stubStore) GetPublishedVersion(_ context.Context, templateID, locale string) (*domain.TemplateVersion, error) {
+	s.getPublishedVersionCalls++
+	for _, v := range s.versions {
+		if v.TemplateID == templateID && v.Locale == locale && v.Status == domain.TemplateVersionPublished {
+			return v, nil
+		}
+	}
+	return nil, domain.ErrTemplateVersionNotFound
+}
+
+func (s *stubStore) RetireTemplate(_ context.Context, p domain.RetireTemplateParams) (*domain.TemplateDefinition, error) {
+	d, ok := s.templates[p.TemplateID]
+	if !ok {
+		return nil, domain.ErrTemplateNotFound
+	}
+	if d.Status == "RETIRED" {
+		return nil, domain.ErrTemplateAlreadyRetired
+	}
+	now := time.Now().UTC()
+	d.Status = "RETIRED"
+	d.RetiredAt = &now
+	d.RetiredByPrincipalID = &p.RetiredByPrincipalID
+	for _, v := range s.versions {
+		if v.TemplateID == p.TemplateID && v.Status == domain.TemplateVersionPublished {
+			v.Status = domain.TemplateVersionRetired
+			v.RetiredAt = &now
+		}
+	}
+	s.emit("template.retired")
+	return d, nil
+}
+
+func (s *stubStore) RenderPreview(_ context.Context, p domain.RenderPreviewParams) (*domain.RenderPreviewResult, error) {
+	v, ok := s.versions[p.VersionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	var missing []string
+	for _, key := range v.VariableSchema {
+		if p.Variables[key] == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, domain.ErrTemplateVariablesMissing{VersionID: p.VersionID, Missing: missing}
+	}
+	tmpl, err := htmltemplate.New("preview").Parse(v.Content)
+	if err != nil {
+		return nil, domain.ErrTemplateContentInvalid
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, p.Variables); err != nil {
+		return nil, err
+	}
+	return &domain.RenderPreviewResult{VersionID: p.VersionID, RenderedContent: buf.String()}, nil
+}
+
+func (s *stubStore) CompareVersions(_ context.Context, versionIDA, versionIDB string) (*domain.CompareVersionsResult, error) {
+	a, ok := s.versions[versionIDA]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	b, ok := s.versions[versionIDB]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	if a.TemplateID != b.TemplateID {
+		return nil, domain.ErrTemplateVersionsBelongToDifferentTemplates
+	}
+	return &domain.CompareVersionsResult{VersionA: *a, VersionB: *b, ContentChanged: a.Content != b.Content}, nil
+}
+
+func (s *stubStore) ListLocales(_ context.Context, templateID string) ([]domain.LocaleSummary, error) {
+	if _, ok := s.templates[templateID]; !ok {
+		return nil, domain.ErrTemplateNotFound
+	}
+	var out []domain.LocaleSummary
+	for _, v := range s.versions {
+		if v.TemplateID != templateID {
+			continue
+		}
+		ls := domain.LocaleSummary{Locale: v.Locale, LatestVersionID: v.VersionID, LatestVersionNumber: v.VersionNumber, LatestStatus: v.Status}
+		if v.Status == domain.TemplateVersionPublished {
+			id := v.VersionID
+			ls.PublishedVersionID = &id
+		}
+		out = append(out, ls)
+	}
+	return out, nil
+}
+
+// stubPublisher counts events the stub store enqueues, by type.
+type stubPublisher struct {
+	sent, failed, outcomeUnknown                                          int
+	templateCreated, templateApproved, templatePublished, templateRetired int
+}
+
+
 
 type stubAuthZ struct {
 	err   error
@@ -417,6 +442,10 @@ type stubDeliverer struct {
 	// schedule rather than conclude.
 	retryable bool
 
+	// unknown makes the refusal an ambiguous one — see
+	// domain.DeliveryOutcome.Unknown's own doc comment.
+	unknown bool
+
 	// seen records the notification handed over, so a test can assert what the
 	// transport was actually given â€” the resolved address in particular, which
 	// is the difference between a message addressed to somebody and one the
@@ -426,6 +455,9 @@ type stubDeliverer struct {
 
 func (d *stubDeliverer) Deliver(_ context.Context, n domain.Notification) domain.DeliveryOutcome {
 	d.seen = &n
+	if d.unknown {
+		return domain.DeliveryOutcome{Reason: d.reason, Unknown: true}
+	}
 	if !d.delivered {
 		return domain.DeliveryOutcome{Reason: d.reason, Retryable: d.retryable}
 	}
@@ -446,18 +478,18 @@ func (s *stubResolver) ResolveEmail(_ context.Context, _, _, _ string) (string, 
 
 // â”€â”€ router factory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-func newRouter(s *stubStore, authz *stubAuthZ) chi.Router {
-	return newRouterWith(s, authz, &stubDeliverer{delivered: true, reason: "delivered via stub"}, "tenant-abc")
+func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ) chi.Router {
+	return newRouterWith(s, pub, authz, &stubDeliverer{delivered: true, reason: "delivered via stub"}, "tenant-abc")
 }
 
 // newRouterWith supplies a resolver that always succeeds, so the tests that
 // predate recipient resolution keep testing what they were written to test.
 // The resolution paths have their own tests below, which pass an explicit one.
-func newRouterWith(s *stubStore, authz *stubAuthZ, del handler.Deliverer, tenantID string) chi.Router {
-	return newRouterFull(s, authz, del, &stubResolver{email: "recipient@example.com"}, tenantID)
+func newRouterWith(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handler.Deliverer, tenantID string) chi.Router {
+	return newRouterFull(s, pub, authz, del, &stubResolver{email: "recipient@example.com"}, tenantID)
 }
 
-func newRouterFull(s *stubStore, authz *stubAuthZ, del handler.Deliverer,
+func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handler.Deliverer,
 	res handler.RecipientResolver, tenantID string) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
@@ -468,11 +500,9 @@ func newRouterFull(s *stubStore, authz *stubAuthZ, del handler.Deliverer,
 			next.ServeHTTP(w, req)
 		})
 	})
+	s.events = pub
 	h := handler.New(handler.Deps{
-		Store: s,
-		// Metrics deliberately left nil. The handler must work without them —
-		// they are observability, not behaviour — and a nil here is what proves
-		// the guards around every metric call are real.
+		Store:     s,
 		AuthZ:     authz,
 		Deliverer: del,
 		Recipient: res,
@@ -504,14 +534,13 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 // â”€â”€ SendNotification tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestSendNotification_MissingPrincipal(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
 		"legal_entity_id":        "le-us",
 		"channel":                "EMAIL",
 		"subject":                "Approval needed",
 		"correlation_id":         "corr-1",
-		"purpose_context":        "TEST_PURPOSE",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -519,14 +548,13 @@ func TestSendNotification_MissingPrincipal(t *testing.T) {
 }
 
 func TestSendNotification_AuthzDenied(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{err: domain.ErrAuthorizationDenied})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied})
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
 		"legal_entity_id":        "le-us",
 		"channel":                "EMAIL",
 		"subject":                "Approval needed",
 		"correlation_id":         "corr-1",
-		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d", rr.Code)
@@ -534,8 +562,8 @@ func TestSendNotification_AuthzDenied(t *testing.T) {
 }
 
 func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
-	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -544,7 +572,6 @@ func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
 		"subject":                "Invoice approval required",
 		"body":                   "Invoice INV-100 needs your approval.",
 		"correlation_id":         "corr-sent",
-		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -554,15 +581,14 @@ func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&n); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	// Provider accepted is the new SENT - it means a provider took the message
-	if n.Status != domain.StatusProviderAccepted {
-		t.Errorf("expected PROVIDER_ACCEPTED got %q", n.Status)
+	if n.Status != "SENT" {
+		t.Errorf("expected SENT got %q", n.Status)
 	}
 	if n.SentAt == nil {
 		t.Error("expected sent_at to be set")
 	}
-	if store.eventCounts().sent != 1 || store.eventCounts().failed != 0 {
-		t.Errorf("expected 1 sent event, 0 failed, got sent=%d failed=%d", store.eventCounts().sent, store.eventCounts().failed)
+	if pub.sent != 1 || pub.failed != 0 {
+		t.Errorf("expected 1 sent event, 0 failed, got sent=%d failed=%d", pub.sent, pub.failed)
 	}
 }
 
@@ -571,8 +597,9 @@ func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
 // a typo produced a stored FAILED record and a notification.failed event,
 // evidence of an attempt no provider ever saw.
 func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelivery(t *testing.T) {
+	pub := &stubPublisher{}
 	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	r := newRouter(store, pub, &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -580,7 +607,6 @@ func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelive
 		"channel":                "CARRIER_PIGEON",
 		"subject":                "Test",
 		"correlation_id":         "corr-bad-channel",
-		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	if rr.Code != http.StatusBadRequest {
@@ -589,8 +615,8 @@ func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelive
 	if len(store.byID) != 0 {
 		t.Errorf("a rejected channel must not leave a notification record, found %d", len(store.byID))
 	}
-	if store.eventCounts().failed != 0 {
-		t.Errorf("a rejected channel must not publish notification.failed, got %d", store.eventCounts().failed)
+	if pub.failed != 0 {
+		t.Errorf("a rejected channel must not publish notification.failed, got %d", pub.failed)
 	}
 }
 
@@ -598,8 +624,8 @@ func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelive
 // constraint (03-microservices.md Â§9.7) is that a notification failure must
 // not collapse the workflow that raised it.
 func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T) {
-	store := newStubStore()
-	r := newRouterWith(store, &stubAuthZ{},
+	pub := &stubPublisher{}
+	r := newRouterWith(newStubStore(), pub, &stubAuthZ{},
 		&stubDeliverer{delivered: false, reason: "provider rejected the recipient address"}, "tenant-abc")
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
@@ -608,7 +634,6 @@ func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T)
 		"channel":                "EMAIL",
 		"subject":                "Test",
 		"correlation_id":         "corr-failed",
-		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -622,8 +647,8 @@ func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T)
 	if n.FailureReason == "" {
 		t.Error("expected a failure_reason to be recorded")
 	}
-	if store.eventCounts().failed != 1 || store.eventCounts().sent != 0 {
-		t.Errorf("expected 1 failed event, 0 sent, got sent=%d failed=%d", store.eventCounts().sent, store.eventCounts().failed)
+	if pub.failed != 1 || pub.sent != 0 {
+		t.Errorf("expected 1 failed event, 0 sent, got sent=%d failed=%d", pub.sent, pub.failed)
 	}
 }
 
@@ -637,7 +662,8 @@ func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T)
 // handler concluded every one of them FAILED regardless.
 func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T) {
 	store := newStubStore()
-	r := newRouterWith(store, &stubAuthZ{},
+	pub := &stubPublisher{}
+	r := newRouterWith(store, pub, &stubAuthZ{},
 		&stubDeliverer{delivered: false, retryable: true, reason: "dial tcp: connection refused"},
 		"tenant-abc")
 
@@ -647,7 +673,6 @@ func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T)
 		"channel":                "EMAIL",
 		"subject":                "Payslip available",
 		"correlation_id":         "corr-transient",
-		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -675,9 +700,54 @@ func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T)
 	if len(store.scheduled) != 1 {
 		t.Fatalf("store.scheduled = %v, want exactly one scheduled retry", store.scheduled)
 	}
-	if store.eventCounts().sent != 0 || store.eventCounts().failed != 0 {
+	if pub.sent != 0 || pub.failed != 0 {
 		t.Errorf("published sent=%d failed=%d, want nothing published while a retry is pending",
-			store.eventCounts().sent, store.eventCounts().failed)
+			pub.sent, pub.failed)
+	}
+}
+
+// TestSendNotification_AmbiguousOutcome_IsPendingUnknownNotRetried proves
+// an ambiguous first-attempt outcome lands in PENDING_UNKNOWN, is never
+// silently retried, and publishes only notification.outcome_unknown —
+// never sent or failed, since neither is actually known yet.
+func TestSendNotification_AmbiguousOutcome_IsPendingUnknownNotRetried(t *testing.T) {
+	store := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouterWith(store, pub, &stubAuthZ{},
+		&stubDeliverer{unknown: true, reason: "connection dropped at verdict"},
+		"tenant-abc")
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
+		"recipient_principal_id": "principal-2",
+		"legal_entity_id":        "le-us",
+		"channel":                "EMAIL",
+		"subject":                "Payslip available",
+		"correlation_id":         "corr-unknown",
+	}, "principal-1")
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var n domain.Notification
+	_ = json.NewDecoder(rr.Body).Decode(&n)
+
+	if n.Status != domain.StatusPendingUnknown {
+		t.Errorf("status = %q, want PENDING_UNKNOWN", n.Status)
+	}
+	if n.UnknownAt == nil {
+		t.Error("unknown_at is nil")
+	}
+	if n.SentAt == nil {
+		t.Error("sent_at should still be set — the attempt did happen, only its outcome is unknown")
+	}
+	if len(store.scheduled) != 0 {
+		t.Errorf("store.scheduled = %v, want nothing rescheduled — an ambiguous outcome must never be silently retried", store.scheduled)
+	}
+	if pub.sent != 0 || pub.failed != 0 {
+		t.Errorf("published sent=%d failed=%d, want neither for an ambiguous outcome", pub.sent, pub.failed)
+	}
+	if pub.outcomeUnknown != 1 {
+		t.Errorf("published outcome_unknown=%d, want 1", pub.outcomeUnknown)
 	}
 }
 
@@ -686,7 +756,8 @@ func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T)
 // change.
 func TestSendNotification_SettledFailure_ConcludesImmediately(t *testing.T) {
 	store := newStubStore()
-	r := newRouterWith(store, &stubAuthZ{},
+	pub := &stubPublisher{}
+	r := newRouterWith(store, pub, &stubAuthZ{},
 		&stubDeliverer{delivered: false, retryable: false, reason: "550 no such mailbox"},
 		"tenant-abc")
 
@@ -696,7 +767,6 @@ func TestSendNotification_SettledFailure_ConcludesImmediately(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Payslip available",
 		"correlation_id":         "corr-settled",
-		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 
 	var n domain.Notification
@@ -711,14 +781,14 @@ func TestSendNotification_SettledFailure_ConcludesImmediately(t *testing.T) {
 	if len(store.scheduled) != 0 {
 		t.Errorf("store.scheduled = %v, want nothing scheduled", store.scheduled)
 	}
-	if store.eventCounts().failed != 1 {
-		t.Errorf("published failed=%d, want 1 for a concluded failure", store.eventCounts().failed)
+	if pub.failed != 1 {
+		t.Errorf("published failed=%d, want 1 for a concluded failure", pub.failed)
 	}
 }
 
 func TestSendNotification_IdempotentReplay(t *testing.T) {
-	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
 
 	body := map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -726,7 +796,6 @@ func TestSendNotification_IdempotentReplay(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Reminder",
 		"correlation_id":         "corr-retry",
-		"purpose_context":        "TEST_PURPOSE",
 	}
 
 	rr1 := doReq(r, http.MethodPost, "/v1/notifications/", body, "principal-1")
@@ -744,15 +813,15 @@ func TestSendNotification_IdempotentReplay(t *testing.T) {
 		t.Fatalf("retried send resolved to a different notification_id (%s) than the original (%s)", n2.NotificationID, n1.NotificationID)
 	}
 	// A retry must not re-send â€” exactly one sent event across both requests.
-	if store.eventCounts().sent != 1 {
-		t.Errorf("expected exactly 1 sent event across both requests, got %d", store.eventCounts().sent)
+	if pub.sent != 1 {
+		t.Errorf("expected exactly 1 sent event across both requests, got %d", pub.sent)
 	}
 }
 
 // â”€â”€ GetNotification / ListNotifications tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestGetNotification_NotFound(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 	rr := doReq(r, http.MethodGet, "/v1/notifications/does-not-exist", nil, "principal-1")
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 got %d", rr.Code)
@@ -760,7 +829,7 @@ func TestGetNotification_NotFound(t *testing.T) {
 }
 
 func TestListNotifications_EmptyIsEmptyArrayNotNull(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 	rr := doReq(r, http.MethodGet, "/v1/notifications/", nil, "principal-1")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d", rr.Code)
@@ -778,7 +847,7 @@ func TestListNotifications_EmptyIsEmptyArrayNotNull(t *testing.T) {
 func TestListNotifications_WithoutLegalEntity_IsScopedToCallersOwnInbox(t *testing.T) {
 	store := newStubStore()
 	authz := &stubAuthZ{}
-	r := newRouter(store, authz)
+	r := newRouter(store, &stubPublisher{}, authz)
 
 	rr := doReq(r, http.MethodGet, "/v1/notifications/", nil, "principal-1")
 	if rr.Code != http.StatusOK {
@@ -791,7 +860,7 @@ func TestListNotifications_WithoutLegalEntity_IsScopedToCallersOwnInbox(t *testi
 }
 
 func TestListNotifications_OtherRecipientWithoutLegalEntity_IsRefused(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 	rr := doReq(r, http.MethodGet, "/v1/notifications/?recipient_principal_id=someone-else", nil, "principal-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 reading another principal's inbox unscoped, got %d: %s", rr.Code, rr.Body.String())
@@ -800,7 +869,7 @@ func TestListNotifications_OtherRecipientWithoutLegalEntity_IsRefused(t *testing
 
 func TestListNotifications_WithLegalEntity_IsAuthorized(t *testing.T) {
 	authz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
-	r := newRouter(newStubStore(), authz)
+	r := newRouter(newStubStore(), &stubPublisher{}, authz)
 	rr := doReq(r, http.MethodGet, "/v1/notifications/?legal_entity_id=le-us", nil, "principal-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d", rr.Code)
@@ -813,7 +882,7 @@ func TestListNotifications_WithLegalEntity_IsAuthorized(t *testing.T) {
 // A missing tenant scope used to be noticed first by the store, which reported
 // it as 503 store_unavailable â€” an outage status for a forgotten header.
 func TestRequests_WithoutTenantScope_Are401NotServiceUnavailable(t *testing.T) {
-	r := newRouterWith(newStubStore(), &stubAuthZ{},
+	r := newRouterWith(newStubStore(), &stubPublisher{}, &stubAuthZ{},
 		&stubDeliverer{delivered: true}, "")
 
 	for _, tc := range []struct{ name, method, path string }{
@@ -834,7 +903,6 @@ func TestRequests_WithoutTenantScope_Are401NotServiceUnavailable(t *testing.T) {
 		"channel":                "EMAIL",
 		"subject":                "Test",
 		"correlation_id":         "corr-no-tenant",
-		"purpose_context":        "TEST_PURPOSE",
 	}, "principal-1")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("send: expected 401 got %d: %s", rr.Code, rr.Body.String())
@@ -844,7 +912,7 @@ func TestRequests_WithoutTenantScope_Are401NotServiceUnavailable(t *testing.T) {
 // A misspelled field used to be discarded silently, so the caller got a 201
 // for a notification that did not say what they wrote.
 func TestSendNotification_UnknownField_IsRejected(t *testing.T) {
-	r := newRouter(newStubStore(), &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
 		"legal_entity_id":        "le-us",
@@ -858,9 +926,330 @@ func TestSendNotification_UnknownField_IsRejected(t *testing.T) {
 	}
 }
 
+// ── BIZ-03 Template tests ────────────────────────────────────────────────────
+
+func createTestTemplate(t *testing.T, r chi.Router, owner string) string {
+	t.Helper()
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/", map[string]any{
+		"legal_entity_id":  "le-us",
+		"name":             "Password Reset",
+		"business_purpose": "Notify a user their password was reset",
+	}, owner)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create template: expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var tmpl domain.TemplateDefinition
+	if err := json.Unmarshal(rr.Body.Bytes(), &tmpl); err != nil {
+		t.Fatalf("decode template: %v", err)
+	}
+	return tmpl.TemplateID
+}
+
+func createTestVersion(t *testing.T, r chi.Router, templateID, author string) string {
+	t.Helper()
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/versions", map[string]any{
+		"locale":          "en-US",
+		"content":         "<p>Hello {{.first_name}}</p>",
+		"variable_schema": []string{"first_name"},
+	}, author)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create version: expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var v domain.TemplateVersion
+	if err := json.Unmarshal(rr.Body.Bytes(), &v); err != nil {
+		t.Fatalf("decode version: %v", err)
+	}
+	return v.VersionID
+}
+
+func TestCreateTemplate_Valid_Returns201(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	createTestTemplate(t, r, "owner-1")
+	if pub.templateCreated != 1 {
+		t.Fatalf("expected 1 TemplateCreated event, got %d", pub.templateCreated)
+	}
+}
+
+func TestCreateTemplate_MissingFields_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/", map[string]any{
+		"legal_entity_id": "le-us",
+	}, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d", rr.Code)
+	}
+}
+
+func TestCreateVersion_UnknownTemplate_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/nope/versions", map[string]any{
+		"locale": "en-US", "content": "hi",
+	}, "owner-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
+func TestCreateVersion_RetiredTemplate_Returns409(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/retire", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("retire: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/versions", map[string]any{
+		"locale": "en-US", "content": "hi",
+	}, "owner-1")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestValidateTemplate_EmptyContent_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	// The stub's CreateVersion requires non-empty content at the handler
+	// boundary, so exercise the store-level validation directly via a
+	// version whose content is blanked out after creation is not possible
+	// through the HTTP surface — this proves the boundary check instead.
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/versions", map[string]any{
+		"locale": "en-US", "content": "",
+	}, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestApproveTemplate_SelfApproval_Returns403(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionID := createTestVersion(t, r, templateID, "owner-1")
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/validate", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("validate: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/approve", nil, "owner-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestApproveTemplate_NotReview_Returns409(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionID := createTestVersion(t, r, templateID, "owner-1")
+	// Never validated — still DRAFT.
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/approve", nil, "approver-1")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPublishTemplate_ThenSupersedesPriorPublished(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+
+	versionID1 := createTestVersion(t, r, templateID, "owner-1")
+	doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID1+"/validate", nil, "owner-1")
+	doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID1+"/approve", nil, "approver-1")
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID1+"/publish", nil, "approver-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first publish: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	versionID2 := createTestVersion(t, r, templateID, "owner-1")
+	doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID2+"/validate", nil, "owner-1")
+	doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID2+"/approve", nil, "approver-1")
+	rr = doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID2+"/publish", nil, "approver-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("second publish: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/published?locale=en-US", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get published: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var current domain.TemplateVersion
+	if err := json.Unmarshal(rr.Body.Bytes(), &current); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if current.VersionID != versionID2 {
+		t.Fatalf("expected the second version to be the current published one, got %s", current.VersionID)
+	}
+	if pub.templatePublished != 2 {
+		t.Fatalf("expected 2 TemplatePublished events, got %d", pub.templatePublished)
+	}
+}
+
+func TestGetPublishedVersion_MissingLocale_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/published", nil, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d", rr.Code)
+	}
+}
+
+func TestGetPublishedVersion_NoneYet_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/published?locale=en-US", nil, "owner-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
+func TestRetireTemplate_AlreadyRetired_Returns409(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/retire", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first retire: expected 200 got %d", rr.Code)
+	}
+	rr = doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/retire", nil, "owner-1")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d", rr.Code)
+	}
+	if pub.templateRetired != 1 {
+		t.Fatalf("expected 1 TemplateRetired event, got %d", pub.templateRetired)
+	}
+}
+
+// Two routers share the same store: one with permissive authz sets up a
+// validated version, a second with denying authz attempts the approve —
+// proving the mutation is refused rather than the setup itself being
+// blocked by the same denial.
+func TestApproveTemplate_AuthzDenied_Returns403(t *testing.T) {
+	store := newStubStore()
+	setupRouter := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, setupRouter, "owner-1")
+	versionID := createTestVersion(t, setupRouter, templateID, "owner-1")
+	doReq(setupRouter, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/validate", nil, "owner-1")
+
+	denyingAuthz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
+	denyRouter := newRouter(store, &stubPublisher{}, denyingAuthz)
+	rr := doReq(denyRouter, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/approve", nil, "approver-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(denyingAuthz.calls) != 1 || denyingAuthz.calls[0] != "TEMPLATE_APPROVE" {
+		t.Errorf("expected one TEMPLATE_APPROVE check, got %v", denyingAuthz.calls)
+	}
+}
+
+// ── RenderPreview / CompareVersions / ListLocales tests (BIZ-03 Wave 2) ──────
+
+func TestRenderPreview_MissingVariables_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionID := createTestVersion(t, r, templateID, "owner-1")
+
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/preview", map[string]any{
+		"variables": map[string]string{},
+	}, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRenderPreview_Valid_Returns200(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionID := createTestVersion(t, r, templateID, "owner-1")
+
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/preview", map[string]any{
+		"variables": map[string]string{"first_name": "Ada"},
+	}, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRenderPreview_UnknownVersion_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/nope/preview", map[string]any{}, "owner-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
+func TestCompareVersions_DifferentTemplates_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateA := createTestTemplate(t, r, "owner-1")
+	versionA := createTestVersion(t, r, templateA, "owner-1")
+	templateB := createTestTemplate(t, r, "owner-1")
+	versionB := createTestVersion(t, r, templateB, "owner-1")
+
+	rr := doReq(r, http.MethodGet,
+		"/v1/document-templates/"+templateA+"/compare?version_a="+versionA+"&version_b="+versionB, nil, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCompareVersions_SameTemplate_ReportsContentChanged(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionA := createTestVersion(t, r, templateID, "owner-1")
+	versionB := createTestVersion(t, r, templateID, "owner-1")
+
+	rr := doReq(r, http.MethodGet,
+		"/v1/document-templates/"+templateID+"/compare?version_a="+versionA+"&version_b="+versionB, nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var result domain.CompareVersionsResult
+	if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if result.VersionA.VersionID != versionA || result.VersionB.VersionID != versionB {
+		t.Fatalf("expected version_a/version_b to match request, got %s/%s", result.VersionA.VersionID, result.VersionB.VersionID)
+	}
+}
+
+func TestCompareVersions_MissingParams_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/compare", nil, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d", rr.Code)
+	}
+}
+
+func TestListLocales_ReturnsEachLocale(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	createTestVersion(t, r, templateID, "owner-1") // en-US, from the shared test helper
+
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/locales", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var locales []domain.LocaleSummary
+	if err := json.Unmarshal(rr.Body.Bytes(), &locales); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(locales) != 1 || locales[0].Locale != "en-US" {
+		t.Fatalf("expected one en-US locale, got %+v", locales)
+	}
+}
+
+func TestListLocales_UnknownTemplate_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/nope/locales", nil, "owner-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
 func TestListNotifications_PagingIsValidated(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubAuthZ{})
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
 
 	for _, q := range []string{"?limit=abc", "?limit=0", "?limit=100000", "?offset=-1"} {
 		rr := doReq(r, http.MethodGet, "/v1/notifications/"+q, nil, "principal-1")
@@ -876,4 +1265,245 @@ func TestListNotifications_PagingIsValidated(t *testing.T) {
 	if store.lastFilter.Limit != 100 {
 		t.Errorf("expected a bounded default limit of 100, got %d", store.lastFilter.Limit)
 	}
+}
+
+// ── GetDeliveryStatus / ResolveDeliveryOutcome tests ────────────────────────
+
+func seedPendingUnknown(store *stubStore, id, legalEntityID string) *domain.Notification {
+	now := time.Now().UTC()
+	n := &domain.Notification{
+		NotificationID: id, TenantID: "tenant-abc", LegalEntityID: legalEntityID,
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Subject: "s", Body: "b",
+		Status: domain.StatusPendingUnknown, CorrelationID: "corr-" + id,
+		CreatedByPrincipalID: "principal-1", CreatedAt: now,
+		FailureReason: "connection dropped at verdict", SentAt: &now, UnknownAt: &now,
+	}
+	store.byID[id] = n
+	return n
+}
+
+func TestGetDeliveryStatus_PendingUnknown_CarriesErrorCode(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodGet, "/v1/notifications/n1/delivery-status", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Status    string `json:"status"`
+		ErrorCode string `json:"error_code"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.Status != domain.StatusPendingUnknown {
+		t.Errorf("status = %q, want PENDING_UNKNOWN", resp.Status)
+	}
+	if resp.ErrorCode != "DELIVERY_OUTCOME_UNKNOWN" {
+		t.Errorf("error_code = %q, want DELIVERY_OUTCOME_UNKNOWN", resp.ErrorCode)
+	}
+}
+
+func TestGetDeliveryStatus_Sent_CarriesNoErrorCode(t *testing.T) {
+	store := newStubStore()
+	now := time.Now().UTC()
+	store.byID["n1"] = &domain.Notification{
+		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "SENT", SentAt: &now,
+	}
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodGet, "/v1/notifications/n1/delivery-status", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rr.Code)
+	}
+	var resp struct {
+		ErrorCode string `json:"error_code"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if resp.ErrorCode != "" {
+		t.Errorf("error_code = %q, want empty for a concluded SENT notification", resp.ErrorCode)
+	}
+}
+
+func TestGetDeliveryStatus_NotFound(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/notifications/nope/delivery-status", nil, "principal-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
+func TestResolveDeliveryOutcome_ToSent_PublishesSent(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "SENT", "resolution_note": "provider support confirmed acceptance",
+		"provider_response": "smtp; confirmed by provider support",
+	}, "ops-1")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var n domain.Notification
+	_ = json.NewDecoder(rr.Body).Decode(&n)
+	if n.Status != "SENT" {
+		t.Errorf("status = %q, want SENT", n.Status)
+	}
+	if n.ResolvedByPrincipalID != "ops-1" {
+		t.Errorf("resolved_by_principal_id = %q, want ops-1", n.ResolvedByPrincipalID)
+	}
+	if n.ResolutionNote == "" {
+		t.Error("resolution_note should be recorded")
+	}
+	if pub.sent != 1 || pub.failed != 0 {
+		t.Errorf("published sent=%d failed=%d, want 1/0", pub.sent, pub.failed)
+	}
+}
+
+func TestResolveDeliveryOutcome_ToFailed_PublishesFailed(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "FAILED", "resolution_note": "provider confirmed the message was never queued",
+	}, "ops-1")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var n domain.Notification
+	_ = json.NewDecoder(rr.Body).Decode(&n)
+	if n.Status != "FAILED" {
+		t.Errorf("status = %q, want FAILED", n.Status)
+	}
+	if pub.sent != 0 || pub.failed != 1 {
+		t.Errorf("published sent=%d failed=%d, want 0/1", pub.sent, pub.failed)
+	}
+}
+
+// TestResolveDeliveryOutcome_NotPendingUnknown_Returns409 is the negative
+// control — only a genuinely ambiguous notification has something to
+// resolve.
+func TestResolveDeliveryOutcome_NotPendingUnknown_Returns409(t *testing.T) {
+	store := newStubStore()
+	now := time.Now().UTC()
+	store.byID["n1"] = &domain.Notification{
+		NotificationID: "n1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		RecipientPrincipalID: "principal-2", Channel: "EMAIL", Status: "SENT", SentAt: &now,
+	}
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "SENT", "resolution_note": "irrelevant",
+	}, "ops-1")
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestResolveDeliveryOutcome_InvalidResolvedStatus_Returns400(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "PENDING", "resolution_note": "x",
+	}, "ops-1")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestResolveDeliveryOutcome_MissingResolutionNote_Returns400(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "SENT",
+	}, "ops-1")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestResolveDeliveryOutcome_AuthzDenied_Returns403(t *testing.T) {
+	store := newStubStore()
+	seedPendingUnknown(store, "n1", "le-us")
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied})
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n1/resolve-delivery-outcome", map[string]any{
+		"resolved_status": "SENT", "resolution_note": "x",
+	}, "ops-1")
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if store.byID["n1"].Status != domain.StatusPendingUnknown {
+		t.Error("expected the notification to remain untouched on authorization denial")
+	}
+}
+
+// emit records one event the real store would have enqueued.
+func (s *stubStore) emit(eventType string) {
+	p := s.events
+	if p == nil {
+		return
+	}
+	switch eventType {
+	case "notification.sent":
+		p.sent++
+	case "notification.failed":
+		p.failed++
+	case "notification.outcome_unknown":
+		p.outcomeUnknown++
+	case "template.created":
+		p.templateCreated++
+	case "template.version_approved":
+		p.templateApproved++
+	case "template.published":
+		p.templatePublished++
+	case "template.retired":
+		p.templateRetired++
+	}
+}
+
+func (s *stubStore) ListAttempts(_ context.Context, id string) ([]domain.DeliveryAttempt, error) {
+	return s.attempts[id], nil
+}
+
+func (s *stubStore) BeginSubmission(_ context.Context, id, _ string, _ time.Time) error {
+	if s.beginSubmissionErr != nil {
+		return s.beginSubmissionErr
+	}
+	s.submitted = append(s.submitted, id)
+	return nil
+}
+
+func (s *stubStore) BeginResend(_ context.Context, id, _, actor, reason string, at time.Time) (*domain.Notification, error) {
+	n, ok := s.byID[id]
+	if !ok || (n.Status != domain.StatusSent && n.Status != domain.StatusFailed) {
+		return nil, domain.ErrNotResendable
+	}
+	n.Status = domain.StatusPending
+	n.ResendCount++
+	n.LastResendReason, n.LastResentAt, n.LastResentByPrincipalID = reason, &at, actor
+	cp := *n
+	return &cp, nil
+}
+
+func (s *stubStore) SetRecipientAddress(_ context.Context, id, _, address, source string) error {
+	if n, ok := s.byID[id]; ok {
+		n.RecipientAddress, n.RecipientAddressSource = address, source
+	}
+	return nil
 }

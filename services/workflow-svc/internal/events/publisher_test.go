@@ -29,13 +29,14 @@ func (f *fakeWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) err
 }
 
 type envelope struct {
-	EventType     string `json:"event_type"`
-	EventVersion  string `json:"event_version"`
-	SourceService string `json:"source_service"`
-	CorrelationID string `json:"correlation_id"`
-	TenantID      string `json:"tenant_id"`
-	LegalEntityID string `json:"legal_entity_id"`
-	ActorID       string `json:"actor_id"`
+	EventType     string          `json:"event_type"`
+	EventVersion  string          `json:"event_version"`
+	SourceService string          `json:"source_service"`
+	CorrelationID string          `json:"correlation_id"`
+	TenantID      string          `json:"tenant_id"`
+	LegalEntityID string          `json:"legal_entity_id"`
+	ActorID       string          `json:"actor_id"`
+	Payload       json.RawMessage `json:"payload"`
 }
 
 func decodeOne(t *testing.T, w *fakeWriter) envelope {
@@ -126,6 +127,45 @@ func TestPublishApprovalRejected_EnvelopeCarriesRejectingActor(t *testing.T) {
 	env := decodeOne(t, w)
 	assert.Equal(t, "approval.rejected", env.EventType)
 	assert.Equal(t, "approver-1", env.ActorID)
+}
+
+func TestPublishAuditEngagementEvent_CarriesAuditableScopeAndCorrelation(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisher(zap.NewNop(), "zoiko.workflow.events", w)
+	e := domain.AuditEngagement{
+		EngagementID: "audit-1", TenantID: "tenant-1", LegalEntityID: "entity-1",
+		EngagementCode: "FY26-STAT", EngagementType: "STATUTORY_AUDIT",
+	}
+	require.NoError(t, p.PublishAuditEngagementEvent(context.Background(), "audit.engagement.created", e, "audit-manager-1", "audit-corr-1"))
+	env := decodeOne(t, w)
+	assert.Equal(t, "audit.engagement.created", env.EventType)
+	assert.Equal(t, "tenant-1", env.TenantID)
+	assert.Equal(t, "entity-1", env.LegalEntityID)
+	assert.Equal(t, "audit-manager-1", env.ActorID)
+	assert.Equal(t, "audit-corr-1", env.CorrelationID)
+}
+
+func TestPublishWorkflowInvalidated_EnvelopeCarriesInvalidatorAndReason(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisher(zap.NewNop(), "zoiko.workflow.events", w)
+	inst := instance()
+	inst.WorkflowStatus = "INVALIDATED"
+	reason := "CONTROL_FAILURE"
+	inst.InvalidationReasonCode = &reason
+	fp := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	inst.SubjectFingerprint = &fp
+
+	require.NoError(t, p.PublishWorkflowInvalidated(context.Background(), inst, "security-lead-1"))
+
+	env := decodeOne(t, w)
+	assert.Equal(t, "workflow.approval.invalidated", env.EventType)
+	assert.Equal(t, "security-lead-1", env.ActorID)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(env.Payload, &payload))
+	assert.Equal(t, "INVALIDATED", payload["workflow_status"])
+	assert.Equal(t, "CONTROL_FAILURE", payload["invalidation_reason_code"])
+	assert.Equal(t, fp, payload["subject_fingerprint"])
 }
 
 func TestPublish_WriteFailure_ReturnsError(t *testing.T) {

@@ -195,3 +195,114 @@ func TestPgStore_CertifyCostPopulation_ExcludesReversedOriginal(t *testing.T) {
 		t.Fatalf("expected entry_count=2 (kept + the reversal entry), got %d", cert.EntryCount)
 	}
 }
+
+// TestPgStore_GetCostSourceLineage_ReclassifyOfAReversal is the real
+// recursive-CTE proof behind PRJ-02's own GetCostSourceLineage query: a
+// chain of length 3 (original -> reversal -> reclassification of the
+// reversal) is reachable end-to-end.
+func TestPgStore_GetCostSourceLineage_ReclassifyOfAReversal(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	projectID := newActiveTestProject(t, s, ctx, tenantID, legalEntityID, "PRJ-COST-6")
+
+	e := newDraftCostEntry(projectID, domain.CostSourceTypeAP, "idem-cost-6", 100)
+	if err := s.CaptureProjectCost(ctx, e); err != nil {
+		t.Fatalf("CaptureProjectCost failed: %v", err)
+	}
+	now := time.Now().UTC()
+	reversal, err := s.CreateLinkedCostEntry(ctx, e.EntryID, "reviewer-2", "wrong amount", true, uuid.New().String(), nil, nil, nil, nil, now)
+	if err != nil {
+		t.Fatalf("CreateLinkedCostEntry (reversal) failed: %v", err)
+	}
+	newCategory := "Travel"
+	if _, err := s.CreateLinkedCostEntry(ctx, reversal.EntryID, "reviewer-3", "correcting category", false, uuid.New().String(), nil, &newCategory, nil, nil, now); err != nil {
+		t.Fatalf("CreateLinkedCostEntry (reclassify) failed: %v", err)
+	}
+
+	lineage, err := s.GetCostSourceLineage(ctx, e.EntryID)
+	if err != nil {
+		t.Fatalf("GetCostSourceLineage failed: %v", err)
+	}
+	if len(lineage) != 3 {
+		t.Fatalf("expected lineage of 3 (original, reversal, reclassification), got %d: %+v", len(lineage), lineage)
+	}
+
+	leafLineage, err := s.GetCostSourceLineage(ctx, reversal.EntryID)
+	if err != nil {
+		t.Fatalf("GetCostSourceLineage (from reversal) failed: %v", err)
+	}
+	if len(leafLineage) != 2 {
+		t.Fatalf("expected lineage of 2 from the reversal (itself + its own reclassification), got %d: %+v", len(leafLineage), leafLineage)
+	}
+}
+
+// TestPgStore_GetUnallocatedCostExceptions_OnlyReturnsCaptured is the real
+// proof of PRJ-02's own GetUnallocatedCostExceptions query — it must
+// exclude an entry that already progressed past CAPTURED.
+func TestPgStore_GetUnallocatedCostExceptions_OnlyReturnsCaptured(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	projectID := newActiveTestProject(t, s, ctx, tenantID, legalEntityID, "PRJ-COST-7")
+
+	stillCaptured := newDraftCostEntry(projectID, domain.CostSourceTypeAP, "idem-cost-7a", 100)
+	stillCaptured.LegalEntityID = legalEntityID
+	if err := s.CaptureProjectCost(ctx, stillCaptured); err != nil {
+		t.Fatalf("CaptureProjectCost (stillCaptured) failed: %v", err)
+	}
+	validated := newDraftCostEntry(projectID, domain.CostSourceTypeAP, "idem-cost-7b", 200)
+	validated.LegalEntityID = legalEntityID
+	if err := s.CaptureProjectCost(ctx, validated); err != nil {
+		t.Fatalf("CaptureProjectCost (validated) failed: %v", err)
+	}
+	if err := s.ValidateProjectCost(ctx, validated.EntryID, time.Now().UTC()); err != nil {
+		t.Fatalf("ValidateProjectCost failed: %v", err)
+	}
+
+	exceptions, err := s.GetUnallocatedCostExceptions(ctx, legalEntityID)
+	if err != nil {
+		t.Fatalf("GetUnallocatedCostExceptions failed: %v", err)
+	}
+	if len(exceptions) != 1 || exceptions[0].EntryID != stillCaptured.EntryID {
+		t.Fatalf("expected only the still-CAPTURED entry, got %+v", exceptions)
+	}
+}
+
+// TestPgStore_GetProjectCostAsOf_ReconstructsHistoricalPopulation is the
+// real proof of PRJ-02's own GetProjectCostAsOf query — it must exclude an
+// entry captured after the requested instant.
+func TestPgStore_GetProjectCostAsOf_ReconstructsHistoricalPopulation(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	projectID := newActiveTestProject(t, s, ctx, tenantID, legalEntityID, "PRJ-COST-8")
+
+	first := newDraftCostEntry(projectID, domain.CostSourceTypeAP, "idem-cost-8a", 100)
+	if err := s.CaptureProjectCost(ctx, first); err != nil {
+		t.Fatalf("CaptureProjectCost (first) failed: %v", err)
+	}
+	cutoff := time.Now().UTC()
+	time.Sleep(10 * time.Millisecond)
+	second := newDraftCostEntry(projectID, domain.CostSourceTypeAP, "idem-cost-8b", 200)
+	if err := s.CaptureProjectCost(ctx, second); err != nil {
+		t.Fatalf("CaptureProjectCost (second) failed: %v", err)
+	}
+
+	entries, err := s.GetProjectCostAsOf(ctx, projectID, cutoff)
+	if err != nil {
+		t.Fatalf("GetProjectCostAsOf failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].EntryID != first.EntryID {
+		t.Fatalf("expected only the entry captured before cutoff, got %+v", entries)
+	}
+}

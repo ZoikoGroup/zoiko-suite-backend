@@ -261,7 +261,6 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishVendorInvoiceReceived(r.Context(), *inv)
 	writeJSON(w, http.StatusCreated, inv)
 }
 
@@ -430,7 +429,6 @@ func (h *Handler) ValidateInvoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	h.publisher.PublishVendorInvoiceValidated(r.Context(), *inv)
 	writeJSON(w, http.StatusOK, inv)
 }
 
@@ -492,8 +490,9 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	h.publisher.PublishVendorInvoiceApproved(r.Context(), *inv)
-
+	// vendor.invoice.approved is written to the outbox inside TransitionInvoice
+	// (ZS-STATE-001), so it is not published here as well.
+	//
 	// AP-08's /ap08/payables is a governed write: correlation_id, request_id and
 	// source_channel are mandatory envelope headers on the outbound call, and an
 	// idempotency key makes a replay of this approval safe at AP-08's boundary the
@@ -587,7 +586,6 @@ func (h *Handler) RequestPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	h.publisher.PublishPaymentRequested(r.Context(), *inv)
 	writeJSON(w, http.StatusOK, inv)
 }
 
