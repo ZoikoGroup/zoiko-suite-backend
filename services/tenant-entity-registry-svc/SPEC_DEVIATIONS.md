@@ -80,8 +80,18 @@ Only the isolation-identifier and sensitive-identifier guards below touch them.
 | §4.3 "permitted calendar/currency references" | `fiscal_calendar_id` must be a UUID. REF-04 Fiscal Calendar does not exist in the estate, so the reference cannot be resolved against its owner — a dependency gap, not a service choice. |
 | §3 "purpose limitation" | Registry-conflict quarantine rows (which hold a rejected claimant's payload) need `ENTITY_REGISTRY_CONFLICT_READ`; approval requests need `APPROVAL_REQUEST_READ` to list or read (deciding implies reading). |
 
+### Added 29 Sep 2026 (re-audit)
+
+| Spec text | Reading implemented |
+|---|---|
+| §4.3 "Required source inputs: legal name; entity type/legal form; incorporation jurisdiction; registry number/date; registered address; functional-currency preference; fiscal-calendar reference; supporting evidence" | `registered_office` and `source_evidence_ref` required at CreateEntity (relaxed only by `LEGACY_PROVISIONING_INPUTS`). The legal form is optional — `entity_type` answers "entity type/legal form" and not every entity has an ELF code — but when sent is held to the ELF control. All are recorded on profile version 1. Before 29 Sep none of the legal-form, registry-authority, registered-office or evidence fields existed on the create request, so a client that sent them had them silently discarded (and an invalid ELF code was accepted with a 201). |
+| §3 "stable typed errors" — a malformed identifier | `VALIDATION_FAILED` (400). Every route taking an id answered 500 `INTERNAL_ERROR` to a non-UUID or empty id before 29 Sep; mapped once, at the store's RLS boundary (SQLSTATE 22P02). |
+| §8 NP3 — which hostname | The guard compares the request's `Host`. The ingress must preserve the client's `Host` (the GCP load balancer does by default); a proxy that rewrites it to the service name silently disables NP3. `X-Forwarded-Host` is deliberately not trusted: any client can set it. |
+
 ### Contract changes a client must adopt (oasdiff, `scripts/contract_gate.sh`)
-14 deliberate breaking changes against the 24 Sep contract:
+16 deliberate breaking changes against the 24 Sep contract — 14 on 28 Sep, and
+on 29 Sep `registered_office` and `source_evidence_ref` required on
+`POST /v1/entities`. The 28 Sep fourteen:
 `expected_version` required on every command body; `primary_jurisdiction_id`,
 `residency_region_id`, `subscription_id` new required and
 `onboarding_request_ref` now required on `POST /v1/tenants`; `ChangeHomeRegion`
@@ -103,5 +113,5 @@ All refused at boot in staging and production.
 | `MAKER_CHECKER_LEGACY_BODY_APPROVER` | body-supplied approver (pre-000007) |
 | `LEGACY_ENTITY_CREATE_ACTIVE` | entities created straight into ACTIVE |
 | `ONBOARDING_KEY_OPTIONAL` | provisioning without `external_customer_key` |
-| `LEGACY_PROVISIONING_INPUTS` | provisioning without the §4.2 inputs (000013) |
+| `LEGACY_PROVISIONING_INPUTS` | provisioning without the §4.2 inputs (000013), and entity creation without `registered_office` / `source_evidence_ref` (§4.3) |
 | `EXPECTED_VERSION_OPTIONAL` | substitution of the read version for a missing `expected_version` |

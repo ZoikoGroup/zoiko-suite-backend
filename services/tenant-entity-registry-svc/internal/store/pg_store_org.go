@@ -506,14 +506,19 @@ func insertInitialProfileVersionTx(ctx context.Context, tx pgx.Tx, v *domain.Leg
 			legal_name, trading_name, registration_number,
 			incorporation_jurisdiction_id, default_currency_code,
 			effective_from, recorded_at, change_reason, created_by_principal_id,
-			lei, lei_source, lei_status, lei_verified_at
-		) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+			lei, lei_source, lei_status, lei_verified_at,
+			legal_form_code, legal_form_source, legal_form_local_text,
+			registry_authority, registered_office, source_evidence_ref
+		) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+		          $17, $18, $19, $20, $21, $22)`,
 		v.ProfileVersionID, v.TenantID, v.LegalEntityID,
 		v.LegalName, v.TradingName, v.RegistrationNumber,
 		v.IncorporationJurisdictionID, v.DefaultCurrencyCode,
 		v.EffectiveFrom, time.Now().UTC(),
 		string(domain.ProfileChangeInitial), v.CreatedByPrincipalID,
 		v.LEI, v.LEISource, v.LEIStatus, v.LEIVerifiedAt,
+		v.LegalFormCode, v.LegalFormSource, v.LegalFormLocalText,
+		v.RegistryAuthority, v.RegisteredOffice, v.SourceEvidenceRef,
 	)
 	return err
 }

@@ -215,7 +215,10 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	if err := gateConfigWriteValue(ctx, tx, params.Key, params.TenantID, params.Value); err != nil {
+	if err := gateDirectWrite(ctx, tx, params.Key); err != nil {
+		return nil, false, err
+	}
+	if err := gateConfigWriteValue(ctx, tx, params.Key, params.Environment, params.TenantID, params.Value); err != nil {
 		return nil, false, err
 	}
 
@@ -240,14 +243,8 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 			s.log.Error("pg UpsertConfigEntry: enqueue failed", zap.Error(err))
 			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		snap, mintErr := s.mintSnapshot(ctx, tx, params.Environment, params.CreatedByPrincipalID)
-		if mintErr != nil {
-			s.log.Error("pg UpsertConfigEntry: mint failed", zap.Error(mintErr))
-			return nil, false, mintErr
-		}
-		if err := enqueueSnapshotPublished(ctx, tx, params.CallerTenantID, params.CreatedByPrincipalID, params.CorrelationID, *snap); err != nil {
-			s.log.Error("pg UpsertConfigEntry: enqueue snapshot failed", zap.Error(err))
-			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		if err := s.mintAndPublish(ctx, tx, "UpsertConfigEntry", params.Environment, params.CreatedByPrincipalID, params.CallerTenantID, params.CorrelationID); err != nil {
+			return nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			s.log.Error("pg UpsertConfigEntry: commit failed", zap.Error(err))
@@ -285,6 +282,12 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 	if err := enqueueConfigUpdated(ctx, tx, params.CallerTenantID, *entry, params.CorrelationID); err != nil {
 		s.log.Error("pg UpsertConfigEntry: enqueue failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	// The supersede is a real transition too, and reads are served from
+	// snapshots (INV-12): without a mint here the new value was recorded and
+	// reported saved while every read kept serving the one it replaced.
+	if err := s.mintAndPublish(ctx, tx, "UpsertConfigEntry", params.Environment, params.CreatedByPrincipalID, params.CallerTenantID, params.CorrelationID); err != nil {
+		return nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		s.log.Error("pg UpsertConfigEntry: commit failed", zap.Error(err))
@@ -404,7 +407,7 @@ func (s *PgStore) ListCurrentConfigEntries(ctx context.Context, filter ListFilte
 			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		for _, e := range entries {
-			if e.Kind != domain.ManifestKindConfig || !entryMatch(filter, e.TenantID) {
+			if e.Kind != domain.ManifestKindConfig || e.Layer != "" || !entryMatch(filter, e.TenantID) {
 				continue
 			}
 			results = append(results, configFromManifest(e))
@@ -471,7 +474,10 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	if err := gateFlagWrite(ctx, tx, params.Key, params.TenantID, params.Enabled, params.RolloutPercentage); err != nil {
+	if err := gateDirectWrite(ctx, tx, params.Key); err != nil {
+		return nil, false, err
+	}
+	if err := gateFlagWrite(ctx, tx, params.Key, params.Environment, params.TenantID, params.Enabled, params.RolloutPercentage); err != nil {
 		return nil, false, err
 	}
 
@@ -495,14 +501,8 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 			s.log.Error("pg UpsertFeatureFlag: enqueue failed", zap.Error(err))
 			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		snap, mintErr := s.mintSnapshot(ctx, tx, params.Environment, params.CreatedByPrincipalID)
-		if mintErr != nil {
-			s.log.Error("pg UpsertFeatureFlag: mint failed", zap.Error(mintErr))
-			return nil, false, mintErr
-		}
-		if err := enqueueSnapshotPublished(ctx, tx, params.CallerTenantID, params.CreatedByPrincipalID, params.CorrelationID, *snap); err != nil {
-			s.log.Error("pg UpsertFeatureFlag: enqueue snapshot failed", zap.Error(err))
-			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		if err := s.mintAndPublish(ctx, tx, "UpsertFeatureFlag", params.Environment, params.CreatedByPrincipalID, params.CallerTenantID, params.CorrelationID); err != nil {
+			return nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			s.log.Error("pg UpsertFeatureFlag: commit failed", zap.Error(err))
@@ -532,6 +532,10 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 	if err := enqueueFlagUpdated(ctx, tx, params.CallerTenantID, *flag, params.CorrelationID); err != nil {
 		s.log.Error("pg UpsertFeatureFlag: enqueue failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	// See UpsertConfigEntry: a supersede must mint or reads never see it.
+	if err := s.mintAndPublish(ctx, tx, "UpsertFeatureFlag", params.Environment, params.CreatedByPrincipalID, params.CallerTenantID, params.CorrelationID); err != nil {
+		return nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		s.log.Error("pg UpsertFeatureFlag: commit failed", zap.Error(err))
@@ -638,6 +642,23 @@ func (s *PgStore) ListCurrentFeatureFlags(ctx context.Context, filter ListFilter
 // Because it shares the transaction, a failure here FAILS THE WRITE. That is
 // deliberate: refusing a change nobody can be told about is better than
 // recording one silently, and the caller can retry.
+// mintAndPublish mints the environment's next snapshot inside the write's
+// transaction and enqueues config.snapshot.published beside it. Every path
+// that records a real transition calls it — first write and supersede alike —
+// so a value can never be committed without the imprint reads are served from.
+func (s *PgStore) mintAndPublish(ctx context.Context, tx pgx.Tx, logOp, environment, actor, callerTenantID, correlationID string) error {
+	snap, err := s.mintSnapshot(ctx, tx, environment, actor)
+	if err != nil {
+		s.log.Error("pg "+logOp+": mint failed", zap.Error(err))
+		return err
+	}
+	if err := enqueueSnapshotPublished(ctx, tx, callerTenantID, actor, correlationID, *snap); err != nil {
+		s.log.Error("pg "+logOp+": enqueue snapshot failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
 func enqueue(ctx context.Context, tx pgx.Tx, tenantID string, out events.Outbound) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO event_outbox (tenant_id, event_type, aggregate_key, payload)

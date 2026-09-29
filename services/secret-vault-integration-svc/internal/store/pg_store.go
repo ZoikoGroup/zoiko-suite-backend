@@ -99,6 +99,7 @@ type Store interface {
 	UpsertRotationSchedule(ctx context.Context, secretPolicyVersionID string, intervalSeconds int, nextRotationAt time.Time) error
 	ListDueRotations(ctx context.Context, now time.Time) ([]*domain.DueRotation, error)
 	UpdateRotationSchedule(ctx context.Context, secretPolicyVersionID string, nextRotationAt time.Time) error
+	ClaimDueRotation(ctx context.Context, secretPolicyVersionID string, listedNext, claimUntil time.Time) (bool, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -1212,7 +1213,12 @@ func (s *PgStore) FindSharedSecretExceptionByID(ctx context.Context, exceptionID
 // ListSharedSecretExceptions returns an optionally-status/secret_path
 // filtered slice of register rows, newest first.
 func (s *PgStore) ListSharedSecretExceptions(ctx context.Context, filter domain.ListSharedSecretExceptionsFilter) ([]*domain.SharedSecretException, error) {
-	conditions := []string{"tenant_id IS NULL OR tenant_id = NULLIF($1, '')::uuid"}
+	// Parenthesised: joined with AND below, the bare OR bound as
+	// "tenant_id IS NULL OR (tenant_id = $1 AND status = .. AND secret_path = ..)",
+	// so every GLOBAL exception came back whatever its status or path — and
+	// emergency retrieval accepted a revoked global exception for another
+	// secret as authority for this one.
+	conditions := []string{"(tenant_id IS NULL OR tenant_id = NULLIF($1, '')::uuid)"}
 	args := []any{filter.TenantID}
 	argIdx := 2
 	if filter.Status != "" {
@@ -1311,7 +1317,7 @@ func (s *PgStore) UpsertRotationSchedule(ctx context.Context, secretPolicyVersio
 // Rotate), and the schedule table carries no tenant scope of its own.
 func (s *PgStore) ListDueRotations(ctx context.Context, now time.Time) ([]*domain.DueRotation, error) {
 	const query = `
-		SELECT v.secret_policy_id, s.secret_policy_version_id, sp.secret_path, sp.secret_class, s.interval_seconds
+		SELECT v.secret_policy_id, s.secret_policy_version_id, sp.secret_path, sp.secret_class, s.interval_seconds, s.next_rotation_at
 		FROM secret_rotation_schedules s
 		JOIN secret_policy_versions v ON v.secret_policy_version_id = s.secret_policy_version_id
 		JOIN secret_policies sp ON sp.secret_policy_id = v.secret_policy_id
@@ -1328,7 +1334,7 @@ func (s *PgStore) ListDueRotations(ctx context.Context, now time.Time) ([]*domai
 
 		for rows.Next() {
 			d := &domain.DueRotation{}
-			if err := rows.Scan(&d.SecretPolicyID, &d.SecretPolicyVersionID, &d.SecretPath, &d.SecretClass, &d.IntervalSeconds); err != nil {
+			if err := rows.Scan(&d.SecretPolicyID, &d.SecretPolicyVersionID, &d.SecretPath, &d.SecretClass, &d.IntervalSeconds, &d.NextRotationAt); err != nil {
 				return err
 			}
 			results = append(results, d)
@@ -1340,6 +1346,25 @@ func (s *PgStore) ListDueRotations(ctx context.Context, now time.Time) ([]*domai
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
+}
+
+// ClaimDueRotation atomically takes one due rotation for this caller: it
+// moves next_rotation_at from the value the caller listed to claimUntil, and
+// reports whether it did. A second sweeper (another replica, or the same one
+// re-listing) sees a changed next_rotation_at and gets false, so a due secret
+// is rotated once, not once per replica. A claim whose rotation then fails is
+// simply due again at claimUntil.
+func (s *PgStore) ClaimDueRotation(ctx context.Context, secretPolicyVersionID string, listedNext, claimUntil time.Time) (bool, error) {
+	const query = `
+		UPDATE secret_rotation_schedules
+		SET next_rotation_at = $3, updated_at = NOW()
+		WHERE secret_policy_version_id = $1 AND next_rotation_at = $2;`
+	tag, err := s.pool.Exec(ctx, query, secretPolicyVersionID, listedNext, claimUntil)
+	if err != nil {
+		s.log.Error("pg ClaimDueRotation failed", zap.Error(err))
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // UpdateRotationSchedule pushes a version's next_rotation_at forward after

@@ -29,7 +29,12 @@ type RotationCore interface {
 type SweepStore interface {
 	ListDueRotations(ctx context.Context, now time.Time) ([]*domain.DueRotation, error)
 	UpdateRotationSchedule(ctx context.Context, secretPolicyVersionID string, nextRotationAt time.Time) error
+	ClaimDueRotation(ctx context.Context, secretPolicyVersionID string, listedNext, claimUntil time.Time) (bool, error)
 }
+
+// claimHold is how long a claimed rotation is withheld from other sweepers.
+// A rotation that fails after its claim is due again once this passes.
+const claimHold = 10 * time.Minute
 
 // Sweeper rotates every due secret on a fixed interval.
 type Sweeper struct {
@@ -103,11 +108,24 @@ func (s *Sweeper) Sweep(ctx context.Context) error {
 }
 
 func (s *Sweeper) rotateOne(ctx context.Context, d *domain.DueRotation) error {
-	// Deterministic request id so a crash between the rotate and the
-	// reschedule can never double-rotate on the next sweep: the idempotency
-	// record written by PerformRotation makes a retried call for the same id
-	// a no-op that answers the original outcome.
-	requestID := fmt.Sprintf("sweep:%s:%d", d.SecretPolicyVersionID, time.Now().Unix())
+	// Claim first. The request id used to embed time.Now(), so it was never
+	// the same twice: two replicas (or one re-listing after a slow pass)
+	// rotated the same due secret independently, each mass-revoking its
+	// leases. The claim is a compare-and-swap on the listed due time, so
+	// exactly one sweeper proceeds.
+	claimed, err := s.store.ClaimDueRotation(ctx, d.SecretPolicyVersionID, d.NextRotationAt, time.Now().Add(claimHold))
+	if err != nil {
+		return fmt.Errorf("claim %s: %w", d.SecretPath, err)
+	}
+	if !claimed {
+		s.log.Info("rotation already claimed by another sweeper",
+			zap.String("secret_policy_version_id", d.SecretPolicyVersionID))
+		return nil
+	}
+
+	// Deterministic: one due occurrence of one version is one request id, so
+	// the evidence of a rotation names the schedule slot it fulfilled.
+	requestID := fmt.Sprintf("sweep:%s:%d", d.SecretPolicyVersionID, d.NextRotationAt.Unix())
 
 	path, _, _, err := s.rotate.PerformRotation(ctx, d.SecretPolicyID, s.actorID, nil, requestID, "rotation-sweeper")
 	if err != nil {
@@ -131,7 +149,7 @@ func (s *Sweeper) rotateOne(ctx context.Context, d *domain.DueRotation) error {
 	}
 
 	// Reschedule ONLY on success (no error path above fell through). A
-	// version that failed to rotate stays due and is retried next pass.
+	// version that failed to rotate is due again when its claim lapses.
 	if err := s.store.UpdateRotationSchedule(ctx, d.SecretPolicyVersionID, time.Now().Add(time.Duration(d.IntervalSeconds)*time.Second)); err != nil {
 		s.log.Warn("rescheduling rotation failed; next pass will retry a stale due time",
 			zap.String("secret_policy_version_id", d.SecretPolicyVersionID),

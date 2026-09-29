@@ -33,6 +33,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/binary"
@@ -120,6 +121,26 @@ func latestSnapshotRowQ(ctx context.Context, q queryer, environment string) (*do
 
 func (s *PgStore) latestSnapshotRow(ctx context.Context, environment string) (*domain.ConfigSnapshot, error) {
 	return latestSnapshotRowQ(ctx, s.pool, environment)
+}
+
+// GetSnapshot returns one imprint by id — the lookup that makes INV-29
+// evidence usable: a consumer that kept an evaluation's snapshot_id can fetch
+// the exact content that produced it, whatever has been written since. The
+// row is immutable (000009), so the same id always answers the same bytes.
+// The content spans every tenant in the environment; the handler restricts
+// this read to platform scope for that reason.
+func (s *PgStore) GetSnapshot(ctx context.Context, snapshotID string) (*domain.ConfigSnapshot, error) {
+	snap, err := scanSnapshot(s.pool.QueryRow(ctx, `
+		SELECT `+snapshotColumns+`
+		FROM config_snapshots
+		WHERE snapshot_id = $1`, snapshotID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrSnapshotNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return snap, nil
 }
 
 // latestSnapshotsByEnv returns the newest imprint for every environment that
@@ -246,9 +267,14 @@ func (s *PgStore) mintSnapshot(ctx context.Context, tx pgx.Tx, environment, acto
 		Environment: environment,
 		Epoch:       epoch,
 	}
+	// $3 is cast explicitly for the column: md5($3::text) makes Postgres infer
+	// $3 as text, and an uncast text parameter is not assignable to jsonb —
+	// without the cast every minting write failed with SQLSTATE 42804 and
+	// answered 503. The digest is then taken over the stored jsonb's own text
+	// form, the same form a verifier reads back with md5(content::text).
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO config_snapshots (environment, epoch, digest, content, created_by_principal_id)
-		VALUES ($1, $2, md5($3::text), $3, $4)
+		VALUES ($1, $2, md5($3::jsonb::text), $3::jsonb, $4)
 		RETURNING snapshot_id, digest, issued_at, freshness_deadline`,
 		environment, epoch, content, actor).Scan(
 		&snap.SnapshotID, &snap.Digest, &snap.IssuedAt, &snap.FreshnessDeadline); err != nil {
@@ -303,7 +329,7 @@ func publishedDefinition(ctx context.Context, q queryer, key string) (*domain.Co
 }
 
 // gateConfigWrite runs the full INV-05/08/09 gate for a config value write.
-func gateConfigWrite(ctx context.Context, q queryer, def *domain.ConfigDefinition, key string, tenantID *string, value json.RawMessage) error {
+func gateConfigWrite(ctx context.Context, q queryer, def *domain.ConfigDefinition, key, environment string, tenantID *string, value json.RawMessage) error {
 	scope := domain.ScopeEnvironment
 	if tenantID != nil {
 		scope = domain.ScopeTenant
@@ -311,13 +337,13 @@ func gateConfigWrite(ctx context.Context, q queryer, def *domain.ConfigDefinitio
 	if err := domain.ValidateScope(def, scope); err != nil {
 		return err
 	}
-	return domain.ValidateValue(value, def)
+	return domain.ValidateValue(value, def, environment)
 }
 
 // flagRetired reports whether (key, environment) carries a non-reusable
 // retirement tombstone. A reusable tombstone — the verified consumer scan has
 // cleared the key — admits new writes.
-func flagRetired(ctx context.Context, tx pgx.Tx, key, environment string) error {
+func flagRetired(ctx context.Context, tx queryer, key, environment string) error {
 	var reusable bool
 	err := tx.QueryRow(ctx, `
 		SELECT reusable FROM flag_retirements WHERE key = $1 AND environment = $2`,
@@ -366,13 +392,24 @@ func isFlagKey(ctx context.Context, q queryer, key string) (bool, error) {
 // declared feature flag, the scope must be admitted by its definition, and the
 // rollout must stay within 0–100 (the same bound the feature_flags CHECK
 // backstops).
-func gateFlagWrite(ctx context.Context, q queryer, key string, tenantID *string, enabled bool, rollout int) error {
+func gateFlagWrite(ctx context.Context, q queryer, key, environment string, tenantID *string, enabled bool, rollout int) error {
 	def, err := publishedDefinition(ctx, q, key)
 	if err != nil {
 		return err
 	}
 	if def.FlagClass == nil {
 		return domain.ErrValueConstraintFailed
+	}
+	// NP-20 / INV-21: a retired key is tombstoned until its removal is
+	// verified. Only the retirement itself checked the tombstone before, so a
+	// retired key could be written again straight away.
+	if err := flagRetired(ctx, q, key, environment); err != nil {
+		return err
+	}
+	// INV-19: an authority-bearing flag is on or off for everyone in scope —
+	// a partial rollout buckets subjects at random.
+	if domain.IsMaterial(def.SafetyClass) && rollout != 0 && rollout != 100 {
+		return domain.ErrTargetingNotPermitted
 	}
 	scope := domain.ScopeEnvironment
 	if tenantID != nil {
@@ -390,12 +427,12 @@ func gateFlagWrite(ctx context.Context, q queryer, key string, tenantID *string,
 // gateConfigWriteValue is gateConfigWrite plus the definition lookup: load the
 // immutable published definition for key, then refuse a scope or value it does
 // not admit (INV-05/08/09).
-func gateConfigWriteValue(ctx context.Context, q queryer, key string, tenantID *string, value json.RawMessage) error {
+func gateConfigWriteValue(ctx context.Context, q queryer, key, environment string, tenantID *string, value json.RawMessage) error {
 	def, err := publishedDefinition(ctx, q, key)
 	if err != nil {
 		return err
 	}
-	return gateConfigWrite(ctx, q, def, key, tenantID, value)
+	return gateConfigWrite(ctx, q, def, key, environment, tenantID, value)
 }
 
 // decodeFlagEnvelope decodes the {enabled, rollout_percentage?} JSON a flag
@@ -516,14 +553,20 @@ const changeColumns = `
 
 func scanChange(row pgx.Row) (*domain.ConfigChange, error) {
 	c := &domain.ConfigChange{}
-	err := row.Scan(
+	err := row.Scan(changeScanTargets(c)...)
+	return c, err
+}
+
+// changeScanTargets lists the scan destinations for changeColumns, in order,
+// followed by any extra columns a query appends.
+func changeScanTargets(c *domain.ConfigChange, extra ...any) []any {
+	return append([]any{
 		&c.ChangeID, &c.ChangeClass, &c.Environment, &c.TenantID,
 		&c.BeforeSnapshotID, &c.ProposedSnapshotID, &c.Parts, &c.Status,
 		&c.Approval, &c.ApprovalRequired, &c.PlannedEffectiveAt,
 		&c.ActivatedAt, &c.VerifiedAt, &c.RollbackChangeID,
 		&c.CreatedByPrincipalID, &c.CreatedAt, &c.UpdatedAt,
-	)
-	return c, err
+	}, extra...)
 }
 
 // ── the configuration-key registry (INV-05/06, Table 11) ──────────────────────
@@ -571,20 +614,25 @@ const definitionColumns = `
 	created_by_principal_id,
 	updated_by_principal_id,
 	created_at,
-	updated_at`
+	updated_at,
+	allowed_regions`
 
 func scanDefinition(row pgx.Row) (*domain.ConfigDefinition, error) {
 	d := &domain.ConfigDefinition{}
-	var allowed, defaultValue, validation, deprecation []byte
+	var allowed, defaultValue, validation, deprecation, regions []byte
 	err := row.Scan(
 		&d.DefinitionID, &d.Key, &d.Owner, &d.ValueType, &d.SafetyClass,
 		&allowed, &defaultValue, &d.FallbackPolicy, &d.Sensitivity,
 		&validation, &d.EffectiveModel, &d.Lifecycle, &deprecation,
 		&d.FlagClass, &d.RetirementDeadline,
 		&d.CreatedByPrincipalID, &d.UpdatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt,
+		&regions,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if len(regions) > 0 {
+		_ = json.Unmarshal(regions, &d.AllowedRegions)
 	}
 	if len(allowed) > 0 {
 		_ = json.Unmarshal(allowed, &d.AllowedScopes)
@@ -654,12 +702,23 @@ func (s *PgStore) CreateDefinition(ctx context.Context, params domain.CreateDefi
 	default:
 		return nil, domain.ErrValueConstraintFailed
 	}
+	// INV-06: an owner is as mandatory as the type. The handler's missing-field
+	// check is not the only door into the registry, so the store refuses too.
+	if strings.TrimSpace(params.Owner) == "" {
+		return nil, domain.ErrValueConstraintFailed
+	}
 	if len(params.AllowedScopes) == 0 {
 		return nil, domain.ErrValueConstraintFailed
 	}
 	for _, sc := range params.AllowedScopes {
 		if !validScopes[sc] {
 			return nil, domain.ErrValueConstraintFailed
+		}
+		// NP-07: a user preference never modifies an authority-bearing key.
+		// Refused at declaration, so no later write can reach that layer.
+		if sc == domain.LayerUserPreference &&
+			(params.SafetyClass == domain.SafetyS2 || params.SafetyClass == domain.SafetyS3) {
+			return nil, domain.ErrScopeNotAllowed
 		}
 	}
 	if len(params.DefaultValue) > 0 {
@@ -678,6 +737,16 @@ func (s *PgStore) CreateDefinition(ctx context.Context, params domain.CreateDefi
 		if domain.IsTemporaryFlagClass(*params.FlagClass) && params.RetirementDeadline == nil {
 			return nil, domain.ErrValueConstraintFailed
 		}
+		// INV-19: no randomized experimentation for rights-affecting
+		// outcomes. An authority-bearing key cannot be an experiment flag.
+		if *params.FlagClass == domain.FlagClassExperiment && domain.IsMaterial(params.SafetyClass) {
+			return nil, domain.ErrTargetingNotPermitted
+		}
+	}
+	for _, r := range params.AllowedRegions {
+		if strings.TrimSpace(r) == "" {
+			return nil, domain.ErrValueConstraintFailed
+		}
 	}
 
 	var def *domain.ConfigDefinition
@@ -686,32 +755,40 @@ func (s *PgStore) CreateDefinition(ctx context.Context, params domain.CreateDefi
 		if err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
+		var regions []byte
+		if len(params.AllowedRegions) > 0 {
+			regions, _ = json.Marshal(params.AllowedRegions)
+		}
 		var created domain.ConfigDefinition
 		err = tx.QueryRow(ctx, `
 			INSERT INTO config_definitions (
 				key, owner, value_type, safety_class, allowed_scopes,
 				default_value, fallback_policy, sensitivity, validation,
 				effective_model, lifecycle, deprecation, flag_class,
-				retirement_deadline, created_by_principal_id, updated_by_principal_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'DRAFT', $11, $12, $13, $14, $14)
+				retirement_deadline, created_by_principal_id, updated_by_principal_id, allowed_regions)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'DRAFT', $11, $12, $13, $14, $14, $15)
 			RETURNING `+definitionColumns,
 			params.Key, params.Owner, params.ValueType, params.SafetyClass, allowed,
 			clampJSON(params.DefaultValue), params.FallbackPolicy, params.Sensitivity,
 			clampJSON(params.Validation), params.EffectiveModel,
 			nil, params.FlagClass, params.RetirementDeadline,
-			params.ActorPrincipalID,
+			params.ActorPrincipalID, regions,
 		).Scan(
 			&created.DefinitionID, &created.Key, &created.Owner, &created.ValueType, &created.SafetyClass,
 			&allowed, &created.DefaultValue, &created.FallbackPolicy, &created.Sensitivity,
 			&created.Validation, &created.EffectiveModel, &created.Lifecycle, &created.Deprecation,
 			&created.FlagClass, &created.RetirementDeadline,
 			&created.CreatedByPrincipalID, &created.UpdatedByPrincipalID, &created.CreatedAt, &created.UpdatedAt,
+			&regions,
 		)
 		if err != nil {
 			return mapWriteInsertError(err, "config_definitions")
 		}
 		if err := json.Unmarshal(allowed, &created.AllowedScopes); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if len(regions) > 0 {
+			_ = json.Unmarshal(regions, &created.AllowedRegions)
 		}
 		def = &created
 		return nil
@@ -761,6 +838,12 @@ func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDe
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 
+		// §10.1: publishing an authority-bearing key is bound to an approval.
+		if target == domain.LifecyclePublished && domain.IsMaterial(working.SafetyClass) &&
+			strings.TrimSpace(params.ApprovalReference) == "" {
+			return domain.ErrApprovalReferenceRequired
+		}
+
 		// Re-declare the key at the new lifecycle: the published artifact is
 		// complete and self-describing (Table 11), never a pointer back to the
 		// editable working row.
@@ -787,13 +870,17 @@ func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDe
 			Lifecycle:              target,
 			PublishedByPrincipalID: params.ActorPrincipalID,
 		}
+		var approval *string
+		if ref := strings.TrimSpace(params.ApprovalReference); ref != "" {
+			approval = &ref
+		}
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO config_definition_versions
-				(definition_id, version, digest, definition, lifecycle, published_by_principal_id)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			RETURNING version_id, definition_id, version, digest, lifecycle, published_by_principal_id, published_at`,
-			v.DefinitionID, v.Version, v.Digest, v.Definition, v.Lifecycle, v.PublishedByPrincipalID,
-		).Scan(&v.VersionID, &v.DefinitionID, &v.Version, &v.Digest, &v.Lifecycle, &v.PublishedByPrincipalID, &v.PublishedAt); err != nil {
+				(definition_id, version, digest, definition, lifecycle, published_by_principal_id, approval_reference)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			RETURNING version_id, definition_id, version, digest, lifecycle, published_by_principal_id, published_at, approval_reference`,
+			v.DefinitionID, v.Version, v.Digest, v.Definition, v.Lifecycle, v.PublishedByPrincipalID, approval,
+		).Scan(&v.VersionID, &v.DefinitionID, &v.Version, &v.Digest, &v.Lifecycle, &v.PublishedByPrincipalID, &v.PublishedAt, &v.ApprovalReference); err != nil {
 			return mapWriteInsertError(err, "config_definition_versions")
 		}
 
@@ -829,6 +916,9 @@ func (s *PgStore) PublishDefinition(ctx context.Context, params domain.PublishDe
 type SweepResult struct {
 	ExpiredKillSwitches     int       `json:"expired_kill_switches"`
 	ExpiredEmergencyChanges int       `json:"expired_emergency_changes"`
+	DriftFindings           int       `json:"drift_findings"`
+	VerifiedChanges         int       `json:"verified_changes"`
+	RefreshedSnapshot       bool      `json:"refreshed_snapshot"`
 	CompletedAt             time.Time `json:"completed_at"`
 }
 
@@ -886,6 +976,9 @@ func (s *PgStore) CreateKillSwitch(ctx context.Context, params domain.CreateKill
 		if err != nil {
 			return err
 		}
+		if def.FlagClass == nil {
+			return domain.ErrNotAFeatureFlag
+		}
 		scope := domain.ScopeEnvironment
 		if params.TenantID != nil {
 			scope = domain.ScopeTenant
@@ -917,7 +1010,12 @@ func (s *PgStore) CreateKillSwitch(ctx context.Context, params domain.CreateKill
 
 		out = k
 		outEv, evErr := events.KillSwitchActivated(*k, params.CorrelationID)
-		return enqueueEvent(ctx, tx, params.CallerTenantID, outEv, evErr)
+		if err := enqueueEvent(ctx, tx, params.CallerTenantID, outEv, evErr); err != nil {
+			return err
+		}
+		// Evaluation reads the snapshot, and the snapshot carries the switch:
+		// without a mint here the switch was recorded but never took effect.
+		return s.mintAndPublish(ctx, tx, "CreateKillSwitch", params.Environment, params.ActorPrincipalID, params.CallerTenantID, params.CorrelationID)
 	})
 	if err != nil {
 		return nil, err
@@ -973,9 +1071,9 @@ func (s *PgStore) ActivateOverride(ctx context.Context, params domain.ActivateOv
 			return nil, domain.ErrScopeNotAllowed
 		}
 		scopeTenant = params.ScopeID
+	case domain.LayerService, domain.LayerOrgUnit, domain.LayerUserPreference:
+		return s.activateLayerOverride(ctx, params, layer)
 	default:
-		// No storage for these layers yet — a silent no-op would make a caller
-		// believe an override had landed that nothing reads.
 		return nil, domain.ErrScopeNotAllowed
 	}
 
@@ -985,7 +1083,10 @@ func (s *PgStore) ActivateOverride(ctx context.Context, params domain.ActivateOv
 		if err != nil {
 			return err
 		}
-		if err := gateConfigWrite(ctx, tx, def, params.Key, scopeTenant, params.Value); err != nil {
+		if domain.IsMaterial(def.SafetyClass) {
+			return domain.ErrMaterialKeyRequiresChange
+		}
+		if err := gateConfigWrite(ctx, tx, def, params.Key, params.Environment, scopeTenant, params.Value); err != nil {
 			return err
 		}
 
@@ -1061,9 +1162,17 @@ func (s *PgStore) Resolve(ctx context.Context, params domain.ResolveParams) (*do
 	for _, k := range params.Keys {
 		requested[k] = true
 	}
+	// Declared safety class and fallback per key: echoed on every value so a
+	// consumer applies INV-28 without a second lookup, and the basis for
+	// answering a requested key the snapshot holds nothing for. Published
+	// definition versions are immutable, so reading them is not reading a
+	// mutable admin record (INV-12).
+	defs, err := publishedDefinitions(ctx, s.pool)
+	if err != nil {
+		return nil, err
+	}
 
-	type resolvedKey struct{ base, tenantKey string }
-	scoped := map[string]resolvedKey{}
+	scoped := map[string]bool{}
 	for _, e := range entries {
 		if e.Kind != domain.ManifestKindConfig {
 			continue
@@ -1071,9 +1180,9 @@ func (s *PgStore) Resolve(ctx context.Context, params domain.ResolveParams) (*do
 		if len(requested) > 0 && !requested[e.Key] {
 			continue
 		}
-		base := domain.ManifestKey(e.Key, nil)
-		scoped[e.Key] = resolvedKey{base: base, tenantKey: domain.ManifestKey(e.Key, params.TenantID)}
+		scoped[e.Key] = true
 	}
+	sc := resolutionScopes{tenant: params.TenantID, service: params.Service, orgUnit: params.OrgUnit, subject: params.Subject}
 
 	ordered := make([]string, 0, len(scoped))
 	for k := range scoped {
@@ -1081,7 +1190,9 @@ func (s *PgStore) Resolve(ctx context.Context, params domain.ResolveParams) (*do
 	}
 	sort.Strings(ordered)
 
+	stale := time.Now().After(snap.FreshnessDeadline)
 	out := &domain.ResolvedConfigSnapshot{
+		Stale:             stale,
 		SnapshotID:        snap.SnapshotID,
 		Environment:       snap.Environment,
 		Epoch:             snap.Epoch,
@@ -1089,25 +1200,22 @@ func (s *PgStore) Resolve(ctx context.Context, params domain.ResolveParams) (*do
 		IssuedAt:          snap.IssuedAt,
 		FreshnessDeadline: snap.FreshnessDeadline,
 		Values:            []domain.ResolvedValue{},
+		ContextHash:       resolveContextHash(params),
+		ResolvedAt:        time.Now().UTC(),
 	}
 	for _, key := range ordered {
-		rk := scoped[key]
-		entry, present := entries[rk.base]
-		layer := domain.ScopeEnvironment
-		reason := domain.ReasonBaseline
-		if params.TenantID != nil {
-			if override, ok := entries[rk.tenantKey]; ok && override.Kind == domain.ManifestKindConfig {
-				entry = override
-				layer = domain.ScopeTenant
-				reason = domain.ReasonOverride
-				present = true
-			}
-		}
+		// INV-07: the highest-precedence layer holding a value wins —
+		// user preference, org unit, tenant, service, environment.
+		entry, layer, present := pickByPrecedence(entries, defs[key], key, sc)
 		if !present {
 			continue
 		}
+		reason := domain.ReasonOverride
+		if layer == domain.ScopeEnvironment {
+			reason = domain.ReasonBaseline
+		}
 		ef := entry.EffectiveFrom
-		out.Values = append(out.Values, domain.ResolvedValue{
+		v := domain.ResolvedValue{
 			Key:           entry.Key,
 			Environment:   entry.Environment,
 			TenantID:      entry.TenantID,
@@ -1116,9 +1224,110 @@ func (s *PgStore) Resolve(ctx context.Context, params domain.ResolveParams) (*do
 			Reason:        reason,
 			Layer:         layer,
 			EffectiveFrom: &ef,
-		})
+		}
+		if def, ok := defs[entry.Key]; ok {
+			v.SafetyClass, v.FallbackPolicy = def.SafetyClass, def.FallbackPolicy
+			switch {
+			case !domain.AllowsRegion(def, params.Region):
+				// INV-26: not delivered outside its declared residency.
+				v.Value, v.Outcome, v.Reason = nil, domain.OutcomeBlocked, domain.ReasonResidency
+			case stale && domain.IsMaterial(def.SafetyClass):
+				// INV-13: a material value is withheld, not served stale.
+				v.Value, v.Outcome, v.Reason = nil, domain.OutcomeBlocked, domain.ReasonStaleSnapshot
+			}
+		}
+		out.Values = append(out.Values, v)
+	}
+
+	// NP-02: every key the caller named gets an answer. Omitting one left the
+	// consumer free to treat silence as "use your own default" — exactly the
+	// invented default the spec forbids.
+	answered := map[string]bool{}
+	for _, v := range out.Values {
+		answered[v.Key] = true
+	}
+	missing := make([]string, 0, len(params.Keys))
+	for k := range requested {
+		if !answered[k] {
+			missing = append(missing, k)
+		}
+	}
+	sort.Strings(missing)
+	for _, k := range missing {
+		v := domain.ResolvedValue{
+			Key: k, Environment: params.Environment, TenantID: params.TenantID,
+			Outcome: domain.OutcomeBlocked, Reason: domain.ReasonUnknownKey,
+		}
+		if def, ok := defs[k]; ok {
+			v.Reason = domain.ReasonNoValue
+			v.SafetyClass, v.FallbackPolicy = def.SafetyClass, def.FallbackPolicy
+			// INV-28: the key's declared safe default, when it has one, is
+			// served as exactly that — never as an authoritative value.
+			if def.FallbackPolicy == domain.FallbackSafeDefault && len(def.DefaultValue) > 0 &&
+				domain.AllowsRegion(def, params.Region) {
+				v.Value, v.Outcome, v.Reason = def.DefaultValue, domain.OutcomeSafeDefault, domain.ReasonDefault
+			}
+		}
+		out.Values = append(out.Values, v)
 	}
 	return out, nil
+}
+
+// publishedDefinitions returns the newest PUBLISHED or DEPRECATED definition
+// of every declared key, in one round trip — the set publishedDefinition
+// answers for one key.
+func publishedDefinitions(ctx context.Context, q interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}) (map[string]*domain.ConfigDefinition, error) {
+	rows, err := q.Query(ctx, `
+		SELECT DISTINCT ON (d.key) v.definition
+		FROM config_definition_versions v
+		JOIN config_definitions d USING (definition_id)
+		ORDER BY d.key, v.version DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+	out := map[string]*domain.ConfigDefinition{}
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		var def domain.ConfigDefinition
+		if err := json.Unmarshal(raw, &def); err != nil {
+			return nil, fmt.Errorf("%w: malformed definition: %v", domain.ErrStoreUnavailable, err)
+		}
+		if def.Lifecycle == domain.LifecyclePublished || def.Lifecycle == domain.LifecycleDeprecated {
+			out[def.Key] = &def
+		}
+	}
+	return out, rows.Err()
+}
+
+// resolveContextHash names a resolution's inputs. Keys are sorted on a copy:
+// the request's order does not change the answer, so it must not change the
+// hash either.
+func resolveContextHash(params domain.ResolveParams) string {
+	keys := append([]string(nil), params.Keys...)
+	sort.Strings(keys)
+	return domain.ContextHash(struct {
+		Environment string   `json:"environment"`
+		TenantID    *string  `json:"tenant_id"`
+		Keys        []string `json:"keys"`
+	}{params.Environment, params.TenantID, keys})
+}
+
+// evaluateContextHash names an evaluation's inputs — everything the decision
+// reads besides the snapshot and the time.
+func evaluateContextHash(params domain.EvaluateFlagParams) string {
+	return domain.ContextHash(struct {
+		Key         string         `json:"key"`
+		Environment string         `json:"environment"`
+		TenantID    *string        `json:"tenant_id"`
+		SubjectKey  string         `json:"subject_key"`
+		Context     map[string]any `json:"context"`
+	}{params.Key, params.Environment, params.TenantID, params.SubjectKey, params.Context})
 }
 
 // ── release plans (INV-04/07/19, POST /v1/flags/{key}/release-plans) ─────────
@@ -1165,16 +1374,16 @@ func (s *PgStore) CreateReleasePlan(ctx context.Context, params domain.CreateRel
 	if plan.BucketCount > 1_000_000 {
 		return nil, domain.ErrValueConstraintFailed
 	}
-	if rules, err := parsePlanRules(params.TargetingRules); err != nil {
-		return nil, domain.ErrValueConstraintFailed
-	} else if strategy == domain.StrategyAllOrNothing {
-		if rules.Percentage != 0 && rules.Percentage != 100 {
-			return nil, domain.ErrTargetingNotPermitted
-		}
+	rules, err := parsePlanRulesStrict(params.TargetingRules)
+	if err != nil {
+		return nil, err
+	}
+	if strategy == domain.StrategyAllOrNothing && rules.Percentage != 0 && rules.Percentage != 100 {
+		return nil, domain.ErrTargetingNotPermitted
 	}
 
 	var out *domain.ReleasePlan
-	err := s.withTenantTx(ctx, params.CallerTenantID, func(tx pgx.Tx) error {
+	err = s.withTenantTx(ctx, params.CallerTenantID, func(tx pgx.Tx) error {
 		def, err := publishedDefinition(ctx, tx, params.FlagKey)
 		if err != nil {
 			return err
@@ -1185,6 +1394,12 @@ func (s *PgStore) CreateReleasePlan(ctx context.Context, params domain.CreateRel
 		}
 		if err := domain.ValidateScope(def, scope); err != nil {
 			return err
+		}
+		// INV-19: no randomized experimentation for rights-affecting
+		// outcomes — an authority-bearing flag rolls out all-or-nothing, with
+		// no variants.
+		if domain.IsMaterial(def.SafetyClass) && (strategy != domain.StrategyAllOrNothing || len(rules.Variants) > 0) {
+			return domain.ErrTargetingNotPermitted
 		}
 
 		var latest int
@@ -1218,7 +1433,14 @@ func (s *PgStore) CreateReleasePlan(ctx context.Context, params domain.CreateRel
 		}
 		out = plan
 		outEv, evErr := events.ReleaseActivated(*plan, params.CorrelationID)
-		return enqueueEvent(ctx, tx, params.CallerTenantID, outEv, evErr)
+		if err := enqueueEvent(ctx, tx, params.CallerTenantID, outEv, evErr); err != nil {
+			return err
+		}
+		// Evaluation reads the snapshot, and the snapshot carries the plan.
+		// Without this mint a published plan — its eligibility, schedule and
+		// variants — never took effect, while flag.release.activated
+		// announced that it had.
+		return s.mintAndPublish(ctx, tx, "CreateReleasePlan", params.Environment, params.ActorPrincipalID, params.CallerTenantID, params.CorrelationID)
 	})
 	if err != nil {
 		return nil, err
@@ -1328,6 +1550,24 @@ type planRules struct {
 	} `json:"variants"`
 }
 
+// parsePlanRulesStrict parses targeting rules for publication. Unknown
+// attributes are refused, not ignored (INV-18): the rule language names the
+// attributes targeting may use, and an attribute outside it — a protected
+// characteristic, say — must not be silently accepted and then silently
+// dropped.
+func parsePlanRulesStrict(raw json.RawMessage) (planRules, error) {
+	var r planRules
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&r); err != nil {
+		if strings.Contains(err.Error(), "unknown field") {
+			return r, domain.ErrTargetingNotPermitted
+		}
+		return r, domain.ErrValueConstraintFailed
+	}
+	return r, nil
+}
+
 func parsePlanRules(raw json.RawMessage) (planRules, error) {
 	var r planRules
 	if err := json.Unmarshal(raw, &r); err != nil {
@@ -1403,7 +1643,9 @@ func applyEligibility(rules planRules, params domain.EvaluateFlagParams) (bool, 
 		}
 	}
 	if len(el.Plans) > 0 {
-		plan := targetContextValue(params.Context, "plan")
+		// The plan comes from the gateway, never the request body: a
+		// caller-asserted plan is NP-08.
+		plan := params.TrustedPlan
 		if plan == "" {
 			return false, domain.ErrContextIncomplete
 		}
@@ -1424,6 +1666,9 @@ func (s *PgStore) EvaluateFlag(ctx context.Context, params domain.EvaluateFlagPa
 	if params.Environment == "" {
 		return nil, domain.ErrEnvironmentBoundaryViolation
 	}
+	// One instant for the whole decision: the schedule read and the evidence
+	// timestamp must agree, or the evidence cannot replay the decision.
+	now := time.Now().UTC()
 	snap, err := s.latestSnapshotRow(ctx, params.Environment)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNoAttestedSnapshot
@@ -1442,6 +1687,19 @@ func (s *PgStore) EvaluateFlag(ctx context.Context, params domain.EvaluateFlagPa
 	}
 	if !ok || entry.Kind != domain.ManifestKindFlag {
 		return nil, domain.ErrFeatureFlagNotFound
+	}
+
+	def, err := publishedDefinition(ctx, s.pool, params.Key)
+	if err != nil && !errors.Is(err, domain.ErrKeyNotRegistered) {
+		return nil, err
+	}
+	// INV-26: residency is evaluated before delivery.
+	if def != nil && !domain.AllowsRegion(def, params.Region) {
+		return s.evaluation(params, entry, *snap, nil, nil, false, 0, domain.OutcomeBlocked, domain.ReasonResidency, nil, "", now), nil
+	}
+	// INV-13: a stale snapshot never silently enables a protected feature.
+	if def != nil && domain.IsMaterial(def.SafetyClass) && now.After(snap.FreshnessDeadline) {
+		return nil, domain.ErrSnapshotStale
 	}
 
 	enabled := entry.Enabled != nil && *entry.Enabled
@@ -1485,9 +1743,9 @@ func (s *PgStore) EvaluateFlag(ctx context.Context, params domain.EvaluateFlagPa
 		}
 		if !eligible {
 			enabled = false
-			return s.evaluation(params, entry, *snap, plan, ks, enabled, rollout, outcome, domain.ReasonBlocked, nil), nil
+			return s.evaluation(params, entry, *snap, plan, ks, enabled, rollout, outcome, domain.ReasonBlocked, nil, "", now), nil
 		}
-		percentage, err = planPercentage(rules, plan, time.Now())
+		percentage, err = planPercentage(rules, plan, now)
 		if err != nil {
 			return nil, err
 		}
@@ -1512,7 +1770,7 @@ func (s *PgStore) EvaluateFlag(ctx context.Context, params domain.EvaluateFlagPa
 	if variant != "" {
 		outcome = domain.OutcomeValue
 	}
-	return s.evaluation(params, entry, *snap, plan, ks, enabled, rollout, outcome, reason, &bucket), nil
+	return s.evaluation(params, entry, *snap, plan, ks, enabled, rollout, outcome, reason, &bucket, variant, now), nil
 }
 
 func planPercentage(rules planRules, plan *domain.ReleasePlanManifest, now time.Time) (int, error) {
@@ -1539,11 +1797,17 @@ func planPercentage(rules planRules, plan *domain.ReleasePlanManifest, now time.
 	}
 }
 
+// saltOf is the bucketing salt: the release plan's own when it names one,
+// otherwise the flag KEY. It used to fall back to entry.FlagID — the id of the
+// current version row, which changes on every write — so raising a rollout
+// from 30% to 60% re-drew every subject's bucket and took the feature away
+// from about four in ten of those who had it (INV-07: bucketing must be stable
+// for a subject). The key is the one identity every version of a flag shares.
 func saltOf(plan *domain.ReleasePlanManifest, entry domain.ManifestEntry) string {
 	if plan != nil && plan.Salt != "" {
 		return plan.Salt
 	}
-	return entry.FlagID
+	return entry.Key
 }
 
 func bucketCountOf(plan *domain.ReleasePlanManifest) int {
@@ -1575,7 +1839,7 @@ func variantFor(rules planRules, bucket, bucketCount int) string {
 }
 
 // evaluation assembles the reusable response for EvaluateFlag.
-func (s *PgStore) evaluation(params domain.EvaluateFlagParams, entry domain.ManifestEntry, snap domain.ConfigSnapshot, plan *domain.ReleasePlanManifest, ks *domain.KillSwitchManifest, enabled bool, rollout int, outcome, reason string, bucket *int) *domain.FlagEvaluation {
+func (s *PgStore) evaluation(params domain.EvaluateFlagParams, entry domain.ManifestEntry, snap domain.ConfigSnapshot, plan *domain.ReleasePlanManifest, ks *domain.KillSwitchManifest, enabled bool, rollout int, outcome, reason string, bucket *int, variant string, evaluatedAt time.Time) *domain.FlagEvaluation {
 	return &domain.FlagEvaluation{
 		Key:               params.Key,
 		Environment:       params.Environment,
@@ -1591,6 +1855,9 @@ func (s *PgStore) evaluation(params domain.EvaluateFlagParams, entry domain.Mani
 		ReleasePlan:       plan,
 		KillSwitch:        ks,
 		Bucket:            bucket,
+		Variant:           variant,
+		ContextHash:       evaluateContextHash(params),
+		EvaluatedAt:       evaluatedAt,
 	}
 }
 
@@ -1615,11 +1882,18 @@ func (s *PgStore) CreateChange(ctx context.Context, params domain.CreateChangePa
 		return nil, domain.ErrValueConstraintFailed
 	}
 
+	switch params.ChangeClass {
+	case domain.ChangeClassC0, domain.ChangeClassC1, domain.ChangeClassC2, domain.ChangeClassC3:
+	default:
+		return nil, domain.ErrValueConstraintFailed
+	}
 	change := &domain.ConfigChange{
-		ChangeClass:          params.ChangeClass,
-		Environment:          params.Environment,
-		TenantID:             params.TenantID,
-		ApprovalRequired:     params.ApprovalRequired,
+		ChangeClass: params.ChangeClass,
+		Environment: params.Environment,
+		TenantID:    params.TenantID,
+		// A C2/C3 change is approval-gated whatever the caller asked for.
+		ApprovalRequired: params.ApprovalRequired ||
+			params.ChangeClass == domain.ChangeClassC2 || params.ChangeClass == domain.ChangeClassC3,
 		PlannedEffectiveAt:   params.PlannedEffectiveAt,
 		RollbackChangeID:     params.RollbackChangeID,
 		CreatedByPrincipalID: params.ActorPrincipalID,
@@ -1631,9 +1905,20 @@ func (s *PgStore) CreateChange(ctx context.Context, params domain.CreateChangePa
 	// police — the gate compares this at activation.
 	var err error
 	byKey := map[string][]domain.ChangePart{}
-	for _, p := range params.Parts {
+	for i, p := range params.Parts {
 		if p.Scope.TenantID != nil && *p.Scope.TenantID != params.CallerTenantID {
 			return nil, domain.ErrScopeNotAllowed
+		}
+		// A change lives in one environment (INV-11). A part naming another
+		// used to be accepted: a staging change — possibly one needing no
+		// approval — could write production values, and the mint that followed
+		// covered staging only. An omitted environment means the change's own.
+		switch p.Scope.Environment {
+		case "":
+			params.Parts[i].Scope.Environment = params.Environment
+		case params.Environment:
+		default:
+			return nil, domain.ErrEnvironmentBoundaryViolation
 		}
 		byKey[p.Key] = append(byKey[p.Key], p)
 	}
@@ -1651,12 +1936,33 @@ func (s *PgStore) doCreateChange(ctx context.Context, callerTenantID string, cha
 	err := s.withTenantTx(ctx, callerTenantID, func(tx pgx.Tx) error {
 		snap, err := latestSnapshotRowQ(ctx, tx, change.Environment)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrNoAttestedSnapshot
-		}
-		if err != nil {
+			// An environment nothing has been written to has an empty
+			// before-state, and that is a state like any other: imprint it,
+			// so the change pins it and a rollback can restore it. Refusing
+			// here deadlocked a material key's first value — a direct write
+			// is refused for it, and so was the change set.
+			minted, mintErr := s.mintSnapshot(ctx, tx, change.Environment, change.CreatedByPrincipalID)
+			if mintErr != nil {
+				return mintErr
+			}
+			snap = &domain.ConfigSnapshot{SnapshotID: minted.SnapshotID, Environment: minted.Environment, Epoch: minted.Epoch}
+		} else if err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		change.BeforeSnapshotID = &snap.SnapshotID
+
+		// Validate every part now, not only at activation: an invalid change
+		// used to sit PROPOSED — and collect approvals — until activation
+		// found it could never apply.
+		var parts []domain.ChangePart
+		if err := json.Unmarshal(partsJSON, &parts); err != nil {
+			return domain.ErrValueConstraintFailed
+		}
+		for _, p := range parts {
+			if _, err := gateChangePart(ctx, tx, p, change.ChangeClass); err != nil {
+				return err
+			}
+		}
 
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO config_changes
@@ -1760,10 +2066,26 @@ func (s *PgStore) ActivateChange(ctx context.Context, changeID, callerTenantID, 
 		if change.Status != domain.ChangeStatusApproved {
 			return domain.ErrChangeApprovalRequired
 		}
+		// §10.1 "effective time": a planned change does not apply early.
+		if change.PlannedEffectiveAt != nil && time.Now().Before(*change.PlannedEffectiveAt) {
+			return domain.ErrChangeNotYetEffective
+		}
 
 		var parts []domain.ChangePart
 		if err := json.Unmarshal(change.Parts, &parts); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+
+		// The state each part expected to replace, as served right now.
+		current, err := latestSnapshotRowQ(ctx, tx, change.Environment)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		var served map[string]domain.ManifestEntry
+		if current != nil {
+			if served, err = parseManifest(current.Content); err != nil {
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			}
 		}
 
 		// Gate the proposed snapshot before applying: the parts must still be
@@ -1779,18 +2101,22 @@ func (s *PgStore) ActivateChange(ctx context.Context, changeID, callerTenantID, 
 			if p.Scope.TenantID != nil && callerTenantID != "" && *p.Scope.TenantID != callerTenantID {
 				return domain.ErrScopeNotAllowed
 			}
-			flag, err := isFlagKey(ctx, tx, p.Key)
+			if p.Scope.Environment != change.Environment {
+				return domain.ErrEnvironmentBoundaryViolation
+			}
+			flag, err := gateChangePart(ctx, tx, p, change.ChangeClass)
 			if err != nil {
 				return err
 			}
 			flagByKey[p.Key] = flag
-			if flag {
-				enabled, rollout := flagPartValue(p)
-				if err := gateFlagWrite(ctx, tx, p.Key, p.Scope.TenantID, enabled, rollout); err != nil {
-					return err
+			// Optimistic concurrency: a part that names the value it expects
+			// to replace is refused if that is no longer what is served. The
+			// field was accepted and never checked, so a change approved
+			// against one value silently overwrote another.
+			if p.ExpectedBeforeHash != nil {
+				if got := servedValueHash(served, p); got != *p.ExpectedBeforeHash {
+					return domain.ErrDriftDetected
 				}
-			} else if err := gateConfigWriteValue(ctx, tx, p.Key, p.Scope.TenantID, p.NewValue); err != nil {
-				return err
 			}
 		}
 
@@ -1798,6 +2124,18 @@ func (s *PgStore) ActivateChange(ctx context.Context, changeID, callerTenantID, 
 		// proposed snapshot, so "proposed" and "applied" can be compared by
 		// hash at verification time.
 		for _, p := range parts {
+			if domain.IsExtendedLayer(domain.PartLayer(p)) {
+				if err := applyLayeredPart(ctx, tx, p, actor); err != nil {
+					return err
+				}
+				continue
+			}
+			if p.Remove {
+				if err := endCurrentValue(ctx, tx, flagByKey[p.Key], p.Key, p.Scope.Environment, p.Scope.TenantID); err != nil {
+					return err
+				}
+				continue
+			}
 			if flagByKey[p.Key] {
 				enabled, rollout := flagPartValue(p)
 				if _, err := upsertFlag(ctx, tx, p.Key, p.Scope.Environment, p.Scope.TenantID, enabled, rollout, actor); err != nil {
@@ -1816,25 +2154,41 @@ func (s *PgStore) ActivateChange(ctx context.Context, changeID, callerTenantID, 
 		if err != nil {
 			return err
 		}
+		// Applied is not verified (NP-25): the change is APPLYING until every
+		// attesting runtime reports the new snapshot. With no attesting
+		// runtime behind, it verifies now; otherwise the sweep verifies it
+		// when the fleet catches up.
 		before := change.BeforeSnapshotID
 		now := time.Now()
-		if err := tx.QueryRow(ctx, `
+		if _, err := tx.Exec(ctx, `
 			UPDATE config_changes
-			SET status = $2, activated_at = $3, verified_at = $3,
+			SET status = $2, activated_at = $3,
 			    before_snapshot_id = $4, proposed_snapshot_id = $5, updated_at = NOW()
-			WHERE change_id = $1
-			RETURNING verified_at`,
-			changeID, domain.ChangeStatusVerified, now, before, snap.SnapshotID,
-		).Scan(&change.VerifiedAt); err != nil {
+			WHERE change_id = $1`,
+			changeID, domain.ChangeStatusApplying, now, before, snap.SnapshotID,
+		); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		change.Status = domain.ChangeStatusVerified
+		change.Status = domain.ChangeStatusApplying
 		change.ActivatedAt = &now
 		change.ProposedSnapshotID = &snap.SnapshotID
 
-		outEv, evErr := events.ChangeVerified(*change, actor, "")
-		if err := enqueueEvent(ctx, tx, callerTenantID, outEv, evErr); err != nil {
+		// A verified rollback retires the change it undid, in the same
+		// transaction, so "rolled back" and "restored" can never disagree.
+		if change.RollbackChangeID != nil {
+			if err := markRolledBack(ctx, tx, *change.RollbackChangeID); err != nil {
+				return err
+			}
+		}
+
+		converged, err := fleetConverged(ctx, tx, change.Environment, snap.Epoch)
+		if err != nil {
 			return err
+		}
+		if converged {
+			if err := markVerified(ctx, tx, change, actor, callerTenantID); err != nil {
+				return err
+			}
 		}
 		if err := enqueueSnapshotPublished(ctx, tx, callerTenantID, actor, "", *snap); err != nil {
 			return err
@@ -1868,19 +2222,26 @@ func (s *PgStore) CreateEmergencyChange(ctx context.Context, params domain.Creat
 
 	var out *domain.EmergencyChange
 	err := s.withTenantTx(ctx, params.CallerTenantID, func(tx pgx.Tx) error {
-		flag, err := isFlagKey(ctx, tx, params.Key)
+		def, err := publishedDefinition(ctx, tx, params.Key)
 		if err != nil {
 			return err
 		}
+		// §10.1 "restricted keys": break-glass exists for material keys, whose
+		// normal path is an approved change set. An S0/S1 key has an ordinary
+		// path and no business bypassing it.
+		if !domain.IsMaterial(def.SafetyClass) {
+			return domain.ErrEmergencyScopeDenied
+		}
+		flag := def.FlagClass != nil
 		if flag {
 			enabled, rollout, err := decodeFlagEnvelope(params.NewValue)
 			if err != nil {
 				return err
 			}
-			if err := gateFlagWrite(ctx, tx, params.Key, params.TenantID, enabled, rollout); err != nil {
+			if err := gateFlagWrite(ctx, tx, params.Key, params.Environment, params.TenantID, enabled, rollout); err != nil {
 				return err
 			}
-		} else if err := gateConfigWriteValue(ctx, tx, params.Key, params.TenantID, params.NewValue); err != nil {
+		} else if err := gateConfigWriteValue(ctx, tx, params.Key, params.Environment, params.TenantID, params.NewValue); err != nil {
 			return err
 		}
 
@@ -1929,10 +2290,11 @@ func (s *PgStore) ActivateEmergencyChange(ctx context.Context, emergencyChangeID
 	var out *domain.EmergencyChange
 	err := s.withOps(ctx, func(tx pgx.Tx) error {
 		e := &domain.EmergencyChange{EmergencyChangeID: emergencyChangeID}
+		var status string
 		if err := tx.QueryRow(ctx, `
-			SELECT key, new_value, environment, tenant_id FROM emergency_changes
+			SELECT key, new_value, environment, tenant_id, status, expires_at FROM emergency_changes
 			WHERE emergency_change_id = $1 FOR UPDATE`, emergencyChangeID).
-			Scan(&e.Key, &e.NewValue, &e.Environment, &e.TenantID); err != nil {
+			Scan(&e.Key, &e.NewValue, &e.Environment, &e.TenantID, &status, &e.ExpiresAt); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrChangeNotFound
 			}
@@ -1941,28 +2303,75 @@ func (s *PgStore) ActivateEmergencyChange(ctx context.Context, emergencyChangeID
 		if callerTenantID != "" && e.TenantID != nil && *e.TenantID != callerTenantID {
 			return domain.ErrScopeNotAllowed
 		}
+		// Break-glass activates once, from OPEN, inside its window. Without
+		// this an EXPIRED or already-ACTIVE change could be re-applied at will,
+		// which is an unbounded emergency by another name.
+		if status != domain.EmergencyStatusOpen || !e.ExpiresAt.After(time.Now()) {
+			return domain.ErrEmergencyNotActivatable
+		}
 
 		flag, err := isFlagKey(ctx, tx, e.Key)
 		if err != nil {
 			return err
 		}
+		// Record what this activation replaces, so expiry can restore it
+		// exactly (INV-15). prior stays nil when the scope had no value.
+		var activatedRowID string
+		var prior []byte
 		if flag {
 			enabled, rollout, err := decodeFlagEnvelope(e.NewValue)
 			if err != nil {
 				return err
 			}
-			if _, err := upsertFlag(ctx, tx, e.Key, e.Environment, e.TenantID, enabled, rollout, actor); err != nil {
+			e.Kind = "flag"
+			cur, err := scanFeatureFlag(tx.QueryRow(ctx, `
+				SELECT `+flagColumns+` FROM feature_flags
+				WHERE key = $1 AND environment = $2
+				  AND COALESCE(tenant_id, '`+nilScopeUUID+`'::UUID) = COALESCE($3::uuid, '`+nilScopeUUID+`'::UUID)
+				  AND effective_to IS NULL`, e.Key, e.Environment, e.TenantID))
+			switch {
+			case err == nil:
+				prior, _ = json.Marshal(map[string]any{"enabled": cur.Enabled, "rollout_percentage": cur.RolloutPercentage})
+			case !errors.Is(err, pgx.ErrNoRows):
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			}
+			row, err := upsertFlag(ctx, tx, e.Key, e.Environment, e.TenantID, enabled, rollout, actor)
+			if err != nil {
 				return err
 			}
-		} else if _, err := upsertConfig(ctx, tx, e.Key, e.Environment, e.TenantID, e.NewValue, actor); err != nil {
-			return err
+			activatedRowID = row.FlagID
+		} else {
+			e.Kind = "config"
+			var priorID *string
+			cur, err := scanConfigEntry(tx.QueryRow(ctx, `
+				SELECT `+configColumns+` FROM config_entries
+				WHERE key = $1 AND environment = $2
+				  AND COALESCE(tenant_id, '`+nilScopeUUID+`'::UUID) = COALESCE($3::uuid, '`+nilScopeUUID+`'::UUID)
+				  AND effective_to IS NULL`, e.Key, e.Environment, e.TenantID))
+			switch {
+			case err == nil:
+				prior, priorID = cur.Value, &cur.ConfigID
+			case !errors.Is(err, pgx.ErrNoRows):
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			}
+			row, err := upsertConfig(ctx, tx, e.Key, e.Environment, e.TenantID, e.NewValue, actor)
+			if err != nil {
+				return err
+			}
+			activatedRowID = row.ConfigID
+			e.ActivatedConfigEntryID, e.PriorConfigEntryID = &row.ConfigID, priorID
 		}
+		e.HadPrior = prior != nil
 
 		if err := tx.QueryRow(ctx, `
 			UPDATE emergency_changes
-			SET status = $2
+			SET status = $2, kind = $3, activated_row_id = $4, activated_at = NOW(),
+			    had_prior = $5, prior_value = $6,
+			    activated_config_entry_id = $7, prior_config_entry_id = $8
 			WHERE emergency_change_id = $1
-			RETURNING status`, emergencyChangeID, domain.EmergencyStatusActive).Scan(&e.Status); err != nil {
+			RETURNING status, activated_at`, emergencyChangeID, domain.EmergencyStatusActive,
+			e.Kind, activatedRowID, e.HadPrior, prior, e.ActivatedConfigEntryID, e.PriorConfigEntryID,
+		).Scan(&e.Status, &e.ActivatedAt); err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 
@@ -1988,7 +2397,7 @@ func (s *PgStore) ActivateEmergencyChange(ctx context.Context, emergencyChangeID
 // detected. The DB backs it with a unique key per flag + env (a replayed
 // attestation collides) and the sweep reads STALE/UNAUTHORIZED/INCOMPATIBLE
 // vs. the current snapshot.
-func (s *PgStore) RecordAttestation(ctx context.Context, params domain.RecordAttestationParams) (*domain.RuntimeAttestation, error) {
+func (s *PgStore) RecordAttestation(ctx context.Context, params domain.RecordAttestationParams) (*domain.AttestationResult, error) {
 	if params.CallerTenantID == "" {
 		return nil, domain.ErrCallerTenantMissing
 	}
@@ -2009,7 +2418,7 @@ func (s *PgStore) RecordAttestation(ctx context.Context, params domain.RecordAtt
 		ObservedDigest:     params.ObservedDigest,
 		ObservedVersions:   params.ObservedVersions,
 	}
-	var out *domain.RuntimeAttestation
+	var out *domain.AttestationResult
 	err := s.withTenantTx(ctx, params.CallerTenantID, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO runtime_attestations
@@ -2022,7 +2431,21 @@ func (s *PgStore) RecordAttestation(ctx context.Context, params domain.RecordAtt
 		).Scan(&att.AttestationID, &att.ReportedAt, &att.FreshnessDeadline); err != nil {
 			return mapWriteInsertError(err, "runtime_attestations")
 		}
-		out = att
+		out = &domain.AttestationResult{RuntimeAttestation: *att}
+
+		// Compare with what the runtime should be serving; a divergence is
+		// recorded and announced in this same transaction.
+		drift, err := classifyDrift(ctx, tx, att.RuntimeID, att.Environment, att.TenantID,
+			att.ObservedSnapshotID, att.ObservedEpoch, att.ObservedDigest)
+		if err != nil {
+			return err
+		}
+		if drift != nil {
+			if err := recordDrift(ctx, tx, drift, params.CallerTenantID, params.CorrelationID); err != nil {
+				return err
+			}
+			out.Drift = drift
+		}
 		return nil
 	})
 	if err != nil {
@@ -2037,17 +2460,63 @@ func (s *PgStore) SweepExpired(ctx context.Context, environment string) (SweepRe
 	result := SweepResult{CompletedAt: time.Now()}
 
 	if err := s.withOps(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		// Scoped to the environment being swept, and minted: the served
+		// snapshot carries the kill switch, so marking it expired without a
+		// mint left the switch in force in every read until some unrelated
+		// write happened to mint.
+		rows, err := tx.Query(ctx, `
 			UPDATE kill_switches
 			SET expired_at = expires_at
-			WHERE expires_at <= NOW() AND expired_at IS NULL`)
+			WHERE expires_at <= NOW() AND expired_at IS NULL
+			  AND ($1 = '' OR environment = $1)
+			RETURNING environment`, environment)
 		if err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		result.ExpiredKillSwitches = int(tag.RowsAffected())
+		mintEnvs := map[string]bool{}
+		for rows.Next() {
+			var env string
+			if err := rows.Scan(&env); err != nil {
+				rows.Close()
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			}
+			mintEnvs[env] = true
+			result.ExpiredKillSwitches++
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 
 		if environment != "" {
-			if err := s.sweepEmergency(ctx, tx, environment, &result); err != nil {
+			verified, err := verifyApplyingChanges(ctx, tx, environment)
+			if err != nil {
+				return err
+			}
+			result.VerifiedChanges = verified
+			if due, err := snapshotRefreshDue(ctx, tx, environment); err != nil {
+				return err
+			} else if due {
+				mintEnvs[environment] = true
+				result.RefreshedSnapshot = true
+			}
+			if err := detectFleetDrift(ctx, tx, environment, &result); err != nil {
+				return err
+			}
+			reverted, err := s.sweepEmergency(ctx, tx, environment, &result)
+			if err != nil {
+				return err
+			}
+			if reverted {
+				mintEnvs[environment] = true
+			}
+		}
+		for env := range mintEnvs {
+			snap, err := s.mintSnapshot(ctx, tx, env, "system:ops_sweep")
+			if err != nil {
+				return err
+			}
+			if err := enqueueSnapshotPublished(ctx, tx, "", "system:ops_sweep", "", *snap); err != nil {
 				return err
 			}
 		}
@@ -2058,32 +2527,135 @@ func (s *PgStore) SweepExpired(ctx context.Context, environment string) (SweepRe
 	return result, nil
 }
 
-func (s *PgStore) sweepEmergency(ctx context.Context, tx pgx.Tx, environment string, result *SweepResult) error {
+func (s *PgStore) sweepEmergency(ctx context.Context, tx pgx.Tx, environment string, result *SweepResult) (bool, error) {
+	// Two kinds of due row. An OPEN change that was never activated simply
+	// lapses. An ACTIVE one is reverted — its value was in force — and its
+	// mandatory retrospective opens (INV-15). The sweep used to select OPEN
+	// rows only, so an activated emergency value never expired at all.
 	rows, err := tx.Query(ctx, `
-		SELECT emergency_change_id, key, new_value, environment, tenant_id
+		SELECT emergency_change_id, key, new_value, environment, tenant_id, status,
+		       COALESCE(kind, ''), activated_row_id, had_prior, prior_value, expires_at, actor_principal_id
 		FROM emergency_changes
-		WHERE environment = $1 AND status = $2 AND expires_at <= NOW()
+		WHERE environment = $1 AND status IN ($2, $3) AND expires_at <= NOW()
 		ORDER BY emergency_change_id
-		FOR UPDATE SKIP LOCKED`, environment, domain.EmergencyStatusOpen)
+		FOR UPDATE SKIP LOCKED`, environment, domain.EmergencyStatusOpen, domain.EmergencyStatusActive)
 	if err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	defer rows.Close()
+	// Read every due row before writing any. A pgx connection carries one
+	// statement at a time: the UPDATE issued while this cursor was still open
+	// failed with "conn busy", so every sweep that found an expired emergency
+	// change errored and none ever expired.
+	type dueRow struct {
+		e           domain.EmergencyChange
+		activatedID *string
+		prior       []byte
+	}
+	var due []dueRow
 	for rows.Next() {
-		e := &domain.EmergencyChange{Status: domain.EmergencyStatusExpired}
-		if err := rows.Scan(&e.EmergencyChangeID, &e.Key, &e.NewValue, &e.Environment, &e.TenantID); err != nil {
-			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		var d dueRow
+		if err := rows.Scan(&d.e.EmergencyChangeID, &d.e.Key, &d.e.NewValue, &d.e.Environment, &d.e.TenantID,
+			&d.e.Status, &d.e.Kind, &d.activatedID, &d.e.HadPrior, &d.prior, &d.e.ExpiresAt, &d.e.ActorPrincipalID); err != nil {
+			rows.Close()
+			return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE emergency_changes SET status = $2
-			WHERE emergency_change_id = $1`, e.EmergencyChangeID, domain.EmergencyStatusExpired); err != nil {
-			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		due = append(due, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	reverted := false
+	for _, d := range due {
+		e := d.e
+		if e.Status == domain.EmergencyStatusOpen {
+			e.Status = domain.EmergencyStatusExpired
+			if _, err := tx.Exec(ctx, `
+				UPDATE emergency_changes SET status = $2 WHERE emergency_change_id = $1`,
+				e.EmergencyChangeID, e.Status); err != nil {
+				return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			}
+		} else {
+			restored, err := revertEmergency(ctx, tx, e, d.activatedID, d.prior)
+			if err != nil {
+				return false, err
+			}
+			e.RevertedToPrior = restored
+			e.Status = domain.EmergencyStatusRetrospectivePending
+			if _, err := tx.Exec(ctx, `
+				UPDATE emergency_changes
+				SET status = $2, reverted_to_prior = $3,
+				    retrospective_due_at = NOW() + make_interval(secs => $4)
+				WHERE emergency_change_id = $1`,
+				e.EmergencyChangeID, e.Status, restored,
+				domain.EmergencyRetrospectiveWindow.Seconds()); err != nil {
+				return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			}
+			reverted = true
 		}
 		result.ExpiredEmergencyChanges++
-		outEv, evErr := events.EmergencyExpired(*e, "")
+		outEv, evErr := events.EmergencyExpired(e, "")
 		if err := enqueueEvent(ctx, tx, "", outEv, evErr); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return rows.Err()
+	return reverted, nil
+}
+
+// revertEmergency undoes an expired emergency activation — but only while the
+// row it wrote is still the scope's current value. If a governed change has
+// superseded it since, that change is the newer intent and is left alone; the
+// emergency is still expired and still owes its retrospective. Returns whether
+// the scope was restored.
+func revertEmergency(ctx context.Context, tx pgx.Tx, e domain.EmergencyChange, activatedID *string, prior []byte) (bool, error) {
+	if activatedID == nil {
+		return false, nil
+	}
+	table, idCol := "config_entries", "config_id"
+	if e.Kind == "flag" {
+		table, idCol = "feature_flags", "flag_id"
+	}
+	tag, err := tx.Exec(ctx, `UPDATE `+table+` SET effective_to = NOW()
+		WHERE `+idCol+` = $1 AND effective_to IS NULL`, *activatedID)
+	if err != nil {
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil // superseded since activation — the newer value stands
+	}
+	if !e.HadPrior {
+		return true, nil // nothing was there before; ending the row restores that
+	}
+	const actor = "system:emergency_expiry"
+	if e.Kind == "flag" {
+		enabled, rollout, err := decodeFlagEnvelope(prior)
+		if err != nil {
+			return false, err
+		}
+		if _, err := upsertFlag(ctx, tx, e.Key, e.Environment, e.TenantID, enabled, rollout, actor); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if _, err := upsertConfig(ctx, tx, e.Key, e.Environment, e.TenantID, prior, actor); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// servedValueHash is the expected_before_hash of a part's scope as currently
+// served: md5 hex of the value exactly as resolve returns it (a flag's
+// {"enabled":..,"rollout_percentage":..}), or "" when the scope has no value.
+func servedValueHash(served map[string]domain.ManifestEntry, p domain.ChangePart) string {
+	e, ok := served[domain.PartManifestKey(p)]
+	if !ok {
+		return ""
+	}
+	raw := []byte(e.Value)
+	if e.Kind == domain.ManifestKindFlag {
+		raw, _ = json.Marshal(map[string]any{"enabled": e.Enabled, "rollout_percentage": e.RolloutPercentage})
+	}
+	sum := md5.Sum(raw)
+	return hex.EncodeToString(sum[:])
 }

@@ -169,3 +169,45 @@ func TestRecordRegistryConflict_EnqueuesTheQuarantineEvent(t *testing.T) {
 	}))
 	assert.Equal(t, before+1, outboxCount(t, f, "entity.registry_conflict.quarantined"))
 }
+
+// 29 Sep 2026 re-audit: profile version 1 records the §4.3 source inputs —
+// legal form, registry authority, registered address, supporting evidence.
+// The insert used to name only the name/registry/LEI columns.
+func TestCreateEntity_InitialProfileRecordsTheSourceInputs(t *testing.T) {
+	f := newORGFixture(t)
+	e := newEntity(f, domain.EntityStatusDraft)
+	str := func(s string) *string { return &s }
+	e.InitialProfile = &domain.LegalEntityProfileVersion{
+		ProfileVersionID: uuid.New().String(), TenantID: f.tenantID, LegalEntityID: e.LegalEntityID,
+		LegalName: e.LegalName, EffectiveFrom: e.CreatedAt, CreatedByPrincipalID: "p-maker",
+		LegalFormCode: str("H0PO"), LegalFormSource: str("GLEIF-ELF-1.6"), LegalFormLocalText: str("Private limited company"),
+		RegistryAuthority: str("Companies House"), RegisteredOffice: str(`{"line1":"1 High St","country":"GB"}`),
+		SourceEvidenceRef: str("CH-EXTRACT-1"),
+	}
+	require.NoError(t, f.s.CreateEntity(withEntityCreated(f.ctx), e))
+
+	vs, err := f.s.ListEntityProfileVersions(f.ctx, e.LegalEntityID)
+	require.NoError(t, err)
+	require.Len(t, vs, 1)
+	v := vs[0]
+	require.NotNil(t, v.LegalFormCode)
+	assert.Equal(t, "H0PO", *v.LegalFormCode)
+	assert.Equal(t, "GLEIF-ELF-1.6", *v.LegalFormSource)
+	assert.Equal(t, "Private limited company", *v.LegalFormLocalText)
+	assert.Equal(t, "Companies House", *v.RegistryAuthority)
+	require.NotNil(t, v.RegisteredOffice)
+	assert.JSONEq(t, `{"line1":"1 High St","country":"GB"}`, *v.RegisteredOffice)
+	assert.Equal(t, "CH-EXTRACT-1", *v.SourceEvidenceRef)
+}
+
+// A malformed id is the caller's error, not a server fault: every route taking
+// an id answered 500 INTERNAL_ERROR to one until 29 Sep 2026.
+func TestMalformedIdentifier_IsInvalidInputNotAServerFault(t *testing.T) {
+	f := newORGFixture(t)
+	for _, id := range []string{"not-a-uuid", ""} {
+		_, err := f.s.GetEntityByID(f.ctx, id)
+		require.ErrorIs(t, err, registry.ErrInvalidInput, "id %q", id)
+		_, err = f.s.GetApprovalRequest(f.ctx, id)
+		require.ErrorIs(t, err, registry.ErrInvalidInput, "approval id %q", id)
+	}
+}

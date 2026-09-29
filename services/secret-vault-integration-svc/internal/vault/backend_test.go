@@ -32,7 +32,7 @@ func TestLocalFileVaultBackend_LeaseTokenLifecycle(t *testing.T) {
 	}
 
 	expiresAt := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
-	token, err := b.Get(ctx, "kv/db", expiresAt)
+	token, err := b.Get(ctx, "kv/db", "req-1", expiresAt)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestLocalFileVaultBackend_ExpiredTokenRejected(t *testing.T) {
 	}
 
 	past := time.Now().UTC().Add(-1 * time.Minute)
-	token, err := b.Get(ctx, "kv/db", past)
+	token, err := b.Get(ctx, "kv/db", "req-1", past)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestLocalFileVaultBackend_TokenContextMissingPath(t *testing.T) {
 		t.Fatalf("construct backend: %v", err)
 	}
 	ctx := context.Background()
-	if _, err := b.Get(ctx, "kv/missing", time.Now().Add(time.Hour)); err != ErrSecretMaterialNotFound {
+	if _, err := b.Get(ctx, "kv/missing", "req-1", time.Now().Add(time.Hour)); err != ErrSecretMaterialNotFound {
 		t.Fatalf("get missing = %v, want ErrSecretMaterialNotFound", err)
 	}
 }
@@ -99,7 +99,7 @@ func TestLocalFileVaultBackend_VerifyRejectsForgeryAndTamper(t *testing.T) {
 	if err := b.Put(ctx, "kv/db", []byte("x")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	valid, err := b.Get(ctx, "kv/db", time.Now().Add(time.Hour))
+	valid, err := b.Get(ctx, "kv/db", "req-1", time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

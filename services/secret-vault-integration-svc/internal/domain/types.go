@@ -156,6 +156,9 @@ type DueRotation struct {
 	SecretPath            string `json:"secret_path"`
 	SecretClass           string `json:"secret_class"`
 	IntervalSeconds       int    `json:"interval_seconds"`
+	// NextRotationAt is the due time as listed; the sweeper claims the row
+	// against it (compare-and-swap) and derives its request id from it.
+	NextRotationAt time.Time `json:"next_rotation_at"`
 }
 
 // SecretAccessAuditLog is one immutable evidence record of a request,

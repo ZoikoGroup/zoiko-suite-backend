@@ -10,9 +10,73 @@ was **not**. A certificate that lists only successes certifies nothing.
 
 ---
 
+## Re-audit — 29 September 2026
+
+Supersedes the gap closure below. The service was re-audited live on :8081,
+rebuilt from current source, with real authorization-svc decisions (temporary
+maker and checker grants in the platform scope and a fresh tenant's scope,
+revoked afterwards: 0 left) and a real jurisdiction-rules-svc. Every
+approval-gated flow was driven end to end, not only the grant-free checks.
+
+```
+go build ./... && go vet ./...   clean
+go test ./...                    all packages pass (253 → 259 top-level tests; store suite on a
+                                 throwaway Postgres 16, the rest in golang:1.25-alpine because
+                                 Windows Application Control blocked the handler test binary)
+scripts/audit.sh                 68 live checks, 68 passing (was 66; section 16 added)
+live end-to-end flow             81 checks, 81 passing (scratchpad e2e script, below)
+scripts/backup_restore_drill.sh  22/22, restore 2 s
+scripts/contract_gate.sh         2 breaking changes vs b9e244f, both deliberate (16 in total
+                                 since 24 Sep — SPEC_DEVIATIONS.md)
+govulncheck ./...                0 reachable vulnerabilities
+```
+
+**Two defects found by this re-audit, both fixed**
+
+1. **Every route taking an id answered 500 to a malformed one.** `GET
+   /v1/entities/not-a-uuid`, an empty approval id (a doubled slash) and the
+   like reached Postgres as a failed uuid cast (SQLSTATE 22P02) that nothing
+   mapped, so a client mistake counted against the availability SLO and read
+   as an outage. Now `VALIDATION_FAILED` (400), mapped once at the store's RLS
+   boundary (`internal/store/pg_store.go`, `asInputError`). Regression test
+   fails on the old code.
+2. **CreateEntity discarded §4.3 source inputs.** The create request had no
+   legal-form, registry-authority, registered-office or evidence fields, so a
+   client that sent them lost them silently, and an invalid ELF code (`bad!`)
+   was accepted with a 201. The legal form could only arrive by a later
+   amendment; `lei_verified_at`, documented in openapi.yaml, was dropped the
+   same way. Now accepted, validated (the ELF control applies at creation) and
+   recorded on profile version 1; the registered address and supporting
+   evidence are required, as §4.3 lists them (`internal/registry/legal_form.go`,
+   `entityProfileInputs`). Item 27 had been scored ✅ on 28 Sep; it was ⚠️.
+
+**Live end-to-end, 81 checks** — provisioning inputs and refusals (no key,
+no jurisdiction, unknown jurisdiction, unknown region, outside platform
+scope); creation maker-checker (activate-before-approval, self-approval,
+wrong fingerprint, double approval); `Idempotency-Key` replay and onboarding-key
+mismatch; `expected_version` missing and stale; suspend/resume and the
+suspended-tenant write refusal; ChangeDefaultLocale; ChangeHomeRegion with
+decision evidence and SoD; termination proposed and rejected; entity
+DRAFT → VERIFIED → ACTIVE with evidence and SoD; ELF, fiscal-calendar,
+registered-office and evidence refusals at creation; rename and as-of
+before/now; LEI check digits and approval; registry-conflict quarantine and
+SoD'd resolution; non-destructive merge with SoD; host binding, resolve and
+NP3 on `Host`; cross-tenant read; RESTRICTED tax bundle with and without
+purpose; malformed ids; and every event of the run carrying the §7 fields,
+delivered to Kafka with no retries.
+
+**Deployment assumption made explicit:** NP3 compares the request's `Host`;
+the ingress must preserve it (RUNBOOK §5.2).
+
+**Still open — outside this service** (unchanged): REF-04 fiscal calendar;
+§9.2 gate 6 (consumers pinning versions); §9.2 gate 7 (production RPO/RTO);
+the Next.js console adopting the 16 contract changes.
+
+---
+
 ## Gap closure — 28 September 2026 (second pass)
 
-Supersedes the re-certification below. Every open item from it was worked; what
+Superseded by the 29 Sep re-audit above; it superseded the re-certification below. Every open item from it was worked; what
 remains open is outside this service and is named at the end.
 
 ```

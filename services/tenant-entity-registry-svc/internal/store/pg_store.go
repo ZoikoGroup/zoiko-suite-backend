@@ -106,9 +106,26 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 	}
 
 	if err := fn(tx); err != nil {
-		return err
+		return asInputError(err)
 	}
 	return tx.Commit(ctx)
+}
+
+// asInputError turns a value Postgres could not parse (SQLSTATE 22P02 —
+// "invalid input syntax for type uuid", or malformed JSON for a jsonb column)
+// into the caller's error it is: a typed VALIDATION_FAILED, not a 500.
+//
+// Before 29 Sep 2026 every route taking an id answered 500 INTERNAL_ERROR to
+// GET /v1/entities/not-a-uuid (and to an empty id, e.g. a doubled slash), so
+// a malformed request read as a server fault in the availability SLO and the
+// alerts. It is mapped here because every tenant-scoped statement passes
+// through withRLS.
+func asInputError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+		return fmt.Errorf("%w: malformed value: %s", registry.ErrInvalidInput, pgErr.Message)
+	}
+	return err
 }
 
 // isUniqueViolation returns true when err is a Postgres unique constraint

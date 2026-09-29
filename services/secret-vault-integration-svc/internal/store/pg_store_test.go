@@ -39,7 +39,12 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS secret_access_audit_log, secret_leases, secret_policy_versions, secret_policies CASCADE;`)
+	// Every table the migrations create. This listed only the four from
+	// 000001, so the 000005/000006 tables survived the first test and every
+	// later test failed re-migrating ("secret_rotation_schedules already
+	// exists") — only the first store test could ever pass.
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS shared_secret_exceptions, secret_rotation_schedules,
+		secret_access_audit_log, secret_leases, secret_policy_versions, secret_policies CASCADE;`)
 
 	// Every .up.sql in the migrations directory, in filename order — NOT a
 	// hardcoded list. This list used to be literal, so adding a migration and

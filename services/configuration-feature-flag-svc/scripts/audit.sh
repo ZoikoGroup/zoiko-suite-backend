@@ -160,7 +160,10 @@ for o in \
   "POST /v1/config/changes/{change_id}/approve" "POST /v1/config/changes/{change_id}/activate" \
   "POST /v1/emergency-changes" "POST /v1/emergency-changes/{emergency_change_id}/activate" \
   "POST /v1/runtime/attest" "POST /v1/flags/{key}/release-plans" \
-  "POST /v1/flags/{key}/evaluate" \
+  "POST /v1/flags/{key}/evaluate" "GET /v1/config/snapshots/{snapshot_id}" \
+  "POST /v1/config/changes/{change_id}/rollback" "POST /v1/flags/{key}/kill-switch" \
+  "POST /v1/emergency-changes/{emergency_change_id}/retrospective" \
+  "POST /v1/flags/{key}/retire" "POST /v1/flags/{key}/removal" \
   "GET /healthz" "GET /readyz" "GET /metrics"; do
   hasf "openapi documents $o" "$SPEC_OPS" "$o"
 done
@@ -168,14 +171,16 @@ done
 # r.Header.Get("X-Principal-Id") — "Heade" + "r.Get(" — and would report routes
 # that do not exist. Put included since ?v1/config/overrides/{scope} is a PUT.
 CODE_ROUTES=$(grep -cE '^[[:space:]]*r\.(Get|Post|Patch|Put|Delete)\("' internal/handler/handler.go)
-chk "handler registers 19 routes" "$CODE_ROUTES" "19"
+chk "handler registers 25 routes" "$CODE_ROUTES" "25"
 # Every error code the handler can emit must appear in the spec, or a client
 # branching on the code meets one the contract never mentioned. Two sources:
 # literal "error": "<code>" payloads, and the governedCodeStatus map whose keys
 # are the AA-001 refusal codes the governed routes emit dynamically.
 SPEC_CODES=$(Q openapi-error-codes openapi.yaml)
 MISSING=0
-for c in $(grep -oE '"error":[[:space:]]*"[a-z_]+"' internal/handler/handler.go | grep -oE '"[a-z_]+"$' | tr -d '"' | sort -u); do
+# Every non-test handler file: the recovery routes live in handler_recovery.go.
+HANDLER_SRC=$(ls internal/handler/*.go | grep -v _test.go)
+for c in $(cat $HANDLER_SRC | grep -oE '"error":[[:space:]]*"[a-z_]+"' | grep -oE '"[a-z_]+"$' | tr -d '"' | sort -u); do
   echo "$SPEC_CODES" | grep -qx "$c" || { MISSING=$((MISSING+1)); echo "        undocumented: $c"; }
 done
 for c in $(grep -oE '"[a-z0-9_]+":[[:space:]]*http\.Status' internal/handler/handler.go \

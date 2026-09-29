@@ -63,7 +63,7 @@ type SecretVaultStore interface {
 // — the grant path was completely unreachable end to end). Administrative
 // seeding, never called from the broker flow itself.
 type VaultBackend interface {
-	Get(ctx context.Context, secretPath string, expiresAt time.Time) (leaseToken string, err error)
+	Get(ctx context.Context, secretPath, requestID string, expiresAt time.Time) (leaseToken string, err error)
 	Verify(ctx context.Context, leaseToken string) (info vault.LeaseTokenInfo, err error)
 	GetMaterial(ctx context.Context, secretPath string) ([]byte, error)
 	Put(ctx context.Context, secretPath string, material []byte) error
@@ -80,6 +80,8 @@ type EventPublisher interface {
 
 // Handler holds all HTTP handler methods.
 type Handler struct {
+	// requireSharedException: see RequireSharedSecretException.
+	requireSharedException bool
 	store     SecretVaultStore
 	vault     VaultBackend
 	publisher EventPublisher
@@ -147,6 +149,13 @@ func New(store SecretVaultStore, vault VaultBackend, publisher EventPublisher, a
 
 // UseMetrics attaches a domain metrics recorder. Separate from New so the
 // existing constructor signature -- and every caller of it -- is unchanged.
+// RequireSharedSecretException turns on the broker's §13 shared-secret rule
+// (see config.RequireSharedSecretException).
+func (h *Handler) RequireSharedSecretException(on bool) *Handler {
+	h.requireSharedException = on
+	return h
+}
+
 func (h *Handler) UseMetrics(m DomainMetrics) *Handler {
 	if m != nil {
 		h.metrics = m
@@ -825,13 +834,47 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Step 4b (§13): a secret more than one workload may broker is a shared
+	// secret, and a shared production secret needs a documented exception.
+	// The register existed but nothing consulted it for this; it gated only
+	// break-glass retrieval.
+	if h.requireSharedException && distinctCount(allowedWorkloads) > 1 {
+		exceptions, err := h.store.ListSharedSecretExceptions(r.Context(), domain.ListSharedSecretExceptionsFilter{
+			SecretPath: applicable.SecretPath,
+			Status:     "ACTIVE",
+			TenantID:   req.TenantID,
+		})
+		if err != nil {
+			h.log.Error("Broker: exception lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
+			h.metrics.BrokerDecision("error")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if activeExceptionFor(exceptions, applicable.SecretPath, req.TenantID) == nil {
+			h.recordDenial(r.Context(), req, applicable.SecretClass, &applicable.SecretPolicyVersionID, "shared secret (multiple allowed workloads) has no active shared-secret exception", correlationID, req.RequestedByPrincipalID)
+			h.metrics.BrokerDecision("denied")
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "shared_secret_exception_required", "secret_path": req.SecretPath})
+			return
+		}
+	}
+
 	// Step 5: grant. Vault call happens before the durable write so a
 	// vault failure never leaves a lease row with no token ever issued.
 	// The expiry is fixed up front and signed into the lease token: since
 	// the audit, a token is bound to the lease's own expiry, so an expired
 	// (or later revoked) lease no longer vouches for access on paper.
-	expiresAt := time.Now().UTC().Add(time.Duration(applicable.MaxLeaseDurationSeconds) * time.Second)
-	leaseToken, err := h.vault.Get(r.Context(), req.SecretPath, expiresAt)
+	// The ceiling is checked when a version is created, but a version created
+	// before it existed — or before an operator lowered it — kept issuing its
+	// stored duration. Clamp at issue time, the one place it cannot be stale.
+	leaseSeconds := applicable.MaxLeaseDurationSeconds
+	if h.maxLeaseDurationCeiling > 0 && leaseSeconds > h.maxLeaseDurationCeiling {
+		h.log.Warn("Broker: policy version lease duration exceeds the platform ceiling; clamped",
+			zap.String("secret_policy_version_id", applicable.SecretPolicyVersionID),
+			zap.Int("declared_seconds", leaseSeconds), zap.Int("ceiling_seconds", h.maxLeaseDurationCeiling))
+		leaseSeconds = h.maxLeaseDurationCeiling
+	}
+	expiresAt := time.Now().UTC().Add(time.Duration(leaseSeconds) * time.Second)
+	leaseToken, err := h.vault.Get(r.Context(), req.SecretPath, req.RequestID, expiresAt)
 	if err != nil {
 		h.log.Error("Broker: vault backend unavailable", zap.String("secret_path", req.SecretPath), zap.Error(err))
 		h.metrics.VaultBackendError("get")
@@ -855,6 +898,21 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("Broker: failed to create lease", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
+	}
+
+	if !created && !lease.ExpiresAt.Equal(expiresAt) {
+		// A replay returns the ORIGINAL lease. The token minted above carried
+		// this call's later expiry, so a retry after N seconds handed out a
+		// token outliving its lease by N seconds; re-bind it to the lease's
+		// own expiry.
+		leaseToken, err = h.vault.Get(r.Context(), lease.SecretPath, lease.RequestID, lease.ExpiresAt)
+		if err != nil {
+			h.log.Error("Broker: vault backend unavailable re-minting replayed lease token", zap.String("secret_path", lease.SecretPath), zap.Error(err))
+			h.metrics.VaultBackendError("get")
+			h.metrics.BrokerDecision("vault_error")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+			return
+		}
 	}
 
 	if created {
@@ -1047,11 +1105,15 @@ func (h *Handler) VerifyLease(w http.ResponseWriter, r *http.Request) {
 	if h.refuseForeignRow(w, lease.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
 		return
 	}
-	if lease.SecretPath != info.SecretPath {
+	// The token names the one lease it was minted for. Checking only the path
+	// let a revoked lease's token verify as valid next to any other live
+	// lease on the same secret — revocation on paper, again.
+	if lease.SecretPath != info.SecretPath || lease.RequestID != info.RequestID {
 		h.log.Warn("VerifyLease refused: token bound to a different secret path",
 			zap.String("lease_id", leaseID),
 			zap.String("token_secret_path", info.SecretPath),
 			zap.String("lease_secret_path", lease.SecretPath),
+			zap.Bool("lease_binding_matches", lease.RequestID == info.RequestID),
 			zap.String("correlation_id", correlationID),
 		)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "lease_token_mismatch"})
@@ -1653,6 +1715,12 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "request_id"})
 		return
 	}
+	// §13: emergency retrieval "requires privileged workflow and evidence".
+	// A break-glass act with no stated reason leaves evidence of nothing.
+	if strings.TrimSpace(req.Reason) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason"})
+		return
+	}
 
 	policy, err := h.store.FindSecretPolicyByID(r.Context(), secretPolicyID)
 	if err != nil {
@@ -1681,26 +1749,27 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
-	var activeException *domain.SharedSecretException
-	for _, e := range exceptions {
-		if !e.ExpiresAt.Before(time.Now()) {
-			activeException = e
-			break
-		}
-	}
+	activeException := activeExceptionFor(exceptions, policy.SecretPath, nil)
 	if activeException == nil {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "no_active_exception"})
 		return
 	}
-
-	material, err := h.vault.GetMaterial(r.Context(), policy.SecretPath)
-	if err != nil {
-		h.log.Error("EmergencyRetrieval: vault backend get failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
-		h.metrics.VaultBackendError("get_material")
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+	// Two people: whoever approved the override may not be the one who uses
+	// it. Otherwise one platform operator registers an exception and
+	// retrieves under it in two calls, and the "privileged workflow" is a
+	// formality the same person completes alone.
+	if activeException.ApprovedByPrincipalID == principalID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":        "exception_self_approval",
+			"exception_id": activeException.ExceptionID,
+			"message":      "the principal who approved this exception cannot perform the retrieval it authorizes",
+		})
 		return
 	}
 
+	// Evidence first. The audit write used to follow the release, and its
+	// failure was only logged — so a store hiccup released raw material with
+	// no record that it had left. Now no record, no material.
 	if _, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
 		EventType:   "EMERGENCY_RETRIEVAL",
 		SecretClass: policy.SecretClass,
@@ -1712,7 +1781,17 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 		OutcomeDetail:          fmt.Sprintf("exception_id=%s reason=%q", activeException.ExceptionID, req.Reason),
 		CorrelationID:          correlationID,
 	}); err != nil {
-		h.log.Error("EmergencyRetrieval: failed to record audit entry", zap.String("correlation_id", correlationID), zap.Error(err))
+		h.log.Error("EmergencyRetrieval: evidence write failed; material withheld", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "evidence_unavailable"})
+		return
+	}
+
+	material, err := h.vault.GetMaterial(r.Context(), policy.SecretPath)
+	if err != nil {
+		h.log.Error("EmergencyRetrieval: vault backend get failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
+		h.metrics.VaultBackendError("get_material")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -1720,6 +1799,25 @@ func (h *Handler) EmergencyRetrieval(w http.ResponseWriter, r *http.Request) {
 		"secret_path":      policy.SecretPath,
 		"material_base64":  base64.StdEncoding.EncodeToString(material),
 	})
+}
+
+// activeExceptionFor picks the exception that actually covers secretPath:
+// ACTIVE, unexpired, for this exact path, and global or in tenantScope (nil
+// tenantScope accepts any). The store filters too; this is re-checked here
+// because a filter bug once returned every global exception regardless of
+// status or path, and the caller trusted the first row.
+func activeExceptionFor(exceptions []*domain.SharedSecretException, secretPath string, tenantScope *string) *domain.SharedSecretException {
+	now := time.Now()
+	for _, e := range exceptions {
+		if e.Status != "ACTIVE" || e.SecretPath != secretPath || !e.ExpiresAt.After(now) {
+			continue
+		}
+		if tenantScope != nil && e.TenantID != nil && *e.TenantID != *tenantScope {
+			continue
+		}
+		return e
+	}
+	return nil
 }
 
 // ── shared-secret exception register ─────────────────────────────────────────
@@ -2010,4 +2108,15 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// distinctCount counts distinct non-empty ids.
+func distinctCount(ids []string) int {
+	seen := map[string]struct{}{}
+	for _, id := range ids {
+		if id != "" {
+			seen[id] = struct{}{}
+		}
+	}
+	return len(seen)
 }

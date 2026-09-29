@@ -2,7 +2,10 @@
 // Field names are verbatim from docs/architecture/04-data-model.md §05.1.
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // ---------------------------------------------------------------------------
 // Tenant  (data-model §05.1)
@@ -306,6 +309,26 @@ type CreateEntityRequest struct {
 	LEI       string `json:"lei,omitempty"`
 	LEISource string `json:"lei_source,omitempty"`
 	LEIStatus string `json:"lei_status,omitempty"`
+	// LEIVerifiedAt is documented in openapi.yaml; until 29 Sep 2026 it was
+	// not a field here and was dropped on the floor.
+	LEIVerifiedAt *time.Time `json:"lei_verified_at,omitempty"`
+
+	// §4.3 required source inputs that profile version 1 records. Until the
+	// 29 Sep re-audit these were not fields here, so a client that sent them
+	// at creation had them silently discarded, and the legal form could only
+	// arrive by a later amendment.
+	//
+	// The legal form is optional (entity_type answers "entity type/legal
+	// form") but, when sent, is held to the ISO 20275 control exactly as an
+	// amendment is. RegisteredOffice is opaque JSON for the reason given on
+	// AmendLegalProfileRequest. RegisteredOffice and SourceEvidenceRef are
+	// required outside local development (LEGACY_PROVISIONING_INPUTS).
+	LegalFormCode      string          `json:"legal_form_code,omitempty"`
+	LegalFormSource    string          `json:"legal_form_source,omitempty"`
+	LegalFormLocalText string          `json:"legal_form_local_text,omitempty"`
+	RegistryAuthority  string          `json:"registry_authority,omitempty"`
+	RegisteredOffice   json.RawMessage `json:"registered_office,omitempty"`
+	SourceEvidenceRef  string          `json:"source_evidence_ref,omitempty"`
 }
 
 type CreateWorkspaceRequest struct {

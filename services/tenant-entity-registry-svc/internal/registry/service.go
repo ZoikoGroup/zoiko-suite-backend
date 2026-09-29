@@ -350,6 +350,10 @@ func (s *Service) CreateEntity(
 	if err := validateFiscalCalendarRef(req.FiscalCalendarID); err != nil {
 		return nil, err
 	}
+	profileInputs, err := s.entityProfileInputs(req)
+	if err != nil {
+		return nil, err
+	}
 
 	// Synchronous jurisdiction validation — fail-closed per Q2 resolution.
 	if err := s.jurisd.ValidateExists(ctx, req.PrimaryJurisdictionID); err != nil {
@@ -423,6 +427,13 @@ func (s *Service) CreateEntity(
 		LEI:                         lei,
 		LEISource:                   leiSource,
 		LEIStatus:                   leiStatus,
+		LEIVerifiedAt:               req.LEIVerifiedAt,
+		LegalFormCode:               profileInputs.legalFormCode,
+		LegalFormSource:             profileInputs.legalFormSource,
+		LegalFormLocalText:          profileInputs.legalFormLocalText,
+		RegistryAuthority:           profileInputs.registryAuthority,
+		RegisteredOffice:            profileInputs.registeredOffice,
+		SourceEvidenceRef:           profileInputs.sourceEvidenceRef,
 	}
 
 	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {

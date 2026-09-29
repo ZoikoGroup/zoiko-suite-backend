@@ -46,7 +46,12 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	// with. Omitting event_outbox left its policy in place, so re-applying
 	// 000003 failed at "policy already exists" — and because openTestPool runs
 	// per test, that broke every test after the first.
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS event_outbox, feature_flags, config_entries CASCADE;`)
+	//
+	// And every table and function the AA-001 migrations (000004–000009)
+	// added. This list stopped at the original three, so each test after the
+	// first failed re-applying 000004 on "config_snapshot_epochs already
+	// exists" — the suite could never run more than one test green.
+	_ = dropSchema(ctx, pool)
 
 	// Every *.up.sql in filename order, not one hardcoded filename. This
 	// used to name 000001_initial_schema.up.sql alone, which meant a
@@ -153,6 +158,24 @@ func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
 	return pool
 }
 
+// dropSchema drops every table and function the migrations create, by name —
+// never the whole schema, so a TEST_DATABASE_URL pointed at the wrong database
+// loses no more than this service's own objects. The list must track the
+// migrations: when it stopped at the original three tables, every test after
+// the first failed re-applying 000004 on "relation already exists".
+func dropSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS
+		event_outbox, feature_flags, config_entries,
+		config_snapshot_epochs, config_snapshots, config_definitions, config_definition_versions,
+		kill_switches, config_changes, emergency_changes, runtime_attestations, drift_events,
+		release_plans, flag_retirements, config_layer_overrides CASCADE;`); err != nil {
+		return err
+	}
+	_, err := pool.Exec(ctx, `DROP FUNCTION IF EXISTS
+		config_environment_manifest(TEXT), config_snapshot_immutable(), _cff000005_infer_value_type(JSONB) CASCADE;`)
+	return err
+}
+
 // restoreSchema re-applies every migration after a test has deliberately
 // dropped a table.
 //
@@ -168,8 +191,7 @@ func restoreSchema(t *testing.T, pool *pgxpool.Pool) {
 	// test did NOT drop fails at "relation already exists" — 000001 creates
 	// both config_entries and feature_flags, and each of these tests drops only
 	// one of them.
-	if _, err := pool.Exec(context.Background(),
-		`DROP TABLE IF EXISTS event_outbox, feature_flags, config_entries CASCADE;`); err != nil {
+	if err := dropSchema(context.Background(), pool); err != nil {
 		t.Fatalf("restore: drop: %v", err)
 	}
 	for _, name := range migrationFiles(t) {
@@ -210,6 +232,14 @@ const testCallerTenant = "11111111-1111-1111-1111-111111111111"
 
 func seedDefinition(t *testing.T, pool *pgxpool.Pool, key, valueType string, flagClass *string) {
 	t.Helper()
+	seedDefinitionClass(t, pool, key, valueType, flagClass, "S1")
+}
+
+// seedDefinitionClass is seedDefinition at a chosen safety class. S2/S3 keys
+// are material: they change only through approved change sets, and they are
+// the only keys break-glass may touch.
+func seedDefinitionClass(t *testing.T, pool *pgxpool.Pool, key, valueType string, flagClass *string, safety string) {
+	t.Helper()
 	ctx := context.Background()
 
 	var defID string
@@ -219,11 +249,11 @@ func seedDefinition(t *testing.T, pool *pgxpool.Pool, key, valueType string, fla
 			 fallback_policy, sensitivity, validation, effective_model, lifecycle,
 			 deprecation, flag_class, retirement_deadline, created_by_principal_id, updated_by_principal_id)
 		VALUES
-			($1, 'test-owner', $2, 'S1', '["ENVIRONMENT","TENANT"]'::jsonb, NULL,
+			($1, 'test-owner', $2, $4, '["ENVIRONMENT","TENANT"]'::jsonb, NULL,
 			 'BLOCK', 'INTERNAL', NULL, 'IMMEDIATE', 'PUBLISHED',
 			 NULL, $3, NULL, 'test:seed', 'test:seed')
 		RETURNING definition_id`,
-		key, valueType, flagClass).Scan(&defID); err != nil {
+		key, valueType, flagClass, safety).Scan(&defID); err != nil {
 		t.Fatalf("seed definition %s: %v", key, err)
 	}
 
@@ -231,7 +261,7 @@ func seedDefinition(t *testing.T, pool *pgxpool.Pool, key, valueType string, fla
 		"key": %q,
 		"owner": "test-owner",
 		"value_type": %q,
-		"safety_class": "S1",
+		"safety_class": %q,
 		"allowed_scopes": ["ENVIRONMENT","TENANT"],
 		"default_value": null,
 		"fallback_policy": "BLOCK",
@@ -242,7 +272,7 @@ func seedDefinition(t *testing.T, pool *pgxpool.Pool, key, valueType string, fla
 		"deprecation": null,
 		"flag_class": %s,
 		"retirement_deadline": null
-	}`, key, valueType, flagClassJSON(flagClass))
+	}`, key, valueType, safety, flagClassJSON(flagClass))
 
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO config_definition_versions
@@ -263,6 +293,17 @@ func flagClassJSON(flagClass *string) string {
 func seedConfig(t *testing.T, pool *pgxpool.Pool, key string) {
 	t.Helper()
 	seedDefinition(t, pool, key, "DECIMAL", nil)
+}
+
+func seedMaterial(t *testing.T, pool *pgxpool.Pool, key string) {
+	t.Helper()
+	seedDefinitionClass(t, pool, key, "DECIMAL", nil, "S2")
+}
+
+func seedMaterialFlag(t *testing.T, pool *pgxpool.Pool, key string) {
+	t.Helper()
+	perm := "PERMANENT"
+	seedDefinitionClass(t, pool, key, "BOOLEAN", &perm, "S2")
 }
 
 func seedFlag(t *testing.T, pool *pgxpool.Pool, key string) {

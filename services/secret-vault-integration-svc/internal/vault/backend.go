@@ -62,9 +62,10 @@ var ErrLeaseTokenExpired = errors.New("vault: lease token has expired")
 // additionally refuses tokens whose lease has been revoked.
 type Backend interface {
 	// Get verifies material exists for secretPath and mints a fresh lease
-	// token bound to that path and to expiresAt. It does not return the
-	// secret value itself.
-	Get(ctx context.Context, secretPath string, expiresAt time.Time) (leaseToken string, err error)
+	// token bound to that path, to the lease it is issued for (requestID —
+	// the lease's unique idempotency key) and to expiresAt. It does not
+	// return the secret value itself.
+	Get(ctx context.Context, secretPath, requestID string, expiresAt time.Time) (leaseToken string, err error)
 
 	// Verify checks a lease token's signature, binding and embedded expiry.
 	// It returns the claims an offline verifier needs: the secret path and
@@ -98,7 +99,11 @@ type Backend interface {
 // rejected before any lease state is consulted.
 type LeaseTokenInfo struct {
 	SecretPath string
-	ExpiresAt  time.Time
+	// RequestID names the one lease this token was minted for. Without it a
+	// revoked lease's token verified as valid when presented alongside any
+	// other live lease on the same path.
+	RequestID string
+	ExpiresAt time.Time
 }
 
 // record is the on-disk shape for one secret's encrypted material.
@@ -249,7 +254,7 @@ func (b *LocalFileVaultBackend) decrypt(rec record) ([]byte, error) {
 // secret path and to the lease's expiry. An expired lease's token is
 // rejected by Verify with no database read, and the token carries its own
 // path so it can never be presented against another secret.
-func (b *LocalFileVaultBackend) Get(_ context.Context, secretPath string, expiresAt time.Time) (string, error) {
+func (b *LocalFileVaultBackend) Get(_ context.Context, secretPath, requestID string, expiresAt time.Time) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -265,28 +270,42 @@ func (b *LocalFileVaultBackend) Get(_ context.Context, secretPath string, expire
 		return "", err
 	}
 
-	return b.mintLeaseToken(secretPath, expiresAt)
+	return b.mintLeaseToken(secretPath, requestID, expiresAt)
 }
 
 // leaseTokenPrefix is the versioned lead-in for the signed token format,
 // so an old random opaque token (or a token from a future format) can
 // never be mistaken for a valid current one.
-const leaseTokenPrefix = "ltk:v2:"
+//
+// v3 added the lease binding (request_id). v2 tokens carry no lease binding
+// and are refused outright — they are exactly the tokens that could outlive
+// their lease's revocation.
+const leaseTokenPrefix = "ltk:v3:"
 
 // tokenPayload is the signed body of a lease token. Kept private — the
 // whole point of the signature is that a holder cannot forge or alter the
 // binding.
 type tokenPayload struct {
 	SecretPath string    `json:"secret_path"`
+	RequestID  string    `json:"request_id"`
 	ExpiresAt  time.Time `json:"expires_at"`
 }
 
-func (b *LocalFileVaultBackend) mintLeaseToken(secretPath string, expiresAt time.Time) (string, error) {
-	payload, err := json.Marshal(tokenPayload{SecretPath: secretPath, ExpiresAt: expiresAt.UTC()})
+func (b *LocalFileVaultBackend) mintLeaseToken(secretPath, requestID string, expiresAt time.Time) (string, error) {
+	return mintLeaseToken(b.key, secretPath, requestID, expiresAt)
+}
+
+// mintLeaseToken signs a lease token with key. Shared by every backend in
+// this package so the token format has exactly one definition.
+func mintLeaseToken(key []byte, secretPath, requestID string, expiresAt time.Time) (string, error) {
+	if requestID == "" {
+		return "", errors.New("vault: a lease token must be bound to a lease (request_id)")
+	}
+	payload, err := json.Marshal(tokenPayload{SecretPath: secretPath, RequestID: requestID, ExpiresAt: expiresAt.UTC()})
 	if err != nil {
 		return "", fmt.Errorf("vault: failed to encode lease token payload: %w", err)
 	}
-	mac := hmac.New(sha256.New, b.key)
+	mac := hmac.New(sha256.New, key)
 	if _, err := mac.Write(payload); err != nil {
 		return "", fmt.Errorf("vault: failed to sign lease token: %w", err)
 	}
@@ -303,6 +322,11 @@ func (b *LocalFileVaultBackend) Verify(_ context.Context, leaseToken string) (Le
 }
 
 func (b *LocalFileVaultBackend) verifyLeaseToken(leaseToken string) (LeaseTokenInfo, error) {
+	return verifyLeaseToken(b.key, leaseToken)
+}
+
+// verifyLeaseToken checks a token minted by mintLeaseToken under key.
+func verifyLeaseToken(key []byte, leaseToken string) (LeaseTokenInfo, error) {
 	if !strings.HasPrefix(leaseToken, leaseTokenPrefix) {
 		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
 	}
@@ -316,7 +340,7 @@ func (b *LocalFileVaultBackend) verifyLeaseToken(leaseToken string) (LeaseTokenI
 	if err != nil {
 		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
 	}
-	mac := hmac.New(sha256.New, b.key)
+	mac := hmac.New(sha256.New, key)
 	if _, err := mac.Write(payload); err != nil {
 		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
 	}
@@ -325,13 +349,13 @@ func (b *LocalFileVaultBackend) verifyLeaseToken(leaseToken string) (LeaseTokenI
 		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
 	}
 	var tp tokenPayload
-	if err := json.Unmarshal(payload, &tp); err != nil || tp.SecretPath == "" || tp.ExpiresAt.IsZero() {
+	if err := json.Unmarshal(payload, &tp); err != nil || tp.SecretPath == "" || tp.RequestID == "" || tp.ExpiresAt.IsZero() {
 		return LeaseTokenInfo{}, ErrLeaseTokenInvalid
 	}
 	if !tp.ExpiresAt.After(time.Now().UTC()) {
-		return LeaseTokenInfo{}, ErrLeaseTokenExpired
+		return LeaseTokenInfo{SecretPath: tp.SecretPath, RequestID: tp.RequestID, ExpiresAt: tp.ExpiresAt}, ErrLeaseTokenExpired
 	}
-	return LeaseTokenInfo{SecretPath: tp.SecretPath, ExpiresAt: tp.ExpiresAt}, nil
+	return LeaseTokenInfo{SecretPath: tp.SecretPath, RequestID: tp.RequestID, ExpiresAt: tp.ExpiresAt}, nil
 }
 
 // GetMaterial decrypts and returns the raw secret material for secretPath.

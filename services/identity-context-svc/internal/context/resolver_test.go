@@ -356,10 +356,16 @@ type mockEnvelopeSigner struct {
 	// this service wrote to its own tables — the distinction that let the
 	// support elevation be evidenced locally and invisible everywhere else.
 	captured *domain.IdentityContextEnvelope
+
+	// mu guards captured: the NFR concurrency test resolves from 16 goroutines
+	// at once, and an unguarded write here was a data race under -race (CI).
+	mu sync.Mutex
 }
 
 func (m *mockEnvelopeSigner) Sign(e *domain.IdentityContextEnvelope) (string, error) {
+	m.mu.Lock()
 	m.captured = e
+	m.mu.Unlock()
 	if m.err != nil {
 		return "", m.err
 	}

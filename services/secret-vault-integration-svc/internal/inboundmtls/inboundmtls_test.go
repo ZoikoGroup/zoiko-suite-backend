@@ -171,7 +171,7 @@ func TestIdentityCheck_MatchingCertPasses(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	w := httptest.NewRecorder()
-	IdentityCheck(true, nil)(next).ServeHTTP(w, req)
+	IdentityCheck(true, nil, nil)(next).ServeHTTP(w, req)
 	if !called {
 		t.Fatal("matching cert must be allowed through")
 	}
@@ -191,7 +191,7 @@ func TestIdentityCheck_MismatchRefused(t *testing.T) {
 		called = true
 	})
 	w := httptest.NewRecorder()
-	IdentityCheck(true, nil)(next).ServeHTTP(w, req)
+	IdentityCheck(true, nil, nil)(next).ServeHTTP(w, req)
 	if called {
 		t.Fatal("mismatched cert must NOT reach the handler")
 	}
@@ -210,7 +210,7 @@ func TestIdentityCheck_DisabledIsNoop(t *testing.T) {
 		called = true
 	})
 	w := httptest.NewRecorder()
-	IdentityCheck(false, nil)(next).ServeHTTP(w, req)
+	IdentityCheck(false, nil, nil)(next).ServeHTTP(w, req)
 	if !called {
 		t.Fatal("disabled identity check must be a transparent no-op")
 	}
@@ -231,7 +231,7 @@ func TestIdentityCheck_NoCertLetsThroughWhenEnabled(t *testing.T) {
 		called = true
 	})
 	w := httptest.NewRecorder()
-	IdentityCheck(true, nil)(next).ServeHTTP(w, req)
+	IdentityCheck(true, nil, nil)(next).ServeHTTP(w, req)
 	if !called {
 		t.Fatal("cert-less request with a verified identity header should pass; the handshake gate decides whether bare requests are acceptable")
 	}
@@ -249,11 +249,82 @@ func TestIdentityCheck_CertButNoClaimRefusedWhenEnabled(t *testing.T) {
 		called = true
 	})
 	w := httptest.NewRecorder()
-	IdentityCheck(true, nil)(next).ServeHTTP(w, req)
+	IdentityCheck(true, nil, nil)(next).ServeHTTP(w, req)
 	if called {
 		t.Fatal("cert without a verified identity claim must be refused")
 	}
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
+	}
+}
+// A certificate proving one header must not vouch for a different identity in
+// the other. The broker authorizes X-Principal-Id first, so checking only
+// X-Workload-Id let svc-a's own certificate lease svc-b's secrets.
+func TestIdentityCheck_SecondIdentityHeaderMustAlsoMatchCert(t *testing.T) {
+	dir := t.TempDir()
+	certFile := testCerts(t, dir, "svc-a")
+	req := requestWithCert(t, certFile, "X-Workload-Id", "svc-a")
+	req.Header.Set("X-Principal-Id", "svc-b")
+
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	})
+	w := httptest.NewRecorder()
+	IdentityCheck(true, nil, nil)(next).ServeHTTP(w, req)
+	if called {
+		t.Fatal("X-Principal-Id the certificate does not name must not reach the handler")
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+}
+
+// Both headers naming the certificate's identity is the ordinary direct
+// workload call and must still pass.
+func TestIdentityCheck_BothHeadersMatchingCertPass(t *testing.T) {
+	dir := t.TempDir()
+	certFile := testCerts(t, dir, "svc-a")
+	req := requestWithCert(t, certFile, "X-Workload-Id", "svc-a")
+	req.Header.Set("X-Principal-Id", "svc-a")
+
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
+	IdentityCheck(true, nil, nil)(next).ServeHTTP(httptest.NewRecorder(), req)
+	if !called {
+		t.Fatal("a certificate naming both claimed identities must pass")
+	}
+}
+
+// The gateway hop presents its own certificate and forwards the human
+// principal it verified; a named forwarder is allowed to do that.
+func TestIdentityCheck_TrustedForwarderMayForwardAnotherPrincipal(t *testing.T) {
+	dir := t.TempDir()
+	certFile := testCerts(t, dir, "gateway-auth-svc")
+	req := requestWithCert(t, certFile, "X-Principal-Id", "user-42")
+
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
+	IdentityCheck(true, []string{"gateway-auth-svc"}, nil)(next).ServeHTTP(httptest.NewRecorder(), req)
+	if !called {
+		t.Fatal("a trusted forwarder's certificate must be allowed to forward a verified principal")
+	}
+}
+
+// Being on the forwarder list is by certificate identity, not by what the
+// headers claim: an ordinary workload naming the gateway in a header gains
+// nothing.
+func TestIdentityCheck_UntrustedCertCannotForward(t *testing.T) {
+	dir := t.TempDir()
+	certFile := testCerts(t, dir, "svc-a")
+	req := requestWithCert(t, certFile, "X-Principal-Id", "user-42")
+	req.Header.Set("X-Workload-Id", "gateway-auth-svc")
+
+	called := false
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true })
+	w := httptest.NewRecorder()
+	IdentityCheck(true, []string{"gateway-auth-svc"}, nil)(next).ServeHTTP(w, req)
+	if called || w.Code != http.StatusForbidden {
+		t.Fatalf("non-forwarder certificate forwarding another principal must be 403, got %d (called=%v)", w.Code, called)
 	}
 }

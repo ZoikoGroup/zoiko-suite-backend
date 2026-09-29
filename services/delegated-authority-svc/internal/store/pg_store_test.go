@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -55,8 +56,6 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	requireNotSuperuser(t, pool)
-
 	// Fresh schema per test run. The outbox depends on nothing; the grants
 	// table must be dropped last only because the outbox references no tables.
 	_, err = pool.Exec(context.Background(), `
@@ -85,7 +84,46 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 		require.NoError(t, err, "applying migration %s", filepath.Base(path))
 	}
 
+	// CI (and most local setups) connect as the postgres superuser, which
+	// bypasses row-level security unconditionally. Rather than refuse to run
+	// there, the schema is built with that connection and every test then runs
+	// through a NOSUPERUSER NOBYPASSRLS role, so RLS is genuinely in force.
+	pool = asUnprivilegedRole(t, pool, dsn)
+	requireNotSuperuser(t, pool)
 	return pool
+}
+
+// asUnprivilegedRole returns pool unchanged when it is already unprivileged.
+// Otherwise it creates (idempotently) a login role with no superuser or
+// BYPASSRLS attribute, grants it DML on the freshly migrated tables, and
+// returns a pool connected as that role.
+func asUnprivilegedRole(t *testing.T, pool *pgxpool.Pool, dsn string) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+	var isSuper bool
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user").Scan(&isSuper))
+	if !isSuper {
+		return pool
+	}
+	const role, password = "delegated_authority_rls_test", "rls-test-only"
+	_, err := pool.Exec(ctx, `DO $do$ BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '`+role+`') THEN
+			CREATE ROLE `+role+` LOGIN PASSWORD '`+password+`' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+		END IF;
+	END $do$;
+	GRANT USAGE ON SCHEMA public TO `+role+`;
+	GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public TO `+role+`;
+	GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO `+role+`;`)
+	require.NoError(t, err, "creating the unprivileged test role")
+
+	u, err := url.Parse(dsn)
+	require.NoError(t, err, "TEST_DATABASE_URL must be a URL to derive the unprivileged role's DSN")
+	u.User = url.UserPassword(role, password)
+	unprivileged, err := pgxpool.New(ctx, u.String())
+	require.NoError(t, err)
+	t.Cleanup(unprivileged.Close)
+	return unprivileged
 }
 
 // The two tenants every test splits between. The second is not filler: RLS and
@@ -218,16 +256,18 @@ func TestCreateDelegationIsIdempotentOnCorrelationID(t *testing.T) {
 	s := store.New(pool)
 	ctx := tenantCtx(testTenantA)
 
-	d := grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa00a2", "corr-a2", testEntityA, principalSelf, principalOther,
-		time.Now().UTC(), time.Now().UTC().Add(30*24*time.Hour))
+	from := time.Now().UTC().Truncate(time.Second)
+	to := from.Add(30 * 24 * time.Hour)
+	d := grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa00a2", "corr-a2", testEntityA, principalSelf, principalOther, from, to)
 	_, err := s.CreateDelegation(ctx, d)
 	require.NoError(t, err)
 
-	// A retried submission carries the same (tenant_id, correlation_id) and may
-	// differ in every other field — a replay is not a fresh grant and must
-	// neither write nor overwrite.
-	replay := grant("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbba", "corr-a2", testEntityB, principalThird, principalOther,
-		time.Now().UTC(), time.Now().UTC().Add(30*24*time.Hour))
+	// A retried submission carries the same idempotency scope — migration
+	// 000008: tenant, correlation, creator, action, entity and effective
+	// window — and may differ in anything outside it (here the delegation id
+	// and the delegate). A replay is not a fresh grant and must neither write
+	// nor overwrite.
+	replay := grant("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbba", "corr-a2", testEntityA, principalSelf, principalThird, from, to)
 	created, err := s.CreateDelegation(ctx, replay)
 	require.NoError(t, err)
 	require.False(t, created, "a replay must not report a real insert")
@@ -381,6 +421,9 @@ func TestListDelegationsPaging(t *testing.T) {
 		"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa00d3",
 	} {
 		d := grant(id, "corr-d"+id[31:], testEntityA, principalSelf, principalOther, now, now.Add(24*time.Hour))
+		// A distinct action per row: three ACTIVE grants for one delegate, action
+		// and window are exactly what the overlap constraint (000006) forbids.
+		d.ActionType = fmt.Sprintf("PO_ISSUE_%d", i)
 		d.CreatedAt = now
 		created, err := s.CreateDelegation(ctx, d)
 		require.NoError(t, err)
@@ -598,6 +641,9 @@ func TestExpireDueAllTenantsRespectsBatchLimit(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		id := fmt.Sprintf("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa04%02d", i)
 		g := grant(id, fmt.Sprintf("corr-04%02d", i), testEntityA, principalSelf, principalOther, from, to)
+		// Distinct actions: overlapping ACTIVE grants for one delegate and action
+		// are refused by the overlap constraint (000006).
+		g.ActionType = fmt.Sprintf("PO_ISSUE_%d", i)
 		_, err := s.CreateDelegation(ctx, g)
 		require.NoError(t, err)
 	}

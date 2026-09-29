@@ -418,6 +418,26 @@ pc=$(psql_q "SELECT count(*) FROM information_schema.columns WHERE
 ok "provisioning-lineage, home-region and record_version columns exist (found $pc of 6)" "$([ "$pc" = "6" ] && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
+section '16. 29 Sep re-audit — malformed ids, §4.3 source inputs at creation'
+# ---------------------------------------------------------------------------
+
+# A malformed id is the caller's error. Every id route answered 500
+# INTERNAL_ERROR to one until 29 Sep, which read as an outage in the SLO.
+mid=$(curl -s -w ' %{http_code}' "$BASE_URL/v1/entities/not-a-uuid" \
+  -H "X-Tenant-Id: $AUD_TENANT" -H 'X-Principal-Id: audit-probe' -H "X-Request-Id: audit-mid-$RANDOM" \
+  -H 'X-Correlation-ID: audit' -H 'X-Source-Channel: api')
+ok "a malformed id is a typed 400, not a 500 (got ${mid##* } $(echo "$mid" | grep -o '"error_code":"[A-Z_]*"' | cut -d'"' -f4))" \
+   "$(echo "$mid" | grep -q '"error_code":"VALIDATION_FAILED"' && [ "${mid##* }" = "400" ] && echo 0 || echo 1)"
+
+# §4.3 required inputs: the contract requires the registered address and the
+# supporting evidence at creation, and documents the legal-form fields.
+ce=$(awk '/^    CreateEntityRequest:/{f=1} f&&/^    UpdateEntityRequest:/{exit} f' openapi.yaml)
+n=$(echo "$ce" | grep -cE '^ +(legal_form_code|legal_form_source|legal_form_local_text|registered_office|source_evidence_ref):')
+req=$(echo "$ce" | tr -d '\n ' | grep -c 'registered_office,source_evidence_ref\]')
+ok "CreateEntityRequest carries the §4.3 inputs and requires office + evidence (fields $n of 5, required $req of 1)" \
+   "$([ "$n" = "5" ] && [ "$req" = "1" ] && echo 0 || echo 1)"
+
+# ---------------------------------------------------------------------------
 printf '\n\033[1mResult:\033[0m %s passed, %s failed, %s skipped\n' \
   "$(green "$PASS")" "$([ "$FAIL" -gt 0 ] && red "$FAIL" || echo "$FAIL")" "$SKIP"
 

@@ -167,23 +167,28 @@ type stubVault struct {
 	rotateErr   error
 	rotateCalls int
 
-	verifyPath   string
-	verifyExpiry time.Time
-	verifyErr    error
+	verifyPath      string
+	verifyRequestID string
+	verifyExpiry    time.Time
+	verifyErr       error
 
 	getMaterial      []byte
 	getMaterialErr   error
 	getMaterialCalls int
 
-	getCalls int
+	getCalls      int
+	getRequestIDs []string
+	getExpiries   []time.Time
 }
 
-func (v *stubVault) Get(_ context.Context, _ string, _ time.Time) (string, error) {
+func (v *stubVault) Get(_ context.Context, _, requestID string, expiresAt time.Time) (string, error) {
 	v.getCalls++
+	v.getRequestIDs = append(v.getRequestIDs, requestID)
+	v.getExpiries = append(v.getExpiries, expiresAt)
 	return v.getToken, v.getErr
 }
 func (v *stubVault) Verify(_ context.Context, _ string) (vault.LeaseTokenInfo, error) {
-	return vault.LeaseTokenInfo{SecretPath: v.verifyPath, ExpiresAt: v.verifyExpiry}, v.verifyErr
+	return vault.LeaseTokenInfo{SecretPath: v.verifyPath, RequestID: v.verifyRequestID, ExpiresAt: v.verifyExpiry}, v.verifyErr
 }
 func (v *stubVault) GetMaterial(_ context.Context, _ string) ([]byte, error) {
 	v.getMaterialCalls++
@@ -1367,6 +1372,67 @@ func TestVerifyLease_MalformedToken_Rejected(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a malformed token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// The token names the lease it was minted for. A revoked lease's token used to
+// verify as valid when presented with any other live lease on the same path,
+// because only the path was compared.
+func TestVerifyLease_RevokedLeasesTokenAgainstAnotherLiveLease_Refused(t *testing.T) {
+	leased := testTenant
+	live := &domain.SecretLease{
+		LeaseID: "33333333-0000-4000-8000-000000000002", RequestID: "req-live",
+		SecretPath: "kv/db", TenantID: &leased, Status: "GRANTED",
+	}
+	s := &stubStore{findLeaseResult: live}
+	// The presented token was minted for the REVOKED lease req-revoked.
+	v := &stubVault{verifyPath: "kv/db", verifyRequestID: "req-revoked", verifyExpiry: time.Now().Add(time.Hour)}
+	r := newTestRouter(s, v, &stubPublisher{})
+
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000002/verify", bytes.NewBufferString(`{"lease_token":"ltk:v3:revoked"}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "lease_token_mismatch") {
+		t.Fatalf("a token for another lease must be 400 lease_token_mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A replayed broker call returns the original lease; its token must be bound
+// to that lease's expiry, not to the replay's later one.
+func TestBroker_Replay_TokenBoundToOriginalLeaseExpiry(t *testing.T) {
+	original := time.Now().Add(2 * time.Minute).UTC().Truncate(time.Second)
+	s := &stubStore{
+		applicableByPath: &domain.ApplicableSecretPolicyVersion{
+			SecretPolicyVersion: domain.SecretPolicyVersion{
+				SecretPolicyVersionID:   "22222222-0000-4000-8000-000000000001",
+				AllowedWorkloadIDs:      json.RawMessage(`["svc-a"]`),
+				MaxLeaseDurationSeconds: 300,
+			},
+			SecretClass: "DATABASE_CREDENTIAL",
+			SecretPath:  "kv/db",
+		},
+		lease: &domain.SecretLease{
+			LeaseID: "33333333-0000-4000-8000-000000000001", RequestID: "req-1", SecretPath: "kv/db", ExpiresAt: original,
+		},
+		leaseCreated: false, // replay
+	}
+	v := &stubVault{getToken: "ltk:v3:stub"}
+	r := newTestRouter(s, v, &stubPublisher{})
+
+	req := asWorkload(authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", testWorkload, "req-1")))), testWorkload)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	last := len(v.getExpiries) - 1
+	if last < 0 || !v.getExpiries[last].Equal(original) {
+		t.Fatalf("replayed token must be minted for the original expiry %v, got %v", original, v.getExpiries)
+	}
+	for _, id := range v.getRequestIDs {
+		if id != "req-1" {
+			t.Fatalf("every token must be bound to the lease's request_id, got %v", v.getRequestIDs)
+		}
 	}
 }
 

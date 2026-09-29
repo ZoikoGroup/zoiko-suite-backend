@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -75,21 +76,24 @@ func NewServerTLSConfig(certFile, keyFile, clientCAFile string, log *zap.Logger)
 // request through: the decision about whether that is acceptable belongs
 // to the config gate that decided whether to run mTLS, not to a
 // best-effort middleware.
-func IdentityCheck(checkIdentity bool, log *zap.Logger) func(http.Handler) http.Handler {
+//
+// trustedForwarders are certificate identities (the gateway hop) allowed to
+// forward a principal other than themselves; see config.MTLSTrustedForwarders.
+func IdentityCheck(checkIdentity bool, trustedForwarders []string, log *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !checkIdentity {
 				next.ServeHTTP(w, r)
 				return
 			}
-			if !rejectsIdentity(w, r, log) {
+			if !rejectsIdentity(w, r, trustedForwarders, log) {
 				next.ServeHTTP(w, r)
 			}
 		})
 	}
 }
 
-func rejectsIdentity(w http.ResponseWriter, r *http.Request, log *zap.Logger) bool {
+func rejectsIdentity(w http.ResponseWriter, r *http.Request, trustedForwarders []string, log *zap.Logger) bool {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		// No client certificate is visible (plain TLS, or a proxy). The
 		// verified identity headers alone remain authority here — without a
@@ -97,11 +101,17 @@ func rejectsIdentity(w http.ResponseWriter, r *http.Request, log *zap.Logger) bo
 		return false
 	}
 
-	claimed := strings.TrimSpace(r.Header.Get("X-Workload-Id"))
-	if claimed == "" {
-		claimed = strings.TrimSpace(r.Header.Get("X-Principal-Id"))
+	// Every identity header present must be one the certificate names.
+	// Checking only X-Workload-Id let a caller prove it with its own
+	// certificate while the broker authorized X-Principal-Id (envelope
+	// Actor() prefers it) — a different workload's lease.
+	var claims []string
+	for _, h := range []string{"X-Principal-Id", "X-Workload-Id"} {
+		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
+			claims = append(claims, v)
+		}
 	}
-	if claimed == "" {
+	if len(claims) == 0 {
 		if log != nil {
 			log.Warn("inbound mTLS identity check: no verified identity header present to match cert against",
 				zap.String("remote_addr", r.RemoteAddr))
@@ -111,15 +121,25 @@ func rejectsIdentity(w http.ResponseWriter, r *http.Request, log *zap.Logger) bo
 	}
 
 	leaf := r.TLS.PeerCertificates[0]
-	if !identityMatches(claimed, leaf) {
-		if log != nil {
-			log.Warn("inbound mTLS identity check refused: cert identity differs from verified header",
-				zap.String("claimed", claimed),
-				zap.String("cert_cn", leaf.Subject.CommonName),
-				zap.String("remote_addr", r.RemoteAddr))
+	// A trusted forwarder vouches for the principal it verified; the
+	// revalidation is of the forwarder itself, which the handshake and this
+	// match together establish.
+	for _, fwd := range trustedForwarders {
+		if identityMatches(fwd, leaf) {
+			return false
 		}
-		http.Error(w, `{"error":"identity_mismatch"}`, http.StatusForbidden)
-		return true
+	}
+	for _, claimed := range claims {
+		if !identityMatches(claimed, leaf) {
+			if log != nil {
+				log.Warn("inbound mTLS identity check refused: cert identity differs from verified header",
+					zap.String("claimed", claimed),
+					zap.String("cert_cn", leaf.Subject.CommonName),
+					zap.String("remote_addr", r.RemoteAddr))
+			}
+			http.Error(w, `{"error":"identity_mismatch"}`, http.StatusForbidden)
+			return true
+		}
 	}
 	return false
 }
@@ -152,4 +172,52 @@ func identityMatches(claimed string, leaf *x509.Certificate) bool {
 		}
 	}
 	return false
+}
+// CertPolicy enforces Security Standard §9's "short-lived workload
+// certificates; identity bound to environment / region / audience" on the
+// presented client certificate:
+//   - maxLifetime > 0 refuses a certificate whose validity window is longer.
+//   - requiredURIPrefix != "" refuses a certificate with no URI SAN under that
+//     prefix (e.g. "spiffe://zoiko/production/"), so a certificate issued for
+//     another environment or audience does not authenticate here even when it
+//     chains to the same CA.
+//
+// Both are off when unset. mtls-management-svc issues CN + DNS-SAN leaves in
+// whole days (default 90) with no URI SAN, so enforcing either today would
+// refuse every certificate; switching them on follows the issuer change
+// (CROSS-SERVICE). A request with no client certificate passes — whether that
+// is allowed is the handshake's decision (config.ValidateInbound).
+func CertPolicy(maxLifetime time.Duration, requiredURIPrefix string, log *zap.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if reason := certPolicyViolation(r.TLS.PeerCertificates[0], maxLifetime, requiredURIPrefix); reason != "" {
+				if log != nil {
+					log.Warn("inbound mTLS certificate policy refused", zap.String("reason", reason),
+						zap.String("cert_cn", r.TLS.PeerCertificates[0].Subject.CommonName), zap.String("remote_addr", r.RemoteAddr))
+				}
+				http.Error(w, `{"error":"client_certificate_policy","reason":"`+reason+`"}`, http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func certPolicyViolation(leaf *x509.Certificate, maxLifetime time.Duration, requiredURIPrefix string) string {
+	if maxLifetime > 0 && leaf.NotAfter.Sub(leaf.NotBefore) > maxLifetime {
+		return "certificate_lifetime_exceeds_maximum"
+	}
+	if requiredURIPrefix != "" {
+		for _, u := range leaf.URIs {
+			if strings.HasPrefix(u.String(), requiredURIPrefix) {
+				return ""
+			}
+		}
+		return "certificate_not_bound_to_this_environment"
+	}
+	return ""
 }

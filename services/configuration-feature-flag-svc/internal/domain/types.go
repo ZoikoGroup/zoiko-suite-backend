@@ -10,6 +10,8 @@ package domain
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -234,7 +236,10 @@ var (
 		"the requested scope crosses an environment boundary")
 	// INV-09: SECRET_REFERENCE_ONLY keys accept a reference, never material.
 	ErrSecretValueProhibited = newCodedError("secret_value_prohibited",
-		"SECRET_REFERENCE_ONLY keys accept a secret reference (secret://...), never material")
+		"secret material is never stored in configuration; SECRET_REFERENCE_ONLY keys take a reference of the form secret://<environment>/<path>")
+	// INV-10/26: a reference resolves only in the environment it names.
+	ErrSecretReferenceEnvironment = newCodedError("secret_reference_environment_mismatch",
+		"the secret reference names a different environment than the one being written")
 	// TC-04: C2/C3 classes bind an approval before activation.
 	ErrChangeApprovalRequired = newCodedError("change_approval_required",
 		"this change class requires an approval before activation")
@@ -252,9 +257,25 @@ var (
 	// INV-21 / NP-20: a retired key is tombstoned, not reusable.
 	ErrFlagKeyRetired = newCodedError("flag_key_retired",
 		"this flag key is retired and cannot be reused")
+	// INV-15: break-glass activates once, from OPEN, before its expiry.
+	ErrEmergencyNotActivatable = newCodedError("emergency_change_not_activatable",
+		"this emergency change is not open or has already expired")
+	// INV-15: a retrospective closes only once the change has expired, and
+	// only with a review record.
+	ErrRetrospectiveNotPending = newCodedError("retrospective_not_pending",
+		"this emergency change has no retrospective pending")
+	// INV-17: only a verified change has a state to roll back from.
+	ErrRollbackTargetInvalid = newCodedError("rollback_target_invalid",
+		"only a VERIFIED change that has not been rolled back can be rolled back")
+	// INV-16: a kill switch applies to a declared feature flag only.
+	ErrNotAFeatureFlag = newCodedError("not_a_feature_flag",
+		"this key is not declared as a feature flag")
 	// INV-12: fail closed — no snapshot, no resolution.
 	ErrNoAttestedSnapshot = newCodedError("no_attested_snapshot",
 		"no snapshot exists for this environment — refusing rather than guessing")
+	// INV-29: the snapshot an evaluation cited is gone or never existed.
+	ErrSnapshotNotFound = newCodedError("snapshot_not_found",
+		"no snapshot has this id")
 	// INV-15 / NP-43: break-glass without a bound is not break-glass.
 	ErrEmergencyChangeNoExpiry = newCodedError("emergency_change_no_expiry",
 		"an emergency change must declare an expiry")
@@ -380,6 +401,8 @@ type ConfigDefinition struct {
 	Deprecation        json.RawMessage `json:"deprecation"`
 	FlagClass          *string         `json:"flag_class"`
 	RetirementDeadline *time.Time      `json:"retirement_deadline"`
+	// INV-26: jurisdictions the key may be delivered to; empty = unrestricted.
+	AllowedRegions []string `json:"allowed_regions,omitempty"`
 
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
@@ -399,6 +422,8 @@ type ConfigDefinitionVersion struct {
 	Lifecycle              string          `json:"lifecycle"`
 	PublishedByPrincipalID string          `json:"published_by_principal_id"`
 	PublishedAt            time.Time       `json:"published_at"`
+	// §10.1 approval binding: required when publishing an S2/S3 key.
+	ApprovalReference *string `json:"approval_reference,omitempty"`
 }
 
 // CreateDefinitionParams carries a POST /v1/config/definitions write.
@@ -415,6 +440,7 @@ type CreateDefinitionParams struct {
 	EffectiveModel     string
 	FlagClass          *string
 	RetirementDeadline *time.Time
+	AllowedRegions     []string
 	ActorPrincipalID   string
 	CorrelationID      string
 }
@@ -422,10 +448,11 @@ type CreateDefinitionParams struct {
 // PublishDefinitionParams carries a definition publish/deprecate/retire acting
 // on a working row; Lifecycle is one of PUBLISHED / DEPRECATED / RETIRED.
 type PublishDefinitionParams struct {
-	DefinitionID     string
-	Lifecycle        string
-	ActorPrincipalID string
-	CorrelationID    string
+	DefinitionID      string
+	Lifecycle         string
+	ApprovalReference string
+	ActorPrincipalID  string
+	CorrelationID     string
 }
 
 // ── Write-gate validation helpers ─────────────────────────────────────────────
@@ -506,11 +533,25 @@ func ValidateValueAgainstType(value json.RawMessage, valueType string) error {
 // key must be registered (INV-05), a SECRET_REFERENCE_ONLY key must hold a
 // reference (INV-09), the value must match the declared type, and an ENUM must
 // name one of the enum options carried in the definition's validation schema.
-func ValidateValue(value json.RawMessage, def *ConfigDefinition) error {
+//
+// environment is the environment the value is being written to. A
+// SECRET_REFERENCE_ONLY key takes a reference naming that same environment
+// (INV-10/26: a production reference never resolves outside production, and a
+// lower environment never reaches a production store — INV-11). Every other
+// key refuses anything shaped like credential material (INV-09).
+func ValidateValue(value json.RawMessage, def *ConfigDefinition, environment string) error {
 	if def == nil {
 		return ErrKeyNotRegistered
 	}
-	if def.Sensitivity == SensitivitySecretReferenceOnly && !IsSecretReference(value) {
+	if def.Sensitivity == SensitivitySecretReferenceOnly {
+		refEnv, _, ok := ParseSecretReference(value)
+		if !ok {
+			return ErrSecretValueProhibited
+		}
+		if refEnv != environment {
+			return ErrSecretReferenceEnvironment
+		}
+	} else if LooksLikeSecretMaterial(value) {
 		return ErrSecretValueProhibited
 	}
 	if err := ValidateValueAgainstType(value, def.ValueType); err != nil {
@@ -600,6 +641,16 @@ type ResolvedConfigSnapshot struct {
 	IssuedAt          time.Time       `json:"issued_at"`
 	FreshnessDeadline time.Time       `json:"freshness_deadline"`
 	Values            []ResolvedValue `json:"values"`
+
+	// Stale is true when the snapshot is past its freshness deadline; material
+	// keys are then withheld (INV-13), the rest served and marked.
+	Stale bool `json:"stale"`
+
+	// EvaluationEvidence (§2.1): the context hash and the time of resolution.
+	// With SnapshotID they reproduce this answer later — the snapshot is
+	// immutable and fetchable by id, and the hash names the exact inputs.
+	ContextHash string    `json:"context_hash"`
+	ResolvedAt  time.Time `json:"resolved_at"`
 }
 
 // ResolvedValue is one key's resolution within a pinned snapshot (Table 14).
@@ -634,6 +685,14 @@ const (
 	ReasonSafeDefault   = "SAFE_DEFAULT"
 	ReasonBlocked       = "BLOCKED"
 	ReasonIndeterminate = "INDETERMINATE"
+
+	// NP-02: a requested key no published definition declares. Answered
+	// explicitly so a consumer cannot mistake silence for "use your default".
+	ReasonUnknownKey = "UNKNOWN_KEY"
+	// A declared key with no value at any applicable layer; the response
+	// carries the definition's fallback policy so the consumer applies it
+	// (INV-28) rather than inventing one.
+	ReasonNoValue = "NO_VALUE"
 )
 
 // Manifest kinds — the discriminator on each entry built by
@@ -667,6 +726,8 @@ type ManifestEntry struct {
 	RolloutPercentage    *int                 `json:"rollout_percentage,omitempty"`
 	Environment          string               `json:"environment"`
 	TenantID             *string              `json:"tenant_id,omitempty"`
+	Layer                string               `json:"layer,omitempty"`    // extended layers only (000013)
+	ScopeID              string               `json:"scope_id,omitempty"` // extended layers only
 	EffectiveFrom        time.Time            `json:"effective_from"`
 	CreatedByPrincipalID string               `json:"created_by_principal_id"`
 	ReleasePlan          *ReleasePlanManifest `json:"release_plan,omitempty"`
@@ -778,12 +839,23 @@ type ChangePart struct {
 	NewEnabled         *bool           `json:"new_enabled,omitempty"`
 	RolloutPercentage  *int            `json:"rollout_percentage,omitempty"`
 	ExpectedBeforeHash *string         `json:"expected_before_hash,omitempty"`
+
+	// Remove ends the scope's current value instead of writing a new one. A
+	// rollback needs it: a key that had no value at a scope before the
+	// rolled-back change must have none after (INV-17 — restore the state,
+	// not merely the latest value).
+	Remove bool `json:"remove,omitempty"`
 }
 
 // ChangePartScope is the (environment, tenant) tuple a part targets.
 type ChangePartScope struct {
 	Environment string  `json:"environment"`
 	TenantID    *string `json:"tenant_id,omitempty"`
+	// Layer and ScopeID target an extended layer (SERVICE, ORG_UNIT,
+	// USER_PREFERENCE — INV-07). Omitted: TENANT when TenantID is set,
+	// otherwise ENVIRONMENT.
+	Layer   string `json:"layer,omitempty"`
+	ScopeID string `json:"scope_id,omitempty"`
 }
 
 // ChangeApproval is the approval binding a C2/C3 change carries.
@@ -864,7 +936,19 @@ type EmergencyChange struct {
 	RetrospectiveDueAt     *time.Time      `json:"retrospective_due_at,omitempty"`
 	RetrospectiveClosedAt  *time.Time      `json:"retrospective_closed_at,omitempty"`
 	CreatedAt              time.Time       `json:"created_at"`
+
+	// Reversion basis (migration 000010): what the activation wrote and what
+	// it replaced, so expiry restores exactly.
+	Kind                   string     `json:"kind,omitempty"`
+	ActivatedAt            *time.Time `json:"activated_at,omitempty"`
+	HadPrior               bool       `json:"had_prior"`
+	RetrospectiveReference *string    `json:"retrospective_reference,omitempty"`
 }
+
+// EmergencyRetrospectiveWindow is how long after expiry the mandatory
+// retrospective (INV-15) is due. AA-001 does not quantify it; seven days is a
+// placeholder recorded as a deviation until the spec names a budget.
+const EmergencyRetrospectiveWindow = 7 * 24 * time.Hour
 
 // CreateEmergencyChangeParams carries a POST /v1/emergency-changes write.
 // ExpiresAt is required — the handler refuses a zero value with
@@ -936,6 +1020,7 @@ type RecordAttestationParams struct {
 	ObservedDigest     string
 	ObservedVersions   json.RawMessage
 	CallerTenantID     string
+	CorrelationID      string
 }
 
 // DriftEvent is a recorded desired/observed pair (TC-08, NP-51: exact hashes
@@ -961,10 +1046,19 @@ type DriftEvent struct {
 // AttestationResult is a runtime's response to POST /v1/runtime/attest: the
 // recorded attestation, plus the drift finding if observed differed from
 // desired (TC-08).
+//
+// The attestation is embedded, so its fields stay at the top level of the
+// response exactly as before; drift is additive.
 type AttestationResult struct {
-	Attestation RuntimeAttestation `json:"attestation"`
-	Drift       *DriftEvent        `json:"drift,omitempty"`
+	RuntimeAttestation
+	Drift *DriftEvent `json:"drift,omitempty"`
 }
+
+// DriftConvergenceWindow is how long after a snapshot is issued a runtime may
+// still report the previous one before the sweep records it STALE. AA-001
+// leaves the budget to OD-04; fifteen minutes is a placeholder recorded as a
+// deviation until it is set.
+const DriftConvergenceWindow = 15 * time.Minute
 
 // ── Release plans (INV-04/07/19, Table 16/17) ─────────────────────────────────
 
@@ -1053,6 +1147,15 @@ type ResolveParams struct {
 	TenantID      *string
 	Keys          []string
 	CorrelationID string
+	// Region is the caller's gateway-verified jurisdiction (X-Jurisdiction-
+	// Context), checked against each key's declared residency (INV-26).
+	Region string
+	// The caller's identity at the extended precedence layers (INV-07), all
+	// gateway-supplied: Service from X-Workload-Id, OrgUnit from
+	// X-Org-Unit-Id, Subject from X-Principal-Id.
+	Service string
+	OrgUnit string
+	Subject string
 }
 
 // EvaluateFlagParams pins one flag evaluation: the exact scope, a stable
@@ -1065,6 +1168,13 @@ type EvaluateFlagParams struct {
 	SubjectKey    string
 	Context       map[string]any
 	CorrelationID string
+	// TrustedPlan is the commercial plan from the gateway (X-Commercial-Plan),
+	// never from Context: a plan asserted by the caller is NP-08 — a client
+	// claiming a higher plan to enable a feature. Plan eligibility reads this
+	// alone.
+	TrustedPlan string
+	// Region is the caller's gateway-verified jurisdiction, for residency.
+	Region string
 }
 
 // FlagEvaluation is the snapshot-pinned outcome for one flag evaluation
@@ -1087,6 +1197,26 @@ type FlagEvaluation struct {
 	KillSwitch        *KillSwitchManifest  `json:"kill_switch,omitempty"`
 	Bucket            *int                 `json:"bucket,omitempty"`
 	Variant           string               `json:"variant,omitempty"`
+
+	// EvaluationEvidence (§2.1). EvaluatedAt is also the instant a progressive
+	// release plan's schedule was read at, so replaying the evaluation against
+	// the same snapshot at this time gives the same percentage.
+	ContextHash string    `json:"context_hash"`
+	EvaluatedAt time.Time `json:"evaluated_at"`
+}
+
+// ContextHash is the EvaluationEvidence context hash: sha256 hex of the JSON
+// encoding of v. encoding/json writes struct fields in declaration order and
+// map keys sorted, so equal inputs hash identically across calls and hosts.
+func ContextHash(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// Inputs are decoded JSON; an unencodable value cannot reach here.
+		// An empty hash is visibly wrong rather than plausibly right.
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // ActivateOverrideParams carries PUT /v1/config/overrides/{scope}: setting a

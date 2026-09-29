@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
@@ -39,6 +40,7 @@ type ConfigStore interface {
 	PublishDefinition(ctx context.Context, params domain.PublishDefinitionParams) (*domain.ConfigDefinitionVersion, error)
 
 	Resolve(ctx context.Context, params domain.ResolveParams) (*domain.ResolvedConfigSnapshot, error)
+	GetSnapshot(ctx context.Context, snapshotID string) (*domain.ConfigSnapshot, error)
 
 	ActivateOverride(ctx context.Context, params domain.ActivateOverrideParams) (*domain.ConfigEntry, error)
 
@@ -49,9 +51,17 @@ type ConfigStore interface {
 	CreateEmergencyChange(ctx context.Context, params domain.CreateEmergencyChangeParams) (*domain.EmergencyChange, error)
 	ActivateEmergencyChange(ctx context.Context, emergencyChangeID, callerTenantID, actor string) (*domain.EmergencyChange, error)
 
-	RecordAttestation(ctx context.Context, params domain.RecordAttestationParams) (*domain.RuntimeAttestation, error)
+	RecordAttestation(ctx context.Context, params domain.RecordAttestationParams) (*domain.AttestationResult, error)
 
 	CreateReleasePlan(ctx context.Context, params domain.CreateReleasePlanParams) (*domain.ReleasePlan, error)
+
+	// Recovery (INV-15/16/17) and target-scoped authorization.
+	TargetScope(ctx context.Context, kind, id string) (*string, error)
+	CreateKillSwitch(ctx context.Context, params domain.CreateKillSwitchParams) (*domain.KillSwitch, error)
+	RollbackChange(ctx context.Context, changeID, callerTenantID, actor, correlationID string) (*domain.ConfigChange, error)
+	CloseEmergencyRetrospective(ctx context.Context, emergencyChangeID, reference, callerTenantID, actor string) (*domain.EmergencyChange, error)
+	RetireFlag(ctx context.Context, params domain.RetireFlagParams) (*domain.FlagRetirement, error)
+	MarkFlagRemoved(ctx context.Context, params store.MarkFlagRemovedParams) (*domain.FlagRetirement, error)
 	EvaluateFlag(ctx context.Context, params domain.EvaluateFlagParams) (*domain.FlagEvaluation, error)
 }
 
@@ -109,20 +119,26 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/config/definitions/{key}/publish", h.PublishConfigDefinition)
 
 	r.Post("/v1/config/resolve", h.ResolveConfig)
+	r.Get("/v1/config/snapshots/{snapshot_id}", h.GetSnapshot)
 
 	r.Put("/v1/config/overrides/{scope}", h.ActivateOverride)
 
 	r.Post("/v1/config/changes", h.CreateChange)
 	r.Post("/v1/config/changes/{change_id}/approve", h.ApproveChange)
 	r.Post("/v1/config/changes/{change_id}/activate", h.ActivateChange)
+	r.Post("/v1/config/changes/{change_id}/rollback", h.RollbackChange)
 
 	r.Post("/v1/emergency-changes", h.CreateEmergencyChange)
 	r.Post("/v1/emergency-changes/{emergency_change_id}/activate", h.ActivateEmergencyChange)
+	r.Post("/v1/emergency-changes/{emergency_change_id}/retrospective", h.CloseEmergencyRetrospective)
 
 	r.Post("/v1/runtime/attest", h.RecordAttestation)
 
 	r.Post("/v1/flags/{key}/release-plans", h.CreateReleasePlan)
 	r.Post("/v1/flags/{key}/evaluate", h.EvaluateFlag)
+	r.Post("/v1/flags/{key}/kill-switch", h.ActivateKillSwitch)
+	r.Post("/v1/flags/{key}/retire", h.RetireFlag)
+	r.Post("/v1/flags/{key}/removal", h.MarkFlagRemoved)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -821,13 +837,14 @@ func (h *Handler) decodeJSON(w http.ResponseWriter, r *http.Request, dst any, wr
 // this map caught up) falls through to 503 so it can never be mistaken for a
 // succeeded write.
 var governedCodeStatus = map[string]int{
-	"key_not_registered":             http.StatusBadRequest,
-	"type_mismatch":                  http.StatusBadRequest,
-	"value_constraint_failed":        http.StatusBadRequest,
-	"secret_value_prohibited":        http.StatusBadRequest,
-	"environment_boundary_violation": http.StatusBadRequest,
-	"emergency_change_no_expiry":     http.StatusBadRequest,
-	"context_incomplete":             http.StatusBadRequest,
+	"key_not_registered":                    http.StatusBadRequest,
+	"type_mismatch":                         http.StatusBadRequest,
+	"value_constraint_failed":               http.StatusBadRequest,
+	"secret_value_prohibited":               http.StatusBadRequest,
+	"secret_reference_environment_mismatch": http.StatusBadRequest,
+	"environment_boundary_violation":        http.StatusBadRequest,
+	"emergency_change_no_expiry":            http.StatusBadRequest,
+	"context_incomplete":                    http.StatusBadRequest,
 
 	"scope_not_allowed":        http.StatusForbidden,
 	"targeting_not_permitted":  http.StatusForbidden,
@@ -843,7 +860,19 @@ var governedCodeStatus = map[string]int{
 	"consumer_incompatible":      http.StatusConflict,
 	"flag_key_retired":           http.StatusConflict,
 
+	"emergency_change_not_activatable": http.StatusConflict,
+	"change_not_yet_effective":         http.StatusConflict,
+	"change_class_insufficient":        http.StatusConflict,
+	"material_key_requires_change":     http.StatusConflict,
+	"approval_reference_required":      http.StatusConflict,
+	"flag_not_retired":                 http.StatusConflict,
+	"retrospective_not_pending":        http.StatusConflict,
+	"rollback_target_invalid":          http.StatusConflict,
+	"not_a_feature_flag":               http.StatusForbidden,
+
 	"no_attested_snapshot": http.StatusNotFound,
+	"change_not_found":     http.StatusNotFound,
+	"snapshot_not_found":   http.StatusNotFound,
 
 	"snapshot_stale":       http.StatusUnprocessableEntity,
 	"safe_fallback_active": http.StatusUnprocessableEntity,
@@ -955,6 +984,7 @@ type createConfigDefinitionRequest struct {
 	EffectiveModel     string          `json:"effective_model,omitempty"`
 	FlagClass          *string         `json:"flag_class,omitempty"`
 	RetirementDeadline *time.Time      `json:"retirement_deadline,omitempty"`
+	AllowedRegions     []string        `json:"allowed_regions,omitempty"`
 }
 
 func (req createConfigDefinitionRequest) missingField() string {
@@ -1030,6 +1060,7 @@ func (h *Handler) CreateConfigDefinition(w http.ResponseWriter, r *http.Request)
 		EffectiveModel:     effectivemodel,
 		FlagClass:          req.FlagClass,
 		RetirementDeadline: req.RetirementDeadline,
+		AllowedRegions:     req.AllowedRegions,
 		ActorPrincipalID:   principalID,
 		CorrelationID:      correlationID,
 	}
@@ -1100,6 +1131,9 @@ func (h *Handler) FindConfigDefinition(w http.ResponseWriter, r *http.Request) {
 // publishDefinitionRequest is the wire shape for POST /v1/config/definitions/{key}/publish.
 type publishDefinitionRequest struct {
 	Lifecycle string `json:"lifecycle"`
+	// ApprovalReference binds an S2/S3 publish to its approval (§10.1). The
+	// envelope's X-Approval-Reference is accepted in its place.
+	ApprovalReference string `json:"approval_reference,omitempty"`
 }
 
 // PublishConfigDefinition copies the ${key} working declaration into an
@@ -1160,10 +1194,11 @@ func (h *Handler) PublishConfigDefinition(w http.ResponseWriter, r *http.Request
 	}
 
 	version, err := h.store.PublishDefinition(r.Context(), domain.PublishDefinitionParams{
-		DefinitionID:     def.DefinitionID,
-		Lifecycle:        req.Lifecycle,
-		ActorPrincipalID: principalID,
-		CorrelationID:    correlationID,
+		DefinitionID:      def.DefinitionID,
+		Lifecycle:         req.Lifecycle,
+		ApprovalReference: firstNonEmpty(req.ApprovalReference, r.Header.Get("X-Approval-Reference")),
+		ActorPrincipalID:  principalID,
+		CorrelationID:     correlationID,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrKeyNotRegistered) {
@@ -1239,11 +1274,77 @@ func (h *Handler) ResolveConfig(w http.ResponseWriter, r *http.Request) {
 		TenantID:      req.TenantID,
 		Keys:          req.Keys,
 		CorrelationID: correlationID,
+		Region:        trustedRegion(r),
+		// INV-07: the caller's identity at each extended layer, from the
+		// gateway — never the body.
+		Service: strings.TrimSpace(r.Header.Get("X-Workload-Id")),
+		OrgUnit: strings.TrimSpace(r.Header.Get(HeaderOrgUnit)),
+		Subject: strings.TrimSpace(r.Header.Get("X-Principal-Id")),
 	})
 	if err != nil {
 		h.governedRefusal(w, "", "ResolveConfig", correlationID, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+// ── GET /v1/config/snapshots/{snapshot_id} ───────────────────────────────────
+
+// GetSnapshot returns one immutable imprint by id (§10.1 GET
+// /config/snapshots/{id}). It is what makes INV-29 evidence usable: an
+// evaluation or resolution names its snapshot_id, and this returns the exact
+// content that produced it, however much has been written since.
+//
+// Platform scope only. An imprint covers a whole environment — globals and
+// every tenant's overrides — so handing it to a tenant caller would disclose
+// other tenants' values (INV-25). The grant checked is
+// CONFIGURATION_GLOBAL_WRITE, the platform-scope configuration grant that is
+// actually seeded (CONFIG_FULL); a dedicated read action would be one nothing
+// grants yet. Filtering the content per tenant instead would break the
+// digest, which is the point of returning it.
+//
+// The row never changes (migration 000009), so the response is cacheable
+// indefinitely by the authorized caller: private, immutable, ETag = digest.
+//
+// Response:
+//
+//	200 → the snapshot: id, environment, epoch, digest, content, issued_at
+//	400 → invalid_snapshot_id (not a UUID)
+//	401 → missing principal / tenant
+//	403 → authorization_denied
+//	404 → snapshot_not_found
+//	503 → store or authz unavailable
+func (h *Handler) GetSnapshot(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+	snapshotID := chi.URLParam(r, "snapshot_id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	// Checked before the store sees it: a non-UUID would otherwise fail the
+	// column cast and answer as an outage.
+	if _, err := uuid.Parse(snapshotID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid_snapshot_id",
+			"field": "snapshot_id",
+		})
+		return
+	}
+	if outcome := h.authorizeGoverned(w, r, principalID, telemetry.ActionConfigGlobalWrite); outcome != "" {
+		return
+	}
+
+	snap, err := h.store.GetSnapshot(r.Context(), snapshotID)
+	if err != nil {
+		h.governedRefusal(w, "", "GetSnapshot", correlationID, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	w.Header().Set("ETag", `"`+snap.Digest+`"`)
 	writeJSON(w, http.StatusOK, snap)
 }
 
@@ -1306,11 +1407,17 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 		layer = domain.ScopeTenant
 	case "environment":
 		layer = domain.ScopeEnvironment
+	case "service":
+		layer = domain.LayerService
+	case "org_unit":
+		layer = domain.LayerOrgUnit
+	case "user_preference":
+		layer = domain.LayerUserPreference
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_field",
 			"field":   "scope",
-			"message": `must be one of "tenant", "environment"`,
+			"message": `must be one of "environment", "service", "tenant", "org_unit", "user_preference"`,
 		})
 		return
 	}
@@ -1330,20 +1437,28 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 	// For the tenant layer the override belongs to ONE tenant and that tenant
 	// is the caller — a tenant-layer override for any other tenant is refused
 	// here, before anything is written.
-	if layer == domain.ScopeTenant {
+	switch {
+	case layer == domain.ScopeTenant:
 		if h.refuseForeignTenant(w, req.ScopeID, tenantScope) {
 			return
 		}
-	} else if req.ScopeID != nil {
+	case domain.IsExtendedLayer(layer):
+		// SERVICE names a service, ORG_UNIT an org unit, USER_PREFERENCE a
+		// principal; each needs its scope id.
+		if req.ScopeID == nil || strings.TrimSpace(*req.ScopeID) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "scope_id"})
+			return
+		}
+	case req.ScopeID != nil:
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_field",
 			"field":   "scope_id",
-			"message": "scope_id is only valid for the tenant override layer",
+			"message": "scope_id is not valid for the environment layer",
 		})
 		return
 	}
 
-	action := governedAction("config", tenantIDForOverride(layer, req))
+	action := governedAction("config", tenantIDForOverride(layer, req, tenantScope))
 	if outcome := h.authorizeGoverned(w, r, principalID, action); outcome != "" {
 		h.metrics.GovernedWrites.WithLabelValues(action, outcome).Inc()
 		return
@@ -1377,11 +1492,19 @@ func (h *Handler) ActivateOverride(w http.ResponseWriter, r *http.Request) {
 // tenantIDForOverride is the tenant the override applies to: at the tenant
 // layer it is the scope the caller claimed; at the environment layer
 // overrides are global, so the write is a global-scope act.
-func tenantIDForOverride(layer string, req activateOverrideRequest) *string {
-	if layer == domain.ScopeTenant {
+// tenantIDForOverride is the tenant an override belongs to, which picks the
+// grant: ENVIRONMENT and SERVICE are tenantless (a platform-scope write, the
+// global grant); TENANT, ORG_UNIT and USER_PREFERENCE belong to the caller's
+// tenant.
+func tenantIDForOverride(layer string, req activateOverrideRequest, callerTenant string) *string {
+	switch layer {
+	case domain.ScopeTenant:
 		return req.ScopeID
+	case domain.LayerOrgUnit, domain.LayerUserPreference:
+		return &callerTenant
+	default:
+		return nil
 	}
-	return nil
 }
 
 // ── POST /v1/config/changes ──────────────────────────────────────────────────
@@ -1400,6 +1523,8 @@ type changePartRequest struct {
 type changePartScopeRequest struct {
 	Environment string  `json:"environment"`
 	TenantID    *string `json:"tenant_id,omitempty"`
+	Layer       string  `json:"layer,omitempty"`
+	ScopeID     string  `json:"scope_id,omitempty"`
 }
 
 // createChangeRequest is the wire shape for POST /v1/config/changes.
@@ -1476,9 +1601,12 @@ func (h *Handler) CreateChange(w http.ResponseWriter, r *http.Request) {
 	parts := make([]domain.ChangePart, 0, len(req.Parts))
 	for _, p := range req.Parts {
 		parts = append(parts, domain.ChangePart{
-			Kind:               p.Kind,
-			Key:                p.Key,
-			Scope:              domain.ChangePartScope{Environment: p.Scope.Environment, TenantID: p.Scope.TenantID},
+			Kind: p.Kind,
+			Key:  p.Key,
+			Scope: domain.ChangePartScope{
+				Environment: p.Scope.Environment, TenantID: p.Scope.TenantID,
+				Layer: strings.ToUpper(p.Scope.Layer), ScopeID: p.Scope.ScopeID,
+			},
 			NewValue:           p.NewValue,
 			NewEnabled:         p.NewEnabled,
 			RolloutPercentage:  p.RolloutPercentage,
@@ -1561,8 +1689,8 @@ func (h *Handler) ApproveChange(w http.ResponseWriter, r *http.Request) {
 		approvedAt = req.ApprovedAt
 	}
 
-	if outcome := h.authorizeGoverned(w, r, principalID, telemetry.ActionConfigWrite); outcome != "" {
-		h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigWrite, outcome).Inc()
+	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "change", changeID)
+	if !ok {
 		return
 	}
 
@@ -1574,18 +1702,18 @@ func (h *Handler) ApproveChange(w http.ResponseWriter, r *http.Request) {
 	}, tenantScope)
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
-			h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigWrite, telemetry.WriteConflict).Inc()
+			h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteConflict).Inc()
 			writeJSON(w, http.StatusNotFound, map[string]string{
 				"error":     "change_not_found",
 				"change_id": changeID,
 			})
 			return
 		}
-		h.governedRefusal(w, telemetry.ActionConfigWrite, "ApproveChange", correlationID, err)
+		h.governedRefusal(w, action, "ApproveChange", correlationID, err)
 		return
 	}
 
-	h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigWrite, telemetry.WriteCreated).Inc()
+	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()
 	h.log.Info("config change approval recorded",
 		zap.String("change_id", changeID),
 		zap.Bool("approved", approved),
@@ -1623,26 +1751,26 @@ func (h *Handler) ActivateChange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if outcome := h.authorizeGoverned(w, r, principalID, telemetry.ActionConfigWrite); outcome != "" {
-		h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigWrite, outcome).Inc()
+	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "change", changeID)
+	if !ok {
 		return
 	}
 
 	updated, err := h.store.ActivateChange(r.Context(), changeID, tenantScope, principalID)
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
-			h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigWrite, telemetry.WriteConflict).Inc()
+			h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteConflict).Inc()
 			writeJSON(w, http.StatusNotFound, map[string]string{
 				"error":     "change_not_found",
 				"change_id": changeID,
 			})
 			return
 		}
-		h.governedRefusal(w, telemetry.ActionConfigWrite, "ActivateChange", correlationID, err)
+		h.governedRefusal(w, action, "ActivateChange", correlationID, err)
 		return
 	}
 
-	h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigWrite, telemetry.WriteCreated).Inc()
+	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()
 	h.log.Info("config change verified",
 		zap.String("change_id", changeID),
 		zap.String("proposed_snapshot_id", derefString(updated.ProposedSnapshotID)),
@@ -1781,26 +1909,26 @@ func (h *Handler) ActivateEmergencyChange(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if outcome := h.authorizeGoverned(w, r, principalID, telemetry.ActionConfigWrite); outcome != "" {
-		h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigWrite, outcome).Inc()
+	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "emergency", emergencyChangeID)
+	if !ok {
 		return
 	}
 
 	activated, err := h.store.ActivateEmergencyChange(r.Context(), emergencyChangeID, tenantScope, principalID)
 	if err != nil {
 		if errors.Is(err, domain.ErrChangeNotFound) {
-			h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigWrite, telemetry.WriteConflict).Inc()
+			h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteConflict).Inc()
 			writeJSON(w, http.StatusNotFound, map[string]string{
 				"error":               "change_not_found",
 				"emergency_change_id": emergencyChangeID,
 			})
 			return
 		}
-		h.governedRefusal(w, telemetry.ActionConfigWrite, "ActivateEmergencyChange", correlationID, err)
+		h.governedRefusal(w, action, "ActivateEmergencyChange", correlationID, err)
 		return
 	}
 
-	h.metrics.GovernedWrites.WithLabelValues(telemetry.ActionConfigWrite, telemetry.WriteCreated).Inc()
+	h.metrics.GovernedWrites.WithLabelValues(action, telemetry.WriteCreated).Inc()
 	h.log.Info("emergency change activated",
 		zap.String("emergency_change_id", emergencyChangeID),
 		zap.String("correlation_id", correlationID),
@@ -1874,6 +2002,25 @@ func (h *Handler) RecordAttestation(w http.ResponseWriter, r *http.Request) {
 	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
 		return
 	}
+	// §10.1 "workload identity": a runtime attests for itself. runtime_id
+	// must be the gateway-verified workload the request came from; it used to
+	// be any string the caller chose, so one workload could attest — or
+	// clear drift — on behalf of another.
+	workload := strings.TrimSpace(r.Header.Get("X-Workload-Id"))
+	if workload == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error":   "workload_identity_missing",
+			"message": "X-Workload-Id is required — attestation is made by a verified workload",
+		})
+		return
+	}
+	if workload != req.RuntimeID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "runtime_identity_mismatch",
+			"message": "runtime_id must be the calling workload's verified identity",
+		})
+		return
+	}
 
 	action := telemetry.ActionConfigWrite
 	if outcome := h.authorizeGoverned(w, r, principalID, action); outcome != "" {
@@ -1891,6 +2038,7 @@ func (h *Handler) RecordAttestation(w http.ResponseWriter, r *http.Request) {
 		ObservedDigest:     req.ObservedDigest,
 		ObservedVersions:   req.ObservedVersions,
 		CallerTenantID:     tenantScope,
+		CorrelationID:      correlationID,
 	})
 	if err != nil {
 		h.governedRefusal(w, action, "RecordAttestation", correlationID, err)
@@ -1903,6 +2051,14 @@ func (h *Handler) RecordAttestation(w http.ResponseWriter, r *http.Request) {
 		zap.String("runtime_id", req.RuntimeID),
 		zap.String("correlation_id", correlationID),
 	)
+	if attestation.Drift != nil {
+		h.log.Warn("runtime drift detected",
+			zap.String("runtime_id", req.RuntimeID),
+			zap.String("drift_class", attestation.Drift.DriftClass),
+			zap.String("severity", attestation.Drift.Severity),
+			zap.String("correlation_id", correlationID),
+		)
+	}
 	writeJSON(w, http.StatusCreated, attestation)
 }
 
@@ -2062,6 +2218,8 @@ func (h *Handler) EvaluateFlag(w http.ResponseWriter, r *http.Request) {
 		SubjectKey:    req.SubjectKey,
 		Context:       req.Context,
 		CorrelationID: correlationID,
+		TrustedPlan:   strings.TrimSpace(r.Header.Get(HeaderCommercialPlan)),
+		Region:        trustedRegion(r),
 	})
 	if err != nil {
 		h.governedRefusal(w, "", "EvaluateFlag", correlationID, err)

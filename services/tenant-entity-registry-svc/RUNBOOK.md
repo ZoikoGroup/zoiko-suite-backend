@@ -19,7 +19,7 @@ transaction and delivered by an in-process relay.
 ```bash
 curl -s localhost:8081/healthz; curl -s localhost:8081/readyz
 curl -s localhost:8081/metrics | grep -E '^(readiness_up|outbox_)'
-scripts/audit.sh            # 58 live checks; anything FAIL is the lead
+scripts/audit.sh            # 68 live checks; anything FAIL is the lead
 docker logs --since 10m tenant-entity-registry-svc | grep '"level":"error"'
 ```
 
@@ -85,7 +85,8 @@ every checker, `APPROVAL_REQUEST_READ`, `ENTITY_REGISTRY_CONFLICT_READ`.
 | `VERSION_CONFLICT` | stale `expected_version` | client reloads and retries |
 | `VALIDATION_FAILED` + "expected_version is required" | client sent no version | client fix; not an incident |
 | `SOD_DENIED` | maker tried to approve own request | a different principal approves |
-| `CONTEXT_INVALID` | host bound to another tenant (NP3), or no identity | check gateway host routing |
+| `CONTEXT_INVALID` | host bound to another tenant (NP3), or no identity | check gateway host routing. NP3 compares the request's `Host`: the ingress must preserve the client's `Host` — a proxy that rewrites it to the service name disables NP3 silently |
+| `VALIDATION_FAILED` + "malformed value" | a non-UUID or empty id in the path or body | client fix; not an incident (was a 500 before 29 Sep) |
 | `INVALID_TRANSITION` | tenant suspended/terminated, entity DRAFT | expected |
 | `JURISDICTION_RESTRICTED` / `NOT_ENTITLED` | provisioning refused by policy / commercial hold | compliance / commercial |
 | `IDEMPOTENCY_MISMATCH` | an Idempotency-Key reused for a different request | client bug |

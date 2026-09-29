@@ -39,6 +39,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
 )
 
@@ -401,10 +402,11 @@ func TestPgStore_TenantIsolation_EndDateHierarchy(t *testing.T) {
 	ctxB := domain.WithTenant(ctx, b.tenantID)
 	endDate := time.Now().UTC()
 
-	// EndDateHierarchy returns no error even on 0 rows (it's idempotent).
-	// The proof is in whether the row was actually modified.
+	// Under RLS tenant A's row does not exist for tenant B, so the attempt is
+	// refused as not-found (it used to report success on 0 rows). The real
+	// proof is still below: the row was not modified.
 	err := s.EndDateHierarchy(ctxB, a.hierarchyID, endDate, "attacker", "corr-x")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, registry.ErrNotFound)
 
 	// Verify: tenant A's hierarchy's effective_to should still be NULL.
 	rows, err := s.ListHierarchiesByEntity(
@@ -450,8 +452,9 @@ func TestPgStore_TenantIsolation_EndDateJurisdictionAssignment(t *testing.T) {
 	b := setupIsolationFixture(t, s, "ISO-B-EndDateAssignment")
 
 	ctxB := domain.WithTenant(ctx, b.tenantID)
+	// Refused as not-found: under RLS tenant A's row does not exist for B.
 	err := s.EndDateJurisdictionAssignment(ctxB, a.assignmentID, time.Now().UTC(), "attacker", "corr-x")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, registry.ErrNotFound)
 
 	// Verify: tenant A's assignment is still active (effective_to = NULL).
 	ctxA := domain.WithTenant(context.Background(), a.tenantID)

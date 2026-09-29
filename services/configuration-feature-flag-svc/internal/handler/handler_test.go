@@ -91,7 +91,7 @@ type stubStore struct {
 	activateEmergencyErr error
 
 	gotAttestation domain.RecordAttestationParams
-	attestation    *domain.RuntimeAttestation
+	attestation    *domain.AttestationResult
 	attestationErr error
 
 	gotReleasePlan domain.CreateReleasePlanParams
@@ -101,6 +101,60 @@ type stubStore struct {
 	gotEvaluate domain.EvaluateFlagParams
 	evaluation  *domain.FlagEvaluation
 	evaluateErr error
+
+	gotSnapshotID string
+	snapshot      *domain.ConfigSnapshot
+	snapshotErr   error
+
+	// Recovery surface. targetScope nil = a global target.
+	targetScope    *string
+	targetScopeErr error
+
+	gotKillSwitch domain.CreateKillSwitchParams
+	killSwitch    *domain.KillSwitch
+	killSwitchErr error
+
+	rollbackOf  string
+	rollback    *domain.ConfigChange
+	rollbackErr error
+
+	gotRetroRef string
+	retro       *domain.EmergencyChange
+	retroErr    error
+
+	gotRetire  domain.RetireFlagParams
+	gotRemoval store.MarkFlagRemovedParams
+	retirement *domain.FlagRetirement
+	retireErr  error
+}
+
+func (s *stubStore) RetireFlag(_ context.Context, params domain.RetireFlagParams) (*domain.FlagRetirement, error) {
+	s.gotRetire = params
+	return s.retirement, s.retireErr
+}
+
+func (s *stubStore) MarkFlagRemoved(_ context.Context, params store.MarkFlagRemovedParams) (*domain.FlagRetirement, error) {
+	s.gotRemoval = params
+	return s.retirement, s.retireErr
+}
+
+func (s *stubStore) TargetScope(_ context.Context, _, _ string) (*string, error) {
+	return s.targetScope, s.targetScopeErr
+}
+
+func (s *stubStore) CreateKillSwitch(_ context.Context, params domain.CreateKillSwitchParams) (*domain.KillSwitch, error) {
+	s.gotKillSwitch = params
+	return s.killSwitch, s.killSwitchErr
+}
+
+func (s *stubStore) RollbackChange(_ context.Context, changeID, _, _, _ string) (*domain.ConfigChange, error) {
+	s.rollbackOf = changeID
+	return s.rollback, s.rollbackErr
+}
+
+func (s *stubStore) CloseEmergencyRetrospective(_ context.Context, _, reference, _, _ string) (*domain.EmergencyChange, error) {
+	s.gotRetroRef = reference
+	return s.retro, s.retroErr
 }
 
 func (s *stubStore) CreateDefinition(_ context.Context, params domain.CreateDefinitionParams) (*domain.ConfigDefinition, error) {
@@ -120,6 +174,11 @@ func (s *stubStore) PublishDefinition(_ context.Context, params domain.PublishDe
 func (s *stubStore) Resolve(_ context.Context, params domain.ResolveParams) (*domain.ResolvedConfigSnapshot, error) {
 	s.gotResolve = params
 	return s.resolveResult, s.resolveErr
+}
+
+func (s *stubStore) GetSnapshot(_ context.Context, snapshotID string) (*domain.ConfigSnapshot, error) {
+	s.gotSnapshotID = snapshotID
+	return s.snapshot, s.snapshotErr
 }
 
 func (s *stubStore) ActivateOverride(_ context.Context, params domain.ActivateOverrideParams) (*domain.ConfigEntry, error) {
@@ -153,7 +212,7 @@ func (s *stubStore) ActivateEmergencyChange(_ context.Context, emergencyChangeID
 	return s.activatedEmergency, s.activateEmergencyErr
 }
 
-func (s *stubStore) RecordAttestation(_ context.Context, params domain.RecordAttestationParams) (*domain.RuntimeAttestation, error) {
+func (s *stubStore) RecordAttestation(_ context.Context, params domain.RecordAttestationParams) (*domain.AttestationResult, error) {
 	s.gotAttestation = params
 	return s.attestation, s.attestationErr
 }
@@ -647,6 +706,9 @@ func testAuthz() *stubAuthz { return &stubAuthz{} }
 func authed(req *http.Request) *http.Request {
 	req.Header.Set("X-Principal-Id", testPrincipal)
 	req.Header.Set("X-Tenant-Id", testTenant)
+	// The calling workload; the attestation fixtures report runtime_id rt-1,
+	// and a runtime may attest only for itself.
+	req.Header.Set("X-Workload-Id", "rt-1")
 	return req
 }
 
@@ -1047,6 +1109,100 @@ func TestResolveConfig_ForwardsKeys(t *testing.T) {
 	}
 }
 
+// ── GET /v1/config/snapshots/{snapshot_id} (INV-29) ──────────────────────────
+
+const testSnapshotID = "33333333-3333-3333-3333-333333333333"
+
+func newSnapshotRouter(s *stubStore, az *stubAuthz) chi.Router {
+	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
+	handler.RegisterRoutes(r, handler.New(s, az, testAuthzScopeID, testMetrics(), zap.NewNop()))
+	return r
+}
+
+// The fetch an evaluation's evidence depends on: the snapshot it cited comes
+// back byte-for-byte, marked cacheable forever, with the digest as its ETag.
+func TestGetSnapshot_ReturnsImmutableImprint(t *testing.T) {
+	s := &stubStore{snapshot: &domain.ConfigSnapshot{
+		SnapshotID: testSnapshotID, Environment: "production", Epoch: 7,
+		Digest: "abc123", Content: json.RawMessage(`{"k|":{"value":1}}`),
+	}}
+	az := &stubAuthz{}
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/config/snapshots/"+testSnapshotID, nil))
+	w := httptest.NewRecorder()
+	newSnapshotRouter(s, az).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotSnapshotID != testSnapshotID {
+		t.Errorf("expected the path id forwarded, got %q", s.gotSnapshotID)
+	}
+	if got := w.Header().Get("ETag"); got != `"abc123"` {
+		t.Errorf("expected ETag to be the digest, got %q", got)
+	}
+	if got := w.Header().Get("Cache-Control"); !strings.Contains(got, "immutable") || !strings.Contains(got, "private") {
+		t.Errorf("expected private immutable caching, got %q", got)
+	}
+	var body domain.ConfigSnapshot
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(body.Content) != `{"k|":{"value":1}}` || body.Digest != "abc123" {
+		t.Errorf("expected the stored content and digest unchanged, got %+v", body)
+	}
+}
+
+// Platform scope only: an imprint spans every tenant in the environment.
+func TestGetSnapshot_AuthorizesPlatformGrant(t *testing.T) {
+	s := &stubStore{snapshot: &domain.ConfigSnapshot{SnapshotID: testSnapshotID}}
+	az := &stubAuthz{}
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/config/snapshots/"+testSnapshotID, nil))
+	newSnapshotRouter(s, az).ServeHTTP(httptest.NewRecorder(), req)
+	if az.actionType != "CONFIGURATION_GLOBAL_WRITE" || az.scope != testAuthzScopeID {
+		t.Errorf("expected CONFIGURATION_GLOBAL_WRITE at platform scope, got %q at %q", az.actionType, az.scope)
+	}
+}
+
+func TestGetSnapshot_Refusals(t *testing.T) {
+	cases := []struct {
+		name       string
+		id         string
+		principal  bool
+		authzErr   error
+		storeErr   error
+		wantStatus int
+		wantCode   string
+		wantStore  bool
+	}{
+		{name: "tenant caller without the platform grant", id: testSnapshotID, principal: true, authzErr: authz.ErrDenied, wantStatus: http.StatusForbidden, wantCode: "authorization_denied"},
+		{name: "authz outage fails closed", id: testSnapshotID, principal: true, authzErr: authz.ErrUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: "authz_unavailable"},
+		{name: "no principal", id: testSnapshotID, wantStatus: http.StatusUnauthorized, wantCode: "missing_principal"},
+		{name: "not a uuid", id: "not-a-uuid", principal: true, wantStatus: http.StatusBadRequest, wantCode: "invalid_snapshot_id"},
+		{name: "unknown id", id: testSnapshotID, principal: true, storeErr: domain.ErrSnapshotNotFound, wantStatus: http.StatusNotFound, wantCode: "snapshot_not_found", wantStore: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &stubStore{snapshotErr: tc.storeErr}
+			az := &stubAuthz{err: tc.authzErr}
+			req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config/snapshots/"+tc.id, nil))
+			if tc.principal {
+				req = authed(req)
+			}
+			w := httptest.NewRecorder()
+			newSnapshotRouter(s, az).ServeHTTP(w, req)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("expected %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), `"`+tc.wantCode+`"`) {
+				t.Errorf("expected code %q, got %s", tc.wantCode, w.Body.String())
+			}
+			if called := s.gotSnapshotID != ""; called != tc.wantStore {
+				t.Errorf("store consulted = %v, want %v — a refused caller must not reach the content", called, tc.wantStore)
+			}
+		})
+	}
+}
+
 func TestCreateChange_Created(t *testing.T) {
 	s := &stubStore{change: &domain.ConfigChange{ChangeID: "c-1", Status: domain.ChangeStatusProposed}}
 	r := newTestRouter(s)
@@ -1144,7 +1300,7 @@ func TestCreateEmergencyChange_ForeignTenantRefused(t *testing.T) {
 }
 
 func TestRecordAttestation_Success(t *testing.T) {
-	s := &stubStore{attestation: &domain.RuntimeAttestation{AttestationID: "att-1"}}
+	s := &stubStore{attestation: &domain.AttestationResult{RuntimeAttestation: domain.RuntimeAttestation{AttestationID: "att-1"}}}
 	r := newTestRouter(s)
 	body := `{"runtime_id":"rt-1","attest_key":"ak-1","environment":"production","observed_digest":"abc"}`
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/runtime/attest", strings.NewReader(body)))

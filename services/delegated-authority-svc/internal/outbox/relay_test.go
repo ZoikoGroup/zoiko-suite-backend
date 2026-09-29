@@ -3,6 +3,7 @@ package outbox_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,9 +22,26 @@ type fakeClaimer struct {
 	queue     []store.OutboxRecord
 	published []store.OutboxRecord
 	claims    int
+	// mu guards every field: Run drains on its own goroutine while the test
+	// polls, which was a data race under -race (CI).
+	mu sync.Mutex
+}
+
+func (f *fakeClaimer) publishedLen() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.published)
+}
+
+func (f *fakeClaimer) queueLen() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.queue)
 }
 
 func (f *fakeClaimer) ClaimOutbox(_ context.Context, limit int, fn func([]store.OutboxRecord) error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.claims++
 	n := limit
 	if len(f.queue) < n {
@@ -42,6 +60,8 @@ func (f *fakeClaimer) ClaimOutbox(_ context.Context, limit int, fn func([]store.
 }
 
 func (f *fakeClaimer) OutboxDepth(context.Context) (int64, time.Duration, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return int64(len(f.queue)), 0, nil
 }
 
@@ -194,7 +214,7 @@ func TestRun_DrainsAFullBacklogWithoutSleepingBetweenBatches(t *testing.T) {
 
 	deadline := time.After(2 * time.Second)
 	for {
-		if len(c.queue) == 0 {
+		if c.queueLen() == 0 {
 			break
 		}
 		select {

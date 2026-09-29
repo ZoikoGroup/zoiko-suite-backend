@@ -2,6 +2,7 @@ package rotation
 
 import (
 	"context"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,10 +40,21 @@ type stubStore struct {
 	updates  atomic.Int32
 	lastNext time.Time
 	skipUpd  bool
+	claimed  map[string]time.Time
 }
 
 func (s *stubStore) ListDueRotations(_ context.Context, _ time.Time) ([]*domain.DueRotation, error) {
 	return s.due, nil
+}
+func (s *stubStore) ClaimDueRotation(_ context.Context, versionID string, listedNext, _ time.Time) (bool, error) {
+	if s.claimed == nil {
+		s.claimed = map[string]time.Time{}
+	}
+	if prev, ok := s.claimed[versionID]; ok && prev.Equal(listedNext) {
+		return false, nil // already claimed at this due time
+	}
+	s.claimed[versionID] = listedNext
+	return true, nil
 }
 func (s *stubStore) UpdateRotationSchedule(_ context.Context, _ string, next time.Time) error {
 	if s.skipUpd {
@@ -107,5 +119,25 @@ func TestSweeper_UpdateFailureDoesNotFailSweep(t *testing.T) {
 	}
 	if core.calls.Load() != 1 {
 		t.Fatalf("expected rotation to have completed despite reschedule failure")
+	}
+}
+// Two sweeps over the same due listing (two replicas, or one slow pass
+// re-listing) must rotate once. The request id used to embed time.Now().
+func TestSweeper_SameDueSlotRotatesOnceAcrossSweepers(t *testing.T) {
+	due := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	core := &stubCore{expectedPath: "kv/db"}
+	store := &stubStore{due: []*domain.DueRotation{
+		{SecretPolicyID: "p1", SecretPolicyVersionID: "v1", SecretPath: "kv/db", IntervalSeconds: 3600, NextRotationAt: due},
+	}}
+	a := New(store, core, zap.NewNop(), time.Hour, "system:rotation-sweeper")
+	b := New(store, core, zap.NewNop(), time.Hour, "system:rotation-sweeper")
+	_ = a.Sweep(context.Background())
+	_ = b.Sweep(context.Background())
+	if n := core.calls.Load(); n != 1 {
+		t.Fatalf("a due slot must be rotated exactly once, got %d", n)
+	}
+	want := "sweep:v1:" + strconv.FormatInt(due.Unix(), 10)
+	if core.lastRequestID != want {
+		t.Fatalf("request id = %q, want deterministic %q", core.lastRequestID, want)
 	}
 }

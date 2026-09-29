@@ -14,8 +14,15 @@ CREATE TABLE IF NOT EXISTS protected_permissions (
 ALTER TABLE protected_permissions ENABLE ROW LEVEL SECURITY;
 
 -- Multi-tenant read policy (all tenants can see the list)
-CREATE POLICY tenant_isolation_policy ON protected_permissions FOR SELECT
-    USING (tenant_id = current_setting('app.tenant_id', true) OR current_setting('app.outbox_relay', true) = 'true');
+-- protected_permissions is a PLATFORM-WIDE catalogue: it has no tenant_id, and
+-- an earlier version of this policy compared one, so the migration failed with
+-- "column tenant_id does not exist" on every database. Every tenant reads the
+-- same catalogue, and nothing may write to it through RLS (there is no INSERT,
+-- UPDATE or DELETE policy), so reads are open and writes are refused.
+DROP POLICY IF EXISTS tenant_isolation_policy ON protected_permissions;
+DROP POLICY IF EXISTS protected_permissions_read ON protected_permissions;
+CREATE POLICY protected_permissions_read ON protected_permissions FOR SELECT
+    USING (true);
 
 -- Seed the 8 baseline protected actions from the static conflict matrix (§10.1)
 -- These mirror authorization-svc's internal protected set
@@ -35,4 +42,4 @@ ON CONFLICT (action_name) DO UPDATE SET
     updated_at = now();
 
 -- Index for fast lookup during validation
-CREATE INDEX idx_protected_permissions_active ON protected_permissions (action_name) WHERE active_flag = TRUE;
+CREATE INDEX IF NOT EXISTS idx_protected_permissions_active ON protected_permissions (action_name) WHERE active_flag = TRUE;

@@ -482,8 +482,13 @@ paths:
            revocable: revoking the exception closes the door until the next
            authorized record restores it.
 
+        3. The caller must not be the principal who approved that exception
+           (`403 exception_self_approval`): break-glass takes two people.
+
         Every retrieval writes an `EMERGENCY_RETRIEVAL` audit entry naming the
-        actor and the exception that authorized it.
+        actor and the exception that authorized it. The entry is written
+        BEFORE the material is read; if it cannot be written the request
+        answers `503 evidence_unavailable` and no material leaves the vault.
 
         Requires the `SECRET_EMERGENCY_RETRIEVAL` action.
       parameters:
@@ -500,14 +505,15 @@ paths:
           application/json:
             schema:
               type: object
-              required: [request_id]
+              required: [request_id, reason]
               properties:
                 request_id:
                   type: string
                   description: Identifies this retrieval in the audit trail.
                 reason:
                   type: string
-                  description: The incident/monitoring justification, recorded verbatim.
+                  minLength: 1
+                  description: The incident/monitoring justification, recorded verbatim. Required - `400 missing_field` without it.
       responses:
         "200":
           description: "The raw material, as `material_base64`. Handle like the credential it is."
@@ -519,7 +525,11 @@ paths:
         "403":
           description: |
             `no_active_exception` - no ACTIVE, unexpired shared-secret exception
-            unlocks this path. Fail safely: the material stays in the vault.
+            for exactly this path unlocks it. Fail safely: the material stays
+            in the vault.
+
+            `exception_self_approval` - the caller approved the exception it is
+            trying to use.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -529,7 +539,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "503":
-          description: "`store_unavailable` or `vault_backend_unavailable`."
+          description: "`store_unavailable`, `vault_backend_unavailable`, or `evidence_unavailable` (the audit entry could not be written, so nothing was released)."
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -648,7 +658,13 @@ paths:
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403":
           description: |
-            Two distinct reasons, both carrying a `DENIED` audit row.
+            Three distinct reasons, each carrying a `DENIED` audit row.
+
+            `shared_secret_exception_required` - the active version lists more
+            than one workload in `allowed_workload_ids` (a shared secret), and
+            no ACTIVE, unexpired shared-secret exception documents it. Enforced
+            when `REQUIRE_SHARED_SECRET_EXCEPTION` is on (default in staging and
+            production).
 
             `access_denied` - a policy IS active for this path and scope, and it
             does not list this caller in `allowed_workload_ids`. The row carries
@@ -744,6 +760,12 @@ paths:
           answers `lease_revoked`.
         - **Good**: answers `valid: true` for a `GRANTED`, unexpired lease whose
           token matches its secret path and tenant.
+
+        A token (format `ltk:v3:`) is bound to the ONE lease it was minted for
+        (by that lease's `request_id`). Presenting it with any other lease's id
+        is `400 lease_token_mismatch` - so a revoked lease's token cannot be
+        passed off as valid next to a live lease on the same path. `ltk:v2:`
+        tokens carried no such binding and are refused as `invalid_lease_token`.
 
         A malformed or mis-bound token is a caller fault and answers `400`
         (`invalid_lease_token`, `lease_token_mismatch`). A negative verdict is

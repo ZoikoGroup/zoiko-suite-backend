@@ -1803,7 +1803,15 @@ components:
 
     CreateEntityRequest:
       type: object
-      required: [tenant_id, entity_code, legal_name, entity_type, default_currency_code, fiscal_calendar_id, primary_jurisdiction_id, data_residency_policy_id, correlation_id]
+      description: |
+        ORG-03 §4.3 required source inputs. registered_office and
+        source_evidence_ref are required outside local development
+        (LEGACY_PROVISIONING_INPUTS relaxes them there only). The legal form is
+        optional, but when sent is held to the ISO 20275 control (four-character
+        ELF code, with its source and the local legal-form text). All of these
+        are recorded on profile version 1.
+      required: [tenant_id, entity_code, legal_name, entity_type, default_currency_code, fiscal_calendar_id, primary_jurisdiction_id, data_residency_policy_id, correlation_id,
+                 registered_office, source_evidence_ref]
       properties:
         tenant_id:              { type: string }
         entity_code:            { type: string }
@@ -1826,6 +1834,15 @@ components:
           type: string
           enum: [ISSUED, LAPSED, PENDING_TRANSFER, PENDING_ARCHIVAL, MERGED, RETIRED, ANNULLED, DUPLICATE, TRANSFERRED, CANCELLED]
         lei_verified_at: { type: string, format: date-time }
+        legal_form_code:       { type: string, pattern: "^[A-Za-z0-9]{4}$", description: "ISO 20275 ELF code; normalised to upper case." }
+        legal_form_source:     { type: string, description: "e.g. GLEIF-ELF-1.6. Required with legal_form_code." }
+        legal_form_local_text: { type: string, description: "The local legal-form text the code maps. Required with legal_form_code." }
+        registry_authority:    { type: string }
+        registered_office:
+          type: object
+          additionalProperties: true
+          description: Structured registered address, held as recorded (ORG-08 owns normalisation).
+        source_evidence_ref:   { type: string, description: "Supporting evidence for the entity's identity (§4.3)." }
 
     UpdateEntityRequest:
       type: object

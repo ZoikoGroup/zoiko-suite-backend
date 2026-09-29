@@ -2,7 +2,9 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,14 +110,8 @@ func TestAA_EmergencyChange_ActivateAppliesAndMints(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
-	seedConfig(t, pool, "payroll.batch_size")
-
-	if _, _, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{
-		Key: "payroll.batch_size", Value: []byte(`100`), Environment: "staging",
-		CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant,
-	}); err != nil {
-		t.Fatalf("baseline write: %v", err)
-	}
+	seedMaterial(t, pool, "payroll.batch_size")
+	applyChange(t, s, "payroll.batch_size", `100`)
 
 	ec, err := s.CreateEmergencyChange(ctx, domain.CreateEmergencyChangeParams{
 		Key: "payroll.batch_size", Environment: "staging",
@@ -163,7 +159,7 @@ func TestAA_EmergencyChange_OpenExpiredChangeIsSwept(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
-	seedConfig(t, pool, "payroll.batch_size")
+	seedMaterial(t, pool, "payroll.batch_size")
 
 	ec, err := s.CreateEmergencyChange(ctx, domain.CreateEmergencyChangeParams{
 		Key: "payroll.batch_size", Environment: "staging",
@@ -211,8 +207,8 @@ func TestAA_Change_ApproveThenActivateAppliesConfig(t *testing.T) {
 	}
 
 	change, err := s.CreateChange(ctx, domain.CreateChangeParams{
-		ChangeClass:      domain.ChangeClassC2,
-		Environment:      "staging",
+		ChangeClass: domain.ChangeClassC2,
+		Environment: "staging",
 		Parts: []domain.ChangePart{{
 			Kind:     domain.PartKindConfig,
 			Key:      "payroll.batch_size",
@@ -273,8 +269,8 @@ func TestAA_Change_RejectedStaysProposedAndCannotActivate(t *testing.T) {
 	}
 
 	change, err := s.CreateChange(ctx, domain.CreateChangeParams{
-		ChangeClass:      domain.ChangeClassC2,
-		Environment:      "staging",
+		ChangeClass: domain.ChangeClassC2,
+		Environment: "staging",
 		Parts: []domain.ChangePart{{
 			Kind:     domain.PartKindConfig,
 			Key:      "payroll.batch_size",
@@ -332,5 +328,106 @@ func TestAA_AttestationReplay_Refused(t *testing.T) {
 	}
 	if _, err := s.RecordAttestation(ctx, params); !errors.Is(err, domain.ErrValueConstraintFailed) {
 		t.Fatalf("a replayed attestation with the same (runtime, attest_key) must be refused, got %v", err)
+	}
+}
+
+// ── INV-29: a past evaluation stays reproducible ─────────────────────────────
+//
+// The audit's scenario: runtime evaluation used to read the live row, so once
+// a value changed nothing could say why an earlier decision came out the way
+// it did. Here the flag is evaluated, then changed; the earlier evaluation's
+// evidence must still fetch the exact imprint it cited, the imprint must still
+// derive the same decision, and no role — the superuser this suite connects as
+// included — may alter or remove that imprint.
+func TestAA_INV29_PastEvaluationReproducibleAfterChange(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedFlag(t, pool, "checkout.new_ui")
+
+	write := func(enabled bool, rollout int) {
+		t.Helper()
+		if _, _, err := s.UpsertFeatureFlag(ctx, domain.UpsertFeatureFlagParams{
+			Key: "checkout.new_ui", Enabled: enabled, RolloutPercentage: rollout,
+			Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant,
+		}); err != nil {
+			t.Fatalf("flag write: %v", err)
+		}
+	}
+	evaluate := func(subject string) *domain.FlagEvaluation {
+		t.Helper()
+		ev, err := s.EvaluateFlag(ctx, domain.EvaluateFlagParams{
+			Key: "checkout.new_ui", Environment: "staging", SubjectKey: subject,
+		})
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		return ev
+	}
+
+	write(true, 50)
+	before := evaluate("user-42")
+	if before.ContextHash == "" || before.EvaluatedAt.IsZero() || before.Bucket == nil {
+		t.Fatalf("evidence incomplete: context_hash=%q evaluated_at=%v bucket=%v",
+			before.ContextHash, before.EvaluatedAt, before.Bucket)
+	}
+	if again := evaluate("user-42"); again.ContextHash != before.ContextHash {
+		t.Errorf("identical inputs must hash identically: %q vs %q", again.ContextHash, before.ContextHash)
+	}
+	if other := evaluate("user-43"); other.ContextHash == before.ContextHash {
+		t.Errorf("a different subject must hash differently")
+	}
+
+	write(false, 50)
+	after := evaluate("user-42")
+	if after.SnapshotID == before.SnapshotID || after.Enabled {
+		t.Fatalf("the change must be served from a new snapshot: before=%s after=%s enabled=%v",
+			before.SnapshotID, after.SnapshotID, after.Enabled)
+	}
+
+	// Reproduce the earlier decision from its evidence alone.
+	snap, err := s.GetSnapshot(ctx, before.SnapshotID)
+	if err != nil {
+		t.Fatalf("fetch cited snapshot: %v", err)
+	}
+	if snap.Digest != before.Digest || snap.Epoch != before.Epoch {
+		t.Fatalf("cited snapshot changed: digest %s→%s epoch %d→%d", before.Digest, snap.Digest, before.Epoch, snap.Epoch)
+	}
+	var stored string
+	if err := pool.QueryRow(ctx,
+		`SELECT md5(content::text) FROM config_snapshots WHERE snapshot_id = $1`, before.SnapshotID,
+	).Scan(&stored); err != nil || stored != before.Digest {
+		t.Fatalf("stored content no longer matches the cited digest: %s vs %s (%v)", stored, before.Digest, err)
+	}
+	var manifest map[string]domain.ManifestEntry
+	if err := json.Unmarshal(snap.Content, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	entry, ok := manifest[domain.ManifestKey("checkout.new_ui", nil)]
+	if !ok || entry.Enabled == nil || entry.RolloutPercentage == nil {
+		t.Fatalf("cited snapshot lost the flag: %+v", entry)
+	}
+	// No release plan: 1000 buckets, threshold rollout*10.
+	replayed := *entry.Enabled && *before.Bucket < *entry.RolloutPercentage*10
+	if replayed != before.Enabled {
+		t.Errorf("replaying the cited snapshot gives enabled=%v, the evaluation said %v", replayed, before.Enabled)
+	}
+
+	// The imprint cannot be altered or removed, even by a superuser.
+	for _, stmt := range []string{
+		`UPDATE config_snapshots SET content = '{}'::jsonb WHERE snapshot_id = '` + before.SnapshotID + `'`,
+		`DELETE FROM config_snapshots WHERE snapshot_id = '` + before.SnapshotID + `'`,
+		`TRUNCATE config_snapshots CASCADE`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err == nil || !strings.Contains(err.Error(), "append-only") {
+			t.Errorf("%s: expected the append-only refusal, got %v", stmt, err)
+		}
+	}
+	if again, err := s.GetSnapshot(ctx, before.SnapshotID); err != nil || again.Digest != before.Digest {
+		t.Fatalf("cited snapshot did not survive the attempts: %v", err)
+	}
+
+	if _, err := s.GetSnapshot(ctx, "00000000-0000-0000-0000-00000000dead"); !errors.Is(err, domain.ErrSnapshotNotFound) {
+		t.Errorf("unknown id: expected ErrSnapshotNotFound, got %v", err)
 	}
 }

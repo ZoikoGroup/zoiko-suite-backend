@@ -77,15 +77,19 @@ CREATE TABLE release_plans (
     published_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     published_by_principal_id TEXT   NOT NULL,
 
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-    CONSTRAINT uq_release_plans_one_version_per_scope UNIQUE (
+-- One row per (flag, scope, version). A unique INDEX for the same reason as
+-- 000006's kill-switch index: a table UNIQUE constraint cannot hold the
+-- COALESCE expression, and as a constraint this migration never applied.
+CREATE UNIQUE INDEX uq_release_plans_one_version_per_scope
+    ON release_plans (
         flag_key,
         environment,
         COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::UUID),
         version
-    )
-);
+    );
 
 CREATE INDEX idx_release_plans_lookup
     ON release_plans (environment, flag_key, version DESC);

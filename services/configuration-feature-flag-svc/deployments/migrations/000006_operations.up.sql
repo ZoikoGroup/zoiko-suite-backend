@@ -69,14 +69,21 @@ CREATE TABLE kill_switches (
     expired_at           TIMESTAMPTZ,
 
     created_by_principal_id TEXT        NOT NULL,
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-    CONSTRAINT uq_kill_switches_one_active_per_scope UNIQUE (
+-- One active switch per scope. A unique INDEX, not a table constraint: a
+-- UNIQUE constraint admits neither an expression (the COALESCE that makes a
+-- NULL tenant one scope) nor a WHERE clause, and written as a constraint this
+-- migration failed to apply at all — which aborted init-db.sh for every
+-- database in the stack. Same name, so a violation reports the same
+-- constraint name it was always going to.
+CREATE UNIQUE INDEX uq_kill_switches_one_active_per_scope
+    ON kill_switches (
         flag_key,
         environment,
         COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::UUID)
-    ) WHERE expired_at IS NULL
-);
+    ) WHERE expired_at IS NULL;
 
 -- ── config_changes ────────────────────────────────────────────────────────────
 
