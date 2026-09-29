@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,7 +23,10 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/classification"
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/entitlement"
+	"zoiko.io/tenant-entity-registry-svc/internal/events"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
+	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 )
 
 // Sentinel errors returned by the service layer.
@@ -40,7 +44,7 @@ var (
 	ErrInvalidInput       = errors.New("invalid input")
 	// ErrConflict is returned when a unique constraint is violated (e.g. duplicate
 	// tenant_code). Handlers should map this to HTTP 409 Conflict.
-	ErrConflict = errors.New("conflict: resource already exists")
+	ErrConflict = errors.New("conflict")
 	// ErrRegionUnresolved is returned by ResolveTenantRegion when the
 	// tenant exists but its active residency policy has no
 	// ResidencyRegionID assigned yet — a real, expected state for
@@ -54,7 +58,6 @@ var (
 // It owns no HTTP concerns — those belong to internal/handler.
 type Service struct {
 	store  Store
-	events EventPublisher
 	authz  AuthorizationClient
 	jurisd JurisdictionValidator
 
@@ -65,13 +68,28 @@ type Service struct {
 	// TENANT_PROVISION must be made against this same ID.
 	platformScopeID string
 
+	// Maker-checker settings — see ConfigureMakerChecker.
+	legacyBodyApprover bool
+	approvalTTL        time.Duration
+
+	// Dev-only compatibility switches for 000008 — see ConfigureCompatibility.
+	legacyEntityCreateActive bool
+	onboardingKeyOptional    bool
+
+	// §4.2 provisioning context — see ConfigureProvisioning.
+	entitlement              entitlement.Checker
+	restrictedJurisdictions  map[string]bool
+	legacyProvisioningInputs bool
+
+	// expectedVersionOptional — dev-only, see ConfigureConcurrency.
+	expectedVersionOptional bool
+
 	log *zap.Logger
 }
 
 // NewService constructs a Service with all required dependencies.
 func NewService(
 	store Store,
-	events EventPublisher,
 	authz AuthorizationClient,
 	jurisd JurisdictionValidator,
 	platformScopeID string,
@@ -79,10 +97,10 @@ func NewService(
 ) *Service {
 	return &Service{
 		store:           store,
-		events:          events,
 		authz:           authz,
 		jurisd:          jurisd,
 		platformScopeID: platformScopeID,
+		approvalTTL:     DefaultApprovalTTL,
 		log:             log,
 	}
 }
@@ -107,9 +125,27 @@ func (s *Service) ProvisionTenant(
 	req domain.ProvisionTenantRequest,
 	correlationID string,
 ) (*domain.Tenant, error) {
-	if err := s.authorize(ctx, "tenant", "provision"); err != nil {
+	// Platform scope explicitly, not the caller's tenant: §4.2 makes this a
+	// platform provisioning permission. The envelope always carries an
+	// X-Tenant-Id, so authorize() would have evaluated it in the operator's
+	// own tenant, and a tenant admin granted TENANT_PROVISION there could
+	// create tenants.
+	if err := s.authorizeIn(ctx, s.platformScopeID, "tenant", "provision"); err != nil {
 		return nil, err
 	}
+
+	// ORG-02 §4.2 idempotency: "Create by approved onboarding correlation /
+	// external customer key". Without it a retried onboarding created a second
+	// tenant.
+	req.ExternalCustomerKey = strings.TrimSpace(req.ExternalCustomerKey)
+	if req.ExternalCustomerKey == "" && !s.onboardingKeyOptional {
+		return nil, ErrOnboardingKeyRequired
+	}
+	homeRegion, err := s.resolveProvisioningContext(ctx, &req)
+	if err != nil {
+		return nil, err
+	}
+	fingerprint := domain.ProvisioningFingerprint(req)
 
 	tenantID := newID()
 	policyID := newID()
@@ -127,8 +163,14 @@ func (s *Service) ProvisionTenant(
 		PrimaryLocale:                req.PrimaryLocale,
 		DefaultDataResidencyPolicyID: policyID,
 		LifecycleState:               domain.TenantLifecycleOnboarding,
+		RecordVersion:                1,
 		CreatedAt:                    now,
 		CreatedByPrincipalID:         actor,
+		ExternalCustomerKey:          nullableString(req.ExternalCustomerKey),
+		OnboardingRequestRef:         nullableString(strings.TrimSpace(req.OnboardingRequestRef)),
+		ProvisioningFingerprint:      fingerprint,
+		PrimaryJurisdictionID:        nullableString(req.PrimaryJurisdictionID),
+		SubscriptionID:               nullableString(req.SubscriptionID),
 	}
 
 	defaultPolicy := &domain.DataResidencyPolicy{
@@ -138,20 +180,36 @@ func (s *Service) ProvisionTenant(
 		PolicyCode:             req.TenantCode + "-DEFAULT",
 		ResidencyMode:          domain.ResidencyModePreferredRegion,
 		ConflictResolutionMode: domain.ConflictResolutionFailClosed,
-		ActiveFlag:             true,
-		CreatedAt:              now,
-		CreatedByPrincipalID:   actor,
+		// The residency preference, resolved against the available regions:
+		// the home region from birth (it used to start unassigned).
+		ResidencyRegionID:    homeRegion,
+		ActiveFlag:           true,
+		CreatedAt:            now,
+		CreatedByPrincipalID: actor,
 	}
 
-	if err := s.store.CreateTenantWithDefaultResidencyPolicy(ctx, t, defaultPolicy); err != nil {
+	// Scoped to the tenant being created. The store scopes RLS to the
+	// request's tenant when there is one, and here that is the caller's
+	// (operator/platform) tenant, not the new row's: the tenants WITH CHECK
+	// then refused every creation made with a full envelope. The follow-on
+	// step and the replay already re-scope; this call did not.
+	tctx := domain.WithTenant(ctx, tenantID)
+	if err := s.store.CreateTenantWithDefaultResidencyPolicy(tctx, t, defaultPolicy); err != nil {
+		if errors.Is(err, ErrOnboardingKeyExists) {
+			return s.replayProvisioning(ctx, req, fingerprint)
+		}
 		s.log.Error("create tenant failed", zap.Error(err), zap.String("correlation_id", correlationID))
 		return nil, fmt.Errorf("store.CreateTenantWithDefaultResidencyPolicy: %w", err)
 	}
 
-	go s.events.PublishTenantCreated(ctx, t, correlationID)
+	// The follow-on step — creation approval (§4.2 maker-checker) and the
+	// tenant.created event, in one transaction. A failure here is §4.2's
+	// "provisioning partial failure": the tenant becomes FAILED_PROVISIONING.
+	s.completeProvisioning(ctx, t, correlationID)
 
 	s.log.Info("tenant provisioned",
 		zap.String("tenant_id", t.TenantID),
+		zap.String("lifecycle_state", string(t.LifecycleState)),
 		zap.String("correlation_id", correlationID),
 	)
 	return t, nil
@@ -235,6 +293,24 @@ func (s *Service) TransitionTenantLifecycle(
 		return fmt.Errorf("%w: %s → %s", ErrInvalidTransition, t.LifecycleState, req.TargetState)
 	}
 
+	// This generic route must not be a way around ORG-02's maker-checker.
+	// Before 000007 it moved a tenant to OFFBOARDING or TERMINATED with no
+	// approver at all, while the named commands demanded one.
+	if !s.legacyBodyApprover {
+		switch req.TargetState {
+		case domain.TenantLifecycleOffboarding, domain.TenantLifecycleTerminated:
+			return fmt.Errorf("%w: termination requires independent approval — use "+
+				"POST /v1/tenants/{id}/commands/InitiateTermination or CompleteTermination",
+				ErrApprovalRequired)
+		case domain.TenantLifecycleActive:
+			if t.LifecycleState == domain.TenantLifecycleOnboarding {
+				if err := s.requireCreationApproval(ctx, t); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
 	return s.store.TransitionTenantLifecycle(ctx, tenantID, req.TargetState, domain.PrincipalFromContext(ctx), req.CorrelationID)
 }
 
@@ -253,33 +329,123 @@ func (s *Service) CreateEntity(
 		return nil, err
 	}
 
+	// The body's tenant_id must be the caller's own verified tenant.
+	//
+	// Previously unchecked: row-level security refused the insert when they
+	// disagreed (the INSERT names the body tenant while the policy checks the
+	// verified one), so nothing could be written cross-tenant -- but the
+	// refusal arrived as a policy violation mapped to a 500, and every check
+	// before it had been evaluated against the wrong tenant. Refusing here
+	// makes the answer a 404 and makes the checks that follow meaningful.
+	if err := s.assertTenantScope(ctx, req.TenantID); err != nil {
+		return nil, err
+	}
+
+	// ORG §8 NP4: a tenant that is suspended, offboarding or terminated may not
+	// perform protected writes. Creating a legal entity is as protected as a
+	// write gets in this service.
+	if err := s.assertTenantMayTransact(ctx, req.TenantID); err != nil {
+		return nil, err
+	}
+	if err := validateFiscalCalendarRef(req.FiscalCalendarID); err != nil {
+		return nil, err
+	}
+	profileInputs, err := s.entityProfileInputs(req)
+	if err != nil {
+		return nil, err
+	}
+
 	// Synchronous jurisdiction validation — fail-closed per Q2 resolution.
 	if err := s.jurisd.ValidateExists(ctx, req.PrimaryJurisdictionID); err != nil {
 		return nil, s.mapJurisdictionErr(err, req.PrimaryJurisdictionID)
 	}
 
+	// ORG §8 NP5: refuse and QUARANTINE if an active entity in this
+	// jurisdiction already claims this registry identity. Deliberately before
+	// the insert: writing the entity and flagging it afterwards would leave two
+	// active entities holding one registry identity in the authoritative table,
+	// which is the state this negative path exists to prevent.
+	lei, leiSource, leiStatus := nullableString(strings.TrimSpace(req.LEI)), nullableString(req.LEISource), nullableString(req.LEIStatus)
+	if err := validateLEI(lei, leiSource, leiStatus); err != nil {
+		return nil, err
+	}
+
+	if err := s.CheckRegistryIdentity(ctx, req.TenantID, req.RegistrationNumber, req.PrimaryJurisdictionID,
+		map[string]any{
+			"entity_code":         req.EntityCode,
+			"legal_name":          req.LegalName,
+			"entity_type":         string(req.EntityType),
+			"registration_number": req.RegistrationNumber,
+			"attempted_by":        "CreateEntity",
+		}, req.CorrelationID); err != nil {
+		return nil, err
+	}
+
+	// ORG-03 §4.3: Draft → Verified → Active. A new entity is a claim until
+	// someone other than its creator has verified it.
+	status := domain.EntityStatusDraft
+	if s.legacyEntityCreateActive {
+		status = domain.EntityStatusActive
+	}
+
+	now := time.Now().UTC()
 	e := &domain.LegalEntity{
 		LegalEntityID:         newID(),
 		TenantID:              req.TenantID,
 		EntityCode:            req.EntityCode,
 		LegalName:             req.LegalName,
 		TradingName:           nullableString(req.TradingName),
+		RegistrationNumber:    nullableString(req.RegistrationNumber),
+		IncorporationDate:     req.IncorporationDate,
 		EntityType:            req.EntityType,
 		DefaultCurrencyCode:   req.DefaultCurrencyCode,
 		FiscalCalendarID:      req.FiscalCalendarID,
 		PrimaryJurisdictionID: req.PrimaryJurisdictionID,
-		EntityStatus:          domain.EntityStatusActive,
+		EntityStatus:          status,
 		DataResidencyPolicyID: req.DataResidencyPolicyID,
-		CreatedAt:             time.Now().UTC(),
+		RecordVersion:         1,
+		CreatedAt:             now,
 		CreatedByPrincipalID:  domain.PrincipalFromContext(ctx),
 	}
 
+	// ORG-03 profile version 1, written in the entity's own transaction.
+	// It used to be a second write whose failure was only logged, leaving an
+	// entity whose as-of reads all answered "no profile".
+	e.InitialProfile = &domain.LegalEntityProfileVersion{
+		ProfileVersionID:            newID(),
+		TenantID:                    e.TenantID,
+		LegalEntityID:               e.LegalEntityID,
+		VersionNumber:               1,
+		LegalName:                   e.LegalName,
+		TradingName:                 e.TradingName,
+		RegistrationNumber:          e.RegistrationNumber,
+		IncorporationJurisdictionID: &e.PrimaryJurisdictionID,
+		DefaultCurrencyCode:         &e.DefaultCurrencyCode,
+		EffectiveFrom:               now,
+		ChangeReason:                domain.ProfileChangeInitial,
+		CreatedByPrincipalID:        e.CreatedByPrincipalID,
+		LEI:                         lei,
+		LEISource:                   leiSource,
+		LEIStatus:                   leiStatus,
+		LEIVerifiedAt:               req.LEIVerifiedAt,
+		LegalFormCode:               profileInputs.legalFormCode,
+		LegalFormSource:             profileInputs.legalFormSource,
+		LegalFormLocalText:          profileInputs.legalFormLocalText,
+		RegistryAuthority:           profileInputs.registryAuthority,
+		RegisteredOffice:            profileInputs.registeredOffice,
+		SourceEvidenceRef:           profileInputs.sourceEvidenceRef,
+	}
+
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if created, ok := res.(*domain.LegalEntity); ok {
+			return events.EntityCreatedRecord(created, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.CreateEntity(ctx, e); err != nil {
 		s.log.Error("create entity failed", zap.Error(err), zap.String("correlation_id", req.CorrelationID))
 		return nil, fmt.Errorf("store.CreateEntity: %w", err)
 	}
-
-	go s.events.PublishEntityCreated(ctx, e, req.CorrelationID)
 
 	s.log.Info("entity created",
 		zap.String("legal_entity_id", e.LegalEntityID),
@@ -299,6 +465,16 @@ func (s *Service) CreateWorkspace(
 	req domain.CreateWorkspaceRequest,
 ) (*domain.Workspace, error) {
 	if err := s.authorize(ctx, "workspace", "create"); err != nil {
+		return nil, err
+	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
+
+	if err := s.assertEntityOperational(ctx, req.LegalEntityID); err != nil {
 		return nil, err
 	}
 
@@ -326,12 +502,16 @@ func (s *Service) CreateWorkspace(
 		CreatedByPrincipalID:  domain.PrincipalFromContext(ctx),
 	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if created, ok := res.(*domain.Workspace); ok {
+			return events.WorkspaceCreatedRecord(created, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.CreateWorkspace(ctx, w); err != nil {
 		s.log.Error("create workspace failed", zap.Error(err), zap.String("correlation_id", req.CorrelationID))
 		return nil, fmt.Errorf("store.CreateWorkspace: %w", err)
 	}
-
-	go s.events.PublishWorkspaceCreated(ctx, w, req.CorrelationID)
 
 	s.log.Info("workspace created",
 		zap.String("workspace_id", w.WorkspaceID),
@@ -356,6 +536,12 @@ func (s *Service) UpdateWorkspace(
 	if err := s.authorize(ctx, "workspace", "update"); err != nil {
 		return nil, err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
 
 	if req.BillingClassification != nil {
 		if !domain.ValidBillingClassifications[domain.BillingClassification(*req.BillingClassification)] {
@@ -378,6 +564,12 @@ func (s *Service) UpdateWorkspace(
 
 	req.ActorPrincipalID = domain.PrincipalFromContext(ctx)
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if updated, ok := res.(*domain.Workspace); ok {
+			return events.WorkspaceUpdatedRecord(updated, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	w, err := s.store.UpdateWorkspace(ctx, workspaceID, req)
 	if err != nil {
 		return nil, fmt.Errorf("store.UpdateWorkspace: %w", err)
@@ -385,8 +577,6 @@ func (s *Service) UpdateWorkspace(
 	if w == nil {
 		return nil, ErrNotFound
 	}
-
-	go s.events.PublishWorkspaceUpdated(ctx, w, req.CorrelationID)
 
 	s.log.Info("workspace updated",
 		zap.String("workspace_id", w.WorkspaceID),
@@ -412,6 +602,12 @@ func (s *Service) TransitionWorkspaceStatus(
 	if err := s.authorize(ctx, "workspace", "status.transition"); err != nil {
 		return err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return err
+	}
 
 	if _, ok := domain.ValidWorkspaceStatusTransitions[req.NewStatus]; !ok {
 		return fmt.Errorf("%w: unrecognized workspace status %q", ErrInvalidInput, req.NewStatus)
@@ -428,6 +624,12 @@ func (s *Service) TransitionWorkspaceStatus(
 	}
 
 	actor := domain.PrincipalFromContext(ctx)
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if c, ok := res.(events.StatusChange); ok {
+			return events.WorkspaceStatusChangedRecord(c, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	affected, previous, err := s.store.TransitionWorkspaceStatus(
 		ctx, workspaceID, req.NewStatus, allowedPriors, actor, req.CorrelationID,
 	)
@@ -438,10 +640,6 @@ func (s *Service) TransitionWorkspaceStatus(
 		return fmt.Errorf("%w: workspace %s cannot transition to %s from its current state",
 			ErrInvalidTransition, workspaceID, req.NewStatus)
 	}
-
-	go s.events.PublishWorkspaceStatusChanged(
-		ctx, domain.TenantFromContext(ctx), workspaceID, actor, previous, req.NewStatus, req.CorrelationID,
-	)
 
 	s.log.Info("workspace status transitioned",
 		zap.String("workspace_id", workspaceID),
@@ -519,18 +717,37 @@ func (s *Service) UpdateEntity(
 	if err := s.authorize(ctx, "entity", "update"); err != nil {
 		return nil, err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
+
+	// legal_name is under ORG-03 SoD ("maker cannot approve legal-name
+	// change") and effective-dating. This PATCH overwrote it in place with
+	// neither, which made it a bypass of both.
+	if req.LegalName != nil && !s.legacyBodyApprover {
+		return nil, fmt.Errorf("%w: legal_name cannot be patched — use "+
+			"POST /v1/entities/{id}/legal-name, which requires independent approval",
+			ErrApprovalRequired)
+	}
 
 	// Populate audit actor from the verified envelope JWT.
 	// actorFromJWT performs payload-only decoding — signature is already
 	// verified by the Authorization Service before this service is called.
 	req.ActorPrincipalID = domain.PrincipalFromContext(ctx)
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if updated, ok := res.(*domain.LegalEntity); ok {
+			return events.EntityUpdatedRecord(updated, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	e, err := s.store.UpdateEntity(ctx, legalEntityID, req)
 	if err != nil {
 		return nil, fmt.Errorf("store.UpdateEntity: %w", err)
 	}
-
-	go s.events.PublishEntityUpdated(ctx, e, req.CorrelationID)
 	return e, nil
 }
 
@@ -570,6 +787,20 @@ func (s *Service) TransitionEntityStatus(
 	if err := s.authorize(ctx, "entity", "status.transition"); err != nil {
 		return err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return err
+	}
+
+	// A merged duplicate leaves DORMANT only through UnmergeEntity, which is
+	// independently approved and completes the merge lineage. Reactivating it
+	// here would undo a governed merge with an ungoverned write.
+	if cur, err := s.GetEntity(ctx, legalEntityID); err == nil && cur.MergedIntoLegalEntityID != nil {
+		return fmt.Errorf("%w: entity %s is merged into %s — use POST /v1/entities/{id}/unmerge",
+			ErrInvalidTransition, legalEntityID, *cur.MergedIntoLegalEntityID)
+	}
 
 	// Compute the set of valid prior states for the requested target transition.
 	// ValidEntityStatusTransitions maps FROM → []TO; we need all states that
@@ -587,7 +818,13 @@ func (s *Service) TransitionEntityStatus(
 	// succeeds with 0 rows affected and is treated as a no-op below.
 	allowedPriors = append(allowedPriors, req.NewStatus)
 
-	affected, tenantID, err := s.store.TransitionEntityStatus(
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if c, ok := res.(events.StatusChange); ok {
+			return events.EntityStatusChangedRecord(c, req.CorrelationID)
+		}
+		return nil, nil
+	})
+	affected, _, err := s.store.TransitionEntityStatus(
 		ctx, legalEntityID, req.NewStatus, allowedPriors,
 		domain.PrincipalFromContext(ctx), req.CorrelationID,
 	)
@@ -603,18 +840,6 @@ func (s *Service) TransitionEntityStatus(
 		return fmt.Errorf("%w: entity %s cannot transition to %s from its current state",
 			ErrInvalidTransition, legalEntityID, req.NewStatus)
 	}
-
-	// Publish entity.status.changed — approved event name per Q4 resolution.
-	// tenantID is returned by the store from the updated row (RETURNING clause).
-	go s.events.PublishEntityStatusChanged(
-		ctx,
-		tenantID,
-		legalEntityID,
-		domain.PrincipalFromContext(ctx),
-		domain.EntityStatus(""), // previous state not known without a read — omit
-		req.NewStatus,
-		req.CorrelationID,
-	)
 
 	s.log.Info("entity status transitioned",
 		zap.String("legal_entity_id", legalEntityID),
@@ -636,6 +861,18 @@ func (s *Service) CreateHierarchy(
 	if err := s.authorize(ctx, "entity.hierarchy", "create"); err != nil {
 		return nil, err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
+
+	for _, id := range []string{req.ParentLegalEntityID, req.ChildLegalEntityID} {
+		if err := s.assertEntityOperational(ctx, id); err != nil {
+			return nil, err
+		}
+	}
 
 	h := &domain.EntityHierarchy{
 		HierarchyID:          newID(),
@@ -648,11 +885,15 @@ func (s *Service) CreateHierarchy(
 		CreatedByPrincipalID: domain.PrincipalFromContext(ctx),
 	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if created, ok := res.(*domain.EntityHierarchy); ok {
+			return events.HierarchyChangedRecord(created, events.HierarchyChangeCreated, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.CreateHierarchy(ctx, h); err != nil {
 		return nil, fmt.Errorf("store.CreateHierarchy: %w", err)
 	}
-
-	go s.events.PublishEntityHierarchyChanged(ctx, h, "CREATED", req.CorrelationID)
 	return h, nil
 }
 
@@ -667,13 +908,22 @@ func (s *Service) EndDateHierarchy(
 	if err := s.authorize(ctx, "entity.hierarchy", "end-date"); err != nil {
 		return err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return err
+	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if ended, ok := res.(*domain.EntityHierarchy); ok {
+			return events.HierarchyChangedRecord(ended, events.HierarchyChangeEndDated, correlationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.EndDateHierarchy(ctx, hierarchyID, endDate, domain.PrincipalFromContext(ctx), correlationID); err != nil {
 		return fmt.Errorf("store.EndDateHierarchy: %w", err)
 	}
-
-	// Emit a synthetic hierarchy object for the event; store provides full record if needed.
-	go s.events.PublishEntityHierarchyChanged(ctx, &domain.EntityHierarchy{HierarchyID: hierarchyID, EffectiveTo: &endDate}, "END_DATED", correlationID)
 	return nil
 }
 
@@ -696,6 +946,16 @@ func (s *Service) AssignJurisdiction(
 	if err := s.authorize(ctx, "entity.jurisdiction", "assign"); err != nil {
 		return nil, err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
+
+	if err := s.assertEntityOperational(ctx, legalEntityID); err != nil {
+		return nil, err
+	}
 
 	// Synchronous validation — fail-closed.
 	if err := s.jurisd.ValidateExists(ctx, req.JurisdictionID); err != nil {
@@ -714,11 +974,15 @@ func (s *Service) AssignJurisdiction(
 		CreatedByPrincipalID: domain.PrincipalFromContext(ctx),
 	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if created, ok := res.(*domain.EntityJurisdictionAssignment); ok {
+			return events.JurisdictionChangedRecord(created, events.JurisdictionChangeAssigned, req.CorrelationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.CreateJurisdictionAssignment(ctx, a); err != nil {
 		return nil, fmt.Errorf("store.CreateJurisdictionAssignment: %w", err)
 	}
-
-	go s.events.PublishEntityJurisdictionChanged(ctx, a, "ASSIGNED", req.CorrelationID)
 	return a, nil
 }
 
@@ -738,17 +1002,23 @@ func (s *Service) EndDateJurisdictionAssignment(
 	if err := s.authorize(ctx, "entity.jurisdiction", "end-date"); err != nil {
 		return err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return err
+	}
 
+	ctx = WithEvent(ctx, func(res any) (*outbox.Record, error) {
+		if ended, ok := res.(*domain.EntityJurisdictionAssignment); ok {
+			return events.JurisdictionChangedRecord(ended, events.JurisdictionChangeEndDated, correlationID)
+		}
+		return nil, nil
+	})
 	if err := s.store.EndDateJurisdictionAssignment(ctx, assignmentID, endDate, domain.PrincipalFromContext(ctx), correlationID); err != nil {
 		return fmt.Errorf("store.EndDateJurisdictionAssignment: %w", err)
 	}
 
-	go s.events.PublishEntityJurisdictionChanged(
-		ctx,
-		&domain.EntityJurisdictionAssignment{AssignmentID: assignmentID, EffectiveTo: &endDate},
-		"END_DATED",
-		correlationID,
-	)
 	return nil
 }
 
@@ -762,6 +1032,12 @@ func (s *Service) CreateResidencyPolicy(
 	req domain.CreateResidencyPolicyRequest,
 ) (*domain.DataResidencyPolicy, error) {
 	if err := s.authorize(ctx, "residency.policy", "create"); err != nil {
+		return nil, err
+	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
 		return nil, err
 	}
 
@@ -883,6 +1159,16 @@ func (s *Service) CreateTaxIdentityBundle(
 	if err := s.authorize(ctx, "tax-identity-bundle", "create"); err != nil {
 		return nil, err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
+
+	if err := s.assertEntityOperational(ctx, legalEntityID); err != nil {
+		return nil, err
+	}
 
 	if req.DataClassification != "" {
 		if !classification.Classification(req.DataClassification).Valid() {
@@ -923,12 +1209,40 @@ func (s *Service) GetTaxIdentityBundle(ctx context.Context, bundleID string) (*d
 	if b == nil {
 		return nil, ErrNotFound
 	}
+	// ORG-03 "sensitive identifier access scoped".
+	if sensitiveClassification(b.DataClassification) {
+		if err := s.authorizeSensitiveRead(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return b, nil
 }
 
 // ListTaxIdentityBundles returns all TaxIdentityBundle headers for an entity.
+//
+// Sensitive (RESTRICTED / CONFIDENTIAL) bundles are omitted unless the caller
+// passes the scoped-access gate. Omitted rather than failing the whole list:
+// a caller entitled to the ordinary bundles should still get them.
 func (s *Service) ListTaxIdentityBundles(ctx context.Context, legalEntityID string) ([]*domain.TaxIdentityBundle, error) {
-	return s.store.ListTaxIdentityBundlesByEntity(ctx, legalEntityID)
+	all, err := s.store.ListTaxIdentityBundlesByEntity(ctx, legalEntityID)
+	if err != nil {
+		return nil, err
+	}
+	var permitted *bool
+	out := make([]*domain.TaxIdentityBundle, 0, len(all))
+	for _, b := range all {
+		if sensitiveClassification(b.DataClassification) {
+			if permitted == nil {
+				ok := s.authorizeSensitiveRead(ctx) == nil
+				permitted = &ok
+			}
+			if !*permitted {
+				continue
+			}
+		}
+		out = append(out, b)
+	}
+	return out, nil
 }
 
 // TransitionTaxIdentityBundleStatus applies a status transition on a bundle header.
@@ -938,6 +1252,12 @@ func (s *Service) TransitionTaxIdentityBundleStatus(
 	req domain.TransitionTaxIdentityBundleStatusRequest,
 ) error {
 	if err := s.authorize(ctx, "tax-identity-bundle", "status.transition"); err != nil {
+		return err
+	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
 		return err
 	}
 	return s.store.TransitionTaxIdentityBundleStatus(ctx, bundleID, req.NewStatus, domain.PrincipalFromContext(ctx), req.CorrelationID)
@@ -976,7 +1296,24 @@ func (s *Service) authorize(ctx context.Context, resource, action string) error 
 	if scopeID == "" {
 		scopeID = s.platformScopeID
 	}
+	return s.authorizeAs(ctx, principalID, scopeID, resource, action)
+}
 
+// authorizeIn is authorize evaluated in an explicit scope. Used where the
+// decision belongs to the platform rather than the caller's tenant — approving
+// a tenant's creation is a platform decision, like provisioning it.
+func (s *Service) authorizeIn(ctx context.Context, scopeID, resource, action string) error {
+	principalID := domain.PrincipalFromContext(ctx)
+	if principalID == "" {
+		return ErrUnauthenticated
+	}
+	if scopeID == "" {
+		scopeID = domain.TenantFromContext(ctx)
+	}
+	return s.authorizeAs(ctx, principalID, scopeID, resource, action)
+}
+
+func (s *Service) authorizeAs(ctx context.Context, principalID, scopeID, resource, action string) error {
 	if err := s.authz.Authorize(ctx, principalID, scopeID, resource, action); err != nil {
 		switch {
 		case errors.Is(err, authz.ErrUnauthorized):
@@ -996,7 +1333,9 @@ func (s *Service) authorize(ctx context.Context, resource, action string) error 
 func (s *Service) mapJurisdictionErr(err error, jurisdictionID string) error {
 	switch {
 	case errors.Is(err, jurisdiction.ErrJurisdictionNotFound):
-		return fmt.Errorf("%w: jurisdiction_id %s not found in Jurisdiction Rules Service", ErrInvalidInput, jurisdictionID)
+		return fmt.Errorf("%w: jurisdiction_id %s not found in Jurisdiction Rules Service", ErrReferenceInvalid, jurisdictionID)
+	case errors.Is(err, jurisdiction.ErrJurisdictionRetired):
+		return fmt.Errorf("%w: jurisdiction_id %s is retired or inactive", ErrReferenceInvalid, jurisdictionID)
 	case errors.Is(err, jurisdiction.ErrValidatorUnavailable):
 		s.log.Error("jurisdiction rules service unavailable — rejecting assignment (fail-closed)",
 			zap.String("jurisdiction_id", jurisdictionID),

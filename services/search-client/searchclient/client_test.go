@@ -61,10 +61,10 @@ func TestPutGet_RoundTrip(t *testing.T) {
 		TenantID:      "tenant-alpha",
 		LegalEntityID: "le-001",
 		Body: map[string]any{
-			"obligation_code": "GST-Q4-2024",
-			"obligation_type": "TAX_PAYMENT",
+			"obligation_code":  "GST-Q4-2024",
+			"obligation_type":  "TAX_PAYMENT",
 			"source_reference": "ATO GST Filing Rule 2024-Q4",
-			"status":          "OPEN",
+			"status":           "OPEN",
 		},
 	}
 	require.NoError(t, c.Index(ctx, idx, doc))

@@ -33,6 +33,7 @@ import (
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
+	"zoiko.io/notification-svc/internal/outbox"
 	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
@@ -81,6 +82,10 @@ func main() {
 	}()
 
 	metrics := telemetry.NewMetrics("notification-svc")
+	// What the service DOES, as opposed to how it is called — see
+	// telemetry/domain.go for why the HTTP metrics alone cannot tell a service
+	// delivering every notice from one delivering none.
+	domainMetrics := telemetry.NewDomain("notification-svc")
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
@@ -346,7 +351,7 @@ func main() {
 
 	h := handler.New(handler.Deps{
 		Store:          pgStore,
-		Publisher:      publisher,
+		Metrics:        domainMetrics,
 		AuthZ:          authzClient,
 		Deliverer:      deliverer,
 		Recipient:      identityClient,
@@ -378,7 +383,7 @@ func main() {
 	defer stopWorker()
 
 	retryWorker := retry.NewWorker(
-		pgStore, deliverer, publisher, identityClient, identity.IsSettled,
+		pgStore, deliverer, domainMetrics, identityClient, identity.IsSettled,
 		retry.Options{
 			Interval:      cfg.Retry.Interval,
 			BatchSize:     cfg.Retry.BatchSize,
@@ -386,6 +391,27 @@ func main() {
 			StrandedAfter: cfg.Retry.StrandedAfter,
 		}, log)
 	go retryWorker.Start(workerCtx)
+
+	// ── 6a'. Outbox relay ────────────────────────────────────────────────────
+	//
+	// Every event this service emits is committed into event_outbox by the
+	// same transaction that records the fact it describes (migration 000010),
+	// and this loop is what carries them to Kafka. Before it existed the
+	// handler and the worker each wrote to the broker directly after
+	// committing and logged the error if that failed, so a broker hiccup at the
+	// moment a notice concluded lost the only record that it had gone out —
+	// silently, with a 201 and a healthy-looking register.
+	//
+	// Started unconditionally, including when KAFKA_BROKERS is empty. A
+	// deployment with no broker still enqueues (the enqueue is part of the
+	// write's transaction and cannot be conditional), so without a relay the
+	// outbox would grow without bound behind a healthy-looking service.
+	// Publisher.Publish treats a nil producer as a successful dry-run write,
+	// which is what makes that drain correct rather than merely quiet.
+	//
+	// Shares workerCtx with the retry worker, so both stop on the same cancel.
+	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
+	go relay.Run(workerCtx)
 
 	// ── 6b. Delivery Ledger Housekeeping Worker ──────────────────────────────
 	housekeepingWorker := housekeeping.NewWorker(

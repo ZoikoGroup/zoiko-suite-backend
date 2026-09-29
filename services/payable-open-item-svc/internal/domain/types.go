@@ -29,14 +29,13 @@
 //     CreatePayableFromApprovedSource (see expense-claim-svc's own updated
 //     package doc) instead of emitting an unconsumed event — the first real
 //     consumer AP-07 has ever had for its approved claims.
+//   - accounts-payable-svc's ApproveInvoice also calls this service's real
+//     CreatePayableFromApprovedSource — the second real source. AP-08 now
+//     holds an open payable for every approved vendor invoice, so the two
+//     sources this subject area actually has both land here.
 //
 // What is a documented, honest gap, left for a natural next step rather
 // than fabricated:
-//   - accounts-payable-svc (vendor invoices, AP-05/06) is NOT yet wired as
-//     a second source — only expense-claim-svc is, in this build. Wiring
-//     accounts-payable-svc's own ApproveInvoice to also call
-//     CreatePayableFromApprovedSource would give this service its second
-//     real source and is scoped but not started here.
 //   - payment-proposal-svc (AP-09) still sources payables directly from
 //     accounts-payable-svc/expense-claim-svc, not from this service yet —
 //     switching AP-09 over to source from here (ListOpenPayables/

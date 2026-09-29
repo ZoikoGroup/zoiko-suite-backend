@@ -16,13 +16,13 @@ func TestEmit_NoFallback_SingleLoadBalancer(t *testing.T) {
 		t.Fatalf("expected single LB to eu-pool, got: %+v", svc.LoadBalancer)
 	}
 
-	// Router points at the service, uses strip + ctx middlewares, host rule set.
+	// Router points at the service, uses strip + auth + ctx middlewares, host rule set.
 	r := cfg.HTTP.Routers["gtrm-acme"]
 	if r.Rule != "Host(`acme.zoikosuite.dev.internal`)" {
 		t.Fatalf("unexpected router rule: %s", r.Rule)
 	}
-	if len(r.Middlewares) != 2 || r.Middlewares[0] != edgeStripMW {
-		t.Fatalf("expected [edge-strip, ctx] middlewares, got: %v", r.Middlewares)
+	if len(r.Middlewares) != 3 || r.Middlewares[0] != edgeStripMW || r.Middlewares[1] != authMW {
+		t.Fatalf("expected [edge-strip, gateway-auth, ctx] middlewares, got: %v", r.Middlewares)
 	}
 }
 

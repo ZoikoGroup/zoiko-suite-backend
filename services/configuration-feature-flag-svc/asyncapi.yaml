@@ -1,0 +1,540 @@
+asyncapi: 2.6.0
+
+info:
+  title: Configuration & Feature Flag Service — Events
+  version: "1.0.0"
+  description: |
+    The ten events this service publishes, and the one rule that governs both
+    of the original pair and the eight ZS-SVC-AA-001 events added alongside
+    them: an event is emitted on a real transition only, and delivery is
+    transactional. The first two announce a recorded value/flag change; the
+    other eight announce the change machinery — snapshots, definition
+    publications, overrides, release plans, kill switches, verified change
+    sets, drift findings and expired break-glass changes.
+
+    ## Events are emitted on a real transition only
+
+    Neither of the two value/flag events is emitted when a write was an
+    idempotent no-op — when the submitted value already equalled the effective
+    one. Re-asserting a value that is already in force is not a new fact, and
+    a consumer invalidating its cache on one would be doing it for a change
+    that did not happen.
+
+    Concretely: `201` from the API means the event was enqueued, `200` means it
+    was not.
+
+    ## Delivery is transactional, not best-effort
+
+    Every event is written to `event_outbox` **in the same transaction as the
+    state change it announces**, and drained to Kafka by a background relay
+    (`internal/outbox`). A change that was recorded therefore always has its
+    event, and an event that exists always has its change.
+
+    This is not decoration. They used to be published from the handler *after*
+    the store had committed, with the error logged and discarded — so a broker
+    hiccup left the new value recorded, the operator told it was saved, and
+    every consumer still reading the value it superseded. That stale value is
+    perfectly valid data, just old, so nothing downstream could detect the
+    problem either.
+
+    Delivery is **at-least-once**, chosen deliberately: a duplicate makes a
+    consumer re-read a value it already has; a lost one leaves it acting on a
+    value this service has already replaced.
+
+    ## Ordering
+
+    The partition key is the **aggregate id** (`config_id` / `flag_id`), not the
+    correlation id. Keying on the correlation id put two changes to the same
+    entry on different partitions whenever they arrived on different requests,
+    so a consumer replaying them could apply an older value after a newer one
+    and serve the superseded value permanently.
+
+    Note that a new version gets a **new** `config_id`, so strict per-key
+    ordering across versions is not guaranteed by the key alone. Consumers that
+    need it should order on `effective_from`, which is server-set.
+
+defaultContentType: application/json
+
+servers:
+  kafka:
+    url: kafka:9094
+    protocol: kafka
+    description: ZoikoSuite event backbone.
+
+channels:
+  zoiko.configuration.events:
+    description: |
+      Every event this service publishes. One topic, discriminated by
+      `event_type` — matching the platform convention.
+
+      The topic name is `KAFKA_EVENTS_TOPIC` and defaults to this value.
+    publish:
+      operationId: publishConfigurationEvents
+      summary: Configuration and feature-flag transitions.
+      message:
+        oneOf:
+          - $ref: '#/components/messages/ConfigUpdated'
+          - $ref: '#/components/messages/FeatureFlagUpdated'
+          - $ref: '#/components/messages/SnapshotPublished'
+          - $ref: '#/components/messages/VersionPublished'
+          - $ref: '#/components/messages/OverrideActivated'
+          - $ref: '#/components/messages/ReleaseActivated'
+          - $ref: '#/components/messages/KillSwitchActivated'
+          - $ref: '#/components/messages/ChangeVerified'
+          - $ref: '#/components/messages/DriftDetected'
+          - $ref: '#/components/messages/EmergencyExpired'
+
+components:
+  messages:
+    ConfigUpdated:
+      name: config.updated
+      title: A configuration value changed
+      summary: |
+        Emitted when `POST /v1/config` records a new version — a first value for
+        the scope, or a genuinely different one. Never on the idempotent path.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: config.updated
+              payload: { $ref: '#/components/schemas/ConfigUpdatedPayload' }
+
+    FeatureFlagUpdated:
+      name: feature_flag.updated
+      title: A feature flag changed
+      summary: |
+        Emitted when `POST /v1/flags` records a new version. Same
+        transition-only rule as `config.updated`.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: feature_flag.updated
+              payload: { $ref: '#/components/schemas/FeatureFlagUpdatedPayload' }
+
+    SnapshotPublished:
+      name: config.snapshot.published
+      title: A new environment imprint was published
+      summary: |
+        Emitted by the mint every time a change records, in the same
+        transaction: an updated snapshot is the fact every consumer pins to
+        (INV-12). The payload carries epoch + digest so a consumer can adopt
+        the imprint and prove which one it serves.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: config.snapshot.published
+              payload: { $ref: '#/components/schemas/SnapshotPublishedPayload' }
+
+    VersionPublished:
+      name: config.version.published
+      title: A configuration definition version was published
+      summary: |
+        Emitted when a ConfigDefinition reaches PUBLISHED/DEPRECATED/RETIRED —
+        the immutable version every resolver reads from then on (INV-04/05).
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: config.version.published
+              payload: { $ref: '#/components/schemas/VersionPublishedPayload' }
+
+    OverrideActivated:
+      name: config.override.activated
+      title: A value was activated at one of the five precedence layers
+      summary: |
+        Emitted when PUT /v1/config/overrides/{scope} records a value at a
+        layer of the INV-07 precedence chain (USER_PREFERENCE > ORG_UNIT >
+        TENANT > SERVICE > ENVIRONMENT).
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: config.override.activated
+              payload: { $ref: '#/components/schemas/OverrideActivatedPayload' }
+
+    ReleaseActivated:
+      name: flag.release.activated
+      title: A release plan version was published for a flag
+      summary: |
+        Emitted when a flag's rollout/targeting plan reaches a new immutable
+        version (INV-04/07/19). The targeting hash lets a consumer fingerprint
+        the exact ruleset.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: flag.release.activated
+              payload: { $ref: '#/components/schemas/ReleaseActivatedPayload' }
+
+    KillSwitchActivated:
+      name: flag.kill_switch.activated
+      title: A kill switch entered force
+      summary: |
+        Emitted when a predeclared, temporary kill switch activates for a flag
+        (INV-16, NP-49). The highest-blast-radius flag event this service
+        emits: it carries the reason and incident alongside the switch.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: flag.kill_switch.activated
+              payload: { $ref: '#/components/schemas/KillSwitchActivatedPayload' }
+
+    ChangeVerified:
+      name: config.change.verified
+      title: A change set reached VERIFIED
+      summary: |
+        Emitted when a governed change set finishes the Table 7 lifecycle
+        successfully — the terminal success a verification step produces.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: config.change.verified
+              payload: { $ref: '#/components/schemas/ChangeVerifiedPayload' }
+
+    DriftDetected:
+      name: config.drift.detected
+      title: A runtime diverged from desired configuration
+      summary: |
+        Emitted when attestation shows a workload serving a snapshot or version
+        different from the desired one (TC-08, NP-51). Desired and observed
+        hashes side by side, never a label comparison.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: config.drift.detected
+              payload: { $ref: '#/components/schemas/DriftDetectedPayload' }
+
+    EmergencyExpired:
+      name: config.emergency.expired
+      title: A break-glass change expired and was reverted
+      summary: |
+        Emitted by the background sweep when an emergency change passes its
+        mandatory expiry and the value is reverted (INV-15, NP-43/44/47).
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: config.emergency.expired
+              payload: { $ref: '#/components/schemas/EmergencyExpiredPayload' }
+
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        The platform event contract (`docs/architecture/03-microservices.md`
+        §19).
+
+        `legal_entity_id` and `jurisdiction` are absent on purpose rather than
+        sent empty: configuration and flags are environment- and tenant-scoped,
+        not legal-entity-scoped, and a fabricated field is worse than a missing
+        one.
+      required:
+        [event_id, event_type, event_version, emitted_at, schema_version,
+         source_service, correlation_id, payload]
+      properties:
+        event_id:
+          type: string
+          description: |
+            A fresh UUID per publish, prefixed `evt-`. Not derived from the
+            aggregate — see `known-gaps.md` on event_id collisions.
+          example: evt-2b6d1f0a-2c1e-4f9a-9a31-0d9d1b2f4c77
+        event_type:
+          type: string
+          enum:
+            - config.updated
+            - feature_flag.updated
+            - config.snapshot.published
+            - config.version.published
+            - config.override.activated
+            - flag.release.activated
+            - flag.kill_switch.activated
+            - config.change.verified
+            - config.drift.detected
+            - config.emergency.expired
+        event_version: { type: string, const: "1.0" }
+        emitted_at: { type: string, format: date-time }
+        schema_version: { type: string, const: "1.0" }
+        source_service:
+          type: string
+          const: configuration-feature-flag-svc
+        tenant_id:
+          type: string
+          description: |
+            The tenant the changed record belongs to. **Omitted entirely** when
+            the record is the environment-wide default, rather than sent as an
+            empty string or a fabricated id. Read `scope_is_global` in the
+            payload rather than inferring scope from this field's absence.
+        actor_id:
+          type: string
+          description: The principal that made the change.
+        correlation_id:
+          type: string
+          description: The correlation id of the request that caused the change.
+        payload: { type: object }
+
+    ConfigUpdatedPayload:
+      type: object
+      required:
+        [config_id, key, value, environment, tenant_id, scope_is_global,
+         effective_from, created_by_principal_id]
+      properties:
+        config_id:
+          type: string
+          format: uuid
+          description: The id of the NEW version. Also the partition key.
+        key: { type: string, example: payroll.release.batch_size }
+        value:
+          description: The new value. Any JSON value.
+        environment: { type: string, example: prod }
+        tenant_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: '`null` for the environment-wide default.'
+        scope_is_global:
+          type: boolean
+          description: |
+            Stated rather than left to be inferred from a null `tenant_id`.
+
+            The two facts read very differently — "this changed for one
+            organisation" versus "the default every organisation without its own
+            value reads has changed" — and a consumer that treats a missing
+            tenant as "unknown" rather than "all" silently ignores the wider of
+            the two.
+        effective_from: { type: string, format: date-time }
+        created_by_principal_id: { type: string }
+
+    FeatureFlagUpdatedPayload:
+      type: object
+      required:
+        [flag_id, key, enabled, environment, tenant_id, scope_is_global,
+         rollout_percentage, effective_from, created_by_principal_id]
+      properties:
+        flag_id:
+          type: string
+          format: uuid
+          description: The id of the NEW version. Also the partition key.
+        key: { type: string, example: payroll.new_ui }
+        enabled: { type: boolean }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        scope_is_global: { type: boolean }
+        rollout_percentage:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: |
+            Dormant while `enabled` is false. A consumer must read both: a flag
+            disabled at 20% is off for everyone, and one enabled at 0% is on but
+            reaching nobody.
+        effective_from: { type: string, format: date-time }
+        created_by_principal_id: { type: string }
+
+    SnapshotPublishedPayload:
+      type: object
+      required:
+        [snapshot_id, environment, epoch, digest, issued_at,
+         freshness_deadline, created_by_principal_id]
+      properties:
+        snapshot_id:
+          type: string
+          format: uuid
+          description: The new immutable imprint. Also the partition key.
+        environment: { type: string, example: prod }
+        epoch:
+          type: integer
+          format: int64
+          description: Monotonic per environment (INV-22) — never rewinds.
+        digest:
+          type: string
+          description: md5 of content::text — re-hash what you fetch and compare.
+        issued_at: { type: string, format: date-time }
+        freshness_deadline:
+          type: string
+          format: date-time
+          description: After this, the imprint is stale (OD-04 placeholder 24h).
+        created_by_principal_id: { type: string }
+
+    VersionPublishedPayload:
+      type: object
+      required:
+        [version_id, definition_id, key, version, digest, lifecycle,
+         published_at, published_by_principal_id]
+      properties:
+        version_id: { type: string, format: uuid, description: Partition key. }
+        definition_id: { type: string, format: uuid }
+        key: { type: string, example: payroll.release.batch_size }
+        version: { type: integer, minimum: 1 }
+        digest: { type: string, description: md5 of the immutable definition JSON. }
+        lifecycle:
+          type: string
+          enum: [PUBLISHED, DEPRECATED, RETIRED]
+        published_at: { type: string, format: date-time }
+        published_by_principal_id: { type: string }
+
+    OverrideActivatedPayload:
+      type: object
+      required: [key, layer, environment, scope_id, value, effective_from,
+                 actor_principal_id]
+      properties:
+        key: { type: string }
+        layer:
+          type: string
+          enum: [USER_PREFERENCE, ORG_UNIT, TENANT, SERVICE, ENVIRONMENT]
+          description: Which of the INV-07 precedence layers was written.
+        environment: { type: string }
+        scope_id:
+          type: string
+          nullable: true
+          description: |
+            The layer's instance — tenant id, org unit id, subject id.
+            `null` for the ENVIRONMENT layer, which is its own scope.
+        value: { description: The activated value, any JSON. }
+        effective_from: { type: string, format: date-time }
+        actor_principal_id: { type: string }
+
+    ReleaseActivatedPayload:
+      type: object
+      required:
+        [release_plan_id, flag_key, environment, version, strategy, salt,
+         bucket_count, targeting_hash, published_at, published_by_principal_id]
+      properties:
+        release_plan_id: { type: string, format: uuid, description: Partition key. }
+        flag_key: { type: string, example: payroll.new_ui }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        version: { type: integer, minimum: 1, description: Immutable per version (INV-04). }
+        strategy:
+          type: string
+          enum: [PERCENTAGE, PROGRESSIVE_SCHEDULE, ALL_OR_NOTHING]
+        salt: { type: string, description: Deterministic bucketing salt (INV-07). }
+        bucket_count: { type: integer, minimum: 1, maximum: 1000000 }
+        targeting_hash: { type: string, description: Fingerprint of targeting_rules (TC-05). }
+        targeting_rules: { type: object }
+        published_at: { type: string, format: date-time }
+        published_by_principal_id: { type: string }
+
+    KillSwitchActivatedPayload:
+      type: object
+      required:
+        [kill_switch_id, flag_key, environment, safe_behavior, reason,
+         expires_at, created_by_principal_id]
+      properties:
+        kill_switch_id: { type: string, format: uuid, description: Partition key. }
+        flag_key: { type: string }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        safe_behavior:
+          type: string
+          enum: [DISABLE, DEGRADE_ONLY]
+          description: |
+            A switch may only narrow the path, never broaden it — there is no
+            ENABLE (INV-16, NP-49).
+        reason: { type: string }
+        incident_id: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+          description: Mandatory — no permanent kill switch (NP-43).
+        created_by_principal_id: { type: string }
+
+    ChangeVerifiedPayload:
+      type: object
+      required: [change_id, change_class, environment, status, verified_at,
+                 verified_by_principal_id]
+      properties:
+        change_id: { type: string, format: uuid, description: Partition key. }
+        change_class:
+          type: string
+          enum: [C0, C1, C2, C3]
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        status: { type: string, const: VERIFIED }
+        verified_at: { type: string, format: date-time }
+        verified_by_principal_id: { type: string }
+
+    DriftDetectedPayload:
+      type: object
+      required: [drift_id, runtime_id, environment, drift_class, severity,
+                 detected_at]
+      properties:
+        drift_id: { type: string, format: uuid, description: Partition key. }
+        runtime_id: { type: string, example: payroll-worker-7f9c }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        drift_class:
+          type: string
+          enum: [STALE, UNAUTHORIZED, PARTIAL, INCOMPATIBLE, UNKNOWN]
+        severity:
+          type: string
+          enum: [LOW, MEDIUM, HIGH, CRITICAL]
+        desired_snapshot_id: { type: string, format: uuid, nullable: true }
+        desired_digest: { type: string, nullable: true }
+        observed_snapshot_id: { type: string, format: uuid, nullable: true }
+        observed_digest: { type: string, nullable: true }
+        detected_at: { type: string, format: date-time }
+
+    EmergencyExpiredPayload:
+      type: object
+      required: [emergency_change_id, key, environment, status, expires_at,
+                 reverted_to_prior]
+      properties:
+        emergency_change_id: { type: string, format: uuid, description: Partition key. }
+        key: { type: string }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        status:
+          type: string
+          enum: [EXPIRED, RETROSPECTIVE_PENDING, CLOSED]
+        reverted_to_prior:
+          type: boolean
+          description: |
+            Whether the sweep put the superseded value back — false means the
+            reversion needs attention, and the evidence row still holds both.
+        expires_at: { type: string, format: date-time }
+        actor_principal_id: { type: string }

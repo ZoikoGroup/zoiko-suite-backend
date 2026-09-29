@@ -3,6 +3,7 @@ package handler_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"zoiko.io/secret-vault-integration-svc/internal/handler"
 	svcmiddleware "zoiko.io/secret-vault-integration-svc/internal/middleware"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
+	"zoiko.io/secret-vault-integration-svc/internal/vault"
 )
 
 // ── stub store ────────────────────────────────────────────────────────────────
@@ -80,6 +82,14 @@ type stubStore struct {
 
 	listAuditResult []*domain.SecretAccessAuditLog
 	listAuditErr    error
+
+	exceptionResult             *domain.SharedSecretException
+	exceptionCreated            bool
+	exceptionErr                error
+	exceptionFilter             domain.ListSharedSecretExceptionsFilter
+	listExceptionsResult        []*domain.SharedSecretException
+	revokeExceptionResult       *domain.SharedSecretException
+	revokeExceptionTransitioned bool
 }
 
 func (s *stubStore) CreateSecretPolicy(_ context.Context, _ domain.CreateSecretPolicyParams) (*domain.SecretPolicy, bool, error) {
@@ -133,6 +143,19 @@ func (s *stubStore) ListAuditLog(_ context.Context, filter store.AuditListFilter
 	s.auditFilter = filter
 	return s.listAuditResult, s.listAuditErr
 }
+func (s *stubStore) CreateSharedSecretException(_ context.Context, params domain.SharedSecretException) (*domain.SharedSecretException, bool, error) {
+	return s.exceptionResult, s.exceptionCreated, s.exceptionErr
+}
+func (s *stubStore) FindSharedSecretExceptionByID(_ context.Context, _, _ string) (*domain.SharedSecretException, error) {
+	return s.exceptionResult, s.exceptionErr
+}
+func (s *stubStore) ListSharedSecretExceptions(_ context.Context, filter domain.ListSharedSecretExceptionsFilter) ([]*domain.SharedSecretException, error) {
+	s.exceptionFilter = filter
+	return s.listExceptionsResult, s.exceptionErr
+}
+func (s *stubStore) RevokeSharedSecretException(_ context.Context, _, _, _ string) (*domain.SharedSecretException, bool, error) {
+	return s.revokeExceptionResult, s.revokeExceptionTransitioned, s.exceptionErr
+}
 
 // ── stub vault backend ───────────────────────────────────────────────────────
 
@@ -143,9 +166,34 @@ type stubVault struct {
 	putCalls    int
 	rotateErr   error
 	rotateCalls int
+
+	verifyPath      string
+	verifyRequestID string
+	verifyExpiry    time.Time
+	verifyErr       error
+
+	getMaterial      []byte
+	getMaterialErr   error
+	getMaterialCalls int
+
+	getCalls      int
+	getRequestIDs []string
+	getExpiries   []time.Time
 }
 
-func (v *stubVault) Get(_ context.Context, _ string) (string, error) { return v.getToken, v.getErr }
+func (v *stubVault) Get(_ context.Context, _, requestID string, expiresAt time.Time) (string, error) {
+	v.getCalls++
+	v.getRequestIDs = append(v.getRequestIDs, requestID)
+	v.getExpiries = append(v.getExpiries, expiresAt)
+	return v.getToken, v.getErr
+}
+func (v *stubVault) Verify(_ context.Context, _ string) (vault.LeaseTokenInfo, error) {
+	return vault.LeaseTokenInfo{SecretPath: v.verifyPath, RequestID: v.verifyRequestID, ExpiresAt: v.verifyExpiry}, v.verifyErr
+}
+func (v *stubVault) GetMaterial(_ context.Context, _ string) ([]byte, error) {
+	v.getMaterialCalls++
+	return v.getMaterial, v.getMaterialErr
+}
 func (v *stubVault) Put(_ context.Context, _ string, _ []byte) error {
 	v.putCalls++
 	return v.putErr
@@ -182,7 +230,7 @@ func (p *stubPublisher) PublishRotationCompleted(_ context.Context, _, _, _ stri
 func newTestRouter(s *stubStore, v *stubVault, p *stubPublisher) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, v, p, testAuthz(), testAuthzScopeID, zap.NewNop())
+	h := handler.New(s, v, p, testAuthz(), testAuthzScopeID, 0, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -195,7 +243,7 @@ func defaultRouter(s *stubStore) chi.Router {
 
 func TestCreateSecretPolicy_Created(t *testing.T) {
 	s := &stubStore{
-		policy:        &domain.SecretPolicy{SecretPolicyID: "sp-1", SecretClass: "DATABASE_CREDENTIAL", SecretPath: "kv/db"},
+		policy:        &domain.SecretPolicy{SecretPolicyID: "11111111-0000-4000-8000-000000000001", SecretClass: "DATABASE_CREDENTIAL", SecretPath: "kv/db"},
 		policyCreated: true,
 	}
 	r := defaultRouter(s)
@@ -250,12 +298,12 @@ func TestCreateSecretPolicy_InvalidDataClassification(t *testing.T) {
 
 func TestCreateSecretPolicyVersion_Created(t *testing.T) {
 	s := &stubStore{
-		version:        &domain.SecretPolicyVersion{SecretPolicyVersionID: "spv-1", VersionStatus: "DRAFT"},
+		version:        &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", VersionStatus: "DRAFT"},
 		versionCreated: true,
 	}
 	r := defaultRouter(s)
 	body := `{"allowed_workload_ids":["svc-a"],"max_lease_duration_seconds":300,"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -266,7 +314,7 @@ func TestCreateSecretPolicyVersion_Created(t *testing.T) {
 func TestCreateSecretPolicyVersion_InvalidMaxLeaseDuration(t *testing.T) {
 	r := defaultRouter(&stubStore{})
 	body := `{"max_lease_duration_seconds":0,"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -278,7 +326,7 @@ func TestCreateSecretPolicyVersion_PolicyNotFound(t *testing.T) {
 	s := &stubStore{versionErr: domain.ErrSecretPolicyNotFound}
 	r := defaultRouter(s)
 	body := `{"max_lease_duration_seconds":300,"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/missing/versions", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/44444444-0000-4000-8000-00000000dead/versions", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -290,12 +338,12 @@ func TestCreateSecretPolicyVersion_PolicyNotFound(t *testing.T) {
 
 func TestActivateVersion_Success(t *testing.T) {
 	s := &stubStore{
-		findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "spv-1", SecretPolicyID: "sp-1", VersionStatus: "DRAFT"},
-		activated:         &domain.SecretPolicyVersion{SecretPolicyVersionID: "spv-1", SecretPolicyID: "sp-1", VersionStatus: "ACTIVE"},
+		findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "DRAFT"},
+		activated:         &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "11111111-0000-4000-8000-000000000001", VersionStatus: "ACTIVE"},
 	}
 	r := defaultRouter(s)
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions/spv-1/activate", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000001/activate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -305,7 +353,7 @@ func TestActivateVersion_Success(t *testing.T) {
 
 func TestActivateVersion_MissingActor(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions/spv-1/activate", strings.NewReader(`{}`)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000001/activate", strings.NewReader(`{}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -314,10 +362,10 @@ func TestActivateVersion_MissingActor(t *testing.T) {
 }
 
 func TestActivateVersion_PolicyMismatch(t *testing.T) {
-	s := &stubStore{findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "spv-1", SecretPolicyID: "OTHER"}}
+	s := &stubStore{findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001", SecretPolicyID: "OTHER"}}
 	r := defaultRouter(s)
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions/spv-1/activate", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000001/activate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -328,12 +376,12 @@ func TestActivateVersion_PolicyMismatch(t *testing.T) {
 // ── PutSecretMaterial ────────────────────────────────────────────────────────
 
 func TestPutSecretMaterial_Success(t *testing.T) {
-	s := &stubStore{findPolicyResult: &domain.SecretPolicy{SecretPolicyID: "sp-1", SecretPath: "kv/db"}}
+	s := &stubStore{findPolicyResult: &domain.SecretPolicy{SecretPolicyID: "11111111-0000-4000-8000-000000000001", SecretPath: "kv/db"}}
 	v := &stubVault{}
 	r := newTestRouter(s, v, &stubPublisher{})
 
 	body := `{"material_base64":"c2VjcmV0LXZhbHVl"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/material", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/material", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -347,7 +395,7 @@ func TestPutSecretMaterial_Success(t *testing.T) {
 
 func TestPutSecretMaterial_MissingField(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/material", strings.NewReader(`{}`)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/material", strings.NewReader(`{}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -359,7 +407,7 @@ func TestPutSecretMaterial_PolicyNotFound(t *testing.T) {
 	s := &stubStore{findPolicyErr: domain.ErrSecretPolicyNotFound}
 	r := defaultRouter(s)
 	body := `{"material_base64":"c2VjcmV0"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/missing/material", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/44444444-0000-4000-8000-00000000dead/material", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -371,7 +419,7 @@ func TestPutSecretMaterial_PolicyNotFound(t *testing.T) {
 
 func TestListVersionHistory_EmptyReturnsArray(t *testing.T) {
 	r := defaultRouter(&stubStore{history: nil})
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secret-policies/sp-1/versions", nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
@@ -381,7 +429,7 @@ func TestListVersionHistory_EmptyReturnsArray(t *testing.T) {
 
 func TestListApplicableSecretPolicyVersions_MissingSecretClass(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secret-policies", nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secret-policies", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -399,7 +447,7 @@ func TestBroker_Granted(t *testing.T) {
 	s := &stubStore{
 		applicableByPath: &domain.ApplicableSecretPolicyVersion{
 			SecretPolicyVersion: domain.SecretPolicyVersion{
-				SecretPolicyVersionID:   "spv-1",
+				SecretPolicyVersionID:   "22222222-0000-4000-8000-000000000001",
 				AllowedWorkloadIDs:      json.RawMessage(`["svc-a"]`),
 				MaxLeaseDurationSeconds: 300,
 			},
@@ -407,7 +455,7 @@ func TestBroker_Granted(t *testing.T) {
 			SecretPath:  "kv/db",
 		},
 		lease: &domain.SecretLease{
-			LeaseID: "lease-1", SecretPath: "kv/db", ExpiresAt: time.Now().Add(5 * time.Minute),
+			LeaseID: "33333333-0000-4000-8000-000000000001", SecretPath: "kv/db", ExpiresAt: time.Now().Add(5 * time.Minute),
 		},
 		leaseCreated: true,
 	}
@@ -415,7 +463,7 @@ func TestBroker_Granted(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouter(s, v, pub)
 
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-a", "req-1"))))
+	req := asWorkload(authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", testWorkload, "req-1")))), testWorkload)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -441,7 +489,7 @@ func TestBroker_NoApplicablePolicy(t *testing.T) {
 	s := &stubStore{applicableByPathErr: domain.ErrSecretPolicyNotFound}
 	r := defaultRouter(s)
 
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/missing", "svc-a", "req-1"))))
+	req := asWorkload(authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/44444444-0000-4000-8000-00000000dead", testWorkload, "req-1")))), testWorkload)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -460,7 +508,7 @@ func TestBroker_NotAuthorized(t *testing.T) {
 	s := &stubStore{
 		applicableByPath: &domain.ApplicableSecretPolicyVersion{
 			SecretPolicyVersion: domain.SecretPolicyVersion{
-				SecretPolicyVersionID: "spv-1",
+				SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001",
 				AllowedWorkloadIDs:    json.RawMessage(`["svc-a"]`),
 			},
 			SecretClass: "DATABASE_CREDENTIAL",
@@ -469,7 +517,7 @@ func TestBroker_NotAuthorized(t *testing.T) {
 	}
 	r := defaultRouter(s)
 
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-b", "req-1"))))
+	req := asWorkload(authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-b", "req-1")))), "svc-b")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -490,11 +538,66 @@ func TestBroker_NotAuthorized(t *testing.T) {
 	}
 }
 
+// TestBroker_RejectsUnverifiedWorkloadIdentity pins the audit's top gap: the
+// broker is the credential-issuing endpoint, and it used to authorize purely
+// on a requested_by_principal_id taken from the JSON body. Any caller inside
+// the right tenant who knew a name from allowed_workload_ids got a lease — and
+// the audit trail recorded that guessed name as both requester and actor, so
+// the evidence vouched for the impersonation.
+//
+// The gateway-verified identity is X-Principal-Id. A body claiming a
+// different workload (a name the caller happens to know from the allowlist)
+// must be refused before the grant path, and the DENIED entry must keep the
+// two names apart: the claimed identity as SUBJECT, the real caller as ACTOR.
+func TestBroker_RejectsUnverifiedWorkloadIdentity(t *testing.T) {
+	s := grantingStore() // allowlist allows testWorkload ("svc-a")
+	v := &stubVault{getToken: "local-lease:abc"}
+	pub := &stubPublisher{}
+	r := newTestRouter(s, v, pub)
+
+	// The caller's verified identity is testPrincipal, but the body claims
+	// testWorkload — a name the caller knows from allowed_workload_ids but
+	// cannot prove is its own.
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker",
+		strings.NewReader(brokerBody("kv/db", testWorkload, "req-identity-1"))))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 workload_identity_mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "workload_identity_mismatch") {
+		t.Errorf("expected workload_identity_mismatch in body, got %s", w.Body.String())
+	}
+	if pub.grantedCalls != 0 {
+		t.Errorf("published secret.access.granted for an unverified workload identity (%d calls)", pub.grantedCalls)
+	}
+	if len(s.auditEntries) != 2 { // REQUESTED + DENIED
+		t.Fatalf("expected REQUESTED + DENIED, got %d entries", len(s.auditEntries))
+	}
+	denied := s.auditEntries[1]
+	if denied.EventType != "DENIED" {
+		t.Errorf("expected DENIED, got %s", denied.EventType)
+	}
+	if denied.RequestedByPrincipalID != testWorkload {
+		t.Errorf("subject: want the claimed workload %q, got %q", testWorkload, denied.RequestedByPrincipalID)
+	}
+	if denied.ActedByPrincipalID == nil || *denied.ActedByPrincipalID != testPrincipal {
+		t.Errorf("actor: want the verified caller %q, got %v", testPrincipal, denied.ActedByPrincipalID)
+	}
+	if *denied.ActedByPrincipalID == denied.RequestedByPrincipalID {
+		t.Error("actor and subject are identical; the DENIED entry vouches for the impersonated name — the fix proves nothing")
+	}
+	if !strings.Contains(denied.OutcomeDetail, "requested_by_principal_id") {
+		t.Errorf("DENIED outcome_detail should name the mismatch, got %q", denied.OutcomeDetail)
+	}
+}
+
 func TestBroker_CorrelationIDFromBody_UsedWhenHeaderAbsent(t *testing.T) {
 	s := &stubStore{
 		applicableByPath: &domain.ApplicableSecretPolicyVersion{
 			SecretPolicyVersion: domain.SecretPolicyVersion{
-				SecretPolicyVersionID:   "spv-1",
+				SecretPolicyVersionID:   "22222222-0000-4000-8000-000000000001",
 				AllowedWorkloadIDs:      json.RawMessage(`["svc-a"]`),
 				MaxLeaseDurationSeconds: 300,
 			},
@@ -502,14 +605,14 @@ func TestBroker_CorrelationIDFromBody_UsedWhenHeaderAbsent(t *testing.T) {
 			SecretPath:  "kv/db",
 		},
 		lease: &domain.SecretLease{
-			LeaseID: "lease-1", SecretPath: "kv/db", ExpiresAt: time.Now().Add(5 * time.Minute),
+			LeaseID: "33333333-0000-4000-8000-000000000001", SecretPath: "kv/db", ExpiresAt: time.Now().Add(5 * time.Minute),
 		},
 		leaseCreated: true,
 	}
 	r := defaultRouter(s)
 
 	body := `{"secret_path":"kv/db","requested_by_principal_id":"svc-a","request_id":"req-1","correlation_id":"corr-from-body"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(body)))
+	req := asWorkload(authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(body))), "svc-a")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -537,7 +640,7 @@ func TestBroker_VaultUnavailable(t *testing.T) {
 	s := &stubStore{
 		applicableByPath: &domain.ApplicableSecretPolicyVersion{
 			SecretPolicyVersion: domain.SecretPolicyVersion{
-				SecretPolicyVersionID: "spv-1",
+				SecretPolicyVersionID: "22222222-0000-4000-8000-000000000001",
 				AllowedWorkloadIDs:    json.RawMessage(`["svc-a"]`),
 			},
 			SecretPath: "kv/db",
@@ -546,7 +649,7 @@ func TestBroker_VaultUnavailable(t *testing.T) {
 	v := &stubVault{getErr: context.DeadlineExceeded}
 	r := newTestRouter(s, v, &stubPublisher{})
 
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-a", "req-1"))))
+	req := asWorkload(authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", testWorkload, "req-1")))), testWorkload)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusServiceUnavailable {
@@ -557,9 +660,9 @@ func TestBroker_VaultUnavailable(t *testing.T) {
 // ── Leases ───────────────────────────────────────────────────────────────────
 
 func TestGetLease_Found(t *testing.T) {
-	s := &stubStore{findLeaseResult: &domain.SecretLease{LeaseID: "lease-1"}}
+	s := &stubStore{findLeaseResult: &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001"}}
 	r := defaultRouter(s)
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/lease-1", nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -570,7 +673,7 @@ func TestGetLease_Found(t *testing.T) {
 func TestGetLease_NotFound(t *testing.T) {
 	s := &stubStore{findLeaseErr: domain.ErrLeaseNotFound}
 	r := defaultRouter(s)
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/missing", nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/44444444-0000-4000-8000-00000000dead", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -580,7 +683,7 @@ func TestGetLease_NotFound(t *testing.T) {
 
 func TestListLeases_EmptyReturnsArray(t *testing.T) {
 	r := defaultRouter(&stubStore{listLeasesResult: nil})
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases", nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
@@ -592,12 +695,12 @@ func TestRevokeLease_Success(t *testing.T) {
 	s := &stubStore{
 		// The revoke path reads the lease first, so the scope can be checked
 		// before a transition that cannot be undone.
-		findLeaseResult:         &domain.SecretLease{LeaseID: "lease-1", Status: "ACTIVE"},
-		revokeLeaseResult:       &domain.SecretLease{LeaseID: "lease-1", Status: "REVOKED"},
+		findLeaseResult:         &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "ACTIVE"},
+		revokeLeaseResult:       &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED"},
 		revokeLeaseTransitioned: true,
 	}
 	r := defaultRouter(s)
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/lease-1/revoke", nil))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/revoke", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -608,13 +711,163 @@ func TestRevokeLease_Success(t *testing.T) {
 	}
 }
 
+// TestRevokeLease_RecordsTheRevokerNotTheLeaseHolder pins the one place in this
+// service where the audited SUBJECT and the audited ACTOR are different
+// principals.
+//
+// The REVOKED entry used to be written with the lease holder in
+// requested_by_principal_id and nothing else identifying anyone, so the
+// operator who ended the lease — authenticated, and authorized against
+// SECRET_LEASE_REVOKE moments earlier — appeared nowhere in the evidence. The
+// audit log could say a lease was revoked and whose it was, and could not say
+// who revoked it, which is the first question asked after a credential
+// incident. Migration 000004 added acted_by_principal_id for exactly this row.
+func TestRevokeLease_RecordsTheRevokerNotTheLeaseHolder(t *testing.T) {
+	const holder = "99999999-0000-4000-8000-00000000beef"
+	s := &stubStore{
+		findLeaseResult: &domain.SecretLease{
+			LeaseID:                "33333333-0000-4000-8000-000000000001",
+			Status:                 "ACTIVE",
+			RequestedByPrincipalID: holder,
+		},
+		revokeLeaseResult: &domain.SecretLease{
+			LeaseID:                "33333333-0000-4000-8000-000000000001",
+			Status:                 "REVOKED",
+			RequestedByPrincipalID: holder,
+		},
+		revokeLeaseTransitioned: true,
+	}
+	r := defaultRouter(s)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/revoke", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(s.auditEntries) != 1 {
+		t.Fatalf("expected exactly one audit entry, got %d", len(s.auditEntries))
+	}
+	e := s.auditEntries[0]
+	if e.RequestedByPrincipalID != holder {
+		t.Errorf("subject: want the lease holder %q, got %q", holder, e.RequestedByPrincipalID)
+	}
+	if e.ActedByPrincipalID == nil {
+		t.Fatal("actor not recorded: acted_by_principal_id is nil on a REVOKED entry")
+	}
+	if *e.ActedByPrincipalID != testPrincipal {
+		t.Errorf("actor: want the revoking caller %q, got %q", testPrincipal, *e.ActedByPrincipalID)
+	}
+	// The distinction is the whole point — a test that passed with both
+	// columns holding the same value would not notice the regression.
+	if *e.ActedByPrincipalID == e.RequestedByPrincipalID {
+		t.Error("actor and subject are identical; this test no longer proves anything")
+	}
+}
+
+// TestAuditEntries_AlwaysNameAnActor covers the other four event types. Each
+// one has an actor that happens to equal its subject, and each must still
+// populate the column: "everything principal X did" has to be answerable by one
+// predicate, without the reader knowing which event types coincide.
+func TestAuditEntries_AlwaysNameAnActor(t *testing.T) {
+	t.Run("broker grant records REQUESTED and GRANTED", func(t *testing.T) {
+		s := grantingStore()
+		r := defaultRouter(s)
+		req := asWorkload(authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker",
+			strings.NewReader(brokerBody("kv/db", testWorkload, "req-actor-1")))), testWorkload)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		assertEveryEntryNamesAnActor(t, s.auditEntries, "REQUESTED", "GRANTED")
+	})
+
+	t.Run("broker denial records DENIED", func(t *testing.T) {
+		s := grantingStore()
+		s.applicableByPath.AllowedWorkloadIDs = json.RawMessage(`["somebody-else"]`)
+		r := defaultRouter(s)
+		req := asWorkload(authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker",
+			strings.NewReader(brokerBody("kv/db", testWorkload, "req-actor-2")))), testWorkload)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+		}
+		assertEveryEntryNamesAnActor(t, s.auditEntries, "REQUESTED", "DENIED")
+	})
+
+	t.Run("rotation records ROTATED and each cascaded REVOKED", func(t *testing.T) {
+		s := &stubStore{
+			findPolicyResult: &domain.SecretPolicy{
+				SecretPolicyID: "11111111-0000-4000-8000-000000000001",
+				SecretClass:    "DATABASE_CREDENTIAL",
+				SecretPath:     "kv/db",
+			},
+			revokedByPath: []*domain.SecretLease{{
+				LeaseID:                "33333333-0000-4000-8000-000000000009",
+				SecretPolicyVersionID:  "22222222-0000-4000-8000-000000000001",
+				RequestedByPrincipalID: "a-different-workload",
+				SecretPath:             "kv/db",
+			}},
+		}
+		r := defaultRouter(s)
+		req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/rotate",
+			strings.NewReader(`{"request_id":"rot-actor-1","rotated_by_principal_id":"`+testPrincipal+`"}`)))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		assertEveryEntryNamesAnActor(t, s.auditEntries, "REVOKED", "ROTATED")
+
+		// The cascaded REVOKED belongs to a holder who did not ask for it;
+		// the rotator is the actor, same divergence as an explicit revoke.
+		for _, e := range s.auditEntries {
+			if e.EventType != "REVOKED" {
+				continue
+			}
+			if e.RequestedByPrincipalID != "a-different-workload" {
+				t.Errorf("cascaded REVOKED subject: want the lease holder, got %q", e.RequestedByPrincipalID)
+			}
+			if *e.ActedByPrincipalID != testPrincipal {
+				t.Errorf("cascaded REVOKED actor: want the rotator %q, got %q", testPrincipal, *e.ActedByPrincipalID)
+			}
+		}
+	})
+}
+
+// assertEveryEntryNamesAnActor checks that the recorded entries are exactly the
+// expected event types and that none of them left the actor column nil.
+func assertEveryEntryNamesAnActor(t *testing.T, entries []domain.RecordAuditEntryParams, wantTypes ...string) {
+	t.Helper()
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.EventType)
+		if e.ActedByPrincipalID == nil {
+			t.Errorf("%s entry: acted_by_principal_id is nil", e.EventType)
+			continue
+		}
+		if *e.ActedByPrincipalID == "" {
+			t.Errorf("%s entry: acted_by_principal_id is empty", e.EventType)
+		}
+	}
+	if len(got) != len(wantTypes) {
+		t.Fatalf("event types: want %v, got %v", wantTypes, got)
+	}
+	for i, want := range wantTypes {
+		if got[i] != want {
+			t.Errorf("event %d: want %s, got %s", i, want, got[i])
+		}
+	}
+}
+
 func TestRevokeLease_InvalidTransition(t *testing.T) {
 	s := &stubStore{
-		findLeaseResult: &domain.SecretLease{LeaseID: "lease-1", Status: "REVOKED"},
+		findLeaseResult: &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED"},
 		revokeLeaseErr:  domain.ErrInvalidTransition,
 	}
 	r := defaultRouter(s)
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/lease-1/revoke", nil))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/revoke", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {
@@ -626,9 +879,9 @@ func TestRevokeLease_InvalidTransition(t *testing.T) {
 
 func TestRotate_Success(t *testing.T) {
 	s := &stubStore{
-		findPolicyResult: &domain.SecretPolicy{SecretPolicyID: "sp-1", SecretClass: "DATABASE_CREDENTIAL", SecretPath: "kv/db"},
+		findPolicyResult: &domain.SecretPolicy{SecretPolicyID: "11111111-0000-4000-8000-000000000001", SecretClass: "DATABASE_CREDENTIAL", SecretPath: "kv/db"},
 		revokedByPath: []*domain.SecretLease{
-			{LeaseID: "lease-1", SecretPath: "kv/db"},
+			{LeaseID: "33333333-0000-4000-8000-000000000001", SecretPath: "kv/db"},
 		},
 	}
 	v := &stubVault{}
@@ -636,7 +889,7 @@ func TestRotate_Success(t *testing.T) {
 	r := newTestRouter(s, v, pub)
 
 	body := `{"request_id":"rot-1","rotated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/rotate", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/rotate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -670,7 +923,7 @@ func TestRotate_IdempotentReplay_DoesNotRotateAgain(t *testing.T) {
 	r := newTestRouter(s, v, &stubPublisher{})
 
 	body := `{"request_id":"rot-1","rotated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/rotate", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/rotate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -685,7 +938,7 @@ func TestRotate_IdempotentReplay_DoesNotRotateAgain(t *testing.T) {
 func TestRotate_MissingRequestID(t *testing.T) {
 	r := defaultRouter(&stubStore{})
 	body := `{"rotated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/rotate", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/rotate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -697,7 +950,7 @@ func TestRotate_PolicyNotFound(t *testing.T) {
 	s := &stubStore{findPolicyErr: domain.ErrSecretPolicyNotFound}
 	r := defaultRouter(s)
 	body := `{"request_id":"rot-1","rotated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/missing/rotate", strings.NewReader(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/44444444-0000-4000-8000-00000000dead/rotate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -709,7 +962,7 @@ func TestRotate_PolicyNotFound(t *testing.T) {
 
 func TestListAuditLog_EmptyReturnsArray(t *testing.T) {
 	r := defaultRouter(&stubStore{listAuditResult: nil})
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/audit", nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secrets/audit", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
@@ -724,6 +977,35 @@ const testAuthzScopeID = "00000000-0000-0000-0000-0000000000f3"
 
 // testPrincipal is what the gateway ForwardAuth middleware sets in
 // X-Principal-Id after verifying the caller identity envelope.
+// testWorkload is the workload identity the broker fixtures authorize. Distinct
+// from testPrincipal, which is the human operator running administrative
+// writes — keeping them different is what lets the actor assertions below
+// prove something.
+const testWorkload = "svc-a"
+
+// grantingStore is the stub shape shared by TestBroker_Granted: one ACTIVE
+// policy version for kv/db that allows testWorkload, and a lease to hand back.
+func grantingStore() *stubStore {
+	return &stubStore{
+		applicableByPath: &domain.ApplicableSecretPolicyVersion{
+			SecretPolicyVersion: domain.SecretPolicyVersion{
+				SecretPolicyVersionID:   "22222222-0000-4000-8000-000000000001",
+				AllowedWorkloadIDs:      json.RawMessage(`["` + testWorkload + `"]`),
+				MaxLeaseDurationSeconds: 300,
+			},
+			SecretClass: "DATABASE_CREDENTIAL",
+			SecretPath:  "kv/db",
+		},
+		lease: &domain.SecretLease{
+			LeaseID:                "33333333-0000-4000-8000-000000000001",
+			SecretPath:             "kv/db",
+			RequestedByPrincipalID: testWorkload,
+			ExpiresAt:              time.Now().Add(5 * time.Minute),
+		},
+		leaseCreated: true,
+	}
+}
+
 const testPrincipal = "principal-test-admin"
 
 // testTenant is the caller's verified tenant scope. A UUID because every
@@ -762,6 +1044,18 @@ func authed(req *http.Request) *http.Request {
 	return req
 }
 
+// asWorkload re-stamps the gateway-verified principal as the workload that is
+// being brokered. Broker requests used to be decided purely by the name in the
+// JSON body, so fixtures could authenticate as testPrincipal and broker as
+// testWorkload in the body — the exact defect the identity gate closes. A
+// broker request must now present the workload it claims as its own verified
+// identity, because the allowlist and the audit trail are keyed to the
+// envelope actor, not to a body-supplied name.
+func asWorkload(req *http.Request, workload string) *http.Request {
+	req.Header.Set("X-Principal-Id", workload)
+	return req
+}
+
 // scoped stamps only the tenant scope, for reads that need no principal.
 func scoped(req *http.Request) *http.Request {
 	req.Header.Set("X-Tenant-Id", testTenant)
@@ -781,17 +1075,17 @@ var gatedRoutes = []struct {
 	body string
 }{
 	{name: "create secret policy", path: "/v1/secret-policies", body: `{}`},
-	{name: "create version", path: "/v1/secret-policies/sp-1/versions", body: `{}`},
-	{name: "activate version", path: "/v1/secret-policies/sp-1/versions/v-1/activate", body: `{}`},
-	{name: "put material", path: "/v1/secret-policies/sp-1/material", body: `{}`},
-	{name: "rotate", path: "/v1/secret-policies/sp-1/rotate", body: `{}`},
-	{name: "revoke lease", path: "/v1/secrets/leases/l-1/revoke", body: `{}`},
+	{name: "create version", path: "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions", body: `{}`},
+	{name: "activate version", path: "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions/22222222-0000-4000-8000-000000000002/activate", body: `{}`},
+	{name: "put material", path: "/v1/secret-policies/11111111-0000-4000-8000-000000000001/material", body: `{}`},
+	{name: "rotate", path: "/v1/secret-policies/11111111-0000-4000-8000-000000000001/rotate", body: `{}`},
+	{name: "revoke lease", path: "/v1/secrets/leases/33333333-0000-4000-8000-000000000002/revoke", body: `{}`},
 }
 
 func gatedRouter(az *stubAuthz) http.Handler {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	handler.RegisterRoutes(r, handler.New(&stubStore{}, &stubVault{}, &stubPublisher{}, az, testAuthzScopeID, zap.NewNop()))
+	handler.RegisterRoutes(r, handler.New(&stubStore{}, &stubVault{}, &stubPublisher{}, az, testAuthzScopeID, 0, zap.NewNop()))
 	return r
 }
 
@@ -894,7 +1188,7 @@ func TestListAuditLog_NoTenantScope_Refused(t *testing.T) {
 func TestListAuditLog_ScopedToVerifiedTenant(t *testing.T) {
 	s := &stubStore{}
 	r := defaultRouter(s)
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/audit", nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secrets/audit", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -910,7 +1204,7 @@ func TestListAuditLog_ScopedToVerifiedTenant(t *testing.T) {
 func TestListLeases_ScopedToVerifiedTenant(t *testing.T) {
 	s := &stubStore{}
 	r := defaultRouter(s)
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases", nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -923,7 +1217,7 @@ func TestListLeases_ScopedToVerifiedTenant(t *testing.T) {
 
 func TestListLeases_ForeignTenantQueryParam_Refused(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases?tenant_id="+otherTenant, nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases?tenant_id="+otherTenant, nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
@@ -935,9 +1229,9 @@ func TestListLeases_ForeignTenantQueryParam_Refused(t *testing.T) {
 // tenant — answered as not-found now, so the route is not an existence oracle.
 func TestGetLease_AnotherTenantsLease_NotFound(t *testing.T) {
 	other := otherTenant
-	s := &stubStore{findLeaseResult: &domain.SecretLease{LeaseID: "lease-1", TenantID: &other}}
+	s := &stubStore{findLeaseResult: &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", TenantID: &other}}
 	r := defaultRouter(s)
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/lease-1", nil))
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -950,12 +1244,12 @@ func TestGetLease_AnotherTenantsLease_NotFound(t *testing.T) {
 func TestRevokeLease_AnotherTenantsLease_NotFoundAndNotRevoked(t *testing.T) {
 	other := otherTenant
 	s := &stubStore{
-		findLeaseResult:         &domain.SecretLease{LeaseID: "lease-1", TenantID: &other, Status: "GRANTED"},
-		revokeLeaseResult:       &domain.SecretLease{LeaseID: "lease-1", Status: "REVOKED"},
+		findLeaseResult:         &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", TenantID: &other, Status: "GRANTED"},
+		revokeLeaseResult:       &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED"},
 		revokeLeaseTransitioned: true,
 	}
 	r := defaultRouter(s)
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/lease-1/revoke", nil))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/revoke", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -985,7 +1279,7 @@ func TestBroker_ForeignTenantBody_Refused(t *testing.T) {
 
 func TestListApplicableSecretPolicyVersions_ForeignTenantQueryParam_Refused(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := scoped(httptest.NewRequest(http.MethodGet,
+	req := authed(httptest.NewRequest(http.MethodGet,
 		"/v1/secret-policies?secret_class=DATABASE_CREDENTIAL&tenant_id="+otherTenant, nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -998,10 +1292,271 @@ func TestCreateSecretPolicyVersion_ForeignTenantBody_Refused(t *testing.T) {
 	s := &stubStore{}
 	r := defaultRouter(s)
 	body := `{"allowed_workload_ids":["wl-1"],"max_lease_duration_seconds":900,"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"` + testPrincipal + `","tenant_id":"` + otherTenant + `"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions", bytes.NewBufferString(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/versions", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 publishing a version into another tenant, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// -- VerifyLease ----------------------------------------------------------------
+
+// The redemption surface the audit said was missing. A revoked lease still held
+// a signed token, so the token alone is not the answer - the register is the
+// second gate.
+func TestVerifyLease_RevokedLease_AnswersInvalid(t *testing.T) {
+	leased := testTenant
+	s := &stubStore{findLeaseResult: &domain.SecretLease{
+		LeaseID: "33333333-0000-4000-8000-000000000001", SecretPath: "kv/db", TenantID: &leased, Status: "REVOKED",
+	}}
+	v := &stubVault{verifyPath: "kv/db", verifyExpiry: time.Now().Add(time.Hour)}
+	r := newTestRouter(s, v, &stubPublisher{})
+
+	body := `{"lease_token":"ltk:v2:whatever"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/verify", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 carrying a negative verdict, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Valid  bool   `json:"valid"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Valid {
+		t.Fatal("revoked lease must answer valid=false")
+	}
+	if resp.Reason != "lease_revoked" {
+		t.Fatalf("reason = %q, want lease_revoked", resp.Reason)
+	}
+}
+
+// Expired tokens are rejected by the backend with zero DB reads.
+func TestVerifyLease_ExpiredToken_AnswersInvalid(t *testing.T) {
+	s := &stubStore{}
+	v := &stubVault{verifyErr: vault.ErrLeaseTokenExpired}
+	r := newTestRouter(s, v, &stubPublisher{})
+
+	body := `{"lease_token":"ltk:v2:expired"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/verify", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid=false for an expired token, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Valid  bool   `json:"valid"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Valid || resp.Reason != "token_expired" {
+		t.Fatalf("got valid=%v reason=%q, want valid=false reason=token_expired", resp.Valid, resp.Reason)
+	}
+}
+
+// A malformed token must not be reported as "still good".
+func TestVerifyLease_MalformedToken_Rejected(t *testing.T) {
+	s := &stubStore{}
+	v := &stubVault{verifyErr: vault.ErrLeaseTokenInvalid}
+	r := newTestRouter(s, v, &stubPublisher{})
+
+	body := `{"lease_token":"not-a-token"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/verify", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// The token names the lease it was minted for. A revoked lease's token used to
+// verify as valid when presented with any other live lease on the same path,
+// because only the path was compared.
+func TestVerifyLease_RevokedLeasesTokenAgainstAnotherLiveLease_Refused(t *testing.T) {
+	leased := testTenant
+	live := &domain.SecretLease{
+		LeaseID: "33333333-0000-4000-8000-000000000002", RequestID: "req-live",
+		SecretPath: "kv/db", TenantID: &leased, Status: "GRANTED",
+	}
+	s := &stubStore{findLeaseResult: live}
+	// The presented token was minted for the REVOKED lease req-revoked.
+	v := &stubVault{verifyPath: "kv/db", verifyRequestID: "req-revoked", verifyExpiry: time.Now().Add(time.Hour)}
+	r := newTestRouter(s, v, &stubPublisher{})
+
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000002/verify", bytes.NewBufferString(`{"lease_token":"ltk:v3:revoked"}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "lease_token_mismatch") {
+		t.Fatalf("a token for another lease must be 400 lease_token_mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A replayed broker call returns the original lease; its token must be bound
+// to that lease's expiry, not to the replay's later one.
+func TestBroker_Replay_TokenBoundToOriginalLeaseExpiry(t *testing.T) {
+	original := time.Now().Add(2 * time.Minute).UTC().Truncate(time.Second)
+	s := &stubStore{
+		applicableByPath: &domain.ApplicableSecretPolicyVersion{
+			SecretPolicyVersion: domain.SecretPolicyVersion{
+				SecretPolicyVersionID:   "22222222-0000-4000-8000-000000000001",
+				AllowedWorkloadIDs:      json.RawMessage(`["svc-a"]`),
+				MaxLeaseDurationSeconds: 300,
+			},
+			SecretClass: "DATABASE_CREDENTIAL",
+			SecretPath:  "kv/db",
+		},
+		lease: &domain.SecretLease{
+			LeaseID: "33333333-0000-4000-8000-000000000001", RequestID: "req-1", SecretPath: "kv/db", ExpiresAt: original,
+		},
+		leaseCreated: false, // replay
+	}
+	v := &stubVault{getToken: "ltk:v3:stub"}
+	r := newTestRouter(s, v, &stubPublisher{})
+
+	req := asWorkload(authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", testWorkload, "req-1")))), testWorkload)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	last := len(v.getExpiries) - 1
+	if last < 0 || !v.getExpiries[last].Equal(original) {
+		t.Fatalf("replayed token must be minted for the original expiry %v, got %v", original, v.getExpiries)
+	}
+	for _, id := range v.getRequestIDs {
+		if id != "req-1" {
+			t.Fatalf("every token must be bound to the lease's request_id, got %v", v.getRequestIDs)
+		}
+	}
+}
+
+// -- shared-secret exception register -----------------------------------------
+
+func TestCreateSharedSecretException_Created(t *testing.T) {
+	s := &stubStore{
+		exceptionResult:  &domain.SharedSecretException{ExceptionID: "44444444-0000-4000-8000-000000000001", SecretPath: "kv/db", Status: "ACTIVE"},
+		exceptionCreated: true,
+	}
+	r := defaultRouter(s)
+	body := `{"secret_path":"kv/db","reason":"incident INC-42 manual remediation","evidence_reference":"ticket/INC-42","expires_at":"2027-01-01T00:00:00Z"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/shared-secret-exceptions", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateSharedSecretException_MissingEvidence_Rejected(t *testing.T) {
+	r := defaultRouter(&stubStore{})
+	body := `{"secret_path":"kv/db","reason":"no evidence","expires_at":"2027-01-01T00:00:00Z"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/shared-secret-exceptions", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no evidence reference, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateSharedSecretException_PastExpiry_Rejected(t *testing.T) {
+	r := defaultRouter(&stubStore{})
+	body := `{"secret_path":"kv/db","reason":"already over","evidence_reference":"ticket/INC-1","expires_at":"2020-01-01T00:00:00Z"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/shared-secret-exceptions", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a past expiry, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListSharedSecretExceptions(t *testing.T) {
+	s := &stubStore{}
+	r := defaultRouter(s)
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/shared-secret-exceptions?status=ACTIVE&secret_path=kv/db", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.exceptionFilter.Status != "ACTIVE" || s.exceptionFilter.SecretPath != "kv/db" {
+		t.Fatalf("filters not threaded through: %+v", s.exceptionFilter)
+	}
+}
+
+func TestRevokeSharedSecretException(t *testing.T) {
+	s := &stubStore{
+		revokeExceptionResult:       &domain.SharedSecretException{ExceptionID: "44444444-0000-4000-8000-000000000001", SecretPath: "kv/db", Status: "REVOKED"},
+		revokeExceptionTransitioned: true,
+	}
+	r := defaultRouter(s)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/shared-secret-exceptions/44444444-0000-4000-8000-000000000001/revoke", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// -- emergency material retrieval ---------------------------------------------
+
+// Break-glass only fires when an ACTIVE exception documents the override;
+// without one the material stays behind the vault.
+func TestEmergencyRetrieval_RequiresActiveException(t *testing.T) {
+	s := &stubStore{
+		findPolicyResult: &domain.SecretPolicy{SecretPolicyID: "11111111-0000-4000-8000-000000000002", SecretPath: "kv/db", SecretClass: "DATABASE_CREDENTIAL"},
+		// No ACTIVE exception registered.
+	}
+	v := &stubVault{getMaterial: []byte("top-secret")}
+	r := newTestRouter(s, v, &stubPublisher{})
+	body := `{"request_id":"er-1","reason":"incident recovery"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000002/emergency-retrieval", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 with no active exception, got %d: %s", w.Code, w.Body.String())
+	}
+	if v.getMaterialCalls != 0 {
+		t.Fatal("the vault must never be consulted without an active exception")
+	}
+}
+
+func TestEmergencyRetrieval_SucceedsWithActiveException(t *testing.T) {
+	s := &stubStore{
+		findPolicyResult: &domain.SecretPolicy{SecretPolicyID: "11111111-0000-4000-8000-000000000002", SecretPath: "kv/db", SecretClass: "DATABASE_CREDENTIAL"},
+		listExceptionsResult: []*domain.SharedSecretException{
+			{ExceptionID: "44444444-0000-4000-8000-000000000001", SecretPath: "kv/db", Status: "ACTIVE", ExpiresAt: time.Now().Add(24 * time.Hour)},
+		},
+	}
+	v := &stubVault{getMaterial: []byte("material-bytes")}
+	r := newTestRouter(s, v, &stubPublisher{})
+	body := `{"request_id":"er-1","reason":"incident recovery"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000002/emergency-retrieval", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["material_base64"] != base64.StdEncoding.EncodeToString([]byte("material-bytes")) {
+		t.Fatalf("material_base64 = %q, want encoded material-bytes", resp["material_base64"])
+	}
+	// An EMERGENCY_RETRIEVAL audit record exists.
+	var found bool
+	for _, e := range s.auditEntries {
+		if e.EventType == "EMERGENCY_RETRIEVAL" && e.SecretPath == "kv/db" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an EMERGENCY_RETRIEVAL audit entry, got %+v", s.auditEntries)
 	}
 }

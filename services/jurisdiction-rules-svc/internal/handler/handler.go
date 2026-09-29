@@ -16,6 +16,7 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
+	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -106,13 +107,10 @@ var endDatingStatuses = map[string]bool{
 
 // createableRuleStatuses are the statuses a rule may be created in.
 //
-// rule_status used to be taken verbatim from the request body, so a caller
-// could POST a rule straight into ACTIVE — or into "BANANAS" — and skip the
-// DRAFT→ACTIVE state machine entirely. Creation is limited to the two states
-// that are not the *result* of a transition.
+// Only DRAFT is allowed at creation. ACTIVE is reached through the
+// transition endpoint, which requires an approval reference.
 var createableRuleStatuses = map[string]bool{
-	"DRAFT":  true,
-	"ACTIVE": true,
+	"DRAFT": true,
 }
 
 // driftStates is the legal_drift_state value space (OQ-4). Same reasoning as
@@ -768,6 +766,18 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Maker-checker: transitioning to ACTIVE requires an approval reference.
+	// The envelope's X-Approval-Reference header carries the independent approval
+	// evidence (ZS-JUR-001 §3, V-001 §18.1).
+	if req.NewStatus == "ACTIVE" {
+		approvalRef := strings.TrimSpace(r.Header.Get("X-Approval-Reference"))
+		if approvalRef == "" {
+			writeError(w, http.StatusBadRequest, "missing_approval_reference",
+				"transition to ACTIVE requires X-Approval-Reference header with approval evidence")
+			return
+		}
+	}
+
 	rule, transitioned, err := h.store.TransitionRuleStatus(r.Context(), store.TransitionParams{
 		RuleID:        ruleID,
 		NewStatus:     req.NewStatus,
@@ -879,29 +889,28 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
 // requirePrincipal resolves the acting principal from the gateway-verified
-// identity headers, writing 401 and returning false when there is none.
+// identity header, writing 401 and returning false when there is none.
 //
-// This used to fall back to the literal string "system" when no header was
-// present, so every unattributed mutation was written into the audit columns
-// as if the platform itself had made it. It also read X-Actor-Principal-ID,
-// a header nothing sets — the gateway's ForwardAuth middleware publishes
-// X-Principal-Id (see the authResponseHeaders label in docker-compose.yml),
-// so in practice the audit trail recorded "system" for every write.
+// The gateway's ForwardAuth middleware publishes X-Principal-Id (see the
+// authResponseHeaders label in docker-compose.yml). X-Workload-Id is accepted
+// as an alternative for workload identities per the envelope policy.
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
-	for _, header := range []string{"X-Principal-Id", "X-Actor-Principal-ID"} {
-		if id := strings.TrimSpace(r.Header.Get(header)); id != "" {
-			return id, true
-		}
+	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
+		return id, true
+	}
+	if id := strings.TrimSpace(r.Header.Get("X-Workload-Id")); id != "" {
+		return id, true
 	}
 	writeError(w, http.StatusUnauthorized, "missing_principal",
-		"X-Principal-Id is required — this header is set by the gateway from a verified identity envelope")
+		"X-Principal-Id or X-Workload-Id is required — this header is set by the gateway from a verified identity envelope")
 	return "", false
 }
 
 // checkAuthz asks the AuthorizationClient for a decision. Doctrine: no domain
 // service self-authorizes a material action.
 func (h *Handler) checkAuthz(r *http.Request, principalID, resource, action string) error {
-	return h.authz.Authorize(r.Context(), principalID, h.authzScopeID, resource, action)
+	env := svcenvelope.MustFromContext(r.Context())
+	return h.authz.Authorize(r.Context(), principalID, h.authzScopeID, resource, action, &env)
 }
 
 // writeAuthzError maps an AuthorizationClient error to an HTTP response.
