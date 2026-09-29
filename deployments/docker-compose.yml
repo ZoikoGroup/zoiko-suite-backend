@@ -3786,6 +3786,7 @@ services:
       PURPOSE_REGISTRY_URL: "http://privacy-purpose-registry-svc:8151"
       CONSENT_REGISTRY_URL: "http://privacy-consent-svc:8152"
       RETENTION_REGISTRY_URL: "http://retention-registry-svc:8148"
+      TRANSFER_SERVICE_URL: "http://privacy-transfer-svc:8155"
     depends_on:
       postgres:
         condition: service_healthy
@@ -3796,6 +3797,8 @@ services:
       privacy-consent-svc:
         condition: service_healthy
       retention-registry-svc:
+        condition: service_healthy
+      privacy-transfer-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

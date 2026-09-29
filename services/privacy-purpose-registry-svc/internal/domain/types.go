@@ -153,34 +153,70 @@ type ProcessingActivity struct {
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }
 
+// NoticeConsentDependency (§8.2 Gate 7: REQUIRED | NOT_REQUIRED | CONDITIONAL).
+type NoticeConsentDependency string
+
+const (
+	NoticeConsentRequired    NoticeConsentDependency = "REQUIRED"
+	NoticeConsentNotRequired NoticeConsentDependency = "NOT_REQUIRED"
+	NoticeConsentConditional NoticeConsentDependency = "CONDITIONAL"
+)
+
+func (d NoticeConsentDependency) Valid() bool {
+	switch d {
+	case NoticeConsentRequired, NoticeConsentNotRequired, NoticeConsentConditional:
+		return true
+	}
+	return false
+}
+
+// DPIATIAStatus (§8.2 Gate 8: RESOLVED | REVIEW_REQUIRED | NOT_REQUIRED).
+type DPIATIAStatus string
+
+const (
+	DPIATIAResolved       DPIATIAStatus = "RESOLVED"
+	DPIATIAReviewRequired DPIATIAStatus = "REVIEW_REQUIRED"
+	DPIATIANotRequired    DPIATIAStatus = "NOT_REQUIRED"
+)
+
+func (s DPIATIAStatus) Valid() bool {
+	switch s {
+	case DPIATIAResolved, DPIATIAReviewRequired, DPIATIANotRequired:
+		return true
+	}
+	return false
+}
+
 // ProcessingActivityVersion is the canonical data model's
 // ProcessingActivityVersion (§7): the full record of what is processed,
 // why, under what role, for whom, and where. Content fields are
 // structurally immutable once the version leaves DRAFT (migration
-// 000002's trigger) — only VersionStatus (and the fields ValidationFindings/
+// 000002 & 000004 triggers) — only VersionStatus (and the fields ValidationFindings/
 // EffectiveFrom/lifecycle timestamps that the lifecycle actions
 // themselves set) may change after that point. Amending content means
 // creating a new version.
 type ProcessingActivityVersion struct {
-	ActivityVersionID    string                `json:"activity_version_id"`
-	ActivityID           string                `json:"activity_id"`
-	PrivacyRole          PrivacyRole           `json:"privacy_role"`
-	Owner                string                `json:"owner"`
-	PurposeIDs           []string              `json:"purpose_ids"`
-	SubjectClasses       []string              `json:"subject_classes"`
-	DataCategories       []string              `json:"data_categories"`
-	Sources              []string              `json:"sources"`
-	Recipients           []string              `json:"recipients"`
-	Jurisdictions        []string              `json:"jurisdictions"`
-	RetentionRuleRefs    []string              `json:"retention_rule_refs"`
-	TransferRefs         []string              `json:"transfer_refs"`
-	VersionStatus        ActivityVersionStatus `json:"version_status"`
-	ValidationFindings   []ValidationFinding   `json:"validation_findings,omitempty"`
-	RejectionReason      *string               `json:"rejection_reason,omitempty"`
-	EffectiveFrom        *time.Time            `json:"effective_from,omitempty"`
-	SupersedesVersionID  *string               `json:"supersedes_version_id,omitempty"`
-	CreatedAt            time.Time             `json:"created_at"`
-	CreatedByPrincipalID string                `json:"created_by_principal_id"`
+	ActivityVersionID       string                  `json:"activity_version_id"`
+	ActivityID              string                  `json:"activity_id"`
+	PrivacyRole             PrivacyRole             `json:"privacy_role"`
+	Owner                   string                  `json:"owner"`
+	PurposeIDs              []string                `json:"purpose_ids"`
+	SubjectClasses          []string                `json:"subject_classes"`
+	DataCategories          []string                `json:"data_categories"`
+	Sources                 []string                `json:"sources"`
+	Recipients              []string                `json:"recipients"`
+	Jurisdictions           []string                `json:"jurisdictions"`
+	RetentionRuleRefs       []string                `json:"retention_rule_refs"`
+	TransferRefs            []string                `json:"transfer_refs"`
+	NoticeConsentDependency NoticeConsentDependency `json:"notice_consent_dependency,omitempty"`
+	DPIATIAStatus           DPIATIAStatus           `json:"dpia_tia_status,omitempty"`
+	VersionStatus           ActivityVersionStatus   `json:"version_status"`
+	ValidationFindings      []ValidationFinding     `json:"validation_findings,omitempty"`
+	RejectionReason         *string                 `json:"rejection_reason,omitempty"`
+	EffectiveFrom           *time.Time              `json:"effective_from,omitempty"`
+	SupersedesVersionID     *string                 `json:"supersedes_version_id,omitempty"`
+	CreatedAt               time.Time               `json:"created_at"`
+	CreatedByPrincipalID    string                  `json:"created_by_principal_id"`
 }
 
 // ValidationFinding is one structural problem Validate found — never a
@@ -189,6 +225,18 @@ type ValidationFinding struct {
 	Code    string `json:"code"` // stable code from §32's contract, e.g. PRV-001
 	Field   string `json:"field"`
 	Message string `json:"message"`
+}
+
+// IdempotencyRecord models an idempotency claim for material write operations (§18.1).
+type IdempotencyRecord struct {
+	IdempotencyKey string    `json:"idempotency_key"`
+	TenantID       *string   `json:"tenant_id,omitempty"`
+	PrincipalID    string    `json:"principal_id"`
+	Operation      string    `json:"operation"`
+	RequestHash    string    `json:"request_hash"`
+	ResponseStatus int       `json:"response_status"`
+	ResponseBody   []byte    `json:"response_body"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
@@ -210,31 +258,35 @@ type CreatePurposeVersionRequest struct {
 }
 
 type CreateActivityRequest struct {
-	TenantID          string   `json:"tenant_id,omitempty"`
-	PrivacyRole       string   `json:"privacy_role"`
-	Owner             string   `json:"owner"`
-	PurposeIDs        []string `json:"purpose_ids"`
-	SubjectClasses    []string `json:"subject_classes"`
-	DataCategories    []string `json:"data_categories"`
-	Sources           []string `json:"sources"`
-	Recipients        []string `json:"recipients"`
-	Jurisdictions     []string `json:"jurisdictions"`
-	RetentionRuleRefs []string `json:"retention_rule_refs"`
-	TransferRefs      []string `json:"transfer_refs"`
+	TenantID                string   `json:"tenant_id,omitempty"`
+	PrivacyRole             string   `json:"privacy_role"`
+	Owner                   string   `json:"owner"`
+	PurposeIDs              []string `json:"purpose_ids"`
+	SubjectClasses          []string `json:"subject_classes"`
+	DataCategories          []string `json:"data_categories"`
+	Sources                 []string `json:"sources"`
+	Recipients              []string `json:"recipients"`
+	Jurisdictions           []string `json:"jurisdictions"`
+	RetentionRuleRefs       []string `json:"retention_rule_refs"`
+	TransferRefs            []string `json:"transfer_refs"`
+	NoticeConsentDependency string   `json:"notice_consent_dependency,omitempty"`
+	DPIATIAStatus           string   `json:"dpia_tia_status,omitempty"`
 }
 
 type CreateActivityVersionRequest struct {
-	ParentVersionID   string   `json:"parent_version_id"`
-	PrivacyRole       string   `json:"privacy_role"`
-	Owner             string   `json:"owner"`
-	PurposeIDs        []string `json:"purpose_ids"`
-	SubjectClasses    []string `json:"subject_classes"`
-	DataCategories    []string `json:"data_categories"`
-	Sources           []string `json:"sources"`
-	Recipients        []string `json:"recipients"`
-	Jurisdictions     []string `json:"jurisdictions"`
-	RetentionRuleRefs []string `json:"retention_rule_refs"`
-	TransferRefs      []string `json:"transfer_refs"`
+	ParentVersionID         string   `json:"parent_version_id"`
+	PrivacyRole             string   `json:"privacy_role"`
+	Owner                   string   `json:"owner"`
+	PurposeIDs              []string `json:"purpose_ids"`
+	SubjectClasses          []string `json:"subject_classes"`
+	DataCategories          []string `json:"data_categories"`
+	Sources                 []string `json:"sources"`
+	Recipients              []string `json:"recipients"`
+	Jurisdictions           []string `json:"jurisdictions"`
+	RetentionRuleRefs       []string `json:"retention_rule_refs"`
+	TransferRefs            []string `json:"transfer_refs"`
+	NoticeConsentDependency string   `json:"notice_consent_dependency,omitempty"`
+	DPIATIAStatus           string   `json:"dpia_tia_status,omitempty"`
 }
 
 type RejectActivityRequest struct {
@@ -259,4 +311,6 @@ var (
 	ErrActivityVersionNotFound = errorString("processing activity version not found")
 	ErrInvalidTransition       = errorString("invalid activity version status transition")
 	ErrStoreUnavailable        = errorString("privacy-purpose-registry store unavailable")
+	ErrSelfApprovalForbidden  = errorString("maker-checker segregation of duties violation: creator cannot approve or publish own object")
+	ErrIdempotencyKeyReused    = errorString("idempotency key reused with different request payload")
 )

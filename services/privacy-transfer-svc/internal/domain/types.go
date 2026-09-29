@@ -147,15 +147,18 @@ func (o AssessmentOutcome) Valid() bool {
 // for a relationship is the latest by created_at, same derived-read
 // pattern as PRV-02's ResolveConsentStatus.
 type TransferAssessment struct {
-	AssessmentID        string            `json:"assessment_id"`
-	TenantID            *string           `json:"tenant_id,omitempty"`
-	RelationshipID      string            `json:"relationship_id"`
-	Outcome             AssessmentOutcome `json:"outcome"`
-	ReviewerPrincipalID string            `json:"reviewer_principal_id"`
-	ResidualRisk        string            `json:"residual_risk,omitempty"`
-	EvidenceRef         string            `json:"evidence_ref,omitempty"`
-	ReviewTriggerAt     *time.Time        `json:"review_trigger_at,omitempty"` // §17.1: expiry/review date
-	CreatedAt           time.Time         `json:"created_at"`
+	AssessmentID            string            `json:"assessment_id"`
+	TenantID                *string           `json:"tenant_id,omitempty"`
+	RelationshipID          string            `json:"relationship_id"`
+	Outcome                 AssessmentOutcome `json:"outcome"`
+	ReviewerPrincipalID     string            `json:"reviewer_principal_id"`
+	ResidualRisk            string            `json:"residual_risk,omitempty"`
+	EvidenceRef             string            `json:"evidence_ref,omitempty"`
+	GovernmentAccessRisk    string            `json:"government_access_risk,omitempty"`
+	TechnicalMeasures       string            `json:"technical_measures,omitempty"`
+	OrganizationalMeasures  string            `json:"organizational_measures,omitempty"`
+	ReviewTriggerAt         *time.Time        `json:"review_trigger_at,omitempty"` // §17.1: expiry/review date
+	CreatedAt               time.Time         `json:"created_at"`
 }
 
 func (a *TransferAssessment) ExpiredAsOf(t time.Time) bool {
@@ -175,29 +178,47 @@ const (
 	ResultReviewRequired AuthorizationResult = "REVIEW_REQUIRED"
 )
 
-// Reason codes — data only, named so a caller acting on BLOCKED/
-// REVIEW_REQUIRED can tell which real check failed.
+// Reason codes — aligned with §32 stable error/reason codes (PRV-015..PRV-020).
 const (
-	ReasonRelationshipNotActive = "PROCESSOR_RELATIONSHIP_NOT_ACTIVE"
-	ReasonMechanismNotFound     = "TRANSFER_MECHANISM_NOT_FOUND"
-	ReasonMechanismExpired      = "TRANSFER_MECHANISM_INVALID_OR_EXPIRED"
-	ReasonAssessmentMissing     = "ASSESSMENT_REQUIRED_NOT_FOUND"
-	ReasonAssessmentRejected    = "ASSESSMENT_REJECTED"
-	ReasonAssessmentRemediate   = "ASSESSMENT_REQUIRES_REMEDIATION"
-	ReasonAssessmentExpired     = "ASSESSMENT_EXPIRED"
-	ReasonDependencyUnavailable = "DEPENDENCY_UNAVAILABLE"
+	ReasonRelationshipNotActive     = "PRV-015: PROCESSOR_RELATIONSHIP_NOT_ACTIVE"
+	ReasonMechanismNotFound         = "PRV-015: TRANSFER_MECHANISM_NOT_FOUND"
+	ReasonMechanismExpired          = "PRV-015: TRANSFER_MECHANISM_INVALID_OR_EXPIRED"
+	ReasonAssessmentMissing         = "PRV-016: ASSESSMENT_REQUIRED_NOT_FOUND"
+	ReasonAssessmentRejected        = "PRV-015: ASSESSMENT_REJECTED"
+	ReasonAssessmentRemediate       = "PRV-016: ASSESSMENT_REQUIRES_REMEDIATION"
+	ReasonAssessmentExpired         = "PRV-016: ASSESSMENT_EXPIRED"
+	ReasonDependencyUnavailable     = "PRV-019: PRIVACY_CONTEXT_INDETERMINATE"
+	ReasonInstructionMissing        = "PRV-017: PROCESSOR_INSTRUCTION_MISSING"
+	ReasonSubprocessorNotApproved   = "PRV-018: SUBPROCESSOR_NOT_APPROVED"
+	ReasonImmutableEvidenceConflict = "PRV-020: IMMUTABLE_EVIDENCE_CONFLICT"
+	ReasonReassessmentTriggerActive = "PRV-016: REASSESSMENT_TRIGGER_ACTIVE"
+)
+
+// Mandatory reassessment triggers (§17.1 — 8 documented triggers).
+const (
+	TriggerNewPurposeOrSensitiveCategory = "NEW_PURPOSE_OR_SENSITIVE_CATEGORY"
+	TriggerAutomatedDecisioning          = "NEW_AUTOMATED_DECISIONING"
+	TriggerNewProcessorOrJurisdiction    = "NEW_PROCESSOR_OR_DESTINATION_JURISDICTION"
+	TriggerChangedTransferMechanism      = "CHANGED_TRANSFER_MECHANISM_OR_INSTRUCTION"
+	TriggerMaterialArchitectureChange    = "MATERIAL_ARCHITECTURE_CHANGE"
+	TriggerNewMinorsContext              = "NEW_MINORS_CONTEXT"
+	TriggerSecurityPrivacyIncident       = "SECURITY_PRIVACY_INCIDENT"
+	TriggerExpiryReviewDateReached       = "EXPIRY_OR_REVIEW_DATE_REACHED"
 )
 
 // TransferDecision is the append-only evidence record for one evaluation
-// — same "decision durability" doctrine as PRV-03's PrivacyDecision.
+// — satisfies §18 critical response fields: authorization_id, result, conditions, mechanism/assessment refs, expiry.
 type TransferDecision struct {
 	DecisionID              string              `json:"decision_id"`
+	AuthorizationID         string              `json:"authorization_id,omitempty"` // §18 critical field alias
 	TenantID                *string             `json:"tenant_id,omitempty"`
 	RelationshipID          string              `json:"relationship_id"`
 	TransferMechanismID     string              `json:"transfer_mechanism_id"`
 	DestinationJurisdiction string              `json:"destination_jurisdiction,omitempty"`
 	AssessmentID            *string             `json:"assessment_id,omitempty"`
 	Result                  AuthorizationResult `json:"result"`
+	Conditions              string              `json:"conditions,omitempty"` // §16.1 & §18 conditions
+	ExpiresAt               *time.Time          `json:"expires_at,omitempty"` // §18 expiry timestamp
 	ReasonCodes             []string            `json:"reason_codes"`
 	ActorPrincipalID        string              `json:"actor_principal_id"`
 	CorrelationID           string              `json:"correlation_id,omitempty"`
@@ -248,19 +269,62 @@ type CreateTransferMechanismRequest struct {
 }
 
 type RecordTransferAssessmentRequest struct {
-	RelationshipID  string            `json:"relationship_id"`
-	Outcome         AssessmentOutcome `json:"outcome"`
-	ResidualRisk    string            `json:"residual_risk,omitempty"`
-	EvidenceRef     string            `json:"evidence_ref,omitempty"`
-	ReviewTriggerAt *time.Time        `json:"review_trigger_at,omitempty"`
+	RelationshipID         string            `json:"relationship_id"`
+	Outcome                AssessmentOutcome `json:"outcome"`
+	ResidualRisk           string            `json:"residual_risk,omitempty"`
+	EvidenceRef            string            `json:"evidence_ref,omitempty"`
+	GovernmentAccessRisk   string            `json:"government_access_risk,omitempty"`
+	TechnicalMeasures      string            `json:"technical_measures,omitempty"`
+	OrganizationalMeasures string            `json:"organizational_measures,omitempty"`
+	ReviewTriggerAt        *time.Time        `json:"review_trigger_at,omitempty"`
 }
 
 type EvaluateTransferRequest struct {
-	TenantID                string `json:"tenant_id,omitempty"`
-	RelationshipID          string `json:"relationship_id"`
-	TransferMechanismID     string `json:"transfer_mechanism_id"`
-	DestinationJurisdiction string `json:"destination_jurisdiction,omitempty"`
-	AssessmentRequired      bool   `json:"assessment_required"`
+	TenantID                string   `json:"tenant_id,omitempty"`
+	RelationshipID          string   `json:"relationship_id"`
+	TransferMechanismID     string   `json:"transfer_mechanism_id"`
+	DestinationJurisdiction string   `json:"destination_jurisdiction,omitempty"`
+	AssessmentRequired      bool     `json:"assessment_required"`
+	Conditions              string   `json:"conditions,omitempty"`
+	EnforceConditions       bool     `json:"enforce_conditions,omitempty"`
+	ReassessmentTrigger     string   `json:"reassessment_trigger,omitempty"`
+	DataCategories          []string `json:"data_categories,omitempty"`
+	SubjectClasses          []string `json:"subject_classes,omitempty"`
+}
+
+type TriggerEvaluation struct {
+	Trigger     string `json:"trigger"`
+	Triggered   bool   `json:"triggered"`
+	Description string `json:"description"`
+	ReasonCode  string `json:"reason_code"`
+}
+
+type EvaluateTriggersRequest struct {
+	RelationshipID          string   `json:"relationship_id"`
+	TransferMechanismID     string   `json:"transfer_mechanism_id,omitempty"`
+	DestinationJurisdiction string   `json:"destination_jurisdiction,omitempty"`
+	DataCategories          []string `json:"data_categories,omitempty"`
+	SubjectClasses          []string `json:"subject_classes,omitempty"`
+	DeclaredTrigger         string   `json:"declared_trigger,omitempty"`
+}
+
+type EvaluateTriggersResponse struct {
+	RelationshipID     string              `json:"relationship_id"`
+	ReassessmentNeeded bool                `json:"reassessment_needed"`
+	ActiveTriggers     []string            `json:"active_triggers"`
+	TriggerEvaluations []TriggerEvaluation `json:"trigger_evaluations"`
+}
+
+// ── Idempotency (§18.1) ──────────────────────────────────────────────────────
+
+type IdempotencyRecord struct {
+	IdempotencyKey string    `json:"idempotency_key"`
+	TenantID       string    `json:"tenant_id"`
+	Endpoint       string    `json:"endpoint"`
+	RequestHash    string    `json:"request_hash"`
+	ResponseCode   int       `json:"response_code"`
+	ResponseBody   []byte    `json:"response_body"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // ── sentinel errors ──────────────────────────────────────────────────────────
@@ -270,9 +334,11 @@ type errorString string
 func (e errorString) Error() string { return string(e) }
 
 var (
-	ErrRelationshipNotFound = errorString("processor relationship not found")
-	ErrMechanismNotFound    = errorString("transfer mechanism not found")
-	ErrDecisionNotFound     = errorString("transfer decision not found")
-	ErrPurposeNotActive     = errorString("referenced processing activity is not active")
-	ErrStoreUnavailable     = errorString("privacy-transfer store unavailable")
+	ErrRelationshipNotFound = errorString("PRV-015: processor relationship not found")
+	ErrMechanismNotFound    = errorString("PRV-015: transfer mechanism not found")
+	ErrDecisionNotFound     = errorString("PRV-015: transfer decision not found")
+	ErrPurposeNotActive     = errorString("PRV-002: referenced processing activity is not active")
+	ErrStoreUnavailable     = errorString("PRV-019: privacy-transfer store unavailable")
+	ErrIdempotencyConflict  = errorString("PRV-020: IMMUTABLE_EVIDENCE_CONFLICT: idempotency key replayed with conflicting payload")
 )
+

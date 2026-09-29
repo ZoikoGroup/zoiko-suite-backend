@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -381,3 +382,301 @@ func TestCreateRelationship_AuthorizationDenied(t *testing.T) {
 		t.Fatalf("expected 403, got %d", w.Code)
 	}
 }
+
+func doRequestWithHeaders(r http.Handler, method, path string, body interface{}, headers map[string]string) *httptest.ResponseRecorder {
+	var buf bytes.Buffer
+	if body != nil {
+		_ = json.NewEncoder(&buf).Encode(body)
+	}
+	req := httptest.NewRequest(method, path, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-01")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func TestIdempotency_ReplayAndConflict(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+
+	reqPayload := domain.CreateProcessorRelationshipRequest{
+		ControllerRef: "controller-1",
+		ProcessorRef:  "processor-1",
+		Service:       "payroll-processing",
+	}
+
+	headers := map[string]string{
+		"X-Tenant-Id":     testTenant,
+		"Idempotency-Key": "transfer-idem-001",
+	}
+
+	// 1. Initial request -> 201 Created
+	w1 := doRequestWithHeaders(r, http.MethodPost, "/privacy/processor-relationships", reqPayload, headers)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var res1 domain.ProcessorRelationship
+	if err := json.Unmarshal(w1.Body.Bytes(), &res1); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// 2. Replay with identical payload -> 201 Created with Idempotency-Replay: true
+	w2 := doRequestWithHeaders(r, http.MethodPost, "/privacy/processor-relationships", reqPayload, headers)
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on replay, got %d", w2.Code)
+	}
+	if w2.Header().Get("Idempotency-Replay") != "true" {
+		t.Fatalf("expected Idempotency-Replay: true header, got %s", w2.Header().Get("Idempotency-Replay"))
+	}
+	var res2 domain.ProcessorRelationship
+	if err := json.Unmarshal(w2.Body.Bytes(), &res2); err != nil {
+		t.Fatalf("failed to decode replay response: %v", err)
+	}
+	if res2.RelationshipID != res1.RelationshipID {
+		t.Fatalf("expected same relationship ID on replay, got %s vs %s", res2.RelationshipID, res1.RelationshipID)
+	}
+
+	// 3. Replay with conflicting payload -> 409 Conflict
+	conflictPayload := domain.CreateProcessorRelationshipRequest{
+		ControllerRef: "controller-2",
+		ProcessorRef:  "processor-2",
+		Service:       "different-service",
+	}
+	w3 := doRequestWithHeaders(r, http.MethodPost, "/privacy/processor-relationships", conflictPayload, headers)
+	if w3.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on payload mismatch, got %d: %s", w3.Code, w3.Body.String())
+	}
+}
+
+func TestEvaluateTransfer_IdempotencyAndReasonCodes(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	evalReq := domain.EvaluateTransferRequest{
+		RelationshipID:      rel.RelationshipID,
+		TransferMechanismID: mech.MechanismID,
+		AssessmentRequired:  false,
+	}
+
+	headers := map[string]string{
+		"X-Tenant-Id":     testTenant,
+		"Idempotency-Key": "transfer-eval-idem-002",
+	}
+
+	// 1. Initial evaluate call
+	w1 := doRequestWithHeaders(r, http.MethodPost, "/v1/privacy/transfer-decisions", evalReq, headers)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var d1 domain.TransferDecision
+	_ = json.Unmarshal(w1.Body.Bytes(), &d1)
+	if d1.Result != domain.ResultAuthorized {
+		t.Fatalf("expected AUTHORIZED, got %s", d1.Result)
+	}
+
+	// 2. Replay with same key
+	w2 := doRequestWithHeaders(r, http.MethodPost, "/v1/privacy/transfer-decisions", evalReq, headers)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on replay, got %d", w2.Code)
+	}
+	if w2.Header().Get("Idempotency-Replay") != "true" {
+		t.Fatalf("expected Idempotency-Replay: true header, got %s", w2.Header().Get("Idempotency-Replay"))
+	}
+}
+
+func TestTransferAssessment_MeasuresAndCanonicalV1(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+
+	req := domain.RecordTransferAssessmentRequest{
+		RelationshipID:         rel.RelationshipID,
+		Outcome:                domain.AssessmentApprove,
+		ResidualRisk:           "LOW",
+		EvidenceRef:            "s3://evidence/tia-001.pdf",
+		GovernmentAccessRisk:   "MINIMAL_SAFEGUARDS_SATISFIED",
+		TechnicalMeasures:      "AES_256_GCM_ENCRYPTION_IN_TRANSIT_AND_REST",
+		OrganizationalMeasures: "ACCESS_LOGGING_AND_QUARTERLY_AUDIT",
+	}
+
+	w := doRequest(r, http.MethodPost, "/v1/privacy/transfer-assessments", req, testTenant)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on /v1/..., got %d: %s", w.Code, w.Body.String())
+	}
+
+	var a domain.TransferAssessment
+	if err := json.Unmarshal(w.Body.Bytes(), &a); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if a.GovernmentAccessRisk != req.GovernmentAccessRisk {
+		t.Fatalf("expected GovernmentAccessRisk %s, got %s", req.GovernmentAccessRisk, a.GovernmentAccessRisk)
+	}
+	if a.TechnicalMeasures != req.TechnicalMeasures {
+		t.Fatalf("expected TechnicalMeasures %s, got %s", req.TechnicalMeasures, a.TechnicalMeasures)
+	}
+	if a.OrganizationalMeasures != req.OrganizationalMeasures {
+		t.Fatalf("expected OrganizationalMeasures %s, got %s", req.OrganizationalMeasures, a.OrganizationalMeasures)
+	}
+
+	// Verify GET latest
+	wGet := doRequest(r, http.MethodGet, "/v1/privacy/transfer-assessments?relationship_id="+rel.RelationshipID, nil, testTenant)
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on GET /v1/..., got %d", wGet.Code)
+	}
+}
+
+func TestEvaluateTransfer_ConditionalOutcomeWithMeasures(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, r)
+	mech := createValidMechanism(t, r)
+
+	// Record assessment with technical and organizational measures
+	assReq := domain.RecordTransferAssessmentRequest{
+		RelationshipID:         rel.RelationshipID,
+		Outcome:                domain.AssessmentApprove,
+		ResidualRisk:           "MEDIUM",
+		TechnicalMeasures:      "TLS_1_3_AND_CUSTOMER_HSM_ENCRYPTION",
+		OrganizationalMeasures: "QUARTERLY_ACCESS_REVIEWS",
+	}
+	wAss := doRequest(r, http.MethodPost, "/privacy/transfer-assessments", assReq, testTenant)
+	if wAss.Code != http.StatusCreated {
+		t.Fatalf("failed to record assessment: %d", wAss.Code)
+	}
+
+	evalReq := domain.EvaluateTransferRequest{
+		RelationshipID:      rel.RelationshipID,
+		TransferMechanismID: mech.MechanismID,
+		AssessmentRequired:  true,
+	}
+
+	w := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", evalReq, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var d domain.TransferDecision
+	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if d.Result != domain.ResultConditional {
+		t.Fatalf("expected CONDITIONAL outcome, got %s", d.Result)
+	}
+	if !strings.Contains(d.Conditions, "TLS_1_3_AND_CUSTOMER_HSM_ENCRYPTION") {
+		t.Fatalf("expected conditions to contain technical measure, got: %s", d.Conditions)
+	}
+	if !strings.Contains(d.Conditions, "QUARTERLY_ACCESS_REVIEWS") {
+		t.Fatalf("expected conditions to contain organizational measure, got: %s", d.Conditions)
+	}
+}
+
+func TestEvaluateTransfer_MandatoryReassessmentTriggers(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	wRel := doRequest(r, http.MethodPost, "/privacy/processor-relationships", domain.CreateProcessorRelationshipRequest{
+		ControllerRef: "controller-1", ProcessorRef: "processor-1", Service: "cloud-hosting",
+		Jurisdictions: []string{"EU-GDPR", "UK-GDPR"},
+	}, testTenant)
+	var rel domain.ProcessorRelationship
+	_ = json.Unmarshal(wRel.Body.Bytes(), &rel)
+
+	mech := createValidMechanism(t, r)
+
+	// 1. Destination jurisdiction mismatch trigger
+	evalReq := domain.EvaluateTransferRequest{
+		RelationshipID:          rel.RelationshipID,
+		TransferMechanismID:     mech.MechanismID,
+		DestinationJurisdiction: "AU-PRIVACY", // not in relationship's ["EU-GDPR", "UK-GDPR"]
+		AssessmentRequired:      false,
+	}
+	w := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", evalReq, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+	var d domain.TransferDecision
+	_ = json.Unmarshal(w.Body.Bytes(), &d)
+	if d.Result != domain.ResultReviewRequired {
+		t.Fatalf("expected REVIEW_REQUIRED on new jurisdiction trigger, got %s", d.Result)
+	}
+	foundJurisdictionTrigger := false
+	for _, code := range d.ReasonCodes {
+		if strings.Contains(code, "NEW_DESTINATION_JURISDICTION") {
+			foundJurisdictionTrigger = true
+			break
+		}
+	}
+	if !foundJurisdictionTrigger {
+		t.Fatalf("expected reason code for new destination jurisdiction, got: %v", d.ReasonCodes)
+	}
+
+	// 2. Minors context trigger
+	evalMinors := domain.EvaluateTransferRequest{
+		RelationshipID:      rel.RelationshipID,
+		TransferMechanismID: mech.MechanismID,
+		SubjectClasses:      []string{"MINORS"},
+		AssessmentRequired:  false,
+	}
+	wMinors := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", evalMinors, testTenant)
+	var dMinors domain.TransferDecision
+	_ = json.Unmarshal(wMinors.Body.Bytes(), &dMinors)
+	if dMinors.Result != domain.ResultReviewRequired {
+		t.Fatalf("expected REVIEW_REQUIRED on minors context trigger, got %s", dMinors.Result)
+	}
+
+	// 3. Security/privacy incident trigger
+	evalIncident := domain.EvaluateTransferRequest{
+		RelationshipID:      rel.RelationshipID,
+		TransferMechanismID: mech.MechanismID,
+		ReassessmentTrigger: domain.TriggerSecurityPrivacyIncident,
+		AssessmentRequired:  false,
+	}
+	wIncident := doRequest(r, http.MethodPost, "/privacy/transfer-decisions", evalIncident, testTenant)
+	var dIncident domain.TransferDecision
+	_ = json.Unmarshal(wIncident.Body.Bytes(), &dIncident)
+	if dIncident.Result != domain.ResultReviewRequired {
+		t.Fatalf("expected REVIEW_REQUIRED on incident trigger, got %s", dIncident.Result)
+	}
+}
+
+func TestEvaluateTriggersEndpoint(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	wRel := doRequest(r, http.MethodPost, "/privacy/processor-relationships", domain.CreateProcessorRelationshipRequest{
+		ControllerRef: "controller-1", ProcessorRef: "processor-1", Service: "cloud-hosting",
+		Jurisdictions: []string{"EU-GDPR", "UK-GDPR"},
+	}, testTenant)
+	var rel domain.ProcessorRelationship
+	_ = json.Unmarshal(wRel.Body.Bytes(), &rel)
+
+	mech := createValidMechanism(t, r)
+
+	req := domain.EvaluateTriggersRequest{
+		RelationshipID:          rel.RelationshipID,
+		TransferMechanismID:     mech.MechanismID,
+		DestinationJurisdiction: "JP-APPI",
+		DeclaredTrigger:         domain.TriggerMaterialArchitectureChange,
+	}
+
+	w := doRequest(r, http.MethodPost, "/v1/privacy/transfer-assessments/evaluate-triggers", req, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on evaluate-triggers, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp domain.EvaluateTriggersResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode triggers response: %v", err)
+	}
+
+	if !resp.ReassessmentNeeded {
+		t.Fatalf("expected ReassessmentNeeded: true")
+	}
+	if len(resp.TriggerEvaluations) != 8 {
+		t.Fatalf("expected 8 trigger evaluations, got %d", len(resp.TriggerEvaluations))
+	}
+	if len(resp.ActiveTriggers) == 0 {
+		t.Fatalf("expected active triggers to be non-empty")
+	}
+}
+
+

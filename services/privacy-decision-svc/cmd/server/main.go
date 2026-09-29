@@ -24,6 +24,7 @@ import (
 	"zoiko.io/privacy-decision-svc/internal/purposeregistry"
 	"zoiko.io/privacy-decision-svc/internal/retentionregistry"
 	"zoiko.io/privacy-decision-svc/internal/store"
+	"zoiko.io/privacy-decision-svc/internal/transferregistry"
 )
 
 func main() {
@@ -64,8 +65,9 @@ func main() {
 	purposeClient := purposeregistry.NewClient(cfg.PurposeRegistryURL)
 	consentClient := consentregistry.NewClient(cfg.ConsentRegistryURL)
 	holdClient := retentionregistry.NewClient(cfg.RetentionRegistryURL)
+	transferClient := transferregistry.NewClient(cfg.TransferServiceURL)
 
-	h := handler.New(pgStore, publisher, purposeClient, consentClient, holdClient, logger)
+	h := handler.New(pgStore, publisher, purposeClient, consentClient, holdClient, transferClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

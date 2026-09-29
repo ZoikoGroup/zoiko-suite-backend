@@ -44,6 +44,12 @@
 //   - Exemption/third-party review, redaction, and response-package
 //     assembly (§15.1's other control points) are not modeled — they
 //     require case-specific legal judgment this service cannot supply.
+//   - §18.1 Idempotency-Key: mandatory on all mutating APIs across the
+//     privacy domain. Implemented with persistent deduplication store,
+//     replay header Idempotency-Replay: true, and 409 Conflict on payload
+//     mismatch.
+//   - §32 Stable Error and Reason Code Contract (PRV-001..PRV-020):
+//     used throughout this service for deterministic error reporting.
 package domain
 
 import "time"
@@ -114,17 +120,18 @@ func (o Outcome) Valid() bool {
 // RightsRequest is the case record — PRV-04's own privacy-meaning state,
 // not a workflow/task list.
 type RightsRequest struct {
-	RequestID            string        `json:"request_id"`
-	TenantID             *string       `json:"tenant_id,omitempty"`
-	SubjectRef           string        `json:"subject_ref"`
-	RightFamily          RightFamily   `json:"right_family"`
-	Jurisdiction         string        `json:"jurisdiction,omitempty"`
-	RequesterRef         string        `json:"requester_ref,omitempty"` // proxy/representative, if not the subject themselves
-	SubmittedVia         string        `json:"submitted_via,omitempty"`
-	Status               RequestStatus `json:"status"`
-	IdentityVerified     bool          `json:"identity_verified"`
-	Outcome              *Outcome      `json:"outcome,omitempty"`
-	ResponseEvidenceHash *string       `json:"response_evidence_hash,omitempty"`
+	RequestID               string        `json:"request_id"`
+	TenantID                *string       `json:"tenant_id,omitempty"`
+	SubjectRef              string        `json:"subject_ref"`
+	RightFamily             RightFamily   `json:"right_family"`
+	Jurisdiction            string        `json:"jurisdiction,omitempty"`
+	RequesterRef            string        `json:"requester_ref,omitempty"` // proxy/representative, if not the subject themselves
+	SubmittedVia            string        `json:"submitted_via,omitempty"`
+	Status                  RequestStatus `json:"status"`
+	IdentityVerified        bool          `json:"identity_verified"`
+	Outcome                 *Outcome      `json:"outcome,omitempty"`
+	ResponseEvidenceHash    *string       `json:"response_evidence_hash,omitempty"`
+	ResponsePackageVersion  int           `json:"response_package_version,omitempty"` // I21: response package versioning — increments on every approved response; change invalidates prior approval
 	// WFCProcessRef is optional and caller-supplied — see the package doc
 	// comment on why this service never creates it itself.
 	WFCProcessRef        *string    `json:"wfc_process_ref,omitempty"`
@@ -211,4 +218,43 @@ var (
 	ErrIdentityNotVerified  = errorString("identity has not been verified for this request")
 	ErrNoDiscoveryManifest  = errorString("no discovery manifest has been recorded for this request")
 	ErrStoreUnavailable     = errorString("privacy-rights store unavailable")
+	ErrIdempotencyConflict  = errorString("PRV-020: IMMUTABLE_EVIDENCE_CONFLICT: idempotency key already used with different payload")
 )
+
+// ── §32 Stable Error and Reason Codes ────────────────────────────────────────
+
+const (
+	PRV001PurposeNotRegistered            = "PRV-001: PURPOSE_NOT_REGISTERED"
+	PRV002ProcessingActivityInactive      = "PRV-002: PROCESSING_ACTIVITY_INACTIVE"
+	PRV003PrivacyRoleUnresolved           = "PRV-003: PRIVACY_ROLE_UNRESOLVED"
+	PRV004JurisdictionUnresolved          = "PRV-004: JURISDICTION_UNRESOLVED"
+	PRV005PolicyUnavailable               = "PRV-005: POLICY_UNAVAILABLE"
+	PRV006ConsentRequiredMissing          = "PRV-006: CONSENT_REQUIRED_MISSING"
+	PRV007ConsentWithdrawn                = "PRV-007: CONSENT_WITHDRAWN"
+	PRV008NoticeVersionInvalid            = "PRV-008: NOTICE_VERSION_INVALID"
+	PRV009PurposeIncompatible             = "PRV-009: PURPOSE_INCOMPATIBLE"
+	PRV010DataCategoryRestricted          = "PRV-010: DATA_CATEGORY_RESTRICTED"
+	PRV011MinimizationRequired            = "PRV-011: MINIMIZATION_REQUIRED"
+	PRV012IdentityAssuranceInsufficient   = "PRV-012: IDENTITY_ASSURANCE_INSUFFICIENT"
+	PRV013ThirdPartyReviewRequired        = "PRV-013: THIRD_PARTY_REVIEW_REQUIRED"
+	PRV014RetentionOrHoldBlock            = "PRV-014: RETENTION_OR_HOLD_BLOCK"
+	PRV015TransferNotAuthorized           = "PRV-015: TRANSFER_NOT_AUTHORIZED"
+	PRV016AssessmentRequired              = "PRV-016: ASSESSMENT_REQUIRED"
+	PRV017ProcessorInstructionMissing     = "PRV-017: PROCESSOR_INSTRUCTION_MISSING"
+	PRV018SubprocessorNotApproved         = "PRV-018: SUBPROCESSOR_NOT_APPROVED"
+	PRV019PrivacyContextIndeterminate     = "PRV-019: PRIVACY_CONTEXT_INDETERMINATE"
+	PRV020ImmutableEvidenceConflict       = "PRV-020: IMMUTABLE_EVIDENCE_CONFLICT"
+)
+
+// ── Idempotency (§18.1) ──────────────────────────────────────────────────────
+
+// IdempotencyRecord stores idempotency execution state per §18.1.
+type IdempotencyRecord struct {
+	Key          string    `json:"idempotency_key"`
+	TenantID     string    `json:"tenant_id"`
+	Endpoint     string    `json:"endpoint"`
+	RequestHash  string    `json:"request_hash"`
+	ResponseCode int       `json:"response_code"`
+	ResponseBody []byte    `json:"response_body"`
+	CreatedAt    time.Time `json:"created_at"`
+}

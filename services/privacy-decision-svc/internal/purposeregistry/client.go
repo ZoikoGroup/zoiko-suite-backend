@@ -16,10 +16,14 @@ import (
 var ErrUnavailable = errors.New("privacy-purpose-registry-svc unavailable")
 
 type ActivityVersion struct {
-	ActivityVersionID string   `json:"activity_version_id"`
-	ActivityID        string   `json:"activity_id"`
-	PurposeIDs        []string `json:"purpose_ids"`
-	VersionStatus     string   `json:"version_status"`
+	ActivityVersionID       string   `json:"activity_version_id"`
+	ActivityID              string   `json:"activity_id"`
+	PurposeIDs              []string `json:"purpose_ids"`
+	VersionStatus           string   `json:"version_status"`
+	NoticeConsentDependency string   `json:"notice_consent_dependency,omitempty"`
+	DpiaTiaStatus           string   `json:"dpia_tia_status,omitempty"`
+	SubjectClasses          []string `json:"subject_classes,omitempty"`
+	DataCategories          []string `json:"data_categories,omitempty"`
 }
 
 type PurposeVersion struct {
