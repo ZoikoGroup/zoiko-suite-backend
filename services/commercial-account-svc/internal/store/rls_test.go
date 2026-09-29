@@ -51,6 +51,10 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS dispute_cases CASCADE;
+		DROP FUNCTION IF EXISTS enforce_dispute_case_lifecycle() CASCADE;
+		DROP TABLE IF EXISTS commercial_evidence_packages CASCADE;
+		DROP TABLE IF EXISTS billing_tax_jurisdictions CASCADE;
 		DROP TABLE IF EXISTS commercial_reconciliations CASCADE;
 		DROP TABLE IF EXISTS dunning_cases CASCADE;
 		DROP FUNCTION IF EXISTS enforce_dunning_case_lifecycle() CASCADE;
@@ -66,6 +70,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP TABLE IF EXISTS usage_adjustments, usage_event_records, usage_statements, meter_definitions CASCADE;
 		DROP FUNCTION IF EXISTS enforce_usage_event_correct_only(), enforce_usage_statement_lifecycle(),
 			enforce_meter_definition_retire_only() CASCADE;
+		DROP TABLE IF EXISTS entitlement_snapshots CASCADE;
 		DROP TABLE IF EXISTS commercial_restrictions, entitlement_policy_versions CASCADE;
 		DROP FUNCTION IF EXISTS enforce_restriction_lift_only(), reject_immutable_row() CASCADE;
 		DROP TABLE IF EXISTS subscription_boundary_queue, subscription_discounts, price_migration_offer_targets,

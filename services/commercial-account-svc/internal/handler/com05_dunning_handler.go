@@ -252,12 +252,26 @@ func (h *DunningHandler) DunningCaseAction(w http.ResponseWriter, r *http.Reques
 	var err error
 	if action == "advance" {
 		c, err = h.store.AdvanceDunning(r.Context(), id, principal, h.now(), cmd.claim)
+		if err != nil {
+			if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+				return h.store.GetDunningCase(r.Context(), resourceID)
+			}) {
+				return
+			}
+			h.fail(w, r, err)
+			return
+		}
 	} else {
 		c, err = h.store.StopDunning(r.Context(), id, principal, req.Reason, h.now(), cmd.claim)
-	}
-	if err != nil {
-		h.fail(w, r, err)
-		return
+		if err != nil {
+			if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+				return h.store.GetDunningCase(r.Context(), resourceID)
+			}) {
+				return
+			}
+			h.fail(w, r, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, c)
 }

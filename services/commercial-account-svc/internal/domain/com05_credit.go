@@ -143,4 +143,6 @@ var (
 	ErrRefundRequestNotFound      = errorString("refund request not found")
 	ErrRefundInvalidState         = errorString("refund request is not in a state that allows this action")
 	ErrRefundDestinationMismatch  = errorString("the settlement destination does not match the destination this refund was approved for; re-request the refund against the new destination")
+	ErrCreditNoteNotFound         = errorString("credit note not found")
+	ErrWriteOffNotFound           = errorString("write-off not found")
 )

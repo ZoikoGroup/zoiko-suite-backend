@@ -612,9 +612,21 @@ func processBoundary(ctx context.Context, tx pgx.Tx, it boundaryItem, now time.T
 				return "SKIPPED_NO_EVENT", nil
 			}
 			m.changeID = v.ChangeID
-			return "EVENT_PUBLISHED", emitSubscriptionEvent(ctx, tx, eventType, a.sub, m, subscriptionEvent{
+			if err := emitSubscriptionEvent(ctx, tx, eventType, a.sub, m, subscriptionEvent{
 				ChangeType: v.ChangeType, Status: v.LifecycleStatus, EffectiveAt: v.EffectiveFrom, EndsAt: a.sub.EndsAt,
-			})
+			}); err != nil {
+				return "", err
+			}
+			// COM-03 gap-remediation (B2): a boundary-driven subscription
+			// change (plan change, quantity/add-on change, cancellation,
+			// expiry) invalidates entitlement automatically, atomically
+			// with the transition itself — negative path #09's "stale
+			// cache invalidated" previously had nothing automatic behind
+			// it; only an explicit :recompute call did.
+			if _, err := recomputeEntitlementsTx(ctx, tx, it.org, boundaryWorkerActor, now); err != nil {
+				return "", err
+			}
+			return "EVENT_PUBLISHED", nil
 		}
 		return "", fmt.Errorf("version %s not found on %s", *it.versionID, it.subID)
 

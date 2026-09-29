@@ -341,3 +341,21 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
+
+// HandleIdempotentReplay handles the common pattern of catching an
+// IdempotentReplayError and returning the original resource. The fetch
+// function should re-fetch the resource by replay.ResourceID.
+func HandleIdempotentReplay(w http.ResponseWriter, r *http.Request, err error, fetch func(resourceID string) (any, error)) bool {
+	var replay *domain.IdempotentReplayError
+	if !errors.As(err, &replay) {
+		return false
+	}
+	resource, gerr := fetch(replay.ResourceID)
+	if gerr != nil {
+		// If we can't fetch the original, fall through to normal error handling
+		return false
+	}
+	w.Header().Set("Idempotent-Replayed", "true")
+	writeJSON(w, http.StatusOK, resource)
+	return true
+}
