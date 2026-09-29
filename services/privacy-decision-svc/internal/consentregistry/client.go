@@ -19,6 +19,7 @@ type ConsentResolution struct {
 	Status        string `json:"status"`
 	LatestReceipt *struct {
 		ConsentReceiptID string `json:"consent_receipt_id"`
+		NoticeVersionID  string `json:"notice_version_id,omitempty"`
 	} `json:"latest_receipt,omitempty"`
 }
 

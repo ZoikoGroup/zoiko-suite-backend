@@ -65,6 +65,10 @@ type Store interface {
 
 	RecordDecision(ctx context.Context, tenantID string, d *domain.TransferDecision) error
 	FindDecision(ctx context.Context, decisionID string) (*domain.TransferDecision, error)
+
+	// Idempotency (§18.1)
+	GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error)
+	SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error
 }
 
 type PgStore struct {
@@ -355,12 +359,12 @@ func (s *PgStore) RecordAssessment(ctx context.Context, tenantID string, req dom
 	var a domain.TransferAssessment
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			INSERT INTO transfer_assessments (assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, review_trigger_at, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-			RETURNING assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, review_trigger_at, created_at`,
+			INSERT INTO transfer_assessments (assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, government_access_risk, technical_measures, organizational_measures, review_trigger_at, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+			RETURNING assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, government_access_risk, technical_measures, organizational_measures, review_trigger_at, created_at`,
 			id, strPtrOrNil(tenantID), req.RelationshipID, req.Outcome, principalID, strPtrOrNil(req.ResidualRisk),
-			strPtrOrNil(req.EvidenceRef), req.ReviewTriggerAt,
-		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &nullString{&a.ResidualRisk}, &nullString{&a.EvidenceRef}, &a.ReviewTriggerAt, &a.CreatedAt)
+			strPtrOrNil(req.EvidenceRef), strPtrOrNil(req.GovernmentAccessRisk), strPtrOrNil(req.TechnicalMeasures), strPtrOrNil(req.OrganizationalMeasures), req.ReviewTriggerAt,
+		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &nullString{&a.ResidualRisk}, &nullString{&a.EvidenceRef}, &nullString{&a.GovernmentAccessRisk}, &nullString{&a.TechnicalMeasures}, &nullString{&a.OrganizationalMeasures}, &a.ReviewTriggerAt, &a.CreatedAt)
 	})
 	if err != nil {
 		s.log.Error("pg RecordAssessment failed", zap.Error(err))
@@ -373,9 +377,9 @@ func (s *PgStore) FindLatestAssessment(ctx context.Context, relationshipID strin
 	var a domain.TransferAssessment
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, review_trigger_at, created_at
+			SELECT assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, government_access_risk, technical_measures, organizational_measures, review_trigger_at, created_at
 			FROM transfer_assessments WHERE relationship_id = $1 ORDER BY created_at DESC LIMIT 1`, relationshipID,
-		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &nullString{&a.ResidualRisk}, &nullString{&a.EvidenceRef}, &a.ReviewTriggerAt, &a.CreatedAt)
+		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &nullString{&a.ResidualRisk}, &nullString{&a.EvidenceRef}, &nullString{&a.GovernmentAccessRisk}, &nullString{&a.TechnicalMeasures}, &nullString{&a.OrganizationalMeasures}, &a.ReviewTriggerAt, &a.CreatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, nil
@@ -393,15 +397,19 @@ func (s *PgStore) RecordDecision(ctx context.Context, tenantID string, d *domain
 	if d.DecisionID == "" {
 		d.DecisionID = uuid.New().String()
 	}
+	if d.AuthorizationID == "" {
+		d.AuthorizationID = d.DecisionID
+	}
 	reasonRaw := marshalSlice(d.ReasonCodes)
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			INSERT INTO transfer_decisions (decision_id, tenant_id, relationship_id, transfer_mechanism_id, destination_jurisdiction,
-				assessment_id, result, reason_codes, actor_principal_id, correlation_id, decided_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+				assessment_id, result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at, decided_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
 			RETURNING decided_at`,
 			d.DecisionID, strPtrOrNil(tenantID), d.RelationshipID, d.TransferMechanismID, strPtrOrNil(d.DestinationJurisdiction),
 			d.AssessmentID, d.Result, reasonRaw, d.ActorPrincipalID, strPtrOrNil(d.CorrelationID),
+			strPtrOrNil(d.Conditions), d.ExpiresAt,
 		).Scan(&d.DecidedAt)
 	})
 	if err != nil {
@@ -415,14 +423,14 @@ func (s *PgStore) RecordDecision(ctx context.Context, tenantID string, d *domain
 func (s *PgStore) FindDecision(ctx context.Context, decisionID string) (*domain.TransferDecision, error) {
 	var d domain.TransferDecision
 	var reasonRaw []byte
-	var correlationID, destJurisdiction *string
+	var correlationID, destJurisdiction, conditions *string
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT decision_id, tenant_id, relationship_id, transfer_mechanism_id, destination_jurisdiction, assessment_id,
-				result, reason_codes, actor_principal_id, correlation_id, decided_at
+				result, reason_codes, actor_principal_id, correlation_id, conditions, expires_at, decided_at
 			FROM transfer_decisions WHERE decision_id = $1`, decisionID,
 		).Scan(&d.DecisionID, &d.TenantID, &d.RelationshipID, &d.TransferMechanismID, &destJurisdiction, &d.AssessmentID,
-			&d.Result, &reasonRaw, &d.ActorPrincipalID, &correlationID, &d.DecidedAt)
+			&d.Result, &reasonRaw, &d.ActorPrincipalID, &correlationID, &conditions, &d.ExpiresAt, &d.DecidedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrDecisionNotFound
@@ -432,11 +440,15 @@ func (s *PgStore) FindDecision(ctx context.Context, decisionID string) (*domain.
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	unmarshalSlice(reasonRaw, &d.ReasonCodes)
+	d.AuthorizationID = d.DecisionID
 	if correlationID != nil {
 		d.CorrelationID = *correlationID
 	}
 	if destJurisdiction != nil {
 		d.DestinationJurisdiction = *destJurisdiction
+	}
+	if conditions != nil {
+		d.Conditions = *conditions
 	}
 	return &d, nil
 }
@@ -446,4 +458,43 @@ func timeOrNow(t *time.Time) time.Time {
 		return time.Now().UTC()
 	}
 	return *t
+}
+
+// ── Idempotency (§18.1) ──────────────────────────────────────────────────────
+
+func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error) {
+	var rec domain.IdempotencyRecord
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at
+			FROM transfer_idempotency_keys
+			WHERE idempotency_key = $1`,
+			key,
+		).Scan(&rec.IdempotencyKey, &rec.TenantID, &rec.Endpoint, &rec.RequestHash, &rec.ResponseCode, &rec.ResponseBody, &rec.CreatedAt)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		s.log.Error("pg GetIdempotency failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return &rec, nil
+}
+
+func (s *PgStore) SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error {
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO transfer_idempotency_keys (idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, NOW())
+			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING`,
+			rec.IdempotencyKey, rec.TenantID, rec.Endpoint, rec.RequestHash, rec.ResponseCode, rec.ResponseBody,
+		)
+		return err
+	})
+	if err != nil {
+		s.log.Error("pg SaveIdempotency failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
 }

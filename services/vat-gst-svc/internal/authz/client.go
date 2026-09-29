@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"zoiko.io/vat-gst-svc/internal/middleware"
 )
 
 // ErrAuthzServiceUnavailable is returned when authorization-svc cannot be
@@ -187,6 +190,20 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	tenantID := middleware.GetTenantID(ctx)
+	if tenantID == "" || tenantID == "default" {
+		tenantID = "11111111-1111-1111-1111-111111111111"
+	}
+	requestID := uuid.New().String()
+
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("Idempotency-Key", requestID+":"+actionType)
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return ErrAuthzServiceUnavailable

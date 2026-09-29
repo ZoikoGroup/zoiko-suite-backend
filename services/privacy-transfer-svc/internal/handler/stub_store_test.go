@@ -18,6 +18,7 @@ type stubStore struct {
 	mechanisms    map[string]*domain.TransferMechanism
 	assessments   map[string][]domain.TransferAssessment // by relationship_id, append order
 	decisions     map[string]*domain.TransferDecision
+	idempotency   map[string]*domain.IdempotencyRecord // key: tenantID:idempotencyKey
 }
 
 func newStubStore() *stubStore {
@@ -27,6 +28,7 @@ func newStubStore() *stubStore {
 		mechanisms:    map[string]*domain.TransferMechanism{},
 		assessments:   map[string][]domain.TransferAssessment{},
 		decisions:     map[string]*domain.TransferDecision{},
+		idempotency:   map[string]*domain.IdempotencyRecord{},
 	}
 }
 
@@ -120,7 +122,9 @@ func (s *stubStore) RecordAssessment(_ context.Context, tenantID string, req dom
 	a := domain.TransferAssessment{
 		AssessmentID: uuid.New().String(), TenantID: strp(tenantID), RelationshipID: req.RelationshipID,
 		Outcome: req.Outcome, ReviewerPrincipalID: principalID, ResidualRisk: req.ResidualRisk,
-		EvidenceRef: req.EvidenceRef, ReviewTriggerAt: req.ReviewTriggerAt, CreatedAt: time.Now().UTC(),
+		EvidenceRef: req.EvidenceRef, GovernmentAccessRisk: req.GovernmentAccessRisk,
+		TechnicalMeasures: req.TechnicalMeasures, OrganizationalMeasures: req.OrganizationalMeasures,
+		ReviewTriggerAt: req.ReviewTriggerAt, CreatedAt: time.Now().UTC(),
 	}
 	s.assessments[req.RelationshipID] = append(s.assessments[req.RelationshipID], a)
 	return &a, nil
@@ -160,3 +164,23 @@ func (s *stubStore) FindDecision(_ context.Context, decisionID string) (*domain.
 	}
 	return d, nil
 }
+
+// ── Idempotency (§18.1) ──────────────────────────────────────────────────────
+
+func (s *stubStore) GetIdempotency(_ context.Context, tenantID, key string) (*domain.IdempotencyRecord, error) {
+	k := tenantID + ":" + key
+	rec, ok := s.idempotency[k]
+	if !ok {
+		return nil, nil
+	}
+	cp := *rec
+	return &cp, nil
+}
+
+func (s *stubStore) SaveIdempotency(_ context.Context, rec domain.IdempotencyRecord) error {
+	k := rec.TenantID + ":" + rec.IdempotencyKey
+	cp := rec
+	s.idempotency[k] = &cp
+	return nil
+}
+

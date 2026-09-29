@@ -19,6 +19,7 @@ type stubStore struct {
 	consentReceipts      map[string]*domain.ConsentReceipt
 	withdrawalReceipts   map[string]*domain.WithdrawalReceipt // keyed by consent_receipt_id
 	preferences          []domain.PreferenceAssertion
+	idempotency          map[string]*domain.IdempotencyRecord
 
 	// seq mirrors the real PgStore's sequence_no column — see
 	// privacy-purpose-registry-svc's identical field for the full
@@ -35,6 +36,7 @@ func newStubStore() *stubStore {
 		noticeVersions:     map[string]*domain.NoticeVersion{},
 		consentReceipts:    map[string]*domain.ConsentReceipt{},
 		withdrawalReceipts: map[string]*domain.WithdrawalReceipt{},
+		idempotency:        map[string]*domain.IdempotencyRecord{},
 		seq:                map[string]int{},
 	}
 }
@@ -91,6 +93,22 @@ func (s *stubStore) FindNoticeVersion(ctx context.Context, noticeID, versionID s
 		return nil, domain.ErrNoticeVersionNotFound
 	}
 	return v, nil
+}
+
+func (s *stubStore) FindLatestNoticeVersion(ctx context.Context, noticeID string) (*domain.NoticeVersion, error) {
+	var best *domain.NoticeVersion
+	for _, v := range s.noticeVersions {
+		if v.NoticeID != noticeID {
+			continue
+		}
+		if best == nil || v.CreatedAt.After(best.CreatedAt) || (v.CreatedAt.Equal(best.CreatedAt) && s.seq[v.NoticeVersionID] > s.seq[best.NoticeVersionID]) {
+			best = v
+		}
+	}
+	if best == nil {
+		return nil, domain.ErrNoticeVersionNotFound
+	}
+	return best, nil
 }
 
 func (s *stubStore) ApproveNoticeVersion(ctx context.Context, noticeID, versionID, principalID string) (*domain.NoticeVersion, error) {
@@ -159,8 +177,16 @@ func (s *stubStore) RecordPresentation(ctx context.Context, tenantID, noticeID, 
 		return nil, domain.ErrNoticeVersionNotFound
 	}
 	r := domain.PresentationReceipt{
-		PresentationReceiptID: uuid.New().String(), TenantID: strp(tenantID), NoticeVersionID: versionID,
-		SubjectRef: req.SubjectRef, Channel: req.Channel, Locale: req.Locale, CreatedAt: time.Now().UTC(),
+		PresentationReceiptID: uuid.New().String(),
+		TenantID:              strp(tenantID),
+		NoticeVersionID:       versionID,
+		SubjectRef:            req.SubjectRef,
+		Channel:               req.Channel,
+		Locale:                req.Locale,
+		SessionRef:            strp(req.SessionRef),
+		TemplateVersion:       strp(req.TemplateVersion),
+		DeliveryEvidence:      strp(req.DeliveryEvidence),
+		CreatedAt:             time.Now().UTC(),
 	}
 	s.presentationReceipts = append(s.presentationReceipts, r)
 	return &r, nil
@@ -169,11 +195,46 @@ func (s *stubStore) RecordPresentation(ctx context.Context, tenantID, noticeID, 
 // ── consent ──────────────────────────────────────────────────────────────────
 
 func (s *stubStore) RecordConsent(ctx context.Context, tenantID string, req domain.RecordConsentRequest, principalID, correlationID string) (*domain.ConsentReceipt, error) {
+	// PRV-N04: Check if an identical unwithdrawn consent receipt already exists
+	for _, cr := range s.consentReceipts {
+		if cr.SubjectRef == req.SubjectRef && cr.PurposeID == req.PurposeID && string(cr.Action) == req.Action {
+			// match notice_version_id
+			nvMatch := false
+			if cr.NoticeVersionID == nil && req.NoticeVersionID == "" {
+				nvMatch = true
+			} else if cr.NoticeVersionID != nil && *cr.NoticeVersionID == req.NoticeVersionID {
+				nvMatch = true
+			}
+			if nvMatch {
+				if _, withdrawn := s.withdrawalReceipts[cr.ConsentReceiptID]; !withdrawn {
+					return cr, nil
+				}
+			}
+		}
+	}
+
+	affAction := req.AffirmativeActionType
+	if affAction == "" {
+		affAction = "EXPLICIT_CHECKBOX"
+	}
+
 	r := &domain.ConsentReceipt{
-		ConsentReceiptID: uuid.New().String(), TenantID: strp(tenantID), SubjectRef: req.SubjectRef,
-		PurposeID: req.PurposeID, NoticeVersionID: strp(req.NoticeVersionID), Action: domain.ConsentAction(req.Action),
-		CaptureChannel: req.CaptureChannel, ActorPrincipalID: principalID, CorrelationID: correlationID,
-		CreatedAt: time.Now().UTC(),
+		ConsentReceiptID:           uuid.New().String(),
+		TenantID:                   strp(tenantID),
+		SubjectRef:                 req.SubjectRef,
+		PurposeID:                  req.PurposeID,
+		NoticeVersionID:            strp(req.NoticeVersionID),
+		Action:                     domain.ConsentAction(req.Action),
+		CaptureChannel:             req.CaptureChannel,
+		ActorPrincipalID:           principalID,
+		CorrelationID:              correlationID,
+		CreatedAt:                  time.Now().UTC(),
+		IsProxy:                    req.IsProxy,
+		RepresentativeSubjectRef:   strp(req.RepresentativeSubjectRef),
+		RepresentativeAuthorityRef: strp(req.RepresentativeAuthorityRef),
+		RepresentativeEvidence:     strp(req.RepresentativeEvidence),
+		AffirmativeActionType:      affAction,
+		AffirmativeEvidence:        strp(req.AffirmativeEvidence),
 	}
 	s.consentReceipts[r.ConsentReceiptID] = r
 	return r, nil
@@ -192,12 +253,17 @@ func (s *stubStore) WithdrawConsent(ctx context.Context, receiptID, channel, pri
 	if !ok {
 		return nil, domain.ErrConsentReceiptNotFound
 	}
-	if _, already := s.withdrawalReceipts[receiptID]; already {
-		return nil, domain.ErrAlreadyWithdrawn
+	// PRV-N05: Replayed withdrawal returns existing withdrawal receipt idempotently
+	if w, already := s.withdrawalReceipts[receiptID]; already {
+		return w, nil
 	}
 	w := &domain.WithdrawalReceipt{
-		WithdrawalReceiptID: uuid.New().String(), TenantID: receipt.TenantID, ConsentReceiptID: receiptID,
-		WithdrawnByPrincipalID: principalID, Channel: channel, CreatedAt: time.Now().UTC(),
+		WithdrawalReceiptID:    uuid.New().String(),
+		TenantID:               receipt.TenantID,
+		ConsentReceiptID:       receiptID,
+		WithdrawnByPrincipalID: principalID,
+		Channel:                channel,
+		CreatedAt:              time.Now().UTC(),
 	}
 	s.withdrawalReceipts[receiptID] = w
 	return w, nil
@@ -254,4 +320,21 @@ func (s *stubStore) ResolvePreference(ctx context.Context, subjectRef, channelOr
 		return &domain.PreferenceAssertion{SubjectRef: subjectRef, ChannelOrPurpose: channelOrPurpose, Value: domain.PreferenceNotApplicable}, nil
 	}
 	return latest, nil
+}
+
+// ── idempotency (§18.1) ──────────────────────────────────────────────────────
+
+func (s *stubStore) GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error) {
+	k := tenantID + ":" + key
+	rec, ok := s.idempotency[k]
+	if !ok {
+		return nil, nil
+	}
+	return rec, nil
+}
+
+func (s *stubStore) SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error {
+	k := rec.TenantID + ":" + rec.Key
+	s.idempotency[k] = &rec
+	return nil
 }
