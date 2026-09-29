@@ -44,6 +44,7 @@ func TestPgStore_Outbox_CreateInvoice_Atomicity_RealDB(t *testing.T) {
 		CorrelationID:        correlationID,
 	}
 
+	withAR05Contract(inv)
 	created, err := s.CreateInvoice(ctx, inv)
 	require.NoError(t, err)
 	assert.True(t, created)
@@ -81,6 +82,7 @@ func TestPgStore_Outbox_CreateInvoice_Atomicity_RealDB(t *testing.T) {
 	assert.Equal(t, correlationID, env.CorrelationID)
 
 	// Idempotent Replay: zero duplicate outbox events
+	withAR05Contract(inv)
 	createdRetry, err := s.CreateInvoice(ctx, inv)
 	require.NoError(t, err)
 	assert.False(t, createdRetry, "expected replay to return created=false")
@@ -108,11 +110,12 @@ func TestPgStore_Outbox_TransitionInvoice_Transitions_RealDB(t *testing.T) {
 		InvoiceNumber:        "INV-TEST-01",
 		Amount:               10000,
 		CurrencyCode:         "USD",
-		DueDate:              time.Now().UTC().Add(30 * 24 * time.Hour),
+		DueDate:              time.Now().UTC().Add(-48 * time.Hour), // past, so SENT -> OVERDUE is legitimate (customer_invoices_overdue_after_due_date)
 		Status:               domain.InvoiceStatusIssued,
 		CreatedByPrincipalID: "user-1",
 		CorrelationID:        uuid.New().String(),
 	}
+	withAR05Contract(inv1)
 	_, err := s.CreateInvoice(ctx, inv1)
 	require.NoError(t, err)
 
@@ -168,6 +171,7 @@ func TestPgStore_Outbox_TransitionInvoice_Transitions_RealDB(t *testing.T) {
 		CreatedByPrincipalID: "user-2",
 		CorrelationID:        uuid.New().String(),
 	}
+	withAR05Contract(inv2)
 	_, err = s.CreateInvoice(ctx, inv2)
 	require.NoError(t, err)
 
@@ -208,6 +212,7 @@ func TestPgStore_Outbox_FailedTransition_NoOutboxRow_RealDB(t *testing.T) {
 		CreatedByPrincipalID: "user-1",
 		CorrelationID:        uuid.New().String(),
 	}
+	withAR05Contract(inv)
 	_, err := s.CreateInvoice(ctx, inv)
 	require.NoError(t, err)
 
@@ -249,11 +254,11 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 		INSERT INTO customer_invoices (
 			invoice_id, tenant_id, legal_entity_id, customer_id, invoice_number,
 			amount, currency_code, due_date, status, created_by_principal_id,
-			correlation_id, created_at
+			correlation_id, created_at, invoice_date, supply_date, net_amount, tax_amount
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
-			$11, now()
+			$11, now(), CURRENT_DATE, CURRENT_DATE, $6, 0
 		)
 	`
 	_, err = tx.Exec(ctx, insertInvoiceSQL,
@@ -298,3 +303,20 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 	assert.Equal(t, 0, outboxCount, "outbox row must not exist after rollback")
 }
 
+
+// withAR05Contract fills the AR-05 fields every invoice now carries — the
+// invoice and supply dates (NOT NULL) and lines accounting for the amount.
+// These fixtures were written before AR-05 and never ran against a real
+// database in CI, so they reached the INSERT without them.
+func withAR05Contract(inv *domain.CustomerInvoice) {
+	// Dated a month before the due date, so a fixture that later marks the
+	// invoice overdue does not trip the date invariants.
+	issued := inv.DueDate.Add(-30 * 24 * time.Hour)
+	inv.InvoiceDate = domain.CalendarDate{Time: issued}
+	inv.SupplyDate = domain.CalendarDate{Time: issued}
+	inv.NetAmount = inv.Amount
+	inv.Lines = []domain.CustomerInvoiceLine{{
+		LineNumber: 1, Description: "Services", Quantity: 1,
+		UnitPrice: inv.Amount, NetAmount: inv.Amount,
+	}}
+}

@@ -555,11 +555,14 @@ func TestPgStore_Invariants_RejectImpossibleInvoices(t *testing.T) {
 			INSERT INTO customer_invoices (
 				invoice_id, tenant_id, legal_entity_id, customer_id, invoice_number,
 				amount, currency_code, due_date, status, created_by_principal_id,
-				correlation_id
-			) VALUES ($1, $2, $3, 'c1', $4, %s, %s, DATE '2026-09-01', %s, 'p1', $5)`,
+				correlation_id, invoice_date, supply_date, net_amount, tax_amount
+			) VALUES ($1, $2, $3, 'c1', $4, %s, %s, DATE '2026-09-01', %s, 'p1', $5,
+			          DATE '2026-08-01', DATE '2026-08-01', %s, 0)`,
 			pick(column, "amount", value, "100.00"),
 			pick(column, "currency_code", value, "'GBP'"),
-			pick(column, "status", value, "'ISSUED'"))
+			pick(column, "status", value, "'ISSUED'"),
+			// net_amount mirrors amount, so a bad amount is the only thing wrong.
+			pick(column, "amount", value, "100.00"))
 		_, err := pool.Exec(ctx, sql,
 			uuid.New().String(), tenantID, uuid.New().String(),
 			"INV-"+uuid.New().String()[:8], "corr-"+uuid.New().String())
