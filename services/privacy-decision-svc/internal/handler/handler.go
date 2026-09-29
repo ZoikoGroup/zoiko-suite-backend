@@ -393,7 +393,7 @@ func (h *Handler) evaluate(
 				RelationshipID:          req.TransferCheck.RelationshipID,
 				TransferMechanismID:     req.TransferCheck.TransferMechanismID,
 				DestinationJurisdiction: req.TransferCheck.DestinationJurisdiction,
-				AssessmentCheck:         req.TransferCheck.AssessmentCheck,
+				AssessmentRequired:      req.TransferCheck.AssessmentCheck,
 			})
 			if err != nil {
 				h.log.Error("evaluate: transfer service unavailable", zap.Error(err))

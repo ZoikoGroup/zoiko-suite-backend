@@ -19,7 +19,7 @@ type EvaluateTransferRequest struct {
 	RelationshipID          string `json:"relationship_id"`
 	TransferMechanismID     string `json:"transfer_mechanism_id"`
 	DestinationJurisdiction string `json:"destination_jurisdiction,omitempty"`
-	AssessmentCheck         bool   `json:"assessment_check,omitempty"`
+	AssessmentRequired      bool   `json:"assessment_required"`
 }
 
 type TransferDecision struct {
