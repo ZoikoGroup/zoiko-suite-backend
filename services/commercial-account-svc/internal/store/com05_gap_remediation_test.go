@@ -197,6 +197,12 @@ func TestGapFix_MoneyMovingCommandsEmitAccountingEvents(t *testing.T) {
 		f.claim(publisher, "outcome", a.AttemptID)); err != nil {
 		t.Fatalf("record outcome: %v", err)
 	}
+	// The payment-collection success path must emit an accounting event too
+	// (mirror of SettleRefund's settled branch) — money was actually
+	// collected here.
+	if n := f.outboxCount(a.AttemptID, "accounting_event.recorded"); n != 1 {
+		t.Fatalf("accounting_event.recorded for RecordProviderOutcome(SUCCEEDED): %d", n)
+	}
 	rfID := domain.NewCommercialID(domain.PrefixRefundRequest)
 	if _, err := f.s.RequestRefund(f.ctx, rfID, inv.InvoiceID, a.AttemptID, "20.00", "dest-ref-1", "buyer's remorse",
 		publisher, day(25), f.claim(publisher, "RequestRefund", rfID)); err != nil {
@@ -213,6 +219,30 @@ func TestGapFix_MoneyMovingCommandsEmitAccountingEvents(t *testing.T) {
 	}
 	if n := f.outboxCount(rfID, "accounting_event.recorded"); n != 1 {
 		t.Fatalf("accounting_event.recorded for SettleRefund: %d", n)
+	}
+}
+
+// D3 continued: a FAILED payment outcome moves no money, so it must emit
+// no accounting event — only the SUCCEEDED branch does.
+func TestGapFix_FailedPaymentOutcomeEmitsNoAccountingEvent(t *testing.T) {
+	f := newSub(t)
+	f.publishPlan("business", planOpts{autoRenew: true, base: "40.00"})
+	f.openBillingAccount(f.org)
+	sub := activateNow(f, f.sv(f.start(f.startParams(f.account, "business", day(11)))), day(11))
+	inv := f.issueSimpleInvoice(f.org, sub.SubscriptionID, sub.CurrentTerm.TermNo)
+
+	a, err := f.collect(inv.InvoiceID)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	failure := "card_declined"
+	if _, err := f.s.RecordProviderOutcome(f.ctx, domain.RecordOutcomeRequest{AttemptID: a.AttemptID,
+		Outcome: domain.PaymentFailed, FailureReason: &failure, OccurredAt: day(24), ActorPrincipalID: publisher},
+		f.claim(publisher, "outcome-fail", a.AttemptID)); err != nil {
+		t.Fatalf("record failed outcome: %v", err)
+	}
+	if n := f.outboxCount(a.AttemptID, "accounting_event.recorded"); n != 0 {
+		t.Fatalf("accounting_event.recorded for a FAILED outcome: %d", n)
 	}
 }
 

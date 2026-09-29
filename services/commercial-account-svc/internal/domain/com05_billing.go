@@ -45,8 +45,8 @@ type BillingAccount struct {
 	PaymentProviderRef      string `json:"payment_provider_ref"`
 	// AccountingMappingKey is this seller's own GL/accounting classification
 	// for every money-moving event on this billing account (COM-CTRL-033).
-	// Server-resolved at OpenBillingAccount time exactly like SellingEntity;
-	// no later command accepts it as an input, so a tenant-supplied
+	// Caller-supplied at OpenBillingAccount time (a privileged seller-operator
+	// action); never accepted on any later command, so a tenant-supplied
 	// accounting-book reference has no field to be injected through
 	// (negative path #44 is refused by construction).
 	AccountingMappingKey string               `json:"accounting_mapping_key"`

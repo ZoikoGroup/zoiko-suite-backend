@@ -23,6 +23,8 @@ type CreditStore interface {
 	ApplyWriteOff(ctx context.Context, writeOffID, invoiceID, amount, reason, actor string, now time.Time, claim domain.IdempotencyClaim) (*domain.WriteOff, error)
 	RequestRefund(ctx context.Context, refundID, invoiceID, paymentAttemptID, amount, destinationRef, reason, actor string, now time.Time, claim domain.IdempotencyClaim) (*domain.RefundRequest, error)
 	SettleRefund(ctx context.Context, req domain.SettleRefundRequest, claim domain.IdempotencyClaim) (*domain.RefundRequest, error)
+	GetCreditNote(ctx context.Context, creditNoteID string) (*domain.CreditNote, error)
+	GetWriteOff(ctx context.Context, writeOffID string) (*domain.WriteOff, error)
 	GetCreditNotes(ctx context.Context, invoiceID string) ([]domain.CreditNote, error)
 	GetWriteOffs(ctx context.Context, invoiceID string) ([]domain.WriteOff, error)
 	GetRefundRequest(ctx context.Context, refundID string) (*domain.RefundRequest, error)
@@ -252,6 +254,32 @@ func (s *PgStore) GetWriteOffs(ctx context.Context, invoiceID string) ([]domain.
 			out = append(out, *w)
 		}
 		return rows.Err()
+	})
+	return out, err
+}
+
+func (s *PgStore) GetCreditNote(ctx context.Context, creditNoteID string) (*domain.CreditNote, error) {
+	var out *domain.CreditNote
+	err := s.creditTx(ctx, func(tx pgx.Tx) error {
+		c, err := scanCreditNote(tx.QueryRow(ctx, `SELECT `+creditNoteColumns+` FROM credit_notes WHERE credit_note_id = $1`, creditNoteID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrCreditNoteNotFound
+		}
+		out = c
+		return err
+	})
+	return out, err
+}
+
+func (s *PgStore) GetWriteOff(ctx context.Context, writeOffID string) (*domain.WriteOff, error) {
+	var out *domain.WriteOff
+	err := s.creditTx(ctx, func(tx pgx.Tx) error {
+		w, err := scanWriteOff(tx.QueryRow(ctx, `SELECT `+writeOffColumns+` FROM write_offs WHERE write_off_id = $1`, writeOffID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrWriteOffNotFound
+		}
+		out = w
+		return err
 	})
 	return out, err
 }
