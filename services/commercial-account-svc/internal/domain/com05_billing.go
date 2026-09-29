@@ -37,15 +37,22 @@ const (
 // CommercialAccount (types.go): that is the verified customer identity;
 // this is the platform's own billing configuration for it.
 type BillingAccount struct {
-	BillingAccountID        string               `json:"billing_account_id"`
-	OrganizationID          string               `json:"organization_id"`
-	SellingEntity           string               `json:"selling_entity"`
-	BillingCurrencyCode     string               `json:"billing_currency_code"`
-	InvoiceNumberingProfile string               `json:"invoice_numbering_profile"`
-	PaymentProviderRef      string               `json:"payment_provider_ref"`
-	Status                  BillingAccountStatus `json:"status"`
-	CreatedAt               time.Time            `json:"created_at"`
-	CreatedByPrincipalID    string               `json:"created_by_principal_id"`
+	BillingAccountID        string `json:"billing_account_id"`
+	OrganizationID          string `json:"organization_id"`
+	SellingEntity           string `json:"selling_entity"`
+	BillingCurrencyCode     string `json:"billing_currency_code"`
+	InvoiceNumberingProfile string `json:"invoice_numbering_profile"`
+	PaymentProviderRef      string `json:"payment_provider_ref"`
+	// AccountingMappingKey is this seller's own GL/accounting classification
+	// for every money-moving event on this billing account (COM-CTRL-033).
+	// Server-resolved at OpenBillingAccount time exactly like SellingEntity;
+	// no later command accepts it as an input, so a tenant-supplied
+	// accounting-book reference has no field to be injected through
+	// (negative path #44 is refused by construction).
+	AccountingMappingKey string               `json:"accounting_mapping_key"`
+	Status               BillingAccountStatus `json:"status"`
+	CreatedAt            time.Time            `json:"created_at"`
+	CreatedByPrincipalID string               `json:"created_by_principal_id"`
 }
 
 func ValidateBillingAccount(b *BillingAccount) error {
@@ -60,6 +67,9 @@ func ValidateBillingAccount(b *BillingAccount) error {
 	}
 	if strEmpty(b.PaymentProviderRef) {
 		return invalid("payment_provider_ref", "is required")
+	}
+	if strEmpty(b.AccountingMappingKey) {
+		return invalid("accounting_mapping_key", "is required")
 	}
 	return nil
 }
@@ -302,4 +312,6 @@ var (
 	ErrInvoiceBasisChanged          = errorString("the usage basis changed since this candidate was generated; regenerate the candidate")
 	ErrInvoiceNotFound              = errorString("invoice not found")
 	ErrEmptyInvoiceCandidate        = errorString("this subscription term has no billable lines")
+	ErrTaxJurisdictionNotRegistered = errorString("tax jurisdiction is not registered for this billing account")
+	ErrTaxRateMismatch              = errorString("supplied tax rate does not match the registered rate for this jurisdiction")
 )

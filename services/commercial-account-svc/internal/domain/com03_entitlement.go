@@ -9,7 +9,10 @@ package domain
 
 import "time"
 
-const PrefixRestriction = "crst_"
+const (
+	PrefixRestriction         = "crst_"
+	PrefixEntitlementSnapshot = "cesn_"
+)
 
 // Outcome is the decision COM-03 returns. Ranked from least to most severe;
 // a restriction can only move a decision toward Deny, never away from it.
@@ -85,14 +88,22 @@ type EntitlementPolicyVersion struct {
 
 // SubscriptionEntitlementBasis is everything a decision needs about the
 // organization's subscription at the instant being evaluated: its status,
-// how long ago it ended (if it has), and the capabilities every price
-// version it is bound to (plan and add-ons) together define. A capability
-// key absent from every bound version is not included — DENY, never assumed.
+// how long ago it ended (if it has), the capabilities every price version
+// it is bound to (plan and add-ons) together define, and — for a capability
+// whose limit is metered — how much of it has already been consumed this
+// period. A capability key absent from every bound version is not included
+// — DENY, never assumed.
 type SubscriptionEntitlementBasis struct {
 	SubscriptionID string
 	Status         LifecycleStatus // zero value ("") means no subscription exists at all
 	EndedAt        *time.Time      // set once Status is Canceled/Expired
 	Capabilities   map[string]PlanCapability
+	// Consumption is how much of a metered capability's quota has already
+	// been consumed this period, keyed by CapabilityKey. Populated by the
+	// store layer from COM-04's usage statements for exactly the
+	// capabilities that declare a MeterKey; a key absent here means zero,
+	// not unknown — a capability with no MeterKey is never looked up.
+	Consumption map[string]int64
 }
 
 // CapabilityDecision is EvaluateCapability's result, and ExplainDecision's
@@ -141,11 +152,25 @@ func EvaluateCapability(capabilityKey string, basis SubscriptionEntitlementBasis
 			break
 		}
 		d.LimitValue, d.LimitUnit = cap.LimitValue, cap.LimitUnit
+		used := basis.Consumption[capabilityKey]
 		switch {
 		case cap.LimitValue == nil:
 			d.SubscriptionOutcome, d.Reason = OutcomeAllow, "capability is included, unlimited"
-		case requestedQuantity != nil && *requestedQuantity > *cap.LimitValue:
-			d.SubscriptionOutcome, d.Reason = OutcomeDeny, "requested quantity exceeds the effective limit"
+		case requestedQuantity != nil && used+*requestedQuantity > *cap.LimitValue:
+			if used > 0 {
+				d.SubscriptionOutcome, d.Reason = OutcomeDeny, "requested quantity would exceed the remaining quota this period"
+			} else {
+				d.SubscriptionOutcome, d.Reason = OutcomeDeny, "requested quantity exceeds the effective limit"
+			}
+		case requestedQuantity == nil && cap.MeterKey != nil && used >= *cap.LimitValue:
+			// A bare eligibility check (no specific quantity requested)
+			// against a metered capability that is already fully consumed
+			// must not keep answering ALLOW_WITH_LIMIT as if nothing were
+			// wrong — the doc's own usage/quota required input exists
+			// precisely so an exhausted quota is visible, not silently
+			// re-approved because a single request alone would still fit
+			// under the static limit.
+			d.SubscriptionOutcome, d.Reason = OutcomeDeny, "quota already exhausted for this period"
 		default:
 			d.SubscriptionOutcome, d.Reason = OutcomeAllowWithLimit, "capability is included, subject to its limit"
 		}
@@ -205,6 +230,30 @@ func EffectiveEntitlements(basis SubscriptionEntitlementBasis, restrictions []Co
 		out[i] = EvaluateCapability(k, basis, restrictions, policy, nil, now)
 	}
 	return out
+}
+
+// EntitlementSnapshot is an append-only evidence record of one decision
+// that was actually computed and recorded — never a cache EvaluateCapability
+// reads from (COM-CTRL-010 exists precisely to forbid that). Written by
+// CreateSnapshot (explicit, operator-facing) and automatically by every
+// touchpoint that changes what a decision would be (a boundary-driven
+// subscription change, a dunning-driven restriction).
+type EntitlementSnapshot struct {
+	SnapshotID           string    `json:"snapshot_id"`
+	OrganizationID       string    `json:"organization_id"`
+	CapabilityKey        string    `json:"capability_key"`
+	Outcome              Outcome   `json:"outcome"`
+	LimitValue           *int64    `json:"limit_value,omitempty"`
+	LimitUnit            *string   `json:"limit_unit,omitempty"`
+	SubscriptionOutcome  Outcome   `json:"subscription_outcome"`
+	RestrictionOutcome   *Outcome  `json:"restriction_outcome,omitempty"`
+	AppliedRestrictionID *string   `json:"applied_restriction_id,omitempty"`
+	PolicyVersion        *int      `json:"policy_version,omitempty"`
+	SubscriptionID       *string   `json:"subscription_id,omitempty"`
+	Reason               string    `json:"reason"`
+	DecidedAt            time.Time `json:"decided_at"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }
 
 var (

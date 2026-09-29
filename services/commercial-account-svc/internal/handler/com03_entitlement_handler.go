@@ -22,10 +22,11 @@ import (
 // Restrictions and the ended-access policy are platform authority only: an
 // organization can never apply or lift its own restriction.
 const (
-	ActionEntitlementRead         = "COMMERCIAL_ENTITLEMENT_READ"
-	ActionRestrictionApply        = "COMMERCIAL_RESTRICTION_APPLY"
-	ActionRestrictionRead         = "COMMERCIAL_RESTRICTION_READ"
-	ActionEntitlementPolicyManage = "COMMERCIAL_ENTITLEMENT_POLICY_MANAGE"
+	ActionEntitlementRead           = "COMMERCIAL_ENTITLEMENT_READ"
+	ActionRestrictionApply          = "COMMERCIAL_RESTRICTION_APPLY"
+	ActionRestrictionRead           = "COMMERCIAL_RESTRICTION_READ"
+	ActionEntitlementPolicyManage   = "COMMERCIAL_ENTITLEMENT_POLICY_MANAGE"
+	ActionEntitlementSnapshotManage = "COMMERCIAL_ENTITLEMENT_SNAPSHOT_MANAGE"
 )
 
 var capabilityKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_.:-]{1,127}$`)
@@ -68,9 +69,11 @@ func RegisterEntitlementRoutes(r chi.Router, h *EntitlementHandler) {
 	r.Post("/v1/commercial/entitlements:evaluate", h.Evaluate)
 	r.Post("/v1/commercial/entitlements:explain", h.Explain)
 	r.Post("/v1/commercial/entitlements:recompute", h.Recompute)
+	r.Post("/v1/commercial/entitlements:snapshot", h.CreateSnapshot)
 	r.Route("/v1/commercial/entitlements", func(r chi.Router) {
 		r.Get("/effective", h.GetEffective)
 		r.Get("/limit", h.GetLimit)
+		r.Get("/history", h.GetHistory)
 	})
 	r.Route("/v1/commercial/restrictions", func(r chi.Router) {
 		r.Post("/", h.ApplyRestriction)
@@ -232,6 +235,84 @@ func (h *EntitlementHandler) Recompute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"decisions": ds})
+}
+
+type snapshotRequest struct {
+	OrganizationID string `json:"organization_id"`
+}
+
+// CreateSnapshot is the explicit, delegated-authority "capture evidence of
+// this organization's entitlement right now" command (§4.3) — platform
+// authority only, distinct from Recompute's self-or-operator read scope,
+// since this is an operator/support evidentiary action, not a tenant's own
+// cache-invalidation signal.
+func (h *EntitlementHandler) CreateSnapshot(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.principal(w, r)
+	if !ok || !h.authorizePlatform(w, r, principal, ActionEntitlementSnapshotManage) {
+		return
+	}
+	var req snapshotRequest
+	raw, ok := readBody(w, r, &req, false)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(req.OrganizationID) == "" {
+		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "organization_id", Detail: "is required"})
+		return
+	}
+	cmd, ok := commandFor(w, r, domain.SellerScope, principal, "CreateSnapshot", req.OrganizationID, raw, false)
+	if !ok {
+		return
+	}
+	ds, err := h.store.CreateSnapshot(r.Context(), req.OrganizationID, principal, h.now(), cmd.claim)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"decisions": ds})
+}
+
+// GetHistory is GetEntitlementHistory: what this organization's entitlement
+// for one capability was recorded as, over a window — evidence, read from
+// the append-only snapshot table, never the live decision path.
+func (h *EntitlementHandler) GetHistory(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("capability_key")
+	if !capabilityKeyPattern.MatchString(key) {
+		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeCapabilityKeyRequired, Field: "capability_key", Detail: "capability_key is required"})
+		return
+	}
+	ctx, ok := h.orgScope(w, r, r.URL.Query().Get("organization_id"))
+	if !ok {
+		return
+	}
+	org := svcmiddleware.TenantFromContext(ctx)
+	now := h.now()
+	since, until := now.AddDate(0, 0, -30), now
+	if v := r.URL.Query().Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "since", Detail: "must be RFC3339"})
+			return
+		}
+		since = t
+	}
+	if v := r.URL.Query().Get("until"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext, Field: "until", Detail: "must be RFC3339"})
+			return
+		}
+		until = t
+	}
+	snaps, err := h.store.GetEntitlementHistory(ctx, org, key, since, until)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	if snaps == nil {
+		snaps = []domain.EntitlementSnapshot{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
 }
 
 // ── Restrictions ─────────────────────────────────────────────────────────────

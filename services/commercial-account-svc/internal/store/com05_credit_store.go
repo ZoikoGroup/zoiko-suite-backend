@@ -150,6 +150,13 @@ func (s *PgStore) IssueCreditNote(ctx context.Context, creditNoteID, invoiceID, 
 			return err
 		}
 		out = got
+		ba, err := loadBillingAccountByOrg(ctx, tx, orgID)
+		if err != nil {
+			return err
+		}
+		if err := emitAccountingEvent(ctx, tx, orgID, ba.AccountingMappingKey, amount, "CREDIT", "credit_note", creditNoteID); err != nil {
+			return err
+		}
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "credit_note", AggregateID: creditNoteID,
 			EventType: "credit_note.issued", TenantID: &orgID, Payload: got})
 	})
@@ -216,6 +223,13 @@ func (s *PgStore) ApplyWriteOff(ctx context.Context, writeOffID, invoiceID, amou
 			return err
 		}
 		out = got
+		ba, err := loadBillingAccountByOrg(ctx, tx, orgID)
+		if err != nil {
+			return err
+		}
+		if err := emitAccountingEvent(ctx, tx, orgID, ba.AccountingMappingKey, amount, "CREDIT", "write_off", writeOffID); err != nil {
+			return err
+		}
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "write_off", AggregateID: writeOffID,
 			EventType: "write_off.applied", TenantID: &orgID, Payload: got})
 	})
@@ -352,6 +366,13 @@ func (s *PgStore) SettleRefund(ctx context.Context, req domain.SettleRefundReque
 		eventType := "refund.failed"
 		if got.Status == domain.RefundSettled {
 			eventType = "refund.settled"
+			ba, err := loadBillingAccountByOrg(ctx, tx, got.OrganizationID)
+			if err != nil {
+				return err
+			}
+			if err := emitAccountingEvent(ctx, tx, got.OrganizationID, ba.AccountingMappingKey, got.Amount, "CREDIT", "refund_request", req.RefundID); err != nil {
+				return err
+			}
 		}
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "refund_request", AggregateID: req.RefundID,
 			EventType: eventType, TenantID: &got.OrganizationID, Payload: got})

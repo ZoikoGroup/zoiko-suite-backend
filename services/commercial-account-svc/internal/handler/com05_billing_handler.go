@@ -181,6 +181,7 @@ type openBillingAccountRequest struct {
 	BillingCurrencyCode     string `json:"billing_currency_code"`
 	InvoiceNumberingProfile string `json:"invoice_numbering_profile"`
 	PaymentProviderRef      string `json:"payment_provider_ref"`
+	AccountingMappingKey    string `json:"accounting_mapping_key"`
 }
 
 func (h *BillingHandler) OpenBillingAccount(w http.ResponseWriter, r *http.Request) {
@@ -201,7 +202,8 @@ func (h *BillingHandler) OpenBillingAccount(w http.ResponseWriter, r *http.Reque
 		BillingAccountID: domain.NewCommercialID(domain.PrefixBillingAccount), OrganizationID: req.OrganizationID,
 		SellingEntity: req.SellingEntity, BillingCurrencyCode: req.BillingCurrencyCode,
 		InvoiceNumberingProfile: req.InvoiceNumberingProfile, PaymentProviderRef: req.PaymentProviderRef,
-		CreatedAt: h.now(), CreatedByPrincipalID: principal,
+		AccountingMappingKey: req.AccountingMappingKey,
+		CreatedAt:            h.now(), CreatedByPrincipalID: principal,
 	}
 	if err := domain.ValidateBillingAccount(b); err != nil {
 		h.fail(w, r, err)
