@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
+
+	"zoiko.io/workflow-history-svc/internal/envelope"
 )
 
 var (
@@ -143,6 +146,36 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	// Set baseline caller context
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := ""
+	authzSourceChannel := "system"
+	if env, ok := envelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	if authzRequestID == "" {
+		authzRequestID = fmt.Sprintf("wfh-authz-%d", time.Now().UnixNano())
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	req.Header.Set("Idempotency-Key", fmt.Sprintf("authz-%s-%s-%s", principalID, legalEntityID, actionType))
 
 	resp, err := c.client.Do(req)
 	if err != nil {

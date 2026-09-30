@@ -54,6 +54,10 @@ func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz) chi.Router 
 }
 
 func doRequest(r http.Handler, method, path string, body interface{}, tenantID string) *httptest.ResponseRecorder {
+	return doRequestWithHeaders(r, method, path, body, tenantID, nil)
+}
+
+func doRequestWithHeaders(r http.Handler, method, path string, body interface{}, tenantID string, headers map[string]string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -63,6 +67,9 @@ func doRequest(r http.Handler, method, path string, body interface{}, tenantID s
 	req.Header.Set("X-Principal-Id", "principal-01")
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -185,8 +192,9 @@ func TestClose_Fulfilled_WithoutIdentityVerification_Blocked(t *testing.T) {
 	}
 	var got map[string]string
 	_ = json.Unmarshal(w.Body.Bytes(), &got)
-	if got["error"] == "" || !bytes.Contains([]byte(got["error"]), []byte("identity")) {
-		t.Fatalf("expected the error to name identity verification specifically, got %q", got["error"])
+	// Check for §32 error code PRV-012: IDENTITY_ASSURANCE_INSUFFICIENT
+	if got["error"] == "" || !bytes.Contains([]byte(got["error"]), []byte("PRV-012")) {
+		t.Fatalf("expected the error to contain PRV-012 (IDENTITY_ASSURANCE_INSUFFICIENT), got %q", got["error"])
 	}
 }
 
@@ -302,5 +310,102 @@ func TestGetRequest_NotFound(t *testing.T) {
 	w := doRequest(r, http.MethodGet, "/privacy/rights-requests/does-not-exist", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestCreateRequest_IdempotencyKey_ReplayAndConflict(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	payload := domain.CreateRightsRequestRequest{
+		SubjectRef:   "subject-idem-1",
+		RightFamily:  domain.RightErasure,
+		Jurisdiction: "GDPR",
+	}
+
+	// 1. Initial request with Idempotency-Key
+	w1 := doRequestWithHeaders(r, http.MethodPost, "/privacy/rights-requests", payload, testTenant, map[string]string{
+		"Idempotency-Key": "key-sar-12345",
+	})
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on first request, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var res1 domain.RightsRequest
+	if err := json.Unmarshal(w1.Body.Bytes(), &res1); err != nil {
+		t.Fatalf("failed to unmarshal first response: %v", err)
+	}
+
+	// 2. Idempotent replay with same key and identical payload -> 201 with Idempotency-Replay: true
+	w2 := doRequestWithHeaders(r, http.MethodPost, "/privacy/rights-requests", payload, testTenant, map[string]string{
+		"Idempotency-Key": "key-sar-12345",
+	})
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on replay, got %d: %s", w2.Code, w2.Body.String())
+	}
+	if w2.Header().Get("Idempotency-Replay") != "true" {
+		t.Fatalf("expected Idempotency-Replay: true header, got %s", w2.Header().Get("Idempotency-Replay"))
+	}
+	var res2 domain.RightsRequest
+	if err := json.Unmarshal(w2.Body.Bytes(), &res2); err != nil {
+		t.Fatalf("failed to unmarshal replay response: %v", err)
+	}
+	if res1.RequestID != res2.RequestID {
+		t.Fatalf("expected identical request_id %s, got %s", res1.RequestID, res2.RequestID)
+	}
+
+	// 3. Conflict: same key with different payload -> 409 Conflict
+	payloadDiff := domain.CreateRightsRequestRequest{
+		SubjectRef:   "subject-DIFFERENT",
+		RightFamily:  domain.RightAccess,
+		Jurisdiction: "CCPA",
+	}
+	w3 := doRequestWithHeaders(r, http.MethodPost, "/privacy/rights-requests", payloadDiff, testTenant, map[string]string{
+		"Idempotency-Key": "key-sar-12345",
+	})
+	if w3.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on payload mismatch for same key, got %d: %s", w3.Code, w3.Body.String())
+	}
+}
+
+func TestClose_ResponsePackageVersion_IncrementedOnFulfilled(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+	req := createRequest(t, r)
+
+	// Verify identity
+	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/identity-verification",
+		domain.RecordIdentityVerificationRequest{Verified: true, Method: "GOVT_ID_MATCH"}, testTenant)
+	// Attach discovery manifest
+	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/discovery-manifests",
+		domain.AttachDiscoveryManifestRequest{Domain: "crm-svc", ContentHash: "sha256:crm123", CandidateCount: 5}, testTenant)
+
+	// Close as FULFILLED
+	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
+		domain.CloseRequestRequest{Outcome: domain.OutcomeFulfilled, ResponseEvidenceHash: "sha256:pkg-v1"}, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var closed domain.RightsRequest
+	_ = json.Unmarshal(w.Body.Bytes(), &closed)
+	if closed.ResponsePackageVersion != 1 {
+		t.Fatalf("expected ResponsePackageVersion=1 (I21), got %d", closed.ResponsePackageVersion)
+	}
+}
+
+func TestV1Routes_Succeed(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	w := doRequest(r, http.MethodPost, "/v1/privacy/rights-requests", domain.CreateRightsRequestRequest{
+		SubjectRef: "subject-v1", RightFamily: domain.RightPortability, Jurisdiction: "EU",
+	}, testTenant)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on /v1/ route, got %d: %s", w.Code, w.Body.String())
+	}
+	var req domain.RightsRequest
+	_ = json.Unmarshal(w.Body.Bytes(), &req)
+
+	// Fetch via /v1/
+	w2 := doRequest(r, http.MethodGet, "/v1/privacy/rights-requests/"+req.RequestID, nil, testTenant)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 fetching via /v1/, got %d: %s", w2.Code, w2.Body.String())
 	}
 }

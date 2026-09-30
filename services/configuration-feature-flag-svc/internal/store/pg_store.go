@@ -22,7 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
+	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -30,6 +31,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/configuration-feature-flag-svc/internal/domain"
+	"zoiko.io/configuration-feature-flag-svc/internal/events"
 )
 
 // nilScopeUUID is the sentinel used in COALESCE() to make the
@@ -140,6 +142,14 @@ type Store interface {
 
 	// ListCurrentFeatureFlags is ListCurrentConfigEntries's counterpart.
 	ListCurrentFeatureFlags(ctx context.Context, filter ListFilter) ([]*domain.FeatureFlag, error)
+
+	// ClaimOutbox takes up to limit unpublished events and hands them to fn,
+	// marking them published only if fn succeeds.
+	ClaimOutbox(ctx context.Context, limit int, fn func([]OutboxRecord) error) error
+
+	// OutboxDepth reports the unpublished backlog and the age of its oldest
+	// entry.
+	OutboxDepth(ctx context.Context) (pending int64, oldestAge time.Duration, err error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -185,6 +195,10 @@ func scanConfigEntry(row pgx.Row) (*domain.ConfigEntry, error) {
 // UpsertConfigEntry implements the upsert-with-value-equality design in
 // context.md §7.3.
 func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertConfigEntryParams) (*domain.ConfigEntry, bool, error) {
+	if params.CallerTenantID == "" {
+		return nil, false, domain.ErrCallerTenantMissing
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		s.log.Error("pg UpsertConfigEntry: begin tx failed", zap.Error(err))
@@ -192,8 +206,20 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op once committed
 
-	if err := setTenantScope(ctx, tx, derefOrEmpty(params.TenantID)); err != nil {
+	// The CALLER's tenant, not the scope being written. A global write has no
+	// scope tenant, and deriving the RLS session from it would leave the write
+	// unscoped — which under FORCE ROW LEVEL SECURITY makes the outbox row this
+	// transaction enqueues invisible to its own policy and refuses it at
+	// INSERT, failing the whole write after the version row was built.
+	if err := setTenantScope(ctx, tx, params.CallerTenantID); err != nil {
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	if err := gateDirectWrite(ctx, tx, params.Key); err != nil {
+		return nil, false, err
+	}
+	if err := gateConfigWriteValue(ctx, tx, params.Key, params.Environment, params.TenantID, params.Value); err != nil {
+		return nil, false, err
 	}
 
 	const findCurrentQuery = `
@@ -212,6 +238,13 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 		entry, insertErr := insertConfigEntry(ctx, tx, params)
 		if insertErr != nil {
 			return nil, false, insertErr
+		}
+		if err := enqueueConfigUpdated(ctx, tx, params.CallerTenantID, *entry, params.CorrelationID); err != nil {
+			s.log.Error("pg UpsertConfigEntry: enqueue failed", zap.Error(err))
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if err := s.mintAndPublish(ctx, tx, "UpsertConfigEntry", params.Environment, params.CreatedByPrincipalID, params.CallerTenantID, params.CorrelationID); err != nil {
+			return nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			s.log.Error("pg UpsertConfigEntry: commit failed", zap.Error(err))
@@ -244,6 +277,16 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 
 	entry, err := insertConfigEntry(ctx, tx, params)
 	if err != nil {
+		return nil, false, err
+	}
+	if err := enqueueConfigUpdated(ctx, tx, params.CallerTenantID, *entry, params.CorrelationID); err != nil {
+		s.log.Error("pg UpsertConfigEntry: enqueue failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	// The supersede is a real transition too, and reads are served from
+	// snapshots (INV-12): without a mint here the new value was recorded and
+	// reported saved while every read kept serving the one it replaced.
+	if err := s.mintAndPublish(ctx, tx, "UpsertConfigEntry", params.Environment, params.CreatedByPrincipalID, params.CallerTenantID, params.CorrelationID); err != nil {
 		return nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -301,80 +344,81 @@ func jsonEqual(a, b []byte) bool {
 // FindCurrentConfigEntry looks up the currently-effective row for an
 // exact (key, environment, tenant_id) scope. No fallback to a global
 // default on a tenant-specific miss — see context.md §7.2.
+//
+// The lookup is served from the environment's newest snapshot imprint
+// (INV-12), never the live admin tables. A scope that has never been
+// written to has no snapshot and answers ErrConfigEntryNotFound, the same
+// 404 semantics the read path always carried.
 func (s *PgStore) FindCurrentConfigEntry(ctx context.Context, key, environment string, tenantID *string) (*domain.ConfigEntry, error) {
-	const query = `
-		SELECT ` + configColumns + `
-		FROM config_entries
-		WHERE key = $1
-		  AND environment = $2
-		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
-		  AND effective_to IS NULL;`
-
-	var entry *domain.ConfigEntry
-	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
-		var scanErr error
-		entry, scanErr = scanConfigEntry(tx.QueryRow(ctx, query, key, environment, tenantID))
-		return scanErr
-	})
+	snap, err := s.latestSnapshotRow(ctx, environment)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrConfigEntryNotFound
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrConfigEntryNotFound
-		}
-		s.log.Error("pg FindCurrentConfigEntry failed", zap.String("key", key), zap.Error(err))
+		s.log.Error("pg FindCurrentConfigEntry: read snapshot failed", zap.String("key", key), zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return entry, nil
+	entries, err := parseManifest(snap.Content)
+	if err != nil {
+		s.log.Error("pg FindCurrentConfigEntry: parse manifest failed", zap.String("key", key), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	e, ok := entries[domain.ManifestKey(key, tenantID)]
+	if !ok || e.Kind != domain.ManifestKindConfig {
+		return nil, domain.ErrConfigEntryNotFound
+	}
+	return configFromManifest(e), nil
 }
 
 // ListCurrentConfigEntries returns every currently-effective config entry,
 // optionally filtered by environment and/or tenant_id. An absent filter
 // dimension means "no filter" (not "global only") — e.g. omitting
 // tenant_id returns entries across all tenants, not just global ones.
+//
+// Each environment's newest snapshot imprint is the source; an environment
+// with no imprint contributes nothing. Missing imprints answer an empty
+// list, matching the list endpoint's 200-with-empty semantics.
 func (s *PgStore) ListCurrentConfigEntries(ctx context.Context, filter ListFilter) ([]*domain.ConfigEntry, error) {
-	args := []any{}
-	conditions := []string{"effective_to IS NULL"}
-	argIdx := 1
-
+	var snaps map[string]*domain.ConfigSnapshot
 	if filter.Environment != "" {
-		conditions = append(conditions, fmt.Sprintf("environment = $%d", argIdx))
-		args = append(args, filter.Environment)
-		argIdx++
+		snap, err := s.latestSnapshotRow(ctx, filter.Environment)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			s.log.Error("pg ListCurrentConfigEntries: read snapshot failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		snaps = map[string]*domain.ConfigSnapshot{snap.Environment: snap}
+	} else {
+		var err error
+		snaps, err = s.latestSnapshotsByEnv(ctx)
+		if err != nil {
+			s.log.Error("pg ListCurrentConfigEntries: list snapshots failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 	}
-	if cond := tenantCondition(filter, argIdx); cond != "" {
-		conditions = append(conditions, cond)
-		args = append(args, *filter.TenantID)
-		argIdx++
-	}
-
-	query := fmt.Sprintf(`
-		SELECT %s
-		FROM config_entries
-		WHERE %s
-		ORDER BY key, environment;`,
-		configColumns, strings.Join(conditions, " AND "),
-	)
 
 	var results []*domain.ConfigEntry
-	err := s.withRLS(ctx, derefOrEmpty(filter.TenantID), func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, query, args...)
+	for _, snap := range snaps {
+		entries, err := parseManifest(snap.Content)
 		if err != nil {
-			return err
+			s.log.Error("pg ListCurrentConfigEntries: parse manifest failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		defer rows.Close()
-
-		for rows.Next() {
-			c, scanErr := scanConfigEntry(rows)
-			if scanErr != nil {
-				return scanErr
+		for _, e := range entries {
+			if e.Kind != domain.ManifestKindConfig || e.Layer != "" || !entryMatch(filter, e.TenantID) {
+				continue
 			}
-			results = append(results, c)
+			results = append(results, configFromManifest(e))
 		}
-		return rows.Err()
-	})
-	if err != nil {
-		s.log.Error("pg ListCurrentConfigEntries failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Key != results[j].Key {
+			return results[i].Key < results[j].Key
+		}
+		return results[i].Environment < results[j].Environment
+	})
 	return results, nil
 }
 
@@ -413,6 +457,10 @@ func scanFeatureFlag(row pgx.Row) (*domain.FeatureFlag, error) {
 // same transactional shape, comparing (enabled, rollout_percentage) for
 // equality instead of a JSON value.
 func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFeatureFlagParams) (*domain.FeatureFlag, bool, error) {
+	if params.CallerTenantID == "" {
+		return nil, false, domain.ErrCallerTenantMissing
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		s.log.Error("pg UpsertFeatureFlag: begin tx failed", zap.Error(err))
@@ -420,8 +468,17 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if err := setTenantScope(ctx, tx, derefOrEmpty(params.TenantID)); err != nil {
+	// The CALLER's tenant — see UpsertConfigEntry for why this is not the scope
+	// being written.
+	if err := setTenantScope(ctx, tx, params.CallerTenantID); err != nil {
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	if err := gateDirectWrite(ctx, tx, params.Key); err != nil {
+		return nil, false, err
+	}
+	if err := gateFlagWrite(ctx, tx, params.Key, params.Environment, params.TenantID, params.Enabled, params.RolloutPercentage); err != nil {
+		return nil, false, err
 	}
 
 	const findCurrentQuery = `
@@ -439,6 +496,13 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 		flag, insertErr := insertFeatureFlag(ctx, tx, params)
 		if insertErr != nil {
 			return nil, false, insertErr
+		}
+		if err := enqueueFlagUpdated(ctx, tx, params.CallerTenantID, *flag, params.CorrelationID); err != nil {
+			s.log.Error("pg UpsertFeatureFlag: enqueue failed", zap.Error(err))
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if err := s.mintAndPublish(ctx, tx, "UpsertFeatureFlag", params.Environment, params.CreatedByPrincipalID, params.CallerTenantID, params.CorrelationID); err != nil {
+			return nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			s.log.Error("pg UpsertFeatureFlag: commit failed", zap.Error(err))
@@ -465,6 +529,14 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 	if err != nil {
 		return nil, false, err
 	}
+	if err := enqueueFlagUpdated(ctx, tx, params.CallerTenantID, *flag, params.CorrelationID); err != nil {
+		s.log.Error("pg UpsertFeatureFlag: enqueue failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	// See UpsertConfigEntry: a supersede must mint or reads never see it.
+	if err := s.mintAndPublish(ctx, tx, "UpsertFeatureFlag", params.Environment, params.CreatedByPrincipalID, params.CallerTenantID, params.CorrelationID); err != nil {
+		return nil, false, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		s.log.Error("pg UpsertFeatureFlag: commit failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -487,79 +559,269 @@ func insertFeatureFlag(ctx context.Context, tx pgx.Tx, params domain.UpsertFeatu
 	return flag, nil
 }
 
-// FindCurrentFeatureFlag is FindCurrentConfigEntry's counterpart.
+// FindCurrentFeatureFlag is FindCurrentConfigEntry's counterpart, served
+// from the environment's newest snapshot imprint.
 func (s *PgStore) FindCurrentFeatureFlag(ctx context.Context, key, environment string, tenantID *string) (*domain.FeatureFlag, error) {
-	const query = `
-		SELECT ` + flagColumns + `
-		FROM feature_flags
-		WHERE key = $1
-		  AND environment = $2
-		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
-		  AND effective_to IS NULL;`
-
-	var flag *domain.FeatureFlag
-	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
-		var scanErr error
-		flag, scanErr = scanFeatureFlag(tx.QueryRow(ctx, query, key, environment, tenantID))
-		return scanErr
-	})
+	snap, err := s.latestSnapshotRow(ctx, environment)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrFeatureFlagNotFound
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrFeatureFlagNotFound
-		}
-		s.log.Error("pg FindCurrentFeatureFlag failed", zap.String("key", key), zap.Error(err))
+		s.log.Error("pg FindCurrentFeatureFlag: read snapshot failed", zap.String("key", key), zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return flag, nil
+	entries, err := parseManifest(snap.Content)
+	if err != nil {
+		s.log.Error("pg FindCurrentFeatureFlag: parse manifest failed", zap.String("key", key), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	e, ok := entries[domain.ManifestKey(key, tenantID)]
+	if !ok || e.Kind != domain.ManifestKindFlag {
+		return nil, domain.ErrFeatureFlagNotFound
+	}
+	return flagFromManifest(e), nil
 }
 
-// ListCurrentFeatureFlags is ListCurrentConfigEntries's counterpart.
+// ListCurrentFeatureFlags is ListCurrentConfigEntries's counterpart: each
+// environment's newest snapshot imprint, filtered the same way.
 func (s *PgStore) ListCurrentFeatureFlags(ctx context.Context, filter ListFilter) ([]*domain.FeatureFlag, error) {
-	args := []any{}
-	conditions := []string{"effective_to IS NULL"}
-	argIdx := 1
-
+	var snaps map[string]*domain.ConfigSnapshot
 	if filter.Environment != "" {
-		conditions = append(conditions, fmt.Sprintf("environment = $%d", argIdx))
-		args = append(args, filter.Environment)
-		argIdx++
+		snap, err := s.latestSnapshotRow(ctx, filter.Environment)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			s.log.Error("pg ListCurrentFeatureFlags: read snapshot failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		snaps = map[string]*domain.ConfigSnapshot{snap.Environment: snap}
+	} else {
+		var err error
+		snaps, err = s.latestSnapshotsByEnv(ctx)
+		if err != nil {
+			s.log.Error("pg ListCurrentFeatureFlags: list snapshots failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 	}
-	if cond := tenantCondition(filter, argIdx); cond != "" {
-		conditions = append(conditions, cond)
-		args = append(args, *filter.TenantID)
-		argIdx++
-	}
-
-	query := fmt.Sprintf(`
-		SELECT %s
-		FROM feature_flags
-		WHERE %s
-		ORDER BY key, environment;`,
-		flagColumns, strings.Join(conditions, " AND "),
-	)
 
 	var results []*domain.FeatureFlag
-	err := s.withRLS(ctx, derefOrEmpty(filter.TenantID), func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, query, args...)
+	for _, snap := range snaps {
+		entries, err := parseManifest(snap.Content)
 		if err != nil {
+			s.log.Error("pg ListCurrentFeatureFlags: parse manifest failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		for _, e := range entries {
+			if e.Kind != domain.ManifestKindFlag || !entryMatch(filter, e.TenantID) {
+				continue
+			}
+			results = append(results, flagFromManifest(e))
+		}
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Key != results[j].Key {
+			return results[i].Key < results[j].Key
+		}
+		return results[i].Environment < results[j].Environment
+	})
+	return results, nil
+}
+
+// ── transactional outbox ─────────────────────────────────────────────────────
+
+// enqueue writes one sealed envelope into event_outbox on the caller's open
+// transaction.
+//
+// Sharing the transaction is the whole point. Before this existed, the handler
+// wrote to Kafka after the store had already committed and logged the error if
+// it failed, so a broker hiccup during a config write left the new version
+// recorded, the operator told it was saved, and every consumer still reading
+// the value it had superseded — with nothing anywhere reporting a fault.
+//
+// Because it shares the transaction, a failure here FAILS THE WRITE. That is
+// deliberate: refusing a change nobody can be told about is better than
+// recording one silently, and the caller can retry.
+// mintAndPublish mints the environment's next snapshot inside the write's
+// transaction and enqueues config.snapshot.published beside it. Every path
+// that records a real transition calls it — first write and supersede alike —
+// so a value can never be committed without the imprint reads are served from.
+func (s *PgStore) mintAndPublish(ctx context.Context, tx pgx.Tx, logOp, environment, actor, callerTenantID, correlationID string) error {
+	snap, err := s.mintSnapshot(ctx, tx, environment, actor)
+	if err != nil {
+		s.log.Error("pg "+logOp+": mint failed", zap.Error(err))
+		return err
+	}
+	if err := enqueueSnapshotPublished(ctx, tx, callerTenantID, actor, correlationID, *snap); err != nil {
+		s.log.Error("pg "+logOp+": enqueue snapshot failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+func enqueue(ctx context.Context, tx pgx.Tx, tenantID string, out events.Outbound) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO event_outbox (tenant_id, event_type, aggregate_key, payload)
+		VALUES ($1, $2, $3, $4)
+	`, tenantID, out.EventType, out.Key, out.Body)
+	if err != nil {
+		return fmt.Errorf("enqueue %s: %w", out.EventType, err)
+	}
+	return nil
+}
+
+func enqueueConfigUpdated(ctx context.Context, tx pgx.Tx, callerTenantID string, entry domain.ConfigEntry, correlationID string) error {
+	out, err := events.ConfigUpdated(entry, correlationID)
+	if err != nil {
+		return err
+	}
+	return enqueue(ctx, tx, callerTenantID, out)
+}
+
+func enqueueFlagUpdated(ctx context.Context, tx pgx.Tx, callerTenantID string, flag domain.FeatureFlag, correlationID string) error {
+	out, err := events.FeatureFlagUpdated(flag, correlationID)
+	if err != nil {
+		return err
+	}
+	return enqueue(ctx, tx, callerTenantID, out)
+}
+
+// OutboxRecord is one claimed, unpublished event.
+type OutboxRecord struct {
+	OutboxID  int64
+	EventType string
+	Key       string
+	Body      []byte
+}
+
+// withRelay runs fn with app.outbox_relay installed instead of a tenant.
+//
+// The relay is the one code path in this service that legitimately crosses
+// tenants: it drains every tenant's backlog from a single loop. Rather than
+// letting it run unscoped — which under FORCE ROW LEVEL SECURITY would simply
+// see nothing, and would present as a relay that publishes nothing while
+// reporting no error at all — it names itself, so migration 000003's policy
+// admits it by an explicit, auditable disjunct rather than by the absence of a
+// control.
+func (s *PgStore) withRelay(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin relay transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
+		return fmt.Errorf("set relay context: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit relay transaction: %w", err)
+	}
+	return nil
+}
+
+// ClaimOutbox takes up to limit unpublished events, oldest first, locking them
+// for the duration of the caller's drain.
+//
+// FOR UPDATE SKIP LOCKED is what makes more than one replica safe: a second
+// relay claims the next batch instead of blocking on, or duplicating, this one.
+func (s *PgStore) ClaimOutbox(ctx context.Context, limit int, fn func([]OutboxRecord) error) error {
+	return s.withRelay(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT outbox_id, event_type, aggregate_key, payload
+			FROM event_outbox
+			WHERE published_at IS NULL
+			ORDER BY created_at, outbox_id
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		`, limit)
+		if err != nil {
+			return fmt.Errorf("claim outbox: %w", err)
+		}
+		var claimed []OutboxRecord
+		for rows.Next() {
+			var r OutboxRecord
+			if err := rows.Scan(&r.OutboxID, &r.EventType, &r.Key, &r.Body); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan outbox row: %w", err)
+			}
+			claimed = append(claimed, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("read outbox rows: %w", err)
+		}
+		if len(claimed) == 0 {
+			return nil
+		}
+
+		// fn publishes. It runs while the rows are still locked and BEFORE the
+		// marking commits, so a crash mid-publish rolls the marking back and
+		// the events are re-delivered rather than lost. At-least-once, chosen
+		// deliberately: a duplicate config.updated makes a consumer re-read a
+		// value it already has, a lost one leaves it serving a value this
+		// service has already superseded, permanently and undetectably.
+		if err := fn(claimed); err != nil {
+			ids := make([]int64, 0, len(claimed))
+			for _, r := range claimed {
+				ids = append(ids, r.OutboxID)
+			}
+			// Recorded on the rows themselves, so a stuck event can be
+			// diagnosed from the table without correlating against logs.
+			if _, uerr := tx.Exec(ctx, `
+				UPDATE event_outbox
+				SET attempts = attempts + 1, last_error = $2
+				WHERE outbox_id = ANY($1)
+			`, ids, err.Error()); uerr != nil {
+				return fmt.Errorf("record publish failure: %w (original: %v)", uerr, err)
+			}
+			// Committed: the attempt count and the error are worth keeping even
+			// though the publish failed. published_at is untouched, so the rows
+			// are claimed again on the next tick.
+			if cerr := tx.Commit(ctx); cerr != nil {
+				return fmt.Errorf("commit publish failure: %w (original: %v)", cerr, err)
+			}
 			return err
 		}
-		defer rows.Close()
 
-		for rows.Next() {
-			f, scanErr := scanFeatureFlag(rows)
-			if scanErr != nil {
-				return scanErr
-			}
-			results = append(results, f)
+		ids := make([]int64, 0, len(claimed))
+		for _, r := range claimed {
+			ids = append(ids, r.OutboxID)
 		}
-		return rows.Err()
+		if _, err := tx.Exec(ctx, `
+			UPDATE event_outbox SET published_at = now() WHERE outbox_id = ANY($1)
+		`, ids); err != nil {
+			return fmt.Errorf("mark published: %w", err)
+		}
+		return nil
 	})
-	if err != nil {
-		s.log.Error("pg ListCurrentFeatureFlags failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return results, nil
+}
+
+// OutboxDepth reports the unpublished backlog and the age of its oldest entry.
+//
+// Both, not just the depth. A backlog of ten that is three seconds old is a
+// service under load; a backlog of ten that is an hour old is a relay that has
+// stopped, and on this service that means consumers have been acting on a
+// superseded configuration value for an hour while the console displays the new
+// one. Depth alone cannot tell them apart, which is why the alert rule uses the
+// age.
+func (s *PgStore) OutboxDepth(ctx context.Context) (pending int64, oldestAge time.Duration, err error) {
+	err = s.withRelay(ctx, func(tx pgx.Tx) error {
+		var oldest *time.Time
+		row := tx.QueryRow(ctx, `
+			SELECT count(*), min(created_at) FROM event_outbox WHERE published_at IS NULL
+		`)
+		if err := row.Scan(&pending, &oldest); err != nil {
+			return fmt.Errorf("outbox depth: %w", err)
+		}
+		if oldest != nil {
+			oldestAge = time.Since(*oldest)
+		}
+		return nil
+	})
+	return pending, oldestAge, err
 }
 
 // ─── compile-time interface check ──────────────────────────────────────────

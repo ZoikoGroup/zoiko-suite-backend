@@ -1,0 +1,69 @@
+# Prometheus alert rules — tenant-entity-registry-svc (ORG §9.2 gate 7).
+#
+# Each alert names the SLO it protects (SLO.md) and the RUNBOOK.md section to
+# open. Metrics: http_requests_total, http_request_duration_seconds,
+# readiness_up (internal/telemetry) and the outbox_* gauges added 28 Sep 2026.
+groups:
+  - name: tenant-entity-registry-svc
+    rules:
+      - alert: TenantRegistryNotReady
+        expr: max by (service) (readiness_up{service="tenant-entity-registry-svc"}) == 0
+        for: 2m
+        labels: { severity: page, slo: availability }
+        annotations:
+          summary: tenant-entity-registry-svc is failing /readyz
+          runbook: RUNBOOK.md §3.1 — service not ready
+
+      - alert: TenantRegistryAvailabilityBurn
+        # 99.9% availability SLO; 14.4x burn over 1h exhausts a 30-day budget in ~2 days.
+        expr: |
+          (
+            sum(rate(http_requests_total{service="tenant-entity-registry-svc",status_code=~"5.."}[1h]))
+            / sum(rate(http_requests_total{service="tenant-entity-registry-svc"}[1h]))
+          ) > (14.4 * 0.001)
+        for: 5m
+        labels: { severity: page, slo: availability }
+        annotations:
+          summary: 5xx rate is burning the availability error budget
+          runbook: RUNBOOK.md §3.2 — elevated 5xx
+
+      - alert: TenantRegistryReadLatency
+        # Resolution path: GET p99 under 300ms (SLO.md §2).
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_request_duration_seconds_bucket{service="tenant-entity-registry-svc",method="GET"}[10m]))
+          ) > 0.3
+        for: 10m
+        labels: { severity: ticket, slo: latency }
+        annotations:
+          summary: GET p99 latency above 300ms
+          runbook: RUNBOOK.md §3.3 — latency
+
+      - alert: TenantRegistryOutboxBacklog
+        # Event delivery SLO: an event reaches Kafka within 60s of commit.
+        expr: max(outbox_pending_events{service="tenant-entity-registry-svc"}) > 100
+        for: 5m
+        labels: { severity: page, slo: event-delivery }
+        annotations:
+          summary: event_outbox backlog is not draining
+          runbook: RUNBOOK.md §4.1 — outbox backlog
+
+      - alert: TenantRegistryOutboxDeadLetters
+        expr: max(outbox_dead_letter_events{service="tenant-entity-registry-svc"}) > 0
+        for: 1m
+        labels: { severity: page, slo: event-delivery }
+        annotations:
+          summary: an event exhausted its publish attempts — consumers are missing a fact
+          runbook: RUNBOOK.md §4.2 — dead letters
+
+      - alert: TenantRegistryAuthzRefusalsSpike
+        # A surge of 403/503 on writes is usually authorization-svc down (fail
+        # closed) or a lost grant — both stop every governed command.
+        expr: |
+          sum(rate(http_requests_total{service="tenant-entity-registry-svc",method=~"POST|PATCH|DELETE",status_code=~"403|503"}[10m]))
+          / clamp_min(sum(rate(http_requests_total{service="tenant-entity-registry-svc",method=~"POST|PATCH|DELETE"}[10m])), 1e-9) > 0.5
+        for: 10m
+        labels: { severity: ticket, slo: availability }
+        annotations:
+          summary: more than half of writes refused 403/503
+          runbook: RUNBOOK.md §5.1 — writes refused

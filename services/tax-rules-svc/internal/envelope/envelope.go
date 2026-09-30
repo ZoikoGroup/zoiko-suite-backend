@@ -244,3 +244,57 @@ func MustFromContext(ctx context.Context) Envelope {
 	e, _ := FromContext(ctx)
 	return e
 }
+
+// ApplyTo writes this envelope onto an OUTBOUND request, so a service calling a
+// peer forwards the caller's envelope instead of dropping it.
+func (e Envelope) ApplyTo(r *http.Request) {
+	set := func(header, value string) {
+		if value != "" {
+			r.Header.Set(header, value)
+		}
+	}
+
+	set(HeaderTenantID, e.TenantID)
+	set(HeaderActorSubjectID, e.ActorSubjectID)
+	set(HeaderWorkloadID, e.WorkloadID)
+	set(HeaderLegalEntityID, e.LegalEntityID)
+	set(HeaderBookID, e.BookID)
+	set(HeaderReportingBasis, e.ReportingBasis)
+	set(HeaderOperation, e.Operation)
+	set(HeaderRequestID, e.RequestID)
+	set(HeaderCorrelationID, e.CorrelationID)
+	set(HeaderCausationID, e.CausationID)
+	set(HeaderIdempotencyKey, e.IdempotencyKey)
+	set(HeaderSourceSystem, e.SourceSystem)
+	set(HeaderExternalReference, e.ExternalReference)
+	set(HeaderTimezone, e.Timezone)
+	set(HeaderJurisdictionContext, e.JurisdictionContext)
+	set(HeaderPurposeContext, e.PurposeContext)
+	set(HeaderExpectedVersion, e.ExpectedVersion)
+	set(HeaderWorkflowInstanceID, e.WorkflowInstanceID)
+	set(HeaderApprovalReference, e.ApprovalReference)
+
+	channel := e.SourceChannel
+	if !channel.Valid() {
+		channel = ChannelSystem
+	}
+	r.Header.Set(HeaderSourceChannel, string(channel))
+
+	if e.OccurredAt != nil {
+		r.Header.Set(HeaderOccurredAt, e.OccurredAt.Format(time.RFC3339))
+	}
+	if e.EffectiveAt != nil {
+		r.Header.Set(HeaderEffectiveAt, e.EffectiveAt.Format(time.RFC3339))
+	}
+	if len(e.EvidenceRefs) > 0 {
+		r.Header.Set(HeaderEvidenceRefs, strings.Join(e.EvidenceRefs, ","))
+	}
+}
+
+// ForwardTo copies the envelope from ctx onto an outbound request.
+func ForwardTo(ctx context.Context, r *http.Request) {
+	if e, ok := FromContext(ctx); ok {
+		e.ApplyTo(r)
+	}
+}
+

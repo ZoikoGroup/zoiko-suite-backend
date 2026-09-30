@@ -90,6 +90,16 @@ type Store interface {
 	RecordAuditEntry(ctx context.Context, params domain.RecordAuditEntryParams) (*domain.SecretAccessAuditLog, error)
 	FindAuditEntryByRotationRequestID(ctx context.Context, requestID string) (*domain.SecretAccessAuditLog, error)
 	ListAuditLog(ctx context.Context, filter AuditListFilter) ([]*domain.SecretAccessAuditLog, error)
+
+	CreateSharedSecretException(ctx context.Context, params domain.SharedSecretException) (*domain.SharedSecretException, bool, error)
+	FindSharedSecretExceptionByID(ctx context.Context, exceptionID, tenantID string) (*domain.SharedSecretException, error)
+	ListSharedSecretExceptions(ctx context.Context, filter domain.ListSharedSecretExceptionsFilter) ([]*domain.SharedSecretException, error)
+	RevokeSharedSecretException(ctx context.Context, exceptionID, tenantID, actorID string) (*domain.SharedSecretException, bool, error)
+
+	UpsertRotationSchedule(ctx context.Context, secretPolicyVersionID string, intervalSeconds int, nextRotationAt time.Time) error
+	ListDueRotations(ctx context.Context, now time.Time) ([]*domain.DueRotation, error)
+	UpdateRotationSchedule(ctx context.Context, secretPolicyVersionID string, nextRotationAt time.Time) error
+	ClaimDueRotation(ctx context.Context, secretPolicyVersionID string, listedNext, claimUntil time.Time) (bool, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -336,6 +346,16 @@ func (s *PgStore) CreateSecretPolicyVersion(ctx context.Context, params domain.C
 		))
 		if err == nil {
 			result, created = v, true
+			if params.RotationIntervalSeconds > 0 {
+				const scheduleQuery = `
+					INSERT INTO secret_rotation_schedules
+						(secret_policy_version_id, interval_seconds, next_rotation_at)
+					VALUES ($1, $2, $3)
+					ON CONFLICT (secret_policy_version_id) DO NOTHING;`
+				if _, err := tx.Exec(ctx, scheduleQuery, v.SecretPolicyVersionID, params.RotationIntervalSeconds, time.Now().Add(time.Duration(params.RotationIntervalSeconds)*time.Second)); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -903,6 +923,7 @@ const auditLogColumns = `
 	secret_class,
 	secret_path,
 	requested_by_principal_id,
+	acted_by_principal_id,
 	tenant_id,
 	legal_entity_id,
 	lease_id,
@@ -916,7 +937,8 @@ func scanAuditEntry(row pgx.Row) (*domain.SecretAccessAuditLog, error) {
 	a := &domain.SecretAccessAuditLog{}
 	err := row.Scan(
 		&a.AuditLogID, &a.EventType, &a.SecretClass, &a.SecretPath,
-		&a.RequestedByPrincipalID, &a.TenantID, &a.LegalEntityID,
+		&a.RequestedByPrincipalID, &a.ActedByPrincipalID,
+		&a.TenantID, &a.LegalEntityID,
 		&a.LeaseID, &a.SecretPolicyVersionID, &a.RequestID,
 		&a.OutcomeDetail, &a.CorrelationID, &a.RecordedAt,
 	)
@@ -934,9 +956,10 @@ func (s *PgStore) RecordAuditEntry(ctx context.Context, params domain.RecordAudi
 	const query = `
 		INSERT INTO secret_access_audit_log (
 			event_type, secret_class, secret_path, requested_by_principal_id,
-			tenant_id, legal_entity_id, lease_id, secret_policy_version_id,
+			acted_by_principal_id, tenant_id, legal_entity_id,
+			secret_policy_version_id, lease_id,
 			request_id, outcome_detail, correlation_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING ` + auditLogColumns + `;`
 
 	var a *domain.SecretAccessAuditLog
@@ -944,7 +967,8 @@ func (s *PgStore) RecordAuditEntry(ctx context.Context, params domain.RecordAudi
 		var scanErr error
 		a, scanErr = scanAuditEntry(tx.QueryRow(ctx, query,
 			params.EventType, params.SecretClass, params.SecretPath, params.RequestedByPrincipalID,
-			params.TenantID, params.LegalEntityID, params.LeaseID, params.SecretPolicyVersionID,
+			params.ActedByPrincipalID, params.TenantID, params.LegalEntityID,
+			params.SecretPolicyVersionID, params.LeaseID,
 			params.RequestID, params.OutcomeDetail, params.CorrelationID,
 		))
 		return scanErr
@@ -963,18 +987,32 @@ func (s *PgStore) RecordAuditEntry(ctx context.Context, params domain.RecordAudi
 // Returns domain.ErrLeaseNotFound-shaped semantics via a plain nil,nil on
 // no match (not found is a valid, expected outcome here, not an error).
 //
-// No withRLS/withPlatformScope wrapping needed: Rotate's handler never
-// sets TenantID on a ROTATED RecordAuditEntry call (rotation is a
-// property of the secret path, not any one tenant), so every ROTATED row
-// has tenant_id = NULL and always satisfies the policy's "tenant_id IS
-// NULL" branch regardless of session state.
+// Runs under withPlatformScope, and must: ROTATED rows now carry the
+// rotating caller's tenant_id (they used to be written with tenant_id =
+// NULL, which made every rotation invisible in the audit query of the
+// very tenants whose leases it revoked). A tenant-bound row is hidden by
+// this table's FORCE-ROW-LEVEL-SECURITY policy from a connection with no
+// app.tenant_id set — which is what this dedup lookup would be if it ran
+// on the bare pool. It would then find nothing, report "no prior
+// rotation", and let a retried request rotate the material a second
+// time: the exact double-rotation the request_id dedup exists to
+// prevent. Platform scope is the correct authority here rather than a
+// tenant one, because the dedup question — "has THIS request_id already
+// rotated anything, anywhere" — is platform-wide by definition, and
+// SECRET_ROTATE is already authorized at platform scope before the
+// handler reaches this call.
 func (s *PgStore) FindAuditEntryByRotationRequestID(ctx context.Context, requestID string) (*domain.SecretAccessAuditLog, error) {
 	const query = `
 		SELECT ` + auditLogColumns + `
 		FROM secret_access_audit_log
 		WHERE event_type = 'ROTATED' AND request_id = $1;`
 
-	a, err := scanAuditEntry(s.pool.QueryRow(ctx, query, requestID))
+	var a *domain.SecretAccessAuditLog
+	err := s.withPlatformScope(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		a, scanErr = scanAuditEntry(tx.QueryRow(ctx, query, requestID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -1061,6 +1099,290 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditListFilter) ([]*
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
+}
+
+// ── shared_secret_exceptions ─────────────────────────────────────────────────
+
+const sharedSecretExceptionColumns = `
+	exception_id,
+	secret_path,
+	reason,
+	evidence_reference,
+	approved_by_principal_id,
+	tenant_id,
+	expires_at,
+	status,
+	created_at,
+	revoked_at,
+	revoked_by_principal_id`
+
+func scanSharedSecretException(row pgx.Row) (*domain.SharedSecretException, error) {
+	e := &domain.SharedSecretException{}
+	err := row.Scan(
+		&e.ExceptionID, &e.SecretPath, &e.Reason, &e.EvidenceReference,
+		&e.ApprovedByPrincipalID, &e.TenantID, &e.ExpiresAt, &e.Status,
+		&e.CreatedAt, &e.RevokedAt, &e.RevokedBy,
+	)
+	return e, err
+}
+
+// CreateSharedSecretException records one evidence-backed exception,
+// idempotently. Dedup key is (secret_path, tenant_id) while ACTIVE — the
+// partial unique index from migration 000006. Returns created=false when a
+// matching ACTIVE exception already exists, so the caller can replay the
+// existing one verbatim instead of stacking a duplicate override.
+func (s *PgStore) CreateSharedSecretException(ctx context.Context, params domain.SharedSecretException) (*domain.SharedSecretException, bool, error) {
+	const query = `
+		INSERT INTO shared_secret_exceptions (
+			exception_id, secret_path, reason, evidence_reference,
+			approved_by_principal_id, tenant_id, expires_at, status
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'ACTIVE')
+		ON CONFLICT DO NOTHING
+		RETURNING ` + sharedSecretExceptionColumns + `;`
+
+	const lookupQuery = `
+		SELECT ` + sharedSecretExceptionColumns + `
+		FROM shared_secret_exceptions
+		WHERE secret_path = $1
+		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($2::uuid, '` + nilScopeUUID + `'::UUID)
+		  AND status = 'ACTIVE';`
+
+	var result *domain.SharedSecretException
+	var created bool
+	err := s.withRLS(ctx, derefOrEmpty(params.TenantID), func(tx pgx.Tx) error {
+		e, err := scanSharedSecretException(tx.QueryRow(ctx, query,
+			params.ExceptionID, params.SecretPath, params.Reason, params.EvidenceReference,
+			params.ApprovedByPrincipalID, params.TenantID, params.ExpiresAt,
+		))
+		if err == nil {
+			result, created = e, true
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		existing, err := scanSharedSecretException(tx.QueryRow(ctx, lookupQuery, params.SecretPath, params.TenantID))
+		if err != nil {
+			return err
+		}
+		if existing.Reason != params.Reason || existing.EvidenceReference != params.EvidenceReference || existing.ExpiresAt != params.ExpiresAt {
+			s.log.Warn("shared secret exception dedup match but payload mismatch (409 conflict)",
+				zap.String("exception_id", existing.ExceptionID),
+			)
+			return domain.ErrConflict
+		}
+		result, created = existing, false
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrConflict) {
+			return nil, false, domain.ErrConflict
+		}
+		s.log.Error("pg CreateSharedSecretException failed", zap.String("secret_path", params.SecretPath), zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return result, created, nil
+}
+
+// FindSharedSecretExceptionByID looks up one exception visible to the
+// caller's tenant, across statuses. tenantID "" means global-only visibility.
+func (s *PgStore) FindSharedSecretExceptionByID(ctx context.Context, exceptionID, tenantID string) (*domain.SharedSecretException, error) {
+	const query = `
+		SELECT ` + sharedSecretExceptionColumns + `
+		FROM shared_secret_exceptions
+		WHERE exception_id = $1
+		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid);`
+
+	var result *domain.SharedSecretException
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		result, scanErr = scanSharedSecretException(tx.QueryRow(ctx, query, exceptionID, tenantID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrSharedSecretExceptionNotFound
+		}
+		s.log.Error("pg FindSharedSecretExceptionByID failed", zap.String("exception_id", exceptionID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return result, nil
+}
+
+// ListSharedSecretExceptions returns an optionally-status/secret_path
+// filtered slice of register rows, newest first.
+func (s *PgStore) ListSharedSecretExceptions(ctx context.Context, filter domain.ListSharedSecretExceptionsFilter) ([]*domain.SharedSecretException, error) {
+	// Parenthesised: joined with AND below, the bare OR bound as
+	// "tenant_id IS NULL OR (tenant_id = $1 AND status = .. AND secret_path = ..)",
+	// so every GLOBAL exception came back whatever its status or path — and
+	// emergency retrieval accepted a revoked global exception for another
+	// secret as authority for this one.
+	conditions := []string{"(tenant_id IS NULL OR tenant_id = NULLIF($1, '')::uuid)"}
+	args := []any{filter.TenantID}
+	argIdx := 2
+	if filter.Status != "" {
+		conditions = append(conditions, fmt.Sprintf("status = $%d", argIdx))
+		args = append(args, filter.Status)
+		argIdx++
+	}
+	if filter.SecretPath != "" {
+		conditions = append(conditions, fmt.Sprintf("secret_path = $%d", argIdx))
+		args = append(args, filter.SecretPath)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT %s
+		FROM shared_secret_exceptions
+		WHERE %s
+		ORDER BY created_at DESC;`,
+		sharedSecretExceptionColumns, strings.Join(conditions, " AND "),
+	)
+
+	var results []*domain.SharedSecretException
+	err := s.withRLS(ctx, derefOrEmpty(filter.TenantID), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			e, scanErr := scanSharedSecretException(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			results = append(results, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListSharedSecretExceptions failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return results, nil
+}
+
+// RevokeSharedSecretException transitions ACTIVE -> REVOKED, recording the
+// acting operator. Idempotent: already-REVOKED rows return created=false
+// (no error); any other status (EXPIRED) is an invalid transition.
+func (s *PgStore) RevokeSharedSecretException(ctx context.Context, exceptionID, tenantID, actorID string) (*domain.SharedSecretException, bool, error) {
+	const query = `
+		UPDATE shared_secret_exceptions
+		SET status = 'REVOKED', revoked_at = NOW(), revoked_by_principal_id = $3
+		WHERE exception_id = $1
+		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid)
+		  AND status IN ('ACTIVE', 'REVOKED')
+		RETURNING ` + sharedSecretExceptionColumns + `;`
+
+	var result *domain.SharedSecretException
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		result, scanErr = scanSharedSecretException(tx.QueryRow(ctx, query, exceptionID, tenantID, actorID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, domain.ErrInvalidTransition
+		}
+		s.log.Error("pg RevokeSharedSecretException failed", zap.String("exception_id", exceptionID), zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return result, result.Status != "REVOKED" || result.RevokedAt == nil, nil
+}
+
+// ── secret_rotation_schedules ────────────────────────────────────────────────
+
+// UpsertRotationSchedule creates (or resets) the rotation schedule for one
+// secret policy version.
+func (s *PgStore) UpsertRotationSchedule(ctx context.Context, secretPolicyVersionID string, intervalSeconds int, nextRotationAt time.Time) error {
+	const query = `
+		INSERT INTO secret_rotation_schedules
+			(secret_policy_version_id, interval_seconds, next_rotation_at)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (secret_policy_version_id)
+		DO UPDATE SET interval_seconds = EXCLUDED.interval_seconds,
+		              next_rotation_at = EXCLUDED.next_rotation_at,
+		              updated_at = NOW();`
+	if _, err := s.pool.Exec(ctx, query, secretPolicyVersionID, intervalSeconds, nextRotationAt); err != nil {
+		s.log.Error("pg UpsertRotationSchedule failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+// ListDueRotations returns every scheduled version whose next_rotation_at
+// has passed, joined back to its policy's path and class. Platform-scoped:
+// the sweeper's rotation must be visible across tenants (same authority as
+// Rotate), and the schedule table carries no tenant scope of its own.
+func (s *PgStore) ListDueRotations(ctx context.Context, now time.Time) ([]*domain.DueRotation, error) {
+	const query = `
+		SELECT v.secret_policy_id, s.secret_policy_version_id, sp.secret_path, sp.secret_class, s.interval_seconds, s.next_rotation_at
+		FROM secret_rotation_schedules s
+		JOIN secret_policy_versions v ON v.secret_policy_version_id = s.secret_policy_version_id
+		JOIN secret_policies sp ON sp.secret_policy_id = v.secret_policy_id
+		WHERE s.next_rotation_at <= $1
+		ORDER BY s.next_rotation_at;`
+
+	var results []*domain.DueRotation
+	err := s.withPlatformScope(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, now)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			d := &domain.DueRotation{}
+			if err := rows.Scan(&d.SecretPolicyID, &d.SecretPolicyVersionID, &d.SecretPath, &d.SecretClass, &d.IntervalSeconds, &d.NextRotationAt); err != nil {
+				return err
+			}
+			results = append(results, d)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListDueRotations failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return results, nil
+}
+
+// ClaimDueRotation atomically takes one due rotation for this caller: it
+// moves next_rotation_at from the value the caller listed to claimUntil, and
+// reports whether it did. A second sweeper (another replica, or the same one
+// re-listing) sees a changed next_rotation_at and gets false, so a due secret
+// is rotated once, not once per replica. A claim whose rotation then fails is
+// simply due again at claimUntil.
+func (s *PgStore) ClaimDueRotation(ctx context.Context, secretPolicyVersionID string, listedNext, claimUntil time.Time) (bool, error) {
+	const query = `
+		UPDATE secret_rotation_schedules
+		SET next_rotation_at = $3, updated_at = NOW()
+		WHERE secret_policy_version_id = $1 AND next_rotation_at = $2;`
+	tag, err := s.pool.Exec(ctx, query, secretPolicyVersionID, listedNext, claimUntil)
+	if err != nil {
+		s.log.Error("pg ClaimDueRotation failed", zap.Error(err))
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// UpdateRotationSchedule pushes a version's next_rotation_at forward after
+// the sweeper (or a manual rotate) has completed a rotation.
+func (s *PgStore) UpdateRotationSchedule(ctx context.Context, secretPolicyVersionID string, nextRotationAt time.Time) error {
+	const query = `
+		UPDATE secret_rotation_schedules
+		SET next_rotation_at = $2, updated_at = NOW()
+		WHERE secret_policy_version_id = $1;`
+	tag, err := s.pool.Exec(ctx, query, secretPolicyVersionID, nextRotationAt)
+	if err != nil {
+		s.log.Error("pg UpdateRotationSchedule failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrRotationScheduleNotFound
+	}
+	return nil
 }
 
 // ─── compile-time interface check ──────────────────────────────────────────

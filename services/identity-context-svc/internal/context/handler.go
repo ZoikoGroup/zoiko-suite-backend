@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
+	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
 )
@@ -38,7 +40,7 @@ type AuthzChecker interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error
 }
 
-// Handler exposes the eight inbound REST endpoints defined in openapi.yaml.
+// Handler exposes the inbound REST endpoints defined in openapi.yaml.
 type Handler struct {
 	resolver   *Resolver
 	auth       *Authenticator
@@ -46,6 +48,20 @@ type Handler struct {
 	principals PrincipalStore
 	authz      AuthzChecker
 	log        *zap.Logger
+
+	// environment is stamped on every TenantContextDecision. Held on the
+	// handler rather than read from config at each call because it is a
+	// deployment fact, not a request one.
+	environment domain.Environment
+
+	// support backs the AttachSupportContext command family. Nil when support
+	// context is not wired, in which case those routes answer 501 rather than
+	// panicking — an unconfigured privileged command should be unavailable,
+	// not silently permissive.
+	support *SupportService
+
+	// cache backs RefreshTenantContextCache and InvalidateTenantContext.
+	cache *ContextCacheService
 }
 
 func NewHandler(
@@ -57,13 +73,34 @@ func NewHandler(
 	log *zap.Logger,
 ) *Handler {
 	return &Handler{
-		resolver:   resolver,
-		auth:       auth,
-		sessions:   sessions,
-		principals: principals,
-		authz:      authz,
-		log:        log,
+		resolver:    resolver,
+		auth:        auth,
+		sessions:    sessions,
+		principals:  principals,
+		authz:       authz,
+		log:         log,
+		environment: domain.EnvironmentLocal,
 	}
+}
+
+// WithEnvironment sets the deployment tier recorded on every decision.
+func (h *Handler) WithEnvironment(e domain.Environment) *Handler {
+	if e.Valid() {
+		h.environment = e
+	}
+	return h
+}
+
+// WithSupport wires the privileged support-context commands.
+func (h *Handler) WithSupport(s *SupportService) *Handler {
+	h.support = s
+	return h
+}
+
+// WithContextCache wires RefreshTenantContextCache and InvalidateTenantContext.
+func (h *Handler) WithContextCache(c *ContextCacheService) *Handler {
+	h.cache = c
+	return h
 }
 
 // ── What is guarded here, and the one route that cannot be ──────────────
@@ -133,6 +170,29 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
+// requireCorrelation returns the request's correlation id, or refuses.
+//
+// §4's Engineering Interaction Wireframe marks every GOV-01 QUERY "Read-only;
+// scoped; correlation required". Scoped was enforced by requireTenant and
+// requirePrincipal; correlation was not enforced by anything. The envelope
+// middleware parses and REPORTS it, but its default mode is write-strict,
+// which refuses material writes and admits reads — so a bare GET carrying no
+// correlation succeeded and produced a decision nothing could later be traced
+// to.
+//
+// 400 rather than 401: the caller is authenticated and scoped, the request is
+// simply not traceable, which is a malformed request rather than an
+// unauthenticated one.
+func (h *Handler) requireCorrelation(w http.ResponseWriter, r *http.Request) (string, bool) {
+	correlationID := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
+	if correlationID == "" {
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved,
+			"X-Correlation-ID is required on GOV-01 queries — a governance read must be traceable to the story that caused it")
+		return "", false
+	}
+	return correlationID, true
+}
+
 // authorizeUnlessSelf permits an action on the caller's OWN principal or
 // session without an authorization round-trip, and requires a grant
 // otherwise.
@@ -172,9 +232,30 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/authenticate", h.Authenticate)
+
+		// ── GOV-01 queries ───────────────────────────────────────────────────
+		// ResolveTenantContext
 		r.Post("/context/resolve", h.ResolveContext)
+		// GetEffectiveContext
 		r.Get("/context/session/{sessionContextID}", h.GetSession)
+		// ExplainContextResolution
+		r.Get("/context/session/{sessionContextID}/explain", h.ExplainContext)
+
+		// ── GOV-01 commands ──────────────────────────────────────────────────
 		r.Post("/context/session/{sessionContextID}/invalidate", h.InvalidateSession)
+		// RefreshTenantContextCache
+		r.Post("/context/cache/refresh", h.RefreshContextCache)
+		// InvalidateTenantContext — tenant-wide, distinct action from the
+		// per-session invalidate above. See InvalidateTenantContext.
+		r.Post("/context/tenant/invalidate", h.InvalidateTenantContext)
+
+		// AttachSupportContext (privileged)
+		r.Post("/context/support", h.AttachSupportContext)
+		r.Get("/context/support/{supportContextID}", h.GetSupportContext)
+		r.Delete("/context/support/{supportContextID}", h.RevokeSupportContext)
+		// The review half of §1's "followed by reconciliation/review". The
+		// reconciler goroutine reports what is pending; this closes one.
+		r.Post("/context/support/{supportContextID}/review", h.ReviewSupportContext)
 
 		r.Get("/principals/{principalID}", h.GetPrincipal)
 		r.Get("/principals/{principalID}/roles", h.GetPrincipalRoles)
@@ -188,30 +269,91 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 	var req domain.ResolveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved, "invalid request body")
 		return
 	}
 
-	jwt, err := h.resolver.Resolve(r.Context(), req)
+	// Server-resolved, never client-supplied. The fields carry json:"-" so a
+	// body that names them is ignored, and they are filled here from what the
+	// SERVER observed about the connection.
+	req.IngressSource = CanonicalIngress(r)
+	req.Environment = h.environment
+	// A support-scoped resolve carries its grant so every session issued under
+	// an elevation is attributable to it. Absent for ordinary traffic.
+	//
+	// This header is CLIENT-SUPPLIED and is not sanitized at the edge — the
+	// gateway's authResponseHeaders list does not include it and neither does
+	// the GTRM edge strip. Taking it here is therefore an assertion, not a
+	// fact; the resolver verifies it against the grant register before any
+	// session is attributed to it. See Resolver.verifySupportContext.
+	if scID := r.Header.Get("X-Support-Context-Id"); scID != "" {
+		req.SupportContextID = &scID
+	}
+
+	// Canonical envelope facts the middleware already parsed and validated.
+	// Read from the resolved envelope rather than re-read from headers, so
+	// there is exactly one place in the service that decides what these mean.
+	if env, ok := svcenvelope.FromContext(r.Context()); ok {
+		req.SourceChannel = string(env.SourceChannel)
+		req.WorkloadID = env.WorkloadID
+		req.CausationID = env.CausationID
+	}
+
+	result, err := h.resolver.Resolve(r.Context(), req)
 	if err != nil {
-		h.log.Warn("resolve failed", zap.Error(err), zap.String("correlation_id", req.CorrelationID))
+		h.log.Warn("resolve failed",
+			zap.Error(err),
+			zap.String("ingress", req.IngressSource),
+			zap.String("correlation_id", req.CorrelationID))
 		switch {
+		case errors.Is(err, domain.ErrIngressTenantMismatch):
+			// 401, not 403. The caller is not forbidden from an action — the
+			// context in which they claimed to act could not be established.
+			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeContextUnresolved,
+				"context could not be resolved for this request")
+		case errors.Is(err, domain.ErrResidencyDenied):
+			writeCoded(w, http.StatusForbidden, domain.ErrCodeResidencyDenied, err.Error())
+		case errors.Is(err, ErrSAMLUnsupported):
+			writeCoded(w, http.StatusBadRequest, domain.ErrCodeUnsupported, err.Error())
+		case errors.Is(err, ErrTrustPostureBlocked):
+			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeTrustPostureBlocked, err.Error())
+		// A refused support elevation. 401 rather than 403 for the same reason
+		// the ingress mismatch above is 401: the caller is not forbidden an
+		// action, the context it claimed to act in could not be established.
+		//
+		// These two codes were declared for exactly this and, until now, were
+		// reachable only from the support read/revoke routes.
+		case errors.Is(err, domain.ErrSupportContextExpired):
+			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeBreakGlassExpired, err.Error())
+		case errors.Is(err, domain.ErrSupportContextNotFound):
+			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeBreakGlassRequired, err.Error())
+		// Not the caller's fault: support is unwired in this deployment, so
+		// the assertion could not be checked either way. 503, not 401.
+		case errors.Is(err, domain.ErrSupportContextUnverifiable):
+			writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable, err.Error())
 		case errors.Is(err, ErrTokenInvalid),
 			errors.Is(err, ErrPrincipalInactive),
 			errors.Is(err, ErrTenantInactive),
 			errors.Is(err, ErrEntityUnauthorized),
-			errors.Is(err, ErrTrustPostureBlocked),
 			errors.Is(err, ErrNoToken):
-			writeError(w, http.StatusUnauthorized, err.Error())
+			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeContextUnresolved, err.Error())
 		case errors.Is(err, ErrUpstreamUnavailable):
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable, err.Error())
 		default:
-			writeError(w, http.StatusInternalServerError, "internal error")
+			writeCoded(w, http.StatusInternalServerError, domain.ErrCodeContextUnresolved, "internal error")
 		}
 		return
 	}
 
-	writeJSON(w, http.StatusOK, domain.ResolveResponse{EnvelopeJWT: jwt})
+	// Tokens must never be cached by an intermediary. Same reasoning as
+	// /v1/authenticate: what is returned here is a bearer credential.
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, domain.ResolveResponseV2{
+		EnvelopeJWT:      result.EnvelopeJWT,
+		EvidenceID:       result.EvidenceID,
+		SessionContextID: result.SessionContextID,
+		ExpiresAt:        result.ExpiresAt.Unix(),
+	})
 }
 
 // ── GET /v1/context/session/:sessionContextID ────────────────────────────────
@@ -239,6 +381,12 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 	}
 	callerPrincipalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		return
+	}
+	// §4: GOV-01 queries are "Read-only; scoped; correlation required".
+	// Scoped was enforced here; correlation was enforced by nothing, because
+	// the envelope's default write-strict mode admits reads.
+	if _, ok := h.requireCorrelation(w, r); !ok {
 		return
 	}
 	sessionContextID := chi.URLParam(r, "sessionContextID")
@@ -307,6 +455,22 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 	var req domain.InvalidateSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// VALIDATE THE REASON HERE, not in Postgres.
+	//
+	// It used to travel unchecked to the store, where the
+	// session_contexts_invalidation_reason_check constraint refused it and the
+	// caller got 500 "failed to invalidate session". A request that names no
+	// reason is a bad request, and saying so is the difference between "you
+	// left a field out" and "this service is broken".
+	//
+	// The reason is not decoration: it is what the evidence record says about
+	// why a session ended, and it is what a reviewer groups by.
+	if !domain.ValidInvalidationReason(req.Reason) {
+		writeError(w, http.StatusBadRequest,
+			`reason is required and must be one of LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED`)
 		return
 	}
 
@@ -442,9 +606,18 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// errorResponse is the refusal body.
+//
+// ErrorCode carries one of the spec's stable error classes (section 16). The
+// message is for a human reading a log; the CODE is what a client branches on,
+// and it is the half that must not change with a refactor. Before this, every
+// refusal from this service was an untyped message string, so a caller could
+// only distinguish "wrong password" from "residency denied" by matching prose.
 type errorResponse struct {
 	Error         string `json:"error"`
+	ErrorCode     string `json:"error_code,omitempty"`
 	CorrelationID string `json:"correlation_id,omitempty"`
+	EvidenceID    string `json:"evidence_id,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -457,9 +630,15 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg})
 }
 
+// writeCoded is writeError with one of the spec's stable error classes.
+func writeCoded(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, errorResponse{Error: msg, ErrorCode: code})
+}
+
 // Ensure the interfaces defined in interfaces.go are satisfied at compile time.
 // The concrete implementations live in their own packages.
 var _ PrincipalStore = (*store.PgStore)(nil)
+
 // DurableCache, not the legacy Redis-only Cache: cmd/server/main.go wires
 // session.NewDurableCache, and it is the one that carries the tenant scope and
 // EvictAllForPrincipal the interface now requires.
@@ -499,7 +678,7 @@ func (h *Handler) Authenticate(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.auth.Authenticate(r.Context(), req)
 	if err != nil {
 		switch {
-		case errors.Is(err, ErrAuthRequestInvalid):
+		case errors.Is(err, ErrRequestInvalid):
 			writeError(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, ErrInvalidCredentials):
 			// One message for every rejection reason. See ErrInvalidCredentials

@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 )
 
@@ -75,7 +76,14 @@ func (s *PgStore) CreateTemplate(ctx context.Context, p domain.CreateTemplatePar
 			RETURNING `+templateDefinitionColumns,
 			tenantID, p.LegalEntityID, p.Name, p.BusinessPurpose, p.OwnerPrincipalID,
 		)
-		return scanTemplateDefinition(row, &out)
+		if err := scanTemplateDefinition(row, &out); err != nil {
+			return err
+		}
+		ev, err := events.TemplateCreated(p.CorrelationID, out)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, tenantID, ev)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("template store unavailable: %w", err)
@@ -272,7 +280,11 @@ func (s *PgStore) ApproveTemplate(ctx context.Context, p domain.ApproveVersionPa
 			}
 			return fmt.Errorf("template store unavailable: %w", err)
 		}
-		return nil
+		ev, err := events.TemplateVersionApproved(p.CorrelationID, out)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, tenantID, ev)
 	})
 	if err != nil {
 		return nil, err
@@ -324,7 +336,11 @@ func (s *PgStore) PublishTemplate(ctx context.Context, p domain.PublishVersionPa
 		`, existing.TemplateID, existing.Locale, out.VersionID, out.VersionID); err != nil {
 			return fmt.Errorf("template store unavailable: %w", err)
 		}
-		return nil
+		ev, err := events.TemplatePublished(p.CorrelationID, p.PublishedByPrincipalID, out)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, tenantID, ev)
 	})
 	if err != nil {
 		return nil, err
@@ -393,7 +409,11 @@ func (s *PgStore) RetireTemplate(ctx context.Context, p domain.RetireTemplatePar
 		`, p.TemplateID); err != nil {
 			return fmt.Errorf("template store unavailable: %w", err)
 		}
-		return nil
+		ev, err := events.TemplateRetired(p.CorrelationID, out)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, tenantID, ev)
 	})
 	if err != nil {
 		return nil, err

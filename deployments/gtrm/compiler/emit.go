@@ -23,6 +23,7 @@ type traefikRouter struct {
 	Service     string   `yaml:"service"`
 	Middlewares []string `yaml:"middlewares,omitempty"`
 	Priority    int      `yaml:"priority,omitempty"`
+	EntryPoints []string `yaml:"entryPoints,omitempty"`
 }
 
 type traefikService struct {
@@ -38,18 +39,27 @@ type traefikServer struct {
 }
 
 type traefikMiddleware struct {
-	Headers *traefikHeaders `yaml:"headers,omitempty"`
+	Headers      *traefikHeaders      `yaml:"headers,omitempty"`
+	ForwardAuth  *traefikForwardAuth  `yaml:"forwardAuth,omitempty"`
 }
 
 type traefikHeaders struct {
 	CustomRequestHeaders map[string]string `yaml:"customRequestHeaders,omitempty"`
 }
 
-// untrustedInboundHeaders are the internal routing-context headers that must be
-// stripped from any client request at the edge before trusted values are set
-// (§6.2 trusted header injection, §10.2 proof headers). In Traefik, setting a
+type traefikForwardAuth struct {
+	Address        string `yaml:"address"`
+	TrustForwardHeader bool   `yaml:"trustForwardHeader,omitempty"`
+	AuthResponseHeaders []string `yaml:"authResponseHeaders,omitempty"`
+}
+
+// untrustedInboundHeaders are the internal routing-context headers AND
+// governance envelope headers that must be stripped from any client request
+// at the edge before trusted values are set (§6.2 trusted header injection,
+// §10.2 proof headers, §5 provenance classes). In Traefik, setting a
 // customRequestHeader to "" removes it.
 var untrustedInboundHeaders = []string{
+	// GTRM routing headers (existing)
 	"X-Zoiko-Tenant",
 	"X-Zoiko-Resolved-Tenant",
 	"X-Zoiko-Resolved-Tenant-Id",
@@ -58,11 +68,25 @@ var untrustedInboundHeaders = []string{
 	"X-Zoiko-Route-Decision",
 	"X-Zoiko-GTRM-State",
 	"X-Zoiko-GTRM-Map-Version",
+
+	// Governance envelope headers (§4 conditional fields, §5 class S server-resolved)
+	// These must be stripped so clients cannot self-assert authoritative context.
+	"X-Workload-Id",
+	"X-Support-Context-Id",
+	"X-Purpose-Context",
+	"X-Causation-Id",
+	"X-Approval-Reference",
+	"X-Workflow-Instance-Id",
+	"X-Evidence-Refs",
+	"X-Book-Id",
+	"X-Source-Channel",
+	"X-Expected-Version",
 }
 
 const (
 	backendPort       = "8080" // pools run as non-root (distroless); can't bind <1024
 	edgeStripMW       = "gtrm-edge-strip"
+	authMW            = "gateway-auth"
 	safeRouter        = "gtrm-catchall-safe"
 	safeService       = "gtrm-safe-endpoint"
 	safeBackend       = "quarantine-terminator" // residency-neutral, no tenant data (§8.1)
@@ -91,6 +115,17 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 	}
 	cfg.HTTP.Middlewares[edgeStripMW] = traefikMiddleware{
 		Headers: &traefikHeaders{CustomRequestHeaders: strip},
+	}
+
+	// gateway-auth ForwardAuth middleware: calls gateway-auth-svc /verify
+	// to validate every request's identity envelope. Configured once and
+	// shared by all tenant routers.
+	cfg.HTTP.Middlewares[authMW] = traefikMiddleware{
+		ForwardAuth: &traefikForwardAuth{
+			Address:            "http://gateway-auth-svc:8092/verify",
+			TrustForwardHeader: true,
+			AuthResponseHeaders: []string{"X-Principal-Id", "X-Tenant-Id", "X-Workload-Id", "X-Carta-Decision"},
+		},
 	}
 
 	for _, t := range m.Tenants {
@@ -147,8 +182,9 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 		cfg.HTTP.Routers[routerName] = traefikRouter{
 			Rule:        fmt.Sprintf("Host(`%s.%s`)", slug, m.EnvDomain),
 			Service:     svcName,
-			Middlewares: []string{edgeStripMW, ctxMW},
+			Middlewares: []string{edgeStripMW, authMW, ctxMW},
 			Priority:    primaryPriority,
+			EntryPoints: []string{"web", "websecure"},
 		}
 
 		// Single load balancer to the target pool. A tenant with no approved

@@ -22,6 +22,7 @@ package handler_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -63,6 +64,18 @@ type stubSvc struct {
 	gotCorrID  string
 	gotEndDate time.Time
 	gotStatus  domain.TransitionEntityStatusRequest
+
+	// ORG-02/ORG-03 recordings — see org_stub_test.go.
+	gotCommand        domain.TenantCommand
+	gotHostname       string
+	gotClaimedTenant  string
+	gotAsOf           time.Time
+	gotRegistryNumber string
+	gotJurisdiction   string
+	gotOpenOnly       bool
+	// hostTenantErr drives VerifyHostTenant only, so the §8 NP3 refusal can be
+	// exercised without every other handler test failing at the host check.
+	hostTenantErr error
 }
 
 func (s *stubSvc) ProvisionTenant(_ context.Context, _ domain.ProvisionTenantRequest, correlationID string) (*domain.Tenant, error) {
@@ -80,7 +93,8 @@ func (s *stubSvc) TransitionTenantLifecycle(_ context.Context, id string, _ doma
 	return s.err
 }
 
-func (s *stubSvc) CreateEntity(_ context.Context, _ domain.CreateEntityRequest) (*domain.LegalEntity, error) {
+func (s *stubSvc) CreateEntity(_ context.Context, req domain.CreateEntityRequest) (*domain.LegalEntity, error) {
+	s.gotCorrID = req.CorrelationID
 	return &domain.LegalEntity{LegalEntityID: entityID}, s.err
 }
 
@@ -94,7 +108,8 @@ func (s *stubSvc) ListEntities(_ context.Context, id string) ([]*domain.LegalEnt
 	return []*domain.LegalEntity{{LegalEntityID: entityID}}, s.err
 }
 
-func (s *stubSvc) CreateWorkspace(_ context.Context, _ domain.CreateWorkspaceRequest) (*domain.Workspace, error) {
+func (s *stubSvc) CreateWorkspace(_ context.Context, req domain.CreateWorkspaceRequest) (*domain.Workspace, error) {
+	s.gotCorrID = req.CorrelationID
 	return &domain.Workspace{WorkspaceID: wsID}, s.err
 }
 
@@ -120,7 +135,8 @@ func (s *stubSvc) TransitionWorkspaceStatus(_ context.Context, id string, req do
 	return s.err
 }
 
-func (s *stubSvc) UpdateEntity(_ context.Context, id string, _ domain.UpdateEntityRequest) (*domain.LegalEntity, error) {
+func (s *stubSvc) UpdateEntity(_ context.Context, id string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error) {
+	s.gotCorrID = req.CorrelationID
 	s.gotID = id
 	return &domain.LegalEntity{LegalEntityID: id}, s.err
 }
@@ -136,7 +152,8 @@ func (s *stubSvc) TransitionEntityStatus(_ context.Context, id string, req domai
 	return s.err
 }
 
-func (s *stubSvc) CreateHierarchy(_ context.Context, _ domain.CreateHierarchyRequest) (*domain.EntityHierarchy, error) {
+func (s *stubSvc) CreateHierarchy(_ context.Context, req domain.CreateHierarchyRequest) (*domain.EntityHierarchy, error) {
+	s.gotCorrID = req.CorrelationID
 	return &domain.EntityHierarchy{HierarchyID: hierID}, s.err
 }
 
@@ -150,7 +167,8 @@ func (s *stubSvc) ListHierarchies(_ context.Context, id string) ([]*domain.Entit
 	return []*domain.EntityHierarchy{{HierarchyID: hierID}}, s.err
 }
 
-func (s *stubSvc) AssignJurisdiction(_ context.Context, id string, _ domain.AssignJurisdictionRequest) (*domain.EntityJurisdictionAssignment, error) {
+func (s *stubSvc) AssignJurisdiction(_ context.Context, id string, req domain.AssignJurisdictionRequest) (*domain.EntityJurisdictionAssignment, error) {
+	s.gotCorrID = req.CorrelationID
 	s.gotID = id
 	return &domain.EntityJurisdictionAssignment{AssignmentID: assignID}, s.err
 }
@@ -273,6 +291,41 @@ func allRoutes() []route {
 		{"list tax bundles", http.MethodGet, "/v1/entities/" + entityID + "/tax-identity-bundles", "", http.StatusOK, entityID},
 		{"get tax bundle", http.MethodGet, "/v1/tax-identity-bundles/" + bundleID, "", http.StatusOK, bundleID},
 		{"tax bundle status", http.MethodPost, "/v1/tax-identity-bundles/" + bundleID + "/status", `{"new_status":"ACTIVE"}`, http.StatusNoContent, bundleID},
+
+		// ── ORG-02 §4.2 ──────────────────────────────────────────────────────
+		{"tenant named command", http.MethodPost, "/v1/tenants/" + tenantID + "/commands/SuspendTenant", `{"reason":"fraud review"}`, http.StatusOK, tenantID},
+		{"change default locale", http.MethodPost, "/v1/tenants/" + tenantID + "/defaults", `{"primary_locale":"fr-FR","reason":"customer request"}`, http.StatusOK, tenantID},
+		{"lifecycle history", http.MethodGet, "/v1/tenants/" + tenantID + "/lifecycle-history", "", http.StatusOK, tenantID},
+		{"get tenant defaults", http.MethodGet, "/v1/tenants/" + tenantID + "/defaults", "", http.StatusOK, tenantID},
+		{"change home region", http.MethodPost, "/v1/tenants/" + tenantID + "/home-region", `{"residency_region_id":"0a000000-0000-4000-8000-000000000001","home_region_decision_ref":"RES-1","reason":"r"}`, http.StatusAccepted, tenantID},
+		{"bind tenant host", http.MethodPost, "/v1/tenants/" + tenantID + "/host-bindings", `{"hostname":"acme.example.com"}`, http.StatusCreated, tenantID},
+		{"list host bindings", http.MethodGet, "/v1/tenants/" + tenantID + "/host-bindings", "", http.StatusOK, tenantID},
+		// No wantID: this route takes no path parameter — it is the lookup that
+		// establishes which tenant a caller belongs to.
+		{"resolve tenant by host", http.MethodGet, "/v1/resolve-tenant?hostname=acme.example.com", "", http.StatusOK, ""},
+
+		// ── ORG-03 §4.3 ──────────────────────────────────────────────────────
+		{"amend legal profile", http.MethodPost, "/v1/entities/" + entityID + "/profile-amendments", `{"change_reason":"AMENDMENT"}`, http.StatusCreated, entityID},
+		{"change legal name", http.MethodPost, "/v1/entities/" + entityID + "/legal-name", `{"legal_name":"Renamed Ltd"}`, http.StatusCreated, entityID},
+		{"change registered office", http.MethodPost, "/v1/entities/" + entityID + "/registered-office", `{"registered_office":"{}"}`, http.StatusCreated, entityID},
+		{"list entity versions", http.MethodGet, "/v1/entities/" + entityID + "/versions", "", http.StatusOK, entityID},
+		{"get entity as-of", http.MethodGet, "/v1/entities/" + entityID + "/as-of?as_of=2026-03-31", "", http.StatusOK, entityID},
+		{"find by registry number", http.MethodGet, "/v1/entities/by-registry-number?registration_number=RC-1", "", http.StatusOK, ""},
+		{"list registry conflicts", http.MethodGet, "/v1/registry-conflicts", "", http.StatusOK, ""},
+		{"resolve registry conflict", http.MethodPost, "/v1/registry-conflicts/conflict-1/resolution", `{"status":"DISMISSED","resolution_note":"n"}`, http.StatusNoContent, "conflict-1"},
+
+		// ── ORG-03 Draft → Verified → Active; merge ─────────────────────────
+		{"request entity verification", http.MethodPost, "/v1/entities/" + entityID + "/verification", `{"verification_evidence_ref":"x"}`, http.StatusAccepted, entityID},
+		{"activate legal entity", http.MethodPost, "/v1/entities/" + entityID + "/activation", `{"reason":"r"}`, http.StatusOK, entityID},
+		{"merge duplicate candidate", http.MethodPost, "/v1/entities/" + entityID + "/merge", `{"survivor_legal_entity_id":"s","reason":"r"}`, http.StatusAccepted, entityID},
+		{"unmerge entity", http.MethodPost, "/v1/entities/" + entityID + "/unmerge", `{"reason":"r"}`, http.StatusAccepted, entityID},
+		{"list entity merge records", http.MethodGet, "/v1/entities/" + entityID + "/merge-records", "", http.StatusOK, entityID},
+
+		// ── Verified maker-checker ──────────────────────────────────────────
+		{"list approval requests", http.MethodGet, "/v1/approval-requests?status=all", "", http.StatusOK, ""},
+		{"get approval request", http.MethodGet, "/v1/approval-requests/apr-1", "", http.StatusOK, "apr-1"},
+		{"approve request", http.MethodPost, "/v1/approval-requests/apr-1/approve", `{"payload_fingerprint":"f"}`, http.StatusOK, "apr-1"},
+		{"reject request", http.MethodPost, "/v1/approval-requests/apr-1/reject", `{"note":"no"}`, http.StatusOK, "apr-1"},
 	}
 }
 
@@ -346,6 +399,13 @@ func TestWriteErr_SentinelToStatus(t *testing.T) {
 		{"invalid input", registry.ErrInvalidInput, http.StatusBadRequest},
 		{"conflict", registry.ErrConflict, http.StatusConflict},
 		{"region unresolved", registry.ErrRegionUnresolved, http.StatusConflict},
+		{"approval required", registry.ErrApprovalRequired, http.StatusUnprocessableEntity},
+		{"self approval", registry.ErrSelfApproval, http.StatusForbidden},
+		{"approval not pending", registry.ErrApprovalNotPending, http.StatusConflict},
+		{"fingerprint mismatch", registry.ErrApprovalFingerprintMismatch, http.StatusConflict},
+		{"approval already pending", registry.ErrApprovalPending, http.StatusConflict},
+		{"onboarding key required", registry.ErrOnboardingKeyRequired, http.StatusUnprocessableEntity},
+		{"entity not operational", registry.ErrEntityNotOperational, http.StatusConflict},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := do(newRouter(&stubSvc{err: tc.err}), http.MethodGet, "/v1/tenants/"+tenantID, "")
@@ -560,5 +620,156 @@ func TestRouteTable_CoversEveryRegisteredRoute(t *testing.T) {
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		t.Fatalf("registered routes with no entry in allRoutes(): %s", strings.Join(missing, ", "))
+	}
+}
+
+// A maker-checker command that was filed rather than executed is a 202 whose
+// body carries the approval request — on every route that can file one — and
+// never the 200/201 the command's own success would be.
+func TestWriteErr_PendingApprovalIs202WithTheRequest(t *testing.T) {
+	pending := &registry.PendingApprovalError{Request: &domain.ApprovalRequest{
+		ApprovalRequestID: "apr-9", PayloadFingerprint: "fp-9", Status: domain.ApprovalPending,
+	}}
+	for _, rt := range []struct{ method, path, body string }{
+		{http.MethodPost, "/v1/tenants/" + tenantID + "/commands/InitiateTermination", `{"reason":"r"}`},
+		{http.MethodPost, "/v1/entities/ent-1/legal-name", `{"legal_name":"X"}`},
+		{http.MethodPost, "/v1/entities/ent-1/profile-amendments", `{"legal_name":"X"}`},
+		{http.MethodPost, "/v1/registry-conflicts/c-1/resolution", `{"status":"DISMISSED","resolution_note":"n"}`},
+	} {
+		t.Run(rt.path, func(t *testing.T) {
+			rec := do(newRouter(&stubSvc{err: pending}), rt.method, rt.path, rt.body)
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("pending approval mapped to %d, want 202", rec.Code)
+			}
+			for _, want := range []string{`"PENDING_APPROVAL"`, `"apr-9"`, `"fp-9"`} {
+				if !strings.Contains(rec.Body.String(), want) {
+					t.Fatalf("202 body %s lacks %s", rec.Body.String(), want)
+				}
+			}
+		})
+	}
+}
+
+// §8 NP3 used to be checked only by the tenant-command and default-locale
+// handlers; every other route served a request on tenant A's hostname that
+// claimed tenant B (found live on 28 Sep 2026: GET /v1/tenants/{B} → 200).
+func TestNP3_HostGuardRunsBeforeEveryV1Route(t *testing.T) {
+	s := &stubSvc{hostTenantErr: registry.ErrHostTenantMismatch}
+	r := newRouter(s)
+
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/tenants/" + tenantID},
+		{http.MethodGet, "/v1/entities/" + entityID},
+		{http.MethodPost, "/v1/entities"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`))
+		req.Host = "tenant-a.example.test"
+		req = req.WithContext(domain.WithTenant(req.Context(), "tenant-b"))
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s %s: got %d, want 403", tc.method, tc.path, rec.Code)
+		}
+		if s.gotHostname != "tenant-a.example.test" || s.gotClaimedTenant != "tenant-b" {
+			t.Errorf("%s %s: compared host %q with tenant %q; want the request host and the verified request tenant",
+				tc.method, tc.path, s.gotHostname, s.gotClaimedTenant)
+		}
+	}
+}
+
+// A request that names no tenant is not a mismatch — ResolveTenantByHost is
+// exactly such a request, and it must keep working.
+func TestNP3_HostGuardIgnoresRequestsWithNoTenant(t *testing.T) {
+	s := &stubSvc{hostTenantErr: registry.ErrHostTenantMismatch}
+	r := newRouter(s)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/resolve-tenant?hostname=x.example.test", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("got %d, want 200", rec.Code)
+	}
+}
+
+// ORG §3 "stable typed errors": every refusal carries a code a client can
+// branch on, and a refined sentinel gets its own code, not its parent's — a
+// stale version must not read as a duplicate (it did, as prose, until 28 Sep
+// 2026: "conflict: resource already exists: record was modified …").
+func TestWriteErr_EveryRefusalCarriesItsTypedCode(t *testing.T) {
+	for _, tc := range []struct {
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{registry.ErrVersionConflict, http.StatusConflict, "VERSION_CONFLICT"},
+		{fmt.Errorf("%w: you supplied 1, it is at 3", registry.ErrVersionConflict), http.StatusConflict, "VERSION_CONFLICT"},
+		{registry.ErrApprovalFingerprintMismatch, http.StatusConflict, "VERSION_CONFLICT"},
+		{registry.ErrRegistryConflict, http.StatusConflict, "DUPLICATE_CANDIDATE"},
+		{registry.ErrConflict, http.StatusConflict, "DUPLICATE_CANDIDATE"},
+		{registry.ErrApprovalPending, http.StatusConflict, "DUPLICATE_CANDIDATE"},
+		{registry.ErrOnboardingKeyMismatch, http.StatusConflict, "IDEMPOTENCY_MISMATCH"},
+		{registry.ErrStateConflict, http.StatusConflict, "INVALID_TRANSITION"},
+		{registry.ErrInvalidTransition, http.StatusUnprocessableEntity, "INVALID_TRANSITION"},
+		{registry.ErrTenantNotTransactable, http.StatusConflict, "INVALID_TRANSITION"},
+		{registry.ErrEntityNotOperational, http.StatusConflict, "INVALID_TRANSITION"},
+		{registry.ErrApprovalNotPending, http.StatusConflict, "INVALID_TRANSITION"},
+		{registry.ErrSelfApproval, http.StatusForbidden, "SOD_DENIED"},
+		{registry.ErrApprovalRequired, http.StatusUnprocessableEntity, "SOD_DENIED"},
+		{registry.ErrSourceUnverified, http.StatusBadRequest, "SOURCE_UNVERIFIED"},
+		{registry.ErrReferenceInvalid, http.StatusBadRequest, "REFERENCE_RETIRED"},
+		{registry.ErrRegionUnresolved, http.StatusConflict, "RULE_AMBIGUOUS"},
+		{registry.ErrServiceUnavailable, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE"},
+		{registry.ErrHostTenantMismatch, http.StatusForbidden, "CONTEXT_INVALID"},
+		{registry.ErrUnauthenticated, http.StatusUnauthorized, "CONTEXT_INVALID"},
+		{registry.ErrUnauthorized, http.StatusForbidden, "AUTHORIZATION_DENIED"},
+		{registry.ErrNotFound, http.StatusNotFound, "NOT_FOUND"},
+		{registry.ErrInvalidInput, http.StatusBadRequest, "VALIDATION_FAILED"},
+		{registry.ErrOnboardingKeyRequired, http.StatusUnprocessableEntity, "VALIDATION_FAILED"},
+		{errString("pq: boom"), http.StatusInternalServerError, "INTERNAL_ERROR"},
+	} {
+		t.Run(tc.err.Error(), func(t *testing.T) {
+			rec := do(newRouter(&stubSvc{err: tc.err}), http.MethodGet, "/v1/tenants/"+tenantID, "")
+			var body struct {
+				Error     string `json:"error"`
+				ErrorCode string `json:"error_code"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body is not JSON: %s", rec.Body.String())
+			}
+			if rec.Code != tc.wantStatus || body.ErrorCode != tc.wantCode {
+				t.Fatalf("got %d %q, want %d %q (body %s)", rec.Code, body.ErrorCode, tc.wantStatus, tc.wantCode, rec.Body.String())
+			}
+			if strings.Contains(body.Error, "already exists") && tc.wantCode != "DUPLICATE_CANDIDATE" {
+				t.Fatalf("a %s must not read as a duplicate: %q", tc.wantCode, body.Error)
+			}
+		})
+	}
+}
+
+// A malformed body has no service error behind it and still gets a code.
+func TestWriteErr_MalformedBodyIsValidationFailed(t *testing.T) {
+	rec := do(newRouter(&stubSvc{}), http.MethodPost, "/v1/entities", "{")
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"error_code":"VALIDATION_FAILED"`) {
+		t.Fatalf("got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The legacy write routes used to pass an empty correlation id to the
+// service whenever the body named none, so their events could not be traced
+// to the request (seen live on 28 Sep 2026 in identity-context-svc's log).
+func TestLegacyWrites_CarryTheEnvelopeCorrelationID(t *testing.T) {
+	for _, rt := range []struct{ method, path string }{
+		{http.MethodPost, "/v1/entities"},
+		{http.MethodPost, "/v1/workspaces"},
+		{http.MethodPatch, "/v1/entities/" + entityID},
+		{http.MethodPost, "/v1/entity-hierarchies"},
+		{http.MethodPost, "/v1/entities/" + entityID + "/jurisdictions"},
+	} {
+		s := &stubSvc{}
+		do(newRouter(s), rt.method, rt.path, `{}`)
+		if s.gotCorrID != corrID {
+			t.Errorf("%s %s: service saw correlation id %q, want the header's %q", rt.method, rt.path, s.gotCorrID, corrID)
+		}
 	}
 }

@@ -13,6 +13,7 @@ package jurisdiction
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -75,13 +76,39 @@ func NewHTTPValidator(baseURL string, log *zap.Logger) *HTTPJurisdictionValidato
 	}
 }
 
+// Ref is the part of a jurisdiction record this service decides on.
+type Ref struct {
+	JurisdictionID   string     `json:"jurisdiction_id"`
+	JurisdictionCode string     `json:"jurisdiction_code"`
+	ActiveFlag       bool       `json:"active_flag"`
+	EffectiveTo      *time.Time `json:"effective_to"`
+}
+
+// ErrJurisdictionRetired — the jurisdiction exists but is inactive or its
+// validity has ended. Before 28 Sep 2026 any 200 counted as valid, so a
+// retired jurisdiction was accepted for a new entity.
+var ErrJurisdictionRetired = fmt.Errorf("jurisdiction retired or inactive")
+
+// ValidateExists reports whether the jurisdiction exists AND is in force.
 func (v *HTTPJurisdictionValidator) ValidateExists(ctx context.Context, jurisdictionID string) error {
-	// TODO: GET {baseURL}/v1/jurisdictions/{jurisdictionID}
-	// 200 → valid; 404 → ErrJurisdictionNotFound; network err → ErrValidatorUnavailable
+	ref, err := v.Lookup(ctx, jurisdictionID)
+	if err != nil {
+		return err
+	}
+	if !ref.ActiveFlag || (ref.EffectiveTo != nil && !ref.EffectiveTo.After(time.Now())) {
+		return fmt.Errorf("%w: %s", ErrJurisdictionRetired, jurisdictionID)
+	}
+	return nil
+}
+
+// Lookup reads the jurisdiction record from the Jurisdiction Rules Service.
+// 404 → ErrJurisdictionNotFound; anything unreadable → ErrValidatorUnavailable
+// (fail closed).
+func (v *HTTPJurisdictionValidator) Lookup(ctx context.Context, jurisdictionID string) (*Ref, error) {
 	url := fmt.Sprintf("%s/v1/jurisdictions/%s", v.baseURL, jurisdictionID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return ErrValidatorUnavailable
+		return nil, ErrValidatorUnavailable
 	}
 	resp, err := v.client.Do(req)
 	if err != nil {
@@ -89,19 +116,25 @@ func (v *HTTPJurisdictionValidator) ValidateExists(ctx context.Context, jurisdic
 			zap.String("jurisdiction_id", jurisdictionID),
 			zap.Error(err),
 		)
-		return ErrValidatorUnavailable
+		return nil, ErrValidatorUnavailable
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return nil
+		var ref Ref
+		if err := json.NewDecoder(resp.Body).Decode(&ref); err != nil {
+			v.log.Error("unreadable jurisdiction record — failing closed",
+				zap.String("jurisdiction_id", jurisdictionID), zap.Error(err))
+			return nil, ErrValidatorUnavailable
+		}
+		return &ref, nil
 	case http.StatusNotFound:
-		return fmt.Errorf("%w: %s", ErrJurisdictionNotFound, jurisdictionID)
+		return nil, fmt.Errorf("%w: %s", ErrJurisdictionNotFound, jurisdictionID)
 	default:
 		v.log.Error("unexpected response from jurisdiction rules service — failing closed",
 			zap.Int("status", resp.StatusCode),
 			zap.String("jurisdiction_id", jurisdictionID),
 		)
-		return ErrValidatorUnavailable
+		return nil, ErrValidatorUnavailable
 	}
 }

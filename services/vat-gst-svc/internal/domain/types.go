@@ -8,6 +8,7 @@ import (
 var (
 	ErrVATReturnNotFound = errors.New("vat return not found")
 	ErrAlreadyFiled      = errors.New("vat return is already filed")
+	ErrVATReturnConflict = errors.New("vat return for this period already exists")
 )
 
 type FilingStatus string

@@ -208,10 +208,103 @@ func TestUsage_LateUsageAfterCertificationCreatesAnAdjustment(t *testing.T) {
 	if target2.Status != domain.StatementAdjusted {
 		t.Fatalf("a statement carrying a late adjustment must certify as ADJUSTED, got %s", target2.Status)
 	}
+	// COM-CTRL-017 fix: the late quantity must actually be counted, not
+	// just flip the status to ADJUSTED while billing nothing.
+	if target2.TotalQuantity != "3.0000" {
+		t.Fatalf("late usage was not actually billed: target2.TotalQuantity = %s, want 3.0000", target2.TotalQuantity)
+	}
+	explained, err := f.s.ExplainAggregation(f.ctxOrg, target2.StatementID)
+	if err != nil || len(explained) != 1 || explained[0].UsageEventID != "evt-late" {
+		t.Fatalf("ExplainAggregation must show the late event that was actually counted: %+v (err=%v)", explained, err)
+	}
 
 	lateEvents, err := f.s.GetLateEvents(f.ctxOrg, sub.SubscriptionID)
 	if err != nil || len(lateEvents) != 1 || lateEvents[0].UsageEventID != "evt-late" {
 		t.Fatalf("GetLateEvents: %+v (err=%v)", lateEvents, err)
+	}
+}
+
+// C2: CreateUsageAdjustment lets an operator redirect an already-ingested
+// (here, quarantined) event's own quantity into a specific open statement —
+// never a caller-supplied amount — and refuses a source event with no
+// statement linkage to use as an origin.
+func TestUsage_CreateUsageAdjustment_RedirectsAQuarantinedEventsQuantity(t *testing.T) {
+	f := newSub(t)
+	dim := "user_id"
+	f.registerMeter("active.users", 1, "UNIQUE_COUNT", &dim)
+	f.publishPlan("business", planOpts{autoRenew: true})
+	sub := activateNow(f, f.sv(f.start(f.startParams(f.account, "business", day(11)))), day(11))
+
+	// Missing the required dimension: quarantined, but the quantity itself
+	// ("1") is still a valid, non-negative recorded fact and the event is
+	// linked to the OPEN statement it would have belonged to (its origin).
+	e, err := f.s.RegisterUsageEvent(f.ctx, f.org, sub.SubscriptionID, "active.users", 1, "evt-missing-dim",
+		domain.EventInput{Quantity: "1", OccurredAt: day(12)}, "app-svc", day(12),
+		f.claim("app-svc", "ingest", "active.users/evt-missing-dim"))
+	if err != nil || e.Status != domain.UsageQuarantined || e.StatementID == nil {
+		t.Fatalf("quarantine setup: %+v (err=%v)", e, err)
+	}
+	origin := *e.StatementID
+
+	// Close term1 (leaving the quarantined event exactly as investigated
+	// evidence) and renew, so there is a genuinely different OPEN window to
+	// redirect the quantity into — an adjustment's origin and target are
+	// never the same statement.
+	f.closeAndCertify(sub.SubscriptionID, sub.CurrentTerm.TermNo, "active.users", day(20))
+	renewAt := sub.CurrentTerm.EndsAt.Add(time.Hour)
+	sub2 := f.sv(f.s.Renew(f.ctxOrg, f.seller(sub, renewAt), f.tclaim(f.org, operator, "renew", sub.SubscriptionID)))
+	targetTerm := sub2.CurrentTerm.TermNo
+
+	// One organic occurrence opens term2's statement to adjust into.
+	f.mustRegisterUniqueEvent(sub.SubscriptionID, "active.users", "evt-organic", "u1", renewAt.Add(time.Hour), renewAt.Add(time.Hour))
+	targetStatement, err := f.s.GetUsage(f.ctxOrg, sub.SubscriptionID, targetTerm, "active.users")
+	if err != nil {
+		t.Fatalf("get term2 usage: %v", err)
+	}
+
+	adj, err := f.s.CreateUsageAdjustment(f.ctx, targetStatement.StatementID, "active.users", "evt-missing-dim",
+		"investigated: this occurrence should count", publisher, day(13),
+		f.claim(publisher, "adjust", "evt-missing-dim"))
+	if err != nil {
+		t.Fatalf("create usage adjustment: %v", err)
+	}
+	if adj.Quantity != "1" || adj.SourceUsageEventID != "evt-missing-dim" || adj.OriginStatementID != origin {
+		t.Fatalf("adjustment: %+v", adj)
+	}
+	if n := f.outboxCount(adj.AdjustmentID, "usage_adjustment.created"); n != 1 {
+		t.Fatalf("usage_adjustment.created events: %d", n)
+	}
+
+	// term2 already has u1 organically (1 distinct) plus the redirected
+	// quantity's dimension is empty (missing user_id) — a second distinct
+	// value — so the certified count must be 2.
+	st := f.closeAndCertify(sub.SubscriptionID, targetTerm, "active.users", sub2.CurrentTerm.EndsAt.Add(time.Hour))
+	if st.TotalQuantity != "2" {
+		t.Fatalf("manually adjusted quantity was not counted: TotalQuantity = %s, want 2", st.TotalQuantity)
+	}
+
+	// A source event with no statement linkage at all cannot be used as an
+	// adjustment origin. Renew again so there is a genuinely OPEN window
+	// (term3) for this late arrival's own automatic routing to succeed
+	// into — its own record is unlinked (statement_id NULL) by design
+	// regardless, but the whole RegisterUsageEvent call must commit for
+	// the row to exist at all to test against.
+	renewAt2 := sub2.CurrentTerm.EndsAt.Add(time.Hour)
+	sub3 := f.sv(f.s.Renew(f.ctxOrg, f.seller(sub2, renewAt2), f.tclaim(f.org, operator, "renew-2", sub.SubscriptionID)))
+	_ = sub3
+	observedInTerm3 := renewAt2.Add(time.Hour)
+	late, err := f.s.RegisterUsageEvent(f.ctx, f.org, sub.SubscriptionID, "active.users", 1, "evt-unlinked",
+		domain.EventInput{Quantity: "1", Dimensions: map[string]string{"user_id": "u9"}, OccurredAt: day(12)},
+		"app-svc", observedInTerm3, f.claim("app-svc", "ingest-late", "active.users/evt-unlinked"))
+	if err != nil {
+		t.Fatalf("ingest late event: %v", err)
+	}
+	if late.StatementID != nil {
+		t.Fatalf("expected an unlinked late event, got statement_id=%v", late.StatementID)
+	}
+	if _, err := f.s.CreateUsageAdjustment(f.ctx, targetStatement.StatementID, "active.users", "evt-unlinked", "should be refused",
+		publisher, day(31), f.claim(publisher, "adjust-unlinked", "x")); !errors.Is(err, domain.ErrAdjustmentSourceUnlinked) {
+		t.Fatalf("an adjustment from an unlinked source event was allowed: %v", err)
 	}
 }
 
@@ -312,6 +405,60 @@ func TestUsage_UniqueCountAggregation(t *testing.T) {
 	if st.TotalQuantity != "2" {
 		t.Fatalf("UNIQUE_COUNT total = %s, want 2 (u1 and u2 are the only distinct users across 3 occurrences)", st.TotalQuantity)
 	}
+}
+
+// COM-CTRL-017 fix, UNIQUE_COUNT case: a late event's dimension value must
+// still be correctly folded into the distinct count — this aggregation
+// method was completely unverified for late arrivals before the fix, since
+// a bare quantity carried no dimension to count by.
+func TestUsage_LateUsage_UniqueCountAggregationIncludesTheLateDimension(t *testing.T) {
+	f := newSub(t)
+	dim := "user_id"
+	f.registerMeter("active.users", 1, "UNIQUE_COUNT", &dim)
+	f.publishPlan("business", planOpts{autoRenew: true})
+	sub := activateNow(f, f.sv(f.start(f.startParams(f.account, "business", day(11)))), day(11))
+	term1 := sub.CurrentTerm.TermNo
+
+	f.mustRegisterUniqueEvent(sub.SubscriptionID, "active.users", "e1", "u1", day(12), day(12))
+	origin := f.closeAndCertify(sub.SubscriptionID, term1, "active.users", day(20))
+	if origin.TotalQuantity != "1" {
+		t.Fatalf("origin total before the late event: %s", origin.TotalQuantity)
+	}
+
+	renewAt := sub.CurrentTerm.EndsAt.Add(time.Hour)
+	sub2 := f.sv(f.s.Renew(f.ctxOrg, f.seller(sub, renewAt), f.tclaim(f.org, operator, "renew", sub.SubscriptionID)))
+	term2 := sub2.CurrentTerm.TermNo
+	observedInTerm2 := renewAt.Add(time.Hour)
+
+	// A late event for a NEW user (u2), occurred inside term1 but observed
+	// after term1 certified.
+	late, err := f.s.RegisterUsageEvent(f.ctx, f.org, sub.SubscriptionID, "active.users", 1, "e-late",
+		domain.EventInput{Quantity: "1", Dimensions: map[string]string{"user_id": "u2"}, OccurredAt: day(15)},
+		"app-svc", observedInTerm2, f.claim("app-svc", "ingest-late", "active.users/e-late"))
+	if err != nil || !late.Late {
+		f.t.Fatalf("ingest late unique-count event: %+v (err=%v)", late, err)
+	}
+
+	target2 := f.closeAndCertify(sub.SubscriptionID, term2, "active.users", sub2.CurrentTerm.EndsAt.Add(time.Hour))
+	if target2.Status != domain.StatementAdjusted {
+		t.Fatalf("target statement must certify ADJUSTED, got %s", target2.Status)
+	}
+	if target2.TotalQuantity != "1" {
+		t.Fatalf("late unique-count arrival: TotalQuantity = %s, want 1 (u2 is the only distinct user this term)", target2.TotalQuantity)
+	}
+}
+
+// mustRegisterUniqueEvent is a small helper for a UNIQUE_COUNT meter, since
+// f.mustIngest/f.ingestAt don't carry Dimensions.
+func (f *subFixture) mustRegisterUniqueEvent(subID, meterKey, eventID, userID string, occurredAt, observedAt time.Time) *domain.UsageEventRecord {
+	f.t.Helper()
+	e, err := f.s.RegisterUsageEvent(f.ctx, f.org, subID, meterKey, 1, eventID,
+		domain.EventInput{Quantity: "1", Dimensions: map[string]string{"user_id": userID}, OccurredAt: occurredAt},
+		"app-svc", observedAt, f.claim("app-svc", "ingest", meterKey+"/"+eventID))
+	if err != nil {
+		f.t.Fatalf("register unique event %s: %v", eventID, err)
+	}
+	return e
 }
 
 // Boundary integration: the worker freezes and certifies usage at term end,

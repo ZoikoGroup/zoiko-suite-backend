@@ -20,6 +20,22 @@ const (
 	TenantLifecycleActive      TenantLifecycleState = "ACTIVE"
 	TenantLifecycleSuspended   TenantLifecycleState = "SUSPENDED"
 	TenantLifecycleOffboarding TenantLifecycleState = "OFFBOARDING"
+	// TenantLifecycleTerminated is the true terminal state. ORG-02 §4.2's
+	// lifecycle is "Provisioning -> Active -> Suspended -> Terminating ->
+	// Terminated", and OFFBOARDING is this platform's name for Terminating.
+	// Until this existed OFFBOARDING was treated as terminal, which left the
+	// named command CompleteTermination with nowhere to move a tenant to and
+	// made "termination initiated" indistinguishable from "termination
+	// finished" -- the distinction the whole offboarding window exists for.
+	TenantLifecycleTerminated TenantLifecycleState = "TERMINATED"
+	// TenantLifecycleFailedProvisioning is §4.2's "Provisioning partial failure
+	// remains Provisioning/FailedProvisioning with compensating cleanup". A
+	// tenant whose core rows committed but whose follow-on provisioning steps
+	// did not lands here instead of lingering in ONBOARDING, where it would be
+	// indistinguishable from one still in progress. It is never transactable
+	// and never activatable; RetryProvisioning or AbandonProvisioning are the
+	// only ways out.
+	TenantLifecycleFailedProvisioning TenantLifecycleState = "FAILED_PROVISIONING"
 )
 
 // ValidTenantLifecycleTransitions maps valid source states to allowed target states.
@@ -28,7 +44,11 @@ var ValidTenantLifecycleTransitions = map[TenantLifecycleState][]TenantLifecycle
 	TenantLifecycleOnboarding:  {TenantLifecycleActive},
 	TenantLifecycleActive:      {TenantLifecycleSuspended, TenantLifecycleOffboarding},
 	TenantLifecycleSuspended:   {TenantLifecycleActive, TenantLifecycleOffboarding},
-	TenantLifecycleOffboarding: {}, // terminal state
+	TenantLifecycleOffboarding: {TenantLifecycleTerminated},
+	TenantLifecycleTerminated:  {}, // terminal state
+	// Only the named RetryProvisioning / AbandonProvisioning commands leave
+	// FAILED_PROVISIONING; the generic route may not.
+	TenantLifecycleFailedProvisioning: {},
 }
 
 // EntityType classifies the legal form of a legal entity.
@@ -46,6 +66,12 @@ const (
 type EntityStatus string
 
 const (
+	// EntityStatusDraft and EntityStatusVerified are ORG-03 §4.3's
+	// "Draft → Verified → Active". A new entity is DRAFT; VerifyLegalEntity
+	// (independently approved) makes it VERIFIED; ActivateLegalEntity makes it
+	// ACTIVE. Neither can be transacted against.
+	EntityStatusDraft     EntityStatus = "DRAFT"
+	EntityStatusVerified  EntityStatus = "VERIFIED"
 	EntityStatusActive    EntityStatus = "ACTIVE"
 	EntityStatusDormant   EntityStatus = "DORMANT"
 	EntityStatusSuspended EntityStatus = "SUSPENDED"
@@ -54,7 +80,14 @@ const (
 
 // ValidEntityStatusTransitions maps valid source states to allowed target states.
 // Any transition not in this map must be rejected fail-closed.
+//
+// DRAFT and VERIFIED may only be abandoned (DISSOLVED) through the generic
+// route. Moving FORWARD out of them is VerifyLegalEntity / ActivateLegalEntity
+// only: ACTIVE's allowed priors are derived from this map, so no path to ACTIVE
+// from DRAFT or VERIFIED exists here.
 var ValidEntityStatusTransitions = map[EntityStatus][]EntityStatus{
+	EntityStatusDraft:     {EntityStatusDissolved},
+	EntityStatusVerified:  {EntityStatusDissolved},
 	EntityStatusActive:    {EntityStatusDormant, EntityStatusSuspended, EntityStatusDissolved},
 	EntityStatusDormant:   {EntityStatusActive, EntityStatusDissolved},
 	EntityStatusSuspended: {EntityStatusActive, EntityStatusDissolved},

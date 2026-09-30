@@ -1,6 +1,9 @@
 # Secret Vault Integration Service — Progress & Phase Plan
 
-Status: **feature-complete for v1 and verified live end-to-end, 2026-07-08.**
+Status: **complete across service and console, audited 83/83 live, 2026-09-21.**
+See `RELEASE_CERTIFICATE.md` for that audit and what it covers. The history
+below is kept as written; the 2026-09-21 section at the end records what
+changed since.
 Full spec is in `context.md` (finalized after two rounds of self-review
 that caught real design bugs before any code was written — see that
 file's §0 and its inline "correction found on review" notes). Building it
@@ -384,13 +387,121 @@ This exact stack is what the 24-request Postman pass above was run
 against — every endpoint in the "Endpoint reference" section was
 exercised live, not just asserted in `go test`.
 
-## Open item flagged, not yet resolved
+## Open item — resolved 2026-09-21
 
-`context.md`'s final section raised a real adversarial-security question
-not yet answered: should `404` (no policy for this `secret_path`) and
-`403` (policy exists, caller not authorized) collapse into the same
-response, to avoid letting a caller enumerate which `secret_path` values
-exist by probing the broker endpoint? Not resolved before starting
-implementation — flagged here so it isn't lost, and worth a `/security-review`
-pass before this service is considered production-ready, not just
-functionally complete.
+`context.md`'s final section asked whether `404` (no policy for this
+`secret_path`) and `403` (policy exists, caller not authorized) should
+collapse into one response, so a caller could not enumerate which
+`secret_path` values exist by probing the broker.
+
+**Resolved: they stay distinct.** The reasoning is written up in
+`RUNBOOK.md` §3 rather than here, because it is something an on-call
+reader needs at the moment they are staring at one of the two codes. In
+short: the difference between them is the difference between a
+permissions fix and a provisioning fix, and the provisioning case (a
+version left `DRAFT`, or material never seeded) is the commonest failure
+mode this service has — collapsing the codes would make it undiagnosable
+from outside. The exposure is bounded because the broker is reachable
+only by a caller that already passed gateway verification and carries a
+verified tenant, and every probe writes a `DENIED` audit row naming the
+caller.
+
+The same question is answered the *other* way on `/v1/secrets/leases/{id}`,
+where a foreign tenant's lease is indistinguishable from one that never
+existed — a lease id is a guessable address for a specific row, whereas a
+`secret_path` is a name the caller already had to know. Section 8 of
+`scripts/audit.sh` pins the lease side.
+
+## 2026-09-21 — completion pass across service and console
+
+Everything below was found by asking what a *complete* service here looks
+like — the bar set by `identity-context-svc` and `tenant-entity-registry-svc`,
+the two that carry a release certificate — and then checking this one
+against it rather than against its own notes.
+
+### Defects found and fixed
+
+1. **The audit log could not say who revoked a lease.** `RevokeLease` read
+   the revoking principal from `X-Principal-Id`, authorized it against
+   `SECRET_LEASE_REVOKE`, and then discarded it: the `REVOKED` row was
+   written with the LEASE HOLDER in `requested_by_principal_id` and
+   nothing else identifying anyone. `outcome_detail` was empty on that
+   path and `correlation_id` is a trace handle, not an identity — so
+   "who ended this lease", the first question asked after a credential
+   incident, had no answer anywhere in the four tables. Rotation's
+   cascaded `REVOKED` rows had the same hole.
+
+   Fixed by migration `000004`, which adds
+   `secret_access_audit_log.acted_by_principal_id` — the ACTOR, distinct
+   from `requested_by_principal_id`, which keeps meaning the SUBJECT. All
+   five event types populate it, so "everything principal X did" is one
+   predicate rather than a per-type special case. Nullable and
+   deliberately not backfilled: copying the subject across would be right
+   for three event types and wrong for the one the column exists for.
+   Surfaced in the console's audit table, which now prints the actor
+   beneath the subject when the two differ.
+
+2. **An empty outcome banner rendered under the broker form before
+   anything was submitted.** `ResultBanner` guarded on `!children`, and a
+   caller passing two conditional children hands it `[undefined, false]`
+   — an array, which is truthy. With one conditional child the same code
+   returned `null` correctly, which is why this survived: it was
+   invisible on six of the seven forms and showed only on the one that
+   passed two. Fixed with `Children.toArray(...).length`. This is a
+   shared component; the fix is not specific to this page.
+
+3. **The console told operators the admin routes were unauthorized.**
+   Both `app/admin/secrets/page.tsx` and `app/admin/secrets/actions.ts`
+   stated that registering, versioning, activating, seeding and rotating
+   were "gated only by this console's session". All six are gated on a
+   named `SECRET_*` action checked against authorization-svc — the guard
+   was added and neither copy was updated. A reader debugging a 403 was
+   being sent to the wrong place. Corrected in both, and the genuine
+   exception (the broker route, authorized by `allowed_workload_ids`
+   rather than by RBAC) is now stated as the exception it is.
+
+4. **The store suite's migration list was hardcoded**, so adding a
+   migration and forgetting to extend it would leave every store test
+   running against the previous schema — passing, against a database the
+   service would never see. Now reads the migrations directory in
+   filename order and fails if it finds none.
+
+5. **Six live alert rules pointed at a runbook that did not exist.**
+   Every rule in the `secret-vault-integration` group annotates a section
+   of `services/secret-vault-integration-svc/RUNBOOK.md` by number. The
+   file was never written. Written now, with §4.1–4.6 matching the six
+   alerts one for one; `scripts/audit.sh` §16 checks both directions so
+   the pointer cannot dangle again.
+
+### Artifacts added
+
+- `openapi.yaml` — all 12 v1 routes plus the three probes, the §4 header
+  contract, and every error code the handlers emit.
+- `asyncapi.yaml` — the three published events and the envelope they
+  share.
+- `RUNBOOK.md` — first response, the 404-vs-403 decision, one section per
+  alert, the configuration that changes behaviour, and what not to do.
+- `deployments/migrations/000004_add_acted_by_principal.{up,down}.sql`.
+- Console e2e: `e2e/secrets.spec.ts` (9 specs) against
+  `e2e/mock/secret-vault-service.mjs`, a hermetic stand-in for this
+  service wired into `playwright.config.ts`. The mock is header-strict
+  because the console shipped for weeks sending none of the §4 headers
+  and nothing caught it — there were no tests on this surface at all.
+  Its first draft was stricter than the service (it demanded a principal
+  on reads, which the service does not) and reported every read panel as
+  `401`; the contract it enforces now was read off the running service,
+  not inferred.
+
+### Audit
+
+`scripts/audit.sh` grew three areas and now runs **83 checks, 0 failures**
+(it was 67 before this pass):
+
+- §11 extended — the `REVOKED` row names the acting principal, the
+  subject is still the holder, the two are genuinely different values,
+  and no row written during the run omits its actor.
+- §16 new — `openapi.yaml`'s route set compared against the chi router in
+  both directions, `asyncapi.yaml`'s event set against the publisher in
+  both directions, and every `RUNBOOK section N.N` annotation in the
+  alert rules resolved to a heading that exists.
+- §17 new — the console e2e suite, skippable with `SKIP_FE=1`.

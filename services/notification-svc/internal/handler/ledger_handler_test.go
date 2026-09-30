@@ -103,7 +103,6 @@ func newLedgerTestRouter(tenantID string, ls *mockLedgerStoreForHandler) (chi.Ro
 
 	h := handler.New(handler.Deps{
 		Store:        newStubStore(),
-		Publisher:    &stubPublisher{},
 		AuthZ:        &stubAuthZ{},
 		Deliverer:    deliverer,
 		Recipient:    res,

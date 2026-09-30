@@ -33,6 +33,19 @@ type stubStore struct {
 	templateSeq              int
 	versionSeq               int
 	getPublishedVersionCalls int
+
+	// events counts what the real store enqueues in event_outbox with each
+	// transition (migration 000010). The handler no longer publishes, so "one
+	// event per conclusion" is a property of the store transition, asserted
+	// here through the same stubPublisher counters the tests already read.
+	events *stubPublisher
+
+	// attempts lets a test seed the chain GET /{id}/attempts returns.
+	attempts map[string][]domain.DeliveryAttempt
+
+	// submitted records BeginSubmission calls; beginSubmissionErr fails them.
+	submitted          []string
+	beginSubmissionErr error
 }
 
 func newStubStore() *stubStore {
@@ -45,12 +58,18 @@ func newStubStore() *stubStore {
 }
 
 func (s *stubStore) CreateNotification(_ context.Context, n *domain.Notification) (bool, error) {
-	if id, ok := s.byCorr[n.CorrelationID]; ok {
+	// Keyed the way the real store is (migration 000012): on the purpose-scoped
+	// idempotency key when there is one, on the correlation id otherwise.
+	key := "corr:" + n.CorrelationID
+	if n.IdempotencyKey != "" {
+		key = "idem:" + n.IdempotencyKey
+	}
+	if id, ok := s.byCorr[key]; ok {
 		*n = *s.byID[id]
 		return false, nil
 	}
 	s.byID[n.NotificationID] = n
-	s.byCorr[n.CorrelationID] = n.NotificationID
+	s.byCorr[key] = n.NotificationID
 	return true, nil
 }
 
@@ -83,7 +102,7 @@ func (s *stubStore) ListNotifications(_ context.Context, f domain.ListFilter) ([
 	return out, nil
 }
 
-func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error {
+func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, _ string, _ domain.AttemptMeta) error {
 	n, ok := s.byID[id]
 	if !ok {
 		return domain.ErrNotificationNotFound
@@ -92,6 +111,11 @@ func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureRe
 	n.FailureReason = failureReason
 	n.ProviderResponse = providerResponse
 	n.SentAt = sentAt
+	if newStatus == domain.StatusSent {
+		s.emit("notification.sent")
+	} else {
+		s.emit("notification.failed")
+	}
 	return nil
 }
 
@@ -104,7 +128,7 @@ type scheduledRetry struct {
 	nextAttemptAt time.Time
 }
 
-func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, attemptedAt, nextAttemptAt time.Time) error {
+func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, attemptedAt, nextAttemptAt time.Time, _ domain.AttemptMeta) error {
 	n, ok := s.byID[id]
 	if !ok {
 		return domain.ErrNotificationNotFound
@@ -122,7 +146,7 @@ func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string
 	return nil
 }
 
-func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, attemptedAt time.Time) error {
+func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, attemptedAt time.Time, _ string, _ domain.AttemptMeta) error {
 	n, ok := s.byID[id]
 	if !ok {
 		return domain.ErrNotificationNotFound
@@ -133,6 +157,7 @@ func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, 
 	n.LastAttemptAt = &attemptedAt
 	n.SentAt = &attemptedAt
 	n.UnknownAt = &attemptedAt
+	s.emit("notification.outcome_unknown")
 	return nil
 }
 
@@ -156,6 +181,11 @@ func (s *stubStore) ResolveDeliveryOutcome(_ context.Context, p domain.ResolveDe
 	n.ResolvedAt = &resolvedAt
 	n.ResolvedByPrincipalID = p.ActorPrincipalID
 	n.ResolutionNote = p.ResolutionNote
+	if p.ResolvedStatus == domain.StatusSent {
+		s.emit("notification.sent")
+	} else {
+		s.emit("notification.failed")
+	}
 	return nil
 }
 
@@ -191,6 +221,7 @@ func (s *stubStore) CreateTemplate(_ context.Context, p domain.CreateTemplatePar
 		OwnerPrincipalID: p.OwnerPrincipalID, Status: "ACTIVE", CreatedAt: time.Now().UTC(),
 	}
 	s.templates[d.TemplateID] = d
+	s.emit("template.created")
 	return d, nil
 }
 
@@ -264,6 +295,7 @@ func (s *stubStore) ApproveTemplate(_ context.Context, p domain.ApproveVersionPa
 	v.Status = domain.TemplateVersionApproved
 	v.ApprovedByPrincipalID = &p.ApprovedByPrincipalID
 	v.ApprovedAt = &now
+	s.emit("template.version_approved")
 	return v, nil
 }
 
@@ -286,6 +318,7 @@ func (s *stubStore) PublishTemplate(_ context.Context, p domain.PublishVersionPa
 			other.SupersededByVersionID = &id
 		}
 	}
+	s.emit("template.published")
 	return v, nil
 }
 
@@ -317,6 +350,7 @@ func (s *stubStore) RetireTemplate(_ context.Context, p domain.RetireTemplatePar
 			v.RetiredAt = &now
 		}
 	}
+	s.emit("template.retired")
 	return d, nil
 }
 
@@ -379,31 +413,13 @@ func (s *stubStore) ListLocales(_ context.Context, templateID string) ([]domain.
 	return out, nil
 }
 
+// stubPublisher counts events the stub store enqueues, by type.
 type stubPublisher struct {
 	sent, failed, outcomeUnknown                                          int
 	templateCreated, templateApproved, templatePublished, templateRetired int
 }
 
-func (p *stubPublisher) PublishSent(_ context.Context, _ string, _ domain.Notification) { p.sent++ }
-func (p *stubPublisher) PublishFailed(_ context.Context, _ string, _ domain.Notification, _ string) {
-	p.failed++
-}
-func (p *stubPublisher) PublishOutcomeUnknown(_ context.Context, _ string, _ domain.Notification, _ string) {
-	p.outcomeUnknown++
-}
 
-func (p *stubPublisher) PublishTemplateCreated(_ context.Context, _ string, _ domain.TemplateDefinition) {
-	p.templateCreated++
-}
-func (p *stubPublisher) PublishTemplateVersionApproved(_ context.Context, _ string, _ domain.TemplateVersion) {
-	p.templateApproved++
-}
-func (p *stubPublisher) PublishTemplatePublished(_ context.Context, _ string, _ domain.TemplateVersion) {
-	p.templatePublished++
-}
-func (p *stubPublisher) PublishTemplateRetired(_ context.Context, _ string, _ domain.TemplateDefinition) {
-	p.templateRetired++
-}
 
 type stubAuthZ struct {
 	err   error
@@ -484,9 +500,9 @@ func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handl
 			next.ServeHTTP(w, req)
 		})
 	})
+	s.events = pub
 	h := handler.New(handler.Deps{
 		Store:     s,
-		Publisher: pub,
 		AuthZ:     authz,
 		Deliverer: del,
 		Recipient: res,
@@ -1435,4 +1451,59 @@ func TestResolveDeliveryOutcome_AuthzDenied_Returns403(t *testing.T) {
 	if store.byID["n1"].Status != domain.StatusPendingUnknown {
 		t.Error("expected the notification to remain untouched on authorization denial")
 	}
+}
+
+// emit records one event the real store would have enqueued.
+func (s *stubStore) emit(eventType string) {
+	p := s.events
+	if p == nil {
+		return
+	}
+	switch eventType {
+	case "notification.sent":
+		p.sent++
+	case "notification.failed":
+		p.failed++
+	case "notification.outcome_unknown":
+		p.outcomeUnknown++
+	case "template.created":
+		p.templateCreated++
+	case "template.version_approved":
+		p.templateApproved++
+	case "template.published":
+		p.templatePublished++
+	case "template.retired":
+		p.templateRetired++
+	}
+}
+
+func (s *stubStore) ListAttempts(_ context.Context, id string) ([]domain.DeliveryAttempt, error) {
+	return s.attempts[id], nil
+}
+
+func (s *stubStore) BeginSubmission(_ context.Context, id, _ string, _ time.Time) error {
+	if s.beginSubmissionErr != nil {
+		return s.beginSubmissionErr
+	}
+	s.submitted = append(s.submitted, id)
+	return nil
+}
+
+func (s *stubStore) BeginResend(_ context.Context, id, _, actor, reason string, at time.Time) (*domain.Notification, error) {
+	n, ok := s.byID[id]
+	if !ok || (n.Status != domain.StatusSent && n.Status != domain.StatusFailed) {
+		return nil, domain.ErrNotResendable
+	}
+	n.Status = domain.StatusPending
+	n.ResendCount++
+	n.LastResendReason, n.LastResentAt, n.LastResentByPrincipalID = reason, &at, actor
+	cp := *n
+	return &cp, nil
+}
+
+func (s *stubStore) SetRecipientAddress(_ context.Context, id, _, address, source string) error {
+	if n, ok := s.byID[id]; ok {
+		n.RecipientAddress, n.RecipientAddressSource = address, source
+	}
+	return nil
 }

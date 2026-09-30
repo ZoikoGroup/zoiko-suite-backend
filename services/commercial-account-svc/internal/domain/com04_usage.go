@@ -110,17 +110,23 @@ type UsageStatement struct {
 
 // UsageAdjustment carries a late event's quantity into the next OPEN
 // statement instead of rewriting the CERTIFIED/ADJUSTED one it would
-// otherwise have belonged to.
+// otherwise have belonged to. OccurredAt/Dimensions are the same evidence a
+// normal AcceptedEvent carries — required so the adjustment can be fed into
+// domain.Aggregate exactly as if it had arrived on time, correctly for
+// every aggregation method (MAX/LAST need OccurredAt; UNIQUE_COUNT needs
+// Dimensions), not just SUM.
 type UsageAdjustment struct {
-	AdjustmentID         string    `json:"adjustment_id"`
-	OriginStatementID    string    `json:"origin_statement_id"`
-	TargetStatementID    string    `json:"target_statement_id"`
-	MeterKey             string    `json:"meter_key"`
-	SourceUsageEventID   string    `json:"source_usage_event_id"`
-	Quantity             string    `json:"quantity"`
-	Reason               string    `json:"reason"`
-	CreatedAt            time.Time `json:"created_at"`
-	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	AdjustmentID         string            `json:"adjustment_id"`
+	OriginStatementID    string            `json:"origin_statement_id"`
+	TargetStatementID    string            `json:"target_statement_id"`
+	MeterKey             string            `json:"meter_key"`
+	SourceUsageEventID   string            `json:"source_usage_event_id"`
+	Quantity             string            `json:"quantity"`
+	OccurredAt           time.Time         `json:"occurred_at"`
+	Dimensions           map[string]string `json:"dimensions"`
+	Reason               string            `json:"reason"`
+	CreatedAt            time.Time         `json:"created_at"`
+	CreatedByPrincipalID string            `json:"created_by_principal_id"`
 }
 
 var aggregationMethodSet = map[string]bool{"SUM": true, "MAX": true, "LAST": true, "UNIQUE_COUNT": true}
@@ -249,4 +255,5 @@ var (
 	ErrStatementInvalidState       = errorString("usage statement is not in a state that allows this action")
 	ErrStatementNotOpenForWindow   = errorString("the subscription has no matching open term for this event's occurred_at")
 	ErrReopenNeedsIndependentActor = errorString("reopening a statement needs a principal other than whoever certified it")
+	ErrAdjustmentSourceUnlinked    = errorString("the source event has no statement linkage to use as an adjustment's origin")
 )

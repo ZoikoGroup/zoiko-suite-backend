@@ -121,12 +121,12 @@ func (s *PgStore) GetEffectiveDunningPolicy(ctx context.Context, now time.Time) 
 // ── Dunning cases ────────────────────────────────────────────────────────────
 
 const dunningCaseColumns = `case_id, organization_id::text, invoice_id, policy_version, status, opened_at,
-	opened_by_principal_id, last_advanced_at, closed_at, closed_by_principal_id, close_reason`
+	opened_by_principal_id, last_advanced_at, applied_restriction_id, closed_at, closed_by_principal_id, close_reason`
 
 func scanDunningCase(row pgx.Row) (*domain.DunningCase, error) {
 	var c domain.DunningCase
 	if err := row.Scan(&c.CaseID, &c.OrganizationID, &c.InvoiceID, &c.PolicyVersion, &c.Status, &c.OpenedAt,
-		&c.OpenedByPrincipalID, &c.LastAdvancedAt, &c.ClosedAt, &c.ClosedByPrincipalID, &c.CloseReason); err != nil {
+		&c.OpenedByPrincipalID, &c.LastAdvancedAt, &c.AppliedRestrictionID, &c.ClosedAt, &c.ClosedByPrincipalID, &c.CloseReason); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -189,8 +189,39 @@ func (s *PgStore) AdvanceDunning(ctx context.Context, caseID, actor string, now 
 		if next == "" {
 			return domain.ErrDunningCaseFullyEscalated
 		}
-		if _, err := tx.Exec(ctx, `UPDATE dunning_cases SET status = $2, last_advanced_at = $3 WHERE case_id = $1`,
-			caseID, next, now); err != nil {
+		// COM-03 gap-remediation (B3): escalating to RESTRICTED (or on to
+		// SUSPENDED, if one isn't already applied) applies a real
+		// CommercialRestriction automatically, atomically with the
+		// escalation — previously the mechanism existed (ApplyRestriction)
+		// but nothing ever called it, so a past-due tenant kept full access
+		// until a human intervened manually. Both stages map to
+		// RestrictionRestricted, the most severe level CommercialRestriction
+		// currently supports (COM-03 has no separate DENY-level
+		// restriction) — a deliberate, documented choice, not a silent gap:
+		// see migration 000016 / the plan this wave implements.
+		//
+		// This must be a SINGLE UPDATE alongside the status change, not a
+		// second one afterward: the lifecycle trigger only permits a status
+		// column to move exactly one stage per UPDATE, and a same-status
+		// "touch" update (e.g. only setting applied_restriction_id) trips
+		// it just as a genuine regression would.
+		restrictionID := c.AppliedRestrictionID
+		if restrictionID == nil && (next == domain.DunningRestricted || next == domain.DunningSuspended) {
+			restriction, err := applyRestrictionTx(ctx, tx, &domain.CommercialRestriction{
+				RestrictionID: domain.NewCommercialID(domain.PrefixRestriction), OrganizationID: c.OrganizationID,
+				Level: domain.RestrictionRestricted, ReasonCode: "DUNNING_ESCALATION",
+				PolicyRef: caseID, BasisRef: c.InvoiceID, AppliedAt: now, AppliedByPrincipalID: actor,
+			})
+			if err != nil {
+				return err
+			}
+			restrictionID = &restriction.RestrictionID
+		}
+		if _, err := tx.Exec(ctx, `UPDATE dunning_cases SET status = $2, last_advanced_at = $3, applied_restriction_id = $4
+			WHERE case_id = $1`, caseID, next, now, restrictionID); err != nil {
+			return err
+		}
+		if _, err := recomputeEntitlementsTx(ctx, tx, c.OrganizationID, actor, now); err != nil {
 			return err
 		}
 		got, err := loadDunningCase(ctx, tx, caseID, false)
@@ -220,6 +251,17 @@ func (s *PgStore) StopDunning(ctx context.Context, caseID, actor, reason string,
 		}
 		if _, err := tx.Exec(ctx, `UPDATE dunning_cases SET status = 'CLOSED', closed_at = $2, closed_by_principal_id = $3,
 			close_reason = $4 WHERE case_id = $1`, caseID, now, actor, reason); err != nil {
+			return err
+		}
+		// B3: lift whatever restriction this case applied, atomically with
+		// closing it — a resolved dunning case must not leave a tenant
+		// permanently restricted.
+		if c.AppliedRestrictionID != nil {
+			if _, err := removeRestrictionTx(ctx, tx, *c.AppliedRestrictionID, actor, "dunning case "+caseID+" closed: "+reason, now); err != nil {
+				return err
+			}
+		}
+		if _, err := recomputeEntitlementsTx(ctx, tx, c.OrganizationID, actor, now); err != nil {
 			return err
 		}
 		got, err := loadDunningCase(ctx, tx, caseID, false)

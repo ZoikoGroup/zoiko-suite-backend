@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,6 +23,15 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
+		// A SILENT SKIP HERE TURNS THE WHOLE STORE SUITE INTO NOTHING while
+		// `go test ./...` still prints ok. Skip locally, where a developer
+		// without Postgres is a normal state, and FAIL wherever the run claims
+		// to be a verification. CI is set by GitHub Actions; REQUIRE_DB_TESTS
+		// is the local opt-in for reproducing a certification run by hand.
+		if os.Getenv("CI") != "" || os.Getenv("REQUIRE_DB_TESTS") != "" {
+			t.Fatal("TEST_DATABASE_URL is not set, but CI or REQUIRE_DB_TESTS is: " +
+				"this run claims to verify the store and would instead have skipped every test in it")
+		}
 		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
 	}
 
@@ -32,31 +42,24 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS feature_flags, config_entries CASCADE;`)
+	// Every table the migrations create, not just the two the service started
+	// with. Omitting event_outbox left its policy in place, so re-applying
+	// 000003 failed at "policy already exists" — and because openTestPool runs
+	// per test, that broke every test after the first.
+	//
+	// And every table and function the AA-001 migrations (000004–000009)
+	// added. This list stopped at the original three, so each test after the
+	// first failed re-applying 000004 on "config_snapshot_epochs already
+	// exists" — the suite could never run more than one test green.
+	_ = dropSchema(ctx, pool)
 
 	// Every *.up.sql in filename order, not one hardcoded filename. This
 	// used to name 000001_initial_schema.up.sql alone, which meant a
 	// migration added later was invisible to this suite — the drift trap
 	// known-gaps.md records for jurisdiction-rules-svc, and the reason
 	// 000002's RLS policy would otherwise have gone completely untested.
-	_, filename, _, _ := runtime.Caller(0)
-	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
-	entries, err := os.ReadDir(migDir)
-	if err != nil {
-		t.Fatalf("failed to read migrations dir %s: %v", migDir, err)
-	}
-	var ups []string
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".up.sql") {
-			ups = append(ups, e.Name())
-		}
-	}
-	if len(ups) == 0 {
-		t.Fatalf("no .up.sql migrations found in %s", migDir)
-	}
-	sort.Strings(ups)
-	for _, name := range ups {
-		migSQL, err := os.ReadFile(filepath.Join(migDir, name))
+	for _, name := range migrationFiles(t) {
+		migSQL, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatalf("failed to read migration %s: %v", name, err)
 		}
@@ -66,6 +69,34 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 
 	return pool
+}
+
+// migrationFiles lists every *.up.sql in filename order.
+//
+// Every one, not one hardcoded filename. It used to name
+// 000001_initial_schema.up.sql alone, which meant a migration added later was
+// invisible to this suite — the drift trap known-gaps.md records for
+// jurisdiction-rules-svc, and the reason 000002's RLS policy would otherwise
+// have gone completely untested, as 000003's outbox would now.
+func migrationFiles(t *testing.T) []string {
+	t.Helper()
+	_, filename, _, _ := runtime.Caller(0)
+	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
+	entries, err := os.ReadDir(migDir)
+	if err != nil {
+		t.Fatalf("failed to read migrations dir %s: %v", migDir, err)
+	}
+	var ups []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".up.sql") {
+			ups = append(ups, filepath.Join(migDir, e.Name()))
+		}
+	}
+	if len(ups) == 0 {
+		t.Fatalf("no .up.sql migrations found in %s", migDir)
+	}
+	sort.Strings(ups)
+	return ups
 }
 
 // appRolePool returns a pool connected as a genuine NOSUPERUSER
@@ -127,7 +158,159 @@ func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
 	return pool
 }
 
+// dropSchema drops every table and function the migrations create, by name —
+// never the whole schema, so a TEST_DATABASE_URL pointed at the wrong database
+// loses no more than this service's own objects. The list must track the
+// migrations: when it stopped at the original three tables, every test after
+// the first failed re-applying 000004 on "relation already exists".
+func dropSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS
+		event_outbox, feature_flags, config_entries,
+		config_snapshot_epochs, config_snapshots, config_definitions, config_definition_versions,
+		kill_switches, config_changes, emergency_changes, runtime_attestations, drift_events,
+		release_plans, flag_retirements, config_layer_overrides CASCADE;`); err != nil {
+		return err
+	}
+	_, err := pool.Exec(ctx, `DROP FUNCTION IF EXISTS
+		config_environment_manifest(TEXT), config_snapshot_immutable(), _cff000005_infer_value_type(JSONB) CASCADE;`)
+	return err
+}
+
+// restoreSchema re-applies every migration after a test has deliberately
+// dropped a table.
+//
+// Without it the suite leaves the schema broken behind it. That is harmless
+// against an isolated test database and destructive against anything else, and
+// it is not hypothetical: this service's progress.md records a live demo losing
+// feature_flags to exactly this, because the run shared one Postgres with it.
+// The lesson was written down and the teardown was not written, so the next run
+// would have done it again.
+func restoreSchema(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	// Drop everything first, then re-apply. Re-applying over the tables the
+	// test did NOT drop fails at "relation already exists" — 000001 creates
+	// both config_entries and feature_flags, and each of these tests drops only
+	// one of them.
+	if err := dropSchema(context.Background(), pool); err != nil {
+		t.Fatalf("restore: drop: %v", err)
+	}
+	for _, name := range migrationFiles(t) {
+		migSQL, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("restore: read migration %s: %v", name, err)
+		}
+		if _, err := pool.Exec(context.Background(), string(migSQL)); err != nil {
+			t.Fatalf("restore: execute migration %s: %v", name, err)
+		}
+	}
+}
+
 func strPtr(s string) *string { return &s }
+
+// testCallerTenant stands in for the gateway-verified X-Tenant-Id the handler
+// resolves before it reaches the store.
+//
+// It is a separate value from the SCOPE being written, and the distinction is
+// the one these tests exist to keep honest: a global write has no scope tenant,
+// but it is still made BY someone, and the RLS session and the outbox row both
+// hang off that someone. A write that names no caller is refused rather than
+// defaulted — see domain.ErrCallerTenantMissing.
+const testCallerTenant = "11111111-1111-1111-1111-111111111111"
+
+// ── definition seeding for the INV-05 write gate ──────────────────────────────
+//
+// Migration 000005's backfill only registers keys that already have values at
+// migration time — and this suite migrates a fresh, empty schema per test. A
+// definition therefore has to be seeded for every key a test writes, or the
+// gate refuses the write as ErrKeyNotRegistered. These helpers register a
+// PUBLISHED definition whose allowed_scopes admit both ENVIRONMENT and TENANT,
+// so tests can exercise all the scope shapes the store supports.
+//
+// Both tables are FORCE RLS with a WITH CHECK naming app.definition_admin; the
+// admin (superuser) pool bypasses RLS, so seeding there needs no GUC. Tests
+// that write through appRolePool seed here via the admin pool first.
+
+func seedDefinition(t *testing.T, pool *pgxpool.Pool, key, valueType string, flagClass *string) {
+	t.Helper()
+	seedDefinitionClass(t, pool, key, valueType, flagClass, "S1")
+}
+
+// seedDefinitionClass is seedDefinition at a chosen safety class. S2/S3 keys
+// are material: they change only through approved change sets, and they are
+// the only keys break-glass may touch.
+func seedDefinitionClass(t *testing.T, pool *pgxpool.Pool, key, valueType string, flagClass *string, safety string) {
+	t.Helper()
+	ctx := context.Background()
+
+	var defID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO config_definitions
+			(key, owner, value_type, safety_class, allowed_scopes, default_value,
+			 fallback_policy, sensitivity, validation, effective_model, lifecycle,
+			 deprecation, flag_class, retirement_deadline, created_by_principal_id, updated_by_principal_id)
+		VALUES
+			($1, 'test-owner', $2, $4, '["ENVIRONMENT","TENANT"]'::jsonb, NULL,
+			 'BLOCK', 'INTERNAL', NULL, 'IMMEDIATE', 'PUBLISHED',
+			 NULL, $3, NULL, 'test:seed', 'test:seed')
+		RETURNING definition_id`,
+		key, valueType, flagClass, safety).Scan(&defID); err != nil {
+		t.Fatalf("seed definition %s: %v", key, err)
+	}
+
+	defJSON := fmt.Sprintf(`{
+		"key": %q,
+		"owner": "test-owner",
+		"value_type": %q,
+		"safety_class": %q,
+		"allowed_scopes": ["ENVIRONMENT","TENANT"],
+		"default_value": null,
+		"fallback_policy": "BLOCK",
+		"sensitivity": "INTERNAL",
+		"validation": null,
+		"effective_model": "IMMEDIATE",
+		"lifecycle": "PUBLISHED",
+		"deprecation": null,
+		"flag_class": %s,
+		"retirement_deadline": null
+	}`, key, valueType, safety, flagClassJSON(flagClass))
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO config_definition_versions
+			(definition_id, version, digest, definition, lifecycle, published_by_principal_id)
+		VALUES ($1, 1, md5($2::text), $2::jsonb, 'PUBLISHED', 'test:seed')`,
+		defID, defJSON); err != nil {
+		t.Fatalf("seed definition version %s: %v", key, err)
+	}
+}
+
+func flagClassJSON(flagClass *string) string {
+	if flagClass == nil {
+		return "null"
+	}
+	return fmt.Sprintf("%q", *flagClass)
+}
+
+func seedConfig(t *testing.T, pool *pgxpool.Pool, key string) {
+	t.Helper()
+	seedDefinition(t, pool, key, "DECIMAL", nil)
+}
+
+func seedMaterial(t *testing.T, pool *pgxpool.Pool, key string) {
+	t.Helper()
+	seedDefinitionClass(t, pool, key, "DECIMAL", nil, "S2")
+}
+
+func seedMaterialFlag(t *testing.T, pool *pgxpool.Pool, key string) {
+	t.Helper()
+	perm := "PERMANENT"
+	seedDefinitionClass(t, pool, key, "BOOLEAN", &perm, "S2")
+}
+
+func seedFlag(t *testing.T, pool *pgxpool.Pool, key string) {
+	t.Helper()
+	perm := "PERMANENT"
+	seedDefinition(t, pool, key, "BOOLEAN", &perm)
+}
 
 // ── config_entries ───────────────────────────────────────────────────────────
 
@@ -135,12 +318,14 @@ func TestPgStore_UpsertConfigEntry_FirstWriteAndIdempotentSameValue(t *testing.T
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedConfig(t, pool, "payroll.batch_size")
 
 	params := domain.UpsertConfigEntryParams{
 		Key:                  "payroll.batch_size",
 		Value:                []byte(`100`),
 		Environment:          "staging",
 		CreatedByPrincipalID: "admin-1",
+		CallerTenantID:       testCallerTenant,
 	}
 
 	// 1. First write.
@@ -180,11 +365,13 @@ func TestPgStore_UpsertConfigEntry_NewValueEndDatesOldRowNotDeletesIt(t *testing
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedConfig(t, pool, "payroll.batch_size")
 
 	base := domain.UpsertConfigEntryParams{
 		Key:                  "payroll.batch_size",
 		Environment:          "staging",
 		CreatedByPrincipalID: "admin-1",
+		CallerTenantID:       testCallerTenant,
 	}
 
 	v1Params := base
@@ -252,14 +439,20 @@ func TestPgStore_ConfigEntry_TenantScopeIsolation(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedConfig(t, pool, "payroll.batch_size")
 
 	tenantA := strPtr("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 
 	global := domain.UpsertConfigEntryParams{
 		Key: "payroll.batch_size", Value: []byte(`100`), Environment: "staging", CreatedByPrincipalID: "admin-1",
+		CallerTenantID: testCallerTenant,
 	}
 	tenantSpecific := domain.UpsertConfigEntryParams{
 		Key: "payroll.batch_size", Value: []byte(`999`), Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1",
+		// The caller IS that tenant. A caller writing another tenant's scope is
+		// refused by RLS before it reaches the unique index, which is the same
+		// rule the handler enforces with refuseForeignTenant.
+		CallerTenantID: *tenantA,
 	}
 
 	if _, created, err := s.UpsertConfigEntry(ctx, global); err != nil || !created {
@@ -292,13 +485,16 @@ func TestPgStore_ListCurrentConfigEntries_FiltersByEnvironmentAndTenant(t *testi
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	for _, key := range []string{"a", "b", "c"} {
+		seedConfig(t, pool, key)
+	}
 
 	tenantA := strPtr("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 
 	writes := []domain.UpsertConfigEntryParams{
-		{Key: "a", Value: []byte(`1`), Environment: "staging", CreatedByPrincipalID: "admin-1"},
-		{Key: "b", Value: []byte(`2`), Environment: "production", CreatedByPrincipalID: "admin-1"},
-		{Key: "c", Value: []byte(`3`), Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1"},
+		{Key: "a", Value: []byte(`1`), Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant},
+		{Key: "b", Value: []byte(`2`), Environment: "production", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant},
+		{Key: "c", Value: []byte(`3`), Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1", CallerTenantID: *tenantA},
 	}
 	for _, p := range writes {
 		if _, _, err := s.UpsertConfigEntry(ctx, p); err != nil {
@@ -336,11 +532,12 @@ func TestPgStore_ConfigEntry_ErrorsWrapErrStoreUnavailable(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
 
-	if _, err := pool.Exec(ctx, `DROP TABLE config_entries CASCADE;`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP TABLE config_entries, config_definition_versions, config_snapshots, config_snapshot_epochs CASCADE;`); err != nil {
 		t.Fatalf("failed to drop table for test setup: %v", err)
 	}
+	t.Cleanup(func() { restoreSchema(t, pool) })
 
-	if _, _, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{Key: "k", Value: []byte(`1`), Environment: "staging", CreatedByPrincipalID: "admin-1"}); !errors.Is(err, domain.ErrStoreUnavailable) {
+	if _, _, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{Key: "k", Value: []byte(`1`), Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant}); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("UpsertConfigEntry: expected ErrStoreUnavailable, got %v", err)
 	}
 	if _, err := s.FindCurrentConfigEntry(ctx, "k", "staging", nil); !errors.Is(err, domain.ErrStoreUnavailable) {
@@ -357,9 +554,11 @@ func TestPgStore_UpsertFeatureFlag_FirstWriteAndIdempotentSameValue(t *testing.T
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedFlag(t, pool, "new_ui")
 
 	params := domain.UpsertFeatureFlagParams{
 		Key: "new_ui", Enabled: true, Environment: "staging", RolloutPercentage: 50, CreatedByPrincipalID: "admin-1",
+		CallerTenantID: testCallerTenant,
 	}
 
 	flag1, created, err := s.UpsertFeatureFlag(ctx, params)
@@ -394,8 +593,9 @@ func TestPgStore_UpsertFeatureFlag_RolloutPercentageChangeEndDatesOldRow(t *test
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedFlag(t, pool, "new_ui")
 
-	base := domain.UpsertFeatureFlagParams{Key: "new_ui", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1"}
+	base := domain.UpsertFeatureFlagParams{Key: "new_ui", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant}
 
 	v1Params := base
 	v1Params.RolloutPercentage = 10
@@ -443,16 +643,24 @@ func TestPgStore_UpsertFeatureFlag_RolloutPercentageOutOfRangeRejectedByCheckCon
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	seedFlag(t, pool, "bad_flag")
 
-	// The handler validates 0-100 before calling the store, but this
-	// proves the DB-level CHECK constraint is itself a real safety net,
-	// not just handler-side validation that could be bypassed by a future
-	// caller of the store package.
+	// The handler and the write gate both validate 0-100 before the store is
+	// reached, so the gate refuses an out-of-range rollout first.
 	_, _, err := s.UpsertFeatureFlag(ctx, domain.UpsertFeatureFlagParams{
 		Key: "bad_flag", Enabled: true, Environment: "staging", RolloutPercentage: 150, CreatedByPrincipalID: "admin-1",
+		CallerTenantID: testCallerTenant,
 	})
-	if !errors.Is(err, domain.ErrStoreUnavailable) {
-		t.Fatalf("expected the CHECK constraint violation to surface as ErrStoreUnavailable, got %v", err)
+	if !errors.Is(err, domain.ErrValueConstraintFailed) {
+		t.Fatalf("expected the gate to refuse rollout 150 as ErrValueConstraintFailed, got %v", err)
+	}
+
+	// The DB-level CHECK constraint is still a real safety net for callers
+	// that bypass the store entirely.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO feature_flags (key, enabled, environment, rollout_percentage, created_by_principal_id)
+		VALUES ('bad_flag', true, 'staging', 150, 'attacker')`); err == nil {
+		t.Fatal("the DB CHECK constraint must reject a rollout of 150")
 	}
 }
 
@@ -471,13 +679,16 @@ func TestPgStore_ListCurrentFeatureFlags_FiltersByEnvironmentAndTenant(t *testin
 	ctx := context.Background()
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
+	for _, key := range []string{"a", "b", "c"} {
+		seedFlag(t, pool, key)
+	}
 
 	tenantA := strPtr("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 
 	writes := []domain.UpsertFeatureFlagParams{
-		{Key: "a", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1"},
-		{Key: "b", Enabled: false, Environment: "production", CreatedByPrincipalID: "admin-1"},
-		{Key: "c", Enabled: true, Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1"},
+		{Key: "a", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant},
+		{Key: "b", Enabled: false, Environment: "production", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant},
+		{Key: "c", Enabled: true, Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1", CallerTenantID: *tenantA},
 	}
 	for _, p := range writes {
 		if _, _, err := s.UpsertFeatureFlag(ctx, p); err != nil {
@@ -507,11 +718,12 @@ func TestPgStore_FeatureFlag_ErrorsWrapErrStoreUnavailable(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
 
-	if _, err := pool.Exec(ctx, `DROP TABLE feature_flags CASCADE;`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP TABLE feature_flags, config_definition_versions, config_snapshots, config_snapshot_epochs CASCADE;`); err != nil {
 		t.Fatalf("failed to drop table for test setup: %v", err)
 	}
+	t.Cleanup(func() { restoreSchema(t, pool) })
 
-	if _, _, err := s.UpsertFeatureFlag(ctx, domain.UpsertFeatureFlagParams{Key: "k", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1"}); !errors.Is(err, domain.ErrStoreUnavailable) {
+	if _, _, err := s.UpsertFeatureFlag(ctx, domain.UpsertFeatureFlagParams{Key: "k", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant}); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("UpsertFeatureFlag: expected ErrStoreUnavailable, got %v", err)
 	}
 	if _, err := s.FindCurrentFeatureFlag(ctx, "k", "staging", nil); !errors.Is(err, domain.ErrStoreUnavailable) {

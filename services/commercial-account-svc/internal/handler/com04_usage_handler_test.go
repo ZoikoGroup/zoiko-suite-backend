@@ -70,6 +70,10 @@ func (s *usageStub) ReopenWindow(ctx context.Context, id, actor, reason string, 
 	s.rec(ctx, "ReopenWindow")
 	return s.stmt, s.err
 }
+func (s *usageStub) CreateUsageAdjustment(ctx context.Context, targetStatementID, meterKey, sourceUsageEventID, reason, actor string, now time.Time, _ domain.IdempotencyClaim) (*domain.UsageAdjustment, error) {
+	s.rec(ctx, "CreateUsageAdjustment")
+	return &domain.UsageAdjustment{}, s.err
+}
 func (s *usageStub) GetUsage(ctx context.Context, sub string, term int, meterKey string) (*domain.UsageStatement, error) {
 	s.rec(ctx, "GetUsage")
 	return s.stmt, s.err

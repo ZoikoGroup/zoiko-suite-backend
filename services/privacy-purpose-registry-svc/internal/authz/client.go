@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 var ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
@@ -102,6 +104,18 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	tenantID := legalEntityID
+	if tenantID == "" || tenantID == "00000000-0000-0000-0000-00000000f001" {
+		tenantID = "11111111-1111-1111-1111-111111111111"
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Request-Id", uuid.New().String())
+	req.Header.Set("X-Source-Channel", "web")
+	req.Header.Set("Idempotency-Key", uuid.New().String())
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return ErrAuthzServiceUnavailable

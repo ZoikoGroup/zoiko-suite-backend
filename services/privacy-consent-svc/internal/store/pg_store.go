@@ -33,6 +33,7 @@ type Store interface {
 	CreateNotice(ctx context.Context, tenantID string, req domain.CreateNoticeRequest, principalID string) (*domain.Notice, *domain.NoticeVersion, error)
 	CreateNoticeVersion(ctx context.Context, noticeID string, req domain.CreateNoticeVersionRequest, principalID string) (*domain.NoticeVersion, error)
 	FindNoticeVersion(ctx context.Context, noticeID, versionID string) (*domain.NoticeVersion, error)
+	FindLatestNoticeVersion(ctx context.Context, noticeID string) (*domain.NoticeVersion, error)
 	ApproveNoticeVersion(ctx context.Context, noticeID, versionID, principalID string) (*domain.NoticeVersion, error)
 	PublishNoticeVersion(ctx context.Context, noticeID, versionID string) (*domain.NoticeVersion, error)
 	WithdrawNoticeVersion(ctx context.Context, noticeID, versionID string) (*domain.NoticeVersion, error)
@@ -47,6 +48,9 @@ type Store interface {
 
 	SetPreference(ctx context.Context, tenantID string, req domain.SetPreferenceRequest) (*domain.PreferenceAssertion, error)
 	ResolvePreference(ctx context.Context, subjectRef, channelOrPurpose string) (*domain.PreferenceAssertion, error)
+
+	GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error)
+	SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error
 }
 
 type PgStore struct {
@@ -193,6 +197,31 @@ func (s *PgStore) FindNoticeVersion(ctx context.Context, noticeID, versionID str
 	return version, nil
 }
 
+func (s *PgStore) FindLatestNoticeVersion(ctx context.Context, noticeID string) (*domain.NoticeVersion, error) {
+	var version *domain.NoticeVersion
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var err error
+		version, err = scanNoticeVersion(tx.QueryRow(ctx, `
+			SELECT `+noticeVersionColumnsJoined+`
+			FROM notice_versions nv
+			JOIN notices n ON n.notice_id = nv.notice_id
+			WHERE nv.notice_id = $1
+			ORDER BY nv.created_at DESC, nv.sequence_no DESC
+			LIMIT 1`,
+			noticeID,
+		))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
+		return nil, domain.ErrNoticeVersionNotFound
+	}
+	if err != nil {
+		s.log.Error("pg FindLatestNoticeVersion failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return version, nil
+}
+
 func (s *PgStore) ApproveNoticeVersion(ctx context.Context, noticeID, versionID, principalID string) (*domain.NoticeVersion, error) {
 	var version *domain.NoticeVersion
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
@@ -307,9 +336,27 @@ func (s *PgStore) ResolveNoticeAsOf(ctx context.Context, noticeID string, asOf t
 
 // ── presentation receipts ────────────────────────────────────────────────────
 
+const presentationReceiptColumns = `
+	presentation_receipt_id, tenant_id, notice_version_id, subject_ref, channel, locale,
+	created_at, session_ref, template_version, delivery_evidence`
+
+func scanPresentationReceipt(row pgx.Row) (*domain.PresentationReceipt, error) {
+	r := &domain.PresentationReceipt{}
+	var sessionRef, templateVer, deliveryEv *string
+	err := row.Scan(&r.PresentationReceiptID, &r.TenantID, &r.NoticeVersionID, &r.SubjectRef,
+		&r.Channel, &r.Locale, &r.CreatedAt, &sessionRef, &templateVer, &deliveryEv)
+	if err != nil {
+		return nil, err
+	}
+	r.SessionRef = sessionRef
+	r.TemplateVersion = templateVer
+	r.DeliveryEvidence = deliveryEv
+	return r, nil
+}
+
 func (s *PgStore) RecordPresentation(ctx context.Context, tenantID, noticeID, versionID string, req domain.RecordPresentationRequest) (*domain.PresentationReceipt, error) {
 	id := uuid.New().String()
-	var receipt domain.PresentationReceipt
+	var receipt *domain.PresentationReceipt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var exists bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM notice_versions WHERE notice_version_id = $1 AND notice_id = $2)`,
@@ -320,13 +367,18 @@ func (s *PgStore) RecordPresentation(ctx context.Context, tenantID, noticeID, ve
 		if !exists {
 			return domain.ErrNoticeVersionNotFound
 		}
-		return tx.QueryRow(ctx, `
-			INSERT INTO presentation_receipts (presentation_receipt_id, tenant_id, notice_version_id, subject_ref, channel, locale)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			RETURNING presentation_receipt_id, tenant_id, notice_version_id, subject_ref, channel, locale, created_at`,
+		var err error
+		receipt, err = scanPresentationReceipt(tx.QueryRow(ctx, `
+			INSERT INTO presentation_receipts (
+				presentation_receipt_id, tenant_id, notice_version_id, subject_ref, channel, locale,
+				session_ref, template_version, delivery_evidence
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			RETURNING `+presentationReceiptColumns,
 			id, strPtrOrNil(tenantID), versionID, req.SubjectRef, req.Channel, req.Locale,
-		).Scan(&receipt.PresentationReceiptID, &receipt.TenantID, &receipt.NoticeVersionID,
-			&receipt.SubjectRef, &receipt.Channel, &receipt.Locale, &receipt.CreatedAt)
+			strPtrOrNil(req.SessionRef), strPtrOrNil(req.TemplateVersion), strPtrOrNil(req.DeliveryEvidence),
+		))
+		return err
 	})
 	if errors.Is(err, domain.ErrNoticeVersionNotFound) || isInvalidUUID(err) {
 		return nil, domain.ErrNoticeVersionNotFound
@@ -335,40 +387,77 @@ func (s *PgStore) RecordPresentation(ctx context.Context, tenantID, noticeID, ve
 		s.log.Error("pg RecordPresentation failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return &receipt, nil
+	return receipt, nil
 }
 
 // ── consent ──────────────────────────────────────────────────────────────────
 
+const consentReceiptColumns = `
+	consent_receipt_id, tenant_id, subject_ref, purpose_id, notice_version_id,
+	action, capture_channel, actor_principal_id, correlation_id, created_at,
+	is_proxy, representative_subject_ref, representative_authority_ref, representative_evidence,
+	affirmative_action_type, affirmative_evidence`
+
 func scanConsentReceipt(row pgx.Row) (*domain.ConsentReceipt, error) {
 	c := &domain.ConsentReceipt{}
-	var correlationID *string
+	var correlationID, repSubject, repAuthority, repEvidence, affEvidence *string
 	err := row.Scan(&c.ConsentReceiptID, &c.TenantID, &c.SubjectRef, &c.PurposeID, &c.NoticeVersionID,
-		&c.Action, &c.CaptureChannel, &c.ActorPrincipalID, &correlationID, &c.CreatedAt)
+		&c.Action, &c.CaptureChannel, &c.ActorPrincipalID, &correlationID, &c.CreatedAt,
+		&c.IsProxy, &repSubject, &repAuthority, &repEvidence,
+		&c.AffirmativeActionType, &affEvidence)
 	if err != nil {
 		return nil, err
 	}
 	if correlationID != nil {
 		c.CorrelationID = *correlationID
 	}
+	c.RepresentativeSubjectRef = repSubject
+	c.RepresentativeAuthorityRef = repAuthority
+	c.RepresentativeEvidence = repEvidence
+	c.AffirmativeEvidence = affEvidence
 	return c, nil
 }
 
-const consentReceiptColumns = `
-	consent_receipt_id, tenant_id, subject_ref, purpose_id, notice_version_id,
-	action, capture_channel, actor_principal_id, correlation_id, created_at`
-
 func (s *PgStore) RecordConsent(ctx context.Context, tenantID string, req domain.RecordConsentRequest, principalID, correlationID string) (*domain.ConsentReceipt, error) {
-	id := uuid.New().String()
+	affAction := req.AffirmativeActionType
+	if affAction == "" {
+		affAction = "EXPLICIT_CHECKBOX"
+	}
+
 	var receipt *domain.ConsentReceipt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
+		// PRV-N04: Check if an identical unwithdrawn consent receipt already exists for this subject and purpose
+		existing, err := scanConsentReceipt(tx.QueryRow(ctx, `
+			SELECT `+consentReceiptColumns+`
+			FROM consent_receipts c
+			WHERE (c.tenant_id IS NULL OR c.tenant_id::text = NULLIF(current_setting('app.tenant_id', true), ''))
+			  AND c.subject_ref = $1
+			  AND c.purpose_id = $2
+			  AND c.action = $3
+			  AND (c.notice_version_id IS NOT DISTINCT FROM $4::uuid)
+			  AND NOT EXISTS (
+				  SELECT 1 FROM withdrawal_receipts w WHERE w.consent_receipt_id = c.consent_receipt_id
+			  )
+			ORDER BY c.created_at DESC
+			LIMIT 1`,
+			req.SubjectRef, req.PurposeID, req.Action, strPtrOrNil(req.NoticeVersionID),
+		))
+		if err == nil && existing != nil {
+			receipt = existing
+			return nil
+		} else if !errors.Is(err, pgx.ErrNoRows) && !isInvalidUUID(err) {
+			return err
+		}
+
+		id := uuid.New().String()
 		receipt, err = scanConsentReceipt(tx.QueryRow(ctx, `
 			INSERT INTO consent_receipts (`+consentReceiptColumns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10, $11, $12, $13, $14, $15)
 			RETURNING `+consentReceiptColumns,
 			id, strPtrOrNil(tenantID), req.SubjectRef, req.PurposeID, strPtrOrNil(req.NoticeVersionID),
 			req.Action, req.CaptureChannel, principalID, strPtrOrNil(correlationID),
+			req.IsProxy, strPtrOrNil(req.RepresentativeSubjectRef), strPtrOrNil(req.RepresentativeAuthorityRef), strPtrOrNil(req.RepresentativeEvidence),
+			affAction, strPtrOrNil(req.AffirmativeEvidence),
 		))
 		return err
 	})
@@ -411,12 +500,25 @@ func (s *PgStore) WithdrawConsent(ctx context.Context, receiptID, channel, princ
 			return err
 		}
 
-		var alreadyWithdrawn bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM withdrawal_receipts WHERE consent_receipt_id = $1)`, receiptID).Scan(&alreadyWithdrawn); err != nil {
+		// PRV-N05: Replayed withdrawal returns the existing effective withdrawal receipt idempotently
+		var existingID, existingPrincipal, existingChannel string
+		var existingTenant *string
+		var existingCreated time.Time
+		err := tx.QueryRow(ctx, `
+			SELECT withdrawal_receipt_id, tenant_id, consent_receipt_id, withdrawn_by_principal_id, channel, created_at
+			FROM withdrawal_receipts
+			WHERE consent_receipt_id = $1`,
+			receiptID,
+		).Scan(&existingID, &existingTenant, &withdrawal.ConsentReceiptID, &existingPrincipal, &existingChannel, &existingCreated)
+		if err == nil {
+			withdrawal.WithdrawalReceiptID = existingID
+			withdrawal.TenantID = existingTenant
+			withdrawal.WithdrawnByPrincipalID = existingPrincipal
+			withdrawal.Channel = existingChannel
+			withdrawal.CreatedAt = existingCreated
+			return nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
-		}
-		if alreadyWithdrawn {
-			return domain.ErrAlreadyWithdrawn
 		}
 
 		return tx.QueryRow(ctx, `
@@ -427,7 +529,7 @@ func (s *PgStore) WithdrawConsent(ctx context.Context, receiptID, channel, princ
 		).Scan(&withdrawal.WithdrawalReceiptID, &withdrawal.TenantID, &withdrawal.ConsentReceiptID,
 			&withdrawal.WithdrawnByPrincipalID, &withdrawal.Channel, &withdrawal.CreatedAt)
 	})
-	if errors.Is(err, domain.ErrConsentReceiptNotFound) || errors.Is(err, domain.ErrAlreadyWithdrawn) {
+	if errors.Is(err, domain.ErrConsentReceiptNotFound) {
 		return nil, err
 	}
 	if err != nil {
@@ -526,3 +628,38 @@ func (s *PgStore) ResolvePreference(ctx context.Context, subjectRef, channelOrPu
 	}
 	return &p, nil
 }
+
+// ── idempotency (§18.1) ──────────────────────────────────────────────────────
+
+func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, key string) (*domain.IdempotencyRecord, error) {
+	var rec domain.IdempotencyRecord
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at
+			FROM consent_idempotency_keys
+			WHERE idempotency_key = $1`,
+			key,
+		).Scan(&rec.Key, &rec.TenantID, &rec.Endpoint, &rec.RequestHash, &rec.ResponseCode, &rec.ResponseBody, &rec.CreatedAt)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		s.log.Error("pg GetIdempotency failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return &rec, nil
+}
+
+func (s *PgStore) SaveIdempotency(ctx context.Context, rec domain.IdempotencyRecord) error {
+	return s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO consent_idempotency_keys (idempotency_key, tenant_id, endpoint, request_hash, response_code, response_body, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING`,
+			rec.Key, rec.TenantID, rec.Endpoint, rec.RequestHash, rec.ResponseCode, rec.ResponseBody, rec.CreatedAt,
+		)
+		return err
+	})
+}
+

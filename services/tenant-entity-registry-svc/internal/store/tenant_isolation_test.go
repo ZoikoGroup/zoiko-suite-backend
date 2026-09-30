@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +40,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
 )
 
@@ -129,20 +132,53 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	_, _ = testPool.Exec(ctx, `DROP TABLE IF EXISTS workspaces, tax_identity_bundles, entity_jurisdiction_assignments, entity_hierarchies, legal_entities, data_residency_policies, tenants, residency_regions CASCADE;`)
-
-	// Run migrations
-	migrations := []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_tenant_id_to_junction_tables.up.sql",
-		"000003_add_residency_region_to_policies.up.sql",
-		"000004_add_data_classification.up.sql",
-		"000005_add_workspaces.up.sql",
+	// A reused database (CI runs the race-test step against the same testdb
+	// first) still holds every table the migrations create. A hand-written
+	// DROP list only covered the first five migrations' tables, so 000006 then
+	// failed with "already exists". Every table in the schema is dropped
+	// instead — and only on a database whose name marks it as disposable.
+	if !isThrowawayDatabase(ctx, testPool) {
+		fmt.Println("refusing to reset: the target database's name does not contain \"test\"")
+		testPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
 	}
+	if _, err := testPool.Exec(ctx, `DO $$
+		DECLARE t record;
+		BEGIN
+			FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+				EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', t.tablename);
+			END LOOP;
+		END $$;`); err != nil {
+		fmt.Printf("failed to reset test schema: %v\n", err)
+		testPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+
+	// Run migrations. Discovered from the directory, NOT listed inline: a
+	// hand-written list silently skips the migration added after it was
+	// written, and every test in this file then runs against a schema missing
+	// those tables while still reporting ok. backend-completion-tracker.md
+	// records this estate hitting that exact trap once already.
+	migrations, globErr := filepath.Glob("../../deployments/migrations/*.up.sql")
+	if globErr != nil || len(migrations) == 0 {
+		fmt.Printf("no migrations found: %v\n", globErr)
+		testPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+	sort.Strings(migrations)
 	for _, mig := range migrations {
-		sql, err := os.ReadFile("../../deployments/migrations/" + mig)
-		if err != nil {
-			fmt.Printf("failed to read migration %s: %v\n", mig, err)
+		sql, readErr := os.ReadFile(mig)
+		if readErr != nil {
+			fmt.Printf("failed to read migration %s: %v\n", mig, readErr)
 			testPool.Close()
 			if pg != nil {
 				_ = pg.Stop()
@@ -150,7 +186,7 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-			fmt.Printf("failed to apply migration %s: %v\n", mig, err)
+			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(mig), err)
 			testPool.Close()
 			if pg != nil {
 				_ = pg.Stop()
@@ -392,10 +428,11 @@ func TestPgStore_TenantIsolation_EndDateHierarchy(t *testing.T) {
 	ctxB := domain.WithTenant(ctx, b.tenantID)
 	endDate := time.Now().UTC()
 
-	// EndDateHierarchy returns no error even on 0 rows (it's idempotent).
-	// The proof is in whether the row was actually modified.
+	// Under RLS tenant A's row does not exist for tenant B, so the attempt is
+	// refused as not-found (it used to report success on 0 rows). The real
+	// proof is still below: the row was not modified.
 	err := s.EndDateHierarchy(ctxB, a.hierarchyID, endDate, "attacker", "corr-x")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, registry.ErrNotFound)
 
 	// Verify: tenant A's hierarchy's effective_to should still be NULL.
 	rows, err := s.ListHierarchiesByEntity(
@@ -441,8 +478,9 @@ func TestPgStore_TenantIsolation_EndDateJurisdictionAssignment(t *testing.T) {
 	b := setupIsolationFixture(t, s, "ISO-B-EndDateAssignment")
 
 	ctxB := domain.WithTenant(ctx, b.tenantID)
+	// Refused as not-found: under RLS tenant A's row does not exist for B.
 	err := s.EndDateJurisdictionAssignment(ctxB, a.assignmentID, time.Now().UTC(), "attacker", "corr-x")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, registry.ErrNotFound)
 
 	// Verify: tenant A's assignment is still active (effective_to = NULL).
 	ctxA := domain.WithTenant(context.Background(), a.tenantID)
@@ -573,4 +611,15 @@ func TestPgStore_TenantIsolation_TransitionTenantLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, tenant)
 	assert.Equal(t, domain.TenantLifecycleOnboarding, tenant.LifecycleState, "ISOLATION FAILURE: tenant B transitioned tenant A's lifecycle state")
+}
+
+// isThrowawayDatabase reports whether the connected database is recognisably
+// disposable. The reset above drops every table, so it must never run against
+// a database that holds real tenants.
+func isThrowawayDatabase(ctx context.Context, pool *pgxpool.Pool) bool {
+	var name string
+	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&name); err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(name), "test")
 }
