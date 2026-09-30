@@ -1,0 +1,299 @@
+{
+  "uid": "identity-context-gov01",
+  "title": "identity-context-svc (GOV-01)",
+  "tags": ["tier-0", "governance", "gov-01", "identity"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "description": "GOV-01 Tenant Context & Resolution. The service-golden-signals dashboard covers RED metrics for every service; this one covers what is specific to GOV-01 and cannot be inferred from request rates — the outbox depth, the security refusals, and the break-glass grants.",
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(up{job=\"identity-context-svc\"}, instance)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Availability",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Up",
+      "description": "Tier 0. Nothing on the platform authenticates while this is down.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "targets": [
+        { "expr": "sum(up{job=\"identity-context-svc\", instance=~\"$instance\"})", "legendFormat": "instances" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Resolve latency (P50 / P95 / P99)",
+      "description": "The 50ms P99 target from the resolver's own doc comment. The in-process portion is guarded in CI by internal/context/nfr_test.go; this is the end-to-end number, which includes the two registry round trips and the Postgres evidence write that the unit test stubs out.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 10, "x": 4, "y": 1 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"identity-context-svc\", path=\"/v1/context/resolve\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"identity-context-svc\", path=\"/v1/context/resolve\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"identity-context-svc\", path=\"/v1/context/resolve\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.04 },
+              { "color": "red", "value": 0.05 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Resolution outcomes",
+      "description": "A rising 401 rate with a flat 200 rate is credential stuffing. A rising 503 rate is an upstream, not a client.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 1 },
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(http_requests_total{job=\"identity-context-svc\", path=\"/v1/context/resolve\"}[5m]))",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Outbox — the signal that is invisible from the request path",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox pending depth",
+      "description": "THE number to alert on. Everything else about this service can look perfectly healthy while governance events pile up in a table, because a stopped relay is invisible from the request path. A short spike during a broker restart is the outbox doing its job; a line that only goes up is the relay not running.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "targets": [
+        {
+          "expr": "identity_context_outbox_pending{job=\"identity-context-svc\", instance=~\"$instance\"}",
+          "legendFormat": "pending"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1000 },
+              { "color": "red", "value": 10000 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "area" } }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox dead letters",
+      "description": "Events that exhausted their retries. They are NOT deleted — they stay in event_outbox with last_error set, which is how you find them. Any non-zero value needs a human; a restart will not fix one. See docs/runbook.md, 'Outbox dead letters'.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "targets": [
+        {
+          "expr": "identity_context_outbox_dead_letter{job=\"identity-context-svc\", instance=~\"$instance\"}",
+          "legendFormat": "dead lettered"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Governance controls",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Ingress / tenant mismatches",
+      "description": "A request arriving on tenant A's hostname bearing tenant B's token. There is no legitimate request of this shape: it is either a routing misconfiguration serving one customer's hostname to another's backend, or somebody probing the boundary. Any sustained non-zero rate is a page, not a ticket.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 19 },
+      "targets": [
+        {
+          "expr": "sum(rate(identity_context_resolution_failed_total{job=\"identity-context-svc\", reason=\"ingress_tenant_mismatch\"}[5m]))",
+          "legendFormat": "mismatches/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.001 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Residency denials",
+      "description": "An entity whose data residency policy this region may not serve. Expect zero. A non-zero rate after a deploy usually means ALLOWED_RESIDENCY_POLICIES was not updated for the region, not that anybody did anything wrong.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 19 },
+      "targets": [
+        {
+          "expr": "sum(rate(identity_context_resolution_failed_total{job=\"identity-context-svc\", reason=\"residency_denied\"}[5m]))",
+          "legendFormat": "denials/s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Risk signal availability",
+      "description": "A sustained 'unavailable' rate means the Intelligence Plane is not publishing session.risk.changed, so every session's posture is DEFAULTED to STANDARD rather than measured. This used to be self-silencing — the service published the alarm on the same topic it consumed risk signals from, and answered its own alarm.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 19 },
+      "targets": [
+        {
+          "expr": "sum(rate(identity_context_risk_signal_unavailable_total{job=\"identity-context-svc\"}[5m]))",
+          "legendFormat": "unavailable/s"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Break-glass (GOV-01 AttachSupportContext)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Live support contexts",
+      "description": "Privileged elevations into customer tenants that are active right now. In steady state this is zero. Every one is scoped, time-limited, independently approved and evidenced — but it is still somebody with standing inside a customer's data.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 27 },
+      "targets": [
+        { "expr": "sum(identity_context_support_contexts_live{job=\"identity-context-svc\"})", "legendFormat": "live" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Awaiting review",
+      "description": "Support contexts that have ENDED and were never reconciled. This is the half of break-glass that is normally missing: the grant expires, nobody looks, and the control is decorative. Non-zero for more than a working day is a process failure, not a system one.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 27 },
+      "targets": [
+        { "expr": "sum(identity_context_support_contexts_unreviewed{job=\"identity-context-svc\"})", "legendFormat": "unreviewed" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Segregation-of-duties outcomes",
+      "description": "Conflicts are the control working. UNAVAILABLE is the control NOT working: the command was refused, which is correct, but a sustained rate means GOV-04 is down and privileged commands cannot be issued at all.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 27 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(identity_context_sod_checks_total{job=\"identity-context-svc\"}[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Retention (GOV-09)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 },
+      "collapsed": true
+    },
+    {
+      "type": "timeseries",
+      "title": "Disposition: disposed vs held back",
+      "description": "These two must be read together. A sweep that disposed nothing because everything was held by a legal hold looks identical to a quiet night if you only watch the disposed count.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 34 },
+      "targets": [
+        {
+          "expr": "sum(rate(identity_context_disposition_disposed_total{job=\"identity-context-svc\"}[1h]))",
+          "legendFormat": "disposed"
+        },
+        {
+          "expr": "sum(rate(identity_context_disposition_held_total{job=\"identity-context-svc\"}[1h]))",
+          "legendFormat": "held by legal hold"
+        }
+      ]
+    }
+  ]
+}

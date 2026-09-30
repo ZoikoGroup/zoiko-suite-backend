@@ -104,6 +104,12 @@ func main() {
 	handler.RegisterPriceBookRoutes(r, handler.NewPriceBookHandler(pgStore, authzClient, logger))
 	handler.RegisterSubscriptionV2Routes(r, handler.NewSubscriptionHandler(pgStore, pgStore, authzClient, logger).WithGovernance(pgStore))
 	handler.RegisterEntitlementRoutes(r, handler.NewEntitlementHandler(pgStore, authzClient, logger))
+	handler.RegisterUsageRoutes(r, handler.NewUsageHandler(pgStore, authzClient, logger))
+	handler.RegisterBillingRoutes(r, handler.NewBillingHandler(pgStore, authzClient, logger))
+	handler.RegisterPaymentRoutes(r, handler.NewPaymentHandler(pgStore, authzClient, logger))
+	handler.RegisterCreditRoutes(r, handler.NewCreditHandler(pgStore, authzClient, logger))
+	handler.RegisterDunningRoutes(r, handler.NewDunningHandler(pgStore, authzClient, logger))
+	handler.RegisterDisputeRoutes(r, handler.NewDisputeHandler(pgStore, pgStore, authzClient, logger))
 
 	// Outbox relay (doc7 backlog item 32 pilot): publishes rows written by
 	// PgStore.CreateSubscription in the same transaction as the business

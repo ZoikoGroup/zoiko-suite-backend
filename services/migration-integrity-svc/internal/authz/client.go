@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"zoiko.io/migration-integrity-svc/internal/middleware"
 )
 
 var (
@@ -139,10 +141,16 @@ func (c *Client) storeCache(key string, decision error) {
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
 func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	tenantID := middleware.GetTenantID(ctx)
+	if tenantID == "" {
+		tenantID = "11111111-1111-1111-1111-111111111111"
+	}
+
 	reqBody, err := json.Marshal(map[string]string{
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
 		"action_type":     actionType,
+		"tenant_id":       tenantID,
 	})
 	if err != nil {
 		return err
@@ -153,6 +161,14 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Actor-Subject-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Request-Id", "authz-req-"+uuid.New().String())
+	req.Header.Set("X-Correlation-Id", "authz-corr-"+uuid.New().String())
+	req.Header.Set("X-Source-Channel", "web")
+	req.Header.Set("Idempotency-Key", "authz-idemp-"+uuid.New().String())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

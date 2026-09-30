@@ -183,10 +183,18 @@ type CommercialTerms struct {
 
 // PlanCapability is one row of the plan capability matrix. A nil LimitValue
 // means unlimited. COM-03 reads this; it grants nothing by itself.
+//
+// MeterKey/MeterVersion are set only for a capability whose limit is a
+// quota metered by COM-04 (e.g. "api_calls this term"), never inferred from
+// CapabilityKey — same explicit-binding doctrine as PriceComponent's own
+// MeterKey on a METERED component. A capability with no MeterKey is a
+// plain static-limit/boolean feature and is never checked against usage.
 type PlanCapability struct {
 	CapabilityKey string  `json:"capability_key"`
 	LimitValue    *int64  `json:"limit_value"`
 	LimitUnit     *string `json:"limit_unit,omitempty"`
+	MeterKey      *string `json:"meter_key,omitempty"`
+	MeterVersion  *int    `json:"meter_version,omitempty"`
 }
 
 // PriceVersion is an immutable-once-submitted ProductPriceVersion together
@@ -295,7 +303,7 @@ var (
 	ErrVersionConflict          = errorString("expected_version does not match the current row_version")
 	ErrSoDViolation             = errorString("approver must be independent of the version's creator and submitter")
 	ErrInFlightVersionExists    = errorString("product already has a price version in DRAFT, REVIEW or APPROVED")
-	ErrMeterNotRegistered       = errorString("metered components need a registered COM-04 meter definition, which does not exist yet")
+	ErrMeterNotRegistered       = errorString("references a meter version that is not registered (or is retired) in the COM-04 meter registry")
 	ErrContentHashMismatch      = errorString("price version content no longer matches the hash that was submitted or approved")
 	ErrIdempotencyKeyReused     = errorString("idempotency key was already used for a different request")
 	ErrVersionsNotComparable    = errorString("versions belong to different products")

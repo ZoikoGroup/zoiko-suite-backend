@@ -13,6 +13,7 @@ type Config struct {
 	PurposeRegistryURL   string
 	ConsentRegistryURL   string
 	RetentionRegistryURL string
+	TransferServiceURL   string
 }
 
 func Load() (*Config, error) {
@@ -32,6 +33,7 @@ func Load() (*Config, error) {
 		PurposeRegistryURL:   getEnvOrDefault("PURPOSE_REGISTRY_URL", "http://privacy-purpose-registry-svc:8151"),
 		ConsentRegistryURL:   getEnvOrDefault("CONSENT_REGISTRY_URL", "http://privacy-consent-svc:8152"),
 		RetentionRegistryURL: getEnvOrDefault("RETENTION_REGISTRY_URL", "http://retention-registry-svc:8148"),
+		TransferServiceURL:   getEnvOrDefault("TRANSFER_SERVICE_URL", "http://privacy-transfer-svc:8155"),
 	}, nil
 }
 

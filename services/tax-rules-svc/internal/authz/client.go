@@ -5,10 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"zoiko.io/tax-rules-svc/internal/envelope"
+	"zoiko.io/tax-rules-svc/internal/middleware"
 )
 
 var (
@@ -144,6 +148,44 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	// Set baseline caller context
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := ""
+	authzSourceChannel := "system"
+	if env, ok := envelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	if req.Header.Get("X-Tenant-Id") == "" {
+		if tid := middleware.GetTenantID(ctx); tid != "" && tid != "default" {
+			req.Header.Set("X-Tenant-Id", tid)
+		}
+	}
+	if authzRequestID == "" {
+		authzRequestID = fmt.Sprintf("taxrules-authz-%d", time.Now().UnixNano())
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
+
+	// Forward caller's full canonical envelope
+	envelope.ForwardTo(ctx, req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return ErrAuthzServiceUnavailable

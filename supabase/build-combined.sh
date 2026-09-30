@@ -10,7 +10,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT="$HERE/zoiko-suite-all.sql"
+OUT="$HERE/zoiko-suite-all.sql"ī
 
 {
     cat <<'HEADER'

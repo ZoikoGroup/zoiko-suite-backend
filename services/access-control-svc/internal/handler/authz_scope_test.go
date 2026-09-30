@@ -25,7 +25,7 @@ import (
 
 func TestCreateRole_ForwardsVerifiedScopeToAuthzAdmin(t *testing.T) {
 	admin := &stubAuthzAdmin{}
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 
 	rr := doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(uuid.NewString()), "admin-1")
 	if rr.Code != http.StatusCreated {
@@ -56,7 +56,7 @@ func TestCreateRole_ForwardsVerifiedScopeToAuthzAdmin(t *testing.T) {
 func TestCreateBundle_ForwardsVerifiedScopeToAuthzAdmin(t *testing.T) {
 	store := newStubStore()
 	admin := &stubAuthzAdmin{}
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, admin)
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, admin, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}})
 
 	// The role has to exist for the bundle route to reach the admin client.
 	correlationID := uuid.NewString()

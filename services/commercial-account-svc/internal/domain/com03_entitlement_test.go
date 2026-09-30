@@ -144,6 +144,49 @@ func TestEvaluateCapability_RestrictionOnlyLowersNeverRaises(t *testing.T) {
 	}
 }
 
+// Gap-remediation: a metered capability's limit is checked against
+// cumulative consumption this period, not just a single request in
+// isolation — a request that alone fits under the static limit must still
+// be denied once prior consumption plus the request would exceed it, and a
+// bare eligibility check against an already-exhausted quota must not keep
+// answering ALLOW_WITH_LIMIT.
+func TestEvaluateCapability_ChecksCumulativeConsumptionNotJustOneRequest(t *testing.T) {
+	meterKey := "api.calls"
+	caps := map[string]domain.PlanCapability{
+		"api_calls": {CapabilityKey: "api_calls", LimitValue: i64(1000), LimitUnit: sp("call"), MeterKey: &meterKey, MeterVersion: intp3(1)},
+	}
+	b := basis(domain.LifecycleActive, caps)
+	b.Consumption = map[string]int64{"api_calls": 900}
+
+	// A single request of 50 alone is well under the static 1000 limit, but
+	// 900 already consumed + 50 requested = 950, still fine.
+	if d := domain.EvaluateCapability("api_calls", b, nil, nil, i64(50), now3); d.Outcome != domain.OutcomeAllowWithLimit {
+		t.Fatalf("50 more on top of 900/1000: %v, want ALLOW_WITH_LIMIT", d.Outcome)
+	}
+	// 900 consumed + 150 requested = 1050 > 1000: must deny even though 150
+	// alone is far under the static limit.
+	if d := domain.EvaluateCapability("api_calls", b, nil, nil, i64(150), now3); d.Outcome != domain.OutcomeDeny {
+		t.Fatalf("900 consumed + 150 requested over the limit: %v, want DENY", d.Outcome)
+	}
+	// A bare eligibility check (no requested quantity) once the quota is
+	// already fully consumed must deny, not silently keep allowing.
+	exhausted := basis(domain.LifecycleActive, caps)
+	exhausted.Consumption = map[string]int64{"api_calls": 1000}
+	if d := domain.EvaluateCapability("api_calls", exhausted, nil, nil, nil, now3); d.Outcome != domain.OutcomeDeny {
+		t.Fatalf("already-exhausted quota, bare eligibility check: %v, want DENY", d.Outcome)
+	}
+	// A non-metered capability (no MeterKey) ignores Consumption entirely,
+	// even if a value happens to be present under its key.
+	plain := map[string]domain.PlanCapability{"seats": {CapabilityKey: "seats", LimitValue: i64(5), LimitUnit: sp("seat")}}
+	pb := basis(domain.LifecycleActive, plain)
+	pb.Consumption = map[string]int64{"seats": 5}
+	if d := domain.EvaluateCapability("seats", pb, nil, nil, nil, now3); d.Outcome != domain.OutcomeAllowWithLimit {
+		t.Fatalf("a non-metered capability was quota-checked: %v, want ALLOW_WITH_LIMIT", d.Outcome)
+	}
+}
+
+func intp3(i int) *int { return &i }
+
 func TestEffectiveEntitlements_CoversEveryBoundCapability(t *testing.T) {
 	caps := map[string]domain.PlanCapability{
 		"api_access": {CapabilityKey: "api_access"},

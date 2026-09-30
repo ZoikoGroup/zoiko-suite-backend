@@ -47,6 +47,26 @@ const (
 	InvalidationReasonDelegationRevoked InvalidationReason = "DELEGATION_REVOKED"
 )
 
+// ValidInvalidationReason reports whether r is one of the four the
+// session_contexts CHECK constraint accepts.
+//
+// It exists because the handler used to pass whatever arrived in the body
+// straight to the store. An absent or misspelled reason reached Postgres,
+// violated session_contexts_invalidation_reason_check, and came back to the
+// caller as a 500 "failed to invalidate session" — an error that reads like
+// the service is broken when the request simply named no reason. A constraint
+// is a backstop, not an input validator.
+func ValidInvalidationReason(r InvalidationReason) bool {
+	switch r {
+	case InvalidationReasonLogout,
+		InvalidationReasonAdminRevoke,
+		InvalidationReasonRiskEscalation,
+		InvalidationReasonDelegationRevoked:
+		return true
+	}
+	return false
+}
+
 type ScopeType string
 
 const (

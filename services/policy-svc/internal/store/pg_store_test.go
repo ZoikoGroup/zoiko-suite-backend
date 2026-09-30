@@ -21,6 +21,15 @@ import (
 func getTestPool(t *testing.T) *pgxpool.Pool {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
+		// A SILENT SKIP HERE TURNS THE WHOLE STORE SUITE INTO NOTHING while
+		// `go test ./...` still prints ok. Skip locally, where a developer
+		// without Postgres is a normal state, and FAIL wherever the run claims
+		// to be a verification. CI is set by GitHub Actions; REQUIRE_DB_TESTS
+		// is the local opt-in for reproducing a certification run by hand.
+		if os.Getenv("CI") != "" || os.Getenv("REQUIRE_DB_TESTS") != "" {
+			t.Fatal("TEST_DATABASE_URL is not set, but CI or REQUIRE_DB_TESTS is: " +
+				"this run claims to verify the store and would instead have skipped every test in it")
+		}
 		t.Skip("TEST_DATABASE_URL not set — skipping real PostgreSQL integration test")
 	}
 	pool, err := pgxpool.New(context.Background(), dsn)

@@ -34,6 +34,18 @@ type Decimal struct {
 }
 
 // Parse validates s and returns it as an exact Decimal.
+// MustParse parses a decimal already known to be valid — a stored value
+// re-read from the database, or one already checked by Parse once. It
+// panics on a malformed string, which a caller should never be able to
+// produce; this is documentation of that guarantee, not error handling.
+func MustParse(s string) Decimal {
+	d, err := Parse(s)
+	if err != nil {
+		panic("money.MustParse: invalid stored decimal " + s + ": " + err.Error())
+	}
+	return d
+}
+
 func Parse(s string) (Decimal, error) {
 	if !decimalPattern.MatchString(s) {
 		return Decimal{}, ErrInvalidAmount

@@ -2,7 +2,10 @@
 // Field names are verbatim from docs/architecture/04-data-model.md §05.1.
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // ---------------------------------------------------------------------------
 // Tenant  (data-model §05.1)
@@ -19,10 +22,38 @@ type Tenant struct {
 	PrimaryLocale                string               `json:"primary_locale"`
 	DefaultDataResidencyPolicyID string               `json:"default_data_residency_policy_id"`
 	LifecycleState               TenantLifecycleState `json:"lifecycle_state"`
-	CreatedAt                    time.Time            `json:"created_at"`
-	UpdatedAt                    time.Time            `json:"updated_at"`
-	CreatedByPrincipalID         string               `json:"created_by_principal_id"`
-	UpdatedByPrincipalID         string               `json:"updated_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency token ORG-02 requires on
+	// lifecycle commands ("lifecycle commands use expected_version").
+	// Incremented by every guarded write; a command carrying a stale value is
+	// refused rather than silently overwriting the change that moved it.
+	RecordVersion        int64     `json:"record_version"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
+
+	// CreationApprovalRequestID is set on the ProvisionTenant response only:
+	// the pending ORG-02 creation approval a second principal must decide
+	// before this tenant can be activated. Not persisted on the tenant row.
+	CreationApprovalRequestID *string `json:"creation_approval_request_id,omitempty"`
+
+	// ORG-02 onboarding evidence and idempotency key.
+	ExternalCustomerKey  *string `json:"external_customer_key"`
+	OnboardingRequestRef *string `json:"onboarding_request_ref"`
+	// ProvisioningFailureReason is set while the tenant is FAILED_PROVISIONING.
+	ProvisioningFailureReason *string    `json:"provisioning_failure_reason"`
+	ProvisioningFailedAt      *time.Time `json:"provisioning_failed_at"`
+
+	// ProvisioningFingerprint is written with the onboarding key; never
+	// serialised.
+	ProvisioningFingerprint string `json:"-"`
+	// IdempotentReplay is set on a ProvisionTenant response that returned an
+	// existing tenant for a repeated onboarding key (answered 200, not 201).
+	IdempotentReplay bool `json:"idempotent_replay,omitempty"`
+	// Provisioning lineage (000013): the primary jurisdiction and the
+	// subscription whose entitlement was checked.
+	PrimaryJurisdictionID *string `json:"primary_jurisdiction_id,omitempty"`
+	SubscriptionID        *string `json:"subscription_id,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -48,11 +79,28 @@ type LegalEntity struct {
 	PrimaryJurisdictionID string       `json:"primary_jurisdiction_id"`
 	// DataResidencyPolicyID is MANDATORY per data-model §05.3 modeling rule 2.
 	// No LegalEntity may be created without a valid residency policy.
-	DataResidencyPolicyID string    `json:"data_residency_policy_id"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
-	CreatedByPrincipalID  string    `json:"created_by_principal_id"`
-	UpdatedByPrincipalID  string    `json:"updated_by_principal_id"`
+	DataResidencyPolicyID string `json:"data_residency_policy_id"`
+	// RecordVersion is the optimistic-concurrency token ORG-03 requires
+	// ("commands use UUID and expected_version"). See Tenant.RecordVersion.
+	RecordVersion        int64     `json:"record_version"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
+
+	// ORG-03 verification evidence.
+	VerifiedByPrincipalID   *string    `json:"verified_by_principal_id"`
+	VerifiedAt              *time.Time `json:"verified_at"`
+	VerificationEvidenceRef *string    `json:"verification_evidence_ref"`
+	// Non-destructive merge: a merged duplicate is DORMANT and points here.
+	MergedIntoLegalEntityID *string    `json:"merged_into_legal_entity_id"`
+	MergedAt                *time.Time `json:"merged_at"`
+	// InitialProfile is version 1 of the entity's legal profile, written in
+	// the same transaction as the entity. Never serialized. Before 28 Sep 2026
+	// it was a second, separate write whose failure was only logged — an
+	// entity could exist with no profile, and every as-of read of it returned
+	// nothing.
+	InitialProfile *LegalEntityProfileVersion `json:"-"`
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +125,9 @@ type Workspace struct {
 	UpdatedAt             time.Time             `json:"updated_at"`
 	CreatedByPrincipalID  string                `json:"created_by_principal_id"`
 	UpdatedByPrincipalID  string                `json:"updated_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency version (migration 000011);
+	// events carry it as object_version (ORG §7).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +147,9 @@ type EntityHierarchy struct {
 	UpdatedAt            time.Time                 `json:"updated_at"`
 	CreatedByPrincipalID string                    `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string                    `json:"updated_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency version (migration 000011);
+	// events carry it as object_version (ORG §7).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +170,9 @@ type EntityJurisdictionAssignment struct {
 	UpdatedAt            time.Time                  `json:"updated_at"`
 	CreatedByPrincipalID string                     `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string                     `json:"updated_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency version (migration 000011);
+	// events carry it as object_version (ORG §7).
+	RecordVersion int64 `json:"record_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +259,24 @@ type ProvisionTenantRequest struct {
 	// always generates a fresh default policy instead. Field kept only so
 	// older clients sending this key don't fail JSON decoding.
 	DefaultDataResidencyPolicyID string `json:"default_data_residency_policy_id,omitempty"`
+
+	// ExternalCustomerKey is ORG-02's "approved onboarding correlation /
+	// external customer key": a replay with the same key returns the tenant
+	// it already created rather than creating a second one.
+	ExternalCustomerKey string `json:"external_customer_key"`
+	// OnboardingRequestRef is §4.2 evidence: the onboarding request this
+	// tenant was created from. Required (§4.2 "onboarding evidence").
+	OnboardingRequestRef string `json:"onboarding_request_ref,omitempty"`
+
+	// §4.2 required source inputs and server-resolved context (000013).
+	// PrimaryJurisdictionID is validated against the Jurisdiction Rules
+	// Service and the restricted-jurisdiction list. ResidencyRegionID is the
+	// residency preference: an active region, which becomes the default
+	// residency policy's region (the home region). SubscriptionID is checked
+	// for plan entitlement with commercial-account-svc.
+	PrimaryJurisdictionID string `json:"primary_jurisdiction_id,omitempty"`
+	ResidencyRegionID     string `json:"residency_region_id,omitempty"`
+	SubscriptionID        string `json:"subscription_id,omitempty"`
 }
 
 type TransitionTenantLifecycleRequest struct {
@@ -210,16 +285,50 @@ type TransitionTenantLifecycleRequest struct {
 }
 
 type CreateEntityRequest struct {
-	TenantID              string     `json:"tenant_id"`
-	EntityCode            string     `json:"entity_code"`
-	LegalName             string     `json:"legal_name"`
-	TradingName           string     `json:"trading_name,omitempty"`
-	EntityType            EntityType `json:"entity_type"`
+	TenantID    string     `json:"tenant_id"`
+	EntityCode  string     `json:"entity_code"`
+	LegalName   string     `json:"legal_name"`
+	TradingName string     `json:"trading_name,omitempty"`
+	EntityType  EntityType `json:"entity_type"`
+	// RegistrationNumber is ORG-03's "registry number", listed among the
+	// required source inputs in §4.3. It was absent from this request until the
+	// ORG completion, which meant an entity could never claim a registry
+	// identity at creation -- and so §8 NP5 ("same registry number claimed by
+	// two active entities in the same jurisdiction") was not merely untested
+	// but unreachable. Optional: not every entity type has one.
+	RegistrationNumber string `json:"registration_number,omitempty"`
+	// IncorporationDate is §4.3's "registry ... date".
+	IncorporationDate     *time.Time `json:"incorporation_date,omitempty"`
 	DefaultCurrencyCode   string     `json:"default_currency_code"`
 	FiscalCalendarID      string     `json:"fiscal_calendar_id"`
 	PrimaryJurisdictionID string     `json:"primary_jurisdiction_id"`
 	DataResidencyPolicyID string     `json:"data_residency_policy_id"`
 	CorrelationID         string     `json:"correlation_id"`
+
+	// Optional LEI, with its source and status (ORG-03 mandatory control).
+	LEI       string `json:"lei,omitempty"`
+	LEISource string `json:"lei_source,omitempty"`
+	LEIStatus string `json:"lei_status,omitempty"`
+	// LEIVerifiedAt is documented in openapi.yaml; until 29 Sep 2026 it was
+	// not a field here and was dropped on the floor.
+	LEIVerifiedAt *time.Time `json:"lei_verified_at,omitempty"`
+
+	// §4.3 required source inputs that profile version 1 records. Until the
+	// 29 Sep re-audit these were not fields here, so a client that sent them
+	// at creation had them silently discarded, and the legal form could only
+	// arrive by a later amendment.
+	//
+	// The legal form is optional (entity_type answers "entity type/legal
+	// form") but, when sent, is held to the ISO 20275 control exactly as an
+	// amendment is. RegisteredOffice is opaque JSON for the reason given on
+	// AmendLegalProfileRequest. RegisteredOffice and SourceEvidenceRef are
+	// required outside local development (LEGACY_PROVISIONING_INPUTS).
+	LegalFormCode      string          `json:"legal_form_code,omitempty"`
+	LegalFormSource    string          `json:"legal_form_source,omitempty"`
+	LegalFormLocalText string          `json:"legal_form_local_text,omitempty"`
+	RegistryAuthority  string          `json:"registry_authority,omitempty"`
+	RegisteredOffice   json.RawMessage `json:"registered_office,omitempty"`
+	SourceEvidenceRef  string          `json:"source_evidence_ref,omitempty"`
 }
 
 type CreateWorkspaceRequest struct {

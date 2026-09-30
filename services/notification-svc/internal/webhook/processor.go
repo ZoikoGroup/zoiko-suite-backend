@@ -28,10 +28,17 @@ type WebhookStore interface {
 	ListRetryableDLQ(ctx context.Context, limit int) ([]*DLQItem, error)
 }
 
+// MetricsRecorder records webhook events and DLQ routing metrics.
+type MetricsRecorder interface {
+	RecordWebhookEvent(provider, eventType string)
+	RecordDLQ(provider, status string)
+}
+
 // Processor manages the normalization, validation, ledger recording, suppression mapping, and DLQ routing.
 type Processor struct {
 	store      WebhookStore
 	normalizer *Normalizer
+	metrics    MetricsRecorder
 	log        *zap.Logger
 }
 
@@ -44,6 +51,11 @@ func NewProcessor(store WebhookStore, log *zap.Logger) *Processor {
 		normalizer: NewNormalizer(),
 		log:        log,
 	}
+}
+
+// SetMetrics configures optional metrics instrumentation on the Processor.
+func (p *Processor) SetMetrics(m MetricsRecorder) {
+	p.metrics = m
 }
 
 // ProcessRawPayload parses, normalizes, and processes raw webhook payloads for a given provider.
@@ -193,6 +205,10 @@ func (p *Processor) ProcessEvent(ctx context.Context, ev *WebhookEvent) error {
 		return err
 	}
 
+	if p.metrics != nil {
+		p.metrics.RecordWebhookEvent(ev.Provider, string(ev.EventType))
+	}
+
 	return nil
 }
 
@@ -259,6 +275,9 @@ func (p *Processor) routeRetryableDLQ(ctx context.Context, ev *WebhookEvent, pro
 		ReceivedAt:   time.Now().UTC(),
 	}
 	_ = p.store.RouteToDLQ(ctx, dlqItem)
+	if p.metrics != nil {
+		p.metrics.RecordDLQ(ev.Provider, "routed")
+	}
 }
 
 // ReprocessDLQItem attempts to reprocess an event from the DLQ.
@@ -271,6 +290,9 @@ func (p *Processor) ReprocessDLQItem(ctx context.Context, tenantID, dlqID string
 	events, err := p.normalizer.Normalize(item.ProviderName, item.RawPayload)
 	if err != nil {
 		_ = p.store.UpdateDLQStatus(ctx, item.TenantID, item.DLQID, DLQStatusAbandoned, item.RetryCount+1, nil, err.Error())
+		if p.metrics != nil {
+			p.metrics.RecordDLQ(item.ProviderName, "abandoned")
+		}
 		return err
 	}
 
@@ -280,6 +302,10 @@ func (p *Processor) ReprocessDLQItem(ctx context.Context, tenantID, dlqID string
 			_ = p.store.UpdateDLQStatus(ctx, item.TenantID, item.DLQID, DLQStatusFailed, item.RetryCount+1, &nextRetry, err.Error())
 			return err
 		}
+	}
+
+	if p.metrics != nil {
+		p.metrics.RecordDLQ(item.ProviderName, "reprocessed")
 	}
 
 	return p.store.UpdateDLQStatus(ctx, item.TenantID, item.DLQID, DLQStatusReprocessed, item.RetryCount+1, nil, "")

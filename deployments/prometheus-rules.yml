@@ -26,3 +26,721 @@ groups:
           severity: page
         annotations:
           summary: "{{ $labels.service }} readiness probe reports DB unreachable for 2m"
+
+  # ---------------------------------------------------------------------------
+  # GOV-01 (identity-context-svc)
+  # ---------------------------------------------------------------------------
+  #
+  # Every alert here fires on something that produces NO 5xx and NO latency, so
+  # none of them would be caught by the two baseline rules above. That is the
+  # selection criterion: if the golden signals already show it, it is not here.
+  #
+  # Runbook: services/identity-context-svc/RUNBOOK.md
+  - name: gov-01-identity-context
+    rules:
+      - alert: IdentityOutboxBacklogGrowing
+        # A stopped relay is invisible from the request path: every request
+        # succeeds, latency is normal, and governance events silently pile up
+        # in a table. This is the single most important alert on the service.
+        #
+        # 15m rather than 5m because a broker restart legitimately produces a
+        # short spike, and the outbox existing is precisely what makes that
+        # spike harmless.
+        expr: identity_context_outbox_pending > 1000
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "identity-context-svc outbox backlog above 1000 for 15m"
+          description: >-
+            Governance events are durable but undelivered. Check the relay is
+            running and the broker is reachable. RUNBOOK section 4.1. Do NOT
+            delete rows to clear the backlog.
+
+      - alert: IdentityOutboxDeadLetters
+        # Exhausted retries. Nothing drains these automatically and a restart
+        # will not fix one, so this is a ticket rather than a page — but it
+        # must not be invisible, because the events are governance evidence
+        # that never reached the estate.
+        expr: identity_context_outbox_dead_letter > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "identity-context-svc has {{ $value }} dead-lettered events"
+          description: >-
+            Events that exhausted delivery attempts. They remain in
+            event_outbox with last_error set. RUNBOOK section 4.2.
+
+      - alert: IdentityIngressTenantMismatch
+        # A request on tenant A's hostname bearing tenant B's token. There is
+        # no legitimate request of this shape — it is either an ingress
+        # misconfiguration serving one customer's hostname to another's
+        # backend, or somebody probing the boundary.
+        #
+        # ANY sustained rate pages. The threshold is deliberately just above
+        # zero rather than a round number.
+        expr: sum(rate(identity_context_resolution_failed_total{reason="ingress_tenant_mismatch"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "identity-context-svc refusing cross-tenant ingress requests"
+          description: >-
+            Requests arriving on one tenant's ingress with another tenant's
+            token. Nothing leaked — the check runs before any tenant-scoped
+            query — but this is either a routing fault or an attack.
+            RUNBOOK section 5.1.
+
+      - alert: IdentityResidencyDenials
+        expr: sum(rate(identity_context_resolution_failed_total{reason="residency_denied"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "identity-context-svc refusing resolutions on data residency"
+          description: >-
+            An entity's residency policy is not servable from this region.
+            After a deploy this usually means ALLOWED_RESIDENCY_POLICIES was
+            not updated for the region. RUNBOOK section 5.2.
+
+      - alert: IdentityRiskSignalPipelineDead
+        # Every resolution defaulting its trust posture means the Intelligence
+        # Plane is not publishing. No request fails, so nothing else would show
+        # it — and this alarm used to silence itself, because the service
+        # published it on the same topic it consumed risk signals from.
+        expr: |
+          sum(rate(identity_context_risk_signal_unavailable_total[15m]))
+          /
+          clamp_min(sum(rate(http_requests_total{service="identity-context-svc", route="/v1/context/resolve", status_code="200"}[15m])), 0.001) > 0.9
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "identity-context-svc: >90% of sessions have no risk signal"
+          description: >-
+            Trust posture is being DEFAULTED rather than measured on almost
+            every session. The Intelligence Plane is probably not publishing
+            session.risk.changed.
+
+      - alert: IdentitySoDUnavailable
+        # Break-glass and status changes are refused while GOV-04 is down.
+        # Correct — a conflict check that did not run is not one that passed —
+        # but it means the emergency control is unavailable during an
+        # emergency, which is when it is wanted.
+        expr: sum(rate(identity_context_sod_checks_total{outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "identity-context-svc cannot reach GOV-04 — privileged commands refused"
+          description: >-
+            Segregation of duties cannot be evaluated, so support contexts and
+            principal status changes are being refused. RUNBOOK section 6.2.
+
+      - alert: IdentitySupportContextAwaitingReview
+        # The half of break-glass that is normally missing: the grant expires,
+        # nobody looks, and the control is decorative.
+        expr: identity_context_support_contexts_unreviewed > 0
+        for: 24h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} support contexts ended without review for over 24h"
+          description: >-
+            Privileged elevations into customer tenants that were never
+            reconciled. RUNBOOK section 6.1.
+
+      - alert: IdentityLiveSupportContexts
+        # Informational by design. Not a fault — every grant is scoped,
+        # time-limited, independently approved and evidenced — but somebody
+        # having standing inside a customer's data should be visible without
+        # anyone having to query this service.
+        expr: sum(identity_context_support_contexts_live) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $value }} live support elevations into customer tenants"
+
+  # ---------------------------------------------------------------------------
+  # gateway-auth-svc
+  #
+  # Chosen on the same criterion as the blocks below: every rule here fires on
+  # something the two baseline rules cannot see. This service answers 401 and
+  # 403 as its NORMAL output — refusing an unauthenticated request is it
+  # working — so error-rate alerting is blind to it in both directions. It
+  # cannot tell a healthy gateway rejecting scanner traffic from a JWKS outage
+  # locking every user out of the estate, because both are a wall of 401s.
+  #
+  # Runbook: services/gateway-auth-svc/RUNBOOK.md
+  - name: gateway-auth
+    rules:
+      - alert: GatewayAuthJWKSUnavailable
+        # identity-context-svc's JWKS endpoint cannot be read and nothing is
+        # cached. EVERY gated request in the estate fails closed while this is
+        # true, and the symptom reported by users is "the whole platform is
+        # down" rather than anything naming this service. Nothing else in the
+        # estate surfaces this: the gateway answers a correct 401 and the
+        # backends never see the request at all.
+        expr: sum(rate(gateway_auth_jwks_errors_total{operation="fetch"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "gateway-auth-svc cannot reach the JWKS endpoint — every gated request is failing"
+          description: >-
+            identity-context-svc's key set is unreachable and no cached key
+            covers the incoming tokens. This is a total authentication outage.
+            RUNBOOK section 4.1.
+
+      - alert: GatewayAuthTokenSpoofingDetected
+        # A validly-signed token presented against a DIFFERENT tenant's
+        # hostname. Unlike everything else in this group, this is not a
+        # misconfiguration: by construction the token verified, so whoever
+        # sent it holds genuine credentials and is using them against a tenant
+        # that is not theirs. Threshold is any occurrence, deliberately — a
+        # rate threshold on this would mean tolerating some amount of it.
+        expr: sum(increase(gateway_auth_verify_decisions_total{outcome="tenant_hostname_mismatch"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "gateway-auth-svc rejected {{ $value }} token/hostname tenant mismatches in 15m"
+          description: >-
+            A token minted for one tenant was presented against another
+            tenant's hostname. Treat as credential theft or replay until shown
+            otherwise. RUNBOOK section 4.2.
+
+      - alert: GatewayAuthTenantContextUnresolved
+        # tenant-entity-registry-svc is unreachable, so GOV-01 resolution
+        # cannot complete. The gateway fails closed: writes are refused
+        # outright and reads only survive inside the bounded stale window, so
+        # this degrades into a full outage rather than announcing itself as
+        # one.
+        expr: sum(rate(gateway_auth_tenant_context_total{outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "gateway-auth-svc cannot resolve tenant context — requests failing closed"
+          description: >-
+            The tenant registry is unreachable. Writes are refused with 503 and
+            reads outlive it only for the stale-grace window.
+            RUNBOOK section 4.3.
+
+      - alert: GatewayAuthTenantContextStale
+        # Serving reads from a cache the registry could not confirm. Correct,
+        # bounded behaviour — and the early warning that the alert above is
+        # coming, which is the only reason to page on it at ticket severity
+        # rather than wait.
+        expr: |
+          sum(rate(gateway_auth_tenant_context_total{outcome="stale"}[10m]))
+          /
+          clamp_min(sum(rate(gateway_auth_tenant_context_total[10m])), 0.001) > 0.1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "gateway-auth-svc serving over 10% of reads from stale tenant context"
+          description: >-
+            The registry is intermittently unreachable and reads are being
+            served from an unconfirmed cache. Writes are already being refused.
+            RUNBOOK section 4.4.
+
+      - alert: GatewayAuthRejectionRateHigh
+        # A sustained collapse in the allowed ratio. Deliberately a RATIO and
+        # deliberately not alerting on 401s alone: a public endpoint always
+        # refuses some traffic, and a raw count would either page on ordinary
+        # scanner noise or need a per-deployment threshold nobody maintains.
+        expr: |
+          sum(rate(gateway_auth_verify_decisions_total{outcome!="allowed"}[10m]))
+          /
+          clamp_min(sum(rate(gateway_auth_verify_decisions_total[10m])), 0.001) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "gateway-auth-svc refusing over 50% of requests for 10m"
+          description: >-
+            Check the outcome label to tell these apart: invalid_token points
+            at an expiry or key-rotation problem, no_token at a client that
+            stopped sending credentials, incomplete_claims at
+            identity-context-svc minting bad envelopes. RUNBOOK section 4.5.
+
+      - alert: GatewayAuthReadinessFailing
+        # Duplicated from the baseline ReadinessProbeFailing on purpose, at a
+        # tighter threshold. Nothing gated is reachable while this service is
+        # unready — it is not one service degrading, it is the front door.
+        expr: readiness_up{service="gateway-auth-svc"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "gateway-auth-svc not ready for 1m"
+          description: >-
+            The gateway cannot verify anything. Every gated route in the estate
+            is refusing traffic. RUNBOOK section 4.6.
+
+  # secret-vault-integration-svc
+  # ---------------------------------------------------------------------------
+  #
+  # Same selection criterion as the GOV-01 block above: every alert here fires
+  # on something the two baseline rules cannot see. Three of these six produce
+  # no 5xx at all — a denial is a 403 and a deny-by-absence is a 404, both
+  # correct responses that the golden signals are right to ignore — and they
+  # are exactly the shapes that matter on a service that brokers credentials.
+  #
+  # Runbook: services/secret-vault-integration-svc/RUNBOOK.md
+  - name: secret-vault-integration
+    rules:
+      - alert: SecretBrokerDenialRateHigh
+        # A workload being refused material it used to get. Every request here
+        # is a well-formed 403, so error-rate alerting never sees it, and the
+        # symptom the on-call actually gets paged for is some other service
+        # failing to start. Ratio rather than a raw count: a busy path and a
+        # quiet one should not need different thresholds.
+        expr: |
+          sum(rate(secret_vault_broker_decisions_total{outcome="denied"}[10m]))
+          /
+          clamp_min(sum(rate(secret_vault_broker_decisions_total[10m])), 0.001) > 0.2
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "secret-vault-integration-svc refusing over 20% of brokerage for 10m"
+          description: >-
+            Workloads are being denied secret material. Usually an
+            allowed_workload_ids list that no longer matches the caller after a
+            deployment changed a workload identity. RUNBOOK section 4.1.
+
+      - alert: SecretPathNotProvisioned
+        # Policy resolves but no material was ever seeded, or the path is
+        # unknown entirely. This is the single most common way a correctly
+        # configured secret still cannot be brokered, and it answers 404 — so
+        # it is invisible to every error-rate rule. A steady trickle is normal
+        # probing; a sustained rate means something real is misconfigured.
+        expr: sum(rate(secret_vault_broker_decisions_total{outcome="no_policy"}[10m])) > 0.1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "secret-vault-integration-svc: sustained brokerage for unregistered secret paths"
+          description: >-
+            A caller is asking for a secret_path with no ACTIVE policy version
+            in its scope. Either the path was never registered, its version was
+            never activated, or the caller's scope is wrong. RUNBOOK section 4.2.
+
+      - alert: SecretVaultBackendFailing
+        # The vault backend is the only thing here that actually holds
+        # material. A get failure means policy says yes and the material
+        # cannot be produced — every dependent workload fails to start, and
+        # this service reports it as a 503 that reads like its own outage.
+        expr: sum(rate(secret_vault_backend_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "secret-vault-integration-svc vault backend failing ({{ $labels.operation }})"
+          description: >-
+            Secret material cannot be read, written or rotated. Nothing
+            downstream can obtain credentials. RUNBOOK section 4.3.
+
+      - alert: SecretVaultAuthorizationUnavailable
+        # This service fails closed, so an authorization-svc outage is a total
+        # write outage here. Separated from denials on purpose: without the
+        # distinction the two are indistinguishable, and they need opposite
+        # responses — one is a permissions problem, the other a dependency
+        # that is down.
+        expr: sum(rate(secret_vault_authz_decisions_total{outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "secret-vault-integration-svc cannot reach authorization-svc"
+          description: >-
+            Every secret policy mutation is being refused fail-closed. This is
+            a dependency outage, not a permissions problem. RUNBOOK section 4.4.
+
+      - alert: SecretMassRevocation
+        # Rotation revokes every lease on a path. That is correct behaviour and
+        # produces no errors at all — but a rotation that cuts off a large
+        # fleet is worth knowing about as it happens rather than from the
+        # resulting incident, because every affected workload will fail on its
+        # next credential fetch.
+        expr: sum(increase(secret_vault_rotation_revoked_leases_total[10m])) > 50
+        for: 0m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "secret-vault-integration-svc rotation revoked {{ $value }} leases in 10m"
+          description: >-
+            A rotation invalidated a large number of live leases. Expect
+            dependent workloads to re-broker; confirm the rotation was
+            intended. RUNBOOK section 4.5.
+
+      - alert: SecretVaultReadinessFailing
+        # Duplicated from the baseline ReadinessProbeFailing on purpose, at a
+        # tighter threshold. This service sits on the startup path of anything
+        # that needs a credential, so two minutes of it being unready is a
+        # longer outage here than the same two minutes elsewhere.
+        expr: readiness_up{service="secret-vault-integration-svc"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "secret-vault-integration-svc not ready for 1m"
+          description: >-
+            The database pool is unreachable. No lease, policy or audit read
+            will succeed. RUNBOOK section 4.6.
+
+  - name: delegated-authority
+    # The register of who may act for whom. Every alert here fires on something
+    # that produces no 5xx and no latency: a delegation that outlives its
+    # window, an escalation attempt that is correctly refused, an event that
+    # never reaches the consumer which ends the delegate's session. The golden
+    # signals show a healthy service throughout all three, which is why they
+    # need rules of their own.
+    rules:
+      - alert: DelegatedAuthorityExpirySweepStalled
+        # The headline failure. Before the background sweeper existed, expiry
+        # waited for somebody to read the register, and a tenant nobody read
+        # expired nothing at all — its delegates kept authority indefinitely
+        # and authority.expired was never published for them. This fires if
+        # that state returns by any route: the sweeper dying, the database
+        # refusing it, or the RLS exemption being removed under it.
+        #
+        # Threshold is in minutes against a 30s sweep interval, so it is ~20
+        # missed passes rather than one slow one.
+        expr: delegated_authority_expiry_oldest_overdue_seconds > 600
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "delegated-authority-svc has a delegation {{ $value | humanizeDuration }} past its window"
+          description: >-
+            A delegation reached its effective_to and has not been expired.
+            Until it is, the delegate still holds authority the register says
+            has lapsed, and no authority.expired has been published to end
+            their session. RUNBOOK section 4.1.
+
+      - alert: DelegatedAuthorityExpirySweepFailing
+        # The sweeper's errors are the only place a persistently failing sweep
+        # surfaces: the read-path sweep logs and swallows its own so it cannot
+        # fail the read it piggybacks on.
+        expr: sum(rate(delegated_authority_expiry_sweep_failures_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "delegated-authority-svc expiry sweep is failing"
+          description: >-
+            The background sweep has been erroring for five minutes. Due
+            delegations are not being ended and authority.expired is not being
+            published. RUNBOOK section 4.1.
+
+      - alert: DelegatedAuthorityEscalationAttempts
+        # delegator_mismatch and self_dealing are the two refusals that are not
+        # mistakes. Each one is a caller trying to route authority that is not
+        # theirs — one by naming a colleague as delegator, the other by
+        # administering a delegation to themselves. Both answer a correct 403,
+        # so an error-rate alert sees a service behaving perfectly.
+        #
+        # Any occurrence, deliberately. A rate threshold here would mean
+        # tolerating some amount of attempted privilege escalation.
+        expr: sum(increase(delegated_authority_grants_total{outcome=~"delegator_mismatch|self_dealing"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "delegated-authority-svc refused {{ $value }} escalation attempts in 15m"
+          description: >-
+            A caller tried to delegate authority that is not theirs, or to
+            route another principal's authority to themselves. Refused
+            correctly; investigate who and why. RUNBOOK section 4.2.
+
+      - alert: DelegatedAuthorityOutboxStalled
+        # authority.revoked is a session-invalidation signal. The gap between
+        # an operator being told a revocation succeeded and the delegate's
+        # session actually ending is this number.
+        expr: delegated_authority_outbox_oldest_age_seconds > 120
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "delegated-authority-svc outbox backlog is {{ $value | humanizeDuration }} old"
+          description: >-
+            Lifecycle events are committed but undelivered. A revoked delegate
+            keeps their session until the relay drains. RUNBOOK section 4.3.
+
+      - alert: DelegatedAuthorityAuthzUnavailable
+        # This service fails closed, so an authorization-svc outage turns every
+        # gated route into a 503. Kept apart from "denied" because the two need
+        # opposite responses: one is a permissions problem, the other an
+        # outage.
+        expr: sum(rate(delegated_authority_authz_decisions_total{outcome="unavailable"}[5m])) > 0
+        for: 3m
+        labels:
+          severity: page
+        annotations:
+          summary: "delegated-authority-svc cannot reach authorization-svc"
+          description: >-
+            Every delegation grant, revoke and entity-scoped read is refused
+            503 while this lasts. Nothing is written — the service fails closed
+            rather than guessing. RUNBOOK section 4.4.
+
+      - alert: DelegatedAuthorityReadinessFailing
+        expr: readiness_up{service="delegated-authority-svc"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "delegated-authority-svc not ready for 2m"
+          description: >-
+            Postgres or authorization-svc is unreachable. Both are readiness
+            dependencies here because every route calls them. RUNBOOK section 4.5.
+
+  - name: access-control
+    # The catalogue of roles and permission bundles, and the front door that
+    # provisions both into authorization-svc.
+    #
+    # Every alert here fires on something that produces an entirely ordinary
+    # response. A write refused because the action name matches no grant is a
+    # 403 like any other; a retirement that never reached the enforcement plane
+    # is a 503 that reads like a dependency blip; an outbox that has stopped
+    # draining produces nothing at all. http_requests_total cannot tell any of
+    # them from normal operation, which is why these read the decision counters.
+    rules:
+      # Writes are authorized against ROLE_MANAGE on the legal entity. A steady
+      # stream of denials is not "users clicking things they should not" — on
+      # this service it is the shape a NAME MISMATCH takes. The handler once
+      # asked for an action ("ACCESS_ROLE_MANAGE") that nothing in the estate
+      # grants, and the result was every write refused 403 while every read
+      # worked, for as long as nobody correlated the two sides.
+      - alert: AccessControlWritesUniformlyDenied
+        expr: >-
+          sum(increase(access_control_authz_decisions_total{service="access-control-svc",outcome="denied"}[15m])) > 5
+          and
+          sum(increase(access_control_authz_decisions_total{service="access-control-svc",outcome="granted"}[15m])) == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "access-control-svc: every authorization check denied for 15m"
+          description: >-
+            More than five denials and not one grant. Either the demo/tenant
+            grants have been withdrawn, or this service is asking
+            authorization-svc for an action name nobody provisions. Check the
+            action in internal/handler/handler.go against the permitted_actions
+            of the bundle that is supposed to grant it. RUNBOOK section 4.1.
+
+      # The propagation path. This is the alert that matters most here: while it
+      # fires, the register is refusing writes rather than recording states it
+      # cannot enforce — which is correct, and also means role administration is
+      # completely unavailable.
+      - alert: AccessControlProvisioningFailing
+        expr: >-
+          sum(rate(access_control_authz_admin_calls_total{service="access-control-svc",outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "access-control-svc cannot provision into authorization-svc"
+          description: >-
+            Role and bundle writes are failing closed, so nothing is being
+            recorded that is not enforced — but no role can be defined, retired
+            or edited while this lasts. A 400 here means this service is sending
+            a malformed admin request; a connection error means authorization-svc
+            is unwell. The service logs the response body for exactly that
+            distinction. RUNBOOK section 4.2.
+
+      # An outbox that has stopped draining is silent by construction: the
+      # writes still succeed, the register still reads correctly, and the rest of
+      # the estate simply stops being told that grants have changed.
+      - alert: AccessControlOutboxStalled
+        expr: access_control_outbox_oldest_age_seconds{service="access-control-svc"} > 120
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "access-control-svc has an event {{ $value | humanizeDuration }} undelivered"
+          description: >-
+            The relay is not draining. authorization-svc's grant cache is not
+            being invalidated, so it may serve a withdrawn grant for up to its
+            TTL, and no consumer is learning that roles have changed. Depth
+            alone cannot see this — a backlog of ten that is three seconds old is
+            healthy. RUNBOOK section 4.3.
+
+      - alert: AccessControlOutboxPublishFailing
+        expr: sum(rate(access_control_outbox_failures_total{service="access-control-svc"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "access-control-svc outbox relay drains are failing"
+          description: >-
+            Rows stay unpublished and are retried, so nothing is lost yet. The
+            failure is recorded on the rows themselves in event_outbox.last_error.
+            RUNBOOK section 4.3.
+
+      # A conflict is the caller's to resolve and is not, on its own, a fault.
+      # A SUSTAINED stream of them usually means a client is retrying a create
+      # with a fresh correlation id each time — which is what an idempotency key
+      # exists to prevent, and which leaves the caller unable to make progress.
+      - alert: AccessControlDuplicateCodeStorm
+        expr: >-
+          sum(increase(access_control_role_writes_total{service="access-control-svc",outcome="conflict"}[15m]))
+          + sum(increase(access_control_bundle_writes_total{service="access-control-svc",outcome="conflict"}[15m])) > 20
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "access-control-svc refused {{ $value }} duplicate codes in 15m"
+          description: >-
+            A client is probably minting a new correlation_id per retry instead
+            of reusing one, so every attempt reads as a new intent and conflicts
+            with its own first success. RUNBOOK section 4.4.
+
+      - alert: AccessControlReadinessFailing
+        expr: readiness_up{service="access-control-svc"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "access-control-svc not ready for 2m"
+          description: >-
+            Postgres or authorization-svc is unreachable. Both are readiness
+            dependencies here: every write calls authorization-svc twice and
+            fails closed, so a healthy pool alone means 100% of writes answer
+            503. /readyz names which one failed. RUNBOOK section 4.5.
+
+  - name: configuration-feature-flag
+    # Runtime configuration and feature flags — the values every other service
+    # reads to decide how to behave.
+    #
+    # Every alert here fires on something that produces an entirely ordinary
+    # response. A write refused for want of a grant is a 403 like any other; a
+    # write that changed nothing is a 200 indistinguishable from a read; an
+    # outbox that has stopped draining produces nothing at all.
+    # http_requests_total cannot tell any of them from normal operation, which
+    # is why these read the decision counters.
+    rules:
+      # The failure this service is most exposed to, and the least visible.
+      #
+      # A config or flag change that is recorded but never published leaves
+      # every consumer acting on the value it superseded. That stale value is
+      # VALID DATA — just old — so nothing downstream can detect it, no request
+      # fails, and no latency moves. The only evidence is here.
+      - alert: ConfigurationOutboxStalled
+        expr: >-
+          configuration_outbox_oldest_age_seconds{service="configuration-feature-flag-svc"} > 300
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "configuration-feature-flag-svc: events undelivered for over 5 minutes"
+          description: >-
+            The oldest unpublished event in the outbox is more than five minutes
+            old, so consumers are still acting on configuration this service has
+            already replaced — silently, because the value they hold is valid.
+            Check the relay and the broker. RUNBOOK section 4.1.
+
+      # Depth on its own cannot tell a busy moment from a stopped relay, which
+      # is why the age alert above exists — but a backlog that keeps growing is
+      # worth catching before it is five minutes old.
+      - alert: ConfigurationOutboxBacklogGrowing
+        expr: >-
+          configuration_outbox_pending{service="configuration-feature-flag-svc"} > 100
+          and
+          deriv(configuration_outbox_pending{service="configuration-feature-flag-svc"}[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "configuration-feature-flag-svc: outbox backlog is growing"
+          description: >-
+            More than a hundred unpublished events and still rising, so the
+            relay is draining slower than writes arrive. RUNBOOK section 4.1.
+
+      - alert: ConfigurationOutboxPublishFailing
+        expr: >-
+          sum(rate(configuration_outbox_failures_total{service="configuration-feature-flag-svc"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "configuration-feature-flag-svc cannot publish to Kafka"
+          description: >-
+            Relay drains are failing. Events are safe — they stay in
+            event_outbox with attempts and last_error recorded — but nothing is
+            being told about them. RUNBOOK section 4.1.
+
+      # Writes are authorized against CONFIGURATION_WRITE / FEATURE_FLAG_WRITE
+      # and their _GLOBAL_ counterparts. A steady stream of denials with not one
+      # grant is not "users clicking things they should not" — on this service
+      # it is the shape a NAME MISMATCH takes. An action name nothing in the
+      # estate provisions refuses every write 403 while every read works, which
+      # reads as an under-granted operator rather than as a service asking for a
+      # name nobody defines. It is exactly how access-control-svc shipped.
+      - alert: ConfigurationWritesUniformlyDenied
+        expr: >-
+          sum(increase(configuration_authz_decisions_total{service="configuration-feature-flag-svc",outcome="denied"}[15m])) > 5
+          and
+          sum(increase(configuration_authz_decisions_total{service="configuration-feature-flag-svc",outcome="granted"}[15m])) == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "configuration-feature-flag-svc: every authorization check denied for 15m"
+          description: >-
+            More than five denials and not one grant. Either the grants have
+            been withdrawn, or this service is asking authorization-svc for an
+            action name nobody provisions. Compare the actions in
+            internal/telemetry/domain.go against the permitted_actions of the
+            CONFIG_FULL bundle. RUNBOOK section 4.2.
+
+      # Fail-closed made visible. While this fires, every write is refused and
+      # every read still works, so the console looks broken rather than blocked.
+      - alert: ConfigurationAuthzUnavailable
+        expr: >-
+          sum(rate(configuration_authz_decisions_total{service="configuration-feature-flag-svc",outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "configuration-feature-flag-svc cannot reach authorization-svc"
+          description: >-
+            No authorization decision can be obtained, so every write is being
+            refused 503 rather than allowed unchecked. Reads are unaffected,
+            which is what makes this look like a console fault. RUNBOOK
+            section 4.3.
+
+      # The highest-blast-radius operation this service offers, given its own
+      # series precisely because on the wire it is a 201 identical to a write
+      # affecting one tenant.
+      - alert: ConfigurationGlobalScopeWriteBurst
+        expr: >-
+          sum(increase(configuration_global_scope_writes_total{service="configuration-feature-flag-svc",outcome="created"}[10m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "configuration-feature-flag-svc: unusual number of environment-wide changes"
+          description: >-
+            More than ten environment-wide defaults changed in ten minutes. Each
+            one takes effect for every tenant that has not set its own value, so
+            this is worth confirming was intended. RUNBOOK section 4.4.
+
+      - alert: ConfigurationReadinessFailing
+        expr: >-
+          readiness_up{service="configuration-feature-flag-svc"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "configuration-feature-flag-svc is not ready"
+          description: >-
+            Postgres or authorization-svc is unreachable. Both are readiness
+            dependencies here: every write calls authorization-svc and fails
+            closed, so a healthy pool alone means 100% of writes answer 503.
+            /readyz names which one failed. RUNBOOK section 4.5.

@@ -28,7 +28,10 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/go-chi/chi/v5/middleware"
+
 	"zoiko.io/evidence-requirements-svc/internal/domain"
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 )
 
 // Client is the narrow interface the evaluator depends on.
@@ -76,6 +79,34 @@ func (c *HTTPClient) VerifyDocument(ctx context.Context, tenantID, legalEntityID
 	// document-vault-svc resolves tenant scope from this header via its own
 	// TenantContext middleware, not a query param.
 	req.Header.Set("X-Tenant-Id", tenantID)
+
+	requestID := middleware.GetReqID(ctx)
+	sourceChannel := "system"
+	principalID := "evidence-requirements-svc"
+
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.Actor() != "" {
+			principalID = env.Actor()
+		}
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			sourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Source-Channel", sourceChannel)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

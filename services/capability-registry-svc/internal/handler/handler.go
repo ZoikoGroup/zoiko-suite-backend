@@ -212,13 +212,15 @@ func (h *Handler) CreateIntegrationCapability(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	now := time.Now().UTC()
 	i := &domain.IntegrationCapability{
 		IntegrationCapabilityID: uuid.NewString(),
 		CapabilityID:            capabilityID,
 		ProviderCode:            req.ProviderCode,
 		Certified:               req.Certified,
 		HealthStatus:            req.HealthStatus,
-		CreatedAt:               time.Now().UTC(),
+		CreatedAt:               now,
+		UpdatedAt:               now,
 		CreatedByPrincipalID:    principalID,
 	}
 	if err := h.store.CreateIntegrationCapability(r.Context(), i); err != nil {

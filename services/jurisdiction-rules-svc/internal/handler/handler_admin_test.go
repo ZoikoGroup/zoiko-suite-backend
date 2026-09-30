@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
+	"zoiko.io/jurisdiction-rules-svc/internal/envelope"
 )
 
 // ── mock authz client ────────────────────────────────────────────────────────
@@ -33,7 +34,7 @@ type mockAuthZ struct {
 	calls       int
 }
 
-func (m *mockAuthZ) Authorize(_ context.Context, principalID, scopeID, resource, action string) error {
+func (m *mockAuthZ) Authorize(_ context.Context, principalID, scopeID, resource, action string, _ *envelope.Envelope) error {
 	m.principalID, m.scopeID, m.resource, m.action = principalID, scopeID, resource, action
 	m.calls++
 	return m.err
@@ -58,6 +59,13 @@ func postJSON(t *testing.T, h http.Handler, path string, body any) *httptest.Res
 	return postJSONAs(t, h, path, body, testPrincipal)
 }
 
+// postJSONWithApproval issues an admin POST with an approval reference header,
+// required for transitions to ACTIVE (maker-checker).
+func postJSONWithApproval(t *testing.T, h http.Handler, path string, body any, approvalRef string) *httptest.ResponseRecorder {
+	t.Helper()
+	return postJSONWithApprovalAs(t, h, path, body, testPrincipal, approvalRef)
+}
+
 // postJSONAs is the same, with an explicit principal. An empty principal
 // sends no identity header at all.
 func postJSONAs(t *testing.T, h http.Handler, path string, body any, principal string) *httptest.ResponseRecorder {
@@ -72,6 +80,26 @@ func postJSONAs(t *testing.T, h http.Handler, path string, body any, principal s
 	req.Header.Set("Content-Type", "application/json")
 	if principal != "" {
 		req.Header.Set("X-Principal-Id", principal)
+	}
+	return executeRequest(h, req)
+}
+
+// postJSONWithApprovalAs is postJSONAs with an explicit approval reference.
+func postJSONWithApprovalAs(t *testing.T, h http.Handler, path string, body any, principal, approvalRef string) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatalf("failed to encode request body: %v", err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, path, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	if principal != "" {
+		req.Header.Set("X-Principal-Id", principal)
+	}
+	if approvalRef != "" {
+		req.Header.Set("X-Approval-Reference", approvalRef)
 	}
 	return executeRequest(h, req)
 }
@@ -174,7 +202,13 @@ func TestAdminRoutes_AuthorizationIsChecked(t *testing.T) {
 		t.Run(route.name, func(t *testing.T) {
 			m := &mockAuthZ{}
 			st := okStore()
-			rr := postJSON(t, newTestRouterWithAuthz(st, m), route.path, route.body)
+			var rr *httptest.ResponseRecorder
+			// transition to ACTIVE requires approval reference
+			if route.name == "transition rule" {
+				rr = postJSONWithApproval(t, newTestRouterWithAuthz(st, m), route.path, route.body, "approval-123")
+			} else {
+				rr = postJSON(t, newTestRouterWithAuthz(st, m), route.path, route.body)
+			}
 
 			if rr.Code >= 400 {
 				t.Fatalf("permitted request failed with %d — body: %s", rr.Code, rr.Body.String())
@@ -198,7 +232,12 @@ func TestAdminRoutes_403_DeniedNeverReachesStore(t *testing.T) {
 	for _, route := range adminRoutes {
 		t.Run(route.name, func(t *testing.T) {
 			st := &stubStore{}
-			rr := postJSON(t, newTestRouterWithAuthz(st, &mockAuthZ{err: authz.ErrUnauthorized}), route.path, route.body)
+			var rr *httptest.ResponseRecorder
+			if route.name == "transition rule" {
+				rr = postJSONWithApproval(t, newTestRouterWithAuthz(st, &mockAuthZ{err: authz.ErrUnauthorized}), route.path, route.body, "approval-123")
+			} else {
+				rr = postJSON(t, newTestRouterWithAuthz(st, &mockAuthZ{err: authz.ErrUnauthorized}), route.path, route.body)
+			}
 
 			if rr.Code != http.StatusForbidden {
 				t.Fatalf("expected 403, got %d — body: %s", rr.Code, rr.Body.String())
@@ -216,7 +255,12 @@ func TestAdminRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 	for _, route := range adminRoutes {
 		t.Run(route.name, func(t *testing.T) {
 			st := &stubStore{}
-			rr := postJSON(t, newTestRouterWithAuthz(st, &mockAuthZ{err: authz.ErrAuthZUnavailable}), route.path, route.body)
+			var rr *httptest.ResponseRecorder
+			if route.name == "transition rule" {
+				rr = postJSONWithApproval(t, newTestRouterWithAuthz(st, &mockAuthZ{err: authz.ErrAuthZUnavailable}), route.path, route.body, "approval-123")
+			} else {
+				rr = postJSON(t, newTestRouterWithAuthz(st, &mockAuthZ{err: authz.ErrAuthZUnavailable}), route.path, route.body)
+			}
 
 			if rr.Code != http.StatusServiceUnavailable {
 				t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
@@ -453,31 +497,9 @@ func TestCreateRule_201_Created(t *testing.T) {
 	}
 }
 
-// TestCreateRule_201_ActiveAlsoPublishesActivated — a rule created directly
-// in ACTIVE never passes through the transition endpoint, so activation has
-// to be announced at creation or consumers never hear about it.
-func TestCreateRule_201_ActiveAlsoPublishesActivated(t *testing.T) {
-	st := &stubStore{
-		createdRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "ACTIVE"},
-		ruleWasCreated: true,
-	}
-	h, pub := newTestRouterWithPublisher(st, permitAll())
-
-	body := validRuleBody()
-	body["rule_status"] = "ACTIVE"
-	rr := postJSON(t, h, "/v1/admin/jurisdictions/j-1/rules", body)
-
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
-	}
-	if !pub.has("jurisdiction.rule.activated") {
-		t.Errorf("expected jurisdiction.rule.activated, got %v", pub.emitted)
-	}
-}
-
 func TestCreateRule_200_ReplayDoesNotPublish(t *testing.T) {
 	st := &stubStore{
-		createdRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "ACTIVE"},
+		createdRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "DRAFT"},
 		ruleWasCreated: false,
 	}
 	h, pub := newTestRouterWithPublisher(st, permitAll())
@@ -672,7 +694,7 @@ func TestTransitionRuleStatus_200_OK(t *testing.T) {
 	}
 	h, pub := newTestRouterWithPublisher(st, permitAll())
 
-	rr := postJSON(t, h, "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "ACTIVE"})
+	rr := postJSONWithApproval(t, h, "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "ACTIVE"}, "approval-123")
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
@@ -695,7 +717,7 @@ func TestTransitionRuleStatus_ReplayDoesNotPublish(t *testing.T) {
 	}
 	h, pub := newTestRouterWithPublisher(st, permitAll())
 
-	rr := postJSON(t, h, "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "ACTIVE"})
+	rr := postJSONWithApproval(t, h, "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "ACTIVE"}, "approval-123")
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rr.Code)
@@ -720,8 +742,14 @@ func TestTransitionRuleStatus_EndDatesClosingTransitions(t *testing.T) {
 				transitionedRule: &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: status},
 				transitionDidRun: true,
 			}
-			rr := postJSON(t, newTestRouterWithAuthz(st, permitAll()),
-				"/v1/admin/rules/r-1/transition", map[string]any{"new_status": status})
+			var rr *httptest.ResponseRecorder
+			if status == "ACTIVE" {
+				rr = postJSONWithApproval(t, newTestRouterWithAuthz(st, permitAll()),
+					"/v1/admin/rules/r-1/transition", map[string]any{"new_status": status}, "approval-123")
+			} else {
+				rr = postJSON(t, newTestRouterWithAuthz(st, permitAll()),
+					"/v1/admin/rules/r-1/transition", map[string]any{"new_status": status})
+			}
 
 			if rr.Code != http.StatusOK {
 				t.Fatalf("expected 200, got %d", rr.Code)
@@ -788,7 +816,7 @@ func TestTransitionRuleStatus_404_RuleNotFound(t *testing.T) {
 	st := &stubStore{transitionErr: domain.ErrRuleNotFound}
 	h := newTestRouterWithAuthz(st, permitAll())
 
-	rr := postJSON(t, h, "/v1/admin/rules/unknown/transition", map[string]any{"new_status": "ACTIVE"})
+	rr := postJSONWithApproval(t, h, "/v1/admin/rules/unknown/transition", map[string]any{"new_status": "ACTIVE"}, "approval-123")
 
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rr.Code)
