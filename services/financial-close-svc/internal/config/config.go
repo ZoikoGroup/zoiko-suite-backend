@@ -41,6 +41,16 @@ type Config struct {
 	// PROJECT_REVENUE source, satisfying the AST/INV/PRJ domain spec's
 	// own §9 "Project revenue/WIP → GL" assertion.
 	ProjectServiceURL string
+	// FinancialControlServiceURL is financial-control-svc, whose close gate
+	// (ZS-CONTROL-001 s22 Period-End Close Certification) period close can
+	// depend on.
+	FinancialControlServiceURL string
+	// CloseGateMode is "off" (default: the gate is never consulted) or
+	// "enforce" (close fails closed unless the gate is open). Any unrecognised
+	// FINCTRL_CLOSE_GATE_MODE value is treated as "enforce" so a typo cannot
+	// silently disable a control; CloseGateModeInvalid records that it happened.
+	CloseGateMode        string
+	CloseGateModeInvalid bool
 
 	// AssetEventsTopic/InventoryEventsTopic/ProjectEventsTopic are the
 	// three Kafka topics this service's own ACC-18 lineage consumer
@@ -110,6 +120,8 @@ func Load() (*Config, error) {
 		return nil, ErrSigningKeyMissing{}
 	}
 
+	gateMode, gateModeInvalid := normalizeCloseGateMode(os.Getenv("FINCTRL_CLOSE_GATE_MODE"))
+
 	return &Config{
 		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8104),
@@ -143,8 +155,26 @@ func Load() (*Config, error) {
 		InventoryEventsTopic: env("INVENTORY_EVENTS_TOPIC", "zoiko.inventory.events"),
 		ProjectEventsTopic:   env("PROJECT_EVENTS_TOPIC", "zoiko.project.events"),
 		CloseSigningKey:      signingKey,
+
+		FinancialControlServiceURL: env("FINCTRL_SERVICE_URL", "http://financial-control-svc:8171"),
+		CloseGateMode:              gateMode,
+		CloseGateModeInvalid:       gateModeInvalid,
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
+}
+
+// normalizeCloseGateMode maps FINCTRL_CLOSE_GATE_MODE to "off" or "enforce".
+// Unset/empty/"off" is off; anything else is enforce (fail closed on a typo),
+// and unrecognised values are reported via the second return.
+func normalizeCloseGateMode(raw string) (mode string, invalid bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "off":
+		return "off", false
+	case "enforce":
+		return "enforce", false
+	default:
+		return "enforce", true
+	}
 }
 
 func env(key, def string) string {

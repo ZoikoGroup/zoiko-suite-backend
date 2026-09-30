@@ -57,10 +57,15 @@ type stubStore struct {
 	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
 	setMappingErr   error
 
-	ledgerEntries        []domain.LedgerEntry
-	ledgerBalance        *domain.LedgerBalance
-	rebuildCalled        bool
-	lastRebuildRequest   domain.RebuildBalanceProjectionRequest
+	ledgerEntries      []domain.LedgerEntry
+	postingsPage       *domain.AccountPostingsPage
+	postingsErr        error
+	postingsCalls      []postingsCall
+	wave4              wave4Stub
+	wave5              wave5Stub
+	ledgerBalance      *domain.LedgerBalance
+	rebuildCalled      bool
+	lastRebuildRequest domain.RebuildBalanceProjectionRequest
 
 	postingExecutions map[string]*domain.PostingExecution // by execution_id
 	bySourceEvent     map[string]string                   // "tenant|source_event_id" -> execution_id
@@ -450,6 +455,17 @@ func (s *stubStore) QueryLedger(_ context.Context, _ string, filter domain.Query
 		out = append(out, e)
 	}
 	return out, nil
+}
+
+func (s *stubStore) QueryAccountPostings(_ context.Context, tenantID string, q domain.AccountPostingsQuery) (*domain.AccountPostingsPage, error) {
+	s.postingsCalls = append(s.postingsCalls, postingsCall{tenantID: tenantID, query: q})
+	if s.postingsErr != nil {
+		return nil, s.postingsErr
+	}
+	if s.postingsPage != nil {
+		return s.postingsPage, nil
+	}
+	return &domain.AccountPostingsPage{}, nil
 }
 
 func (s *stubStore) QuerySourceEntries(_ context.Context, _, sourceEventID string) ([]domain.LedgerEntry, error) {
@@ -1380,4 +1396,10 @@ func TestGetAccountMapping_NotFound_Returns404(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rec.Code)
 	}
+}
+
+// postingsCall records one QueryAccountPostings invocation.
+type postingsCall struct {
+	tenantID string
+	query    domain.AccountPostingsQuery
 }

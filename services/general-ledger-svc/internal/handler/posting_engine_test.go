@@ -61,11 +61,13 @@ func newRouterWithRecordingAuthZ(s *stubStore, p *stubPublisher, a *recordingAut
 func validPostEventReq() domain.PostAccountingEventRequest {
 	code1, code2 := "1000", "4000"
 	return domain.PostAccountingEventRequest{
-		LegalEntityID: "e1",
-		FiscalPeriod:  "2026-07",
-		Description:   "revenue recognized",
-		SourceEventID: "src-evt-1",
-		CorrelationID: "corr-post-1",
+		LegalEntityID:       "e1",
+		FiscalPeriod:        "2026-07",
+		Description:         "revenue recognized",
+		SourceEventID:       "src-evt-1",
+		CorrelationID:       "corr-post-1",
+		TransactionCurrency: "USD",
+		DocumentDate:        domain.NewDate(2026, 7, 1),
 		Lines: []domain.PostingEventLineInput{
 			{AccountCode: &code1, DebitAmount: 100},
 			{AccountCode: &code2, CreditAmount: 100},
@@ -482,5 +484,81 @@ func TestGetPostingExecution_NotFound_Returns404(t *testing.T) {
 	rec := doRequest(r, http.MethodGet, "/v1/postings/does-not-exist", nil, "principal-1")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
+// ── Spec s5.1 / s8.1 mandatory fields on PostAccountingEvent ────────────────
+
+func TestPostAccountingEvent_CarriesCurrencyDatesAndType(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	req := validPostEventReq()
+	req.PostingDate = domain.NewDate(2026, 7, 5)
+
+	rec := doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.journals) != 1 {
+		t.Fatalf("expected 1 journal, got %d", len(s.journals))
+	}
+	for _, j := range s.journals {
+		if j.CurrencyCode != "USD" || j.JournalType == "" || j.JournalType == domain.JournalTypeUnspecified {
+			t.Errorf("header missing currency/type: %+v", j)
+		}
+		if j.TransactionDate.String() != "2026-07-01" || j.PostingDate.String() != "2026-07-05" {
+			t.Errorf("dates not carried: txn=%s posting=%s", j.TransactionDate, j.PostingDate)
+		}
+	}
+}
+
+func TestPostAccountingEvent_PostingDateDefaultsToDocumentDate(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/postings/events", validPostEventReq(), "svc-ap")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, j := range s.journals {
+		if j.PostingDate.String() != "2026-07-01" {
+			t.Errorf("posting_date should default to document_date, got %s", j.PostingDate)
+		}
+	}
+}
+
+func TestPostAccountingEvent_InvalidMandatoryFields_Return400(t *testing.T) {
+	cases := map[string]func(*domain.PostAccountingEventRequest){
+		"missing currency":   func(q *domain.PostAccountingEventRequest) { q.TransactionCurrency = "" },
+		"lowercase currency": func(q *domain.PostAccountingEventRequest) { q.TransactionCurrency = "usd" },
+		"long currency":      func(q *domain.PostAccountingEventRequest) { q.TransactionCurrency = "USDX" },
+		"missing document":   func(q *domain.PostAccountingEventRequest) { q.DocumentDate = domain.Date{} },
+		"posting before doc": func(q *domain.PostAccountingEventRequest) { q.PostingDate = domain.NewDate(2026, 6, 30) },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := newStubStore()
+			r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+			req := validPostEventReq()
+			mutate(&req)
+			rec := doRequest(r, http.MethodPost, "/v1/postings/events", req, "svc-ap")
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+			}
+			if len(s.journals) != 0 || len(s.postingExecutions) != 0 {
+				t.Errorf("a rejected request must post nothing")
+			}
+		})
+	}
+}
+
+func TestPostAccountingEvent_MalformedDate_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	body := map[string]any{
+		"legal_entity_id": "e1", "fiscal_period": "2026-07", "source_event_id": "s", "correlation_id": "c",
+		"transaction_currency": "USD", "document_date": "07/01/2026",
+	}
+	rec := doRequest(r, http.MethodPost, "/v1/postings/events", body, "svc-ap")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

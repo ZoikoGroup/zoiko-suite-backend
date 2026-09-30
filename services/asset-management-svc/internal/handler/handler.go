@@ -84,7 +84,7 @@ type Store interface {
 type DepreciationLedgerClient interface {
 	PostDepreciationAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []clients.LedgerLine) (journalID string, err error)
 	ReverseDepreciationJournal(ctx context.Context, tenantID, principalID, journalID, reason string) error
-	PostAssetEventAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []clients.LedgerLine) (journalID string, err error)
+	PostAssetEventAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID, transactionCurrency, documentDate string, lines []clients.LedgerLine) (journalID string, err error)
 	ReverseAssetEventJournal(ctx context.Context, tenantID, principalID, journalID, reason string) error
 
 	// CheckPeriodOpen is AST-03's own real "hard-closed-period" dependency

@@ -26,6 +26,7 @@ type Store interface {
 	GetInvoice(ctx context.Context, invoiceID string) (*domain.VendorInvoice, error)
 	ListInvoices(ctx context.Context, filter domain.ListInvoicesFilter) ([]domain.VendorInvoice, error)
 	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string) error
+	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -49,6 +50,10 @@ const (
 	actionValidateInvoice = "AP_INVOICE_VALIDATE"
 	actionApproveInvoice  = "AP_INVOICE_APPROVE"
 	actionRequestPayment  = "AP_PAYMENT_REQUEST"
+
+	// actionReadControlPopulation gates ZS-CONTROL-001 §9 population reads, checked
+	// against the requested legal entity.
+	actionReadControlPopulation = "AP_CONTROL_POPULATION_READ"
 )
 
 // maxListLimit caps how many rows a single register read may return, matching
@@ -117,6 +122,7 @@ func linesFromRequest(in []domain.CreateVendorInvoiceLineInput) []domain.VendorI
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Get("/v1/control-populations/{population}", h.ControlPopulation)
 	r.Route("/v1/invoices", func(r chi.Router) {
 		r.Post("/", h.CreateInvoice)
 		r.Get("/", h.ListInvoices)

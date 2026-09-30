@@ -36,6 +36,12 @@ type BNK02Store interface {
 	HasRegionPolicy(ctx context.Context, tenantID, legalEntityID string) (bool, error)
 }
 
+// ControlPopulationStore serves the read-only control-population contract
+// (docs/architecture/control-population-contract.md). Only PgStore implements it.
+type ControlPopulationStore interface {
+	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
+}
+
 // BNK0304Store is BNK-03 Statement Ingestion + BNK-04 Transaction
 // Normalization's persistence surface — same composed-interface pattern
 // as BNK02Store, colocated because normalization reads BNK-03's evidence

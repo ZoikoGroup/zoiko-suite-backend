@@ -23,6 +23,12 @@ import (
 type stubStoreReal struct {
 	entries         map[string]*domain.IntercompanyEntry
 	bySourceJournal map[string]string
+
+	// control-population fake
+	cpPage  *domain.ControlPopulationPage
+	cpErr   error
+	cpCalls int
+	cpQuery domain.ControlPopulationQuery
 }
 
 func newStubStoreReal() *stubStoreReal {

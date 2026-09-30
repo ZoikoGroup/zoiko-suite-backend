@@ -45,6 +45,7 @@ type stubStore struct {
 
 	stockCounts         map[string]*domain.StockCount
 	stockCountLocations map[string][]string // count_id -> location_ids
+	ctrlPop             ctrlPopStub         // control-population recorder (control_population_test.go)
 	countLines          map[string]*domain.StockCountLine
 
 	offerings        map[string]*domain.Offering

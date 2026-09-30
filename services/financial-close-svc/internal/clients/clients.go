@@ -55,6 +55,10 @@ type Clients struct {
 	http         *http.Client
 	log          *zap.Logger
 
+	// financialControlURL is financial-control-svc, set via
+	// WithFinancialControlURL so the New constructors keep their signatures.
+	financialControlURL string
+
 	// authzHTTP, when set, is used instead of http for calls to
 	// authorization-svc only — the mTLS pilot's Transport carries this
 	// service's leaf certificate and trusts authorization-svc's CA (see
@@ -1273,6 +1277,57 @@ func (c *Clients) GetInventoryNegativeOnHandCount(ctx context.Context, tenantID,
 		return 0, err
 	}
 	return out.NegativeOnHandCount, nil
+}
+
+// WithFinancialControlURL sets the financial-control-svc base URL used by
+// GetCloseGate and returns c for chaining.
+func (c *Clients) WithFinancialControlURL(u string) *Clients {
+	c.financialControlURL = u
+	return c
+}
+
+// GetCloseGate asks financial-control-svc whether the mandatory controls for
+// the entity/period are certified (ZS-CONTROL-001 s22). Any transport error,
+// non-200 status or undecodable body is ErrFinancialControlUnavailable: "could
+// not ask" must never be read as "gate open". The principal is forwarded as
+// X-Principal-Id, same as CompileTrialBalance; like the other non-authz
+// service-to-service calls it uses the plain http client (mTLS is pilot-only
+// for authorization-svc).
+func (c *Clients) GetCloseGate(ctx context.Context, tenantID, principalID, legalEntityID, periodID string) (*domain.CloseGateResponse, error) {
+	u, err := url.Parse(c.financialControlURL + "/controls/v1/close-gate")
+	if err != nil {
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("period_id", periodID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch close gate from financial-control-svc", zap.Error(err))
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.log.Error("financial-control-svc close gate returned non-200", zap.Int("status", resp.StatusCode))
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+
+	var out domain.CloseGateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		c.log.Error("failed to decode close gate from financial-control-svc", zap.Error(err))
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+	return &out, nil
 }
 
 // inventoryUnapprovedVarianceResponse mirrors inventory-management-svc's
