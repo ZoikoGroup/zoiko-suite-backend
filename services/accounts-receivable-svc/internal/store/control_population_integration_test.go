@@ -109,8 +109,10 @@ func insertPopInv(t *testing.T, in popInv) string {
 	_, err := embeddedPool.Exec(context.Background(), `
 		INSERT INTO customer_invoices (invoice_id, tenant_id, legal_entity_id, customer_id, invoice_number,
 			amount, currency_code, due_date, status, created_by_principal_id, sent_by_principal_id,
-			payment_received_by_principal_id, correlation_id, created_at, sent_at, payment_received_at)
-		VALUES ($1,$2,$3,'cust-1',$4,$5::numeric,$6,'2026-12-31',$7,'creator',$8,$9,$10,$11,$12,$13)`,
+			payment_received_by_principal_id, correlation_id, created_at, sent_at, payment_received_at,
+			invoice_date, supply_date, net_amount, tax_amount)
+		VALUES ($1,$2,$3,'cust-1',$4,$5::numeric,$6,'2026-12-31',$7,'creator',$8,$9,$10,$11,$12,$13,
+			$11::timestamptz::date, $11::timestamptz::date, $5::numeric, 0)`,
 		id, in.tenant, in.entity, in.number, in.amount, in.currency, in.status, sentBy, paidBy,
 		"corr-"+id, in.createdAt, sentAt, in.paidAt)
 	require.NoError(t, err)
