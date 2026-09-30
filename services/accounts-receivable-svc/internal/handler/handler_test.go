@@ -35,6 +35,11 @@ type stubStore struct {
 	getErr        error
 	listErr       error
 	transitionErr error
+
+	// Control population stub: the page returned and the query last received.
+	popPage  *domain.ControlPopulationPage
+	popErr   error
+	popQuery domain.ControlPopulationQuery
 }
 
 func newStubStore() *stubStore {

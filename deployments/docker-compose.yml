@@ -76,6 +76,7 @@ services:
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
       - ../services/financial-close-svc/deployments/migrations:/migrations/financial-close:ro
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
+      - ../services/financial-control-svc/deployments/migrations:/migrations/financial-control:ro
       - ../services/intercompany-accounting-svc/deployments/migrations:/migrations/intercompany-accounting:ro
       - ../services/consolidation-svc/deployments/migrations:/migrations/consolidation:ro
       - ../services/asset-management-svc/deployments/migrations:/migrations/asset-management:ro
@@ -2294,6 +2295,10 @@ services:
       # ACC-06's PROJECT_REVENUE source — same §9 posture, satisfies the
       # "Project revenue/WIP → GL" assertion.
       PROJECT_SERVICE_URL: "http://project-accounting-svc:8169"
+      # Period close depends on financial-control-svc's close gate only when
+      # FINCTRL_CLOSE_GATE_MODE=enforce; off until mandatory controls are configured.
+      FINCTRL_SERVICE_URL: "http://financial-control-svc:8171"
+      FINCTRL_CLOSE_GATE_MODE: "off"
       # The three topics this service's own ACC-18 lineage Kafka consumer
       # subscribes to (asset-management-svc's, inventory-management-svc's
       # and project-accounting-svc's own events topics) — satisfies the
@@ -2381,6 +2386,58 @@ services:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
       # dead database pool reads as healthy while every read returns 500.
       test: ["CMD", "/healthcheck", "http://localhost:8102/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Financial Control Service (ZS-CONTROL-001) — governed control definitions,
+  # versioned tolerance/materiality policies, and control runs with orthogonal
+  # lifecycle / result / certification state. It VERIFIES financial truth and
+  # never becomes a second ledger: it has no general-ledger-svc client and no
+  # route that can write accounting state. State and events are committed in
+  # one transaction (outbox); every material command is checked against
+  # authorization-svc, fail-closed. Postgres RLS + explicit tenant_id filters.
+  financial-control-svc:
+    build:
+      context: ../services/financial-control-svc
+      dockerfile: Dockerfile
+    container_name: financial-control-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8171:8171"
+    environment:
+      PORT: "8171"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: financial_control
+      DB_USER: "${DB_USER_FINANCIAL_CONTROL:-app_financial_control}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.financial-control.events"
+      KAFKA_GROUP_ID: "financial-control-svc"
+      # Registered source systems for control populations (name=base-url). A run can select a
+      # registered system by name but can never supply a URL. Each source must implement
+      # docs/architecture/control-population-contract.md; until then, runs against it end
+      # FAILED/INDETERMINATE, never Pass.
+      # Names must match the catalogue (internal/catalogue). banking-connector-svc runs in
+      # docker-compose.phase7.yml, not this file: the FIN-CTRL-003/032 controls fail closed
+      # (FAILED/INDETERMINATE) until that stack is reachable on the same network.
+      SOURCE_ENDPOINTS: "accounts-receivable=http://accounts-receivable-svc:8101,accounts-payable=http://accounts-payable-svc:8099,general-ledger=http://general-ledger-svc:8098,banking-connector=http://banking-connector-svc:8145,inventory-management=http://inventory-management-svc:8168,payroll-run=http://payroll-run-svc:8110,intercompany-accounting=http://intercompany-accounting-svc:8105,consolidation=http://consolidation-svc:8106,financial-close=http://financial-close-svc:8104,payee-banking-identity=http://payee-banking-identity-svc:8166,tax-authority-interface=http://tax-authority-interface-svc:8147"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8171/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5

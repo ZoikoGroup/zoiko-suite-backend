@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -249,8 +250,9 @@ func TestApplyAssetEvent_WithAmountAndAccountCodes_PostsJournalAndEmits(t *testi
 	r := newRouterWithLedger(s, pub, &stubAuthZ{}, ledger)
 	id := createActiveAsset(t, s, r, "le-1")
 	amount := 250.0
+	effDate := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
 	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{
-		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-1",
+		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-1", Currency: "EUR", EffectiveDate: &effDate,
 		DebitAccountCode: "IMPAIRMENT-EXPENSE", CreditAccountCode: "ACCUM-IMPAIRMENT",
 	})
 	walkToApproved(t, r, e.EventID)
@@ -269,6 +271,9 @@ func TestApplyAssetEvent_WithAmountAndAccountCodes_PostsJournalAndEmits(t *testi
 	if ledger.lastPostedSourceEventID != e.EventID {
 		t.Fatalf("expected source_event_id keyed by the event's own ID, got %q", ledger.lastPostedSourceEventID)
 	}
+	if ledger.lastCurrency != "EUR" || ledger.lastDocumentDate != "2026-09-15" {
+		t.Fatalf("expected the event's own currency/effective_date (EUR, 2026-09-15), got %q, %q", ledger.lastCurrency, ledger.lastDocumentDate)
+	}
 	// Three publishes on a successful IMPAIRMENT apply-with-journal:
 	// PublishAssetEventAccountingEventEmitted (financial-close-svc's own
 	// ACC-18 lineage consumer's real source), PublishAssetEventApplied
@@ -276,6 +281,30 @@ func TestApplyAssetEvent_WithAmountAndAccountCodes_PostsJournalAndEmits(t *testi
 	// type-specific event for this event_type).
 	if pub.calls != callsBeforeApply+3 {
 		t.Fatalf("expected exactly 3 new publish calls (accounting-event-emitted + applied + impaired), got %d", pub.calls-callsBeforeApply)
+	}
+}
+
+func TestApplyAssetEvent_AmountWithoutCurrency_Returns422AndNeverPosts(t *testing.T) {
+	s := newStubStore()
+	ledger := &stubLedger{}
+	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	id := createActiveAsset(t, s, r, "le-1")
+	amount := 250.0
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{
+		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-1",
+		DebitAccountCode: "IMPAIRMENT-EXPENSE", CreditAccountCode: "ACCUM-IMPAIRMENT",
+	})
+	walkToApproved(t, r, e.EventID)
+
+	rr := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/apply", nil, "approver-1")
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if ledger.postCalls != 0 {
+		t.Fatalf("must not post without a currency, got %d posts", ledger.postCalls)
+	}
+	if s.assetEvents[e.EventID].Status != domain.AssetEventStatusApproved {
+		t.Fatalf("event must stay APPROVED, got %q", s.assetEvents[e.EventID].Status)
 	}
 }
 
@@ -324,7 +353,7 @@ func TestAssetEvent_PublishesRemainingLifecycleEvents(t *testing.T) {
 
 	callsBeforeCreate := pub.calls
 	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeRevaluation, domain.CreateAssetEventRequest{
-		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-2",
+		Amount: &amount, Currency: "USD", ValuationEvidenceRef: "APPRAISAL-2",
 		DebitAccountCode: "FIXED-ASSETS", CreditAccountCode: "REVALUATION-SURPLUS",
 	})
 	if pub.calls != callsBeforeCreate+1 {
@@ -375,7 +404,7 @@ func TestReverseAssetEvent_Disposal_RevertsAssetToActive(t *testing.T) {
 	id := createActiveAsset(t, s, r, "le-1")
 	proceeds, amount := 500.0, 100.0
 	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeDisposal, domain.CreateAssetEventRequest{
-		ProceedsAmount: &proceeds, Amount: &amount, DebitAccountCode: "DISPOSAL-CLEARING", CreditAccountCode: "FIXED-ASSETS",
+		ProceedsAmount: &proceeds, Amount: &amount, Currency: "USD", DebitAccountCode: "DISPOSAL-CLEARING", CreditAccountCode: "FIXED-ASSETS",
 	})
 	walkToApproved(t, r, e.EventID)
 	apply := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/apply", nil, "approver-1")

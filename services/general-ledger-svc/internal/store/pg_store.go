@@ -454,6 +454,16 @@ func (s *PgStore) ReverseJournal(
 			return fmt.Errorf("insert outbox event for journal.reversed: %w", err)
 		}
 
+		// AK-INV-003 / AK-INV-001: the reversing journal is born FINALIZED, so
+		// it never passes through TransitionJournal's FINALIZED branch. Append
+		// its ledger entries here, in the same transaction, so the ledger holds
+		// the neutralizing rows atomically with the REVERSED flip. No separate
+		// journal.posted event: journal.reversed above is the reversal's event
+		// (outbox_atomicity_test pins that contract).
+		if err := appendLedgerEntries(ctx, tx, tenantID, reversing.JournalID); err != nil {
+			return err
+		}
+
 		return nil
 	})
 	if err != nil {

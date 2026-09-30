@@ -84,6 +84,17 @@ type Store interface {
 	QuerySourceEntries(ctx context.Context, tenantID, sourceEventID string) ([]domain.LedgerEntry, error)
 	QueryAccountBalance(ctx context.Context, tenantID string, req domain.QueryAccountBalanceRequest) (*domain.LedgerBalance, error)
 	RebuildDerivedBalanceProjection(ctx context.Context, tenantID string, req domain.RebuildBalanceProjectionRequest) error
+
+	// ZS-CONTROL-001 §9 control population source — see
+	// docs/architecture/control-population-contract.md. Read-only.
+	QueryAccountPostings(ctx context.Context, tenantID string, q domain.AccountPostingsQuery) (*domain.AccountPostingsPage, error)
+	QueryJournalAccountTotals(ctx context.Context, tenantID string, q domain.JournalAccountTotalsQuery) (*domain.ControlPopulationPage, error)
+	QueryTrialBalancePopulation(ctx context.Context, tenantID string, q domain.TrialBalancePopulationQuery) (*domain.ControlPopulationPage, error)
+	QueryJournalBalances(ctx context.Context, tenantID string, q domain.FiscalPeriodPopulationQuery) (*domain.ControlPopulationPage, error)
+	QueryControlAccountPostings(ctx context.Context, tenantID string, q domain.FiscalPeriodPopulationQuery) (*domain.ControlPopulationPage, error)
+	QueryUnpostedEvents(ctx context.Context, tenantID string, q domain.UnpostedEventsQuery) (*domain.ControlPopulationPage, error)
+	QueryManualJournals(ctx context.Context, tenantID string, q domain.FiscalPeriodPopulationQuery) (*domain.ControlPopulationPage, error)
+	QueryEventJournalBreaks(ctx context.Context, tenantID string, q domain.EventJournalBreaksQuery) (*domain.ControlPopulationPage, error)
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -167,8 +178,14 @@ const (
 	// "controlled" annotation on RebuildDerivedBalanceProjection marks it
 	// as a materially more sensitive act than an ordinary read, grantable
 	// to a narrower operational group.
-	actionLedgerQuery            = "GL_LEDGER_QUERY"
-	actionLedgerRebuildBalances  = "GL_LEDGER_REBUILD_BALANCES"
+	actionLedgerQuery           = "GL_LEDGER_QUERY"
+	actionLedgerRebuildBalances = "GL_LEDGER_REBUILD_BALANCES"
+
+	// actionControlPopulationRead gates the ZS-CONTROL-001 §9 control
+	// population read (GET /v1/control-populations/{population}). Distinct
+	// from actionLedgerQuery: it hands a whole-entity extract to the control
+	// framework, and is granted to that service identity only.
+	actionControlPopulationRead = "GL_CONTROL_POPULATION_READ"
 )
 
 // coaPlatformScopeID is the legal_entity_id presented to authorization-svc
@@ -261,6 +278,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/balance", h.QueryAccountBalance)
 		r.Post("/rebuild-balances", h.RebuildDerivedBalanceProjection)
 	})
+	r.Get("/v1/control-populations/{population}", h.GetControlPopulation)
 }
 
 // ── POST /v1/journals ────────────────────────────────────────────────────────
@@ -1762,6 +1780,21 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id, fiscal_period, source_event_id and correlation_id are required")
 		return
 	}
+	if req.TransactionCurrency == "" || req.DocumentDate.IsZero() {
+		writeError(w, http.StatusBadRequest, "missing_field", "transaction_currency and document_date are required")
+		return
+	}
+	if !domain.ValidCurrencyCode(req.TransactionCurrency) {
+		writeError(w, http.StatusBadRequest, "invalid_currency_code", domain.ErrInvalidCurrency.Error())
+		return
+	}
+	if req.PostingDate.IsZero() {
+		req.PostingDate = req.DocumentDate
+	}
+	if req.PostingDate.Before(req.DocumentDate.Time) {
+		writeError(w, http.StatusBadRequest, "invalid_posting_date", domain.ErrPostingBeforeTransaction.Error())
+		return
+	}
 	if len(req.Lines) == 0 {
 		writeError(w, http.StatusBadRequest, "no_lines", domain.ErrNoLines.Error())
 		return
@@ -1832,6 +1865,8 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 		JournalID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID,
 		FiscalPeriod: req.FiscalPeriod, Status: domain.JournalStatusPending, Description: req.Description,
 		CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID, SourceEventID: &sourceEventID,
+		JournalType: domain.JournalTypeStandard, TransactionDate: req.DocumentDate,
+		PostingDate: req.PostingDate, CurrencyCode: req.TransactionCurrency,
 		// System-originated: this bypasses ACC-03's human Draft/Submit/
 		// Approve workflow entirely (already gated by actionPostingExecute,
 		// which a deployment grants only to internal service identities —
