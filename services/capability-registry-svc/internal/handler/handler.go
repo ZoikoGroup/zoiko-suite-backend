@@ -332,6 +332,10 @@ func (h *Handler) CreateCapabilityClaim(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "claim_text, wording_owner_principal_id, and approved_by_principal_id are required")
 		return
 	}
+	if req.WordingOwnerPrincipalID == req.ApprovedByPrincipalID {
+		writeError(w, http.StatusBadRequest, "wording_owner_principal_id and approved_by_principal_id must be distinct principals (segregation of duties)")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {

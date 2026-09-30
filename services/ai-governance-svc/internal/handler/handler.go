@@ -152,24 +152,29 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}", h.GetAIRun)
 	})
 	r.Route("/v1/action-risk-classifications", func(r chi.Router) {
+		r.Get("/", h.ListActionRiskClassifications)
 		r.Post("/", h.SetActionRiskClassification)
 		r.Get("/{actionType}", h.GetActionRiskClassification)
 	})
 	r.Route("/v1/automation-policies", func(r chi.Router) {
+		r.Get("/", h.ListAutomationPolicies)
 		r.Post("/", h.CreateAutomationPolicy)
 		r.Get("/resolve", h.ResolveAutomationPolicy)
 	})
 	r.Route("/v1/automation-actions", func(r chi.Router) {
+		r.Get("/", h.ListAutomationActions)
 		r.Post("/", h.ProposeAutomationAction)
 		r.Get("/{id}", h.GetAutomationAction)
 		r.Post("/{id}/decision", h.DecideAutomationAction)
 	})
 	r.Route("/v1/model-providers", func(r chi.Router) {
+		r.Get("/", h.ListModelProviders)
 		r.Post("/", h.RegisterModelProvider)
 		r.Get("/{provider}/{model}", h.GetModelProvider)
 		r.Get("/{provider}/{model}/verify", h.VerifyModelProvider)
 	})
 	r.Route("/v1/policy-change-approvals", func(r chi.Router) {
+		r.Get("/", h.ListPolicyChangeApprovals)
 		r.Post("/", h.ProposePolicyChange)
 		r.Get("/{id}", h.GetPolicyChangeApproval)
 		r.Post("/{id}/decision", h.DecidePolicyChange)
@@ -761,6 +766,64 @@ func (h *Handler) DecidePolicyChange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)
+}
+
+func (h *Handler) ListActionRiskClassifications(w http.ResponseWriter, r *http.Request) {
+	classifications, err := h.store.ListActionRiskClassifications(r.Context())
+	if err != nil {
+		h.logger.Error("list action risk classifications failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to list action risk classifications")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"action_risk_classifications": classifications})
+}
+
+func (h *Handler) ListAutomationPolicies(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requireTenant(w, r, "")
+	if !ok {
+		return
+	}
+	policies, err := h.store.ListAutomationPolicies(r.Context())
+	if err != nil {
+		h.logger.Error("list automation policies failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to list automation policies")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"automation_policies": policies})
+}
+
+func (h *Handler) ListAutomationActions(w http.ResponseWriter, r *http.Request) {
+	_, ok := h.requireTenant(w, r, "")
+	if !ok {
+		return
+	}
+	actions, err := h.store.ListAutomationActions(r.Context())
+	if err != nil {
+		h.logger.Error("list automation actions failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to list automation actions")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"automation_actions": actions})
+}
+
+func (h *Handler) ListModelProviders(w http.ResponseWriter, r *http.Request) {
+	providers, err := h.store.ListModelProviders(r.Context())
+	if err != nil {
+		h.logger.Error("list model providers failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to list model providers")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model_providers": providers})
+}
+
+func (h *Handler) ListPolicyChangeApprovals(w http.ResponseWriter, r *http.Request) {
+	approvals, err := h.store.ListPolicyChangeApprovals(r.Context())
+	if err != nil {
+		h.logger.Error("list policy change approvals failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to list policy change approvals")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"policy_change_approvals": approvals})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

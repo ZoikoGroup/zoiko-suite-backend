@@ -298,3 +298,43 @@ func TestCreateCapability_DuplicateCodeConflict(t *testing.T) {
 		t.Fatalf("expected 409, got %d", w.Code)
 	}
 }
+
+func TestCreateCapabilityClaim_SoDDistinctPrincipalsEnforced(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+	cap := createTestCapability(t, r, "PAYMENT_ROUTING")
+
+	// Negative Case: wording_owner == approved_by (SoD violation) -> Expect 400 Bad Request.
+	wSame := httptest.NewRecorder()
+	r.ServeHTTP(wSame, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
+		ClaimText:               "Instant settlement capability across EEA markets.",
+		WordingOwnerPrincipalID: "principal-user-01",
+		ApprovedByPrincipalID:   "principal-user-01",
+	}))
+	if wSame.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request when wording owner equals approver, got %d: %s", wSame.Code, wSame.Body.String())
+	}
+	if !bytes.Contains(wSame.Body.Bytes(), []byte("must be distinct principals")) {
+		t.Errorf("expected error message to mention distinct principals, got %s", wSame.Body.String())
+	}
+
+	// Positive Case: wording_owner != approved_by (SoD satisfied) -> Expect 201 Created.
+	wDistinct := httptest.NewRecorder()
+	r.ServeHTTP(wDistinct, buildRequest(http.MethodPost, "/v1/capabilities/"+cap.CapabilityID+"/claims", domain.CreateCapabilityClaimRequest{
+		ClaimText:               "Instant settlement capability across EEA markets.",
+		WordingOwnerPrincipalID: "principal-wording-owner",
+		ApprovedByPrincipalID:   "principal-legal-approver",
+	}))
+	if wDistinct.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created when wording owner and approver are distinct, got %d: %s", wDistinct.Code, wDistinct.Body.String())
+	}
+
+	var claim domain.CapabilityClaim
+	if err := json.NewDecoder(wDistinct.Body).Decode(&claim); err != nil {
+		t.Fatalf("failed to decode created claim: %v", err)
+	}
+	if claim.WordingOwnerPrincipalID != "principal-wording-owner" || claim.ApprovedByPrincipalID != "principal-legal-approver" {
+		t.Errorf("claim contains unexpected principals: %+v", claim)
+	}
+}
+

@@ -28,20 +28,25 @@ type Store interface {
 
 	SetActionRiskClassification(ctx context.Context, c *domain.ActionRiskClassification) error
 	GetActionRiskClassification(ctx context.Context, actionType string) (*domain.ActionRiskClassification, error)
+	ListActionRiskClassifications(ctx context.Context) ([]domain.ActionRiskClassification, error)
 
 	CreateAutomationPolicy(ctx context.Context, p *domain.AutomationPolicy) error
 	ResolveAutomationPolicy(ctx context.Context, tenantID, role, riskCategory, tool, actionType string) (*domain.AutomationPolicyResolution, error)
+	ListAutomationPolicies(ctx context.Context) ([]domain.AutomationPolicy, error)
 
 	ProposeAutomationAction(ctx context.Context, a *domain.AutomationAction) error
 	GetAutomationAction(ctx context.Context, automationActionID string) (*domain.AutomationAction, error)
 	DecideAutomationAction(ctx context.Context, automationActionID, decision, deciderPrincipalID string) (*domain.AutomationAction, error)
+	ListAutomationActions(ctx context.Context) ([]domain.AutomationAction, error)
 
 	RegisterModelProvider(ctx context.Context, m *domain.ModelProviderRegistration) error
 	GetModelProvider(ctx context.Context, providerName, modelName string) (*domain.ModelProviderRegistration, error)
+	ListModelProviders(ctx context.Context) ([]domain.ModelProviderRegistration, error)
 
 	ProposePolicyChange(ctx context.Context, p *domain.PolicyChangeApproval) error
 	GetPolicyChangeApproval(ctx context.Context, policyChangeApprovalID string) (*domain.PolicyChangeApproval, error)
 	DecidePolicyChange(ctx context.Context, policyChangeApprovalID, decision, decidedByPrincipalID, reason string) (*domain.PolicyChangeApproval, error)
+	ListPolicyChangeApprovals(ctx context.Context) ([]domain.PolicyChangeApproval, error)
 }
 
 type PgStore struct {
@@ -485,3 +490,194 @@ func (s *PgStore) DecidePolicyChange(ctx context.Context, policyChangeApprovalID
 	}
 	return s.GetPolicyChangeApproval(ctx, policyChangeApprovalID)
 }
+
+func (s *PgStore) ListActionRiskClassifications(ctx context.Context) ([]domain.ActionRiskClassification, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT action_type, risk_category, human_review_trigger, requires_maker_checker,
+		       created_at, created_by_principal_id
+		FROM action_risk_classifications
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list action risk classifications: %w", err)
+	}
+	defer rows.Close()
+
+	var list []domain.ActionRiskClassification
+	for rows.Next() {
+		var c domain.ActionRiskClassification
+		var riskCategory string
+		if err := rows.Scan(
+			&c.ActionType, &riskCategory, &c.HumanReviewTrigger, &c.RequiresMakerChecker,
+			&c.CreatedAt, &c.CreatedByPrincipalID,
+		); err != nil {
+			return nil, fmt.Errorf("scan action risk classification: %w", err)
+		}
+		c.RiskCategory = domain.RiskCategory(riskCategory)
+		list = append(list, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []domain.ActionRiskClassification{}
+	}
+	return list, nil
+}
+
+func (s *PgStore) ListAutomationPolicies(ctx context.Context) ([]domain.AutomationPolicy, error) {
+	var list []domain.AutomationPolicy
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT automation_policy_id, tenant_id, role, risk_category, tool, action_type,
+			       max_scope_amount, required_approvals, dry_run_required, rate_limit_per_day,
+			       kill_switch_engaged, created_at, created_by_principal_id
+			FROM automation_policies
+			WHERE tenant_id = $1
+			ORDER BY created_at DESC
+		`, middleware.TenantFromContext(ctx))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var p domain.AutomationPolicy
+			var riskCategory string
+			if err := rows.Scan(
+				&p.AutomationPolicyID, &p.TenantID, &p.Role, &riskCategory, &p.Tool, &p.ActionType,
+				&p.MaxScopeAmount, &p.RequiredApprovals, &p.DryRunRequired, &p.RateLimitPerDay,
+				&p.KillSwitchEngaged, &p.CreatedAt, &p.CreatedByPrincipalID,
+			); err != nil {
+				return err
+			}
+			p.RiskCategory = domain.RiskCategory(riskCategory)
+			list = append(list, p)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list automation policies: %w", err)
+	}
+	if list == nil {
+		list = []domain.AutomationPolicy{}
+	}
+	return list, nil
+}
+
+func (s *PgStore) ListAutomationActions(ctx context.Context) ([]domain.AutomationAction, error) {
+	var list []domain.AutomationAction
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT automation_action_id, tenant_id, action_type, risk_category, idempotency_key,
+			       preconditions_met, approval_status, postcondition_verified, rollback_plan,
+			       status, proposed_by_principal_id, approved_by_principal_id, created_at, updated_at
+			FROM automation_actions
+			WHERE tenant_id = $1
+			ORDER BY created_at DESC
+		`, middleware.TenantFromContext(ctx))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var a domain.AutomationAction
+			var riskCategory, approvalStatus, status string
+			if err := rows.Scan(
+				&a.AutomationActionID, &a.TenantID, &a.ActionType, &riskCategory, &a.IdempotencyKey,
+				&a.PreconditionsMet, &approvalStatus, &a.PostconditionVerified, &a.RollbackPlan,
+				&status, &a.ProposedByPrincipalID, &a.ApprovedByPrincipalID, &a.CreatedAt, &a.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			a.RiskCategory = domain.RiskCategory(riskCategory)
+			a.ApprovalStatus = domain.ApprovalStatus(approvalStatus)
+			a.Status = domain.AutomationActionStatus(status)
+			list = append(list, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list automation actions: %w", err)
+	}
+	if list == nil {
+		list = []domain.AutomationAction{}
+	}
+	return list, nil
+}
+
+func (s *PgStore) ListModelProviders(ctx context.Context) ([]domain.ModelProviderRegistration, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT provider_registration_id, provider_name, model_name, training_use_posture,
+		       retention_policy_ref, data_region, dpa_verified, approved_data_classes,
+		       approved_at, approved_by_principal_id, created_at
+		FROM model_provider_registrations
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list model providers: %w", err)
+	}
+	defer rows.Close()
+
+	var list []domain.ModelProviderRegistration
+	for rows.Next() {
+		var m domain.ModelProviderRegistration
+		var trainingUsePosture string
+		var dataClasses []byte
+		if err := rows.Scan(
+			&m.ProviderRegistrationID, &m.ProviderName, &m.ModelName, &trainingUsePosture,
+			&m.RetentionPolicyRef, &m.DataRegion, &m.DPAVerified, &dataClasses,
+			&m.ApprovedAt, &m.ApprovedByPrincipalID, &m.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan model provider: %w", err)
+		}
+		m.TrainingUsePosture = domain.TrainingUsePosture(trainingUsePosture)
+		m.ApprovedDataClasses = unmarshalStrings(dataClasses)
+		list = append(list, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []domain.ModelProviderRegistration{}
+	}
+	return list, nil
+}
+
+func (s *PgStore) ListPolicyChangeApprovals(ctx context.Context) ([]domain.PolicyChangeApproval, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT policy_change_approval_id, target_policy_ref, proposed_change,
+		       proposed_by_principal_id, decision, decided_by_principal_id,
+		       decision_reason, decided_at, created_at
+		FROM policy_change_approvals
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list policy change approvals: %w", err)
+	}
+	defer rows.Close()
+
+	var list []domain.PolicyChangeApproval
+	for rows.Next() {
+		var p domain.PolicyChangeApproval
+		var decision string
+		if err := rows.Scan(
+			&p.PolicyChangeApprovalID, &p.TargetPolicyRef, &p.ProposedChange,
+			&p.ProposedByPrincipalID, &decision, &p.DecidedByPrincipalID,
+			&p.DecisionReason, &p.DecidedAt, &p.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan policy change approval: %w", err)
+		}
+		p.Decision = domain.PolicyChangeDecision(decision)
+		list = append(list, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []domain.PolicyChangeApproval{}
+	}
+	return list, nil
+}
+

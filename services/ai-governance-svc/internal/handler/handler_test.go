@@ -180,6 +180,52 @@ func (s *stubStore) DecidePolicyChange(_ context.Context, id, decision, decidedB
 	return p, nil
 }
 
+func (s *stubStore) ListActionRiskClassifications(_ context.Context) ([]domain.ActionRiskClassification, error) {
+	var list []domain.ActionRiskClassification
+	for _, c := range s.classifications {
+		list = append(list, *c)
+	}
+	return list, nil
+}
+
+func (s *stubStore) ListAutomationPolicies(ctx context.Context) ([]domain.AutomationPolicy, error) {
+	tenantID := middleware.TenantFromContext(ctx)
+	var list []domain.AutomationPolicy
+	for _, p := range s.policies {
+		if p.TenantID == tenantID {
+			list = append(list, *p)
+		}
+	}
+	return list, nil
+}
+
+func (s *stubStore) ListAutomationActions(ctx context.Context) ([]domain.AutomationAction, error) {
+	tenantID := middleware.TenantFromContext(ctx)
+	var list []domain.AutomationAction
+	for _, a := range s.actions {
+		if a.TenantID == tenantID {
+			list = append(list, *a)
+		}
+	}
+	return list, nil
+}
+
+func (s *stubStore) ListModelProviders(_ context.Context) ([]domain.ModelProviderRegistration, error) {
+	var list []domain.ModelProviderRegistration
+	for _, m := range s.providers {
+		list = append(list, *m)
+	}
+	return list, nil
+}
+
+func (s *stubStore) ListPolicyChangeApprovals(_ context.Context) ([]domain.PolicyChangeApproval, error) {
+	var list []domain.PolicyChangeApproval
+	for _, p := range s.policyChanges {
+		list = append(list, *p)
+	}
+	return list, nil
+}
+
 var _ store.Store = (*stubStore)(nil)
 
 type stubPublisher struct{}
@@ -550,3 +596,149 @@ func TestProposeAutomationAction_BlockedByLiveKillSwitch(t *testing.T) {
 		t.Fatalf("expected 403 — an engaged live kill switch must block proposing the action, not just reading its resolution, got %d — %s", w.Code, w.Body.String())
 	}
 }
+
+func TestListEndpoints(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{}, &stubKillSwitch{}, logger)
+	r := newTestRouter(h)
+
+	// Seed Model Provider
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, buildRequest(http.MethodPost, "/v1/model-providers", domain.RegisterModelProviderRequest{
+		ProviderName: "anthropic",
+		ModelName:    "claude-3-7-sonnet",
+		DataRegion:   "eu-west-1",
+		DPAVerified:  true,
+	}))
+	if w1.Code != http.StatusOK && w1.Code != http.StatusCreated {
+		t.Fatalf("seed model provider failed: %d - %s", w1.Code, w1.Body.String())
+	}
+
+	// Query GET /v1/model-providers
+	wListModels := httptest.NewRecorder()
+	r.ServeHTTP(wListModels, buildRequest(http.MethodGet, "/v1/model-providers", nil))
+	if wListModels.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /v1/model-providers, got %d", wListModels.Code)
+	}
+	var modelsResp struct {
+		ModelProviders []domain.ModelProviderRegistration `json:"model_providers"`
+	}
+	if err := json.NewDecoder(wListModels.Body).Decode(&modelsResp); err != nil {
+		t.Fatalf("decode models failed: %v", err)
+	}
+	if len(modelsResp.ModelProviders) != 1 || modelsResp.ModelProviders[0].ModelName != "claude-3-7-sonnet" {
+		t.Fatalf("unexpected model providers list: %+v", modelsResp.ModelProviders)
+	}
+
+	// Seed Action Risk Classification
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, buildRequest(http.MethodPost, "/v1/action-risk-classifications", domain.SetActionRiskClassificationRequest{
+		ActionType:           "SEND_REFUND",
+		RiskCategory:         "MONEY",
+		HumanReviewTrigger:   true,
+		RequiresMakerChecker: true,
+	}))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("seed classification failed: %d - %s", w2.Code, w2.Body.String())
+	}
+
+	// Query GET /v1/action-risk-classifications
+	wListRisk := httptest.NewRecorder()
+	r.ServeHTTP(wListRisk, buildRequest(http.MethodGet, "/v1/action-risk-classifications", nil))
+	if wListRisk.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /v1/action-risk-classifications, got %d", wListRisk.Code)
+	}
+	var riskResp struct {
+		Classifications []domain.ActionRiskClassification `json:"action_risk_classifications"`
+	}
+	if err := json.NewDecoder(wListRisk.Body).Decode(&riskResp); err != nil {
+		t.Fatalf("decode risk classifications failed: %v", err)
+	}
+	if len(riskResp.Classifications) != 1 || riskResp.Classifications[0].ActionType != "SEND_REFUND" {
+		t.Fatalf("unexpected risk classifications list: %+v", riskResp.Classifications)
+	}
+
+	// Seed Automation Policy
+	wPolicy := httptest.NewRecorder()
+	r.ServeHTTP(wPolicy, buildRequest(http.MethodPost, "/v1/automation-policies", domain.CreateAutomationPolicyRequest{
+		TenantID:     testTenantA,
+		Role:         "billing-agent",
+		RiskCategory: "MONEY",
+		Tool:         "stripe-refund-tool",
+		ActionType:   "SEND_REFUND",
+	}))
+	if wPolicy.Code != http.StatusCreated {
+		t.Fatalf("create automation policy failed: %d - %s", wPolicy.Code, wPolicy.Body.String())
+	}
+
+	// Query GET /v1/automation-policies
+	wListPolicies := httptest.NewRecorder()
+	r.ServeHTTP(wListPolicies, buildRequest(http.MethodGet, "/v1/automation-policies", nil))
+	if wListPolicies.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /v1/automation-policies, got %d", wListPolicies.Code)
+	}
+	var policiesResp struct {
+		Policies []domain.AutomationPolicy `json:"automation_policies"`
+	}
+	if err := json.NewDecoder(wListPolicies.Body).Decode(&policiesResp); err != nil {
+		t.Fatalf("decode policies failed: %v", err)
+	}
+	if len(policiesResp.Policies) != 1 || policiesResp.Policies[0].Tool != "stripe-refund-tool" {
+		t.Fatalf("unexpected automation policies list: %+v", policiesResp.Policies)
+	}
+
+	// Seed Automation Action
+	w3 := httptest.NewRecorder()
+	r.ServeHTTP(w3, buildRequest(http.MethodPost, "/v1/automation-actions", domain.ProposeAutomationActionRequest{
+		ActionType:     "SEND_REFUND",
+		Role:           "billing-agent",
+		Tool:           "stripe-refund-tool",
+		IdempotencyKey: "test-idem-list-1",
+	}))
+	if w3.Code != http.StatusCreated {
+		t.Fatalf("seed automation action failed: %d - %s", w3.Code, w3.Body.String())
+	}
+
+	// Query GET /v1/automation-actions
+	wListActions := httptest.NewRecorder()
+	r.ServeHTTP(wListActions, buildRequest(http.MethodGet, "/v1/automation-actions", nil))
+	if wListActions.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /v1/automation-actions, got %d", wListActions.Code)
+	}
+	var actionsResp struct {
+		Actions []domain.AutomationAction `json:"automation_actions"`
+	}
+	if err := json.NewDecoder(wListActions.Body).Decode(&actionsResp); err != nil {
+		t.Fatalf("decode actions failed: %v", err)
+	}
+	if len(actionsResp.Actions) != 1 || actionsResp.Actions[0].ActionType != "SEND_REFUND" {
+		t.Fatalf("unexpected automation actions list: %+v", actionsResp.Actions)
+	}
+
+	// Seed Policy Change Approval
+	w4 := httptest.NewRecorder()
+	r.ServeHTTP(w4, buildRequest(http.MethodPost, "/v1/policy-change-approvals", domain.ProposePolicyChangeRequest{
+		TargetPolicyRef: "policy-refund-001",
+		ProposedChange:  "Raise refund cap to $500",
+	}))
+	if w4.Code != http.StatusCreated {
+		t.Fatalf("seed policy change failed: %d - %s", w4.Code, w4.Body.String())
+	}
+
+	// Query GET /v1/policy-change-approvals
+	wListApprovals := httptest.NewRecorder()
+	r.ServeHTTP(wListApprovals, buildRequest(http.MethodGet, "/v1/policy-change-approvals", nil))
+	if wListApprovals.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /v1/policy-change-approvals, got %d", wListApprovals.Code)
+	}
+	var approvalsResp struct {
+		Approvals []domain.PolicyChangeApproval `json:"policy_change_approvals"`
+	}
+	if err := json.NewDecoder(wListApprovals.Body).Decode(&approvalsResp); err != nil {
+		t.Fatalf("decode approvals failed: %v", err)
+	}
+	if len(approvalsResp.Approvals) != 1 || approvalsResp.Approvals[0].TargetPolicyRef != "policy-refund-001" {
+		t.Fatalf("unexpected policy change approvals list: %+v", approvalsResp.Approvals)
+	}
+}
+
