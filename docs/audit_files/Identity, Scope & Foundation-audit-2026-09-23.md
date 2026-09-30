@@ -1,6 +1,6 @@
 # Group 1 — Identity, Scope & Foundation: documentation-compliance audit
 
-**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026)
+**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026)
 **Scope:** all nine services of Group 1, audited one at a time.
 **Source of truth:** the original `.docx` specifications in `docs/architecture/`, **not** the
 per-service `openapi.yaml` / `asyncapi.yaml` artefacts. This is deliberate: auditing code
@@ -22,7 +22,7 @@ diff the two → report. Anything ambiguous in the documents is flagged **needs 
 | 4 | secret-vault-integration-svc | 8087 | Security Standard §13, §9, §3.1 | **86%** (was 40%) | **93%** (was 52%) |
 | 5 | gateway-auth-svc | 8092 | Security §8 + GOV-01 ingress | **95%** (was 68%; 82% at re-audit) | **98%** (was 80%) |
 | 6 | search-indexer-svc | 8096 | ZS-SVC-AB-001 (ESR-01…05) | **96%** (was 86% recounted; published 90%) | **98%** (was 90%; published 93%) |
-| 7 | notification-svc | 8133 | ZS-SVC-Y-001 (NCD-01…05) | 12% | 19% |
+| 7 | notification-svc | 8133 | ZS-SVC-Y-001 (NCD-01…05) | **95%** (was 12%) | **97%** (was 19%) |
 | 8 | delegated-authority-svc | 8136 | ORG-06 (delegation half) | 62% | 69% |
 | 9 | access-control-svc | 8137 | Authorization Standard §9 | 18% | 23% |
 
@@ -1082,103 +1082,154 @@ without a provider rather than falling back to lexical. LAGGING (past half of
 **Contract extracted from:**
 `ZS-SVC-Y-001_Notification_Communication_Delivery_Control_Detailed_Service_Specifications_v1.0.docx`
 §2.1 (five canonical services), §3.3 (sent semantics), §3.4 (idempotency), §4.5 and §5.5 (API
-surfaces), §6–§7.
+surfaces), §6–§8, §10 (APIs, events, reason codes), §14 (NP-01…60), §15 (INV-01…30).
 **Code:** `services/notification-svc/`.
 
-Same shape as service 3: the `.docx` specifies a **five-service control plane**; the
-implementation is a 6-route in-app + SMTP notifier.
+> **Status as of 30 September 2026 — CLOSED within service scope: 35 of 37 scored items met, 2
+> partial pending services that do not exist yet (PRV, DRC).** Remediated on 30 Sep the way
+> service 3 was: the **five-service Y-001 control plane is implemented inside this one service**
+> (`internal/ncd`, migrations `000015`–`000021`), next to the legacy register it now also governs.
+> Each row keeps its 23 Sep finding as *Was:*. Verified three ways: **45 new Go tests** (40 store
+> integration tests run as a `NOSUPERUSER NOBYPASSRLS` role, 2 HTTP-level through the real
+> router and middleware, 3 unit), the whole service suite green (392 tests); **57/57 live checks**
+> (`scripts/ncd_live_check.py`) against the rebuilt image on the real `notification` database with
+> real SMTP (mailpit); and **21/21 Playwright** for the console after the §3.3 change.
+> **Live stand-ins, stated:** authorization-svc and identity-context-svc were small local stubs
+> for the live run (grant all but one principal; resolve every principal but one); the service's
+> own authz client, identity client, envelope, idempotency, RLS and SMTP path were the real ones.
 
-Implemented: `POST /v1/notifications` · `GET /v1/notifications` ·
-`GET /v1/notifications/unread-count` · `GET /v1/notifications/templates` ·
-`GET /v1/notifications/{id}` · `POST /v1/notifications/{id}/read`.
-Events: `notification.sent`, `notification.failed`.
+**Framing, kept from the baseline because it explains the starting number.** The `.docx`
+specifies a control plane of **five canonical services**; on 23 Sep this was a 6-route in-app +
+SMTP notifier. The 23 Sep text scored "34 items" without enumerating them; this section scores the
+**37 rows of its own tables** (the 33 NCD/§3 rows plus the 4 cross-cutting rows), as service 4 was
+rescored on its table's rows.
+
+## Defects found beyond the audit (fixed 2026-09-30)
+
+None of these appear in the 23 Sep tables — most are in code merged after it (`7ac04fc4`).
+
+| Defect | Effect | Fix |
+|---|---|---|
+| The legacy send path (`POST /v1/notifications`, its resend, the retry worker) consulted **no suppression list at all** | A hard-bounced, complained or security-held address was mailed again on every send; the `email_suppressions` rows the webhook processor wrote were read only by the ledger pipeline | `ncd.GatedDeliverer` in front of the provider on all three paths — canonical + legacy suppression, fail closed if unreadable (NP-56). Verified live: a held address now concludes `FAILED` with `NCD-010` |
+| `POST /v1/notifications/webhooks/{provider}` was **unauthenticated** (and envelope-exempt) | One forged POST could suppress any address in any tenant, or mark a message delivered | HMAC-SHA256 over `<timestamp>.<body>` with a per-provider secret, 5-minute replay window; no secret ⇒ refuse everything (INV-27). Verified live: unsigned → 401 |
+| The live `notification` database was on the **pre-merge migration lineage** (its `000005` was our old `event_outbox`; main's `000005`–`000014` were never applied) | The running code referenced tables and columns that did not exist — every template, attempt, resend and suppression write would have failed | Rebuilt (it held **0 rows**) from `000001`–`000021`; grants restored for `app_notification` |
+| `Idempotency-Key` demanded by the envelope, **read by nothing** (cross-service finding 2) | A retried resend recorded a second reasoned resend; a retried approval answered 409 because the first had succeeded | `internal/idempotency` (the identity-context/search-indexer pattern, principal-bound fingerprint, crash takeover), `000015`. Verified live: replay returns the first response with `X-Idempotent-Replay: true` |
+| The dev RBAC seed granted only `NOTIFICATION_SEND`/`VIEW` | The four other actions the service authorizes — `TEMPLATE_MANAGE`, `TEMPLATE_APPROVE`, `NOTIFICATION_SUPPRESS`, `NOTIFICATION_RESOLVE_OUTCOME` — were held by nobody: every template authoring, approval, suppression and outcome resolution was a 403 on the stack | Added to `NOTIFICATION_FULL` in `seed-demo-rbac.ps1`; maker-checker is enforced by the service (author ≠ approver), not by withholding a grant |
+| `openapi.yaml` and `scripts/audit.sh` were **lost in the merge** | No contract artefact for the service | `openapi.yaml` regenerated from the registered routes (76 operations, validated with `openapi-spec-validator`); `scripts/ncd_live_check.py` replaces the audit script |
+| Found during the live run, in the new plane: provider-event and provider-message dedupe keyed on the binding **without the tenant** | An event id seen in one tenant silently swallowed the same id in another, reported `DUPLICATE` against a row the caller cannot see under RLS | Keys are `(tenant, binding, id)` (§7.5 "within tenant/provider scope"); regression test, with a negative control that fails on the old index |
 
 ## NCD-01 Intent, Template & Content Registry (§4.5)
 
-All seven operations — `POST /communication-intents`, `POST /templates`, `/{id}/validate`,
-`/{id}/approve`, `/{id}/publish`, `POST /render-previews`, `GET /intents/{id}/effective` — are
-❌ **missing**. There is no intent registry, no template version lifecycle, no approval with SoD,
-no effective-dated publication, and no locale dimension (zero occurrences of `locale`).
-`GET /v1/notifications/templates` returns a compiled-in catalogue; it is extra surface, not any
-of the seven.
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| `POST /communication-intents` | Create draft intent; server assigns id | `POST /v1/communication-intents` (+ `/versions`, `/activate`, `/retire`, `GET`) | ✅ | **FIXED 2026-09-30.** Server UUID + version; purpose class, domain owner, S/U/E dimensions, allowed channels, fallback, marketing/mandatory flags, typed variable contract, attachment contract, approved URL domains. §4.2 rules in code *and* as DB CHECKs (no marketing in security/regulated, a marketing intent is never mandatory). Activation by a second principal (SoD CHECK); an active version is immutable by trigger — a change is a new version. *Was:* ❌ |
+| `POST /templates` | Draft version bound to intent/channel/locale | `POST /v1/templates` | ✅ | **FIXED.** Stable `template_id` per variant, monotonic versions, content and schema hashes; content immutable from the moment it is written (trigger), so an approval certifies exactly the bytes sent. *Was:* ❌ |
+| `POST /templates/{id}/validate` | Schema, content, security, accessibility, policy | `POST /v1/templates/{id}/validate` | ✅ | **FIXED.** 15 checks, each listed in the report: undeclared variables, CRLF in subject, S2/S3 in subjects (NP-32) and on non-in-app bodies (NP-31), script/event handlers/embeds, external images and tracking pixels, alt text, https + approved-domain links, promotional blocks in non-marketing intents (NP-48), locale format. A failing report keeps the version DRAFT and answers 422. *Was:* ❌ |
+| `POST /templates/{id}/approve` | Cannot approve own material change | `/approve` (+ `/reject`) | ✅ | **FIXED.** Needs a passing report; approver ≠ author in code and by DB CHECK. *Was:* ❌ |
+| `POST /templates/{id}/publish` | Effective-dated immutable publication | `/publish` (+ `/retire`) | ✅ | **FIXED.** `effective_from` (never in the past) + knowledge time; NP-05 in-place edit refused by the database (verified live). *Was:* ❌ |
+| `POST /render-previews` | Side-effect free, synthetic/redacted data | `POST /v1/render-previews` | ✅ | **FIXED.** Synthetic values from the contract by default; any supplied S2/S3 value is redacted; writes nothing (tested); exempt from the idempotency requirement as a query. *Was:* ❌ |
+| `GET /intents/{id}/effective` | By transaction time and knowledge time | `GET /v1/intents/{id}/effective?transaction_time&knowledge_time` | ✅ | **FIXED.** Bitemporal for intents and templates; historical sets reconstruct exactly (tested: as-known-then returns the old version); NCD-001 / NCD-002. *Was:* ❌ |
 
 ## NCD-02 Recipient, Channel, Preference & Suppression (§5.5)
 
-All five operations — `POST /recipient-resolution`, `POST /channel-decision`,
-`GET /suppressions`, `POST /preferences`, `POST /revalidate` — are ❌ **missing**. Zero
-occurrences of `suppression` or `preference`; `quiet` appears 3 times, in comments. §5.3's
-"preference versus permission" separation and §5.4's suppression precedence have nothing to
-enforce them.
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| `POST /recipient-resolution` | Plan id, party/contact refs, endpoint snapshots, locale/time zone | `POST /v1/recipient-resolution` | ✅ | **FIXED.** IAM-verified endpoints from identity-context-svc (provenance `IDENTITY_CONTEXT`), the authenticated inbox (`PLATFORM_INBOX`); addresses hashed and masked in every response; NP-11 free-text endpoint for regulated/mandatory/security only under a controlled exception naming a reviewer ≠ caller; NP-12 cross-tenant refused (`NCD-020`) — no MDM relationship registry exists, so none is authorized. *Was:* ❌ |
+| `POST /channel-decision` | Ordered channels, restrictions, quiet-hour timing, evidence requirement, fallback | `POST /v1/channel-decision` | ⚠️ | **FIXED except PRV.** Pure, replayable decision: privacy DENY blocks even mandatory notices (NP-18), INDETERMINATE → review (NP-17), marketing needs a PERMIT (NP-47), §5.4 precedence, mute override only for mandatory policy with evidence (NP-15/16), quiet hours in the recipient's IANA zone with DST (NP-19, TC-08), unknown zone → review (NP-20), evidence class, residency (NP-30). **Open:** the PRV decision is a *reference the calling domain supplies*; with no PRV service, a non-marketing send that supplies none proceeds on the recorded absence. *Was:* ❌ |
+| `GET /suppressions` | Purpose/channel-scoped effective facts | `GET /v1/suppressions` (+ `POST /v1/suppressions`, `/lift`) | ✅ | **FIXED.** Canonical table keyed on subject or endpoint **hash** (never the address, §7.3); legacy `email_suppressions` projected in (NP-45); rows never deleted; hard-bounce/complaint/legal/security lifts need a second principal's approval (§7.3). *Was:* ❌ |
+| `POST /preferences` | Governed preference; cannot mutate consent | `POST /v1/preferences`, `GET /v1/preferences/me` | ✅ | **FIXED.** Caller's own profile only, versioned with append-only history; quiet hours require an IANA zone; a consent-shaped field is a 400 (unknown fields refused), so NP-60's "disable unsubscribe" has nowhere to go. *Was:* ❌ |
+| `POST /revalidate` | Re-evaluate before first submit / after change | `POST /v1/revalidate` | ✅ | **FIXED.** Fresh plan + decision; an unsubmitted job takes the new routes or is cancelled; submitted attempts are never mutated. The final gate also re-checks suppression and preference atomically before every submission (INV-24). *Was:* ❌ |
 
 ## NCD-03 Delivery Orchestration (§6)
 
 | Item | Documented | Implemented | Status | Notes |
 |---|---|---|---|---|
-| Durable delivery job | §6.1 job contract | the `notifications` row doubles as the job | ⚠️ | |
-| Attempt state machine | §6.2 | `PENDING` (with `next_attempt_at`) → `SENT` \| `FAILED`, concluding exactly once, with backoff | ⚠️ | Well-built for what it models — but see §3.4 below |
-| Provider routing | §6.3 certified providers | single SMTP path | ❌ | |
-| Multi-channel fallback | §6.4 governed new attempt on the same communication_id | — | ❌ | |
-| Rate / abuse / storm controls | §6.5 | — | ❌ | |
-| Cancellation & material change | §6.6 | — | ❌ | |
+| Durable delivery job | §6.1 job contract | `ncd_delivery_jobs` | ✅ | **FIXED.** Route plan, not_before/expires_at, priority, stream, per-route attempt budget, lease; dispatch runs the atomic final recheck in the transaction that creates it. *Was:* ⚠️ the `notifications` row doubled as the job |
+| Attempt state machine | §6.2 | `ncd_attempts` + `ncd_attempt_transition` trigger | ✅ | **FIXED.** Exactly the §6.2 graph, enforced by the database; identity, content hash, render and endpoint snapshot immutable; NP-25 a callback that overtook the API response is not rolled back (verified live). *Was:* ⚠️ PENDING→SENT/FAILED |
+| Provider routing | §6.3 certified providers | `ncd_provider_bindings` + health | ✅ | **FIXED.** Channel capability, evidence class, residency, health (automatic circuit breaker with half-open, operator circuit control), cost only among compliant routes, failover only within the certified group (NP-28 verified: an outage defers, never reroutes). Provider catalogue is email (SMTP) + in-app, the OD-01 baseline; SMS/push await OD-03/OD-04. *Was:* ❌ single SMTP path |
+| Multi-channel fallback | §6.4 governed new attempt, same communication_id | job route advance | ✅ | **FIXED.** Only if the intent allows it, the next route keeps the evidence class (NP-29) and residency, and nothing is UNKNOWN; otherwise an exception. Verified live: a hard bounce falls back to in-app under the same communication. *Was:* ❌ |
+| Rate / abuse / storm | §6.5 | quotas, priority, streams, bulk | ✅ | **FIXED.** Per-tenant/intent/recipient-channel hourly quotas that **defer, never drop** (NP-51); security traffic exempt but bounded per recipient; priority queue (NP-53); storm dedupe by purpose-scoped key; governed bulk sends with audience count + hash, maker-checker at a threshold, dispatch refuses a changed audience (NP-49/50). *Was:* ❌ |
+| Cancellation & material change | §6.6 | `/cancel`, `/misdelivery`, corrections | ✅ | **FIXED.** Queued jobs cancelled with evidence; jobs bound to the exact pinned render; corrections are new communications linked `supersedes_communication_id` + reason (`communication.correction.issued`); misdelivery (NP-44) stops sends, security-holds the endpoint, opens an incident, deletes nothing. *Was:* ❌ |
 
 ## NCD-04 Evidence, Bounce, Complaint & Suppression (§7)
 
-Evidence normalization is ⚠️ — `provider_response` is captured with exactly the right semantics
-in the data model ("a provider took it", never "it arrived"). Bounce handling, complaint
-handling, channel reputation and suppression state are all ❌ **missing**.
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Evidence normalization | §7.1 | `ncd_delivery_evidence` (append-only) | ✅ | **FIXED.** Every fact carries source, confidence and what it **does not prove**; corrections append with lineage (NP-59); open pixels are LOW-confidence signals, never display or acknowledgment (NP-37/38, verified live). *Was:* ⚠️ `provider_response` only |
+| Bounce handling | §7.2 | `POST /v1/provider-events/{binding}` | ✅ | **FIXED.** Authenticated (HMAC, replay window, NP-26), deduplicated (NP-24), binding-scoped; hard bounce → canonical endpoint suppression + remediation exception + fallback; three soft bounces in 72h promote to hard. *Was:* ❌ |
+| Complaint handling | §7.2 | same | ✅ | **FIXED.** Complaint → marketing-scoped suppression immediately + review exception. *Was:* ❌ |
+| Channel reputation | §7.4 | `GET /v1/reputation`, stream controls | ✅ | **FIXED.** Per tenant × stream × binding; a complaint spike pauses MARKETING, a hard-bounce spike pauses the stream — CRITICAL is never paused, only alerted; paused traffic is deferred (tested). *Was:* ❌ |
+| Suppression state | §7.3 | canonical suppressions | ✅ | **FIXED.** Idempotent, effective immediately, cross-provider (NP-45), lifts governed. *Was:* ❌ |
 
-## NCD-05 Regulated Notice & Acknowledgment
+## NCD-05 Regulated Notice & Acknowledgment (§8)
 
-❌ Missing entirely — no notice packages, acknowledgement requirements, escalation evidence or
-DRC handoff.
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Notice packages | §8.1 | `POST /v1/regulated-notices`, `ncd_regulated_notices` | ✅ | **FIXED.** PDC basis reference, recipient capacity, delivery methods, content-package hash over the pinned renders + attachments, WFC clock, ack requirement; package immutable by trigger; a regulated communication cannot dispatch without one (`NCD-018`); `legal_sufficiency` is always `NOT_DETERMINED_BY_NCD` (§8.5). *Was:* ❌ |
+| Acknowledgment requirements | §8.3 | `POST /v1/acknowledgments` | ✅ | **FIXED.** The authenticated recipient only; bound to the exact notice version and the content hash they were shown (NP-40); superseded versions refused; operator-recorded evidence only through maker-checker with an artifact (NP-41). *Was:* ❌ |
+| Escalation evidence | §8.2 | deadline sweep | ✅ | **FIXED.** `notice.deadline.at_risk` inside the at-risk window and at expiry; expiry never fabricates an acknowledgment (NP-42); delivery failure escalates the notice. *Was:* ❌ |
+| DRC handoff | §8.1 record declaration | `POST /v1/regulated-notices/{id}/record-declaration` | ⚠️ | **FIXED except DRC.** Record requirement tracked (`PENDING` → `DECLARED`, `communication.record.declared`), an overdue declaration escalates (NP-58). **Open:** there is no DRC service to push the package to; the declaration arrives by callback. *Was:* ❌ |
 
 ## §3.3 and §3.4 — the non-bypassable rules
 
 | Item | Documented | Implemented | Status | Notes |
 |---|---|---|---|---|
-| **"Sent" is never overloaded** | §3.3 **non-bypassable semantic rule**: "NCD must never expose one generic `sent=true` status". Five distinct claims are enumerated | the DB status enum is exactly `PENDING`, `SENT`, `FAILED`, and `SENT` is what `GET /v1/notifications` returns | ❌ | The data model's comments show the distinction was understood; the *exposed status* collapses it anyway |
-| Stable `communication_id` | §3.4 | the notification id | ✅ | |
-| Purpose-scoped idempotency key derived from the originating business event | §3.4 | unique index on `(tenant_id, correlation_id)` | ⚠️ | Close, but not purpose-scoped — two different communications sharing a correlation collide |
-| **Durable `attempt_id` per provider submission** | §3.4 | `delivery_attempts INT` — a counter, not records | ❌ | |
-| **Timeout after submit becomes UNKNOWN, not FAILED; reconcile before re-attempting** | §3.4 | no UNKNOWN state exists. A post-submit timeout is a retryable error, so the row stays `PENDING` and the worker **sends again** | ❌ | Duplicate delivery on exactly the failure §3.4 was written to prevent |
-| Resend carries an explicit reason and preserves the evidence chain | §3.4 | — | ❌ | |
+| **"Sent" is never overloaded** | §3.3 | precise delivery states everywhere | ✅ | **FIXED.** The plane has no SENT state; claims are separate fields (provider accepted / delivered / opened / acknowledged / `legally_served: NOT_DETERMINED_BY_NCD`). The legacy register now exposes `PROVIDER_ACCEPTED` or `DELIVERED_TO_INBOX` as `status` (column kept as `stored_status`, filter accepts both), and `notification.sent` carries `delivery_state`. Console updated (21/21 Playwright). *Was:* ❌ |
+| Stable `communication_id` | §3.4 | `ncd_communications` | ✅ | Unchanged at baseline for the register; the plane's communication carries every job, attempt and fallback (INV-02). |
+| Purpose-scoped idempotency key from the business event | §3.4 | `(tenant, idempotency_key)` unique | ✅ | **FIXED.** Key = hash(tenant, entity, intent, source event, recipient); a replayed source event returns the existing communication with `NCD-019` (NP-21, verified live with a different `Idempotency-Key`). *Was:* ⚠️ correlation-only |
+| **Durable `attempt_id` per provider submission** | §3.4 | `ncd_attempts` | ✅ | **FIXED.** One immutable row per submission with its own provider idempotency token (sent as `X-Zoiko-Idempotency-Token`); one provider message id per attempt within tenant/provider scope (NP-27 collision → quarantine exception). *Was:* ❌ counter |
+| **Timeout after submit → UNKNOWN, reconcile first** | §3.4 | UNKNOWN + trigger | ✅ | **FIXED.** Ambiguous submit → UNKNOWN with a resolution deadline; an attempt left SUBMITTING by a crash becomes UNKNOWN; **the database refuses any new attempt of the communication while one is UNKNOWN** (verified live); resolution only against the original with evidence; past its deadline → human exception. *Was:* ❌ re-sent |
+| Resend carries a reason, preserves the chain | §3.4 | `/resend` | ✅ | **FIXED.** Reason mandatory, new job under the same communication, original attempts untouched; high-impact (regulated/mandatory/security) resends go through maker-checker (§11.3). *Was:* ❌ |
 
 ## Cross-cutting platform controls (done well)
 
-✅ Tenant isolation via RLS with two *separately named* GUCs (`app.platform_scope`, read-only,
-for the retry worker; `app.outbox_relay` for the relay) — reusing one name would have silently
-widened the retry hatch to writes across every tenant's message bodies.
-✅ Transactional outbox with `CompleteDelivery` taking the sealed event as a **required**
-argument, so "conclude and tell nobody" is unrepresentable.
-✅ Channel enum validated at the request boundary.
-⚠️ `GET /v1/notifications/templates` now requires principal + tenant — an earlier
-unauthenticated-read defect is **fixed** (verified in code, not assumed).
+✅ Tenant isolation via RLS on every table, now **proven as a non-superuser role** (the suite
+connects as `NOSUPERUSER NOBYPASSRLS`); cross-tenant discovery only through the SELECT-only
+`app.platform_scope` hatch projecting ids; platform binding writes under their own
+`app.binding_admin` flag. ✅ Transactional outbox for all ten §10.2 events (`000021`), drained by the
+relay (verified live). ✅ Channel enum validated at the request boundary. ✅ `GET
+/v1/notifications/templates` requires principal + tenant.
 
 ## Compliance
 
-**4 of 34 scored items fully met — 12%** (partials at half: **19%**).
+**35 of 37 scored items fully met — 95%** (partials at half: **97%**). *Was:* 4 of 34 — 12% (19%).
 
-**Top gaps by risk**
+**Top gaps by risk** — all six closed within service scope on 2026-09-30:
 
-1. **A post-submit timeout re-sends** (data integrity, user-visible). No UNKNOWN state and no
-   provider reconciliation, so a network break after the SMTP server accepted produces a second
-   delivery. For a payslip or a legal notice that is a real-world incident, and §3.4 calls it
-   out by name.
-2. **`SENT` is exposed as a single generic status** (correctness, legal). §3.3 is labelled
-   non-bypassable precisely because "provider accepted" and "legally served" are different
-   propositions. Downstream consumers and the UI currently cannot tell them apart.
-3. **No suppression, preference or channel-decision layer** (privacy / compliance). Nothing
-   stops a communication going to a recipient who has opted out or is suppressed — NCD-02 is the
-   control that prevents it and it does not exist.
-4. **No bounce or complaint ingestion** (deliverability + compliance). Channel reputation
-   degrades invisibly.
-5. **No template registry, approval or effective-dated publication** (governance). Content is
-   compiled in, so a content change is a code deploy with no approval trail.
-6. **No regulated-notice / acknowledgement path** (legal) — NCD-05 absent.
+1. ~~**A post-submit timeout re-sends**~~ — **FIXED.** UNKNOWN is a state, a database trigger forbids
+   a second attempt while one exists, and only reconciliation of the original releases it.
+2. ~~**`SENT` is exposed as a single generic status**~~ — **FIXED** in the plane, the legacy API, the
+   event payload and the console.
+3. ~~**No suppression, preference or channel-decision layer**~~ — **FIXED**, and the legacy send path
+   is gated by it too (it was not gated by anything).
+4. ~~**No bounce or complaint ingestion**~~ — **FIXED**, authenticated; the legacy webhook is now
+   authenticated as well.
+5. ~~**No template registry, approval or effective-dated publication**~~ — **FIXED.**
+6. ~~**No regulated-notice / acknowledgement path**~~ — **FIXED**; DRC handoff waits on DRC.
 
-As with service 3, confirm whether Y-001 was ever this service's contract before treating 12% as
-a verdict. If NCD-01…05 are planned as separate services, this one is a reasonable NCD-03 core
-with the §3.3 / §3.4 defects being the genuine bugs.
+**Still true, and worth stating: the legacy path is not an intent.** `POST /v1/notifications` and
+`POST /v1/notifications/events/ingest` still accept sends that name no communication intent — now
+suppression-gated and §3.3-correct, but not purpose-classified. INV-01 ("no production
+person-directed message bypasses NCD") holds only once callers move to `POST /v1/communications`;
+progress.md (8 Sep) recorded that nothing on the estate sends a notification yet, so this is the
+moment to move callers.
+
+## Remaining cross-service dependencies
+
+1. **PRV** — authoritative privacy/marketing permission decisions (closes the channel-decision ⚠️).
+2. **DRC** — record declaration of the notice evidence package (closes the DRC-handoff ⚠️).
+3. **XIC / secret store** — provider bindings and callback secrets live here as registry rows and
+   environment variables until XIC and the vault own them (INV-26 holds: no secret in a row).
+4. **MDM** — external-party contacts and authorized cross-tenant relationships (refused until then).
+5. **authorization-svc** — the four notification actions now in the dev seed must be granted in
+   real deployments.
+
+**Decisions taken where the spec is silent** (OD-06, OD-13, OD-15; revisit when ratified): E4 needs
+an E3-capable route plus an NCD-05 acknowledgment; UNKNOWN resolution deadline 30 min; evidence
+window 15 min; quotas 5000/tenant, 2000/intent, 20/recipient-channel per hour (security 30/recipient);
+bulk approval at 50 recipients or any S3 intent; reputation spike thresholds 0.3% complaints / 5%
+hard bounces over ≥20 attempts in 24h; three soft bounces in 72h promote to hard; platform default
+quiet window 21:00–08:00 for marketing only.
 
 ---
 
@@ -1338,18 +1389,17 @@ overwrote each other's actions there and detaching either retired both.
 | 4 | secret-vault-integration-svc | Security Standard §13, §9, §3.1 | 21 | 18 (**86%**) — was 10 of 25 (40%) as stated; 7 of 19 on its table | **93%** — was 52% |
 | 5 | gateway-auth-svc | Security §8 + GOV-01 ingress | 22 | 21 (**95%**) — was 15 (68%); 18 at re-audit | **98%** — was 80% |
 | 6 | search-indexer-svc | ZS-SVC-AB-001 | 49 | 47 (**96%**) — was 42 of 49 (86%) recounted; published 43 of 48 (90%) | **98%** — was 90%; published 93% |
-| 7 | notification-svc | ZS-SVC-Y-001 | 34 | 4 (12%) | 19% |
+| 7 | notification-svc | ZS-SVC-Y-001 | 37 | 35 (**95%**) — was 4 of 34 (12%) | **97%** — was 19% |
 | 8 | delegated-authority-svc | ORG-06 (delegation half) | 37 | 23 (62%) | 69% |
 | 9 | access-control-svc | Authorization Standard §9 | 11 | 2 (18%) | 23% |
-| | **Group total** | | **315** | **251 — 80%** (was 247 of 314 — 79%; 241 — 77%; 233 — 73%; 192 — 60%; 171 — 54% at baseline) | **≈83%** (was ≈82%; ≈81%; ≈78%; ≈66%; 61% at baseline) |
+| | **Group total** | | **318** | **282 — 89%** (was 251 of 315 — 80%; 247 of 314 — 79%; 241 — 77%; 233 — 73%; 192 — 60%; 171 — 54% at baseline) | **≈92%** (was ≈83%; ≈82%; ≈81%; ≈78%; ≈66%; 61% at baseline) |
 
-24 items scored partial and **9 need clarification** (was 25 before the search-indexer-svc remediation; 29 before the gateway-auth-svc remediation and re-audit; 32 and 11 before the secret-vault-integration-svc remediation; 45 and 17 at baseline, before the re-audits of identity-context-svc and tenant-entity-registry-svc and the remediation of configuration-feature-flag-svc). secret-vault-integration-svc is now scored on its table's 21 rows rather than the unreproducible 25, and search-indexer-svc on its table's 49 rows rather than the 48 its first headline used. The group total is an unweighted item
+21 items scored partial and **9 need clarification** (was 24 before the notification-svc remediation, which also rescored it on its tables' 37 rows rather than the unenumerated 34; 25 before the search-indexer-svc remediation; 29 before the gateway-auth-svc remediation and re-audit; 32 and 11 before the secret-vault-integration-svc remediation; 45 and 17 at baseline, before the re-audits of identity-context-svc and tenant-entity-registry-svc and the remediation of configuration-feature-flag-svc). secret-vault-integration-svc is now scored on its table's 21 rows rather than the unreproducible 25, and search-indexer-svc on its table's 49 rows rather than the 48 its first headline used. The group total is an unweighted item
 count across services of very different sizes; the per-service figures are the ones to act on.
 
-Service 7 pulls the mean down because it implements one slice of a five-service control plane.
-**That is the first thing to resolve**, since it decides whether it is a 12%-complete service or a
-correctly-sized component of a plane that was never built. Service 3 had the same shape; it was
-resolved on 29 Sep by implementing the AA-001 control plane inside the one service (96%).
+Service 7 used to pull the mean down because it implemented one slice of a five-service control
+plane. It was resolved on 30 Sep the way service 3 was on 29 Sep: the Y-001 plane implemented inside the
+one service (95%). The weakest remaining services are now 8 and 9.
 
 ## The four findings that cross service boundaries
 
@@ -1386,7 +1436,8 @@ resolved on 29 Sep by implementing the AA-001 control plane inside the one servi
    2026-09-23, replay bound to the principal and crash recovery 2026-09-28 — the pattern to copy;
    **also fixed in tenant-entity-registry-svc**, so a replayed tenant provision no longer creates a
    second tenant; **also fixed in search-indexer-svc 2026-09-30** — every command now honours the key,
-   verified live and under RLS as an unprivileged role). Replaying a break-glass grant elsewhere still
+   verified live and under RLS as an unprivileged role; **also fixed in notification-svc 2026-09-30** — the
+   middleware on every write, verified live). Replaying a break-glass grant elsewhere still
    creates a second one.
 
 3. **Maker-checker must be server-side, not self-asserted.** tenant-entity-registry-svc used to
@@ -1408,8 +1459,8 @@ Ranked by risk across all nine services:
 1. Header sanitation at the edge — **fixed in gateway-auth-svc 2026-09-29** (split policy); `X-Commercial-Plan` / `X-Org-Unit-Id` still open
 2. Role-revocation topic mismatch (access-control-svc → identity-context-svc) — **consumer side fixed 2026-09-28**
 3. Broker workload identity (secret-vault-integration-svc) — **fixed in service 2026-09-29**; the edge strips `X-Workload-Id` since 2026-09-29 (5/9)
-4. Notification post-submit retry duplication
-5. Idempotency replay protection — **done in identity-context-svc, tenant-entity-registry-svc and search-indexer-svc**; other services still to follow
+4. Notification post-submit retry duplication — **fixed in notification-svc 2026-09-30** (UNKNOWN state; the database refuses a second attempt while one is UNKNOWN)
+5. Idempotency replay protection — **done in identity-context-svc, tenant-entity-registry-svc, search-indexer-svc and notification-svc**; other services still to follow
 6. Maker-checker approver verification — **done in tenant-entity-registry-svc**
 
 ## Open questions — decisions, not further searching
@@ -1417,7 +1468,10 @@ Ranked by risk across all nine services:
 - **OD-10 — which embedding provider and model?** search-indexer-svc's semantic search is built and
   verified with a stub; until a provider is chosen its two semantic rows stay ⚠️ (6/9).
 
-- Are CFG-01 / CFG-04 / CFG-05 and NCD-01 / NCD-02 / NCD-04 / NCD-05 planned as separate services?
+- ~~Are CFG-01 / CFG-04 / CFG-05 and NCD-01 / NCD-02 / NCD-04 / NCD-05 planned as separate services?~~
+  Resolved in practice: both control planes are implemented inside their one service (3/9 on 29 Sep, 7/9 on 30 Sep).
+- Which services own PRV, DRC, XIC and MDM? notification-svc consumes all four by reference and has two items
+  waiting on PRV and DRC (7/9).
 - Are access-control-svc and authorization-svc meant to share role ownership?
 - Do the §8 Internet-edge controls (DDoS, WAF, rate limiting, TLS, request-size limits) live in
   the GCP deployment runbook? *Partly answered 29 Sep:* the runbook puts TLS at the GCP L7 load

@@ -1,6 +1,54 @@
 # notification-svc — Progress
 
-## Status: complete and working, with no callers (2026-09-08)
+## Status: ZS-SVC-Y-001 control plane implemented and verified live (2026-09-30)
+
+The five canonical NCD services now live in this one service (`internal/ncd`, migrations
+`000015`–`000021`), the way configuration-feature-flag-svc implemented AA-001. Group 1 audit 7/9
+went from 12% to **95%** (35 of 37 rows; the two partials wait on PRV and DRC, which do not exist).
+The full scoring, row by row, is in `docs/audit_files/Identity, Scope & Foundation-audit-2026-09-23.md`.
+
+**Re-prove it:** `python scripts/ncd_live_check.py` against a running service (57 checks; header of
+the script says what it needs), and the store suite with `TEST_DATABASE_URL` pointing at
+`notification_test` — it resets the schema, applies every migration and connects as the
+unprivileged `zoiko_ncd_app` role, because a superuser bypasses RLS and would hide exactly the
+defects RLS exists to catch. Regenerate the contract with `python scripts/gen_openapi.py`.
+
+**Shape.** `internal/ncd` is pure policy over two ports: `Store.InTx` hands out a tenant-scoped
+`Tx` whose `Enqueue` is the only way to emit an event (so no fact is announced outside the
+transaction that records it), and `Transport` submits through a certified binding (SMTP router,
+or the in-app register). Handlers in `internal/handler/ncd_handler.go` fetch, authorize against the
+stored object's legal entity, then act. The worker (`Service.Run`) moves jobs, turns stranded
+SUBMITTING attempts into UNKNOWN, raises UNKNOWN past its deadline as an exception, runs notice
+clocks and evaluates reputation; dispatch kicks it.
+
+**The rules that are database rules, not conventions:** template and intent content immutable
+(triggers); the §6.2 attempt graph (trigger); no new attempt of a communication while one is
+UNKNOWN (trigger — INV-13 cannot be forgotten by any code path); evidence, plans, decisions and
+acknowledgments append-only; suppressions never deleted, governed lifts need a second principal
+(CHECK); SoD on intent activation and template approval (CHECK).
+
+**Defects found on the way, all fixed:** the legacy send path consulted no suppression list at all
+(`GatedDeliverer` now gates handler, resend and retry worker); the legacy provider webhook was
+unauthenticated (HMAC now); the live `notification` DB was on the pre-merge migration lineage
+(empty — rebuilt to 000021); `Idempotency-Key` was demanded and never read (middleware now); the dev
+RBAC seed granted none of the four other actions this service authorizes; `openapi.yaml` and the
+audit script were lost in the merge; and, in the new code, callback dedupe keyed without the tenant.
+
+**§3.3 on the legacy register.** `status` in every API response is now the precise proposition
+(`PROVIDER_ACCEPTED`, `DELIVERED_TO_INBOX`, `DELIVERY_UNKNOWN`, `RETRY_SCHEDULED`, …); the column is
+unchanged and returned as `stored_status`; `?status=` accepts both vocabularies; the console and its
+e2e mock follow.
+
+**Still open:** the legacy `POST /v1/notifications` and `/events/ingest` paths remain for existing
+callers and name no intent — gated and §3.3-correct, but INV-01 holds only once callers move to
+`POST /v1/communications`. Provider callbacks for SMTP need a real adapter posting to
+`/v1/provider-events/smtp-primary` with `NCD_CALLBACK_SECRET_SMTP_PRIMARY`; the legacy webhook needs
+`NOTIFICATION_WEBHOOK_SECRET[_<PROVIDER>]` or it refuses everything (by design). `docker-compose.yml`
+sets development defaults for both; a real deployment must set them from the secret store.
+
+---
+
+## Earlier status: complete and working, with no callers (2026-09-08)
 
 Six routes, all wired to the Next.js console. Templates, retry with
 exponential backoff and jitter, the stranded-delivery sweep added this pass,

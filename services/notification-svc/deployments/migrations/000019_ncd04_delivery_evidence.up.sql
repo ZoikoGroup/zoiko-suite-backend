@@ -39,8 +39,12 @@ CREATE TABLE IF NOT EXISTS ncd_delivery_evidence (
 );
 CREATE INDEX IF NOT EXISTS idx_ncd_evidence_comm ON ncd_delivery_evidence (tenant_id, communication_id, received_at);
 CREATE INDEX IF NOT EXISTS idx_ncd_evidence_reputation ON ncd_delivery_evidence (tenant_id, binding_id, evidence_type, received_at);
--- NP-24: a duplicated provider callback is deduplicated by provider event id.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_ncd_evidence_provider_event ON ncd_delivery_evidence (binding_id, provider_event_id)
+-- NP-24: a duplicated provider callback is deduplicated by provider event id,
+-- within tenant/provider scope (§7.5). Tenant is part of the key: without it
+-- an event id seen in one tenant silently swallowed the same id in another —
+-- reported DUPLICATE against a row the caller cannot even see under RLS.
+DROP INDEX IF EXISTS idx_ncd_evidence_provider_event;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ncd_evidence_provider_event ON ncd_delivery_evidence (tenant_id, binding_id, provider_event_id)
     WHERE provider_event_id IS NOT NULL;
 
 DROP TRIGGER IF EXISTS trg_ncd_evidence_append_only ON ncd_delivery_evidence;

@@ -1,9 +1,11 @@
 package webhook
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -13,7 +15,13 @@ import (
 type Handler struct {
 	processor *Processor
 	log       *zap.Logger
+	// secretFor resolves a provider's signing secret (see auth.go).
+	secretFor func(provider string) string
+	now       func() time.Time
 }
+
+// SetSecretLookup replaces the secret source (tests, secret stores).
+func (h *Handler) SetSecretLookup(f func(provider string) string) { h.secretFor = f }
 
 func NewHandler(processor *Processor, log *zap.Logger) *Handler {
 	if log == nil {
@@ -22,6 +30,8 @@ func NewHandler(processor *Processor, log *zap.Logger) *Handler {
 	return &Handler{
 		processor: processor,
 		log:       log,
+		secretFor: EnvSecret,
+		now:       time.Now,
 	}
 }
 
@@ -47,6 +57,17 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	if len(body) == 0 {
 		http.Error(w, `{"error":"empty webhook payload"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Authenticate before anything is parsed or written (INV-27).
+	if err := verify(h.secretFor(provider), r.Header.Get("X-Webhook-Timestamp"), r.Header.Get("X-Webhook-Signature"), body, h.now()); err != nil {
+		h.log.Warn("webhook rejected", zap.String("provider", provider), zap.String("remote", r.RemoteAddr), zap.Error(err))
+		status := http.StatusUnauthorized
+		if errors.Is(err, errSecretUnset) {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(w, `{"status":"error","message":"`+err.Error()+`"}`, status)
 		return
 	}
 

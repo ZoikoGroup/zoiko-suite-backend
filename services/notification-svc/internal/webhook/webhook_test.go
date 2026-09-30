@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -507,14 +508,42 @@ func TestWebhook_HTTPHandler_Routing(t *testing.T) {
 
 	processor := webhook.NewProcessor(store, zap.NewNop())
 	h := webhook.NewHandler(processor, zap.NewNop())
+	h.SetSecretLookup(func(string) string { return "wh-secret" })
 
 	r := chi.NewRouter()
 	h.RegisterRoutes(r)
 
+	sign := func(req *http.Request, body string) {
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		req.Header.Set("X-Webhook-Timestamp", ts)
+		req.Header.Set("X-Webhook-Signature", webhook.Sign("wh-secret", ts, []byte(body)))
+	}
+
 	// Valid payload
 	payload := `{"event_id":"evt-h-1","event_type":"DELIVERED","recipient_email":"http@example.com","provider_message_id":"<msg-http-001@zoikosuite.com>"}`
+
+	// INV-27: unsigned and wrongly signed webhooks change nothing.
+	unsigned := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(payload)))
+	uw := httptest.NewRecorder()
+	r.ServeHTTP(uw, unsigned)
+	if uw.Code != http.StatusUnauthorized {
+		t.Fatalf("an unsigned webhook must be refused, got %d", uw.Code)
+	}
+	forged := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(payload)))
+	forged.Header.Set("X-Webhook-Timestamp", strconv.FormatInt(time.Now().Unix(), 10))
+	forged.Header.Set("X-Webhook-Signature", "sha256=00")
+	fw := httptest.NewRecorder()
+	r.ServeHTTP(fw, forged)
+	if fw.Code != http.StatusUnauthorized {
+		t.Fatalf("a forged webhook must be refused, got %d", fw.Code)
+	}
+	if len(store.events) != 0 {
+		t.Fatalf("a refused webhook must record nothing, got %d events", len(store.events))
+	}
+
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(payload)))
 	req.Header.Set("Content-Type", "application/json")
+	sign(req, payload)
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -525,6 +554,7 @@ func TestWebhook_HTTPHandler_Routing(t *testing.T) {
 
 	// Malformed payload
 	badReq := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(`{not json`)))
+	sign(badReq, `{not json`)
 	badW := httptest.NewRecorder()
 
 	r.ServeHTTP(badW, badReq)

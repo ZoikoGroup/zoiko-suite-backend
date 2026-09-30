@@ -1998,6 +1998,15 @@ services:
       # replica is still working on and the recipient gets it twice. 0 is a
       # true off switch, not "sweep everything now".
       NOTIFICATION_STRANDED_AFTER: "${NOTIFICATION_STRANDED_AFTER:-15m}"
+
+      # Provider callbacks are authenticated (ZS-SVC-Y-001 INV-27). With no
+      # secret configured both routes refuse every request — fail closed —
+      # so the development stack sets its own; a real deployment sets these
+      # from the secret store, never from these defaults.
+      #   NCD plane:     POST /v1/provider-events/smtp-primary
+      #   legacy route:  POST /v1/notifications/webhooks/{provider}
+      NCD_CALLBACK_SECRET_SMTP_PRIMARY: "${NCD_CALLBACK_SECRET_SMTP_PRIMARY:-dev-ncd-callback-secret}"
+      NOTIFICATION_WEBHOOK_SECRET: "${NOTIFICATION_WEBHOOK_SECRET:-dev-webhook-secret}"
     depends_on:
       postgres:
         condition: service_healthy

@@ -205,10 +205,11 @@ CREATE INDEX IF NOT EXISTS idx_ncd_attempts_awaiting ON ncd_attempts (submitted_
 -- One ambiguous-or-in-flight attempt per job at a time.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ncd_attempts_one_open ON ncd_attempts (job_id)
     WHERE state IN ('CREATED','SUBMITTING','UNKNOWN');
--- §7.5: every provider message id maps to exactly one attempt within a
--- provider scope. A second attempt claiming the same id is refused here and
--- becomes a reconciliation exception (NP-27), never a silent merge.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_ncd_attempts_provider_msg ON ncd_attempts (binding_id, provider_message_id)
+-- §7.5: every provider message id maps to exactly one attempt within
+-- tenant/provider scope. A second attempt claiming the same id is refused here
+-- and becomes a reconciliation exception (NP-27), never a silent merge.
+DROP INDEX IF EXISTS idx_ncd_attempts_provider_msg;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ncd_attempts_provider_msg ON ncd_attempts (tenant_id, binding_id, provider_message_id)
     WHERE provider_message_id IS NOT NULL;
 
 -- §6.2 as a database rule, not a convention: the transitions of the figure
@@ -329,7 +330,7 @@ CREATE TABLE IF NOT EXISTS ncd_exceptions (
                                 'UNKNOWN_UNRESOLVED','PROVIDER_ID_COLLISION','MISSING_CALLBACK',
                                 'FALLBACK_BLOCKED','NO_ROUTE','DELIVERY_EXPIRED','DEADLINE_AT_RISK',
                                 'ACK_EXPIRED','RECORD_HANDOFF_PENDING','STREAM_PAUSED','CALLBACK_REJECTED',
-                                'ENDPOINT_REMEDIATION')),
+                                'ENDPOINT_REMEDIATION','MISDELIVERY_INCIDENT','REPUTATION_ALERT')),
     reason_code             VARCHAR(10),
     detail                  TEXT         NOT NULL,
     created_at              TIMESTAMPTZ  NOT NULL DEFAULT now(),

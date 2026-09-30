@@ -234,9 +234,21 @@ $BUNDLES = @(
         # notification-svc authorizes sends against the target legal entity
         # and views against the legal entity being queried, so the console
         # grants these on the legal entity scope.
+        #
+        # The ZS-SVC-Y-001 control plane (30 Sep 2026) also authorizes intent
+        # and template authorship (TEMPLATE_MANAGE), their activation and
+        # publication (TEMPLATE_APPROVE), suppression and circuit/stream
+        # controls (NOTIFICATION_SUPPRESS) and UNKNOWN reconciliation /
+        # operator evidence (NOTIFICATION_RESOLVE_OUTCOME). Without them every
+        # NCD authoring or approval call is a 403 on this stack. Maker-checker
+        # is enforced by the service (author != approver), not by withholding
+        # a grant, so one development bundle can hold both halves.
         Code    = "NOTIFICATION_FULL"
         Service = "notification-svc"
-        Actions = @("NOTIFICATION_SEND", "NOTIFICATION_VIEW")
+        Actions = @(
+            "NOTIFICATION_SEND", "NOTIFICATION_VIEW", "TEMPLATE_MANAGE", "TEMPLATE_APPROVE",
+            "NOTIFICATION_SUPPRESS", "NOTIFICATION_RESOLVE_OUTCOME"
+        )
     },
     @{
         # board-resolutions-svc authorizes meeting creation against the

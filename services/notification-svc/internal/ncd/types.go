@@ -276,31 +276,31 @@ const (
 // TemplateVersion is one immutable channel/locale variant of an intent's
 // content (§9.1 TemplateVersion).
 type TemplateVersion struct {
-	TemplateVersionID      string           `json:"template_version_id"`
-	TemplateID             string           `json:"template_id"`
-	Version                int              `json:"version"`
-	TenantID               string           `json:"tenant_id"`
-	LegalEntityID          string           `json:"legal_entity_id"`
-	IntentID               string           `json:"intent_id"`
-	IntentVersion          int              `json:"intent_version"`
-	Channel                string           `json:"channel"`
-	Locale                 string           `json:"locale"`
-	CompatibleLocales      []string         `json:"compatible_locales"`
-	Subject                string           `json:"subject"`
-	Body                   string           `json:"body"`
-	ContentHash            string           `json:"content_hash"`
-	SchemaHash             string           `json:"schema_hash"`
-	Status                 string           `json:"status"`
-	CreatedByPrincipalID   string           `json:"created_by_principal_id"`
-	CreatedAt              time.Time        `json:"created_at"`
-	ValidatedAt            *time.Time       `json:"validated_at,omitempty"`
+	TemplateVersionID      string            `json:"template_version_id"`
+	TemplateID             string            `json:"template_id"`
+	Version                int               `json:"version"`
+	TenantID               string            `json:"tenant_id"`
+	LegalEntityID          string            `json:"legal_entity_id"`
+	IntentID               string            `json:"intent_id"`
+	IntentVersion          int               `json:"intent_version"`
+	Channel                string            `json:"channel"`
+	Locale                 string            `json:"locale"`
+	CompatibleLocales      []string          `json:"compatible_locales"`
+	Subject                string            `json:"subject"`
+	Body                   string            `json:"body"`
+	ContentHash            string            `json:"content_hash"`
+	SchemaHash             string            `json:"schema_hash"`
+	Status                 string            `json:"status"`
+	CreatedByPrincipalID   string            `json:"created_by_principal_id"`
+	CreatedAt              time.Time         `json:"created_at"`
+	ValidatedAt            *time.Time        `json:"validated_at,omitempty"`
 	ValidationReport       *ValidationReport `json:"validation_report,omitempty"`
-	ApprovedByPrincipalID  string           `json:"approved_by_principal_id,omitempty"`
-	ApprovedAt             *time.Time       `json:"approved_at,omitempty"`
-	PublishedByPrincipalID string           `json:"published_by_principal_id,omitempty"`
-	PublishedAt            *time.Time       `json:"published_at,omitempty"`
-	EffectiveFrom          *time.Time       `json:"effective_from,omitempty"`
-	RetiredAt              *time.Time       `json:"retired_at,omitempty"`
+	ApprovedByPrincipalID  string            `json:"approved_by_principal_id,omitempty"`
+	ApprovedAt             *time.Time        `json:"approved_at,omitempty"`
+	PublishedByPrincipalID string            `json:"published_by_principal_id,omitempty"`
+	PublishedAt            *time.Time        `json:"published_at,omitempty"`
+	EffectiveFrom          *time.Time        `json:"effective_from,omitempty"`
+	RetiredAt              *time.Time        `json:"retired_at,omitempty"`
 }
 
 // EffectiveSet is GET /v1/intents/{id}/effective (§4.5): the exact intent
@@ -433,24 +433,24 @@ func GovernedReactivation(reason string) bool {
 
 // Suppression is one canonical suppression fact.
 type Suppression struct {
-	SuppressionID       string     `json:"suppression_id"`
-	TenantID            string     `json:"tenant_id"`
-	SubjectPrincipalID  string     `json:"subject_principal_id,omitempty"`
-	EndpointHash        string     `json:"endpoint_hash,omitempty"`
-	EndpointMasked      string     `json:"endpoint_masked,omitempty"`
-	ChannelScope        string     `json:"channel_scope"`
-	PurposeScope        string     `json:"purpose_scope"`
-	Reason              string     `json:"reason"`
-	Source              string     `json:"source"`
-	SourceEvidenceRef   string     `json:"source_evidence_ref"`
-	EffectiveFrom       time.Time  `json:"effective_from"`
-	EffectiveUntil      *time.Time `json:"effective_until,omitempty"`
-	CreatedByPrincipal  string     `json:"created_by_principal_id"`
-	CreatedAt           time.Time  `json:"created_at"`
-	LiftedAt            *time.Time `json:"lifted_at,omitempty"`
-	LiftedByPrincipal   string     `json:"lifted_by_principal_id,omitempty"`
-	LiftEvidenceRef     string     `json:"lift_evidence_ref,omitempty"`
-	LiftApprovedBy      string     `json:"lift_approved_by_principal_id,omitempty"`
+	SuppressionID      string     `json:"suppression_id"`
+	TenantID           string     `json:"tenant_id"`
+	SubjectPrincipalID string     `json:"subject_principal_id,omitempty"`
+	EndpointHash       string     `json:"endpoint_hash,omitempty"`
+	EndpointMasked     string     `json:"endpoint_masked,omitempty"`
+	ChannelScope       string     `json:"channel_scope"`
+	PurposeScope       string     `json:"purpose_scope"`
+	Reason             string     `json:"reason"`
+	Source             string     `json:"source"`
+	SourceEvidenceRef  string     `json:"source_evidence_ref"`
+	EffectiveFrom      time.Time  `json:"effective_from"`
+	EffectiveUntil     *time.Time `json:"effective_until,omitempty"`
+	CreatedByPrincipal string     `json:"created_by_principal_id"`
+	CreatedAt          time.Time  `json:"created_at"`
+	LiftedAt           *time.Time `json:"lifted_at,omitempty"`
+	LiftedByPrincipal  string     `json:"lifted_by_principal_id,omitempty"`
+	LiftEvidenceRef    string     `json:"lift_evidence_ref,omitempty"`
+	LiftApprovedBy     string     `json:"lift_approved_by_principal_id,omitempty"`
 	// Legacy marks a row read from the pre-NCD email_suppressions list, which
 	// the webhook processor and RFC 8058 unsubscribe still write. Read so that
 	// no suppression recorded before this plane existed is forgotten (NP-45).
@@ -626,42 +626,42 @@ type FreeTextEndpoint struct {
 
 // Communication is the §10.1 logical communication.
 type Communication struct {
-	CommunicationID           string              `json:"communication_id"`
-	TenantID                  string              `json:"tenant_id"`
-	LegalEntityID             string              `json:"legal_entity_id"`
-	IntentID                  string              `json:"intent_id"`
-	IntentVersion             int                 `json:"intent_version,omitempty"`
-	PurposeClass              PurposeClass        `json:"purpose_class,omitempty"`
-	IdempotencyKey            string              `json:"idempotency_key"`
-	SourceEventID             string              `json:"source_event_id"`
-	SourceEventType           string              `json:"source_event_type,omitempty"`
-	WorkflowID                string              `json:"workflow_id,omitempty"`
-	RecipientPrincipalID      string              `json:"recipient_principal_id"`
-	RecipientTenantID         string              `json:"recipient_tenant_id,omitempty"`
-	FreeTextEndpoint          *FreeTextEndpoint   `json:"-"`
-	Locale                    string              `json:"locale"`
-	Variables                 map[string]string   `json:"-"`
-	Attachments               []Attachment        `json:"attachments"`
-	PrivacyPermission         PermissionDecision  `json:"privacy_permission"`
-	MarketingPermission       PermissionDecision  `json:"marketing_permission"`
-	PDCDecisionRef            string              `json:"pdc_decision_ref,omitempty"`
-	ResidencyRegions          []string            `json:"residency_regions"`
-	LifecycleState            string              `json:"lifecycle_state"`
-	BlockedReasonCode         ReasonCode          `json:"blocked_reason_code,omitempty"`
-	BlockedDetail             string              `json:"blocked_detail,omitempty"`
-	RecipientPlanID           string              `json:"recipient_plan_id,omitempty"`
-	ChannelDecisionID         string              `json:"channel_decision_id,omitempty"`
-	NotBefore                 *time.Time          `json:"not_before,omitempty"`
-	ExpiresAt                 time.Time           `json:"expires_at"`
-	Priority                  int                 `json:"priority"`
-	SupersedesCommunicationID string              `json:"supersedes_communication_id,omitempty"`
-	CorrectionReason          string              `json:"correction_reason,omitempty"`
-	BulkID                    string              `json:"bulk_id,omitempty"`
-	CreatedByPrincipalID      string              `json:"created_by_principal_id"`
-	CreatedAt                 time.Time           `json:"created_at"`
-	PreparedAt                *time.Time          `json:"prepared_at,omitempty"`
-	DispatchedAt              *time.Time          `json:"dispatched_at,omitempty"`
-	ConcludedAt               *time.Time          `json:"concluded_at,omitempty"`
+	CommunicationID           string             `json:"communication_id"`
+	TenantID                  string             `json:"tenant_id"`
+	LegalEntityID             string             `json:"legal_entity_id"`
+	IntentID                  string             `json:"intent_id"`
+	IntentVersion             int                `json:"intent_version,omitempty"`
+	PurposeClass              PurposeClass       `json:"purpose_class,omitempty"`
+	IdempotencyKey            string             `json:"idempotency_key"`
+	SourceEventID             string             `json:"source_event_id"`
+	SourceEventType           string             `json:"source_event_type,omitempty"`
+	WorkflowID                string             `json:"workflow_id,omitempty"`
+	RecipientPrincipalID      string             `json:"recipient_principal_id"`
+	RecipientTenantID         string             `json:"recipient_tenant_id,omitempty"`
+	FreeTextEndpoint          *FreeTextEndpoint  `json:"-"`
+	Locale                    string             `json:"locale"`
+	Variables                 map[string]string  `json:"-"`
+	Attachments               []Attachment       `json:"attachments"`
+	PrivacyPermission         PermissionDecision `json:"privacy_permission"`
+	MarketingPermission       PermissionDecision `json:"marketing_permission"`
+	PDCDecisionRef            string             `json:"pdc_decision_ref,omitempty"`
+	ResidencyRegions          []string           `json:"residency_regions"`
+	LifecycleState            string             `json:"lifecycle_state"`
+	BlockedReasonCode         ReasonCode         `json:"blocked_reason_code,omitempty"`
+	BlockedDetail             string             `json:"blocked_detail,omitempty"`
+	RecipientPlanID           string             `json:"recipient_plan_id,omitempty"`
+	ChannelDecisionID         string             `json:"channel_decision_id,omitempty"`
+	NotBefore                 *time.Time         `json:"not_before,omitempty"`
+	ExpiresAt                 time.Time          `json:"expires_at"`
+	Priority                  int                `json:"priority"`
+	SupersedesCommunicationID string             `json:"supersedes_communication_id,omitempty"`
+	CorrectionReason          string             `json:"correction_reason,omitempty"`
+	BulkID                    string             `json:"bulk_id,omitempty"`
+	CreatedByPrincipalID      string             `json:"created_by_principal_id"`
+	CreatedAt                 time.Time          `json:"created_at"`
+	PreparedAt                *time.Time         `json:"prepared_at,omitempty"`
+	DispatchedAt              *time.Time         `json:"dispatched_at,omitempty"`
+	ConcludedAt               *time.Time         `json:"concluded_at,omitempty"`
 }
 
 // RenderedContent is the exact as-issued content for one channel.
@@ -716,6 +716,7 @@ type DeliveryJob struct {
 	CreatedBy           string     `json:"created_by_principal_id"`
 	CreatedAt           time.Time  `json:"created_at"`
 	ConcludedAt         *time.Time `json:"concluded_at,omitempty"`
+	LeasedUntil         *time.Time `json:"-"`
 }
 
 // Attempt states (§6.2).
@@ -789,18 +790,18 @@ type Evidence struct {
 
 // Notice states (§8.2).
 const (
-	NoticePrepared           = "PREPARED"
-	NoticeReady              = "READY"
-	NoticeInProgress         = "DELIVERY_IN_PROGRESS"
-	NoticeDeliveryEvidenced  = "DELIVERY_EVIDENCED"
-	NoticeSatisfiedByPolicy  = "SATISFIED_BY_POLICY"
-	NoticeAckPending         = "ACK_PENDING"
-	NoticeAcknowledged       = "ACKNOWLEDGED"
-	NoticeDeclined           = "DECLINED"
-	NoticeExpired            = "EXPIRED"
-	NoticeDisputed           = "DISPUTED"
-	NoticeException          = "EXCEPTION"
-	NoticeSuperseded         = "SUPERSEDED"
+	NoticePrepared          = "PREPARED"
+	NoticeReady             = "READY"
+	NoticeInProgress        = "DELIVERY_IN_PROGRESS"
+	NoticeDeliveryEvidenced = "DELIVERY_EVIDENCED"
+	NoticeSatisfiedByPolicy = "SATISFIED_BY_POLICY"
+	NoticeAckPending        = "ACK_PENDING"
+	NoticeAcknowledged      = "ACKNOWLEDGED"
+	NoticeDeclined          = "DECLINED"
+	NoticeExpired           = "EXPIRED"
+	NoticeDisputed          = "DISPUTED"
+	NoticeException         = "EXCEPTION"
+	NoticeSuperseded        = "SUPERSEDED"
 )
 
 // Acknowledgment requirements (§8.1).

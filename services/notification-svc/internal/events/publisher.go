@@ -139,6 +139,11 @@ func Sent(correlationID string, n domain.Notification) (Outbound, error) {
 		"source_event_type":      n.SourceEventType,
 		"source_reference":       n.SourceReference,
 		"sent_at":                n.SentAt,
+		// §3.3: the precise proposition — PROVIDER_ACCEPTED for a remote
+		// channel, DELIVERED_TO_INBOX for in-app. The event name predates the
+		// rule and is kept for its consumers; this field is what they should
+		// read.
+		"delivery_state": domain.DeliveryStateOf(n),
 		// Acceptance evidence, never a delivery receipt — the same weaker
 		// claim the column carries.
 		"provider_response": n.ProviderResponse,

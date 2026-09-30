@@ -169,6 +169,10 @@ type Handler struct {
 	// metrics may be nil (tests); every observation is nil-safe.
 	metrics *telemetry.Domain
 
+	// inAppOpened, when set, records the first read of an NCD-routed in-app
+	// notice as OPENED evidence on its communication (ZS-SVC-Y-001 §7.1).
+	inAppOpened InAppOpenedFunc
+
 	// retryPolicy decides whether a first-attempt failure is scheduled for
 	// another try. The same policy the worker uses, so the schedule a send
 	// writes and the schedule the worker extends cannot disagree.
@@ -193,8 +197,13 @@ type Deps struct {
 	WebhookHandler *webhook.Handler
 	Suppressions   SuppressionStore
 	Metrics        *telemetry.Domain
+	InAppOpened    InAppOpenedFunc
 	Log            *zap.Logger
 }
+
+// InAppOpenedFunc records that a recipient opened an NCD in-app notice. The
+// inbox row's id is the NCD attempt id; its source_reference the communication.
+type InAppOpenedFunc func(ctx context.Context, tenantID, principalID, communicationID, attemptID string, at time.Time) error
 
 func New(d Deps) *Handler {
 	return &Handler{
@@ -208,6 +217,7 @@ func New(d Deps) *Handler {
 		webhookHandler: d.WebhookHandler,
 		suppressions:   d.Suppressions,
 		metrics:        d.Metrics,
+		inAppOpened:    d.InAppOpened,
 		log:            d.Log,
 	}
 }
@@ -770,7 +780,8 @@ func (h *Handler) ListNotifications(w http.ResponseWriter, r *http.Request) {
 	filter := domain.ListFilter{
 		LegalEntityID:        r.URL.Query().Get("legal_entity_id"),
 		RecipientPrincipalID: r.URL.Query().Get("recipient_principal_id"),
-		Status:               r.URL.Query().Get("status"),
+		// Either vocabulary: the precise §3.3 state or the stored value.
+		Status:               domain.StoredStatusFor(r.URL.Query().Get("status")),
 		UnreadOnly:           r.URL.Query().Get("unread_only") == "true",
 	}
 
@@ -903,6 +914,15 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.inAppOpened != nil && notification.ReadAt == nil && notification.SourceEventType == "ncd.communication" {
+		if err := h.inAppOpened(r.Context(), notification.TenantID, principalID, notification.SourceReference,
+			notification.NotificationID, readAt); err != nil {
+			// The read itself is recorded; the evidence write is logged
+			// rather than turning a successful read into an error.
+			h.log.Warn("failed to record NCD in-app OPENED evidence", zap.Error(err))
+		}
+	}
+
 	// Re-read rather than assuming readAt was stored: the store keeps the
 	// FIRST read, so on a repeat call the value written now is discarded and
 	// returning it would report a read time that is not in the database.
@@ -959,7 +979,7 @@ func (h *Handler) GetDeliveryStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := deliveryStatusResponse{
-		NotificationID: notification.NotificationID, Status: notification.Status,
+		NotificationID: notification.NotificationID, Status: domain.DeliveryStateOf(*notification),
 		FailureReason: notification.FailureReason, SentAt: notification.SentAt, ResolvedAt: notification.ResolvedAt,
 	}
 	if notification.Status == domain.StatusPendingUnknown {

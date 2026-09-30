@@ -30,9 +30,11 @@ import (
 	"zoiko.io/notification-svc/internal/health"
 	"zoiko.io/notification-svc/internal/housekeeping"
 	"zoiko.io/notification-svc/internal/identity"
+	"zoiko.io/notification-svc/internal/idempotency"
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
+	"zoiko.io/notification-svc/internal/ncd"
 	"zoiko.io/notification-svc/internal/outbox"
 	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/retry"
@@ -259,6 +261,17 @@ func main() {
 	}
 	deliverer.SetMetrics(metrics)
 
+	// ── 4a'. ZS-SVC-Y-001 control plane (NCD-01 … NCD-05) ─────────────────────
+	//
+	// The plane routes its own submissions through the same SMTP router and
+	// the recipient's in-app register, behind certified provider bindings
+	// (migration 000018). The legacy send path gets the plane's canonical
+	// suppression check in front of its provider call (GatedDeliverer) —
+	// before it, that path consulted no suppression list at all.
+	ncdStore := store.NewNCD(pgStore)
+	ncdSvc := ncd.NewService(ncdStore, identityClient, ncd.RouterTransport{Email: deliverer, Inbox: ncdStore}, ncd.DefaultLimits(), log)
+	gatedDeliverer := ncd.GatedDeliverer{Inner: deliverer, Svc: ncdSvc}
+
 	// ── 4b. Retry policy and worker ──────────────────────────────────────────
 	//
 	// One policy, shared. The handler writes the first schedule when a send
@@ -307,11 +320,28 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	envelopePolicy := svcenvelope.ServicePolicy()
+	// A render preview is side-effect free (§4.5) and changes no state, so it
+	// is not a material write and carries no idempotency key.
+	envelopePolicy.MaterialWrite = func(req *http.Request) bool {
+		if req.URL.Path == "/v1/render-previews" {
+			return false
+		}
+		switch req.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			return false
+		}
+		return true
+	}
 	envelopePolicy.Exempt = func(req *http.Request) bool {
 		if req.URL.Path == "/healthz" || req.URL.Path == "/readyz" || req.URL.Path == "/health" {
 			return true
 		}
 		if strings.HasPrefix(req.URL.Path, "/v1/notifications/webhooks/") || strings.HasPrefix(req.URL.Path, "/v1/notifications/actions/") {
+			return true
+		}
+		// NCD provider callbacks carry no ZoikoSuite identity; they are
+		// authenticated by the binding's HMAC signature instead (INV-27).
+		if strings.HasPrefix(req.URL.Path, "/v1/provider-events/") {
 			return true
 		}
 		// RFC 8058 one-click unsubscribe: originates from mail clients with no
@@ -322,6 +352,9 @@ func main() {
 		return false
 	}
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
+	// Idempotency-Key is honoured, not merely demanded: a repeated command is
+	// answered from its first response (migration 000015).
+	r.Use(idempotency.Middleware(pgStore, log))
 
 	webhookProcessor := webhook.NewProcessor(pgStore, log)
 	webhookProcessor.SetMetrics(metrics)
@@ -353,16 +386,20 @@ func main() {
 		Store:          pgStore,
 		Metrics:        domainMetrics,
 		AuthZ:          authzClient,
-		Deliverer:      deliverer,
+		Deliverer:      gatedDeliverer,
 		Recipient:      identityClient,
 		RetryPolicy:    retryPolicy,
 		Orchestrator:   orchestrator,
 		LedgerStore:    pgStore,
 		WebhookHandler: webhookHandler,
 		Suppressions:   pgStore,
-		Log:            log,
+		InAppOpened: func(ctx context.Context, tenantID, principalID, communicationID, attemptID string, at time.Time) error {
+			return ncdSvc.RecordInAppOpened(ctx, ncd.Actor{TenantID: tenantID, PrincipalID: principalID}, communicationID, attemptID, at)
+		},
+		Log: log,
 	})
 	handler.RegisterRoutes(r, h)
+	handler.RegisterNCDRoutes(r, handler.NewNCDHandler(ncdSvc, authzClient, log))
 
 	// Register action gateway routes if configured. These are exempt from the
 	// envelope middleware (set above) because they serve end-user browsers
@@ -383,7 +420,7 @@ func main() {
 	defer stopWorker()
 
 	retryWorker := retry.NewWorker(
-		pgStore, deliverer, domainMetrics, identityClient, identity.IsSettled,
+		pgStore, gatedDeliverer, domainMetrics, identityClient, identity.IsSettled,
 		retry.Options{
 			Interval:      cfg.Retry.Interval,
 			BatchSize:     cfg.Retry.BatchSize,
@@ -412,6 +449,16 @@ func main() {
 	// Shares workerCtx with the retry worker, so both stop on the same cancel.
 	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
 	go relay.Run(workerCtx)
+
+	// ── 6a''. NCD delivery worker ─────────────────────────────────────────────
+	// Moves delivery jobs, reconciles stranded and UNKNOWN attempts, runs the
+	// regulated-notice clocks and evaluates reputation. Dispatch kicks it, so
+	// the interval bounds latency only when nothing is happening.
+	ncdInterval := 2 * time.Second
+	if v, err := time.ParseDuration(os.Getenv("NCD_WORKER_INTERVAL")); err == nil && v > 0 {
+		ncdInterval = v
+	}
+	go ncdSvc.Run(workerCtx, ncdInterval)
 
 	// ── 6b. Delivery Ledger Housekeeping Worker ──────────────────────────────
 	housekeepingWorker := housekeeping.NewWorker(

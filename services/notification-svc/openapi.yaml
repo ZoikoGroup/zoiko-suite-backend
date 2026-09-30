@@ -1,0 +1,3123 @@
+openapi: 3.0.3
+info:
+  title: notification-svc - Notification, Communication & Delivery Control (ZS-SVC-Y-001)
+  version: 2.0.0
+  description: 'NCD-01 to NCD-05 control plane plus the legacy delivery register. No response exposes a generic ''sent'' status
+    (3.3). Delivery states: CREATED, SUBMITTED_TO_PROVIDER, PROVIDER_ACCEPTED, PROVIDER_PENDING, DELIVERY_UNKNOWN, DELIVERED_TO_MAILBOX,
+    DELIVERED_TO_INBOX, DELIVERED_TO_NETWORK, FAILED, BOUNCED (legacy register: PENDING, RETRY_SCHEDULED, PROVIDER_ACCEPTED,
+    DELIVERED_TO_INBOX, DELIVERY_UNKNOWN, FAILED; stored_status keeps the column). Legal sufficiency is always NOT_DETERMINED_BY_NCD.
+    Every write needs the six envelope headers; Idempotency-Key replays the first response with X-Idempotent-Replay: true.'
+servers:
+- url: http://localhost:8133
+tags:
+- name: BIZ-03 document templates
+- name: Communications (10.1)
+- name: Legacy register
+- name: Maker-checker
+- name: NCD-01 registry
+- name: NCD-02 recipient & channel
+- name: NCD-03 routing
+- name: NCD-04 evidence
+- name: NCD-05 notices
+paths:
+  /v1/acknowledgments:
+    post:
+      tags:
+      - NCD-05 notices
+      operationId: post_v1_acknowledgments
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: &id001
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/approvals/{id}:
+    get:
+      tags:
+      - Maker-checker
+      operationId: get_v1_approvals_id
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/approvals/{id}/approve:
+    post:
+      tags:
+      - Maker-checker
+      operationId: post_v1_approvals_id_approve
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/approvals/{id}/reject:
+    post:
+      tags:
+      - Maker-checker
+      operationId: post_v1_approvals_id_reject
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/bulk-sends:
+    post:
+      tags:
+      - NCD-03 routing
+      operationId: post_v1_bulk_sends
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/bulk-sends/{id}/dispatch:
+    post:
+      tags:
+      - NCD-03 routing
+      operationId: post_v1_bulk_sends_id_dispatch
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/channel-decision:
+    post:
+      tags:
+      - NCD-02 recipient & channel
+      operationId: post_v1_channel_decision
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communication-intents:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_communication_intents
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communication-intents/{id}:
+    get:
+      tags:
+      - NCD-01 registry
+      operationId: get_v1_communication_intents_id
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/communication-intents/{id}/activate:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_communication_intents_id_activate
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communication-intents/{id}/retire:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_communication_intents_id_retire
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communication-intents/{id}/templates:
+    get:
+      tags:
+      - NCD-01 registry
+      operationId: get_v1_communication_intents_id_templates
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/communication-intents/{id}/versions:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_communication_intents_id_versions
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communications:
+    post:
+      tags:
+      - Communications (10.1)
+      operationId: post_v1_communications
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communications/{id}:
+    get:
+      tags:
+      - Communications (10.1)
+      operationId: get_v1_communications_id
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/communications/{id}/attempts/{attempt_id}/resolve:
+    post:
+      tags:
+      - Communications (10.1)
+      operationId: post_v1_communications_id_attempts_attempt_id_resolve
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: attempt_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communications/{id}/cancel:
+    post:
+      tags:
+      - Communications (10.1)
+      operationId: post_v1_communications_id_cancel
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communications/{id}/dispatch:
+    post:
+      tags:
+      - Communications (10.1)
+      operationId: post_v1_communications_id_dispatch
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communications/{id}/misdelivery:
+    post:
+      tags:
+      - Communications (10.1)
+      operationId: post_v1_communications_id_misdelivery
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communications/{id}/prepare:
+    post:
+      tags:
+      - Communications (10.1)
+      operationId: post_v1_communications_id_prepare
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/communications/{id}/resend:
+    post:
+      tags:
+      - Communications (10.1)
+      operationId: post_v1_communications_id_resend
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/document-templates:
+    post:
+      tags:
+      - BIZ-03 document templates
+      operationId: post_v1_document_templates
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/document-templates/versions/{versionID}/approve:
+    post:
+      tags:
+      - BIZ-03 document templates
+      operationId: post_v1_document_templates_versions_versionID_approve
+      parameters:
+      - name: versionID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/document-templates/versions/{versionID}/preview:
+    post:
+      tags:
+      - BIZ-03 document templates
+      operationId: post_v1_document_templates_versions_versionID_preview
+      parameters:
+      - name: versionID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/document-templates/versions/{versionID}/publish:
+    post:
+      tags:
+      - BIZ-03 document templates
+      operationId: post_v1_document_templates_versions_versionID_publish
+      parameters:
+      - name: versionID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/document-templates/versions/{versionID}/validate:
+    post:
+      tags:
+      - BIZ-03 document templates
+      operationId: post_v1_document_templates_versions_versionID_validate
+      parameters:
+      - name: versionID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/document-templates/{templateID}:
+    get:
+      tags:
+      - BIZ-03 document templates
+      operationId: get_v1_document_templates_templateID
+      parameters:
+      - name: templateID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/document-templates/{templateID}/compare:
+    get:
+      tags:
+      - BIZ-03 document templates
+      operationId: get_v1_document_templates_templateID_compare
+      parameters:
+      - name: templateID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/document-templates/{templateID}/locales:
+    get:
+      tags:
+      - BIZ-03 document templates
+      operationId: get_v1_document_templates_templateID_locales
+      parameters:
+      - name: templateID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/document-templates/{templateID}/published:
+    get:
+      tags:
+      - BIZ-03 document templates
+      operationId: get_v1_document_templates_templateID_published
+      parameters:
+      - name: templateID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/document-templates/{templateID}/retire:
+    post:
+      tags:
+      - BIZ-03 document templates
+      operationId: post_v1_document_templates_templateID_retire
+      parameters:
+      - name: templateID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/document-templates/{templateID}/versions:
+    post:
+      tags:
+      - BIZ-03 document templates
+      operationId: post_v1_document_templates_templateID_versions
+      parameters:
+      - name: templateID
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/evidence/{id}:
+    get:
+      tags:
+      - NCD-04 evidence
+      operationId: get_v1_evidence_id
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/exceptions:
+    get:
+      tags:
+      - NCD-03 routing
+      operationId: get_v1_exceptions
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/intents/{id}/effective:
+    get:
+      tags:
+      - NCD-01 registry
+      operationId: get_v1_intents_id_effective
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/notifications:
+    get:
+      tags:
+      - Legacy register
+      operationId: get_v1_notifications
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    post:
+      tags:
+      - Legacy register
+      operationId: post_v1_notifications
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/notifications/events/ingest:
+    post:
+      tags:
+      - Legacy register
+      operationId: post_v1_notifications_events_ingest
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/notifications/intents/{id}:
+    get:
+      tags:
+      - Legacy register
+      operationId: get_v1_notifications_intents_id
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/notifications/suppression:
+    get:
+      tags:
+      - Legacy register
+      operationId: get_v1_notifications_suppression
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    post:
+      tags:
+      - Legacy register
+      operationId: post_v1_notifications_suppression
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/notifications/suppression/{email}:
+    delete:
+      tags:
+      - Legacy register
+      operationId: delete_v1_notifications_suppression_email
+      parameters:
+      - name: email
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/notifications/templates:
+    get:
+      tags:
+      - Legacy register
+      operationId: get_v1_notifications_templates
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/notifications/unread-count:
+    get:
+      tags:
+      - Legacy register
+      operationId: get_v1_notifications_unread_count
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/notifications/unsubscribe:
+    post:
+      tags:
+      - Legacy register
+      operationId: post_v1_notifications_unsubscribe
+      parameters: []
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      description: 'Exempt from the 4-envelope: the caller carries no ZoikoSuite identity. Authenticated by HMAC-SHA256 over
+        ''<timestamp>.<body>'' (X-NCD-Signature / X-Webhook-Signature with X-NCD-Timestamp / X-Webhook-Timestamp), inside
+        a 5-minute replay window. With no secret configured every request is refused (INV-27).'
+      requestBody:
+        required: false
+        content: *id001
+  /v1/notifications/webhooks/{provider}:
+    post:
+      tags:
+      - Legacy register
+      operationId: post_v1_notifications_webhooks_provider
+      parameters:
+      - name: provider
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      description: 'Exempt from the 4-envelope: the caller carries no ZoikoSuite identity. Authenticated by HMAC-SHA256 over
+        ''<timestamp>.<body>'' (X-NCD-Signature / X-Webhook-Signature with X-NCD-Timestamp / X-Webhook-Timestamp), inside
+        a 5-minute replay window. With no secret configured every request is refused (INV-27).'
+      requestBody:
+        required: false
+        content: *id001
+  /v1/notifications/{id}:
+    get:
+      tags:
+      - Legacy register
+      operationId: get_v1_notifications_id
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/notifications/{id}/attempts:
+    get:
+      tags:
+      - Legacy register
+      operationId: get_v1_notifications_id_attempts
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/notifications/{id}/delivery-status:
+    get:
+      tags:
+      - Legacy register
+      operationId: get_v1_notifications_id_delivery_status
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/notifications/{id}/read:
+    post:
+      tags:
+      - Legacy register
+      operationId: post_v1_notifications_id_read
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/notifications/{id}/resend:
+    post:
+      tags:
+      - Legacy register
+      operationId: post_v1_notifications_id_resend
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/notifications/{id}/resolve-delivery-outcome:
+    post:
+      tags:
+      - Legacy register
+      operationId: post_v1_notifications_id_resolve_delivery_outcome
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/preferences:
+    post:
+      tags:
+      - NCD-02 recipient & channel
+      operationId: post_v1_preferences
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/preferences/me:
+    get:
+      tags:
+      - NCD-02 recipient & channel
+      operationId: get_v1_preferences_me
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/provider-bindings:
+    get:
+      tags:
+      - NCD-03 routing
+      operationId: get_v1_provider_bindings
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/provider-bindings/{id}/circuit:
+    post:
+      tags:
+      - NCD-03 routing
+      operationId: post_v1_provider_bindings_id_circuit
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/provider-events/{binding}:
+    post:
+      tags:
+      - NCD-04 evidence
+      operationId: post_v1_provider_events_binding
+      parameters:
+      - name: binding
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      description: 'Exempt from the 4-envelope: the caller carries no ZoikoSuite identity. Authenticated by HMAC-SHA256 over
+        ''<timestamp>.<body>'' (X-NCD-Signature / X-Webhook-Signature with X-NCD-Timestamp / X-Webhook-Timestamp), inside
+        a 5-minute replay window. With no secret configured every request is refused (INV-27).'
+      requestBody:
+        required: false
+        content: *id001
+  /v1/recipient-resolution:
+    post:
+      tags:
+      - NCD-02 recipient & channel
+      operationId: post_v1_recipient_resolution
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/regulated-notices:
+    post:
+      tags:
+      - NCD-05 notices
+      operationId: post_v1_regulated_notices
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/regulated-notices/{id}:
+    get:
+      tags:
+      - NCD-05 notices
+      operationId: get_v1_regulated_notices_id
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/regulated-notices/{id}/manual-evidence:
+    post:
+      tags:
+      - NCD-05 notices
+      operationId: post_v1_regulated_notices_id_manual_evidence
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/regulated-notices/{id}/record-declaration:
+    post:
+      tags:
+      - NCD-05 notices
+      operationId: post_v1_regulated_notices_id_record_declaration
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/render-previews:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_render_previews
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/reputation:
+    get:
+      tags:
+      - NCD-04 evidence
+      operationId: get_v1_reputation
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/revalidate:
+    post:
+      tags:
+      - NCD-02 recipient & channel
+      operationId: post_v1_revalidate
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/streams/{stream}:
+    post:
+      tags:
+      - NCD-04 evidence
+      operationId: post_v1_streams_stream
+      parameters:
+      - name: stream
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/suppressions:
+    get:
+      tags:
+      - NCD-02 recipient & channel
+      operationId: get_v1_suppressions
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    post:
+      tags:
+      - NCD-02 recipient & channel
+      operationId: post_v1_suppressions
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/suppressions/{id}/lift:
+    post:
+      tags:
+      - NCD-02 recipient & channel
+      operationId: post_v1_suppressions_id_lift
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/templates:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_templates
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/templates/{id}:
+    get:
+      tags:
+      - NCD-01 registry
+      operationId: get_v1_templates_id
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/templates/{id}/approve:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_templates_id_approve
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/templates/{id}/publish:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_templates_id_publish
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/templates/{id}/reject:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_templates_id_reject
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/templates/{id}/retire:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_templates_id_retire
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+  /v1/templates/{id}/validate:
+    post:
+      tags:
+      - NCD-01 registry
+      operationId: post_v1_templates_id_validate
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: OK
+          content: *id001
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Refused'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '201':
+          description: Created
+          content: *id001
+        '202':
+          description: 'Accepted: queued, or filed for maker-checker approval'
+          content: *id001
+      requestBody:
+        required: false
+        content: *id001
+components:
+  parameters:
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Gateway-verified tenant.
+    PrincipalId:
+      name: X-Principal-Id
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Gateway-verified actor. Maker-checker compares this, never a body field.
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      schema:
+        type: string
+      description: Correlation id carried onto every event.
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Mandatory on writes (request tracing).
+    SourceChannel:
+      name: X-Source-Channel
+      in: header
+      required: true
+      schema:
+        type: string
+      description: api, import, integration, mobile, scheduled_job, system or web.
+    LegalEntityId:
+      name: X-Legal-Entity-Id
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Mandatory on writes (INV-02); tenant-wide operations authorize on it.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Mandatory on writes (INV-08); a repeat is answered from the first response.
+  schemas:
+    Error:
+      type: object
+      required:
+      - error_code
+      properties:
+        error_code:
+          type: string
+        error_message:
+          type: string
+    EnvelopeError:
+      type: object
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
+        violations:
+          type: array
+          items:
+            type: object
+    Refusal:
+      type: object
+      required:
+      - error_code
+      - reason_code
+      properties:
+        error_code:
+          type: string
+        error_message:
+          type: string
+        reason_code:
+          type: string
+          enum:
+          - NCD-001
+          - NCD-002
+          - NCD-003
+          - NCD-004
+          - NCD-005
+          - NCD-006
+          - NCD-007
+          - NCD-008
+          - NCD-009
+          - NCD-010
+          - NCD-011
+          - NCD-012
+          - NCD-013
+          - NCD-014
+          - NCD-015
+          - NCD-016
+          - NCD-017
+          - NCD-018
+          - NCD-019
+          - NCD-020
+        reason:
+          type: string
+  responses:
+    Invalid:
+      description: Invalid request, or the 4-envelope is incomplete
+      content:
+        application/json:
+          schema:
+            oneOf:
+            - $ref: '#/components/schemas/Error'
+            - $ref: '#/components/schemas/EnvelopeError'
+    Unauthenticated:
+      description: No principal or tenant, or an unauthenticated callback
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Not granted, or segregation of duties
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Not found in this tenant
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: The object's state does not permit the command
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Refused:
+      description: A 10.3 coded refusal (NCD-001 to NCD-020)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Refusal'
+    Unavailable:
+      description: A dependency or the store is unavailable; nothing was done
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

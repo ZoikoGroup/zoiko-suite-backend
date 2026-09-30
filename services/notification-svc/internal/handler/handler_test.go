@@ -1296,8 +1296,9 @@ func TestGetDeliveryStatus_PendingUnknown_CarriesErrorCode(t *testing.T) {
 		ErrorCode string `json:"error_code"`
 	}
 	_ = json.NewDecoder(rr.Body).Decode(&resp)
-	if resp.Status != domain.StatusPendingUnknown {
-		t.Errorf("status = %q, want PENDING_UNKNOWN", resp.Status)
+	// §3.3: the exposed state is the precise proposition, not the column.
+	if resp.Status != domain.DeliveryUnknown {
+		t.Errorf("status = %q, want DELIVERY_UNKNOWN", resp.Status)
 	}
 	if resp.ErrorCode != "DELIVERY_OUTCOME_UNKNOWN" {
 		t.Errorf("error_code = %q, want DELIVERY_OUTCOME_UNKNOWN", resp.ErrorCode)
