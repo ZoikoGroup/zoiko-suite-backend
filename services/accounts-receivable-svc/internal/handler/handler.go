@@ -33,7 +33,7 @@ type Store interface {
 	CreateInvoice(ctx context.Context, inv *domain.CustomerInvoice) (created bool, err error)
 	GetInvoice(ctx context.Context, tenantID, invoiceID string) (*domain.CustomerInvoice, error)
 	ListInvoices(ctx context.Context, filter domain.ListInvoicesFilter) ([]domain.CustomerInvoice, error)
-	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string) (*domain.CustomerInvoice, error)
+	
 	// ControlPopulation serves the control-population contract (open-invoices).
 	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
 	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string, paymentDate *domain.CalendarDate, paymentReference *string) (*domain.CustomerInvoice, error)
