@@ -31,6 +31,7 @@ import (
 
 	"zoiko.io/workflow-svc/internal/authz"
 	"zoiko.io/workflow-svc/internal/config"
+	"zoiko.io/workflow-svc/internal/decisionlog"
 	"zoiko.io/workflow-svc/internal/documentvault"
 	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"zoiko.io/workflow-svc/internal/events"
@@ -120,6 +121,7 @@ func main() {
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	authzClient := authz.NewHTTPClient(cfg.AuthorizationServiceURL, log)
 	documentVaultClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, log)
+	decisionLogClient := decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL, log)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -139,6 +141,7 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, authzClient, documentVaultClient, log)
+	h = h.WithDecisionLogClient(decisionLogClient)
 	handler.RegisterRoutes(r, h)
 
 	// Outbox relay (ZS-STATE-001 Invariant I-13 / doc7 item 32):

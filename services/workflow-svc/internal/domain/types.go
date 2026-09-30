@@ -55,6 +55,25 @@ type WorkflowInstance struct {
 	InvalidationReasonCode   *string    `json:"invalidation_reason_code,omitempty"`
 	InvalidationNarrative    *string    `json:"invalidation_narrative,omitempty"`
 	InvalidationEvidenceRefs []string   `json:"invalidation_evidence_refs,omitempty"`
+
+	// Deadline tracking for SLA/escalation per GOV-06 NFR
+	DueAt        *time.Time `json:"due_at,omitempty"`
+	NextActionAt *time.Time `json:"next_action_at,omitempty"`
+
+	// R-001 §9.1 common columns for optimistic concurrency and audit
+	RowVersion      int       `json:"row_version"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	CreatedBy       string    `json:"created_by"`
+	Plane           string    `json:"plane"`
+	DataClass       string    `json:"data_class"`
+	ResidencyRegion string    `json:"residency_region"`
+
+	// Idempotency key for INV-08 compliance
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+
+	// Versioned workflow definition reference per R-001 WFC-02
+	WorkflowDefinitionID      string `json:"workflow_definition_id,omitempty"`
+	WorkflowDefinitionVersion int    `json:"workflow_definition_version,omitempty"`
 }
 
 // WorkflowStage is one approver slot in a workflow's ordered chain, supplied
@@ -73,6 +92,14 @@ type WorkflowStage struct {
 
 	ActedAt   *time.Time `json:"acted_at"`
 	Rationale *string    `json:"rationale"`
+
+	// R-001 §9.1 common columns for optimistic concurrency and audit
+	RowVersion      int       `json:"row_version"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	CreatedBy       string    `json:"created_by"`
+	Plane           string    `json:"plane"`
+	DataClass       string    `json:"data_class"`
+	ResidencyRegion string    `json:"residency_region"`
 }
 
 // WorkflowTransition is the append-only audit trail — one row per state
@@ -114,6 +141,7 @@ type CreateWorkflowParams struct {
 	SubjectFingerprint *string
 	InitiatedBy        string
 	CorrelationID      string
+	IdempotencyKey     string
 	Stages             []CreateWorkflowStageInput
 }
 
@@ -160,6 +188,57 @@ type ReleaseVerificationResult struct {
 	SubjectFingerprint *string `json:"subject_fingerprint,omitempty"`
 }
 
+// WorkflowDefinition is a versioned, immutable definition of an approval workflow.
+// Per R-001 WFC-02 and GOV-06, definitions are separate from instances.
+type WorkflowDefinition struct {
+	WorkflowDefinitionID   string    `json:"workflow_definition_id"`
+	TenantID               string    `json:"tenant_id"`
+	WorkflowType           string    `json:"workflow_type"`
+	Version                int       `json:"version"`
+	StagesJSON             []byte    `json:"stages_json"`
+	Name                   *string   `json:"name,omitempty"`
+	Description            *string   `json:"description,omitempty"`
+	CreatedBy              string    `json:"created_by"`
+	CreatedAt              time.Time `json:"created_at"`
+	SupersededBy           *string   `json:"superseded_by,omitempty"`
+	IsActive               bool      `json:"is_active"`
+
+	// R-001 §9.1 common columns
+	RowVersion      int       `json:"row_version"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	Plane           string    `json:"plane"`
+	DataClass       string    `json:"data_class"`
+	ResidencyRegion string    `json:"residency_region"`
+}
+
+// CreateWorkflowDefinitionParams holds input for creating a workflow definition.
+type CreateWorkflowDefinitionParams struct {
+	TenantID             string
+	WorkflowType         string
+	Version              int
+	StagesJSON           []byte
+	Name                 *string
+	Description          *string
+	CreatedBy            string
+}
+
+// GetWorkflowDefinitionParams holds input for retrieving a workflow definition.
+type GetWorkflowDefinitionParams struct {
+	TenantID               string
+	WorkflowType           string
+	Version                *int // nil = latest active
+	WorkflowDefinitionID   *string
+}
+
+// ListWorkflowDefinitionsParams holds input for listing workflow definitions.
+type ListWorkflowDefinitionsParams struct {
+	TenantID     string
+	WorkflowType *string
+	IsActive     *bool
+	Limit        int
+	Offset       int
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 var ErrWorkflowNotFound = errorString("workflow not found")
@@ -169,6 +248,14 @@ var ErrWrongApprover = errorString("actor is not the approver for the current st
 var ErrStoreUnavailable = errorString("workflow store unavailable")
 var ErrAuthorizationDenied = errorString("authorization denied for this approval action")
 var ErrAuthorizationServiceUnavailable = errorString("authorization-svc unavailable")
+
+// ErrConcurrencyConflict is returned when an optimistic concurrency check fails:
+// the workflow or stage was modified by another transaction concurrently.
+var ErrConcurrencyConflict = errorString("concurrency conflict: workflow was modified by another request")
+
+// ErrIdempotencyMismatch is returned when the same idempotency key is used
+// with a different request body — INV-08 / GCP §16 IDEMPOTENCY_MISMATCH.
+var ErrIdempotencyMismatch = errorString("idempotency key mismatch: same key used with different request body")
 
 // ErrInitiatorCannotBeApprover is a creation-time validation error:
 // Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3)

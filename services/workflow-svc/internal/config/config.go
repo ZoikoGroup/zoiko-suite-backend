@@ -24,6 +24,11 @@ type Config struct {
 	// pinned in the engagement record; workflow-svc never owns evidence bytes.
 	DocumentVaultServiceURL string
 
+	// GovernanceDecisionLogServiceURL is used to record governance decisions
+	// (workflow approvals, rejections, escalations, cancellations, invalidations)
+	// to the governance-decision-log-svc per GOV §1 "No evidence afterthought".
+	GovernanceDecisionLogServiceURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -75,6 +80,7 @@ func Load() (*Config, error) {
 		},
 		AuthorizationServiceURL: env("AUTHORIZATION_SERVICE_URL", "http://authorization-svc:8089"),
 		DocumentVaultServiceURL: env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		GovernanceDecisionLogServiceURL: env("GOVERNANCE_DECISION_LOG_SERVICE_URL", "http://governance-decision-log-svc:8083"),
 		OTELExporterEndpoint:    env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
