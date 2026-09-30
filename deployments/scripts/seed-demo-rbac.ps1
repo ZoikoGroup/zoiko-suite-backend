@@ -412,6 +412,30 @@ $BUNDLES = @(
         Actions = @("ROLE_MANAGE")
     },
     @{
+        # authorization-svc admin API. These actions gate the 22 /v1/admin/* routes
+        # that create/manage roles, bundles, assignments, SoD rules, ABAC rules,
+        # delegations, PAM, break-glass and support sessions. They are
+        # PLATFORM-SCOPED: authorization-svc is the platform's authorization
+        # engine, so managing its configuration is a platform-wide act.
+        #
+        # The demo principal gets this on the platform scope assignment below.
+        Code    = "IAM_ADMIN_FULL"
+        Service = "authorization-svc"
+        Actions = @(
+            "iam.role.manage",
+            "iam.permission_bundle.manage",
+            "iam.assignment.grant",
+            "iam.assignment.revoke",
+            "iam.sod_rule.manage",
+            "iam.abac_rule.manage",
+            "iam.delegation.grant",
+            "iam.delegation.revoke",
+            "iam.pam.manage",
+            "iam.break_glass.manage",
+            "iam.support.manage"
+        )
+    },
+    @{
         # retention-registry-svc. LEGAL_HOLD_RELEASE is deliberately in the same
         # bundle as LEGAL_HOLD_CREATE for the demo principal only because this
         # seeds a DEVELOPMENT stack -- in a real deployment engaging a freeze and
@@ -491,7 +515,9 @@ $PLATFORM_SCOPED_ACTION_CODES = @(
     # scope. A grant made only on the legal entity would be invisible to every
     # one of its checks -- silently, and fail-closed, so it would read as
     # "no_grant" rather than as a scope mismatch.
-    "SEARCH_FULL")
+    "SEARCH_FULL",
+    # authorization-svc admin API manages the platform's authorization engine
+    "IAM_ADMIN_FULL")
 $PLATFORM_SCOPED_ACTIONS = $BUNDLES |
     Where-Object { $PLATFORM_SCOPED_ACTION_CODES -contains $_.Code } |
     ForEach-Object { $_.Actions }

@@ -112,6 +112,11 @@ func (s *stubStore) FindDriftEvents(_ context.Context, _ string, _, _ int) ([]*d
 	return s.driftEvents, s.driftEventsErr
 }
 
+func (s *stubStore) FindRuleStatusHistory(_ context.Context, _ string, _, _ int) ([]*domain.RuleStatusHistory, error) {
+	s.storeCalled = true
+	return nil, nil
+}
+
 func (s *stubStore) FindByID(_ context.Context, _ string) (*domain.Jurisdiction, error) {
 	s.storeCalled = true
 	return s.jurisdiction, s.err
@@ -191,6 +196,39 @@ func (s *stubStore) FindRules(_ context.Context, params store.FindRulesParams) (
 	return filtered[offset:end], nil
 }
 
+// CreateJurisdictionWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) CreateJurisdictionWithQuerier(_ context.Context, _ store.Querier, p domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error) {
+	return s.CreateJurisdiction(context.Background(), p)
+}
+
+// DeactivateJurisdictionWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) DeactivateJurisdictionWithQuerier(_ context.Context, _ store.Querier, _, actorID string) (*domain.Jurisdiction, error) {
+	return s.DeactivateJurisdiction(context.Background(), "", actorID)
+}
+
+// CreateRuleWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) CreateRuleWithQuerier(_ context.Context, _ store.Querier, p domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error) {
+	return s.CreateRule(context.Background(), p)
+}
+
+// TransitionRuleStatusWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) TransitionRuleStatusWithQuerier(_ context.Context, _ store.Querier, p store.TransitionParams) (*domain.JurisdictionRule, bool, error) {
+	return s.TransitionRuleStatus(context.Background(), p)
+}
+
+// RecordDriftWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) RecordDriftWithQuerier(_ context.Context, _ store.Querier, p domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error) {
+	return s.RecordDrift(context.Background(), p)
+}
+
+// WithTransaction implements handler.JurisdictionStore.
+func (s *stubStore) WithTransaction(ctx context.Context, fn func(store.Querier) error) error {
+	// For testing, we just call the function with a nil querier since stubStore
+	// doesn't actually use transactions. The function should work with our
+	// stub methods which ignore the querier parameter.
+	return fn(nil)
+}
+
 // ── spy publisher ─────────────────────────────────────────────────────────────
 
 // spyPublisher records every event the handler emits so tests can assert both
@@ -224,6 +262,10 @@ func (p *spyPublisher) PublishRuleActivated(context.Context, domain.Jurisdiction
 
 func (p *spyPublisher) PublishLegalDriftDetected(context.Context, domain.JurisdictionRule, domain.DriftEvent, string) error {
 	return p.record("legal.drift.detected")
+}
+
+func (p *spyPublisher) FlushPending(context.Context, store.Querier) error {
+	return p.err
 }
 
 func (p *spyPublisher) has(eventType string) bool {

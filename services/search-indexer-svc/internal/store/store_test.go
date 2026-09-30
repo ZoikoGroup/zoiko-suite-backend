@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -57,10 +59,14 @@ func testStore(t *testing.T) (*PgStore, func()) {
 
 	// Schema, applied per run. The suite owns its database — audit.sh points
 	// it at a scratch one — so a clean slate is the right starting state.
-	for _, path := range []string{
-		"../../deployments/migrations/000001_initial_schema.up.sql",
-		"../../deployments/migrations/000002_add_rls.up.sql",
-	} {
+	// EVERY migration, in order — not a hand-kept list. The list this
+	// replaced stopped at 000002, so the suite ran against a schema the code
+	// no longer matched the moment 000003 added columns the store reads.
+	paths, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	require.NoError(t, err)
+	sort.Strings(paths)
+	require.NotEmpty(t, paths)
+	for _, path := range paths {
 		sql, err := os.ReadFile(path)
 		require.NoError(t, err, "migration %s", path)
 		_, err = pool.Exec(ctx, string(sql))
@@ -76,8 +82,8 @@ func testStore(t *testing.T) (*PgStore, func()) {
 		// secret-vault audit script had to work around with a scratch
 		// database.
 		_, _ = pool.Exec(ctx, `TRUNCATE search_evidence, restriction_tombstones,
-			projection_ledger, index_checkpoints, index_generations,
-			search_field_definitions, index_contracts, search_sources CASCADE`)
+			projection_ledger, index_checkpoints, retrieval_evaluations, index_generations,
+			search_field_definitions, index_contracts, search_sources, idempotency_keys CASCADE`)
 		pool.Close()
 	}
 }
@@ -451,9 +457,26 @@ func TestIndexContracts_OnlyOnePublishedPerScope(t *testing.T) {
 	second := seedContract(t, s, src, scope, domain.ContractDraft)
 	require.NoError(t, s.TransitionContract(ctx, second.ContractID, domain.ContractDraft, domain.ContractCertified))
 
-	err := s.TransitionContract(ctx, second.ContractID, domain.ContractCertified, domain.ContractPublished)
-	require.Error(t, err, "a scope must never have two PUBLISHED contracts")
-	assert.True(t, errors.Is(err, domain.ErrConflict))
+	// Publishing the second SUPERSEDES the first in the same transaction:
+	// still never two PUBLISHED, and no window with none.
+	require.NoError(t, s.TransitionContract(ctx, second.ContractID, domain.ContractCertified, domain.ContractPublished))
+	all, err := s.ListContracts(ctx, scope)
+	require.NoError(t, err)
+	published := 0
+	for _, c := range all {
+		if c.State == domain.ContractPublished {
+			published++
+			assert.Equal(t, second.ContractID, c.ContractID)
+		} else {
+			assert.Equal(t, domain.ContractRetired, c.State, "the superseded version is RETIRED")
+		}
+	}
+	assert.Equal(t, 1, published)
+
+	// And the database itself still refuses two, whatever the code does.
+	_, err = s.pool.Exec(ctx, `UPDATE index_contracts SET publication_state = 'PUBLISHED' WHERE scope_name = $1`, scope)
+	require.Error(t, err, "the unique partial index must refuse a second PUBLISHED version")
+	_ = errors.Is
 }
 
 // A contract and its fields are written in ONE transaction. A contract with
@@ -705,4 +728,9 @@ func TestCreateSource_SourceTypeIsUnique(t *testing.T) {
 	err := s.CreateSource(ctx, dup)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, domain.ErrConflict))
+}
+
+func readMigration(name string) (string, error) {
+	b, err := os.ReadFile("../../deployments/migrations/" + name)
+	return string(b), err
 }

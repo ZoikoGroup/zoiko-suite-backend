@@ -40,7 +40,7 @@ func (h *Handler) CreateWorkpaper(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionWorkpaperManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionWorkpaperManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -87,7 +87,7 @@ func (h *Handler) getWorkpaperForAccess(w http.ResponseWriter, r *http.Request, 
 		h.writeAuditEngagementErr(w, err)
 		return nil, false
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, action); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, action, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return nil, false
 	}

@@ -23,6 +23,7 @@ import (
 	"zoiko.io/search-indexer-svc/internal/indexer"
 	"zoiko.io/search-indexer-svc/internal/query"
 	"zoiko.io/search-indexer-svc/internal/retrieval"
+	"zoiko.io/search-indexer-svc/internal/store"
 	"zoiko.io/search-indexer-svc/internal/telemetry"
 )
 
@@ -36,6 +37,19 @@ type fakeStore struct {
 	evidence     []domain.SearchEvidence
 	tombstones   []domain.RestrictionTombstone
 	tombstoneErr error
+
+	checkpoint    *domain.IndexCheckpoint
+	checkpointErr error
+	failedRefs    []string
+	failedErr     error
+	evaluations   []domain.RetrievalEvaluation
+
+	// Optional id-keyed overrides, for tests that need more than one
+	// contract or generation (a model migration has two of each).
+	contractsByID   map[string]*domain.IndexContract
+	generationsByID map[string]*domain.IndexGeneration
+	backfillStates  map[string]domain.BackfillState
+	ledger          []domain.ProjectionRecord
 }
 
 func (f *fakeStore) GetPublishedContract(_ context.Context, scope string) (*domain.IndexContract, error) {
@@ -98,7 +112,10 @@ func (f *fakeStore) GetSource(context.Context, string) (*domain.SearchSource, er
 	return nil, domain.ErrNotFound
 }
 func (f *fakeStore) CreateContract(context.Context, domain.IndexContract) error { return nil }
-func (f *fakeStore) GetContract(context.Context, string) (*domain.IndexContract, error) {
+func (f *fakeStore) GetContract(_ context.Context, id string) (*domain.IndexContract, error) {
+	if c, ok := f.contractsByID[id]; ok {
+		return c, nil
+	}
 	if f.contract == nil {
 		return nil, domain.ErrNotFound
 	}
@@ -109,7 +126,10 @@ func (f *fakeStore) TransitionContract(context.Context, string, domain.ContractS
 }
 func (f *fakeStore) NextContractVersion(context.Context, string) (int, error)       { return 1, nil }
 func (f *fakeStore) CreateGeneration(context.Context, domain.IndexGeneration) error { return nil }
-func (f *fakeStore) GetGeneration(context.Context, string) (*domain.IndexGeneration, error) {
+func (f *fakeStore) GetGeneration(_ context.Context, id string) (*domain.IndexGeneration, error) {
+	if g, ok := f.generationsByID[id]; ok {
+		return g, nil
+	}
 	if f.generation == nil {
 		return nil, domain.ErrNotFound
 	}
@@ -128,11 +148,60 @@ func (f *fakeStore) UpsertCheckpoint(context.Context, domain.IndexCheckpoint) er
 func (f *fakeStore) ListCheckpoints(context.Context, string) ([]domain.IndexCheckpoint, error) {
 	return []domain.IndexCheckpoint{}, nil
 }
-func (f *fakeStore) GetLatestCheckpoint(context.Context, string) (*domain.IndexCheckpoint, error) { return nil, nil }
+func (f *fakeStore) GetCheckpoint(_ context.Context, scope, partition string) (*domain.IndexCheckpoint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.checkpointErr != nil {
+		return nil, f.checkpointErr
+	}
+	if f.checkpoint != nil {
+		cp := *f.checkpoint
+		return &cp, nil
+	}
+	// Default: a fresh CURRENT measurement, so tests not about freshness run
+	// the ordinary path.
+	return &domain.IndexCheckpoint{ScopeName: scope, SourcePartition: partition,
+		Freshness: domain.FreshnessCurrent, ObservedAt: time.Now()}, nil
+}
+func (f *fakeStore) ListFailedRestrictions(context.Context, string, string, int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.failedRefs, f.failedErr
+}
+func (f *fakeStore) CreateRetrievalEvaluation(_ context.Context, e domain.RetrievalEvaluation) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.evaluations = append(f.evaluations, e)
+	return nil
+}
+func (f *fakeStore) LatestRetrievalEvaluation(_ context.Context, id string) (*domain.RetrievalEvaluation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.evaluations) - 1; i >= 0; i-- {
+		if f.evaluations[i].GenerationID == id {
+			e := f.evaluations[i]
+			return &e, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+func (f *fakeStore) ClaimIdempotencyKey(context.Context, string, string, string, string) (*store.IdempotencyRecord, error) {
+	return nil, nil
+}
+func (f *fakeStore) CompleteIdempotencyKey(context.Context, string, string, string, int, []byte) error {
+	return nil
+}
+func (f *fakeStore) ReleaseIdempotencyKey(context.Context, string, string, string) error { return nil }
+func (f *fakeStore) PurgeIdempotencyKeysBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
 func (f *fakeStore) GetProjectionRecord(context.Context, string, string, string, string) (*domain.ProjectionRecord, error) {
 	return nil, nil
 }
-func (f *fakeStore) UpsertProjectionRecord(context.Context, domain.ProjectionRecord) (bool, error) {
+func (f *fakeStore) UpsertProjectionRecord(_ context.Context, r domain.ProjectionRecord) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ledger = append(f.ledger, r)
 	return true, nil
 }
 func (f *fakeStore) CountProjections(context.Context, string) (int64, int64, error) {
@@ -155,13 +224,24 @@ func (f *fakeStore) ListEvidence(context.Context, string, string, int) ([]domain
 	return f.evidence, nil
 }
 func (f *fakeStore) Ping(context.Context) error { return nil }
-func (f *fakeStore) Close()                     {}
+func (f *fakeStore) SetBackfillState(_ context.Context, id string, st domain.BackfillState, note string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.backfillStates == nil {
+		f.backfillStates = map[string]domain.BackfillState{}
+	}
+	f.backfillStates[id] = st
+	return nil
+}
+func (f *fakeStore) Close() {}
 
 type fakeEngine struct {
 	result   searchclient.Result
 	err      error
 	lastPlan searchclient.ExecutionPlan
 	indexed  []searchclient.Projection
+	count    int64
+	missing  int64
 }
 
 func (f *fakeEngine) ExecutePlan(_ context.Context, _ string, p searchclient.ExecutionPlan) (searchclient.Result, error) {
@@ -172,11 +252,21 @@ func (f *fakeEngine) IndexProjection(_ context.Context, _ string, p searchclient
 	f.indexed = append(f.indexed, p)
 	return nil
 }
+func (f *fakeEngine) CreateProjection(_ context.Context, _ string, p searchclient.Projection) error {
+	f.indexed = append(f.indexed, p)
+	return nil
+}
 func (f *fakeEngine) GetProjection(context.Context, string, string) (map[string]any, bool, error) {
 	return nil, false, nil
 }
-func (f *fakeEngine) CountProjections(context.Context, string, map[string]string) (int64, error) {
-	return 0, nil
+func (f *fakeEngine) CountMissing(context.Context, string, string) (int64, error) {
+	return f.missing, nil
+}
+func (f *fakeEngine) CountProjections(_ context.Context, _ string, terms map[string]string) (int64, error) {
+	if v, ok := terms["tenant_id"]; ok && v == "" {
+		return 0, nil // no untenanted documents
+	}
+	return f.count, nil
 }
 func (f *fakeEngine) EnsureIndex(context.Context, searchclient.IndexName) error { return nil }
 func (f *fakeEngine) Index(context.Context, searchclient.IndexName, searchclient.Document) error {
@@ -246,10 +336,11 @@ func testGeneration() *domain.IndexGeneration {
 }
 
 type harness struct {
-	router *chi.Mux
-	store  *fakeStore
-	engine *fakeEngine
-	authz  *stubAuthz
+	router  *chi.Mux
+	handler *Handler
+	store   *fakeStore
+	engine  *fakeEngine
+	authz   *stubAuthz
 }
 
 type stubAuthz struct {
@@ -271,7 +362,7 @@ func newHarness(t *testing.T, az *stubAuthz) *harness {
 	eng := &fakeEngine{result: searchclient.Result{Total: 0, Relation: "eq"}}
 
 	metrics := testMetrics()
-	planner := query.NewPlanner(query.DefaultLimits(), st, testKey)
+	planner := query.NewPlanner(query.DefaultLimits(), testKey)
 	retriever := retrieval.New(eng, az, nil, metrics, zap.NewNop(), time.Second)
 	ix := indexer.New(st, eng, nil, metrics, zap.NewNop())
 
@@ -288,7 +379,7 @@ func newHarness(t *testing.T, az *stubAuthz) *harness {
 	r.Use(envelope.MiddlewareWithMode(envelope.ServicePolicy(), envelope.ModeStrict, nil))
 	h.Routes(r)
 
-	return &harness{router: r, store: st, engine: eng, authz: az}
+	return &harness{router: r, handler: h, store: st, engine: eng, authz: az}
 }
 
 // req builds a fully-enveloped request. Every §4 mandatory field is present,

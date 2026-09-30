@@ -62,7 +62,11 @@ func (f *fakeEngine) GetProjection(context.Context, string, string) (map[string]
 func (f *fakeEngine) CountProjections(context.Context, string, map[string]string) (int64, error) {
 	return 0, nil
 }
-func (f *fakeEngine) Ping(context.Context) error { return nil }
+func (f *fakeEngine) Ping(context.Context) error                                  { return nil }
+func (f *fakeEngine) CountMissing(context.Context, string, string) (int64, error) { return 0, nil }
+func (f *fakeEngine) CreateProjection(context.Context, string, searchclient.Projection) error {
+	return nil
+}
 
 type fakeAuthz struct {
 	err   error
@@ -125,6 +129,9 @@ func testPlan() *query.Plan {
 			"obligation_code": true, "obligation_status": true,
 		},
 		SnippetFields: map[string]bool{"obligation_code": true},
+		// Measured CURRENT. The zero value is untrusted by design, so a
+		// plan that forgot to carry freshness suppresses protected hits.
+		Freshness: domain.FreshnessCurrent,
 	}
 }
 

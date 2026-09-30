@@ -349,13 +349,21 @@ func (s *PgStore) SubmitAction(ctx context.Context, params domain.SubmitActionPa
 		return nil, nil, false, domain.ErrInvalidTransition
 	}
 
-	// Look up the actor's OWN stage first, not just "the current stage" —
+	// Determine which approver's stage to look up.
+	// If AssignedApproverID is provided (delegation), use that.
+	// Otherwise, use ActorPrincipalID (direct approval).
+	approverID := params.ActorPrincipalID
+	if params.AssignedApproverID != "" {
+		approverID = params.AssignedApproverID
+	}
+
+	// Look up the approver's stage (not just "the current stage") —
 	// a duplicate/retried submission must be recognized as idempotent even
 	// after the workflow has already advanced past that stage (e.g. a
 	// slow network retry of stage 1's approval arriving after stage 2 has
 	// already become current). Assumes at most one stage per approver per
 	// workflow — a documented v1 simplification.
-	actorStage, err := s.findStageByApprover(ctx, params.WorkflowInstanceID, params.ActorPrincipalID)
+	actorStage, err := s.findStageByApprover(ctx, params.WorkflowInstanceID, approverID)
 	if err != nil {
 		return nil, nil, false, err
 	}

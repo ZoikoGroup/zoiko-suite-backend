@@ -129,8 +129,16 @@ func main() {
 		}
 	}
 
-	publisher, closeProducer := newPublisher(cfg, log)
+	publisher, writer, closeProducer := newPublisher(cfg, log, pgStore)
 	defer closeProducer()
+
+	// Start outbox worker for reliable event publishing
+	var outboxWorker *events.OutboxWorker
+	if writer != nil {
+		outboxWorker = events.NewOutboxWorker(log, pgStore, writer, cfg.Kafka.Topic)
+		outboxWorker.Start()
+		defer outboxWorker.Stop()
+	}
 
 	// ── 6. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -210,13 +218,13 @@ func main() {
 // refused outside local development, because a production deployment
 // silently publishing nothing is exactly the failure the events exist to
 // prevent.
-func newPublisher(cfg *config.Config, log *zap.Logger) (events.Publisher, func()) {
+func newPublisher(cfg *config.Config, log *zap.Logger, pgStore *store.PgStore) (events.Publisher, *kafka.Writer, func()) {
 	if len(cfg.Kafka.Brokers) == 0 {
 		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "staging") {
 			log.Fatal("KAFKA_BROKERS must be set in " + cfg.Env + " environment")
 		}
 		log.Warn("no Kafka brokers configured — domain events will be dropped")
-		return events.NewNoopPublisher(log), func() {}
+		return events.NewNoopPublisher(log), nil, func() {}
 	}
 
 	writer := &kafka.Writer{
@@ -244,7 +252,7 @@ func newPublisher(cfg *config.Config, log *zap.Logger) (events.Publisher, func()
 		// only the artificial wait goes away.
 		BatchTimeout: 10 * time.Millisecond,
 	}
-	return events.NewPublisher(log, cfg.Kafka.Topic, writer), func() { _ = writer.Close() }
+	return events.NewOutboxPublisher(log, pgStore, cfg.Kafka.Topic), writer, func() { _ = writer.Close() }
 }
 
 // correlationIDMiddleware propagates X-Correlation-ID through every request.

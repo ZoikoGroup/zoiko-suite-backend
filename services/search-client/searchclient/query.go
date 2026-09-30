@@ -74,6 +74,16 @@ type ExecutionPlan struct {
 	// repeats documents at a score boundary.
 	Sort []SortKey
 
+	// Vector, when set, makes this a semantic plan: approximate nearest
+	// neighbours to Vector over EmbeddingVectorField, K of them. The query
+	// vector is server-computed from the pinned model (§10.1); like every
+	// other field here, a caller has no way to supply one.
+	Vector []float32
+	K      int
+	// Hybrid combines the vector match with the lexical multi_match over
+	// TextFields. False means pure semantic: Text is ignored for matching.
+	Hybrid bool
+
 	Timeout time.Duration
 }
 
@@ -246,6 +256,10 @@ func (p ExecutionPlan) compile() map[string]any {
 		}
 	}
 
+	if len(p.Vector) > 0 {
+		return p.compileSemantic(filter, mustNot)
+	}
+
 	var must []map[string]any
 	switch {
 	case p.Text == "":
@@ -367,6 +381,94 @@ func (p ExecutionPlan) compile() map[string]any {
 		body["aggs"] = aggs
 	}
 
+	if p.Timeout > 0 {
+		body["timeout"] = fmt.Sprintf("%dms", p.Timeout.Milliseconds())
+	}
+	return body
+}
+
+// compileSemantic lowers a vector plan.
+//
+// The eligibility filters are applied TWICE, and both are load-bearing:
+//
+//   - inside the knn clause's own `filter`, so the Lucene graph walk only ever
+//     visits eligible documents. This is §10.1's "ANN execution occurs only
+//     within server-selected eligible partitions/filter sets" and NP-33's
+//     "ANN partition/filter prevents cross-tenant candidates". Without it the
+//     K nearest neighbours are chosen from every tenant first.
+//   - in the outer bool, so a hybrid plan's lexical clause is bounded by the
+//     same set, and so a future engine that ignored the inner filter would
+//     still return nothing ineligible. Similarity is not authorization.
+//
+// No highlight, facets or cursor: a nearest-neighbour page is one bounded
+// page (the planner refuses a cursor), and facet counts over "the K most
+// similar" would describe an arbitrary cut rather than a population.
+func (p ExecutionPlan) compileSemantic(filter, mustNot []map[string]any) map[string]any {
+	k := p.K
+	if k <= 0 {
+		k = p.Size
+	}
+	if k <= 0 {
+		k = 20
+	}
+	size := p.Size
+	if size <= 0 || size > k {
+		size = k
+	}
+
+	eligible := map[string]any{
+		"bool": map[string]any{
+			"filter":   filter,
+			"must_not": mustNot,
+		},
+	}
+	knn := map[string]any{
+		"knn": map[string]any{
+			EmbeddingVectorField: map[string]any{
+				"vector": p.Vector,
+				"k":      k,
+				"filter": eligible,
+			},
+		},
+	}
+
+	boolQuery := map[string]any{
+		"filter":   filter,
+		"must_not": mustNot,
+	}
+	if p.Hybrid && p.Text != "" && len(p.TextFields) > 0 {
+		boolQuery["should"] = []map[string]any{
+			knn,
+			{"multi_match": map[string]any{
+				"query":    p.Text,
+				"type":     "best_fields",
+				"fields":   p.TextFields,
+				"operator": "and",
+			}},
+		}
+		boolQuery["minimum_should_match"] = 1
+	} else {
+		boolQuery["must"] = []map[string]any{knn}
+	}
+
+	body := map[string]any{
+		"size":             size,
+		"query":            map[string]any{"bool": boolQuery},
+		"track_total_hits": true,
+		"sort": []any{
+			map[string]any{"_score": map[string]any{"order": "desc"}},
+			map[string]any{"source_id": map[string]any{"order": "asc"}},
+		},
+	}
+	if len(p.SourceIncludes) > 0 {
+		body["_source"] = map[string]any{"includes": p.SourceIncludes}
+	} else {
+		body["_source"] = map[string]any{"includes": []string{
+			"tenant_id", "legal_entity_id", "source_type", "source_id",
+			"source_version", "restriction_epoch", "retrieval_class",
+			"sensitivity_class", "acl_refs", "index_generation", "indexed_at",
+		}}
+	}
 	if p.Timeout > 0 {
 		body["timeout"] = fmt.Sprintf("%dms", p.Timeout.Milliseconds())
 	}

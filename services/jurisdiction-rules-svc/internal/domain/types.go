@@ -86,6 +86,21 @@ type JurisdictionRule struct {
 	// RuleStatus: ACTIVE, SUPERSEDED, DRAFT, RETIRED — VARCHAR, not enum.
 	RuleStatus string `json:"rule_status"`
 
+	// RuleVersion for immutable version tracking (ZS-JUR-001 §3, V-001 §8.1).
+	// Incremented on each status change; the combination of rule_code + rule_version
+	// uniquely identifies an immutable rule version.
+	RuleVersion int `json:"rule_version"`
+
+	// SupersedesRuleID references the rule this rule supersedes, forming a
+	// version chain for historical replay.
+	SupersedesRuleID *string `json:"supersedes_rule_id,omitempty"`
+
+	// PrecedenceLevel for explicit precedence ordering (V-001 §8.2).
+	// Lower number = higher precedence. When multiple rules match the same
+	// (rule_domain, rule_code) at a point in time, the one with the lowest
+	// precedence_level wins. Equal precedence with overlapping periods = CONFLICTED.
+	PrecedenceLevel int `json:"precedence_level"`
+
 	// LegalDriftState: CURRENT, DRIFTED, UNDER_REVIEW.
 	// Current value only — full transition history is in drift_events table,
 	// readable via GET /v1/rules/{id}/drift-events.
@@ -119,6 +134,21 @@ type DriftEvent struct {
 	SchemaVersion         string    `json:"schema_version"`
 }
 
+// RuleStatusHistory represents one entry in the bitemporal status history
+// (known_from/known_to tracks when the platform became aware of the status).
+type RuleStatusHistory struct {
+	HistoryID              string     `json:"history_id"`
+	JurisdictionRuleID     string     `json:"jurisdiction_rule_id"`
+	RuleStatus             string     `json:"rule_status"`
+	EffectiveFrom          time.Time  `json:"effective_from"`
+	EffectiveTo            *time.Time `json:"effective_to"`
+	KnownFrom              time.Time  `json:"known_from"`
+	KnownTo                *time.Time `json:"known_to"`
+	ChangedByPrincipalID   string     `json:"changed_by_principal_id"`
+	ChangeReason           *string    `json:"change_reason"`
+	SchemaVersion          string     `json:"schema_version"`
+}
+
 // RecordDriftParams holds input parameters for recording a drift transition.
 type RecordDriftParams struct {
 	JurisdictionRuleID    string
@@ -137,6 +167,9 @@ type RecordDriftParams struct {
 // most specific jurisdiction wins, and within one jurisdiction the latest
 // effective_from wins. ResolvedFrom records which jurisdictions contributed,
 // nearest first, so a caller can explain the basis of a governed action.
+//
+// ConflictResolution captures cases where multiple rules have equal precedence
+// and overlapping periods (CONFLICTED) or no rules match (INSUFFICIENT).
 type RulePack struct {
 	JurisdictionID string    `json:"jurisdiction_id"`
 	EffectiveAt    time.Time `json:"effective_at"`
@@ -146,6 +179,24 @@ type RulePack struct {
 	ResolvedFrom []string `json:"resolved_from"`
 
 	Rules []*JurisdictionRule `json:"rules"`
+
+	// Conflicts lists (rule_domain, rule_code) pairs where multiple rules
+	// have equal precedence and overlapping periods. Callers MUST NOT execute
+	// governed actions against conflicted rules without human resolution.
+	Conflicts []RuleConflict `json:"conflicts,omitempty"`
+
+	// Insufficient lists (rule_domain, rule_code) pairs where no rule was
+	// found in the entire ancestor chain. Callers MUST treat this as a
+	// configuration error for governed actions requiring that rule.
+	Insufficient []string `json:"insufficient,omitempty"`
+}
+
+// RuleConflict represents a (rule_domain, rule_code) pair where multiple
+// rules have equal precedence and overlapping effective periods.
+type RuleConflict struct {
+	RuleDomain string   `json:"rule_domain"`
+	RuleCode   string   `json:"rule_code"`
+	RuleIDs    []string `json:"rule_ids"`
 }
 
 // CreateJurisdictionParams holds input parameters for creating a jurisdiction.
@@ -166,21 +217,24 @@ type CreateJurisdictionParams struct {
 
 // CreateRuleParams holds input parameters for creating a rule.
 type CreateRuleParams struct {
-	JurisdictionRuleID    string     `json:"jurisdiction_rule_id"`
-	JurisdictionID        string     `json:"jurisdiction_id"`
-	RuleDomain            string     `json:"rule_domain"`
-	RuleCode              string     `json:"rule_code"`
-	RuleName              string     `json:"rule_name"`
-	EffectiveFrom         time.Time  `json:"effective_from"`
-	EffectiveTo           *time.Time `json:"effective_to"`
-	RulePayload           []byte     `json:"rule_payload"`
-	SourceReference       *string    `json:"source_reference"`
-	ExternalFeedReference *string    `json:"external_feed_reference"`
-	RuleStatus            string     `json:"rule_status"`
-	LegalDriftState       string     `json:"legal_drift_state"`
-	DataClassification    string     `json:"data_classification"`
-	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
-	SchemaVersion         string     `json:"schema_version"`
+	JurisdictionRuleID      string     `json:"jurisdiction_rule_id"`
+	JurisdictionID          string     `json:"jurisdiction_id"`
+	RuleDomain              string     `json:"rule_domain"`
+	RuleCode                string     `json:"rule_code"`
+	RuleName                string     `json:"rule_name"`
+	EffectiveFrom           time.Time  `json:"effective_from"`
+	EffectiveTo             *time.Time `json:"effective_to"`
+	RulePayload             []byte     `json:"rule_payload"`
+	SourceReference         *string    `json:"source_reference"`
+	ExternalFeedReference   *string    `json:"external_feed_reference"`
+	RuleStatus              string     `json:"rule_status"`
+	RuleVersion             int        `json:"rule_version"`
+	SupersedesRuleID        *string    `json:"supersedes_rule_id"`
+	PrecedenceLevel         int        `json:"precedence_level"`
+	LegalDriftState         string     `json:"legal_drift_state"`
+	DataClassification      string     `json:"data_classification"`
+	CreatedByPrincipalID    string     `json:"created_by_principal_id"`
+	SchemaVersion           string     `json:"schema_version"`
 }
 
 // ErrJurisdictionNotFound is returned when the jurisdiction_id does not exist

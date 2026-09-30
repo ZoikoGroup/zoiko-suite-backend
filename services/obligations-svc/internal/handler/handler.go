@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/domain"
+	"zoiko.io/obligations-svc/internal/envelope"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
 	"zoiko.io/obligations-svc/internal/middleware"
 )
@@ -293,6 +294,20 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// Envelope LegalEntityID (from X-Legal-Entity-Id header) must match the
+	// body's legal_entity_id. The envelope is required on writes (contract.go:
+	// LegalEntityID: RequiredOnWrite) and the body field is required by the
+	// request schema. A mismatch indicates a confused or malicious caller.
+	env, _ := envelope.FromContext(r.Context())
+	if env.LegalEntityID != "" && env.LegalEntityID != req.LegalEntityID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":           "legal_entity_mismatch",
+			"detail":          "X-Legal-Entity-Id header must match body legal_entity_id",
+			"header_value":    env.LegalEntityID,
+			"body_value":      req.LegalEntityID,
+		})
+		return
+	}
 	// created_by_principal_id is accepted so the console's existing payload is
 	// not a 400, but it must name the caller. Taking it from the body would
 	// make the record of who raised a statutory obligation self-declared —
@@ -387,11 +402,13 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 //
 //	200 → the Obligation
 //	404 → obligation_id not found
+//	403 → principal holds no OBLIGATION_READ grant on the entity
 //	503 → store unavailable
 func (h *Handler) GetObligation(w http.ResponseWriter, r *http.Request) {
 	obligationID := chi.URLParam(r, "obligation_id")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
@@ -403,6 +420,11 @@ func (h *Handler) GetObligation(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreErr(w, "GetObligation: store unavailable", err)
 		return
 	}
+
+	if !h.authorize(w, r, principalID, o.LegalEntityID, authz.ActionObligationRead) {
+		return
+	}
+
 	writeJSON(w, http.StatusOK, o)
 }
 
@@ -412,22 +434,24 @@ func (h *Handler) GetObligation(w http.ResponseWriter, r *http.Request) {
 //
 // Query parameters (all optional, combined with AND):
 //
-//	legal_entity_id
+//	legal_entity_id  (required for authorization)
 //	jurisdiction_id
 //	obligation_type
 //	status
-//	due_before   RFC3339 timestamp
-//	due_after    RFC3339 timestamp
+//	due_before       RFC3339 timestamp
+//	due_after        RFC3339 timestamp
 //
 // Response:
 //
 //	200 → JSON array of Obligation (may be empty)
-//	400 → due_before/due_after not valid RFC3339
+//	400 → legal_entity_id filter required for authorization, or due_before/due_after not valid RFC3339
+//	403 → principal holds no OBLIGATION_READ grant on the entity
 //	503 → store unavailable
 func (h *Handler) ListObligations(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
@@ -438,10 +462,23 @@ func (h *Handler) ListObligations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Require legal_entity_id filter for object-level authorization.
+	legalEntityID := q.Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": "legal_entity_id query parameter required for authorization",
+		})
+		return
+	}
+	if !h.authorize(w, r, principalID, legalEntityID, authz.ActionObligationRead) {
+		return
+	}
+
 	filter := domain.ListObligationsFilter{
 		Limit:          limit,
 		Offset:         offset,
-		LegalEntityID:  q.Get("legal_entity_id"),
+		LegalEntityID:  legalEntityID,
 		JurisdictionID: q.Get("jurisdiction_id"),
 		ObligationType: q.Get("obligation_type"),
 		Status:         q.Get("status"),
@@ -683,14 +720,26 @@ func (h *Handler) CreateFilingRequirement(w http.ResponseWriter, r *http.Request
 //
 //	200 → JSON array of FilingRequirement (may be empty)
 //	404 → obligation_id not found
+//	403 → principal holds no FILING_REQUIREMENT_READ grant on the entity
 //	503 → store unavailable
 func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request) {
 	obligationID := chi.URLParam(r, "obligation_id")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, "ListFilingRequirements: lookup failed", err)
+		return
+	}
+
+	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionFilingRequirementRead) {
 		return
 	}
 

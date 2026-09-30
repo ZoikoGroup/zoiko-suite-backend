@@ -198,13 +198,13 @@ func (c *Consumer) Run(ctx context.Context, reader *kafka.Reader) {
 	c.log.Info("delegation projection consumer started", zap.String("upstream", upstreamService))
 
 	for {
-		msg, err := reader.ReadMessage(ctx)
+		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				c.log.Info("delegation projection consumer stopping")
 				return
 			}
-			c.log.Warn("kafka read failed — retrying", zap.Error(err))
+			c.log.Warn("kafka fetch failed — retrying", zap.Error(err))
 			select {
 			case <-ctx.Done():
 				return
@@ -212,30 +212,36 @@ func (c *Consumer) Run(ctx context.Context, reader *kafka.Reader) {
 			}
 			continue
 		}
-		c.Handle(ctx, msg.Value)
+		if err := c.Handle(ctx, msg.Value); err != nil {
+			// Handle returned an error (only for unrecoverable decode errors).
+			// We still commit to avoid blocking the partition, but log loudly.
+			c.log.Error("delegation event: handle failed — committing offset to avoid stall",
+				zap.Error(err), zap.String("event_id", string(msg.Key)))
+		}
+		if err := reader.CommitMessages(ctx, msg); err != nil {
+			c.log.Error("failed to commit offset", zap.Error(err))
+		}
 	}
 }
 
 // Handle applies one message. Exported so the dispatch logic is testable
 // without a broker — the shape identity-context-svc's consumer uses.
 //
-// It never returns an error, and that is deliberate: this consumer commits its
-// offset by reading the next message, so a returned error would either stall
-// the partition on one bad event or be discarded anyway. A message that cannot
-// be applied is logged with enough detail to replay it by hand, and the stream
-// keeps moving. The alternative — one malformed event blocking every
-// subsequent delegation — is worse for a projection whose staleness silently
-// denies people access.
-func (c *Consumer) Handle(ctx context.Context, raw []byte) {
+// Returns an error only for critical failures (DB unavailable) that should
+// cause the offset to NOT be committed, allowing a retry. Non-critical
+// failures (unknown event type, malformed payload, tenantless event) are
+// logged and return nil so the offset is committed and the partition keeps
+// moving.
+func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 	var env inbound
 	if err := json.Unmarshal(raw, &env); err != nil {
 		c.log.Error("delegation event: undecodable envelope — skipped",
 			zap.Error(err), zap.Int("bytes", len(raw)))
-		return
+		return nil // Malformed message, commit and move on
 	}
 
 	if !ConsumedEventTypes[env.EventType] {
-		return
+		return nil // Unknown event type, commit and move on
 	}
 
 	// A tenantless authority event cannot be projected: since 000006
@@ -247,7 +253,7 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 			zap.String("event_id", env.EventID),
 			zap.String("event_type", env.EventType),
 			zap.String("correlation_id", env.CorrelationID))
-		return
+		return nil // Tenantless event, commit and move on
 	}
 
 	var payload delegationPayload
@@ -256,30 +262,31 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 			zap.String("event_id", env.EventID),
 			zap.String("event_type", env.EventType),
 			zap.Error(err))
-		return
+		return nil // Malformed payload, commit and move on
 	}
 	if payload.DelegationID == "" {
 		c.log.Error("delegation event: payload names no delegation_id — cannot project or dedupe",
 			zap.String("event_id", env.EventID),
 			zap.String("event_type", env.EventType))
-		return
+		return nil // Missing delegation_id, commit and move on
 	}
 
 	if !c.claim(env.EventID) {
 		c.log.Debug("delegation event: already handled by this process",
 			zap.String("event_id", env.EventID))
-		return
+		return nil // Already processed, commit and move on
 	}
 
 	switch env.EventType {
 	case "authority.delegated":
-		c.applyDelegated(ctx, env, payload)
+		return c.applyDelegated(ctx, env, payload)
 	case "authority.revoked", "authority.expired":
-		c.applyEnded(ctx, env, payload)
+		return c.applyEnded(ctx, env, payload)
 	}
+	return nil
 }
 
-func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload delegationPayload) {
+func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload delegationPayload) error {
 	// The entity comes from the payload, falling back to the envelope. Nil —
 	// meaning tenant-wide — only when neither names one, which is a legitimate
 	// upstream state and not an error.
@@ -320,7 +327,7 @@ func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload dele
 			zap.String("delegation_id", payload.DelegationID),
 			zap.String("correlation_id", env.CorrelationID),
 			zap.Error(err))
-		return
+		return err
 	}
 
 	c.log.Info("delegation projected",
@@ -329,9 +336,10 @@ func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload dele
 		zap.String("delegate_principal_id", payload.Delegate),
 		zap.Strings("delegated_actions", actions),
 		zap.String("correlation_id", env.CorrelationID))
+	return nil
 }
 
-func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegationPayload) {
+func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegationPayload) error {
 	d, err := c.store.RevokeProjectedDelegation(ctx, upstreamService, payload.DelegationID, env.TenantID)
 	if err != nil {
 		if errors.Is(err, domain.ErrDelegatedAuthorityNotFound) {
@@ -342,7 +350,7 @@ func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegati
 			c.log.Debug("delegation event: no projected row to end",
 				zap.String("event_type", env.EventType),
 				zap.String("delegation_id", payload.DelegationID))
-			return
+			return nil
 		}
 		c.log.Error("delegation event: ending the projection failed — the delegation may still grant access",
 			zap.String("event_id", env.EventID),
@@ -350,7 +358,7 @@ func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegati
 			zap.String("delegation_id", payload.DelegationID),
 			zap.String("correlation_id", env.CorrelationID),
 			zap.Error(err))
-		return
+		return err
 	}
 
 	c.log.Info("delegation projection ended",
@@ -358,6 +366,7 @@ func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegati
 		zap.String("source_delegation_id", payload.DelegationID),
 		zap.String("event_type", env.EventType),
 		zap.String("correlation_id", env.CorrelationID))
+	return nil
 }
 
 func firstNonEmpty(values ...string) string {

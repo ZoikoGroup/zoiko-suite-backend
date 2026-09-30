@@ -927,21 +927,23 @@ func TestRecordDrift_404_RuleNotFound(t *testing.T) {
 	}
 }
 
-// TestRecordDrift_PublishFailureDoesNotFailRequest — the state change is
-// already committed; refusing the response would tell the caller nothing
-// happened when something did.
+// TestRecordDrift_PublishFailureDoesNotFailRequest — with the outbox pattern,
+// the event is written to the outbox within the same transaction as the state
+// change. The actual Kafka publish happens asynchronously in the background
+// worker, so the request always succeeds (the state change is already committed).
 func TestRecordDrift_PublishFailureDoesNotFailRequest(t *testing.T) {
 	st := &stubStore{
 		driftRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", LegalDriftState: "DRIFTED"},
 		driftEvent:   &domain.DriftEvent{DriftEventID: "d-1"},
 		driftChanged: true,
 	}
-	h, pub := newTestRouterWithPublisher(st, permitAll())
-	pub.err = context.DeadlineExceeded
+	h, _ := newTestRouterWithPublisher(st, permitAll())
 
 	rr := postJSON(t, h, "/v1/admin/rules/r-1/drift", map[string]any{"drift_state": "DRIFTED"})
 
+	// The request should succeed because the event is written to the outbox
+	// within the transaction. Kafka publish happens asynchronously.
 	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 despite a broker failure, got %d", rr.Code)
+		t.Fatalf("expected 200 with outbox pattern, got %d", rr.Code)
 	}
 }

@@ -58,11 +58,13 @@ import (
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/authz"
 	"zoiko.io/search-indexer-svc/internal/config"
+	"zoiko.io/search-indexer-svc/internal/embedding"
 	svcenvelope "zoiko.io/search-indexer-svc/internal/envelope"
 	"zoiko.io/search-indexer-svc/internal/events"
 	"zoiko.io/search-indexer-svc/internal/handler"
 	"zoiko.io/search-indexer-svc/internal/health"
 	"zoiko.io/search-indexer-svc/internal/hydrator"
+	"zoiko.io/search-indexer-svc/internal/idempotency"
 	"zoiko.io/search-indexer-svc/internal/indexer"
 	svckafka "zoiko.io/search-indexer-svc/internal/kafka"
 	"zoiko.io/search-indexer-svc/internal/query"
@@ -167,8 +169,29 @@ func run(log *zap.Logger) error {
 	}
 	publisher := events.NewPublisher(log, eventWriter)
 
+	// ── Embedding provider (§10.1; provider and model are OD-10) ──────────
+	var embedder embedding.Embedder = embedding.Unconfigured{}
+	if cfg.EmbeddingProviderURL != "" {
+		embedder = embedding.NewHTTPProvider(cfg.EmbeddingProviderURL, cfg.EmbeddingProviderToken, cfg.EmbeddingTimeout)
+		log.Info("embedding provider configured", zap.String("url", cfg.EmbeddingProviderURL))
+	} else {
+		// Not fatal: lexical search is unaffected. Semantic scopes refuse to
+		// build and POST /v1/search/semantic answers ESR-019, which is the
+		// honest state while OD-10 is open.
+		log.Warn("no embedding provider configured — semantic scopes are unavailable (EMBEDDING_PROVIDER_URL)")
+	}
+
 	// ── Domain wiring ────────────────────────────────────────────────────
 	ix := indexer.New(st, engine, publisher, metrics, log)
+	// Freshness is measured at the broker (§5.3): the group's committed
+	// offsets against the log end, and the age of the oldest unconsumed
+	// message. Without this every checkpoint would read UNKNOWN.
+	ix.SetLagProbe(svckafka.NewLagProbe(cfg.Kafka.Brokers, cfg.Kafka.GroupID))
+	ix.SetEmbedder(embedder)
+	// New generations are filled by replaying their source topic (INV-21),
+	// under the process lifetime rather than the request that built them.
+	ix.SetReplayer(svckafka.NewReplayer(cfg.Kafka.Brokers))
+	ix.SetBaseContext(ctx)
 	if err := ix.Reload(ctx); err != nil {
 		// Fatal, unlike the telemetry failures above. Without the registry
 		// this process does not know which generation is live for any scope,
@@ -178,19 +201,27 @@ func run(log *zap.Logger) error {
 		return fmt.Errorf("load projector registry: %w", err)
 	}
 
+	// A restart mid-backfill resumes it; otherwise the generation could never
+	// become READY. Writes are create-only, so repeating one is harmless.
+	ix.ResumeBackfills()
+
 	planner := query.NewPlanner(query.Limits{
 		MaxResultWindow:    cfg.MaxResultWindow,
 		MaxComplexityScore: cfg.MaxComplexityScore,
 		FacetMinCount:      cfg.FacetMinCount,
 		MaxPages:           100,
 		MinQueryLength:     2,
-	}, st, cfg.CursorSigningKey)
+	}, cfg.CursorSigningKey)
 
-	// Hydrator for R2/R3 retrieval. Configured via SOURCE_SERVICE_URL_<SOURCE_TYPE>
-	// env vars (e.g. SOURCE_SERVICE_URL_OBLIGATION=http://obligations-svc:8080).
-	// If no URLs are configured, the hydrator is a no-op and R2/R3 scopes
-	// answer ESR-014 — a loud refusal rather than a silent downgrade.
-	hyd := hydrator.New(log, cfg.SourceHydrationTimeout)
+	// Hydrator for R2/R3 retrieval, one record collection per source type
+	// from SOURCE_SERVICE_URL_<SOURCE_TYPE>. It hydrates AS THE CALLER, with
+	// the caller's envelope. A source type with no collection configured
+	// suppresses its R2 results with ESR-014 — a loud refusal rather than a
+	// silent downgrade to index content (NP-20).
+	hyd := hydrator.New(cfg.SourceCollections, cfg.SourceHydrationTimeout)
+	if !hyd.Configured() {
+		log.Warn("no hydration sources configured — R2/R3 results will be suppressed with ESR-014 (SOURCE_SERVICE_URL_<TYPE>)")
+	}
 
 	retriever := retrieval.New(engine, azClient, hyd, metrics, log, cfg.SourceHydrationTimeout)
 
@@ -222,6 +253,26 @@ func run(log *zap.Logger) error {
 
 	go ix.RunSweeps(ctx, cfg.RestrictionVerifyInterval, cfg.CheckpointInterval)
 
+	// Replay records are kept seven days, the same window identity-context-svc
+	// keeps: long past any client's retry horizon, short enough that the table
+	// is not a second archive of command responses.
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n, err := st.PurgeIdempotencyKeysBefore(ctx, time.Now().Add(-7*24*time.Hour)); err != nil {
+					log.Error("idempotency purge failed", zap.Error(err))
+				} else if n > 0 {
+					log.Info("idempotency records purged", zap.Int64("rows", n))
+				}
+			}
+		}
+	}()
+
 	// ── Health ───────────────────────────────────────────────────────────
 	healthH := health.New(2*time.Second,
 		health.Checker{Name: "postgres", Critical: true, Probe: pool.Ping},
@@ -248,6 +299,12 @@ func run(log *zap.Logger) error {
 		// two: both are HMAC keys with the same rotation story, and a second
 		// environment variable is a second thing to leave unset.
 		EvidenceKey: cfg.CursorSigningKey,
+		Embedder:    embedder,
+		// Three missed sweeps and a checkpoint stops being evidence: the
+		// sweep that writes it has stopped, and a CURRENT nobody refreshed is
+		// read as UNKNOWN (§2.2).
+		CheckpointMaxAge: 3 * cfg.CheckpointInterval,
+		MaxResultWindow:  cfg.MaxResultWindow,
 	})
 
 	r := chi.NewRouter()
@@ -274,6 +331,10 @@ func run(log *zap.Logger) error {
 					zap.String("method", req.Method),
 					zap.Error(verr))
 			}))
+		// After the envelope, so only a request with a verified tenant and
+		// principal can claim a key — and before the handlers, so a retry is
+		// answered from the record without doing the work twice.
+		r.Use(idempotency.Middleware(st, log))
 		h.Routes(r)
 	})
 

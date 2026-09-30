@@ -15,6 +15,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	svcenvelope "zoiko.io/policy-svc/internal/envelope"
 )
 
 // globalScopeSentinel is substituted for TenantID/LegalEntityID when a
@@ -106,6 +108,9 @@ type createDecisionRequest struct {
 // evidence side-channel is not, and only when the caller doesn't supply
 // its own decision_id.
 func (c *HTTPClient) RecordDecision(ctx context.Context, params RecordDecisionParams) error {
+	// Extract the envelope from context to forward all required headers
+	env, hasEnv := svcenvelope.FromContext(ctx)
+
 	tenantID := globalScopeSentinel
 	if params.TenantID != nil && *params.TenantID != "" {
 		tenantID = *params.TenantID
@@ -135,6 +140,8 @@ func (c *HTTPClient) RecordDecision(ctx context.Context, params RecordDecisionPa
 		return fmt.Errorf("build decision request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	// Forward the complete envelope headers that governance-decision-log-svc requires
 	// governance-decision-log-svc now authenticates writers to its ledger:
 	// an append with no identified caller is a forged governance decision.
 	// The acting principal that produced this evaluation is forwarded as the
@@ -142,14 +149,41 @@ func (c *HTTPClient) RecordDecision(ctx context.Context, params RecordDecisionPa
 	if params.ActorID != "" {
 		req.Header.Set("X-Principal-Id", params.ActorID)
 	}
+
 	// The tenant is forwarded in the header too, not only in the body.
 	// governance-decision-log-svc now files a decision under its VERIFIED tenant
 	// scope and refuses a body that names a different one — a body-only tenant
 	// used to be believed outright, which is what made its log cross-writable.
 	// The same value goes in both places, sentinel included, so they agree.
 	req.Header.Set("X-Tenant-Id", tenantID)
+
 	if params.CorrelationID != "" {
 		req.Header.Set("X-Correlation-ID", params.CorrelationID)
+	}
+
+	// Forward additional envelope headers if available
+	if hasEnv {
+		if env.RequestID != "" {
+			req.Header.Set("X-Request-Id", env.RequestID)
+		}
+		if env.SourceChannel != "" {
+			req.Header.Set("X-Source-Channel", string(env.SourceChannel))
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+		if env.IdempotencyKey != "" {
+			req.Header.Set("Idempotency-Key", env.IdempotencyKey)
+		}
+		if env.LegalEntityID != "" {
+			req.Header.Set("X-Legal-Entity-Id", env.LegalEntityID)
+		}
+		if env.PurposeContext != "" {
+			req.Header.Set("X-Purpose-Context", env.PurposeContext)
+		}
 	}
 
 	resp, err := c.http.Do(req)

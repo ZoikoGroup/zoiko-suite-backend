@@ -18,7 +18,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -28,13 +27,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
-	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/governance-decision-log-svc/internal/authz"
 	"zoiko.io/governance-decision-log-svc/internal/config"
 	svcenvelope "zoiko.io/governance-decision-log-svc/internal/envelope"
-	"zoiko.io/governance-decision-log-svc/internal/events"
 	"zoiko.io/governance-decision-log-svc/internal/handler"
 	"zoiko.io/governance-decision-log-svc/internal/health"
 	"zoiko.io/governance-decision-log-svc/internal/mtls"
@@ -114,12 +111,9 @@ func main() {
 	// ── 4. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
 
-	// ── 5. Event publisher (stub — logs until kafka.Writer is injected) ─────────
-	kafkaWriter := newKafkaWriter(cfg, log)
-	if kafkaWriter != nil {
-		defer func() { _ = kafkaWriter.Close() }()
-	}
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+	// ── 5. Event publisher removed - using transactional outbox instead ────────────
+	// Events are written to the outbox table in the same transaction as the
+	// business write, then published asynchronously by a background worker.
 
 	// AuthZ client. Refuses to start in production/staging against a
 	// placeholder URL — no service may silently fall back to permit-all.
@@ -156,7 +150,7 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	policyClient := policyclient.NewHTTPClient(cfg.PolicyServiceURL)
-	h := handler.New(pgStore, publisher, authzClient, policyClient, cfg.AuthZPlatformScopeID, log)
+	h := handler.New(pgStore, authzClient, policyClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 7. Health probes + metrics ────────────────────────────────────────────
@@ -216,47 +210,4 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
-}
-
-// newKafkaWriter builds the event-backbone producer, or nil when no brokers
-// are configured.
-//
-// Kafka connects lazily on first write, so it is not a fail-fast startup
-// dependency like Postgres — the same posture as obligations-svc and
-// jurisdiction-rules-svc. A nil writer makes every publish a logged no-op,
-// which keeps a single-service local run to two containers; that fallback is
-// refused outside local development, because a production deployment
-// silently publishing nothing is exactly the failure events exist to prevent.
-func newKafkaWriter(cfg *config.Config, log *zap.Logger) *kafka.Writer {
-	if len(cfg.Kafka.Brokers) == 0 {
-		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "staging") {
-			log.Fatal("KAFKA_BROKERS must be set in " + cfg.Env + " environment")
-		}
-		log.Warn("no Kafka brokers configured — domain events will be dropped")
-		return nil
-	}
-	return &kafka.Writer{
-		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:    cfg.Kafka.Topic,
-		Balancer: &kafka.LeastBytes{},
-		// Required even though the broker sets auto.create.topics.enable:
-		// kafka-go defaults this to false and never asks the broker to
-		// auto-create in its metadata request, so a write to a topic that does
-		// not exist yet fails with "Unknown Topic Or Partition" regardless of
-		// the broker-side setting. Matches the platform-wide fix in 7589bc3.
-		AllowAutoTopicCreation: true,
-		// Bounded so an unreachable broker delays a response rather than
-		// holding the request open — the write is already committed by the
-		// time an event is emitted.
-		WriteTimeout: 5 * time.Second,
-		// Without this, every write to this service costs an extra second.
-		// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
-		// WriteMessages of a single message waits for the batch to fill (100
-		// messages) or for that timer, whichever comes first. These events are
-		// emitted one per state transition, so the batch never fills and the
-		// timer always wins — and publishing is on the request path, so the
-		// caller pays for it. Ordering and synchronous delivery are unchanged;
-		// only the artificial wait goes away.
-		BatchTimeout: 10 * time.Millisecond,
-	}
 }

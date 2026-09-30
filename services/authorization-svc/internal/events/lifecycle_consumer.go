@@ -248,13 +248,13 @@ func (c *LifecycleConsumer) Run(ctx context.Context, reader *kafka.Reader) {
 		zap.Int("event_types", len(LifecycleConsumedEventTypes())))
 
 	for {
-		msg, err := reader.ReadMessage(ctx)
+		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				c.log.Info("lifecycle consumer stopping")
 				return
 			}
-			c.log.Warn("kafka read failed — retrying", zap.Error(err))
+			c.log.Warn("kafka fetch failed — retrying", zap.Error(err))
 			select {
 			case <-ctx.Done():
 				return
@@ -262,23 +262,32 @@ func (c *LifecycleConsumer) Run(ctx context.Context, reader *kafka.Reader) {
 			}
 			continue
 		}
-		c.Handle(ctx, msg.Value)
+		if err := c.Handle(ctx, msg.Value); err != nil {
+			// Handle returned an error (only for critical DB failures).
+			// We still commit to avoid blocking the partition, but log loudly.
+			c.log.Error("lifecycle event: handle failed — committing offset to avoid stall",
+				zap.Error(err), zap.String("event_id", string(msg.Key)))
+		}
+		if err := reader.CommitMessages(ctx, msg); err != nil {
+			c.log.Error("failed to commit offset", zap.Error(err))
+		}
 	}
 }
 
 // Handle applies one message. Exported so dispatch is testable without a
 // broker.
 //
-// Never returns an error, on the same terms as Consumer.Handle: the offset is
-// committed by reading the next message, so a returned error would either stall
-// the partition on one bad event or be discarded. A message that cannot be
-// applied is logged with enough detail to replay it by hand.
-func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) {
+// Returns an error only for critical failures (DB unavailable) that should
+// cause the offset to NOT be committed, allowing a retry. Non-critical
+// failures (unknown event type, malformed payload, missing tenant for status)
+// are logged and return nil so the offset is committed and the partition keeps
+// moving.
+func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) error {
 	var env inbound
 	if err := json.Unmarshal(raw, &env); err != nil {
 		c.log.Error("lifecycle event: undecodable envelope — skipped",
 			zap.Error(err), zap.Int("bytes", len(raw)))
-		return
+		return nil // Malformed message, commit and move on
 	}
 
 	isStatus := principalStatusEvents[env.EventType]
@@ -287,29 +296,29 @@ func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) {
 		// Three topics are subscribed and each carries events this service has
 		// no interest in. Silently skipped, not logged: at this volume a line
 		// per uninteresting event is how the log stops being readable.
-		return
+		return nil
 	}
 
 	if !c.claim(env.EventID) {
 		c.log.Debug("lifecycle event: already handled by this process",
 			zap.String("event_id", env.EventID),
 			zap.String("event_type", env.EventType))
-		return
+		return nil // Already processed, commit and move on
 	}
 
 	if isStatus {
-		c.handlePrincipalStatus(ctx, env)
-		return
+		return c.handlePrincipalStatus(ctx, env)
 	}
 	c.handleInvalidation(env)
+	return nil
 }
 
-func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbound) {
+func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbound) error {
 	var payload principalStatusPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		c.log.Error("principal status event: undecodable payload — skipped",
 			zap.String("event_id", env.EventID), zap.Error(err))
-		return
+		return nil // Malformed payload, commit and move on
 	}
 
 	principalID := strings.TrimSpace(payload.PrincipalID)
@@ -317,7 +326,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 		c.log.Error("principal status event: payload names no principal_id — cannot project",
 			zap.String("event_id", env.EventID),
 			zap.String("correlation_id", env.CorrelationID))
-		return
+		return nil // Missing principal_id, commit and move on
 	}
 
 	status := strings.ToUpper(strings.TrimSpace(payload.NewStatus))
@@ -331,7 +340,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 			zap.String("event_id", env.EventID),
 			zap.String("principal_id", principalID),
 			zap.String("correlation_id", env.CorrelationID))
-		return
+		return nil // Empty status, commit and move on
 	}
 
 	// Payload first, envelope second: identity-context-svc puts the tenant in
@@ -346,7 +355,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 			zap.String("event_id", env.EventID),
 			zap.String("principal_id", principalID),
 			zap.String("correlation_id", env.CorrelationID))
-		return
+		return nil // Missing tenant, commit and move on
 	}
 
 	projected, err := c.store.ProjectPrincipalStatus(ctx, domain.ProjectPrincipalStatusParams{
@@ -364,7 +373,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 			c.log.Debug("principal status event: a newer status is already projected — skipped",
 				zap.String("principal_id", principalID),
 				zap.String("status", status))
-			return
+			return nil
 		}
 		// Logged at Error with the consequence spelled out, because the
 		// direction of this failure matters: a SUSPENSION that fails to
@@ -375,7 +384,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 			zap.String("status", status),
 			zap.String("correlation_id", env.CorrelationID),
 			zap.Error(err))
-		return
+		return err // DB error - return error to allow retry
 	}
 
 	// At Warn rather than Info when the projected status is not ACTIVE: a
@@ -393,6 +402,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 	} else {
 		c.log.Warn("principal status projected — this principal is now denied EVERY action until reinstated", fields...)
 	}
+	return nil
 }
 
 // handleInvalidation drops the cached grant and delegation reads for the

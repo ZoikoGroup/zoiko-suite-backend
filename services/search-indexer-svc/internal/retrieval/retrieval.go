@@ -82,6 +82,17 @@ type Response struct {
 	NextCursor      string   `json:"next_cursor,omitempty"`
 	IndexGeneration string   `json:"index_generation"`
 	ReasonCodes     []string `json:"reason_codes,omitempty"`
+
+	// IndexFreshness is the active generation's measured freshness —
+	// CURRENT / LAGGING / STALE / UNKNOWN — and IndexLagMS the lag behind it.
+	// §4's "return exact source lineage plus freshness status": a caller must
+	// be able to tell an answer from a current index from one from an index
+	// hours behind, which before this field it could not.
+	IndexFreshness domain.Freshness `json:"index_freshness"`
+	IndexLagMS     int64            `json:"index_lag_ms"`
+	// EmbeddingModel names the pinned "model@version" that answered a
+	// semantic request; empty for lexical search.
+	EmbeddingModel string `json:"embedding_model,omitempty"`
 }
 
 type Bucket struct {
@@ -142,14 +153,53 @@ func (r *Retriever) Execute(ctx context.Context, plan *query.Plan, tc query.Cont
 		Total:           raw.Total,
 		TotalIsExact:    raw.Relation == "eq" || raw.Relation == "",
 		IndexGeneration: strings.Join(plan.PartitionSet, ","),
+		IndexFreshness:  plan.Freshness,
+		IndexLagMS:      plan.LagMS,
+		EmbeddingModel:  plan.PinnedModel,
+	}
+	if resp.IndexFreshness == "" {
+		resp.IndexFreshness = domain.FreshnessUnknown
+	}
+
+	// An R0 answer from a STALE index is DEGRADED and from an UNKNOWN one is
+	// UNKNOWN — never COMPLETE. §2.2: "UNKNOWN is never represented as
+	// CURRENT", and INV-23: "index drift/staleness is observable". ESR-012 is
+	// carried as a reason code so a caller branching on codes sees it too.
+	switch plan.Freshness {
+	case domain.FreshnessStale:
+		resp.Completeness = degrade(resp.Completeness, domain.CompletenessDegraded)
+		resp.CompletenessDetail = "the index is STALE: it is behind its source beyond the declared freshness bound"
+		resp.ReasonCodes = appendUnique(resp.ReasonCodes, string(domain.ReasonIndexStaleForScope))
+	case domain.FreshnessUnknown, "":
+		resp.Completeness = degrade(resp.Completeness, domain.CompletenessUnknown)
+		resp.CompletenessDetail = "the index's freshness could not be measured"
+		resp.ReasonCodes = appendUnique(resp.ReasonCodes, string(domain.ReasonIndexStaleForScope))
+	}
+
+	// NP-59 / §8.2: the tenant has restrictions in this scope whose
+	// propagation FAILED. Their refs were excluded at query time, so nothing
+	// withdrawn is returned — but "health model separates normal freshness from
+	// restriction safety; scope becomes unsafe/degraded", and a caller must not
+	// read an answer from a scope with a failing restriction lane as COMPLETE.
+	if plan.RestrictionExclusions > 0 {
+		resp.Completeness = degrade(resp.Completeness, domain.CompletenessDegraded)
+		if resp.CompletenessDetail == "" {
+			resp.CompletenessDetail = "restriction propagation is failing in this scope; affected records were excluded"
+		}
+		resp.ReasonCodes = appendUnique(resp.ReasonCodes, string(domain.ReasonRestrictionPropFailed))
+		resp.TotalIsExact = false
 	}
 
 	// NP-19. A partial engine answer is reported as partial before anything
 	// else happens to it, so a suppression later cannot overwrite the state
 	// with something that reads better.
 	if raw.Partial {
-		resp.Completeness = domain.CompletenessPartial
-		resp.CompletenessDetail = raw.PartialReason
+		resp.Completeness = degrade(resp.Completeness, domain.CompletenessPartial)
+		if resp.CompletenessDetail != "" {
+			resp.CompletenessDetail += "; " + raw.PartialReason
+		} else {
+			resp.CompletenessDetail = raw.PartialReason
+		}
 		resp.TotalIsExact = false
 		resp.ReasonCodes = append(resp.ReasonCodes, string(domain.ReasonSearchDegradedPartial))
 	}
@@ -191,6 +241,21 @@ func (r *Retriever) Execute(ctx context.Context, plan *query.Plan, tc query.Cont
 			if docClass := domain.RetrievalClass(candidate.retrievalClass); stricter(docClass, class) {
 				class = docClass
 			}
+		}
+
+		// §8.3: under STALE or UNKNOWN freshness, "protected results may
+		// require source hydration or block". The scope-level gate in the
+		// handler already refused scopes whose CONTRACT class is protected;
+		// this is the per-document half — a record stamped R1 or stricter
+		// inside an R0 scope is protected content too, and an index that
+		// cannot be trusted as current cannot be trusted about its access.
+		if plan.Freshness.Untrusted() && class != domain.RetrievalR0 {
+			suppressed[domain.ReasonIndexStaleForScope]++
+			resp.Completeness = degrade(resp.Completeness, domain.CompletenessDegraded)
+			if resp.CompletenessDetail == "" {
+				resp.CompletenessDetail = "protected results withheld: the index is " + string(plan.Freshness)
+			}
+			continue
 		}
 
 		if class.RequiresReauthorization() {
@@ -257,9 +322,9 @@ func (r *Retriever) Execute(ctx context.Context, plan *query.Plan, tc query.Cont
 				// entirely, filtered through the same returnable allowlist —
 				// a hydrated document must not expose fields the contract
 				// never made returnable just because it came from the source.
-				result.Fields = projectFields(hydrated, plan.ReturnableFields)
+				result.Fields = projectHydrated(hydrated, plan.ReturnableFields, plan.SourcePaths)
 				result.Freshness = "SOURCE"
-			case errors.Is(herr, errSourceGone):
+			case errors.Is(herr, domain.ErrSourceGone):
 				// NP-55: "current source is deleted between query and
 				// hydration → hydration returns NOT_FOUND/SUPPRESS; no stale
 				// result body." Suppressed, never served from the index.
@@ -347,8 +412,6 @@ func (r *Retriever) Execute(ctx context.Context, plan *query.Plan, tc query.Cont
 	return resp, nil
 }
 
-var errSourceGone = errors.New("source record no longer exists")
-
 func (r *Retriever) hydrate(ctx context.Context, c candidate, plan *query.Plan) (map[string]any, error) {
 	if r.hydrator == nil {
 		// ESR-014 rather than a silent downgrade to index content. A scope
@@ -418,6 +481,43 @@ func projectFields(source map[string]any, returnable map[string]bool) map[string
 		}
 	}
 	return out
+}
+
+// projectHydrated filters a hydrated SOURCE object through the returnable
+// allowlist, reading each field at its registered source path.
+//
+// The source's representation is keyed by its own paths ("amount.currency",
+// "obligation_code"), not by the contract's field names, which is why
+// projectFields cannot be used here: it found nothing whenever the two
+// differed, and an R2 result came back with no fields at all — correct by
+// accident on the allowlist, wrong about what the record contains.
+func projectHydrated(source map[string]any, returnable map[string]bool, paths map[string]string) map[string]any {
+	out := make(map[string]any, len(returnable))
+	for name := range returnable {
+		path := paths[name]
+		if path == "" {
+			path = name
+		}
+		if v, ok := lookupPath(source, path); ok && v != nil {
+			out[name] = v
+		}
+	}
+	return out
+}
+
+// lookupPath resolves a dotted path against a decoded JSON object.
+func lookupPath(obj map[string]any, path string) (any, bool) {
+	var current any = obj
+	for _, part := range strings.Split(path, ".") {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		if current, ok = m[part]; !ok {
+			return nil, false
+		}
+	}
+	return current, true
 }
 
 // safeSnippets escapes a highlight fragment and re-applies markup only around

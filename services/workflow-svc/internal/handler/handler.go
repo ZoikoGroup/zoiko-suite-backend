@@ -382,6 +382,26 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Validate each approver is authorized to approve for this legal entity.
+	// This is a defense-in-depth measure; full server-resolved routing (WFC-01)
+	// requires a separate rule engine service per R-001.
+	for _, st := range req.Stages {
+		if err := h.authz.CheckApprovalAllowed(r.Context(), st.ApproverPrincipalID, req.LegalEntityID, principalID); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrAuthorizationDenied):
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error":                 "approver_not_authorized",
+					"approver_principal_id": st.ApproverPrincipalID,
+					"message":               "approver is not authorized to approve for this legal entity",
+				})
+			default:
+				h.log.Error("CreateWorkflow: authorization-svc unavailable for approver check — failing closed",
+					zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+			}
+			return
+		}
+	}
 	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
 	// the initiator of a workflow may not be listed as an approver in any
 	// of its own stages. This is a validation error on the caller-supplied
@@ -580,7 +600,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID); err != nil {
+	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy); err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAuthorizationDenied):
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
@@ -613,9 +633,34 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Resolve the current stage to get the assigned approver for delegation support.
+	currentStage, err := h.store.FindCurrentStage(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, h.log, err, correlationID, "SubmitAction")
+		return
+	}
+
+	assignedApproverID := ""
+	if currentStage.ApproverPrincipalID != principalID {
+		// Caller is not the assigned approver — check if they're a delegate.
+		if err := h.authz.CheckDelegation(r.Context(), principalID, currentStage.ApproverPrincipalID, instanceForAuthzCheck.LegalEntityID); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrAuthorizationDenied):
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "wrong_approver"})
+			default:
+				h.log.Error("SubmitAction: authorization-svc unavailable for delegation check — failing closed",
+					zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+			}
+			return
+		}
+		// Delegate authorized: use the assigned approver's ID for stage lookup.
+		assignedApproverID = currentStage.ApproverPrincipalID
+	}
+
 	instance, stage, transitioned, err := h.store.SubmitAction(r.Context(), domain.SubmitActionParams{
-		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, Action: req.Action,
-		Rationale: req.Rationale, CausationID: req.CausationID,
+		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, AssignedApproverID: assignedApproverID,
+		Action: req.Action, Rationale: req.Rationale, CausationID: req.CausationID,
 	})
 	if err != nil {
 		switch {
@@ -656,7 +701,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 
 // EscalateWorkflow handles POST /v1/workflows/{workflow_instance_id}/escalate.
 //
-// Response: 200 escalated (or idempotent no-op) / 401 no verified principal or tenant / 404 not found / 409 illegal transition / 503 unavailable.
+// Response: 200 escalated (or idempotent no-op) / 401 no verified principal or tenant / 403 authorization denied / 404 not found / 409 illegal transition / 503 unavailable.
 func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -666,6 +711,23 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, h.log, err, correlationID, "EscalateWorkflow")
+		return
+	}
+	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy); err != nil {
+		switch {
+		case errors.Is(err, domain.ErrAuthorizationDenied):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+		default:
+			h.log.Error("EscalateWorkflow: authorization-svc unavailable — failing closed",
+				zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+		}
 		return
 	}
 
@@ -685,7 +747,7 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 
 // CancelWorkflow handles POST /v1/workflows/{workflow_instance_id}/cancel.
 //
-// Response: 200 cancelled (or idempotent no-op) / 401 no verified principal or tenant / 404 not found / 409 illegal transition (already terminal) / 503 unavailable.
+// Response: 200 cancelled (or idempotent no-op) / 401 no verified principal or tenant / 403 authorization denied / 404 not found / 409 illegal transition (already terminal) / 503 unavailable.
 func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -695,6 +757,23 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, h.log, err, correlationID, "CancelWorkflow")
+		return
+	}
+	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy); err != nil {
+		switch {
+		case errors.Is(err, domain.ErrAuthorizationDenied):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+		default:
+			h.log.Error("CancelWorkflow: authorization-svc unavailable — failing closed",
+				zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+		}
 		return
 	}
 

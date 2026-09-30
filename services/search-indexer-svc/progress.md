@@ -4,7 +4,7 @@ Tracked against ZS-SVC-AB-001's §18.2 Definition of Done and its §19 eight-wav
 sequence. Every "Done" row below has a test that fails if the behaviour is
 removed; the test names are in README.md's invariant table.
 
-Last updated: 2026-09-21.
+Last updated: 2026-09-30 (compliance re-audit remediation — see the 30 Sep section at the end).
 
 ---
 
@@ -15,10 +15,10 @@ Last updated: 2026-09-21.
 | **1** | Authority & contract foundation — ESR-01, field exposure classes, source registration, tenant/residency partition metadata, reason-code taxonomy | **Done** |
 | **2** | Secure indexing core — durable source ingestion, projection rules, checkpoints, tombstones, source-to-index reconciliation | **Done** |
 | **3** | Query gateway — trusted context, scope registry, mandatory filter compiler, complexity budgets, cursors, lexical search | **Done** |
-| **4** | Secure retrieval — current re-authorization, source hydration, snippets/redaction, safe facets/counts, export boundary | **Done**, except the R2 hydrator (OD-05 — no scope is registered R2; a scope that were would answer ESR-014 rather than silently serving index content) |
+| **4** | Secure retrieval — current re-authorization, source hydration, snippets/redaction, safe facets/counts, export boundary | **Done**. R2 hydration is wired for `obligation` and hydrates as the caller; other source types need a `SOURCE_SERVICE_URL_<TYPE>` (OD-05 decides which scopes are R2) |
 | **5** | Lifecycle & operations — generation build/validate/activate/retire, drift, recovery, degraded modes, priority restriction SLOs | **Done**, except numeric SLOs (OD-03/OD-04 — the metrics exist and are correctly separated; the thresholds are a capacity decision) |
 | **6** | Sensitive-domain adoption | **Not started** — a registration exercise, not a code change. See "Onboarding a domain" in README.md |
-| **7** | Semantic / RAG retrieval | **Not started** (OD-10/OD-11). The projection and restriction model already carries the lineage vectors need |
+| **7** | Semantic / RAG retrieval | **Built, fail-closed** — `/v1/search/semantic`, pinned models, filtered ANN, NP-33/34/35 controls, migration certification. No provider is configured (OD-10), so no semantic scope can build yet |
 | **8** | Global search certification | **Not started** — gated on waves 6 and 7 |
 
 ---
@@ -31,7 +31,7 @@ Last updated: 2026-09-21.
 | NP-01..NP-60 pass in CI/pre-production certification for applicable source classes | **50 of 60** covered by tests or the audit script; 10 belong to waves 6–8 or to open decisions (table below) | test suites + `scripts/audit.sh` |
 | Index generation lifecycle supports parallel build, validation, atomic activation and safe abort | **Done** | `TestIndexGenerations_OnlyOneActivePerScope`; audit §7 |
 | Restriction propagation independently verified, producing measurable evidence | **Done** | `VerifyRestrictions` sweep; `esr.restriction.propagated` at VERIFIED only; audit §9 |
-| Current-authorization retrieval across keyword, autocomplete, facet and semantic paths | **Done** for keyword and facet; autocomplete and semantic are waves 7–8 | `TestExecute_ReauthorizesEveryR1Hit` |
+| Current-authorization retrieval across keyword, autocomplete, facet and semantic paths | **Done** for keyword, facet and semantic; autocomplete is wave 8 | `TestExecute_ReauthorizesEveryR1Hit`, `TestSemantic_HappyPathEmbedsWithThePinAndFiltersInsideTheWalk` |
 | Search logs/telemetry pass privacy minimisation review | **Done** | `TestSearch_EvidenceNeverStoresQueryText`; keyed actor hash on the abuse stream |
 | Cross-domain global search cannot reveal inaccessible existence/count/snippet information | **Done** for the mechanisms; global search itself is wave 8 | facet min-cell ×2, `total_is_exact`, TC-06 suppressions |
 | Runbooks, SLOs, dashboards, alerting, rollback and emergency disable exercised | **Partial** — RUNBOOK.md covers all eight §13.3 scenarios and the emergency lever; dashboards and alert thresholds are OD-03/OD-04 | `RUNBOOK.md` |
@@ -65,7 +65,7 @@ Deferred, with the reason:
 |---|---|
 | NP-23 | Special-category query telemetry — the minimisation is done (digest only); the *classification* of a query as special-category is PRV's. |
 | NP-27, NP-28 | Analyzer/synonym change certification. The mechanism is done — an analyzer change is a new contract version and therefore a new generation — but the relevance-evaluation gold sets are OD-15. |
-| NP-32, NP-33, NP-34, NP-35 | AI/RAG and vector boundary — wave 7. |
+| NP-32 | Prompt-injection handling is AIG's (§10.2); retrieved text is returned as data. |
 | NP-37 | AI citation deep links — wave 7; the re-authorization that makes it work is done. |
 | NP-38, NP-39 | Search personalisation and recent-query history. **Not built at all**, which is the strongest form of compliance with both: there is no profile to lack a purpose and no history to leak between sessions. |
 | NP-43 | "Active generation corrupt but old generation stale on permissions" — an operator judgement, in RUNBOOK §3. |
@@ -159,3 +159,70 @@ go build ./... && go vet ./... && go test ./...
 `audit.sh` reports a pass percentage and exits non-zero on any failure. It
 detects the case where the RBAC bundle has not been seeded and *says so*,
 rather than reporting a correctly fail-closed service as broken.
+
+---
+
+## 30 Sep 2026 — compliance re-audit remediation
+
+The Group 1 re-audit (docs/audit_files, 6/9) found the 25 Sep "fixes" for
+ESR-012 and R2 did not work. Closed here:
+
+| Gap | Was | Now | Evidence |
+|---|---|---|---|
+| ESR-012 STALE unreachable | lag = `time.Since(time.Now())` | broker-measured lag; STALE/UNKNOWN refuse R1+ (503), flag R0 | `TestCheckpoint_ConsumerHoursBehindIsStale`, `TestSearch_StaleProtectedScopeIsRefusedWithESR012`, `TestSearch_StaleR0ScopeAnswersFlagged` |
+| Freshness never reached the caller | — | `index_freshness`, `index_lag_ms` on every response | `TestSearch_LaggingIsSurfacedNotBlocked` |
+| False `esr.index_checkpoint.advanced` | emitted when nothing advanced | only when the broker watermark moves | `recordCheckpoint` |
+| R2 hydrator | unwired, wrong path, no envelope, self-asserted identity | configured collections, caller's envelope, 404 → ESR-010 | `internal/hydrator` tests, `TestExecute_HydratedObjectIsProjectedBySourcePath` |
+| ESR-018 never returned | event only | FAILED restrictions excluded + DEGRADED ESR-018; >500 blocks | `TestSearch_FailedRestrictionsAreExcludedAndReported` |
+| Semantic / vector (§10.1, ESR-019) | absent | built, fail-closed pending OD-10 | `vector_test.go`, `semantic_test.go`, `freshness_test.go` |
+| Idempotency-Key not honoured | — | dedupe store, principal-bound | `internal/idempotency` tests |
+| openapi.yaml invalid | 2 structural errors | valid (redocly + openapi-spec-validator) | — |
+
+### 30 Sep 2026 — live re-audit and second remediation
+
+Run against real Postgres, Kafka and OpenSearch (service in a golang container;
+permit-all authz; stubs for the embedding provider and obligations-svc). The
+live run found five defects no unit test had, all fixed and re-verified live:
+
+| Defect | Fix | Live proof |
+|---|---|---|
+| **CRITICAL** — HTTP restriction left the ledger at epoch 0; a later update re-indexed the ERASED record, and it still read VERIFIED | ledger stamped tombstoned at the restriction epoch first; every serving/candidate generation tombstoned | erased r3 stayed tombstoned after a later update; semantic search excluded it |
+| **HIGH** — generations were never filled; validation passed `engine=0 ledger=4`; activating a rebuild emptied the scope | Kafka replay backfill (ledger-authoritative, create-only), parallel live writes, READY needs COMPLETE, no empty-index exemption | rebuild: `engine=2 ledger=2 vectors=2`, results unchanged after cutover |
+| **HIGH** — model migration impossible (v2 contract written into v1's index) | each generation projected and searched with its own contract; publishing v2 retires v1 atomically | v1 served under m@1 while v2 built; certified; cut over to m@2 |
+| **HIGH** — consumer subscribed before its topic existed never recovered | reader created only once the topic exists; retried every 30s | events indexed ~9s after the topic appeared, no restart |
+| **HIGH** — NP-41 contamination check counted every document (empty term skipped), so every populated generation failed READY; failed open on error | `CountMissing` (must_not exists), fail closed | populated generation passed; untenanted doc still fails (unit) |
+| MED — first quarantined message per topic lost from the DLQ | DLQ write retried; not committed until copied | first quarantine landed in a DLQ that did not exist |
+| MED — watermark unit change pinned old rows | migration 000004 resets wall-clock watermarks | — |
+| MED — retrieval evaluation was a cross-tenant existence oracle | runs in the caller's tenant only, with FAILED-restriction exclusion | — |
+| LOW — migration gate failed open; 5xx refusals flooded the abuse stream; 409s cached 7 days; no X-Source-System to sources; lag corners read CURRENT; evidence lacked the model; 000002 not re-runnable | all fixed | migrations applied twice cleanly |
+
+Verified in Docker afterwards (golang:1.25 + postgres:16, `-race`,
+REQUIRE_DB_TESTS=1): all 13 packages race-clean; all 27 store integration tests
+pass against real Postgres — 9 new ones for 000003/000004 — with RLS exercised
+as an unprivileged role; the store harness now applies EVERY migration (it had
+stopped at 000002); and 000001–000004 applied cleanly to a copy of the existing
+search_indexer database.
+
+Still not verified live: authorization-denial paths (permit-all stub), the real
+obligations-svc, a real embedding provider.
+
+### 30 Sep 2026 — `scripts/audit.sh` against the real compose stack
+
+`search_indexer` was backed up (`pg_dump -Fc`) and upgraded with 000003 and
+000004; the stack (this service + authorization-svc, mtls-management-svc,
+postgres, kafka, opensearch) was rebuilt from source. `audit.sh` was updated:
+it now waits for the generation backfill before READY, has a section 16 for the
+30 Sep remediation (freshness on responses, checkpoint measured on activation,
+HTTP restriction stamped into the ledger, idempotency replay and mismatch,
+semantic refusal on a lexical scope, rebuild + cutover without resurrection),
+validates openapi.yaml with a real validator, and re-runs the Go suite in
+golang:1.25 with -race when host Application Control keeps blocking binaries.
+
+Result: **51 PASS, 1 FAIL, 1 SKIP.** The run found one more defect in this
+service, fixed: the restriction-backlog and freshness gauges exposed no series
+until a scope went live, so alerts on them had nothing to evaluate
+(`bootstrap` placeholders added). The one FAIL, and the sections behind it
+(7–12, 16), are **authorization-svc**: its database is behind its code
+(`column pra.book_id does not exist`; permission denied on its partition
+functions), so every `/v1/authorize` answers 503 and this service correctly
+refuses control-plane writes with ESR-008. Not a search-indexer defect.

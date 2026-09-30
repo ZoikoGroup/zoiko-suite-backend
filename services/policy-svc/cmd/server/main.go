@@ -26,14 +26,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
-	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/config"
 	"zoiko.io/policy-svc/internal/decisionlog"
 	svcenvelope "zoiko.io/policy-svc/internal/envelope"
-	"zoiko.io/policy-svc/internal/events"
 	"zoiko.io/policy-svc/internal/handler"
 	"zoiko.io/policy-svc/internal/health"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
@@ -109,33 +107,6 @@ func main() {
 	// ── 4. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
 
-	// Kafka producer — connects lazily on first write, same posture as
-	// identity-context-svc/tenant-entity-registry-svc: not a fail-fast
-	// startup dependency like Postgres.
-	// AllowAutoTopicCreation is required even though the broker itself has
-	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
-	// this to false and never asks the broker to auto-create in its
-	// metadata request, so every write to a not-yet-existing topic fails
-	// with "Unknown Topic Or Partition" regardless of the broker-side
-	// setting.
-	kafkaWriter := &kafka.Writer{
-		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:                  cfg.Kafka.Topic,
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
-		// Without this, every write to this service costs an extra second.
-		// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
-		// WriteMessages of a single message waits for the batch to fill (100
-		// messages) or for that timer, whichever comes first. These events are
-		// emitted one per state transition, so the batch never fills and the
-		// timer always wins — and publishing is on the request path, so the
-		// caller pays for it. Ordering and synchronous delivery are unchanged;
-		// only the artificial wait goes away.
-		BatchTimeout: 10 * time.Millisecond,
-	}
-	defer func() { _ = kafkaWriter.Close() }()
-
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	decisionLogClient := decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL)
 
 	// AuthZ client. Refuses to start in production/staging against a
@@ -161,9 +132,25 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	//
+	// Override MaterialWrite so that POST /v1/policies/evaluate (a read-type
+	// computation that does not mutate state in policy-svc) is not forced to
+	// carry an idempotency key or legal_entity_id it has no state to protect.
+	envelopePolicy := svcenvelope.ServicePolicy()
+	envelopePolicy.MaterialWrite = func(req *http.Request) bool {
+		if req.URL.Path == "/v1/policies/evaluate" && req.Method == http.MethodPost {
+			return false
+		}
+		switch req.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			return false
+		default:
+			return true
+		}
+	}
+	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, decisionLogClient, authzClient, cfg.AuthZPlatformScopeID, log)
+	h := handler.New(pgStore, decisionLogClient, authzClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
 

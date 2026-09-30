@@ -131,9 +131,17 @@ func main() {
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter, metrics)
 	jurisdictionValidator := jurisdiction.NewHTTPValidator(cfg.JurisdictionRulesURL, log)
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+
+	// ── 4b. Overdue scheduler ─────────────────────────────────────────────────
+	// Runs every minute to find obligations past their due_date and transition
+	// them to OVERDUE. This addresses the audit gap where overdue was never
+	// computed automatically.
+	overdueCtx, overdueCancel := context.WithCancel(context.Background())
+	defer overdueCancel()
+	go runOverdueScheduler(overdueCtx, pgStore, publisher, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -214,4 +222,52 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// runOverdueScheduler periodically checks for obligations past their due_date
+// and transitions them to OVERDUE status.
+func runOverdueScheduler(ctx context.Context, pgStore *store.PgStore, publisher *events.Publisher, log *zap.Logger) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	log.Info("overdue scheduler started")
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("overdue scheduler stopped")
+			return
+		case <-ticker.C:
+			// Create a background context with tenant for the store
+			// Note: In a multi-tenant setup, we'd need to iterate tenants.
+			// For now, we use a system context that the store will scope.
+			bgCtx := context.Background()
+
+			overdue, err := pgStore.FindOverdueObligations(bgCtx)
+			if err != nil {
+				log.Error("overdue scheduler: failed to find overdue obligations", zap.Error(err))
+				continue
+			}
+
+			for _, o := range overdue {
+				updated, transitioned, err := pgStore.TransitionOverdue(bgCtx, o.ObligationID)
+				if err != nil {
+					log.Error("overdue scheduler: failed to transition obligation",
+						zap.String("obligation_id", o.ObligationID),
+						zap.Error(err))
+					continue
+				}
+				if transitioned {
+					// Publish the overdue event
+					if pubErr := publisher.PublishObligationOverdue(bgCtx, *updated, "system", ""); pubErr != nil {
+						log.Error("overdue scheduler: failed to publish obligation.overdue",
+							zap.String("obligation_id", updated.ObligationID),
+							zap.Error(pubErr))
+					}
+					log.Info("overdue scheduler: transitioned obligation to OVERDUE",
+						zap.String("obligation_id", updated.ObligationID),
+						zap.String("due_date", updated.DueDate.Format(time.RFC3339)))
+				}
+			}
+		}
+	}
 }

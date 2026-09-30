@@ -402,7 +402,7 @@ func TestGetObligation_NotFound(t *testing.T) {
 func TestListObligations_EmptyReturnsArray(t *testing.T) {
 	r := newTestRouter(&stubStore{list: nil})
 
-	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations", nil))
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations?legal_entity_id=le-1", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -417,7 +417,7 @@ func TestListObligations_EmptyReturnsArray(t *testing.T) {
 func TestListObligations_InvalidDueBefore(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations?due_before=not-a-date", nil))
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations?legal_entity_id=le-1&due_before=not-a-date", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

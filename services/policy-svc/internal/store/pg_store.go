@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -101,6 +102,10 @@ type Store interface {
 	// legalEntityID), most-specific-scope first. See the method's own
 	// doc comment on PgStore for the precedence rule.
 	FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string) ([]*domain.ApplicablePolicyVersion, error)
+
+	// EnqueueEvent adds an event to the transactional outbox. The event
+	// will be published asynchronously by a background worker.
+	EnqueueEvent(ctx context.Context, event OutboxEvent) error
 
 	// ── Chunk 10: control tests & attestations (doc7 §E3, §E6, §I3) ─────────
 	CreateControlTestDefinition(ctx context.Context, params domain.CreateControlTestDefinitionParams) (*domain.ControlTestDefinition, bool, error)
@@ -593,6 +598,12 @@ func (s *PgStore) ActivateVersion(ctx context.Context, policyVersionID, actorID 
 // set on the version but NOT matching the request's is excluded outright
 // (never leaks across tenants/entities).
 //
+// Additionally, only versions that are currently effective are returned:
+// the current time must be >= effective_from AND (effective_to IS NULL OR
+// current time < effective_to). This gates applicability by the version's
+// effective window.
+// If asOf is provided, the check uses that timestamp instead of NOW().
+//
 // Results are ordered most-specific-scope first: an exact
 // (tenant_id, legal_entity_id) match sorts before a tenant-only match,
 // which sorts before a global (both NULL) match. GET /v1/policies
@@ -603,13 +614,13 @@ func (s *PgStore) ActivateVersion(ctx context.Context, policyVersionID, actorID 
 // tier, the tie-break is effective_from DESC — a known v1 simplification
 // (see PROGRESS.md); v1 assumes at most one Policy per policy_type is
 // the realistic case.
-func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string) ([]*domain.ApplicablePolicyVersion, error) {
+func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string, asOf *time.Time) ([]*domain.ApplicablePolicyVersion, error) {
 	// Column list is policyVersionColumns qualified with the pv. alias, plus
 	// p.policy_code last. Keep it in that order and complete: this query cannot
 	// use the shared const because of the join, and omitting
 	// activated_by_principal_id/activated_at here once made GET /v1/policies
 	// report every ACTIVE version as never activated.
-	const query = `
+const query = `
 		SELECT
 			pv.policy_version_id, pv.policy_id, pv.tenant_id, pv.legal_entity_id,
 			pv.rule_payload, pv.effective_from, pv.effective_to, pv.version_status,
@@ -621,6 +632,8 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string,
 		  AND pv.version_status = 'ACTIVE'
 		  AND (pv.tenant_id IS NULL OR pv.tenant_id = $2::uuid)
 		  AND (pv.legal_entity_id IS NULL OR pv.legal_entity_id = $3::uuid)
+		  AND pv.effective_from <= COALESCE($4, NOW())
+		  AND (pv.effective_to IS NULL OR pv.effective_to > COALESCE($4, NOW()))
 		ORDER BY
 			(CASE WHEN pv.tenant_id IS NOT NULL THEN 1 ELSE 0 END
 			 + CASE WHEN pv.legal_entity_id IS NOT NULL THEN 1 ELSE 0 END) DESC,
@@ -628,7 +641,7 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string,
 
 	var results []*domain.ApplicablePolicyVersion
 	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, query, policyType, tenantID, legalEntityID)
+		rows, err := tx.Query(ctx, query, policyType, tenantID, legalEntityID, asOf)
 		if err != nil {
 			return err
 		}
@@ -640,18 +653,61 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string,
 				&v.PolicyVersionID, &v.PolicyID, &v.TenantID, &v.LegalEntityID,
 				&v.RulePayload, &v.EffectiveFrom, &v.EffectiveTo, &v.VersionStatus,
 				&v.ActivatedByPrincipalID, &v.ActivatedAt,
-				&v.CreatedAt, &v.CreatedByPrincipalID, &v.PolicyCode,
-			); scanErr != nil {
-				return scanErr
-			}
-			v.ScopeType = domain.DeriveScopeType(v.TenantID, v.LegalEntityID)
-			results = append(results, v)
+			&v.CreatedAt, &v.CreatedByPrincipalID, &v.PolicyCode,
+		); scanErr != nil {
+			return scanErr
 		}
-		return rows.Err()
-	})
-	if err != nil {
-		s.log.Error("pg FindApplicableVersions failed", zap.String("policy_type", policyType), zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		v.ScopeType = domain.DeriveScopeType(v.TenantID, v.LegalEntityID)
+		results = append(results, v)
 	}
-	return results, nil
+	return rows.Err()
+})
+if err != nil {
+	s.log.Error("pg FindApplicableVersions failed", zap.String("policy_type", policyType), zap.Error(err))
+	return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+}
+return results, nil
+}
+
+// ── outbox ────────────────────────────────────────────────────────────────
+
+// OutboxEvent represents an event to be published via the transactional outbox.
+type OutboxEvent struct {
+	EventType      string
+	EventVersion   string
+	SchemaVersion  string
+	SourceService  string
+	TenantID       *string
+	LegalEntityID  *string
+	ActorID        string
+	CorrelationID  string
+	IdempotencyKey string
+	Payload        []byte
+}
+
+// EnqueueEvent adds an event to the transactional outbox in the same
+// transaction as the business write.
+func (s *PgStore) EnqueueEvent(ctx context.Context, event OutboxEvent) error {
+	tenantID := derefOrEmpty(event.TenantID)
+
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO outbox (
+				event_type, event_version, schema_version, source_service,
+				tenant_id, legal_entity_id, actor_id, correlation_id, idempotency_key, payload
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`,
+			event.EventType,
+			event.EventVersion,
+			event.SchemaVersion,
+			event.SourceService,
+			event.TenantID,
+			event.LegalEntityID,
+			event.ActorID,
+			event.CorrelationID,
+			event.IdempotencyKey,
+			event.Payload,
+		)
+		return err
+	})
 }

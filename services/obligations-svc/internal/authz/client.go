@@ -26,6 +26,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/obligations-svc/internal/domain"
+	"zoiko.io/obligations-svc/internal/envelope"
 )
 
 // Client is the narrow interface the handler depends on.
@@ -43,13 +44,18 @@ type Client interface {
 // ActionApplicabilityDecide is separate for the same reason and is the strongest
 // of the four in practice: an applicability decision is the record of WHETHER a
 // statutory obligation binds an entity at all, and everything downstream —
-// filings, evidence, aging — is derived from it. "May raise an obligation" and
-// "may decide it does not apply" are emphatically not the same authority.
+// filings, evidence, aging — is all derived from it. "May raise an obligation"
+// and "may decide it does not apply" are emphatically not the same authority.
+//
+// Read actions for object-level authorization on GET endpoints.
 const (
 	ActionObligationCreate       = "OBLIGATION_CREATE"
 	ActionObligationStatusUpdate = "OBLIGATION_STATUS_UPDATE"
 	ActionFilingRequirementAdd   = "FILING_REQUIREMENT_CREATE"
 	ActionApplicabilityDecide    = "APPLICABILITY_DECISION_RECORD"
+	ActionObligationRead         = "OBLIGATION_READ"
+	ActionFilingRequirementRead  = "FILING_REQUIREMENT_READ"
+	ActionApplicabilityRead      = "APPLICABILITY_DECISION_READ"
 )
 
 type HTTPClient struct {
@@ -98,6 +104,30 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 	req.Header.Set("Content-Type", "application/json")
 	if correlationID != "" {
 		req.Header.Set("X-Correlation-ID", correlationID)
+	}
+
+	// Forward envelope headers for audit attribution (tracker 82i).
+	// The canonical envelope (ZS-ARCH-SVC-001 §4) requires these on the
+	// authorization decision record so it appears in tenant-scoped reads.
+	if env, ok := envelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.ActorSubjectID != "" {
+			req.Header.Set("X-Principal-Id", env.ActorSubjectID)
+		}
+		if env.LegalEntityID != "" {
+			req.Header.Set("X-Legal-Entity-Id", env.LegalEntityID)
+		}
+		if env.RequestID != "" {
+			req.Header.Set("X-Request-Id", env.RequestID)
+		}
+		if env.SourceChannel != "" {
+			req.Header.Set("X-Source-Channel", string(env.SourceChannel))
+		}
+		if env.IdempotencyKey != "" {
+			req.Header.Set("Idempotency-Key", env.IdempotencyKey)
+		}
 	}
 
 	resp, err := c.http.Do(req)

@@ -406,8 +406,9 @@ func (p *stubPublisher) PublishFormEvent(_ context.Context, eventType string, _ 
 
 type stubAuthz struct{ err error }
 
-func (a *stubAuthz) CheckApprovalAllowed(_ context.Context, _, _ string) error { return a.err }
-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error      { return a.err }
+func (a *stubAuthz) CheckApprovalAllowed(_ context.Context, _, _, _ string) error { return a.err }
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _, _ string) error      { return a.err }
+func (a *stubAuthz) CheckDelegation(_ context.Context, _, _, _ string) error      { return a.err }
 
 type stubDocuments struct {
 	version int
@@ -564,6 +565,7 @@ func TestCreateWorkflow_InitiatorAsApprover_Rejected(t *testing.T) {
 func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing.T) {
 	store := &stubStore{
 		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage:       &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "PENDING"},
 		submitStage:        &domain.WorkflowStage{StageOrder: 1, StageStatus: "APPROVED"},
 		submitTransitioned: true,
@@ -589,6 +591,7 @@ func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing
 func TestSubmitAction_FinalApprove_PublishesCompleted(t *testing.T) {
 	store := &stubStore{
 		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage:       &domain.WorkflowStage{StageOrder: 2, ApproverPrincipalID: "approver-2"},
 		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "APPROVED"},
 		submitStage:        &domain.WorkflowStage{StageOrder: 2, StageStatus: "APPROVED"},
 		submitTransitioned: true,
@@ -614,6 +617,7 @@ func TestSubmitAction_FinalApprove_PublishesCompleted(t *testing.T) {
 func TestSubmitAction_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	store := &stubStore{
 		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage:       &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "PENDING"},
 		submitStage:        &domain.WorkflowStage{StageOrder: 1, StageStatus: "APPROVED"},
 		submitTransitioned: false,
@@ -637,6 +641,7 @@ func TestSubmitAction_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 func TestSubmitAction_AuthorizationDenied_Returns403_NeverTouchesStore(t *testing.T) {
 	store := &stubStore{
 		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 		submitErr:    domain.ErrWorkflowNotFound, // would only be hit if SubmitAction were called
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{err: domain.ErrAuthorizationDenied})
@@ -652,7 +657,10 @@ func TestSubmitAction_AuthorizationDenied_Returns403_NeverTouchesStore(t *testin
 }
 
 func TestSubmitAction_AuthorizationServiceUnavailable_FailsClosed(t *testing.T) {
-	store := &stubStore{findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"}}
+	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
+	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{err: domain.ErrAuthorizationServiceUnavailable})
 
 	body := `{"action":"APPROVE"}`
@@ -668,6 +676,7 @@ func TestSubmitAction_AuthorizationServiceUnavailable_FailsClosed(t *testing.T) 
 func TestSubmitAction_WrongApprover(t *testing.T) {
 	store := &stubStore{
 		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 		submitErr:    domain.ErrWrongApprover,
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
@@ -690,6 +699,7 @@ func TestSubmitAction_WrongApprover(t *testing.T) {
 func TestSubmitAction_InitiatorSelfApproval_Forbidden(t *testing.T) {
 	store := &stubStore{
 		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
+		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "requester-1"},
 		submitErr:    domain.ErrWorkflowNotFound, // would only be hit if SubmitAction were called
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
@@ -765,8 +775,16 @@ func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
 // ── Escalate / Cancel ────────────────────────────────────────────────────────
 
 func TestEscalateWorkflow_InvalidTransition(t *testing.T) {
-	store := &stubStore{escalateErr: domain.ErrInvalidTransition}
-	r := newTestRouter(store)
+	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID: "w-1",
+			TenantID:           "t-1",
+			LegalEntityID:      "le-1",
+			WorkflowStatus:     "APPROVED",
+		},
+		escalateErr: domain.ErrInvalidTransition,
+	}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
 
 	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/escalate", nil), "admin-1")
 	w := httptest.NewRecorder()
@@ -778,7 +796,16 @@ func TestEscalateWorkflow_InvalidTransition(t *testing.T) {
 }
 
 func TestCancelWorkflow_Success(t *testing.T) {
-	store := &stubStore{cancelInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "CANCELLED"}, cancelTransitioned: true}
+	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID: "w-1",
+			TenantID:           "t-1",
+			LegalEntityID:      "le-1",
+			WorkflowStatus:     "PENDING",
+		},
+		cancelInstance:     &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "CANCELLED"},
+		cancelTransitioned: true,
+	}
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubAuthz{})
 

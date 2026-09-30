@@ -177,7 +177,7 @@ func main() {
 	// without this a SIGTERM would discard security events already accepted
 	// from a request that has long since been answered.
 	defer siemClient.Close()
-	h := handler.New(authzStore, publisher, jurisdictionValidator, siemClient, cfg.PlatformScopeEntityID, log)
+	h := handler.New(authzStore, publisher, jurisdictionValidator, siemClient, cfg.PlatformScopeEntityID, cfg.EnforceTenantOnAuthorize, log)
 	handler.RegisterRoutes(r, h)
 
 	if cfg.PlatformScopeEntityID == "" {

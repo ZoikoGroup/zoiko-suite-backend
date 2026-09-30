@@ -251,17 +251,17 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			severityFor(assessment.Decision),
 			"CARTA flagged principal "+claims.Principal.PrincipalID+": "+string(assessment.Decision))
 
-		// ISOLATE/DENY/STEP_UP_MFA are hard-blocked: they represent risk high
-		// enough that this platform has no automated remediation for them.
-		// STEP_UP_MFA was previously allowed through because there was no
-		// step-up challenge flow downstream, but letting it pass silently
-		// defeats the risk engine's intent — a request that needs step-up
-		// must not proceed as if it were ALLOW.
-		if assessment.Decision == carta.DecisionIsolate || assessment.Decision == carta.DecisionDeny || assessment.Decision == carta.DecisionStepUpMFA {
-			h.metrics.VerifyDecision(outcomeCartaBlocked)
-			h.denyCarta(w, "access denied by continuous risk assessment", string(assessment.Decision))
-			return
-		}
+		// Every answer except ALLOW blocks. STEP_UP_MFA blocks because no
+		// step-up factor exists anywhere in the estate to satisfy it, and
+		// letting it pass answers the risk engine's "not like this" with yes.
+		// The test is "not ALLOW" rather than a list of the blocking values
+		// on purpose: a list lets through any decision it does not name — a
+		// value carta-svc adds later, or an empty one from a reply that
+		// parsed but carried no decision — and CARTA having answered is not
+		// the unreachable case that Evaluate deliberately fails open on.
+		h.metrics.VerifyDecision(outcomeCartaBlocked)
+		h.denyCarta(w, "access denied by continuous risk assessment", string(assessment.Decision))
+		return
 	}
 
 	// GOV-01 (ZS-SVC-A-001 §4): resolve the authoritative tenant and operating
@@ -409,9 +409,18 @@ func severityFor(d carta.Decision) siem.Severity {
 
 // clientIP prefers the value Traefik sets over the raw socket address, which
 // would otherwise always be the gateway container's own address.
+// clientIP is the address CARTA scores. It is the RIGHTMOST X-Forwarded-For
+// entry: the one appended by the proxy directly in front of this service,
+// which no client can write. The leftmost entry is whatever the client sent,
+// so taking it let any caller choose the IP its risk was assessed on. With
+// ForwardAuth's trustForwardHeader off, Traefik sends a single entry (its
+// peer), so rightmost and only are the same.
 func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.TrimSpace(strings.Split(fwd, ",")[0])
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		if hop := strings.TrimSpace(hops[i]); hop != "" {
+			return hop
+		}
 	}
 	return r.RemoteAddr
 }

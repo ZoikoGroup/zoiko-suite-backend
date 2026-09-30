@@ -262,6 +262,34 @@ paths:
         "404": { $ref: '#/components/responses/NotFound' }
         "503": { $ref: '#/components/responses/StoreUnavailable' }
 
+  /v1/rules/{jurisdiction_rule_id}/status-history:
+    get:
+      tags: [Rules]
+      summary: Bitemporal status history for a rule
+      description: |
+        The `known_from`/`known_to` history tracking when the platform became aware
+        of each rule status change (V-001 §8.1). Enables "what did the platform know
+        on date X" queries for audit and replay.
+      operationId: getRuleStatusHistory
+      parameters:
+        - $ref: '#/components/parameters/RuleID'
+        - $ref: '#/components/parameters/Limit200'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: Status history, newest known_from first. Always an array, never null.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RuleStatusHistory' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  # ── Validate Action ────────────────────────────────────────────────────────────
+
   # ── Admin mutations ────────────────────────────────────────────────────────
 
   /v1/admin/jurisdictions:
@@ -485,6 +513,47 @@ paths:
         "404": { $ref: '#/components/responses/NotFound' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
+  # ── Validate Action ────────────────────────────────────────────────────────────
+
+  /v1/validate-action:
+    post:
+      tags: [Rules]
+      summary: Validate an action against the resolved rule pack
+      description: |
+        The "validate-action" API of §8.2: given an action type, entity, and
+        jurisdiction, resolve the applicable rule pack and return the applicable
+        rule metadata (payload) or a conflict/insufficient decision.
+
+        This is the synchronous validation call other services make before
+        executing a governed action (e.g., tax calculation, payroll run).
+      operationId: validateAction
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ValidateActionRequest' }
+      responses:
+        "200":
+          description: Action is permitted. Returns the applicable rule payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidateActionResponse' }
+        "409":
+          description: |
+            `conflicted` — multiple rules with equal precedence and overlapping periods.
+            `insufficient` — no rule found in the ancestor chain.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidateActionConflictResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
   # ── Health ─────────────────────────────────────────────────────────────────
 
   /healthz:
@@ -567,6 +636,49 @@ components:
       in: header
       required: true
       description: See the `principalHeader` security scheme.
+      schema: { type: string }
+
+    TenantID:
+      name: X-Tenant-Id
+      in: header
+      required: false
+      description: |
+        The tenant context from the verified identity envelope. Set by the gateway's
+        ForwardAuth middleware. Required for tenant-scoped operations.
+      schema: { type: string }
+
+    RequestID:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Unique request identifier from the gateway. Used for tracing and idempotency.
+      schema: { type: string }
+
+    WorkloadID:
+      name: X-Workload-Id
+      in: header
+      required: false
+      description: |
+        Workload identity for service-to-service calls. Alternative to X-Principal-Id.
+      schema: { type: string }
+
+    SourceChannel:
+      name: X-Source-Channel
+      in: header
+      required: false
+      description: |
+        Originating channel: api, batch, webhook, cli. Used for attribution.
+      schema:
+        type: string
+        enum: [api, batch, webhook, cli]
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-generated idempotency key for safe retries on mutations.
       schema: { type: string }
 
     EffectiveAt:
@@ -656,19 +768,39 @@ components:
 
     Error:
       type: object
-      required: [error]
+      required: [type, title, status, detail, instance]
+      description: |
+        RFC 9457 Problem Details format. Clients can switch on `type` or `title`.
+        The `extension` fields provide machine-readable codes.
       properties:
-        error:
+        type:
           type: string
-          description: Stable machine-readable code. Clients switch on this, not on the message.
-        message:
+          format: uri
+          description: URI identifying the problem type.
+        title:
           type: string
-          description: Human-readable detail. May change without notice.
+          description: Short, human-readable summary of the problem type.
+        status:
+          type: integer
+          format: int32
+          description: HTTP status code generated by the origin server.
+        detail:
+          type: string
+          description: Human-readable explanation specific to this occurrence.
+        instance:
+          type: string
+          format: uri
+          description: URI reference identifying the specific occurrence.
+        code:
+          type: string
+          description: Stable machine-readable code for client logic (e.g., "missing_field").
         field:
           type: string
-          description: The offending field, when error is `missing_field`.
+          description: The offending field, when code is "missing_field".
         jurisdiction_id:
           type: string
+          format: uuid
+          description: The jurisdiction ID, when relevant.
 
     Jurisdiction:
       type: object
@@ -774,6 +906,16 @@ components:
         rule_status:
           type: string
           description: DRAFT, ACTIVE, SUPERSEDED or RETIRED. VARCHAR, not an enum.
+        rule_version:
+          type: integer
+          description: Immutable version number. Incremented on each status change.
+        supersedes_rule_id:
+          type: [string, "null"]
+          format: uuid
+          description: The rule this rule supersedes, forming a version chain.
+        precedence_level:
+          type: integer
+          description: Explicit precedence level. Lower = higher precedence. Used for conflict resolution.
         legal_drift_state:
           type: string
           description: |
@@ -804,6 +946,16 @@ components:
           type: array
           description: One winning rule per (rule_domain, rule_code). Never null.
           items: { $ref: '#/components/schemas/JurisdictionRule' }
+        conflicts:
+          type: array
+          description: (rule_domain, rule_code) pairs with equal precedence and overlapping periods.
+          items: { $ref: '#/components/schemas/RuleConflict' }
+        insufficient:
+          type: array
+          description: (rule_domain, rule_code) pairs with no rule in the ancestor chain.
+          items:
+            type: string
+            description: "Format: rule_domain|rule_code"
 
     DriftEvent:
       type: object
@@ -875,6 +1027,18 @@ components:
           description: |
             SUPERSEDED and RETIRED are not accepted here — they are reached only
             through the transition endpoint.
+        rule_version:
+          type: integer
+          default: 1
+          description: Immutable version number. Defaults to 1 for new rules.
+        supersedes_rule_id:
+          type: [string, "null"]
+          format: uuid
+          description: The rule this rule supersedes, forming a version chain.
+        precedence_level:
+          type: integer
+          default: 0
+          description: Explicit precedence level. Lower = higher precedence.
 
     TransitionRuleStatusRequest:
       type: object
@@ -919,3 +1083,132 @@ components:
           description: |
             False for a replay. Consumers use this to tell a real divergence from a
             retried call.
+
+    RuleStatusHistory:
+      type: object
+      description: One entry in the bitemporal rule status history (V-001 §8.1).
+      required:
+        - history_id
+        - jurisdiction_rule_id
+        - rule_status
+        - effective_from
+        - known_from
+        - changed_by_principal_id
+        - schema_version
+      properties:
+        history_id: { type: string, format: uuid }
+        jurisdiction_rule_id: { type: string, format: uuid }
+        rule_status: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: [string, "null"], format: date-time }
+        known_from: { type: string, format: date-time }
+        known_to: { type: [string, "null"], format: date-time }
+        changed_by_principal_id: { type: string }
+        change_reason: { type: [string, "null"] }
+        schema_version: { type: string }
+
+    RuleConflict:
+      type: object
+      description: A (rule_domain, rule_code) pair with equal precedence and overlapping periods.
+      required: [rule_domain, rule_code, rule_ids]
+      properties:
+        rule_domain: { type: string }
+        rule_code: { type: string }
+        rule_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: The conflicting rule IDs.
+
+    ValidateActionRequest:
+      type: object
+      required: [action_type, jurisdiction_id, entity_type]
+      additionalProperties: false
+      properties:
+        action_type:
+          type: string
+          description: The action being validated, e.g., "tax.calculate", "payroll.run".
+        jurisdiction_id:
+          type: string
+          format: uuid
+          description: The jurisdiction context for the action.
+        entity_type:
+          type: string
+          description: The entity type the action applies to, e.g., "COMPANY", "EMPLOYEE".
+        effective_at:
+          type: [string, "null"]
+          format: date-time
+          description: RFC3339 point-in-time. Defaults to now.
+        payload:
+          type: object
+          description: Optional action-specific context for rule evaluation.
+
+    ValidateActionResponse:
+      type: object
+      description: Action is permitted; returns the applicable rule payload.
+      required: [permitted, rule]
+      properties:
+        permitted:
+          type: boolean
+          const: true
+        rule:
+          $ref: '#/components/schemas/JurisdictionRule'
+        resolved_from:
+          type: array
+          items: { type: string, format: uuid }
+          description: The jurisdiction chain the pack was assembled from.
+
+    ValidateActionConflictResponse:
+      type: object
+      description: Action cannot be validated due to conflict or insufficient rules.
+      required: [permitted, detail]
+      properties:
+        permitted:
+          type: boolean
+          const: false
+        detail:
+          type: string
+          enum: [conflicted, insufficient]
+        conflicts:
+          type: array
+          items: { $ref: '#/components/schemas/RuleConflict' }
+          description: Present when detail=conflicted.
+        insufficient:
+          type: array
+          items: { type: string }
+          description: Present when detail=insufficient. List of (rule_domain, rule_code) pairs with no rule.
+
+    EventEnvelope:
+      type: object
+      description: The standard event envelope published by this service (Event Catalogue §19).
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, correlation_id, payload]
+      properties:
+        event_id:
+          type: string
+          description: Unique event identifier (evt-<uuid>).
+        event_type:
+          type: string
+          description: |
+            jurisdiction.created, jurisdiction.deactivated, jurisdiction.rule.updated,
+            jurisdiction.rule.activated, legal.drift.detected
+        event_version:
+          type: string
+          const: "1.0"
+        emitted_at:
+          type: string
+          format: date-time
+        schema_version:
+          type: string
+          const: "1.0"
+        source_service:
+          type: string
+          const: "jurisdiction-rules-svc"
+        jurisdiction_id:
+          type: [string, "null"]
+          format: uuid
+        actor_id:
+          type: [string, "null"]
+        correlation_id:
+          type: string
+        payload:
+          type: object
+          description: The event-specific payload.

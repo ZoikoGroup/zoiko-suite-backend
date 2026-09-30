@@ -1,5 +1,9 @@
 -- Row-level security for the three tenant-scoped tables.
 --
+-- Re-runnable: each policy is dropped before it is created, so applying this
+-- file to a database that already has it (the RUNBOOK's hand-apply loop) ends
+-- in the same state instead of stopping on "policy already exists".
+--
 -- NULLIF(current_setting('app.tenant_id', true), '')::uuid, not the bare cast.
 --
 -- This is the trap this estate has already been bitten by. `current_setting`
@@ -29,6 +33,7 @@ $$ LANGUAGE sql STABLE;
 
 ALTER TABLE projection_ledger ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projection_ledger FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_policy ON projection_ledger;
 CREATE POLICY tenant_isolation_policy ON projection_ledger
     FOR ALL
     USING (
@@ -42,6 +47,7 @@ CREATE POLICY tenant_isolation_policy ON projection_ledger
 
 ALTER TABLE restriction_tombstones ENABLE ROW LEVEL SECURITY;
 ALTER TABLE restriction_tombstones FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_policy ON restriction_tombstones;
 CREATE POLICY tenant_isolation_policy ON restriction_tombstones
     FOR ALL
     USING (
@@ -59,6 +65,7 @@ CREATE POLICY tenant_isolation_policy ON restriction_tombstones
 -- looking for what, which §9.2 treats as personal data in its own right.
 ALTER TABLE search_evidence ENABLE ROW LEVEL SECURITY;
 ALTER TABLE search_evidence FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_policy ON search_evidence;
 CREATE POLICY tenant_isolation_policy ON search_evidence
     FOR ALL
     USING (

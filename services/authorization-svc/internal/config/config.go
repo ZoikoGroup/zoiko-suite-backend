@@ -92,6 +92,15 @@ type Config struct {
 	AccessDecisionRetentionMonths int
 	RetentionSweepInterval        time.Duration
 	PartitionMonthsAhead          int
+
+	// EnforceTenantOnAuthorize controls whether /v1/authorize requires a tenant
+	// scope (via X-Tenant-Id header or tenant_id in body). When false (default),
+	// tenantless requests are allowed but logged with a warning — they are
+	// evaluated against globally-applicable SoD rules only. When true, a missing
+	// tenant scope returns 400. This is a migration aid for the ~86 callers that
+	// do not yet forward X-Tenant-Id; once they are all migrated, this should be
+	// set to true.
+	EnforceTenantOnAuthorize bool
 }
 
 type DBConfig struct {
@@ -321,6 +330,15 @@ func Load() (*Config, error) {
 		// is a runway, not a guess: it means the sweep can fail silently for two
 		// consecutive months before any decision lands in the default partition.
 		PartitionMonthsAhead: envInt("AUTHZ_PARTITION_MONTHS_AHEAD", 3),
+
+		// EnforceTenantOnAuthorize controls whether /v1/authorize requires a tenant
+		// scope (via X-Tenant-Id header or tenant_id in body). When false (default),
+		// tenantless requests are allowed but logged with a warning — they are
+		// evaluated against globally-applicable SoD rules only. When true, a missing
+		// tenant scope returns 400. This is a migration aid for the ~86 callers that
+		// do not yet forward X-Tenant-Id; once they are all migrated, this should be
+		// set to true.
+		EnforceTenantOnAuthorize: envBool("AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE", false),
 	}, nil
 }
 

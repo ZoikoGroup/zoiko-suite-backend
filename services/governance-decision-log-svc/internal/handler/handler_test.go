@@ -43,6 +43,12 @@ type stubStore struct {
 	createManifestErr   error
 	listManifestsResult []*domain.ReplayManifest
 	listManifestsErr    error
+
+	// idempotency keys
+	idempotencyKeys map[string]struct {
+		decisionID string
+		bodyHash   []byte
+	}
 }
 
 func (s *stubStore) Insert(_ context.Context, d domain.GovernanceDecision) (bool, error) {
@@ -68,8 +74,40 @@ func (s *stubStore) CreateReplayManifest(_ context.Context, m *domain.ReplayMani
 	return s.createManifestErr
 }
 
-func (s *stubStore) ListReplayManifestsByDecision(_ context.Context, _ string) ([]*domain.ReplayManifest, error) {
+func (s *stubStore) ListReplayManifestsByDecision(_ context.Context, _, _ string) ([]*domain.ReplayManifest, error) {
 	return s.listManifestsResult, s.listManifestsErr
+}
+
+// ── idempotency keys ──────────────────────────────────────────────────────────
+
+func (s *stubStore) CheckIdempotencyKey(_ context.Context, _, idempotencyKey string) (string, []byte, error) {
+	if s.idempotencyKeys == nil {
+		return "", nil, nil
+	}
+	if entry, ok := s.idempotencyKeys[idempotencyKey]; ok {
+		return entry.decisionID, entry.bodyHash, nil
+	}
+	return "", nil, nil
+}
+
+func (s *stubStore) StoreIdempotencyKey(_ context.Context, _, idempotencyKey string, bodyHash []byte, decisionID string) error {
+	if s.idempotencyKeys == nil {
+		s.idempotencyKeys = make(map[string]struct {
+			decisionID string
+			bodyHash   []byte
+		})
+	}
+	s.idempotencyKeys[idempotencyKey] = struct {
+		decisionID string
+		bodyHash   []byte
+	}{decisionID: decisionID, bodyHash: bodyHash}
+	return nil
+}
+
+// ── outbox ────────────────────────────────────────────────────────────────────
+
+func (s *stubStore) EnqueueEvent(_ context.Context, _, _ store.OutboxEvent) error {
+	return nil
 }
 
 // stubPolicyClient implements policyclient.Client for unit testing.

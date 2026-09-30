@@ -1442,7 +1442,7 @@ func (s *PgStore) FindGrantedActionsScoped(ctx context.Context, principalID, leg
 		JOIN roles r ON r.role_id = pra.role_id AND r.active_flag
 		JOIN permission_bundles pb ON pb.role_id = r.role_id AND pb.active_flag
 		WHERE pra.principal_id = $1
-		  AND (pra.legal_entity_id = $2 OR pra.legal_entity_id IS NULL)
+		  AND (pra.legal_entity_id = $2 OR (pra.legal_entity_id IS NULL AND $3 != ''))
 		  AND ($3 = '' OR r.tenant_id::text = $3)
 		  AND (pra.book_id IS NULL OR pra.book_id = NULLIF($4, '')::uuid)
 		  AND (pra.org_unit_id IS NULL OR pra.org_unit_id = NULLIF($5, '')::uuid)
@@ -1593,7 +1593,7 @@ func (s *PgStore) FindDelegatedActionsScoped(ctx context.Context, principalID, l
 		  JOIN permission_bundles pb
 		    ON pb.role_id = r.role_id AND pb.active_flag
 		 WHERE da.delegate_principal_id = $1
-		   AND (da.legal_entity_id = $2 OR da.legal_entity_id IS NULL)
+		   AND (da.legal_entity_id = $2 OR (da.legal_entity_id IS NULL AND $3 != ''))
 		   AND ($3 = '' OR da.tenant_id::text = $3)
 		   AND (da.book_id IS NULL OR da.book_id = NULLIF($4, '')::uuid)
 		   AND (da.org_unit_id IS NULL OR da.org_unit_id = NULLIF($5, '')::uuid)
@@ -1601,7 +1601,7 @@ func (s *PgStore) FindDelegatedActionsScoped(ctx context.Context, principalID, l
 		   AND da.effective_from <= NOW()
 		   AND (da.effective_to IS NULL OR da.effective_to > NOW())
 		   AND r.tenant_id = da.tenant_id
-		   AND (pra.legal_entity_id = $2 OR pra.legal_entity_id IS NULL)
+		   AND (pra.legal_entity_id = $2 OR (pra.legal_entity_id IS NULL AND $3 != ''))
 		   AND (pra.book_id IS NULL OR pra.book_id = NULLIF($4, '')::uuid)
 		   AND (pra.org_unit_id IS NULL OR pra.org_unit_id = NULLIF($5, '')::uuid)
 		   AND pra.effective_from <= NOW()

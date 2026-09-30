@@ -38,6 +38,7 @@ import (
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/authz"
 	"zoiko.io/search-indexer-svc/internal/domain"
+	"zoiko.io/search-indexer-svc/internal/embedding"
 	"zoiko.io/search-indexer-svc/internal/envelope"
 	"zoiko.io/search-indexer-svc/internal/events"
 	"zoiko.io/search-indexer-svc/internal/indexer"
@@ -79,6 +80,14 @@ type Handler struct {
 	platformScopeID string
 	// evidenceKey salts the actor hash in esr.security_filter.denied.
 	evidenceKey []byte
+
+	// embedder produces query vectors for semantic scopes (§10.1).
+	embedder embedding.Embedder
+	// checkpointMaxAge is how old a checkpoint may be before its freshness
+	// is read as UNKNOWN — the sweep that writes it has stopped.
+	checkpointMaxAge time.Duration
+	// maxResultWindow bounds k on a retrieval evaluation, as on a search.
+	maxResultWindow int
 }
 
 type Config struct {
@@ -93,14 +102,29 @@ type Config struct {
 	Log             *zap.Logger
 	PlatformScopeID string
 	EvidenceKey     []byte
+	// Embedder is the semantic provider. Nil behaves as unconfigured.
+	Embedder embedding.Embedder
+	// CheckpointMaxAge: a checkpoint older than this reads as UNKNOWN. Zero
+	// disables the age check (tests only).
+	CheckpointMaxAge time.Duration
+	MaxResultWindow  int
 }
 
 func New(cfg Config) *Handler {
+	embedder := cfg.Embedder
+	if embedder == nil {
+		embedder = embedding.Unconfigured{}
+	}
+	window := cfg.MaxResultWindow
+	if window <= 0 {
+		window = 100
+	}
 	return &Handler{
 		store: cfg.Store, engine: cfg.Engine, planner: cfg.Planner,
 		retriever: cfg.Retriever, indexer: cfg.Indexer, authz: cfg.AuthZ,
 		events: cfg.Events, metrics: cfg.Metrics, log: cfg.Log,
 		platformScopeID: cfg.PlatformScopeID, evidenceKey: cfg.EvidenceKey,
+		embedder: embedder, checkpointMaxAge: cfg.CheckpointMaxAge, maxResultWindow: window,
 	}
 }
 
@@ -109,6 +133,7 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Route("/v1", func(r chi.Router) {
 		// ── Tenant plane ─────────────────────────────────────────────────
 		r.Post("/search", h.Search)
+		r.Post("/search/semantic", h.SearchSemantic)
 		r.Post("/retrieve", h.Retrieve)
 		r.Get("/scopes", h.ListScopes)
 		r.Post("/restrictions", h.ApplyRestriction)
@@ -126,6 +151,8 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Post("/index-generations", h.CreateGeneration)
 		r.Get("/index-generations", h.ListGenerations)
 		r.Post("/index-generations/{generationID}/state", h.TransitionGeneration)
+		r.Post("/index-generations/{generationID}/retrieval-evaluations", h.EvaluateRetrieval)
+		r.Get("/index-generations/{generationID}/retrieval-evaluations", h.GetRetrievalEvaluation)
 		r.Get("/checkpoints", h.ListCheckpoints)
 	})
 }
@@ -164,7 +191,7 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plan, err := h.planner.Compile(r.Context(), req, tc, contract, generation)
+	plan, err := h.planner.Compile(req, tc, contract, generation)
 	if err != nil {
 		var qerr *query.Error
 		if errors.As(err, &qerr) {
@@ -175,6 +202,14 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		h.internal(w, r, "compile query plan", err)
 		return
 	}
+
+	health, herr := h.checkScopeHealth(r.Context(), tc.TenantID, contract, generation)
+	if herr != nil {
+		h.metrics.QueryRejectionsTotal.WithLabelValues(req.Scope, string(herr.Code)).Inc()
+		h.refuse(w, r, statusFor(herr.Code), herr.Code, herr.Detail, req.Scope, tc)
+		return
+	}
+	health.apply(plan)
 
 	resp, err := h.retriever.Execute(r.Context(), plan, tc, func(lastSort []any) (string, error) {
 		return h.planner.NextCursor(plan, tc.TenantID, lastSort)
@@ -297,7 +332,7 @@ func (h *Handler) Retrieve(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, searchclient.ProjectionDocID(tc.TenantID, sourceType, ref.SourceID))
 	}
 
-	plan, err := h.planner.Compile(r.Context(), query.Request{
+	plan, err := h.planner.Compile(query.Request{
 		Scope: req.Scope,
 		Size:  len(ids),
 	}, tc, contract, generation)
@@ -310,6 +345,12 @@ func (h *Handler) Retrieve(w http.ResponseWriter, r *http.Request) {
 		h.internal(w, r, "compile retrieve plan", err)
 		return
 	}
+	health, herr := h.checkScopeHealth(r.Context(), tc.TenantID, contract, generation)
+	if herr != nil {
+		h.refuse(w, r, statusFor(herr.Code), herr.Code, herr.Detail, req.Scope, tc)
+		return
+	}
+	health.apply(plan)
 	// The ref set is added as a MANDATORY filter, not a user filter: it is
 	// not narrowing the caller chose from registered fields, it is the
 	// request itself, and _id is not a contract field.
@@ -461,9 +502,12 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 			"no verified tenant on the request", req.Scope, tc)
 		return
 	}
-	if req.SourceType == "" || req.SourceID == "" || req.Reason == "" {
+	if req.Scope == "" || req.SourceType == "" || req.SourceID == "" || req.Reason == "" {
+		// scope is required: it is half of the ledger key the restriction
+		// is recorded under, and a restriction recorded under no scope
+		// protects nothing.
 		writeError(w, http.StatusBadRequest, "invalid_request",
-			"source_type, source_id and reason are required")
+			"scope, source_type, source_id and reason are required")
 		return
 	}
 	if req.SourceEventID == "" {
@@ -527,6 +571,25 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// THE LEDGER FIRST, at the restriction's epoch. This is the write that
+	// makes the restriction stick: every later projection of this record goes
+	// through the ledger's compare-and-set, which refuses anything whose epoch
+	// is below the one recorded here. The HTTP lane used to skip it — the
+	// ledger kept epoch 0, so the next ordinary update event for the record
+	// passed the compare-and-set and re-indexed an ERASED record, content and
+	// vector, while its restriction still read VERIFIED (NP-11, NP-48, NP-60;
+	// found live 30 Sep 2026). The event lane always did this, because the
+	// projector stamps restriction events with their epoch.
+	if err := h.recordRestrictionInLedger(r.Context(), tomb); err != nil {
+		h.log.Error("restriction could not be recorded in the projection ledger — refusing to report it applied",
+			zap.String("scope", req.Scope), zap.String("source_id", req.SourceID), zap.Error(err))
+		_ = h.store.MarkTombstoneState(r.Context(), tomb.TenantID, tomb.SourceType, tomb.SourceID,
+			tomb.SourceEventID, domain.PropagationFailed, "ledger not updated: "+err.Error())
+		writeErrorCode(w, http.StatusServiceUnavailable, "restriction_not_recorded",
+			"the restriction could not be made durable against later updates; retry", domain.ReasonRestrictionPropFailed)
+		return
+	}
+
 	// Apply to the index immediately rather than waiting for the sweep. §8.2:
 	// "visibility-reducing events outrank normal indexing backlog", and a
 	// restriction that sat in a queue behind ordinary indexing would be
@@ -560,12 +623,74 @@ func (h *Handler) ApplyRestriction(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// applyTombstoneToIndex writes the tombstone into the scope's live generation.
-func (h *Handler) applyTombstoneToIndex(ctx context.Context, t domain.RestrictionTombstone) error {
-	gen, err := h.store.GetActiveGeneration(ctx, t.ScopeName)
+// recordRestrictionInLedger stamps the record's ledger row with the
+// restriction's epoch, tombstoned.
+//
+// The source version is kept from the existing row (or 0 when the record was
+// never indexed): a restriction is not a new version of the content, and the
+// epoch alone is what orders it. The compare-and-set applies because the
+// epoch is strictly newer — a stale epoch was already refused by
+// UpsertTombstone. For a record never indexed, the row is created tombstoned,
+// so an in-flight create arriving later is refused rather than indexed (the
+// out-of-order half of NP-48).
+func (h *Handler) recordRestrictionInLedger(ctx context.Context, t domain.RestrictionTombstone) error {
+	existing, err := h.store.GetProjectionRecord(ctx, t.TenantID, t.ScopeName, t.SourceType, t.SourceID)
 	if err != nil {
 		return err
 	}
+	var version int64
+	if existing != nil {
+		version = existing.SourceVersion
+		if existing.RestrictionEpoch >= t.Epoch {
+			// Already held at this epoch or newer.
+			return nil
+		}
+	}
+	applied, err := h.store.UpsertProjectionRecord(ctx, domain.ProjectionRecord{
+		TenantID:         t.TenantID,
+		ScopeName:        t.ScopeName,
+		SourceType:       t.SourceType,
+		SourceID:         t.SourceID,
+		SourceVersion:    version,
+		RestrictionEpoch: t.Epoch,
+		Tombstoned:       true,
+		LastEventID:      t.SourceEventID,
+	})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return errors.New("the ledger refused the restriction epoch")
+	}
+	return nil
+}
+
+// applyTombstoneToIndex writes the tombstone into EVERY generation of the scope
+// that is serving or being built — ACTIVE, and BUILDING / VALIDATING / READY.
+// A candidate that kept the record would bring it back at cutover.
+func (h *Handler) applyTombstoneToIndex(ctx context.Context, t domain.RestrictionTombstone) error {
+	gens, err := h.store.ListGenerations(ctx, t.ScopeName)
+	if err != nil {
+		return err
+	}
+	var failures []string
+	for _, g := range gens {
+		switch g.State {
+		case domain.GenerationActive, domain.GenerationBuilding, domain.GenerationValidating, domain.GenerationReady:
+		default:
+			continue
+		}
+		if err := h.tombstoneIn(ctx, g, t); err != nil {
+			failures = append(failures, g.GenerationID+": "+err.Error())
+		}
+	}
+	if len(failures) > 0 {
+		return errors.New("tombstone write failed in " + strings.Join(failures, "; "))
+	}
+	return nil
+}
+
+func (h *Handler) tombstoneIn(ctx context.Context, gen domain.IndexGeneration, t domain.RestrictionTombstone) error {
 	docID := searchclient.ProjectionDocID(t.TenantID, t.SourceType, t.SourceID)
 	existing, found, err := h.engine.GetProjection(ctx, gen.PhysicalIndex, docID)
 	if err != nil {
@@ -573,11 +698,8 @@ func (h *Handler) applyTombstoneToIndex(ctx context.Context, t domain.Restrictio
 	}
 	if !found {
 		// Nothing indexed under that ref. A tombstone is still written, so a
-		// document that arrives LATER — an in-flight event, a replay — is
-		// refused by the ledger's epoch comparison rather than indexed into
-		// visibility. This is the out-of-order half of NP-48, and skipping it
-		// because "there is nothing to remove" is how the resurrection
-		// happens.
+		// document that arrives LATER — an in-flight event, a replay — finds
+		// the restriction in place rather than an empty slot (NP-48).
 		return h.engine.IndexProjection(ctx, gen.PhysicalIndex, searchclient.Projection{
 			DocID:            docID,
 			TenantID:         t.TenantID,
@@ -611,10 +733,10 @@ func (h *Handler) applyTombstoneToIndex(ctx context.Context, t domain.Restrictio
 		Tombstoned:       true,
 		TombstoneReason:  t.Reason,
 		TombstoneSource:  t.SourceEventID,
-		// Content dropped. The lineage stays so the tombstone can be ordered
-		// and audited; the fields go, because leaving them would mean the
-		// restricted content is still in the index and only a filter stands
-		// between it and a query.
+		// Content and vector dropped. The lineage stays so the tombstone can be
+		// ordered and audited; the fields go, because leaving them would mean
+		// the restricted content is still in the index and only a filter
+		// stands between it and a query.
 		Fields: map[string]any{},
 	})
 }
@@ -682,12 +804,29 @@ func (h *Handler) ListScopes(w http.ResponseWriter, r *http.Request) {
 		RetrievalClass  string      `json:"retrieval_class"`
 		FreshnessClass  string      `json:"freshness_class"`
 		Active          bool        `json:"active"`
+		Semantic        bool        `json:"semantic"`
+		EmbeddingModel  string      `json:"embedding_model,omitempty"`
 		Fields          []fieldView `json:"fields"`
 	}
 
+	// One entry per scope, describing what callers can actually use: the
+	// ACTIVE generation's contract when one is serving, else the published
+	// version (not yet searchable). During a migration the published v2 is
+	// not what answers queries, so listing its fields would advertise a
+	// request shape that is refused.
+	serving := map[string]domain.IndexContract{}
+	for _, c := range contracts {
+		if gen, err := h.store.GetActiveGeneration(r.Context(), c.ScopeName); err == nil && gen.ContractID == c.ContractID {
+			serving[c.ScopeName] = c
+		}
+	}
 	out := []scopeView{}
 	for _, c := range contracts {
-		if c.State != domain.ContractPublished {
+		if s, ok := serving[c.ScopeName]; ok {
+			if s.ContractID != c.ContractID {
+				continue
+			}
+		} else if c.State != domain.ContractPublished {
 			continue
 		}
 		view := scopeView{
@@ -695,6 +834,8 @@ func (h *Handler) ListScopes(w http.ResponseWriter, r *http.Request) {
 			ContractVersion: c.Version,
 			RetrievalClass:  string(c.RetrievalClass),
 			FreshnessClass:  c.FreshnessClass,
+			Semantic:        c.Embedding != nil,
+			EmbeddingModel:  c.Embedding.PinnedModel(),
 			Fields:          []fieldView{},
 		}
 		if _, err := h.store.GetActiveGeneration(r.Context(), c.ScopeName); err == nil {
@@ -727,18 +868,25 @@ func (h *Handler) resolveScope(ctx context.Context, scope string) (*domain.Index
 	if strings.TrimSpace(scope) == "" {
 		return nil, nil, errors.New("scope is required")
 	}
-	contract, err := h.store.GetPublishedContract(ctx, scope)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return nil, nil, errors.New("scope " + scope + " has no published index contract")
-		}
-		return nil, nil, err
-	}
+	// The ACTIVE generation decides, and it is searched with ITS OWN
+	// contract — the one its mapping was built from. Pairing the scope's
+	// PUBLISHED contract with the active generation was correct only until a
+	// new version was published: from then on searches ran v2's fields and
+	// embedding pin against v1's index (engine errors, or an empty semantic
+	// answer reported COMPLETE). A new version serves only once its own
+	// generation is certified and activated.
 	generation, err := h.store.GetActiveGeneration(ctx, scope)
 	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
+		if !errors.Is(err, domain.ErrNotFound) {
+			return nil, nil, err
+		}
+		if _, perr := h.store.GetPublishedContract(ctx, scope); perr == nil {
 			return nil, nil, errNoActiveGeneration
 		}
+		return nil, nil, errors.New("scope " + scope + " has no published index contract")
+	}
+	contract, err := h.store.GetContract(ctx, generation.ContractID)
+	if err != nil {
 		return nil, nil, err
 	}
 	return contract, generation, nil
@@ -788,7 +936,12 @@ func (h *Handler) refuse(w http.ResponseWriter, r *http.Request, status int, cod
 		})
 	}
 
-	if h.events != nil {
+	// Only refusals caused by the REQUEST go to the abuse stream. A 5xx is
+	// the server's own state — authorization unreachable, index STALE,
+	// restriction lane failing, embedding provider down — and emitting a
+	// security denial per protected search during an outage would bury the
+	// real abuse signal under an availability incident.
+	if h.events != nil && status < 500 {
 		_ = h.events.SecurityFilterDenied(r.Context(), tc.TenantID, scope,
 			string(code), h.actorHash(tc), env.CorrelationID)
 	}
@@ -851,8 +1004,16 @@ func statusFor(code domain.ReasonCode) int {
 		return http.StatusForbidden
 	case domain.ReasonScopeNotRegistered, domain.ReasonGenerationNotActive:
 		return http.StatusNotFound
-	case domain.ReasonAuthorizationIndet:
+	case domain.ReasonAuthorizationIndet,
+		// ESR-012 and ESR-018 are the SERVER's state, not the request's: the
+		// index is behind, or the restriction lane is failing. 503, because
+		// the same request will succeed once the condition clears — a 400
+		// would tell the caller to change a request that was fine.
+		domain.ReasonIndexStaleForScope, domain.ReasonRestrictionPropFailed:
 		return http.StatusServiceUnavailable
+	case domain.ReasonSemanticModelMismatch:
+		// The request named an embedding space the scope is not pinned to.
+		return http.StatusConflict
 	case domain.ReasonSearchDegradedPartial:
 		return http.StatusPartialContent
 	default:

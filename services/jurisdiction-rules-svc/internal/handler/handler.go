@@ -36,25 +36,36 @@ type JurisdictionStore interface {
 
 	// CreateJurisdiction inserts a new jurisdiction idempotently.
 	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
+	CreateJurisdictionWithQuerier(ctx context.Context, q store.Querier, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
 
 	// DeactivateJurisdiction sets active_flag=false and updates audit columns.
 	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error)
+	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, error)
 
 	// FindRuleByID looks up a rule by ID.
 	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
 
 	// CreateRule inserts a new rule idempotently.
 	CreateRule(ctx context.Context, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error)
+	CreateRuleWithQuerier(ctx context.Context, q store.Querier, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error)
 
 	// TransitionRuleStatus atomically updates rule_status if current status is
 	// in allowedPriors. The bool reports whether anything actually changed.
 	TransitionRuleStatus(ctx context.Context, params store.TransitionParams) (*domain.JurisdictionRule, bool, error)
+	TransitionRuleStatusWithQuerier(ctx context.Context, q store.Querier, params store.TransitionParams) (*domain.JurisdictionRule, bool, error)
 
 	// RecordDrift moves legal_drift_state and appends to the drift history.
 	RecordDrift(ctx context.Context, params domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error)
+	RecordDriftWithQuerier(ctx context.Context, q store.Querier, params domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error)
 
 	// FindDriftEvents returns the append-only drift history for a rule.
 	FindDriftEvents(ctx context.Context, ruleID string, limit, offset int) ([]*domain.DriftEvent, error)
+
+	// FindRuleStatusHistory returns the bitemporal status history for a rule.
+	FindRuleStatusHistory(ctx context.Context, ruleID string, limit, offset int) ([]*domain.RuleStatusHistory, error)
+
+	// WithTransaction executes fn within a database transaction.
+	WithTransaction(ctx context.Context, fn func(q store.Querier) error) error
 }
 
 // Handler holds all HTTP handler methods.
@@ -548,16 +559,30 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	j, created, err := h.store.CreateJurisdiction(r.Context(), domain.CreateJurisdictionParams{
-		JurisdictionCode:     req.JurisdictionCode,
-		JurisdictionName:     req.JurisdictionName,
-		JurisdictionType:     req.JurisdictionType,
-		ParentJurisdictionID: req.ParentJurisdictionID,
-		AuthorityType:        req.AuthorityType,
-		EffectiveFrom:        req.EffectiveFrom,
-		EffectiveTo:          req.EffectiveTo,
-		ActiveFlag:           true,
-		CreatedByPrincipalID: principalID,
+	var j *domain.Jurisdiction
+	var created bool
+	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		j, created, err = h.store.CreateJurisdictionWithQuerier(r.Context(), q, domain.CreateJurisdictionParams{
+			JurisdictionCode:     req.JurisdictionCode,
+			JurisdictionName:     req.JurisdictionName,
+			JurisdictionType:     req.JurisdictionType,
+			ParentJurisdictionID: req.ParentJurisdictionID,
+			AuthorityType:        req.AuthorityType,
+			EffectiveFrom:        req.EffectiveFrom,
+			EffectiveTo:          req.EffectiveTo,
+			ActiveFlag:           true,
+			CreatedByPrincipalID: principalID,
+		})
+		if err != nil {
+			return err
+		}
+		if created {
+			if err := h.publisher.PublishJurisdictionCreated(r.Context(), *j, correlationID); err != nil {
+				return err
+			}
+		}
+		return h.publisher.FlushPending(r.Context(), q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -566,11 +591,6 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 
 	status := http.StatusOK
 	if created {
-		// Only a real insert emits. An idempotent replay must not make
-		// consumers think a second jurisdiction appeared.
-		h.publish("jurisdiction.created", correlationID, func() error {
-			return h.publisher.PublishJurisdictionCreated(r.Context(), *j, correlationID)
-		})
 		status = http.StatusCreated
 	}
 	h.log.Info("CreateJurisdiction",
@@ -604,15 +624,22 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	j, err := h.store.DeactivateJurisdiction(r.Context(), jurisdictionID, principalID)
+	var j *domain.Jurisdiction
+	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		j, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID)
+		if err != nil {
+			return err
+		}
+		if err := h.publisher.PublishJurisdictionDeactivated(r.Context(), *j, correlationID); err != nil {
+			return err
+		}
+		return h.publisher.FlushPending(r.Context(), q)
+	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
 	}
-
-	h.publish("jurisdiction.deactivated", correlationID, func() error {
-		return h.publisher.PublishJurisdictionDeactivated(r.Context(), *j, correlationID)
-	})
 
 	h.log.Info("DeactivateJurisdiction",
 		zap.String("jurisdiction_id", jurisdictionID),
@@ -688,18 +715,39 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rule, created, err := h.store.CreateRule(r.Context(), domain.CreateRuleParams{
-		JurisdictionID:        jurisdictionID,
-		RuleDomain:            req.RuleDomain,
-		RuleCode:              req.RuleCode,
-		RuleName:              req.RuleName,
-		EffectiveFrom:         req.EffectiveFrom,
-		EffectiveTo:           req.EffectiveTo,
-		RulePayload:           payload,
-		SourceReference:       req.SourceReference,
-		ExternalFeedReference: req.ExternalFeedReference,
-		RuleStatus:            ruleStatus,
-		CreatedByPrincipalID:  principalID,
+	var rule *domain.JurisdictionRule
+	var created bool
+	err = h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		rule, created, err = h.store.CreateRuleWithQuerier(r.Context(), q, domain.CreateRuleParams{
+			JurisdictionID:        jurisdictionID,
+			RuleDomain:            req.RuleDomain,
+			RuleCode:              req.RuleCode,
+			RuleName:              req.RuleName,
+			EffectiveFrom:         req.EffectiveFrom,
+			EffectiveTo:           req.EffectiveTo,
+			RulePayload:           payload,
+			SourceReference:       req.SourceReference,
+			ExternalFeedReference: req.ExternalFeedReference,
+			RuleStatus:            ruleStatus,
+			CreatedByPrincipalID:  principalID,
+		})
+		if err != nil {
+			return err
+		}
+		if created {
+			if err := h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID); err != nil {
+				return err
+			}
+			// A rule created directly in ACTIVE never passes through the
+			// transition endpoint, so activation is announced here instead.
+			if rule.RuleStatus == "ACTIVE" {
+				if err := h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID); err != nil {
+					return err
+				}
+			}
+		}
+		return h.publisher.FlushPending(r.Context(), q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -708,16 +756,6 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 
 	status := http.StatusOK
 	if created {
-		h.publish("jurisdiction.rule.updated", correlationID, func() error {
-			return h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID)
-		})
-		// A rule created directly in ACTIVE never passes through the
-		// transition endpoint, so activation is announced here instead.
-		if rule.RuleStatus == "ACTIVE" {
-			h.publish("jurisdiction.rule.activated", correlationID, func() error {
-				return h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID)
-			})
-		}
 		status = http.StatusCreated
 	}
 	h.log.Info("CreateRule",
@@ -778,30 +816,39 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rule, transitioned, err := h.store.TransitionRuleStatus(r.Context(), store.TransitionParams{
-		RuleID:        ruleID,
-		NewStatus:     req.NewStatus,
-		AllowedPriors: allowedPriors,
-		EndDate:       endDatingStatuses[req.NewStatus],
-		EffectiveTo:   req.EffectiveTo,
-		ActorID:       principalID,
+	var rule *domain.JurisdictionRule
+	var transitioned bool
+	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		rule, transitioned, err = h.store.TransitionRuleStatusWithQuerier(r.Context(), q, store.TransitionParams{
+			RuleID:        ruleID,
+			NewStatus:     req.NewStatus,
+			AllowedPriors: allowedPriors,
+			EndDate:       endDatingStatuses[req.NewStatus],
+			EffectiveTo:   req.EffectiveTo,
+			ActorID:       principalID,
+		})
+		if err != nil {
+			return err
+		}
+
+		// A replayed transition must not re-emit — a consumer that saw
+		// rule.activated twice would double-apply whatever it does on activation.
+		if transitioned {
+			if err := h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID); err != nil {
+				return err
+			}
+			if req.NewStatus == "ACTIVE" {
+				if err := h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID); err != nil {
+					return err
+				}
+			}
+		}
+		return h.publisher.FlushPending(r.Context(), q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
-	}
-
-	// A replayed transition must not re-emit — a consumer that saw
-	// rule.activated twice would double-apply whatever it does on activation.
-	if transitioned {
-		h.publish("jurisdiction.rule.updated", correlationID, func() error {
-			return h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID)
-		})
-		if req.NewStatus == "ACTIVE" {
-			h.publish("jurisdiction.rule.activated", correlationID, func() error {
-				return h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID)
-			})
-		}
 	}
 
 	h.log.Info("TransitionRuleStatus",
@@ -852,24 +899,34 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rule, event, changed, err := h.store.RecordDrift(r.Context(), domain.RecordDriftParams{
-		JurisdictionRuleID:    ruleID,
-		ToState:               req.DriftState,
-		Reason:                req.Reason,
-		RecordedByPrincipalID: principalID,
-		CorrelationID:         correlationID,
+	var rule *domain.JurisdictionRule
+	var event *domain.DriftEvent
+	var changed bool
+	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		rule, event, changed, err = h.store.RecordDriftWithQuerier(r.Context(), q, domain.RecordDriftParams{
+			JurisdictionRuleID:    ruleID,
+			ToState:               req.DriftState,
+			Reason:                req.Reason,
+			RecordedByPrincipalID: principalID,
+			CorrelationID:         correlationID,
+		})
+		if err != nil {
+			return err
+		}
+
+		// Only a real divergence is news. Returning to CURRENT is a resolution,
+		// carried by the history rather than by a "drift detected" fact.
+		if changed && req.DriftState != "CURRENT" {
+			if err := h.publisher.PublishLegalDriftDetected(r.Context(), *rule, *event, correlationID); err != nil {
+				return err
+			}
+		}
+		return h.publisher.FlushPending(r.Context(), q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
-	}
-
-	// Only a real divergence is news. Returning to CURRENT is a resolution,
-	// carried by the history rather than by a "drift detected" fact.
-	if changed && req.DriftState != "CURRENT" {
-		h.publish("legal.drift.detected", correlationID, func() error {
-			return h.publisher.PublishLegalDriftDetected(r.Context(), *rule, *event, correlationID)
-		})
 	}
 
 	h.log.Info("RecordDrift",

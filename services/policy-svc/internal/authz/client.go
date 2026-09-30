@@ -65,6 +65,14 @@ const (
 	ActionControlTestExecutionRecord  = "CONTROL_TEST_EXECUTION_RECORD"
 	ActionAttestationCreate           = "ATTESTATION_CREATE"
 	ActionAttestationRevoke           = "ATTESTATION_REVOKE"
+
+	// Read actions for control tests and attestations — these are global
+	// (cross-tenant) resources, so they use the platform scope for
+	// authorization rather than a specific legal entity.
+	ActionControlTestDefinitionRead = "CONTROL_TEST_DEFINITION_READ"
+	ActionControlTestExecutionRead  = "CONTROL_TEST_EXECUTION_READ"
+	ActionControlEffectivenessRead  = "CONTROL_EFFECTIVENESS_READ"
+	ActionAttestationRead           = "ATTESTATION_READ"
 )
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from

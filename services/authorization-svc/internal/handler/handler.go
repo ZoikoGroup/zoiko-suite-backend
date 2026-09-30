@@ -161,16 +161,22 @@ type Handler struct {
 	// platform-wide act, which is the correct default for a control that has
 	// not been provisioned yet.
 	platformScopeEntityID string
+
+	// enforceTenantOnAuthorize controls whether /v1/authorize requires a tenant
+	// scope. When true, missing tenant returns 400. When false (default),
+	// tenantless requests are allowed with a warning.
+	enforceTenantOnAuthorize bool
 }
 
-func New(store AuthorizationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, siemClient *siem.Client, platformScopeEntityID string, log *zap.Logger) *Handler {
+func New(store AuthorizationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, siemClient *siem.Client, platformScopeEntityID string, enforceTenantOnAuthorize bool, log *zap.Logger) *Handler {
 	return &Handler{
-		store:                 store,
-		publisher:             publisher,
-		jurisdictionValidator: jurisdictionValidator,
-		siem:                  siemClient,
-		platformScopeEntityID: platformScopeEntityID,
-		log:                   log,
+		store:                   store,
+		publisher:               publisher,
+		jurisdictionValidator:   jurisdictionValidator,
+		siem:                    siemClient,
+		platformScopeEntityID:   platformScopeEntityID,
+		enforceTenantOnAuthorize: enforceTenantOnAuthorize,
+		log:                     log,
 	}
 }
 
@@ -338,6 +344,58 @@ func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed, verifiedTe
 	return false
 }
 
+// requirePermission confirms the caller holds actionType in their tenant scope,
+// and records the decision like any other.
+//
+// This service is the authorization engine, so it does not call itself over
+// HTTP — it asks its own store the same question /v1/authorize asks.
+func (h *Handler) requirePermission(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	actions, basis, err := h.store.FindGrantedActions(r.Context(), principalID, tenantID, tenantID)
+	if err != nil {
+		h.log.Error("permission check failed — refusing",
+			zap.String("correlation_id", correlationID),
+			zap.String("action_type", actionType),
+			zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return false
+	}
+
+	outcome, decisionBasis := "DENIED", "no_grant"
+	if contains(actions, actionType) {
+		outcome, decisionBasis = "GRANTED", basis
+	}
+
+	if _, recErr := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
+		PrincipalID:   principalID,
+		LegalEntityID: tenantID,
+		ActionType:    actionType,
+		Outcome:       outcome,
+		Basis:         decisionBasis,
+		CorrelationID: correlationID,
+		TenantID:      tenantID,
+	}); recErr != nil {
+		h.log.Error("permission check: failed to record decision — refusing",
+			zap.String("correlation_id", correlationID),
+			zap.String("action_type", actionType),
+			zap.Error(recErr))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return false
+	}
+
+	if outcome != "GRANTED" {
+		h.siem.Stream(r.Context(), tenantID, "authorization.denied", siem.SeverityHigh,
+			"Admin action "+actionType+" denied for principal "+principalID)
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "authorization_denied",
+			"message": actionType + " is required to perform this admin action",
+		})
+		return false
+	}
+	return true
+}
+
 // requirePlatformAction confirms the caller holds actionType at platform
 // scope, and records the decision like any other.
 //
@@ -453,7 +511,7 @@ func (req createRoleRequest) missingField() string {
 
 // CreateRole handles POST /v1/admin/roles. Idempotent on (tenant_id, role_code).
 //
-// Response: 201 created / 200 idempotent replay / 400 missing field / 409 conflict / 503 unavailable.
+// Response: 201 created / 200 idempotent replay / 400 missing field / 403 unauthorized / 409 conflict / 503 unavailable.
 func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -463,6 +521,10 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.role.manage to create roles
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.role.manage") {
 		return
 	}
 
@@ -534,17 +596,16 @@ func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active b
 	roleID := chi.URLParam(r, "role_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	// This pair of routes checked NOTHING before: not the principal, not the
-	// tenant, not who owns the role. An unauthenticated POST could retire any
-	// tenant's role by id — stripping every principal holding it of every
-	// action it grants, since FindGrantedActions joins through
-	// roles.active_flag — or reactivate one that had been deliberately
-	// retired. Seven sibling admin routes already required both headers.
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.role.manage to retire/reactivate roles
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.role.manage") {
 		return
 	}
 
@@ -607,16 +668,21 @@ type createBundleRequest struct {
 
 // CreatePermissionBundle handles POST /v1/admin/roles/{role_id}/permission-bundles.
 //
-// Response: 201 created (or updated in place, same code) / 400 missing field / 404 role not found / 503 unavailable.
+// Response: 201 created (or updated in place, same code) / 400 missing field / 403 unauthorized / 404 role not found / 503 unavailable.
 func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request) {
 	roleID := chi.URLParam(r, "role_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.permission_bundle.manage to create permission bundles
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.permission_bundle.manage") {
 		return
 	}
 
@@ -790,11 +856,16 @@ func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Reque
 	bundleID := chi.URLParam(r, "permission_bundle_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.permission_bundle.manage to retire/reactivate permission bundles
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.permission_bundle.manage") {
 		return
 	}
 
@@ -854,7 +925,7 @@ func (req createAssignmentRequest) missingField() string {
 
 // CreateRoleAssignment handles POST /v1/admin/role-assignments.
 //
-// Response: 201 created / 400 missing field / 404 role not found / 503 unavailable.
+// Response: 201 created / 400 missing field / 403 unauthorized / 404 role not found / 503 unavailable.
 func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -864,6 +935,10 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.assignment.grant to assign roles
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.assignment.grant") {
 		return
 	}
 
@@ -893,6 +968,16 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	}
 	if role.TenantID != tenantScope {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": req.RoleID})
+		return
+	}
+
+	// Prevent self-grant: a principal cannot assign a role to themselves.
+	// Per ZS-IAM-001 §10.1 "Own access elevation" and §10.2 "Own access elevation".
+	if req.PrincipalID == principalID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "self_grant_not_allowed",
+			"message": "a principal cannot assign a role to themselves",
+		})
 		return
 	}
 
@@ -931,16 +1016,21 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 
 // RevokeRoleAssignment handles POST /v1/admin/role-assignments/{assignment_id}/revoke.
 //
-// Response: 200 revoked / 404 not found or already ended / 503 unavailable.
+// Response: 200 revoked / 403 unauthorized / 404 not found or already ended / 503 unavailable.
 func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	assignmentID := chi.URLParam(r, "assignment_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.assignment.revoke to revoke role assignments
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.assignment.revoke") {
 		return
 	}
 
@@ -1027,7 +1117,7 @@ func (req createDelegationRequest) missingField() string {
 // what the delegator holds can change after the delegation is written.
 //
 // Response: 201 created / 400 missing field / 401 missing principal or tenant
-// scope / 403 delegator is not the caller / 503 unavailable.
+// scope / 403 delegator is not the caller / 403 unauthorized / 503 unavailable.
 func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -1035,11 +1125,12 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	// This was the one /v1/admin/* route that never resolved a tenant, because
-	// the table had no tenant_id to put one in. 000006 gives it one, NOT NULL,
-	// so the scope is now required here as it already was everywhere else.
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.delegation.grant to create delegations
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.delegation.grant") {
 		return
 	}
 
@@ -1066,6 +1157,15 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusForbidden, map[string]string{
 			"error":   "delegator_must_be_caller",
 			"message": "a principal may only delegate authority that is their own",
+		})
+		return
+	}
+	// Prevent self-delegation: a principal cannot delegate to themselves.
+	// Per ZS-IAM-001 §11 constraints and §10.2 "Own access elevation".
+	if req.DelegatePrincipalID == principalID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "self_delegation_not_allowed",
+			"message": "a principal cannot delegate authority to themselves",
 		})
 		return
 	}
@@ -1102,7 +1202,7 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 
 // RevokeDelegatedAuthority handles POST /v1/admin/delegated-authorities/{delegation_id}/revoke.
 //
-// Response: 200 revoked / 401 no scope / 404 not found / 409 already revoked /
+// Response: 200 revoked / 401 no scope / 403 unauthorized / 404 not found / 409 already revoked /
 // 503 unavailable.
 //
 // The lookup below is tenant-scoped, so another tenant's delegation is a 404
@@ -1119,6 +1219,10 @@ func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.delegation.revoke to revoke delegations
+	if !h.requirePermission(w, r, principalID, revokeTenantScope, "iam.delegation.revoke") {
 		return
 	}
 
@@ -1204,7 +1308,7 @@ func (req createSoDRuleRequest) missingField() string {
 // the caller's own tenant.
 //
 // Response: 201 created / 400 missing field / 401 missing principal or tenant
-// scope / 403 not authorized for a platform-wide rule / 404 jurisdiction not
+// scope / 403 not authorized for a platform-wide rule / 403 unauthorized / 404 jurisdiction not
 // found / 503 unavailable.
 func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -1236,8 +1340,12 @@ func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Require iam.sod_rule.manage for tenant-scoped SoD rules
 	if req.TenantID != nil && *req.TenantID != "" {
 		if h.refuseForeignTenant(w, *req.TenantID, tenantScope) {
+			return
+		}
+		if !h.requirePermission(w, r, principalID, tenantScope, "iam.sod_rule.manage") {
 			return
 		}
 	} else {
@@ -1312,11 +1420,16 @@ func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, activ
 	sodRuleID := chi.URLParam(r, "sod_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.sod_rule.manage to retire/reactivate SoD rules
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.sod_rule.manage") {
 		return
 	}
 
@@ -1447,23 +1560,27 @@ func (h *Handler) CreateABACRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A tenant scope is required to reach this route at all, whether or not the
-	// body names one — the same reasoning CreateSoDRule carries. Without it, a
-	// request holding nothing but a principal header could store a rule with
-	// tenant_id NULL that denies an action for every tenant on the platform.
-	tenantScope, ok := h.requireTenant(w, r)
-	if !ok {
+// A tenant scope is required to reach this route at all, whether or not the
+// body names one — the same reasoning CreateSoDRule carries. Without it, a
+// request holding nothing but a principal header could store a rule with
+// tenant_id NULL that denies an action for every tenant on the platform.
+tenantScope, ok := h.requireTenant(w, r)
+if !ok {
+	return
+}
+if req.TenantID != nil && *req.TenantID != "" {
+	if h.refuseForeignTenant(w, *req.TenantID, tenantScope) {
 		return
 	}
-	if req.TenantID != nil && *req.TenantID != "" {
-		if h.refuseForeignTenant(w, *req.TenantID, tenantScope) {
-			return
-		}
-	} else {
-		if !h.requirePlatformAction(w, r, principalID, ActionABACRuleManageGlobal) {
-			return
-		}
+	// Require iam.abac_rule.manage for tenant-scoped ABAC rules
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.abac_rule.manage") {
+		return
 	}
+} else {
+	if !h.requirePlatformAction(w, r, principalID, ActionABACRuleManageGlobal) {
+		return
+	}
+}
 
 	rule, err := h.store.CreateABACRule(r.Context(), domain.CreateABACRuleParams{
 		TenantID:             req.TenantID,
@@ -1563,11 +1680,16 @@ func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, acti
 	abacRuleID := chi.URLParam(r, "abac_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.abac_rule.manage to retire/reactivate ABAC rules
+	if !h.requirePermission(w, r, principalID, tenantScope, "iam.abac_rule.manage") {
 		return
 	}
 
@@ -1821,7 +1943,16 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bod
 	}
 
 	// No tenant anywhere: only globally-applicable SoD rules can be
-	// considered. Warned at every call so "this tenant's SoD rules never
+	// considered.
+	if h.enforceTenantOnAuthorize {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "missing_tenant_scope",
+			"message": "X-Tenant-Id header or tenant_id in body is required",
+		})
+		return "", false
+	}
+
+	// Warned at every call so "this tenant's SoD rules never
 	// fired" is diagnosable from the logs rather than from an incident.
 	h.log.Warn("authorize: no tenant scope supplied — only global SoD rules will be evaluated",
 		zap.String("correlation_id", r.Header.Get("X-Correlation-ID")))
@@ -2742,6 +2873,10 @@ func (h *Handler) CreatePrivilegedSession(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	// Require iam.pam.manage to create privileged sessions
+	if !h.requirePermission(w, r, callerPrincipalID, tenantScope, "iam.pam.manage") {
+		return
+	}
 
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -2826,6 +2961,10 @@ func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	// Require iam.pam.manage to revoke privileged sessions
+	if !h.requirePermission(w, r, callerPrincipalID, tenantScope, "iam.pam.manage") {
+		return
+	}
 
 	sessionID := chi.URLParam(r, "session_id")
 	if sessionID == "" {
@@ -2868,6 +3007,10 @@ func (h *Handler) CreateBreakGlassSession(w http.ResponseWriter, r *http.Request
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.break_glass.manage to create break-glass sessions
+	if !h.requirePermission(w, r, callerPrincipalID, tenantScope, "iam.break_glass.manage") {
 		return
 	}
 
@@ -2999,6 +3142,10 @@ func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	// Require iam.break_glass.manage to revoke break-glass sessions
+	if !h.requirePermission(w, r, callerPrincipalID, tenantScope, "iam.break_glass.manage") {
+		return
+	}
 
 	sessionID := chi.URLParam(r, "session_id")
 	if sessionID == "" {
@@ -3045,6 +3192,10 @@ func (h *Handler) CreateSupportSession(w http.ResponseWriter, r *http.Request) {
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.support.manage to create support sessions
+	if !h.requirePermission(w, r, callerPrincipalID, tenantScope, "iam.support.manage") {
 		return
 	}
 
@@ -3171,6 +3322,10 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// Require iam.support.manage to revoke support sessions
+	if !h.requirePermission(w, r, callerPrincipalID, tenantScope, "iam.support.manage") {
 		return
 	}
 

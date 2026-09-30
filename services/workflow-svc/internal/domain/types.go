@@ -119,8 +119,9 @@ type CreateWorkflowParams struct {
 
 // SubmitActionParams holds input for approving or rejecting the current stage.
 type SubmitActionParams struct {
-	WorkflowInstanceID string
-	ActorPrincipalID   string
+	WorkflowInstanceID   string
+	ActorPrincipalID     string
+	AssignedApproverID   string // optional: the assigned approver for this stage (for delegation)
 	// Action: APPROVE | REJECT.
 	Action    string
 	Rationale *string
