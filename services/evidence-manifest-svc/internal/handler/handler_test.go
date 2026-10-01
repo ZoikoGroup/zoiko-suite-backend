@@ -18,14 +18,16 @@ import (
 	"zoiko.io/evidence-manifest-svc/internal/domain"
 	"zoiko.io/evidence-manifest-svc/internal/handler"
 	svcmiddleware "zoiko.io/evidence-manifest-svc/internal/middleware"
+	"zoiko.io/evidence-manifest-svc/internal/outbox"
 )
 
 // ── stub store ───────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	manifests map[string]*domain.EvidenceManifest
-	records   map[string][]domain.ManifestRecord
-	createErr error
+	manifests    map[string]*domain.EvidenceManifest
+	records      map[string][]domain.ManifestRecord
+	outboxEvents []outbox.Event
+	createErr    error
 
 	// AUD-03 population stub state — a simple fixture, not a full
 	// in-memory simulation of the real CAS/reconciliation logic (that is
@@ -103,13 +105,25 @@ func (s *stubStore) AddRecord(ctx context.Context, r *domain.ManifestRecord) err
 	return nil
 }
 
-func (s *stubStore) FinalizeGenerated(ctx context.Context, manifestID, checksum string) (*domain.EvidenceManifest, error) {
+func (s *stubStore) FinalizeGenerated(ctx context.Context, manifestID, checksum string, correlationID ...string) (*domain.EvidenceManifest, error) {
 	m, ok := s.tenantOf(ctx, manifestID)
 	if !ok {
 		return nil, domain.ErrManifestNotFound
 	}
 	m.Status = domain.StatusGenerated
 	m.ChecksumSHA256 = &checksum
+	corrID := ""
+	if len(correlationID) > 0 {
+		corrID = correlationID[0]
+	}
+	s.outboxEvents = append(s.outboxEvents, outbox.Event{
+		AggregateType: "MANIFEST",
+		AggregateID:   manifestID,
+		EventType:     "evidence.manifest.generated",
+		TenantID:      m.TenantID,
+		LegalEntityID: m.LegalEntityID,
+		CorrelationID: corrID,
+	})
 	return m, nil
 }
 
@@ -129,6 +143,26 @@ func (s *stubStore) FindManifestByID(ctx context.Context, manifestID string) (*d
 		return nil, domain.ErrManifestNotFound
 	}
 	return m, nil
+}
+
+func (s *stubStore) ListManifests(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.EvidenceManifest, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	var out []domain.EvidenceManifest
+	for _, m := range s.manifests {
+		if m.TenantID == tenantID {
+			if legalEntityID == "" || m.LegalEntityID == legalEntityID {
+				out = append(out, *m)
+			}
+		}
+	}
+	if offset >= len(out) {
+		return []domain.EvidenceManifest{}, nil
+	}
+	end := offset + limit
+	if end > len(out) {
+		end = len(out)
+	}
+	return out[offset:end], nil
 }
 
 func (s *stubStore) ListRecords(ctx context.Context, manifestID string) ([]domain.ManifestRecord, error) {
@@ -326,9 +360,13 @@ func TestGenerateManifest_WithExplicitGovernanceID_Returns201Generated(t *testin
 	require.NotNil(t, got.ChecksumSHA256)
 	assert.NotEmpty(t, *got.ChecksumSHA256)
 
-	// Published event fired.
-	require.Len(t, pub.published, 1)
-	assert.Equal(t, "manifest-1", pub.published[0].ManifestID)
+	// Transactional outbox event recorded atomically on manifest finalization.
+	require.Len(t, s.outboxEvents, 1)
+	assert.Equal(t, "manifest-1", s.outboxEvents[0].AggregateID)
+	assert.Equal(t, "evidence.manifest.generated", s.outboxEvents[0].EventType)
+
+	// Direct synchronous publish has been eliminated in favor of transactional outbox.
+	assert.Empty(t, pub.published, "expected 0 synchronous publish calls (handled by transactional outbox)")
 }
 
 func TestGenerateManifest_MissingScenarioType_Returns400(t *testing.T) {
@@ -403,6 +441,7 @@ func TestGenerateManifest_OneSourceUnavailable_FailsClosed_WholeManifestFails(t 
 	require.NotNil(t, m)
 	assert.Equal(t, domain.StatusFailed, m.Status)
 	assert.Empty(t, pub.published, "no event must be published for a failed manifest")
+	assert.Empty(t, s.outboxEvents, "no outbox event must be created for a failed manifest")
 	assert.Empty(t, s.records["manifest-1"], "no partial records must be persisted for a failed manifest")
 }
 
@@ -534,3 +573,95 @@ func TestListRecords_ReturnsAllRecordsForManifest(t *testing.T) {
 	require.Len(t, records, 1)
 	assert.Equal(t, domain.SourceGovernanceDecision, records[0].SourceType)
 }
+
+// ── ListManifests (EVD-03) ───────────────────────────────────────────────────
+
+func TestListManifests_ReturnsAllManifestsForTenant(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	gov.getResult = &aggregator.SourceRecord{SourceType: domain.SourceGovernanceDecision, SourceRecordID: "gd-1", RawJSON: []byte(`{}`)}
+
+	s := newStubStore()
+	r := newRouter(s, gov, acc, wf, pub)
+
+	// Seed one manifest
+	createBody, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioAudit,
+		GovernanceDecisionIDs: []string{"gd-1"},
+	})
+	seedReq := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(createBody))
+	seedReq.Header.Set("X-Tenant-Id", "t1")
+	seedReq.Header.Set("X-Principal-Id", "principal-test-01")
+	r.ServeHTTP(httptest.NewRecorder(), seedReq)
+
+	// List manifests
+	listReq := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests", nil)
+	listReq.Header.Set("X-Tenant-Id", "t1")
+	listReq.Header.Set("X-Principal-Id", "principal-test-01")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, listReq)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var list []domain.EvidenceManifest
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
+	require.Len(t, list, 1)
+	assert.Equal(t, "manifest-1", list[0].ManifestID)
+	assert.Equal(t, "e1", list[0].LegalEntityID)
+	assert.Equal(t, domain.ScenarioAudit, list[0].ScenarioType)
+}
+
+func TestListManifests_LegalEntityFilter(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	gov.getResult = &aggregator.SourceRecord{SourceType: domain.SourceGovernanceDecision, SourceRecordID: "gd-1", RawJSON: []byte(`{}`)}
+
+	s := newStubStore()
+	r := newRouter(s, gov, acc, wf, pub)
+
+	// Seed manifest for e1
+	createBody, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioAudit,
+		GovernanceDecisionIDs: []string{"gd-1"},
+	})
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(createBody))
+	req1.Header.Set("X-Tenant-Id", "t1")
+	req1.Header.Set("X-Principal-Id", "principal-test-01")
+	r.ServeHTTP(httptest.NewRecorder(), req1)
+
+	// Query with matching legal_entity_id
+	listReq := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests?legal_entity_id=e1", nil)
+	listReq.Header.Set("X-Tenant-Id", "t1")
+	listReq.Header.Set("X-Principal-Id", "principal-test-01")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, listReq)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var list []domain.EvidenceManifest
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &list))
+	assert.Len(t, list, 1)
+
+	// Query with non-matching legal_entity_id
+	listReq2 := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests?legal_entity_id=e2", nil)
+	listReq2.Header.Set("X-Tenant-Id", "t1")
+	listReq2.Header.Set("X-Principal-Id", "principal-test-01")
+	rec2 := httptest.NewRecorder()
+	r.ServeHTTP(rec2, listReq2)
+
+	require.Equal(t, http.StatusOK, rec2.Code)
+	var list2 []domain.EvidenceManifest
+	require.NoError(t, json.Unmarshal(rec2.Body.Bytes(), &list2))
+	assert.Empty(t, list2)
+}
+
+func TestListManifests_InvalidPagination_Returns400(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	r := newRouter(newStubStore(), gov, acc, wf, pub)
+
+	for _, query := range []string{"?limit=0", "?limit=201", "?limit=abc", "?offset=-1", "?offset=xyz"} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests"+query, nil)
+		req.Header.Set("X-Tenant-Id", "t1")
+		req.Header.Set("X-Principal-Id", "principal-test-01")
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, "expected 400 for query %s", query)
+	}
+}
+

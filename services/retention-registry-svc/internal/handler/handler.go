@@ -83,13 +83,23 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, dec
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
+	return h.authorizePrincipal(w, r, principalID, tenantID, actionType, "not authorized to perform this action")
+}
+
+// authorizePrincipal checks actionType for a given principalID against tenantID's scope
+// (or platform scope if tenantID is empty) and emits a customized forbidden message if denied.
+func (h *Handler) authorizePrincipal(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType, deniedMsg string) bool {
 	scope := platformScopeID
 	if tenantID != "" {
 		scope = tenantID
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+			msg := "not authorized to perform this action"
+			if deniedMsg != "" {
+				msg = deniedMsg
+			}
+			writeError(w, http.StatusForbidden, msg)
 		} else {
 			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 		}
@@ -476,11 +486,18 @@ func (h *Handler) ReleaseLegalHold(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if principalID == req.ReleaseApprovedByPrincipalID {
+		writeError(w, http.StatusForbidden, "maker-checker violation: principal cannot approve their own legal hold release")
+		return
+	}
 	scope := ""
 	if existing.TenantID != nil {
 		scope = *existing.TenantID
 	}
 	if !h.authorize(w, r, principalID, scope, LegalHoldRelease) {
+		return
+	}
+	if !h.authorizePrincipal(w, r, req.ReleaseApprovedByPrincipalID, scope, LegalHoldRelease, "approver is not authorized to release legal hold") {
 		return
 	}
 

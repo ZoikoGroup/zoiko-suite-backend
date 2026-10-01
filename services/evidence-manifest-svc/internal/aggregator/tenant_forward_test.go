@@ -122,3 +122,44 @@ func TestClient_TenantlessContext_SendsNoHeader(t *testing.T) {
 		t.Fatal("a tenant-less context must send NO X-Tenant-Id header, not an empty or invented one")
 	}
 }
+
+func TestWorkflowAndHistoryClients_ForwardPrincipalHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(baseURL string, ctx context.Context) error
+	}{
+		{"workflow", func(baseURL string, ctx context.Context) error {
+			_, err := aggregator.NewWorkflowClient(baseURL, zap.NewNop()).GetByID(ctx, "wf-1")
+			return err
+		}},
+		{"workflow-history", func(baseURL string, ctx context.Context) error {
+			_, err := aggregator.NewWorkflowHistoryClient(baseURL, zap.NewNop()).ListByInstanceID(ctx, "wf-1")
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotTenant string
+			var gotPrincipal string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotTenant = r.Header.Get("X-Tenant-Id")
+				gotPrincipal = r.Header.Get("X-Principal-Id")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[]`))
+			}))
+			defer srv.Close()
+
+			ctx := svcmiddleware.WithTenant(context.Background(), "tenant-a")
+			ctx = svcmiddleware.WithPrincipal(ctx, "principal-user-1")
+			if err := tc.call(srv.URL, ctx); err != nil {
+				t.Fatalf("%s call failed: %v", tc.name, err)
+			}
+			if gotTenant != "tenant-a" {
+				t.Fatalf("%s: expected X-Tenant-Id %q, got %q", tc.name, "tenant-a", gotTenant)
+			}
+			if gotPrincipal != "principal-user-1" {
+				t.Fatalf("%s: expected X-Principal-Id %q, got %q", tc.name, "principal-user-1", gotPrincipal)
+			}
+		})
+	}
+}
+

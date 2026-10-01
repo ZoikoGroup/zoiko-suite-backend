@@ -134,13 +134,20 @@ func ValidateJSONSchema(raw json.RawMessage) error {
 	return nil
 }
 
-// Shape is the part of a JSON Schema this registry understands: the top-level
-// property types and the required list.
+// PropertyDef describes a property's declared type and any nested structure.
+type PropertyDef struct {
+	Type       string                 `json:"type"`
+	Properties map[string]PropertyDef `json:"properties,omitempty"`
+	Required   []string               `json:"required,omitempty"`
+	Items      *PropertyDef           `json:"items,omitempty"`
+}
+
+// Shape is the part of a JSON Schema this registry understands: the
+// property types, nested structure, and required list.
 type Shape struct {
-	Properties map[string]struct {
-		Type string `json:"type"`
-	} `json:"properties"`
-	Required []string `json:"required"`
+	Type       string                 `json:"type"`
+	Properties map[string]PropertyDef `json:"properties"`
+	Required   []string               `json:"required"`
 }
 
 // ShapeOf parses the analysable part of a schema. It lives in domain rather

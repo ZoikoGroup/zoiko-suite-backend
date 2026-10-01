@@ -186,9 +186,19 @@ func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error
 
 var _ events.Publisher = (*stubPublisher)(nil)
 
-type stubAuthz struct{ err error }
+type stubAuthz struct {
+	err          error
+	principalErr map[string]error
+}
 
-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
+func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, _, _ string) error {
+	if a.principalErr != nil {
+		if err, ok := a.principalErr[principalID]; ok {
+			return err
+		}
+	}
+	return a.err
+}
 
 var _ AuthzChecker = (*stubAuthz)(nil)
 
@@ -353,5 +363,85 @@ func TestCreateLegalHold_AuthorizationDenied403(t *testing.T) {
 	}))
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReleaseLegalHold_SelfApproval_Forbidden403(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	wHold := httptest.NewRecorder()
+	r.ServeHTTP(wHold, buildRequest(http.MethodPost, "/v1/legal-holds", domain.CreateLegalHoldRequest{
+		ScopeDescription: "test hold self approval",
+		Authority:        "Legal Counsel",
+	}))
+	var hld domain.LegalHold
+	_ = json.Unmarshal(wHold.Body.Bytes(), &hld)
+
+	// Attempt release where approver is identical to caller ("records-officer-1")
+	wRelease := httptest.NewRecorder()
+	r.ServeHTTP(wRelease, buildRequest(http.MethodPost, "/v1/legal-holds/"+hld.LegalHoldID+"/release", domain.ReleaseLegalHoldRequest{
+		ReleaseApprovedByPrincipalID: "records-officer-1",
+	}))
+	if wRelease.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on self-approval, got %d — %s", wRelease.Code, wRelease.Body.String())
+	}
+}
+
+func TestReleaseLegalHold_ApproverNotAuthorized_Forbidden403(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	st := &stubStore{}
+	pub := &stubPublisher{}
+	az := &stubAuthz{
+		principalErr: map[string]error{
+			"unauthorized-approver-2": authzpkg.ErrAuthorizationDenied,
+		},
+	}
+	h := New(st, pub, az, logger)
+	r := newTestRouter(h)
+
+	wHold := httptest.NewRecorder()
+	r.ServeHTTP(wHold, buildRequest(http.MethodPost, "/v1/legal-holds", domain.CreateLegalHoldRequest{
+		ScopeDescription: "test hold approver unauthorized",
+		Authority:        "Legal Counsel",
+	}))
+	var hld domain.LegalHold
+	_ = json.Unmarshal(wHold.Body.Bytes(), &hld)
+
+	wRelease := httptest.NewRecorder()
+	r.ServeHTTP(wRelease, buildRequest(http.MethodPost, "/v1/legal-holds/"+hld.LegalHoldID+"/release", domain.ReleaseLegalHoldRequest{
+		ReleaseApprovedByPrincipalID: "unauthorized-approver-2",
+	}))
+	if wRelease.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when approver is not authorized, got %d — %s", wRelease.Code, wRelease.Body.String())
+	}
+}
+
+func TestReleaseLegalHold_ApproverAuthzUnavailable_503(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	st := &stubStore{}
+	pub := &stubPublisher{}
+	az := &stubAuthz{
+		principalErr: map[string]error{
+			"external-approver-3": context.DeadlineExceeded,
+		},
+	}
+	h := New(st, pub, az, logger)
+	r := newTestRouter(h)
+
+	wHold := httptest.NewRecorder()
+	r.ServeHTTP(wHold, buildRequest(http.MethodPost, "/v1/legal-holds", domain.CreateLegalHoldRequest{
+		ScopeDescription: "test hold authz unavailable",
+		Authority:        "Legal Counsel",
+	}))
+	var hld domain.LegalHold
+	_ = json.Unmarshal(wHold.Body.Bytes(), &hld)
+
+	wRelease := httptest.NewRecorder()
+	r.ServeHTTP(wRelease, buildRequest(http.MethodPost, "/v1/legal-holds/"+hld.LegalHoldID+"/release", domain.ReleaseLegalHoldRequest{
+		ReleaseApprovedByPrincipalID: "external-approver-3",
+	}))
+	if wRelease.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when approver authz is unavailable, got %d — %s", wRelease.Code, wRelease.Body.String())
 	}
 }

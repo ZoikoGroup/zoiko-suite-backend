@@ -23,6 +23,7 @@ import (
 	"zoiko.io/kill-switch-registry-svc/internal/health"
 	"zoiko.io/kill-switch-registry-svc/internal/middleware"
 	"zoiko.io/kill-switch-registry-svc/internal/mtls"
+	"zoiko.io/kill-switch-registry-svc/internal/outbox"
 	"zoiko.io/kill-switch-registry-svc/internal/store"
 	"zoiko.io/kill-switch-registry-svc/internal/telemetry"
 )
@@ -66,6 +67,15 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+
+	var relayCancel context.CancelFunc
+	if pool != nil {
+		relay := outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, logger)
+		var relayCtx context.Context
+		relayCtx, relayCancel = context.WithCancel(context.Background())
+		go relay.Start(relayCtx)
+		logger.Info("started outbox relay worker")
+	}
 
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
@@ -119,6 +129,10 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down kill-switch-registry-svc gracefully...")
+	if relayCancel != nil {
+		relayCancel()
+	}
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

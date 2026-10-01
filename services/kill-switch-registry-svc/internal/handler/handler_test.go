@@ -16,13 +16,15 @@ import (
 	"zoiko.io/kill-switch-registry-svc/internal/domain"
 	"zoiko.io/kill-switch-registry-svc/internal/events"
 	svcmiddleware "zoiko.io/kill-switch-registry-svc/internal/middleware"
+	"zoiko.io/kill-switch-registry-svc/internal/outbox"
 )
 
 // stubStore is a tiny in-memory re-implementation of the real
 // ResolveKillSwitch/ListCurrentStates logic — good enough to exercise the
 // handler's own validation and wiring without a real database.
 type stubStore struct {
-	events []domain.KillSwitchEvent
+	events       []domain.KillSwitchEvent
+	outboxEvents []outbox.Event
 }
 
 func scopeKey(plane, domainName, providerCode, tenantID *string) string {
@@ -35,8 +37,9 @@ func scopeKey(plane, domainName, providerCode, tenantID *string) string {
 	return deref(plane) + "|" + deref(domainName) + "|" + deref(providerCode) + "|" + deref(tenantID)
 }
 
-func (s *stubStore) AppendEvent(_ context.Context, e *domain.KillSwitchEvent) error {
+func (s *stubStore) AppendEvent(_ context.Context, e *domain.KillSwitchEvent, outboxEvents ...outbox.Event) error {
 	s.events = append(s.events, *e)
+	s.outboxEvents = append(s.outboxEvents, outboxEvents...)
 	return nil
 }
 
@@ -133,9 +136,19 @@ func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error
 
 var _ events.Publisher = (*stubPublisher)(nil)
 
-type stubAuthz struct{ err error }
+type stubAuthz struct {
+	err          error
+	principalErr map[string]error
+}
 
-func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error { return s.err }
+func (s *stubAuthz) CheckAllowed(_ context.Context, principalID, _, _ string) error {
+	if s.principalErr != nil {
+		if err, ok := s.principalErr[principalID]; ok {
+			return err
+		}
+	}
+	return s.err
+}
 
 var _ AuthzChecker = (*stubAuthz)(nil)
 
@@ -185,7 +198,7 @@ func TestEngage_RequiresReconciliationProcedureRef(t *testing.T) {
 	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
 		Domain:                "AUTOMATION_ACTION",
 		Reason:                "runaway automation loop detected",
-		ApprovedByPrincipalID: "incident-commander-1",
+		ApprovedByPrincipalID: "sre-lead-approver-2",
 	}))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 missing reconciliation_procedure_ref, got %d — %s", w.Code, w.Body.String())
@@ -193,20 +206,23 @@ func TestEngage_RequiresReconciliationProcedureRef(t *testing.T) {
 }
 
 func TestEngage_PlatformWideThenResolveBlocksEverything(t *testing.T) {
-	h, _, pub := newTestHandler()
+	h, st, _ := newTestHandler()
 	r := newTestRouter(h)
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
 		Reason:                     "platform-wide incident INC-1234",
 		ReconciliationProcedureRef: "runbook:INC-1234",
-		ApprovedByPrincipalID:      "incident-commander-1",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
 	}))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d — %s", w.Code, w.Body.String())
 	}
-	if pub.calls != 1 {
-		t.Errorf("expected kill_switch.engaged published once, got %d", pub.calls)
+	if len(st.outboxEvents) != 1 {
+		t.Fatalf("expected 1 outbox event published, got %d", len(st.outboxEvents))
+	}
+	if st.outboxEvents[0].EventType != events.EventTypeKillSwitchEngaged {
+		t.Errorf("expected outbox event %q, got %q", events.EventTypeKillSwitchEngaged, st.outboxEvents[0].EventType)
 	}
 
 	// A completely unrelated, narrowly-scoped resolve request must still be
@@ -230,7 +246,7 @@ func TestResolve_MostSpecificEngagedSwitchWins(t *testing.T) {
 		Domain:                     "AUTOMATION_ACTION",
 		Reason:                     "broad automation concern",
 		ReconciliationProcedureRef: "runbook:broad",
-		ApprovedByPrincipalID:      "incident-commander-1",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
 	}))
 	// ...then disengage it for one specific tenant only (more specific).
 	r.ServeHTTP(httptest.NewRecorder(), buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
@@ -238,7 +254,7 @@ func TestResolve_MostSpecificEngagedSwitchWins(t *testing.T) {
 		TenantID:                   "tenant-safe",
 		Reason:                     "tenant-safe cleared for automation resumption",
 		ReconciliationProcedureRef: "runbook:tenant-safe",
-		ApprovedByPrincipalID:      "incident-commander-1",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
 	}))
 
 	if len(st.events) != 2 {
@@ -264,7 +280,7 @@ func TestDisengage_RejectsWhenNotCurrentlyEngaged(t *testing.T) {
 	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/kill-switches/disengage", domain.DisengageKillSwitchRequest{
 		Domain:                "COMMERCIAL_CHARGING",
 		Reason:                "attempting to clear a switch that was never engaged",
-		ApprovedByPrincipalID: "incident-commander-1",
+		ApprovedByPrincipalID: "sre-lead-approver-2",
 	}))
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 disengaging a never-engaged scope, got %d — %s", w.Code, w.Body.String())
@@ -272,24 +288,33 @@ func TestDisengage_RejectsWhenNotCurrentlyEngaged(t *testing.T) {
 }
 
 func TestEngageThenDisengage_ResolveNoLongerBlocked(t *testing.T) {
-	h, _, _ := newTestHandler()
+	h, st, _ := newTestHandler()
 	r := newTestRouter(h)
 
 	r.ServeHTTP(httptest.NewRecorder(), buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
 		Domain:                     "PUBLIC_CLAIM_PUBLICATION",
 		Reason:                     "pending legal review",
 		ReconciliationProcedureRef: "runbook:legal-review-" + uuid.NewString(),
-		ApprovedByPrincipalID:      "incident-commander-1",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
 	}))
 
 	wDisengage := httptest.NewRecorder()
 	r.ServeHTTP(wDisengage, buildRequest(http.MethodPost, "/v1/kill-switches/disengage", domain.DisengageKillSwitchRequest{
 		Domain:                "PUBLIC_CLAIM_PUBLICATION",
 		Reason:                "legal review complete, cleared to resume",
-		ApprovedByPrincipalID: "incident-commander-1",
+		ApprovedByPrincipalID: "sre-lead-approver-2",
 	}))
 	if wDisengage.Code != http.StatusOK {
 		t.Fatalf("expected 200 disengaging an engaged switch, got %d — %s", wDisengage.Code, wDisengage.Body.String())
+	}
+	if len(st.outboxEvents) != 2 {
+		t.Fatalf("expected 2 outbox events (engage + disengage), got %d", len(st.outboxEvents))
+	}
+	if st.outboxEvents[0].EventType != events.EventTypeKillSwitchEngaged {
+		t.Errorf("expected outbox event 0 to be %s, got %s", events.EventTypeKillSwitchEngaged, st.outboxEvents[0].EventType)
+	}
+	if st.outboxEvents[1].EventType != events.EventTypeKillSwitchDisengaged {
+		t.Errorf("expected outbox event 1 to be %s, got %s", events.EventTypeKillSwitchDisengaged, st.outboxEvents[1].EventType)
 	}
 
 	w := httptest.NewRecorder()
@@ -311,9 +336,128 @@ func TestAuthorizationDenied_Engage403(t *testing.T) {
 		Domain:                     "MODEL_PROVIDER_USE",
 		Reason:                     "should be denied",
 		ReconciliationProcedureRef: "runbook:denied",
-		ApprovedByPrincipalID:      "incident-commander-1",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
 	}))
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+// ── Segregation of Duties (SoD) / Two-Man Rule Tests ────────────────────────
+
+func TestEngage_SelfApproval_Forbidden403(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	// Caller is "incident-commander-1", passes own ID as approved_by_principal_id
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+		Domain:                     "AUTOMATION_ACTION",
+		Reason:                     "unilateral emergency attempt",
+		ReconciliationProcedureRef: "runbook:unilateral",
+		ApprovedByPrincipalID:      "incident-commander-1",
+	}))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for self-approval, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDisengage_SelfApproval_Forbidden403(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	// First engage with valid two-man rule
+	r.ServeHTTP(httptest.NewRecorder(), buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+		Domain:                     "COMMERCIAL_CHARGING",
+		Reason:                     "billing discrepancy detected",
+		ReconciliationProcedureRef: "runbook:billing-stop",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
+	}))
+
+	// Attempt disengagement with self-approval
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/kill-switches/disengage", domain.DisengageKillSwitchRequest{
+		Domain:                "COMMERCIAL_CHARGING",
+		Reason:                "unilateral disengage attempt",
+		ApprovedByPrincipalID: "incident-commander-1", // same as X-Principal-Id
+	}))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for disengage self-approval, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEngage_ApproverNotAuthorized_Forbidden403(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	authzClient := &stubAuthz{
+		principalErr: map[string]error{
+			"unauthorized-approver-9": authzpkg.ErrAuthorizationDenied,
+		},
+	}
+	h := New(&stubStore{}, &stubPublisher{}, authzClient, logger)
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+		Domain:                     "MODEL_PROVIDER_USE",
+		Reason:                     "model provider leak",
+		ReconciliationProcedureRef: "runbook:model-provider",
+		ApprovedByPrincipalID:      "unauthorized-approver-9",
+	}))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when approver lacks authorization, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDisengage_ApproverNotAuthorized_Forbidden403(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	authzClient := &stubAuthz{
+		principalErr: map[string]error{
+			"unauthorized-approver-9": authzpkg.ErrAuthorizationDenied,
+		},
+	}
+	st := &stubStore{}
+	pub := &stubPublisher{}
+	h := New(st, pub, authzClient, logger)
+	r := newTestRouter(h)
+
+	// Pre-engage switch
+	r.ServeHTTP(httptest.NewRecorder(), buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+		Domain:                     "IMPORT_SYNC",
+		Reason:                     "sync corruption",
+		ReconciliationProcedureRef: "runbook:sync-corruption",
+		ApprovedByPrincipalID:      "valid-sre-lead-2",
+	}))
+
+	// Attempt disengage with unauthorized approver
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/kill-switches/disengage", domain.DisengageKillSwitchRequest{
+		Domain:                "IMPORT_SYNC",
+		Reason:                "sync cleared",
+		ApprovedByPrincipalID: "unauthorized-approver-9",
+	}))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when disengage approver lacks authorization, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEngage_ApproverAuthzUnavailable_503(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	authzClient := &stubAuthz{
+		principalErr: map[string]error{
+			"sre-lead-approver-2": authzpkg.ErrAuthzServiceUnavailable,
+		},
+	}
+	h := New(&stubStore{}, &stubPublisher{}, authzClient, logger)
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+		Domain:                     "NOTIFICATION_EXPORT",
+		Reason:                     "notification flooding",
+		ReconciliationProcedureRef: "runbook:notification",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
+	}))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when approver authz check fails, got %d — %s", w.Code, w.Body.String())
 	}
 }

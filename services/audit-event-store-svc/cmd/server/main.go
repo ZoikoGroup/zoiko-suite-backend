@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -141,7 +142,14 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	router.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	policy := svcenvelope.ServicePolicy()
+	policy.MaterialWrite = func(r *http.Request) bool {
+		if r.Method == http.MethodPost && (r.URL.Path == "/v1/events/verify" || strings.HasSuffix(r.URL.Path, "/verify")) {
+			return false
+		}
+		return r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+	}
+	router.Use(svcenvelope.Middleware(policy, svcenvelope.DefaultReporter()))
 
 	// Health probes — no auth, no tenant context required.
 	healthH := health.New(pool, log)

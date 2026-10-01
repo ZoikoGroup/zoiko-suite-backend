@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -22,9 +23,10 @@ import (
 type Store interface {
 	CreateManifest(ctx context.Context, m *domain.EvidenceManifest) error
 	AddRecord(ctx context.Context, r *domain.ManifestRecord) error
-	FinalizeGenerated(ctx context.Context, manifestID, checksumSHA256 string) (*domain.EvidenceManifest, error)
+	FinalizeGenerated(ctx context.Context, manifestID, checksumSHA256 string, correlationID ...string) (*domain.EvidenceManifest, error)
 	FinalizeFailed(ctx context.Context, manifestID, reason string) (*domain.EvidenceManifest, error)
 	FindManifestByID(ctx context.Context, manifestID string) (*domain.EvidenceManifest, error)
+	ListManifests(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.EvidenceManifest, error)
 	ListRecords(ctx context.Context, manifestID string) ([]domain.ManifestRecord, error)
 
 	// AUD-03 Audit Population — see internal/store/population_store.go's
@@ -155,6 +157,7 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/evidence-manifests", func(r chi.Router) {
 		r.Post("/", h.GenerateManifest)
+		r.Get("/", h.ListManifests)
 		r.Get("/{manifestID}", h.GetManifest)
 		r.Get("/{manifestID}/records", h.ListRecords)
 	})
@@ -284,18 +287,18 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 	}
 	checksum := hex.EncodeToString(hasher.Sum(nil))
 
-	finalManifest, err := h.store.FinalizeGenerated(r.Context(), manifest.ManifestID, checksum)
+	correlationID := r.Header.Get("X-Correlation-ID")
+	finalManifest, err := h.store.FinalizeGenerated(r.Context(), manifest.ManifestID, checksum, correlationID)
 	if err != nil {
 		h.log.Error("GenerateManifest: failed to finalize", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
-	if pubErr := h.publisher.PublishManifestGenerated(r.Context(), finalManifest, r.Header.Get("X-Correlation-ID")); pubErr != nil {
-		h.log.Error("GenerateManifest: failed to publish evidence.manifest.generated",
-			zap.String("manifest_id", finalManifest.ManifestID), zap.Error(pubErr))
-	}
-
+	// Transactional outbox pattern (ZS-STATE-001 Invariant I-13): The domain
+	// event evidence.manifest.generated is committed atomically to outbox_events
+	// inside FinalizeGenerated. The background relay worker handles at-least-once
+	// delivery to Kafka with automatic retries, eliminating publish error swallowing.
 	writeJSON(w, http.StatusCreated, finalManifest)
 }
 
@@ -343,6 +346,52 @@ func (h *Handler) collectRecords(ctx context.Context, req domain.GenerateManifes
 		out = append(out, historyRecs...)
 	}
 	return out, nil
+}
+
+// ── GET /v1/evidence-manifests ───────────────────────────────────────────────
+
+// ListManifests returns the manifests for the caller's tenant, ordered newest first.
+// If legal_entity_id is provided, checks authorization against that legal entity.
+func (h *Handler) ListManifests(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID != "" {
+		if !h.authorize(w, r, principalID, legalEntityID, EvidenceManifestRead) {
+			return
+		}
+	}
+
+	limit := 50
+	offset := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		v, err := strconv.Atoi(l)
+		if err != nil || v < 1 || v > 200 {
+			writeError(w, http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 200")
+			return
+		}
+		limit = v
+	}
+	if o := r.URL.Query().Get("offset"); o != "" {
+		v, err := strconv.Atoi(o)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_offset", "offset must be non-negative")
+			return
+		}
+		offset = v
+	}
+
+	manifests, err := h.store.ListManifests(r.Context(), legalEntityID, limit, offset)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if manifests == nil {
+		manifests = []domain.EvidenceManifest{}
+	}
+	writeJSON(w, http.StatusOK, manifests)
 }
 
 // ── GET /v1/evidence-manifests/{manifestID} ──────────────────────────────────

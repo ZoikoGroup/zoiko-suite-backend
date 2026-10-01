@@ -15,6 +15,7 @@ import (
 	"zoiko.io/kill-switch-registry-svc/internal/domain"
 	"zoiko.io/kill-switch-registry-svc/internal/events"
 	svcmiddleware "zoiko.io/kill-switch-registry-svc/internal/middleware"
+	"zoiko.io/kill-switch-registry-svc/internal/outbox"
 	"zoiko.io/kill-switch-registry-svc/internal/store"
 )
 
@@ -88,13 +89,23 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, dec
 // a role granted for that tenant specifically, same doctrine as every other
 // service's per-scope authorize helper (e.g. commercial-account-svc).
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
+	return h.authorizePrincipal(w, r, principalID, tenantID, actionType, "not authorized to perform this action")
+}
+
+// authorizePrincipal checks actionType for a given principalID against tenantID's scope
+// (or platform scope if tenantID is empty) and emits a customized forbidden message if denied.
+func (h *Handler) authorizePrincipal(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType, deniedMsg string) bool {
 	scope := platformScopeID
 	if tenantID != "" {
 		scope = tenantID
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+			msg := "not authorized to perform this action"
+			if deniedMsg != "" {
+				msg = deniedMsg
+			}
+			writeError(w, http.StatusForbidden, msg)
 		} else {
 			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 		}
@@ -144,7 +155,17 @@ func (h *Handler) EngageKillSwitch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	// Segregation of Duties (SoD) — Two-man rule: creator cannot self-approve.
+	if principalID == req.ApprovedByPrincipalID {
+		writeError(w, http.StatusForbidden, "self-approval forbidden: maker cannot be checker under segregation of duties")
+		return
+	}
+
 	if !h.authorize(w, r, principalID, req.TenantID, KillSwitchEngage) {
+		return
+	}
+	if !h.authorizePrincipal(w, r, req.ApprovedByPrincipalID, req.TenantID, KillSwitchEngage, "approver not authorized to approve kill switch engagement") {
 		return
 	}
 
@@ -161,16 +182,34 @@ func (h *Handler) EngageKillSwitch(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:                  time.Now().UTC(),
 		CreatedByPrincipalID:       principalID,
 	}
-	if err := h.store.AppendEvent(r.Context(), e); err != nil {
+
+	outboxEvt := outbox.Event{
+		AggregateType: "kill_switch",
+		AggregateID:   e.KillSwitchEventID,
+		EventType:     "kill_switch.engaged",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "kill_switch.engaged",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "kill-switch-registry-svc",
+			EntityID:      e.KillSwitchEventID,
+			TenantID:      req.TenantID,
+			ActorID:       principalID,
+			CorrelationID: req.CorrelationID,
+			OccurredAt:    e.CreatedAt,
+			Payload:       e,
+		},
+		CorrelationID: req.CorrelationID,
+		TenantID:      strPtrOrNil(req.TenantID),
+	}
+
+	if err := h.store.AppendEvent(r.Context(), e, outboxEvt); err != nil {
 		h.logger.Error("engage kill switch failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to engage kill switch")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "kill_switch.engaged", EntityID: e.KillSwitchEventID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: req.CorrelationID, Payload: e,
-	})
 	writeJSON(w, http.StatusCreated, e)
 }
 
@@ -196,7 +235,17 @@ func (h *Handler) DisengageKillSwitch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	// Segregation of Duties (SoD) — Two-man rule: creator cannot self-approve.
+	if principalID == req.ApprovedByPrincipalID {
+		writeError(w, http.StatusForbidden, "self-approval forbidden: maker cannot be checker under segregation of duties")
+		return
+	}
+
 	if !h.authorize(w, r, principalID, req.TenantID, KillSwitchDisengage) {
+		return
+	}
+	if !h.authorizePrincipal(w, r, req.ApprovedByPrincipalID, req.TenantID, KillSwitchDisengage, "approver not authorized to approve kill switch disengagement") {
 		return
 	}
 
@@ -224,16 +273,34 @@ func (h *Handler) DisengageKillSwitch(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:             time.Now().UTC(),
 		CreatedByPrincipalID:  principalID,
 	}
-	if err := h.store.AppendEvent(r.Context(), e); err != nil {
+
+	outboxEvt := outbox.Event{
+		AggregateType: "kill_switch",
+		AggregateID:   e.KillSwitchEventID,
+		EventType:     "kill_switch.disengaged",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "kill_switch.disengaged",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "kill-switch-registry-svc",
+			EntityID:      e.KillSwitchEventID,
+			TenantID:      req.TenantID,
+			ActorID:       principalID,
+			CorrelationID: req.CorrelationID,
+			OccurredAt:    e.CreatedAt,
+			Payload:       e,
+		},
+		CorrelationID: req.CorrelationID,
+		TenantID:      strPtrOrNil(req.TenantID),
+	}
+
+	if err := h.store.AppendEvent(r.Context(), e, outboxEvt); err != nil {
 		h.logger.Error("disengage kill switch failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to disengage kill switch")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "kill_switch.disengaged", EntityID: e.KillSwitchEventID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: req.CorrelationID, Payload: e,
-	})
 	writeJSON(w, http.StatusOK, e)
 }
 

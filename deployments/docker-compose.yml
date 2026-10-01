@@ -1559,6 +1559,8 @@ services:
         condition: service_healthy
       workflow-svc:
         condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8097/healthz"]
       interval: 10s

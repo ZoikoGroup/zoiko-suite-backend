@@ -33,6 +33,11 @@ type Event struct {
 	Payload       interface{} `json:"payload"`
 }
 
+const (
+	EventTypeKillSwitchEngaged    = "kill_switch.engaged"
+	EventTypeKillSwitchDisengaged = "kill_switch.disengaged"
+)
+
 // PublishParams carries the envelope-level fields a call site supplies,
 // alongside the payload-level business object.
 type PublishParams struct {
@@ -107,3 +112,51 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 	}
 	return nil
 }
+
+// PublishOutbox delivers a message from the outbox relay worker to Kafka.
+// It returns a non-nil error on failure so the relay can track retry attempts.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	headers := []kafka.Header{
+		{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+	}
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(aggregateID),
+		Value:   payload,
+		Headers: headers,
+	})
+	if err != nil {
+		p.logger.Warn("kafka outbox publish failed",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.Error(err),
+		)
+		return err
+	}
+	return nil
+}
+
+// LogOnlyPublisher is used in development/test environments where Kafka is not configured.
+type LogOnlyPublisher struct {
+	Logger *zap.Logger
+}
+
+func (l *LogOnlyPublisher) Publish(_ context.Context, params PublishParams) error {
+	if l.Logger != nil {
+		l.Logger.Info("log-only publisher received event",
+			zap.String("event_type", params.EventType),
+			zap.String("entity_id", params.EntityID),
+		)
+	}
+	return nil
+}
+
+func (l *LogOnlyPublisher) PublishOutbox(_ context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	if l.Logger != nil {
+		l.Logger.Info("log-only publisher received outbox event",
+			zap.String("outbox_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+		)
+	}
+	return nil
+}
+

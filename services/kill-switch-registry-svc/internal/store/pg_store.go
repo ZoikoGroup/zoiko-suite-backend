@@ -12,12 +12,13 @@ import (
 
 	"zoiko.io/kill-switch-registry-svc/internal/domain"
 	svcmiddleware "zoiko.io/kill-switch-registry-svc/internal/middleware"
+	"zoiko.io/kill-switch-registry-svc/internal/outbox"
 )
 
 type Store interface {
-	// AppendEvent inserts a new ENGAGE/DISENGAGE record. Never an UPDATE —
-	// the append-only doctrine is enforced here, not just documented.
-	AppendEvent(ctx context.Context, e *domain.KillSwitchEvent) error
+	// AppendEvent inserts a new ENGAGE/DISENGAGE record and optional outbox events atomically.
+	// Never an UPDATE — the append-only doctrine is enforced here, not just documented.
+	AppendEvent(ctx context.Context, e *domain.KillSwitchEvent, outboxEvents ...outbox.Event) error
 
 	// LatestEventForScope returns the most recent event for the EXACT
 	// scope tuple given (nil means that dimension is nil in the row too —
@@ -113,7 +114,7 @@ func scanEvent(row pgx.Row) (*domain.KillSwitchEvent, error) {
 // policy must keep the IS NULL branch for reads. The control on that path
 // is the handler's authorization at platform scope, not this. See migration
 // 000002's header, which says so at length rather than leaving it implied.
-func (s *PgStore) AppendEvent(ctx context.Context, e *domain.KillSwitchEvent) error {
+func (s *PgStore) AppendEvent(ctx context.Context, e *domain.KillSwitchEvent, outboxEvents ...outbox.Event) error {
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO kill_switch_events (
@@ -125,7 +126,15 @@ func (s *PgStore) AppendEvent(ctx context.Context, e *domain.KillSwitchEvent) er
 			string(e.Action), e.Reason, e.ReconciliationProcedureRef,
 			e.ApprovedByPrincipalID, e.CreatedAt, e.CreatedByPrincipalID,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		for _, oEvt := range outboxEvents {
+			if err := outbox.Insert(ctx, tx, oEvt); err != nil {
+				return fmt.Errorf("insert outbox event: %w", err)
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("insert kill switch event: %w", err)

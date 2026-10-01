@@ -41,6 +41,10 @@ type Config struct {
 	// including the one that returns document bytes.
 	AuthZServiceURL string
 
+	// ClamAVURL is the host:port of clamd for virus scanning (e.g. "clamav:3310").
+	// If empty, the service falls back to scan.NoOpScanner for local/dev.
+	ClamAVURL string
+
 	Kafka KafkaConfig
 }
 
@@ -82,6 +86,7 @@ func Load() (*Config, error) {
 		StorageMasterKeyHex: strEnv("DOCUMENT_VAULT_MASTER_KEY_HEX", ""),
 		TenantRegistryURL:   strEnv("TENANT_REGISTRY_URL", "http://tenant-svc:8081"),
 		AuthZServiceURL:     strEnv("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		ClamAVURL:           strEnv("CLAMAV_URL", ""),
 		Kafka: KafkaConfig{
 			Brokers: splitBrokers(strEnv("KAFKA_BROKERS", "localhost:9092")),
 			GroupID: strEnv("KAFKA_GROUP_ID", "document-vault-svc"),
