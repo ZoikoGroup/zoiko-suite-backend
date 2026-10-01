@@ -29,6 +29,7 @@ const (
 	ActionUsageIngest           = "COMMERCIAL_USAGE_INGEST"
 	ActionUsageCertify          = "COMMERCIAL_USAGE_CERTIFY"
 	ActionUsageRead             = "COMMERCIAL_USAGE_READ"
+	ActionUsageAdjustmentCreate = "COMMERCIAL_USAGE_ADJUSTMENT_CREATE"
 )
 
 const (
@@ -41,6 +42,7 @@ const (
 	CodeStatementNotFound        = "USAGE_STATEMENT_NOT_FOUND"
 	CodeStatementInvalidState    = "USAGE_STATEMENT_INVALID_STATE"
 	CodeNoOpenTermForUsage       = "NO_OPEN_TERM_FOR_USAGE"
+	CodeAdjustmentSourceUnlinked = "ADJUSTMENT_SOURCE_UNLINKED"
 )
 
 // usageFailure maps COM-04 errors; writeFailure consults it last.
@@ -66,6 +68,8 @@ func usageFailure(err error) (int, string, bool) {
 		return http.StatusUnprocessableEntity, CodeNoOpenTermForUsage, true
 	case errors.Is(err, domain.ErrReopenNeedsIndependentActor):
 		return http.StatusForbidden, CodeSoDViolation, true
+	case errors.Is(err, domain.ErrAdjustmentSourceUnlinked):
+		return http.StatusUnprocessableEntity, CodeAdjustmentSourceUnlinked, true
 	}
 	return 0, "", false
 }
@@ -401,8 +405,13 @@ func (h *UsageHandler) CorrectUsageEvent(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusCreated, e)
 }
 
+// GetDedupStatus is a diagnostic read (C3 gap-remediation): it was gated
+// behind ActionUsageIngest, so only an ingest-workload identity could check
+// whether a usage event had already been recorded — a support/billing-ops
+// principal holding only the read grant was locked out. A read has no
+// business requiring ingest-workload authority.
 func (h *UsageHandler) GetDedupStatus(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.sellerPrincipal(w, r, ActionUsageIngest); !ok {
+	if _, ok := h.sellerPrincipal(w, r, ActionUsageRead); !ok {
 		return
 	}
 	meterKey, id := r.URL.Query().Get("meter_key"), r.URL.Query().Get("usage_event_id")
@@ -456,12 +465,16 @@ func (h *UsageHandler) CloseUsageWindow(w http.ResponseWriter, r *http.Request) 
 // StatementAction dispatches POST /usage-statements/{id}:{certify|reopen}.
 func (h *UsageHandler) StatementAction(w http.ResponseWriter, r *http.Request) {
 	rawID, action, found := strings.Cut(chi.URLParam(r, "id"), ":")
-	if !found || (action != "certify" && action != "reopen") {
-		writeProblem(w, r, Problem{Status: http.StatusNotFound, Code: CodeNotFound, Detail: "expected :certify or :reopen"})
+	if !found || (action != "certify" && action != "reopen" && action != "adjust") {
+		writeProblem(w, r, Problem{Status: http.StatusNotFound, Code: CodeNotFound, Detail: "expected :certify, :reopen or :adjust"})
 		return
 	}
 	id, ok := parseID(w, r, domain.PrefixUsageStatement, rawID)
 	if !ok {
+		return
+	}
+	if action == "adjust" {
+		h.createUsageAdjustment(w, r, id)
 		return
 	}
 	principal, ok := h.sellerPrincipal(w, r, ActionUsageCertify)
@@ -493,6 +506,46 @@ func (h *UsageHandler) StatementAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+type createUsageAdjustmentRequest struct {
+	MeterKey           string `json:"meter_key"`
+	SourceUsageEventID string `json:"source_usage_event_id"`
+	Reason             string `json:"reason"`
+}
+
+// createUsageAdjustment is C2: an explicit, evidenced operator command to
+// redirect an already-ingested event's quantity into a specific open
+// window — distinct from StatementAction's certify/reopen in both request
+// and response shape, so it stays a dedicated method even though it shares
+// the :adjust dispatch in StatementAction.
+func (h *UsageHandler) createUsageAdjustment(w http.ResponseWriter, r *http.Request, targetStatementID string) {
+	principal, ok := h.sellerPrincipal(w, r, ActionUsageAdjustmentCreate)
+	if !ok {
+		return
+	}
+	var req createUsageAdjustmentRequest
+	raw, ok := readBody(w, r, &req, false)
+	if !ok {
+		return
+	}
+	if req.MeterKey == "" || strings.TrimSpace(req.SourceUsageEventID) == "" || strings.TrimSpace(req.Reason) == "" {
+		writeProblem(w, r, Problem{Status: http.StatusBadRequest, Code: CodeInvalidCommercialContext,
+			Detail: "meter_key, source_usage_event_id and reason are all required"})
+		return
+	}
+	cmd, ok := commandFor(w, r, domain.SellerScope, principal, "CreateUsageAdjustment",
+		targetStatementID+"/"+req.MeterKey+"/"+req.SourceUsageEventID, raw, false)
+	if !ok {
+		return
+	}
+	adj, err := h.store.CreateUsageAdjustment(r.Context(), targetStatementID, req.MeterKey, req.SourceUsageEventID,
+		req.Reason, principal, h.now(), cmd.claim)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, adj)
 }
 
 // ── Queries ──────────────────────────────────────────────────────────────────

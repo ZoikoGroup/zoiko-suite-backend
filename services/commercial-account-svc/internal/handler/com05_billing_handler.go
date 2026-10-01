@@ -30,16 +30,18 @@ const (
 )
 
 const (
-	CodeBillingAccountNotFound   = "BILLING_ACCOUNT_NOT_FOUND"
-	CodeBillingAccountExists     = "BILLING_ACCOUNT_EXISTS"
-	CodeBillingAccountNotActive  = "BILLING_ACCOUNT_NOT_ACTIVE"
-	CodeUsageBasisNotCertified   = "USAGE_BASIS_NOT_CERTIFIED"
-	CodeInvoiceCandidateNotFound = "INVOICE_CANDIDATE_NOT_FOUND"
-	CodeInvoiceCandidateInvalid  = "INVOICE_CANDIDATE_INVALID_STATE"
-	CodeInvoiceAlreadyIssuedTerm = "INVOICE_ALREADY_ISSUED_FOR_TERM"
-	CodeInvoiceBasisChanged      = "INVOICE_BASIS_CHANGED"
-	CodeInvoiceNotFound          = "INVOICE_NOT_FOUND"
-	CodeEmptyInvoiceCandidate    = "EMPTY_INVOICE_CANDIDATE"
+	CodeBillingAccountNotFound       = "BILLING_ACCOUNT_NOT_FOUND"
+	CodeBillingAccountExists         = "BILLING_ACCOUNT_EXISTS"
+	CodeBillingAccountNotActive      = "BILLING_ACCOUNT_NOT_ACTIVE"
+	CodeUsageBasisNotCertified       = "USAGE_BASIS_NOT_CERTIFIED"
+	CodeInvoiceCandidateNotFound     = "INVOICE_CANDIDATE_NOT_FOUND"
+	CodeInvoiceCandidateInvalid      = "INVOICE_CANDIDATE_INVALID_STATE"
+	CodeInvoiceAlreadyIssuedTerm     = "INVOICE_ALREADY_ISSUED_FOR_TERM"
+	CodeInvoiceBasisChanged          = "INVOICE_BASIS_CHANGED"
+	CodeInvoiceNotFound              = "INVOICE_NOT_FOUND"
+	CodeEmptyInvoiceCandidate        = "EMPTY_INVOICE_CANDIDATE"
+	CodeTaxJurisdictionNotRegistered = "TAX_JURISDICTION_NOT_REGISTERED"
+	CodeTaxRateMismatch              = "TAX_RATE_MISMATCH"
 )
 
 // billingFailure maps COM-05 (part 5a) errors; writeFailure consults it last.
@@ -67,6 +69,10 @@ func billingFailure(err error) (int, string, bool) {
 		return http.StatusNotFound, CodeInvoiceNotFound, true
 	case errors.Is(err, domain.ErrEmptyInvoiceCandidate):
 		return http.StatusUnprocessableEntity, CodeEmptyInvoiceCandidate, true
+	case errors.Is(err, domain.ErrTaxJurisdictionNotRegistered):
+		return http.StatusUnprocessableEntity, CodeTaxJurisdictionNotRegistered, true
+	case errors.Is(err, domain.ErrTaxRateMismatch):
+		return http.StatusUnprocessableEntity, CodeTaxRateMismatch, true
 	case errors.Is(err, domain.ErrSubscriptionNotFound), errors.Is(err, ErrNoEffectiveVersionAlias):
 		return http.StatusNotFound, CodeNotFound, true
 	}
@@ -106,6 +112,8 @@ func RegisterBillingRoutes(r chi.Router, h *BillingHandler) {
 	r.Route("/v1/commercial/invoices", func(r chi.Router) {
 		r.Get("/{id}", h.GetInvoice)
 		r.Get("/{id}/basis", h.GetInvoiceBasis)
+		// GET .../evidence-package is registered by DisputeHandler
+		// (com05_dispute_handler.go), not here.
 	})
 }
 
@@ -181,6 +189,7 @@ type openBillingAccountRequest struct {
 	BillingCurrencyCode     string `json:"billing_currency_code"`
 	InvoiceNumberingProfile string `json:"invoice_numbering_profile"`
 	PaymentProviderRef      string `json:"payment_provider_ref"`
+	AccountingMappingKey    string `json:"accounting_mapping_key"`
 }
 
 func (h *BillingHandler) OpenBillingAccount(w http.ResponseWriter, r *http.Request) {
@@ -201,7 +210,8 @@ func (h *BillingHandler) OpenBillingAccount(w http.ResponseWriter, r *http.Reque
 		BillingAccountID: domain.NewCommercialID(domain.PrefixBillingAccount), OrganizationID: req.OrganizationID,
 		SellingEntity: req.SellingEntity, BillingCurrencyCode: req.BillingCurrencyCode,
 		InvoiceNumberingProfile: req.InvoiceNumberingProfile, PaymentProviderRef: req.PaymentProviderRef,
-		CreatedAt: h.now(), CreatedByPrincipalID: principal,
+		AccountingMappingKey: req.AccountingMappingKey,
+		CreatedAt:            h.now(), CreatedByPrincipalID: principal,
 	}
 	if err := domain.ValidateBillingAccount(b); err != nil {
 		h.fail(w, r, err)
@@ -347,6 +357,11 @@ func (h *BillingHandler) InvoiceCandidateAction(w http.ResponseWriter, r *http.R
 		}
 		c, err := h.store.ApproveInvoiceCandidate(r.Context(), id, principal, h.now(), cmd.claim)
 		if err != nil {
+			if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+				return h.store.GetInvoiceCandidate(r.Context(), resourceID)
+			}) {
+				return
+			}
 			h.fail(w, r, err)
 			return
 		}
@@ -355,6 +370,11 @@ func (h *BillingHandler) InvoiceCandidateAction(w http.ResponseWriter, r *http.R
 	}
 	inv, err := h.store.IssueInvoice(r.Context(), id, principal, h.now(), cmd.claim)
 	if err != nil {
+		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+			return h.store.GetInvoice(r.Context(), resourceID)
+		}) {
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}

@@ -114,6 +114,9 @@ type Store interface {
 	// AST/INV/PRJ domain spec's own §9 "Stock count" assertion.
 	GetUnapprovedVarianceCount(ctx context.Context, legalEntityID, fiscalPeriod string) (int, error)
 	CancelStockCount(ctx context.Context, countID, principalID, reason string, at time.Time) error
+	// ControlPopulationStockCountLines serves the `stock-count-lines` control
+	// population (docs/architecture/control-population-contract.md); read-only.
+	ControlPopulationStockCountLines(ctx context.Context, q domain.StockCountLinesQuery) (*domain.ControlPopulationPage, error)
 
 	// BIZ-07 (Product & Service Catalog) — see
 	// internal/store/catalog_store.go's own doc comments for the
@@ -263,6 +266,10 @@ const (
 	actionInventoryCountApprove = "INVENTORY_COUNT_APPROVE"
 	actionInventoryCountCertify = "INVENTORY_COUNT_CERTIFY"
 
+	// actionInventoryControlPopulationRead authorizes reading a control
+	// population for a legal entity (docs/architecture/control-population-contract.md).
+	actionInventoryControlPopulationRead = "INVENTORY_CONTROL_POPULATION_READ"
+
 	// BIZ-07 (Product & Service Catalog) actions — no dedicated
 	// Permissions field is quoted verbatim in the doc's BIZ-07 section, so
 	// this platform's own CATALOG_* namespace convention is used, mirroring
@@ -354,6 +361,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/supersede", h.SupersedeMovement)
 		r.Get("/{id}/lineage", h.GetMovementLineage)
 		r.Get("/{id}/chain", h.GetMovementChain)
+	})
+	r.Route("/v1/control-populations", func(r chi.Router) {
+		r.Get("/{population}", h.GetControlPopulation)
 	})
 	r.Get("/v1/on-hand", h.GetOnHand)
 	r.Get("/v1/on-hand/negative-count", h.GetNegativeOnHandCount)

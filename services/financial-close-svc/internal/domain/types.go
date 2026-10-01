@@ -769,6 +769,24 @@ type ReadinessCheckResponse struct {
 	BlockingIssues []string `json:"blocking_issues"`
 }
 
+// CloseGateItem is one mandatory control's state in financial-control-svc's
+// close gate.
+type CloseGateItem struct {
+	ControlCode string `json:"control_code"`
+	Status      string `json:"status"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+// CloseGateResponse mirrors financial-control-svc's
+// GET /controls/v1/close-gate wire shape. Configured is false when the entity
+// has no mandatory controls at all (an open gate then proves nothing).
+type CloseGateResponse struct {
+	Open          bool            `json:"open"`
+	Configured    bool            `json:"configured"`
+	BlockingCount int             `json:"blocking_count"`
+	Items         []CloseGateItem `json:"items"`
+}
+
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
@@ -788,6 +806,9 @@ var (
 	ErrAssetServiceUnavailable     = errorString("asset-management-svc unavailable")
 	ErrInventoryServiceUnavailable = errorString("inventory-management-svc unavailable")
 	ErrProjectServiceUnavailable   = errorString("project-accounting-svc unavailable")
+	// ErrFinancialControlUnavailable: financial-control-svc could not answer the
+	// close-gate question. Under enforce mode the close fails closed on it.
+	ErrFinancialControlUnavailable = errorString("financial-control-svc unavailable")
 
 	// ErrLedgerPageTruncated is returned when the ledger answered with a full
 	// page, so there may be journals this service never saw. A trial balance

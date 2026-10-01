@@ -537,7 +537,7 @@ func loadChildren(ctx context.Context, tx pgx.Tx, vs []*domain.PriceVersion) err
 	}
 
 	capRows, err := tx.Query(ctx, `
-		SELECT price_version_id, capability_key, limit_value, limit_unit
+		SELECT price_version_id, capability_key, limit_value, limit_unit, meter_key, meter_version
 		FROM price_version_capabilities WHERE price_version_id = ANY($1)
 		ORDER BY price_version_id, capability_key`, ids)
 	if err != nil {
@@ -547,7 +547,7 @@ func loadChildren(ctx context.Context, tx pgx.Tx, vs []*domain.PriceVersion) err
 	for capRows.Next() {
 		var versionID string
 		var c domain.PlanCapability
-		if err := capRows.Scan(&versionID, &c.CapabilityKey, &c.LimitValue, &c.LimitUnit); err != nil {
+		if err := capRows.Scan(&versionID, &c.CapabilityKey, &c.LimitValue, &c.LimitUnit, &c.MeterKey, &c.MeterVersion); err != nil {
 			return err
 		}
 		v := byID[versionID]
@@ -773,8 +773,8 @@ func insertComponent(ctx context.Context, tx pgx.Tx, c *domain.PriceComponent) e
 func insertCapabilities(ctx context.Context, tx pgx.Tx, versionID string, caps []domain.PlanCapability) error {
 	for _, c := range caps {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO price_version_capabilities (price_version_id, capability_key, limit_value, limit_unit)
-			VALUES ($1, $2, $3, $4)`, versionID, c.CapabilityKey, c.LimitValue, c.LimitUnit); err != nil {
+			INSERT INTO price_version_capabilities (price_version_id, capability_key, limit_value, limit_unit, meter_key, meter_version)
+			VALUES ($1, $2, $3, $4, $5, $6)`, versionID, c.CapabilityKey, c.LimitValue, c.LimitUnit, c.MeterKey, c.MeterVersion); err != nil {
 			return err
 		}
 	}
@@ -972,6 +972,13 @@ func (s *PgStore) SubmitForApproval(ctx context.Context, versionID string, expec
 		registeredMeters, err := loadRegisteredMeters(ctx, tx, v.Components)
 		if err != nil {
 			return err
+		}
+		capMeters, err := loadRegisteredMetersForCapabilities(ctx, tx, v.Capabilities)
+		if err != nil {
+			return err
+		}
+		for k := range capMeters {
+			registeredMeters[k] = true
 		}
 		if err := domain.CheckSubmittable(v, *cur, now, registeredMeters); err != nil {
 			return err

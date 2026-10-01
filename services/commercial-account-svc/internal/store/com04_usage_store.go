@@ -30,6 +30,7 @@ type UsageStore interface {
 	CloseUsageWindow(ctx context.Context, subscriptionID string, termNo int, meterKey string, actor string, now time.Time, claim domain.IdempotencyClaim) (*domain.UsageStatement, error)
 	CertifyUsageStatement(ctx context.Context, statementID, actor string, now time.Time, claim domain.IdempotencyClaim) (*domain.UsageStatement, error)
 	ReopenWindow(ctx context.Context, statementID, actor, reason string, now time.Time, claim domain.IdempotencyClaim) (*domain.UsageStatement, error)
+	CreateUsageAdjustment(ctx context.Context, targetStatementID, meterKey, sourceUsageEventID, reason, actor string, now time.Time, claim domain.IdempotencyClaim) (*domain.UsageAdjustment, error)
 
 	GetUsage(ctx context.Context, subscriptionID string, termNo int, meterKey string) (*domain.UsageStatement, error)
 	GetUsageStatement(ctx context.Context, statementID string) (*domain.UsageStatement, error)
@@ -167,6 +168,31 @@ func loadRegisteredMeters(ctx context.Context, tx pgx.Tx, components []domain.Pr
 	out := map[string]bool{}
 	for _, c := range components {
 		if c.ComponentType != domain.ComponentMetered || c.MeterKey == nil || c.MeterVersion == nil {
+			continue
+		}
+		var retiredAt *time.Time
+		err := tx.QueryRow(ctx, `SELECT retired_at FROM meter_definitions WHERE meter_key = $1 AND meter_version = $2`,
+			*c.MeterKey, *c.MeterVersion).Scan(&retiredAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if retiredAt == nil {
+			out[domain.RegisteredMeterKey(*c.MeterKey, *c.MeterVersion)] = true
+		}
+	}
+	return out, nil
+}
+
+// loadRegisteredMetersForCapabilities is loadRegisteredMeters' counterpart
+// for a price version's plan capabilities: of the meters a metered
+// capability's limit references, which are registered and not retired?
+func loadRegisteredMetersForCapabilities(ctx context.Context, tx pgx.Tx, caps []domain.PlanCapability) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, c := range caps {
+		if c.MeterKey == nil || c.MeterVersion == nil {
 			continue
 		}
 		var retiredAt *time.Time
@@ -423,10 +449,10 @@ func (s *PgStore) registerLateEvent(ctx context.Context, tx pgx.Tx, organization
 	}
 	adjID := domain.NewCommercialID(domain.PrefixUsageAdjustment)
 	if _, err := tx.Exec(ctx, `INSERT INTO usage_adjustments (adjustment_id, origin_statement_id, target_statement_id,
-		meter_key, source_usage_event_id, quantity, reason, created_at, created_by_principal_id)
-		VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, $9)`,
+		meter_key, source_usage_event_id, quantity, occurred_at, dimensions, reason, created_at, created_by_principal_id)
+		VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, $9, $10, $11)`,
 		adjID, origin.StatementID, target.StatementID, m.MeterKey, usageEventID, in.Quantity,
-		reasonPrefix, observedAt, "system:usage-ingest"); err != nil {
+		in.OccurredAt, dimJSON, reasonPrefix, observedAt, "system:usage-ingest"); err != nil {
 		return e, err
 	}
 	if err := bumpStatement(ctx, tx, &target.StatementID, in.Quantity, observedAt, true); err != nil {
@@ -435,6 +461,81 @@ func (s *PgStore) registerLateEvent(ctx context.Context, tx pgx.Tx, organization
 	return e, outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_event", AggregateID: m.MeterKey + "/" + usageEventID,
 		EventType: "usage.late_adjustment_created", TenantID: &organizationID,
 		Payload: map[string]any{"adjustment_id": adjID, "origin_statement_id": origin.StatementID, "target_statement_id": target.StatementID}})
+}
+
+const usageAdjustmentColumns = `adjustment_id, origin_statement_id, target_statement_id, meter_key, source_usage_event_id,
+	quantity::text, occurred_at, dimensions, reason, created_at, created_by_principal_id`
+
+func scanUsageAdjustment(row pgx.Row) (*domain.UsageAdjustment, error) {
+	var a domain.UsageAdjustment
+	var dimJSON []byte
+	if err := row.Scan(&a.AdjustmentID, &a.OriginStatementID, &a.TargetStatementID, &a.MeterKey, &a.SourceUsageEventID,
+		&a.Quantity, &a.OccurredAt, &dimJSON, &a.Reason, &a.CreatedAt, &a.CreatedByPrincipalID); err != nil {
+		return nil, err
+	}
+	if len(dimJSON) > 0 {
+		if err := json.Unmarshal(dimJSON, &a.Dimensions); err != nil {
+			return nil, fmt.Errorf("decode dimensions: %w", err)
+		}
+	}
+	return &a, nil
+}
+
+// CreateUsageAdjustment is the explicit, evidenced operator command C2:
+// unlike the automatic late-routing path (registerLateEvent), this is for
+// when an operator needs to redirect an ALREADY-INGESTED event's quantity
+// into a specific open window — e.g. a quarantined event that investigation
+// determined should count after all. The quantity is always the source
+// event's own recorded quantity, never a caller-supplied number: an
+// operator can redirect evidence, never fabricate an amount (the same
+// doctrine the source_usage_event_id foreign key to usage_event_records
+// already enforces at the schema level).
+func (s *PgStore) CreateUsageAdjustment(ctx context.Context, targetStatementID, meterKey, sourceUsageEventID, reason, actor string, now time.Time, claim domain.IdempotencyClaim) (*domain.UsageAdjustment, error) {
+	var out *domain.UsageAdjustment
+	err := s.usageTx(ctx, func(tx pgx.Tx) error {
+		if err := claimIdempotency(ctx, tx, claim); err != nil {
+			return err
+		}
+		source, err := scanUsageEvent(tx.QueryRow(ctx, `SELECT `+usageEventColumns+` FROM usage_event_records
+			WHERE meter_key = $1 AND usage_event_id = $2`, meterKey, sourceUsageEventID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrUsageEventNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if source.StatementID == nil {
+			return domain.ErrAdjustmentSourceUnlinked
+		}
+		target, err := loadStatement(ctx, tx, targetStatementID, true)
+		if err != nil {
+			return err
+		}
+		if target.Status != domain.StatementOpen {
+			return fmt.Errorf("%w: target statement is %s, must be OPEN", domain.ErrStatementInvalidState, target.Status)
+		}
+		dimJSON, err := json.Marshal(source.Dimensions)
+		if err != nil {
+			return fmt.Errorf("marshal dimensions: %w", err)
+		}
+		adjID := domain.NewCommercialID(domain.PrefixUsageAdjustment)
+		got, err := scanUsageAdjustment(tx.QueryRow(ctx, `
+			INSERT INTO usage_adjustments (adjustment_id, origin_statement_id, target_statement_id, meter_key,
+				source_usage_event_id, quantity, occurred_at, dimensions, reason, created_at, created_by_principal_id)
+			VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, $8, $9, $10, $11) RETURNING `+usageAdjustmentColumns,
+			adjID, *source.StatementID, targetStatementID, meterKey, sourceUsageEventID, source.Quantity,
+			source.OccurredAt, dimJSON, reason, now, actor))
+		if err != nil {
+			return err
+		}
+		if err := bumpStatement(ctx, tx, &targetStatementID, source.Quantity, source.OccurredAt, true); err != nil {
+			return err
+		}
+		out = got
+		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "usage_adjustment", AggregateID: adjID,
+			EventType: "usage_adjustment.created", Payload: got})
+	})
+	return out, err
 }
 
 // CorrectUsageEvent replaces an accepted event's quantity/occurrence before
@@ -594,6 +695,38 @@ func acceptedEvents(ctx context.Context, tx pgx.Tx, statementID string) ([]domai
 	return out, rows.Err()
 }
 
+// adjustmentEvents is acceptedEvents' counterpart for late usage: every
+// usage_adjustments row targeting this statement, converted to the exact
+// same domain.AcceptedEvent shape so domain.Aggregate treats a late-arrived
+// fact exactly as if it had arrived on time — correctly for every
+// aggregation method (MAX/LAST need OccurredAt for ordering/tie-breaking;
+// UNIQUE_COUNT needs Dimensions), not just SUM. Fixes COM-CTRL-017: before
+// this, an adjustment's quantity was computed and stored but never actually
+// counted toward any billed total.
+func adjustmentEvents(ctx context.Context, tx pgx.Tx, statementID string) ([]domain.AcceptedEvent, error) {
+	rows, err := tx.Query(ctx, `SELECT source_usage_event_id, quantity::text, dimensions, occurred_at
+		FROM usage_adjustments WHERE target_statement_id = $1 ORDER BY source_usage_event_id`, statementID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.AcceptedEvent
+	for rows.Next() {
+		var e domain.AcceptedEvent
+		var dimJSON []byte
+		if err := rows.Scan(&e.EventID, &e.Quantity, &dimJSON, &e.OccurredAt); err != nil {
+			return nil, err
+		}
+		if len(dimJSON) > 0 {
+			if err := json.Unmarshal(dimJSON, &e.Dimensions); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // closeWindow is CloseUsageWindow's body, shared between the handler-facing
 // command and the boundary worker at term end.
 func closeWindow(ctx context.Context, tx pgx.Tx, subscriptionID string, termNo int, meterKey, actor string, now time.Time) (*domain.UsageStatement, error) {
@@ -690,12 +823,14 @@ func certifyStatement(ctx context.Context, tx pgx.Tx, statementID, actor string,
 	if err != nil {
 		return nil, err
 	}
-	total := domain.Aggregate(*m, events)
-
-	var adjustmentCount int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM usage_adjustments WHERE target_statement_id = $1`, statementID).Scan(&adjustmentCount); err != nil {
+	adjustments, err := adjustmentEvents(ctx, tx, statementID)
+	if err != nil {
 		return nil, err
 	}
+	// COM-CTRL-017 fix: a late usage fact's quantity must actually count
+	// toward the certified total, not just flip the status to ADJUSTED.
+	total := domain.Aggregate(*m, append(events, adjustments...))
+	adjustmentCount := len(adjustments)
 	status := domain.StatementCertified
 	if adjustmentCount > 0 {
 		status = domain.StatementAdjusted
@@ -821,8 +956,17 @@ func (s *PgStore) ExplainAggregation(ctx context.Context, statementID string) ([
 		if _, err := loadStatement(ctx, tx, statementID, false); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT `+usageEventColumns+` FROM usage_event_records
-			WHERE statement_id = $1 ORDER BY occurred_at, usage_event_id`, statementID)
+		// Includes every event directly linked to this statement, plus —
+		// since COM-CTRL-017's fix — every late event whose quantity was
+		// carried in via a usage_adjustments row targeting it: certified and
+		// explained must never disagree about what was counted.
+		rows, err := tx.Query(ctx, `
+			SELECT `+usageEventColumns+` FROM usage_event_records WHERE statement_id = $1
+			UNION
+			SELECT `+usageEventColumns+` FROM usage_event_records
+			WHERE (meter_key, usage_event_id) IN (
+				SELECT meter_key, source_usage_event_id FROM usage_adjustments WHERE target_statement_id = $1)
+			ORDER BY occurred_at, usage_event_id`, statementID)
 		if err != nil {
 			return err
 		}

@@ -23,11 +23,24 @@ func (f *subFixture) openBillingAccount(org string) *domain.BillingAccount {
 	b := &domain.BillingAccount{
 		BillingAccountID: domain.NewCommercialID(domain.PrefixBillingAccount), OrganizationID: org,
 		SellingEntity: "ZOIKOSUITE_INC_US", BillingCurrencyCode: "USD", InvoiceNumberingProfile: "US-STD",
-		PaymentProviderRef: "provider:stripe:acct_test", CreatedAt: t0, CreatedByPrincipalID: publisher,
+		PaymentProviderRef: "provider:stripe:acct_test", AccountingMappingKey: "gl:us-inc:default",
+		CreatedAt: t0, CreatedByPrincipalID: publisher,
 	}
 	got, err := f.s.OpenBillingAccount(f.ctx, b, f.claim(publisher, "OpenBillingAccount", org))
 	if err != nil {
 		f.t.Fatalf("open billing account: %v", err)
+	}
+	// Every existing test generates candidates against the "US-CA"/875bps
+	// jurisdiction (below) — registering it here by default keeps every
+	// pre-existing caller of generateCandidate working under D2's new
+	// server-side registration requirement without touching each test.
+	rate := 875
+	j := &domain.TaxJurisdiction{
+		BillingAccountID: got.BillingAccountID, JurisdictionCode: "US-CA", RegisteredRateBasisPoints: &rate,
+		EffectiveFrom: t0, CreatedAt: t0, CreatedByPrincipalID: publisher,
+	}
+	if _, err := f.s.RegisterTaxJurisdiction(f.ctx, org, j); err != nil {
+		f.t.Fatalf("register tax jurisdiction: %v", err)
 	}
 	return got
 }
@@ -192,7 +205,7 @@ func TestBilling_GenerateInvoiceCandidate_IdempotentReplay(t *testing.T) {
 
 	id := domain.NewCommercialID(domain.PrefixInvoiceCandidate)
 	req := domain.GenerateInvoiceCandidateRequest{CandidateID: id, OrganizationID: f.org, SubscriptionID: sub.SubscriptionID,
-		TermNo: sub.CurrentTerm.TermNo, TaxJurisdictionCode: "US-CA", TaxRateBasisPoints: 0, TaxAmount: "0.00",
+		TermNo: sub.CurrentTerm.TermNo, TaxJurisdictionCode: "US-CA", TaxRateBasisPoints: 875, TaxAmount: "0.88",
 		CreatedByPrincipalID: publisher}
 	claim := f.claim(publisher, "GenerateInvoiceCandidate", id)
 	first, err := f.s.GenerateInvoiceCandidate(f.ctx, req, claim)

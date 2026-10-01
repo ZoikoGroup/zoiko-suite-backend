@@ -86,9 +86,14 @@ type DunningCase struct {
 	OpenedAt            time.Time     `json:"opened_at"`
 	OpenedByPrincipalID string        `json:"opened_by_principal_id"`
 	LastAdvancedAt      *time.Time    `json:"last_advanced_at,omitempty"`
-	ClosedAt            *time.Time    `json:"closed_at,omitempty"`
-	ClosedByPrincipalID *string       `json:"closed_by_principal_id,omitempty"`
-	CloseReason         *string       `json:"close_reason,omitempty"`
+	// AppliedRestrictionID is set once the case escalates to RESTRICTED or
+	// SUSPENDED and a CommercialRestriction (COM-03) is applied on its
+	// behalf — so StopDunning knows exactly which restriction to lift.
+	// Never set for NOTICE_1/NOTICE_2, which are informational only.
+	AppliedRestrictionID *string    `json:"applied_restriction_id,omitempty"`
+	ClosedAt             *time.Time `json:"closed_at,omitempty"`
+	ClosedByPrincipalID  *string    `json:"closed_by_principal_id,omitempty"`
+	CloseReason          *string    `json:"close_reason,omitempty"`
 }
 
 // ── Reconciliation ───────────────────────────────────────────────────────────

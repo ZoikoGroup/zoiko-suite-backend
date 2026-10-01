@@ -432,14 +432,40 @@ func (s *PgStore) RequestChange(ctx context.Context, c domain.SubscriptionComman
 		if err := setEndsAt(ctx, tx, a.sub.SubscriptionID, a.sub.EndsAt); err != nil {
 			return err
 		}
+		// A NEXT_RENEWAL (deferred) change must not emit its real event now —
+		// applyPlan already enqueued a VERSION_EFFECTIVE boundary item for
+		// the new version (migration 000009's enqueue_version_boundary
+		// trigger), and processBoundary's VERSION_EFFECTIVE case will fire
+		// the real event itself once EffectiveAt actually arrives
+		// (versionEventTypes maps every ChangeType this command can produce
+		// — com02_governance_store.go). Firing it here too would emit it
+		// twice, once prematurely with a future EffectiveAt embedded in the
+		// payload — exactly the negative-path #08/#09 risk ("applies before
+		// effective timestamp") for any consumer that reacts to arrival
+		// rather than reading EffectiveAt. Mirrors ScheduleCancellation,
+		// which emits a single distinct "_scheduled" event now and leaves
+		// the real one to the boundary worker alone.
+		if q.Timing == domain.TimingNextRenewal {
+			return emitSubscriptionEvent(ctx, tx, "subscription.change_scheduled", a.sub, m, subscriptionEvent{
+				ChangeType: changeType, Status: domain.LifecycleActive, EffectiveAt: q.EffectiveAt,
+				PriceVersionID: q.ToPlanPriceVersionID,
+			})
+		}
 		eventType := map[domain.ChangeKind]string{
 			domain.ChangeKindPlan: "subscription.changed", domain.ChangeKindQuantity: "subscription.quantity_changed",
 			domain.ChangeKindAddOn: "subscription.add_on_changed", domain.ChangeKindMigration: "subscription.changed",
 		}[req.Kind]
-		return emitSubscriptionEvent(ctx, tx, eventType, a.sub, m, subscriptionEvent{
+		if err := emitSubscriptionEvent(ctx, tx, eventType, a.sub, m, subscriptionEvent{
 			ChangeType: changeType, Status: domain.LifecycleActive, EffectiveAt: q.EffectiveAt,
 			PriceVersionID: q.ToPlanPriceVersionID,
-		})
+		}); err != nil {
+			return err
+		}
+		// COM-03 gap-remediation (B2): an immediate change has no boundary
+		// pass to invalidate entitlement for it later — recompute now, in
+		// the same transaction as the change itself.
+		_, err = recomputeEntitlementsTx(ctx, tx, a.sub.OrganizationID, m.actor, c.Now)
+		return err
 	})
 }
 

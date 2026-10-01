@@ -40,6 +40,23 @@ type stubStore struct {
 	getErr        error
 	listErr       error
 	transitionErr error
+
+	popPage  *domain.ControlPopulationPage
+	popErr   error
+	popQuery domain.ControlPopulationQuery
+	popCalls int
+}
+
+func (s *stubStore) ControlPopulation(_ context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error) {
+	s.popCalls++
+	s.popQuery = q
+	if s.popErr != nil {
+		return nil, s.popErr
+	}
+	if s.popPage != nil {
+		return s.popPage, nil
+	}
+	return &domain.ControlPopulationPage{Records: []domain.ControlRecord{}}, nil
 }
 
 func newStubStore() *stubStore {

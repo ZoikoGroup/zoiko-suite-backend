@@ -179,6 +179,11 @@ func (h *CreditHandler) IssueCreditNote(w http.ResponseWriter, r *http.Request) 
 	}
 	c, err := h.store.IssueCreditNote(r.Context(), id, invoiceID, req.Amount, req.Reason, principal, h.now(), cmd.claim)
 	if err != nil {
+		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+			return h.store.GetCreditNote(r.Context(), resourceID)
+		}) {
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -232,6 +237,11 @@ func (h *CreditHandler) ApplyWriteOff(w http.ResponseWriter, r *http.Request) {
 	}
 	wo, err := h.store.ApplyWriteOff(r.Context(), id, invoiceID, req.Amount, req.Reason, principal, h.now(), cmd.claim)
 	if err != nil {
+		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+			return h.store.GetWriteOff(r.Context(), resourceID)
+		}) {
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -297,6 +307,11 @@ func (h *CreditHandler) RequestRefund(w http.ResponseWriter, r *http.Request) {
 	}
 	rr, err := h.store.RequestRefund(r.Context(), id, invoiceID, attemptID, req.Amount, req.DestinationRef, req.Reason, principal, h.now(), cmd.claim)
 	if err != nil {
+		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+			return h.store.GetRefundRequest(r.Context(), resourceID)
+		}) {
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -338,6 +353,11 @@ func (h *CreditHandler) SettleRefund(w http.ResponseWriter, r *http.Request) {
 	}
 	rr, err := h.store.SettleRefund(r.Context(), domainReq, cmd.claim)
 	if err != nil {
+		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+			return h.store.GetRefundRequest(r.Context(), resourceID)
+		}) {
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}

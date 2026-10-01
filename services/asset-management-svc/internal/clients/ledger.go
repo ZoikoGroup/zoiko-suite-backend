@@ -90,7 +90,13 @@ type postAccountingEventRequest struct {
 	Description   string             `json:"description"`
 	SourceEventID string             `json:"source_event_id"`
 	CorrelationID string             `json:"correlation_id"`
-	Lines         []postingEventLine `json:"lines"`
+	// TransactionCurrency / DocumentDate are required by general-ledger-svc
+	// (ZS-ACC-KERNEL-001). omitempty only so a posting path that has no real
+	// source for them (depreciation runs) is left unchanged rather than
+	// sending an invented value; GL will reject those requests.
+	TransactionCurrency string             `json:"transaction_currency,omitempty"`
+	DocumentDate        string             `json:"document_date,omitempty"`
+	Lines               []postingEventLine `json:"lines"`
 }
 
 type postingExecutionResponse struct {
@@ -115,13 +121,17 @@ type LedgerLine struct {
 // GL's own UNIQUE(tenant_id, source_event_id) — the spec's own negative
 // path, "Rerun emits duplicate accounting event."
 func (c *Clients) PostDepreciationAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []LedgerLine) (journalID string, err error) {
-	return c.postAccountingEvent(ctx, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID, lines)
+	// NOT YET COMPLIANT with ZS-ACC-KERNEL-001: a depreciation run carries no
+	// currency and no business date anywhere in this service's data (only a
+	// fiscal-period name), so none is sent rather than inventing one.
+	return c.postAccountingEvent(ctx, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID, "", "", lines)
 }
 
-func (c *Clients) postAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []LedgerLine) (journalID string, err error) {
+func (c *Clients) postAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID, transactionCurrency, documentDate string, lines []LedgerLine) (journalID string, err error) {
 	body := postAccountingEventRequest{
 		LegalEntityID: legalEntityID, FiscalPeriod: fiscalPeriod, Description: description,
 		SourceEventID: sourceEventID, CorrelationID: correlationID,
+		TransactionCurrency: transactionCurrency, DocumentDate: documentDate,
 	}
 	for _, l := range lines {
 		body.Lines = append(body.Lines, postingEventLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
@@ -168,9 +178,11 @@ func (c *Clients) ReverseDepreciationJournal(ctx context.Context, tenantID, prin
 // PostAssetEventAccountingEvent is AST-03's own "ACC-04" dependency — the
 // same system-originated posting path as AST-02's own
 // PostDepreciationAccountingEvent, keyed by the event's own ID as
-// source_event_id for idempotency.
-func (c *Clients) PostAssetEventAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []LedgerLine) (journalID string, err error) {
-	return c.postAccountingEvent(ctx, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID, lines)
+// source_event_id for idempotency. transactionCurrency (ISO 4217) and
+// documentDate (YYYY-MM-DD) come from the asset event's own stored
+// currency and effective_date.
+func (c *Clients) PostAssetEventAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID, transactionCurrency, documentDate string, lines []LedgerLine) (journalID string, err error) {
+	return c.postAccountingEvent(ctx, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID, transactionCurrency, documentDate, lines)
 }
 
 // ReverseAssetEventJournal calls general-ledger-svc's own

@@ -444,13 +444,20 @@ func (h *Handler) ApplyAssetEvent(w http.ResponseWriter, r *http.Request) {
 
 	var journalID *string
 	if e.Amount != nil && e.DebitAccountCode != nil && e.CreditAccountCode != nil {
+		// currency is nullable on asset_events; the ledger requires a real
+		// one (ZS-ACC-KERNEL-001), so refuse rather than invent it.
+		if e.Currency == nil || *e.Currency == "" {
+			writeError(w, http.StatusUnprocessableEntity, "currency_required", "asset event carries an amount but no currency; a currency is required to post to the ledger")
+			return
+		}
 		correlationID := getCorrelationID(r)
 		lines := []clients.LedgerLine{
 			{AccountCode: *e.DebitAccountCode, DebitAmount: *e.Amount},
 			{AccountCode: *e.CreditAccountCode, CreditAmount: *e.Amount},
 		}
 		postedJournalID, err := h.ledger.PostAssetEventAccountingEvent(r.Context(), tenantID, principalID, e.LegalEntityID, e.FiscalPeriod,
-			"Asset event "+e.EventID+" ("+e.EventType+")", e.EventID, correlationID, lines)
+			"Asset event "+e.EventID+" ("+e.EventType+")", e.EventID, correlationID,
+			*e.Currency, e.EffectiveDate.Format("2006-01-02"), lines)
 		if err != nil {
 			h.log.Error("ApplyAssetEvent: journal posting failed", zap.String("event_id", e.EventID), zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "journal_posting_failed", err.Error())
