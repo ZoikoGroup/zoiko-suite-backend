@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/obligations-svc/internal/domain"
@@ -32,7 +33,7 @@ import (
 type Client interface {
 	// CheckAllowed returns nil only when authorization-svc explicitly GRANTS
 	// actionType for principalID within legalEntityID.
-	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, correlationID string) error
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, tenantID, actionType, correlationID string) error
 }
 
 // The four mutating actions this service exposes. One action per route rather
@@ -70,6 +71,11 @@ type authorizeRequest struct {
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
+	// TenantID is the pre-header fallback authorization-svc's resolveTenantScope
+	// still accepts. The X-Tenant-Id header set below is what its mandatory §4
+	// envelope check actually looks for; this is sent alongside it so the two
+	// calling conventions can never disagree about which tenant is asking.
+	TenantID string `json:"tenant_id,omitempty"`
 }
 
 // authorizeResponse is the shape authorization-svc actually sends: it always
@@ -81,11 +87,12 @@ type authorizeResponse struct {
 	DecisionOutcome string `json:"decision_outcome"`
 }
 
-func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, correlationID string) error {
+func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, tenantID, actionType, correlationID string) error {
 	body, err := json.Marshal(authorizeRequest{
 		PrincipalID:   principalID,
 		LegalEntityID: legalEntityID,
 		ActionType:    actionType,
+		TenantID:      tenantID,
 	})
 	if err != nil {
 		return err
@@ -96,9 +103,39 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 		return domain.ErrAuthorizationUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if correlationID != "" {
-		req.Header.Set("X-Correlation-ID", correlationID)
+	if correlationID == "" {
+		correlationID = uuid.NewString()
 	}
+	req.Header.Set("X-Correlation-ID", correlationID)
+	// authorization-svc enforces its own §4 canonical input contract on every
+	// route, including /v1/authorize, and this client used to send none of it:
+	// only Content-Type and an optional X-Correlation-ID. tenant_id and
+	// actor_subject_id (X-Tenant-Id / X-Principal-Id) missing answers 401 before
+	// the request reaches RBAC evaluation at all; request_id, source_channel,
+	// idempotency_key and (since this is a POST, so RequiredOnWrite promotes it)
+	// legal_entity_id missing answers 400. Either way this client folded the
+	// refusal into ErrAuthorizationUnavailable and obligations-svc failed
+	// closed on it — every write was refused, on a caller who was in fact
+	// authorized, because the internal call never identified itself.
+	// tenant_id/legal_entity_id are also sent in the body for the pre-header
+	// calling convention authorization-svc still accepts, but the headers are
+	// what its envelope check actually looks for.
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if legalEntityID != "" {
+		req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	}
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "system")
+	// Each authorization check is its own evaluation, not a resubmission of a
+	// prior one, so it gets its own key rather than reusing the caller's —
+	// reusing it would make an unrelated authorize call collide with the
+	// material write's own idempotency record.
+	req.Header.Set("Idempotency-Key", uuid.NewString())
 
 	resp, err := c.http.Do(req)
 	if err != nil {

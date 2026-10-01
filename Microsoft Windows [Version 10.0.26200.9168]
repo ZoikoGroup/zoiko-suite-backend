@@ -1,0 +1,383 @@
+[1mdiff --git a/deployments/scripts/seed-demo-rbac.ps1 b/deployments/scripts/seed-demo-rbac.ps1[m
+[1mindex 9d02c6e3..f2a62ef9 100644[m
+[1m--- a/deployments/scripts/seed-demo-rbac.ps1[m
+[1m+++ b/deployments/scripts/seed-demo-rbac.ps1[m
+[36m@@ -429,8 +429,24 @@[m [mfunction Invoke-Authz {[m
+         [Parameter(Mandatory)] $Body[m
+     )[m
+     $json = $Body | ConvertTo-Json -Compress -Depth 5[m
+[32m+[m[32m    # authorization-svc's envelope middleware now rejects every request missing[m
+[32m+[m[32m    # this header set (tenant authority, an identified actor, request tracing,[m
+[32m+[m[32m    # a source channel, and a replay-protection key) with 401[m
+[32m+[m[32m    # envelope_incomplete -- this script predates that middleware. The legal[m
+[32m+[m[32m    # entity mirrors the body's own scope when the call carries one (Get-Decision[m
+[32m+[m[32m    # probes different scopes per call), falling back to the demo legal entity[m
+[32m+[m[32m    # for admin calls that scope themselves some other way.[m
+[32m+[m[32m    $legalEntityHeader = if ($Body.legal_entity_id) { $Body.legal_entity_id } else { $LEGAL_ENTITY }[m
+[32m+[m[32m    $headers = @{[m
+[32m+[m[32m        "X-Tenant-Id"       = $TENANT_ID[m
+[32m+[m[32m        "X-Principal-Id"    = $PRINCIPAL_ID[m
+[32m+[m[32m        "X-Legal-Entity-Id" = $legalEntityHeader[m
+[32m+[m[32m        "X-Request-Id"      = [guid]::NewGuid().ToString()[m
+[32m+[m[32m        "X-Source-Channel"  = "system"[m
+[32m+[m[32m        "Idempotency-Key"   = [guid]::NewGuid().ToString()[m
+[32m+[m[32m    }[m
+     try {[m
+[31m-        $response = Invoke-WebRequest -Uri "$AUTHZ$Path" -Method POST -Body $json `[m
+[32m+[m[32m        $response = Invoke-WebRequest -Uri "$AUTHZ$Path" -Method POST -Body $json -Headers $headers `[m
+             -ContentType "application/json" -UseBasicParsing -TimeoutSec 10[m
+         return @{ status = [int] $response.StatusCode; body = $response.Content | ConvertFrom-Json }[m
+     } catch {[m
+[1mdiff --git a/services/board-resolutions-svc/internal/evidencereq/client.go b/services/board-resolutions-svc/internal/evidencereq/client.go[m
+[1mindex 5ac784e2..a5a53ac0 100644[m
+[1m--- a/services/board-resolutions-svc/internal/evidencereq/client.go[m
+[1m+++ b/services/board-resolutions-svc/internal/evidencereq/client.go[m
+[36m@@ -15,6 +15,9 @@[m [mimport ([m
+ 	"net/http"[m
+ 	"strings"[m
+ 	"time"[m
+[32m+[m
+[32m+[m	[32m"github.com/go-chi/chi/v5/middleware"[m
+[32m+[m	[32msvcenvelope "zoiko.io/board-resolutions-svc/internal/envelope"[m
+ )[m
+ [m
+ // Sentinel errors. Callers must fail closed: any error returned means the[m
+[36m@@ -91,8 +94,33 @@[m [mfunc (c *Client) EvaluateSufficient(ctx context.Context, tenantID, legalEntityID[m
+ 	req.Header.Set("Content-Type", "application/json")[m
+ 	req.Header.Set("X-Tenant-Id", tenantID)[m
+ 	req.Header.Set("X-Principal-Id", principalID)[m
+[32m+[m	[32mreq.Header.Set("X-Legal-Entity-Id", legalEntityID)[m
+ 	req.Header.Set("X-Correlation-ID", correlationID)[m
+ [m
+[32m+[m	[32m// evidence-requirements-svc validates the same canonical envelope contract[m
+[32m+[m	[32m// this service does and answers 401 envelope_incomplete without it. A[m
+[32m+[m	[32m// non-200 is treated as unavailable below, so an unforwarded envelope[m
+[32m+[m	[32m// turned every pass attempt into a misleading "unavailable" refusal[m
+[32m+[m	[32m// instead of the fixable validation error it actually was. Same defect,[m
+[32m+[m	[32m// same fix as internal/authz.Client.checkAllowedLive.[m
+[32m+[m	[32mevidenceRequestID := middleware.GetReqID(ctx)[m
+[32m+[m	[32mevidenceSourceChannel := "system"[m
+[32m+[m	[32mif env, ok := svcenvelope.FromContext(ctx); ok {[m
+[32m+[m		[32mif env.RequestID != "" {[m
+[32m+[m			[32mevidenceRequestID = env.RequestID[m
+[32m+[m		[32m}[m
+[32m+[m		[32mif env.SourceChannel != "" {[m
+[32m+[m			[32mevidenceSourceChannel = string(env.SourceChannel)[m
+[32m+[m		[32m}[m
+[32m+[m	[32m}[m
+[32m+[m	[32mreq.Header.Set("X-Request-Id", evidenceRequestID)[m
+[32m+[m	[32mreq.Header.Set("X-Source-Channel", evidenceSourceChannel)[m
+[32m+[m	[32m// One evaluation per (request, correlation): correlationID already[m
+[32m+[m	[32m// distinguishes a genuine retry from a distinct attempt (see the caller's[m
+[32m+[m	[32m// comment on why it is never defaulted to the resolution's own ID), so it[m
+[32m+[m	[32m// doubles as the idempotency key here rather than minting a third value.[m
+[32m+[m	[32mreq.Header.Set("Idempotency-Key", correlationID)[m
+[32m+[m
+ 	resp, err := c.httpClient.Do(req)[m
+ 	if err != nil {[m
+ 		return ErrServiceUnavailable[m
+[1mdiff --git a/services/board-resolutions-svc/internal/evidencereq/client_test.go b/services/board-resolutions-svc/internal/evidencereq/client_test.go[m
+[1mindex 7ec95fb4..485be625 100644[m
+[1m--- a/services/board-resolutions-svc/internal/evidencereq/client_test.go[m
+[1m+++ b/services/board-resolutions-svc/internal/evidencereq/client_test.go[m
+[36m@@ -16,6 +16,8 @@[m [mimport ([m
+ 	"net/http"[m
+ 	"net/http/httptest"[m
+ 	"testing"[m
+[32m+[m
+[32m+[m	[32m"github.com/go-chi/chi/v5/middleware"[m
+ )[m
+ [m
+ func newServer(t *testing.T, status int, body string) *httptest.Server {[m
+[36m@@ -103,6 +105,41 @@[m [mfunc TestEvaluateSufficient_Unreachable_FailsClosed(t *testing.T) {[m
+ 	}[m
+ }[m
+ [m
+[32m+[m[32m// evidence-requirements-svc enforces the same canonical envelope contract as[m
+[32m+[m[32m// authorization-svc (X-Request-Id, X-Source-Channel, Idempotency-Key,[m
+[32m+[m[32m// X-Legal-Entity-Id) and answers 401 envelope_incomplete without them — which[m
+[32m+[m[32m// this client used to fold into the indistinguishable ErrServiceUnavailable,[m
+[32m+[m[32m// so a fixable header gap read as a real outage. Guards against that[m
+[32m+[m[32m// regressing silently a second time.[m
+[32m+[m[32mfunc TestEvaluateSufficient_ForwardsTheEnvelopeHeaders(t *testing.T) {[m
+[32m+[m	[32mvar got http.Header[m
+[32m+[m	[32msrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {[m
+[32m+[m		[32mgot = r.Header.Clone()[m
+[32m+[m		[32mw.Header().Set("Content-Type", "application/json")[m
+[32m+[m		[32m_, _ = w.Write([]byte(`{"outcome":"SATISFIED"}`))[m
+[32m+[m	[32m}))[m
+[32m+[m	[32mdefer srv.Close()[m
+[32m+[m
+[32m+[m	[32m// A bare context.Background() has no chi request id, same as a real[m
+[32m+[m	[32m// inbound request would after chi's RequestID middleware has run.[m
+[32m+[m	[32mctx := context.WithValue(context.Background(), middleware.RequestIDKey, "req-123")[m
+[32m+[m	[32mc := NewClient(srv.URL)[m
+[32m+[m	[32mif err := c.EvaluateSufficient(ctx, "tenant-a", "le-us", "FINANCIAL",[m
+[32m+[m		[32m"RESOLUTION_PASS", "corr-1", "principal-1", []Artifact{{[m
+[32m+[m			[32mEvidenceType: "SUPPORTING_DOCUMENT", ReferenceID: "doc-1",[m
+[32m+[m		[32m}}); err != nil {[m
+[32m+[m		[32mt.Fatalf("evaluate: %v", err)[m
+[32m+[m	[32m}[m
+[32m+[m	[32mfor _, header := range []string{"X-Request-Id", "X-Source-Channel", "Idempotency-Key", "X-Legal-Entity-Id"} {[m
+[32m+[m		[32mif got.Get(header) == "" {[m
+[32m+[m			[32mt.Errorf("request is missing %s — evidence-requirements-svc will answer 401 envelope_incomplete", header)[m
+[32m+[m		[32m}[m
+[32m+[m	[32m}[m
+[32m+[m	[32mif got.Get("X-Legal-Entity-Id") != "le-us" {[m
+[32m+[m		[32mt.Errorf("X-Legal-Entity-Id sent as %q, want %q", got.Get("X-Legal-Entity-Id"), "le-us")[m
+[32m+[m	[32m}[m
+[32m+[m[32m}[m
+[32m+[m
+ // The request body is the other half of the contract: the field names have to[m
+ // be the ones evidence-requirements-svc reads, or the evaluation is performed[m
+ // against an empty domain and action.[m
+[1mdiff --git a/services/identity-context-svc/cmd/seed-demo-principals/main.go b/services/identity-context-svc/cmd/seed-demo-principals/main.go[m
+[1mindex 4c0edafb..38bc5497 100644[m
+[1m--- a/services/identity-context-svc/cmd/seed-demo-principals/main.go[m
+[1m+++ b/services/identity-context-svc/cmd/seed-demo-principals/main.go[m
+[36m@@ -47,7 +47,7 @@[m [mimport ([m
+ // schema is this service's schema on the managed single-database host. Under[m
+ // the docker/local provider each service owns a whole database and this is the[m
+ // database name instead; both resolve the same way through search_path.[m
+[31m-const schema = "identity_context"[m
+[32m+[m[32mconst schema = "public"[m
+ [m
+ // demoTenant is the console's DEMO_IDENTITY tenant. Every account below belongs[m
+ // to it, and principal_credentials is RLS-FORCEd on exactly this column.[m
+[1mdiff --git a/services/jurisdiction-rules-svc/internal/authz/client.go b/services/jurisdiction-rules-svc/internal/authz/client.go[m
+[1mindex 85456e88..39261f99 100644[m
+[1m--- a/services/jurisdiction-rules-svc/internal/authz/client.go[m
+[1m+++ b/services/jurisdiction-rules-svc/internal/authz/client.go[m
+[36m@@ -25,7 +25,10 @@[m [mimport ([m
+ 	"sync"[m
+ 	"time"[m
+ [m
+[32m+[m	[32m"github.com/go-chi/chi/v5/middleware"[m
+ 	"go.uber.org/zap"[m
+[32m+[m
+[32m+[m	[32msvcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"[m
+ )[m
+ [m
+ // AuthorizationClient is the contract for authorizing mutations.[m
+[36m@@ -230,6 +233,44 @@[m [mfunc (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeI[m
+ 	}[m
+ 	req.Header.Set("Content-Type", "application/json")[m
+ [m
+[32m+[m	[32m// authorization-svc validates the same canonical envelope contract this[m
+[32m+[m	[32m// service does and answers 401 envelope_incomplete without it — which[m
+[32m+[m	[32m// this client folded into the indistinguishable ErrAuthZUnavailable, so[m
+[32m+[m	[32m// a missing header on every single admin write read as authorization-svc[m
+[32m+[m	[32m// being down rather than a fixable gap in this client. Same defect,[m
+[32m+[m	[32m// same fix as board-resolutions-svc's internal/authz.Client and[m
+[32m+[m	[32m// internal/evidencereq.Client.[m
+[32m+[m	[32m//[m
+[32m+[m	[32m// The values are the CALLER's, taken from the envelope this service's own[m
+[32m+[m	[32m// middleware already parsed into the request's context — minting fresh[m
+[32m+[m	[32m// ones would satisfy the contract and lose the only thing it is for: a[m
+[32m+[m	[32m// decision in access_decision_log traceable to the request that caused[m
+[32m+[m	[32m// it.[m
+[32m+[m	[32mreq.Header.Set("X-Principal-Id", principalID)[m
+[32m+[m	[32mreq.Header.Set("X-Legal-Entity-Id", scopeID)[m
+[32m+[m
+[32m+[m	[32mauthzRequestID := middleware.GetReqID(ctx)[m
+[32m+[m	[32mauthzSourceChannel := "system"[m
+[32m+[m	[32mif env, ok := svcenvelope.FromContext(ctx); ok {[m
+[32m+[m		[32mif env.TenantID != "" {[m
+[32m+[m			[32mreq.Header.Set("X-Tenant-Id", env.TenantID)[m
+[32m+[m		[32m}[m
+[32m+[m		[32mif env.RequestID != "" {[m
+[32m+[m			[32mauthzRequestID = env.RequestID[m
+[32m+[m		[32m}[m
+[32m+[m		[32mif env.SourceChannel != "" {[m
+[32m+[m			[32mauthzSourceChannel = string(env.SourceChannel)[m
+[32m+[m		[32m}[m
+[32m+[m		[32mif env.CorrelationID != "" {[m
+[32m+[m			[32mreq.Header.Set("X-Correlation-ID", env.CorrelationID)[m
+[32m+[m		[32m}[m
+[32m+[m	[32m}[m
+[32m+[m	[32mreq.Header.Set("X-Request-Id", authzRequestID)[m
+[32m+[m	[32mreq.Header.Set("X-Source-Channel", authzSourceChannel)[m
+[32m+[m	[32m// One decision per (request, action): an inbound request may authorize[m
+[32m+[m	[32m// several actions, and each is its own decision to record.[m
+[32m+[m	[32mreq.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)[m
+[32m+[m
+ 	resp, err := c.client.Do(req)[m
+ 	if err != nil {[m
+ 		c.log.Error("authorization-svc unreachable — failing closed",[m
+[1mdiff --git a/services/jurisdiction-rules-svc/internal/authz/client_test.go b/services/jurisdiction-rules-svc/internal/authz/client_test.go[m
+[1mindex f0c485f3..cc26908e 100644[m
+[1m--- a/services/jurisdiction-rules-svc/internal/authz/client_test.go[m
+[1m+++ b/services/jurisdiction-rules-svc/internal/authz/client_test.go[m
+[36m@@ -9,6 +9,7 @@[m [mimport ([m
+ 	"net/http/httptest"[m
+ 	"testing"[m
+ [m
+[32m+[m	[32m"github.com/go-chi/chi/v5/middleware"[m
+ 	"go.uber.org/zap"[m
+ [m
+ 	"zoiko.io/jurisdiction-rules-svc/internal/authz"[m
+[36m@@ -97,6 +98,42 @@[m [mfunc TestHTTPClient_Granted(t *testing.T) {[m
+ 	}[m
+ }[m
+ [m
+[32m+[m[32m// TestHTTPClient_ForwardsTheEnvelopeHeaders is the regression test for the[m
+[32m+[m[32m// defect this client just replaced: authorizeLive sent NO envelope headers[m
+[32m+[m[32m// at all, so authorization-svc's canonical-envelope middleware answered 401[m
+[32m+[m[32m// envelope_incomplete on every single admin write, and this client folded[m
+[32m+[m[32m// that into the indistinguishable ErrAuthZUnavailable — a missing header[m
+[32m+[m[32m// read as authorization-svc being down.[m
+[32m+[m[32mfunc TestHTTPClient_ForwardsTheEnvelopeHeaders(t *testing.T) {[m
+[32m+[m	[32mvar got http.Header[m
+[32m+[m	[32msrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {[m
+[32m+[m		[32mgot = r.Header.Clone()[m
+[32m+[m		[32mw.Header().Set("Content-Type", "application/json")[m
+[32m+[m		[32m_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED"}`))[m
+[32m+[m	[32m}))[m
+[32m+[m	[32mdefer srv.Close()[m
+[32m+[m
+[32m+[m	[32m// A real inbound request carries a chi request id by the time this client[m
+[32m+[m	[32m// runs; context.Background() alone (as the other tests use) would not.[m
+[32m+[m	[32mctx := context.WithValue(context.Background(), middleware.RequestIDKey, "req-123")[m
+[32m+[m	[32mc := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())[m
+[32m+[m	[32mif err := c.Authorize(ctx, "principal-1", "scope-1", "jurisdiction", "create"); err != nil {[m
+[32m+[m		[32mt.Fatalf("expected permit, got %v", err)[m
+[32m+[m	[32m}[m
+[32m+[m
+[32m+[m	[32mfor _, header := range []string{"X-Request-Id", "X-Source-Channel", "Idempotency-Key", "X-Legal-Entity-Id", "X-Principal-Id"} {[m
+[32m+[m		[32mif got.Get(header) == "" {[m
+[32m+[m			[32mt.Errorf("request is missing %s — authorization-svc will answer 401 envelope_incomplete", header)[m
+[32m+[m		[32m}[m
+[32m+[m	[32m}[m
+[32m+[m	[32mif got.Get("X-Legal-Entity-Id") != "scope-1" {[m
+[32m+[m		[32mt.Errorf("X-Legal-Entity-Id sent as %q, want %q", got.Get("X-Legal-Entity-Id"), "scope-1")[m
+[32m+[m	[32m}[m
+[32m+[m	[32mif got.Get("X-Principal-Id") != "principal-1" {[m
+[32m+[m		[32mt.Errorf("X-Principal-Id sent as %q, want %q", got.Get("X-Principal-Id"), "principal-1")[m
+[32m+[m	[32m}[m
+[32m+[m[32m}[m
+[32m+[m
+ // TestHTTPClient_Denied — authorization-svc answers DENIED with HTTP 200, so[m
+ // a client that only checked the status code would permit the action.[m
+ func TestHTTPClient_Denied(t *testing.T) {[m
+[1mdiff --git a/services/obligations-svc/internal/authz/client.go b/services/obligations-svc/internal/authz/client.go[m
+[1mindex 916ab73e..272c824a 100644[m
+[1m--- a/services/obligations-svc/internal/authz/client.go[m
+[1m+++ b/services/obligations-svc/internal/authz/client.go[m
+[36m@@ -23,6 +23,7 @@[m [mimport ([m
+ 	"strings"[m
+ 	"time"[m
+ [m
+[32m+[m	[32m"github.com/google/uuid"[m
+ 	"go.uber.org/zap"[m
+ [m
+ 	"zoiko.io/obligations-svc/internal/domain"[m
+[36m@@ -32,7 +33,7 @@[m [mimport ([m
+ type Client interface {[m
+ 	// CheckAllowed returns nil only when authorization-svc explicitly GRANTS[m
+ 	// actionType for principalID within legalEntityID.[m
+[31m-	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, correlationID string) error[m
+[32m+[m	[32mCheckAllowed(ctx context.Context, principalID, legalEntityID, tenantID, actionType, correlationID string) error[m
+ }[m
+ [m
+ // The four mutating actions this service exposes. One action per route rather[m
+[36m@@ -70,6 +71,11 @@[m [mtype authorizeRequest struct {[m
+ 	PrincipalID   string `json:"principal_id"`[m
+ 	LegalEntityID string `json:"legal_entity_id"`[m
+ 	ActionType    string `json:"action_type"`[m
+[32m+[m	[32m// TenantID is the pre-header fallback authorization-svc's resolveTenantScope[m
+[32m+[m	[32m// still accepts. The X-Tenant-Id header set below is what its mandatory §4[m
+[32m+[m	[32m// envelope check actually looks for; this is sent alongside it so the two[m
+[32m+[m	[32m// calling conventions can never disagree about which tenant is asking.[m
+[32m+[m	[32mTenantID string `json:"tenant_id,omitempty"`[m
+ }[m
+ [m
+ // authorizeResponse is the shape authorization-svc actually sends: it always[m
+[36m@@ -81,11 +87,12 @@[m [mtype authorizeResponse struct {[m
+ 	DecisionOutcome string `json:"decision_outcome"`[m
+ }[m
+ [m
+[31m-func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, correlationID string) error {[m
+[32m+[m[32mfunc (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, tenantID, actionType, correlationID string) error {[m
+ 	body, err := json.Marshal(authorizeRequest{[m
+ 		PrincipalID:   principalID,[m
+ 		LegalEntityID: legalEntityID,[m
+ 		ActionType:    actionType,[m
+[32m+[m		[32mTenantID:      tenantID,[m
+ 	})[m
+ 	if err != nil {[m
+ 		return err[m
+[36m@@ -96,9 +103,39 @@[m [mfunc (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI[m
+ 		return domain.ErrAuthorizationUnavailable[m
+ 	}[m
+ 	req.Header.Set("Content-Type", "application/json")[m
+[31m-	if correlationID != "" {[m
+[31m-		req.Header.Set("X-Correlation-ID", correlationID)[m
+[32m+[m	[32mif correlationID == "" {[m
+[32m+[m		[32mcorrelationID = uuid.NewString()[m
+ 	}[m
+[32m+[m	[32mreq.Header.Set("X-Correlation-ID", correlationID)[m
+[32m+[m	[32m// authorization-svc enforces its own §4 canonical input contract on every[m
+[32m+[m	[32m// route, including /v1/authorize, and this client used to send none of it:[m
+[32m+[m	[32m// only Content-Type and an optional X-Correlation-ID. tenant_id and[m
+[32m+[m	[32m// actor_subject_id (X-Tenant-Id / X-Principal-Id) missing answers 401 before[m
+[32m+[m	[32m// the request reaches RBAC evaluation at all; request_id, source_channel,[m
+[32m+[m	[32m// idempotency_key and (since this is a POST, so RequiredOnWrite promotes it)[m
+[32m+[m	[32m// legal_entity_id missing answers 400. Either way this client folded the[m
+[32m+[m	[32m// refusal into ErrAuthorizationUnavailable and obligations-svc failed[m
+[32m+[m	[32m// closed on it — every write was refused, on a caller who was in fact[m
+[32m+[m	[32m// authorized, because the internal call never identified itself.[m
+[32m+[m	[32m// tenant_id/legal_entity_id are also sent in the body for the pre-header[m
+[32m+[m	[32m// calling convention authorization-svc still accepts, but the headers are[m
+[32m+[m	[32m// what its envelope check actually looks for.[m
+[32m+[m	[32mif tenantID != "" {[m
+[32m+[m		[32mreq.Header.Set("X-Tenant-Id", tenantID)[m
+[32m+[m	[32m}[m
+[32m+[m	[32mif principalID != "" {[m
+[32m+[m		[32mreq.Header.Set("X-Principal-Id", principalID)[m
+[32m+[m	[32m}[m
+[32m+[m	[32mif legalEntityID != "" {[m
+[32m+[m		[32mreq.Header.Set("X-Legal-Entity-Id", legalEntityID)[m
+[32m+[m	[32m}[m
+[32m+[m	[32mreq.Header.Set("X-Request-Id", uuid.NewString())[m
+[32m+[m	[32mreq.Header.Set("X-Source-Channel", "system")[m
+[32m+[m	[32m// Each authorization check is its own evaluation, not a resubmission of a[m
+[32m+[m	[32m// prior one, so it gets its own key rather than reusing the caller's —[m
+[32m+[m	[32m// reusing it would make an unrelated authorize call collide with the[m
+[32m+[m	[32m// material write's own idempotency record.[m
+[32m+[m	[32mreq.Header.Set("Idempotency-Key", uuid.NewString())[m
+ [m
+ 	resp, err := c.http.Do(req)[m
+ 	if err != nil {[m
+[1mdiff --git a/services/obligations-svc/internal/handler/handler.go b/services/obligations-svc/internal/handler/handler.go[m
+[1mindex dd81d2e2..9b32de91 100644[m
+[1m--- a/services/obligations-svc/internal/handler/handler.go[m
+[1m+++ b/services/obligations-svc/internal/handler/handler.go[m
+[36m@@ -90,7 +90,7 @@[m [mfunc (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,[m
+ [m
+ // authorize gates a mutation, failing closed.[m
+ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, action string) bool {[m
+[31m-	err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, action, r.Header.Get("X-Correlation-ID"))[m
+[32m+[m	[32merr := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, r.Header.Get("X-Tenant-Id"), action, r.Header.Get("X-Correlation-ID"))[m
+ 	if err == nil {[m
+ 		return true[m
+ 	}[m
+[1mdiff --git a/services/obligations-svc/internal/handler/handler_test.go b/services/obligations-svc/internal/handler/handler_test.go[m
+[1mindex b25e712f..5e77c5c1 100644[m
+[1m--- a/services/obligations-svc/internal/handler/handler_test.go[m
+[1m+++ b/services/obligations-svc/internal/handler/handler_test.go[m
+[36m@@ -157,7 +157,7 @@[m [mtype stubAuthz struct {[m
+ 	calls []string // action types, in order[m
+ }[m
+ [m
+[31m-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, actionType, _ string) error {[m
+[32m+[m[32mfunc (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _, actionType, _ string) error {[m
+ 	a.calls = append(a.calls, actionType)[m
+ 	return a.err[m
+ }[m
+[1mdiff --git a/zoiko-suite-backend b/zoiko-suite-backend[m
+[1mindex b76484c1..f26311c5 160000[m
+[1m--- a/zoiko-suite-backend[m
+[1m+++ b/zoiko-suite-backend[m
+[36m@@ -1 +1 @@[m
+[31m-Subproject commit b76484c1503e21a64a780c48605db2277db1a93a[m
+[32m+[m[32mSubproject commit f26311c5e2683541470868c3ef91f99b3a3686a4[m

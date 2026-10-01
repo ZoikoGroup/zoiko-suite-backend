@@ -90,7 +90,7 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 
 // authorize gates a mutation, failing closed.
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, action string) bool {
-	err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, action, r.Header.Get("X-Correlation-ID"))
+	err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, r.Header.Get("X-Tenant-Id"), action, r.Header.Get("X-Correlation-ID"))
 	if err == nil {
 		return true
 	}

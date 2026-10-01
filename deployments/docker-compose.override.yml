@@ -1,0 +1,15 @@
+version: '3.8'
+
+# Local QA-only override: authorization-svc's mTLS pilot listener fails to
+# provision its certificate (mtls-management-svc answers 401 to the
+# self-provisioning bootstrap request), which makes the service exit fatally
+# on startup and blocks every write path that depends on it -- including
+# board-resolutions-svc's MEETING_CREATE / RESOLUTION_CREATE / RESOLUTION_VOTE
+# / RESOLUTION_PASS checks. The plain :8089 port (used by every other service)
+# is unaffected; this only disables the experimental :8449 mTLS listener.
+# Delete this file to restore the default. Approved by the user 2026-09-16 to
+# unblock manual QA of board-resolutions-svc.
+services:
+  authorization-svc:
+    environment:
+      MTLS_ENABLED: "false"

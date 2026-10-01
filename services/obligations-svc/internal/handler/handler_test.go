@@ -157,7 +157,7 @@ type stubAuthz struct {
 	calls []string // action types, in order
 }
 
-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, actionType, _ string) error {
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _, actionType, _ string) error {
 	a.calls = append(a.calls, actionType)
 	return a.err
 }
