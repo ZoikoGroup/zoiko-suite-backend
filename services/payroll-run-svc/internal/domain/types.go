@@ -2,32 +2,51 @@ package domain
 
 import "time"
 
-type PayrollRun struct {
-	RunID                string     `json:"run_id"`
-	TenantID             string     `json:"tenant_id"`
-	LegalEntityID        string     `json:"legal_entity_id"`
-	RunNumber            string     `json:"run_number"`
-	PayPeriodStart       string     `json:"pay_period_start"` // YYYY-MM-DD
-	PayPeriodEnd         string     `json:"pay_period_end"`   // YYYY-MM-DD
-	PayDate              string     `json:"pay_date"`         // YYYY-MM-DD
-	Status               string     `json:"status"`           // INITIATED, CALCULATED, BLOCKED, COMPLETED
-	IsShadowRun          bool       `json:"is_shadow_run"`
-	TotalGrossPay        float64    `json:"total_gross_pay"`
-	TotalNetPay          float64    `json:"total_net_pay"`
-	TotalTaxDeductions   float64    `json:"total_tax_deductions"`
-	TotalOtherDeductions float64    `json:"total_other_deductions"`
-	EmployeeCount        int        `json:"employee_count"`
-	CorrelationID        string     `json:"correlation_id"`
-	CreatedAt            time.Time  `json:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at"`
-	FinalizedAt          *time.Time `json:"finalized_at,omitempty"`
+type PayrollRunStatus string
 
-	// GovernanceDecisionID is nil unless the caller finalizing this run
-	// supplied one. SnapshotHash is computed by this service itself at the
-	// moment of finalization, over the run's own totals — a reproducibility
-	// hash an auditor can recompute from the stored numbers.
+const (
+	PayrollRunStatusInitiated   PayrollRunStatus = "INITIATED"
+	PayrollRunStatusCalculated  PayrollRunStatus = "CALCULATED"
+	PayrollRunStatusBlocked     PayrollRunStatus = "BLOCKED"
+	PayrollRunStatusCompleted   PayrollRunStatus = "COMPLETED"
+	PayrollRunStatusReversed    PayrollRunStatus = "REVERSED"
+	PayrollRunStatusOnHold      PayrollRunStatus = "ON_HOLD"
+)
+
+type PayrollRun struct {
+	RunID                string           `json:"run_id"`
+	TenantID             string           `json:"tenant_id"`
+	LegalEntityID        string           `json:"legal_entity_id"`
+	RunNumber            string           `json:"run_number"`
+	PayPeriodStart       string           `json:"pay_period_start"` // YYYY-MM-DD
+	PayPeriodEnd         string           `json:"pay_period_end"`   // YYYY-MM-DD
+	PayDate              string           `json:"pay_date"`         // YYYY-MM-DD
+	Status               PayrollRunStatus `json:"status"`
+	IsShadowRun          bool             `json:"is_shadow_run"`
+	TotalGrossPay        float64          `json:"total_gross_pay"`
+	TotalNetPay          float64          `json:"total_net_pay"`
+	TotalTaxDeductions   float64          `json:"total_tax_deductions"`
+	TotalOtherDeductions float64          `json:"total_other_deductions"`
+	EmployeeCount        int              `json:"employee_count"`
+	CorrelationID        string           `json:"correlation_id"`
+	CreatedAt            time.Time        `json:"created_at"`
+	UpdatedAt            time.Time        `json:"updated_at"`
+	FinalizedAt          *time.Time       `json:"finalized_at,omitempty"`
+
 	GovernanceDecisionID *string `json:"governance_decision_id,omitempty"`
 	SnapshotHash         *string `json:"snapshot_hash,omitempty"`
+
+	// Monolith-aligned fields
+	TotalEmployerContributions *float64 `json:"total_employer_contributions,omitempty"`
+	TotalEmployeeContributions *float64 `json:"total_employee_contributions,omitempty"`
+	TotalTDS                   *float64 `json:"total_tds,omitempty"`
+	TotalPF                    *float64 `json:"total_pf,omitempty"`
+	TotalESI                   *float64 `json:"total_esi,omitempty"`
+	TotalPT                    *float64 `json:"total_pt,omitempty"`
+	BatchID                    *string  `json:"batch_id,omitempty"`
+	ProcessedBy                *string  `json:"processed_by,omitempty"`
+	ApprovedBy                 *string  `json:"approved_by,omitempty"`
+	ApprovedAt                 *time.Time `json:"approved_at,omitempty"`
 }
 
 type PaySlip struct {
@@ -44,27 +63,37 @@ type PaySlip struct {
 	Currency           string  `json:"currency"`
 	EffectiveDate      string  `json:"effective_date"`
 
-	// TaxableAmount is the base tax was actually applied to. It is not gross:
-	// non-taxable earnings are excluded and taxable deductions come off it.
 	TaxableAmount float64 `json:"taxable_amount"`
 
-	// StructureID is the compensation structure this slip was computed from.
-	// nil means the employee is paid a flat base salary with no components —
-	// a valid state, not missing data.
 	StructureID *string `json:"structure_id,omitempty"`
 
-	// Items are the lines behind the totals, in payslip order.
 	Items []PaySlipItem `json:"items,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
+
+	// Monolith-aligned fields
+	BasicSalary       *float64 `json:"basic_salary,omitempty"`
+	HRA               *float64 `json:"hra,omitempty"`
+	SpecialAllowance  *float64 `json:"special_allowance,omitempty"`
+	Conveyance        *float64 `json:"conveyance,omitempty"`
+	MedicalAllowance  *float64 `json:"medical_allowance,omitempty"`
+	LTA               *float64 `json:"lta,omitempty"`
+	PFEmployee        *float64 `json:"pf_employee,omitempty"`
+	PFEmployer        *float64 `json:"pf_employer,omitempty"`
+	ESIEmployee       *float64 `json:"esi_employee,omitempty"`
+	ESIEmployer       *float64 `json:"esi_employer,omitempty"`
+	PT                *float64 `json:"pt,omitempty"`
+	TDS               *float64 `json:"tds,omitempty"`
+	OtherDeductions   *float64 `json:"other_deductions,omitempty"`
+	Arrears           *float64 `json:"arrears,omitempty"`
+	Bonus             *float64 `json:"bonus,omitempty"`
+	OvertimePay       *float64 `json:"overtime_pay,omitempty"`
+	LeaveEncashment   *float64 `json:"leave_encashment,omitempty"`
+	Reimbursements    *float64 `json:"reimbursements,omitempty"`
+	AdvanceDeduction  *float64 `json:"advance_deduction,omitempty"`
+	LoanDeduction     *float64 `json:"loan_deduction,omitempty"`
 }
 
-// PaySlipItem is one line of a payslip, copied from the compensation breakdown
-// that produced it.
-//
-// CalculationMethod and CalculationValue are stored rather than referenced: if
-// a structure changes 40% HRA to 35% next quarter, this payslip must still show
-// the 40% it was actually paid on.
 type PaySlipItem struct {
 	ItemID            string    `json:"item_id"`
 	TenantID          string    `json:"tenant_id"`
@@ -121,9 +150,7 @@ type CalculateRunRequest struct {
 }
 
 type FinalizeRunRequest struct {
-	ConfirmationNote string `json:"confirmation_note,omitempty"`
-	// GovernanceDecisionID is optional: the governance-decision-log-svc
-	// decision that authorized this finalization, when the caller has one.
+	ConfirmationNote     string  `json:"confirmation_note,omitempty"`
 	GovernanceDecisionID *string `json:"governance_decision_id,omitempty"`
 }
 
@@ -141,17 +168,6 @@ var (
 	ErrIdentityMissing         = errorString("caller identity missing")
 	ErrStoreUnavailable        = errorString("payroll store unavailable")
 
-	// ErrContractLookupFailed means employment-contracts-svc could not
-	// confirm a real active salary contract for one or more employees in
-	// this run. Calculation must fail closed here rather than falling
-	// back to a fabricated baseline salary — computing real pay off a
-	// made-up number is worse than refusing to compute it at all.
-	ErrContractLookupFailed = errorString("failed to verify an active salary contract for one or more employees")
-
-	// ErrCompensationLookupFailed means compensation-svc could not be reached
-	// to resolve what an employee's pay is composed of. An employee with no
-	// structure configured is a normal state and does not raise this — it is
-	// reserved for the service being unable to answer at all, where guessing
-	// the composition would mean inventing deductions.
+	ErrContractLookupFailed    = errorString("failed to verify an active salary contract for one or more employees")
 	ErrCompensationLookupFailed = errorString("failed to resolve compensation breakdown: compensation-svc unavailable")
 )

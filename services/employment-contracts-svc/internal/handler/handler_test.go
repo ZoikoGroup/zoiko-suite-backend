@@ -58,7 +58,7 @@ func (s *stubStore) GetContract(_ context.Context, id string) (*domain.Employmen
 
 func (s *stubStore) GetActiveContractByEmployee(_ context.Context, employeeID string) (*domain.EmploymentContract, error) {
 	for _, c := range s.contracts {
-		if c.EmployeeID == employeeID && c.Status == "ACTIVE" {
+		if c.EmployeeID == employeeID && c.Status == domain.ContractStatusActive {
 			return c, nil
 		}
 	}
@@ -74,7 +74,7 @@ func (s *stubStore) ListContracts(_ context.Context, legalEntityID, employeeID, 
 		if employeeID != "" && c.EmployeeID != employeeID {
 			continue
 		}
-		if status != "" && c.Status != status {
+		if status != "" && string(c.Status) != status {
 			continue
 		}
 		out = append(out, *c)
@@ -94,10 +94,10 @@ func (s *stubStore) GetContractVersionHistory(_ context.Context, contractNumber 
 
 func (s *stubStore) AmendContract(_ context.Context, oldContractID string, newContract *domain.EmploymentContract, amd *domain.ContractAmendment) error {
 	old, ok := s.contracts[oldContractID]
-	if !ok || old.Status != "ACTIVE" {
+	if !ok || old.Status != domain.ContractStatusActive {
 		return domain.ErrContractAlreadyTerminated
 	}
-	old.Status = "SUPERSEDED"
+	old.Status = domain.ContractStatusSuperseded
 	old.EffectiveTo = &amd.EffectiveFrom
 	old.UpdatedAt = time.Now().UTC()
 
@@ -108,10 +108,10 @@ func (s *stubStore) AmendContract(_ context.Context, oldContractID string, newCo
 
 func (s *stubStore) TerminateContract(_ context.Context, contractID, terminationDate string) error {
 	c, ok := s.contracts[contractID]
-	if !ok || (c.Status != "ACTIVE" && c.Status != "DRAFT") {
+	if !ok || (c.Status != domain.ContractStatusActive && c.Status != domain.ContractStatusDraft) {
 		return domain.ErrContractAlreadyTerminated
 	}
-	c.Status = "TERMINATED"
+	c.Status = domain.ContractStatusTerminated
 	c.EffectiveTo = &terminationDate
 	c.UpdatedAt = time.Now().UTC()
 	return nil

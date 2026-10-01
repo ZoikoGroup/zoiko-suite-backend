@@ -51,7 +51,7 @@ func (s *stubStore) ListComponents(_ context.Context, legalEntityID, componentTy
 		if legalEntityID != "" && c.LegalEntityID != legalEntityID {
 			continue
 		}
-		if componentType != "" && c.ComponentType != componentType {
+		if componentType != "" && c.ComponentType != domain.ComponentType(componentType) {
 			continue
 		}
 		if !includeInactive && c.Status != "ACTIVE" {

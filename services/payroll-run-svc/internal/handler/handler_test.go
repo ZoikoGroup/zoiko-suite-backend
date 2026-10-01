@@ -66,7 +66,7 @@ func (s *stubStore) ListPayrollRuns(_ context.Context, legalEntityID, status str
 		if legalEntityID != "" && r.LegalEntityID != legalEntityID {
 			continue
 		}
-		if status != "" && r.Status != status {
+		if status != "" && string(r.Status) != status {
 			continue
 		}
 		if isShadowRun != nil && r.IsShadowRun != *isShadowRun {
@@ -82,11 +82,11 @@ func (s *stubStore) SaveCalculatedResults(_ context.Context, runID string, total
 	if !ok {
 		return domain.ErrPayrollRunNotFound
 	}
-	if r.Status == "COMPLETED" {
+	if r.Status == domain.PayrollRunStatusCompleted {
 		return domain.ErrRunAlreadyFinalized
 	}
 
-	r.Status = "CALCULATED"
+	r.Status = domain.PayrollRunStatusCalculated
 	r.TotalGrossPay = totalGross
 	r.TotalNetPay = totalNet
 	r.TotalTaxDeductions = totalTax
@@ -112,15 +112,15 @@ func (s *stubStore) FinalizePayrollRun(_ context.Context, runID string, governan
 	if !ok {
 		return domain.ErrPayrollRunNotFound
 	}
-	if r.Status == "COMPLETED" {
+	if r.Status == domain.PayrollRunStatusCompleted {
 		return domain.ErrRunAlreadyFinalized
 	}
-	if r.Status != "CALCULATED" {
+	if r.Status != domain.PayrollRunStatusCalculated {
 		return domain.ErrRunNotCalculated
 	}
 
 	now := time.Now().UTC()
-	r.Status = "COMPLETED"
+	r.Status = domain.PayrollRunStatusCompleted
 	r.UpdatedAt = now
 	r.FinalizedAt = &now
 	r.GovernanceDecisionID = governanceDecisionID
@@ -251,7 +251,7 @@ func TestInitiateRun_HappyPath(t *testing.T) {
 	if run.RunNumber != "PAY-2024-01" {
 		t.Errorf("expected PAY-2024-01 got %q", run.RunNumber)
 	}
-	if run.Status != "INITIATED" {
+	if run.Status != domain.PayrollRunStatusInitiated {
 		t.Errorf("expected status INITIATED got %q", run.Status)
 	}
 	if !run.IsShadowRun {
@@ -338,7 +338,7 @@ func TestCalculateRun_StandardAndShadowMode(t *testing.T) {
 	}
 	_ = json.NewDecoder(rrCalc.Body).Decode(&calcRes)
 
-	if calcRes.Run.Status != "CALCULATED" {
+	if calcRes.Run.Status != domain.PayrollRunStatusCalculated {
 		t.Errorf("expected CALCULATED got %q", calcRes.Run.Status)
 	}
 	if len(calcRes.PaySlips) != 1 {
@@ -448,7 +448,7 @@ func TestFinalizeRun_LocksRunAndEnforcesImmutability(t *testing.T) {
 
 	var finalizedRun domain.PayrollRun
 	_ = json.NewDecoder(rrFin.Body).Decode(&finalizedRun)
-	if finalizedRun.Status != "COMPLETED" {
+	if finalizedRun.Status != domain.PayrollRunStatusCompleted {
 		t.Errorf("expected status COMPLETED got %q", finalizedRun.Status)
 	}
 

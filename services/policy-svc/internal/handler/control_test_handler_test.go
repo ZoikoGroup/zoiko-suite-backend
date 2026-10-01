@@ -86,7 +86,7 @@ func TestGetControlEffectiveness_DesignAndOperatingAreIndependent(t *testing.T) 
 	}
 	r := newControlTestRouter(store, &stubAuthz{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/controls/CTRL-SOD-01/effectiveness", nil)
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/controls/CTRL-SOD-01/effectiveness", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -106,7 +106,7 @@ func TestGetControlEffectiveness_NoExecutionsRecorded(t *testing.T) {
 	store := &stubStore{}
 	r := newControlTestRouter(store, &stubAuthz{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/controls/CTRL-NEVER-TESTED/effectiveness", nil)
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/controls/CTRL-NEVER-TESTED/effectiveness", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

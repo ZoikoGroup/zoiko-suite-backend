@@ -95,23 +95,27 @@ func (s *PgStore) CreateStructure(ctx context.Context, str *domain.CompensationS
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO compensation_structures (
 				structure_id, tenant_id, legal_entity_id, name, pay_type,
-				min_amount, max_amount, currency, overtime_multiplier, correlation_id, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				min_amount, max_amount, currency, overtime_multiplier, correlation_id, created_at, updated_at,
+				description, grade_code, level_code, is_default, applicable_location
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, str.StructureID, tenantID, str.LegalEntityID, str.Name, str.PayType,
-			str.MinAmount, str.MaxAmount, str.Currency, str.OvertimeMultiplier, str.CorrelationID, str.CreatedAt, str.UpdatedAt)
+			str.MinAmount, str.MaxAmount, str.Currency, str.OvertimeMultiplier, str.CorrelationID, str.CreatedAt, str.UpdatedAt,
+			str.Description, str.GradeCode, str.LevelCode, str.IsDefault, str.ApplicableLocation)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
 			row := tx.QueryRow(ctx, `
 				SELECT structure_id, legal_entity_id, name, pay_type, min_amount, max_amount,
-				       currency, overtime_multiplier, created_at, updated_at
+				       currency, overtime_multiplier, created_at, updated_at,
+				       description, grade_code, level_code, is_default, applicable_location
 				FROM compensation_structures WHERE tenant_id = $1 AND correlation_id = $2
 			`, tenantID, str.CorrelationID)
 			if err := row.Scan(
 				&str.StructureID, &str.LegalEntityID, &str.Name, &str.PayType, &str.MinAmount, &str.MaxAmount,
 				&str.Currency, &str.OvertimeMultiplier, &str.CreatedAt, &str.UpdatedAt,
+				&str.Description, &str.GradeCode, &str.LevelCode, &str.IsDefault, &str.ApplicableLocation,
 			); err != nil {
 				return err
 			}
@@ -134,7 +138,8 @@ func (s *PgStore) ListStructures(ctx context.Context, legalEntityID string) ([]d
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		query := `
 			SELECT structure_id, tenant_id, legal_entity_id, name, pay_type,
-			       min_amount, max_amount, currency, overtime_multiplier, created_at, updated_at
+			       min_amount, max_amount, currency, overtime_multiplier, created_at, updated_at,
+			       description, grade_code, level_code, is_default, applicable_location
 			FROM compensation_structures
 			WHERE tenant_id = $1
 		`
@@ -157,6 +162,7 @@ func (s *PgStore) ListStructures(ctx context.Context, legalEntityID string) ([]d
 			if err := rows.Scan(
 				&str.StructureID, &str.TenantID, &str.LegalEntityID, &str.Name, &str.PayType,
 				&str.MinAmount, &str.MaxAmount, &str.Currency, &str.OvertimeMultiplier, &str.CreatedAt, &str.UpdatedAt,
+				&str.Description, &str.GradeCode, &str.LevelCode, &str.IsDefault, &str.ApplicableLocation,
 			); err != nil {
 				return err
 			}
@@ -197,12 +203,14 @@ func (s *PgStore) CreateWageRevision(ctx context.Context, rev *domain.WageRevisi
 			if err == nil {
 				row := tx.QueryRow(ctx, `
 					SELECT revision_id, employee_id, structure_id, pay_type, amount, currency,
-					       effective_from::text, effective_to::text, reason, revised_by, status, created_at
+					       effective_from::text, effective_to::text, reason, revised_by, status, created_at,
+					       previous_amount, previous_currency, revision_type, approved_by, approved_at
 					FROM wage_revisions WHERE revision_id = $1 AND tenant_id = $2
 				`, existingID, tenantID)
 				if err := row.Scan(
 					&rev.RevisionID, &rev.EmployeeID, &rev.StructureID, &rev.PayType, &rev.Amount, &rev.Currency,
 					&rev.EffectiveFrom, &rev.EffectiveTo, &rev.Reason, &rev.RevisedBy, &rev.Status, &rev.CreatedAt,
+					&rev.PreviousAmount, &rev.PreviousCurrency, &rev.RevisionType, &rev.ApprovedBy, &rev.ApprovedAt,
 				); err != nil {
 					return err
 				}
@@ -231,10 +239,12 @@ func (s *PgStore) CreateWageRevision(ctx context.Context, rev *domain.WageRevisi
 		_, err = tx.Exec(ctx, `
 			INSERT INTO wage_revisions (
 				revision_id, tenant_id, employee_id, structure_id, pay_type,
-				amount, currency, effective_from, effective_to, reason, revised_by, status, correlation_id, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+				amount, currency, effective_from, effective_to, reason, revised_by, status, correlation_id, created_at,
+				previous_amount, previous_currency, revision_type, approved_by, approved_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		`, rev.RevisionID, tenantID, rev.EmployeeID, rev.StructureID, rev.PayType,
-			rev.Amount, rev.Currency, rev.EffectiveFrom, rev.EffectiveTo, rev.Reason, rev.RevisedBy, rev.Status, rev.CorrelationID, rev.CreatedAt)
+			rev.Amount, rev.Currency, rev.EffectiveFrom, rev.EffectiveTo, rev.Reason, rev.RevisedBy, rev.Status, rev.CorrelationID, rev.CreatedAt,
+			rev.PreviousAmount, rev.PreviousCurrency, rev.RevisionType, rev.ApprovedBy, rev.ApprovedAt)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return domain.ErrConcurrentWageRevision
@@ -257,13 +267,15 @@ func (s *PgStore) GetActiveWageRevision(ctx context.Context, employeeID string) 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT revision_id, tenant_id, employee_id, structure_id, pay_type,
-			       amount, currency, effective_from::text, effective_to::text, reason, revised_by, status, created_at
+			       amount, currency, effective_from::text, effective_to::text, reason, revised_by, status, created_at,
+			       previous_amount, previous_currency, revision_type, approved_by, approved_at
 			FROM wage_revisions
 			WHERE tenant_id = $1 AND employee_id = $2 AND status = 'ACTIVE'
 			LIMIT 1
 		`, tenantID, employeeID).Scan(
 			&rev.RevisionID, &rev.TenantID, &rev.EmployeeID, &rev.StructureID, &rev.PayType,
 			&rev.Amount, &rev.Currency, &rev.EffectiveFrom, &rev.EffectiveTo, &rev.Reason, &rev.RevisedBy, &rev.Status, &rev.CreatedAt,
+			&rev.PreviousAmount, &rev.PreviousCurrency, &rev.RevisionType, &rev.ApprovedBy, &rev.ApprovedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -285,7 +297,8 @@ func (s *PgStore) GetWageRevisionHistory(ctx context.Context, employeeID string)
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT revision_id, tenant_id, employee_id, structure_id, pay_type,
-			       amount, currency, effective_from::text, effective_to::text, reason, revised_by, status, created_at
+			       amount, currency, effective_from::text, effective_to::text, reason, revised_by, status, created_at,
+			       previous_amount, previous_currency, revision_type, approved_by, approved_at
 			FROM wage_revisions
 			WHERE tenant_id = $1 AND employee_id = $2
 			ORDER BY effective_from DESC, created_at DESC
@@ -300,6 +313,7 @@ func (s *PgStore) GetWageRevisionHistory(ctx context.Context, employeeID string)
 			if err := rows.Scan(
 				&rev.RevisionID, &rev.TenantID, &rev.EmployeeID, &rev.StructureID, &rev.PayType,
 				&rev.Amount, &rev.Currency, &rev.EffectiveFrom, &rev.EffectiveTo, &rev.Reason, &rev.RevisedBy, &rev.Status, &rev.CreatedAt,
+				&rev.PreviousAmount, &rev.PreviousCurrency, &rev.RevisionType, &rev.ApprovedBy, &rev.ApprovedAt,
 			); err != nil {
 				return err
 			}
@@ -328,23 +342,27 @@ func (s *PgStore) CreateBonusGrant(ctx context.Context, b *domain.BonusGrant) (c
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO bonus_grants (
 				grant_id, tenant_id, employee_id, bonus_type, amount,
-				currency, grant_date, status, approved_by, correlation_id, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				currency, grant_date, status, approved_by, correlation_id, created_at,
+				paid_at, payment_reference, payout_period, taxable_amount, conditions, notes
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, b.GrantID, tenantID, b.EmployeeID, b.BonusType, b.Amount,
-			b.Currency, b.GrantDate, b.Status, b.ApprovedBy, b.CorrelationID, b.CreatedAt)
+			b.Currency, b.GrantDate, b.Status, b.ApprovedBy, b.CorrelationID, b.CreatedAt,
+			b.PaidAt, b.PaymentReference, b.PayoutPeriod, b.TaxableAmount, b.Conditions, b.Notes)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
 			row := tx.QueryRow(ctx, `
 				SELECT grant_id, employee_id, bonus_type, amount, currency,
-				       grant_date::text, status, approved_by, created_at
+				       grant_date::text, status, approved_by, created_at,
+				       paid_at, payment_reference, payout_period, taxable_amount, conditions, notes
 				FROM bonus_grants WHERE tenant_id = $1 AND correlation_id = $2
 			`, tenantID, b.CorrelationID)
 			if err := row.Scan(
 				&b.GrantID, &b.EmployeeID, &b.BonusType, &b.Amount, &b.Currency,
 				&b.GrantDate, &b.Status, &b.ApprovedBy, &b.CreatedAt,
+				&b.PaidAt, &b.PaymentReference, &b.PayoutPeriod, &b.TaxableAmount, &b.Conditions, &b.Notes,
 			); err != nil {
 				return err
 			}
@@ -371,11 +389,13 @@ func (s *PgStore) GetBonusGrant(ctx context.Context, grantID string) (*domain.Bo
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT grant_id, tenant_id, employee_id, bonus_type, amount,
-			       currency, grant_date::text, status, approved_by, created_at
+			       currency, grant_date::text, status, approved_by, created_at,
+			       paid_at, payment_reference, payout_period, taxable_amount, conditions, notes
 			FROM bonus_grants WHERE grant_id = $1 AND tenant_id = $2
 		`, grantID, tenantID).Scan(
 			&b.GrantID, &b.TenantID, &b.EmployeeID, &b.BonusType, &b.Amount,
 			&b.Currency, &b.GrantDate, &b.Status, &b.ApprovedBy, &b.CreatedAt,
+			&b.PaidAt, &b.PaymentReference, &b.PayoutPeriod, &b.TaxableAmount, &b.Conditions, &b.Notes,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -426,7 +446,8 @@ func (s *PgStore) ListBonusGrants(ctx context.Context, employeeID, status string
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		query := `
 			SELECT grant_id, tenant_id, employee_id, bonus_type, amount,
-			       currency, grant_date::text, status, approved_by, created_at
+			       currency, grant_date::text, status, approved_by, created_at,
+			       paid_at, payment_reference, payout_period, taxable_amount, conditions, notes
 			FROM bonus_grants
 			WHERE tenant_id = $1
 		`
@@ -453,6 +474,7 @@ func (s *PgStore) ListBonusGrants(ctx context.Context, employeeID, status string
 			if err := rows.Scan(
 				&b.GrantID, &b.TenantID, &b.EmployeeID, &b.BonusType, &b.Amount,
 				&b.Currency, &b.GrantDate, &b.Status, &b.ApprovedBy, &b.CreatedAt,
+				&b.PaidAt, &b.PaymentReference, &b.PayoutPeriod, &b.TaxableAmount, &b.Conditions, &b.Notes,
 			); err != nil {
 				return err
 			}

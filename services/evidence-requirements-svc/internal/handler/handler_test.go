@@ -35,6 +35,7 @@ import (
 	"zoiko.io/evidence-requirements-svc/internal/domain"
 	"zoiko.io/evidence-requirements-svc/internal/handler"
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 )
 
 const (
@@ -145,6 +146,8 @@ func (d *stubDocs) VerifyDocument(_ context.Context, _, _, _ string) error {
 func newRouter(store handler.Store, pub handler.Publisher, az handler.AuthZClient, docs handler.DocumentVaultClient) http.Handler {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
+	// Envelope middleware in observe mode so tests can pass with partial headers
+	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
 	handler.RegisterRoutes(r, handler.New(store, pub, az, docs, zap.NewNop()))
 	return r
 }
@@ -160,6 +163,7 @@ func do(t *testing.T, h http.Handler, method, path string, body any, tenant, pri
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "idem-test-"+t.Name()) // unique per test
 	if tenant != "" {
 		req.Header.Set("X-Tenant-Id", tenant)
 	}

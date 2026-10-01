@@ -81,12 +81,19 @@ func (s *PgStore) IssueContract(ctx context.Context, c *domain.EmploymentContrac
 			INSERT INTO employment_contracts (
 				contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 				version, contract_type, status, title, base_salary_amount, currency,
-				pay_frequency, effective_from, effective_to, document_vault_ref, correlation_id, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+				pay_frequency, effective_from, effective_to, document_vault_ref, correlation_id,
+				ctc, basic_salary, hra, special_allowance, conveyance_allowance, medical_allowance, lta,
+				probation_period_days, notice_period_days, working_hours_per_week, shift_type,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+				$17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, c.ContractID, tenantID, c.LegalEntityID, c.EmployeeID, c.ContractNumber,
 			c.Version, c.ContractType, c.Status, c.Title, c.BaseSalaryAmount, c.Currency,
-			c.PayFrequency, c.EffectiveFrom, c.EffectiveTo, c.DocumentVaultRef, c.CorrelationID, c.CreatedAt, c.UpdatedAt)
+			c.PayFrequency, c.EffectiveFrom, c.EffectiveTo, c.DocumentVaultRef, c.CorrelationID,
+			c.CTC, c.BasicSalary, c.HRA, c.SpecialAllowance, c.ConveyanceAllowance, c.MedicalAllowance, c.LTA,
+			c.ProbationPeriodDays, c.NoticePeriodDays, c.WorkingHoursPerWeek, c.ShiftType,
+			c.CreatedAt, c.UpdatedAt)
 		if err != nil {
 			return mapUniqueViolation(err)
 		}
@@ -94,13 +101,19 @@ func (s *PgStore) IssueContract(ctx context.Context, c *domain.EmploymentContrac
 			row := tx.QueryRow(ctx, `
 				SELECT contract_id, legal_entity_id, employee_id, contract_number, version, contract_type,
 				       status, title, base_salary_amount, currency, pay_frequency,
-				       effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
+				       effective_from::text, effective_to::text, document_vault_ref,
+				       ctc, basic_salary, hra, special_allowance, conveyance_allowance, medical_allowance, lta,
+				       probation_period_days, notice_period_days, working_hours_per_week, shift_type,
+				       created_at, updated_at
 				FROM employment_contracts WHERE tenant_id = $1 AND correlation_id = $2
 			`, tenantID, c.CorrelationID)
 			if err := row.Scan(
 				&c.ContractID, &c.LegalEntityID, &c.EmployeeID, &c.ContractNumber, &c.Version, &c.ContractType,
 				&c.Status, &c.Title, &c.BaseSalaryAmount, &c.Currency, &c.PayFrequency,
-				&c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef, &c.CreatedAt, &c.UpdatedAt,
+				&c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef,
+				&c.CTC, &c.BasicSalary, &c.HRA, &c.SpecialAllowance, &c.ConveyanceAllowance, &c.MedicalAllowance, &c.LTA,
+				&c.ProbationPeriodDays, &c.NoticePeriodDays, &c.WorkingHoursPerWeek, &c.ShiftType,
+				&c.CreatedAt, &c.UpdatedAt,
 			); err != nil {
 				return err
 			}
@@ -124,13 +137,19 @@ func (s *PgStore) GetContract(ctx context.Context, id string) (*domain.Employmen
 		return tx.QueryRow(ctx, `
 			SELECT contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 			       version, contract_type, status, title, base_salary_amount, currency,
-			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
+			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref,
+			       ctc, basic_salary, hra, special_allowance, conveyance_allowance, medical_allowance, lta,
+			       probation_period_days, notice_period_days, working_hours_per_week, shift_type,
+			       created_at, updated_at
 			FROM employment_contracts
 			WHERE contract_id = $1 AND tenant_id = $2
 		`, id, tenantID).Scan(
 			&c.ContractID, &c.TenantID, &c.LegalEntityID, &c.EmployeeID, &c.ContractNumber,
 			&c.Version, &c.ContractType, &c.Status, &c.Title, &c.BaseSalaryAmount, &c.Currency,
-			&c.PayFrequency, &c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef, &c.CreatedAt, &c.UpdatedAt,
+			&c.PayFrequency, &c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef,
+			&c.CTC, &c.BasicSalary, &c.HRA, &c.SpecialAllowance, &c.ConveyanceAllowance, &c.MedicalAllowance, &c.LTA,
+			&c.ProbationPeriodDays, &c.NoticePeriodDays, &c.WorkingHoursPerWeek, &c.ShiftType,
+			&c.CreatedAt, &c.UpdatedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -153,14 +172,20 @@ func (s *PgStore) GetActiveContractByEmployee(ctx context.Context, employeeID st
 		return tx.QueryRow(ctx, `
 			SELECT contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 			       version, contract_type, status, title, base_salary_amount, currency,
-			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
+			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref,
+			       ctc, basic_salary, hra, special_allowance, conveyance_allowance, medical_allowance, lta,
+			       probation_period_days, notice_period_days, working_hours_per_week, shift_type,
+			       created_at, updated_at
 			FROM employment_contracts
 			WHERE tenant_id = $1 AND employee_id = $2 AND status = 'ACTIVE'
 			ORDER BY version DESC LIMIT 1
 		`, tenantID, employeeID).Scan(
 			&c.ContractID, &c.TenantID, &c.LegalEntityID, &c.EmployeeID, &c.ContractNumber,
 			&c.Version, &c.ContractType, &c.Status, &c.Title, &c.BaseSalaryAmount, &c.Currency,
-			&c.PayFrequency, &c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef, &c.CreatedAt, &c.UpdatedAt,
+			&c.PayFrequency, &c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef,
+			&c.CTC, &c.BasicSalary, &c.HRA, &c.SpecialAllowance, &c.ConveyanceAllowance, &c.MedicalAllowance, &c.LTA,
+			&c.ProbationPeriodDays, &c.NoticePeriodDays, &c.WorkingHoursPerWeek, &c.ShiftType,
+			&c.CreatedAt, &c.UpdatedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -183,7 +208,10 @@ func (s *PgStore) ListContracts(ctx context.Context, legalEntityID, employeeID, 
 		query := `
 			SELECT contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 			       version, contract_type, status, title, base_salary_amount, currency,
-			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
+			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref,
+			       ctc, basic_salary, hra, special_allowance, conveyance_allowance, medical_allowance, lta,
+			       probation_period_days, notice_period_days, working_hours_per_week, shift_type,
+			       created_at, updated_at
 			FROM employment_contracts
 			WHERE tenant_id = $1
 		`
@@ -214,7 +242,10 @@ func (s *PgStore) ListContracts(ctx context.Context, legalEntityID, employeeID, 
 			if err := rows.Scan(
 				&c.ContractID, &c.TenantID, &c.LegalEntityID, &c.EmployeeID, &c.ContractNumber,
 				&c.Version, &c.ContractType, &c.Status, &c.Title, &c.BaseSalaryAmount, &c.Currency,
-				&c.PayFrequency, &c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef, &c.CreatedAt, &c.UpdatedAt,
+				&c.PayFrequency, &c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef,
+				&c.CTC, &c.BasicSalary, &c.HRA, &c.SpecialAllowance, &c.ConveyanceAllowance, &c.MedicalAllowance, &c.LTA,
+				&c.ProbationPeriodDays, &c.NoticePeriodDays, &c.WorkingHoursPerWeek, &c.ShiftType,
+				&c.CreatedAt, &c.UpdatedAt,
 			); err != nil {
 				return err
 			}
@@ -239,7 +270,10 @@ func (s *PgStore) GetContractVersionHistory(ctx context.Context, contractNumber 
 		rows, err := tx.Query(ctx, `
 			SELECT contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 			       version, contract_type, status, title, base_salary_amount, currency,
-			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
+			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref,
+			       ctc, basic_salary, hra, special_allowance, conveyance_allowance, medical_allowance, lta,
+			       probation_period_days, notice_period_days, working_hours_per_week, shift_type,
+			       created_at, updated_at
 			FROM employment_contracts
 			WHERE tenant_id = $1 AND contract_number = $2
 			ORDER BY version ASC
@@ -254,7 +288,10 @@ func (s *PgStore) GetContractVersionHistory(ctx context.Context, contractNumber 
 			if err := rows.Scan(
 				&c.ContractID, &c.TenantID, &c.LegalEntityID, &c.EmployeeID, &c.ContractNumber,
 				&c.Version, &c.ContractType, &c.Status, &c.Title, &c.BaseSalaryAmount, &c.Currency,
-				&c.PayFrequency, &c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef, &c.CreatedAt, &c.UpdatedAt,
+				&c.PayFrequency, &c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef,
+				&c.CTC, &c.BasicSalary, &c.HRA, &c.SpecialAllowance, &c.ConveyanceAllowance, &c.MedicalAllowance, &c.LTA,
+				&c.ProbationPeriodDays, &c.NoticePeriodDays, &c.WorkingHoursPerWeek, &c.ShiftType,
+				&c.CreatedAt, &c.UpdatedAt,
 			); err != nil {
 				return err
 			}
@@ -293,11 +330,18 @@ func (s *PgStore) AmendContract(ctx context.Context, oldContractID string, newCo
 			INSERT INTO employment_contracts (
 				contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 				version, contract_type, status, title, base_salary_amount, currency,
-				pay_frequency, effective_from, effective_to, document_vault_ref, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+				pay_frequency, effective_from, effective_to, document_vault_ref,
+				ctc, basic_salary, hra, special_allowance, conveyance_allowance, medical_allowance, lta,
+				probation_period_days, notice_period_days, working_hours_per_week, shift_type,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+				$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 		`, newContract.ContractID, tenantID, newContract.LegalEntityID, newContract.EmployeeID, newContract.ContractNumber,
 			newContract.Version, newContract.ContractType, newContract.Status, newContract.Title, newContract.BaseSalaryAmount, newContract.Currency,
-			newContract.PayFrequency, newContract.EffectiveFrom, newContract.EffectiveTo, newContract.DocumentVaultRef, newContract.CreatedAt, newContract.UpdatedAt)
+			newContract.PayFrequency, newContract.EffectiveFrom, newContract.EffectiveTo, newContract.DocumentVaultRef,
+			newContract.CTC, newContract.BasicSalary, newContract.HRA, newContract.SpecialAllowance, newContract.ConveyanceAllowance, newContract.MedicalAllowance, newContract.LTA,
+			newContract.ProbationPeriodDays, newContract.NoticePeriodDays, newContract.WorkingHoursPerWeek, newContract.ShiftType,
+			newContract.CreatedAt, newContract.UpdatedAt)
 		if err != nil {
 			// A concurrent amend of the same contract reaches the same
 			// (contract_number, version) — 409, not 500.

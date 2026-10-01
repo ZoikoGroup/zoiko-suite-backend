@@ -151,6 +151,12 @@ func (h *Handler) CreateStructure(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:      req.CorrelationID,
 		CreatedAt:          now,
 		UpdatedAt:          now,
+		// Monolith-aligned fields
+		Description:        req.Description,
+		GradeCode:          req.GradeCode,
+		LevelCode:          req.LevelCode,
+		IsDefault:          req.IsDefault != nil && *req.IsDefault,
+		ApplicableLocation: req.ApplicableLocation,
 	}
 
 	created, err := h.store.CreateStructure(r.Context(), str)
@@ -243,9 +249,13 @@ func (h *Handler) ReviseWage(w http.ResponseWriter, r *http.Request) {
 		EffectiveFrom: req.EffectiveFrom,
 		Reason:        req.Reason,
 		RevisedBy:     principalID,
-		Status:        "ACTIVE",
+		Status:        domain.WageRevisionStatusActive,
 		CorrelationID: req.CorrelationID,
 		CreatedAt:     now,
+		// Monolith-aligned fields
+		RevisionType:     derefString(req.RevisionType),
+		PreviousAmount:   req.PreviousAmount,
+		PreviousCurrency: req.PreviousCurrency,
 	}
 
 	created, err := h.store.CreateWageRevision(r.Context(), rev)
@@ -380,9 +390,14 @@ func (h *Handler) GrantBonus(w http.ResponseWriter, r *http.Request) {
 		Amount:        req.Amount,
 		Currency:      req.Currency,
 		GrantDate:     req.GrantDate,
-		Status:        "PENDING",
+		Status:        domain.BonusStatusPending,
 		CorrelationID: req.CorrelationID,
 		CreatedAt:     now,
+		// Monolith-aligned fields
+		PayoutPeriod:  req.PayoutPeriod,
+		TaxableAmount: req.TaxableAmount,
+		Conditions:    req.Conditions,
+		Notes:         req.Notes,
 	}
 
 	created, err := h.store.CreateBonusGrant(r.Context(), grant)
@@ -441,7 +456,7 @@ func (h *Handler) ApproveBonus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target.Status = "APPROVED"
+	target.Status = domain.BonusStatusApproved
 	target.ApprovedBy = &principalID
 
 	correlationID := getCorrelationID(r)
@@ -545,6 +560,13 @@ func getCorrelationID(r *http.Request) string {
 		return uuid.NewString()
 	}
 	return cid
+}
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func writeError(w http.ResponseWriter, status int, code, msg string) {
