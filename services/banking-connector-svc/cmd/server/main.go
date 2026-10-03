@@ -110,6 +110,7 @@ func main() {
 	handler.RegisterRoutes(r, h)
 	handler.RegisterBNK02Routes(r, h, st, bankAcctClient, vaultClient)
 	handler.RegisterBNK0304Routes(r, h, st)
+	handler.RegisterControlPopulationRoutes(r, h, st)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

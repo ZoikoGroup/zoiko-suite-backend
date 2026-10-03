@@ -40,6 +40,9 @@ type Store interface {
 	SupersedeDestination(ctx context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID string) (*domain.PayeeDestination, error)
 
 	ListEvents(ctx context.Context, destinationID string) ([]domain.ChangeEvent, error)
+
+	// QueryDestinationChanges serves the destination-changes control population.
+	QueryDestinationChanges(ctx context.Context, tenantID string, q domain.DestinationChangesQuery) (*domain.ControlPopulationPage, error)
 }
 
 type PgStore struct {

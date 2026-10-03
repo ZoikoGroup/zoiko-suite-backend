@@ -180,6 +180,9 @@ type Clients interface {
 	// GetInventoryNegativeOnHandCount is ACC-06's INVENTORY_QUANTITY
 	// source — see its doc comment in internal/clients.
 	GetInventoryNegativeOnHandCount(ctx context.Context, tenantID, legalEntityID string) (int, error)
+	// GetCloseGate is financial-control-svc's period-end close gate — see its
+	// doc comment in internal/clients. Only consulted when the gate is enforced.
+	GetCloseGate(ctx context.Context, tenantID, principalID, legalEntityID, periodID string) (*domain.CloseGateResponse, error)
 	// GetInventoryValueTotal is ACC-06's INVENTORY_VALUE source — see its
 	// doc comment in internal/clients.
 	GetInventoryValueTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error)
@@ -317,6 +320,16 @@ type Handler struct {
 	// signingKey is the HMAC secret for close evidence. See signEvidence.
 	signingKey []byte
 	log        *zap.Logger
+	// enforceCloseGate makes period close depend on financial-control-svc's
+	// close gate. Off by default; see SetCloseGateEnforced.
+	enforceCloseGate bool
+}
+
+// SetCloseGateEnforced turns the financial-control-svc close-gate dependency
+// on or off. Off (the zero value) never calls the service and adds no issue.
+func (h *Handler) SetCloseGateEnforced(enforce bool) *Handler {
+	h.enforceCloseGate = enforce
+	return h
 }
 
 func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, signingKey []byte, log *zap.Logger) *Handler {
@@ -331,6 +344,7 @@ func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, s
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Get("/v1/control-populations/migration-batch-tieout", h.GetMigrationBatchTieoutPopulation)
 	r.Route("/v1/close/periods", func(r chi.Router) {
 		r.Post("/", h.CreateFiscalPeriod)
 		r.Get("/", h.ListFiscalPeriods)
@@ -611,7 +625,7 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 	h.publisher.PublishCloseStarted(r.Context(), correlationID, principalID, *fp)
 
 	// Step 1: Run Readiness Checks (FAIL CLOSED on any dependency query error)
-	blockingIssues, err := h.checkReadiness(r.Context(), tenantID, fp)
+	blockingIssues, err := h.checkReadiness(r.Context(), tenantID, principalID, fp)
 	if err != nil {
 		h.writeReadinessErr(w, err)
 		return
@@ -4190,7 +4204,7 @@ func (h *Handler) GetPeriodReadiness(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blockingIssues, err := h.checkReadiness(r.Context(), tenantID, fp)
+	blockingIssues, err := h.checkReadiness(r.Context(), tenantID, principalID, fp)
 	if err != nil {
 		h.writeReadinessErr(w, err)
 		return
@@ -4210,7 +4224,7 @@ func (h *Handler) GetPeriodReadiness(w http.ResponseWriter, r *http.Request) {
 // empty issue list. "We could not check" and "there is nothing to report" are
 // opposite answers, and conflating them would close a period on the strength of
 // a service being down.
-func (h *Handler) checkReadiness(ctx context.Context, tenantID string, fp *domain.FiscalPeriod) ([]string, error) {
+func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID string, fp *domain.FiscalPeriod) ([]string, error) {
 	var issues []string
 
 	unposted, err := h.clients.GetUnpostedJournalsCount(ctx, tenantID, fp.LegalEntityID, fp.PeriodName)
@@ -4241,6 +4255,20 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID string, fp *domai
 	if unsettledAR > 0 {
 		issues = append(issues, fmt.Sprintf("unsettled_ar_invoices_exist: %d %s due in this period not PAID",
 			unsettledAR, plural(unsettledAR, "invoice is", "invoices are")))
+	}
+
+	if h.enforceCloseGate {
+		gate, err := h.clients.GetCloseGate(ctx, tenantID, principalID, fp.LegalEntityID, fp.PeriodName)
+		if err != nil {
+			h.log.Error("failed to verify financial control close gate", zap.Error(err))
+			return nil, fmt.Errorf("financial-control-svc: %w", err)
+		}
+		if !gate.Open {
+			issues = append(issues, fmt.Sprintf("financial_controls: %d mandatory control(s) not certified", gate.BlockingCount))
+		}
+		if !gate.Configured {
+			issues = append(issues, "financial_controls: no mandatory controls configured for this entity")
+		}
 	}
 
 	return issues, nil

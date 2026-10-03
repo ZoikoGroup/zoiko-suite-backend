@@ -59,6 +59,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{destinationID}/suspend", h.SuspendDestination)
 		r.Post("/{destinationID}/supersede", h.SupersedeDestination)
 	})
+	r.Get("/v1/control-populations/destination-changes", h.GetDestinationChangesPopulation)
 	r.Get("/org10/parties/{partyRef}/versions", h.ListPayeeVersions)
 	r.Get("/org10/parties/{partyRef}/active", h.GetActivePayeeDestination)
 }

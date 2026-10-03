@@ -34,6 +34,7 @@ func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Log
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	h.registerControlPopulationRoutes(r)
 	r.Route("/v1/tax-authority", func(r chi.Router) {
 		r.Post("/interfaces", h.CreateInterface)
 		r.Get("/interfaces", h.ListInterfaces)

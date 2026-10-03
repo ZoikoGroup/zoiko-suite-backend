@@ -660,6 +660,8 @@ type stubLedger struct {
 	reverseErr              error
 	reverseCalls            int
 	lastPostedSourceEventID string
+	lastCurrency            string
+	lastDocumentDate        string
 
 	checkPeriodErr error
 }
@@ -681,8 +683,10 @@ func (l *stubLedger) ReverseDepreciationJournal(_ context.Context, _, _, _, _ st
 	return l.reverseErr
 }
 
-func (l *stubLedger) PostAssetEventAccountingEvent(_ context.Context, _, _, _, _, _, sourceEventID, _ string, _ []clients.LedgerLine) (string, error) {
+func (l *stubLedger) PostAssetEventAccountingEvent(_ context.Context, _, _, _, _, _, sourceEventID, _, currency, docDate string, _ []clients.LedgerLine) (string, error) {
 	l.postCalls++
+	l.lastCurrency = currency
+	l.lastDocumentDate = docDate
 	l.lastPostedSourceEventID = sourceEventID
 	if l.postErr != nil {
 		return "", l.postErr
