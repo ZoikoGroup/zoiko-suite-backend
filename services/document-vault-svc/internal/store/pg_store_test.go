@@ -42,9 +42,21 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 		DROP TABLE IF EXISTS audit_evidence;
 		DROP TABLE IF EXISTS document_links;
 		DROP TABLE IF EXISTS record_classifications;
+		DROP TABLE IF EXISTS legal_hold_targets;
+		DROP TABLE IF EXISTS legal_holds;
+		DROP TABLE IF EXISTS record_retention_states;
+		DROP TABLE IF EXISTS retention_rule_versions;
+		DROP TABLE IF EXISTS record_relationships;
+		DROP TABLE IF EXISTS records;
 		DROP TABLE IF EXISTS document_access_log;
 		DROP TABLE IF EXISTS document_versions;
 		DROP TABLE IF EXISTS documents;
+		DROP FUNCTION IF EXISTS reject_record_relationship_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_record_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_legal_hold_target_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_legal_hold_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_retention_state_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_retention_rule_mutation() CASCADE;
 	`)
 	require.NoError(t, err)
 

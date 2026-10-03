@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -21,6 +24,10 @@ const (
 	FORECAST_CREATE      = "FORECAST_CREATE"
 	FORECAST_RECALCULATE = "FORECAST_RECALCULATE"
 	FORECAST_ARCHIVE     = "FORECAST_ARCHIVE"
+
+	// AI-05 governed advisory layer actions.
+	FORECAST_ASSIST_MANAGE = "FORECAST_ASSIST_MANAGE"
+	FORECAST_ASSIST_READ   = "FORECAST_ASSIST_READ"
 )
 
 type Handler struct {
@@ -71,6 +78,23 @@ func NewRouter(h *Handler) http.Handler {
 		r.Get("/{id}", h.GetForecastByID)
 		r.Post("/{id}/recalculate", h.RecalculateForecast)
 		r.Delete("/{id}", h.ArchiveForecast)
+	})
+
+	// AI-05 governed advisory layer (ZS-SVC-N-001 §4/§13 Wave 8) — additive,
+	// lives alongside the forecasting-engine surface above under its own path.
+	r.With(customMiddleware.TenantMiddleware).Route("/v1/forecast-assist", func(r chi.Router) {
+		r.Post("/model-releases", h.RegisterForecastModelRelease)
+		r.Post("/suggest-drivers", h.SuggestDrivers)
+		r.Post("/suggest-range", h.SuggestRange)
+		r.Post("/generate-narrative", h.GenerateNarrative)
+		r.Post("/jobs/{jobID}:start-review", h.StartPlannerReview)
+		r.Post("/jobs/{jobID}:accept", h.AcceptForecastSuggestion)
+		r.Post("/jobs/{jobID}:reject", h.RejectForecastSuggestion)
+		r.Get("/jobs/{jobID}", h.GetForecastAssistJob)
+		r.Get("/jobs/{jobID}/drivers", h.GetSuggestedDrivers)
+		r.Get("/jobs/{jobID}/ranges", h.GetSuggestedRanges)
+		r.Get("/jobs/{jobID}/evidence", h.GetEvidenceReferences)
+		r.Get("/jobs/{jobID}/decision", h.GetPlannerDecision)
 	})
 
 	return r
@@ -275,4 +299,312 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	}
 	h.logger.Error("authorization check failed", zap.Error(err))
 	h.respondError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI-05 governed advisory layer (ZS-SVC-N-001 §4/§13 Wave 8) — additive.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func assistClaim(principalID, operation, resourceID, requestSHA256, key string) domain.AssistIdempotencyClaim {
+	return domain.AssistIdempotencyClaim{
+		OwnerScope: domain.AssistSellerScope, PrincipalID: principalID, Key: key,
+		Operation: operation, RequestSHA256: requestSHA256, ResourceID: resourceID,
+	}
+}
+
+func readAssistBody(r *http.Request, v interface{}) (string, error) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, v); err != nil {
+			return "", err
+		}
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (h *Handler) RegisterForecastModelRelease(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	var req domain.RegisterForecastModelReleaseRequest
+	if _, err := readAssistBody(r, &req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	got, err := h.store.RegisterForecastModelRelease(r.Context(), tenantID, req, principalID)
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) SuggestDrivers(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	var req domain.SuggestDriversRequest
+	reqHash, err := readAssistBody(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	claim := assistClaim(principalID, "SuggestDrivers", req.JobID+"|"+req.PlanVersion, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.SuggestDrivers(r.Context(), tenantID, req, principalID, claim)
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusCreated, got)
+}
+
+func (h *Handler) SuggestRange(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	var req domain.SuggestRangeRequest
+	reqHash, err := readAssistBody(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	claim := assistClaim(principalID, "SuggestRange", req.JobID+"|"+req.PlanVersion, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.SuggestRange(r.Context(), tenantID, req, principalID, claim)
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusCreated, got)
+}
+
+func (h *Handler) GenerateNarrative(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	var req domain.GenerateNarrativeRequest
+	reqHash, err := readAssistBody(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	claim := assistClaim(principalID, "GenerateNarrative", req.JobID+"|"+req.PlanVersion, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.GenerateNarrative(r.Context(), tenantID, req, principalID, claim)
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusCreated, got)
+}
+
+func (h *Handler) StartPlannerReview(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	jobID := chi.URLParam(r, "jobID")
+	claim := assistClaim(principalID, "StartPlannerReview", jobID, "", r.Header.Get("Idempotency-Key"))
+	got, err := h.store.StartPlannerReview(r.Context(), tenantID, jobID, principalID, claim)
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) AcceptForecastSuggestion(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	jobID := chi.URLParam(r, "jobID")
+	claim := assistClaim(principalID, "AcceptSuggestion", jobID, "", r.Header.Get("Idempotency-Key"))
+	got, err := h.store.AcceptSuggestion(r.Context(), tenantID, jobID, principalID, claim)
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) RejectForecastSuggestion(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	jobID := chi.URLParam(r, "jobID")
+	var req domain.RejectForecastSuggestionRequest
+	reqHash, err := readAssistBody(r, &req)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	claim := assistClaim(principalID, "RejectSuggestion", jobID, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.RejectSuggestion(r.Context(), tenantID, jobID, req, principalID, claim)
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) GetForecastAssistJob(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	got, err := h.store.GetForecastAssistJob(r.Context(), tenantID, chi.URLParam(r, "jobID"))
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) GetSuggestedDrivers(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	items, err := h.store.GetSuggestedDrivers(r.Context(), tenantID, chi.URLParam(r, "jobID"))
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	if items == nil {
+		items = []domain.SuggestedDriver{}
+	}
+	h.respondJSON(w, http.StatusOK, map[string]interface{}{"data": items, "count": len(items)})
+}
+
+func (h *Handler) GetSuggestedRanges(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	items, err := h.store.GetSuggestedRanges(r.Context(), tenantID, chi.URLParam(r, "jobID"))
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	if items == nil {
+		items = []domain.SuggestedRange{}
+	}
+	h.respondJSON(w, http.StatusOK, map[string]interface{}{"data": items, "count": len(items)})
+}
+
+func (h *Handler) GetEvidenceReferences(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	items, err := h.store.GetEvidenceReferences(r.Context(), tenantID, chi.URLParam(r, "jobID"))
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	if items == nil {
+		items = []domain.EvidenceReference{}
+	}
+	h.respondJSON(w, http.StatusOK, map[string]interface{}{"data": items, "count": len(items)})
+}
+
+func (h *Handler) GetPlannerDecision(w http.ResponseWriter, r *http.Request) {
+	tenantID := customMiddleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, FORECAST_ASSIST_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	got, err := h.store.GetPlannerDecision(r.Context(), tenantID, chi.URLParam(r, "jobID"))
+	if err != nil {
+		h.respondAssistError(w, err)
+		return
+	}
+	h.respondJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) respondAssistError(w http.ResponseWriter, err error) {
+	var replay *domain.AssistIdempotentReplayError
+	if errors.As(err, &replay) {
+		w.Header().Set("Idempotent-Replayed", "true")
+		h.respondJSON(w, http.StatusOK, map[string]string{"resource_id": replay.ResourceID})
+		return
+	}
+	switch {
+	case errors.Is(err, domain.ErrForecastAssistJobNotFound), errors.Is(err, domain.ErrForecastModelReleaseNotFound):
+		h.respondError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, domain.ErrForecastJobNotGenerated), errors.Is(err, domain.ErrForecastJobNotInReview),
+		errors.Is(err, domain.ErrForecastJobNotOpen), errors.Is(err, domain.ErrNarrativeAlreadySet),
+		errors.Is(err, domain.ErrAssistIdempotencyKeyReused):
+		h.respondError(w, http.StatusConflict, err.Error())
+	default:
+		h.logger.Error("forecasting-svc assist request failed", zap.Error(err))
+		h.respondError(w, http.StatusBadRequest, err.Error())
+	}
 }
