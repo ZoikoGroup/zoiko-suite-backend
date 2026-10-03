@@ -31,6 +31,9 @@ type Store interface {
 	CreateBalanceContributions(ctx context.Context, contributions []domain.BalanceContribution) error
 	ListContributionsByRun(ctx context.Context, runID string) ([]domain.BalanceContribution, error)
 
+	// BalanceContributionsPopulation serves the control-population contract (balance-contributions).
+	BalanceContributionsPopulation(ctx context.Context, q domain.BalanceContributionsQuery) (*domain.ControlPopulationPage, error)
+
 	// ACC-12 Elimination & Consolidation Adjustments — see migration
 	// 000003's doc comment.
 	GroupEntityHasRun(ctx context.Context, groupLegalEntityID string) (bool, error)
@@ -106,6 +109,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}", h.GetRun)
 		r.Get("/{id}/snapshots", h.ListSnapshots)
 		r.Get("/{id}/contributions", h.ListContributions)
+	})
+	r.Route("/v1/control-populations", func(r chi.Router) {
+		r.Get("/{population}", h.GetControlPopulation)
 	})
 	r.Route("/v1/consolidation/adjustments", func(r chi.Router) {
 		r.Post("/", h.CreateEliminationProposal)

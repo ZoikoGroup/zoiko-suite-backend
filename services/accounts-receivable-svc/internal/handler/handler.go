@@ -33,6 +33,9 @@ type Store interface {
 	CreateInvoice(ctx context.Context, inv *domain.CustomerInvoice) (created bool, err error)
 	GetInvoice(ctx context.Context, tenantID, invoiceID string) (*domain.CustomerInvoice, error)
 	ListInvoices(ctx context.Context, filter domain.ListInvoicesFilter) ([]domain.CustomerInvoice, error)
+	
+	// ControlPopulation serves the control-population contract (open-invoices).
+	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
 	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string, paymentDate *domain.CalendarDate, paymentReference *string) (*domain.CustomerInvoice, error)
 }
 
@@ -66,6 +69,9 @@ const (
 	actionSendInvoice    = "AR_INVOICE_SEND"
 	actionMarkOverdue    = "AR_MARK_OVERDUE"
 	actionPaymentReceive = "AR_PAYMENT_RECEIVE"
+	// actionControlPopulationRead authorizes reading a control population for a
+	// legal entity (docs/architecture/control-population-contract.md).
+	actionControlPopulationRead = "AR_CONTROL_POPULATION_READ"
 )
 
 type Handler struct {
@@ -117,6 +123,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{invoice_id}/send", h.SendInvoice)
 		r.Post("/{invoice_id}/overdue", h.MarkOverdue)
 		r.Post("/{invoice_id}/pay", h.ReceivePayment)
+	})
+	r.Route("/v1/control-populations", func(r chi.Router) {
+		r.Get("/{population}", h.GetControlPopulation)
 	})
 }
 

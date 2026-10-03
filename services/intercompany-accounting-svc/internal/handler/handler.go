@@ -29,6 +29,9 @@ type Store interface {
 	AcknowledgeCounterparty(ctx context.Context, id, principalID string) error
 	DisputeIntercompany(ctx context.Context, id, principalID, reason string) error
 	ResolveMismatch(ctx context.Context, id, principalID, resolutionNote string) error
+
+	// Control-population read (docs/architecture/control-population-contract.md).
+	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
 }
 
 type Publisher interface {
@@ -97,6 +100,7 @@ func (h *Handler) WithEntityRegistry(c EntityRegistryClient) *Handler {
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Get("/v1/control-populations/{population}", h.GetControlPopulation)
 	r.Route("/v1/intercompany/entries", func(r chi.Router) {
 		r.Post("/", h.CreateEntry)
 		r.Get("/", h.ListEntries)

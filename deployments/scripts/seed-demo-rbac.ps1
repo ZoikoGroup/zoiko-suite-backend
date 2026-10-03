@@ -166,6 +166,30 @@ $BUNDLES = @(
         Actions = @("PERIOD_CLOSE_CONFIG", "PERIOD_CLOSE_VIEW", "PERIOD_CLOSE_INITIATE")
     },
     @{
+        # financial-control-svc (ZS-CONTROL-001). DEFINE / APPROVE_RULE / EXECUTE / CERTIFY /
+        # EXCEPTION_WAIVE / REPERFORM are deliberately separate actions: a real tenant should grant
+        # them through separate roles. The service itself also refuses a certifier who created or
+        # took part in a run, and a waiver from the exception's own owner, whatever is granted here.
+        Code    = "FINCTRL_FULL"
+        Service = "financial-control-svc"
+        Actions = @("FINCTRL_DEFINE", "FINCTRL_APPROVE_RULE", "FINCTRL_POLICY_MANAGE", "FINCTRL_RUN_CREATE",
+                    "FINCTRL_READ", "FINCTRL_EXECUTE", "FINCTRL_EXCEPTION_ASSIGN", "FINCTRL_CERTIFY",
+                    "FINCTRL_EXCEPTION_RESOLVE", "FINCTRL_EXCEPTION_WAIVE", "FINCTRL_REPERFORM",
+                    "FINCTRL_EVIDENCE_EXPORT")
+    },
+    @{
+        # The source services authorize the HUMAN caller of a control population (the control service
+        # forwards the caller's identity), so whoever executes a control needs the read action of every
+        # source that control reads. One action per source service, exactly as their handlers declare.
+        Code    = "FINCTRL_POPULATION_READ"
+        Service = "financial-control-svc"
+        Actions = @("AR_CONTROL_POPULATION_READ", "AP_CONTROL_POPULATION_READ", "GL_CONTROL_POPULATION_READ",
+                    "BANKING_CONTROL_POPULATION_READ", "PAYROLL_CONTROL_POPULATION_READ",
+                    "INVENTORY_CONTROL_POPULATION_READ", "INTERCOMPANY_CONTROL_POPULATION_READ",
+                    "CONSOLIDATION_CONTROL_POPULATION_READ", "FINANCIAL_CLOSE_CONTROL_POPULATION_READ",
+                    "PAYEE_BANKING_CONTROL_POPULATION_READ", "TAX_AUTHORITY_CONTROL_POPULATION_READ")
+    },
+    @{
         # spend-controls-svc separates setting a limit from spending against it,
         # and checks VIEW on its two read routes as well -- the reads are
         # authorized unconditionally, so without VIEW the console's registers

@@ -210,7 +210,13 @@ func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
-	tx, err := s.pool.Begin(ctx)
+	return s.withRLSOpts(ctx, tenantID, pgx.TxOptions{}, fn)
+}
+
+// withRLSOpts is withRLS with explicit transaction options (the control
+// population read needs one REPEATABLE READ, read-only snapshot).
+func (s *PgStore) withRLSOpts(ctx context.Context, tenantID string, opts pgx.TxOptions, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.BeginTx(ctx, opts)
 	if err != nil {
 		return err
 	}

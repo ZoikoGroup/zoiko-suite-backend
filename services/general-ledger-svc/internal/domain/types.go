@@ -434,6 +434,13 @@ type PostAccountingEventRequest struct {
 	SourceEventID string                  `json:"source_event_id"`
 	CorrelationID string                  `json:"correlation_id"`
 	Lines         []PostingEventLineInput `json:"lines"`
+
+	// Spec s5.1 / s8.1 mandatory fields. TransactionCurrency is ISO 4217
+	// shape (three uppercase letters); DocumentDate maps to the journal's
+	// TransactionDate; PostingDate defaults to DocumentDate when omitted.
+	TransactionCurrency string `json:"transaction_currency"`
+	DocumentDate        Date   `json:"document_date"`
+	PostingDate         Date   `json:"posting_date"`
 }
 
 type PostApprovedJournalRequest struct {
