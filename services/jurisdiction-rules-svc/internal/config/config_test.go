@@ -23,6 +23,9 @@ func withEnv(t *testing.T, vars map[string]string) {
 		"ENV", "PORT", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_SSLMODE",
 		"KAFKA_BROKERS", "KAFKA_GROUP_ID", "KAFKA_EVENTS_TOPIC",
 		"AUTHZ_SERVICE_URL", "AUTHZ_PLATFORM_SCOPE_ID", "OTEL_EXPORTER_OTLP_ENDPOINT",
+		"PACK_SIGNING_KEY_REF", "PACK_SIGNING_KEY_FILE", "PACK_CERT_MIN_REVIEWS",
+		"RESOLVER_ELIGIBLE_STATUSES", "RESOLVER_CACHE_TTL_SECONDS",
+		"RESOLVER_ENABLED", "RESOLVER_RING", "RESOLVER_REGION", "HOTFIX_RETRO_SLA_HOURS", "PACK_CERT_AGE_WARN_DAYS",
 	} {
 		t.Setenv(k, "")
 		if err := os.Unsetenv(k); err != nil {
@@ -194,5 +197,141 @@ func TestLoad_LocalIsNotGuarded(t *testing.T) {
 
 	if _, err := config.Load(); err != nil {
 		t.Fatalf("local development must not be blocked by the production guards, got %v", err)
+	}
+}
+
+// A half-configured signer must stop the service from starting in every
+// environment: discovering it at the first release is too late.
+func TestLoad_PackSigningKeyMustBeConfiguredTogether(t *testing.T) {
+	withEnv(t, map[string]string{"PACK_SIGNING_KEY_REF": "pack-key-1"})
+	if _, err := config.Load(); err == nil {
+		t.Fatal("key ref without key file must be rejected")
+	}
+	withEnv(t, map[string]string{"PACK_SIGNING_KEY_FILE": "/run/secrets/pack-key"})
+	if _, err := config.Load(); err == nil {
+		t.Fatal("key file without key ref must be rejected")
+	}
+	withEnv(t, map[string]string{"PACK_SIGNING_KEY_REF": "pack-key-1", "PACK_SIGNING_KEY_FILE": "/run/secrets/pack-key"})
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("both set must load: %v", err)
+	}
+	if cfg.PackSigningKeyRef != "pack-key-1" || cfg.PackSigningKeyFile != "/run/secrets/pack-key" {
+		t.Fatalf("unexpected signer config: %+v", cfg)
+	}
+	withEnv(t, nil)
+	cfg, err = config.Load()
+	if err != nil || cfg.PackSigningKeyRef != "" {
+		t.Fatalf("neither set is the safe default (signing disabled): %v", err)
+	}
+}
+
+func TestLoad_PackCertMinReviews(t *testing.T) {
+	withEnv(t, nil)
+	cfg, err := config.Load()
+	if err != nil || cfg.PackCertMinReviews != 1 {
+		t.Fatalf("default must be 1: %v %+v", err, cfg)
+	}
+	withEnv(t, map[string]string{"PACK_CERT_MIN_REVIEWS": "3"})
+	if cfg, err = config.Load(); err != nil || cfg.PackCertMinReviews != 3 {
+		t.Fatalf("explicit value must load: %v", err)
+	}
+	withEnv(t, map[string]string{"PACK_CERT_MIN_REVIEWS": "0"})
+	if _, err = config.Load(); err == nil {
+		t.Fatal("zero reviews would remove independent review and must be rejected")
+	}
+}
+
+func TestLoad_ResolverEligibilityIsProductionSafe(t *testing.T) {
+	withEnv(t, nil)
+	cfg, err := config.Load()
+	if err != nil || len(cfg.ResolverEligibleStatuses) != 1 || cfg.ResolverEligibleStatuses[0] != "RELEASED" || cfg.ResolverCacheTTLSeconds != 30 {
+		t.Fatalf("defaults must be RELEASED only, 30s: %v %+v", err, cfg)
+	}
+	// CERTIFIED may be enabled below production to exercise the resolver early.
+	withEnv(t, map[string]string{"RESOLVER_ELIGIBLE_STATUSES": "released, certified"})
+	if cfg, err = config.Load(); err != nil || len(cfg.ResolverEligibleStatuses) != 2 || cfg.ResolverEligibleStatuses[1] != "CERTIFIED" {
+		t.Fatalf("lower environments may include CERTIFIED (normalised to upper case): %v %+v", err, cfg)
+	}
+	// ...but never in production or staging (s23: CERTIFIED is not production eligible).
+	for _, env := range []string{"production", "staging"} {
+		withEnv(t, map[string]string{"ENV": env, "RESOLVER_ELIGIBLE_STATUSES": "RELEASED,CERTIFIED", "DB_PASSWORD": "x",
+			"DB_SSLMODE": "require", "AUTHZ_PLATFORM_SCOPE_ID": "scope"})
+		if _, err = config.Load(); err == nil {
+			t.Fatalf("%s must refuse CERTIFIED as an eligible status", env)
+		}
+	}
+	for _, bad := range []string{"DRAFT", "WITHDRAWN", "bogus"} {
+		withEnv(t, map[string]string{"RESOLVER_ELIGIBLE_STATUSES": bad})
+		if _, err = config.Load(); err == nil {
+			t.Fatalf("%s must not be an eligible status", bad)
+		}
+	}
+	for _, ttl := range []string{"-1", "3601"} {
+		withEnv(t, map[string]string{"RESOLVER_CACHE_TTL_SECONDS": ttl})
+		if _, err = config.Load(); err == nil {
+			t.Fatalf("ttl %s must be rejected", ttl)
+		}
+	}
+	withEnv(t, map[string]string{"RESOLVER_CACHE_TTL_SECONDS": "0"})
+	if cfg, err = config.Load(); err != nil || cfg.ResolverCacheTTLSeconds != 0 {
+		t.Fatalf("0 (no caching) is valid: %v", err)
+	}
+}
+
+// Existing production deployments must keep starting after an upgrade, so the
+// resolver is opt-in; enabling it in production then demands a ring and region.
+func TestLoad_ResolverIsOptInAndNeedsARolloutScopeInProduction(t *testing.T) {
+	prod := map[string]string{"ENV": "production", "DB_PASSWORD": "x", "DB_SSLMODE": "require", "AUTHZ_PLATFORM_SCOPE_ID": "scope"}
+	with := func(extra map[string]string) map[string]string {
+		m := map[string]string{}
+		for k, v := range prod {
+			m[k] = v
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+
+	withEnv(t, prod)
+	cfg, err := config.Load()
+	if err != nil || cfg.ResolverEnabled {
+		t.Fatalf("a production config that never heard of the resolver must still start, with it off: %v", err)
+	}
+	withEnv(t, with(map[string]string{"RESOLVER_ENABLED": "true"}))
+	if _, err = config.Load(); err == nil {
+		t.Fatal("enabling the resolver in production without a ring and region would bypass the rollout")
+	}
+	withEnv(t, with(map[string]string{"RESOLVER_ENABLED": "true", "RESOLVER_RING": "canary"}))
+	if _, err = config.Load(); err == nil {
+		t.Fatal("ring without region must be rejected")
+	}
+	withEnv(t, with(map[string]string{"RESOLVER_ENABLED": "true", "RESOLVER_RING": "canary", "RESOLVER_REGION": "eu-west"}))
+	if cfg, err = config.Load(); err != nil || !cfg.ResolverEnabled || cfg.ResolverRing != "canary" || cfg.ResolverRegion != "eu-west" {
+		t.Fatalf("a scoped production resolver must start: %v %+v", err, cfg)
+	}
+	// Lower environments may run ungated.
+	withEnv(t, map[string]string{"RESOLVER_ENABLED": "true"})
+	if cfg, err = config.Load(); err != nil || cfg.ResolverRing != "" {
+		t.Fatalf("an ungated resolver is allowed outside production: %v", err)
+	}
+	withEnv(t, map[string]string{"RESOLVER_REGION": "eu-west"})
+	if _, err = config.Load(); err == nil {
+		t.Fatal("a half-set scope is a misconfiguration everywhere")
+	}
+}
+
+func TestLoad_OperationsPolicyDefaultsAndBounds(t *testing.T) {
+	withEnv(t, nil)
+	cfg, err := config.Load()
+	if err != nil || cfg.HotfixRetroSLAHours != 120 || cfg.PackCertAgeWarnDays != 180 {
+		t.Fatalf("defaults: %v %+v", err, cfg)
+	}
+	for _, k := range []string{"HOTFIX_RETRO_SLA_HOURS", "PACK_CERT_AGE_WARN_DAYS"} {
+		withEnv(t, map[string]string{k: "0"})
+		if _, err = config.Load(); err == nil {
+			t.Fatalf("%s=0 must be rejected", k)
+		}
 	}
 }

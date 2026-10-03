@@ -242,7 +242,7 @@ func (p *KafkaPublisher) emit(ctx context.Context, eventType, correlationID, jur
 
 // partitionKey prefers the rule id, falling back to the jurisdiction id.
 func partitionKey(payload map[string]any) string {
-	for _, k := range []string{"jurisdiction_rule_id", "jurisdiction_id"} {
+	for _, k := range []string{"aggregate_id", "jurisdiction_rule_id", "jurisdiction_id"} {
 		if v, ok := payload[k].(string); ok && v != "" {
 			return v
 		}

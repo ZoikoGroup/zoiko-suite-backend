@@ -54,6 +54,8 @@ tags:
     description: Legal Drift Detection — divergence between stored rules and legal reality
   - name: Admin
     description: Mutations. Authenticated and authorized on every route.
+  - name: Rollout
+    description: Jurisdiction rollout governance (ZS-JUR-001 Wave 8)
   - name: Health
     description: Liveness and readiness probes
 
@@ -484,6 +486,1002 @@ paths:
         "403": { $ref: '#/components/responses/Forbidden' }
         "404": { $ref: '#/components/responses/NotFound' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  # ── ZS-JUR-001 Wave 0: regime, source, interpretation and pack registries ───
+  # Mounted only when the registry store is wired (it is, in main.go). Every
+  # privileged command below is a separate authorization action so authoring,
+  # independent review/approval and submission can sit with different roles.
+  # Error bodies are {"error": "<code>", "message": "..."}.
+
+  /v1/regimes:
+    get: { tags: [Registry], summary: List regulatory regimes, operationId: listRegimes, responses: { "200": { description: Regimes. } } }
+  /v1/regimes/{regime}:
+    get:
+      tags: [Registry]
+      summary: Get a regime by id or code
+      operationId: getRegime
+      parameters: [{ name: regime, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: The regime. }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/sources:
+    get:
+      tags: [Registry]
+      summary: List captured regulatory sources (newest first)
+      operationId: listSources
+      parameters:
+        - { name: jurisdiction_id, in: query, schema: { type: string } }
+        - { name: authority, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer } }
+        - { name: offset, in: query, schema: { type: integer } }
+      responses: { "200": { description: Sources. } }
+  /v1/sources/{source_id}:
+    get:
+      tags: [Registry]
+      summary: Get a source, including superseded ones (kept for reproducibility)
+      operationId: getSource
+      parameters: [{ name: source_id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: The source. }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/interpretations/{interpretation_id}:
+    get:
+      tags: [Registry]
+      summary: Get an interpretation record and its cited sources
+      operationId: getInterpretation
+      parameters: [{ name: interpretation_id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: The record. }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/packs:
+    get: { tags: [Packs], summary: List jurisdiction packs, operationId: listPacks, responses: { "200": { description: Packs. } } }
+  /v1/packs/{pack_ref}:
+    get:
+      tags: [Packs]
+      summary: Get a pack identity
+      operationId: getPack
+      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string, example: jur.gb.tax.core } }]
+      responses: { "200": { description: The pack. }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/packs/{pack_ref}/versions:
+    get:
+      tags: [Packs]
+      summary: List versions of a pack
+      operationId: listPackVersions
+      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: Versions. }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/packs/{pack_ref}/versions/{version}:
+    get:
+      tags: [Packs]
+      summary: Get one pack version with its manifest and digest
+      operationId: getPackVersion
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string, example: "2026.08.1" } }
+      responses: { "200": { description: The version. }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/rules/{jurisdiction_rule_id}/provenance:
+    get:
+      tags: [Registry]
+      summary: Get a rule's regime, interpretation, precedence, supersedes link and sources
+      operationId: getRuleProvenance
+      parameters: [{ $ref: '#/components/parameters/RuleID' }]
+      responses: { "200": { description: Provenance. }, "404": { $ref: '#/components/responses/NotFound' } }
+
+  /v1/admin/regimes:
+    post:
+      tags: [Admin, Registry]
+      summary: Create a regime (idempotent by code; a different name is 409)
+      description: "Action REGULATORY_REGIME_CREATE. Body: regime_code, regime_name, description?."
+      operationId: createRegime
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      responses:
+        "200": { description: Already existed. }
+        "201": { description: Created. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "409": { description: Same code, different name. }
+  /v1/admin/sources:
+    post:
+      tags: [Admin, Registry]
+      summary: Capture a regulatory source with its snapshot hash
+      description: |
+        Action REGULATORY_SOURCE_CREATE. A source is evidence: `snapshot_hash`
+        (sha256:<64 hex>) is mandatory so the reviewed text can be identified later
+        (JUR-NEG-06). Idempotent on (jurisdiction, authority, snapshot_hash); the same
+        hash with a different title/location/type/level is 409. Captured content is
+        immutable (database trigger); only review and supersede links can be added.
+      operationId: createSource
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      responses:
+        "200": { description: Identical capture already recorded. }
+        "201": { description: Captured. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { description: Unknown jurisdiction. }
+        "409": { description: Hash collision with different attributes. }
+  /v1/admin/sources/{source_id}/review:
+    post:
+      tags: [Admin, Registry]
+      summary: Record the independent source review (once)
+      description: "Action REGULATORY_SOURCE_REVIEW. The reviewer must not be the author (403 segregation_of_duties); a second different reviewer is 409."
+      operationId: reviewSource
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: source_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Reviewed (or the same reviewer replaying). }, "403": { $ref: '#/components/responses/Forbidden' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Already reviewed by someone else. } }
+  /v1/admin/sources/{source_id}/supersede:
+    post:
+      tags: [Admin, Registry]
+      summary: Link a source to its replacement; the old record is preserved
+      description: "Action REGULATORY_SOURCE_SUPERSEDE. Body: replacement_source_id."
+      operationId: supersedeSource
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: source_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Superseded. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Already superseded by another source. } }
+  /v1/admin/interpretations:
+    post:
+      tags: [Admin, Registry]
+      summary: Record a PENDING interpretation citing at least one live source
+      description: "Action INTERPRETATION_RECORD_CREATE. Body: jurisdiction_id, regime_id?, subject, decision, rationale, source_ids[]."
+      operationId: createInterpretation
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "201": { description: Recorded as PENDING. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { $ref: '#/components/responses/Forbidden' } }
+  /v1/admin/interpretations/{interpretation_id}/approve:
+    post:
+      tags: [Admin, Registry]
+      summary: Approve an interpretation (qualified human, not the author)
+      description: |
+        Action INTERPRETATION_RECORD_APPROVE. The approver must differ from the author
+        (403 segregation_of_duties) and every cited source must be independently
+        reviewed and not superseded (409 source_not_ready). Approved records are
+        immutable. AI-proposed content cannot become authoritative without this step (JUR-NEG-18).
+      operationId: approveInterpretation
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: interpretation_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Approved (or the same approver replaying). }, "403": { $ref: '#/components/responses/Forbidden' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Source not ready, or already approved by someone else. } }
+  /v1/admin/packs:
+    post:
+      tags: [Admin, Packs]
+      summary: Register a pack identity (idempotent by pack_ref)
+      description: "Action JURISDICTION_PACK_CREATE. Body: pack_ref (jur.gb.tax.core), pack_name, owner, support_owner?."
+      operationId: createPack
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Already existed. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Same ref, different attributes. } }
+  /v1/admin/packs/{pack_ref}/versions:
+    post:
+      tags: [Admin, Packs]
+      summary: Draft a pack version from a manifest (the request body IS the manifest)
+      description: |
+        Action JURISDICTION_PACK_VERSION_CREATE. The manifest carries pack_id,
+        pack_version, jurisdiction_ids (codes), regimes (codes), effective_from/to,
+        dependencies and schema_dependencies (each pinned to an exact version),
+        source_register_version, rule_modules (rule ids). Status, digests and
+        signature are server-owned: a manifest that includes them is rejected.
+        The server stores the version as DRAFT with the sha256 of the canonical
+        manifest. Versions must strictly increase (numeric order). Replaying
+        identical content is 200; different content under an existing version is 409
+        (JUR-NEG-20). Signing, artifact digest and certification arrive in later waves.
+      operationId: createPackVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Identical version already drafted. }, "201": { description: Drafted. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Version collision or not newer. } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/submit-review:
+    post:
+      tags: [Admin, Packs]
+      summary: Move a DRAFT version to REVIEW (content freezes)
+      description: "Action JURISDICTION_PACK_VERSION_SUBMIT. Later states require the compiler and certification harness; the database forbids skipping them."
+      operationId: submitPackVersion
+      security: [{ principalHeader: [] }]
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/PrincipalID' }
+      responses: { "200": { description: In REVIEW (or already was). }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Past DRAFT in another direction. } }
+  /v1/admin/rules/{jurisdiction_rule_id}/provenance:
+    put:
+      tags: [Admin, Registry]
+      summary: Replace the provenance of a DRAFT rule
+      description: |
+        Action JURISDICTION_RULE_SET_PROVENANCE. Body: regime_id?, interpretation_id?,
+        supersedes_rule_id?, precedence?, published_on?, source_ids[]. Full replacement.
+        The interpretation must be APPROVED and belong to the rule's jurisdiction or an
+        ancestor; supersedes_rule_id must be an earlier version of the same rule code.
+        A rule past DRAFT is immutable (409 not_draft).
+      operationId: setRuleProvenance
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RuleID' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Provenance replaced. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Rule not DRAFT, or interpretation not approved. } }
+
+  # ── ZS-JUR-001 Wave 1: compiler, signing, verification, trusted keys ───────
+
+  /v1/admin/packs/{pack_ref}/versions/{version}/compile:
+    post:
+      tags: [Admin, Packs]
+      summary: Compile a REVIEW version into an unsigned, digest-pinned artifact
+      description: |
+        Action JURISDICTION_PACK_VERSION_COMPILE. Pure and reproducible: the artifact
+        contains no clock, so unchanged inputs give the same digest. Rule modules are
+        snapshotted with their sources and interpretations. Errors (422, body has the
+        report) include: rule without regime/source/approved interpretation, unreviewed or
+        superseded source, retired rule, overlapping rules with no declared precedence or
+        supersedes link (JUR-NEG-02), floating-point numbers in rule content (JUR-NEG-25),
+        self/missing/withdrawn/uncompiled dependency packs. Nothing is stored on error.
+        Replaying unchanged inputs is 200; changed inputs under the same version are 409
+        already_compiled (JUR-NEG-20). Mandatory test suites are NOT run here (Wave 3);
+        the report says so.
+      operationId: compilePackVersion
+      security: [{ principalHeader: [] }]
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/PrincipalID' }
+      responses:
+        "200": { description: Identical artifact already compiled. }
+        "201": { description: Compiled. }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409": { description: Not under REVIEW, or inputs changed since the artifact was compiled. }
+        "422": { description: Compile errors; the body carries the full report. }
+  /v1/admin/packs/{pack_ref}/versions/{version}/sign:
+    post:
+      tags: [Admin, Packs]
+      summary: Sign the compiled artifact digest (write-once)
+      description: |
+        Action JURISDICTION_PACK_VERSION_SIGN. Ed25519 over a domain-separated artifact
+        digest. The service signs only with its configured key, and only when that key is
+        registered, ACTIVE and has the same public key. 503 signing_not_configured when no
+        key file is configured; 503 signing_key_not_active otherwise. Signing again is a
+        no-op returning the original signature.
+      operationId: signPackVersion
+      security: [{ principalHeader: [] }]
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/PrincipalID' }
+      responses: { "200": { description: Signed (or already signed). }, "404": { $ref: '#/components/responses/NotFound' }, "503": { description: Signing unavailable. } }
+  /v1/packs/{pack_ref}/versions/{version}/artifact:
+    get:
+      tags: [Packs]
+      summary: Get the compiled artifact with its live verification verdict
+      operationId: getPackArtifact
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: "{artifact, verification}." }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/packs/{pack_ref}/versions/{version}/verify:
+    post:
+      tags: [Packs]
+      summary: Loader-facing verification; fails closed (JUR-NEG-03, JUR-NEG-04)
+      description: |
+        Action JURISDICTION_PACK_VERSION_VERIFY. Recomputes the artifact digest, compares
+        the recorded digests, and verifies the signature against the registered key
+        (ACTIVE or RETIRED verify; REVOKED does not). 200 only when verified; 409 with the
+        reasons otherwise, so a caller that ignores the body still fails closed. A failure
+        also emits jurisdiction-pack.verification-failed.
+      operationId: verifyPackArtifact
+      security: [{ principalHeader: [] }]
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/PrincipalID' }
+      responses: { "200": { description: Verified. }, "409": { description: Not verified; reasons in body. } }
+  /v1/pack-signing-keys:
+    get: { tags: [Registry], summary: List trusted signing PUBLIC keys, operationId: listSigningKeys, responses: { "200": { description: Keys. } } }
+  /v1/admin/pack-signing-keys:
+    post:
+      tags: [Admin, Registry]
+      summary: Register a trusted signing PUBLIC key
+      description: "Action PACK_SIGNING_KEY_REGISTER. Body: key_ref, public_key (base64 32-byte Ed25519), algorithm? (ED25519). A key_ref names one key forever (different key = 409). Private keys are never accepted or stored."
+      operationId: registerSigningKey
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Already registered. }, "201": { description: Registered. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: key_ref held by a different key. } }
+  /v1/admin/pack-signing-keys/{key_ref}/retire:
+    post:
+      tags: [Admin, Registry]
+      summary: Retire a key (stops signing; still verifies what it signed)
+      description: "Action PACK_SIGNING_KEY_RETIRE. Body: reason (required)."
+      operationId: retireSigningKey
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: key_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Retired (or already). }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Illegal status move. } }
+  /v1/admin/pack-signing-keys/{key_ref}/revoke:
+    post:
+      tags: [Admin, Registry]
+      summary: Revoke a compromised key (verification against it fails)
+      description: "Action PACK_SIGNING_KEY_REVOKE. Body: reason (required). Status only moves forward; never deleted."
+      operationId: revokeSigningKey
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: key_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Revoked (or already). }, "404": { $ref: '#/components/responses/NotFound' } }
+
+  # ── ZS-JUR-001 Wave 3: test harness, reviews, certification ─────────────────
+
+  /v1/admin/packs/{pack_ref}/versions/{version}/test-bundle:
+    post:
+      tags: [Admin, Packs]
+      summary: Append a test bundle revision (identical content is a no-op)
+      description: |
+        Action JURISDICTION_PACK_VERSION_AUTHOR_TESTS. Body: {bundle_version:"1", cases:[{id, class
+        (GOLDEN|BOUNDARY|HISTORICAL|NEGATIVE), description?, input:{jurisdiction, rule_domain, rule_code,
+        effective_at (RFC3339)}, expect:{outcome (RESOLVED|NO_RULE|UNSUPPORTED_JURISDICTION|AMBIGUOUS),
+        rule_id?, content_digest?}}]}. Only while the version is under REVIEW. Revisions are append-only.
+      operationId: submitTestBundle
+      security: [{ principalHeader: [] }]
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/PrincipalID' }
+      responses: { "200": { description: Identical to the latest revision. }, "201": { description: New revision. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Not under REVIEW. } }
+  /v1/packs/{pack_ref}/versions/{version}/test-bundle:
+    get:
+      tags: [Packs]
+      summary: Latest test bundle revision
+      operationId: getTestBundle
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: The bundle. }, "409": { description: No bundle submitted yet. } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/test-runs:
+    post:
+      tags: [Admin, Packs]
+      summary: Run the latest bundle against the compiled artifact
+      description: |
+        Action JURISDICTION_PACK_VERSION_EXECUTE_TESTS. Executes against the artifact ONLY (what is signed is
+        what is tested). The run is recorded whether it passes or fails (201 either way; see `passed`). A
+        run passes only if every case passes AND coverage is complete: a GOLDEN case per rule, BOUNDARY
+        cases at each rule's start, start-minus-1ns, end and end-minus-1ns, a HISTORICAL case for each
+        supersession, and a NEGATIVE case expecting UNSUPPORTED_JURISDICTION. Each gap names the exact
+        instant to add. The result lists the s22 classes that are NOT implemented.
+      operationId: runTests
+      security: [{ principalHeader: [] }]
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/PrincipalID' }
+      responses: { "201": { description: Run recorded. }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Not under REVIEW or no bundle. } }
+  /v1/packs/{pack_ref}/versions/{version}/test-runs:
+    get:
+      tags: [Packs]
+      summary: Test run history (newest first)
+      operationId: listTestRuns
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer } }
+      responses: { "200": { description: Runs. } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/reviews:
+    post:
+      tags: [Admin, Packs]
+      summary: Record an independent review of the compiled artifact
+      description: |
+        Action JURISDICTION_PACK_VERSION_REVIEW. Body: role (UPPER_SNAKE, e.g. TAX), decision
+        (APPROVE|REJECT), findings (required for REJECT). The reviewer must differ from the version author,
+        the compiler and every test author (403 segregation_of_duties; also enforced by trigger). The latest
+        decision per (reviewer, role) counts; a REJECT blocks certification until that reviewer changes it.
+      operationId: addReview
+      security: [{ principalHeader: [] }]
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/PrincipalID' }
+      responses: { "201": { description: Review recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Not under REVIEW / not compiled. } }
+  /v1/packs/{pack_ref}/versions/{version}/reviews:
+    get:
+      tags: [Packs]
+      summary: Full review history including rejections
+      operationId: listReviews
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Reviews. } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/certify:
+    post:
+      tags: [Admin, Packs]
+      summary: Certify a pack version (REVIEW to CERTIFIED), signed
+      description: |
+        Action JURISDICTION_PACK_VERSION_CERTIFY. Succeeds only when ALL hold: the artifact is compiled, signed and
+        verifies; the latest bundle was run against exactly this artifact and passed with complete coverage;
+        at least PACK_CERT_MIN_REVIEWS distinct independent reviewers approve and no latest decision is REJECT;
+        the certifier is independent of the author, compiler, test authors and every approving reviewer.
+        409 certification_blocked lists EVERY unmet gate. The certification report is signed with the service key;
+        with no signer configured the call is 503. It states which s22 classes were NOT run. The database
+        independently refuses a certification that violates any gate, and refuses CERTIFIED without one.
+        Re-certifying returns the original (200).
+      operationId: certifyPackVersion
+      security: [{ principalHeader: [] }]
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/PrincipalID' }
+      responses: { "200": { description: Already certified. }, "201": { description: Certified. }, "409": { description: certification_blocked, or not under REVIEW. }, "503": { description: Signing unavailable. } }
+  /v1/packs/{pack_ref}/versions/{version}/certification:
+    get:
+      tags: [Packs]
+      summary: The certification record with a live signature verdict
+      operationId: getCertification
+      parameters:
+        - { name: pack_ref, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: "{certification, verification}." }, "404": { $ref: '#/components/responses/NotFound' } }
+
+  # ── ZS-JUR-001 Wave 2: runtime rule resolution ──────────────────────────────
+
+  /v1/rule-resolutions:resolve:
+    post:
+      tags: [Resolver]
+      summary: Resolve which rule applies, from verified released pack artifacts
+      description: |
+        Action RULE_RESOLUTION_RESOLVE. Body: jurisdiction (a code: a FACT, not a conclusion), rule_domain,
+        rule_code, effective_at (RFC3339), pack_ref? (restrict to one pack), pack_version? (with pack_ref:
+        replay that exact version, for reproducing a past decision; WITHDRAWN/EMERGENCY_BLOCKED never resolve).
+        Optional header Idempotency-Key (scoped to the caller; same key + same request returns the same
+        decision with replayed=true; same key + different request is 409).
+
+        The server picks the pack: among RELEASED versions (configurable; CERTIFIED only outside
+        production) whose scope names the jurisdiction and whose window contains the instant, the highest
+        version per pack. Every consulted pack is verified first (artifact digest, recorded digests,
+        registered non-revoked key, signature, and the certification's own signature). If a covering pack
+        fails verification the answer is **503 pack_unverified**, never a different answer from an older
+        pack (JUR-NEG-03/04). Overlapping rules are decided only by declared precedence or supersedes;
+        otherwise AMBIGUOUS. Two packs defining the same rule for the same jurisdiction and instant is a
+        cross-pack conflict, also AMBIGUOUS (JUR-NEG-24). No eligible pack naming the jurisdiction is
+        UNSUPPORTED_JURISDICTION (JUR-NEG-22): nothing is guessed.
+
+        Every answer except 503 is recorded in the evidence ledger. HTTP: 200 RESOLVED or NO_RULE;
+        409 AMBIGUOUS; 422 UNSUPPORTED_JURISDICTION; 503 pack_unverified. The body is
+        {decision_id, replayed, decision{outcome, pack{pack_ref, version, artifact_digest, certification_id},
+        rule{...payload}, sources[], basis, considered_rule_ids[], packs_consulted[], explanation[]}}.
+
+        NOT BUILT: POST /jurisdiction-decisions:resolve (needs authoritative entity/counterparty/transaction
+        facts and place-of-supply rules) and POST /regulatory-calculations:execute (needs a rule formula
+        language). Neither is faked.
+      operationId: resolveRule
+      security: [{ principalHeader: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/PrincipalID' }
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }
+      responses:
+        "200": { description: RESOLVED or NO_RULE. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { description: Pinned pack version not found. }
+        "409": { description: AMBIGUOUS, idempotency_conflict, or pinned_pack_not_eligible. }
+        "422": { description: UNSUPPORTED_JURISDICTION. }
+        "503": { description: pack_unverified (fail closed) or authorization/store unavailable. }
+  /v1/rule-decisions/{decision_id}:
+    get:
+      tags: [Resolver]
+      summary: A recorded decision (the evidence of a past resolution)
+      description: "Action RULE_DECISION_VIEW. The stored response is exactly what the caller received."
+      operationId: getRuleDecision
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: decision_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: The decision. }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/pack-coverage:
+    get:
+      tags: [Resolver]
+      summary: Which eligible pack versions name a jurisdiction (read model, no legal conclusion)
+      operationId: packCoverage
+      parameters:
+        - { name: jurisdiction, in: query, required: true, schema: { type: string } }
+        - { name: effective_at, in: query, schema: { type: string, format: date-time } }
+      responses: { "200": { description: Packs naming the jurisdiction, with in_force. }, "400": { $ref: '#/components/responses/BadRequest' } }
+  /v1/admin/resolver-cache:invalidate:
+    post:
+      tags: [Admin, Resolver]
+      summary: Drop every cached pack so the next resolution re-reads and re-verifies
+      description: |
+        Action RESOLVER_CACHE_INVALIDATE. Verified artifacts are cached for RESOLVER_CACHE_TTL_SECONDS
+        (default 30, 0 = never). A key revocation or withdrawal takes effect within that bound; call this to
+        make it immediate. The cache is per process: with several replicas, invalidate each.
+      operationId: invalidateResolverCache
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Invalidated; cache counters in the body. }, "403": { $ref: '#/components/responses/Forbidden' } }
+
+  # ── ZS-JUR-001 Wave 7: release, rings, rollback, hotfix, source-change intake, metrics ──
+  # Every command below is its own authorization action. Refusals that depend on several gates answer
+  # 409 {"error":"operation_blocked","reasons":[...]} listing ALL unmet gates at once.
+
+  /v1/admin/deployment-regions:
+    post: { tags: [Admin, Rollout], summary: Register a deployment region (append-only), description: "Action DEPLOYMENT_REGION_CREATE. Body: region_code (lowercase), description?.", operationId: createRegion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' } } }
+  /v1/deployment-regions:
+    get: { tags: [Rollout], summary: List regions, operationId: listRegions, responses: { "200": { description: Regions. } } }
+  /v1/admin/deployment-rings:
+    post: { tags: [Admin, Rollout], summary: Define a rollout ring (append-only), description: "Action DEPLOYMENT_RING_CREATE. Body: ring_code, ordinal (>=1, unique), min_soak_seconds (time a version must have been active in THIS ring before the next), description?. Same code with different values is 409.", operationId: createRing, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "409": { description: Conflicting definition. } } }
+  /v1/deployment-rings:
+    get: { tags: [Rollout], summary: List rings in rollout order, operationId: listRings, responses: { "200": { description: Rings. } } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/publish:
+    post:
+      tags: [Admin, Packs]
+      summary: Release a CERTIFIED version (CERTIFIED to RELEASED)
+      description: |
+        Action JURISDICTION_PACK_VERSION_PUBLISH. Re-verifies the artifact and certification (never trusting an
+        earlier check), requires every registered-pack dependency to be RELEASED, and for a hotfix its rollback target
+        to be RELEASED. Optional body {evidence_ref}. RELEASED, WITHDRAWN and EMERGENCY_BLOCKED are reachable only
+        through these commands (database-enforced). Publishing again is a no-op.
+      operationId: publishPackVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Released (changed=true) or already released. }, "409": { description: Not CERTIFIED, or operation_blocked. } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/withdraw:
+    post:
+      tags: [Admin, Packs]
+      summary: "Withdraw a version: no new use, history stays resolvable"
+
+      description: "Action JURISDICTION_PACK_VERSION_WITHDRAW. Body: reason AND evidence_ref are required. Refused while another RELEASED version depends on it. Rolls its ACTIVE deployments back with the reason."
+      operationId: withdrawPackVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Withdrawn (or already). }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: In use by a released dependent, or wrong state. } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/block:
+    post: { tags: [Admin, Packs], summary: Emergency stop (RELEASED to EMERGENCY_BLOCKED), description: "Action JURISDICTION_PACK_VERSION_BLOCK. Body: reason (required). The resolver stops using it within its cache TTL.", operationId: blockPackVersion, security: [{ principalHeader: [] }], parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Blocked. }, "409": { description: Not RELEASED. } } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/unblock:
+    post: { tags: [Admin, Packs], summary: Return a blocked version to RELEASED after incident review, description: "Action JURISDICTION_PACK_VERSION_UNBLOCK. Body: reason (required). Re-verifies the version first.", operationId: unblockPackVersion, security: [{ principalHeader: [] }], parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Released again. }, "409": { description: Not blocked, or unverified. } } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/deploy:
+    post:
+      tags: [Admin, Packs]
+      summary: Deploy (promote) a RELEASED version to a ring and region
+      description: |
+        Action JURISDICTION_PACK_VERSION_DEPLOY. Body: ring, region, exception_reason?. Gates (all reported together):
+        the version re-verifies; the PREVIOUS ring has this version active in the same region for at least that ring's
+        min_soak_seconds with no runtime verification failure since it was deployed there; every registered-pack
+        dependency is ACTIVE in the same ring and region (JUR-NEG-15); a hotfix has its rollback target active here and two
+        independent approving reviewers (JUR-NEG-14). exception_reason skips ring order, is accepted ONLY for a
+        declared hotfix and ONLY from its incident commander, and is recorded. Nothing here measures business or
+        reconciliation health: there is no such signal in this service.
+      operationId: deployPackVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Already active there. }, "201": { description: Deployed. }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: operation_blocked or not RELEASED. } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/rollback:
+    post:
+      tags: [Admin, Packs]
+      summary: Roll a version back in one ring and region and restore an older release
+      description: |
+        Action JURISDICTION_PACK_VERSION_ROLLBACK. Body: ring, region, restore_version, reason (all required). The restore
+        version must be the same pack, strictly older, RELEASED, re-verify, and have been deployed in that scope before.
+        Rollback changes FUTURE resolution only (JUR-NEG-19): the response counts the decisions already made with the
+        rolled-back version in that scope, states that remediating them is a separate workflow (not built), and states that
+        no reconciliation was performed.
+      operationId: rollbackDeployment
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Rolled back and restored. }, "404": { description: No active deployment of that version there. }, "409": { description: operation_blocked. } }
+  /v1/packs/{pack_ref}/versions/{version}/deployments:
+    get: { tags: [Rollout], summary: Deployment history of a version, operationId: listDeployments, parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }], responses: { "200": { description: Deployments. } } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/hotfix:
+    post:
+      tags: [Admin, Packs]
+      summary: Declare an emergency hotfix (s24) before certification
+      description: |
+        Action JURISDICTION_PACK_VERSION_DECLARE_HOTFIX. Body: severity (P0|P1), scope_summary, incident_ref,
+        incident_commander, rollback_target_version (an older RELEASED version, named BEFORE promotion). Only while the
+        version is DRAFT or REVIEW, so the enhanced review always applies: certification then needs at least TWO independent
+        approving reviewers regardless of PACK_CERT_MIN_REVIEWS. Starts the retrospective clock (HOTFIX_RETRO_SLA_HOURS).
+      operationId: declareHotfix
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Identical declaration already exists. }, "201": { description: Declared. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Different declaration exists, wrong state, or invalid rollback target. } }
+  /v1/packs/{pack_ref}/versions/{version}/hotfix:
+    get: { tags: [Packs], summary: The hotfix record of a version, operationId: getHotfix, parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The hotfix. }, "404": { $ref: '#/components/responses/NotFound' } } }
+  /v1/admin/packs/{pack_ref}/versions/{version}/hotfix/retrospective:
+    post: { tags: [Admin, Packs], summary: Record the mandatory post-incident retrospective (once), description: "Action JURISDICTION_PACK_VERSION_COMPLETE_RETROSPECTIVE. Body: note (required). Overdue retrospectives appear in /v1/ops/metrics.", operationId: completeRetrospective, security: [{ principalHeader: [] }], parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Completed (or already). }, "404": { $ref: '#/components/responses/NotFound' } } }
+  /v1/admin/source-change-notices:
+    post:
+      tags: [Admin, SourceChange]
+      summary: Record that an authority's material may have changed (s29, s31)
+      description: |
+        Action SOURCE_CHANGE_NOTICE_CREATE. Body: authority, change_type (FUTURE_DATED_LAW, SCHEMA_OR_CODE_LIST_UPDATE,
+        CLARIFICATION, RETROACTIVE_CHANGE, AUTHORITY_PROCESS_CHANGE, SOURCE_WITHDRAWN, DISPUTED_INTERPRETATION), title,
+        jurisdiction_id?, location?, observed_hash?, affected_source_id?, detail?. It opens a CONTROLLED REVIEW and never
+        edits, activates or publishes a rule.
+      operationId: createNotice
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "201": { description: Recorded OPEN. }, "400": { $ref: '#/components/responses/BadRequest' } }
+  /v1/source-change-notices:
+    get: { tags: [SourceChange], summary: List notices (filter status=open|under_review|closed), operationId: listNotices, responses: { "200": { description: Notices. } } }
+  /v1/source-change-notices/{notice_id}:
+    get: { tags: [SourceChange], summary: Get a notice, operationId: getNotice, parameters: [{ name: notice_id, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The notice. }, "404": { $ref: '#/components/responses/NotFound' } } }
+  /v1/admin/source-change-notices/{notice_id}/review:
+    post: { tags: [Admin, SourceChange], summary: Take the notice for independent review, description: "Action SOURCE_CHANGE_NOTICE_REVIEW. The reviewer must differ from the author (403 segregation_of_duties).", operationId: startNoticeReview, security: [{ principalHeader: [] }], parameters: [{ name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Under review. }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Already reviewed by someone else. } } }
+  /v1/admin/source-change-notices/{notice_id}/close:
+    post: { tags: [Admin, SourceChange], summary: Close with a conclusion, description: "Action SOURCE_CHANGE_NOTICE_CLOSE. Only the assigned reviewer may close. Body: outcome (NO_CHANGE|INTERPRETATION_RECORDED|RULE_CHANGE_PLANNED|CAPABILITY_BLOCKED), note, linked_interpretation_id (required, and must be APPROVED, for INTERPRETATION_RECORDED). Changes no rule or pack.", operationId: closeNotice, security: [{ principalHeader: [] }], parameters: [{ name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Closed (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Different conclusion already recorded. } } }
+  /v1/ops/metrics:
+    get:
+      tags: [Ops]
+      summary: Regulatory operations feed (s29)
+      description: |
+        Action PACK_OPS_METRICS_VIEW. Query: window_hours, cert_age_warn_days, upcoming_days. Returns: resolutions by
+        outcome and by pack version, runtime verification failures, upcoming effective pack windows, deployment skew
+        between regions per pack and ring, released versions never deployed, certification age with a stale flag, versions
+        by status, open source-change notices and the oldest age, overdue hotfix retrospectives. `not_measured` lists
+        what this service cannot measure (historical replay drift, e-invoice/filing rejection rates, override usage,
+        deadline exceptions, and skew between running services). Data for a dashboard or alert; no UI exists.
+      operationId: opsMetrics
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: The feed. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { $ref: '#/components/responses/Forbidden' } }
+
+  # ── ZS-JUR-001 Wave 4 (calendar half): calendars, obligation rules, due-date calculation ──
+  # Calendar versions and obligation rules are authored as DRAFT, given source provenance, and PUBLISHED by a
+  # DIFFERENT principal; PUBLISHED is immutable (database-enforced) and an amendment is a new version. They reach
+  # runtime only inside signed, certified, released packs (manifest fields calendar_modules and obligation_modules).
+
+  /v1/admin/calendars:
+    post: { tags: [Admin, Calendar], summary: Register an authority calendar, description: "Action REGULATORY_CALENDAR_CREATE. Body: calendar_code (lowercase), jurisdiction_id, authority, description?. Same code with different jurisdiction or authority is 409.", operationId: createCalendar, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Conflicting definition. } } }
+  /v1/calendars:
+    get: { tags: [Calendar], summary: List calendars, operationId: listCalendars, responses: { "200": { description: Calendars. } } }
+  /v1/calendars/{calendar_code}:
+    get: { tags: [Calendar], summary: Get a calendar, operationId: getCalendar, parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The calendar. }, "404": { $ref: '#/components/responses/NotFound' } } }
+  /v1/calendars/{calendar_code}/versions:
+    get: { tags: [Calendar], summary: List versions with holidays and sources, operationId: listCalendarVersions, parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }], responses: { "200": { description: Versions. } } }
+    post:
+      tags: [Admin, Calendar]
+      summary: Draft the next calendar version
+      description: |
+        Action REGULATORY_CALENDAR_VERSION_CREATE. Body: effective_from (date), timezone (IANA), weekend_days (REQUIRED,
+        0=Sunday..6=Saturday; it differs between authorities so it is never defaulted), cutoff_time? (HH:MM authority-local),
+        holidays [{date, name}]. The version number is assigned by the server.
+      operationId: createCalendarVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "201": { description: Drafted. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/calendars/{calendar_code}/versions/{version}:
+    get: { tags: [Calendar], summary: One calendar version, operationId: getCalendarVersion, parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }], responses: { "200": { description: The version. }, "404": { $ref: '#/components/responses/NotFound' } } }
+  /v1/admin/calendars/{calendar_code}/versions/{version}/sources:
+    put: { tags: [Admin, Calendar], summary: Replace the official sources of a DRAFT version, description: "Action REGULATORY_CALENDAR_VERSION_SET_SOURCES. Body: source_ids[]. 409 not_draft once published.", operationId: setCalendarVersionSources, security: [{ principalHeader: [] }], parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Sources set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Not DRAFT. } } }
+  /v1/admin/calendars/{calendar_code}/versions/{version}/publish:
+    post:
+      tags: [Admin, Calendar]
+      summary: Publish (freeze) a calendar version
+      description: |
+        Action REGULATORY_CALENDAR_VERSION_PUBLISH. The publisher must differ from the author (403 segregation_of_duties,
+        also a database check); the version must cite at least one reviewed, non-superseded source (409 source_not_ready).
+        Emits jurisdiction.calendar.changed. An amended holiday list is a NEW version, never an edit (JUR-NEG-13).
+      operationId: publishCalendarVersion
+      security: [{ principalHeader: [] }]
+      parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready. } }
+  /v1/admin/obligation-rules:
+    post:
+      tags: [Admin, Obligations]
+      summary: Draft the next version of an obligation (due-date) rule
+      description: |
+        Action OBLIGATION_RULE_CREATE. Body: jurisdiction_id, obligation_code (UPPER_SNAKE), name, period_basis
+        (MONTHLY|QUARTERLY|ANNUAL|EVENT_DRIVEN|PAYROLL_CYCLE), anchor (PERIOD_END|EVENT_DATE|REGISTRATION_DATE|ANNIVERSARY),
+        offset_months, offset_to_month_end (move to the last day of that month: "end of next month + N days"), offset_days,
+        business_day_adjustment (NONE|NEXT|PREVIOUS; needs calendar_code), calendar_code?, effective_from, effective_to?,
+        extension_allowed, max_extension_days, extension_requires_evidence, cutoff_applies, escalation_owner?,
+        escalation_sla_hours?. rule_version is assigned by the server.
+        Order of operations (an assumption the document leaves open): anchor, plus months, optionally to month end, plus days,
+        plus a granted extension, then the business-day adjustment, then the authority-local cutoff.
+      operationId: createObligationRule
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "201": { description: Drafted. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' } }
+  /v1/obligation-rules:
+    get: { tags: [Obligations], summary: List obligation rules (filters jurisdiction_id, obligation_code), operationId: listObligationRules, responses: { "200": { description: Rules. } } }
+  /v1/obligation-rules/{obligation_rule_id}:
+    get: { tags: [Obligations], summary: Get an obligation rule, operationId: getObligationRule, parameters: [{ name: obligation_rule_id, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The rule. }, "404": { $ref: '#/components/responses/NotFound' } } }
+  /v1/admin/obligation-rules/{obligation_rule_id}/provenance:
+    put: { tags: [Admin, Obligations], summary: Set regime, interpretation and sources of a DRAFT rule, description: "Action OBLIGATION_RULE_SET_PROVENANCE. Body: regime_id, interpretation_id (must be APPROVED, in the rule's jurisdiction or an ancestor), source_ids[]. Full replacement.", operationId: setObligationProvenance, security: [{ principalHeader: [] }], parameters: [{ name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Not DRAFT, or interpretation not approved. } } }
+  /v1/admin/obligation-rules/{obligation_rule_id}/publish:
+    post: { tags: [Admin, Obligations], summary: Publish (freeze) an obligation rule, description: "Action OBLIGATION_RULE_PUBLISH. Publisher must differ from the author (403). Needs regime, an APPROVED interpretation, reviewed non-superseded sources, and an existing calendar when one is named.", operationId: publishObligationRule, security: [{ principalHeader: [] }], parameters: [{ name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready or interpretation_not_approved. } } }
+  /v1/obligation-calculations:calculate:
+    post:
+      tags: [Resolver]
+      summary: Derive an obligation's due date from verified released pack artifacts
+      description: |
+        Action OBLIGATION_CALCULATION_CALCULATE. Body: jurisdiction (code), obligation_code, ONE anchor fact (period_end,
+        event_date, registration_date, or anniversary_date with anchor_year), extension_days?, extension_evidence_ref?,
+        as_of? (adds an `overdue` verdict against the due instant), pack_ref?/pack_version? (replay a past calculation against
+        the exact pack release it used). Header Idempotency-Key as for rule resolution; as_of is not part of the question.
+
+        The pack, obligation rule version and calendar version are chosen by the server (the same eligibility, ring/region,
+        verification and fail-closed rules as /v1/rule-resolutions:resolve). A calendar amendment is a new pack release, so a
+        past calculation stays reproducible (JUR-NEG-13). The response carries every step, the pack release, the rule and
+        calendar versions, the sources and the escalation owner. Every answer except 503 is recorded in the evidence ledger.
+
+        HTTP: 200 DUE_DATE_CALCULATED or NO_OBLIGATION_RULE; 409 AMBIGUOUS (including two packs defining the same obligation)
+        or NO_CALENDAR; 422 UNSUPPORTED_JURISDICTION, INVALID_FACTS (for example a MONTHLY period_end that is not a month end)
+        or EXTENSION_NOT_PERMITTED (not legally supported, over the cap, or not evidenced); 503 pack_unverified.
+      operationId: calculateObligation
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      responses: { "200": { description: Calculated, or no obligation rule applies. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS, NO_CALENDAR or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  # ── ZS-JUR-001 Wave 4 (tax half): rule parameters and regulatory calculation ──
+  # DECISION: ZS-JUR-001 governs. Rates, thresholds and rounding live in a rule's typed `parameters`, frozen with the rule and
+  # carried in signed, tested, certified, released packs; they are executed with exact decimal arithmetic. `rule_payload` keeps
+  # its original meaning (applicability metadata only).
+
+  /v1/admin/rules/{jurisdiction_rule_id}/parameters:
+    put:
+      tags: [Admin, Rules]
+      summary: Set the typed calculation parameters of a DRAFT rule
+      description: |
+        Action JURISDICTION_RULE_SET_PARAMETERS. Body: {"parameters": {...}} (required; an explicit null clears them).
+        Two closed families, decimal STRINGS only (a JSON number is refused: JUR-NEG-25):
+        TAX_RATE {"family":"TAX_RATE","rate":"0.2000","rounding":{"mode":"HALF_UP","scale":2}} and
+        TAX_BANDS {"family":"TAX_BANDS","bands":[{"up_to":"12570","rate":"0"},{"up_to":"50270","rate":"0.2"},{"up_to":null,"rate":"0.4"}],
+        "rounding":{...}} (marginal bands; limits strictly increasing and inclusive; the last band must have up_to null).
+        Rates are 0 to 1. Rounding mode HALF_UP, HALF_EVEN, UP or DOWN, scale 0 to 6, applied ONCE to the total.
+        409 not_draft once the rule leaves DRAFT; the database also refuses any change then.
+      operationId: setRuleParameters
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/RuleID' }, { $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Set (or cleared). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Not DRAFT. } }
+  /v1/rules/{jurisdiction_rule_id}/parameters:
+    get: { tags: [Rules], summary: A rule's typed calculation parameters (null when none), operationId: getRuleParameters, parameters: [{ $ref: '#/components/parameters/RuleID' }], responses: { "200": { description: The parameters. }, "404": { $ref: '#/components/responses/NotFound' } } }
+  /v1/regulatory-calculations:execute:
+    post:
+      tags: [Resolver]
+      summary: Calculate tax from the applicable rule's parameters (exact decimal arithmetic)
+      description: |
+        Action REGULATORY_CALCULATION_EXECUTE. Body: jurisdiction, rule_domain, rule_code, effective_at, taxable_amount (a
+        non-negative decimal STRING, at most 12 decimal places; "1e3", "-5" and "1." are refused), currency (three upper-case letters;
+        echoed, not validated against a registry), pack_ref?/pack_version? (replay against the exact pack release a past calculation
+        used). Header Idempotency-Key as for rule resolution.
+
+        The rule is resolved exactly as in /v1/rule-resolutions:resolve (verified released pack, fail closed), then its parameters are
+        applied with exact rational arithmetic and ONE rounding step. The response carries the resolution (pack release, rule, sources),
+        the tax (taxable amount, tax amount, unrounded tax, whether rounding changed it) and every step. Every answer except 503 is
+        recorded as evidence (decision_kind CALCULATION): inputs, steps, result, rule and pack versions (s12).
+
+        HTTP: 200 CALCULATED or NO_RULE; 409 AMBIGUOUS; 422 UNSUPPORTED_JURISDICTION, NO_PARAMETERS (the rule carries no parameters:
+        no rate is ever guessed) or INVALID_FACTS; 503 pack_unverified. A rate quietly altered in storage cannot be served: the artifact
+        digest and signature fail and there is no answer instead of a wrong tax.
+
+        Certification: a rule that carries parameters needs calculation coverage in its test bundle: a GOLDEN calculation case
+        (JUR-T020), a BOUNDARY case at exactly each finite band limit (JUR-T021), a BOUNDARY case whose result is actually rounded
+        (JUR-T022), and a NEGATIVE case in which an unsupported amount is refused (JUR-T023).
+      operationId: executeCalculation
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      responses: { "200": { description: Calculated, or no rule applies. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/payroll-statutory-parameters:resolve:
+    post:
+      tags: [Resolver]
+      summary: Resolve the statutory payroll parameter set in force (allowances, withholding bands, contributions)
+      description: |
+        Action PAYROLL_PARAMETERS_RESOLVE. Body: jurisdiction, effective_at (pay date), classes? (INCOME_WITHHOLDING, EMPLOYEE_CONTRIBUTION,
+        EMPLOYER_CONTRIBUTION, ALLOWANCE_OR_THRESHOLD, STATUTORY_PAY_LEAVE), pack_ref?/pack_version? (pinned replay). Header Idempotency-Key.
+
+        Returns every PAYROLL rule in force from verified, certified, released packs with its typed parameters, class, sources and content
+        digest, ordered by class then code, plus a bundle_digest over the whole set. The payroll product consumes the parameters; payroll
+        CALCULATION is not done here. If any rule code is ambiguous across packs the answer is AMBIGUOUS with NO items (never a partial set).
+        Recorded as evidence (decision_kind PARAMETER_SET, anchored on the bundle digest).
+
+        HTTP: 200 PARAMETERS_RESOLVED or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION; 503 pack_unverified.
+      operationId: resolvePayrollParameters
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      responses: { "200": { description: Parameter set, or no rule applies. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: UNSUPPORTED_JURISDICTION. }, "503": { description: pack_unverified. } }
+
+  /v1/retention-rules:resolve:
+    post:
+      tags: [Resolver]
+      summary: Resolve a record class's statutory retention period and retain-until date
+      description: |
+        Action RETENTION_RULE_RESOLVE. Body: jurisdiction, record_class, trigger_date (YYYY-MM-DD; the rule in force on that date applies),
+        trigger? (the event the caller measures from; a mismatch is refused), tenant_minimum? ({years, months, days}), pack_ref?/pack_version?.
+        Header Idempotency-Key.
+
+        Returns the statutory minimum (ISO 8601), retain_until, format requirement, legal_hold_override (always true) and destruction_rule
+        (always ELIGIBILITY_ONLY: this service decides eligibility and NEVER deletes). A tenant policy may extend retention but never
+        shorten it (TENANT_POLICY_TOO_SHORT, JUR-NEG-12). Recorded as evidence (decision_kind RETENTION).
+
+        HTTP: 200 RETENTION_RESOLVED or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION, TENANT_POLICY_TOO_SHORT,
+        TRIGGER_MISMATCH or NO_PARAMETERS; 503 pack_unverified.
+      operationId: resolveRetention
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      responses: { "200": { description: Retention determined, or no rule applies. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/accounting-mappings:resolve:
+    post:
+      tags: [Resolver]
+      summary: Resolve an accounting or reporting mapping (classification only; never posts)
+      description: |
+        Action ACCOUNTING_MAPPING_RESOLVE. Body: jurisdiction, mapping_code, effective_at, from? (one code to look up; omitted returns the whole
+        mapping), pack_ref?/pack_version?. Header Idempotency-Key. Mapping types: TAX_CODE_TO_ACCOUNT_CLASS, STATUTORY_LINE_TO_METRIC,
+        REPORTING_TAXONOMY, DISCLOSURE_REQUIREMENT, CONTROL_ACCOUNT_CLASS. An unmapped code is MAPPING_ENTRY_NOT_FOUND: nothing is guessed.
+        The Accounting Kernel remains the only posting authority. Recorded as evidence (decision_kind MAPPING).
+
+        HTTP: 200 MAPPING_RESOLVED or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION, MAPPING_ENTRY_NOT_FOUND
+        or NO_PARAMETERS; 503 pack_unverified.
+      operationId: resolveAccountingMapping
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      responses: { "200": { description: Mapping resolved, or no rule applies. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/submission-profiles:resolve:
+    post:
+      tags: [Resolver]
+      summary: Resolve the e-invoice or filing profile in force, and check the dependencies a payload was built with
+      description: |
+        Action SUBMISSION_PROFILE_RESOLVE. Body: jurisdiction, kind (EINVOICE or FILING), profile_code, effective_at, dependencies_used? ([{ref, version}]
+        schema, code-list and business-rule versions the payload was built with), pack_ref?/pack_version?. Header Idempotency-Key.
+
+        Returns the profile (channel, document type, version, syntax, transmission mode, timing, corrections, dependencies with validity windows,
+        semantic mapping or filing obligation, lifecycle) from the verified released pack. A used dependency the profile does not declare is
+        DEPENDENCY_UNKNOWN, and one outside its validity window is DEPENDENCY_EXPIRED; both name the exact reference and version (JUR-NEG-08, 27).
+        No endpoint, credential or certificate is ever part of a profile. Recorded as evidence (decision_kind PROFILE).
+
+        HTTP: 200 PROFILE_RESOLVED or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION, DEPENDENCY_UNKNOWN,
+        DEPENDENCY_EXPIRED or NO_PARAMETERS; 503 pack_unverified.
+      operationId: resolveSubmissionProfile
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      responses: { "200": { description: Profile resolved, or no rule applies. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/regulatory-submissions:
+    post:
+      tags: [Resolver]
+      summary: Register an e-invoice or filing submission under the profile in force
+      description: |
+        Action REGULATORY_SUBMISSION_CREATE. Body as /v1/submission-profiles:resolve plus subject_ref (the invoice or filing in the caller's system),
+        payload_hash (sha256:<64 hex>) and, for filings, approvals ([{role, principal_id}]). Header Idempotency-Key.
+
+        Registers nothing, and returns the refusal with its outcome, when a dependency is unknown or expired, or when a filing lacks an approval for
+        every role its profile requires from a principal other than the preparer and the other approvers (APPROVAL_MISSING). A registered submission
+        snapshots the profile (so a later pack release cannot change an in-flight lifecycle), the pack release and the artifact digest. This service
+        does not transmit anything: adapters, endpoints and credentials belong to the provider layer.
+
+        HTTP: 201 registered, 200 idempotent repeat; 409 AMBIGUOUS or idempotency_conflict; 422 refusal; 503 pack_unverified.
+      operationId: registerSubmission
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      responses: { "200": { description: Idempotent repeat. }, "201": { description: Registered. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
+
+  /v1/regulatory-submissions/{submission_id}:
+    get:
+      tags: [Resolver]
+      summary: Read a submission with every status report it received
+      description: Action REGULATORY_SUBMISSION_VIEW.
+      operationId: getSubmission
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: submission_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "200": { description: The submission and its events. }, "404": { description: submission_not_found. } }
+
+  /v1/regulatory-submissions/{submission_id}/events:
+    post:
+      tags: [Resolver]
+      summary: Record an authority or provider status report
+      description: |
+        Action REGULATORY_SUBMISSION_RECORD_EVENT. Body: provider_event_id (the provider's own id; a repeat is stored once), status (UPPER_SNAKE),
+        receipt_id? (required to enter a state the profile marks receipt_required, such as ACCEPTED), occurred_at, detail?.
+
+        Always 200 once stored: the body says whether the report changed the status (applied) and why not otherwise (disposition), so a webhook
+        caller is not pushed into retries by a late or duplicate report. Dispositions: APPLIED; STALE (older than the last applied report);
+        AFTER_TERMINAL (the submission already reached a final outcome: no regression, JUR-NEG-11); ILLEGAL_TRANSITION (not in the profile's
+        lifecycle); MISSING_RECEIPT (no false accepted state, JUR-NEG-09); UNKNOWN_STATUS. A duplicate provider_event_id returns the stored result
+        with replayed true (JUR-NEG-10). Every report is append-only evidence.
+      operationId: recordSubmissionEvent
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: submission_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "200": { description: Report stored (see applied and disposition). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: submission_not_found. } }
+
+  /v1/admin/rollouts:
+    post:
+      tags: [Rollout]
+      summary: Add a jurisdiction pack family to the rollout portfolio (PLANNED)
+      description: |
+        Action JURISDICTION_ROLLOUT_CREATE. Body: family_ref (for example gb or us.state.ca), display_name, layer (GLOBAL_REFERENCE, GLOBAL_CORE,
+        REGIONAL_FRAMEWORK, COUNTRY, SUBDIVISION), jurisdiction_code (required for COUNTRY and SUBDIVISION), owner, support_owner?, scope_note?.
+        Naming a family here does NOT mean certified rules exist for it (s32).
+      operationId: createRollout
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: One rollout per family_ref. } }
+    get:
+      tags: [Rollout]
+      summary: List rollouts (optional status filter)
+      description: Action JURISDICTION_ROLLOUT_VIEW.
+      operationId: listRollouts
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: status, in: query, required: false, schema: { type: string, enum: [PLANNED, AUTHORING, READY, LAUNCHED, SUSPENDED, RETIRED] } }]
+      responses: { "200": { description: Rollouts. } }
+
+  /v1/admin/rollouts:seed-portfolio:
+    post:
+      tags: [Rollout]
+      summary: Seed the s32 initial portfolio as PLANNED entries with no owner (idempotent)
+      description: Action JURISDICTION_ROLLOUT_SEED. States intent only; a PLANNED entry is not support.
+      operationId: seedRolloutPortfolio
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: Counts of created and already present entries. } }
+
+  /v1/admin/rollouts/{rollout_id}:
+    get:
+      tags: [Rollout]
+      summary: A rollout with its checklist state, expert decisions, packs, history and what blocks each next step
+      description: Action JURISDICTION_ROLLOUT_VIEW.
+      operationId: getRollout
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "200": { description: Detail. }, "404": { description: rollout_not_found. } }
+
+  /v1/admin/rollouts/{rollout_id}/owner:
+    put:
+      tags: [Rollout]
+      summary: Assign the accountable owner and support owner (DOR_09)
+      description: Action JURISDICTION_ROLLOUT_SET_OWNER. A principal who already attested to or approved the rollout cannot become its owner. Not allowed once LAUNCHED or RETIRED.
+      operationId: setRolloutOwner
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "200": { description: Updated. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties. }, "404": { description: rollout_not_found. } }
+
+  /v1/admin/rollouts/{rollout_id}/packs:
+    put:
+      tags: [Rollout]
+      summary: Link the packs that make up the rollout (additive, idempotent)
+      description: Action JURISDICTION_ROLLOUT_LINK_PACKS. Body pack_refs (1 to 50).
+      operationId: linkRolloutPacks
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "200": { description: Linked pack refs. }, "404": { description: rollout_not_found or pack_not_found. } }
+
+  /v1/admin/rollouts/{rollout_id}/attestations:
+    post:
+      tags: [Rollout]
+      summary: Record a Definition of Ready (DOR_01..10) or Definition of Done (DOD_01..11) answer
+      description: |
+        Action JURISDICTION_ROLLOUT_ATTEST. Body: checklist (READY or DONE), item_code, met, evidence_ref (required when met). The attester cannot be the
+        rollout owner. Append-only: the latest answer for an item is current, so an item can be withdrawn by recording met false.
+      operationId: attestRollout
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "201": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties. }, "404": { description: rollout_not_found. } }
+
+  /v1/admin/rollouts/{rollout_id}/expert-approvals:
+    post:
+      tags: [Rollout]
+      summary: Record a qualified local expert, legal or tax decision
+      description: Action JURISDICTION_ROLLOUT_EXPERT_APPROVE. Body: qualification, scope, decision (APPROVE or REJECT), notes?. The expert cannot be the rollout owner. An expert's latest decision counts.
+      operationId: expertApproveRollout
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "201": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties. }, "404": { description: rollout_not_found. } }
+
+  /v1/admin/rollouts/{rollout_id}/transition:
+    post:
+      tags: [Rollout]
+      summary: Move a rollout (AUTHORING, READY, LAUNCHED, SUSPENDED, RETIRED)
+      description: |
+        Action JURISDICTION_ROLLOUT_TRANSITION. Body: to, reason (required for SUSPENDED, RETIRED and for READY back to AUTHORING).
+        READY needs the whole Definition of Ready. LAUNCHED additionally needs the whole Definition of Done, at least one approving qualified expert, a linked pack with a
+        RELEASED version, and a launcher who is neither the owner nor an expert on the rollout. A refused move returns 409 with EVERY blocker. The database enforces the same gates.
+      operationId: transitionRollout
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { "200": { description: Moved. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: rollout_not_found. }, "409": { description: rollout_blocked, with blockers. } }
+
+  /v1/rollout-checklists:
+    get:
+      tags: [Rollout]
+      summary: The Definition of Ready (s35) and Definition of Done (s36) items
+      description: Action JURISDICTION_ROLLOUT_VIEW.
+      operationId: rolloutChecklists
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      responses: { "200": { description: The two checklists. } }
+
+  /v1/jurisdiction-support/{jurisdiction_code}:
+    get:
+      tags: [Rollout]
+      summary: Is this jurisdiction supported for production? (never guesses)
+      description: |
+        Action JURISDICTION_SUPPORT_VIEW. SUPPORTED only when a LAUNCHED rollout names the jurisdiction AND a linked pack has a RELEASED version covering it. Otherwise
+        NOT_YET_SUPPORTED, SUSPENDED, NO_RELEASED_PACK (launched but nothing released covers it, for example after a withdrawal) or NO_ROLLOUT, each with an explanation (JUR-NEG-22).
+        Matches the rollout's jurisdiction_code exactly: a subdivision is not supported because its country is.
+      operationId: jurisdictionSupport
+      security: [{ principalHeader: [] }]
+      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: jurisdiction_code, in: path, required: true, schema: { type: string, maxLength: 32 } }]
+      responses: { "200": { description: Support status. } }
 
   # ── Health ─────────────────────────────────────────────────────────────────
 
