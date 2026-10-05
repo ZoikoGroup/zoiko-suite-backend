@@ -62,6 +62,16 @@ const (
 	DispositionRead      = "AI_OUTPUT_DISPOSITION_READ"
 	DispositionDecide    = "AI_OUTPUT_DISPOSITION_DECIDE"
 	DispositionSupersede = "AI_OUTPUT_DISPOSITION_SUPERSEDE"
+
+	// AIG-05
+	EvaluationCreate  = "AI_EVALUATION_CREATE"
+	EvaluationRead    = "AI_EVALUATION_READ"
+	IncidentReport    = "AI_INCIDENT_REPORT"
+	IncidentRead      = "AI_INCIDENT_READ"
+	IncidentContain   = "AI_INCIDENT_CONTAIN"
+	IncidentResolve   = "AI_INCIDENT_RESOLVE"
+	IncidentClose     = "AI_INCIDENT_CLOSE"
+	ReleaseReactivate = "AI_MODEL_RELEASE_REACTIVATE"
 )
 
 type AuthzChecker interface {
@@ -226,6 +236,18 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/decide", h.DecideDisposition)
 		r.Post("/{id}/supersede", h.SupersedeDisposition)
 	})
+	r.Route("/v1/ai/evaluations", func(r chi.Router) {
+		r.Post("/", h.CreateEvaluation)
+		r.Get("/{id}", h.GetEvaluation)
+	})
+	r.Route("/v1/ai/incidents", func(r chi.Router) {
+		r.Post("/", h.ReportIncident)
+		r.Get("/{id}", h.GetIncident)
+		r.Post("/{id}/contain", h.ContainIncident)
+		r.Post("/{id}/resolve", h.ResolveIncident)
+		r.Post("/{id}/close", h.CloseIncident)
+	})
+	r.Post("/v1/ai/model-releases/{id}/reactivate", h.ReactivateRelease)
 }
 
 // CreateAIRun records doc7 §G1's AI run/recommendation object. No authz gate

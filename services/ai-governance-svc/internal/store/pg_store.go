@@ -73,6 +73,16 @@ type Store interface {
 	GetDisposition(ctx context.Context, dispositionID string) (*domain.OutputDisposition, error)
 	DecideDisposition(ctx context.Context, dispositionID string, req domain.DecideDispositionRequest, reviewer string) (*domain.OutputDisposition, error)
 	SupersedeDisposition(ctx context.Context, dispositionID string, req domain.SupersedeDispositionRequest, actor string) (*domain.OutputDisposition, error)
+
+	// AIG-05: Evaluation, Monitoring, Incident & Change Governance (additive; platform-wide, no tenant_id).
+	CreateEvaluation(ctx context.Context, req domain.CreateEvaluationRequest, actor string) (*domain.AIEvaluation, error)
+	GetEvaluation(ctx context.Context, evaluationID string) (*domain.AIEvaluation, error)
+	ReportIncident(ctx context.Context, req domain.ReportIncidentRequest, actor string) (*domain.AIIncident, error)
+	GetIncident(ctx context.Context, incidentID string) (*domain.AIIncident, error)
+	ContainIncident(ctx context.Context, incidentID string, req domain.ContainIncidentRequest) (*domain.AIIncident, error)
+	ResolveIncident(ctx context.Context, incidentID string, req domain.ResolveIncidentRequest) (*domain.AIIncident, error)
+	CloseIncident(ctx context.Context, incidentID string, req domain.CloseIncidentRequest, actor string) (*domain.AIIncident, error)
+	ReactivateRelease(ctx context.Context, modelReleaseID string, req domain.ReactivateReleaseRequest, actor string) (*domain.AIModelRelease, error)
 }
 
 type PgStore struct {
@@ -1117,8 +1127,12 @@ func (s *PgStore) UnrestrictRelease(ctx context.Context, modelReleaseID string, 
 	return s.transitionRelease(ctx, modelReleaseID, []domain.ReleaseState{domain.ReleaseRestricted}, domain.ReleaseActive, nil, "")
 }
 
+// QuarantineRelease is reachable from ACTIVE or RESTRICTED — AIG-05's
+// migration 000006 extended the trigger so a restricted release that
+// then has a critical (AI-P0) incident can still be quarantined
+// directly, matching the doc's "immediate kill switch" requirement.
 func (s *PgStore) QuarantineRelease(ctx context.Context, modelReleaseID string, req domain.AdvanceReleaseRequest, actor string) (*domain.AIModelRelease, error) {
-	return s.transitionRelease(ctx, modelReleaseID, []domain.ReleaseState{domain.ReleaseActive}, domain.ReleaseQuarantined, req.ControlEvidence, req.Reason)
+	return s.transitionRelease(ctx, modelReleaseID, []domain.ReleaseState{domain.ReleaseActive, domain.ReleaseRestricted}, domain.ReleaseQuarantined, req.ControlEvidence, req.Reason)
 }
 
 func (s *PgStore) RetireRelease(ctx context.Context, modelReleaseID string, req domain.AdvanceReleaseRequest, actor string) (*domain.AIModelRelease, error) {
