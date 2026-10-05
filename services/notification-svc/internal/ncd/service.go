@@ -60,6 +60,9 @@ type Service struct {
 	log       *zap.Logger
 	now       func() time.Time
 	kick      chan struct{}
+	// metrics records §13.1 signals; never nil (noMetrics until SetMetrics).
+	metrics     Metrics
+	lastBacklog time.Time
 }
 
 // NewService wires the plane.
@@ -70,7 +73,14 @@ func NewService(store Store, recipient RecipientResolver, transport Transport, l
 	return &Service{
 		store: store, recipient: recipient, transport: transport, limits: limits, log: log,
 		now:  func() time.Time { return time.Now().UTC() },
-		kick: make(chan struct{}, 1),
+		kick: make(chan struct{}, 1), metrics: noMetrics{},
+	}
+}
+
+// SetMetrics attaches the operational metrics recorder (§13.1).
+func (s *Service) SetMetrics(m Metrics) {
+	if m != nil {
+		s.metrics = m
 	}
 }
 

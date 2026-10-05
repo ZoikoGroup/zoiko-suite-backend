@@ -43,6 +43,24 @@ type Config struct {
 	// gateway — tokens cannot be generated or verified without it.
 	ActionTokenSecret string
 
+	// UnsubscribeSecret keys the one-click unsubscribe tokens of RFC 8058
+	// (internal/unsubscribe; ZS-SVC-Y-001 §11.1, INV-25). At least 32 bytes,
+	// from NOTIFICATION_UNSUBSCRIBE_SECRET. Empty means no unsubscribe link can
+	// be issued, and the service then refuses to send marketing mail at all
+	// rather than send it without one.
+	UnsubscribeSecret string
+
+	// DKIM signs outbound mail and arms the NP-55 sender-authentication
+	// monitor (internal/senderauth; ZS-SVC-Y-001 §11.1). All three of
+	// NOTIFICATION_DKIM_DOMAIN, _SELECTOR and _PRIVATE_KEY (PEM, from the
+	// secret store; literal "\n" sequences are accepted for one-line env
+	// files) are needed; none set means the provider is expected to sign.
+	DKIMDomain     string
+	DKIMSelector   string
+	DKIMPrivateKey string
+	// SenderAuthCheckInterval is how often the monitor re-reads DNS.
+	SenderAuthCheckInterval time.Duration
+
 	// SecondaryEmail is an optional failover SMTP provider. When configured,
 	// the router fails over to it after a transient primary failure (§13 P1-12).
 	// All secondary vars default to empty (disabled).
@@ -185,6 +203,14 @@ func (c *Config) ActionLinkBaseURL() string {
 	return env("ACTION_LINK_BASE_URL", "")
 }
 
+// PublicBaseURL is the externally reachable origin mail clients POST
+// one-click unsubscribes to: NOTIFICATION_PUBLIC_BASE_URL, falling back to
+// ACTION_LINK_BASE_URL. It must be absolute, because a List-Unsubscribe URI
+// cannot be relative. It replaces a host that used to be hard-coded.
+func (c *Config) PublicBaseURL() string {
+	return env("NOTIFICATION_PUBLIC_BASE_URL", c.ActionLinkBaseURL())
+}
+
 func Load() (*Config, error) {
 	cfg := &Config{
 		Env:  env("ENV", "local"),
@@ -243,7 +269,12 @@ func Load() (*Config, error) {
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 
-		ActionTokenSecret: env("ACTION_TOKEN_SECRET", ""),
+		ActionTokenSecret:       env("ACTION_TOKEN_SECRET", ""),
+		UnsubscribeSecret:       env("NOTIFICATION_UNSUBSCRIBE_SECRET", ""),
+		DKIMDomain:              env("NOTIFICATION_DKIM_DOMAIN", ""),
+		DKIMSelector:            env("NOTIFICATION_DKIM_SELECTOR", ""),
+		DKIMPrivateKey:          strings.ReplaceAll(env("NOTIFICATION_DKIM_PRIVATE_KEY", ""), `\n`, "\n"),
+		SenderAuthCheckInterval: envDuration("NOTIFICATION_SENDER_AUTH_CHECK_INTERVAL", 10*time.Minute),
 
 		SecondaryEmail: EmailConfig{
 			Provider:       env("SMTP_SECONDARY_PROVIDER", ""),

@@ -99,6 +99,39 @@ type ReputationRow struct {
 }
 
 // Store is the persistence the plane needs outside a transaction.
+// Backlog is the durable-process side of §13.1: what is waiting, and for how
+// long. It is read from the database rather than counted in code, so it is
+// right after a restart and cannot drift from what a transaction rolled back.
+type Backlog struct {
+	UnknownAttempts           int
+	OldestUnknown             time.Duration
+	QueuedJobs                int
+	OldestQueued              time.Duration
+	NoticesPastDeadline       int
+	RecordDeclarationsPending int
+	OldestRecordPending       time.Duration
+}
+
+// Metrics records the plane's operational signals (§13.1). Implementations
+// must use no tenant, address or other personal label (§13.3).
+type Metrics interface {
+	// AttemptSubmitted records one provider submission's normalized outcome
+	// and how long the provider took to give it.
+	AttemptSubmitted(channel, binding, state string, took time.Duration)
+	// Callback records one provider callback: rejected at authentication
+	// (outcome "rejected_<code>") or one event's result (applied, duplicate,
+	// unmatched, invalid, retry).
+	Callback(binding, outcome string)
+	// Backlog publishes a fresh snapshot.
+	Backlog(b Backlog)
+}
+
+type noMetrics struct{}
+
+func (noMetrics) AttemptSubmitted(string, string, string, time.Duration) {}
+func (noMetrics) Callback(string, string)                                {}
+func (noMetrics) Backlog(Backlog)                                        {}
+
 type Store interface {
 	// InTx runs fn in one tenant-scoped transaction. Everything that must be
 	// atomic with a state change — the attempt, its evidence, its event —
@@ -108,6 +141,9 @@ type Store interface {
 	// Cross-tenant discovery (SELECT-only platform scope).
 	DueJobs(ctx context.Context, now time.Time, limit int) ([]WorkRef, error)
 	UnknownPastDue(ctx context.Context, now time.Time, limit int) ([]WorkRef, error)
+	// Backlog aggregates the §13.1 backlog measures across tenants: counts
+	// and ages only, never an id, tenant or address.
+	Backlog(ctx context.Context, now time.Time) (Backlog, error)
 	StaleSubmitting(ctx context.Context, before time.Time, limit int) ([]WorkRef, error)
 	NoticesDue(ctx context.Context, horizon time.Time, limit int) ([]WorkRef, error)
 	FindAttempt(ctx context.Context, bindingID, token, providerMessageID string) (*WorkRef, error)
@@ -231,6 +267,9 @@ type Message struct {
 	Body                 string
 	CorrelationID        string
 	SenderIdentity       string
+	// PurposeClass decides transport obligations that follow from purpose,
+	// such as marketing mail's one-click unsubscribe link (§11.1, INV-25).
+	PurposeClass PurposeClass
 }
 
 // Transport submits one message through one binding.

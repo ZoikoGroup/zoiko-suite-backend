@@ -286,4 +286,16 @@ func (s *Service) RunOnce(ctx context.Context) {
 			s.logErr("notice sweep failed", s.SweepNotice(ctx, r))
 		}
 	}
+	if now.Sub(s.lastBacklog) >= backlogEvery {
+		if b, err := s.store.Backlog(ctx, now); err == nil {
+			s.metrics.Backlog(b)
+			s.lastBacklog = now
+		} else {
+			s.logErr("backlog snapshot failed", err)
+		}
+	}
 }
+
+// backlogEvery bounds how often the §13.1 backlog is re-read: often enough to
+// alert on, cheap enough to run beside a two-second worker.
+const backlogEvery = 15 * time.Second

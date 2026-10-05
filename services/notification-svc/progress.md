@@ -1,6 +1,41 @@
 # notification-svc — Progress
 
-## Status: ZS-SVC-Y-001 control plane implemented and verified live (2026-09-30)
+## Status: 5 Oct 2026 re-audit — six defects fixed and proven live
+
+The 30 Sep audit scored 37 API and table rows. The re-audit also read the spec's NP and INV
+matrices and the legacy code beside the plane. The NCD plane held up. The legacy surface did not.
+All six defects are fixed. Store suite 128 pass, 1 skip (the legacy outbox RLS test refuses to run as superuser), 0 fail
+against Postgres 16, NCD tests as the
+`NOSUPERUSER NOBYPASSRLS` role. `scripts/ncd_live_check.py` 69/69 on three consecutive runs,
+including a real marketing round-trip through Mailpit.
+
+| # | Defect (as found) | Fix |
+|---|---|---|
+| 1 | `POST /v1/notifications/unsubscribe` was envelope-exempt and never verified its token. An anonymous `{tenant_id, email}` wrote an UNSUBSCRIBE. The legacy upsert (`ON CONFLICT DO UPDATE reason`) then rewrote a recorded HARD_BOUNCE as UNSUBSCRIBE, which the gate scopes to marketing, so transactional and security mail resumed to a dead address. **Proven live.** | `internal/unsubscribe`: AES-256-GCM token over (tenant, address), keyed by `NOTIFICATION_UNSUBSCRIBE_SECRET`. The receiver believes only the token: forged gets 403, absent gets 400, unconfigured gets 503. The upsert never weakens a reason (rank UNSUBSCRIBE < COMPLAINT < HARD_BOUNCE < ADMIN_SUPPRESSED). Negative control recorded. |
+| 2 | `DELETE /v1/notifications/suppression/{email}` hard-deleted a suppression: one principal, no evidence. | Route and store method removed. Migration `000022` adds lift columns with the canonical CHECKs (evidence, plus a second principal for bounce/complaint/hold), refuses DELETE by trigger, and makes the uniqueness active-rows-only so a lifted row stays as history. `POST /v1/suppressions/{id}/lift` now reaches legacy rows. |
+| 3 | The housekeeping worker deleted concluded `message_intents` older than 90 days. The FK cascade took renders, attempts and delivery events with them, with no legal-hold check (§8.4, §9.2, INV-28). | Purge step, option, stat and store methods removed. Migration `000023` makes all six evidence tables refuse DELETE. Retention is DRC's. Negative control recorded. |
+| 4 | Marketing mail from the plane carried no unsubscribe link. The legacy header hard-coded `notify.zoiko.com` with the raw address in the URL, plus a `mailto:` nobody reads. | Both paths add the sealed RFC 8058 header, with its base from `NOTIFICATION_PUBLIC_BASE_URL`. Marketing that cannot carry a working link is refused before the provider (NCD-011 / `ErrUnsubscribeUnavailable`), never sent without one (INV-25). |
+| 5 | The plane exported no metrics. No §13.1 dimension was observable. | `telemetry.NCD` through an `ncd.Metrics` port. Counters only where nothing can roll back: submits (state, latency) and callbacks (`rejected_<code>`, applied, duplicate…). Backlog gauges re-read from the DB every 15 s under platform scope: UNKNOWN count and age, queue depth and age, notices past deadline, pending DRC declarations. Label allow-list test (§13.3). The RLS negative control showed zeros. |
+| 6 | No DKIM, and no reaction to broken sender authentication (§11.1, NP-55). | `internal/senderauth`: DKIM relaxed/relaxed signing (go-msgauth), covering List-Unsubscribe(-Post) per RFC 8058 §4. A monitor checks the selector key, DMARC and SPF. A definite break holds email as retryable before the relay. Resolver timeouts change nothing. Enabled by `NOTIFICATION_DKIM_DOMAIN/_SELECTOR/_PRIVATE_KEY`. **Proven live**: email went to RETRY_SCHEDULED with the NP-55 reason and Mailpit was unchanged. |
+
+The live check also changed. It raced the worker (it read the attempt while still SUBMITTING;
+53/57 on one run), its README and stand-ins were never committed, and it covered none of the
+above. It now waits for a concluded attempt and adds 12 checks. `scripts/README-live-check.md`
+and `scripts/live_check_stubs.py` make it reproducible.
+
+**Deploy notes.** Apply `000022` and `000023`. Set `NOTIFICATION_UNSUBSCRIBE_SECRET` (32+ bytes)
+and `NOTIFICATION_PUBLIC_BASE_URL` from the secret store, otherwise marketing email is refused.
+Set the DKIM trio only where this service, not the provider, signs.
+
+**Still open (not defects in this service):** nothing in the estate calls notification-svc
+(INV-01 adoption). The console uses only the 6 legacy routes, with no NCD screens and no
+acknowledgment UI. PRV and DRC do not exist. `ncd_exceptions` has no platform-read policy, so
+open exceptions are not in the backlog gauges. 62 pre-existing files are not gofmt-clean (CI
+does not check).
+
+---
+
+## Earlier status: ZS-SVC-Y-001 control plane implemented and verified live (2026-09-30)
 
 The five canonical NCD services now live in this one service (`internal/ncd`, migrations
 `000015`–`000021`), the way configuration-feature-flag-svc implemented AA-001. Group 1 audit 7/9

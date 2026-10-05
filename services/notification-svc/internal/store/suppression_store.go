@@ -12,8 +12,26 @@ import (
 	"zoiko.io/notification-svc/internal/ledger"
 )
 
+// The legacy reasons ranked by how much traffic they stop: an unsubscribe or a
+// complaint scopes to marketing, a hard bounce to every purpose, an operator
+// hold to every purpose regardless of the stream rules.
+//
+// AddSuppression upserts on (tenant, address, stream), and without a rank a
+// later, weaker event overwrote a stronger one: an unsubscribe arriving after a
+// hard bounce rewrote it as UNSUBSCRIBE, which the send gate scopes to
+// marketing, so transactional and security mail resumed to a dead address.
+const (
+	rankCase     = ` WHEN 'UNSUBSCRIBE' THEN 1 WHEN 'COMPLAINT' THEN 2 WHEN 'HARD_BOUNCE' THEN 3 WHEN 'ADMIN_SUPPRESSED' THEN 4 ELSE 0 END)`
+	rankEXCLUDED = `(CASE EXCLUDED.reason` + rankCase
+	rankExisting = `(CASE email_suppressions.reason` + rankCase
+)
+
 // AddSuppression records an email suppression entry with tenant-scoped RLS.
-// It is idempotent on (tenant_id, recipient_email, source_stream).
+// It is idempotent on (tenant_id, recipient_email, source_stream), and it never
+// weakens a recorded reason: a stronger reason replaces a weaker one, while an
+// equal or weaker one leaves the row and the time it was first recorded as
+// they were. Lifting a suppression is not an upsert; it is the governed NCD
+// lift (POST /v1/suppressions/{id}/lift).
 func (s *PgStore) AddSuppression(ctx context.Context, supp *ledger.EmailSuppression) error {
 	if strings.TrimSpace(supp.TenantID) == "" {
 		return fmt.Errorf("missing tenant_id")
@@ -42,12 +60,13 @@ func (s *PgStore) AddSuppression(ctx context.Context, supp *ledger.EmailSuppress
 				suppression_id, tenant_id, recipient_email, reason, source_stream,
 				provider_name, raw_metadata, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			ON CONFLICT (tenant_id, recipient_email, source_stream)
+			ON CONFLICT (tenant_id, recipient_email, source_stream) WHERE lifted_at IS NULL
 			DO UPDATE SET
 				reason = EXCLUDED.reason,
 				provider_name = EXCLUDED.provider_name,
 				raw_metadata = EXCLUDED.raw_metadata,
-				created_at = EXCLUDED.created_at;
+				created_at = EXCLUDED.created_at
+			WHERE ` + rankEXCLUDED + ` > ` + rankExisting + `;
 		`
 		_, err := tx.Exec(ctx, insertSQL,
 			supp.SuppressionID, supp.TenantID, normEmail, string(supp.Reason), supp.SourceStream,
@@ -89,6 +108,7 @@ func (s *PgStore) IsEmailSuppressed(
 			FROM email_suppressions
 			WHERE tenant_id = $1
 			  AND recipient_email = $2
+			  AND lifted_at IS NULL
 			  AND (source_stream = 'ALL' OR source_stream = $3);
 		`
 		rows, err := tx.Query(ctx, querySQL, tenantID, normEmail, string(stream))
@@ -128,34 +148,6 @@ func (s *PgStore) IsEmailSuppressed(
 	return isSuppressed, blockReason, nil
 }
 
-// RemoveSuppression removes an active suppression for recipientEmail and stream.
-func (s *PgStore) RemoveSuppression(ctx context.Context, tenantID, recipientEmail, stream string) error {
-	if strings.TrimSpace(tenantID) == "" {
-		return fmt.Errorf("missing tenant_id")
-	}
-	normEmail := strings.ToLower(strings.TrimSpace(recipientEmail))
-	if normEmail == "" {
-		return fmt.Errorf("missing recipient_email")
-	}
-	if stream == "" {
-		stream = "ALL"
-	}
-
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		const deleteSQL = `
-			DELETE FROM email_suppressions
-			WHERE tenant_id = $1
-			  AND recipient_email = $2
-			  AND source_stream = $3;
-		`
-		_, err := tx.Exec(ctx, deleteSQL, tenantID, normEmail, stream)
-		if err != nil {
-			return fmt.Errorf("delete email_suppression: %w", err)
-		}
-		return nil
-	})
-}
-
 // ListSuppressions returns the active suppressions for a tenant.
 func (s *PgStore) ListSuppressions(ctx context.Context, tenantID string, limit, offset int) ([]*ledger.EmailSuppression, error) {
 	if strings.TrimSpace(tenantID) == "" {
@@ -178,7 +170,7 @@ func (s *PgStore) ListSuppressions(ctx context.Context, tenantID string, limit, 
 			SELECT suppression_id, tenant_id, recipient_email, reason, source_stream,
 			       provider_name, raw_metadata, created_at
 			FROM email_suppressions
-			WHERE tenant_id = $1
+			WHERE tenant_id = $1 AND lifted_at IS NULL
 			ORDER BY created_at DESC
 			LIMIT $2 OFFSET $3;
 		`

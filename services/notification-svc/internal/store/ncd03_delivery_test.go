@@ -123,6 +123,8 @@ func TestNCD03_TimeoutBecomesUnknownAndNeverBlindResends(t *testing.T) {
 	h.email.outcome = func(domain.Notification) domain.DeliveryOutcome {
 		return domain.DeliveryOutcome{Unknown: true, Reason: "connection dropped after DATA", ProviderName: "smtp"}
 	}
+	rec := &recMetrics{}
+	h.svc.SetMetrics(rec)
 	c := h.comm(i.IntentID, r, nil)
 	v := h.send(c)
 	if v.Attempts[0].State != ncd.AttemptUnknown || v.Attempts[0].ResolutionDueAt == nil {
@@ -154,6 +156,15 @@ func TestNCD03_TimeoutBecomesUnknownAndNeverBlindResends(t *testing.T) {
 	if !hasException(ex, "UNKNOWN_UNRESOLVED") {
 		t.Fatalf("stuck UNKNOWN must surface as an exception: %+v", ex)
 	}
+	// §13.1 unknown resolution: the submission was counted as UNKNOWN, and the
+	// worker's backlog snapshot — read across tenants as the unprivileged role,
+	// so RLS would hide it without the platform-scope policy — shows it waiting.
+	if rec.attempts["EMAIL/UNKNOWN"] != 1 {
+		t.Fatalf("the UNKNOWN submission must be counted once, got %v", rec.attempts)
+	}
+	if rec.backlog.UnknownAttempts < 1 || rec.backlog.OldestUnknown <= 0 {
+		t.Fatalf("the backlog must show the stuck UNKNOWN attempt and its age, got %+v", rec.backlog)
+	}
 	// Reconciling the ORIGINAL attempt to FAILED permits the governed
 	// fallback, which goes to IN_APP under the same communication.
 	h.email.outcome = nil
@@ -169,6 +180,29 @@ func TestNCD03_TimeoutBecomesUnknownAndNeverBlindResends(t *testing.T) {
 		t.Fatalf("INV-02: one communication, precise state; got %+v", v.Claims)
 	}
 }
+
+// recMetrics records what the plane reports through ncd.Metrics.
+type recMetrics struct {
+	attempts  map[string]int
+	callbacks map[string]int
+	backlog   ncd.Backlog
+}
+
+func (m *recMetrics) AttemptSubmitted(channel, _, state string, _ time.Duration) {
+	if m.attempts == nil {
+		m.attempts = map[string]int{}
+	}
+	m.attempts[channel+"/"+state]++
+}
+
+func (m *recMetrics) Callback(_, outcome string) {
+	if m.callbacks == nil {
+		m.callbacks = map[string]int{}
+	}
+	m.callbacks[outcome]++
+}
+
+func (m *recMetrics) Backlog(b ncd.Backlog) { m.backlog = b }
 
 func hasException(xs []ncd.Exception, kind string) bool {
 	for _, x := range xs {

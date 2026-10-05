@@ -322,7 +322,8 @@ const legacySuppCols = `e.suppression_id::text, e.tenant_id, '',
 	     WHEN 'UNSUBSCRIBE' THEN 'MARKETING_OPTOUT' ELSE 'SECURITY_HOLD' END,
 	CASE WHEN e.provider_name IS NOT NULL THEN 'PROVIDER_EVENT' ELSE 'OPERATOR' END,
 	'legacy:email_suppressions/' || e.suppression_id::text, 'epoch'::timestamptz, NULL::timestamptz, 'legacy', e.created_at,
-	NULL::timestamptz, '', '', '', true`
+	e.lifted_at, COALESCE(e.lifted_by_principal_id, ''), COALESCE(e.lift_evidence_ref, ''),
+	COALESCE(e.lift_approved_by_principal_id, ''), true`
 
 func scanSupp(r scannable) (*ncd.Suppression, error) {
 	var s ncd.Suppression
@@ -381,24 +382,38 @@ func (t *ncdTx) InsertSuppression(s *ncd.Suppression) (bool, error) {
 	return false, nil
 }
 
+// GetSuppression reads a canonical suppression or, failing that, a legacy
+// email_suppressions row projected into the canonical shape. The send gate
+// honours both lists, so both are lifted the same governed way (000022).
 func (t *ncdTx) GetSuppression(id string) (*ncd.Suppression, error) {
-	return scanSupp(t.tx.QueryRow(t.ctx, `SELECT `+suppCols+` FROM ncd_suppressions
+	s, err := scanSupp(t.tx.QueryRow(t.ctx, `SELECT `+suppCols+` FROM ncd_suppressions
 		WHERE tenant_id = $1 AND suppression_id = $2`, t.tenant, id))
+	if !errors.Is(err, ncd.ErrNotFound) {
+		return s, err
+	}
+	return scanSupp(t.tx.QueryRow(t.ctx, `SELECT `+legacySuppCols+` FROM email_suppressions e
+		WHERE e.tenant_id = $1 AND e.suppression_id::text = $2`, t.tenant, id))
 }
 
+// LiftSuppression lifts a canonical row or, failing that, a legacy one. The
+// database enforces the same evidence and second-principal rules on both.
 func (t *ncdTx) LiftSuppression(id, liftedBy, evidenceRef, approvedBy string, at time.Time) error {
-	tag, err := t.tx.Exec(t.ctx, `
+	for _, q := range []string{`
 		UPDATE ncd_suppressions SET lifted_at = $3, lifted_by_principal_id = $4, lift_evidence_ref = $5,
 		       lift_approved_by_principal_id = $6
-		WHERE tenant_id = $1 AND suppression_id = $2 AND lifted_at IS NULL`,
-		t.tenant, id, at, liftedBy, evidenceRef, nullStr(approvedBy))
-	if err != nil {
-		return nf(err)
+		WHERE tenant_id = $1 AND suppression_id = $2 AND lifted_at IS NULL`, `
+		UPDATE email_suppressions SET lifted_at = $3, lifted_by_principal_id = $4, lift_evidence_ref = $5,
+		       lift_approved_by_principal_id = $6
+		WHERE tenant_id = $1 AND suppression_id::text = $2 AND lifted_at IS NULL`} {
+		tag, err := t.tx.Exec(t.ctx, q, t.tenant, id, at, liftedBy, evidenceRef, nullStr(approvedBy))
+		if err != nil {
+			return nf(err)
+		}
+		if tag.RowsAffected() == 1 {
+			return nil
+		}
 	}
-	if tag.RowsAffected() == 0 {
-		return ncd.ErrNotFound
-	}
-	return nil
+	return ncd.ErrNotFound
 }
 
 func (t *ncdTx) ListSuppressions(principalID, endpointHash string, activeOnly bool, limit int) ([]ncd.Suppression, error) {
@@ -412,7 +427,7 @@ func (t *ncdTx) ListSuppressions(principalID, endpointHash string, activeOnly bo
 			  AND (NOT $4 OR lifted_at IS NULL)
 			UNION ALL
 			SELECT `+legacySuppCols+` FROM email_suppressions e
-			WHERE e.tenant_id = $1 AND $2 = ''
+			WHERE e.tenant_id = $1 AND $2 = '' AND (NOT $4 OR e.lifted_at IS NULL)
 			  AND ($3 = '' OR encode(sha256(convert_to('endpoint' || chr(31) || 'EMAIL' || chr(31) || lower(btrim(e.recipient_email)), 'UTF8')), 'hex') = $3)
 		) s ORDER BY 14 DESC LIMIT $5`, t.tenant, principalID, endpointHash, activeOnly, limit)
 }
@@ -428,7 +443,7 @@ func (t *ncdTx) ActiveSuppressions(principalID string, endpointHashes, _ []strin
 		  AND (subject_principal_id = $2 OR endpoint_hash = ANY($3))
 		UNION ALL
 		SELECT `+legacySuppCols+` FROM email_suppressions e
-		WHERE e.tenant_id = $1
+		WHERE e.tenant_id = $1 AND e.lifted_at IS NULL
 		  AND encode(sha256(convert_to('endpoint' || chr(31) || 'EMAIL' || chr(31) || lower(btrim(e.recipient_email)), 'UTF8')), 'hex') = ANY($3)`,
 		t.tenant, principalID, endpointHashes, now)
 }

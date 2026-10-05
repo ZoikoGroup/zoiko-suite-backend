@@ -187,13 +187,18 @@ s, p, _ = req("POST", f"/v1/communications/{cid}/prepare")
 check("prepare pins renders, plan and decision", s == 200 and p.get("refusal") is None and len(p.get("renders", [])) == 2 and p["communication"]["lifecycle_state"] == "PREPARED", (s, p.get("refusal")))
 s, dsp, _ = req("POST", f"/v1/communications/{cid}/dispatch")
 check("dispatch rechecks and queues a durable job (202)", s == 202 and dsp.get("job", {}).get("state") == "QUEUED", (s, dsp))
-v = wait_for(lambda: (lambda r: r[1] if r[1].get("attempts") else None)(req("GET", f"/v1/communications/{cid}")))
+# Wait for the attempt to CONCLUDE its submission, not merely to exist: an
+# attempt is created SUBMITTING before the provider is called, and reading it
+# then (as this script used to) races the worker.
+v = wait_for(lambda: (lambda r: r[1] if r[1].get("attempts") and r[1]["attempts"][0]["state"] not in ("CREATED", "SUBMITTING") else None)(req("GET", f"/v1/communications/{cid}")))
 a0 = v["attempts"][0]
 check("the worker makes one durable attempt with token, content hash and endpoint snapshot",
       a0["channel"] == "EMAIL" and a0["state"] == "ACCEPTED" and a0["idempotency_token"] and a0["content_hash"] and a0["recipient_snapshot"].get("endpoint_hash"), a0)
 check("§3.3 exposed state is PROVIDER_ACCEPTED, not a generic sent", v["claims"]["delivery_state"] == "PROVIDER_ACCEPTED" and not v["claims"]["delivered"] and "sent" not in v["communication"], v["claims"])
 check("legal sufficiency is never claimed", v["claims"]["legally_served"] == "NOT_DETERMINED_BY_NCD", v["claims"])
-mp = json.loads(urllib.request.urlopen("http://localhost:8025/api/v1/search?query=" + urllib.parse.quote("INV-LIVE-1"), timeout=10).read()) if True else {}
+def mailpit(query):
+    return json.loads(urllib.request.urlopen("http://localhost:8025/api/v1/search?query=" + urllib.parse.quote(query), timeout=10).read())
+mp = wait_for(lambda: (lambda m: m if m.get("messages_count", m.get("total", 0)) >= 1 else None)(mailpit("INV-LIVE-1"))) or {}
 check("the email really reached the relay (mailpit)", mp.get("messages_count", mp.get("total", 0)) >= 1, mp.get("messages_count"))
 
 # Provider callbacks (NCD-04) against this attempt.
@@ -313,6 +318,64 @@ try:
 except urllib.error.HTTPError as e:
     code = e.code
 check("legacy provider webhook refuses an unsigned request (INV-27)", code == 401, code)
+
+# ── 5 Oct 2026 audit fixes ──────────────────────────────────────────────────
+print("── one-click unsubscribe, suppression governance, evidence retention, metrics")
+s, b, _ = req("POST", "/v1/notifications/unsubscribe", headers={"X-Tenant-Id": None, "X-Principal-Id": None},
+              body={"tenant_id": TENANT, "email": "victim2@example.test"})
+check("anonymous unsubscribe naming a tenant and address is refused", s in (400, 403), (s, b))
+out, _ = sql(f"SELECT count(*) FROM email_suppressions WHERE tenant_id='{TENANT}' AND recipient_email='victim2@example.test'")
+check("...and writes nothing", out == "0", out)
+s, b, _ = req("POST", "/v1/notifications/unsubscribe?token=dummytoken", headers={"X-Tenant-Id": None, "X-Principal-Id": None})
+check("a forged token is refused (403)", s == 403, (s, b))
+
+# A marketing communication carries a sealed one-click link; following it
+# records the unsubscribe for exactly that tenant and address.
+mi = intent("promo", purpose_class="MARKETING_PROMOTIONAL", marketing_allowed=True, allowed_channels=["EMAIL"], fallback_allowed=False,
+            sensitivity="S0", evidence_class="E0")
+publish(mi["intent_id"], "EMAIL", "Offers {{invoice_no}}", "<p>Offer {{invoice_no}}</p>")
+mkey = "MKT-" + RUN
+s, mc, _ = req("POST", "/v1/communications", body={"intent_id": mi["intent_id"], "legal_entity_id": LE, "recipient_principal_id": "pat",
+    "locale": "en-GB", "variables": {"invoice_no": mkey}, "source_event_id": "mkt-" + RUN,
+    "privacy_permission": {"decision": "PERMIT", "decision_id": "prv-live"}, "marketing_permission": {"decision": "PERMIT", "decision_id": "prv-mkt-live"}})
+mcid = mc.get("communication", {}).get("communication_id")
+req("POST", f"/v1/communications/{mcid}/prepare")
+s, md, _ = req("POST", f"/v1/communications/{mcid}/dispatch")
+if s != 202:
+    print(f"SKIP  marketing round-trip (dispatch answered {s}: {md.get('reason_code') or md.get('error_code')} — e.g. quiet hours)")
+else:
+    msg = wait_for(lambda: (lambda m: m["messages"][0] if m.get("messages") else None)(mailpit(mkey)))
+    hdrs = json.loads(urllib.request.urlopen(f"http://localhost:8025/api/v1/message/{msg['ID']}/headers", timeout=10).read()) if msg else {}
+    lu = (hdrs.get("List-Unsubscribe") or [""])[0]
+    check("NCD marketing email carries a one-click List-Unsubscribe (§11.1, INV-25)",
+          "/v1/notifications/unsubscribe?token=" in lu and (hdrs.get("List-Unsubscribe-Post") or [""])[0] == "List-Unsubscribe=One-Click", list(hdrs.keys()))
+    check("the link carries neither the address nor the tenant (§11.2)", "pat@" not in lu and TENANT not in lu, lu)
+    r = urllib.request.Request(lu.strip("<>"), data=b"List-Unsubscribe=One-Click", method="POST",
+                               headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        code = urllib.request.urlopen(r, timeout=10).status
+    except urllib.error.HTTPError as e:
+        code = e.code
+    out, _ = sql(f"SELECT reason FROM email_suppressions WHERE tenant_id='{TENANT}' AND recipient_email='pat@example.test' AND lifted_at IS NULL")
+    check("following the link records UNSUBSCRIBE for that tenant and address", code == 200 and out == "UNSUBSCRIBE", (code, out))
+
+# A recorded hard bounce cannot be weakened by an unsubscribe, nor deleted.
+sql(f"INSERT INTO email_suppressions (suppression_id, tenant_id, recipient_email, reason, source_stream, created_at) "
+    f"VALUES (gen_random_uuid(), '{TENANT}', 'dead@example.test', 'HARD_BOUNCE', 'ALL', now())")
+s, b, _ = req("POST", "/v1/notifications/suppression/", body={"recipient_email": "dead@example.test", "reason": "UNSUBSCRIBE", "source_stream": "ALL"})
+out, _ = sql(f"SELECT reason FROM email_suppressions WHERE tenant_id='{TENANT}' AND recipient_email='dead@example.test'")
+check("a later UNSUBSCRIBE cannot weaken a recorded HARD_BOUNCE", out == "HARD_BOUNCE", (s, out))
+s, _, _ = req("DELETE", "/v1/notifications/suppression/dead%40example.test")
+check("there is no DELETE for a suppression (405/404)", s in (404, 405), s)
+out, err = sql(f"DELETE FROM email_suppressions WHERE tenant_id='{TENANT}'")
+check("the database refuses to delete a suppression", "never deleted" in err, err)
+out, err = sql(f"DELETE FROM notifications WHERE tenant_id='{TENANT}'")
+check("the database refuses to delete delivery evidence (INV-28)", "never deleted" in err, err)
+
+mtext = urllib.request.urlopen(BASE + "/metrics", timeout=10).read().decode()
+check("the NCD plane exports §13.1 metrics", "notification_ncd_attempts_total" in mtext and "notification_ncd_unknown_attempts" in mtext
+      and "notification_ncd_callbacks_total" in mtext, "")
+check("no metric label carries an address (§13.3)", "@example.test" not in mtext, "")
 
 print(f"\n{passes} passed, {failures} failed")
 sys.exit(failures)

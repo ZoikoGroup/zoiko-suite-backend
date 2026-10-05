@@ -51,6 +51,16 @@ var SecretLookup = os.Getenv
 // "<timestamp>.<body>" with the binding's secret, inside the replay window.
 // A binding with no configured secret accepts nothing — fail closed.
 func (s *Service) VerifyCallback(ctx context.Context, bindingID, timestamp, signature string, body []byte) (*Binding, error) {
+	b, err := s.verifyCallback(ctx, bindingID, timestamp, signature, body)
+	if err != nil {
+		// §13.1 callback integrity: invalid signatures, stale timestamps and
+		// unknown bindings are counted, not only logged.
+		s.metrics.Callback(bindingID, "rejected_"+AsError(err).Code)
+	}
+	return b, err
+}
+
+func (s *Service) verifyCallback(ctx context.Context, bindingID, timestamp, signature string, body []byte) (*Binding, error) {
 	bindings, err := s.store.Bindings(ctx, s.now())
 	if err != nil {
 		return nil, err
@@ -100,6 +110,14 @@ func SignCallback(secret, timestamp string, body []byte) string {
 
 // IngestProviderEvents applies authenticated callback events.
 func (s *Service) IngestProviderEvents(ctx context.Context, b *Binding, evs []ProviderEvent) []EventResult {
+	out := s.ingestProviderEvents(ctx, b, evs)
+	for _, r := range out {
+		s.metrics.Callback(b.BindingID, strings.ToLower(r.Status))
+	}
+	return out
+}
+
+func (s *Service) ingestProviderEvents(ctx context.Context, b *Binding, evs []ProviderEvent) []EventResult {
 	out := make([]EventResult, 0, len(evs))
 	for _, ev := range evs {
 		r := EventResult{EventID: ev.EventID}

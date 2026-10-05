@@ -1629,42 +1629,6 @@ paths:
       requestBody:
         required: false
         content: *id001
-  /v1/notifications/suppression/{email}:
-    delete:
-      tags:
-      - Legacy register
-      operationId: delete_v1_notifications_suppression_email
-      parameters:
-      - name: email
-        in: path
-        required: true
-        schema:
-          type: string
-      - $ref: '#/components/parameters/TenantId'
-      - $ref: '#/components/parameters/PrincipalId'
-      - $ref: '#/components/parameters/CorrelationId'
-      - $ref: '#/components/parameters/RequestId'
-      - $ref: '#/components/parameters/SourceChannel'
-      - $ref: '#/components/parameters/LegalEntityId'
-      - $ref: '#/components/parameters/IdempotencyKey'
-      responses:
-        '200':
-          description: OK
-          content: *id001
-        '400':
-          $ref: '#/components/responses/Invalid'
-        '401':
-          $ref: '#/components/responses/Unauthenticated'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
-        '422':
-          $ref: '#/components/responses/Refused'
-        '503':
-          $ref: '#/components/responses/Unavailable'
   /v1/notifications/templates:
     get:
       tags:

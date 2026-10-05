@@ -23,6 +23,7 @@ import (
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
 	"zoiko.io/notification-svc/internal/templates"
+	"zoiko.io/notification-svc/internal/unsubscribe"
 	"zoiko.io/notification-svc/internal/webhook"
 )
 
@@ -73,7 +74,6 @@ type Store interface {
 type SuppressionStore interface {
 	AddSuppression(ctx context.Context, supp *ledger.EmailSuppression) error
 	IsEmailSuppressed(ctx context.Context, tenantID, recipientEmail string, stream ledger.SenderStream, commClass ledger.CommunicationClass) (bool, string, error)
-	RemoveSuppression(ctx context.Context, tenantID, recipientEmail, stream string) error
 	ListSuppressions(ctx context.Context, tenantID string, limit, offset int) ([]*ledger.EmailSuppression, error)
 }
 
@@ -166,6 +166,9 @@ type Handler struct {
 	ledgerStore    ledger.LedgerStore
 	webhookHandler *webhook.Handler
 	suppressions   SuppressionStore
+	// unsubscribe opens one-click unsubscribe tokens. Nil means unsubscribe
+	// is not configured, and the receiver refuses every request.
+	unsubscribe *unsubscribe.Codec
 	// metrics may be nil (tests); every observation is nil-safe.
 	metrics *telemetry.Domain
 
@@ -196,6 +199,7 @@ type Deps struct {
 	LedgerStore    ledger.LedgerStore
 	WebhookHandler *webhook.Handler
 	Suppressions   SuppressionStore
+	Unsubscribe    *unsubscribe.Codec
 	Metrics        *telemetry.Domain
 	InAppOpened    InAppOpenedFunc
 	Log            *zap.Logger
@@ -216,6 +220,7 @@ func New(d Deps) *Handler {
 		ledgerStore:    d.LedgerStore,
 		webhookHandler: d.WebhookHandler,
 		suppressions:   d.Suppressions,
+		unsubscribe:    d.Unsubscribe,
 		metrics:        d.Metrics,
 		inAppOpened:    d.InAppOpened,
 		log:            d.Log,
@@ -245,11 +250,14 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		// Phase 3: Admin suppression management
 		// POST   /v1/notifications/suppression         — add or update a suppression entry
 		// GET    /v1/notifications/suppression         — list active suppressions
-		// DELETE /v1/notifications/suppression/{email} — remove a specific suppression
+		//
+		// There is deliberately no DELETE. A suppression is a durable fact (§7.3,
+		// migration 000022): it is lifted on evidence through POST
+		// /v1/suppressions/{id}/lift, which needs a second principal for a hard
+		// bounce, complaint or operator hold, and the row is kept.
 		r.Route("/suppression", func(r chi.Router) {
 			r.Post("/", h.AddSuppression)
 			r.Get("/", h.ListSuppressions)
-			r.Delete("/{email}", h.RemoveSuppression)
 		})
 
 		// Phase 3: RFC 8058 one-click unsubscribe receiver.
@@ -781,8 +789,8 @@ func (h *Handler) ListNotifications(w http.ResponseWriter, r *http.Request) {
 		LegalEntityID:        r.URL.Query().Get("legal_entity_id"),
 		RecipientPrincipalID: r.URL.Query().Get("recipient_principal_id"),
 		// Either vocabulary: the precise §3.3 state or the stored value.
-		Status:               domain.StoredStatusFor(r.URL.Query().Get("status")),
-		UnreadOnly:           r.URL.Query().Get("unread_only") == "true",
+		Status:     domain.StoredStatusFor(r.URL.Query().Get("status")),
+		UnreadOnly: r.URL.Query().Get("unread_only") == "true",
 	}
 
 	limit, offset, ok := parsePaging(w, r)
@@ -1707,6 +1715,8 @@ func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "template_integrity_failure", "template hash integrity check failed")
 		case errors.Is(err, ledger.ErrRecipientEmailUnresolved):
 			writeError(w, http.StatusUnprocessableEntity, "recipient_unresolved", err.Error())
+		case errors.Is(err, ledger.ErrUnsubscribeUnavailable):
+			writeError(w, http.StatusServiceUnavailable, "unsubscribe_unavailable", err.Error())
 		default:
 			h.log.Error("event orchestration failed", zap.String("event_id", req.EventID), zap.Error(err))
 			writeError(w, http.StatusInternalServerError, "orchestration_failed", err.Error())

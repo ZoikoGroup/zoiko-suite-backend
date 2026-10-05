@@ -105,6 +105,34 @@ func (n *NCDStore) DueJobs(ctx context.Context, now time.Time, limit int) ([]ncd
 		LIMIT $2`, now, limit)
 }
 
+// Backlog aggregates the §13.1 backlog across tenants under the SELECT-only
+// platform scope. It returns counts and ages only — no id, tenant or address
+// leaves the database, so nothing personal can reach a metric (§13.3).
+func (n *NCDStore) Backlog(ctx context.Context, now time.Time) (ncd.Backlog, error) {
+	var b ncd.Backlog
+	var unknownAge, queuedAge, recordAge float64
+	err := n.withPlatformScope(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT
+				(SELECT count(*) FROM ncd_attempts WHERE state = 'UNKNOWN'),
+				COALESCE((SELECT EXTRACT(EPOCH FROM $1 - min(state_changed_at))::float8 FROM ncd_attempts WHERE state = 'UNKNOWN'), 0),
+				(SELECT count(*) FROM ncd_delivery_jobs WHERE state = 'QUEUED'),
+				COALESCE((SELECT EXTRACT(EPOCH FROM $1 - min(next_run_at))::float8 FROM ncd_delivery_jobs
+				          WHERE state = 'QUEUED' AND next_run_at <= $1), 0),
+				(SELECT count(*) FROM ncd_regulated_notices WHERE deadline_at <= $1
+				    AND state IN ('READY','DELIVERY_IN_PROGRESS','DELIVERY_EVIDENCED','ACK_PENDING','EXCEPTION')),
+				(SELECT count(*) FROM ncd_regulated_notices WHERE record_status = 'PENDING'),
+				COALESCE((SELECT EXTRACT(EPOCH FROM $1 - min(created_at))::float8 FROM ncd_regulated_notices
+				          WHERE record_status = 'PENDING'), 0)`, now).
+			Scan(&b.UnknownAttempts, &unknownAge, &b.QueuedJobs, &queuedAge, &b.NoticesPastDeadline,
+				&b.RecordDeclarationsPending, &recordAge)
+	})
+	b.OldestUnknown = time.Duration(unknownAge * float64(time.Second))
+	b.OldestQueued = time.Duration(queuedAge * float64(time.Second))
+	b.OldestRecordPending = time.Duration(recordAge * float64(time.Second))
+	return b, err
+}
+
 // UnknownPastDue finds UNKNOWN attempts past their resolution deadline.
 func (n *NCDStore) UnknownPastDue(ctx context.Context, now time.Time, limit int) ([]ncd.WorkRef, error) {
 	return n.refs(ctx, `

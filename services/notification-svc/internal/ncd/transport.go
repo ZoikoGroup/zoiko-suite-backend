@@ -2,6 +2,7 @@ package ncd
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -20,12 +21,22 @@ type InboxWriter interface {
 	DeliverInApp(ctx context.Context, tenantID string, n domain.Notification) error
 }
 
+// UnsubscribeLinker issues the RFC 8058 List-Unsubscribe headers for one
+// recipient (internal/unsubscribe.Codec).
+type UnsubscribeLinker interface {
+	Headers(tenantID, email string) (map[string]string, error)
+}
+
 // RouterTransport adapts the service's existing transports to bindings.
 // Provider credentials stay in the transport's configuration (SMTP_* from
 // the environment / secret store), never in a binding or a template (INV-26).
 type RouterTransport struct {
 	Email EmailDeliverer
 	Inbox InboxWriter
+	// Unsubscribe issues marketing mail's one-click unsubscribe link. Nil
+	// means none can be issued, and marketing email is then refused before
+	// any provider is called — never sent without one (§11.4, INV-25).
+	Unsubscribe UnsubscribeLinker
 }
 
 // Submit sends one message through the binding's provider.
@@ -55,13 +66,31 @@ func (t RouterTransport) Submit(ctx context.Context, b Binding, m Message) Submi
 		if t.Email == nil {
 			return SubmitOutcome{Reason: "no email transport configured", ProviderName: "smtp"}
 		}
+		// The provider idempotency token of §6.1, carried in the message so a
+		// provider export can be reconciled against the attempt.
+		headers := map[string]string{"X-Zoiko-Idempotency-Token": m.IdempotencyToken, "X-Zoiko-Communication-Id": m.CommunicationID}
+		if m.PurposeClass == PurposeMarketing {
+			var unsub map[string]string
+			var err error
+			if t.Unsubscribe == nil {
+				err = errNoUnsubscribe
+			} else {
+				unsub, err = t.Unsubscribe.Headers(m.TenantID, m.To)
+			}
+			if err != nil {
+				// Refused before the provider is called: a known failure, never
+				// UNKNOWN, and not retryable — the next attempt would be refused too.
+				return SubmitOutcome{Reason: string(NCD011NoCompliantChannel) + ": marketing email refused, no one-click unsubscribe link can be issued (INV-25): " + err.Error(), ProviderName: "smtp"}
+			}
+			for k, v := range unsub {
+				headers[k] = v
+			}
+		}
 		out := t.Email.Deliver(ctx, domain.Notification{
 			NotificationID: m.AttemptID, TenantID: m.TenantID, LegalEntityID: m.LegalEntityID,
 			RecipientPrincipalID: m.RecipientPrincipalID, RecipientAddress: m.To, Channel: domain.ChannelEmail,
 			Subject: m.Subject, Body: m.Body, CorrelationID: m.CorrelationID,
-			// The provider idempotency token of §6.1, carried in the message
-			// so a provider export can be reconciled against the attempt.
-			Headers: map[string]string{"X-Zoiko-Idempotency-Token": m.IdempotencyToken, "X-Zoiko-Communication-Id": m.CommunicationID},
+			Headers: headers,
 		})
 		return SubmitOutcome{
 			Accepted: out.Delivered, Unknown: out.Unknown, Retryable: out.Retryable, Reason: out.Reason,
@@ -70,6 +99,8 @@ func (t RouterTransport) Submit(ctx context.Context, b Binding, m Message) Submi
 	}
 	return SubmitOutcome{Reason: "binding " + b.BindingID + " names provider " + b.ProviderName + ", which has no transport", ProviderName: b.ProviderName}
 }
+
+var errNoUnsubscribe = errors.New("unsubscribe is not configured (NOTIFICATION_UNSUBSCRIBE_SECRET)")
 
 // messageID extracts "message-id=<...>" from the SMTP receipt.
 func messageID(receipt string) string {

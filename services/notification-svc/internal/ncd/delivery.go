@@ -618,7 +618,7 @@ func (s *Service) ProcessJob(ctx context.Context, ref WorkRef) error {
 			TenantID: ref.TenantID, LegalEntityID: c.LegalEntityID, CommunicationID: c.CommunicationID, AttemptID: att.AttemptID,
 			IdempotencyToken: att.IdempotencyToken, Channel: route.Channel, BindingID: b.BindingID, To: to,
 			RecipientPrincipalID: c.RecipientPrincipalID, Subject: render.Subject, Body: render.Body,
-			CorrelationID: a.CorrelationID, SenderIdentity: b.SenderIdentity,
+			CorrelationID: a.CorrelationID, SenderIdentity: b.SenderIdentity, PurposeClass: att.PurposeClass,
 		}}
 		return nil
 	})
@@ -630,8 +630,10 @@ func (s *Service) ProcessJob(ctx context.Context, ref WorkRef) error {
 	// The attempt is already committed SUBMITTING, so a crash here leaves a
 	// row the stranded sweep turns UNKNOWN — never one that is silently
 	// resent.
+	started := time.Now()
 	outcome := s.transport.Submit(context.WithoutCancel(ctx), sub.binding, sub.msg)
 	norm := NormalizeSubmit(sub.msg.Channel, outcome)
+	s.metrics.AttemptSubmitted(sub.msg.Channel, sub.binding.BindingID, string(norm.AttemptState), time.Since(started))
 	success := outcome.Accepted || outcome.DeliveredNow
 	if !success && (outcome.Retryable || outcome.Unknown) {
 		_ = s.store.RecordBindingResult(ctx, sub.binding.BindingID, false, s.limits.CircuitFailureThreshold)

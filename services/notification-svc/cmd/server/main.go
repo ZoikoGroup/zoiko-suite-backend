@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
@@ -29,8 +30,8 @@ import (
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/health"
 	"zoiko.io/notification-svc/internal/housekeeping"
-	"zoiko.io/notification-svc/internal/identity"
 	"zoiko.io/notification-svc/internal/idempotency"
+	"zoiko.io/notification-svc/internal/identity"
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
@@ -38,8 +39,10 @@ import (
 	"zoiko.io/notification-svc/internal/outbox"
 	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/retry"
+	"zoiko.io/notification-svc/internal/senderauth"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
+	"zoiko.io/notification-svc/internal/unsubscribe"
 	"zoiko.io/notification-svc/internal/webhook"
 )
 
@@ -170,6 +173,29 @@ func main() {
 	// address or an impossible TLS mode is a startup failure with the variable
 	// named, not one FAILED notification per send describing the same mistake
 	// in the vocabulary of a delivery error.
+	// Sender authentication (§11.1, NP-55). With a DKIM key configured, every
+	// message is signed and a monitor holds the email stream while DNS no
+	// longer authenticates it. Without one, the provider is expected to sign,
+	// and this service says so rather than pretend. The interface values stay
+	// nil when unconfigured: a nil pointer inside an interface reads as set.
+	var dkimSigner deliver.MessageSigner
+	var sendGate deliver.SendGate
+	var senderAuthMonitor *senderauth.Monitor
+	if cfg.DKIMDomain != "" || cfg.DKIMSelector != "" || cfg.DKIMPrivateKey != "" {
+		s, err := senderauth.NewSigner(cfg.DKIMDomain, cfg.DKIMSelector, []byte(cfg.DKIMPrivateKey))
+		if err != nil {
+			log.Fatal("DKIM misconfigured (NOTIFICATION_DKIM_DOMAIN / _SELECTOR / _PRIVATE_KEY)", zap.Error(err))
+		}
+		senderAuthMonitor = senderauth.NewMonitor(s, nil)
+		if err := senderAuthMonitor.Check(context.Background()); err != nil {
+			log.Error("sender authentication check failed — email is held until DNS authenticates it (NP-55)", zap.Error(err))
+		}
+		dkimSigner, sendGate = s, senderAuthMonitor
+		log.Info("DKIM signing enabled", zap.String("domain", s.Domain()), zap.String("selector", s.Selector()))
+	} else {
+		log.Warn("DKIM not configured — this service sends unsigned mail; the mail provider must sign it (§11.1)")
+	}
+
 	var emailProvider deliver.Provider
 	switch cfg.Email.Provider {
 	case "":
@@ -184,6 +210,8 @@ func main() {
 			From:           cfg.Email.From,
 			TLSMode:        deliver.TLSMode(cfg.Email.TLSMode),
 			AllowCleartext: cfg.Email.AllowCleartext,
+			Signer:         dkimSigner,
+			Gate:           sendGate,
 		})
 		if err != nil {
 			log.Fatal("email provider configuration is invalid", zap.Error(err))
@@ -243,6 +271,8 @@ func main() {
 			From:           cfg.SecondaryEmail.From,
 			TLSMode:        deliver.TLSMode(cfg.SecondaryEmail.TLSMode),
 			AllowCleartext: cfg.SecondaryEmail.AllowCleartext,
+			Signer:         dkimSigner,
+			Gate:           sendGate,
 		})
 		if err != nil {
 			log.Fatal("secondary email provider configuration is invalid", zap.Error(err))
@@ -268,8 +298,30 @@ func main() {
 	// (migration 000018). The legacy send path gets the plane's canonical
 	// suppression check in front of its provider call (GatedDeliverer) —
 	// before it, that path consulted no suppression list at all.
+	// One-click unsubscribe (RFC 8058; §11.1, INV-25). The link's sealed token
+	// is the receiver's only credential. Without a secret no link can be
+	// issued, so marketing mail is refused on both send paths — never sent
+	// without one. The interface values stay nil in that case: a nil *Codec
+	// inside an interface would read as configured.
+	var unsubCodec *unsubscribe.Codec
+	var ncdUnsub ncd.UnsubscribeLinker
+	var ledgerUnsub ledger.UnsubscribeLinker
+	if cfg.UnsubscribeSecret != "" {
+		c, err := unsubscribe.New([]byte(cfg.UnsubscribeSecret), cfg.PublicBaseURL())
+		if err != nil {
+			log.Fatal("one-click unsubscribe misconfigured (NOTIFICATION_UNSUBSCRIBE_SECRET / NOTIFICATION_PUBLIC_BASE_URL)", zap.Error(err))
+		}
+		unsubCodec, ncdUnsub, ledgerUnsub = c, c, c
+		log.Info("one-click unsubscribe enabled", zap.String("base_url", cfg.PublicBaseURL()))
+	} else {
+		log.Warn("NOTIFICATION_UNSUBSCRIBE_SECRET not set — marketing email will be refused, " +
+			"because it cannot carry a working one-click unsubscribe link")
+	}
+
 	ncdStore := store.NewNCD(pgStore)
-	ncdSvc := ncd.NewService(ncdStore, identityClient, ncd.RouterTransport{Email: deliverer, Inbox: ncdStore}, ncd.DefaultLimits(), log)
+	ncdSvc := ncd.NewService(ncdStore, identityClient,
+		ncd.RouterTransport{Email: deliverer, Inbox: ncdStore, Unsubscribe: ncdUnsub}, ncd.DefaultLimits(), log)
+	ncdSvc.SetMetrics(telemetry.NewNCD("notification-svc", prometheus.DefaultRegisterer))
 	gatedDeliverer := ncd.GatedDeliverer{Inner: deliverer, Svc: ncdSvc}
 
 	// ── 4b. Retry policy and worker ──────────────────────────────────────────
@@ -301,7 +353,8 @@ func main() {
 	policyEngine := policy.NewPrecedenceEngine(pgStore, log)
 	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log).
 		WithPolicyResolver(policyEngine).
-		WithMetrics(metrics)
+		WithMetrics(metrics).
+		WithUnsubscribe(ledgerUnsub)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -393,6 +446,7 @@ func main() {
 		LedgerStore:    pgStore,
 		WebhookHandler: webhookHandler,
 		Suppressions:   pgStore,
+		Unsubscribe:    unsubCodec,
 		InAppOpened: func(ctx context.Context, tenantID, principalID, communicationID, attemptID string, at time.Time) error {
 			return ncdSvc.RecordInAppOpened(ctx, ncd.Actor{TenantID: tenantID, PrincipalID: principalID}, communicationID, attemptID, at)
 		},
@@ -459,6 +513,15 @@ func main() {
 		ncdInterval = v
 	}
 	go ncdSvc.Run(workerCtx, ncdInterval)
+	if senderAuthMonitor != nil {
+		go senderAuthMonitor.Run(workerCtx, cfg.SenderAuthCheckInterval, func(healthy bool, why string) {
+			if healthy {
+				log.Info("sender authentication restored — email stream released (NP-55)")
+			} else {
+				log.Error("sender authentication broken — email stream held (NP-55)", zap.String("problem", why))
+			}
+		})
+	}
 
 	// ── 6b. Delivery Ledger Housekeeping Worker ──────────────────────────────
 	housekeepingWorker := housekeeping.NewWorker(
@@ -467,7 +530,6 @@ func main() {
 			Interval:             10 * time.Minute,
 			BatchSize:            50,
 			TokenRetention:       30 * 24 * time.Hour,
-			LedgerRetention:      90 * 24 * time.Hour,
 			StaleIntentThreshold: 24 * time.Hour,
 		},
 		log,
