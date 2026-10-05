@@ -19,7 +19,7 @@ import (
 // cannot touch roles, assignments or decisions.
 type DelegationProjector interface {
 	ProjectDelegation(ctx context.Context, params domain.ProjectDelegationParams) (*domain.DelegatedAuthority, error)
-	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error)
+	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string, version int64) (*domain.DelegatedAuthority, error)
 }
 
 // upstreamService is the source_service value written on every projected row.
@@ -90,6 +90,11 @@ var ConsumedEventTypes = map[string]bool{
 	"authority.delegated": true,
 	"authority.revoked":   true,
 	"authority.expired":   true,
+	// Produced since 5 Oct 2026 (ORG-06 lifecycle). Without these entries the
+	// gate below drops them before the switch ever sees them.
+	"authority.extended":  true,
+	"authority.suspended": true,
+	"authority.resumed":   true,
 }
 
 // inbound is the read side of the platform event contract (Doc 03 §19). Only
@@ -118,6 +123,13 @@ type delegationPayload struct {
 	ActionType    string     `json:"action_type"`
 	EffectiveFrom *time.Time `json:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to"`
+	// Version orders events about one grant; 0 is an event from before the
+	// producer sent versions.
+	Version int64 `json:"version"`
+	// The delegation's own ceiling (producer field names).
+	LimitCents    *int64  `json:"authority_limit_cents"`
+	LimitCurrency *string `json:"authority_limit_currency"`
+	LimitQuantity *int64  `json:"authority_limit_quantity"`
 }
 
 // dedupeTTL bounds how long an event id is remembered — long enough to cover
@@ -278,9 +290,14 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 	}
 
 	switch env.EventType {
-	case "authority.delegated":
+	// authority.extended carries the new window and authority.resumed the
+	// whole grant: both re-project it exactly as authority.delegated does.
+	// Extension used to be dropped, so /v1/authorize ended an extended
+	// delegation at its ORIGINAL end; a resume had no handler at all.
+	case "authority.delegated", "authority.extended", "authority.resumed":
 		return c.applyDelegated(ctx, env, payload)
-	case "authority.revoked", "authority.expired":
+	// A suspended grant confers nothing until resumed — the same as an ended one.
+	case "authority.revoked", "authority.expired", "authority.suspended":
 		return c.applyEnded(ctx, env, payload)
 	}
 	return nil
@@ -320,7 +337,17 @@ func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload dele
 		DelegatedActions:     actions,
 		EffectiveFrom:        effectiveFrom,
 		EffectiveTo:          payload.EffectiveTo,
+		SourceVersion:        payload.Version,
+		LimitMinor:           payload.LimitCents,
+		LimitCurrency:        payload.LimitCurrency,
+		LimitQuantity:        payload.LimitQuantity,
 	})
+	if errors.Is(err, domain.ErrStaleProjection) {
+		c.log.Info("delegation event older than the projection; ignored",
+			zap.String("event_id", env.EventID), zap.String("delegation_id", payload.DelegationID),
+			zap.Int64("version", payload.Version))
+		return nil
+	}
 	if err != nil {
 		c.log.Error("delegation event: projection failed — the delegation will not grant anything until this is replayed",
 			zap.String("event_id", env.EventID),
@@ -340,7 +367,7 @@ func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload dele
 }
 
 func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegationPayload) error {
-	d, err := c.store.RevokeProjectedDelegation(ctx, upstreamService, payload.DelegationID, env.TenantID)
+	d, err := c.store.RevokeProjectedDelegation(ctx, upstreamService, payload.DelegationID, env.TenantID, payload.Version)
 	if err != nil {
 		if errors.Is(err, domain.ErrDelegatedAuthorityNotFound) {
 			// Nothing to end: either a redelivery of an event already applied,

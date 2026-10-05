@@ -20,6 +20,11 @@ import (
 // ── stub store ────────────────────────────────────────────────────────────────
 
 type stubStore struct {
+	// denyAdmin withholds the tenant-scoped iam.* administration permissions
+	// requirePermission checks. By default the test caller is a tenant
+	// administrator (see FindGrantedActions).
+	denyAdmin bool
+
 	role        *domain.Role
 	roleCreated bool
 	roleErr     error
@@ -307,8 +312,26 @@ func (s *stubStore) ListSoDRules(_ context.Context, tenantID string) ([]domain.S
 func (s *stubStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleParams) (*domain.SoDRule, error) {
 	return s.sodRule, s.sodRuleErr
 }
-func (s *stubStore) FindGrantedActions(_ context.Context, _, _, tenantID string) ([]string, string, error) {
+
+// stubAdminActions are the administration permissions requirePermission
+// checks on the /v1/admin/* routes.
+var stubAdminActions = []string{
+	"iam.abac_rule.manage", "iam.assignment.grant", "iam.assignment.revoke", "iam.break_glass.manage",
+	"iam.delegation.grant", "iam.delegation.revoke", "iam.pam.manage", "iam.permission_bundle.manage",
+	"iam.role.manage", "iam.sod_rule.manage", "iam.support.manage",
+}
+
+// FindGrantedActions returns the seeded RBAC actions. requirePermission asks
+// at TENANT scope (legal entity = tenant), and only it does — decision paths
+// always name a real entity — so on that lookup the stub also grants the
+// administration permissions unless denyAdmin is set. Those tests were written
+// before the admin routes required a permission and failed with 403 from then
+// on, unnoticed, because this package did not compile.
+func (s *stubStore) FindGrantedActions(_ context.Context, _, legalEntityID, tenantID string) ([]string, string, error) {
 	s.grantedTenantArg = tenantID
+	if s.rbacErr == nil && !s.denyAdmin && legalEntityID != "" && legalEntityID == tenantID {
+		return append(append([]string{}, s.rbacActions...), stubAdminActions...), s.rbacBasis, nil
+	}
 	return s.rbacActions, s.rbacBasis, s.rbacErr
 }
 func (s *stubStore) FindGrantedActionsScoped(_ context.Context, _, _, tenantID, bookID, orgUnitID string) ([]string, string, error) {
@@ -713,7 +736,7 @@ func newTestRouter(s *stubStore) chi.Router {
 
 func newTestRouterFull(s *stubStore, p *stubPublisher, v *stubValidator) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, v, siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", zap.NewNop())
+	h := handler.New(s, p, v, siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", false, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }

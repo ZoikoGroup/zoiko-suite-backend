@@ -427,21 +427,21 @@ const (
 
 // SupportSession records a purpose-bound tenant support / diagnostic access session (ZS-IAM-001 §15 & §21).
 type SupportSession struct {
-	SessionID              string     `json:"session_id"`
-	TenantID               string     `json:"tenant_id"`
-	SupportOperatorID      string     `json:"support_operator_id"`
-	TicketRef              string     `json:"ticket_ref"`
-	Purpose                string     `json:"purpose"`
-	ReadOnly               bool       `json:"read_only"`
-	AllowBulkExport        bool       `json:"allow_bulk_export"`
-	AllowedActions         []string   `json:"allowed_actions"`
-	Status                 string     `json:"status"`
-	DurationSeconds        int        `json:"duration_seconds"`
-	ExpiresAt              time.Time  `json:"expires_at"`
-	TenantConsentObtained  bool       `json:"tenant_consent_obtained"`
-	CreatedAt              time.Time  `json:"created_at"`
-	RevokedAt              *time.Time `json:"revoked_at,omitempty"`
-	RevokedBy              *string    `json:"revoked_by,omitempty"`
+	SessionID             string     `json:"session_id"`
+	TenantID              string     `json:"tenant_id"`
+	SupportOperatorID     string     `json:"support_operator_id"`
+	TicketRef             string     `json:"ticket_ref"`
+	Purpose               string     `json:"purpose"`
+	ReadOnly              bool       `json:"read_only"`
+	AllowBulkExport       bool       `json:"allow_bulk_export"`
+	AllowedActions        []string   `json:"allowed_actions"`
+	Status                string     `json:"status"`
+	DurationSeconds       int        `json:"duration_seconds"`
+	ExpiresAt             time.Time  `json:"expires_at"`
+	TenantConsentObtained bool       `json:"tenant_consent_obtained"`
+	CreatedAt             time.Time  `json:"created_at"`
+	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
+	RevokedBy             *string    `json:"revoked_by,omitempty"`
 }
 
 type CreateSupportSessionParams struct {
@@ -538,6 +538,23 @@ type ProjectDelegationParams struct {
 	DelegatedActions []string
 	EffectiveFrom    time.Time
 	EffectiveTo      *time.Time
+	// SourceVersion is the upstream grant's version; one older than the
+	// projection holds is ignored (a replayed event must not undo a later one).
+	SourceVersion int64
+	// The delegation's own ceiling, in minor units, as the upstream grant set
+	// it. Nil means the delegation sets no ceiling of that kind.
+	LimitMinor    *int64
+	LimitCurrency *string
+	LimitQuantity *int64
+}
+
+// DelegationCeiling is the ceiling one active delegation places on the
+// authority it confers (delegated-authority-svc authority_limit_*).
+type DelegationCeiling struct {
+	SourceDelegationID string
+	LimitMinor         *int64
+	LimitCurrency      *string
+	LimitQuantity      *int64
 }
 
 type CreateSoDRuleParams struct {
@@ -748,6 +765,10 @@ var ErrRoleNotFound = errorString("role not found")
 var ErrRoleAssignmentNotFound = errorString("role assignment not found")
 var ErrLegalEntityRequiredForRoleScope = errorString("legal_entity_id is required: this role's scope_type is not TENANT")
 var ErrDelegatedAuthorityNotFound = errorString("delegated authority not found")
+
+// ErrStaleProjection: a delegation event older than the projection it would
+// change. Ignored, never applied.
+var ErrStaleProjection = errorString("delegation event is older than the projection")
 
 // ErrTenantScopeRequired means a delegation operation was attempted without a
 // verified tenant. Since 000006 delegated_authorities.tenant_id is NOT NULL and

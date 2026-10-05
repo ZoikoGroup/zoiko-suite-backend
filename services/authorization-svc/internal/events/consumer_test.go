@@ -2,6 +2,7 @@ package events_test
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -29,7 +30,7 @@ func (f *fakeProjector) ProjectDelegation(_ context.Context, p domain.ProjectDel
 	return &domain.DelegatedAuthority{DelegatedAuthorityID: "local-1"}, nil
 }
 
-func (f *fakeProjector) RevokeProjectedDelegation(_ context.Context, service, delegationID, tenantID string) (*domain.DelegatedAuthority, error) {
+func (f *fakeProjector) RevokeProjectedDelegation(_ context.Context, service, delegationID, tenantID string, _ int64) (*domain.DelegatedAuthority, error) {
 	if f.revokeErr != nil {
 		return nil, f.revokeErr
 	}
@@ -263,5 +264,77 @@ func TestConsumedEventTypes(t *testing.T) {
 		if events.ConsumedEventTypes[notWanted] {
 			t.Errorf("%s is consumed — it has no producer on this estate, so the handler cannot have been tested against a real event", notWanted)
 		}
+	}
+}
+
+// ── ORG-06 lifecycle events (5 Oct 2026) ─────────────────────────────────────
+
+func lifecycleEvent(eventID, eventType string, version int, extra string) []byte {
+	return []byte(`{
+  "event_id": "` + eventID + `",
+  "event_type": "` + eventType + `",
+  "source_service": "delegated-authority-svc",
+  "tenant_id": "00000000-0000-0000-0000-0000000000a1",
+  "correlation_id": "corr-1",
+  "payload": {
+    "delegation_id": "upstream-9",
+    "legal_entity_id": "00000000-0000-0000-0000-0000000000e1",
+    "delegator_principal_id": "boss-1",
+    "delegate_principal_id": "assistant-1",
+    "action_type": "PAYMENT_APPROVE",
+    "effective_from": "2026-09-01T00:00:00Z",
+    "effective_to": "2026-12-31T00:00:00Z",
+    "version": ` + strconv.Itoa(version) + extra + `
+  }
+}`)
+}
+
+// extended and resumed re-project the grant; suspended ends it. The first
+// used to be dropped, so an extension ended at its ORIGINAL date here.
+func TestConsumer_LifecycleEventsRouteToTheRightProjection(t *testing.T) {
+	f := &fakeProjector{}
+	c := events.NewConsumer(zap.NewNop(), f)
+	c.Handle(context.Background(), lifecycleEvent("e-ext", "authority.extended", 2, ""))
+	c.Handle(context.Background(), lifecycleEvent("e-sus", "authority.suspended", 3, ""))
+	c.Handle(context.Background(), lifecycleEvent("e-res", "authority.resumed", 4, ""))
+
+	if len(f.projected) != 2 || len(f.revoked) != 1 {
+		t.Fatalf("want 2 projections (extended, resumed) and 1 end (suspended), got %d and %d", len(f.projected), len(f.revoked))
+	}
+	if f.projected[0].SourceVersion != 2 || f.projected[1].SourceVersion != 4 {
+		t.Errorf("versions must reach the store: %d, %d", f.projected[0].SourceVersion, f.projected[1].SourceVersion)
+	}
+	if f.projected[0].EffectiveTo == nil || f.projected[0].EffectiveTo.Format(time.RFC3339) != "2026-12-31T00:00:00Z" {
+		t.Errorf("the extended window must be projected: %v", f.projected[0].EffectiveTo)
+	}
+	for _, et := range []string{"authority.extended", "authority.suspended", "authority.resumed"} {
+		if !events.ConsumedEventTypes[et] {
+			t.Errorf("%s is not consumed — the gate drops it before the switch", et)
+		}
+	}
+}
+
+// The producer's limit fields reach the projection; they used to be dropped.
+func TestConsumer_CarriesTheDelegationCeiling(t *testing.T) {
+	f := &fakeProjector{}
+	c := events.NewConsumer(zap.NewNop(), f)
+	c.Handle(context.Background(), lifecycleEvent("e-lim", "authority.delegated", 1,
+		`, "authority_limit_cents": 50000, "authority_limit_currency": "USD", "authority_limit_quantity": 3`))
+	if len(f.projected) != 1 {
+		t.Fatalf("projected %d", len(f.projected))
+	}
+	p := f.projected[0]
+	if p.LimitMinor == nil || *p.LimitMinor != 50000 || p.LimitCurrency == nil || *p.LimitCurrency != "USD" ||
+		p.LimitQuantity == nil || *p.LimitQuantity != 3 {
+		t.Errorf("ceiling not carried: %+v", p)
+	}
+}
+
+// An event older than the projection is acknowledged and ignored, not retried.
+func TestConsumer_StaleEventIsIgnoredNotRetried(t *testing.T) {
+	f := &fakeProjector{projErr: domain.ErrStaleProjection}
+	c := events.NewConsumer(zap.NewNop(), f)
+	if err := c.Handle(context.Background(), lifecycleEvent("e-old", "authority.delegated", 1, "")); err != nil {
+		t.Fatalf("a stale event must be acknowledged, got %v", err)
 	}
 }

@@ -750,3 +750,43 @@ func TestScenarioA10_ApprovalFactsUnchanged_Allowed(t *testing.T) {
 		t.Errorf("expected ALLOW when approval facts are unchanged, got %s (basis=%s)", resp.Decision, resp.Basis)
 	}
 }
+
+// A rate supplied by the caller whose amount is checked is ignored (decision
+// 5 Oct 2026). With it honoured, fx_rate=0.0001 brought 100,000 USD under a
+// 50,000 GBP limit; at the reference rate it is ~78,000 GBP and over.
+func TestCallerSuppliedFXRateCannotMoveTheLimit(t *testing.T) {
+	const (
+		tenantID    = "11111111-1111-4111-8111-111111111111"
+		legalEntity = "22222222-2222-4222-8222-222222222222"
+		principalID = "usr-approver-001"
+	)
+	store := &stubStore{
+		rbacActions: []string{"payment.release"},
+		rbacBasis:   "rbac:role=PAYMENT_RELEASER",
+		authorityLimits: []domain.AuthorityLimit{{
+			AuthorityLimitID: "lim-001", TenantID: tenantID, PrincipalID: strptr(principalID),
+			AuthorityType: "payment_release", LegalEntityID: strptr(legalEntity), Currency: "GBP",
+			UpperLimit: "50000.00", EffectiveFrom: time.Now().Add(-1 * time.Hour),
+		}},
+	}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
+	for _, attr := range []string{"fx_rate", "exchange_rate"} {
+		body := `{
+			"subject_id": "` + principalID + `",
+			"tenant_id": "` + tenantID + `",
+			"legal_entity_id": "` + legalEntity + `",
+			"action": "payment.release",
+			"resource_attributes": {"amount": "100000.00", "currency": "USD", "` + attr + `": "0.0001"}
+		}`
+		req := httptest.NewRequest(http.MethodPost, "/internal/authorization/decisions", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-Id", tenantID)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		var resp domain.CanonicalDecisionResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp.Decision != domain.CanonicalDecisionDeny {
+			t.Errorf("%s=0.0001 must not bring 100,000 USD under a 50,000 GBP limit; got %s (%s)", attr, resp.Decision, resp.Basis)
+		}
+	}
+}

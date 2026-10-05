@@ -62,7 +62,10 @@ type Store interface {
 	// table becomes the evaluation read-model rather than a rival write model.
 	// Only internal/events.Consumer calls them; the admin API never does.
 	ProjectDelegation(ctx context.Context, params domain.ProjectDelegationParams) (*domain.DelegatedAuthority, error)
-	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error)
+	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string, version int64) (*domain.DelegatedAuthority, error)
+	// FindDelegationCeilings returns the ceilings of the active delegations
+	// that confer actionType on principalID in the entity right now.
+	FindDelegationCeilings(ctx context.Context, principalID, legalEntityID, tenantID, actionType string) ([]domain.DelegationCeiling, error)
 
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
 
@@ -880,8 +883,9 @@ func (s *PgStore) ProjectDelegation(ctx context.Context, params domain.ProjectDe
 		INSERT INTO delegated_authorities (
 			tenant_id, delegator_principal_id, delegate_principal_id, scope_type,
 			legal_entity_id, book_id, org_unit_id, delegated_actions, source_service, source_delegation_id,
-			effective_from, effective_to)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			effective_from, effective_to, source_version,
+			delegation_limit_minor, delegation_limit_currency, delegation_limit_quantity)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		ON CONFLICT (source_service, source_delegation_id)
 			WHERE source_delegation_id IS NOT NULL
 		DO UPDATE SET
@@ -894,7 +898,14 @@ func (s *PgStore) ProjectDelegation(ctx context.Context, params domain.ProjectDe
 			delegated_actions      = EXCLUDED.delegated_actions,
 			effective_from         = EXCLUDED.effective_from,
 			effective_to           = EXCLUDED.effective_to,
+			source_version         = EXCLUDED.source_version,
+			delegation_limit_minor    = EXCLUDED.delegation_limit_minor,
+			delegation_limit_currency = EXCLUDED.delegation_limit_currency,
+			delegation_limit_quantity = EXCLUDED.delegation_limit_quantity,
 			revocation_status      = 'ACTIVE'
+		-- A replayed older event must not undo a later suspension or
+		-- revocation; version 0 is an event from before versions existed.
+		WHERE delegated_authorities.source_version <= EXCLUDED.source_version
 		RETURNING ` + delegationColumns + `;`
 
 	var d *domain.DelegatedAuthority
@@ -904,14 +915,103 @@ func (s *PgStore) ProjectDelegation(ctx context.Context, params domain.ProjectDe
 			params.TenantID, params.DelegatorPrincipalID, params.DelegatePrincipalID, scopeType,
 			params.LegalEntityID, params.BookID, params.OrgUnitID, marshalActionSubset(params.DelegatedActions),
 			params.SourceService, params.SourceDelegationID,
-			params.EffectiveFrom, params.EffectiveTo))
+			params.EffectiveFrom, params.EffectiveTo, params.SourceVersion,
+			params.LimitMinor, params.LimitCurrency, params.LimitQuantity))
 		return scanErr
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The conflict's WHERE refused it: older than the stored projection.
+		return nil, domain.ErrStaleProjection
+	}
 	if err != nil {
 		s.log.Error("pg ProjectDelegation failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return d, nil
+}
+
+// FindGrantedActionsInTenant returns every action principalID currently holds
+// through an active role anywhere in the tenant — the question a tenant-level
+// segregation check asks ("does the approver hold a conflicting duty"), which
+// is not scoped to one legal entity.
+func (s *PgStore) FindGrantedActionsInTenant(ctx context.Context, principalID, tenantID string) ([]string, error) {
+	const query = `
+		SELECT DISTINCT a
+		  FROM principal_role_assignments pra
+		  JOIN roles r ON r.role_id = pra.role_id AND r.active_flag
+		  JOIN permission_bundles pb ON pb.role_id = r.role_id AND pb.active_flag
+		 CROSS JOIN LATERAL jsonb_array_elements_text(pb.permitted_actions) a
+		 WHERE pra.principal_id = $1
+		   AND r.tenant_id = $2::uuid
+		   AND pra.effective_from <= NOW()
+		   AND (pra.effective_to IS NULL OR pra.effective_to > NOW())
+		 ORDER BY a`
+	var out []string
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, principalID, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a string
+			if err := rows.Scan(&a); err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
+// FindDelegationCeilings returns the ceiling each currently effective
+// delegation conferring actionType on principalID carries. Matching mirrors
+// FindDelegatedActionsScoped: same entity rule, same window, and a delegation
+// with no action subset confers every action.
+func (s *PgStore) FindDelegationCeilings(ctx context.Context, principalID, legalEntityID, tenantID, actionType string) ([]domain.DelegationCeiling, error) {
+	const query = `
+		SELECT COALESCE(da.source_delegation_id, da.delegated_authority_id::text),
+		       da.delegation_limit_minor, da.delegation_limit_currency, da.delegation_limit_quantity
+		  FROM delegated_authorities da
+		 WHERE da.delegate_principal_id = $1
+		   AND (da.legal_entity_id = $2 OR (da.legal_entity_id IS NULL AND $3 != ''))
+		   AND ($3 = '' OR da.tenant_id::text = $3)
+		   AND da.revocation_status = 'ACTIVE'
+		   AND da.effective_from <= NOW()
+		   AND (da.effective_to IS NULL OR da.effective_to > NOW())
+		   AND (da.delegated_actions IS NULL OR da.delegated_actions @> jsonb_build_array($4::text))`
+	var out []domain.DelegationCeiling
+	evaluate := func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, principalID, legalEntityID, tenantID, actionType)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var c domain.DelegationCeiling
+			if err := rows.Scan(&c.SourceDelegationID, &c.LimitMinor, &c.LimitCurrency, &c.LimitQuantity); err != nil {
+				return err
+			}
+			out = append(out, c)
+		}
+		return rows.Err()
+	}
+	// Same scoping as FindDelegatedActionsScoped: tenant RLS when the caller
+	// is tenant-scoped, the read-only platform scope otherwise.
+	var err error
+	if tenantID != "" {
+		err = s.withRLS(ctx, tenantID, evaluate)
+	} else {
+		err = s.withPlatformScope(ctx, evaluate)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
 }
 
 // RevokeProjectedDelegation ends a projected delegation on an upstream
@@ -924,7 +1024,7 @@ func (s *PgStore) ProjectDelegation(ctx context.Context, params domain.ProjectDe
 // LOCALLY-authored row — source_delegation_id IS NOT NULL is in the
 // predicate — because an upstream id colliding with a local delegation must
 // not let one service revoke another's grant.
-func (s *PgStore) RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error) {
+func (s *PgStore) RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string, version int64) (*domain.DelegatedAuthority, error) {
 	if tenantID == "" {
 		return nil, domain.ErrTenantScopeRequired
 	}
@@ -934,17 +1034,20 @@ func (s *PgStore) RevokeProjectedDelegation(ctx context.Context, sourceService, 
 
 	const query = `
 		UPDATE delegated_authorities
-		   SET revocation_status = 'REVOKED'
+		   SET revocation_status = 'REVOKED', source_version = GREATEST(source_version, $4)
 		 WHERE source_service = $1
 		   AND source_delegation_id = $2
 		   AND source_delegation_id IS NOT NULL
 		   AND tenant_id = $3::uuid
+		   -- an end older than the projection (a replayed suspension after a
+		   -- resume) must not end it again
+		   AND source_version <= $4
 		RETURNING ` + delegationColumns + `;`
 
 	var d *domain.DelegatedAuthority
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var scanErr error
-		d, scanErr = scanDelegation(tx.QueryRow(ctx, query, sourceService, sourceDelegationID, tenantID))
+		d, scanErr = scanDelegation(tx.QueryRow(ctx, query, sourceService, sourceDelegationID, tenantID, version))
 		return scanErr
 	})
 	if err != nil {

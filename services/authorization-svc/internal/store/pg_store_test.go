@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -50,7 +51,7 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	// for the same reason: 000009 creates them, and CREATE OR REPLACE FUNCTION
 	// cannot change a function's return type, so a stale definition from an
 	// earlier schema version fails the migration rather than being replaced.
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS authority_limits, support_sessions, break_glass_sessions, privileged_sessions, principal_status_projection, abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS access_reviews, workload_bindings, authority_limits, support_sessions, break_glass_sessions, privileged_sessions, principal_status_projection, abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
 	_, _ = pool.Exec(ctx, "DROP VIEW IF EXISTS access_decision_log_retention_status;")
 	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS detach_access_decision_log_partitions_before(DATE);")
 	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS create_access_decision_log_partition(DATE);")
@@ -72,7 +73,7 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	// access_decision_log had no tenant_id here and both AccessDecisionLog
 	// tests failed on a column the real schema has. A list is the shape that
 	// makes the next migration a one-line change instead of a missed one.
-	for _, name := range []string{
+	migrations := []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_sod_rule_tenant_scoping.up.sql",
 		"000003_nullable_legal_entity_for_tenant_scope.up.sql",
@@ -106,7 +107,22 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000014_add_privileged_sessions.up.sql",
 		"000015_add_break_glass_and_support_sessions.up.sql",
 		"000016_add_scope_dimensions_and_authority_limits.up.sql",
-	} {
+		// 000017 was the third migration missed here (access reviews and
+		// workload identities); 000018 adds the delegation projection's
+		// source_version and ceiling columns.
+		"000017_add_access_reviews_and_workload_identities.up.sql",
+		"000018_delegation_projection_version_and_limits.up.sql",
+	}
+	// Three migrations have now been missed from this list. Refuse to run
+	// against a schema the list does not fully describe.
+	onDisk, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	if err != nil {
+		t.Fatalf("listing migrations: %v", err)
+	}
+	if len(onDisk) != len(migrations) {
+		t.Fatalf("setupTestDB applies %d migrations but %d exist on disk — add the new one to the list", len(migrations), len(onDisk))
+	}
+	for _, name := range migrations {
 		sql, err := os.ReadFile("../../deployments/migrations/" + name)
 		if err != nil {
 			t.Fatalf("failed to read migration %s: %v", name, err)

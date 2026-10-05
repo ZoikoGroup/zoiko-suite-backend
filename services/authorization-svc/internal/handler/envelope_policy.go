@@ -29,8 +29,10 @@ var evaluatePaths = map[string]bool{
 	// principal in scope for", "is this authority borrowed" — and none of them
 	// writes anything at all, not even the decision artifact /v1/authorize
 	// writes. See internal/handler/validation.go.
-	EntityScopeValidatePath:     true,
-	SoDValidatePath:             true,
+	EntityScopeValidatePath: true,
+	SoDValidatePath:         true,
+	// The maker-checker question (5 Oct 2026). Answers; writes nothing.
+	SoDEvaluatePath:             true,
 	DelegatedAccessEvaluatePath: true,
 }
 

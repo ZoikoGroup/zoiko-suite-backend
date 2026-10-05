@@ -170,13 +170,13 @@ type Handler struct {
 
 func New(store AuthorizationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, siemClient *siem.Client, platformScopeEntityID string, enforceTenantOnAuthorize bool, log *zap.Logger) *Handler {
 	return &Handler{
-		store:                   store,
-		publisher:               publisher,
-		jurisdictionValidator:   jurisdictionValidator,
-		siem:                    siemClient,
-		platformScopeEntityID:   platformScopeEntityID,
+		store:                    store,
+		publisher:                publisher,
+		jurisdictionValidator:    jurisdictionValidator,
+		siem:                     siemClient,
+		platformScopeEntityID:    platformScopeEntityID,
 		enforceTenantOnAuthorize: enforceTenantOnAuthorize,
-		log:                     log,
+		log:                      log,
 	}
 }
 
@@ -251,6 +251,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// one is and why it is not a material write.
 	r.Post(EntityScopeValidatePath, h.ValidateEntityScope)
 	r.Post(SoDValidatePath, h.ValidateSoDConflicts)
+	r.Post(SoDEvaluatePath, h.EvaluateSoD)
 	r.Post(DelegatedAccessEvaluatePath, h.EvaluateDelegatedAccess)
 
 	// "Retrieve authorization rationale" — both halves. The collection read is
@@ -1560,27 +1561,27 @@ func (h *Handler) CreateABACRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-// A tenant scope is required to reach this route at all, whether or not the
-// body names one — the same reasoning CreateSoDRule carries. Without it, a
-// request holding nothing but a principal header could store a rule with
-// tenant_id NULL that denies an action for every tenant on the platform.
-tenantScope, ok := h.requireTenant(w, r)
-if !ok {
-	return
-}
-if req.TenantID != nil && *req.TenantID != "" {
-	if h.refuseForeignTenant(w, *req.TenantID, tenantScope) {
+	// A tenant scope is required to reach this route at all, whether or not the
+	// body names one — the same reasoning CreateSoDRule carries. Without it, a
+	// request holding nothing but a principal header could store a rule with
+	// tenant_id NULL that denies an action for every tenant on the platform.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
-	// Require iam.abac_rule.manage for tenant-scoped ABAC rules
-	if !h.requirePermission(w, r, principalID, tenantScope, "iam.abac_rule.manage") {
-		return
+	if req.TenantID != nil && *req.TenantID != "" {
+		if h.refuseForeignTenant(w, *req.TenantID, tenantScope) {
+			return
+		}
+		// Require iam.abac_rule.manage for tenant-scoped ABAC rules
+		if !h.requirePermission(w, r, principalID, tenantScope, "iam.abac_rule.manage") {
+			return
+		}
+	} else {
+		if !h.requirePlatformAction(w, r, principalID, ActionABACRuleManageGlobal) {
+			return
+		}
 	}
-} else {
-	if !h.requirePlatformAction(w, r, principalID, ActionABACRuleManageGlobal) {
-		return
-	}
-}
 
 	rule, err := h.store.CreateABACRule(r.Context(), domain.CreateABACRuleParams{
 		TenantID:             req.TenantID,
@@ -2093,6 +2094,9 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	granted := contains(rbacActions, req.ActionType)
 	basis := rbacBasis
 	allHeldActions := append([]string{}, rbacActions...)
+	// grantedViaDelegation: the action is held only through a delegation, so
+	// the delegation's own ceiling applies (Layer 5.9 below).
+	grantedViaDelegation := false
 
 	if !granted {
 		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActionsScoped(r.Context(), req.PrincipalID, evaluationEntityID, tenantScope, req.BookID, req.OrgUnitID)
@@ -2105,6 +2109,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		if contains(delegatedActions, req.ActionType) {
 			granted = true
 			basis = delegatedBasis
+			grantedViaDelegation = true
 		}
 	}
 
@@ -2363,6 +2368,23 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 						zap.String("action_type", req.ActionType),
 						zap.String("correlation_id", correlationID))
 				}
+			}
+		}
+
+		// Layer 5.9 — the ceiling of the delegation the grant rests on (ORG-06).
+		if outcome == "GRANTED" && grantedViaDelegation {
+			denied, ceilingBasis, _, err := h.evaluateDelegationCeiling(r.Context(), evalContext{
+				PrincipalID: req.PrincipalID, TenantID: tenantScope, LegalEntityID: evaluationEntityID,
+				ActionType: req.ActionType, Attributes: req.Attributes, CorrelationID: correlationID,
+			}, evaluationEntityID)
+			if err != nil {
+				h.log.Error("Authorize: store unavailable (delegation ceiling)", zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return
+			}
+			if denied {
+				outcome = "DENIED"
+				basis = ceilingBasis
 			}
 		}
 

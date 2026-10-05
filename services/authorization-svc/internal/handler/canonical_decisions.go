@@ -167,9 +167,11 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		return nil, fmt.Errorf("delegation lookup: %w", err)
 	}
 	allHeldActions = append(allHeldActions, delegatedActions...)
+	grantedViaDelegation := false
 	if !granted && contains(delegatedActions, in.ActionType) {
 		granted = true
 		basis = delegatedBasis
+		grantedViaDelegation = true
 		res.MatchedGrants = append(res.MatchedGrants, delegatedBasis)
 	}
 
@@ -420,6 +422,24 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 
 		h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 		return res, nil
+	}
+
+	// ── Layer 5.9: the ceiling of the delegation the grant rests on (ORG-06) ──
+	if grantedViaDelegation {
+		ceilingDenied, ceilingBasis, ceilingReason, err := h.evaluateDelegationCeiling(ctx, in, evaluationEntityID)
+		if err != nil {
+			return nil, fmt.Errorf("delegation ceiling evaluation: %w", err)
+		}
+		if ceilingDenied {
+			res.Decision = domain.CanonicalDecisionDeny
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = ceilingBasis
+			res.Reason = ceilingReason
+			res.ReasonCodes = []string{"DELEGATION_LIMIT_EXCEEDED"}
+			res.NegativeControls = []string{ceilingBasis}
+			h.computeAvailableActions(ctx, in, evaluationEntityID, res)
+			return res, nil
+		}
 	}
 
 	// ── Layer 6.0: Monetary Authority Limits & FX Basis (Phase 3.6 & 3.7, Scenario A09) ──
@@ -753,7 +773,7 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 		ResourceOwnerID:     resourceOwnerID,
 		Attributes:          req.ResourceAttributes,
 		Environment:         req.Environment,
-		PrivilegedSessionID:  req.SessionID,
+		PrivilegedSessionID: req.SessionID,
 		CorrelationID:       correlationID,
 		InitiatingSubjectID: initiatingSubjectID,
 	}
@@ -841,7 +861,7 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 	}
 	if principalID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_principal",
+			"error":   "missing_principal",
 			"message": "X-Principal-Id header or principal_id query parameter is required",
 		})
 		return
@@ -853,7 +873,7 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 	}
 	if tenantScope == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_tenant_scope",
+			"error":   "missing_tenant_scope",
 			"message": "X-Tenant-Id header or tenant_id query parameter is required",
 		})
 		return
@@ -1217,4 +1237,3 @@ func (h *Handler) GetMyCapabilities(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, resp)
 }
-

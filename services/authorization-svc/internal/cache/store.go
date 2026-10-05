@@ -80,7 +80,8 @@ type Inner interface {
 	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	ProjectDelegation(ctx context.Context, params domain.ProjectDelegationParams) (*domain.DelegatedAuthority, error)
-	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error)
+	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string, version int64) (*domain.DelegatedAuthority, error)
+	FindDelegationCeilings(ctx context.Context, principalID, legalEntityID, tenantID, actionType string) ([]domain.DelegationCeiling, error)
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
 	ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error)
 	SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error)
@@ -545,8 +546,27 @@ func (s *Store) ProjectPrincipalStatus(ctx context.Context, params domain.Projec
 	return p, err
 }
 
-func (s *Store) RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error) {
-	d, err := s.inner.RevokeProjectedDelegation(ctx, sourceService, sourceDelegationID, tenantID)
+// FindGrantedActionsInTenant is not cached: it answers a segregation check in
+// front of a privileged command, where a stale "no conflicting duty" is the
+// wrong way to be wrong.
+func (s *Store) FindGrantedActionsInTenant(ctx context.Context, principalID, tenantID string) ([]string, error) {
+	if f, ok := s.inner.(interface {
+		FindGrantedActionsInTenant(ctx context.Context, principalID, tenantID string) ([]string, error)
+	}); ok {
+		return f.FindGrantedActionsInTenant(ctx, principalID, tenantID)
+	}
+	return nil, domain.ErrStoreUnavailable
+}
+
+// FindDelegationCeilings is not cached: a ceiling is consulted only on a
+// decision granted through a delegation that names an amount, and a stale
+// ceiling would be the wrong way to be wrong.
+func (s *Store) FindDelegationCeilings(ctx context.Context, principalID, legalEntityID, tenantID, actionType string) ([]domain.DelegationCeiling, error) {
+	return s.inner.FindDelegationCeilings(ctx, principalID, legalEntityID, tenantID, actionType)
+}
+
+func (s *Store) RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string, version int64) (*domain.DelegatedAuthority, error) {
+	d, err := s.inner.RevokeProjectedDelegation(ctx, sourceService, sourceDelegationID, tenantID, version)
 	if err == nil {
 		s.invalidate(nsDelegation, tenantID)
 	}

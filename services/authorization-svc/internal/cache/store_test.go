@@ -126,8 +126,12 @@ func (c *countingStore) RevokeDelegatedAuthority(_ context.Context, _, _ string)
 func (c *countingStore) ProjectDelegation(_ context.Context, _ domain.ProjectDelegationParams) (*domain.DelegatedAuthority, error) {
 	return &domain.DelegatedAuthority{}, nil
 }
-func (c *countingStore) RevokeProjectedDelegation(_ context.Context, _, _, _ string) (*domain.DelegatedAuthority, error) {
+func (c *countingStore) RevokeProjectedDelegation(_ context.Context, _, _, _ string, _ int64) (*domain.DelegatedAuthority, error) {
 	return &domain.DelegatedAuthority{}, nil
+}
+
+func (c *countingStore) FindDelegationCeilings(_ context.Context, _, _, _, _ string) ([]domain.DelegationCeiling, error) {
+	return nil, nil
 }
 func (c *countingStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleParams) (*domain.SoDRule, error) {
 	return &domain.SoDRule{}, nil
