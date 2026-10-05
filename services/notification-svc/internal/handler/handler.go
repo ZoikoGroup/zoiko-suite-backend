@@ -168,6 +168,7 @@ type Handler struct {
 	webhookHandler *webhook.Handler
 	suppressions   SuppressionStore
 	intents        IntentStore
+	preferences    PreferenceStore
 	// metrics may be nil (tests); every observation is nil-safe.
 	metrics *telemetry.Domain
 
@@ -198,6 +199,9 @@ type Deps struct {
 	// registry routes answer 503 and a template bound to an intent cannot be sent
 	// (fail closed).
 	Intents IntentStore
+	// Preferences is the recipient preference store (NCD-02). Optional: without it the
+	// preference routes answer 503.
+	Preferences PreferenceStore
 	Metrics        *telemetry.Domain
 	Log            *zap.Logger
 }
@@ -214,6 +218,7 @@ func New(d Deps) *Handler {
 		webhookHandler: d.WebhookHandler,
 		suppressions:   d.Suppressions,
 		intents:        d.Intents,
+		preferences:    d.Preferences,
 		metrics:        d.Metrics,
 		log:            d.Log,
 	}
@@ -265,6 +270,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 
 	registerIntentRoutes(r, h)
+	registerPreferenceRoutes(r, h)
+	r.Post("/v1/channel-decision", h.ChannelDecision)
 
 	r.Route("/v1/document-templates", func(r chi.Router) {
 		r.Post("/", h.CreateTemplate)
@@ -707,7 +714,7 @@ func (h *Handler) recordAttemptOutcome(w http.ResponseWriter, r *http.Request, n
 	// it up — which is the whole difference between classifying a failure and
 	// doing something about it.
 	if !outcome.Delivered && outcome.Retryable {
-		if next, ok := h.retryPolicy.NextAttempt(attemptedAt, attemptNumber); ok {
+		if next, ok := h.retryPolicy.NextAttemptFor(attemptedAt, attemptNumber, outcome.DeferUntil); ok {
 			if err := h.store.ScheduleRetry(outcomeCtx, notification.NotificationID,
 				tenantID, outcome.Reason, attemptedAt, next, meta); err != nil {
 				h.log.Error("failed to schedule delivery retry", zap.Error(err))

@@ -354,3 +354,40 @@ Sending an email uses the recipient's contact details for a purpose, and `privac
 * **The sender principal is used as the actor** on the decision request; there is no service identity distinct from the caller yet.
 * **No preferences, quiet hours or recipient channel decision yet** (the rest of NCD-02), and no call to the PDC (data-classification) service.
 * **No mutual TLS or retry/backoff of the privacy call itself:** a failure becomes a retryable refusal and the existing retry worker asks again.
+
+## 14. Wave 3 slice 2: recipient preferences and quiet hours (NCD-02 5.3, INV-23, NP-19, NP-20)
+
+A preference is a state dimension of its own: it selects when and whether a routine message arrives, it never creates permission to send, and it never overrides a mandatory notice.
+
+* **Profile:** `recipient_preferences` (migration 000023, row-level security): IANA time zone (mandatory, never an offset and never guessed), optional quiet window as local `HH:MM` (overnight windows allowed), muted channels, version. The database refuses a half window, an empty window, a non-zone string and a non-array mute list (each constraint is proven individually).
+* **API:** `GET /v1/preferences` and `POST /v1/preferences` act on the **caller's own** profile only. The principal comes from the authenticated request; a body that names one is rejected. Preferences cannot touch privacy consent or PDC rules.
+* **Applied in the direct-send guard**, only to **operational (A1)** messages, after suppression and before the privacy question (a held message makes no remote call). **Security (S0) and transactional (T0) messages are never delayed or muted, and their profile is not even read:** overriding a mandatory notice needs an explicit policy, and a convenience setting is not one.
+  * Quiet hours: the message is **held** (NCD-012) until the window ends in the recipient's own calendar. Daylight saving comes from the zone database (tested across the March change, and an end time that falls inside the spring-forward gap still moves forward).
+  * Muted channel: terminal refusal (NCD-010).
+  * Profile unreadable, zone unknown or quiet hours unparseable: the routine message is withheld and retried, not sent on a guess.
+* **Held, not failing:** the outcome carries `DeferUntil`. Both the first attempt and the retry worker schedule the next attempt at that time instead of a 30-second backoff (`Policy.NextAttemptFor`), so a message is not retried through the night until its attempts run out. The notification stays PENDING with the reason recorded on the attempt.
+* **Tests:** evaluator table (classes, mute, same-day and overnight windows, zones versus UTC, DST), validation, guard (hold, bypass, mute, no profile, unreadable, unusable, ordering against privacy), retry scheduling, API (own profile only, strict body, validation), and real-Postgres tests for storage and versions, each constraint, tenant isolation, a stored deferral, and migration 000023 down/up.
+
+**Not built, deliberately:**
+* **A deferral counts as an attempt.** A message held across one night uses one of its five attempts; a message that is deferred and then fails transiently several times can still conclude as failed. A separate "held" state that does not consume attempts, and an expiry for held messages (NCD-015), are not built.
+* **No tenant, jurisdiction or PDC quiet-hour rules.** Quiet hours are the recipient's own setting only, so a statutory curfew is not enforced. A recipient with no profile gets no quiet hours (nothing was expressed); there is no governed default or review route for a missing zone (NP-20 is honoured by not guessing, not by routing to review).
+* **No urgency override:** there is no way to mark a specific A1 message as urgent enough to break quiet hours; only S0 and T0 bypass.
+* **Only EMAIL is guarded**, so the same limit as the privacy gate: IN_APP, SMS and push are not covered, and the ledger pipeline does not apply preferences yet.
+* **No recipient plan, channel decision, `/revalidate` or `/suppressions` read API** (the rest of NCD-02), and no admin or delegated change of someone else's profile.
+
+## 15. Wave 3 slice 3: channel decision (NCD-02 5.5, POST /channel-decision)
+
+`POST /v1/channel-decision` answers "which channels may this communication use for this recipient, in order, and why not the others". It sends nothing and records nothing.
+
+* **Input:** `recipient_principal_id` and a `legal_entity_id` or an `intent_id` (an intent supplies the legal entity, the purpose class and the allowed channels; a class that conflicts with it, or a different legal entity, is refused); optional `communication_class` (default T0, direct-path classes only) and `channels` (narrows and orders; duplicates dropped).
+* **Output:** `eligible_channels` best first (EMAIL, then IN_APP, or the caller's order) and `rejected_channels`, each with a code: NCD-010 suppressed or muted, NCD-011 not allowed by the intent or unknown or no usable endpoint, NCD-012 quiet hours (an eligible routine channel carries `not_before`; an unusable profile is refused), NCD-013 no provider route (SMS and push). `code` is NCD-011 when nothing is eligible.
+* **Facts it reads:** the intent (effective now), the recipient's email endpoint from identity, the suppression list for the class's stream, and the recipient's preferences. **Email that cannot be established is not eligible**: no endpoint, an unreadable suppression state, or no suppression store configured all remove it (fail closed).
+* **Authorization:** NOTIFICATION_SEND on the legal entity, because the answer reveals suppression and mute state.
+* **Same rules as delivery:** it reuses the preference evaluator, so what the decision predicts and what the guard later does agree (S0 and T0 never deferred or muted).
+* **Tests:** the pure decision table (defaults, ordering, intent constraint, email facts, preference classes, unusable profile) and the API (authorization, validation, strict body, suppressed address, fail-closed without a suppression store, intent-driven class and channels).
+
+**Not built, deliberately:**
+* **Advisory only.** There is no persisted `recipient_plan_id`, so a send does not consume a plan and cannot be shown to have followed one; the delivery guard re-decides at send time.
+* **Privacy permission is not part of the answer.** It needs an activity and purpose from an intent and a remote call, and is enforced at send; a channel listed as eligible can still be refused by the privacy gate.
+* **No fallback rules or evidence requirement** in the output (the spec lists both), and no `/revalidate`.
+* **Email is the only channel with endpoint and suppression facts;** IN_APP has none to check.

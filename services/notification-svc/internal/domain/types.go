@@ -279,6 +279,12 @@ type DeliveryOutcome struct {
 	// retry worker possible without re-litigating every historical failure.
 	Retryable bool
 
+	// DeferUntil, when set on a Retryable outcome, is when the next attempt is due
+	// instead of the usual backoff: the message is being held on purpose (a recipient's
+	// quiet hours, NCD-012), not failing, so it must not be retried every 30 seconds
+	// until its attempts run out.
+	DeferUntil time.Time
+
 	// Unknown marks an outcome that is neither a confirmed acceptance nor a
 	// safely-retryable or terminal failure — the message may or may not
 	// have reached the provider, and guessing either way risks a duplicate

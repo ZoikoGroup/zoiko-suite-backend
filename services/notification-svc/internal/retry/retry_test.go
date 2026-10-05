@@ -498,3 +498,27 @@ func (s *stubStore) MarkStrandedUnknown(_ context.Context, id, _ string, _, at t
 	}
 	return true, nil
 }
+
+func TestNextAttemptFor_AHoldIsDueWhenItsDeferralEndsNotAfterABackoff(t *testing.T) {
+	now := time.Now().UTC()
+	p := retry.DefaultPolicy
+	until := now.Add(6 * time.Hour)
+	next, ok := p.NextAttemptFor(now, 1, until)
+	if !ok || !next.Equal(until) {
+		t.Fatalf("a deferral is due at its own time, got %v ok=%v", next, ok)
+	}
+	// A zero deferral behaves exactly like NextAttempt.
+	a, ok1 := p.NextAttemptFor(now, 1, time.Time{})
+	if !ok1 || !a.After(now) || a.After(now.Add(2*p.BaseDelay)) {
+		t.Fatalf("no deferral means the usual backoff, got %v", a)
+	}
+	// A deferral never extends past exhaustion: attempts still run out.
+	if _, ok := p.NextAttemptFor(now, p.MaxAttempts, until); ok {
+		t.Fatal("a held message with no attempts left is concluded, not looped")
+	}
+	// A deferral already in the past never makes the retry sooner than the backoff.
+	b, _ := p.NextAttemptFor(now, 1, now.Add(-time.Hour))
+	if b.Before(now) {
+		t.Fatalf("retry scheduled in the past: %v", b)
+	}
+}

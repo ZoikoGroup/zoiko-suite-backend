@@ -2,12 +2,16 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/ledger"
+	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/preference"
 	"zoiko.io/notification-svc/internal/privacy"
 )
 
@@ -50,7 +54,52 @@ type DirectSendGuard struct {
 	policy     PolicyResolver
 	killSwitch KillSwitch
 	privacy    PrivacyGate
+	prefs      PreferenceSource
+	now        func() time.Time
 	log        *zap.Logger
+}
+
+// PreferenceSource reads a recipient's convenience profile. A recipient who has expressed
+// none returns domain.ErrPreferencesNotFound. The Postgres store satisfies it.
+type PreferenceSource interface {
+	GetPreferences(ctx context.Context, principalID string) (*domain.RecipientPreferences, error)
+}
+
+// WithPreferences enables recipient preferences (NCD-02 5.3): a routine (A1) message is
+// held through the recipient's quiet hours and refused on a channel they muted. Security
+// and transactional messages are never touched. A profile that cannot be read or applied
+// withholds the message (retryable) rather than risk a 3am notification.
+func (g *DirectSendGuard) WithPreferences(p PreferenceSource) *DirectSendGuard {
+	g.prefs = p
+	return g
+}
+
+// applyPreferences returns (outcome, true) when a preference stops this delivery now.
+func (g *DirectSendGuard) applyPreferences(ctx context.Context, n domain.Notification, class ledger.CommunicationClass) (domain.DeliveryOutcome, bool) {
+	if g.prefs == nil || !preference.Subject(string(class)) {
+		return domain.DeliveryOutcome{}, false
+	}
+	p, err := g.prefs.GetPreferences(svcmiddleware.WithTenant(ctx, n.TenantID), n.RecipientPrincipalID)
+	if errors.Is(err, domain.ErrPreferencesNotFound) {
+		return domain.DeliveryOutcome{}, false
+	}
+	if err != nil {
+		g.log.Error("direct send held: recipient preferences unreadable; the provider was not called",
+			zap.String("notification_id", n.NotificationID), zap.Error(err))
+		return domain.DeliveryOutcome{Reason: "recipient preferences unavailable; routine delivery withheld: " + err.Error(), Retryable: true}, true
+	}
+	d := preference.Evaluate(p, string(class), n.Channel, g.now())
+	switch d.Effect {
+	case preference.Mute:
+		return domain.DeliveryOutcome{Reason: d.Reason}, true
+	case preference.Defer:
+		g.log.Info("direct send deferred by recipient quiet hours; the provider was not called",
+			zap.String("notification_id", n.NotificationID), zap.Time("until", d.Until))
+		return domain.DeliveryOutcome{Reason: d.Reason, Retryable: true, DeferUntil: d.Until}, true
+	case preference.Unusable:
+		return domain.DeliveryOutcome{Reason: d.Reason, Retryable: true}, true
+	}
+	return domain.DeliveryOutcome{}, false
 }
 
 // PrivacyGate asks the privacy authority whether an intent-bound message may use the
@@ -94,7 +143,7 @@ func NewDirectSendGuard(inner Deliverer, policy PolicyResolver, killSwitch KillS
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &DirectSendGuard{inner: inner, policy: policy, killSwitch: killSwitch, log: log}, nil
+	return &DirectSendGuard{inner: inner, policy: policy, killSwitch: killSwitch, now: time.Now, log: log}, nil
 }
 
 // Deliver applies the controls and, only if they pass, hands the notification to
@@ -153,6 +202,10 @@ func (g *DirectSendGuard) Deliver(ctx context.Context, n domain.Notification) do
 			Reason:    "refused by delivery policy (" + decision.RuleName + "): " + decision.Reason,
 			Retryable: false,
 		}
+	}
+
+	if out, held := g.applyPreferences(ctx, n, class); held {
+		return out
 	}
 
 	if g.privacy == nil {

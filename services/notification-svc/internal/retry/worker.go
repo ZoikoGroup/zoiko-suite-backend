@@ -473,7 +473,7 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 	}
 
 	if outcome.Retryable {
-		if next, ok := w.policy.NextAttempt(now, attemptsMade); ok {
+		if next, ok := w.policy.NextAttemptFor(now, attemptsMade, outcome.DeferUntil); ok {
 			if err := w.store.ScheduleRetry(ctx, n.NotificationID, n.TenantID, outcome.Reason, now, next, retryMeta(outcome)); err != nil {
 				w.log.Error("retry worker: could not reschedule",
 					zap.String("notification_id", n.NotificationID), zap.Error(err))

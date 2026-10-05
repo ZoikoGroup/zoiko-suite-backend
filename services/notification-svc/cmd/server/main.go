@@ -307,6 +307,7 @@ func main() {
 	if err != nil {
 		log.Fatal("failed to construct the direct send guard", zap.Error(err))
 	}
+	directDeliverer.WithPreferences(pgStore)
 	if cfg.PrivacyEnforcement {
 		gate, gerr := privacy.NewGate(privacy.NewClient(cfg.PrivacyDecisionURL, cfg.PrivacyTimeout, log), pgStore, log)
 		if gerr != nil {
@@ -398,6 +399,7 @@ func main() {
 		WebhookHandler: webhookHandler,
 		Suppressions:   pgStore,
 		Intents:        pgStore,
+		Preferences:    pgStore,
 		Log:            log,
 	})
 	handler.RegisterRoutes(r, h)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
@@ -260,6 +261,95 @@ func TestDirectGuard_PrivacyGate(t *testing.T) {
 		n.Channel = domain.ChannelInApp
 		out := guard(t, &fakeInner{}, allowed(), &fakeKill{}).WithPrivacyGate(pg).Deliver(context.Background(), n)
 		assert.True(t, out.Delivered)
+		assert.Zero(t, pg.calls)
+	})
+}
+
+type fakePrefs struct {
+	p     *domain.RecipientPreferences
+	err   error
+	calls int
+}
+
+func (f *fakePrefs) GetPreferences(_ context.Context, _ string) (*domain.RecipientPreferences, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.p == nil {
+		return nil, domain.ErrPreferencesNotFound
+	}
+	return f.p, nil
+}
+
+func ptr(s string) *string { return &s }
+
+func TestDirectGuard_RecipientPreferences(t *testing.T) {
+	night := time.Date(2026, 1, 10, 23, 30, 0, 0, time.UTC) // London is on UTC in January
+	quiet := &domain.RecipientPreferences{TimeZone: "Europe/London", QuietStart: ptr("22:00"), QuietEnd: ptr("07:00"), MutedChannels: []string{}}
+	routine := func() domain.Notification { n := email(); n.CommunicationClass = "A1"; return n }
+
+	run := func(t *testing.T, f *fakePrefs, n domain.Notification) (domain.DeliveryOutcome, *fakeInner) {
+		in := &fakeInner{}
+		g := guard(t, in, allowed(), &fakeKill{}).WithPreferences(f)
+		g.now = func() time.Time { return night }
+		return g.Deliver(context.Background(), n), in
+	}
+
+	t.Run("a routine message is held through quiet hours until they end", func(t *testing.T) {
+		out, in := run(t, &fakePrefs{p: quiet}, routine())
+		assert.False(t, out.Delivered)
+		assert.True(t, out.Retryable)
+		assert.Zero(t, in.calls, "the provider is not called")
+		assert.Equal(t, time.Date(2026, 1, 11, 7, 0, 0, 0, time.UTC), out.DeferUntil)
+		assert.Contains(t, out.Reason, "NCD-012")
+	})
+	t.Run("a security or transactional message is never held and the profile is not even read", func(t *testing.T) {
+		for _, class := range []string{"S0", "T0", ""} {
+			f := &fakePrefs{p: quiet}
+			n := email()
+			n.CommunicationClass = class
+			out, in := run(t, f, n)
+			assert.True(t, out.Delivered, class)
+			assert.Equal(t, 1, in.calls, class)
+			assert.Zero(t, f.calls, class)
+		}
+	})
+	t.Run("a muted channel is a terminal refusal", func(t *testing.T) {
+		out, in := run(t, &fakePrefs{p: &domain.RecipientPreferences{TimeZone: "UTC", MutedChannels: []string{"EMAIL"}}}, routine())
+		assert.False(t, out.Delivered)
+		assert.False(t, out.Retryable)
+		assert.Zero(t, in.calls)
+		assert.Contains(t, out.Reason, "NCD-010")
+	})
+	t.Run("no profile means no preference", func(t *testing.T) {
+		out, _ := run(t, &fakePrefs{}, routine())
+		assert.True(t, out.Delivered)
+	})
+	t.Run("an unreadable profile withholds a routine message and retries", func(t *testing.T) {
+		out, in := run(t, &fakePrefs{err: errors.New("db down")}, routine())
+		assert.False(t, out.Delivered)
+		assert.True(t, out.Retryable)
+		assert.True(t, out.DeferUntil.IsZero())
+		assert.Zero(t, in.calls)
+	})
+	t.Run("an unusable zone withholds rather than guesses", func(t *testing.T) {
+		out, in := run(t, &fakePrefs{p: &domain.RecipientPreferences{TimeZone: "Not/AZone", QuietStart: ptr("22:00"), QuietEnd: ptr("07:00")}}, routine())
+		assert.False(t, out.Delivered)
+		assert.True(t, out.Retryable)
+		assert.Zero(t, in.calls)
+	})
+	t.Run("outside quiet hours it is delivered", func(t *testing.T) {
+		in := &fakeInner{}
+		g := guard(t, in, allowed(), &fakeKill{}).WithPreferences(&fakePrefs{p: quiet})
+		g.now = func() time.Time { return time.Date(2026, 1, 11, 12, 0, 0, 0, time.UTC) }
+		assert.True(t, g.Deliver(context.Background(), routine()).Delivered)
+	})
+	t.Run("preferences run before the privacy question so a held message makes no remote call", func(t *testing.T) {
+		pg := &fakePrivacy{out: privacy.Outcome{Applies: true, Verdict: privacy.Verdict{Allow: true, Result: "PERMIT", DecisionID: "d"}}}
+		g := guard(t, &fakeInner{}, allowed(), &fakeKill{}).WithPreferences(&fakePrefs{p: quiet}).WithPrivacyGate(pg)
+		g.now = func() time.Time { return night }
+		g.Deliver(context.Background(), routine())
 		assert.Zero(t, pg.calls)
 	})
 }
