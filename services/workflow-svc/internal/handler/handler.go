@@ -26,6 +26,7 @@ type WorkflowStore interface {
 	FindStagesByWorkflowID(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowStage, error)
 	FindCurrentStage(ctx context.Context, workflowInstanceID string) (*domain.WorkflowStage, error)
 	SubmitAction(ctx context.Context, params domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
+	SubmitQuorumVote(ctx context.Context, params domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
 	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
 	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
 	InvalidateWorkflow(ctx context.Context, params domain.InvalidateWorkflowParams) (*domain.WorkflowInstance, bool, error)
@@ -165,6 +166,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/workflows/{workflow_instance_id}", h.GetWorkflow)
 	r.Get("/v1/workflows/{workflow_instance_id}/next-approver", h.GetNextApprover)
 	r.Post("/v1/workflows/{workflow_instance_id}/actions", h.SubmitAction)
+	r.Post("/v1/workflows/{workflow_instance_id}/quorum-votes", h.SubmitQuorumVote)
 	r.Post("/v1/workflows/{workflow_instance_id}/escalate", h.EscalateWorkflow)
 	r.Post("/v1/workflows/{workflow_instance_id}/cancel", h.CancelWorkflow)
 	r.Post("/v1/workflows/{workflow_instance_id}/invalidate", h.InvalidateWorkflow)
@@ -376,19 +378,50 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no_stages"})
 		return
 	}
-	for _, st := range req.Stages {
-		if st.ApproverPrincipalID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].approver_principal_id"})
-			return
-		}
-	}
+	// Each stage is SINGLE (default, one named approver) or QUORUM (an
+	// eligible pool with an N-of-M threshold — ZS-SVC-R-001 §5.1).
 	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
 	// the initiator of a workflow may not be listed as an approver in any
-	// of its own stages. This is a validation error on the caller-supplied
-	// workflow definition, not an authz decision.
-	for _, st := range req.Stages {
-		if st.ApproverPrincipalID == principalID {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].approver_principal_id"})
+	// of its own stages, for either shape — a validation error on the
+	// caller-supplied workflow definition, not an authz decision.
+	for i, st := range req.Stages {
+		stageType := st.StageType
+		if stageType == "" {
+			stageType = domain.StageTypeSingle
+		}
+		switch stageType {
+		case domain.StageTypeSingle:
+			if st.ApproverPrincipalID == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].approver_principal_id"})
+				return
+			}
+			if st.ApproverPrincipalID == principalID {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].approver_principal_id"})
+				return
+			}
+		case domain.StageTypeQuorum:
+			if len(st.QuorumApprovers) == 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "stages[].quorum_approvers"})
+				return
+			}
+			if st.RequiredApprovals <= 0 || st.RequiredApprovals > len(st.QuorumApprovers) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_required_approvals", "field": "stages[].required_approvals"})
+				return
+			}
+			seen := make(map[string]bool, len(st.QuorumApprovers))
+			for _, approver := range st.QuorumApprovers {
+				if seen[approver] {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "duplicate_quorum_approver", "field": "stages[].quorum_approvers"})
+					return
+				}
+				seen[approver] = true
+				if approver == principalID {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].quorum_approvers"})
+					return
+				}
+			}
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_stage_type", "field": fmt.Sprintf("stages[%d].stage_type", i)})
 			return
 		}
 	}
@@ -514,6 +547,12 @@ type submitActionRequest struct {
 	Rationale *string `json:"rationale,omitempty"`
 	// CausationID is optional: the event/decision that caused this specific
 	// action, when the caller knows it.
+	CausationID *string `json:"causation_id,omitempty"`
+}
+
+type submitQuorumVoteRequest struct {
+	Action      string  `json:"action"`
+	Rationale   *string `json:"rationale,omitempty"`
 	CausationID *string `json:"causation_id,omitempty"`
 }
 
@@ -643,6 +682,98 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.log.Info("workflow action submitted",
+		zap.String("workflow_instance_id", workflowInstanceID),
+		zap.String("action", req.Action),
+		zap.Bool("transitioned", transitioned),
+		zap.String("workflow_status", instance.WorkflowStatus),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}})
+}
+
+// ── POST /v1/workflows/{id}/quorum-votes ─────────────────────────────────────
+
+// SubmitQuorumVote casts one eligible approver's vote against the
+// workflow's current QUORUM stage (ZS-SVC-R-001 §5.1/§8.3). Mirrors
+// SubmitAction's authorization/validation shape but calls the store's
+// separate SubmitQuorumVote path — see that method's own doc comment
+// for why quorum voting is not threaded through SubmitAction itself.
+func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
+	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req submitQuorumVoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+	if req.Action != "APPROVE" && req.Action != "REJECT" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_field", "field": "action", "message": "must be APPROVE or REJECT"})
+		return
+	}
+
+	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
+	if err != nil {
+		writeStoreErr(w, h.log, err, correlationID, "SubmitQuorumVote")
+		return
+	}
+
+	// Segregation of Duties, defense-in-depth — same guard as
+	// SubmitAction: the initiator may never vote on their own workflow,
+	// regardless of whether CreateWorkflow's own pool validation was
+	// somehow bypassed.
+	if principalID == instanceForAuthzCheck.InitiatedBy {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed", "message": domain.ErrSelfApprovalNotAllowed.Error()})
+		return
+	}
+
+	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID); err != nil {
+		switch {
+		case errors.Is(err, domain.ErrAuthorizationDenied):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+		default:
+			h.log.Error("SubmitQuorumVote: authorization-svc unavailable — failing closed",
+				zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+		}
+		return
+	}
+
+	instance, stage, transitioned, err := h.store.SubmitQuorumVote(r.Context(), domain.SubmitQuorumVoteParams{
+		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, Action: req.Action,
+		Rationale: req.Rationale, CausationID: req.CausationID,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrWorkflowNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+		case errors.Is(err, domain.ErrNotQuorumStage):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "not_quorum_stage"})
+		case errors.Is(err, domain.ErrNotEligibleQuorumApprover):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "not_eligible_quorum_approver"})
+		case errors.Is(err, domain.ErrInvalidTransition):
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "invalid_transition",
+				"reason_family":   string(svcenvelope.ReasonFamilyReject),
+				"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
+				"exception_class": string(svcenvelope.ExceptionClassBusinessRule),
+			})
+		default:
+			h.log.Error("SubmitQuorumVote: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	h.log.Info("workflow quorum vote submitted",
 		zap.String("workflow_instance_id", workflowInstanceID),
 		zap.String("action", req.Action),
 		zap.Bool("transitioned", transitioned),
@@ -883,11 +1014,12 @@ type verifyReleaseRequest struct {
 // current material fingerprint matches the approved fingerprint without stale divergence.
 //
 // Response:
-//   200 OK: {"can_release": true, "status": "VALID", ...}
-//   409 Conflict: {"can_release": false, "status": "INVALID", "reason": "...", ...}
-//   400 Bad Request: missing or invalid input
-//   404 Not Found: workflow does not exist
-//   503 Service Unavailable: store unavailable
+//
+//	200 OK: {"can_release": true, "status": "VALID", ...}
+//	409 Conflict: {"can_release": false, "status": "INVALID", "reason": "...", ...}
+//	400 Bad Request: missing or invalid input
+//	404 Not Found: workflow does not exist
+//	503 Service Unavailable: store unavailable
 func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")

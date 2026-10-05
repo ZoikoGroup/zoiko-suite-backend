@@ -45,10 +45,13 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS policy_change_approvals, model_provider_registrations,
 		automation_actions, automation_policies, action_risk_classifications, ai_runs,
-		ai_impact_assessments, ai_use_cases, ai_model_releases CASCADE;
+		ai_incidents, ai_evaluations, output_dispositions, ai_impact_assessments, ai_use_cases, ai_model_releases CASCADE;
 		DROP FUNCTION IF EXISTS aig01_enforce_use_case_lifecycle() CASCADE;
 		DROP FUNCTION IF EXISTS aig01_enforce_assessment_immutability() CASCADE;
-		DROP FUNCTION IF EXISTS aig02_enforce_release_lifecycle() CASCADE;`)
+		DROP FUNCTION IF EXISTS aig02_enforce_release_lifecycle() CASCADE;
+		DROP FUNCTION IF EXISTS aig04_enforce_disposition_lifecycle() CASCADE;
+		DROP FUNCTION IF EXISTS aig05_reject_evaluation_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS aig05_enforce_incident_lifecycle() CASCADE;`)
 
 	// Every up migration in filename order, never one hardcoded name — a
 	// suite that names migrations individually silently skips new ones,

@@ -180,7 +180,7 @@ func (h *Handler) RequestPaymentAuthorization(w http.ResponseWriter, r *http.Req
 		// a payee with no ORG-10 coverage yet is a real, expected absence,
 		// not a failure (see internal/domain's package doc). Only a
 		// genuine ORG-10 outage is logged; either way the request proceeds.
-		if dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, proposal.LegalEntityID, item.PayeeRef); err == nil {
+		if dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, principalID, proposal.LegalEntityID, item.PayeeRef); err == nil {
 			snap.DestinationID = dest.DestinationID
 		} else if !errors.Is(err, domain.ErrNoActiveDestination) {
 			h.log.Warn("RequestPaymentAuthorization: payee-banking-identity-svc lookup failed — proceeding without a pinned destination", zap.Error(err))
@@ -233,7 +233,7 @@ func (h *Handler) GetPaymentAuthorization(w http.ResponseWriter, r *http.Request
 // INVALIDATED — a reachable, terminal state, not merely a blocked request —
 // matching the state model's own words ("any protected-field mismatch
 // invalidates").
-func (h *Handler) verifyStillEligible(w http.ResponseWriter, r *http.Request, a *domain.PaymentAuthorization) bool {
+func (h *Handler) verifyStillEligible(w http.ResponseWriter, r *http.Request, principalID string, a *domain.PaymentAuthorization) bool {
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
 
 	liveFingerprint, err := h.proposal.GetFingerprint(r.Context(), verifiedTenant, a.ProposalID)
@@ -268,7 +268,7 @@ func (h *Handler) verifyStillEligible(w http.ResponseWriter, r *http.Request, a 
 		if snap.DestinationID == "" {
 			continue // no ORG-10 coverage was on file at request time — nothing to re-check
 		}
-		dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, a.LegalEntityID, snap.PayeeRef)
+		dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, principalID, a.LegalEntityID, snap.PayeeRef)
 		if errors.Is(err, domain.ErrNoActiveDestination) {
 			// A destination that was pinned at request time and is no
 			// longer the active one at all (superseded/suspended with no
@@ -336,7 +336,7 @@ func (h *Handler) ApprovePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.verifyStillEligible(w, r, a) {
+	if !h.verifyStillEligible(w, r, principalID, a) {
 		return
 	}
 
@@ -427,7 +427,7 @@ func (h *Handler) ConsumePaymentAuthorization(w http.ResponseWriter, r *http.Req
 	if !h.authorize(w, r, principalID, a.LegalEntityID, PaymentAuthorize) {
 		return
 	}
-	if !h.verifyStillEligible(w, r, a) {
+	if !h.verifyStillEligible(w, r, principalID, a) {
 		return
 	}
 
@@ -587,7 +587,7 @@ func (h *Handler) ValidateAuthorization(w http.ResponseWriter, r *http.Request) 
 			if snap.DestinationID == "" {
 				continue
 			}
-			dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, a.LegalEntityID, snap.PayeeRef)
+			dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, r.Header.Get("X-Principal-Id"), a.LegalEntityID, snap.PayeeRef)
 			if err != nil || dest.DestinationID != snap.DestinationID {
 				valid = false
 				reasons = append(reasons, "payee "+snap.PayeeRef+"'s active banking destination has changed")
