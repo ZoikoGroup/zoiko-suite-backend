@@ -1,7 +1,9 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -42,6 +44,25 @@ type Config struct {
 	// Sourced from ACTION_TOKEN_SECRET. An empty value disables the action
 	// gateway — tokens cannot be generated or verified without it.
 	ActionTokenSecret string
+
+	// WebhookSecrets are the per-provider HMAC secrets that authenticate provider
+	// callbacks (ZS-SVC-Y-001 INV-27). Sourced from NOTIFICATION_WEBHOOK_SECRETS,
+	// a JSON object of provider name to a list of secrets (several so a secret can
+	// be rotated): {"ses":["new-secret-......","old-secret-......"]}. Each secret
+	// must be at least 16 bytes. A provider with no entry has every callback
+	// refused; an empty value therefore closes the webhook ingress entirely.
+	// LedgerRegisterEnabled makes every ledger-pipeline delivery also a register
+	// row (the notifications table) linked to its intent, so one communication has
+	// one identity (ZS-SVC-Y-001 INV-02; plan step 3). Sourced from
+	// NOTIFICATION_LEDGER_REGISTER_ENABLED, default false: it makes the pipeline
+	// write twice and changes where ledger deliveries are visible, so it is turned
+	// on deliberately, per environment.
+	LedgerRegisterEnabled bool
+
+	WebhookSecrets map[string][]string
+	// WebhookTolerance is how far a callback timestamp may differ from the clock.
+	// Sourced from NOTIFICATION_WEBHOOK_TOLERANCE (default 5m).
+	WebhookTolerance time.Duration
 
 	// SecondaryEmail is an optional failover SMTP provider. When configured,
 	// the router fails over to it after a transient primary failure (§13 P1-12).
@@ -245,6 +266,10 @@ func Load() (*Config, error) {
 
 		ActionTokenSecret: env("ACTION_TOKEN_SECRET", ""),
 
+		WebhookTolerance: envDuration("NOTIFICATION_WEBHOOK_TOLERANCE", 5*time.Minute),
+
+		LedgerRegisterEnabled: env("NOTIFICATION_LEDGER_REGISTER_ENABLED", "false") == "true",
+
 		SecondaryEmail: EmailConfig{
 			Provider:       env("SMTP_SECONDARY_PROVIDER", ""),
 			Host:           env("SMTP_SECONDARY_HOST", ""),
@@ -263,6 +288,15 @@ func Load() (*Config, error) {
 			BatchSize: envInt("NOTIFICATION_WEBHOOK_DLQ_BATCH_SIZE", 50),
 		},
 	}
+
+	// A malformed secret list is refused outright rather than ignored: ignoring it
+	// would close the webhook ingress (every callback refused) with nothing to say
+	// why, and a short secret would silently weaken the signature.
+	secrets, err := parseWebhookSecrets(os.Getenv("NOTIFICATION_WEBHOOK_SECRETS"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.WebhookSecrets = secrets
 
 	// Load returned a nil error unconditionally, so every default above was
 	// also a production default: an empty DB password, and an authz URL that
@@ -318,6 +352,36 @@ func Load() (*Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// minWebhookSecret mirrors webhook.MinSecretLength; config does not import the
+// webhook package, so the number is repeated and a test pins them together.
+const minWebhookSecret = 16
+
+// parseWebhookSecrets reads NOTIFICATION_WEBHOOK_SECRETS. Empty is valid and means
+// "no provider may call back".
+func parseWebhookSecrets(raw string) (map[string][]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out map[string][]string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("invalid NOTIFICATION_WEBHOOK_SECRETS: must be a JSON object of provider to a list of secrets: %w", err)
+	}
+	for provider, list := range out {
+		if strings.TrimSpace(provider) == "" {
+			return nil, errors.New("invalid NOTIFICATION_WEBHOOK_SECRETS: empty provider name")
+		}
+		if len(list) == 0 {
+			return nil, fmt.Errorf("invalid NOTIFICATION_WEBHOOK_SECRETS: provider %q has no secrets", provider)
+		}
+		for _, s := range list {
+			if len(s) < minWebhookSecret {
+				return nil, fmt.Errorf("invalid NOTIFICATION_WEBHOOK_SECRETS: a secret for provider %q is shorter than %d bytes", provider, minWebhookSecret)
+			}
+		}
+	}
+	return out, nil
 }
 
 func brokers() []string {

@@ -23,10 +23,11 @@ import (
 // â”€â”€ stubs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 type stubStore struct {
-	byID       map[string]*domain.Notification
-	byCorr     map[string]string // correlation_id -> notification_id
-	lastFilter domain.ListFilter
-	scheduled  []scheduledRetry
+	byID        map[string]*domain.Notification
+	ledgerOwned map[string]bool   // ids produced by the ledger pipeline (not resendable through the direct path)
+	byCorr      map[string]string // correlation_id -> notification_id
+	lastFilter  domain.ListFilter
+	scheduled   []scheduledRetry
 
 	templates                map[string]*domain.TemplateDefinition
 	versions                 map[string]*domain.TemplateVersion
@@ -418,8 +419,6 @@ type stubPublisher struct {
 	sent, failed, outcomeUnknown                                          int
 	templateCreated, templateApproved, templatePublished, templateRetired int
 }
-
-
 
 type stubAuthZ struct {
 	err   error
@@ -1493,6 +1492,9 @@ func (s *stubStore) BeginResend(_ context.Context, id, _, actor, reason string, 
 	n, ok := s.byID[id]
 	if !ok || (n.Status != domain.StatusSent && n.Status != domain.StatusFailed) {
 		return nil, domain.ErrNotResendable
+	}
+	if s.ledgerOwned[id] {
+		return nil, domain.ErrResendLedgerOwned
 	}
 	n.Status = domain.StatusPending
 	n.ResendCount++

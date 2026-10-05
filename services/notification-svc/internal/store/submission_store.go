@@ -145,10 +145,21 @@ func (s *PgStore) BeginResend(ctx context.Context, id, tenantID, actorPrincipalI
 			    last_resent_at              = $2,
 			    last_resent_by_principal_id = $3
 			WHERE notification_id = $4 AND tenant_id = $5 AND status IN ('SENT', 'FAILED')
+			  AND message_intent_id IS NULL
 			RETURNING `+notificationColumns,
 			reason, at, actorPrincipalID, id, tenantID), &n)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
+		// Tell a ledger-owned communication apart from one that simply is not in
+		// a resendable state, so the caller is told the real reason.
+		var ledgerOwned bool
+		_ = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT message_intent_id IS NOT NULL FROM notifications
+				WHERE notification_id = $1 AND tenant_id = $2 AND status IN ('SENT', 'FAILED')`, id, tenantID).Scan(&ledgerOwned)
+		})
+		if ledgerOwned {
+			return nil, domain.ErrResendLedgerOwned
+		}
 		return nil, domain.ErrNotResendable
 	}
 	if err != nil {

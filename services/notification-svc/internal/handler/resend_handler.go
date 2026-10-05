@@ -81,6 +81,10 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	n, err := h.store.BeginResend(r.Context(), id, tenantID, principalID, req.Reason, time.Now().UTC())
+	if errors.Is(err, domain.ErrResendLedgerOwned) {
+		writeError(w, http.StatusConflict, "ledger_communication_not_resendable", err.Error())
+		return
+	}
 	if errors.Is(err, domain.ErrNotResendable) {
 		// A race: another resend (or a resolution) moved it first.
 		writeError(w, http.StatusConflict, "not_resendable", err.Error())

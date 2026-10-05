@@ -33,15 +33,22 @@ func recordAttempt(ctx context.Context, tx pgx.Tx, n domain.Notification, outcom
 		actor = n.CreatedByPrincipalID
 	}
 	attemptID := uuid.NewString()
+	// The id a provider callback will quote, recorded only for an accepted
+	// attempt: a failed or ambiguous attempt has no message to point at, and
+	// inventing one would let a callback attach itself to the wrong row.
+	var providerMessageID string
+	if outcome == domain.AttemptOutcomeAccepted {
+		providerMessageID = domain.ExtractProviderMessageID(providerResponse)
+	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO notification_delivery_attempts (
 			attempt_id, tenant_id, notification_id, attempt_number, origin, channel,
 			provider_name, outcome, provider_response, failure_reason, retryable,
-			resend_reason, actor_principal_id, attempted_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+			resend_reason, actor_principal_id, attempted_at, provider_message_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 	`, attemptID, n.TenantID, n.NotificationID, n.DeliveryAttempts, origin, n.Channel,
 		nullIfEmpty(meta.ProviderName), outcome, nullIfEmpty(providerResponse), nullIfEmpty(failureReason),
-		meta.Retryable, nullIfEmpty(meta.ResendReason), nullIfEmpty(actor), attemptedAt)
+		meta.Retryable, nullIfEmpty(meta.ResendReason), nullIfEmpty(actor), attemptedAt, nullIfEmpty(providerMessageID))
 	if err != nil {
 		return fmt.Errorf("record delivery attempt %d: %w", n.DeliveryAttempts, err)
 	}
