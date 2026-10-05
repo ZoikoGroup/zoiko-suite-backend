@@ -27,7 +27,7 @@ func (k e2eKill) Check(context.Context, string, string) (bool, string) {
 
 func guardedRouter(t *testing.T, del *stubDeliverer, supp e2eSuppression, kill e2eKill) chi.Router {
 	t.Helper()
-	g, err := policy.NewDirectSendGuard(del, supp, kill, zap.NewNop())
+	g, err := policy.NewDirectSendGuard(del, policy.NewPrecedenceEngine(supp, zap.NewNop()), kill, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,5 +73,28 @@ func TestSend_KillSwitchHoldsTheNoticeForRetry(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), `"status":"FAILED"`) {
 		t.Fatalf("a kill-switch hold is retryable and must not be concluded as FAILED: %s", rr.Body.String())
+	}
+}
+
+// Step 5: the sender states what kind of message this is, it is recorded on the
+// notification, and a class the direct path does not offer is a 400 (INV-06, INV-07).
+func TestSend_CommunicationClassIsValidatedAndRecorded(t *testing.T) {
+	for _, class := range []string{"S0", "T0", "A1"} {
+		del := &stubDeliverer{delivered: true}
+		body := emailBody("corr-class-" + class)
+		body["communication_class"] = class
+		rr := doReq(guardedRouter(t, del, e2eSuppression{}, e2eKill{}), http.MethodPost, "/v1/notifications/", body, "p-1")
+		if rr.Code != http.StatusCreated || !strings.Contains(rr.Body.String(), `"communication_class":"`+class+`"`) || del.seen == nil {
+			t.Errorf("%s: want 201 recorded and delivered, got %d: %s", class, rr.Code, rr.Body.String())
+		}
+	}
+	for _, class := range []string{"M1", "L1", "t0", "bogus"} {
+		del := &stubDeliverer{delivered: true}
+		body := emailBody("corr-bad-" + class)
+		body["communication_class"] = class
+		rr := doReq(guardedRouter(t, del, e2eSuppression{}, e2eKill{}), http.MethodPost, "/v1/notifications/", body, "p-1")
+		if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "invalid_communication_class") || del.seen != nil {
+			t.Errorf("%s: want 400 invalid_communication_class and no delivery, got %d seen=%v: %s", class, rr.Code, del.seen != nil, rr.Body.String())
+		}
 	}
 }

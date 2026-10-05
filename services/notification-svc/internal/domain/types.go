@@ -100,6 +100,22 @@ type Notification struct {
 	PurposeContext string `json:"purpose_context,omitempty"`
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 
+	// CommunicationClass is what KIND of message this is (S0 security, T0
+	// transactional, A1 operational, L1 lifecycle, M1 marketing), fixed when the row
+	// is created (migration 000019). Empty means the sender stated none and the
+	// message is judged as T0.
+	CommunicationClass string `json:"communication_class,omitempty"`
+
+	// MessageIntentID is the ledger intent this notification was produced from, when
+	// there is one (migration 000016); empty for a direct send. With the notification
+	// id (the communication id) it is how one communication is recognised from both
+	// send paths.
+	MessageIntentID string `json:"message_intent_id,omitempty"`
+
+	// IntentVersionID is the exact communication intent version the message was sent
+	// under (migration 000021), fixed at creation. Empty when the send used no intent.
+	IntentVersionID string `json:"intent_version_id,omitempty"`
+
 	// Resend summary (migration 000014). The full reasoned chain is in the
 	// attempt records; these say how often and why most recently.
 	ResendCount             int        `json:"resend_count"`
@@ -179,6 +195,13 @@ type SendNotificationRequest struct {
 	// IdempotencyKey lets a caller supply the purpose-scoped key it derived
 	// from the originating business event itself; otherwise one is derived.
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
+
+	// CommunicationClass states what KIND of message this is. The direct path
+	// accepts S0 (security), T0 (transactional) and A1 (operational); marketing (M1)
+	// and lifecycle (L1) mail must use the ledger pipeline, which carries the stream
+	// sender identity and one-click unsubscribe headers this path does not. Empty is
+	// treated as T0.
+	CommunicationClass string `json:"communication_class,omitempty"`
 
 	// RecipientAddress overrides recipient resolution for channels that need
 	// an endpoint. Left empty — the normal case — the address is resolved from

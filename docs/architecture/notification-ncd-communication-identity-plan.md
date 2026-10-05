@@ -40,9 +40,9 @@ Each ledger send creates a `notifications` row (and `notification_delivery_attem
 1. **DONE: Webhook lookup (F-12):** record a `provider_message_id` on `notification_delivery_attempts` (new nullable column, written from the SMTP provider's message id) and make `LookupAttemptByProviderMessageID` search it too. Independent of the rest, high value, no data move.
 2. **DONE: Link column:** add nullable `message_intents.notification_id` and `notifications.message_intent_id`. No behaviour change.
 3. **DONE (behind NOTIFICATION_LEDGER_REGISTER_ENABLED, default off): Ledger path writes a `notifications` row** for each delivery (same transaction as the intent), so every send has a register row, attempts and retry. Behind a config flag, default off, until step 4 is proven.
-4. **Backfill and unify attempts:** copy existing ledger `delivery_attempts` into `notification_delivery_attempts` (or keep the ledger table as a read-only history and stop writing it). Decide before this step.
-5. **One policy gate:** run the class-aware precedence engine in front of both paths (the direct path then gets a real class via an optional `purpose_class` request field, replacing the T0 default in `DirectSendGuard`).
-6. Update Y-001 events to carry one `communication_id` for both.
+4. **DECIDED, NO CODE: Backfill and unify attempts:** copy existing ledger `delivery_attempts` into `notification_delivery_attempts` (or keep the ledger table as a read-only history and stop writing it). Decide before this step.
+5. **DONE: One policy gate:** run the class-aware precedence engine in front of both paths (the direct path then gets a real class via an optional `purpose_class` request field, replacing the T0 default in `DirectSendGuard`).
+6. **DONE:** Update Y-001 events to carry one `communication_id` for both.
 
 Each step is reversible until step 4. Steps 1 to 2 are safe to do first.
 

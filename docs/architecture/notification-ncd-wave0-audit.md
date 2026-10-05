@@ -30,11 +30,11 @@ Shared: tenant isolation (forced RLS on every table that migrations create), the
 | F-02 | **High** | Two send paths with no shared `communication_id`. The ledger path writes no `notifications` row; the direct path writes no `message_intents`. Controls exist on one path or the other, never both. | INV-02, Section 9.1 |
 | F-03 | **High, FIXED in Wave 1** | The direct path performs **no suppression, permission or kill-switch check** before submit **(search)**. Hard-bounced or opted-out recipients are reachable through it. | INV-24, NP-13, NP-14 |
 | F-04 | Med | Three template sources: embedded static catalogue, governed BIZ-03 (`template_versions`), ledger Go catalogue. Only BIZ-03 has the publication lifecycle. | NCD-01, INV-03 |
-| F-05 | Med | On the governed-template path the **subject is caller free text**; templates carry no subject. Sensitive facts can reach a subject. CRLF is stripped at the SMTP layer (`sanitizeHeaderValue`), not rejected and audited. | INV-17, NP-08, NP-32 |
+| F-05 | Med, FIXED in Wave 2 slice 2 | On the governed-template path the **subject is caller free text**; templates carry no subject. Sensitive facts can reach a subject. CRLF is stripped at the SMTP layer (`sanitizeHeaderValue`), not rejected and audited. | INV-17, NP-08, NP-32 |
 | F-06 | Med | `recipient_address` free text is accepted with provenance `REQUEST`. There is no regulated-notice restriction. | INV-15, NP-11 |
-| F-07 | Med | Extra, undeclared variables are silently ignored; `variable_schema` is `[]string` (names only, no types, sensitivity or escape policy). Missing required variables are refused (good). | NP-07, Section 4.2 |
-| F-08 | Med | BIZ-03 template state **edges are not enforced in the database**: the trigger freezes content and terminal states and a CHECK enforces maker-checker (`approved_by <> created_by`), but nothing stops a direct SQL `DRAFT` to `PUBLISHED`. | TC-02 |
-| F-09 | Low | `RenderPreview` renders any version (including DRAFT) with caller-supplied variables; the spec requires synthetic or authorized data only. | Section 4.5 |
+| F-07 | Med, FIXED in Wave 2 | Extra, undeclared variables are silently ignored; `variable_schema` is `[]string` (names only, no types, sensitivity or escape policy). Missing required variables are refused (good). | NP-07, Section 4.2 |
+| F-08 | Med, FIXED in Wave 2 | BIZ-03 template state **edges are not enforced in the database**: the trigger freezes content and terminal states and a CHECK enforces maker-checker (`approved_by <> created_by`), but nothing stops a direct SQL `DRAFT` to `PUBLISHED`. | TC-02 |
+| F-09 | Low, DECIDED and mitigated in Wave 2 slice 2 | `RenderPreview` renders any version (including DRAFT) with caller-supplied variables; the spec requires synthetic or authorized data only. | Section 4.5 |
 | F-10 | Low, PARTLY FIXED (direct attempts) | `provider_message_id` has a **non-unique** index (migration 000009). A message id mapping to two attempts is not prevented. | NP-27, Section 7.5 |
 | F-11 | Low | `progress.md` is dated 2026-09-08 and omits migrations 000007-000014. Known-gaps rows 97c (no caller) and 97d (unbounded register) are still open. | n/a |
 
@@ -133,14 +133,14 @@ Basis: code and test names read; **not run**. Counts are at the end.
 | 04 Draft template referenced | BUILT | governed path uses `GetPublishedVersion` |
 | 05 Published template edited in place | BUILT | DB trigger |
 | 06 Required variable missing | BUILT | refused on static, governed and ledger paths |
-| 07 Unexpected variable | GAP | F-07 |
-| 08 CRLF in subject or address | PARTIAL | stripped, not rejected or audited |
+| 07 Unexpected variable | BUILT (Wave 2) | refused on governed and built-in templates |
+| 08 CRLF in subject or address | PARTIAL (Wave 2) | a governed subject refuses a value with a control character or line break; the SMTP layer still strips for free-text subjects |
 | 09 Unapproved locale, regulated | PARTIAL | no silent fallback; no regulated class |
 | 10 Attachment "latest" pointer | GAP | no attachments |
 | 11 Free-text legal recipient | GAP | F-06 |
 | 12 Recipient in another tenant | PARTIAL | RLS only |
 | 13 Endpoint previously hard-bounced | BUILT (Wave 1) | both paths; but see F-12: bounces for direct sends are not matched |
-| 14 Marketing opt-out | PARTIAL | ledger yes; direct path is treated as transactional so opt-out does not block it |
+| 14 Marketing opt-out | BUILT (Wave 1 step 5) | one engine for both paths; marketing (M1) is refused on the direct path and goes through the ledger pipeline |
 | 15 Muted SMS, urgent security policy | GAP | no preferences |
 | 16 Muted SMS, routine reminder | GAP | no preferences |
 | 17 PRV INDETERMINATE | GAP | no PRV |
@@ -158,7 +158,7 @@ Basis: code and test names read; **not run**. Counts are at the end.
 | 29 Fallback lowers evidence class | GAP | no evidence class |
 | 30 Fallback violates residency | GAP | no residency routing |
 | 31 SMS exposes S3 payload | GAP | no sensitivity model |
-| 32 Subject contains sensitive fact | GAP | F-05 |
+| 32 Subject contains sensitive fact | BUILT (Wave 2) | a governed subject is reviewed and frozen with the body; only author-declared variables may appear in it |
 | 33 Secure-link token forwarded | PARTIAL | signed action tokens, link-scanner safe; audience binding UNVERIFIED |
 | 34 Attachment hash differs | GAP | no attachments |
 | 35 Provider says accepted | PARTIAL | `SENT` means provider accepted (documented); spec wants distinct terms |
@@ -174,7 +174,7 @@ Basis: code and test names read; **not run**. Counts are at the end.
 | 45 Complaint then provider switch | PARTIAL | suppression is keyed by tenant, email and stream, not provider; no migration test |
 | 46 Unsubscribe callback delayed | BUILT | direct endpoint writes suppression |
 | 47 Purchased list, no consent | GAP | no PRV |
-| 48 Promo module in transactional template | GAP | no purpose class |
+| 48 Promo module in transactional template | PARTIAL (step 5) | the class is explicit, fixed at creation and judged by the shared engine; no content check for promotional blocks yet |
 | 49 Bulk query spans tenants | PARTIAL | RLS; no bulk API |
 | 50 Audience changes preview to send | GAP | no bulk |
 | 51 Rate limit backlog | UNVERIFIED | no rate controls found |
@@ -255,3 +255,83 @@ The 30 gaps are concentrated in the parts that depend on services the NCD does n
 * **Cost of turning it on:** every ledger delivery writes twice, and the rendered subject and body now also sit in the register (known-gaps 97d: the register stores bodies in clear and is unbounded). Turn it on per environment, deliberately.
 * Tests: 6 orchestrator unit tests (call order, failure-before-send sends nothing, unknown not failed, replay does not re-register, off means no register calls); 2 end-to-end tests against real Postgres 16 (one identity from both ends, concluded and evidenced, callback still resolves and suppresses, resend refused, replay does not duplicate; failed delivery is concluded and invisible to the retry worker); handler test for the resend refusal; config default test. Full service suite passes.
 * **Not done:** existing ledger deliveries made before the flag are not backfilled (step 4); the two attempt tables are not unified (step 4); the policy gate is not yet shared (step 5).
+
+## 9. Wave 2 (NCD-01 intent and template control), slice 1
+
+Scope chosen: the smallest concrete NCD-01 findings that need no decision from anyone. The larger NCD-01 items (first-class communication intents, typed variable contract, subject from typed variables, effective-dated publication) change the schema and the API and are not in this slice.
+
+**F-07 fixed: undeclared variables are refused (NP-07).** A governed template's `variable_schema` is the reviewed list of what the wording may be given; `RenderPreview` (also used by the governed-template send) now returns `ErrTemplateVariablesUnexpected` (400 `unexpected_variables`) for any other key, naming all of them. The built-in catalogue gets the same rule (400 `unexpected_template_variables`), with an explicit `optional` list (`reason` on `rejected`) so a legitimately optional variable is still accepted; the catalogue endpoint now advertises `optional_variables`. **Behaviour change for callers:** a caller that sent extra variables, previously ignored, now gets a 400. No other service calls this one today.
+
+**F-08 fixed: template version status edges are enforced in the database (TC-02).** Migration `000017` adds `guard_template_version_status`: a version is created as DRAFT, and only the edges the store actually uses are legal (DRAFT to REVIEW, REVIEW to APPROVED, APPROVED to PUBLISHED, PUBLISHED to SUPERSEDED or RETIRED), each only with the evidence it needs (`validated_at`, approval, `published_at`, `superseded_by_version_id`, `retired_at`). The spec's reject path (REVIEW to DRAFT) is deliberately not allowed yet: no endpoint performs it. Existing rows are not re-checked.
+* Negative control recorded: with the migration removed, six illegal moves (REVIEW back to DRAFT, APPROVED back to REVIEW, APPROVED straight to RETIRED, PUBLISHED back to APPROVED or DRAFT, DRAFT to REVIEW without `validated_at`) were accepted; with it all are refused.
+* Tests: store (illegal edges attacked in SQL, legal lifecycle including supersession and retirement, undeclared variables, migration down/up), templates (undeclared refused, optional accepted, the catalogue test now gives each template only what it declares), handler (400 for an undeclared variable and the provider not called).
+
+**Not done in this slice:** F-05 (a governed template renders only a body; the subject is caller free text), F-09 (the preview endpoint renders any version, including drafts, with caller-supplied variables; limiting it to synthetic data or a distinct authorization is an authorization-model decision), communication intents, typed variables, attachments, locale policy for regulated notices.
+
+### Wave 2 slice 2: decisions (taken by the implementer on the owner's delegation, 2026-10-05) and F-05, F-09
+
+**F-05, decision: a template version owns a reviewed subject.** A version gets an optional `subject` (text with `{{.variable}}` placeholders only: no conditionals, loops, pipelines, functions or nested fields) and `subject_variables`, the list of variables its author declares safe to appear in a subject. The list must be a subset of `variable_schema` and the subject may reference nothing outside it; a reviewer sees the list. Both are frozen with the version by extending the 000005 immutability trigger (migration `000018`), with CHECKs for shape (1 to 200 characters, one line), declaration and "variables need a subject".
+* **Send path:** a version with a subject owns it, and a caller-supplied subject is refused (400 `conflicting_content`): reviewed wording cannot be sent under unreviewed text. A version without one is legacy: the caller still supplies it (400 `missing_fields` if absent), so nothing existing changes.
+* **Rendering:** a missing variable is refused, and a value containing a control character or line break is refused with 400 `invalid_subject` (not stripped, NP-08); an over-long result is refused.
+* **Why this shape and not typed variables:** there is no sensitivity metadata on variables yet (Y-001 NCD-01 typed variable contract). Until there is, "the author declares which variables are safe for a subject, and a reviewer approves that list" is the strongest control that does not invent a classification. Replace it with sensitivity-driven checks when the typed contract exists.
+* **Bug caught by the full suite before release:** the first version of the CHECK rejected any version created with no `variable_schema` (stored as JSON `null`). Fixed: an empty subject-safe list is always valid.
+
+**F-09, decision: no new authorization action; preview shows placeholders.** The preview endpoint is already gated by `TEMPLATE_MANAGE` (template authors only), and a new action would break existing grants for no gain. The real exposure was authors being pushed to use real data to check wording, so a preview now fills any declared variable not supplied with a visible marker (`[variable]`, listed in `placeholders_used`) instead of refusing. The send path is unchanged: a missing variable is still refused there.
+
+**Identity plan step 4, decision: keep the ledger `delivery_attempts` as the system of record for ledger attempts; no backfill, no folding.** New ledger deliveries already have a linked register row with its own attempt (step 3); folding the old table into the register would duplicate evidence and risk, and deliveries made before the flag was turned on stay ledger-only, which is the truthful state (known, stated, and visible by the missing link). Step 4 therefore needs no code. Next in that plan: step 5, one policy gate for both paths.
+
+Tests: domain (subject parse and refusals, declaration checks, rendering and header-injection refusals), store against real Postgres (stored and rendered, frozen by the database, bad shapes refused by CHECK, legacy version unaffected, unsafe subjects refused, migration down/up), handler (reviewed subject sent and no salary in it, caller subject refused, header-injecting value refused, unsafe declarations refused, legacy still works, preview markers). Full service suite passes.
+
+## 10. Identity plan step 5: one policy gate, with an explicit communication class
+
+**Decision (implementer, on the owner's delegation):** the direct send path states what KIND of message it is, and is judged by the same precedence engine as the ledger pipeline.
+* **`communication_class`** (migration `000019`) on `notifications`: S0 security, T0 transactional, A1 operational, L1 lifecycle, M1 marketing (the classes the engine already uses). NULL means none stated and is judged as T0, which is how every direct send was treated before. A CHECK limits the values; a trigger **fixes the class at creation** (it decides what can block a message, so a retry, a resend or an UPDATE cannot reclassify it, for example from marketing to transactional to slip past an opt-out).
+* **The direct API accepts S0, T0 and A1 only.** M1 and L1 are a 400 (`invalid_communication_class`) and are also refused by the guard if a row somehow carries them: marketing and lifecycle mail need the stream's sender identity and RFC 8058 one-click unsubscribe, which only the ledger pipeline provides, and a direct send must not be a way around them (INV-07).
+* **`DirectSendGuard` now takes the precedence engine** (`policy.PolicyResolver`) instead of a bare suppression checker, and builds the stream from the class (`ledger.StreamForDirectClass`). A unit test pins every seed template's class/stream pair to that mapping so they cannot drift. The rules (suppression, a class the engine does not know fails closed) are therefore the same code on both paths.
+* **The ledger register row** (step 3) records the template's class, so both paths' rows carry the same field.
+* **Behaviour change:** the guard's refusal reason now names the rule (`refused by delivery policy (SUPPRESSION_ENFORCED): ...`).
+* Proven against real Postgres with the real suppression store: an unsubscribe does **not** stop an S0, T0 or unclassified notice and **does** stop an A1; a hard bounce stops every class; M1 never reaches the provider; the class is stored, read back, frozen and constrained by the database.
+* **Not done:** the engine still has no per-user preferences, quiet hours, privacy (PRV) or jurisdiction (PDC) inputs, so "one gate" means one rule set, not yet the full NCD-02 decision. The Y-001 purpose-class names (SECURITY_CRITICAL, ...) are not used; the ledger's S0/T0/A1/L1/M1 are the vocabulary until NCD-01 defines the intent catalogue.
+
+## 11. Identity plan step 6: one communication identity in the events
+
+**Done (additive, no migration).** Every `notification.sent`, `notification.failed`, `notification.outcome_unknown`, `delivery.attempt.created` and `delivery.attempt.unknown` event now names the communication the same way, built by one helper (`events.buildFor`):
+
+| field | meaning | when present |
+|---|---|---|
+| `communication_id` | the stable id of the logical communication (the register id) | always |
+| `notification_id` | the same value, kept for consumers written before `communication_id` | always |
+| `message_intent_id` | the ledger intent the message was produced from | only when linked (omitted, never blank, for a direct send) |
+| `communication_class` | S0/T0/A1/L1/M1 | only when stated |
+
+* No existing field changes meaning or moves, and the Kafka key is still the communication id, so one communication stays ordered on one partition. The payload still carries no subject, body or address.
+* `domain.Notification` gained `message_intent_id` (read from migration 000016's link), so `GET /v1/notifications/{id}` also shows which intent a notification came from.
+* Tests: unit tests per builder (identity present, optional fields omitted when absent, earlier fields unchanged, still no content or address); two real-Postgres tests: a ledger delivery's events all name the same communication, the intent and the class, and a direct send's events omit the intent.
+* **Known remaining gaps in the event contract:**
+  * With `NOTIFICATION_LEDGER_REGISTER_ENABLED` off (the default), a ledger delivery leaves **no events at all**, so consumers cannot see it. The identity exists only for deliveries made with the flag on.
+  * The spec's canonical names (`communication.prepared`, `communication.blocked`, `delivery.evidence.recorded`, `endpoint.suppressed`, `notice.*`) are not emitted; the service publishes `notification.*` and `delivery.attempt.*`. Introducing them is a contract decision for consumers, best made before any consumer exists.
+  * `event_outbox_event_known` (migration 000010) lists the allowed event types; a new type needs a migration.
+  * The comments reference an `asyncapi.yaml` that does not exist in the repository.
+
+**Identity plan status:** steps 1 to 6 are done or decided. What the plan does not cover: turning `NOTIFICATION_LEDGER_REGISTER_ENABLED` on, which is an operational decision per environment (it doubles ledger writes and puts rendered content in the register).
+
+## 12. Wave 2 slice 3: the communication intent registry (NCD-01)
+
+**Built (migrations `000020`, `000021`).** `POST/GET /v1/communication-intents...` (section 4.5), with the template roles for authorization (`TEMPLATE_MANAGE` to author, `TEMPLATE_APPROVE` to approve, publish and retire; a new action would have to be granted everywhere for no gain).
+
+* **An intent** is a stable, server-assigned identity (`intent_key` such as `payroll.payslip_available`, unique per tenant, never derived from a display name; the database makes the identity immutable and undeletable). **A version** carries `purpose_class` (S0/T0/A1/L1/M1), `evidence_class` (E0 to E4), `allowed_channels`, `marketing_allowed`, `record_requirement` and a **typed variable contract**.
+* **Typed contract:** every variable declares a `type` (STRING with a length, NUMBER as a decimal string, DATE, ID, URL as https without credentials), `required`, and a **`sensitivity` (S0 to S3) that is never defaulted**. Values are checked on send: control characters, exponent numbers, `http://` and `javascript:` URLs, over-long strings, missing required and undeclared variables are all refused, and every problem is reported at once (NCD-004).
+* **Lifecycle:** DRAFT, REVIEW, APPROVED, PUBLISHED, with the maker-checker as a CHECK, content frozen from the moment of writing, and illegal edges refused by a trigger. A change of purpose class is a new version. `marketing_allowed` is only possible for lifecycle (L1) or marketing (M1) purposes (INV-07), by service and by CHECK.
+* **Effective-dated and bitemporal (section 9.2):** a version is published with an `effective_from` that is never in the past and is later than every version already published, so "the version in force" is never ambiguous. `GET .../effective?at=&known_at=` resolves what was in force at transaction time `at` as the platform knew it at `known_at`. Retiring an intent ends its future but not its history: it blocks resolution only when the retirement is at or before both times, so a message from before the retirement still reconstructs exactly.
+* **Binding:** a template definition can be bound to an intent at creation, for good (a trigger refuses rebinding, unbinding or later binding, and cross-tenant binding even if the service is bypassed), so a reviewed template cannot be moved under a more permissive intent. The bound intent must be active, of the same tenant and legal entity. Wording is authored against the contract in force now: it may only use variables the intent governs, and **a subject may only use variables whose sensitivity is S0 or S1** (INV-17 by the contract, replacing the earlier "author declares subject-safe variables" stopgap for bound templates). A bound template cannot be authored before its intent has a version in force.
+* **Enforcement at send:** a bound template is sent under the intent version in force NOW and nothing else. The purpose class comes from the intent (a different one from the sender is refused), the channel must be one the intent allows (NCD-011), a purpose the direct path does not offer (M1, L1) is refused with a pointer to the ledger pipeline, the template must still conform, and every variable must satisfy its declared type. **Fail closed:** no registry, or no version in force, means no send. The notification is **pinned to the exact intent version** (`intent_version_id`, fixed at creation by a trigger), and its events carry it (INV-04).
+* **Bugs caught on the way:** the test harness's table-reset list did not include the new tables; and the migration test showed the real rollback order (000021 before 000020).
+
+**Not built, deliberately:**
+* **Evidence classes are recorded and carried, not enforced** against a provider's capability: their exact minimums per channel are open decision OD-06.
+* **Template sets** (one exact template version per channel and locale inside an intent) and **attachment contracts** (DRC record slots): templates are bound to an intent, but the intent does not enumerate them.
+* **Re-validation on drift:** if a later intent version drops a variable that an already-published template uses, the send is refused (fail closed) at the next send, but nothing flags the template in advance, and revalidation against a newly effective contract is covered by the send-time check, not tested with a real clock.
+* **No intent events** (`intent.published` and so on): the outbox allow-list needs a migration and the event contract is undecided.
+* **Reason codes:** the NCD-nnn codes appear in messages and in one error code; there is no full stable-code catalogue yet.
+* **Typed contract for unbound templates and the ledger catalogue is not applied:** only templates bound to an intent are governed by it; the built-in catalogue and ledger Go templates keep their own rules.
+* **Variable sensitivity is not yet used to keep S2/S3 values out of logs, previews or provider metadata**; it governs subjects only.

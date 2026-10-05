@@ -130,7 +130,7 @@ func Build(eventType, correlationID, tenantID, legalEntityID, actorID, key strin
 // consumer. A consumer that needs content reads the register under its own
 // authorization.
 func Sent(correlationID string, n domain.Notification) (Outbound, error) {
-	return Build(TypeSent, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+	return buildFor(n, TypeSent, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
 		"notification_id":        n.NotificationID,
 		"tenant_id":              n.TenantID,
 		"legal_entity_id":        n.LegalEntityID,
@@ -164,7 +164,7 @@ func Failed(correlationID string, n domain.Notification, reason string) (Outboun
 		now := time.Now().UTC()
 		failedAt = &now
 	}
-	return Build(TypeFailed, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+	return buildFor(n, TypeFailed, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
 		"notification_id":        n.NotificationID,
 		"tenant_id":              n.TenantID,
 		"legal_entity_id":        n.LegalEntityID,
@@ -181,7 +181,7 @@ func Failed(correlationID string, n domain.Notification, reason string) (Outboun
 
 // OutcomeUnknown seals notification.outcome_unknown (BIZ-10).
 func OutcomeUnknown(correlationID string, n domain.Notification, reason string) (Outbound, error) {
-	return Build(TypeOutcomeUnknown, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+	return buildFor(n, TypeOutcomeUnknown, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
 		"notification_id":        n.NotificationID,
 		"tenant_id":              n.TenantID,
 		"legal_entity_id":        n.LegalEntityID,
@@ -309,7 +309,7 @@ func (p *Publisher) Publish(ctx context.Context, msgs []kafka.Message) error {
 // Keyed on the notification, so every attempt of one communication shares a
 // partition with its notification.* events and arrives in order.
 func AttemptCreated(correlationID string, n domain.Notification, a domain.DeliveryAttempt) (Outbound, error) {
-	return Build(TypeAttemptCreated, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, map[string]any{
+	return buildFor(n, TypeAttemptCreated, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, map[string]any{
 		"attempt_id":               a.AttemptID,
 		"communication_id":         n.NotificationID,
 		"notification_id":          n.NotificationID,
@@ -330,7 +330,7 @@ func AttemptCreated(correlationID string, n domain.Notification, a domain.Delive
 // outcome is ambiguous, with the cause and the deadline by which a person is
 // expected to resolve it.
 func AttemptUnknown(correlationID string, n domain.Notification, a domain.DeliveryAttempt, resolutionDueAt time.Time) (Outbound, error) {
-	return Build(TypeAttemptUnknown, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, map[string]any{
+	return buildFor(n, TypeAttemptUnknown, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, map[string]any{
 		"attempt_id":        a.AttemptID,
 		"communication_id":  n.NotificationID,
 		"notification_id":   n.NotificationID,
@@ -338,4 +338,34 @@ func AttemptUnknown(correlationID string, n domain.Notification, a domain.Delive
 		"resolution_due_at": resolutionDueAt,
 		"reason_code":       "NCD-014",
 	})
+}
+
+// buildFor seals an event about one notification and stamps it with the identity of
+// the communication (ZS-SVC-Y-001 INV-02, identity plan step 6).
+//
+// Every notification.* and delivery.attempt.* event names the communication the same
+// way, whichever send path produced it:
+//
+//	communication_id    the stable id of this logical communication (the register id)
+//	notification_id     the same value, kept for consumers written before communication_id
+//	message_intent_id   the ledger intent it was produced from, when there is one
+//	communication_class what kind of message it is (S0/T0/A1/L1/M1), when stated
+//	intent_version_id   the exact communication intent version it was sent under, when it used one
+//
+// The additions are additive: no existing field changes meaning or moves, so a
+// consumer of the earlier shape keeps working. An absent intent or class is omitted,
+// never sent as an empty string, so "not linked" is distinguishable from a blank id.
+func buildFor(n domain.Notification, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) (Outbound, error) {
+	payload["communication_id"] = n.NotificationID
+	if n.MessageIntentID != "" {
+		payload["message_intent_id"] = n.MessageIntentID
+	}
+	if n.CommunicationClass != "" {
+		payload["communication_class"] = n.CommunicationClass
+	}
+	// The exact intent version the message was sent under (INV-04), when it used one.
+	if n.IntentVersionID != "" {
+		payload["intent_version_id"] = n.IntentVersionID
+	}
+	return Build(eventType, correlationID, tenantID, legalEntityID, actorID, key, payload)
 }

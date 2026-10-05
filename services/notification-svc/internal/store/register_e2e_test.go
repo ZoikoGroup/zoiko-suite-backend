@@ -2,7 +2,9 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"github.com/jackc/pgx/v5"
 	"testing"
 	"time"
 
@@ -124,5 +126,77 @@ func TestRegister_E2E_FailedDeliveryIsConcludedAndNeverRetriedByTheDirectWorker(
 	require.NoError(t, err)
 	for _, d := range due {
 		assert.NotEqual(t, notifID, d.NotificationID, "the direct retry worker must not pick up a ledger-owned row")
+	}
+}
+
+// outboxFor reads every event (attempt events included) whose aggregate is the given
+// communication, decoded.
+func outboxFor(t *testing.T, pool interface {
+	Begin(context.Context) (pgx.Tx, error)
+}, aggregate string) map[string]map[string]any {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)")
+	require.NoError(t, err)
+	rows, err := tx.Query(ctx, `SELECT event_type, payload FROM event_outbox WHERE aggregate_key = $1 ORDER BY outbox_id`, aggregate)
+	require.NoError(t, err)
+	defer rows.Close()
+	out := map[string]map[string]any{}
+	for rows.Next() {
+		var typ string
+		var raw []byte
+		require.NoError(t, rows.Scan(&typ, &raw))
+		var env struct {
+			Payload map[string]any `json:"payload"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &env))
+		if env.Payload == nil { // some deployments store the payload column as the bare payload
+			require.NoError(t, json.Unmarshal(raw, &env.Payload))
+		}
+		out[typ] = env.Payload
+	}
+	require.NoError(t, rows.Err())
+	return out
+}
+
+// Step 6 end to end: a ledger delivery's events all name the SAME communication and
+// the intent it came from, so a consumer sees one identity.
+func TestRegister_E2E_EventsCarryOneCommunicationIdentity(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	tenant := "tenant-events-identity"
+	ctx := svcmiddleware.WithTenant(context.Background(), tenant)
+	del := &e2eDeliverer{delivered: true, response: "smtp h accepted; message-id=<events-identity@example.com>"}
+	res, err := registerOrchestrator(t, s, del).IngestEvent(ctx, registerRequest("evt-events-identity"), "caller")
+	require.NoError(t, err)
+	notifID, err := s.NotificationIDForIntent(ctx, res.MessageIntentID)
+	require.NoError(t, err)
+
+	evs := outboxFor(t, pool, notifID)
+	require.Contains(t, evs, "notification.sent")
+	require.Contains(t, evs, "delivery.attempt.created")
+	for typ, p := range evs {
+		assert.Equal(t, notifID, p["communication_id"], typ)
+		assert.Equal(t, notifID, p["notification_id"], "%s: the earlier field is still there", typ)
+		assert.Equal(t, res.MessageIntentID, p["message_intent_id"], "%s: names the ledger intent it came from", typ)
+		assert.NotEmpty(t, p["communication_class"], typ)
+	}
+}
+
+// A direct send has no intent: its events say so by omitting the field.
+func TestRegister_E2E_DirectSendEventsOmitTheIntent(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	n := classed(t, s, "tenant-events-direct", "corr-events-direct", "T0")
+	require.NoError(t, complete(t, s, "tenant-events-direct", n.NotificationID, "SENT", "", receiptFor("<events-direct@example.com>")))
+	evs := outboxFor(t, pool, n.NotificationID)
+	require.Contains(t, evs, "notification.sent")
+	for typ, p := range evs {
+		assert.Equal(t, n.NotificationID, p["communication_id"], typ)
+		assert.NotContains(t, p, "message_intent_id", typ)
+		assert.Equal(t, "T0", p["communication_class"], typ)
 	}
 }

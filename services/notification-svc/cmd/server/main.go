@@ -302,7 +302,7 @@ func main() {
 	// the kill switch immediately before submission (ZS-SVC-Y-001 INV-24). The
 	// ledger orchestrator above keeps the unwrapped deliverer because it applies
 	// its own, class-aware policy before rendering.
-	directDeliverer, err := policy.NewDirectSendGuard(deliverer, pgStore, killSwitch, log)
+	directDeliverer, err := policy.NewDirectSendGuard(deliverer, policyEngine, killSwitch, log)
 	if err != nil {
 		log.Fatal("failed to construct the direct send guard", zap.Error(err))
 	}
@@ -387,6 +387,7 @@ func main() {
 		LedgerStore:    pgStore,
 		WebhookHandler: webhookHandler,
 		Suppressions:   pgStore,
+		Intents:        pgStore,
 		Log:            log,
 	})
 	handler.RegisterRoutes(r, h)

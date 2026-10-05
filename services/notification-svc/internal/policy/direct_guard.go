@@ -11,7 +11,8 @@ import (
 )
 
 // DirectSendGuard puts the delivery controls the ledger pipeline already has in
-// front of the direct send path (ZS-SVC-Y-001 INV-24, INV-30, NP-13, NP-56).
+// front of the direct send path (ZS-SVC-Y-001 INV-24, INV-30, NP-13, NP-56) and,
+// since the identity plan's step 5, runs them through the SAME policy engine.
 //
 // WHY. POST /v1/notifications, the retry worker and an explicit resend all reach
 // the provider through one Deliverer, and until this guard that Deliverer asked
@@ -20,35 +21,45 @@ import (
 // pipeline (POST /v1/notifications/events/ingest) checked both. Controls that
 // exist on one of two send paths are not controls.
 //
+// ONE GATE. The decision is made by the same PolicyResolver the ledger orchestrator
+// uses (the precedence engine), with the message's own communication class. The
+// rules therefore cannot drift between the two paths: what blocks a ledger message
+// blocks the same direct message, and a class the engine does not know fails closed.
+//
 // WHERE. At the Deliverer, because that is the last point before the provider is
 // called, which is what INV-24 asks for ("suppression is checked immediately
 // before provider submission"), and because the first attempt, every retry and
 // every resend pass through it. The ledger pipeline keeps the unwrapped
-// Deliverer: it evaluates its own policy, with a real communication class, before
-// rendering.
+// Deliverer: it evaluates the engine itself, before rendering.
 //
-// ASSUMPTION, stated rather than hidden: a direct send carries no communication
-// class, so it is treated as TRANSACTIONAL / T0. Under the precedence rules that
-// means hard bounces, complaints and administrative suppressions block it and an
-// unsubscribe does not (a transactional notice is not marketing). When direct
-// sends gain an explicit purpose class (Y-001 NCD-01) this default should give
-// way to it.
+// CLASS. A notification states its class when it is created (migration 000019). The
+// direct path accepts S0 (security), T0 (transactional) and A1 (operational); a
+// notification that stated none is judged as T0, which is how every direct send was
+// treated before classes existed. M1 (marketing) and L1 (lifecycle) are refused
+// here even if a row somehow carries them: they need the stream identity and
+// one-click unsubscribe headers only the ledger pipeline provides (INV-07).
 //
-// FAILURE MODES. A suppressed address is a terminal FAILED outcome, not a retry:
-// the situation does not improve with time. A kill switch is an operator pause,
-// so the outcome is retryable and the notification is delivered after the switch
-// is lifted. A suppression lookup that itself fails blocks delivery (fail
-// closed, INV-30) and is retryable.
+// FAILURE MODES. A policy refusal is a terminal FAILED outcome, not a retry: the
+// situation does not improve with time. A kill switch is an operator pause, so the
+// outcome is retryable and the notification is delivered after the switch is lifted.
+// A policy evaluation that itself fails blocks delivery (fail closed, INV-30) and is
+// retryable.
 type DirectSendGuard struct {
-	inner       Deliverer
-	suppression SuppressionChecker
-	killSwitch  KillSwitch
-	log         *zap.Logger
+	inner      Deliverer
+	policy     PolicyResolver
+	killSwitch KillSwitch
+	log        *zap.Logger
 }
 
 // Deliverer is the transport the guard wraps.
 type Deliverer interface {
 	Deliver(ctx context.Context, n domain.Notification) domain.DeliveryOutcome
+}
+
+// PolicyResolver is the engine both send paths consult. The precedence engine
+// satisfies it.
+type PolicyResolver interface {
+	Evaluate(ctx context.Context, intent *ledger.MessageIntent, stream ledger.SenderStream) (ledger.PolicyDecision, error)
 }
 
 // KillSwitch reports whether delivery is halted for a tenant and template. The
@@ -57,17 +68,16 @@ type KillSwitch interface {
 	Check(ctx context.Context, tenantID, templateKey string) (engaged bool, reason string)
 }
 
-// NewDirectSendGuard wraps inner. A nil suppression checker or kill switch is
-// refused: a guard that quietly guards nothing is the defect this type exists to
-// remove.
-func NewDirectSendGuard(inner Deliverer, suppression SuppressionChecker, killSwitch KillSwitch, log *zap.Logger) (*DirectSendGuard, error) {
-	if inner == nil || suppression == nil || killSwitch == nil {
-		return nil, fmt.Errorf("direct send guard needs a deliverer, a suppression checker and a kill switch")
+// NewDirectSendGuard wraps inner. A nil policy resolver or kill switch is refused: a
+// guard that quietly guards nothing is the defect this type exists to remove.
+func NewDirectSendGuard(inner Deliverer, policy PolicyResolver, killSwitch KillSwitch, log *zap.Logger) (*DirectSendGuard, error) {
+	if inner == nil || policy == nil || killSwitch == nil {
+		return nil, fmt.Errorf("direct send guard needs a deliverer, a policy resolver and a kill switch")
 	}
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &DirectSendGuard{inner: inner, suppression: suppression, killSwitch: killSwitch, log: log}, nil
+	return &DirectSendGuard{inner: inner, policy: policy, killSwitch: killSwitch, log: log}, nil
 }
 
 // Deliver applies the controls and, only if they pass, hands the notification to
@@ -87,21 +97,43 @@ func (g *DirectSendGuard) Deliver(ctx context.Context, n domain.Notification) do
 		}
 	}
 
-	suppressed, why, err := g.suppression.IsEmailSuppressed(ctx, n.TenantID, n.RecipientAddress, ledger.StreamTransactional, ledger.ClassT0)
+	class := ledger.CommunicationClass(n.CommunicationClass)
+	if class == "" {
+		class = ledger.ClassT0
+	}
+	stream, ok := ledger.StreamForDirectClass(class)
+	if !ok {
+		g.log.Error("direct send refused: class is not permitted on the direct path; the provider was not called",
+			zap.String("notification_id", n.NotificationID), zap.String("class", string(class)))
+		return domain.DeliveryOutcome{
+			Reason:    fmt.Sprintf("communication class %q is not permitted on the direct send path; use the ledger pipeline", class),
+			Retryable: false,
+		}
+	}
+
+	decision, err := g.policy.Evaluate(ctx, &ledger.MessageIntent{
+		TenantID:             n.TenantID,
+		LegalEntityID:        n.LegalEntityID,
+		RecipientPrincipalID: n.RecipientPrincipalID,
+		RecipientEmail:       n.RecipientAddress,
+		Channel:              n.Channel,
+		CommunicationClass:   class,
+	}, stream)
 	if err != nil {
-		// Fail closed (INV-30): an unreadable suppression list is not permission.
-		g.log.Error("direct send held: suppression lookup failed; the provider was not called",
+		// Fail closed (INV-30): a policy that cannot be evaluated is not permission.
+		g.log.Error("direct send held: policy evaluation failed; the provider was not called",
 			zap.String("notification_id", n.NotificationID), zap.String("tenant_id", n.TenantID), zap.Error(err))
 		return domain.DeliveryOutcome{
-			Reason:    "suppression check unavailable; delivery withheld: " + err.Error(),
+			Reason:    "policy evaluation unavailable; delivery withheld: " + err.Error(),
 			Retryable: true,
 		}
 	}
-	if suppressed {
-		g.log.Info("direct send refused: address is suppressed; the provider was not called",
-			zap.String("notification_id", n.NotificationID), zap.String("tenant_id", n.TenantID), zap.String("reason", why))
+	if !decision.Allowed {
+		g.log.Info("direct send refused by policy; the provider was not called",
+			zap.String("notification_id", n.NotificationID), zap.String("tenant_id", n.TenantID),
+			zap.String("class", string(class)), zap.String("rule", decision.RuleName), zap.String("reason", decision.Reason))
 		return domain.DeliveryOutcome{
-			Reason:    "recipient address is suppressed (" + why + ")",
+			Reason:    "refused by delivery policy (" + decision.RuleName + "): " + decision.Reason,
 			Retryable: false,
 		}
 	}

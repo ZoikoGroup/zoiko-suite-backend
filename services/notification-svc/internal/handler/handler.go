@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/mail"
+	"strings"
 	"strconv"
 	"time"
 
@@ -166,6 +167,7 @@ type Handler struct {
 	ledgerStore    ledger.LedgerStore
 	webhookHandler *webhook.Handler
 	suppressions   SuppressionStore
+	intents        IntentStore
 	// metrics may be nil (tests); every observation is nil-safe.
 	metrics *telemetry.Domain
 
@@ -192,6 +194,10 @@ type Deps struct {
 	LedgerStore    ledger.LedgerStore
 	WebhookHandler *webhook.Handler
 	Suppressions   SuppressionStore
+	// Intents is the communication intent registry (NCD-01). Optional: without it the
+	// registry routes answer 503 and a template bound to an intent cannot be sent
+	// (fail closed).
+	Intents IntentStore
 	Metrics        *telemetry.Domain
 	Log            *zap.Logger
 }
@@ -207,6 +213,7 @@ func New(d Deps) *Handler {
 		ledgerStore:    d.LedgerStore,
 		webhookHandler: d.WebhookHandler,
 		suppressions:   d.Suppressions,
+		intents:        d.Intents,
 		metrics:        d.Metrics,
 		log:            d.Log,
 	}
@@ -256,6 +263,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/resend", h.ResendNotification)
 		r.Post("/{id}/resolve-delivery-outcome", h.ResolveDeliveryOutcome)
 	})
+
+	registerIntentRoutes(r, h)
 
 	r.Route("/v1/document-templates", func(r chi.Router) {
 		r.Post("/", h.CreateTemplate)
@@ -359,6 +368,9 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 			// or an empty login link.
 			writeError(w, http.StatusBadRequest, "missing_template_variables", e.Error())
 			return
+		case templates.ErrUnexpectedVariables:
+			writeError(w, http.StatusBadRequest, "unexpected_template_variables", e.Error())
+			return
 		default:
 			h.log.Error("failed to render notification template",
 				zap.String("template", req.Template), zap.Error(err))
@@ -379,7 +391,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.RecipientPrincipalID == "" || req.LegalEntityID == "" || req.Channel == "" ||
-		req.Subject == "" || req.CorrelationID == "" {
+		(req.Subject == "" && !usingGovernedTemplate) || req.CorrelationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields",
 			"recipient_principal_id, legal_entity_id, channel, correlation_id are required, plus either subject or template")
 		return
@@ -389,6 +401,17 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	if !supportedChannels[req.Channel] {
 		writeError(w, http.StatusBadRequest, "unsupported_channel",
 			"channel must be one of EMAIL, IN_APP, WEBHOOK")
+		return
+	}
+
+	// The class decides which suppressions and preferences may block the message
+	// (INV-06), so it is stated, validated and fixed at creation. Marketing and
+	// lifecycle mail are not a direct send: they need the ledger pipeline's stream
+	// identity and one-click unsubscribe (INV-07).
+	if req.CommunicationClass != "" && !domain.ValidDirectPathClass(req.CommunicationClass) {
+		writeError(w, http.StatusBadRequest, "invalid_communication_class",
+			"communication_class must be one of "+strings.Join(domain.DirectPathClasses, ", ")+
+				" on the direct send path; marketing (M1) and lifecycle (L1) mail use the ledger pipeline")
 		return
 	}
 
@@ -438,7 +461,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// requirement ("template/version, rendered hash") onto the notification
 	// row — empty for free-text/static-catalogue sends, which cite no
 	// governed version.
-	var templateVersionID, renderedHash string
+	var templateVersionID, renderedHash, intentVersionID string
 	if usingGovernedTemplate {
 		published, err := h.store.GetPublishedVersion(r.Context(), req.TemplateID, req.Locale)
 		if err != nil {
@@ -454,12 +477,45 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 				"the published template belongs to a different legal_entity_id than this notification is being sent under")
 			return
 		}
+		// A template bound to a communication intent is sent under the intent version in
+		// force NOW, and under nothing else (NCD-01, INV-04): the purpose class comes from
+		// the intent, the channel must be one it allows, every variable must satisfy its
+		// typed contract, and the message is pinned to the exact version.
+		tmplDef, derr := h.store.GetTemplate(r.Context(), req.TemplateID)
+		if derr != nil {
+			h.handleTemplateError(w, derr)
+			return
+		}
+		if tmplDef.IntentID != nil {
+			iv, ok := h.enforceIntent(w, r, *tmplDef.IntentID, published, &req)
+			if !ok {
+				return
+			}
+			intentVersionID = iv.VersionID
+		}
+		// A version that carries a subject OWNS it: the subject was reviewed and
+		// frozen with the body, and a caller-supplied one would send reviewed
+		// wording under unreviewed text (F-05). A version without one is legacy and
+		// still needs the caller's.
+		if published.Subject != nil && req.Subject != "" {
+			writeError(w, http.StatusBadRequest, "conflicting_content",
+				"this template version defines its own subject; do not supply one")
+			return
+		}
+		if published.Subject == nil && req.Subject == "" {
+			writeError(w, http.StatusBadRequest, "missing_fields",
+				"subject is required: this template version does not define one")
+			return
+		}
 		rendered, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{
 			VersionID: published.VersionID, Variables: req.Variables,
 		})
 		if err != nil {
 			h.handleTemplateError(w, err)
 			return
+		}
+		if published.Subject != nil {
+			req.Subject = rendered.RenderedSubject
 		}
 		req.Body = rendered.RenderedContent
 		templateVersionID = published.VersionID
@@ -520,6 +576,8 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		RenderedContentHash:    renderedHash,
 		PurposeContext:         purpose,
 		IdempotencyKey:         idempotencyKey,
+		CommunicationClass:     req.CommunicationClass,
+		IntentVersionID:        intentVersionID,
 	}
 
 	created, err := h.store.CreateNotification(r.Context(), notification)
@@ -1099,6 +1157,8 @@ type createTemplateRequest struct {
 	LegalEntityID   string `json:"legal_entity_id"`
 	Name            string `json:"name"`
 	BusinessPurpose string `json:"business_purpose"`
+	// IntentID optionally binds the template to a communication intent, for good (NCD-01).
+	IntentID string `json:"intent_id,omitempty"`
 }
 
 // CreateTemplate creates a new template definition — BIZ-03's own
@@ -1125,10 +1185,14 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tmpl, err := h.store.CreateTemplate(r.Context(), domain.CreateTemplateParams{
-		LegalEntityID: req.LegalEntityID, Name: req.Name, BusinessPurpose: req.BusinessPurpose, OwnerPrincipalID: principalID,
+		LegalEntityID: req.LegalEntityID, Name: req.Name, BusinessPurpose: req.BusinessPurpose, OwnerPrincipalID: principalID, IntentID: req.IntentID,
 		CorrelationID: getCorrelationID(r),
 	})
 	if err != nil {
+		if isIntentBindingError(err) {
+			h.writeIntentError(w, err)
+			return
+		}
 		h.log.Error("failed to create template", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
@@ -1162,6 +1226,11 @@ type createVersionRequest struct {
 	Locale                string   `json:"locale"`
 	Content               string   `json:"content"`
 	VariableSchema        []string `json:"variable_schema,omitempty"`
+	// Subject is the reviewed subject text, placeholders only; SubjectVariables are
+	// the variables the author declares safe to appear in it (a subset of
+	// variable_schema). Omit both to leave the subject to the sender (legacy).
+	Subject          string   `json:"subject,omitempty"`
+	SubjectVariables []string `json:"subject_variables,omitempty"`
 	BrandingMetadata      string   `json:"branding_metadata,omitempty"`
 	AccessibilityMetadata string   `json:"accessibility_metadata,omitempty"`
 }
@@ -1198,6 +1267,7 @@ func (h *Handler) CreateVersion(w http.ResponseWriter, r *http.Request) {
 
 	version, err := h.store.CreateVersion(r.Context(), domain.CreateVersionParams{
 		TemplateID: templateID, Locale: req.Locale, Content: req.Content, VariableSchema: req.VariableSchema,
+		Subject: req.Subject, SubjectVariables: req.SubjectVariables,
 		BrandingMetadata: req.BrandingMetadata, AccessibilityMetadata: req.AccessibilityMetadata,
 		CreatedByPrincipalID: principalID,
 	})
@@ -1395,7 +1465,7 @@ func (h *Handler) RenderPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{VersionID: versionID, Variables: req.Variables})
+	result, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{VersionID: versionID, Variables: req.Variables, Placeholders: true})
 	if err != nil {
 		h.handleTemplateError(w, err)
 		return
@@ -1490,6 +1560,10 @@ func (h *Handler) handleTemplateError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "self_approval_forbidden", err.Error())
 	case errors.Is(err, domain.ErrTemplateContentInvalid):
 		writeError(w, http.StatusBadRequest, "invalid_content", err.Error())
+	case errors.Is(err, domain.ErrSubjectInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_subject", err.Error())
+	case isIntentBindingError(err):
+		h.writeIntentError(w, err)
 	case errors.Is(err, domain.ErrTemplateLocaleRequired):
 		writeError(w, http.StatusBadRequest, "missing_fields", err.Error())
 	case errors.Is(err, domain.ErrTemplateVersionsBelongToDifferentTemplates):
@@ -1498,6 +1572,11 @@ func (h *Handler) handleTemplateError(w http.ResponseWriter, err error) {
 		var missing domain.ErrTemplateVariablesMissing
 		if errors.As(err, &missing) {
 			writeError(w, http.StatusBadRequest, "missing_variables", missing.Error())
+			return
+		}
+		var unexpected domain.ErrTemplateVariablesUnexpected
+		if errors.As(err, &unexpected) {
+			writeError(w, http.StatusBadRequest, "unexpected_variables", unexpected.Error())
 			return
 		}
 		h.log.Error("template store error", zap.Error(err))

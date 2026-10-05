@@ -19,21 +19,22 @@ func (f *fakeInner) Deliver(_ context.Context, _ domain.Notification) domain.Del
 	return domain.DeliveryOutcome{Delivered: true, ProviderResponse: "accepted"}
 }
 
-type fakeSuppression struct {
-	suppressed bool
-	reason     string
-	err        error
-	gotStream  ledger.SenderStream
-	gotClass   ledger.CommunicationClass
-	gotEmail   string
-	calls      int
+// fakePolicy stands in for the precedence engine and records what it was asked.
+type fakePolicy struct {
+	decision  ledger.PolicyDecision
+	err       error
+	calls     int
+	gotIntent ledger.MessageIntent
+	gotStream ledger.SenderStream
 }
 
-func (f *fakeSuppression) IsEmailSuppressed(_ context.Context, _ string, email string, s ledger.SenderStream, c ledger.CommunicationClass) (bool, string, error) {
+func (f *fakePolicy) Evaluate(_ context.Context, in *ledger.MessageIntent, s ledger.SenderStream) (ledger.PolicyDecision, error) {
 	f.calls++
-	f.gotEmail, f.gotStream, f.gotClass = email, s, c
-	return f.suppressed, f.reason, f.err
+	f.gotIntent, f.gotStream = *in, s
+	return f.decision, f.err
 }
+
+func allowed() *fakePolicy { return &fakePolicy{decision: ledger.PolicyDecision{Allowed: true}} }
 
 type fakeKill struct {
 	engaged bool
@@ -50,93 +51,150 @@ func (f *fakeKill) Check(_ context.Context, tenant, tmpl string) (bool, string) 
 }
 
 func email() domain.Notification {
-	return domain.Notification{NotificationID: "n1", TenantID: "t1", Channel: domain.ChannelEmail, RecipientAddress: "a@example.com", TemplateID: "tpl-1"}
+	return domain.Notification{NotificationID: "n1", TenantID: "t1", LegalEntityID: "le1", RecipientPrincipalID: "p1",
+		Channel: domain.ChannelEmail, RecipientAddress: "a@example.com", TemplateID: "tpl-1"}
 }
 
-func guard(t *testing.T, in *fakeInner, s *fakeSuppression, k *fakeKill) *DirectSendGuard {
+func guard(t *testing.T, in *fakeInner, p *fakePolicy, k *fakeKill) *DirectSendGuard {
 	t.Helper()
-	g, err := NewDirectSendGuard(in, s, k, zap.NewNop())
+	g, err := NewDirectSendGuard(in, p, k, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}
 	return g
 }
 
-func TestDirectGuard_CleanEmailIsDelivered(t *testing.T) {
-	in, s, k := &fakeInner{}, &fakeSuppression{}, &fakeKill{}
-	out := guard(t, in, s, k).Deliver(context.Background(), email())
+func TestDirectGuard_CleanEmailIsDeliveredAndJudgedAsT0ByDefault(t *testing.T) {
+	in, p, k := &fakeInner{}, allowed(), &fakeKill{}
+	out := guard(t, in, p, k).Deliver(context.Background(), email())
 	if !out.Delivered || in.calls != 1 {
 		t.Fatalf("a clean email must reach the provider exactly once: %+v calls=%d", out, in.calls)
 	}
-	if s.gotStream != ledger.StreamTransactional || s.gotClass != ledger.ClassT0 || s.gotEmail != "a@example.com" {
-		t.Errorf("a direct send is checked as TRANSACTIONAL/T0 against its own address: %v %v %q", s.gotStream, s.gotClass, s.gotEmail)
+	if p.gotStream != ledger.StreamTransactional || p.gotIntent.CommunicationClass != ledger.ClassT0 || p.gotIntent.RecipientEmail != "a@example.com" {
+		t.Errorf("a direct send that states no class is judged as TRANSACTIONAL/T0 against its own address: %v %v %q",
+			p.gotStream, p.gotIntent.CommunicationClass, p.gotIntent.RecipientEmail)
+	}
+	if p.gotIntent.TenantID != "t1" {
+		t.Errorf("the engine must be asked about the right tenant: %q", p.gotIntent.TenantID)
 	}
 	if k.gotTnnt != "t1" || k.gotTmpl != "tpl-1" {
 		t.Errorf("kill switch asked about the wrong scope: %q %q", k.gotTnnt, k.gotTmpl)
 	}
 }
 
-// NP-13: a hard-bounced or complaint-suppressed address is not mailed.
-func TestDirectGuard_SuppressedAddressIsTerminalAndNeverReachesTheProvider(t *testing.T) {
-	in, s := &fakeInner{}, &fakeSuppression{suppressed: true, reason: "HARD_BOUNCE"}
-	out := guard(t, in, s, &fakeKill{}).Deliver(context.Background(), email())
-	if in.calls != 0 || out.Delivered {
-		t.Fatalf("the provider must not be called for a suppressed address: %+v calls=%d", out, in.calls)
-	}
-	if out.Retryable || out.Unknown {
-		t.Errorf("suppression is terminal; retrying cannot help: %+v", out)
-	}
-	if !strings.Contains(out.Reason, "HARD_BOUNCE") {
-		t.Errorf("the reason should name the suppression: %q", out.Reason)
+// Step 5: the message's own class selects the stream and reaches the shared engine.
+func TestDirectGuard_StatedClassSelectsTheStream(t *testing.T) {
+	for class, stream := range map[string]ledger.SenderStream{
+		"S0": ledger.StreamCritical, "T0": ledger.StreamTransactional, "A1": ledger.StreamOperational,
+	} {
+		in, p := &fakeInner{}, allowed()
+		n := email()
+		n.CommunicationClass = class
+		guard(t, in, p, &fakeKill{}).Deliver(context.Background(), n)
+		if p.gotStream != stream || string(p.gotIntent.CommunicationClass) != class || in.calls != 1 {
+			t.Errorf("%s: stream=%v class=%v delivered=%d", class, p.gotStream, p.gotIntent.CommunicationClass, in.calls)
+		}
 	}
 }
 
-// NP-56 / INV-30: an unreadable suppression list is not permission.
-func TestDirectGuard_SuppressionLookupFailureFailsClosed(t *testing.T) {
+// INV-07: marketing and lifecycle are not a direct send, even if a row carries the class.
+func TestDirectGuard_MarketingAndLifecycleAreRefusedWithoutAskingThePolicy(t *testing.T) {
+	for _, class := range []string{"M1", "L1", "X9"} {
+		in, p := &fakeInner{}, allowed()
+		n := email()
+		n.CommunicationClass = class
+		out := guard(t, in, p, &fakeKill{}).Deliver(context.Background(), n)
+		if in.calls != 0 || out.Delivered || out.Retryable {
+			t.Errorf("%s: the provider must not be called and the refusal is terminal: %+v calls=%d", class, out, in.calls)
+		}
+		if !strings.Contains(out.Reason, "ledger pipeline") {
+			t.Errorf("%s: the reason should point to the ledger pipeline: %q", class, out.Reason)
+		}
+	}
+}
+
+// NP-13: a policy refusal is terminal and the provider is not called.
+func TestDirectGuard_PolicyRefusalIsTerminalAndNeverReachesTheProvider(t *testing.T) {
 	in := &fakeInner{}
-	out := guard(t, in, &fakeSuppression{err: errors.New("db down")}, &fakeKill{}).Deliver(context.Background(), email())
+	p := &fakePolicy{decision: ledger.PolicyDecision{Allowed: false, RuleName: "SUPPRESSION_ENFORCED", Reason: "address suppressed due to HARD_BOUNCE"}}
+	out := guard(t, in, p, &fakeKill{}).Deliver(context.Background(), email())
 	if in.calls != 0 || out.Delivered {
-		t.Fatalf("a failed lookup must not fall through to the provider: %+v calls=%d", out, in.calls)
+		t.Fatalf("the provider must not be called for a refused message: %+v calls=%d", out, in.calls)
+	}
+	if out.Retryable || out.Unknown {
+		t.Errorf("a policy refusal is terminal; retrying cannot help: %+v", out)
+	}
+	if !strings.Contains(out.Reason, "HARD_BOUNCE") || !strings.Contains(out.Reason, "SUPPRESSION_ENFORCED") {
+		t.Errorf("the reason should name the rule and the cause: %q", out.Reason)
+	}
+}
+
+// NP-56 / INV-30: a policy that cannot be evaluated is not permission.
+func TestDirectGuard_PolicyEvaluationFailureFailsClosed(t *testing.T) {
+	in := &fakeInner{}
+	out := guard(t, in, &fakePolicy{err: errors.New("db down")}, &fakeKill{}).Deliver(context.Background(), email())
+	if in.calls != 0 || out.Delivered {
+		t.Fatalf("a failed evaluation must not fall through to the provider: %+v calls=%d", out, in.calls)
 	}
 	if !out.Retryable {
-		t.Errorf("a lookup failure is transient and should be retried: %+v", out)
+		t.Errorf("a failure to evaluate is transient and should be retried: %+v", out)
 	}
 }
 
 func TestDirectGuard_KillSwitchHoldsDeliveryAndIsRetryable(t *testing.T) {
-	in, s := &fakeInner{}, &fakeSuppression{}
-	out := guard(t, in, s, &fakeKill{engaged: true, reason: "provider incident"}).Deliver(context.Background(), email())
+	in, p := &fakeInner{}, allowed()
+	out := guard(t, in, p, &fakeKill{engaged: true, reason: "provider incident"}).Deliver(context.Background(), email())
 	if in.calls != 0 || out.Delivered || !out.Retryable {
 		t.Fatalf("an engaged kill switch pauses delivery without dropping the notice: %+v calls=%d", out, in.calls)
 	}
 	if !strings.Contains(out.Reason, "provider incident") {
 		t.Errorf("the reason should say why: %q", out.Reason)
 	}
-	if s.calls != 0 {
-		t.Errorf("the kill switch is checked first; no need to read the suppression list while halted")
+	if p.calls != 0 {
+		t.Errorf("the kill switch is checked first; no need to evaluate policy while halted")
 	}
 }
 
 func TestDirectGuard_InAppAndOtherChannelsAreNotGuarded(t *testing.T) {
 	for _, ch := range []string{domain.ChannelInApp, domain.ChannelWebhook, domain.ChannelSMS} {
-		in, s, k := &fakeInner{}, &fakeSuppression{suppressed: true}, &fakeKill{engaged: true}
+		in, p, k := &fakeInner{}, &fakePolicy{decision: ledger.PolicyDecision{Allowed: false}}, &fakeKill{engaged: true}
 		n := email()
 		n.Channel = ch
-		guard(t, in, s, k).Deliver(context.Background(), n)
-		if in.calls != 1 || s.calls != 0 || k.checked != 0 {
-			t.Errorf("%s: only EMAIL has an address to suppress; got inner=%d suppression=%d kill=%d", ch, in.calls, s.calls, k.checked)
+		guard(t, in, p, k).Deliver(context.Background(), n)
+		if in.calls != 1 || p.calls != 0 || k.checked != 0 {
+			t.Errorf("%s: only EMAIL has an address to judge; got inner=%d policy=%d kill=%d", ch, in.calls, p.calls, k.checked)
 		}
 	}
 }
 
 func TestDirectGuard_RefusesToBeBuiltWithoutItsControls(t *testing.T) {
-	if _, err := NewDirectSendGuard(nil, &fakeSuppression{}, &fakeKill{}, nil); err == nil {
+	if _, err := NewDirectSendGuard(nil, allowed(), &fakeKill{}, nil); err == nil {
 		t.Error("no deliverer")
 	}
 	if _, err := NewDirectSendGuard(&fakeInner{}, nil, &fakeKill{}, nil); err == nil {
-		t.Error("no suppression checker: a guard that guards nothing must not be constructible")
+		t.Error("no policy resolver: a guard that guards nothing must not be constructible")
 	}
-	if _, err := NewDirectSendGuard(&fakeInner{}, &fakeSuppression{}, nil, nil); err == nil {
+	if _, err := NewDirectSendGuard(&fakeInner{}, allowed(), nil, nil); err == nil {
 		t.Error("no kill switch")
+	}
+}
+
+// The mapping the guard relies on, and the classes the direct path accepts, agree.
+func TestDirectPathClassesAndStreamsAgree(t *testing.T) {
+	for _, c := range domain.DirectPathClasses {
+		if _, ok := ledger.StreamForDirectClass(ledger.CommunicationClass(c)); !ok {
+			t.Errorf("class %s is accepted by the API but has no stream", c)
+		}
+	}
+	for _, c := range []ledger.CommunicationClass{ledger.ClassL1, ledger.ClassM1} {
+		if _, ok := ledger.StreamForDirectClass(c); ok || domain.ValidDirectPathClass(string(c)) {
+			t.Errorf("class %s must not be available on the direct path", c)
+		}
+	}
+	// Every seed template's class/stream pair is consistent with the mapping where one exists.
+	for _, d := range ledger.DefaultSeedDefinitions() {
+		if s, ok := ledger.StreamForDirectClass(d.CommunicationClass); ok && s != d.SenderStream {
+			t.Errorf("template %s: class %s is on stream %s but the direct path would use %s", d.TemplateKey, d.CommunicationClass, d.SenderStream, s)
+		}
 	}
 }

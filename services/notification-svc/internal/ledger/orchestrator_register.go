@@ -46,6 +46,7 @@ func (o *Orchestrator) registerCommunication(ctx context.Context, tenantID strin
 		CreatedAt:              time.Now().UTC(),
 		PurposeContext:         templateKey,
 		IdempotencyKey:         "ledger:" + dedupKey,
+		CommunicationClass:     string(intent.CommunicationClass),
 	}
 	created, err := o.register.CreateNotification(ctx, row)
 	if err != nil {
