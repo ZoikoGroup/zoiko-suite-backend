@@ -247,6 +247,19 @@ func (s *stubStore) RetireRelease(context.Context, string, domain.AdvanceRelease
 	return nil, errors.New("not implemented in stubStore")
 }
 
+func (s *stubStore) CreateDisposition(context.Context, domain.CreateDispositionRequest, string) (*domain.OutputDisposition, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) GetDisposition(context.Context, string) (*domain.OutputDisposition, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) DecideDisposition(context.Context, string, domain.DecideDispositionRequest, string) (*domain.OutputDisposition, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) SupersedeDisposition(context.Context, string, domain.SupersedeDispositionRequest, string) (*domain.OutputDisposition, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+
 var _ store.Store = (*stubStore)(nil)
 
 type stubPublisher struct{}

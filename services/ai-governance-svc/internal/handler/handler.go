@@ -56,6 +56,12 @@ const (
 	ModelReleaseRegister = "AI_MODEL_RELEASE_REGISTER"
 	ModelReleaseAdvance  = "AI_MODEL_RELEASE_ADVANCE"
 	ModelReleaseApprove  = "AI_MODEL_RELEASE_APPROVE"
+
+	// AIG-04
+	DispositionCreate    = "AI_OUTPUT_DISPOSITION_CREATE"
+	DispositionRead      = "AI_OUTPUT_DISPOSITION_READ"
+	DispositionDecide    = "AI_OUTPUT_DISPOSITION_DECIDE"
+	DispositionSupersede = "AI_OUTPUT_DISPOSITION_SUPERSEDE"
 )
 
 type AuthzChecker interface {
@@ -213,6 +219,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/unrestrict", h.UnrestrictRelease)
 		r.Post("/{id}/quarantine", h.QuarantineRelease)
 		r.Post("/{id}/retire", h.RetireRelease)
+	})
+	r.Route("/v1/ai/output-dispositions", func(r chi.Router) {
+		r.Post("/", h.CreateDisposition)
+		r.Get("/{id}", h.GetDisposition)
+		r.Post("/{id}/decide", h.DecideDisposition)
+		r.Post("/{id}/supersede", h.SupersedeDisposition)
 	})
 }
 

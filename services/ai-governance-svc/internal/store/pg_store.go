@@ -67,6 +67,12 @@ type Store interface {
 	UnrestrictRelease(ctx context.Context, modelReleaseID string, actor string) (*domain.AIModelRelease, error)
 	QuarantineRelease(ctx context.Context, modelReleaseID string, req domain.AdvanceReleaseRequest, actor string) (*domain.AIModelRelease, error)
 	RetireRelease(ctx context.Context, modelReleaseID string, req domain.AdvanceReleaseRequest, actor string) (*domain.AIModelRelease, error)
+
+	// AIG-04: Human Oversight, Output Disposition & Decision Boundary (additive).
+	CreateDisposition(ctx context.Context, req domain.CreateDispositionRequest, actor string) (*domain.OutputDisposition, error)
+	GetDisposition(ctx context.Context, dispositionID string) (*domain.OutputDisposition, error)
+	DecideDisposition(ctx context.Context, dispositionID string, req domain.DecideDispositionRequest, reviewer string) (*domain.OutputDisposition, error)
+	SupersedeDisposition(ctx context.Context, dispositionID string, req domain.SupersedeDispositionRequest, actor string) (*domain.OutputDisposition, error)
 }
 
 type PgStore struct {
