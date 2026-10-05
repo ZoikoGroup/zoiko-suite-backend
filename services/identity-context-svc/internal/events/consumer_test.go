@@ -155,6 +155,20 @@ func TestAuthorityExpiredRevokesToo(t *testing.T) {
 	assert.Len(t, h.sessions.principals, 1, "an expired authority grants nothing and must revoke like a revoked one")
 }
 
+// A suspended delegation confers nothing until resumed, so the delegate's
+// sessions end; resuming needs no revocation (it ADDS access).
+func TestAuthoritySuspendedRevokesAndResumedDoesNot(t *testing.T) {
+	h := newHarness()
+	h.consumer.Handle(context.Background(), event(t, "authority.suspended", "e1", "tenant-1",
+		map[string]any{"delegate_principal_id": "p-42"}))
+	require.Len(t, h.sessions.principals, 1, "a suspended authority grants nothing and must end the delegate's sessions")
+	assert.Equal(t, "p-42", h.sessions.principals[0].id)
+
+	h.consumer.Handle(context.Background(), event(t, "authority.resumed", "e2", "tenant-1",
+		map[string]any{"delegate_principal_id": "p-42"}))
+	assert.Len(t, h.sessions.principals, 1, "resuming must not revoke anything")
+}
+
 func TestDuplicateEventIsNotActedOnTwice(t *testing.T) {
 	h := newHarness()
 	raw := event(t, "authority.revoked", "same-id", "tenant-1", map[string]any{"delegate_principal_id": "p-42"})

@@ -106,6 +106,7 @@ func (d *RedisDeduper) Claim(ctx context.Context, eventID string) (bool, error) 
 // why revocation events changed nothing and the risk cache — whose only writer
 // is HandleRiskSignalUpdate — was permanently empty, pinning every resolved
 // session to STANDARD posture with signal source UNAVAILABLE.
+//
 //	legal.hold.*        → project GOV-10's holds so disposition can be refused
 type Consumer struct {
 	log      *zap.Logger
@@ -308,14 +309,17 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 	}
 
 	switch ev.EventType {
-	case "authority.revoked", "authority.expired", "role.updated", "entity.updated":
+	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated":
 		if c.stale(ev) {
 			return
 		}
 	}
 
 	switch ev.EventType {
-	case "authority.revoked", "authority.expired":
+	// A suspended delegation confers nothing until it is resumed (ORG-06
+	// lifecycle), so the delegate's sessions end exactly as on a revocation.
+	// authority.resumed needs nothing: like authority.delegated it ADDS access.
+	case "authority.revoked", "authority.expired", "authority.suspended":
 		c.handleAuthorityEnded(ctx, ev)
 	case "authority.delegated":
 		c.handleAuthorityDelegated(ctx, ev)
