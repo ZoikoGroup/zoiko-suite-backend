@@ -57,16 +57,32 @@ type WorkflowInstance struct {
 	InvalidationEvidenceRefs []string   `json:"invalidation_evidence_refs,omitempty"`
 }
 
-// WorkflowStage is one approver slot in a workflow's ordered chain, supplied
-// by the caller at creation time — this service does not resolve "who
-// should approve X" from any rule engine; no such rules are specified
-// anywhere in the architecture docs. See progress.md.
+// WorkflowStage is one approval gate in a workflow's ordered chain,
+// supplied by the caller at creation time — this service does not
+// resolve "who should approve X" from any rule engine; no such rules
+// are specified anywhere in the architecture docs. See progress.md.
+//
+// StageType is SINGLE (one named approver, the original shape) or
+// QUORUM (an eligible pool with an N-of-M threshold, ZS-SVC-R-001
+// §5.1/§8.3 — see quorum.go). Exactly one of
+// ApproverPrincipalID/RequiredApprovals is set, matching which shape
+// the stage is — enforced at the database by migration 000012's
+// workflow_stages_shape_matches_type CHECK.
 type WorkflowStage struct {
 	WorkflowStageID    string `json:"workflow_stage_id"`
 	WorkflowInstanceID string `json:"workflow_instance_id"`
 
-	StageOrder          int    `json:"stage_order"`
-	ApproverPrincipalID string `json:"approver_principal_id"`
+	StageOrder int `json:"stage_order"`
+
+	// StageType: SINGLE | QUORUM.
+	StageType string `json:"stage_type"`
+
+	// ApproverPrincipalID is set (non-empty) only for a SINGLE stage —
+	// kept a plain string, not a pointer, so every existing SINGLE-stage
+	// code path (which predates QUORUM entirely) is untouched.
+	ApproverPrincipalID string `json:"approver_principal_id,omitempty"`
+	// RequiredApprovals is set only for a QUORUM stage — the N in N-of-M.
+	RequiredApprovals *int `json:"required_approvals,omitempty"`
 
 	// StageStatus: PENDING | APPROVED | REJECTED | SKIPPED.
 	StageStatus string `json:"stage_status"`
@@ -98,9 +114,15 @@ type WorkflowTransition struct {
 
 // ── params ───────────────────────────────────────────────────────────────────
 
-// CreateWorkflowStageInput is one entry in the caller-supplied approval chain.
+// CreateWorkflowStageInput is one entry in the caller-supplied approval
+// chain. A SINGLE stage (the default, when StageType is empty) sets
+// ApproverPrincipalID only. A QUORUM stage sets StageType, RequiredApprovals
+// and QuorumApprovers instead — see quorum.go.
 type CreateWorkflowStageInput struct {
-	ApproverPrincipalID string `json:"approver_principal_id"`
+	StageType           string   `json:"stage_type,omitempty"`
+	ApproverPrincipalID string   `json:"approver_principal_id,omitempty"`
+	RequiredApprovals   int      `json:"required_approvals,omitempty"`
+	QuorumApprovers     []string `json:"quorum_approvers,omitempty"`
 }
 
 type CreateWorkflowParams struct {
@@ -192,6 +214,14 @@ var ErrSubjectFingerprintMismatch = errorString("subject fingerprint does not ma
 var ErrSubjectVersionMismatch = errorString("subject version does not match expected version")
 var ErrWorkflowUnboundSubject = errorString("workflow has no bound subject fingerprint for release verification")
 var ErrInvalidReasonCode = errorString("invalid or unrecognized reason code")
+
+// Quorum stage errors (ZS-SVC-R-001 §5.1/§8.3) — see quorum.go.
+var ErrInvalidStageType = errorString("stage_type must be SINGLE or QUORUM")
+var ErrQuorumRequiresApprovers = errorString("a QUORUM stage requires at least one quorum_approvers entry")
+var ErrQuorumThresholdExceedsPool = errorString("required_approvals cannot exceed the number of quorum_approvers")
+var ErrQuorumDuplicateApprover = errorString("quorum_approvers must not list the same principal twice")
+var ErrNotQuorumStage = errorString("the current stage is not a QUORUM stage")
+var ErrNotEligibleQuorumApprover = errorString("actor is not an eligible approver for this quorum stage")
 
 type errorString string
 
