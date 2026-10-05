@@ -49,6 +49,10 @@ func (a *scopedAuthZ) CheckAllowed(_ context.Context, principalID, _, actionType
 	return nil
 }
 
+func (a *scopedAuthZ) CheckAllowedAtLimit(_ context.Context, principalID, _, actionType, _, _ string) error {
+	return a.CheckAllowed(context.Background(), principalID, "", actionType+"@limit")
+}
+
 func (a *scopedAuthZ) called(principal, action string) bool {
 	for _, c := range a.calls {
 		if c == principal+"|"+action {
@@ -72,7 +76,7 @@ func tenantInjector(tenantID string) func(http.Handler) http.Handler {
 func newRouterAuthz(s *stubStore, authz handler.AuthZClient) chi.Router {
 	r := chi.NewRouter()
 	r.Use(tenantInjector("tenant-abc"))
-	h := handler.New(s, authz, nil, zap.NewNop(), nil)
+	h := handler.New(s, authz, newStubSoD(), zap.NewNop(), nil)
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -95,6 +99,7 @@ func body(delegator, delegate, correlationID string) map[string]any {
 		"effective_from":         time.Now().UTC(),
 		"effective_to":           time.Now().UTC().Add(24 * time.Hour),
 		"correlation_id":         correlationID,
+		"reason":                 "cover during leave",
 	}
 }
 

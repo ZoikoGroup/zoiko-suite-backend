@@ -75,16 +75,9 @@ func TestRevoke_SweepsExpiryFirstSoALapsedGrantIsNotRecordedAsRevoked(t *testing
 	store := newStubStore()
 	r := newRouter(store, &stubAuthZ{}, nil)
 
-	past := time.Now().Add(-48 * time.Hour)
-	created := doReq(r, http.MethodPost, "/v1/delegations/",
-		delegationBody("delegator-1", uuid.NewString(), past, past.Add(time.Hour)), "delegator-1")
-	if created.Code != http.StatusCreated {
-		t.Fatalf("setup: %d %s", created.Code, created.Body.String())
-	}
-	var d domain.DelegationGrant
-	_ = json.NewDecoder(created.Body).Decode(&d)
+	d := seedLapsed(store, "delegator-1")
 
-	rr := doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", nil, "admin-1")
+	rr := revokeReq(r, d.DelegationID, d.Version, "admin-1")
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("expected 409 — the grant expired before anyone revoked it — got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -103,7 +96,7 @@ func TestRevoke_InWindowGrantStillRevokes(t *testing.T) {
 	r := newRouter(store, &stubAuthZ{}, nil)
 	d := createActiveDelegation(t, r)
 
-	rr := doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", nil, "admin-1")
+	rr := revokeReq(r, d.DelegationID, d.Version, "admin-1")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
 	}

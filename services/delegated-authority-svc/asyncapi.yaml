@@ -50,7 +50,9 @@ servers:
 channels:
   zoiko.delegated-authority.events:
     description: |
-      All three lifecycle events. Configured by `KAFKA_EVENTS_TOPIC`; consumers
+      Every lifecycle event. Each payload carries `version`; consumers apply
+      an event only if it is not older than what they hold, so a replay cannot
+      undo a later change. Configured by `KAFKA_EVENTS_TOPIC`; consumers
       that read delegation state (notably identity-context-svc) bind to it via
       `KAFKA_DELEGATION_TOPIC`.
     subscribe:
@@ -62,6 +64,8 @@ channels:
           - $ref: '#/components/messages/AuthorityRevoked'
           - $ref: '#/components/messages/AuthorityExpired'
           - $ref: '#/components/messages/AuthorityExtended'
+          - $ref: '#/components/messages/AuthoritySuspended'
+          - $ref: '#/components/messages/AuthorityResumed'
 
 components:
   messages:
@@ -148,6 +152,44 @@ components:
                 description: The principal that performed the extension.
               payload: { $ref: '#/components/schemas/ExtendedPayload' }
 
+    AuthoritySuspended:
+      name: authority.suspended
+      title: A delegation was suspended
+      description: |
+        Active → Suspended (ORG-06). The grant confers nothing until resumed:
+        consumers treat it exactly as an end — identity-context-svc ends the
+        delegate's sessions; authorization-svc stops honouring the grant.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: authority.suspended }
+              actor_id: { type: string, description: The principal that suspended it. }
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/RevokedPayload'
+                  - type: object
+                    properties:
+                      suspension_reason: { type: string }
+
+    AuthorityResumed:
+      name: authority.resumed
+      title: A suspended delegation was resumed
+      description: |
+        Suspended → Active, after the delegator's authority, limit and SoD were
+        re-checked. Carries the whole grant, so a consumer re-projects it as
+        from authority.delegated.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: authority.resumed }
+              payload: { $ref: '#/components/schemas/DelegatedPayload' }
+
   schemas:
     Envelope:
       type: object
@@ -170,7 +212,8 @@ components:
           example: evt-2f8c1f22-0b1e-4a43-9a2f-3d4c6e7a8b90
         event_type:
           type: string
-          enum: [authority.delegated, authority.revoked, authority.expired, authority.extended]
+          enum: [authority.delegated, authority.revoked, authority.expired, authority.extended,
+                 authority.suspended, authority.resumed]
         event_version: { type: string, example: "1.0" }
         emitted_at:
           type: string

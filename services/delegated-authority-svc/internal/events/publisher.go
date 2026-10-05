@@ -19,6 +19,13 @@ const (
 	EventRevoked   = "authority.revoked"
 	EventExpired   = "authority.expired"
 	EventExtended  = "authority.extended"
+	// EventSuspended ends a grant's effect until it is resumed; consumers
+	// treat it exactly like a revocation of the delegate's sessions and
+	// projected authority.
+	EventSuspended = "authority.suspended"
+	// EventResumed restores a suspended grant; it carries the full grant so a
+	// consumer can project it again exactly as from authority.delegated.
+	EventResumed = "authority.resumed"
 )
 
 // envelope is this platform's event contract (Doc 03 §19): every published
@@ -52,27 +59,43 @@ type envelope struct {
 // the request that caused the change, and by the time the relay runs that
 // request is long gone. Rebuilding later would either lose them or invent them.
 func Build(eventType string, d domain.DelegationGrant) (key string, body []byte, err error) {
+	return BuildFor(eventType, d, "", "")
+}
+
+// BuildFor builds the event with an explicit actor and reason. A transition
+// knows who performed it; the grant row alone does not — extend used to name
+// the grant's creator as the actor of somebody else's extension.
+func BuildFor(eventType string, d domain.DelegationGrant, actor, reason string) (key string, body []byte, err error) {
 	var actorID string
 	var payload map[string]any
 
 	switch eventType {
-	case EventDelegated:
+	case EventDelegated, EventResumed:
 		actorID = d.CreatedByPrincipalID
+		if d.ApprovedByPrincipalID != nil {
+			actorID = *d.ApprovedByPrincipalID
+		}
 		payload = map[string]any{
-			"delegation_id":             d.DelegationID,
-			"legal_entity_id":           d.LegalEntityID,
-			"delegator_principal_id":    d.DelegatorPrincipalID,
-			"delegate_principal_id":     d.DelegatePrincipalID,
-			"action_type":               d.ActionType,
-			"effective_from":            d.EffectiveFrom,
-			"effective_to":              d.EffectiveTo,
-			"authority_limit_cents":     d.AuthorityLimitCents,
-			"authority_limit_currency":  d.AuthorityLimitCurrency,
-			"authority_limit_quantity":  d.AuthorityLimitQuantity,
+			"approved_by_principal_id": d.ApprovedByPrincipalID,
+			"approval_method":          d.ApprovalMethod,
+			"reason":                   d.Reason,
+			"version":                  d.Version,
+			"delegation_id":            d.DelegationID,
+			"legal_entity_id":          d.LegalEntityID,
+			"delegator_principal_id":   d.DelegatorPrincipalID,
+			"delegate_principal_id":    d.DelegatePrincipalID,
+			"action_type":              d.ActionType,
+			"effective_from":           d.EffectiveFrom,
+			"effective_to":             d.EffectiveTo,
+			"authority_limit_cents":    d.AuthorityLimitCents,
+			"authority_limit_currency": d.AuthorityLimitCurrency,
+			"authority_limit_quantity": d.AuthorityLimitQuantity,
 		}
 	case EventRevoked:
 		actorID = deref(d.RevokedByPrincipalID)
 		payload = map[string]any{
+			"revocation_reason":      deref(d.RevocationReason),
+			"version":                d.Version,
 			"delegation_id":          d.DelegationID,
 			"legal_entity_id":        d.LegalEntityID,
 			"delegator_principal_id": d.DelegatorPrincipalID,
@@ -94,9 +117,21 @@ func Build(eventType string, d domain.DelegationGrant) (key string, body []byte,
 			"action_type":            d.ActionType,
 			"effective_to":           d.EffectiveTo,
 		}
-	case EventExtended:
-		actorID = d.CreatedByPrincipalID // who extended it
+	case EventSuspended:
+		actorID = deref(d.SuspendedByPrincipalID)
 		payload = map[string]any{
+			"delegation_id":          d.DelegationID,
+			"legal_entity_id":        d.LegalEntityID,
+			"delegator_principal_id": d.DelegatorPrincipalID,
+			"delegate_principal_id":  d.DelegatePrincipalID,
+			"action_type":            d.ActionType,
+			"suspension_reason":      deref(d.SuspensionReason),
+			"version":                d.Version,
+		}
+	case EventExtended:
+		actorID = d.CreatedByPrincipalID
+		payload = map[string]any{
+			"version":                d.Version,
 			"delegation_id":          d.DelegationID,
 			"legal_entity_id":        d.LegalEntityID,
 			"delegator_principal_id": d.DelegatorPrincipalID,
@@ -107,6 +142,14 @@ func Build(eventType string, d domain.DelegationGrant) (key string, body []byte,
 		}
 	default:
 		return "", nil, fmt.Errorf("events: unknown event type %q", eventType)
+	}
+	if actor != "" {
+		actorID = actor
+	}
+	if reason != "" {
+		if _, has := payload["reason"]; !has {
+			payload["reason"] = reason
+		}
 	}
 
 	raw, err := json.Marshal(payload)

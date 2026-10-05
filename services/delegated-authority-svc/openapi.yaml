@@ -191,6 +191,13 @@ paths:
         - name: delegate_principal_id
           in: query
           schema: { type: string }
+        - name: as_of
+          in: query
+          schema: { type: string, format: date-time }
+          description: |
+            GetEffectiveDelegations as of an instant: the grants effective then,
+            with the status and window they had then, from the append-only
+            history. Cannot be combined with `status`.
         - name: status
           in: query
           schema: { $ref: '#/components/schemas/DelegationStatus' }
@@ -262,9 +269,12 @@ paths:
   /v1/delegations/{delegation_id}/revoke:
     post:
       tags: [delegations]
-      summary: Revoke an ACTIVE delegation
+      summary: Revoke a PROPOSED, ACTIVE or SUSPENDED delegation
       description: |
         Terminal. A revoked grant cannot be reinstated; issue a new one.
+        `expected_version` is required (409 `version_mismatch` if the grant has
+        changed since it was read; 428 without it) and so is a `reason`, which
+        is recorded as `revocation_reason`.
 
         Requires `DELEGATION_REVOKE`. `authority.revoked` is written in the same
         transaction as the status change and delivered by the outbox relay —
@@ -276,10 +286,16 @@ paths:
         - $ref: '#/components/parameters/PrincipalId'
         - $ref: '#/components/parameters/LegalEntityId'
         - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
         - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
       responses:
         '200':
-          description: Revoked. `revoked_by_principal_id` and `revoked_at` are set.
+          description: Revoked. `revoked_by_principal_id`, `revoked_at` and `revocation_reason` are set.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
@@ -295,9 +311,14 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '428':
+          description: '`version_required`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            `invalid_transition` — already `REVOKED` or `EXPIRED`. Not a fault
+            `version_mismatch`, or `invalid_transition` — already `REVOKED` or `EXPIRED`. Not a fault
             and not a refusal: a correct answer that the caller is late. A
             rising rate of it means two operators are chasing the same
             delegation.
@@ -315,9 +336,12 @@ paths:
         Extends an ACTIVE delegation to a later end date. Only the delegator
         or an administrator with `DELEGATION_ADMINISTER` may extend.
 
-        The new `effective_to` must be strictly after the current one. The
-        extension checks for overlapping delegations (ORG-06 §4.4) and fails
-        with `overlap_conflict` if another ACTIVE delegation would overlap.
+        The new `effective_to` must be strictly after the current one, and a
+        grant whose window has already ended is not revived (409 `lapsed`). The
+        extension re-checks the delegator's authority, limit and SoD, and fails
+        with `overlap_conflict` only if ANOTHER active delegation would overlap
+        — the grant itself is excluded by id. `expected_version` and a `reason`
+        are required.
 
         `authority.extended` is written in the same transaction as the change.
       operationId: extendDelegation
@@ -326,6 +350,7 @@ paths:
         - $ref: '#/components/parameters/PrincipalId'
         - $ref: '#/components/parameters/LegalEntityId'
         - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CorrelationId'
       requestBody:
@@ -362,6 +387,222 @@ paths:
             `overlap_conflict` — another ACTIVE delegation for the same delegate
             and action would overlap the new window.
             `cannot_extend` — delegation is not ACTIVE.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/delegations/{delegation_id}/activate:
+    post:
+      tags: [delegations]
+      summary: Approve a PROPOSED delegation
+      description: |
+        Proposed → Active (ORG-06). The approver is the delegator
+        (`DELEGATOR_APPROVAL`) or a holder of `DELEGATION_ADMINISTER` who is neither
+        the maker nor the delegate (`ADMINISTRATOR_APPROVAL`); the database enforces the
+        same rule. Re-checks the delegator's authority, the delegated ceiling against
+        the delegator's own limit, SoD and overlap. Publishes `authority.delegated`
+        (DelegationActivated).
+      operationId: activateDelegation
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
+      responses:
+        '200':
+          description: Applied; the grant at its new version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`approval_not_segregated`, `delegator_lacks_authority`, `delegator_exceeds_limit`, `sod_conflict` or `forbidden`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`not_found`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`invalid_transition`, `version_mismatch`, `lapsed` (window already ended) or `overlap_conflict`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '428':
+          description: '`version_required` — no expected_version.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/delegations/{delegation_id}/suspend:
+    post:
+      tags: [delegations]
+      summary: Suspend an ACTIVE delegation
+      description: |
+        Active → Suspended. Confers nothing until resumed. The delegator or a
+        holder of `DELEGATION_REVOKE` may suspend; a reason is required. Publishes
+        `authority.suspended`, on which identity-context-svc ends the delegate's
+        sessions and authorization-svc stops honouring the grant.
+      operationId: suspendDelegation
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
+      responses:
+        '200':
+          description: Applied; the grant at its new version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`forbidden` — not the delegator and lacks `DELEGATION_REVOKE`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`not_found`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`invalid_transition`, `version_mismatch`, `lapsed` (window already ended) or `overlap_conflict`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '428':
+          description: '`version_required` — no expected_version.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/delegations/{delegation_id}/resume:
+    post:
+      tags: [delegations]
+      summary: Resume a SUSPENDED delegation
+      description: |
+        Suspended → Active, after the same re-checks as activation. The
+        delegator, or a holder of `DELEGATION_ADMINISTER` who is not the delegate.
+        Publishes `authority.resumed`.
+      operationId: resumeDelegation
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/ExpectedVersion'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
+      responses:
+        '200':
+          description: Applied; the grant at its new version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: '`reason_required`, `invalid_expected_version` or `invalid_json`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`self_dealing`, `delegator_lacks_authority`, `delegator_exceeds_limit`, `sod_conflict` or `forbidden`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`not_found`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`invalid_transition`, `version_mismatch`, `lapsed` (window already ended) or `overlap_conflict`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '428':
+          description: '`version_required` — no expected_version.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/delegations/explain:
+    get:
+      tags: [delegations]
+      summary: Explain the delegation chain between two principals
+      description: |
+        ExplainDelegationChain (ORG-06): every currently effective link by which
+        authority for `action_type` flows from `start_principal_id` to
+        `target_principal_id`, in order, along the shortest path. Requires
+        `DELEGATION_VIEW` on the entity.
+      operationId: explainDelegationChain
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - { name: legal_entity_id, in: query, required: true, schema: { type: string } }
+        - { name: start_principal_id, in: query, required: true, schema: { type: string } }
+        - { name: target_principal_id, in: query, required: true, schema: { type: string } }
+        - { name: action_type, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The chain; `found` is false when no path exists.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  found: { type: boolean }
+                  chain:
+                    type: array
+                    items: { $ref: '#/components/schemas/DelegationChainStep' }
+        '400':
+          description: '`missing_fields`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`forbidden` — `DELEGATION_VIEW` required.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -447,6 +688,14 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    ExpectedVersion:
+      name: expected_version
+      in: query
+      required: true
+      description: |
+        The version the caller read. ORG-06: every protected change requires
+        the authoritative current version. `If-Match` is accepted instead.
+      schema: { type: integer, format: int64, minimum: 1 }
 
   responses:
     Unauthenticated:
@@ -470,11 +719,10 @@ components:
       type: string
       enum: [PROPOSED, ACTIVE, SUSPENDED, REVOKED, EXPIRED]
       description: |
-        A linear chain. `ACTIVE` → `REVOKED` (explicit) or `ACTIVE` → `EXPIRED`
-        (by time). Both terminal; nothing returns to `ACTIVE`.
-
-        `PROPOSED` and `SUSPENDED` are non-terminal intermediate states per
-        ORG-06 §4.2.
+        ORG-06: `PROPOSED` → `ACTIVE` → `SUSPENDED` ⇄ `ACTIVE`; `REVOKED`
+        (explicit) and `EXPIRED` (by time, from any non-terminal state) are
+        terminal. A grant the delegator makes of their own authority starts
+        `ACTIVE`; one made on someone else's behalf starts `PROPOSED`.
 
     CreateDelegationRequest:
       type: object
@@ -486,7 +734,14 @@ components:
         - effective_from
         - effective_to
         - correlation_id
+        - reason
       properties:
+        reason:
+          type: string
+          description: Why the authority is delegated (ORG-06 required input; evidence).
+        propose:
+          type: boolean
+          description: Ask for a PROPOSED grant even when delegating your own authority.
         legal_entity_id:
           type: string
           description: The entity this delegation is scoped to.
@@ -518,10 +773,14 @@ components:
         authority_limit_cents:
           type: integer
           format: int64
-          description: Optional monetary ceiling in minor units (cents)
+          description: |
+            Optional monetary ceiling in minor units. Must be positive and within
+            the delegator's own authority limit for the action (else 403
+            `delegator_exceeds_limit`); authorization-svc enforces it on every
+            decision granted through this delegation.
         authority_limit_currency:
           type: string
-          description: ISO 4217 currency code when monetary limit is set
+          description: ISO 4217 code, uppercase; required with authority_limit_cents.
         authority_limit_quantity:
           type: integer
           format: int64
@@ -544,7 +803,10 @@ components:
           description: The new end date (must be after current effective_to).
         correlation_id:
           type: string
-          description: Idempotency key for the extension request.
+          description: Correlation for the extension request.
+        reason:
+          type: string
+          description: Why the window is extended (required).
 
     DelegationGrant:
       type: object
@@ -617,6 +879,37 @@ components:
           format: int64
           nullable: true
           description: Optional quantitative ceiling (max count of actions)
+        version: { type: integer, format: int64, description: Send as expected_version on any change. }
+        reason: { type: string }
+        approved_by_principal_id: { type: string, nullable: true }
+        approved_at: { type: string, format: date-time, nullable: true }
+        approval_method:
+          type: string
+          nullable: true
+          enum: [DELEGATOR_SELF, DELEGATOR_APPROVAL, ADMINISTRATOR_APPROVAL, LEGACY_UNRECORDED]
+        suspended_by_principal_id: { type: string, nullable: true }
+        suspended_at: { type: string, format: date-time, nullable: true }
+        suspension_reason: { type: string, nullable: true }
+        revocation_reason: { type: string, nullable: true }
+
+    TransitionRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          description: Required for suspend and revoke; recorded as evidence.
+
+    DelegationChainStep:
+      type: object
+      properties:
+        step_number: { type: integer }
+        delegation_id: { type: string, format: uuid }
+        delegator_principal_id: { type: string }
+        delegate_principal_id: { type: string }
+        action_type: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        status: { $ref: '#/components/schemas/DelegationStatus' }
 
     Error:
       type: object
