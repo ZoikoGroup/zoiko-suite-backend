@@ -286,8 +286,8 @@ func TestIntent_RetirementEndsTheFutureNotTheHistory(t *testing.T) {
 
 func TestMigration000020_DownThenUp(t *testing.T) {
 	pool := openTestPool(t)
-	// 000021 depends on 000020, so it is rolled back first and re-applied last.
-	for _, f := range []string{"000021_intent_binding.down.sql", "000020_communication_intents.down.sql", "000020_communication_intents.up.sql", "000021_intent_binding.up.sql"} {
+	// 000022 and 000021 depend on 000020, so they are rolled back first and re-applied last.
+	for _, f := range []string{"000022_privacy_binding_and_evidence.down.sql", "000021_intent_binding.down.sql", "000020_communication_intents.down.sql", "000020_communication_intents.up.sql", "000021_intent_binding.up.sql", "000022_privacy_binding_and_evidence.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)
 		_, err = pool.Exec(context.Background(), string(b))

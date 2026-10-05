@@ -65,3 +65,21 @@ func TestLedgerRegisterIsOffByDefault(t *testing.T) {
 		t.Fatalf("explicit opt-in must enable it: %v", err)
 	}
 }
+
+func TestPrivacyEnforcementIsOffByDefaultAndNeedsItsAuthority(t *testing.T) {
+	t.Setenv("NOTIFICATION_WEBHOOK_SECRETS", "")
+	t.Setenv("NOTIFICATION_PRIVACY_ENFORCEMENT", "")
+	t.Setenv("PRIVACY_DECISION_URL", "")
+	cfg, err := Load()
+	if err != nil || cfg.PrivacyEnforcement {
+		t.Fatalf("privacy enforcement refuses sends and must be opt-in: err=%v", err)
+	}
+	t.Setenv("NOTIFICATION_PRIVACY_ENFORCEMENT", "true")
+	if _, err := Load(); err == nil {
+		t.Fatal("enforcement without PRIVACY_DECISION_URL would refuse every send; Load must refuse to start")
+	}
+	t.Setenv("PRIVACY_DECISION_URL", "http://privacy-decision-svc:8080")
+	if cfg, err = Load(); err != nil || !cfg.PrivacyEnforcement || cfg.PrivacyTimeout != 3*time.Second {
+		t.Fatalf("explicit opt-in with an authority must load: %v", err)
+	}
+}

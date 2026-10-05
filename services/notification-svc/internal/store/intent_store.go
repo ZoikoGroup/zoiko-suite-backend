@@ -29,14 +29,14 @@ func scanIntent(s scannable, i *domain.CommunicationIntent) error {
 const intentVersionColumns = `v.version_id, v.intent_id, v.tenant_id, v.legal_entity_id, v.version_number,
 	v.purpose_class, v.evidence_class, v.allowed_channels, v.marketing_allowed, v.record_requirement, v.variable_contract,
 	v.status, v.created_by_principal_id, v.created_at, v.validated_at, v.approved_by_principal_id, v.approved_at,
-	v.effective_from, v.published_at, v.published_by_principal_id`
+	v.effective_from, v.published_at, v.published_by_principal_id, v.privacy_activity_id, v.privacy_purpose_id`
 
 func scanIntentVersion(s scannable, v *domain.IntentVersion) error {
 	var channels, contract []byte
 	if err := s.Scan(&v.VersionID, &v.IntentID, &v.TenantID, &v.LegalEntityID, &v.VersionNumber,
 		&v.PurposeClass, &v.EvidenceClass, &channels, &v.MarketingAllowed, &v.RecordRequirement, &contract,
 		&v.Status, &v.CreatedByPrincipalID, &v.CreatedAt, &v.ValidatedAt, &v.ApprovedByPrincipalID, &v.ApprovedAt,
-		&v.EffectiveFrom, &v.PublishedAt, &v.PublishedByPrincipalID); err != nil {
+		&v.EffectiveFrom, &v.PublishedAt, &v.PublishedByPrincipalID, &v.PrivacyActivityID, &v.PrivacyPurposeID); err != nil {
 		return err
 	}
 	if err := json.Unmarshal(channels, &v.AllowedChannels); err != nil {
@@ -145,11 +145,13 @@ func (s *PgStore) CreateIntentVersion(ctx context.Context, p domain.CreateIntent
 			WITH ins AS (
 				INSERT INTO communication_intent_versions
 					(intent_id, tenant_id, legal_entity_id, version_number, purpose_class, evidence_class, allowed_channels,
-					 marketing_allowed, record_requirement, variable_contract, created_by_principal_id)
-				VALUES ($1::uuid,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb,$11) RETURNING *)
+					 marketing_allowed, record_requirement, variable_contract, created_by_principal_id,
+					 privacy_activity_id, privacy_purpose_id)
+				VALUES ($1::uuid,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb,$11,$12,$13) RETURNING *)
 			SELECT `+intentVersionColumns+` FROM ins v`,
 			p.IntentID, tenantID, legalEntityID, next, p.PurposeClass, p.EvidenceClass, string(channels),
-			p.MarketingAllowed, p.RecordRequirement, string(contract), p.CreatedByPrincipalID), &out)
+			p.MarketingAllowed, p.RecordRequirement, string(contract), p.CreatedByPrincipalID,
+			p.PrivacyActivityID, p.PrivacyPurposeID), &out)
 	})
 	if err != nil {
 		return nil, err

@@ -35,6 +35,7 @@ import (
 	"zoiko.io/notification-svc/internal/mtls"
 	"zoiko.io/notification-svc/internal/outbox"
 	"zoiko.io/notification-svc/internal/policy"
+	"zoiko.io/notification-svc/internal/privacy"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
@@ -305,6 +306,15 @@ func main() {
 	directDeliverer, err := policy.NewDirectSendGuard(deliverer, policyEngine, killSwitch, log)
 	if err != nil {
 		log.Fatal("failed to construct the direct send guard", zap.Error(err))
+	}
+	if cfg.PrivacyEnforcement {
+		gate, gerr := privacy.NewGate(privacy.NewClient(cfg.PrivacyDecisionURL, cfg.PrivacyTimeout, log), pgStore, log)
+		if gerr != nil {
+			log.Fatal("failed to construct the privacy gate", zap.Error(gerr))
+		}
+		directDeliverer.WithPrivacyGate(gate)
+		log.Info("privacy enforcement is on: intent-bound emails are sent only on a PERMIT decision",
+			zap.String("privacy_decision_url", cfg.PrivacyDecisionURL))
 	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────

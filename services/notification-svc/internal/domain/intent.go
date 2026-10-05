@@ -118,6 +118,12 @@ type IntentVersion struct {
 	VariableContract  map[string]VariableSpec `json:"variable_contract"`
 	Status            string                  `json:"status"` // DRAFT, REVIEW, APPROVED, PUBLISHED
 
+	// PrivacyActivityID and PrivacyPurposeID name the privacy processing activity and purpose
+	// this intent's messages run under (both or neither); the privacy gate asks the decision
+	// service about exactly these. Frozen with the version.
+	PrivacyActivityID *string `json:"privacy_activity_id,omitempty"`
+	PrivacyPurposeID  *string `json:"privacy_purpose_id,omitempty"`
+
 	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
 	CreatedAt              time.Time  `json:"created_at"`
 	ValidatedAt            *time.Time `json:"validated_at,omitempty"`
@@ -150,6 +156,8 @@ type CreateIntentVersionParams struct {
 	MarketingAllowed     bool
 	RecordRequirement    bool
 	VariableContract     map[string]VariableSpec
+	PrivacyActivityID    *string
+	PrivacyPurposeID     *string
 	CreatedByPrincipalID string
 }
 
@@ -249,8 +257,18 @@ func ValidateIntentVersion(p CreateIntentVersionParams) error {
 	if p.MarketingAllowed && p.PurposeClass != "L1" && p.PurposeClass != "M1" {
 		return IntentProblem{"marketing_allowed is only possible for a lifecycle (L1) or marketing (M1) purpose"}
 	}
+	if (p.PrivacyActivityID == nil) != (p.PrivacyPurposeID == nil) {
+		return IntentProblem{"privacy_activity_id and privacy_purpose_id are given together or not at all"}
+	}
+	for _, id := range []*string{p.PrivacyActivityID, p.PrivacyPurposeID} {
+		if id != nil && !privacyIDRe.MatchString(*id) {
+			return IntentProblem{"privacy_activity_id and privacy_purpose_id must start with a letter or digit and use only letters, digits and _ . : - (at most 128)"}
+		}
+	}
 	return ValidateContract(p.VariableContract)
 }
+
+var privacyIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 
 // SubjectSafe reports whether a variable may appear in a subject line: S0 and S1 only.
 func SubjectSafe(s VariableSpec) bool { return s.Sensitivity == "S0" || s.Sensitivity == "S1" }

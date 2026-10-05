@@ -612,6 +612,8 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		Origin:           domain.AttemptOriginRequest,
 		ProviderName:     outcome.ProviderName,
 		Retryable:        outcome.Retryable,
+		PrivacyDecisionID: outcome.PrivacyDecisionID,
+		PrivacyResult:     outcome.PrivacyResult,
 		ActorPrincipalID: principalID,
 	}, correlationID, tenantID, http.StatusCreated)
 }

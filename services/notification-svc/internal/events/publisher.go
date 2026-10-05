@@ -309,7 +309,7 @@ func (p *Publisher) Publish(ctx context.Context, msgs []kafka.Message) error {
 // Keyed on the notification, so every attempt of one communication shares a
 // partition with its notification.* events and arrives in order.
 func AttemptCreated(correlationID string, n domain.Notification, a domain.DeliveryAttempt) (Outbound, error) {
-	return buildFor(n, TypeAttemptCreated, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, map[string]any{
+	p := map[string]any{
 		"attempt_id":               a.AttemptID,
 		"communication_id":         n.NotificationID,
 		"notification_id":          n.NotificationID,
@@ -323,7 +323,15 @@ func AttemptCreated(correlationID string, n domain.Notification, a domain.Delive
 		"attempted_at":             a.AttemptedAt,
 		"payload_hash":             n.RenderedContentHash,
 		"recipient_address_source": n.RecipientAddressSource,
-	})
+	}
+	// The privacy decision that governed this attempt, when one did (omitted, never blank).
+	if a.PrivacyDecisionID != "" {
+		p["privacy_decision_id"] = a.PrivacyDecisionID
+	}
+	if a.PrivacyResult != "" {
+		p["privacy_result"] = a.PrivacyResult
+	}
+	return buildFor(n, TypeAttemptCreated, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, p)
 }
 
 // AttemptUnknown seals delivery.attempt.unknown (§10.2): an attempt whose

@@ -291,6 +291,11 @@ type DeliveryOutcome struct {
 	// ProviderName records the name of the provider that actually handled or refused
 	// the attempt (e.g. "smtp-primary", "smtp-secondary", "ses").
 	ProviderName string
+
+	// PrivacyDecisionID and PrivacyResult are set when a privacy decision governed this
+	// attempt, whether it permitted the send or stopped it (migration 000022).
+	PrivacyDecisionID string
+	PrivacyResult     string
 }
 
 // AddressSource values for Notification.RecipientAddressSource.
@@ -406,6 +411,10 @@ type AttemptMeta struct {
 	ProviderName     string
 	Retryable        bool
 	ResendReason     string
+	// PrivacyDecisionID and PrivacyResult are the privacy decision that governed this
+	// attempt (migration 000022), recorded for a refusal as well as a permission.
+	PrivacyDecisionID string
+	PrivacyResult     string
 	ActorPrincipalID string
 }
 
@@ -426,4 +435,7 @@ type DeliveryAttempt struct {
 	ActorPrincipalID string    `json:"actor_principal_id,omitempty"`
 	AttemptedAt      time.Time `json:"attempted_at"`
 	RecordedAt       time.Time `json:"recorded_at"`
+	// The privacy decision that governed this attempt, when one did.
+	PrivacyDecisionID string `json:"privacy_decision_id,omitempty"`
+	PrivacyResult     string `json:"privacy_result,omitempty"`
 }

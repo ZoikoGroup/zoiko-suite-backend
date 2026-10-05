@@ -335,3 +335,22 @@ Tests: domain (subject parse and refusals, declaration checks, rendering and hea
 * **Reason codes:** the NCD-nnn codes appear in messages and in one error code; there is no full stable-code catalogue yet.
 * **Typed contract for unbound templates and the ledger catalogue is not applied:** only templates bound to an intent are governed by it; the built-in catalogue and ledger Go templates keep their own rules.
 * **Variable sensitivity is not yet used to keep S2/S3 values out of logs, previews or provider metadata**; it governs subjects only.
+
+## 13. Wave 3 slice 1: the privacy permission gate (NCD-02 5.3)
+
+Sending an email uses the recipient's contact details for a purpose, and `privacy-decision-svc` is the authority on whether that use is permitted. Until now this service never asked. The standard is explicit: personal-data use needs PERMIT (or RESTRICT with the restrictions satisfied); INDETERMINATE fails closed; no operational mode may turn BLOCK or INDETERMINATE into permission (INV-30, NP-17, NP-18).
+
+* **Where:** inside the direct-send guard, the last point before the provider, so the first attempt, every retry and every resend are asked again (a consent withdrawn since creation is honoured on the retry). It runs after the local controls (kill switch, class, suppression, precedence), so the remote question is asked only for a message that would otherwise go out.
+* **What is asked:** the privacy activity and purpose named by the **intent version** the notification is pinned to (`privacy_activity_id`, `privacy_purpose_id`, both or neither, frozen with the version by the immutability trigger; the sender never chooses them), about the recipient principal, operation `USE`, data category contact details.
+* **Verdicts:** PERMIT sends. RESTRICT is **refused**, because a restriction is a duty this service cannot perform and it will not pretend to by sending anyway. BLOCK and REVIEW_REQUIRED are terminal refusals (NCD-008). INDETERMINATE, a timeout, an unreachable service, a non-200, an unreadable or unrecognised answer, an answer without a decision id, and an unreadable intent version are **retryable refusals** (fail closed). An intent version with no privacy binding is a terminal refusal: a person-directed message is never sent on an assumption.
+* **Evidence:** every attempt records `privacy_decision_id` and `privacy_result` (PERMIT, RESTRICT, BLOCK, REVIEW_REQUIRED, INDETERMINATE, UNAVAILABLE, NOT_BOUND), including refusals; both are on `GET .../attempts` and the `delivery.attempt.created` event (omitted when blank). Migration 000022 (rollback order 000022, 000021, 000020).
+* **Switch:** `NOTIFICATION_PRIVACY_ENFORCEMENT`, default **off**, because turning it on starts refusing intent-bound sends whose intent has no binding. With it on, `PRIVACY_DECISION_URL` is required (the service refuses to start without it); `PRIVACY_DECISION_TIMEOUT` defaults to 3s.
+* **Tests:** client over a real HTTP server (headers, body, every failure shape), the verdict table (only PERMIT allows), gate and guard fakes (refusal never reaches the provider; local refusals come first), config, and real-Postgres tests for binding validation, binding immutability at the database, attempt evidence round trip, rejection of an unknown result, and migration 000022 down/up. Full suite passes.
+
+**Not built, deliberately:**
+* **Legacy sends are not gated:** a notification with no intent (no `intent_version_id`) has no binding to enforce, so it passes untouched. Closing that means requiring an intent for every send, a separate decision.
+* **IN_APP is not gated**, as the guard as a whole only covers EMAIL; the ledger pipeline does not call this gate yet.
+* **RESTRICT is always refused.** Honouring specific constraint types (minimise, redact) needs the content pipeline to cooperate.
+* **The sender principal is used as the actor** on the decision request; there is no service identity distinct from the caller yet.
+* **No preferences, quiet hours or recipient channel decision yet** (the rest of NCD-02), and no call to the PDC (data-classification) service.
+* **No mutual TLS or retry/backoff of the privacy call itself:** a failure becomes a retryable refusal and the existing retry worker asks again.

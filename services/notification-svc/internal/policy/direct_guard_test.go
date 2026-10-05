@@ -6,10 +6,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/ledger"
+	"zoiko.io/notification-svc/internal/privacy"
 )
 
 type fakeInner struct{ calls int }
@@ -197,4 +199,67 @@ func TestDirectPathClassesAndStreamsAgree(t *testing.T) {
 			t.Errorf("template %s: class %s is on stream %s but the direct path would use %s", d.TemplateKey, d.CommunicationClass, d.SenderStream, s)
 		}
 	}
+}
+
+type fakePrivacy struct {
+	out   privacy.Outcome
+	calls int
+}
+
+func (f *fakePrivacy) Check(_ context.Context, _ domain.Notification) privacy.Outcome {
+	f.calls++
+	return f.out
+}
+
+func TestDirectGuard_PrivacyGate(t *testing.T) {
+	permit := privacy.Outcome{Applies: true, Verdict: privacy.Verdict{Allow: true, Result: "PERMIT", DecisionID: "d-1"}}
+	deny := privacy.Outcome{Applies: true, Verdict: privacy.Verdict{Result: "BLOCK", DecisionID: "d-2", Reason: "NCD-008 blocked"}}
+	retry := privacy.Outcome{Applies: true, Verdict: privacy.Verdict{Result: "UNAVAILABLE", Retryable: true, Reason: "NCD-008 down"}}
+
+	t.Run("permit delivers and carries the decision as evidence", func(t *testing.T) {
+		in, pg := &fakeInner{}, &fakePrivacy{out: permit}
+		out := guard(t, in, allowed(), &fakeKill{}).WithPrivacyGate(pg).Deliver(context.Background(), email())
+		assert.True(t, out.Delivered)
+		assert.Equal(t, "d-1", out.PrivacyDecisionID)
+		assert.Equal(t, "PERMIT", out.PrivacyResult)
+		assert.Equal(t, 1, in.calls)
+	})
+	t.Run("refusal never reaches the provider and keeps the decision", func(t *testing.T) {
+		in := &fakeInner{}
+		out := guard(t, in, allowed(), &fakeKill{}).WithPrivacyGate(&fakePrivacy{out: deny}).Deliver(context.Background(), email())
+		assert.False(t, out.Delivered)
+		assert.False(t, out.Retryable)
+		assert.Zero(t, in.calls)
+		assert.Equal(t, "d-2", out.PrivacyDecisionID)
+		assert.Equal(t, "BLOCK", out.PrivacyResult)
+		assert.Contains(t, out.Reason, "NCD-008")
+	})
+	t.Run("an outage is retryable and recorded as UNAVAILABLE", func(t *testing.T) {
+		in := &fakeInner{}
+		out := guard(t, in, allowed(), &fakeKill{}).WithPrivacyGate(&fakePrivacy{out: retry}).Deliver(context.Background(), email())
+		assert.True(t, out.Retryable)
+		assert.Zero(t, in.calls)
+		assert.Equal(t, "UNAVAILABLE", out.PrivacyResult)
+	})
+	t.Run("no intent: legacy send passes untouched", func(t *testing.T) {
+		in := &fakeInner{}
+		out := guard(t, in, allowed(), &fakeKill{}).WithPrivacyGate(&fakePrivacy{}).Deliver(context.Background(), email())
+		assert.True(t, out.Delivered)
+		assert.Empty(t, out.PrivacyResult)
+	})
+	t.Run("local refusals come first, so the remote question is not asked", func(t *testing.T) {
+		pg := &fakePrivacy{out: permit}
+		g := guard(t, &fakeInner{}, &fakePolicy{decision: ledger.PolicyDecision{Allowed: false, RuleName: "r"}}, &fakeKill{}).WithPrivacyGate(pg)
+		out := g.Deliver(context.Background(), email())
+		assert.False(t, out.Delivered)
+		assert.Zero(t, pg.calls)
+	})
+	t.Run("in-app is not gated", func(t *testing.T) {
+		pg := &fakePrivacy{out: deny}
+		n := email()
+		n.Channel = domain.ChannelInApp
+		out := guard(t, &fakeInner{}, allowed(), &fakeKill{}).WithPrivacyGate(pg).Deliver(context.Background(), n)
+		assert.True(t, out.Delivered)
+		assert.Zero(t, pg.calls)
+	})
 }

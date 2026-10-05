@@ -123,6 +123,8 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 		Origin:           domain.AttemptOriginResend,
 		ProviderName:     outcome.ProviderName,
 		Retryable:        outcome.Retryable,
+		PrivacyDecisionID: outcome.PrivacyDecisionID,
+		PrivacyResult:     outcome.PrivacyResult,
 		ResendReason:     req.Reason,
 		ActorPrincipalID: principalID,
 	}, getCorrelationID(r), tenantID, http.StatusOK)

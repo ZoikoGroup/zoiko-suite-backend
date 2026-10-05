@@ -544,5 +544,6 @@ func AttemptOutcome(o domain.DeliveryOutcome) string { return attemptOutcome(o) 
 
 // retryMeta describes a worker attempt for its durable attempt row.
 func retryMeta(o domain.DeliveryOutcome) domain.AttemptMeta {
-	return domain.AttemptMeta{Origin: domain.AttemptOriginRetry, ProviderName: o.ProviderName, Retryable: o.Retryable}
+	return domain.AttemptMeta{Origin: domain.AttemptOriginRetry, ProviderName: o.ProviderName, Retryable: o.Retryable,
+		PrivacyDecisionID: o.PrivacyDecisionID, PrivacyResult: o.PrivacyResult}
 }

@@ -59,6 +59,15 @@ type Config struct {
 	// on deliberately, per environment.
 	LedgerRegisterEnabled bool
 
+	// PrivacyEnforcement makes the direct send path ask privacy-decision-svc before an
+	// intent-bound email goes out, and fail closed when the answer is anything but PERMIT
+	// (ZS-SVC-Y-001 INV-30, NP-17). NOTIFICATION_PRIVACY_ENFORCEMENT, default false: it
+	// starts refusing sends whose intent has no privacy binding, so it is turned on
+	// deliberately, once intents carry one. It needs PRIVACY_DECISION_URL.
+	PrivacyEnforcement bool
+	PrivacyDecisionURL string
+	PrivacyTimeout     time.Duration
+
 	WebhookSecrets map[string][]string
 	// WebhookTolerance is how far a callback timestamp may differ from the clock.
 	// Sourced from NOTIFICATION_WEBHOOK_TOLERANCE (default 5m).
@@ -270,6 +279,10 @@ func Load() (*Config, error) {
 
 		LedgerRegisterEnabled: env("NOTIFICATION_LEDGER_REGISTER_ENABLED", "false") == "true",
 
+		PrivacyEnforcement: env("NOTIFICATION_PRIVACY_ENFORCEMENT", "false") == "true",
+		PrivacyDecisionURL: env("PRIVACY_DECISION_URL", ""),
+		PrivacyTimeout:     envDuration("PRIVACY_DECISION_TIMEOUT", 3*time.Second),
+
 		SecondaryEmail: EmailConfig{
 			Provider:       env("SMTP_SECONDARY_PROVIDER", ""),
 			Host:           env("SMTP_SECONDARY_HOST", ""),
@@ -350,6 +363,10 @@ func Load() (*Config, error) {
 		if len(missing) > 0 {
 			return nil, errors.New("invalid production config: " + strings.Join(missing, ", "))
 		}
+	}
+	// Enforcement without an authority to ask would refuse every send, silently.
+	if cfg.PrivacyEnforcement && cfg.PrivacyDecisionURL == "" {
+		return nil, errors.New("NOTIFICATION_PRIVACY_ENFORCEMENT is on but PRIVACY_DECISION_URL is not set")
 	}
 	return cfg, nil
 }

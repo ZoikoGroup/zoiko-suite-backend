@@ -184,6 +184,9 @@ type createIntentVersionRequest struct {
 	MarketingAllowed  bool                           `json:"marketing_allowed"`
 	RecordRequirement bool                           `json:"record_requirement"`
 	VariableContract  map[string]domain.VariableSpec `json:"variable_contract"`
+
+	PrivacyActivityID *string `json:"privacy_activity_id"`
+	PrivacyPurposeID  *string `json:"privacy_purpose_id"`
 }
 
 // CreateIntentVersion writes a DRAFT version. A change of purpose class is simply a new
@@ -203,7 +206,8 @@ func (h *Handler) CreateIntentVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.intents.CreateIntentVersion(r.Context(), domain.CreateIntentVersionParams{IntentID: intentID, PurposeClass: req.PurposeClass,
 		EvidenceClass: req.EvidenceClass, AllowedChannels: req.AllowedChannels, MarketingAllowed: req.MarketingAllowed,
-		RecordRequirement: req.RecordRequirement, VariableContract: req.VariableContract, CreatedByPrincipalID: principalID})
+		RecordRequirement: req.RecordRequirement, VariableContract: req.VariableContract, PrivacyActivityID: req.PrivacyActivityID, PrivacyPurposeID: req.PrivacyPurposeID,
+		CreatedByPrincipalID: principalID})
 	if err != nil {
 		h.writeIntentError(w, err)
 		return

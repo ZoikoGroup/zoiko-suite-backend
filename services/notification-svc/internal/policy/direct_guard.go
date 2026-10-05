@@ -8,6 +8,7 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/ledger"
+	"zoiko.io/notification-svc/internal/privacy"
 )
 
 // DirectSendGuard puts the delivery controls the ledger pipeline already has in
@@ -48,7 +49,23 @@ type DirectSendGuard struct {
 	inner      Deliverer
 	policy     PolicyResolver
 	killSwitch KillSwitch
+	privacy    PrivacyGate
 	log        *zap.Logger
+}
+
+// PrivacyGate asks the privacy authority whether an intent-bound message may use the
+// recipient's data (ZS-SVC-Y-001 NCD-02 5.3). *privacy.Gate satisfies it.
+type PrivacyGate interface {
+	Check(ctx context.Context, n domain.Notification) privacy.Outcome
+}
+
+// WithPrivacyGate enables privacy enforcement. It runs after the local controls (kill
+// switch, class, suppression) so the remote question is asked only for a message that
+// would otherwise go out, and it is evidence-recording: the decision id and result are
+// returned on the outcome and stored with the attempt.
+func (g *DirectSendGuard) WithPrivacyGate(p PrivacyGate) *DirectSendGuard {
+	g.privacy = p
+	return g
 }
 
 // Deliverer is the transport the guard wraps.
@@ -138,5 +155,23 @@ func (g *DirectSendGuard) Deliver(ctx context.Context, n domain.Notification) do
 		}
 	}
 
-	return g.inner.Deliver(ctx, n)
+	if g.privacy == nil {
+		return g.inner.Deliver(ctx, n)
+	}
+	pv := g.privacy.Check(ctx, n)
+	if !pv.Applies {
+		// No intent: the legacy, ungoverned send has no privacy binding to enforce.
+		return g.inner.Deliver(ctx, n)
+	}
+	if !pv.Allow {
+		return domain.DeliveryOutcome{
+			Reason:            pv.Reason,
+			Retryable:         pv.Retryable,
+			PrivacyDecisionID: pv.DecisionID,
+			PrivacyResult:     pv.Result,
+		}
+	}
+	out := g.inner.Deliver(ctx, n)
+	out.PrivacyDecisionID, out.PrivacyResult = pv.DecisionID, pv.Result
+	return out
 }
