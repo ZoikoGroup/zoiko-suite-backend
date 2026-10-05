@@ -7,6 +7,8 @@ import (
 )
 
 type tenantCtxKey struct{}
+type principalCtxKey struct{}
+type correlationCtxKey struct{}
 
 func WithTenant(ctx context.Context, tenantID string) context.Context {
 	return context.WithValue(ctx, tenantCtxKey{}, tenantID)
@@ -18,6 +20,24 @@ func WithTenant(ctx context.Context, tenantID string) context.Context {
 // sees and writes nothing.
 func TenantFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(tenantCtxKey{}).(string)
+	return v
+}
+
+func WithPrincipal(ctx context.Context, principalID string) context.Context {
+	return context.WithValue(ctx, principalCtxKey{}, principalID)
+}
+
+func PrincipalFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(principalCtxKey{}).(string)
+	return v
+}
+
+func WithCorrelationID(ctx context.Context, correlationID string) context.Context {
+	return context.WithValue(ctx, correlationCtxKey{}, correlationID)
+}
+
+func CorrelationIDFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(correlationCtxKey{}).(string)
 	return v
 }
 

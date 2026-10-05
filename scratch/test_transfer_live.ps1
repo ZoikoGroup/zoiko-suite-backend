@@ -103,7 +103,7 @@ $assessResp = Invoke-RestMethod -Uri "$baseUrl/v1/privacy/transfer-assessments" 
 Write-Host "Assessment recorded. ID:" $assessResp.assessment_id "Outcome:" $assessResp.outcome
 Write-Host "Measures: GovAccess=" $assessResp.government_access_risk "Tech=" $assessResp.technical_measures
 
-Write-Host "`n=== 8. Evaluate Transfer Decision (AUTHORIZED) ==="
+Write-Host "`n=== 8a. Evaluate Transfer Decision (CONDITIONAL due to measures) ==="
 $evalBody = @{
     relationship_id          = $relId
     transfer_mechanism_id    = $mechId
@@ -112,9 +112,24 @@ $evalBody = @{
 } | ConvertTo-Json
 
 $evalResp = Invoke-RestMethod -Uri "$baseUrl/privacy/transfer-decisions" -Method Post -Headers $headers -Body $evalBody -ContentType "application/json"
-Write-Host "Evaluation Result:" $evalResp.result "AssessmentID:" $evalResp.assessment_id
-if ($evalResp.result -ne "AUTHORIZED") {
-    Write-Error "Expected AUTHORIZED, got $($evalResp.result)"
+Write-Host "Evaluation Result:" $evalResp.result "AssessmentID:" $evalResp.assessment_id "Conditions:" $evalResp.conditions
+if ($evalResp.result -ne "CONDITIONAL") {
+    Write-Error "Expected CONDITIONAL, got $($evalResp.result)"
+}
+
+Write-Host "`n=== 8b. Evaluate Transfer Decision (AUTHORIZED without assessment) ==="
+$evalAuthBody = @{
+    relationship_id          = $relId
+    transfer_mechanism_id    = $mechId
+    destination_jurisdiction = "US"
+    assessment_required      = $false
+} | ConvertTo-Json
+
+$evalAuthResp = Invoke-RestMethod -Uri "$baseUrl/privacy/transfer-decisions" -Method Post -Headers $headers -Body $evalAuthBody -ContentType "application/json"
+Write-Host "Evaluation Result:" $evalAuthResp.result
+if ($evalAuthResp.result -ne "AUTHORIZED") {
+    Write-Error "Expected AUTHORIZED, got $($evalAuthResp.result)"
 }
 
 Write-Host "`n=== 9. Verification Successful! All Live Checks Passed! ==="
+

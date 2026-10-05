@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -41,6 +44,29 @@ const (
 	ModelProviderRegister       = "MODEL_PROVIDER_REGISTER"
 	PolicyChangePropose         = "POLICY_CHANGE_PROPOSE"
 	PolicyChangeDecide          = "POLICY_CHANGE_DECIDE"
+
+	// AIG-01
+	UseCaseCreate     = "AI_USE_CASE_CREATE"
+	UseCaseRead       = "AI_USE_CASE_READ"
+	UseCaseAssess     = "AI_USE_CASE_ASSESS"
+	AssessmentDecide  = "AI_ASSESSMENT_DECIDE"
+	UseCaseActivate   = "AI_USE_CASE_ACTIVATE"
+	UseCaseSuspend    = "AI_USE_CASE_SUSPEND"
+	UseCaseReassess   = "AI_USE_CASE_REASSESS"
+	UseCaseRetire     = "AI_USE_CASE_RETIRE"
+	AIExecutionCreate = "AI_EXECUTION_CREATE"
+	AIExecutionRead   = "AI_EXECUTION_READ"
+	AIIncidentCreate  = "AI_INCIDENT_CREATE"
+
+	// AIG-04
+	OutputDispositionCreate = "AI_OUTPUT_DISPOSITION_CREATE"
+	OutputDispositionDecide = "AI_OUTPUT_DISPOSITION_DECIDE"
+	OutputDispositionRead   = "AI_OUTPUT_DISPOSITION_READ"
+
+	// AIG-02
+	ModelReleaseRegister = "AI_MODEL_RELEASE_REGISTER"
+	ModelReleaseAdvance  = "AI_MODEL_RELEASE_ADVANCE"
+	ModelReleaseApprove  = "AI_MODEL_RELEASE_APPROVE"
 )
 
 type AuthzChecker interface {
@@ -98,6 +124,9 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
 		return "", false
 	}
+	ctx := middleware.WithPrincipal(r.Context(), principalID)
+	ctx = middleware.WithCorrelationID(ctx, r.Header.Get("X-Correlation-ID"))
+	*r = *r.WithContext(ctx)
 	return principalID, true
 }
 
@@ -179,6 +208,311 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}", h.GetPolicyChangeApproval)
 		r.Post("/{id}/decision", h.DecidePolicyChange)
 	})
+	r.Route("/v1/ai/use-cases", func(r chi.Router) {
+		r.Post("/", h.CreateUseCase)
+		r.Get("/", h.ListUseCases)
+		r.Get("/{id}", h.GetUseCase)
+		r.Post("/{id}/assess", h.StartAssessment)
+		r.Post("/assessments/{assessmentID}/decision", h.DecideAssessment)
+		r.Post("/{id}/activate", h.ActivateUseCase)
+		r.Post("/{id}/suspend", h.SuspendUseCase)
+		r.Post("/{id}/reassess", h.RequestReassessment)
+		r.Post("/{id}/retire", h.RetireUseCase)
+		r.Get("/{id}/effective", h.GetEffectiveUseCaseControl)
+	})
+	r.Route("/v1/ai/executions", func(r chi.Router) {
+		r.Post("/", h.CreateExecution)
+		r.Get("/{id}", h.GetExecution)
+	})
+	r.Post("/v1/ai/incidents", h.CreateAIIncident)
+	r.Route("/v1/ai/output-dispositions", func(r chi.Router) {
+		r.Post("/", h.CreateOutputDisposition)
+		r.Get("/{id}", h.GetOutputDisposition)
+		r.Post("/{id}/decision", h.DecideOutputDisposition)
+	})
+	r.Route("/v1/ai/model-releases", func(r chi.Router) {
+		r.Post("/", h.RegisterModelRelease)
+		r.Get("/", h.ListModelReleases)
+		r.Get("/{id}", h.GetModelRelease)
+		r.Post("/{id}/due-diligence", h.RecordDueDiligence)
+		r.Post("/{id}/evaluation", h.RecordEvaluation)
+		r.Post("/{id}/approve", h.ApproveRelease)
+		r.Post("/{id}/reject", h.RejectRelease)
+		r.Post("/{id}/block", h.BlockRelease)
+		r.Post("/{id}/activate", h.ActivateRelease)
+		r.Post("/{id}/restrict", h.RestrictRelease)
+		r.Post("/{id}/unrestrict", h.UnrestrictRelease)
+		r.Post("/{id}/quarantine", h.QuarantineRelease)
+		r.Post("/{id}/retire", h.RetireRelease)
+	})
+}
+
+func (h *Handler) CreateExecution(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateExecutionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.UseCaseID == "" || req.ModelReleaseID == "" || req.PackageID == "" || req.PackageVersion == "" || len(req.Input) == 0 || !json.Valid(req.Input) {
+		writeError(w, http.StatusBadRequest, "use_case_id, model_release_id, package_id, package_version and valid input are required")
+		return
+	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" || len(idempotencyKey) > 255 {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key is required and must not exceed 255 characters")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, AIExecutionCreate) {
+		return
+	}
+
+	var canonicalInput any
+	decoder := json.NewDecoder(bytes.NewReader(req.Input))
+	decoder.UseNumber()
+	if err := decoder.Decode(&canonicalInput); err != nil {
+		writeError(w, http.StatusBadRequest, "input must be a valid JSON value")
+		return
+	}
+	canonicalReq := req
+	canonicalInputJSON, err := json.Marshal(canonicalInput)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "input cannot be canonicalized")
+		return
+	}
+	canonicalReq.Input = canonicalInputJSON
+	canonicalBody, err := json.Marshal(canonicalReq)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "request cannot be canonicalized")
+		return
+	}
+	requestSHA256 := fmt.Sprintf("%x", sha256.Sum256(canonicalBody))
+	execution, _, err := h.store.CreateExecution(r.Context(), req, idempotencyKey, requestSHA256)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrIdempotencyConflict):
+			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, domain.ErrUseCaseNotFound), errors.Is(err, domain.ErrModelReleaseNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, domain.ErrUseCaseNotActive), errors.Is(err, domain.ErrModelReleaseNotApproved):
+			writeError(w, http.StatusConflict, err.Error())
+		default:
+			h.logger.Error("create governed execution failed", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to record governed execution")
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, execution)
+}
+
+func (h *Handler) GetExecution(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, AIExecutionRead) {
+		return
+	}
+	execution, err := h.store.GetExecution(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		if errors.Is(err, domain.ErrExecutionNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		h.logger.Error("get governed execution failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to get governed execution")
+		return
+	}
+	writeJSON(w, http.StatusOK, execution)
+}
+
+func (h *Handler) CreateAIIncident(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateAIIncidentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	switch req.Severity {
+	case "AI-P0", "AI-P1", "AI-P2", "AI-P3":
+	default:
+		writeError(w, http.StatusBadRequest, "severity must be AI-P0, AI-P1, AI-P2 or AI-P3")
+		return
+	}
+	if req.ModelReleaseID == "" || req.Description == "" || len(req.Description) > 4000 {
+		writeError(w, http.StatusBadRequest, "model_release_id and description (maximum 4000 characters) are required")
+		return
+	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" || len(idempotencyKey) > 255 {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key is required and must not exceed 255 characters")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, AIIncidentCreate) {
+		return
+	}
+	canonicalBody, err := json.Marshal(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "request cannot be canonicalized")
+		return
+	}
+	requestSHA256 := fmt.Sprintf("%x", sha256.Sum256(canonicalBody))
+	incident, _, err := h.store.CreateAIIncident(r.Context(), req, idempotencyKey, requestSHA256)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrIdempotencyConflict):
+			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, domain.ErrModelReleaseNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, domain.ErrInvalidReleaseTransition):
+			writeError(w, http.StatusConflict, err.Error())
+		default:
+			h.logger.Error("create ai incident failed", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to open ai incident")
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, incident)
+}
+
+// CreateOutputDisposition is ZS-SVC-X-001 §7's disposition creation step —
+// see domain.CreateOutputDispositionRequest and PgStore.CreateOutputDisposition
+// for the oversight-class fail-closed/state-machine rules.
+func (h *Handler) CreateOutputDisposition(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateOutputDispositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.AIRunID == "" || req.OversightClass == "" {
+		writeError(w, http.StatusBadRequest, "ai_run_id and oversight_class are required")
+		return
+	}
+	if !domain.OversightClass(req.OversightClass).Valid() {
+		writeError(w, http.StatusBadRequest, "oversight_class must be one of O0, O1, O2, O3, O4")
+		return
+	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" || len(idempotencyKey) > 255 {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key is required and must not exceed 255 characters")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, OutputDispositionCreate) {
+		return
+	}
+	canonicalBody, err := json.Marshal(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "request cannot be canonicalized")
+		return
+	}
+	requestSHA256 := fmt.Sprintf("%x", sha256.Sum256(canonicalBody))
+	disposition, _, err := h.store.CreateOutputDisposition(r.Context(), req, idempotencyKey, requestSHA256)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrIdempotencyConflict):
+			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, domain.ErrAIRunNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, domain.ErrOversightClassProhibited):
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+		case errors.Is(err, domain.ErrAIRunAlreadyHasDisposition):
+			writeError(w, http.StatusConflict, err.Error())
+		default:
+			h.logger.Error("create ai output disposition failed", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to create ai output disposition")
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, disposition)
+}
+
+func (h *Handler) GetOutputDisposition(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, OutputDispositionRead) {
+		return
+	}
+	disposition, err := h.store.GetOutputDisposition(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		if errors.Is(err, domain.ErrDispositionNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		h.logger.Error("get ai output disposition failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to get ai output disposition")
+		return
+	}
+	writeJSON(w, http.StatusOK, disposition)
+}
+
+// DecideOutputDisposition enforces §7.2's no-self-bypass rule: the deciding
+// principal must differ from whoever created the disposition — see
+// PgStore.DecideOutputDisposition.
+func (h *Handler) DecideOutputDisposition(w http.ResponseWriter, r *http.Request) {
+	dispositionID := chi.URLParam(r, "id")
+	var req domain.DecideOutputDispositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Decision != string(domain.DispositionAccepted) && req.Decision != string(domain.DispositionRejected) {
+		writeError(w, http.StatusBadRequest, "decision must be ACCEPTED or REJECTED")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, OutputDispositionDecide) {
+		return
+	}
+	updated, err := h.store.DecideOutputDisposition(r.Context(), dispositionID, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrDispositionNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, domain.ErrSelfApprovalBlocked):
+			writeError(w, http.StatusForbidden, err.Error())
+		case errors.Is(err, domain.ErrDispositionNotReviewable):
+			writeError(w, http.StatusConflict, err.Error())
+		default:
+			h.logger.Error("decide ai output disposition failed", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to decide ai output disposition")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 // CreateAIRun records doc7 §G1's AI run/recommendation object. No authz gate
@@ -236,6 +570,10 @@ func (h *Handler) CreateAIRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create ai run")
 		return
 	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai_run.created", EntityID: a.AIRunID, TenantID: a.TenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: a,
+	})
 	writeJSON(w, http.StatusCreated, a)
 }
 
@@ -296,6 +634,10 @@ func (h *Handler) SetActionRiskClassification(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "failed to set action risk classification")
 		return
 	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "action_risk_classification.set", EntityID: c.ActionType, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
+	})
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -364,6 +706,10 @@ func (h *Handler) CreateAutomationPolicy(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "failed to create automation policy")
 		return
 	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "automation_policy.created", EntityID: p.AutomationPolicyID, TenantID: p.TenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: p,
+	})
 	writeJSON(w, http.StatusCreated, p)
 }
 
@@ -614,6 +960,10 @@ func (h *Handler) RegisterModelProvider(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "failed to register model provider")
 		return
 	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "model_provider.registered", EntityID: m.ProviderRegistrationID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
 	writeJSON(w, http.StatusOK, m)
 }
 
@@ -711,6 +1061,10 @@ func (h *Handler) ProposePolicyChange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to propose policy change")
 		return
 	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "policy_change.proposed", EntityID: p.PolicyChangeApprovalID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: p,
+	})
 	writeJSON(w, http.StatusCreated, p)
 }
 
@@ -765,6 +1119,10 @@ func (h *Handler) DecidePolicyChange(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "policy_change.decided", EntityID: updated.PolicyChangeApprovalID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
+	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -824,6 +1182,617 @@ func (h *Handler) ListPolicyChangeApprovals(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"policy_change_approvals": approvals})
+}
+
+func (h *Handler) CreateUseCase(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateUseCaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Domain == "" || req.Purpose == "" || req.OutcomeType == "" || req.OperationalClass == "" ||
+		req.OwnerPrincipalID == "" || req.BusinessOutcome == "" || req.AutomationLevel == "" {
+		writeError(w, http.StatusBadRequest, "domain, purpose, outcome_type, operational_class, owner_principal_id, business_outcome and automation_level are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r, "")
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, UseCaseCreate) {
+		return
+	}
+
+	uc, err := h.store.CreateUseCase(r.Context(), req, tenantID, principalID, req.ClientRequestID)
+	if err != nil {
+		h.logger.Error("create ai use case failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to create ai use case")
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.use_case.state_changed", EntityID: uc.UseCaseID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: uc,
+	})
+	writeJSON(w, http.StatusCreated, uc)
+}
+
+func (h *Handler) GetUseCase(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, UseCaseRead) {
+		return
+	}
+	uc, err := h.store.GetUseCase(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		h.respondUseCaseError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, uc)
+}
+
+func (h *Handler) StartAssessment(w http.ResponseWriter, r *http.Request) {
+	var req domain.StartAssessmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, UseCaseAssess) {
+		return
+	}
+	a, err := h.store.StartAssessment(r.Context(), chi.URLParam(r, "id"), req, principalID)
+	if err != nil {
+		h.respondUseCaseError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, a)
+}
+
+// DecideAssessment is not a named AIG-01 API endpoint in §4.4, but is
+// required to complete the documented ASSESSING -> APPROVED/REJECTED
+// lifecycle hop — same precedent as adding an equivalent decision
+// endpoint elsewhere in this platform when a doc names a lifecycle
+// stage but not every transition into it.
+func (h *Handler) DecideAssessment(w http.ResponseWriter, r *http.Request) {
+	var req domain.DecideAssessmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Decision != string(domain.AssessmentApproved) && req.Decision != string(domain.AssessmentRejected) {
+		writeError(w, http.StatusBadRequest, "decision must be APPROVED or REJECTED")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, AssessmentDecide) {
+		return
+	}
+	a, err := h.store.DecideAssessment(r.Context(), chi.URLParam(r, "assessmentID"), req.Decision, principalID, req.Reason)
+	if err != nil {
+		h.respondUseCaseError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (h *Handler) ActivateUseCase(w http.ResponseWriter, r *http.Request) {
+	var req domain.ActivateUseCaseRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r, "")
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, UseCaseActivate) {
+		return
+	}
+	uc, err := h.store.ActivateUseCase(r.Context(), chi.URLParam(r, "id"), req)
+	if err != nil {
+		h.respondUseCaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.use_case.state_changed", EntityID: uc.UseCaseID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: uc,
+	})
+	writeJSON(w, http.StatusOK, uc)
+}
+
+func (h *Handler) SuspendUseCase(w http.ResponseWriter, r *http.Request) {
+	var req domain.SuspendUseCaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r, "")
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, UseCaseSuspend) {
+		return
+	}
+	uc, err := h.store.SuspendUseCase(r.Context(), chi.URLParam(r, "id"), req)
+	if err != nil {
+		h.respondUseCaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.use_case.state_changed", EntityID: uc.UseCaseID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: uc,
+	})
+	writeJSON(w, http.StatusOK, uc)
+}
+
+func (h *Handler) RequestReassessment(w http.ResponseWriter, r *http.Request) {
+	var req domain.RequestReassessmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r, "")
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, UseCaseReassess) {
+		return
+	}
+	uc, err := h.store.RequestReassessment(r.Context(), chi.URLParam(r, "id"), req)
+	if err != nil {
+		h.respondUseCaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.use_case.state_changed", EntityID: uc.UseCaseID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: uc,
+	})
+	writeJSON(w, http.StatusOK, uc)
+}
+
+func (h *Handler) RetireUseCase(w http.ResponseWriter, r *http.Request) {
+	var req domain.RetireUseCaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r, "")
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, UseCaseRetire) {
+		return
+	}
+	uc, err := h.store.RetireUseCase(r.Context(), chi.URLParam(r, "id"), req)
+	if err != nil {
+		h.respondUseCaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.use_case.state_changed", EntityID: uc.UseCaseID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: uc,
+	})
+	writeJSON(w, http.StatusOK, uc)
+}
+
+func (h *Handler) GetEffectiveUseCaseControl(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, UseCaseRead) {
+		return
+	}
+	eff, err := h.store.GetEffectiveUseCaseControl(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		h.respondUseCaseError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, eff)
+}
+
+// ListUseCases uses the same auth posture as GetUseCase (requirePrincipal +
+// requireTenant + UseCaseRead) rather than the looser requireTenant-only
+// pattern ListAutomationPolicies/ListAutomationActions use — ai_use_cases
+// is governed, risk-classified registry data (ZS-SVC-X-001 §4), and its own
+// single-record read already requires UseCaseRead, so the collection read
+// of the same table requires the same authority.
+func (h *Handler) ListUseCases(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, UseCaseRead) {
+		return
+	}
+	useCases, err := h.store.ListUseCases(r.Context())
+	if err != nil {
+		h.logger.Error("list use cases failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to list ai use cases")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"use_cases": useCases})
+}
+
+func (h *Handler) respondUseCaseError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrUseCaseNotFound), errors.Is(err, domain.ErrAssessmentNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, domain.ErrUseCaseNotAssessable), errors.Is(err, domain.ErrUseCaseNotActivatable),
+		errors.Is(err, domain.ErrUseCaseNotSuspendable), errors.Is(err, domain.ErrUseCaseNotReassessable),
+		errors.Is(err, domain.ErrUseCaseNotRetirable), errors.Is(err, domain.ErrAssessmentNotPending),
+		errors.Is(err, domain.ErrAssessmentNotApproved), errors.Is(err, domain.ErrAssessmentExpired),
+		errors.Is(err, domain.ErrLegalClassificationIndeterminate), errors.Is(err, domain.ErrOperationalClassProhibited),
+		errors.Is(err, domain.ErrInvalidDecision):
+		writeError(w, http.StatusConflict, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "ai use case request failed")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AIG-02: Model, Provider & Capability Registry
+// ─────────────────────────────────────────────────────────────────────────────
+
+func (h *Handler) RegisterModelRelease(w http.ResponseWriter, r *http.Request) {
+	var req domain.RegisterModelReleaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Provider == "" || req.ProviderModelID == "" || req.DeploymentRegion == "" {
+		writeError(w, http.StatusBadRequest, "provider, provider_model_id and deployment_region are required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseRegister) {
+		return
+	}
+	m, err := h.store.RegisterModelRelease(r.Context(), req, principalID)
+	if err != nil {
+		h.logger.Error("register model release failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to register model release")
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_registered", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusCreated, m)
+}
+
+func (h *Handler) GetModelRelease(w http.ResponseWriter, r *http.Request) {
+	m, err := h.store.GetModelRelease(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (h *Handler) RecordDueDiligence(w http.ResponseWriter, r *http.Request) {
+	var req domain.AdvanceReleaseRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseAdvance) {
+		return
+	}
+	m, err := h.store.RecordDueDiligence(r.Context(), chi.URLParam(r, "id"), req, principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_due_diligence_recorded", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (h *Handler) RecordEvaluation(w http.ResponseWriter, r *http.Request) {
+	var req domain.AdvanceReleaseRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseAdvance) {
+		return
+	}
+	m, err := h.store.RecordEvaluation(r.Context(), chi.URLParam(r, "id"), req, principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_evaluated", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+// ApproveRelease is §5.4's procurement/enablement gate — every one of
+// the seven gates must be attested cleared, or the release is refused
+// outright.
+func (h *Handler) ApproveRelease(w http.ResponseWriter, r *http.Request) {
+	var req domain.ApproveReleaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseApprove) {
+		return
+	}
+	m, err := h.store.ApproveRelease(r.Context(), chi.URLParam(r, "id"), req, principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_approved", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (h *Handler) RejectRelease(w http.ResponseWriter, r *http.Request) {
+	var req domain.AdvanceReleaseRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseAdvance) {
+		return
+	}
+	m, err := h.store.RejectRelease(r.Context(), chi.URLParam(r, "id"), req, principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_rejected", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (h *Handler) BlockRelease(w http.ResponseWriter, r *http.Request) {
+	var req domain.AdvanceReleaseRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseAdvance) {
+		return
+	}
+	m, err := h.store.BlockRelease(r.Context(), chi.URLParam(r, "id"), req, principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_blocked", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (h *Handler) ActivateRelease(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseAdvance) {
+		return
+	}
+	m, err := h.store.ActivateRelease(r.Context(), chi.URLParam(r, "id"), principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_activated", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (h *Handler) RestrictRelease(w http.ResponseWriter, r *http.Request) {
+	var req domain.AdvanceReleaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseAdvance) {
+		return
+	}
+	m, err := h.store.RestrictRelease(r.Context(), chi.URLParam(r, "id"), req, principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_restricted", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (h *Handler) UnrestrictRelease(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseAdvance) {
+		return
+	}
+	m, err := h.store.UnrestrictRelease(r.Context(), chi.URLParam(r, "id"), principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_unrestricted", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (h *Handler) QuarantineRelease(w http.ResponseWriter, r *http.Request) {
+	var req domain.AdvanceReleaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseAdvance) {
+		return
+	}
+	m, err := h.store.QuarantineRelease(r.Context(), chi.URLParam(r, "id"), req, principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	// ZS-SVC-X-001 §9.3 explicitly names ai.model.release_quarantined as a
+	// required event — do not rename or omit this one.
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_quarantined", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+func (h *Handler) RetireRelease(w http.ResponseWriter, r *http.Request) {
+	var req domain.AdvanceReleaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, ModelReleaseAdvance) {
+		return
+	}
+	m, err := h.store.RetireRelease(r.Context(), chi.URLParam(r, "id"), req, principalID)
+	if err != nil {
+		h.respondModelReleaseError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "ai.model.release_retired", EntityID: m.ModelReleaseID, TenantID: "",
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
+	writeJSON(w, http.StatusOK, m)
+}
+
+// ListModelReleases has no auth check, matching GetModelRelease and the
+// rest of AIG-02's read surface — this registry is platform-wide and
+// publicly readable by design, same posture as ListModelProviders.
+func (h *Handler) ListModelReleases(w http.ResponseWriter, r *http.Request) {
+	releases, err := h.store.ListModelReleases(r.Context())
+	if err != nil {
+		h.logger.Error("list model releases failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to list model releases")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model_releases": releases})
+}
+
+func (h *Handler) respondModelReleaseError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrModelReleaseNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, domain.ErrInvalidReleaseTransition), errors.Is(err, domain.ErrReleaseGatesNotCleared):
+		writeError(w, http.StatusConflict, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "ai model release request failed")
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

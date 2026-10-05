@@ -49,6 +49,12 @@ func (s *billingStub) GetInvoice(_ context.Context, _ string) (*domain.PlatformC
 func (s *billingStub) GetInvoiceBasis(_ context.Context, _ string) (*domain.InvoiceCandidate, error) {
 	return s.candidate, s.err
 }
+func (s *billingStub) GetEvidencePackage(_ context.Context, _ string) (*domain.CommercialEvidencePackage, error) {
+	return nil, s.err
+}
+func (s *billingStub) RegisterTaxJurisdiction(_ context.Context, _ string, j *domain.TaxJurisdiction) (*domain.TaxJurisdiction, error) {
+	return j, s.err
+}
 
 var _ store.BillingStore = (*billingStub)(nil)
 

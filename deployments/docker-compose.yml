@@ -3754,7 +3754,8 @@ services:
   # keeping and gate-checking for AI runs, action-risk classification,
   # automation allowlists, provider/model registry, and maker-checker
   # self-approval blocking — never runs models or executes automations
-  # itself.
+  # itself. Keep the service private to the compose network; authenticated
+  # browser requests must pass through gateway-auth-svc.
   ai-governance-svc:
     build:
       context: ../services/ai-governance-svc

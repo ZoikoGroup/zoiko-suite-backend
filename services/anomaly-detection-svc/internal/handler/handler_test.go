@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -102,6 +103,33 @@ func (m *mockStore) ListRules(ctx context.Context, domainName string) ([]domain.
 		out = append(out, *r)
 	}
 	return out, nil
+}
+
+// AI-04 governed advisory layer — not exercised by this file's existing
+// tests, so these stubs only exist to satisfy store.Store.
+func (m *mockStore) RegisterAnomalyModel(ctx context.Context, tenantID string, req domain.RegisterAnomalyModelRequest, actor string) (*domain.AnomalyModel, error) {
+	return nil, errors.New("not implemented in mockStore")
+}
+func (m *mockStore) RunDetection(ctx context.Context, tenantID string, req domain.RunDetectionRequest, actor string, claim domain.IdempotencyClaim) (*domain.DetectionRun, error) {
+	return nil, errors.New("not implemented in mockStore")
+}
+func (m *mockStore) AcknowledgeSignal(ctx context.Context, tenantID, signalID string, actor string, claim domain.IdempotencyClaim) (*domain.GovernedAnomalySignal, error) {
+	return nil, errors.New("not implemented in mockStore")
+}
+func (m *mockStore) EscalateForReview(ctx context.Context, tenantID, signalID string, req domain.EscalateForReviewRequest, actor string, claim domain.IdempotencyClaim) (*domain.GovernedAnomalySignal, error) {
+	return nil, errors.New("not implemented in mockStore")
+}
+func (m *mockStore) CloseSignal(ctx context.Context, tenantID, signalID string, req domain.CloseSignalRequest, actor string, claim domain.IdempotencyClaim) (*domain.GovernedAnomalySignal, error) {
+	return nil, errors.New("not implemented in mockStore")
+}
+func (m *mockStore) GetGovernedSignal(ctx context.Context, tenantID, signalID string) (*domain.GovernedAnomalySignal, error) {
+	return nil, errors.New("not implemented in mockStore")
+}
+func (m *mockStore) GetSignalsByRun(ctx context.Context, tenantID, runID string) ([]domain.GovernedAnomalySignal, error) {
+	return nil, errors.New("not implemented in mockStore")
+}
+func (m *mockStore) GetDisposition(ctx context.Context, tenantID, signalID string) (*domain.ReviewDisposition, error) {
+	return nil, errors.New("not implemented in mockStore")
 }
 
 type mockPublisher struct{}

@@ -424,6 +424,71 @@ $BUNDLES = @(
         )
     },
     @{
+        # ZS-JUR-001 Wave 2 runtime resolver: what a CALLING service (tax
+        # determination, invoicing, filing) needs. Deliberately separate from
+        # the registry/admin bundle: a caller can resolve a rule and read its
+        # decision evidence, and cannot author, sign or certify anything.
+        Code    = "JURISDICTION_RESOLVER_CALLER"
+        Service = "jurisdiction-rules-svc"
+        Actions = @(
+            "RULE_RESOLUTION_RESOLVE", "RULE_DECISION_VIEW",
+            "OBLIGATION_CALCULATION_CALCULATE", "REGULATORY_CALCULATION_EXECUTE", "PAYROLL_PARAMETERS_RESOLVE", "RETENTION_RULE_RESOLVE", "ACCOUNTING_MAPPING_RESOLVE", "SUBMISSION_PROFILE_RESOLVE", "REGULATORY_SUBMISSION_CREATE", "REGULATORY_SUBMISSION_VIEW", "REGULATORY_SUBMISSION_RECORD_EVENT", "JURISDICTION_SUPPORT_VIEW"
+        )
+    },
+    @{
+        # ZS-JUR-001 Wave 0 registries. The demo bundle grants every action to
+        # one role; real tenants must split authoring (create), independent
+        # review/approval (REVIEW, APPROVE) and pack submission across roles.
+        # The service additionally refuses a reviewer/approver who authored
+        # the record, so one demo principal can create but not self-approve.
+        Code    = "JURISDICTION_PACK_REGISTRY_FULL"
+        Service = "jurisdiction-rules-svc"
+        Actions = @(
+            "REGULATORY_REGIME_CREATE",
+            "REGULATORY_SOURCE_CREATE", "REGULATORY_SOURCE_REVIEW", "REGULATORY_SOURCE_SUPERSEDE",
+            "INTERPRETATION_RECORD_CREATE", "INTERPRETATION_RECORD_APPROVE",
+            "JURISDICTION_PACK_CREATE",
+            "JURISDICTION_PACK_VERSION_CREATE", "JURISDICTION_PACK_VERSION_SUBMIT",
+            # Wave 1: compile, sign and verify are separate capabilities, as are
+            # registering/retiring/revoking trusted signing keys. Grant them to
+            # different roles in real environments.
+            "JURISDICTION_PACK_VERSION_COMPILE", "JURISDICTION_PACK_VERSION_SIGN", "JURISDICTION_PACK_VERSION_VERIFY",
+            "PACK_SIGNING_KEY_REGISTER", "PACK_SIGNING_KEY_RETIRE", "PACK_SIGNING_KEY_REVOKE",
+            # Wave 3: test authoring, test execution, independent review and
+            # certification are separate capabilities. The service also refuses
+            # a reviewer/certifier who built the version, so even this single
+            # demo role cannot certify its own work with one principal.
+            "JURISDICTION_PACK_VERSION_AUTHOR_TESTS", "JURISDICTION_PACK_VERSION_EXECUTE_TESTS",
+            "JURISDICTION_PACK_VERSION_REVIEW", "JURISDICTION_PACK_VERSION_CERTIFY",
+            # Wave 2: dropping the resolver's verified-artifact cache is an
+            # operator action (after a key revocation or a withdrawal).
+            "RESOLVER_CACHE_INVALIDATE",
+            # Wave 7: release and rollout are separate capabilities, as is the
+            # emergency stop and hotfix declaration. Grant publish, deploy,
+            # rollback and block/unblock to different roles in real
+            # environments; the demo bundle gives one role all of them.
+            "JURISDICTION_PACK_VERSION_PUBLISH", "JURISDICTION_PACK_VERSION_WITHDRAW",
+            "JURISDICTION_PACK_VERSION_BLOCK", "JURISDICTION_PACK_VERSION_UNBLOCK",
+            "JURISDICTION_PACK_VERSION_DEPLOY", "JURISDICTION_PACK_VERSION_ROLLBACK",
+            "JURISDICTION_PACK_VERSION_DECLARE_HOTFIX", "JURISDICTION_PACK_VERSION_COMPLETE_RETROSPECTIVE",
+            "DEPLOYMENT_REGION_CREATE", "DEPLOYMENT_RING_CREATE",
+            "SOURCE_CHANGE_NOTICE_CREATE", "SOURCE_CHANGE_NOTICE_REVIEW", "SOURCE_CHANGE_NOTICE_CLOSE",
+            "PACK_OPS_METRICS_VIEW",
+            # Wave 4 (calendar half): authoring, sourcing and publishing of
+            # calendars and obligation rules are separate capabilities, and the
+            # service refuses a publisher who authored the same record.
+            "REGULATORY_CALENDAR_CREATE", "REGULATORY_CALENDAR_VERSION_CREATE",
+            "REGULATORY_CALENDAR_VERSION_SET_SOURCES", "REGULATORY_CALENDAR_VERSION_PUBLISH",
+            "OBLIGATION_RULE_CREATE", "OBLIGATION_RULE_SET_PROVENANCE", "OBLIGATION_RULE_PUBLISH",
+            # Wave 4 (tax half): typed calculation parameters (rates, bands, rounding).
+            "JURISDICTION_RULE_SET_PARAMETERS",
+            # Wave 8: jurisdiction rollout governance (portfolio, readiness evidence, expert approval, launch).
+            "JURISDICTION_ROLLOUT_CREATE", "JURISDICTION_ROLLOUT_SEED", "JURISDICTION_ROLLOUT_VIEW", "JURISDICTION_ROLLOUT_SET_OWNER", "JURISDICTION_ROLLOUT_LINK_PACKS",
+            "JURISDICTION_ROLLOUT_ATTEST", "JURISDICTION_ROLLOUT_EXPERT_APPROVE", "JURISDICTION_ROLLOUT_TRANSITION", "JURISDICTION_SUPPORT_VIEW",
+            "JURISDICTION_RULE_SET_PROVENANCE"
+        )
+    },
+    @{
         # access-control-svc is the governed authoring layer in front of
         # authorization-svc's own admin API. Without this grant the /admin/
         # access-control page reads fine and every write 403s, which looks like
@@ -487,6 +552,28 @@ $BUNDLES = @(
             "SEARCH_GENERATION_CREATE", "SEARCH_GENERATION_ACTIVATE",
             "SEARCH_RESTRICTION_APPLY", "SEARCH_EXPORT"
         )
+    },
+    @{
+        # commercial-account-svc's COM-01 price book checks every write
+        # against AUTHZ_PLATFORM_SCOPE_ID, not a legal entity -- same
+        # posture as governance-decision-log-svc etc. above. Propose,
+        # approve and publish are separate actions (COM-CTRL-004 maker-
+        # checker: the handler itself refuses an approve/publish from the
+        # same principal who proposed, regardless of what this bundle
+        # grants -- RBAC only answers "is this principal allowed to call
+        # this action at all", never "are these two principals distinct").
+        Code    = "COMMERCIAL_PRICE_BOOK_FULL"
+        Service = "commercial-account-svc"
+        Actions = @(
+            "COMMERCIAL_PRICE_BOOK_PROPOSE", "COMMERCIAL_PRICE_BOOK_APPROVE",
+            "COMMERCIAL_PRICE_BOOK_PUBLISH", "COMMERCIAL_PRICE_BOOK_RETIRE",
+            "COMMERCIAL_PRICE_BOOK_READ",
+            # Currency registration is a prerequisite seller-authority action
+            # for creating any price version at all (pricebook_handler.go's
+            # PutCurrency route) -- same platform scope as the price-book
+            # actions above.
+            "COMMERCIAL_CURRENCY_MANAGE"
+        )
     }
 )
 
@@ -506,7 +593,7 @@ $ALL_ACTIONS = $BUNDLES | ForEach-Object { $_.Actions } | Sort-Object -Unique
 # platform scope. It then reported success and had granted nothing.
 $PLATFORM_SCOPED_ACTION_CODES = @(
     "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL",
-    "SCHEMA_FULL", "JURISDICTION_FULL",
+    "SCHEMA_FULL", "JURISDICTION_FULL", "JURISDICTION_PACK_REGISTRY_FULL", "JURISDICTION_RESOLVER_CALLER",
     # retention-registry-svc falls back to the platform scope when a hold or
     # policy names no tenant -- the console offers that as a "platform-wide"
     # checkbox, so the grant has to exist on that scope too.
@@ -515,7 +602,12 @@ $PLATFORM_SCOPED_ACTION_CODES = @(
     # scope. A grant made only on the legal entity would be invisible to every
     # one of its checks -- silently, and fail-closed, so it would read as
     # "no_grant" rather than as a scope mismatch.
-    "SEARCH_FULL")
+    "SEARCH_FULL",
+    # commercial-account-svc's COM-01 price book (propose/approve/publish/
+    # retire/read) checks every write against platformScopeID -- see
+    # handler.go's platformScopeID constant and pricebook_handler.go's
+    # h.authz.CheckAllowed(ctx, principal, platformScopeID, action) call.
+    "COMMERCIAL_PRICE_BOOK_FULL")
 $PLATFORM_SCOPED_ACTIONS = $BUNDLES |
     Where-Object { $PLATFORM_SCOPED_ACTION_CODES -contains $_.Code } |
     ForEach-Object { $_.Actions }
@@ -727,6 +819,29 @@ try {
         principal_id    = $APPROVER_ID
         role_id         = $ROLE_ID
         legal_entity_id = $LEGAL_ENTITY
+        effective_from  = "2020-01-01T00:00:00Z"
+        assigned_by     = $PRINCIPAL_ID
+    }
+    Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
+} catch {
+    if ("$_" -match "409|23505|duplicate|already") {
+        Write-Host "  -> already assigned" -ForegroundColor DarkGray
+    } else {
+        throw
+    }
+}
+
+# $APPROVER_ID also needs the platform scope: commercial-account-svc's COM-01
+# price book (and every other PLATFORM_SCOPED_ACTION_CODES bundle) checks
+# against platformScopeID, not the legal entity. Without this, a genuine SoD
+# approve/publish test (a second principal distinct from the proposer) has no
+# principal to use for any platform-scoped action.
+Write-Host "assign role to $APPROVER_ID on the platform scope (SoD approver)" -NoNewline
+try {
+    $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+        principal_id    = $APPROVER_ID
+        role_id         = $ROLE_ID
+        legal_entity_id = $PLATFORM_SCOPE
         effective_from  = "2020-01-01T00:00:00Z"
         assigned_by     = $PRINCIPAL_ID
     }
