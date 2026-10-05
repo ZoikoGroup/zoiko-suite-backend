@@ -1,6 +1,6 @@
 # Group 1 — Identity, Scope & Foundation: documentation-compliance audit
 
-**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026)
+**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026, re-audited and six further defects fixed 5 October 2026)
 **Scope:** all nine services of Group 1, audited one at a time.
 **Source of truth:** the original `.docx` specifications in `docs/architecture/`, **not** the
 per-service `openapi.yaml` / `asyncapi.yaml` artefacts. This is deliberate: auditing code
@@ -22,8 +22,8 @@ diff the two → report. Anything ambiguous in the documents is flagged **needs 
 | 4 | secret-vault-integration-svc | 8087 | Security Standard §13, §9, §3.1 | **86%** (was 40%) | **93%** (was 52%) |
 | 5 | gateway-auth-svc | 8092 | Security §8 + GOV-01 ingress | **95%** (was 68%; 82% at re-audit) | **98%** (was 80%) |
 | 6 | search-indexer-svc | 8096 | ZS-SVC-AB-001 (ESR-01…05) | **96%** (was 86% recounted; published 90%) | **98%** (was 90%; published 93%) |
-| 7 | notification-svc | 8133 | ZS-SVC-Y-001 (NCD-01…05) | **95%** (was 12%) | **97%** (was 19%) |
-| 8 | delegated-authority-svc | 8136 | ORG-06 (delegation half) | 62% | 69% |
+| 7 | notification-svc | 8133 | ZS-SVC-Y-001 (NCD-01…05) | **95%** (was 12%; 81% on 5 Oct re-audit of 43 rows, 95% after fixes) | **97%** (was 19%; 98% on 43 rows after fixes) |
+| 8 | delegated-authority-svc | 8136 | ORG-06 (delegation half) | **100%** (23 table rows; was 62% published, 48% recounted) | **100%** (was 69%; 57% recounted) |
 | 9 | access-control-svc | 8137 | Authorization Standard §9 | 18% | 23% |
 
 ---
@@ -1231,6 +1231,75 @@ bulk approval at 50 recipients or any S3 intent; reputation spike thresholds 0.3
 hard bounces over ≥20 attempts in 24h; three soft bounces in 72h promote to hard; platform default
 quiet window 21:00–08:00 for marketing only.
 
+## Re-audit, 5 October 2026: six defects outside the scored rows, all fixed
+
+The 30 Sep score covered the 37 API and table rows above. A re-audit against the NP-01…60 and
+INV-01…30 matrices, and against the legacy code that runs beside the plane, found six defects.
+None is in a scored row, so the 95% stands for those rows. Two of the six were proven live
+before the fix. Detail and evidence are in `services/notification-svc/progress.md`.
+
+| # | Defect | Spec | Fixed by |
+|---|---|---|---|
+| 1 | Anonymous `POST /v1/notifications/unsubscribe` wrote suppressions for any tenant/address, and the legacy upsert rewrote HARD_BOUNCE as UNSUBSCRIBE, re-opening transactional and security mail to a dead address (**proven live**) | §7.3, INV-10, NP-13, NP-46 | Sealed AES-GCM unsubscribe token (`internal/unsubscribe`); upsert never weakens a reason |
+| 2 | `DELETE /v1/notifications/suppression/{email}`: one-principal hard delete | §7.3 | Route removed; `000022` governed lift for legacy rows, DELETE refused by trigger |
+| 3 | 90-day housekeeping purge deleted delivery evidence through FK cascade | §8.4, §9.2, INV-28 | Purge removed; `000023` evidence tables refuse DELETE |
+| 4 | Plane marketing mail had no unsubscribe link; legacy link hard-coded a host and the raw address | §11.1, §11.2, §11.4, INV-25 | Sealed RFC 8058 header on both paths; marketing refused if no link can be issued |
+| 5 | Plane exported no metrics | §13.1, §13.3 | `notification_ncd_*` counters and DB-sourced backlog gauges; label allow-list |
+| 6 | No DKIM; no response to broken sender authentication (**NP-55 proven live after fix**) | §11.1, NP-55 | DKIM signing + DNS monitor that holds email as retryable (`internal/senderauth`) |
+
+**Verified:** all packages green; store suite 128 pass / 1 skip / 0 fail against Postgres 16;
+live check 69/69 on three consecutive runs (it was racy before, 53/57 on one run, and its README
+and stand-ins are now committed); three negative controls fail as expected (upsert rank, `000023`,
+backlog without platform scope).
+
+### Compliance, before and after 5 October
+
+The six defects are scored as six more rows beside the 37 above, so 43 rows in all. Partials
+count as half in the weighted column.
+
+| Basis | Before (30 Sep work, re-audited 5 Oct) | After (5 Oct fixes) |
+|---|---|---|
+| The 37 rows scored on 30 Sep | 35 met, 2 partial: **95%** (97% weighted) | unchanged: **95%** (97% weighted) |
+| 37 rows + the 6 defects (43 rows) | 35 met, 2 partial, 6 not met: **81%** (84% weighted) | 41 met, 2 partial: **95%** (98% weighted) |
+
+The 30 Sep 95% was accurate for the rows it scored, but it never looked at the legacy code beside
+the plane. The 81% is the honest "before". These percentages are **not** a score against the
+whole specification: NP-01…60, INV-01…30 and the §18.2 Definition of Done have not been scored
+row by row (gap G-10).
+
+### Remaining gaps
+
+**Blocked on services that do not exist**
+
+| # | Gap | Spec | Effect today |
+|---|---|---|---|
+| G-1 | **No PRV service.** The privacy and marketing permission is a reference the calling domain supplies. | §5.3, NP-17, NP-47, INV-30 | A non-marketing send that supplies no PRV decision goes ahead on the recorded absence. One of the two partial rows. |
+| G-2 | **No DRC service.** The record declaration arrives by callback; nothing receives the evidence package. | §8.1, NP-58, TC-20 | Overdue declarations escalate, but no record is ever declared automatically. The other partial row. Evidence retention (now delete-proof) waits on DRC for a disposition policy. |
+| G-3 | **No XIC / vault for provider bindings and secrets.** Bindings are registry rows. Callback, webhook, unsubscribe and DKIM secrets are environment variables. | INV-26, §6.3 | Holds as long as deployments source them from the secret store. Nothing enforces that. |
+| G-4 | **No MDM.** No external-party contacts or authorized cross-tenant relationships exist. | §5.2, NP-12, INV-16 | Every cross-tenant recipient is refused (NCD-020). Safe, but external-party notices cannot be sent. |
+| G-5 | **No PDC or WFC integration.** Legal basis and deadlines are references supplied by the caller. | §8.1, §8.2 | Notice clocks run on caller-supplied deadlines. Legal sufficiency is always `NOT_DETERMINED_BY_NCD`, which is correct. |
+
+**Inside the estate, outside this service**
+
+| # | Gap | Spec | Effect today |
+|---|---|---|---|
+| G-6 | **No caller anywhere in the estate.** No service calls notification-svc or publishes events it consumes. | INV-01, §18.2 | No workflow sends a governed notification. The plane is proven but unused. |
+| G-7 | **Legacy send path still open.** `POST /v1/notifications` and `/events/ingest` accept free-text subject, body and address with no intent. They are suppression-gated and use precise statuses, but bypass NCD-01 content controls. | INV-01, INV-04, NP-11 | Becomes moot once callers move to `POST /v1/communications` (G-6). The console's send form uses this path. |
+| G-8 | **Console covers only the legacy register** (6 routes). There are no screens for intents, template approval, suppressions, preferences, regulated notices, evidence, exceptions or reputation, and no recipient acknowledgment screen. | §8.3, §10.1 | Regulated-notice acknowledgment is API-only. A real recipient has nowhere to acknowledge a notice. |
+| G-9 | **authorization-svc grants.** The four notification actions (TEMPLATE_MANAGE/APPROVE, NOTIFICATION_SUPPRESS, NOTIFICATION_RESOLVE_OUTCOME) are in the dev seed only. | — | Real deployments answer 403 until they are granted. |
+
+**In this service**
+
+| # | Gap | Spec | Effect today |
+|---|---|---|---|
+| G-10 | **Certification matrix not scored row by row.** NP-01…60, INV-01…30 and TC-01…20 have tests and live checks for many items, but no per-row certification table exists. | §14, §15, §16, §21.1 | No defensible percentage against the full spec yet. |
+| G-11 | **Channels limited to EMAIL and IN_APP.** No SMS, push or voice. | OD-01, OD-03, OD-04 | Matches the OD-01 baseline. SMS/push await provider decisions. |
+| G-12 | **Open exceptions are not in the backlog metrics.** `ncd_exceptions` has no platform-read policy. | §13.1 | Exceptions are visible per tenant (`GET /v1/exceptions`), not as an alertable gauge. |
+| G-13 | **No runbook artefacts.** §13.2 lists 10 runbooks; the code supports them (circuit control, stream pause, UNKNOWN resolution, misdelivery), but no written runbooks exist. | §13.2, §18.2 | Operators have the controls but no procedures. |
+| G-14 | **Legacy-table RLS not proven as an unprivileged role.** The legacy store tests run as superuser; one isolation test skips for that reason. NCD tables are proven as `NOSUPERUSER NOBYPASSRLS`. | §11.3 | Legacy-table isolation rests on code review, not a test. |
+| G-15 | **Spec decisions taken in code, awaiting ratification:** E4 rule, 30-min UNKNOWN deadline, quotas, bulk threshold, reputation thresholds, marketing quiet window (see "Decisions taken" above). | OD-06, OD-13, OD-15 | Revisit when the open decisions close. |
+| G-16 | **62 pre-existing Go files are not gofmt-clean.** CI does not check this. | — | Cosmetic. |
+
 ---
 
 # 8/9 — delegated-authority-svc (:8136) vs ORG-06 (Role & Delegation)
@@ -1308,6 +1377,99 @@ Events: `authority.delegated`, `authority.revoked`, `authority.expired`.
 
 This service and search-indexer-svc are the two where the hard invariants are genuinely enforced
 rather than described.
+
+## Re-audit and remediation, 5 October 2026
+
+**Re-audit (verification only).** Commit `b9e244fc` (28 Sep) claimed five fixes for this service.
+The section above was never updated after it. A re-audit against the `.docx` and the current code
+found:
+
+- **One regression.** `DelegateAuthority` (✅ above) returned **503 on every create** in a stack
+  wired to the real authorization-svc. The new SoD client posted to `/v1/sod/check`, which nothing
+  serves. Its request and response shapes did not match authorization-svc's `/v1/sod/validate`
+  either, so fixing only the path would have failed open. Unit tests passed because they injected
+  a stub SoD client.
+- **Several "fixed" items not closed:**
+  - **ExtendDelegation.** Every extend returned 409, because the grant overlapped its own window.
+    The outbox CHECK also refused `authority.extended`, and authorization-svc ignored the event.
+  - **AuthorityLimit.** Stored, but not checked against the delegator (negative case 11). The
+    consumer also dropped the limit fields, so delegated authority was uncapped at decision time.
+  - **ExplainDelegationChain.** Returned only the final hop.
+  - **PROPOSED / SUSPENDED.** Declared as Go constants only.
+  - **expected_version.** Optional, and silently ignored when malformed.
+- **One ✅ above was wrong.** "Revocation reason" was never recorded.
+- **Deployment gap.** The dev database was still at migration 000004.
+
+On this section's own 23 table rows the 23 Sep state was 11 ✅ / 4 ⚠️ / 8 ❌: **48%** (57%
+weighted). The published "23 of 37" could not be reproduced, because the 37 were never listed.
+
+**Remediation (same day).** Every row closed, verified by tests, database checks and a live run.
+
+| Item | Was | Now | How it was closed |
+|---|---|---|---|
+| Cannot delegate around SoD | ❌ (regressed create to 503) | ✅ | Client speaks `/v1/sod/validate`'s real contract, checks the **delegate's** holdings, and fails closed on an unreadable answer; contract tests run against a fake that serves only real routes |
+| DelegateAuthority | ✅ → ❌ | ✅ | Proven live against the real authorization-svc |
+| ExtendDelegation | ❌ | ✅ | Overlap check excludes the grant by id; re-checks authority, limit and SoD; refuses a lapsed window; outbox CHECK admits the event; authorization-svc re-projects it |
+| GetEffectiveDelegations | ⚠️ | ✅ | `?as_of=` reconstructs from an append-only `delegation_history` |
+| ExplainDelegationChain | ❌ | ✅ | Full shortest path, window-checked, cycle-safe |
+| States `Proposed` / `Suspended` | ❌ / ❌ | ✅ / ✅ | Activate (maker-checker), suspend and resume, with DB CHECKs and events |
+| AuthorityLimit | ❌ | ✅ | Validated; negative case 11 via `/v1/authorize` at the ceiling; authorization-svc stores it and denies amounts or quantities over it on every delegation-based decision |
+| Duplicate overlap prevented | ❌ | ✅ | `EXCLUDE` on `[from, to)`, matching expiry and authorization-svc |
+| Idempotency scope | ⚠️ | ✅ | Exclusion constraint, plus an `Idempotency-Key` replay store |
+| Evidence: limits, approval chain | ❌ | ✅ | Approval who/when/method, creation reason, suspension and revocation reasons |
+| Refused escalations durable | ⚠️ | ✅ | Written for 11 named reasons; delegate = delegator no longer mislabelled |
+| Protected changes require current version | ⚠️ | ✅ | Required on every transition: 428 without it, 409 on mismatch |
+| Revocation reason (was scored ✅) | ❌ in fact | ✅ | Required and recorded |
+
+**Design decisions taken where the specification is open** (they settle the ❓ items):
+
+- A delegator delegating their own authority is the approval, so the grant is ACTIVE at once.
+  A grant made on someone else's behalf is PROPOSED until the delegator, or an administrator who
+  is neither its maker nor its delegate, approves it.
+- Negative case 11 is enforced through authorization-svc's existing authority limits.
+- Intervals are half-open `[from, to)`, so back-to-back grants are not an overlap.
+- A capped delegation used with no amount stated is denied.
+
+**Verified:**
+
+- **delegated-authority-svc:** 7 packages green. Store suite 24/24 as a non-superuser role (9 new
+  DB tests). Handler suite 42/42 (15 new). Client contract tests 5/5.
+- **authorization-svc:**
+  - Store suite 66 pass / 0 fail (HEAD baseline 65 / 0).
+  - Ceiling unit tests 13/13.
+  - Consumer tests green, with negative controls.
+- **identity-context-svc:** a suspension ends the delegate's sessions; a resume does not.
+- **Console:** delegation e2e 9/9.
+- **Live:** `scripts/live_lifecycle_check.py` 19/19 against a real authorization-svc. Migrations
+  000005–000010 applied to the dev database.
+
+**Compliance now: 23 of 23 table rows — 100% (weighted 100%)**, delegation half of ORG-06. The
+role half (`AssignBusinessRole`, `SuspendAssignment`, …) belongs to access-control-svc (9/9).
+
+**Follow-up, 5 Oct 2026: the five items left open above, all closed.**
+
+| # | Was open | Closed by |
+|---|---|---|
+| 1 | identity-context-svc SoD unwired: it called `/v1/sod/evaluate` (not served), with `SOD_SERVICE_URL` empty, so it used a permit-everything stub | `POST /v1/sod/evaluate` added to authorization-svc (decision: no GOV-04 service exists, and authz owns the SoD rules). It answers CONFLICT for maker = checker, checker = subject, maker = subject, or a maker/checker duty conflicting with the action under `sod_rules`, and 503 (never NO_CONFLICT) on failure. The client now sends the canonical envelope; compose sets `SOD_SERVICE_URL=http://authorization-svc:8089` |
+| 2 | Authority limits trusted a caller-supplied `fx_rate` / `exchange_rate` | Reference rates only (decision); an unconvertible pair still fails closed. Regression test: `fx_rate=0.0001` no longer brings 100,000 USD under a 50,000 GBP limit |
+| 3 | 41 authorization-svc handler tests failing; the package did not compile on HEAD | Test calls updated to the current `handler.New`. The stub grants the tenant-scope admin permissions the `/v1/admin/*` gate checks, and a new test proves the gate refuses non-administrators (none did before). 239 pass / 0 fail |
+| 4 | The new events had not been run through Kafka live | `scripts/live_kafka_projection_check.py` 16/16 through a real broker. Delegation, extension, suspension, resume and revocation all change what `/v1/authorize` answers; the delegation ceiling and reference-only FX hold at decision time; `/v1/sod/evaluate` answers as identity-context calls it |
+| 5 | `init-db.sh` migrated only fresh volumes, and nothing recorded what ran | `deployments/migrate.py` (status / baseline / up, `schema_migrations` per database). Baseline detects applied migrations from the objects they create and refuses gaps. `init-db.sh` records into the same table. All 84 dev databases baselined and brought current (88 files across 25 databases; `comments_collaboration` created). A fresh volume initialises: 398 files across 84 databases, all tracked |
+
+**Found while closing item 5:**
+
+- **jurisdiction-rules-svc broke fresh-volume init.** Migrations 000005–000009 granted to
+  `jurisdiction_rules_app`, a role nothing creates (the real role is `app_jurisdiction_rules`).
+  000006 also used `tsrange` on `timestamptz` columns and needed `btree_gist`. Under
+  `set -euo pipefail` either defect stopped Postgres initialisation, so a clean `compose up` could
+  not start the stack. Fixed: guarded grants to the real role, `tstzrange`, and the extension.
+- **Out-of-order history in three databases, resolved explicitly at baseline:**
+  - `policy` and `accounts_receivable` each contain two migrations with the same number; one of
+    each pair had never run.
+  - `configuration_feature_flag` was really at 000003.
+
+Cross-service finding 4 (SoD unwired) is now closed for all three callers: delegated-authority-svc,
+access-control-svc and identity-context-svc.
 
 ---
 
@@ -1389,10 +1551,10 @@ overwrote each other's actions there and detaching either retired both.
 | 4 | secret-vault-integration-svc | Security Standard §13, §9, §3.1 | 21 | 18 (**86%**) — was 10 of 25 (40%) as stated; 7 of 19 on its table | **93%** — was 52% |
 | 5 | gateway-auth-svc | Security §8 + GOV-01 ingress | 22 | 21 (**95%**) — was 15 (68%); 18 at re-audit | **98%** — was 80% |
 | 6 | search-indexer-svc | ZS-SVC-AB-001 | 49 | 47 (**96%**) — was 42 of 49 (86%) recounted; published 43 of 48 (90%) | **98%** — was 90%; published 93% |
-| 7 | notification-svc | ZS-SVC-Y-001 | 37 | 35 (**95%**) — was 4 of 34 (12%) | **97%** — was 19% |
-| 8 | delegated-authority-svc | ORG-06 (delegation half) | 37 | 23 (62%) | 69% |
+| 7 | notification-svc | ZS-SVC-Y-001 | 37 (43 incl. 5 Oct defects) | 35 (**95%**) — was 4 of 34 (12%); on 43 rows 81% → 95% after 5 Oct fixes | **97%** — was 19%; 98% on 43 rows |
+| 8 | delegated-authority-svc | ORG-06 (delegation half) | 23 (table rows; was 37 unenumerated) | 23 (**100%**) — was 23 of 37 (62%) published; 11 of 23 (48%) recounted 5 Oct | **100%** — was 69%; 57% recounted |
 | 9 | access-control-svc | Authorization Standard §9 | 11 | 2 (18%) | 23% |
-| | **Group total** | | **318** | **282 — 89%** (was 251 of 315 — 80%; 247 of 314 — 79%; 241 — 77%; 233 — 73%; 192 — 60%; 171 — 54% at baseline) | **≈92%** (was ≈83%; ≈82%; ≈81%; ≈78%; ≈66%; 61% at baseline) |
+| | **Group total** | | **304** | **282 — 93%** (5 Oct, service 8 rescored on its 23 rows and remediated; was 282 of 318 — 89%; 251 of 315 — 80%; 247 of 314 — 79%; 241 — 77%; 233 — 73%; 192 — 60%; 171 — 54% at baseline) | **≈95%** (was ≈92%; ≈83%; ≈82%; ≈81%; ≈78%; ≈66%; 61% at baseline) |
 
 21 items scored partial and **9 need clarification** (was 24 before the notification-svc remediation, which also rescored it on its tables' 37 rows rather than the unenumerated 34; 25 before the search-indexer-svc remediation; 29 before the gateway-auth-svc remediation and re-audit; 32 and 11 before the secret-vault-integration-svc remediation; 45 and 17 at baseline, before the re-audits of identity-context-svc and tenant-entity-registry-svc and the remediation of configuration-feature-flag-svc). secret-vault-integration-svc is now scored on its table's 21 rows rather than the unreproducible 25, and search-indexer-svc on its table's 49 rows rather than the 48 its first headline used. The group total is an unweighted item
 count across services of very different sizes; the per-service figures are the ones to act on.
@@ -1446,7 +1608,7 @@ one service (95%). The weakest remaining services are now 8 and 9.
    reviewed (**fixed**, verified live). delegated-authority-svc binds the delegator to the
    verified caller and refuses self-dealing outright. Those are the patterns to copy.
 
-4. **SoD exists but is unwired.** authorization-svc implements SoD rules, `CheckSoDConflict`,
+4. **SoD exists but is unwired.** *(5 Oct: delegated-authority-svc now calls the real `/v1/sod/validate` contract, verified live; access-control-svc calls the right path; identity-context-svc now reaches authorization-svc's new `/v1/sod/evaluate` (maker-checker), and `SOD_SERVICE_URL` is set in compose — closed for all three callers.)* authorization-svc implements SoD rules, `CheckSoDConflict`,
    `CheckOwnObjectSoD` and `/v1/sod/validate`. `SOD_SERVICE_URL` is empty in the compose, so
    identity-context-svc falls back to `PermitAllChecker` locally (it correctly refuses to boot in
    staging or production without it), and neither delegated-authority-svc nor access-control-svc
