@@ -12,6 +12,15 @@ import (
 // tests pin the current, honestly-documented heuristic behavior — not
 // because the heuristic is correct or governed, but so a future change to
 // these thresholds is visible in a diff and a test failure, not silent.
+//
+// The two tolerances are passed explicitly here, mirroring what a real
+// caller fetches from financial-control-svc's governed TolerancePolicy
+// registry (internal/financialcontrol) — these are no longer package
+// constants (ZS-SVC-Z-001 INV-09).
+const (
+	testAmountMismatchTolerance   = 50.0
+	testMissingReferenceTolerance = 10.0
+)
 
 func reqWith(a, b []TransactionItem) *AnalyzeReconciliationRequest {
 	return &AnalyzeReconciliationRequest{
@@ -25,14 +34,14 @@ func TestPerformIntelligentReconciliation_AmountMismatch_RationaleNamesTheThresh
 		[]TransactionItem{{RefID: "r1", Amount: 100.00}},
 		[]TransactionItem{{RefID: "r1", Amount: 100 + 32.00}}, // $32.00 discrepancy — below the $50 tolerance
 	)
-	_, _, _, items := PerformIntelligentReconciliation(req, "job-1", "tenant-1")
+	_, _, _, items := PerformIntelligentReconciliation(req, "job-1", "tenant-1", testAmountMismatchTolerance, testMissingReferenceTolerance)
 	if len(items) != 1 {
 		t.Fatalf("expected 1 unmatched item, got %d", len(items))
 	}
 	item := items[0]
 
 	if item.Recommendation != RecommendationWriteOff {
-		t.Fatalf("expected WRITE_OFF below the $%.2f tolerance, got %s", amountMismatchWriteOffTolerance, item.Recommendation)
+		t.Fatalf("expected WRITE_OFF below the $%.2f tolerance, got %s", testAmountMismatchTolerance, item.Recommendation)
 	}
 	if item.ConfidenceScore != amountMismatchConfidence {
 		t.Fatalf("expected confidence %.1f, got %.1f", amountMismatchConfidence, item.ConfidenceScore)
@@ -52,7 +61,7 @@ func TestPerformIntelligentReconciliation_AmountMismatch_AtOrAboveTolerance_IsTi
 		[]TransactionItem{{RefID: "r1", Amount: 100.00}},
 		[]TransactionItem{{RefID: "r1", Amount: 100 + 50.00}}, // exactly at the tolerance boundary
 	)
-	_, _, _, items := PerformIntelligentReconciliation(req, "job-1", "tenant-1")
+	_, _, _, items := PerformIntelligentReconciliation(req, "job-1", "tenant-1", testAmountMismatchTolerance, testMissingReferenceTolerance)
 	if items[0].Recommendation != RecommendationTimingAdjustment {
 		t.Fatalf("expected TIMING_ADJUSTMENT at the tolerance boundary, got %s", items[0].Recommendation)
 	}
@@ -63,11 +72,11 @@ func TestPerformIntelligentReconciliation_MissingReference_SmallAmount_WriteOffW
 		[]TransactionItem{{RefID: "orphan", Amount: 5.00}}, // below the $10 small-amount tolerance, no match in B
 		nil,
 	)
-	_, _, _, items := PerformIntelligentReconciliation(req, "job-1", "tenant-1")
+	_, _, _, items := PerformIntelligentReconciliation(req, "job-1", "tenant-1", testAmountMismatchTolerance, testMissingReferenceTolerance)
 	item := items[0]
 
 	if item.Recommendation != RecommendationWriteOff {
-		t.Fatalf("expected WRITE_OFF below the $%.2f small-amount tolerance, got %s", missingReferenceSmallAmountTolerance, item.Recommendation)
+		t.Fatalf("expected WRITE_OFF below the $%.2f small-amount tolerance, got %s", testMissingReferenceTolerance, item.Recommendation)
 	}
 	if !strings.Contains(item.ResolutionNotes, "heuristic rule") {
 		t.Fatalf("FABRICATION: no visible rationale, got %q", item.ResolutionNotes)
@@ -79,7 +88,7 @@ func TestPerformIntelligentReconciliation_MissingReference_LargerAmount_ManualRe
 		[]TransactionItem{{RefID: "orphan", Amount: 500.00}},
 		nil,
 	)
-	_, _, _, items := PerformIntelligentReconciliation(req, "job-1", "tenant-1")
+	_, _, _, items := PerformIntelligentReconciliation(req, "job-1", "tenant-1", testAmountMismatchTolerance, testMissingReferenceTolerance)
 	item := items[0]
 
 	if item.Recommendation != RecommendationManualReview {

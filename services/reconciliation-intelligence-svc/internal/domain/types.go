@@ -120,48 +120,54 @@ func (r *AnalyzeReconciliationRequest) Validate() error {
 	return nil
 }
 
-// Heuristic thresholds and scores for PerformIntelligentReconciliation.
-//
-// These were previously bare numeric literals inline in the function body
-// (50.0, 10.0, 85.0, 60.0, 90.0), with no name, no comment, and no visible
-// connection between "this threshold" and "that confidence score." Named and
-// documented here instead — not because naming them makes the rule
-// governed or versioned (it does not; see the ConfidenceScore field comment
-// above and ZS-SVC-Z-001 INV-09), but because a rule a reviewer cannot see
-// is a rule they cannot audit or question. A future real tolerance-policy
-// service replaces this block, not just its literals.
+// Confidence-score labels for PerformIntelligentReconciliation's
+// recommendations. These are NOT a governed policy and carry no
+// monetary meaning — they are fixed descriptive labels telling a human
+// reviewer which fixed heuristic rule fired (see ConfidenceScore's own
+// field comment). The monetary tolerances the heuristic compares
+// against are no longer hardcoded here — see AmountMismatchWriteOffTolerance
+// and MissingReferenceSmallAmountTolerance's doc comments below:
+// PerformIntelligentReconciliation now takes them as caller-supplied
+// parameters, fetched from financial-control-svc's governed, versioned
+// TolerancePolicy registry (ZS-SVC-Z-001 INV-09 — tolerance must be
+// "explicit and versioned"). There is no package-level default; a
+// caller with no configured policy must refuse rather than guess.
 const (
-	// amountMismatchWriteOffTolerance: a matched pair (same reference in
-	// both systems) whose amounts differ by less than this is recommended
-	// for write-off; at or above it, a timing adjustment is recommended
-	// instead. Arbitrary and unversioned — not a tenant- or entity-specific
-	// materiality policy.
-	amountMismatchWriteOffTolerance = 50.0
-	amountMismatchConfidence        = 85.0
+	amountMismatchConfidence = 85.0
 
-	// missingReferenceSmallAmountTolerance: an item present in system A with
-	// no matching reference in system B is normally flagged for manual
-	// review; below this amount it is instead recommended for write-off
-	// outright, on the reasoning that the review cost exceeds the amount at
-	// risk. Also arbitrary and unversioned.
-	missingReferenceSmallAmountTolerance   = 10.0
 	missingReferenceWriteOffConfidence     = 90.0
 	missingReferenceManualReviewConfidence = 60.0
+)
+
+// Metric names under which the two monetary tolerances this heuristic
+// needs are expected to exist as financial-control-svc TolerancePolicy
+// rows, scoped per (tenant, legal_entity).
+const (
+	MetricAmountMismatchWriteOffTolerance = "RECONCILIATION_AMOUNT_MISMATCH_WRITEOFF"
+	MetricMissingReferenceTolerance       = "RECONCILIATION_MISSING_REFERENCE_WRITEOFF"
 )
 
 // PerformIntelligentReconciliation executes matching analysis, discrepancy
 // detection, & resolution recommendations.
 //
-// "Intelligent" here means two fixed threshold comparisons, not a model or a
-// governed rule — see the heuristic constants above. Every item this
-// produces carries ResolutionStatus RECOMMENDED, never anything further:
+// "Intelligent" here means two fixed threshold comparisons against a
+// governed, versioned tolerance the caller fetched from
+// financial-control-svc (internal/financialcontrol) — never a model, and
+// no longer a hardcoded platform default. Every item this produces
+// carries ResolutionStatus RECOMMENDED, never anything further:
 // domain.StatusApproved/Rejected/Executed are only ever reached through
 // Handler.ApplyResolution, which requires an authenticated principal to hold
 // RECONCILIATION_APPLY_RESOLUTION. Nothing in this function writes anything
 // off; it proposes, and a human decides. That human-approval gate is what
 // keeps a heuristic acceptable as a starting point here — it would not be
 // if this function's output executed anything itself.
-func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, tenantID string) (int, int, float64, []UnmatchedItem) {
+//
+// amountMismatchTolerance and missingReferenceTolerance are the current
+// values of MetricAmountMismatchWriteOffTolerance and
+// MetricMissingReferenceTolerance respectively, for this request's
+// legal entity — resolving "no policy configured" is the caller's job
+// (refuse, per ZS-SVC-Z-001 INV-09), not this function's.
+func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, tenantID string, amountMismatchTolerance, missingReferenceTolerance float64) (int, int, float64, []UnmatchedItem) {
 	mapB := make(map[string]TransactionItem)
 	for _, txB := range req.TransactionsB {
 		mapB[txB.RefID] = txB
@@ -184,16 +190,16 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 				confScore := amountMismatchConfidence
 				var rec ResolutionRecommendation
 				var rationale string
-				if discAmount < amountMismatchWriteOffTolerance {
+				if discAmount < amountMismatchTolerance {
 					rec = RecommendationWriteOff
 					rationale = fmt.Sprintf(
-						"heuristic rule: discrepancy $%.2f is below the $%.2f write-off tolerance (unversioned platform default, not a governed policy)",
-						discAmount, amountMismatchWriteOffTolerance)
+						"heuristic rule: discrepancy $%.2f is below the $%.2f governed write-off tolerance",
+						discAmount, amountMismatchTolerance)
 				} else {
 					rec = RecommendationTimingAdjustment
 					rationale = fmt.Sprintf(
-						"heuristic rule: discrepancy $%.2f is at or above the $%.2f write-off tolerance (unversioned platform default, not a governed policy)",
-						discAmount, amountMismatchWriteOffTolerance)
+						"heuristic rule: discrepancy $%.2f is at or above the $%.2f governed write-off tolerance",
+						discAmount, amountMismatchTolerance)
 				}
 
 				unmatchedItems = append(unmatchedItems, UnmatchedItem{
@@ -218,16 +224,16 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 			confScore := missingReferenceManualReviewConfidence
 			rec := RecommendationManualReview
 			var rationale string
-			if txA.Amount < missingReferenceSmallAmountTolerance {
+			if txA.Amount < missingReferenceTolerance {
 				rec = RecommendationWriteOff
 				confScore = missingReferenceWriteOffConfidence
 				rationale = fmt.Sprintf(
-					"heuristic rule: amount $%.2f is below the $%.2f small-amount write-off tolerance (unversioned platform default, not a governed policy)",
-					txA.Amount, missingReferenceSmallAmountTolerance)
+					"heuristic rule: amount $%.2f is below the $%.2f governed small-amount write-off tolerance",
+					txA.Amount, missingReferenceTolerance)
 			} else {
 				rationale = fmt.Sprintf(
-					"heuristic rule: no matching reference in system B; amount $%.2f is at or above the $%.2f small-amount tolerance, so manual review is recommended rather than automatic write-off",
-					txA.Amount, missingReferenceSmallAmountTolerance)
+					"heuristic rule: no matching reference in system B; amount $%.2f is at or above the $%.2f governed small-amount tolerance, so manual review is recommended rather than automatic write-off",
+					txA.Amount, missingReferenceTolerance)
 			}
 
 			unmatchedItems = append(unmatchedItems, UnmatchedItem{
