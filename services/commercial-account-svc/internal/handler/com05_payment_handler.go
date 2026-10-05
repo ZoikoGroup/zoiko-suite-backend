@@ -213,6 +213,11 @@ func (h *PaymentHandler) RecordProviderOutcome(w http.ResponseWriter, r *http.Re
 	}
 	a, err := h.store.RecordProviderOutcome(r.Context(), domainReq, cmd.claim)
 	if err != nil {
+		if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {
+			return h.store.GetPaymentAttempt(r.Context(), resourceID)
+		}) {
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}

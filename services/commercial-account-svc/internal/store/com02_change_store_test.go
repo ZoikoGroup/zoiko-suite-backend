@@ -144,6 +144,15 @@ func TestChange_DowngradeAtRenewalRepricesOnlyTheNextTerm(t *testing.T) {
 	if sub.Effective.Items[0].PriceVersionID != enterprise.PriceVersionID || len(sub.Scheduled) != 1 {
 		t.Fatalf("a renewal-time downgrade changed the current plan: %+v", sub.Effective.Items)
 	}
+	// Negative path #08/#09: a deferred change must not emit its real event
+	// at confirm time — only a distinct "scheduled" event, with the real one
+	// left to the boundary worker at the actual effective time.
+	if n := f.outboxCount(sub.SubscriptionID, "subscription.change_scheduled"); n != 1 {
+		t.Fatalf("subscription.change_scheduled events at confirm time: %d", n)
+	}
+	if n := f.outboxCount(sub.SubscriptionID, "subscription.changed"); n != 0 {
+		t.Fatalf("subscription.changed fired before its effective time: %d events", n)
+	}
 	if _, err := f.s.ScheduleCancellation(f.ctxOrg, f.cmd(sub, "customer-admin", midTerm),
 		f.tclaim(f.org, "customer-admin", "cancel", sub.SubscriptionID)); !errors.Is(err, domain.ErrChangeAlreadyScheduled) {
 		t.Fatalf("a cancellation was stacked on a scheduled downgrade: %v", err)
@@ -156,6 +165,14 @@ func TestChange_DowngradeAtRenewalRepricesOnlyTheNextTerm(t *testing.T) {
 	changes, _ := f.s.GetChanges(f.ctxOrg, sub.SubscriptionID)
 	if len(changes) != 1 || changes[0].Timing != domain.TimingNextRenewal || changes[0].Proration != nil {
 		t.Fatalf("downgrade evidence: %+v", changes)
+	}
+
+	// Draining the boundary queue at the real effective time fires the real
+	// event exactly once — not a second time on top of the premature one
+	// (there is none), and not zero times either.
+	f.drain(termEnd)
+	if n := f.outboxCount(sub.SubscriptionID, "subscription.changed"); n != 1 {
+		t.Fatalf("subscription.changed events after the boundary fired: %d, want exactly 1", n)
 	}
 }
 

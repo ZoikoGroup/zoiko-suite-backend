@@ -15,6 +15,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
+	"zoiko.io/payee-banking-identity-svc/internal/middleware"
 )
 
 var ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
@@ -52,6 +55,20 @@ func (c *Client) checkAllowed(ctx context.Context, principalID, legalEntityID, a
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	tenantID := middleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		tenantID = "11111111-1111-1111-1111-111111111111"
+	}
+	reqID := uuid.New().String()
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Request-Id", reqID)
+	req.Header.Set("X-Correlation-ID", reqID)
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("Idempotency-Key", reqID+":"+actionType)
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return ErrAuthzServiceUnavailable

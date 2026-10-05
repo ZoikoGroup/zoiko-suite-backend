@@ -28,7 +28,10 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/go-chi/chi/v5/middleware"
+
 	"zoiko.io/evidence-requirements-svc/internal/domain"
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 )
 
 // Client is the narrow interface the evaluator depends on.
@@ -76,13 +79,38 @@ func (c *HTTPClient) VerifyDocument(ctx context.Context, tenantID, legalEntityID
 	// document-vault-svc resolves tenant scope from this header via its own
 	// TenantContext middleware, not a query param.
 	req.Header.Set("X-Tenant-Id", tenantID)
-	// document-vault-svc also requires X-Principal-Id for authentication
-	// (handler.go:191, 529-531). Without it, a 401 is returned which maps
-	// to ErrDocumentServiceUnavailable, making every document-backed
-	// evaluation fail with 503.
-	if principalID != "" {
-		req.Header.Set("X-Principal-Id", principalID)
+	requestID := middleware.GetReqID(ctx)
+	sourceChannel := "system"
+	// document-vault-svc requires X-Principal-Id (handler.go:191, 529-531);
+	// without it every document-backed evaluation fails closed with 503. The
+	// caller's principal is the default, the request envelope's actor wins.
+	if principalID == "" {
+		principalID = "evidence-requirements-svc"
 	}
+
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.Actor() != "" {
+			principalID = env.Actor()
+		}
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			sourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Source-Channel", sourceChannel)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

@@ -3,6 +3,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -29,6 +32,10 @@ type BillingStore interface {
 	GetInvoiceCandidate(ctx context.Context, candidateID string) (*domain.InvoiceCandidate, error)
 	GetInvoice(ctx context.Context, invoiceID string) (*domain.PlatformCommercialInvoice, error)
 	GetInvoiceBasis(ctx context.Context, invoiceID string) (*domain.InvoiceCandidate, error)
+
+	// Gap-remediation additions (see com05_gap_remediation_store.go).
+	GetEvidencePackage(ctx context.Context, invoiceID string) (*domain.CommercialEvidencePackage, error)
+	RegisterTaxJurisdiction(ctx context.Context, organizationID string, j *domain.TaxJurisdiction) (*domain.TaxJurisdiction, error)
 }
 
 var _ BillingStore = (*PgStore)(nil)
@@ -89,12 +96,12 @@ func (s *PgStore) billingSellerTx(ctx context.Context, organizationID string, fn
 // ── Billing accounts ─────────────────────────────────────────────────────────
 
 const billingAccountColumns = `billing_account_id, organization_id::text, selling_entity, billing_currency_code,
-	invoice_numbering_profile, payment_provider_ref, status, created_at, created_by_principal_id`
+	invoice_numbering_profile, payment_provider_ref, accounting_mapping_key, status, created_at, created_by_principal_id`
 
 func scanBillingAccount(row pgx.Row) (*domain.BillingAccount, error) {
 	var b domain.BillingAccount
 	if err := row.Scan(&b.BillingAccountID, &b.OrganizationID, &b.SellingEntity, &b.BillingCurrencyCode,
-		&b.InvoiceNumberingProfile, &b.PaymentProviderRef, &b.Status, &b.CreatedAt, &b.CreatedByPrincipalID); err != nil {
+		&b.InvoiceNumberingProfile, &b.PaymentProviderRef, &b.AccountingMappingKey, &b.Status, &b.CreatedAt, &b.CreatedByPrincipalID); err != nil {
 		return nil, err
 	}
 	return &b, nil
@@ -108,10 +115,10 @@ func (s *PgStore) OpenBillingAccount(ctx context.Context, b *domain.BillingAccou
 		}
 		got, err := scanBillingAccount(tx.QueryRow(ctx, `
 			INSERT INTO billing_accounts (billing_account_id, organization_id, selling_entity, billing_currency_code,
-				invoice_numbering_profile, payment_provider_ref, status, created_at, created_by_principal_id)
-			VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE', $7, $8) RETURNING `+billingAccountColumns,
+				invoice_numbering_profile, payment_provider_ref, accounting_mapping_key, status, created_at, created_by_principal_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, 'ACTIVE', $8, $9) RETURNING `+billingAccountColumns,
 			b.BillingAccountID, b.OrganizationID, b.SellingEntity, b.BillingCurrencyCode,
-			b.InvoiceNumberingProfile, b.PaymentProviderRef, b.CreatedAt, b.CreatedByPrincipalID))
+			b.InvoiceNumberingProfile, b.PaymentProviderRef, b.AccountingMappingKey, b.CreatedAt, b.CreatedByPrincipalID))
 		if err != nil {
 			return err
 		}
@@ -293,6 +300,18 @@ func (s *PgStore) GenerateInvoiceCandidate(ctx context.Context, req domain.Gener
 		if ba.Status != domain.BillingAccountActive {
 			return domain.ErrBillingAccountNotActive
 		}
+		// D2: the jurisdiction/rate context must be a real, seller-registered
+		// fact — not a bare caller assertion — the same "explicit
+		// registration required" doctrine already used for currencies and
+		// meters. TaxAmount itself remains caller-supplied evidence (this
+		// service still computes no tax); only jurisdiction/rate is checked.
+		jur, err := loadTaxJurisdiction(ctx, tx, ba.BillingAccountID, req.TaxJurisdictionCode)
+		if err != nil {
+			return err
+		}
+		if jur.RegisteredRateBasisPoints != nil && *jur.RegisteredRateBasisPoints != req.TaxRateBasisPoints {
+			return domain.ErrTaxRateMismatch
+		}
 
 		var alreadyIssued bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM invoice_candidates
@@ -434,7 +453,12 @@ func (s *PgStore) IssueInvoice(ctx context.Context, candidateID, actor string, n
 		// Negative path #42: re-verify every USAGE line's basis is still
 		// exactly what it was when the candidate was generated. A statement
 		// reopened/superseded/adjusted after generate invalidates the
-		// candidate rather than silently issuing a stale total.
+		// candidate rather than silently issuing a stale total. The
+		// status/total_quantity read here also becomes part of the sealed
+		// evidence package below (D1) — never a second, possibly divergent
+		// query.
+		type statementFact struct{ status, totalQty string }
+		statementEvidence := map[string]statementFact{}
 		for _, l := range c.Lines {
 			if l.Kind != domain.LineUsage {
 				continue
@@ -447,6 +471,7 @@ func (s *PgStore) IssueInvoice(ctx context.Context, candidateID, actor string, n
 			if (status != "CERTIFIED" && status != "ADJUSTED") || totalQuantity != *l.StatementTotalQuantityAtGenerate {
 				return domain.ErrInvoiceBasisChanged
 			}
+			statementEvidence[*l.StatementID] = statementFact{status: status, totalQty: totalQuantity}
 		}
 
 		ba, err := loadBillingAccountByOrg(ctx, tx, c.OrganizationID)
@@ -485,11 +510,78 @@ func (s *PgStore) IssueInvoice(ctx context.Context, candidateID, actor string, n
 			candidateID, invoiceID); err != nil {
 			return err
 		}
+
+		// D1: seal a CommercialEvidencePackage in the same transaction the
+		// invoice itself is issued in — server-generated evidence, never a
+		// separate operator command, same doctrine as entitlement_snapshots.
+		priceVersionIDs := make([]string, 0, len(c.Lines))
+		seen := map[string]bool{}
+		for _, l := range c.Lines {
+			if !seen[l.PriceVersionID] {
+				seen[l.PriceVersionID] = true
+				priceVersionIDs = append(priceVersionIDs, l.PriceVersionID)
+			}
+		}
+		hashes := map[string]*string{}
+		if len(priceVersionIDs) > 0 {
+			rows, err := tx.Query(ctx, `SELECT price_version_id, content_sha256 FROM product_price_versions WHERE price_version_id = ANY($1)`, priceVersionIDs)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var id string
+				var hash *string
+				if err := rows.Scan(&id, &hash); err != nil {
+					rows.Close()
+					return err
+				}
+				hashes[id] = hash
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+		}
+		manifest := domain.EvidenceManifest{
+			InvoiceID: invoiceID, InvoiceNumber: invoiceNumber, SubscriptionID: c.SubscriptionID,
+			SubscriptionVersionID: c.SubscriptionVersionID, TermNo: c.TermNo,
+		}
+		for _, l := range c.Lines {
+			el := domain.EvidenceLine{LineNo: l.LineNo, Kind: string(l.Kind), PriceVersionID: l.PriceVersionID,
+				PriceVersionSHA256: hashes[l.PriceVersionID]}
+			if l.Kind == domain.LineUsage && l.StatementID != nil {
+				if fact, ok := statementEvidence[*l.StatementID]; ok {
+					el.StatementID = l.StatementID
+					el.StatementStatus = &fact.status
+					el.StatementTotalQty = &fact.totalQty
+				}
+			}
+			manifest.Lines = append(manifest.Lines, el)
+		}
+		manifestJSON, err := json.Marshal(manifest)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(manifestJSON)
+		manifestSHA256 := hex.EncodeToString(sum[:])
+		packageID := domain.NewCommercialID(domain.PrefixEvidencePackage)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO commercial_evidence_packages (package_id, invoice_id, organization_id, manifest, manifest_sha256,
+				sealed_at, sealed_by_principal_id)
+			VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
+			packageID, invoiceID, c.OrganizationID, manifestJSON, manifestSHA256, now, actor); err != nil {
+			return err
+		}
+
 		got, err := loadInvoice(ctx, tx, invoiceID)
 		if err != nil {
 			return err
 		}
 		out = got
+		if err := emitAccountingEvent(ctx, tx, got.OrganizationID, ba.AccountingMappingKey, got.TotalAmount, "DEBIT",
+			"platform_commercial_invoice", invoiceID); err != nil {
+			return err
+		}
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "platform_commercial_invoice", AggregateID: invoiceID,
 			EventType: "platform_invoice.issued", TenantID: &got.OrganizationID, Payload: got})
 	})

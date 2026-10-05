@@ -73,7 +73,7 @@ func rulePayload(r domain.JurisdictionRule) map[string]any {
 }
 
 func partitionKey(payload map[string]any) string {
-	for _, k := range []string{"jurisdiction_rule_id", "jurisdiction_id"} {
+	for _, k := range []string{"aggregate_id", "jurisdiction_rule_id", "jurisdiction_id"} {
 		if v, ok := payload[k].(string); ok && v != "" {
 			return v
 		}

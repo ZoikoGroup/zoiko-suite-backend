@@ -195,6 +195,14 @@ func (s *PgStore) RecordProviderOutcome(ctx context.Context, req domain.RecordOu
 		eventType := "payment_attempt.outcome_resolved"
 		if got.Status == domain.PaymentSucceeded {
 			eventType = "platform_payment.settled"
+			ba, err := loadBillingAccountByOrg(ctx, tx, got.OrganizationID)
+			if err != nil {
+				return err
+			}
+			if err := emitAccountingEvent(ctx, tx, got.OrganizationID, ba.AccountingMappingKey, got.Amount, "DEBIT",
+				"payment_attempt", got.AttemptID); err != nil {
+				return err
+			}
 		}
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "payment_attempt", AggregateID: req.AttemptID,
 			EventType: eventType, TenantID: &got.OrganizationID, Payload: got})

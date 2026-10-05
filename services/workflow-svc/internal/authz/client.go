@@ -17,9 +17,12 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
+	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
 
 // Client is the narrow interface the handler depends on.
@@ -114,6 +117,44 @@ func (c *HTTPClient) checkAllowed(ctx context.Context, principalID, legalEntityI
 		return domain.ErrAuthorizationServiceUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := ""
+	authzSourceChannel := "web"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+		if env.IdempotencyKey != "" {
+			req.Header.Set("Idempotency-Key", env.IdempotencyKey)
+		}
+	}
+	if req.Header.Get("X-Tenant-Id") == "" {
+		if tid := svcmiddleware.TenantFromContext(ctx); tid != "" {
+			req.Header.Set("X-Tenant-Id", tid)
+		}
+	}
+	if authzRequestID == "" {
+		authzRequestID = uuid.New().String()
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	if req.Header.Get("Idempotency-Key") == "" {
+		req.Header.Set("Idempotency-Key", "authz-"+authzRequestID)
+	}
 
 	// Forward envelope headers for audit trail
 	if requestID := ctx.Value("request_id"); requestID != nil {

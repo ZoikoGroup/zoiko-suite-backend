@@ -38,6 +38,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	opensearch "github.com/opensearch-project/opensearch-go/v4"
 	"github.com/opensearch-project/opensearch-go/v4/opensearchapi"
@@ -166,12 +167,16 @@ func (c *client) EnsureIndex(ctx context.Context, index IndexName) error {
 		Indices: []string{string(index)},
 	})
 	if err != nil {
-		return fmt.Errorf("searchclient: EnsureIndex exists check: %w", err)
-	}
-	_ = resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		return nil // already exists
+		if !strings.Contains(err.Error(), "404") {
+			return fmt.Errorf("searchclient: EnsureIndex exists check: %w", err)
+		}
+	} else {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if resp != nil && resp.StatusCode == 200 {
+			return nil // already exists
+		}
 	}
 
 	// Create with basic mappings that enforce tenant_id and legal_entity_id

@@ -2,9 +2,13 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -41,7 +45,7 @@ func New(st store.Store, pub events.Publisher, az AuthzChecker, log *zap.Logger)
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
-	r.Route("/privacy/rights-requests", func(r chi.Router) {
+	mountRoutes := func(r chi.Router) {
 		r.Post("/", h.CreateRequest)
 		r.Get("/", h.ListRequestsBySubject)
 		r.Get("/{requestID}", h.GetRequest)
@@ -50,7 +54,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{requestID}/discovery-manifests", h.ListDiscoveryManifests)
 		r.Post("/{requestID}/wfc-process-ref", h.AttachWFCProcessRef)
 		r.Post("/{requestID}/close", h.CloseRequest)
-	})
+	}
+
+	r.Route("/privacy/rights-requests", mountRoutes)
+	r.Route("/v1/privacy/rights-requests", mountRoutes)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -61,6 +68,69 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func hashBody(body []byte) string {
+	h := sha256.Sum256(body)
+	return hex.EncodeToString(h[:])
+}
+
+func readBodyBytes(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return []byte{}, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return body, nil
+}
+
+func (h *Handler) checkIdempotency(w http.ResponseWriter, r *http.Request, tenantID, principalID string, body []byte) (*domain.IdempotencyRecord, bool, string, string) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		return nil, false, "", ""
+	}
+	reqHash := hashBody(body)
+	existing, err := h.store.GetIdempotency(r.Context(), tenantID, key)
+	if err != nil {
+		h.log.Warn("idempotency lookup error", zap.Error(err))
+		return nil, false, key, reqHash
+	}
+	if existing != nil {
+		if existing.RequestHash != reqHash {
+			writeError(w, http.StatusConflict, domain.ErrIdempotencyConflict.Error())
+			return existing, true, key, reqHash
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Idempotency-Replay", "true")
+		w.WriteHeader(existing.ResponseCode)
+		_, _ = w.Write(existing.ResponseBody)
+		return existing, true, key, reqHash
+	}
+	return nil, false, key, reqHash
+}
+
+func (h *Handler) writeJSONWithIdempotency(ctx context.Context, w http.ResponseWriter, tenantID, principalID, endpoint, key, reqHash string, status int, v interface{}) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal response")
+		return
+	}
+	if key != "" {
+		_ = h.store.SaveIdempotency(ctx, domain.IdempotencyRecord{
+			Key:          key,
+			TenantID:     tenantID,
+			Endpoint:     endpoint,
+			RequestHash:  reqHash,
+			ResponseCode: status,
+			ResponseBody: body,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -94,23 +164,41 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 // workflow-svc instance (see the domain package's doc comment on
 // wfc_process_ref for why).
 func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
-	var req domain.CreateRightsRequestRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-	if req.SubjectRef == "" {
-		writeError(w, http.StatusBadRequest, "subject_ref is required")
-		return
-	}
-	if !req.RightFamily.Valid() {
-		writeError(w, http.StatusBadRequest, "right_family is missing or not a recognized value")
+
+	bodyBytes, err := readBodyBytes(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
+
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
+	if handled {
+		return
+	}
+
+	var req domain.CreateRightsRequestRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+	if req.SubjectRef == "" {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+	if !req.RightFamily.Valid() {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+
 	if req.TenantID != "" && req.TenantID != verifiedTenant {
-		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
+		writeError(w, http.StatusForbidden, domain.PRV003PrivacyRoleUnresolved)
 		return
 	}
 	tenantID := req.TenantID
@@ -118,10 +206,6 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		tenantID = verifiedTenant
 	}
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
 	if !h.authorize(w, r, principalID, tenantID, PrivacyRightsRequestCreate) {
 		return
 	}
@@ -129,7 +213,7 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	request, err := h.store.CreateRequest(r.Context(), tenantID, req, principalID)
 	if err != nil {
 		h.log.Error("CreateRequest: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		writeError(w, http.StatusServiceUnavailable, domain.PRV019PrivacyContextIndeterminate)
 		return
 	}
 
@@ -137,7 +221,8 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		EventType: "privacy.rights_request.received", EntityID: request.RequestID, TenantID: tenantID,
 		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: request,
 	})
-	writeJSON(w, http.StatusCreated, request)
+
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateRequest", idemKey, reqHash, http.StatusCreated, request)
 }
 
 func (h *Handler) GetRequest(w http.ResponseWriter, r *http.Request) {
@@ -181,29 +266,26 @@ func (h *Handler) ListRequestsBySubject(w http.ResponseWriter, r *http.Request) 
 // still recorded, but must never advance the case status.
 func (h *Handler) RecordIdentityVerification(w http.ResponseWriter, r *http.Request) {
 	requestID := chi.URLParam(r, "requestID")
-	var req domain.RecordIdentityVerificationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.Method == "" {
-		writeError(w, http.StatusBadRequest, "method is required")
-		return
-	}
-
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 
+	bodyBytes, err := readBodyBytes(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	// Check idempotency (§18.1)
 	existing, err := h.store.FindRequest(r.Context(), requestID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, "rights request not found")
+			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
 			return
 		}
 		h.log.Error("RecordIdentityVerification: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		writeError(w, http.StatusServiceUnavailable, domain.PRV019PrivacyContextIndeterminate)
 		return
 	}
 	tenantID := ""
@@ -214,18 +296,34 @@ func (h *Handler) RecordIdentityVerification(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	event, request, err := h.store.RecordIdentityVerification(r.Context(), requestID, req, principalID)
-	if err != nil {
-		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, "rights request not found")
-			return
-		}
-		h.log.Error("RecordIdentityVerification: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]interface{}{"event": event, "request": request})
+	var req domain.RecordIdentityVerificationRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+	if req.Method == "" {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+
+	event, request, err := h.store.RecordIdentityVerification(r.Context(), requestID, req, principalID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRequestNotFound) {
+			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			return
+		}
+		h.log.Error("RecordIdentityVerification: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, domain.PRV019PrivacyContextIndeterminate)
+		return
+	}
+
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "RecordIdentityVerification", idemKey, reqHash, http.StatusCreated, map[string]interface{}{"event": event, "request": request})
 }
 
 // AttachDiscoveryManifest handles
@@ -234,29 +332,25 @@ func (h *Handler) RecordIdentityVerification(w http.ResponseWriter, r *http.Requ
 // domain adapter already produced (§15.1).
 func (h *Handler) AttachDiscoveryManifest(w http.ResponseWriter, r *http.Request) {
 	requestID := chi.URLParam(r, "requestID")
-	var req domain.AttachDiscoveryManifestRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.Domain == "" || req.ContentHash == "" {
-		writeError(w, http.StatusBadRequest, "domain and content_hash are required")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
+	bodyBytes, err := readBodyBytes(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 
 	existing, err := h.store.FindRequest(r.Context(), requestID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, "rights request not found")
+			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
 			return
 		}
 		h.log.Error("AttachDiscoveryManifest: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		writeError(w, http.StatusServiceUnavailable, domain.PRV019PrivacyContextIndeterminate)
 		return
 	}
 	tenantID := ""
@@ -267,18 +361,34 @@ func (h *Handler) AttachDiscoveryManifest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	manifest, request, err := h.store.AttachDiscoveryManifest(r.Context(), requestID, req, principalID)
-	if err != nil {
-		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, "rights request not found")
-			return
-		}
-		h.log.Error("AttachDiscoveryManifest: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]interface{}{"manifest": manifest, "request": request})
+	var req domain.AttachDiscoveryManifestRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+	if req.Domain == "" || req.ContentHash == "" {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+
+	manifest, request, err := h.store.AttachDiscoveryManifest(r.Context(), requestID, req, principalID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRequestNotFound) {
+			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
+			return
+		}
+		h.log.Error("AttachDiscoveryManifest: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, domain.PRV019PrivacyContextIndeterminate)
+		return
+	}
+
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "AttachDiscoveryManifest", idemKey, reqHash, http.StatusCreated, map[string]interface{}{"manifest": manifest, "request": request})
 }
 
 func (h *Handler) ListDiscoveryManifests(w http.ResponseWriter, r *http.Request) {
@@ -302,29 +412,25 @@ func (h *Handler) ListDiscoveryManifests(w http.ResponseWriter, r *http.Request)
 // that instance itself.
 func (h *Handler) AttachWFCProcessRef(w http.ResponseWriter, r *http.Request) {
 	requestID := chi.URLParam(r, "requestID")
-	var req domain.AttachWFCProcessRefRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.WFCProcessRef == "" {
-		writeError(w, http.StatusBadRequest, "wfc_process_ref is required")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
+	bodyBytes, err := readBodyBytes(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 
 	existing, err := h.store.FindRequest(r.Context(), requestID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, "rights request not found")
+			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
 			return
 		}
 		h.log.Error("AttachWFCProcessRef: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		writeError(w, http.StatusServiceUnavailable, domain.PRV019PrivacyContextIndeterminate)
 		return
 	}
 	tenantID := ""
@@ -335,48 +441,62 @@ func (h *Handler) AttachWFCProcessRef(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
+		return
+	}
+
+	var req domain.AttachWFCProcessRefRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+	if req.WFCProcessRef == "" {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+
 	request, err := h.store.AttachWFCProcessRef(r.Context(), requestID, req.WFCProcessRef)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, "rights request not found")
+			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
 			return
 		}
 		h.log.Error("AttachWFCProcessRef: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		writeError(w, http.StatusServiceUnavailable, domain.PRV019PrivacyContextIndeterminate)
 		return
 	}
-	writeJSON(w, http.StatusOK, request)
+
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "AttachWFCProcessRef", idemKey, reqHash, http.StatusOK, request)
 }
 
 // CloseRequest handles POST /privacy/rights-requests/{requestID}/close —
 // the DISCLOSURE GATE from §15.2, enforced verbatim: FULFILLED requires
 // identity assurance AND at least one discovery manifest.
 // REJECTED/WITHDRAWN carry no such precondition.
+// I21: response package versioning — increments on every FULFILLED closure.
 func (h *Handler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 	requestID := chi.URLParam(r, "requestID")
-	var req domain.CloseRequestRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if !req.Outcome.Valid() {
-		writeError(w, http.StatusBadRequest, "outcome is missing or not a recognized value")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
+	bodyBytes, err := readBodyBytes(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 
 	existing, err := h.store.FindRequest(r.Context(), requestID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequestNotFound) {
-			writeError(w, http.StatusNotFound, "rights request not found")
+			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
 			return
 		}
 		h.log.Error("CloseRequest: lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		writeError(w, http.StatusServiceUnavailable, domain.PRV019PrivacyContextIndeterminate)
 		return
 	}
 	tenantID := ""
@@ -387,20 +507,36 @@ func (h *Handler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
+		return
+	}
+
+	var req domain.CloseRequestRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+	if !req.Outcome.Valid() {
+		writeError(w, http.StatusBadRequest, domain.PRV005PolicyUnavailable)
+		return
+	}
+
 	request, err := h.store.CloseRequest(r.Context(), requestID, req, principalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrRequestNotFound):
-			writeError(w, http.StatusNotFound, "rights request not found")
+			writeError(w, http.StatusNotFound, domain.PRV001PurposeNotRegistered)
 		case errors.Is(err, domain.ErrRequestAlreadyClosed):
-			writeError(w, http.StatusConflict, "rights request is already closed")
+			writeError(w, http.StatusConflict, domain.PRV020ImmutableEvidenceConflict)
 		case errors.Is(err, domain.ErrIdentityNotVerified):
-			writeError(w, http.StatusUnprocessableEntity, "DISCLOSURE GATE: identity has not been verified — cannot close as FULFILLED")
+			writeError(w, http.StatusUnprocessableEntity, domain.PRV012IdentityAssuranceInsufficient)
 		case errors.Is(err, domain.ErrNoDiscoveryManifest):
-			writeError(w, http.StatusUnprocessableEntity, "DISCLOSURE GATE: no discovery manifest recorded — cannot close as FULFILLED")
+			writeError(w, http.StatusUnprocessableEntity, domain.PRV013ThirdPartyReviewRequired)
 		default:
 			h.log.Error("CloseRequest: store unavailable", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
+			writeError(w, http.StatusServiceUnavailable, domain.PRV019PrivacyContextIndeterminate)
 		}
 		return
 	}
@@ -409,5 +545,5 @@ func (h *Handler) CloseRequest(w http.ResponseWriter, r *http.Request) {
 		EventType: "privacy.rights_request.closed", EntityID: request.RequestID, TenantID: tenantID,
 		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: request,
 	})
-	writeJSON(w, http.StatusOK, request)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CloseRequest", idemKey, reqHash, http.StatusOK, request)
 }

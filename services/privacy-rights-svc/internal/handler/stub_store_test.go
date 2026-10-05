@@ -13,16 +13,18 @@ import (
 // replicates PgStore's actual state-machine and DISCLOSURE GATE
 // semantics, not canned responses.
 type stubStore struct {
-	requests  map[string]*domain.RightsRequest
-	events    map[string][]domain.IdentityVerificationEvent // by request_id
-	manifests map[string][]domain.DiscoveryManifest         // by request_id
+	requests      map[string]*domain.RightsRequest
+	events        map[string][]domain.IdentityVerificationEvent // by request_id
+	manifests     map[string][]domain.DiscoveryManifest         // by request_id
+	idempotency   map[string]*domain.IdempotencyRecord          // key: tenantID:idempotencyKey
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		requests:  map[string]*domain.RightsRequest{},
-		events:    map[string][]domain.IdentityVerificationEvent{},
-		manifests: map[string][]domain.DiscoveryManifest{},
+		requests:    map[string]*domain.RightsRequest{},
+		events:      map[string][]domain.IdentityVerificationEvent{},
+		manifests:   map[string][]domain.DiscoveryManifest{},
+		idempotency: map[string]*domain.IdempotencyRecord{},
 	}
 }
 
@@ -120,6 +122,7 @@ func (s *stubStore) CloseRequest(_ context.Context, requestID string, req domain
 		if len(s.manifests[requestID]) == 0 {
 			return nil, domain.ErrNoDiscoveryManifest
 		}
+		r.ResponsePackageVersion++
 	}
 	now := time.Now().UTC()
 	r.Status = domain.StatusClosed
@@ -138,4 +141,22 @@ func (s *stubStore) AttachWFCProcessRef(_ context.Context, requestID, wfcProcess
 	}
 	r.WFCProcessRef = strp(wfcProcessRef)
 	return r, nil
+}
+
+// Idempotency (§18.1) — stub implementations
+
+func (s *stubStore) GetIdempotency(_ context.Context, tenantID, key string) (*domain.IdempotencyRecord, error) {
+	k := tenantID + ":" + key
+	rec, ok := s.idempotency[k]
+	if !ok {
+		return nil, nil
+	}
+	return rec, nil
+}
+
+func (s *stubStore) SaveIdempotency(_ context.Context, rec domain.IdempotencyRecord) error {
+	k := rec.TenantID + ":" + rec.Key
+	cp := rec
+	s.idempotency[k] = &cp
+	return nil
 }

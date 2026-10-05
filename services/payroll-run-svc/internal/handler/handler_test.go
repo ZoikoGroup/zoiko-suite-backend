@@ -27,6 +27,12 @@ type stubStore struct {
 	runsByCorr  map[string]string
 	slips       map[string][]domain.PaySlip
 	shadowComps map[string][]domain.ShadowComparison
+
+	// control-population stub state (see control_population_test.go)
+	cpPage  *domain.ControlPopulationPage
+	cpErr   error
+	cpCalls int
+	cpLast  domain.ControlPopulationQuery
 }
 
 func newStubStore() *stubStore {

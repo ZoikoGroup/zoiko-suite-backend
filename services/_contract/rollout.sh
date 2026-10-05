@@ -33,7 +33,7 @@ corporate-actions-svc corporate-tax-svc counterparty-management-svc decision-sup
 delegated-authority-svc document-vault-svc employee-master-svc employment-contracts-svc \
 esignature-integration-svc evidence-manifest-svc evidence-requirements-svc \
 exception-escalation-svc external-data-feed-svc filing-preparation-svc filing-tracker-svc \
-financial-close-svc forecasting-svc general-ledger-svc governance-decision-log-svc \
+financial-close-svc financial-control-svc forecasting-svc general-ledger-svc governance-decision-log-svc \
 hris-connector-svc identity-context-svc inventory-management-svc invoice-approval-svc key-management-svc \
 leave-absence-svc migration-integrity-svc mtls-management-svc notification-svc \
 obligation-tracking-svc obligations-svc offboarding-severance-svc org-structure-svc \
@@ -82,7 +82,7 @@ audit-event-store-svc hris-connector-svc search-indexer-svc"
 # carries book_id today so callers can begin sending it; flipping these to
 # Required is a one-line change per service once REF-06 ships.
 ACCOUNTING="general-ledger-svc accounts-payable-svc accounts-receivable-svc \
-asset-management-svc consolidation-svc intercompany-accounting-svc financial-close-svc migration-integrity-svc \
+asset-management-svc consolidation-svc intercompany-accounting-svc financial-close-svc financial-control-svc migration-integrity-svc \
 inventory-management-svc project-accounting-svc \
 reporting-orchestration-svc metric-registry-svc corporate-tax-svc vat-gst-svc \
 withholding-tax-svc tax-determination-svc payroll-tax-svc treasury-svc \

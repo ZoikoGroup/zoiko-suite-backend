@@ -83,6 +83,7 @@ accounts_receivable:app_accounts_receivable
 general_ledger:app_general_ledger
 financial_close:app_financial_close
 bank_reconciliation:app_bank_reconciliation
+financial_control:app_financial_control
 notification:app_notification
 board_resolutions:app_board_resolutions
 schema_registry:app_schema_registry

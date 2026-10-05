@@ -129,6 +129,7 @@ decision_support:decision-support
 treasury:treasury
 financial_close:financial-close
 bank_reconciliation:bank-reconciliation
+financial_control:financial-control
 intercompany_accounting:intercompany-accounting
 consolidation_svc:consolidation
 asset_management:asset-management
@@ -243,7 +244,7 @@ for db in \
     clause_template commercial_account compensation configuration_feature_flag consolidation_svc \
     contract_lifecycle corporate_actions corporate_tax counterparty_management decision_support \
     delegated_authority document_vault employee_master employment_contracts evidence_manifest \
-    evidence_requirements expense_claim financial_close general_ledger goods_service_receipt governance_decision_log identity_context \
+    evidence_requirements expense_claim financial_close financial_control general_ledger goods_service_receipt governance_decision_log identity_context \
     intercompany_accounting invoice_approval jurisdiction_rules kill_switch_registry leave_absence \
     metric_registry notification obligation_tracking obligations offboarding_severance org_structure \
     payable_open_item payee_banking_identity payment_authorization payment_initiation_adapter payment_proposal payment_run payment_status payroll_exceptions payroll_run payroll_tax performance_review policy privacy_consent \

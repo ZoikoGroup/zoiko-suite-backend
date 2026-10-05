@@ -33,11 +33,13 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/config"
+	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/health"
 	"zoiko.io/jurisdiction-rules-svc/internal/mtls"
+	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 	"zoiko.io/jurisdiction-rules-svc/internal/telemetry"
 )
@@ -158,6 +160,53 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, authzClient, publisher, cfg.AuthZPlatformScopeID, log)
+	var registryPub events.RegistryPublisher
+	if rp, ok := publisher.(events.RegistryPublisher); ok {
+		registryPub = rp
+	}
+	h.WithRegistry(pgStore, registryPub).WithCertificationPolicy(cfg.PackCertMinReviews)
+	h.WithOperations(handler.OpsPolicy{
+		HotfixRetroSLA:  time.Duration(cfg.HotfixRetroSLAHours) * time.Hour,
+		CertAgeWarnDays: cfg.PackCertAgeWarnDays,
+	})
+	if cfg.ResolverEnabled {
+		res, err := resolver.New(pgStore, resolver.Config{
+			Ring: cfg.ResolverRing, Region: cfg.ResolverRegion,
+			EligibleStatuses: cfg.ResolverEligibleStatuses,
+			CacheTTL:         time.Duration(cfg.ResolverCacheTTLSeconds) * time.Second,
+			// JUR-NEG-04: a pack that fails verification at load raises a security event.
+			OnUnverified: func(packRef, version string, reasons []string) {
+				log.Error("jurisdiction pack failed verification; resolutions covering it are refused",
+					zap.String("pack_ref", packRef), zap.String("version", version), zap.Strings("reasons", reasons))
+				// Feeds the promotion health gate and the operations metrics.
+				if rerr := pgStore.RecordVerificationFailure(context.Background(), packRef, version, cfg.ResolverRing, cfg.ResolverRegion, reasons); rerr != nil {
+					log.Error("could not record the verification failure", zap.Error(rerr))
+				}
+				if registryPub != nil {
+					_ = registryPub.PublishRegistryEvent(context.Background(), events.EventPackVerificationFailed, packRef+"@"+version,
+						"jurisdiction-rules-svc", "", map[string]any{"pack_ref": packRef, "version": version, "reasons": reasons, "detected_by": "runtime-resolver"})
+				}
+			},
+		})
+		if err != nil {
+			log.Fatal("resolver could not be constructed", zap.Error(err))
+		}
+		h.WithResolver(res)
+		log.Info("rule resolver enabled", zap.Strings("eligible_statuses", cfg.ResolverEligibleStatuses), zap.Int("cache_ttl_seconds", cfg.ResolverCacheTTLSeconds),
+			zap.String("ring", cfg.ResolverRing), zap.String("region", cfg.ResolverRegion))
+	} else {
+		log.Info("rule resolver disabled: set RESOLVER_ENABLED=true (with RESOLVER_RING and RESOLVER_REGION in production) to serve /v1/rule-resolutions:resolve")
+	}
+	if cfg.PackSigningKeyFile != "" {
+		signer, err := domain.LoadEd25519SignerFromFile(cfg.PackSigningKeyRef, cfg.PackSigningKeyFile)
+		if err != nil {
+			log.Fatal("pack signing key could not be loaded", zap.String("key_ref", cfg.PackSigningKeyRef), zap.Error(err))
+		}
+		h.WithSigner(signer)
+		log.Info("pack signing enabled", zap.String("key_ref", cfg.PackSigningKeyRef))
+	} else {
+		log.Warn("pack signing disabled: PACK_SIGNING_KEY_REF/PACK_SIGNING_KEY_FILE are not set; the sign command will answer 503")
+	}
 	handler.RegisterRoutes(r, h)
 
 	// ── 7. Health probes + metrics ────────────────────────────────────────────

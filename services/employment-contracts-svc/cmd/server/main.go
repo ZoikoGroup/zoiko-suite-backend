@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
@@ -143,6 +144,22 @@ func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, leg
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		tenantID = "11111111-1111-1111-1111-111111111111"
+	}
+	requestID := middleware.GetReqID(ctx)
+	if requestID == "" {
+		requestID = uuid.New().String()
+	}
+
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("Idempotency-Key", requestID+":"+actionType)
 
 	resp, err := a.client.Do(req)
 	if err != nil {

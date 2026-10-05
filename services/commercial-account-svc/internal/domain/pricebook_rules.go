@@ -118,6 +118,12 @@ func ValidateCapabilities(caps []PlanCapability) error {
 				return invalid(field+".limit_unit", "is required (at most 32 characters) when limit_value is set")
 			}
 		}
+		if (c.MeterKey == nil) != (c.MeterVersion == nil) {
+			return invalid(field+".meter_key", "meter_key and meter_version must be set together, or not at all")
+		}
+		if c.MeterKey != nil && c.LimitValue == nil {
+			return invalid(field+".limit_value", "a metered capability must declare a limit_value to check usage against")
+		}
 	}
 	return nil
 }
@@ -446,6 +452,13 @@ func CheckSubmittable(v *PriceVersion, cur CommercialCurrency, now time.Time, re
 			!registeredMeters[RegisteredMeterKey(*c.MeterKey, *c.MeterVersion)] {
 			reasons = append(reasons, fmt.Sprintf("component %s: %s (%s/%d)",
 				c.ComponentKey, ErrMeterNotRegistered.Error(), *c.MeterKey, *c.MeterVersion))
+		}
+	}
+	for i := range v.Capabilities {
+		c := &v.Capabilities[i]
+		if c.MeterKey != nil && c.MeterVersion != nil && !registeredMeters[RegisteredMeterKey(*c.MeterKey, *c.MeterVersion)] {
+			reasons = append(reasons, fmt.Sprintf("capability %s: %s (%s/%d)",
+				c.CapabilityKey, ErrMeterNotRegistered.Error(), *c.MeterKey, *c.MeterVersion))
 		}
 	}
 	if chargeable == 0 {

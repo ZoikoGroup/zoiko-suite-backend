@@ -99,11 +99,127 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Mi
 }
 
 func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.MigrationJob, error) {
-	return nil, fmt.Errorf("not implemented")
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+
+	var job domain.MigrationJob
+	var startedAt, completedAt *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
+		       total_records_count, valid_records_count, invalid_records_count, integrity_score,
+		       status, started_at, completed_at, created_at, updated_at
+		FROM migration_jobs
+		WHERE id = $1`, id).Scan(
+		&job.ID, &job.TenantID, &job.LegalEntityID, &job.MigrationName, &job.SourceSystem, &job.TargetService,
+		&job.TotalRecordsCount, &job.ValidRecordsCount, &job.InvalidRecordsCount, &job.IntegrityScore,
+		&job.Status, &startedAt, &completedAt, &job.CreatedAt, &job.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("migration job not found: %w", err)
+	}
+	job.StartedAt = startedAt
+	job.CompletedAt = completedAt
+
+	rows, err := tx.Query(ctx, `
+		SELECT id, tenant_id, job_id, check_name, check_type, records_checked, records_passed, records_failed, severity, detail, created_at
+		FROM migration_integrity_checks WHERE job_id = $1 ORDER BY created_at ASC`, id)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var c domain.IntegrityCheck
+			if err := rows.Scan(&c.ID, &c.TenantID, &c.JobID, &c.CheckName, &c.CheckType, &c.RecordsChecked, &c.RecordsPassed, &c.RecordsFailed, &c.Severity, &c.Detail, &c.CreatedAt); err == nil {
+				job.IntegrityChecks = append(job.IntegrityChecks, c)
+			}
+		}
+	}
+
+	arows, err := tx.Query(ctx, `
+		SELECT id, tenant_id, job_id, record_ref, field_name, source_value, target_value, violation_type, is_remediated, created_at
+		FROM migration_audit_entries WHERE job_id = $1 ORDER BY created_at ASC`, id)
+	if err == nil {
+		defer arows.Close()
+		for arows.Next() {
+			var e domain.AuditEntry
+			var fieldName, srcVal, tgtVal *string
+			if err := arows.Scan(&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType, &e.IsRemediated, &e.CreatedAt); err == nil {
+				if fieldName != nil {
+					e.FieldName = *fieldName
+				}
+				if srcVal != nil {
+					e.SourceValue = *srcVal
+				}
+				if tgtVal != nil {
+					e.TargetValue = *tgtVal
+				}
+				job.AuditEntries = append(job.AuditEntries, e)
+			}
+		}
+	}
+
+	_ = tx.Commit(ctx)
+	return &job, nil
 }
 
 func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, status string) ([]domain.MigrationJob, error) {
-	return nil, nil
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+
+	query := `
+		SELECT id, tenant_id, legal_entity_id, migration_name, source_system, target_service,
+		       total_records_count, valid_records_count, invalid_records_count, integrity_score,
+		       status, started_at, completed_at, created_at, updated_at
+		FROM migration_jobs
+		WHERE 1=1`
+	var args []interface{}
+	idx := 1
+	if legalEntityID != "" {
+		query += fmt.Sprintf(" AND legal_entity_id = $%d", idx)
+		args = append(args, legalEntityID)
+		idx++
+	}
+	if status != "" {
+		query += fmt.Sprintf(" AND status = $%d", idx)
+		args = append(args, status)
+		idx++
+	}
+	query += " ORDER BY created_at DESC"
+
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []domain.MigrationJob
+	for rows.Next() {
+		var j domain.MigrationJob
+		var startedAt, completedAt *time.Time
+		if err := rows.Scan(
+			&j.ID, &j.TenantID, &j.LegalEntityID, &j.MigrationName, &j.SourceSystem, &j.TargetService,
+			&j.TotalRecordsCount, &j.ValidRecordsCount, &j.InvalidRecordsCount, &j.IntegrityScore,
+			&j.Status, &startedAt, &completedAt, &j.CreatedAt, &j.UpdatedAt,
+		); err == nil {
+			j.StartedAt = startedAt
+			j.CompletedAt = completedAt
+			jobs = append(jobs, j)
+		}
+	}
+	_ = tx.Commit(ctx)
+	return jobs, nil
 }
 
 func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
@@ -126,7 +242,43 @@ func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
 }
 
 func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes string) (*domain.AuditEntry, error) {
-	return nil, fmt.Errorf("not implemented")
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return nil, err
+	}
+
+	var e domain.AuditEntry
+	var fieldName, srcVal, tgtVal *string
+	err = tx.QueryRow(ctx, `
+		UPDATE migration_audit_entries
+		SET is_remediated = true
+		WHERE id = $1 AND job_id = $2
+		RETURNING id, tenant_id, job_id, record_ref, field_name, source_value, target_value, violation_type, is_remediated, created_at`,
+		entryID, jobID).Scan(
+		&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType, &e.IsRemediated, &e.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("audit entry not found: %w", err)
+	}
+	if fieldName != nil {
+		e.FieldName = *fieldName
+	}
+	if srcVal != nil {
+		e.SourceValue = *srcVal
+	}
+	if tgtVal != nil {
+		e.TargetValue = *tgtVal
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &e, nil
 }
 
 // ─── MemoryStore ──────────────────────────────────────────────────────────────

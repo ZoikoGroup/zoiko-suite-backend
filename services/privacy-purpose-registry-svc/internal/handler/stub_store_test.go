@@ -19,6 +19,7 @@ type stubStore struct {
 	purposeVersions  map[string]*domain.PurposeVersion
 	activities       map[string]*domain.ProcessingActivity
 	activityVersions map[string]*domain.ProcessingActivityVersion
+	idempotency      map[string]*domain.IdempotencyRecord
 
 	// seq mirrors the real PgStore's sequence_no column: a monotonic,
 	// collision-proof insertion ordinal. Two versions created moments
@@ -36,6 +37,7 @@ func newStubStore() *stubStore {
 		purposeVersions:  map[string]*domain.PurposeVersion{},
 		activities:       map[string]*domain.ProcessingActivity{},
 		activityVersions: map[string]*domain.ProcessingActivityVersion{},
+		idempotency:      map[string]*domain.IdempotencyRecord{},
 		seq:              map[string]int{},
 	}
 }
@@ -177,9 +179,12 @@ func (s *stubStore) CreateActivity(ctx context.Context, tenantID string, req dom
 		PurposeIDs: copyStrs(req.PurposeIDs), SubjectClasses: copyStrs(req.SubjectClasses),
 		DataCategories: copyStrs(req.DataCategories), Sources: copyStrs(req.Sources),
 		Recipients: copyStrs(req.Recipients), Jurisdictions: copyStrs(req.Jurisdictions),
-		RetentionRuleRefs: copyStrs(req.RetentionRuleRefs), TransferRefs: copyStrs(req.TransferRefs),
-		VersionStatus: domain.ActivityStatusDraft,
-		CreatedAt:     time.Now().UTC(), CreatedByPrincipalID: principalID,
+		RetentionRuleRefs:       copyStrs(req.RetentionRuleRefs),
+		TransferRefs:            copyStrs(req.TransferRefs),
+		NoticeConsentDependency: domain.NoticeConsentDependency(req.NoticeConsentDependency),
+		DPIATIAStatus:           domain.DPIATIAStatus(req.DPIATIAStatus),
+		VersionStatus:           domain.ActivityStatusDraft,
+		CreatedAt:               time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	s.activityVersions[v.ActivityVersionID] = v
 	s.nextSequence(v.ActivityVersionID)
@@ -197,10 +202,13 @@ func (s *stubStore) CreateActivityVersion(ctx context.Context, activityID string
 		PurposeIDs: copyStrs(req.PurposeIDs), SubjectClasses: copyStrs(req.SubjectClasses),
 		DataCategories: copyStrs(req.DataCategories), Sources: copyStrs(req.Sources),
 		Recipients: copyStrs(req.Recipients), Jurisdictions: copyStrs(req.Jurisdictions),
-		RetentionRuleRefs: copyStrs(req.RetentionRuleRefs), TransferRefs: copyStrs(req.TransferRefs),
-		VersionStatus:       domain.ActivityStatusDraft,
-		SupersedesVersionID: strp(req.ParentVersionID),
-		CreatedAt:           time.Now().UTC(), CreatedByPrincipalID: principalID,
+		RetentionRuleRefs:       copyStrs(req.RetentionRuleRefs),
+		TransferRefs:            copyStrs(req.TransferRefs),
+		NoticeConsentDependency: domain.NoticeConsentDependency(req.NoticeConsentDependency),
+		DPIATIAStatus:           domain.DPIATIAStatus(req.DPIATIAStatus),
+		VersionStatus:           domain.ActivityStatusDraft,
+		SupersedesVersionID:     strp(req.ParentVersionID),
+		CreatedAt:               time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	s.activityVersions[v.ActivityVersionID] = v
 	s.nextSequence(v.ActivityVersionID)
@@ -313,3 +321,39 @@ func (s *stubStore) ActivateActivity(ctx context.Context, activityID, versionID 
 	v.EffectiveFrom = &effectiveFrom
 	return v, nil
 }
+
+func (s *stubStore) FindLatestActivityVersion(ctx context.Context, activityID string) (*domain.ProcessingActivityVersion, error) {
+	var best *domain.ProcessingActivityVersion
+	for _, v := range s.activityVersions {
+		if v.ActivityID != activityID {
+			continue
+		}
+		if best == nil || s.seq[v.ActivityVersionID] > s.seq[best.ActivityVersionID] {
+			best = v
+		}
+	}
+	if best == nil {
+		return nil, domain.ErrActivityNotFound
+	}
+	return best, nil
+}
+
+func (s *stubStore) GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
+	compositeKey := tenantID + ":" + principalID + ":" + key
+	rec, ok := s.idempotency[compositeKey]
+	if !ok {
+		return nil, nil
+	}
+	return rec, nil
+}
+
+func (s *stubStore) SaveIdempotency(ctx context.Context, record domain.IdempotencyRecord) error {
+	tenantStr := ""
+	if record.TenantID != nil {
+		tenantStr = *record.TenantID
+	}
+	compositeKey := tenantStr + ":" + record.PrincipalID + ":" + record.IdempotencyKey
+	s.idempotency[compositeKey] = &record
+	return nil
+}
+

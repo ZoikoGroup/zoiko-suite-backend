@@ -15,8 +15,9 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
-	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
+	"zoiko.io/jurisdiction-rules-svc/internal/events"
+	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -78,6 +79,14 @@ type Handler struct {
 	// authzScopeID is the legal_entity_id presented to authorization-svc.
 	// See config.AuthZPlatformScopeID for why a platform-wide service needs one.
 	authzScopeID string
+
+	// registry and registryPub are the optional ZS-JUR-001 registries (see WithRegistry).
+	registry    RegistryStore
+	registryPub events.RegistryPublisher
+	signer      domain.Signer
+	minReviews  int
+	resolver    *resolver.Resolver
+	ops         OpsPolicy
 }
 
 // New constructs a Handler.
@@ -206,6 +215,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/rules", h.CreateRule)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/transition", h.TransitionRuleStatus)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/drift", h.RecordDrift)
+
+	// ZS-JUR-001 registries: mounted only when WithRegistry was called.
+	if h.registry != nil {
+		registerRegistryRoutes(r, h)
+	}
 }
 
 // correlationIDMiddleware echoes X-Correlation-ID from the request into the

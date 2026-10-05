@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -20,6 +23,10 @@ const (
 	ANOMALY_DETECT = "ANOMALY_DETECT"
 	ANOMALY_ACK    = "ANOMALY_ACK"
 	RULE_CREATE    = "RULE_CREATE"
+
+	// AI-04 governed advisory layer actions.
+	ANOMALY_MODEL_MANAGE  = "ANOMALY_MODEL_MANAGE"
+	ANOMALY_GOVERNED_READ = "ANOMALY_GOVERNED_READ"
 )
 
 type Handler struct {
@@ -42,6 +49,19 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 		r.Post("/rules", h.CreateRule)
 		r.Get("/rules", h.ListRules)
+	})
+
+	// AI-04 governed advisory layer (ZS-SVC-N-001 §4/§13 Wave 8) — additive,
+	// lives alongside the rule-engine surface above under its own path.
+	r.Route("/v1/anomaly-governance", func(r chi.Router) {
+		r.Post("/models", h.RegisterAnomalyModel)
+		r.Post("/runs", h.RunDetection)
+		r.Get("/runs/{runID}/signals", h.GetSignalsByRun)
+		r.Get("/signals/{signalID}", h.GetGovernedSignal)
+		r.Post("/signals/{signalID}:acknowledge", h.AcknowledgeSignal)
+		r.Post("/signals/{signalID}:escalate", h.EscalateForReview)
+		r.Post("/signals/{signalID}:close", h.CloseSignal)
+		r.Get("/signals/{signalID}/disposition", h.GetDisposition)
 	})
 }
 
@@ -285,4 +305,237 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	}
 	h.logger.Error("authorization check failed", zap.Error(err))
 	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI-04 governed advisory layer (ZS-SVC-N-001 §4/§13 Wave 8) — additive.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func idempotencyClaim(principalID, operation, resourceID, requestSHA256, key string) domain.IdempotencyClaim {
+	return domain.IdempotencyClaim{
+		OwnerScope: domain.SellerScope, PrincipalID: principalID, Key: key,
+		Operation: operation, RequestSHA256: requestSHA256, ResourceID: resourceID,
+	}
+}
+
+func readBodyHashed(r *http.Request, v interface{}) (string, error) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, v); err != nil {
+			return "", err
+		}
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (h *Handler) RegisterAnomalyModel(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, ANOMALY_MODEL_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	var req domain.RegisterAnomalyModelRequest
+	if _, err := readBodyHashed(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	got, err := h.store.RegisterAnomalyModel(r.Context(), tenantID, req, principalID)
+	if err != nil {
+		h.respondGovernedError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) RunDetection(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, ANOMALY_DETECT); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	var req domain.RunDetectionRequest
+	reqHash, err := readBodyHashed(r, &req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	claim := idempotencyClaim(principalID, "RunDetection", req.DomainName+"|"+req.ModelVersion, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.RunDetection(r.Context(), tenantID, req, principalID, claim)
+	if err != nil {
+		h.respondGovernedError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "AI.AnomalyDetected", SubjectID: got.RunID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: got,
+	})
+	writeJSON(w, http.StatusCreated, got)
+}
+
+func (h *Handler) GetSignalsByRun(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, ANOMALY_GOVERNED_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	items, err := h.store.GetSignalsByRun(r.Context(), tenantID, chi.URLParam(r, "runID"))
+	if err != nil {
+		h.respondGovernedError(w, err)
+		return
+	}
+	if items == nil {
+		items = []domain.GovernedAnomalySignal{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"data": items, "count": len(items)})
+}
+
+func (h *Handler) GetGovernedSignal(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, ANOMALY_GOVERNED_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	got, err := h.store.GetGovernedSignal(r.Context(), tenantID, chi.URLParam(r, "signalID"))
+	if err != nil {
+		h.respondGovernedError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) AcknowledgeSignal(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, ANOMALY_ACK); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	signalID := chi.URLParam(r, "signalID")
+	claim := idempotencyClaim(principalID, "AcknowledgeSignal", signalID, "", r.Header.Get("Idempotency-Key"))
+	got, err := h.store.AcknowledgeSignal(r.Context(), tenantID, signalID, principalID, claim)
+	if err != nil {
+		h.respondGovernedError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) EscalateForReview(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, ANOMALY_ACK); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	signalID := chi.URLParam(r, "signalID")
+	var req domain.EscalateForReviewRequest
+	reqHash, err := readBodyHashed(r, &req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	claim := idempotencyClaim(principalID, "EscalateForReview", signalID, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.EscalateForReview(r.Context(), tenantID, signalID, req, principalID, claim)
+	if err != nil {
+		h.respondGovernedError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "AI.AnomalyDispositioned", SubjectID: signalID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: got,
+	})
+	writeJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) CloseSignal(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, ANOMALY_ACK); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	signalID := chi.URLParam(r, "signalID")
+	var req domain.CloseSignalRequest
+	reqHash, err := readBodyHashed(r, &req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	claim := idempotencyClaim(principalID, "CloseSignal", signalID, reqHash, r.Header.Get("Idempotency-Key"))
+	got, err := h.store.CloseSignal(r.Context(), tenantID, signalID, req, principalID, claim)
+	if err != nil {
+		h.respondGovernedError(w, err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "AI.AnomalyDispositioned", SubjectID: signalID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: got,
+	})
+	writeJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) GetDisposition(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, ANOMALY_GOVERNED_READ); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	got, err := h.store.GetDisposition(r.Context(), tenantID, chi.URLParam(r, "signalID"))
+	if err != nil {
+		h.respondGovernedError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, got)
+}
+
+func (h *Handler) respondGovernedError(w http.ResponseWriter, err error) {
+	var replay *domain.IdempotentReplayError
+	if errors.As(err, &replay) {
+		w.Header().Set("Idempotent-Replayed", "true")
+		writeJSON(w, http.StatusOK, map[string]string{"resource_id": replay.ResourceID})
+		return
+	}
+	switch {
+	case errors.Is(err, domain.ErrSignalNotFound), errors.Is(err, domain.ErrAnomalyModelNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, domain.ErrSignalNotDetected), errors.Is(err, domain.ErrSignalNotReviewable),
+		errors.Is(err, domain.ErrDriftExceedsThreshold), errors.Is(err, domain.ErrIdempotencyKeyReused):
+		writeError(w, http.StatusConflict, err.Error())
+	default:
+		h.logger.Error("anomaly-detection-svc governance request failed", zap.Error(err))
+		writeError(w, http.StatusBadRequest, err.Error())
+	}
 }

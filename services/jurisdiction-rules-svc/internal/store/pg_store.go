@@ -207,6 +207,10 @@ type querier interface {
 // Querier is the public alias for querier used by other packages (e.g., events).
 type Querier = querier
 
+// Pool returns the store's pool as a Querier, for writes that run outside a
+// caller-managed transaction (e.g. registry events written to the outbox).
+func (s *PgStore) Pool() Querier { return s.pool }
+
 // ── error classification ─────────────────────────────────────────────────────
 
 // isInvalidTextRepresentation reports whether err is Postgres SQLSTATE 22P02,
@@ -914,8 +918,8 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 
 	// Collect all rules grouped by (rule_domain, rule_code)
 	type ruleCandidate struct {
-		rule   *domain.JurisdictionRule
-		depth  int
+		rule  *domain.JurisdictionRule
+		depth int
 	}
 	candidates := make(map[string][]ruleCandidate) // key: rule_domain|rule_code
 
@@ -1456,12 +1460,12 @@ func clampLimit(limit, def, max int) int {
 
 // OutboxEvent represents an event in the transactional outbox.
 type OutboxEvent struct {
-	OutboxID       string
-	EventType      string
-	EventPayload   []byte
-	Topic          string
-	PartitionKey   *string
-	CreatedAt      time.Time
+	OutboxID        string
+	EventType       string
+	EventPayload    []byte
+	Topic           string
+	PartitionKey    *string
+	CreatedAt       time.Time
 	PublishAttempts int
 }
 
@@ -1472,12 +1476,12 @@ func (s *PgStore) AddEventToOutbox(ctx context.Context, q querier, eventType, to
 	query := `
 		INSERT INTO event_outbox (event_type, event_payload, topic, partition_key)
 		VALUES ($1, $2, $3, $4);`
-	
+
 	var pk *string
 	if partitionKey != "" {
 		pk = &partitionKey
 	}
-	
+
 	_, err := q.Exec(ctx, query, eventType, payload, topic, pk)
 	if err != nil {
 		s.log.Error("pg AddEventToOutbox failed",
@@ -1500,14 +1504,14 @@ func (s *PgStore) GetPendingOutboxEvents(ctx context.Context, limit int) ([]Outb
 		WHERE published_at IS NULL
 		ORDER BY created_at ASC
 		LIMIT $1;`
-	
+
 	rows, err := s.pool.Query(ctx, query, limit)
 	if err != nil {
 		s.log.Error("pg GetPendingOutboxEvents failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer rows.Close()
-	
+
 	var events []OutboxEvent
 	for rows.Next() {
 		var e OutboxEvent
@@ -1526,7 +1530,7 @@ func (s *PgStore) MarkOutboxEventPublished(ctx context.Context, outboxID string)
 		UPDATE event_outbox
 		SET published_at = NOW()
 		WHERE outbox_id = $1;`
-	
+
 	_, err := s.pool.Exec(ctx, query, outboxID)
 	if err != nil {
 		s.log.Error("pg MarkOutboxEventPublished failed", zap.Error(err))
@@ -1542,7 +1546,7 @@ func (s *PgStore) MarkOutboxEventFailed(ctx context.Context, outboxID, errMsg st
 		SET publish_attempts = publish_attempts + 1,
 		    last_error = $2
 		WHERE outbox_id = $1;`
-	
+
 	_, err := s.pool.Exec(ctx, query, outboxID, errMsg)
 	if err != nil {
 		s.log.Error("pg MarkOutboxEventFailed failed", zap.Error(err))

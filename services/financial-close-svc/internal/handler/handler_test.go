@@ -1058,6 +1058,10 @@ type stubClients struct {
 	stockUnapprovedCount int
 	stockUnapprovedErr   error
 
+	closeGate      *domain.CloseGateResponse
+	closeGateErr   error
+	closeGateCalls int
+
 	postJournalErr   error
 	postedJournalID  string
 	lastPostedAmount float64
@@ -1157,6 +1161,11 @@ func (c *stubClients) GetAssetDepreciationCompleteness(_ context.Context, _, _, 
 
 func (c *stubClients) GetInventoryNegativeOnHandCount(_ context.Context, _, _ string) (int, error) {
 	return c.invNegativeCount, c.invNegativeErr
+}
+
+func (c *stubClients) GetCloseGate(_ context.Context, _, _, _, _ string) (*domain.CloseGateResponse, error) {
+	c.closeGateCalls++
+	return c.closeGate, c.closeGateErr
 }
 
 func (c *stubClients) GetInventoryValueTotal(_ context.Context, _, _ string) (float64, error) {

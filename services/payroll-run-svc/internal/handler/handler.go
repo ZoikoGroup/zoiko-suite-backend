@@ -29,6 +29,8 @@ type Store interface {
 	GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.PaySlip, error)
 	GetShadowComparisonsByRun(ctx context.Context, runID string) ([]domain.ShadowComparison, error)
 	FinalizePayrollRun(ctx context.Context, runID string, governanceDecisionID *string) error
+	// ControlPopulation serves the control-population contract (pay-slips, payroll-runs).
+	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
 }
 
 // actorID on every method is the already-authorized principal from that
@@ -100,6 +102,7 @@ func New(store Store, publisher Publisher, authz AuthZClient, empClient Employee
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Get("/v1/control-populations/{population}", h.GetControlPopulation)
 	r.Route("/v1/payroll/runs", func(r chi.Router) {
 		r.Post("/", h.InitiateRun)
 		r.Get("/", h.ListRuns)

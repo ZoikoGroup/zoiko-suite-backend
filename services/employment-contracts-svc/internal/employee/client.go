@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/google/uuid"
 	"zoiko.io/employment-contracts-svc/internal/domain"
 )
 
@@ -39,6 +40,8 @@ func (c *Client) ValidateEmployee(ctx context.Context, tenantID, principalID, em
 
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Request-Id", uuid.New().String())
+	req.Header.Set("X-Source-Channel", "system")
 
 	resp, err := c.client.Do(req)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -178,6 +179,72 @@ func (s *stubStore) DecidePolicyChange(_ context.Context, id, decision, decidedB
 		p.DecisionReason = &reason
 	}
 	return p, nil
+}
+
+// AIG-01/AIG-02 — not exercised by this file's existing tests, so these
+// stubs only exist to satisfy store.Store.
+func (s *stubStore) CreateUseCase(context.Context, domain.CreateUseCaseRequest, string, string, string) (*domain.AIUseCase, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) GetUseCase(context.Context, string) (*domain.AIUseCase, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) StartAssessment(context.Context, string, domain.StartAssessmentRequest, string) (*domain.AIImpactAssessment, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) DecideAssessment(context.Context, string, string, string, string) (*domain.AIImpactAssessment, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) ActivateUseCase(context.Context, string, domain.ActivateUseCaseRequest) (*domain.AIUseCase, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) SuspendUseCase(context.Context, string, domain.SuspendUseCaseRequest) (*domain.AIUseCase, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) RequestReassessment(context.Context, string, domain.RequestReassessmentRequest) (*domain.AIUseCase, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) RetireUseCase(context.Context, string, domain.RetireUseCaseRequest) (*domain.AIUseCase, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) GetEffectiveUseCaseControl(context.Context, string) (*domain.EffectiveUseCaseControl, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) RegisterModelRelease(context.Context, domain.RegisterModelReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) GetModelRelease(context.Context, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) RecordDueDiligence(context.Context, string, domain.AdvanceReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) RecordEvaluation(context.Context, string, domain.AdvanceReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) ApproveRelease(context.Context, string, domain.ApproveReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) RejectRelease(context.Context, string, domain.AdvanceReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) BlockRelease(context.Context, string, domain.AdvanceReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) ActivateRelease(context.Context, string, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) RestrictRelease(context.Context, string, domain.AdvanceReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) UnrestrictRelease(context.Context, string, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) QuarantineRelease(context.Context, string, domain.AdvanceReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) RetireRelease(context.Context, string, domain.AdvanceReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
 }
 
 var _ store.Store = (*stubStore)(nil)

@@ -59,20 +59,31 @@ func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz) chi.Router 
 	return r
 }
 
-func doRequest(r http.Handler, method, path string, body interface{}, tenantID string) *httptest.ResponseRecorder {
+func doRequestWithPrincipal(r http.Handler, method, path string, body interface{}, tenantID, principalID string, headers ...map[string]string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Principal-Id", "principal-01")
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
+	}
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	for _, h := range headers {
+		for k, v := range h {
+			req.Header.Set(k, v)
+		}
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w
+}
+
+func doRequest(r http.Handler, method, path string, body interface{}, tenantID string) *httptest.ResponseRecorder {
+	return doRequestWithPrincipal(r, method, path, body, tenantID, "principal-01")
 }
 
 const testTenant = "tenant-privacy-1"
@@ -96,7 +107,8 @@ func TestCreatePurpose_ThenPublish(t *testing.T) {
 		t.Fatalf("expected DRAFT, got %s", v.VersionStatus)
 	}
 
-	wPub := doRequest(r, http.MethodPost, "/privacy/purposes/"+v.PurposeID+"/versions/"+v.PurposeVersionID+"/publish", nil, testTenant)
+	// Maker-checker (SoD): publishing must be done by a distinct reviewer principal
+	wPub := doRequestWithPrincipal(r, http.MethodPost, "/privacy/purposes/"+v.PurposeID+"/versions/"+v.PurposeVersionID+"/publish", nil, testTenant, "reviewer-01")
 	if wPub.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", wPub.Code, wPub.Body.String())
 	}
@@ -121,10 +133,10 @@ func TestPublishPurposeVersion_TwiceReturns409(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &v)
 
 	publishURL := "/privacy/purposes/" + v.PurposeID + "/versions/" + v.PurposeVersionID + "/publish"
-	if w := doRequest(r, http.MethodPost, publishURL, nil, testTenant); w.Code != http.StatusOK {
-		t.Fatalf("first publish: expected 200, got %d", w.Code)
+	if w := doRequestWithPrincipal(r, http.MethodPost, publishURL, nil, testTenant, "reviewer-01"); w.Code != http.StatusOK {
+		t.Fatalf("first publish: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	w2 := doRequest(r, http.MethodPost, publishURL, nil, testTenant)
+	w2 := doRequestWithPrincipal(r, http.MethodPost, publishURL, nil, testTenant, "reviewer-01")
 	if w2.Code != http.StatusConflict {
 		t.Fatalf("FABRICATION: second publish should be rejected (PRV-I06 immutability), got %d: %s", w2.Code, w2.Body.String())
 	}
@@ -170,7 +182,95 @@ func TestCreatePurpose_MissingPrincipal_Returns401(t *testing.T) {
 	}
 }
 
-// ── activity: validate ───────────────────────────────────────────────────────
+// ── segregation of duties ────────────────────────────────────────────────────
+
+func TestSegregationOfDuties_MakerCannotPublishOwnPurpose(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	w := doRequestWithPrincipal(r, http.MethodPost, "/privacy/purposes", domain.CreatePurposeRequest{
+		Statement: "self approval test", CompatibilityClass: "PRIMARY",
+	}, testTenant, "maker-01")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var v domain.PurposeVersion
+	_ = json.Unmarshal(w.Body.Bytes(), &v)
+
+	// Maker attempts to self-publish
+	wPub := doRequestWithPrincipal(r, http.MethodPost, "/privacy/purposes/"+v.PurposeID+"/versions/"+v.PurposeVersionID+"/publish", nil, testTenant, "maker-01")
+	if wPub.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for self-publish under SoD, got %d: %s", wPub.Code, wPub.Body.String())
+	}
+}
+
+func TestSegregationOfDuties_MakerCannotApproveOwnActivity(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	purpose := createPublishedPurpose(t, r, "test purpose")
+	w := doRequestWithPrincipal(r, http.MethodPost, "/privacy/processing-activities", domain.CreateActivityRequest{
+		PrivacyRole:              string(domain.RoleController),
+		Owner:                    "privacy-team",
+		PurposeIDs:               []string{purpose.PurposeID},
+		SubjectClasses:           []string{"CUSTOMER"},
+		DataCategories:           []string{"CONTACT_INFO"},
+		Jurisdictions:            []string{"US"},
+		RetentionRuleRefs:        []string{"retention-rule-7y"},
+		NoticeConsentDependency: string(domain.NoticeConsentRequired),
+		DPIATIAStatus:            string(domain.DPIATIAResolved),
+	}, testTenant, "maker-01")
+	var v domain.ProcessingActivityVersion
+	_ = json.Unmarshal(w.Body.Bytes(), &v)
+
+	base := "/privacy/processing-activities/" + v.ActivityID + "/versions/" + v.ActivityVersionID
+	doRequestWithPrincipal(r, http.MethodPost, base+"/validate", nil, testTenant, "maker-01")
+	doRequestWithPrincipal(r, http.MethodPost, base+"/submit", nil, testTenant, "maker-01")
+
+	// Maker attempts to self-approve
+	wApprove := doRequestWithPrincipal(r, http.MethodPost, base+"/approve", nil, testTenant, "maker-01")
+	if wApprove.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for self-approval under SoD, got %d: %s", wApprove.Code, wApprove.Body.String())
+	}
+
+	// Distinct reviewer approves successfully
+	wApproveReviewer := doRequestWithPrincipal(r, http.MethodPost, base+"/approve", nil, testTenant, "reviewer-01")
+	if wApproveReviewer.Code != http.StatusOK {
+		t.Fatalf("expected 200 for reviewer approval under SoD, got %d: %s", wApproveReviewer.Code, wApproveReviewer.Body.String())
+	}
+}
+
+func TestSegregationOfDuties_MakerCannotRejectOwnActivity(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	purpose := createPublishedPurpose(t, r, "test purpose")
+	w := doRequestWithPrincipal(r, http.MethodPost, "/privacy/processing-activities", domain.CreateActivityRequest{
+		PrivacyRole:              string(domain.RoleController),
+		Owner:                    "privacy-team",
+		PurposeIDs:               []string{purpose.PurposeID},
+		SubjectClasses:           []string{"CUSTOMER"},
+		DataCategories:           []string{"CONTACT_INFO"},
+		Jurisdictions:            []string{"US"},
+		RetentionRuleRefs:        []string{"retention-rule-7y"},
+		NoticeConsentDependency: string(domain.NoticeConsentRequired),
+		DPIATIAStatus:            string(domain.DPIATIAResolved),
+	}, testTenant, "maker-01")
+	var v domain.ProcessingActivityVersion
+	_ = json.Unmarshal(w.Body.Bytes(), &v)
+
+	base := "/privacy/processing-activities/" + v.ActivityID + "/versions/" + v.ActivityVersionID
+	doRequestWithPrincipal(r, http.MethodPost, base+"/validate", nil, testTenant, "maker-01")
+	doRequestWithPrincipal(r, http.MethodPost, base+"/submit", nil, testTenant, "maker-01")
+
+	// Maker attempts to self-reject
+	wReject := doRequestWithPrincipal(r, http.MethodPost, base+"/reject", domain.RejectActivityRequest{Reason: "self reject"}, testTenant, "maker-01")
+	if wReject.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for self-reject under SoD, got %d: %s", wReject.Code, wReject.Body.String())
+	}
+}
+
+// ── activity: validate (all 8 gates) ─────────────────────────────────────────
 
 func createPublishedPurpose(t *testing.T, r http.Handler, statement string) *domain.PurposeVersion {
 	t.Helper()
@@ -179,7 +279,7 @@ func createPublishedPurpose(t *testing.T, r http.Handler, statement string) *dom
 	}, testTenant)
 	var v domain.PurposeVersion
 	_ = json.Unmarshal(w.Body.Bytes(), &v)
-	wPub := doRequest(r, http.MethodPost, "/privacy/purposes/"+v.PurposeID+"/versions/"+v.PurposeVersionID+"/publish", nil, testTenant)
+	wPub := doRequestWithPrincipal(r, http.MethodPost, "/privacy/purposes/"+v.PurposeID+"/versions/"+v.PurposeVersionID+"/publish", nil, testTenant, "reviewer-01")
 	var published domain.PurposeVersion
 	_ = json.Unmarshal(wPub.Body.Bytes(), &published)
 	return &published
@@ -188,19 +288,21 @@ func createPublishedPurpose(t *testing.T, r http.Handler, statement string) *dom
 func createDraftActivity(t *testing.T, r http.Handler, purposeIDs []string) *domain.ProcessingActivityVersion {
 	t.Helper()
 	w := doRequest(r, http.MethodPost, "/privacy/processing-activities", domain.CreateActivityRequest{
-		PrivacyRole: string(domain.RoleController), Owner: "privacy-team",
-		PurposeIDs: purposeIDs, SubjectClasses: []string{"CUSTOMER"}, DataCategories: []string{"CONTACT_INFO"},
-		Jurisdictions: []string{"US"},
+		PrivacyRole:              string(domain.RoleController),
+		Owner:                    "privacy-team",
+		PurposeIDs:               purposeIDs,
+		SubjectClasses:           []string{"CUSTOMER"},
+		DataCategories:           []string{"CONTACT_INFO"},
+		Jurisdictions:            []string{"US"},
+		RetentionRuleRefs:        []string{"retention-rule-7y"},
+		NoticeConsentDependency: string(domain.NoticeConsentRequired),
+		DPIATIAStatus:            string(domain.DPIATIAResolved),
 	}, testTenant)
 	var v domain.ProcessingActivityVersion
 	_ = json.Unmarshal(w.Body.Bytes(), &v)
 	return &v
 }
 
-// TestValidateActivity_UnregisteredPurpose_StaysDraftWithFinding is the
-// regression test for PRV-001/PRV-I13: an activity naming a purpose that
-// isn't a registered, published purpose must fail validation and stay
-// DRAFT — never silently PERMIT.
 func TestValidateActivity_UnregisteredPurpose_StaysDraftWithFinding(t *testing.T) {
 	st := newStubStore()
 	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
@@ -245,6 +347,249 @@ func TestValidateActivity_AllPurposesPublished_TransitionsToValidated(t *testing
 	}
 }
 
+func TestValidateActivity_Gate6_RetentionMissing_EmitsPRV014(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	purpose := createPublishedPurpose(t, r, "test retention")
+	w := doRequest(r, http.MethodPost, "/privacy/processing-activities", domain.CreateActivityRequest{
+		PrivacyRole:              string(domain.RoleController),
+		Owner:                    "privacy-team",
+		PurposeIDs:               []string{purpose.PurposeID},
+		SubjectClasses:           []string{"CUSTOMER"},
+		DataCategories:           []string{"CONTACT_INFO"},
+		Jurisdictions:            []string{"US"},
+		RetentionRuleRefs:        []string{}, // Missing Gate 6
+		NoticeConsentDependency: string(domain.NoticeConsentRequired),
+		DPIATIAStatus:            string(domain.DPIATIAResolved),
+	}, testTenant)
+	var v domain.ProcessingActivityVersion
+	_ = json.Unmarshal(w.Body.Bytes(), &v)
+
+	wVal := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+v.ActivityID+"/versions/"+v.ActivityVersionID+"/validate", nil, testTenant)
+	var got domain.ProcessingActivityVersion
+	_ = json.Unmarshal(wVal.Body.Bytes(), &got)
+	if got.VersionStatus != domain.ActivityStatusDraft {
+		t.Fatalf("expected DRAFT, got %s", got.VersionStatus)
+	}
+	found := false
+	for _, f := range got.ValidationFindings {
+		if f.Code == "PRV-014" && f.Field == "retention_rule_refs" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected PRV-014 finding for retention_rule_refs, got %+v", got.ValidationFindings)
+	}
+}
+
+func TestValidateActivity_Gate7_NoticeConsentMissing_EmitsPRV006(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	purpose := createPublishedPurpose(t, r, "test notice consent")
+	w := doRequest(r, http.MethodPost, "/privacy/processing-activities", domain.CreateActivityRequest{
+		PrivacyRole:       string(domain.RoleController),
+		Owner:             "privacy-team",
+		PurposeIDs:        []string{purpose.PurposeID},
+		SubjectClasses:    []string{"CUSTOMER"},
+		DataCategories:    []string{"CONTACT_INFO"},
+		Jurisdictions:     []string{"US"},
+		RetentionRuleRefs: []string{"retention-7y"},
+		// NoticeConsentDependency left empty: violates Gate 7
+		DPIATIAStatus: string(domain.DPIATIAResolved),
+	}, testTenant)
+	var v domain.ProcessingActivityVersion
+	_ = json.Unmarshal(w.Body.Bytes(), &v)
+
+	wVal := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+v.ActivityID+"/versions/"+v.ActivityVersionID+"/validate", nil, testTenant)
+	var got domain.ProcessingActivityVersion
+	_ = json.Unmarshal(wVal.Body.Bytes(), &got)
+	if got.VersionStatus != domain.ActivityStatusDraft {
+		t.Fatalf("expected DRAFT, got %s", got.VersionStatus)
+	}
+	found := false
+	for _, f := range got.ValidationFindings {
+		if f.Code == "PRV-006" && f.Field == "notice_consent_dependency" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected PRV-006 finding for notice_consent_dependency, got %+v", got.ValidationFindings)
+	}
+}
+
+func TestValidateActivity_Gate8_DPIATIAMissing_EmitsPRV016(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	purpose := createPublishedPurpose(t, r, "test dpia")
+	w := doRequest(r, http.MethodPost, "/privacy/processing-activities", domain.CreateActivityRequest{
+		PrivacyRole:              string(domain.RoleController),
+		Owner:                    "privacy-team",
+		PurposeIDs:               []string{purpose.PurposeID},
+		SubjectClasses:           []string{"CUSTOMER"},
+		DataCategories:           []string{"CONTACT_INFO"},
+		Jurisdictions:            []string{"US"},
+		RetentionRuleRefs:        []string{"retention-7y"},
+		NoticeConsentDependency: string(domain.NoticeConsentRequired),
+		// DPIATIAStatus left empty: violates Gate 8
+	}, testTenant)
+	var v domain.ProcessingActivityVersion
+	_ = json.Unmarshal(w.Body.Bytes(), &v)
+
+	wVal := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+v.ActivityID+"/versions/"+v.ActivityVersionID+"/validate", nil, testTenant)
+	var got domain.ProcessingActivityVersion
+	_ = json.Unmarshal(wVal.Body.Bytes(), &got)
+	if got.VersionStatus != domain.ActivityStatusDraft {
+		t.Fatalf("expected DRAFT, got %s", got.VersionStatus)
+	}
+	found := false
+	for _, f := range got.ValidationFindings {
+		if f.Code == "PRV-016" && f.Field == "dpia_tia_status" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected PRV-016 finding for dpia_tia_status, got %+v", got.ValidationFindings)
+	}
+}
+
+func TestValidateActivity_Gate5_SubjectClassesAndCategories_EmitsPRV010(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	purpose := createPublishedPurpose(t, r, "test categories")
+	w := doRequest(r, http.MethodPost, "/privacy/processing-activities", domain.CreateActivityRequest{
+		PrivacyRole:              string(domain.RoleController),
+		Owner:                    "privacy-team",
+		PurposeIDs:               []string{purpose.PurposeID},
+		SubjectClasses:           []string{}, // Missing
+		DataCategories:           []string{}, // Missing
+		Jurisdictions:            []string{"US"},
+		RetentionRuleRefs:        []string{"retention-7y"},
+		NoticeConsentDependency: string(domain.NoticeConsentRequired),
+		DPIATIAStatus:            string(domain.DPIATIAResolved),
+	}, testTenant)
+	var v domain.ProcessingActivityVersion
+	_ = json.Unmarshal(w.Body.Bytes(), &v)
+
+	wVal := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+v.ActivityID+"/versions/"+v.ActivityVersionID+"/validate", nil, testTenant)
+	var got domain.ProcessingActivityVersion
+	_ = json.Unmarshal(wVal.Body.Bytes(), &got)
+	for _, f := range got.ValidationFindings {
+		if f.Code == "PRV-019" {
+			t.Fatalf("REGRESSION: PRV-019 should not be emitted for missing subject_classes or data_categories, got %+v", f)
+		}
+	}
+	var count010 int
+	for _, f := range got.ValidationFindings {
+		if f.Code == "PRV-010" {
+			count010++
+		}
+	}
+	if count010 < 2 {
+		t.Fatalf("expected at least two PRV-010 findings for subject_classes and data_categories, got %d in %+v", count010, got.ValidationFindings)
+	}
+}
+
+// ── idempotency (§18.1) ──────────────────────────────────────────────────────
+
+func TestIdempotency_ReplayReturnsCachedResponse(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	payload := domain.CreatePurposeRequest{
+		Statement: "idempotency test statement", CompatibilityClass: "PRIMARY",
+	}
+	header := map[string]string{"Idempotency-Key": "idem-key-001"}
+
+	// Initial request
+	w1 := doRequestWithPrincipal(r, http.MethodPost, "/privacy/purposes", payload, testTenant, "principal-01", header)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first request expected 201, got %d: %s", w1.Code, w1.Body.String())
+	}
+	if w1.Header().Get("Idempotency-Replay") != "" {
+		t.Fatalf("first request should not have Idempotency-Replay header")
+	}
+
+	// Repeated identical request with same key
+	w2 := doRequestWithPrincipal(r, http.MethodPost, "/privacy/purposes", payload, testTenant, "principal-01", header)
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("replay expected 201, got %d: %s", w2.Code, w2.Body.String())
+	}
+	if w2.Header().Get("Idempotency-Replay") != "true" {
+		t.Fatalf("expected Idempotency-Replay header 'true', got '%s'", w2.Header().Get("Idempotency-Replay"))
+	}
+	if w1.Body.String() != w2.Body.String() {
+		t.Fatalf("expected exact matching response body, got:\nw1: %s\nw2: %s", w1.Body.String(), w2.Body.String())
+	}
+}
+
+func TestIdempotency_PayloadMismatchReturns409(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	payload1 := domain.CreatePurposeRequest{
+		Statement: "payload 1 statement", CompatibilityClass: "PRIMARY",
+	}
+	payload2 := domain.CreatePurposeRequest{
+		Statement: "payload 2 DIFFERENT statement", CompatibilityClass: "PRIMARY",
+	}
+	header := map[string]string{"Idempotency-Key": "idem-key-conflict-002"}
+
+	// First request
+	w1 := doRequestWithPrincipal(r, http.MethodPost, "/privacy/purposes", payload1, testTenant, "principal-01", header)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first request expected 201, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// Second request with conflicting payload
+	w2 := doRequestWithPrincipal(r, http.MethodPost, "/privacy/purposes", payload2, testTenant, "principal-01", header)
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for modified payload under same key, got %d: %s", w2.Code, w2.Body.String())
+	}
+}
+
+// ── canonical route aliases (§9.1) ───────────────────────────────────────────
+
+func TestCanonicalLatestActivityRoutes(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	purpose := createPublishedPurpose(t, r, "canonical routes purpose")
+	activity := createDraftActivity(t, r, []string{purpose.PurposeID})
+
+	// 1. POST /privacy/processing-activities/{id}/validate
+	wVal := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+activity.ActivityID+"/validate", nil, testTenant)
+	if wVal.Code != http.StatusOK {
+		t.Fatalf("canonical validate failed: %d %s", wVal.Code, wVal.Body.String())
+	}
+
+	// 2. POST /privacy/processing-activities/{id}/submit
+	wSub := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+activity.ActivityID+"/submit", nil, testTenant)
+	if wSub.Code != http.StatusOK {
+		t.Fatalf("canonical submit failed: %d %s", wSub.Code, wSub.Body.String())
+	}
+
+	// 3. POST /privacy/processing-activities/{id}/approve (by reviewer)
+	wApp := doRequestWithPrincipal(r, http.MethodPost, "/privacy/processing-activities/"+activity.ActivityID+"/approve", nil, testTenant, "reviewer-01")
+	if wApp.Code != http.StatusOK {
+		t.Fatalf("canonical approve failed: %d %s", wApp.Code, wApp.Body.String())
+	}
+
+	// 4. POST /privacy/processing-activities/{id}/activate
+	wAct := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+activity.ActivityID+"/activate", nil, testTenant)
+	if wAct.Code != http.StatusOK {
+		t.Fatalf("canonical activate failed: %d %s", wAct.Code, wAct.Body.String())
+	}
+	var activated domain.ProcessingActivityVersion
+	_ = json.Unmarshal(wAct.Body.Bytes(), &activated)
+	if activated.VersionStatus != domain.ActivityStatusActive {
+		t.Fatalf("expected ACTIVE after canonical activate, got %s", activated.VersionStatus)
+	}
+}
+
 // ── activity: full lifecycle ─────────────────────────────────────────────────
 
 func TestActivityFullLifecycle_DraftToActive(t *testing.T) {
@@ -256,9 +601,9 @@ func TestActivityFullLifecycle_DraftToActive(t *testing.T) {
 	activity := createDraftActivity(t, r, []string{purpose.PurposeID})
 	base := "/privacy/processing-activities/" + activity.ActivityID + "/versions/" + activity.ActivityVersionID
 
-	step := func(action string, wantCode int) domain.ProcessingActivityVersion {
+	step := func(action string, principalID string, wantCode int) domain.ProcessingActivityVersion {
 		t.Helper()
-		w := doRequest(r, http.MethodPost, base+"/"+action, nil, testTenant)
+		w := doRequestWithPrincipal(r, http.MethodPost, base+"/"+action, nil, testTenant, principalID)
 		if w.Code != wantCode {
 			t.Fatalf("%s: expected %d, got %d: %s", action, wantCode, w.Code, w.Body.String())
 		}
@@ -267,19 +612,20 @@ func TestActivityFullLifecycle_DraftToActive(t *testing.T) {
 		return v
 	}
 
-	v := step("validate", http.StatusOK)
+	v := step("validate", "principal-01", http.StatusOK)
 	if v.VersionStatus != domain.ActivityStatusValidated {
 		t.Fatalf("expected VALIDATED, got %s", v.VersionStatus)
 	}
-	v = step("submit", http.StatusOK)
+	v = step("submit", "principal-01", http.StatusOK)
 	if v.VersionStatus != domain.ActivityStatusSubmitted {
 		t.Fatalf("expected SUBMITTED, got %s", v.VersionStatus)
 	}
-	v = step("approve", http.StatusOK)
+	// Maker-checker SoD: must be approved by reviewer, not maker
+	v = step("approve", "reviewer-01", http.StatusOK)
 	if v.VersionStatus != domain.ActivityStatusApproved {
 		t.Fatalf("expected APPROVED, got %s", v.VersionStatus)
 	}
-	v = step("activate", http.StatusOK)
+	v = step("activate", "principal-01", http.StatusOK)
 	if v.VersionStatus != domain.ActivityStatusActive {
 		t.Fatalf("expected ACTIVE, got %s", v.VersionStatus)
 	}
@@ -304,15 +650,15 @@ func TestActivityFullLifecycle_DraftToActive(t *testing.T) {
 	}
 
 	// Now suspend and retire.
-	v = step("suspend", http.StatusOK)
+	v = step("suspend", "principal-01", http.StatusOK)
 	if v.VersionStatus != domain.ActivityStatusSuspended {
 		t.Fatalf("expected SUSPENDED, got %s", v.VersionStatus)
 	}
-	v = step("resume", http.StatusOK)
+	v = step("resume", "principal-01", http.StatusOK)
 	if v.VersionStatus != domain.ActivityStatusActive {
 		t.Fatalf("expected ACTIVE again after resume, got %s", v.VersionStatus)
 	}
-	v = step("retire", http.StatusOK)
+	v = step("retire", "principal-01", http.StatusOK)
 	if v.VersionStatus != domain.ActivityStatusRetired {
 		t.Fatalf("expected RETIRED, got %s", v.VersionStatus)
 	}
@@ -320,9 +666,7 @@ func TestActivityFullLifecycle_DraftToActive(t *testing.T) {
 
 // TestActivateActivity_SkippingApproval_Rejected is the regression test
 // for the state machine itself: activation must be reachable ONLY from
-// APPROVED. Skipping straight from DRAFT (or any other state) to ACTIVE
-// would mean SUBMITTED silently becoming APPROVED — the exact fabrication
-// this service's domain package doc comment says it must not do.
+// APPROVED.
 func TestActivateActivity_SkippingApproval_Rejected(t *testing.T) {
 	st := newStubStore()
 	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
@@ -367,7 +711,8 @@ func TestRejectActivity_ThenFixLoop_CreatesNewVersion(t *testing.T) {
 	doRequest(r, http.MethodPost, base+"/validate", nil, testTenant)
 	doRequest(r, http.MethodPost, base+"/submit", nil, testTenant)
 
-	wReject := doRequest(r, http.MethodPost, base+"/reject", domain.RejectActivityRequest{Reason: "missing DPIA"}, testTenant)
+	// Reject by distinct reviewer principal to satisfy SoD
+	wReject := doRequestWithPrincipal(r, http.MethodPost, base+"/reject", domain.RejectActivityRequest{Reason: "missing DPIA"}, testTenant, "reviewer-01")
 	if wReject.Code != http.StatusOK {
 		t.Fatalf("expected 200 rejecting a SUBMITTED version, got %d: %s", wReject.Code, wReject.Body.String())
 	}
@@ -390,7 +735,10 @@ func TestRejectActivity_ThenFixLoop_CreatesNewVersion(t *testing.T) {
 	wNewVersion := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+activity.ActivityID+"/versions", domain.CreateActivityVersionRequest{
 		ParentVersionID: activity.ActivityVersionID, PrivacyRole: string(domain.RoleController), Owner: "privacy-team",
 		PurposeIDs: []string{purpose.PurposeID}, SubjectClasses: []string{"CUSTOMER"}, DataCategories: []string{"CONTACT_INFO"},
-		Jurisdictions: []string{"US"},
+		Jurisdictions:            []string{"US"},
+		RetentionRuleRefs:        []string{"retention-rule-7y"},
+		NoticeConsentDependency: string(domain.NoticeConsentRequired),
+		DPIATIAStatus:            string(domain.DPIATIAResolved),
 	}, testTenant)
 	if wNewVersion.Code != http.StatusCreated {
 		t.Fatalf("expected 201 creating a successor version, got %d: %s", wNewVersion.Code, wNewVersion.Body.String())
@@ -413,7 +761,7 @@ func activateFullActivity(t *testing.T, r http.Handler, purposeID string) *domai
 	base := "/privacy/processing-activities/" + activity.ActivityID + "/versions/" + activity.ActivityVersionID
 	doRequest(r, http.MethodPost, base+"/validate", nil, testTenant)
 	doRequest(r, http.MethodPost, base+"/submit", nil, testTenant)
-	doRequest(r, http.MethodPost, base+"/approve", nil, testTenant)
+	doRequestWithPrincipal(r, http.MethodPost, base+"/approve", nil, testTenant, "reviewer-01")
 	w := doRequest(r, http.MethodPost, base+"/activate", nil, testTenant)
 	var v domain.ProcessingActivityVersion
 	_ = json.Unmarshal(w.Body.Bytes(), &v)
