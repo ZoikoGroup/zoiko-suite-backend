@@ -145,7 +145,7 @@ func (p *stubPayee) set(legalEntityID, payeeRef, destinationID string) {
 	p.destinations[legalEntityID+"|"+payeeRef] = payeeidentity.Destination{DestinationID: destinationID, LegalEntityID: legalEntityID, Status: "ACTIVE"}
 }
 
-func (p *stubPayee) GetActiveDestination(_ context.Context, _, legalEntityID, payeeRef string) (*payeeidentity.Destination, error) {
+func (p *stubPayee) GetActiveDestination(_ context.Context, _, _, legalEntityID, payeeRef string) (*payeeidentity.Destination, error) {
 	d, ok := p.destinations[legalEntityID+"|"+payeeRef]
 	if !ok {
 		return nil, domain.ErrNoActiveDestination

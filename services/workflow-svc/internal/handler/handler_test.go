@@ -213,6 +213,9 @@ func (s *stubStore) FindCurrentStage(_ context.Context, _ string) (*domain.Workf
 func (s *stubStore) SubmitAction(_ context.Context, _ domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
 	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
 }
+func (s *stubStore) SubmitQuorumVote(_ context.Context, _ domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
+	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
+}
 func (s *stubStore) EscalateWorkflow(_ context.Context, _, _ string) (*domain.WorkflowInstance, bool, error) {
 	return s.escalateInstance, s.escalateTransitioned, s.escalateErr
 }

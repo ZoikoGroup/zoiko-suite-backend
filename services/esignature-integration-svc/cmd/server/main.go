@@ -81,6 +81,8 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 	h := handler.New(st, publisher, authzClient, logger)
+	orchestrationStore := store.NewPgOrchestrationStore(dbpool)
+	oh := handler.NewOrchestrationHandler(orchestrationStore, st, publisher, authzClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -98,6 +100,7 @@ func main() {
 
 	r.Get("/healthz", health.Handler())
 	handler.RegisterRoutes(r, h)
+	handler.RegisterOrchestrationRoutes(r, oh)
 
 	srv := &http.Server{
 		Addr: ":" + cfg.Port, Handler: r,

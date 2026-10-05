@@ -14,6 +14,7 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
 	"zoiko.io/reconciliation-intelligence-svc/internal/config"
 	"zoiko.io/reconciliation-intelligence-svc/internal/events"
+	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
 	"zoiko.io/reconciliation-intelligence-svc/internal/mtls"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
@@ -77,7 +78,9 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzURL, logger)
 	}
 
-	h := handler.NewHandler(dataStore, publisher, authzClient, logger)
+	financialControlClient := financialcontrol.NewClient(cfg.FinancialControlURL, logger)
+
+	h := handler.NewHandler(dataStore, publisher, authzClient, financialControlClient, logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{
