@@ -252,3 +252,19 @@ type ActionToken struct {
 	ConsumedByIP         *string           `json:"consumed_by_ip,omitempty"`
 	CreatedAt            time.Time         `json:"created_at"`
 }
+
+// StreamForDirectClass maps the classes the direct send path accepts onto the sender
+// stream they are judged under. Only S0, T0 and A1 have a mapping: marketing and
+// lifecycle mail need a stream identity and unsubscribe headers the direct path does
+// not carry, so they are not offered a stream here.
+func StreamForDirectClass(c CommunicationClass) (SenderStream, bool) {
+	switch c {
+	case ClassS0:
+		return StreamCritical, true
+	case ClassT0:
+		return StreamTransactional, true
+	case ClassA1:
+		return StreamOperational, true
+	}
+	return "", false
+}

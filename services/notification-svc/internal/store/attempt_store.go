@@ -33,15 +33,24 @@ func recordAttempt(ctx context.Context, tx pgx.Tx, n domain.Notification, outcom
 		actor = n.CreatedByPrincipalID
 	}
 	attemptID := uuid.NewString()
+	// The id a provider callback will quote, recorded only for an accepted
+	// attempt: a failed or ambiguous attempt has no message to point at, and
+	// inventing one would let a callback attach itself to the wrong row.
+	var providerMessageID string
+	if outcome == domain.AttemptOutcomeAccepted {
+		providerMessageID = domain.ExtractProviderMessageID(providerResponse)
+	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO notification_delivery_attempts (
 			attempt_id, tenant_id, notification_id, attempt_number, origin, channel,
 			provider_name, outcome, provider_response, failure_reason, retryable,
-			resend_reason, actor_principal_id, attempted_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+			resend_reason, actor_principal_id, attempted_at, provider_message_id,
+			privacy_decision_id, privacy_result
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 	`, attemptID, n.TenantID, n.NotificationID, n.DeliveryAttempts, origin, n.Channel,
 		nullIfEmpty(meta.ProviderName), outcome, nullIfEmpty(providerResponse), nullIfEmpty(failureReason),
-		meta.Retryable, nullIfEmpty(meta.ResendReason), nullIfEmpty(actor), attemptedAt)
+		meta.Retryable, nullIfEmpty(meta.ResendReason), nullIfEmpty(actor), attemptedAt, nullIfEmpty(providerMessageID),
+		nullIfEmpty(meta.PrivacyDecisionID), nullIfEmpty(meta.PrivacyResult))
 	if err != nil {
 		return fmt.Errorf("record delivery attempt %d: %w", n.DeliveryAttempts, err)
 	}
@@ -52,6 +61,7 @@ func recordAttempt(ctx context.Context, tx pgx.Tx, n domain.Notification, outcom
 		AttemptNumber: n.DeliveryAttempts, Origin: origin, Channel: n.Channel, ProviderName: meta.ProviderName,
 		Outcome: outcome, ProviderResponse: providerResponse, FailureReason: failureReason,
 		Retryable: meta.Retryable, ResendReason: meta.ResendReason, ActorPrincipalID: actor, AttemptedAt: attemptedAt,
+		PrivacyDecisionID: meta.PrivacyDecisionID, PrivacyResult: meta.PrivacyResult,
 	}
 	ev, err := events.AttemptCreated(n.CorrelationID, n, a)
 	if err != nil {
@@ -88,7 +98,8 @@ func (s *PgStore) ListAttempts(ctx context.Context, notificationID string) ([]do
 			SELECT attempt_id, tenant_id, notification_id, attempt_number, origin, channel,
 			       COALESCE(provider_name, ''), outcome, COALESCE(provider_response, ''),
 			       COALESCE(failure_reason, ''), retryable, COALESCE(resend_reason, ''),
-			       COALESCE(actor_principal_id, ''), attempted_at, recorded_at
+			       COALESCE(actor_principal_id, ''), attempted_at, recorded_at,
+			       COALESCE(privacy_decision_id, ''), COALESCE(privacy_result, '')
 			FROM notification_delivery_attempts
 			WHERE tenant_id = $1 AND notification_id = $2
 			ORDER BY attempt_number
@@ -101,7 +112,8 @@ func (s *PgStore) ListAttempts(ctx context.Context, notificationID string) ([]do
 			var a domain.DeliveryAttempt
 			if err := rows.Scan(&a.AttemptID, &a.TenantID, &a.NotificationID, &a.AttemptNumber, &a.Origin, &a.Channel,
 				&a.ProviderName, &a.Outcome, &a.ProviderResponse, &a.FailureReason, &a.Retryable,
-				&a.ResendReason, &a.ActorPrincipalID, &a.AttemptedAt, &a.RecordedAt); err != nil {
+				&a.ResendReason, &a.ActorPrincipalID, &a.AttemptedAt, &a.RecordedAt,
+				&a.PrivacyDecisionID, &a.PrivacyResult); err != nil {
 				return err
 			}
 			out = append(out, a)

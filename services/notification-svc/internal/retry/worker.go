@@ -473,7 +473,7 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 	}
 
 	if outcome.Retryable {
-		if next, ok := w.policy.NextAttempt(now, attemptsMade); ok {
+		if next, ok := w.policy.NextAttemptFor(now, attemptsMade, outcome.DeferUntil); ok {
 			if err := w.store.ScheduleRetry(ctx, n.NotificationID, n.TenantID, outcome.Reason, now, next, retryMeta(outcome)); err != nil {
 				w.log.Error("retry worker: could not reschedule",
 					zap.String("notification_id", n.NotificationID), zap.Error(err))
@@ -544,5 +544,6 @@ func AttemptOutcome(o domain.DeliveryOutcome) string { return attemptOutcome(o) 
 
 // retryMeta describes a worker attempt for its durable attempt row.
 func retryMeta(o domain.DeliveryOutcome) domain.AttemptMeta {
-	return domain.AttemptMeta{Origin: domain.AttemptOriginRetry, ProviderName: o.ProviderName, Retryable: o.Retryable}
+	return domain.AttemptMeta{Origin: domain.AttemptOriginRetry, ProviderName: o.ProviderName, Retryable: o.Retryable,
+		PrivacyDecisionID: o.PrivacyDecisionID, PrivacyResult: o.PrivacyResult}
 }

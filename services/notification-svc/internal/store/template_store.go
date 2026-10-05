@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	htmltemplate "html/template"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 
@@ -22,25 +23,25 @@ import (
 
 const templateDefinitionColumns = `
 	template_id, tenant_id, legal_entity_id, name, business_purpose, owner_principal_id,
-	status, created_at, retired_at, retired_by_principal_id
+	status, created_at, retired_at, retired_by_principal_id, intent_id
 `
 
 const templateVersionColumns = `
 	version_id, template_id, tenant_id, legal_entity_id, version_number, locale,
-	content, content_hash, variable_schema, branding_metadata, accessibility_metadata,
+	content, content_hash, variable_schema, subject, subject_variables, branding_metadata, accessibility_metadata,
 	status, created_by_principal_id, created_at, validated_at,
 	approved_by_principal_id, approved_at, published_at, retired_at, superseded_by_version_id
 `
 
 func scanTemplateDefinition(s scannable, d *domain.TemplateDefinition) error {
 	return s.Scan(&d.TemplateID, &d.TenantID, &d.LegalEntityID, &d.Name, &d.BusinessPurpose, &d.OwnerPrincipalID,
-		&d.Status, &d.CreatedAt, &d.RetiredAt, &d.RetiredByPrincipalID)
+		&d.Status, &d.CreatedAt, &d.RetiredAt, &d.RetiredByPrincipalID, &d.IntentID)
 }
 
 func scanTemplateVersion(s scannable, v *domain.TemplateVersion) error {
-	var schemaRaw []byte
+	var schemaRaw, subjectVarsRaw []byte
 	if err := s.Scan(&v.VersionID, &v.TemplateID, &v.TenantID, &v.LegalEntityID, &v.VersionNumber, &v.Locale,
-		&v.Content, &v.ContentHash, &schemaRaw, &v.BrandingMetadata, &v.AccessibilityMetadata,
+		&v.Content, &v.ContentHash, &schemaRaw, &v.Subject, &subjectVarsRaw, &v.BrandingMetadata, &v.AccessibilityMetadata,
 		&v.Status, &v.CreatedByPrincipalID, &v.CreatedAt, &v.ValidatedAt,
 		&v.ApprovedByPrincipalID, &v.ApprovedAt, &v.PublishedAt, &v.RetiredAt, &v.SupersededByVersionID,
 	); err != nil {
@@ -50,6 +51,14 @@ func scanTemplateVersion(s scannable, v *domain.TemplateVersion) error {
 		if err := json.Unmarshal(schemaRaw, &v.VariableSchema); err != nil {
 			return fmt.Errorf("decode variable_schema: %w", err)
 		}
+	}
+	if len(subjectVarsRaw) > 0 {
+		if err := json.Unmarshal(subjectVarsRaw, &v.SubjectVariables); err != nil {
+			return fmt.Errorf("decode subject_variables: %w", err)
+		}
+	}
+	if v.SubjectVariables == nil {
+		v.SubjectVariables = []string{}
 	}
 	return nil
 }
@@ -70,11 +79,16 @@ func (s *PgStore) CreateTemplate(ctx context.Context, p domain.CreateTemplatePar
 	}
 	var out domain.TemplateDefinition
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if p.IntentID != "" {
+			if err := checkBindableIntent(ctx, tx, tenantID, p.IntentID, p.LegalEntityID); err != nil {
+				return err
+			}
+		}
 		row := tx.QueryRow(ctx, `
-			INSERT INTO template_definitions (tenant_id, legal_entity_id, name, business_purpose, owner_principal_id)
-			VALUES ($1, $2, $3, $4, $5)
+			INSERT INTO template_definitions (tenant_id, legal_entity_id, name, business_purpose, owner_principal_id, intent_id)
+			VALUES ($1, $2, $3, $4, $5, $6::uuid)
 			RETURNING `+templateDefinitionColumns,
-			tenantID, p.LegalEntityID, p.Name, p.BusinessPurpose, p.OwnerPrincipalID,
+			tenantID, p.LegalEntityID, p.Name, p.BusinessPurpose, p.OwnerPrincipalID, nullIfEmpty(p.IntentID),
 		)
 		if err := scanTemplateDefinition(row, &out); err != nil {
 			return err
@@ -85,6 +99,9 @@ func (s *PgStore) CreateTemplate(ctx context.Context, p domain.CreateTemplatePar
 		}
 		return enqueue(ctx, tx, tenantID, ev)
 	})
+	if errors.Is(err, domain.ErrIntentNotFound) || errors.Is(err, domain.ErrIntentRetired) || errors.Is(err, domain.ErrIntentInvalid) {
+		return nil, err // the caller asked for something that cannot be: not an outage
+	}
 	if err != nil {
 		return nil, fmt.Errorf("template store unavailable: %w", err)
 	}
@@ -129,12 +146,30 @@ func (s *PgStore) CreateVersion(ctx context.Context, p domain.CreateVersionParam
 	if err != nil {
 		return nil, fmt.Errorf("encode variable_schema: %w", err)
 	}
+	// The subject is part of the reviewed wording (F-05). It is checked now, so a
+	// bad one never becomes a version, and again at validation.
+	subjectVars := p.SubjectVariables
+	if subjectVars == nil {
+		subjectVars = []string{}
+	}
+	if p.Subject != "" {
+		if err := domain.CheckSubjectVariables(p.Subject, subjectVars, p.VariableSchema); err != nil {
+			return nil, err
+		}
+	} else if len(subjectVars) > 0 {
+		return nil, domain.SubjectProblem{Reason: "subject_variables needs a subject"}
+	}
+	subjectVarsJSON, err := json.Marshal(subjectVars)
+	if err != nil {
+		return nil, fmt.Errorf("encode subject_variables: %w", err)
+	}
 
 	var out domain.TemplateVersion
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var legalEntityID, status string
-		if err := tx.QueryRow(ctx, `SELECT legal_entity_id, status FROM template_definitions
-			WHERE template_id = $1 AND tenant_id = $2`, p.TemplateID, tenantID).Scan(&legalEntityID, &status); err != nil {
+		var boundIntent *string
+		if err := tx.QueryRow(ctx, `SELECT legal_entity_id, status, intent_id::text FROM template_definitions
+			WHERE template_id = $1 AND tenant_id = $2`, p.TemplateID, tenantID).Scan(&legalEntityID, &status, &boundIntent); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrTemplateNotFound
 			}
@@ -142,6 +177,17 @@ func (s *PgStore) CreateVersion(ctx context.Context, p domain.CreateVersionParam
 		}
 		if status == "RETIRED" {
 			return domain.ErrTemplateRetired
+		}
+
+		// A template bound to an intent is authored against that intent's contract: it may use
+		// only the variables the intent governs, and a subject only variables the contract
+		// marks subject-safe by sensitivity.
+		iv, err := effectiveContractTx(ctx, tx, tenantID, boundIntent)
+		if err != nil {
+			return err
+		}
+		if err := conformToContract(iv, p.VariableSchema, p.SubjectVariables, p.Subject != ""); err != nil {
+			return err
 		}
 
 		var nextVersion int
@@ -153,12 +199,13 @@ func (s *PgStore) CreateVersion(ctx context.Context, p domain.CreateVersionParam
 		row := tx.QueryRow(ctx, `
 			INSERT INTO template_versions (
 				template_id, tenant_id, legal_entity_id, version_number, locale,
-				content, content_hash, variable_schema, branding_metadata, accessibility_metadata,
+				content, content_hash, variable_schema, subject, subject_variables, branding_metadata, accessibility_metadata,
 				created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb, $11, $12, $13)
 			RETURNING `+templateVersionColumns,
 			p.TemplateID, tenantID, legalEntityID, nextVersion, p.Locale,
-			p.Content, contentHash(p.Content), schemaJSON, nullIfEmpty(p.BrandingMetadata), nullIfEmpty(p.AccessibilityMetadata),
+			p.Content, contentHash(p.Content), schemaJSON, nullIfEmpty(p.Subject), subjectVarsJSON,
+			nullIfEmpty(p.BrandingMetadata), nullIfEmpty(p.AccessibilityMetadata),
 			p.CreatedByPrincipalID,
 		)
 		return scanTemplateVersion(row, &out)
@@ -217,6 +264,25 @@ func (s *PgStore) ValidateTemplate(ctx context.Context, versionID string) (*doma
 			return domain.ErrTemplateVersionNotDraft
 		}
 		if err := validateTemplateContent(existing.Content); err != nil {
+			return err
+		}
+		if existing.Subject != nil {
+			if err := domain.CheckSubjectVariables(*existing.Subject, existing.SubjectVariables, existing.VariableSchema); err != nil {
+				return err
+			}
+		}
+		// Re-checked against the contract in force NOW: the intent may have moved on
+		// since the draft was written, and wording must conform to what governs it today.
+		var boundIntent *string
+		if err := tx.QueryRow(ctx, `SELECT intent_id::text FROM template_definitions
+			WHERE template_id = $1 AND tenant_id = $2`, existing.TemplateID, tenantID).Scan(&boundIntent); err != nil {
+			return fmt.Errorf("template store unavailable: %w", err)
+		}
+		iv, err := effectiveContractTx(ctx, tx, tenantID, boundIntent)
+		if err != nil {
+			return err
+		}
+		if err := conformToContract(iv, existing.VariableSchema, existing.SubjectVariables, existing.Subject != nil); err != nil {
 			return err
 		}
 
@@ -431,14 +497,44 @@ func (s *PgStore) RenderPreview(ctx context.Context, p domain.RenderPreviewParam
 		return nil, err
 	}
 
-	var missing []string
+	// An undeclared variable is refused, not ignored (NP-07): the schema is the
+	// reviewed list of what this wording may be given.
+	declared := make(map[string]bool, len(v.VariableSchema))
 	for _, key := range v.VariableSchema {
-		if p.Variables[key] == "" {
+		declared[key] = true
+	}
+	var unexpected []string
+	for key := range p.Variables {
+		if !declared[key] {
+			unexpected = append(unexpected, key)
+		}
+	}
+	if len(unexpected) > 0 {
+		sort.Strings(unexpected)
+		return nil, domain.ErrTemplateVariablesUnexpected{VersionID: p.VersionID, Unexpected: unexpected}
+	}
+
+	vars := p.Variables
+	var missing, placeholders []string
+	for _, key := range v.VariableSchema {
+		if vars[key] == "" {
 			missing = append(missing, key)
 		}
 	}
 	if len(missing) > 0 {
-		return nil, domain.ErrTemplateVariablesMissing{VersionID: p.VersionID, Missing: missing}
+		if !p.Placeholders {
+			return nil, domain.ErrTemplateVariablesMissing{VersionID: p.VersionID, Missing: missing}
+		}
+		// Preview only (F-09): an author checking wording needs no real data, so a
+		// variable not supplied is shown as a visible marker, never as blank text.
+		vars = make(map[string]string, len(p.Variables)+len(missing))
+		for k, val := range p.Variables {
+			vars[k] = val
+		}
+		for _, key := range missing {
+			vars[key] = "[" + key + "]"
+		}
+		placeholders = missing
 	}
 
 	tmpl, err := htmltemplate.New("preview").Parse(v.Content)
@@ -446,10 +542,22 @@ func (s *PgStore) RenderPreview(ctx context.Context, p domain.RenderPreviewParam
 		return nil, domain.ErrTemplateContentInvalid
 	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, p.Variables); err != nil {
+	if err := tmpl.Execute(&buf, vars); err != nil {
 		return nil, fmt.Errorf("render preview: %w", err)
 	}
-	return &domain.RenderPreviewResult{VersionID: p.VersionID, RenderedContent: buf.String()}, nil
+	out := &domain.RenderPreviewResult{VersionID: p.VersionID, RenderedContent: buf.String(), PlaceholdersUsed: placeholders}
+
+	// A version that carries a subject renders it with the same variables. The
+	// subject is only ever the reviewed text; a value that would break the header
+	// is refused, not stripped (NP-08).
+	if v.Subject != nil {
+		subject, err := domain.RenderSubject(*v.Subject, vars)
+		if err != nil {
+			return nil, err
+		}
+		out.RenderedSubject = subject
+	}
+	return out, nil
 }
 
 // CompareVersions diffs two versions of the same template — BIZ-03's

@@ -57,6 +57,17 @@ func (p Policy) Normalize() Policy {
 	return p
 }
 
+// NextAttemptFor is NextAttempt for an outcome that may name its own time. A deliberate
+// hold (deferUntil set) is due at that time, not after a backoff; it still counts as an
+// attempt, so a message held beyond MaxAttempts is concluded rather than looped.
+func (p Policy) NextAttemptFor(now time.Time, attemptsMade int, deferUntil time.Time) (time.Time, bool) {
+	next, ok := p.NextAttempt(now, attemptsMade)
+	if ok && deferUntil.After(next) {
+		return deferUntil, true
+	}
+	return next, ok
+}
+
 // NextAttempt returns when the next attempt is due, given how many have
 // already been made, and whether there should be one at all.
 //

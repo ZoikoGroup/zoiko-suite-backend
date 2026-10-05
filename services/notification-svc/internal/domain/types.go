@@ -100,6 +100,22 @@ type Notification struct {
 	PurposeContext string `json:"purpose_context,omitempty"`
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 
+	// CommunicationClass is what KIND of message this is (S0 security, T0
+	// transactional, A1 operational, L1 lifecycle, M1 marketing), fixed when the row
+	// is created (migration 000019). Empty means the sender stated none and the
+	// message is judged as T0.
+	CommunicationClass string `json:"communication_class,omitempty"`
+
+	// MessageIntentID is the ledger intent this notification was produced from, when
+	// there is one (migration 000016); empty for a direct send. With the notification
+	// id (the communication id) it is how one communication is recognised from both
+	// send paths.
+	MessageIntentID string `json:"message_intent_id,omitempty"`
+
+	// IntentVersionID is the exact communication intent version the message was sent
+	// under (migration 000021), fixed at creation. Empty when the send used no intent.
+	IntentVersionID string `json:"intent_version_id,omitempty"`
+
 	// Resend summary (migration 000014). The full reasoned chain is in the
 	// attempt records; these say how often and why most recently.
 	ResendCount             int        `json:"resend_count"`
@@ -180,6 +196,13 @@ type SendNotificationRequest struct {
 	// from the originating business event itself; otherwise one is derived.
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 
+	// CommunicationClass states what KIND of message this is. The direct path
+	// accepts S0 (security), T0 (transactional) and A1 (operational); marketing (M1)
+	// and lifecycle (L1) mail must use the ledger pipeline, which carries the stream
+	// sender identity and one-click unsubscribe headers this path does not. Empty is
+	// treated as T0.
+	CommunicationClass string `json:"communication_class,omitempty"`
+
 	// RecipientAddress overrides recipient resolution for channels that need
 	// an endpoint. Left empty — the normal case — the address is resolved from
 	// identity-context-svc's record for RecipientPrincipalID, which is the
@@ -256,6 +279,12 @@ type DeliveryOutcome struct {
 	// retry worker possible without re-litigating every historical failure.
 	Retryable bool
 
+	// DeferUntil, when set on a Retryable outcome, is when the next attempt is due
+	// instead of the usual backoff: the message is being held on purpose (a recipient's
+	// quiet hours, NCD-012), not failing, so it must not be retried every 30 seconds
+	// until its attempts run out.
+	DeferUntil time.Time
+
 	// Unknown marks an outcome that is neither a confirmed acceptance nor a
 	// safely-retryable or terminal failure — the message may or may not
 	// have reached the provider, and guessing either way risks a duplicate
@@ -268,6 +297,11 @@ type DeliveryOutcome struct {
 	// ProviderName records the name of the provider that actually handled or refused
 	// the attempt (e.g. "smtp-primary", "smtp-secondary", "ses").
 	ProviderName string
+
+	// PrivacyDecisionID and PrivacyResult are set when a privacy decision governed this
+	// attempt, whether it permitted the send or stopped it (migration 000022).
+	PrivacyDecisionID string
+	PrivacyResult     string
 }
 
 // AddressSource values for Notification.RecipientAddressSource.
@@ -383,6 +417,10 @@ type AttemptMeta struct {
 	ProviderName     string
 	Retryable        bool
 	ResendReason     string
+	// PrivacyDecisionID and PrivacyResult are the privacy decision that governed this
+	// attempt (migration 000022), recorded for a refusal as well as a permission.
+	PrivacyDecisionID string
+	PrivacyResult     string
 	ActorPrincipalID string
 }
 
@@ -403,4 +441,7 @@ type DeliveryAttempt struct {
 	ActorPrincipalID string    `json:"actor_principal_id,omitempty"`
 	AttemptedAt      time.Time `json:"attempted_at"`
 	RecordedAt       time.Time `json:"recorded_at"`
+	// The privacy decision that governed this attempt, when one did.
+	PrivacyDecisionID string `json:"privacy_decision_id,omitempty"`
+	PrivacyResult     string `json:"privacy_result,omitempty"`
 }

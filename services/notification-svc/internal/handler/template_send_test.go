@@ -338,3 +338,22 @@ func TestSendNotification_GovernedTemplateAuthzDenied_NeverFetchesTemplate(t *te
 		t.Fatalf("expected GetPublishedVersion never to be called before authorization, got %d calls", store.getPublishedVersionCalls)
 	}
 }
+
+// NP-07 at the API: a variable the built-in template does not declare is a 400,
+// not a message sent with the value silently dropped.
+func TestSend_StaticTemplateWithUndeclaredVariableIsRefused(t *testing.T) {
+	del := &stubDeliverer{delivered: true}
+	r := newRouterWith(newStubStore(), &stubPublisher{}, &stubAuthZ{}, del, "tenant-abc")
+	body := map[string]any{
+		"recipient_principal_id": "emp-1", "legal_entity_id": "le-us", "channel": "EMAIL", "correlation_id": "corr-np07",
+		"template":  "approved",
+		"variables": map[string]string{"organization_name": "Acme", "login_url": "https://app.example.com", "smuggled": "x"},
+	}
+	rr := doReq(r, http.MethodPost, "/v1/notifications/", body, "p-1")
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "unexpected_template_variables") {
+		t.Fatalf("want 400 unexpected_template_variables, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if del.seen != nil {
+		t.Fatal("a message was handed to the provider with an undeclared variable")
+	}
+}

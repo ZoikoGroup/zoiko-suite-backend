@@ -35,6 +35,7 @@ import (
 	"zoiko.io/notification-svc/internal/mtls"
 	"zoiko.io/notification-svc/internal/outbox"
 	"zoiko.io/notification-svc/internal/policy"
+	"zoiko.io/notification-svc/internal/privacy"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
@@ -290,6 +291,33 @@ func main() {
 		WithPolicyResolver(policyEngine).
 		WithMetrics(metrics)
 
+	// One communication, one identity (plan step 3): with the flag on, each ledger
+	// delivery also creates a linked register row. Off by default.
+	if cfg.LedgerRegisterEnabled {
+		orchestrator.WithRegister(pgStore)
+		log.Info("ledger pipeline will record each delivery in the communication register")
+	}
+
+	// The direct send path (POST /v1/notifications, the retry worker, a resend)
+	// reaches the provider through a guard that applies the suppression list and
+	// the kill switch immediately before submission (ZS-SVC-Y-001 INV-24). The
+	// ledger orchestrator above keeps the unwrapped deliverer because it applies
+	// its own, class-aware policy before rendering.
+	directDeliverer, err := policy.NewDirectSendGuard(deliverer, policyEngine, killSwitch, log)
+	if err != nil {
+		log.Fatal("failed to construct the direct send guard", zap.Error(err))
+	}
+	directDeliverer.WithPreferences(pgStore)
+	if cfg.PrivacyEnforcement {
+		gate, gerr := privacy.NewGate(privacy.NewClient(cfg.PrivacyDecisionURL, cfg.PrivacyTimeout, log), pgStore, log)
+		if gerr != nil {
+			log.Fatal("failed to construct the privacy gate", zap.Error(gerr))
+		}
+		directDeliverer.WithPrivacyGate(gate)
+		log.Info("privacy enforcement is on: intent-bound emails are sent only on a PERMIT decision",
+			zap.String("privacy_decision_url", cfg.PrivacyDecisionURL))
+	}
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -325,7 +353,17 @@ func main() {
 
 	webhookProcessor := webhook.NewProcessor(pgStore, log)
 	webhookProcessor.SetMetrics(metrics)
-	webhookHandler := webhook.NewHandler(webhookProcessor, log)
+	// Provider callbacks are authenticated with per-provider HMAC secrets
+	// (ZS-SVC-Y-001 INV-27, NP-26). With none configured every callback is refused:
+	// the route is envelope-exempt, so there is no other gate in front of it.
+	webhookVerifier := webhook.NewVerifier(cfg.WebhookSecrets, cfg.WebhookTolerance)
+	if len(webhookVerifier.Providers()) == 0 {
+		log.Warn("NOTIFICATION_WEBHOOK_SECRETS is empty: every provider callback will be refused; " +
+			"delivery receipts, bounces and complaints will not be recorded until a secret is configured")
+	} else {
+		log.Info("webhook callback authentication enabled", zap.Strings("providers", webhookVerifier.Providers()))
+	}
+	webhookHandler := webhook.NewHandler(webhookProcessor, log).WithVerifier(webhookVerifier)
 
 	// ── 4d. Action Link Gateway (optional) ──────────────────────────────────────────
 	//
@@ -353,13 +391,15 @@ func main() {
 		Store:          pgStore,
 		Metrics:        domainMetrics,
 		AuthZ:          authzClient,
-		Deliverer:      deliverer,
+		Deliverer:      directDeliverer,
 		Recipient:      identityClient,
 		RetryPolicy:    retryPolicy,
 		Orchestrator:   orchestrator,
 		LedgerStore:    pgStore,
 		WebhookHandler: webhookHandler,
 		Suppressions:   pgStore,
+		Intents:        pgStore,
+		Preferences:    pgStore,
 		Log:            log,
 	})
 	handler.RegisterRoutes(r, h)
@@ -383,7 +423,7 @@ func main() {
 	defer stopWorker()
 
 	retryWorker := retry.NewWorker(
-		pgStore, deliverer, domainMetrics, identityClient, identity.IsSettled,
+		pgStore, directDeliverer, domainMetrics, identityClient, identity.IsSettled,
 		retry.Options{
 			Interval:      cfg.Retry.Interval,
 			BatchSize:     cfg.Retry.BatchSize,

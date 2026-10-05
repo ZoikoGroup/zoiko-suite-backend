@@ -506,7 +506,9 @@ func TestWebhook_HTTPHandler_Routing(t *testing.T) {
 	}
 
 	processor := webhook.NewProcessor(store, zap.NewNop())
-	h := webhook.NewHandler(processor, zap.NewNop())
+	secret := []byte("0123456789abcdef-test-secret")
+	h := webhook.NewHandler(processor, zap.NewNop()).
+		WithVerifier(webhook.NewVerifier(map[string][]string{"smtp": {string(secret)}}, 0))
 
 	r := chi.NewRouter()
 	h.RegisterRoutes(r)
@@ -515,6 +517,7 @@ func TestWebhook_HTTPHandler_Routing(t *testing.T) {
 	payload := `{"event_id":"evt-h-1","event_type":"DELIVERED","recipient_email":"http@example.com","provider_message_id":"<msg-http-001@zoikosuite.com>"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(payload)))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(webhook.SignatureHeader, webhook.Sign(secret, time.Now(), []byte(payload)))
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -525,6 +528,7 @@ func TestWebhook_HTTPHandler_Routing(t *testing.T) {
 
 	// Malformed payload
 	badReq := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(`{not json`)))
+	badReq.Header.Set(webhook.SignatureHeader, webhook.Sign(secret, time.Now(), []byte(`{not json`)))
 	badW := httptest.NewRecorder()
 
 	r.ServeHTTP(badW, badReq)

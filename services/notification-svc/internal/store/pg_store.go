@@ -52,7 +52,8 @@ const notificationColumns = `
 	unknown_at, resolved_at, COALESCE(resolved_by_principal_id, ''), COALESCE(resolution_note, ''),
 	COALESCE(template_id, ''), COALESCE(template_version_id, ''), COALESCE(rendered_content_hash, ''),
 	COALESCE(purpose_context, ''), COALESCE(idempotency_key, ''),
-	resend_count, COALESCE(last_resend_reason, ''), last_resent_at, COALESCE(last_resent_by_principal_id, '')`
+	resend_count, COALESCE(last_resend_reason, ''), last_resent_at, COALESCE(last_resent_by_principal_id, ''),
+	COALESCE(communication_class, ''), COALESCE(message_intent_id::text, ''), COALESCE(intent_version_id::text, '')`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface{ Scan(dest ...any) error }
@@ -70,6 +71,7 @@ func scanNotification(s scannable, n *domain.Notification) error {
 		&n.TemplateID, &n.TemplateVersionID, &n.RenderedContentHash,
 		&n.PurposeContext, &n.IdempotencyKey,
 		&n.ResendCount, &n.LastResendReason, &n.LastResentAt, &n.LastResentByPrincipalID,
+		&n.CommunicationClass, &n.MessageIntentID, &n.IntentVersionID,
 	)
 }
 
@@ -143,15 +145,15 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 				channel, subject, body, status, source_event_type, source_reference,
 				correlation_id, created_by_principal_id, created_at,
 				template_id, template_version_id, rendered_content_hash,
-				purpose_context, idempotency_key
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+				purpose_context, idempotency_key, communication_class, intent_version_id
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 			`+conflict,
 			n.NotificationID, tenantID, n.LegalEntityID, n.RecipientPrincipalID,
 			nullIfEmpty(n.RecipientAddress), nullIfEmpty(n.RecipientAddressSource),
 			n.Channel, n.Subject, n.Body, n.Status, n.SourceEventType, n.SourceReference,
 			n.CorrelationID, n.CreatedByPrincipalID, n.CreatedAt,
 			nullIfEmpty(n.TemplateID), nullIfEmpty(n.TemplateVersionID), nullIfEmpty(n.RenderedContentHash),
-			nullIfEmpty(n.PurposeContext), nullIfEmpty(n.IdempotencyKey))
+			nullIfEmpty(n.PurposeContext), nullIfEmpty(n.IdempotencyKey), nullIfEmpty(n.CommunicationClass), nullIfEmpty(n.IntentVersionID))
 		if err != nil {
 			return err
 		}

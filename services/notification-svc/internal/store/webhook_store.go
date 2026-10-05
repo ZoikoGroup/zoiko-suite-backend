@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/ledger"
 	"zoiko.io/notification-svc/internal/webhook"
 )
@@ -39,22 +40,47 @@ func (s *PgStore) LookupAttemptByProviderMessageID(ctx context.Context, provider
 		return nil, fmt.Errorf("set platform scope: %w", err)
 	}
 
-	const query = `
+	// A callback may quote the id with or without the angle brackets of an
+	// RFC 5322 Message-ID; both spellings are looked up.
+	variants := domain.ProviderMessageIDVariants(trimmed)
+	if len(variants) == 0 {
+		variants = []string{trimmed}
+	}
+
+	const ledgerQuery = `
 		SELECT provider_attempt_id, message_intent_id, tenant_id, sender_stream, to_address
 		FROM delivery_attempts
-		WHERE provider_message_id = $1
-		   OR provider_attempt_id::text = $1
+		WHERE provider_message_id = ANY($1)
+		   OR provider_attempt_id::text = $2
 		ORDER BY attempted_at DESC
 		LIMIT 1;
 	`
 	var res webhook.AttemptLookupResult
-	err = tx.QueryRow(ctx, query, trimmed).Scan(
+	err = tx.QueryRow(ctx, ledgerQuery, variants, trimmed).Scan(
 		&res.ProviderAttemptID,
 		&res.MessageIntentID,
 		&res.TenantID,
 		&res.SenderStream,
 		&res.RecipientAddress,
 	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Not a ledger attempt: try the direct send path (audit finding F-12).
+		// Its attempts carry no message_intent_id and no sender stream: the
+		// processor then skips the ledger-only delivery_events insert (whose
+		// foreign keys point at ledger rows) and still applies the suppression
+		// a bounce or complaint calls for, which is what mattered.
+		const directQuery = `
+			SELECT a.attempt_id::text, a.tenant_id, COALESCE(n.recipient_address, '')
+			FROM notification_delivery_attempts a
+			JOIN notifications n ON n.notification_id = a.notification_id AND n.tenant_id = a.tenant_id
+			WHERE a.provider_message_id = ANY($1)
+			   OR a.attempt_id::text = $2
+			ORDER BY a.attempted_at DESC
+			LIMIT 1;
+		`
+		res = webhook.AttemptLookupResult{}
+		err = tx.QueryRow(ctx, directQuery, variants, trimmed).Scan(&res.ProviderAttemptID, &res.TenantID, &res.RecipientAddress)
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAttemptNotFound
