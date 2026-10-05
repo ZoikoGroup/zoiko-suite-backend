@@ -34,31 +34,42 @@ type SourceRecord struct {
 	RawJSON        []byte
 }
 
-// forwardTenant propagates the caller's verified tenant to the source
-// service.
+// forwardIdentity propagates the caller's verified tenant AND principal to
+// the source service.
 //
-// This was missing entirely, and it was not merely a defence-in-depth gap —
-// it left manifest generation NON-FUNCTIONAL for two of the three sources.
-// governance-decision-log-svc returns 400 missing_tenant_id without the
-// header and workflow-svc returns 401 missing_tenant_scope (the latter as a
-// direct result of the Priority 1 row 6 fix, which correctly stopped its
-// by-id read falling back to an unscoped lookup). getByID maps any non-200
-// to ErrSourceUnavailable and collectRecords fails closed on the first
-// source error, so the whole manifest failed — and reported it as "source
-// unavailable", which reads as a downstream outage rather than a missing
-// header. That misdiagnosis is the expensive part.
+// Tenant forwarding was missing entirely before this, and it was not merely
+// a defence-in-depth gap — it left manifest generation NON-FUNCTIONAL for
+// two of the three sources. governance-decision-log-svc returns 400
+// missing_tenant_id without the header and workflow-svc returns 401
+// missing_tenant_scope (the latter as a direct result of the Priority 1 row
+// 6 fix, which correctly stopped its by-id read falling back to an unscoped
+// lookup). getByID maps any non-200 to ErrSourceUnavailable and
+// collectRecords fails closed on the first source error, so the whole
+// manifest failed — and reported it as "source unavailable", which reads as
+// a downstream outage rather than a missing header. That misdiagnosis is
+// the expensive part.
 //
-// authorization-svc's access-decision read does not currently require the
-// header, so that source kept working; the header is forwarded to all three
-// regardless, since a source that does not require a tenant today may
-// tomorrow, and the correct value is the same either way.
+// Principal forwarding was added later, found while wiring
+// WorkflowHistoryClient's cross-workflow query: workflow-history-svc
+// requires X-Principal-Id on EVERY route, including the per-instance
+// history endpoint ListByInstanceID already called — meaning that call was
+// silently 401ing against a real workflow-history-svc the whole time this
+// client's tenant-only forwarding shipped, masked because the only tests
+// covering it used a stub that never checked for the header. Both headers
+// are now forwarded to all four source clients uniformly, not just the ones
+// currently known to require them — a source that does not require an
+// identity header today may tomorrow, and the correct value is the same
+// either way.
 //
-// The tenant is read from the incoming request's context — never from the
-// manifest request body — so a caller cannot widen its own evidence
-// collection by naming a different tenant downstream.
-func forwardTenant(ctx context.Context, req *http.Request) {
+// Both values are read from the incoming request's context — never from
+// the manifest request body — so a caller cannot widen its own evidence
+// collection by naming a different tenant or principal downstream.
+func forwardIdentity(ctx context.Context, req *http.Request) {
 	if tenantID := svcmiddleware.TenantFromContext(ctx); tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	if principalID := svcmiddleware.PrincipalFromContext(ctx); principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
 	}
 }
 
@@ -91,7 +102,7 @@ func (c *GovernanceDecisionClient) ListByEntityAndDateRange(ctx context.Context,
 	if err != nil {
 		return nil, ErrSourceUnavailable
 	}
-	forwardTenant(ctx, req)
+	forwardIdentity(ctx, req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("governance-decision-log-svc unreachable — failing closed", zap.Error(err))
@@ -184,11 +195,15 @@ func (c *WorkflowClient) GetByID(ctx context.Context, workflowInstanceID string)
 // WorkflowHistoryClient closes the gap workflow-history-svc's own package
 // doc named directly: "evidence-manifest-svc currently fetches workflow
 // data directly from workflow-svc by workflow_instance_id and is NOT wired
-// to this cross-workflow query endpoint." This client uses the per-instance
-// endpoint specifically (GET /v1/workflows/{id}/history) — the
-// cross-workflow query (GET /v1/workflows/history) is a distinct,
-// broader discovery surface this service has no request shape for yet,
-// left as a further, separate gap rather than fabricated here.
+// to this cross-workflow query endpoint." ListByInstanceID covers the
+// per-instance endpoint (GET /v1/workflows/{id}/history); this client
+// now also covers the cross-workflow endpoint itself
+// (ListByEntityAndDateRange, GET /v1/workflows/history) — the "distinct,
+// broader discovery surface" that was the one piece deliberately left
+// unfabricated when the per-instance wiring was added, now built as its
+// own request shape (GenerateManifestRequest's WorkflowHistoryFrom/To)
+// rather than silently reused from the governance-decision time-window
+// fields it structurally resembles.
 type WorkflowHistoryClient struct {
 	baseURL string
 	http    *http.Client
@@ -210,7 +225,7 @@ func (c *WorkflowHistoryClient) ListByInstanceID(ctx context.Context, workflowIn
 	if err != nil {
 		return nil, ErrSourceUnavailable
 	}
-	forwardTenant(ctx, req)
+	forwardIdentity(ctx, req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("workflow-history-svc unreachable — failing closed", zap.Error(err))
@@ -256,6 +271,62 @@ func (c *WorkflowHistoryClient) ListByInstanceID(ctx context.Context, workflowIn
 	return out, nil
 }
 
+// ListByEntityAndDateRange calls workflow-history-svc's real cross-workflow
+// GET /v1/workflows/history?legal_entity_id=...&from=...&to=... — all
+// three query parameters are required on that endpoint (unlike
+// GovernanceDecisionClient's optional from/to), so both from and to must
+// be non-nil; the handler-level request validation enforces that before
+// this is ever called. Produces one SourceRecord per transition event
+// across every workflow instance in scope, the same shape as
+// ListByInstanceID and GovernanceDecisionClient.ListByEntityAndDateRange.
+func (c *WorkflowHistoryClient) ListByEntityAndDateRange(ctx context.Context, legalEntityID string, from, to time.Time) ([]SourceRecord, error) {
+	q := url.Values{}
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("from", from.UTC().Format(time.RFC3339))
+	q.Set("to", to.UTC().Format(time.RFC3339))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/workflows/history?"+q.Encode(), nil)
+	if err != nil {
+		return nil, ErrSourceUnavailable
+	}
+	forwardIdentity(ctx, req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("workflow-history-svc unreachable — failing closed", zap.Error(err))
+		return nil, ErrSourceUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		c.log.Error("workflow-history-svc unexpected status", zap.Int("status", resp.StatusCode))
+		return nil, ErrSourceUnavailable
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, ErrSourceUnavailable
+	}
+	var events []struct {
+		EventID string `json:"event_id"`
+	}
+	if err := json.Unmarshal(body, &events); err != nil {
+		return nil, fmt.Errorf("aggregator: decode cross-workflow history list: %w", err)
+	}
+	var raw []json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("aggregator: decode cross-workflow history list: %w", err)
+	}
+
+	out := make([]SourceRecord, 0, len(events))
+	for i, e := range events {
+		out = append(out, SourceRecord{
+			SourceType:     domain.SourceWorkflowHistory,
+			SourceRecordID: e.EventID,
+			RawJSON:        raw[i],
+		})
+	}
+	return out, nil
+}
+
 // ── shared helper ────────────────────────────────────────────────────────────
 
 func getByID(ctx context.Context, client *http.Client, log *zap.Logger, url string, sourceType domain.SourceType, id string) (*SourceRecord, error) {
@@ -263,7 +334,7 @@ func getByID(ctx context.Context, client *http.Client, log *zap.Logger, url stri
 	if err != nil {
 		return nil, ErrSourceUnavailable
 	}
-	forwardTenant(ctx, req)
+	forwardIdentity(ctx, req)
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Error("source service unreachable — failing closed", zap.String("url", url), zap.Error(err))
