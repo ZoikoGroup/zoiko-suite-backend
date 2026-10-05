@@ -34,6 +34,11 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 
 	// Fresh schema per test run.
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS export_package_items;
+		DROP TABLE IF EXISTS export_packages;
+		DROP TABLE IF EXISTS redaction_profiles;
+		DROP TABLE IF EXISTS fixity_manifests;
+		DROP TABLE IF EXISTS renditions;
 		DROP TABLE IF EXISTS custody_entries;
 		DROP TABLE IF EXISTS evidence_contradictions;
 		DROP TABLE IF EXISTS evidence_procedure_links;
@@ -51,6 +56,11 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 		DROP TABLE IF EXISTS document_access_log;
 		DROP TABLE IF EXISTS document_versions;
 		DROP TABLE IF EXISTS documents;
+		DROP FUNCTION IF EXISTS reject_export_package_item_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_export_package_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_redaction_profile_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_fixity_manifest_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_rendition_mutation() CASCADE;
 		DROP FUNCTION IF EXISTS reject_record_relationship_mutation() CASCADE;
 		DROP FUNCTION IF EXISTS reject_record_mutation() CASCADE;
 		DROP FUNCTION IF EXISTS reject_legal_hold_target_mutation() CASCADE;
