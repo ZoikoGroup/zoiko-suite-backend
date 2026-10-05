@@ -7,17 +7,18 @@
 -- First, create the exclusion constraint using a partial index with the
 -- range operator on the effective period (effective_from, effective_to).
 
--- We use a custom operator class for the tsrange type to enable the
--- exclusion constraint on the half-open interval.
-
--- Note: PostgreSQL doesn't have a built-in tsrange operator class for
--- EXCLUDE USING GIST, so we use a workaround with a GENERATED column
--- that creates a tsrange from effective_from and effective_to.
+-- The effective period as a half-open range, stored so the exclusion
+-- constraint can index it. effective_from/effective_to are TIMESTAMPTZ, so the
+-- range is tstzrange — this file used tsrange, which has no (timestamptz,
+-- timestamptz) form, so it failed and a fresh volume could not initialise.
+-- btree_gist supplies the GiST "=" operator classes for jurisdiction_id and
+-- rule_code; it was never installed in this database either.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 ALTER TABLE jurisdiction_rules
-ADD COLUMN IF NOT EXISTS effective_period tsrange
+ADD COLUMN IF NOT EXISTS effective_period tstzrange
 GENERATED ALWAYS AS (
-    tsrange(effective_from, effective_to, '[)')
+    tstzrange(effective_from, effective_to, '[)')
 ) STORED;
 
 -- Create the exclusion constraint
@@ -31,4 +32,12 @@ EXCLUDE USING GIST (
 WHERE (rule_status NOT IN ('DRAFT', 'RETIRED'));
 
 -- Grant permissions
-GRANT SELECT, INSERT, UPDATE ON jurisdiction_rules TO jurisdiction_rules_app;
+-- The runtime role is app_jurisdiction_rules (create-app-roles.sh). This used to
+-- name jurisdiction_rules_app, which nothing creates, so the migration failed
+-- and a fresh volume could not initialise. On a fresh volume roles are created
+-- after migrations and default privileges cover this table; hence the guard.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_jurisdiction_rules') THEN
+        GRANT SELECT, INSERT, UPDATE ON jurisdiction_rules TO app_jurisdiction_rules;
+    END IF;
+END $$;

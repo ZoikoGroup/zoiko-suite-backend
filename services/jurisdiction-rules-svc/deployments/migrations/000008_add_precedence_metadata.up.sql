@@ -13,4 +13,12 @@ CREATE INDEX IF NOT EXISTS idx_jurisdiction_rules_precedence
     ON jurisdiction_rules (jurisdiction_id, rule_domain, rule_code, precedence_level);
 
 -- Grant permissions
-GRANT SELECT, INSERT, UPDATE ON jurisdiction_rules TO jurisdiction_rules_app;
+-- The runtime role is app_jurisdiction_rules (create-app-roles.sh). This used to
+-- name jurisdiction_rules_app, which nothing creates, so the migration failed
+-- and a fresh volume could not initialise. On a fresh volume roles are created
+-- after migrations and default privileges cover this table; hence the guard.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_jurisdiction_rules') THEN
+        GRANT SELECT, INSERT, UPDATE ON jurisdiction_rules TO app_jurisdiction_rules;
+    END IF;
+END $$;

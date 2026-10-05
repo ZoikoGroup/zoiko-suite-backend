@@ -21,4 +21,12 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_pending
     WHERE published_at IS NULL;
 
 -- Grant minimal permissions to the app role
-GRANT SELECT, INSERT ON event_outbox TO jurisdiction_rules_app;
+-- The runtime role is app_jurisdiction_rules (create-app-roles.sh). This used to
+-- name jurisdiction_rules_app, which nothing creates, so the migration failed
+-- and a fresh volume could not initialise. On a fresh volume roles are created
+-- after migrations and default privileges cover this table; hence the guard.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_jurisdiction_rules') THEN
+        GRANT SELECT, INSERT ON event_outbox TO app_jurisdiction_rules;
+    END IF;
+END $$;
