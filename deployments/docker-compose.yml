@@ -607,7 +607,10 @@ services:
       # authz stub on purpose, because a deployment with a real GOV-03 and a
       # stubbed GOV-04 would satisfy "authorization enforced" while having no
       # segregation control at all.
-      SOD_SERVICE_URL: "${SOD_SERVICE_URL:-}"
+      # GOV-04 maker-checker answers come from authorization-svc's
+      # /v1/sod/evaluate (it owns the SoD rules). Empty used to mean a
+      # permit-everything stub in development.
+      SOD_SERVICE_URL: "${SOD_SERVICE_URL:-http://authorization-svc:8089}"
 
       # Break-glass bounds. The maximum is the ceiling on how long a support
       # engineer can hold standing inside a customer tenant; raising it is a
@@ -2007,6 +2010,21 @@ services:
       #   legacy route:  POST /v1/notifications/webhooks/{provider}
       NCD_CALLBACK_SECRET_SMTP_PRIMARY: "${NCD_CALLBACK_SECRET_SMTP_PRIMARY:-dev-ncd-callback-secret}"
       NOTIFICATION_WEBHOOK_SECRET: "${NOTIFICATION_WEBHOOK_SECRET:-dev-webhook-secret}"
+
+      # One-click unsubscribe (RFC 8058). The link's sealed token is the
+      # receiver's only credential; without a secret the service refuses to
+      # send marketing mail at all rather than send it without a working
+      # link. The base URL is where mail clients POST the unsubscribe — the
+      # gateway route in development. A real deployment sets both from the
+      # secret store and its public hostname.
+      NOTIFICATION_UNSUBSCRIBE_SECRET: "${NOTIFICATION_UNSUBSCRIBE_SECRET:-dev-unsubscribe-secret-0123456789abcdef}"
+      NOTIFICATION_PUBLIC_BASE_URL: "${NOTIFICATION_PUBLIC_BASE_URL:-http://localhost:8133}"
+
+      # DKIM signing and the NP-55 sender-authentication monitor. Unset here:
+      # mailpit needs no signature, and a monitor pointed at a domain with no
+      # published records would (correctly) hold all mail. Set
+      # NOTIFICATION_DKIM_DOMAIN, _SELECTOR and _PRIVATE_KEY together when this
+      # service, not the provider, signs.
     depends_on:
       postgres:
         condition: service_healthy
