@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,35 +21,50 @@ func req() Request {
 	return Request{TenantID: "t1", PrincipalID: "sender", CorrelationID: "c1", SubjectRef: "recipient", ActivityID: "act-1", PurposeID: "pur-1"}
 }
 
-func serve(t *testing.T, status int, body string) (*Client, *http.Request, *[]byte) {
+// capture hands the request a test server saw back to the test goroutine under a lock, so
+// the race detector sees the happens-before the network hides.
+type capture struct {
+	mu  sync.Mutex
+	req *http.Request
+	raw []byte
+}
+
+func (c *capture) get() (*http.Request, []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.req, c.raw
+}
+
+func serve(t *testing.T, status int, body string) (*Client, *capture) {
 	t.Helper()
-	var got http.Request
-	var raw []byte
+	cap := &capture{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = *r.Clone(r.Context())
 		buf := make([]byte, 4096)
 		n, _ := r.Body.Read(buf)
-		raw = buf[:n]
+		cap.mu.Lock()
+		cap.req, cap.raw = r.Clone(r.Context()), buf[:n]
+		cap.mu.Unlock()
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
-	return NewClient(srv.URL, time.Second, nil), &got, &raw
+	return NewClient(srv.URL, time.Second, nil), cap
 }
 
 func TestClient_AsksTheDecisionServiceAndReadsAPermit(t *testing.T) {
-	c, got, raw := serve(t, 200, `{"decision_id":"d-1","result":"PERMIT","reason_codes":[]}`)
+	c, cap := serve(t, 200, `{"decision_id":"d-1","result":"PERMIT","reason_codes":[]}`)
 	d, err := c.Decide(context.Background(), req())
 	require.NoError(t, err)
 	assert.Equal(t, "PERMIT", d.Result)
 	assert.Equal(t, "d-1", d.DecisionID)
 
+	got, raw := cap.get()
 	assert.Equal(t, "/v1/privacy/decisions", got.URL.Path)
 	assert.Equal(t, "t1", got.Header.Get("X-Tenant-Id"))
 	assert.Equal(t, "sender", got.Header.Get("X-Principal-Id"))
 	assert.Equal(t, "c1", got.Header.Get("X-Correlation-ID"))
 	var body map[string]any
-	require.NoError(t, json.Unmarshal(*raw, &body))
+	require.NoError(t, json.Unmarshal(raw, &body))
 	assert.Equal(t, "recipient", body["subject_ref"])
 	assert.Equal(t, "act-1", body["processing_activity_id"])
 	assert.Equal(t, "pur-1", body["purpose_id"])
@@ -70,7 +86,7 @@ func TestClient_AnythingButARecognisableDecisionIsUnavailable(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			c, _, _ := serve(t, tc.status, tc.body)
+			c, _ := serve(t, tc.status, tc.body)
 			d, err := c.Decide(context.Background(), req())
 			assert.Nil(t, d)
 			assert.ErrorIs(t, err, ErrUnavailable)
