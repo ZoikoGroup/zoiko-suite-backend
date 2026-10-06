@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/ncd"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
 
@@ -105,7 +106,7 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 			RecipientPrincipalID: n.RecipientPrincipalID, Channel: n.Channel,
 		})
 		if resolveErr != nil {
-			outcome.Reason = "recipient resolution failed: " + resolveErr.Error()
+			outcome.Reason = ncd.Format(ncd.RecipientUnresolved) + ": recipient resolution failed: " + resolveErr.Error()
 		} else if err := h.store.SetRecipientAddress(r.Context(), n.NotificationID, tenantID, addr, source); err != nil {
 			outcome.Reason = "resolved a recipient address but could not record it: " + err.Error()
 		} else {
@@ -120,12 +121,13 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.recordAttemptOutcome(w, r, n, outcome, domain.AttemptMeta{
-		Origin:           domain.AttemptOriginResend,
-		ProviderName:     outcome.ProviderName,
-		Retryable:        outcome.Retryable,
+		Origin:            domain.AttemptOriginResend,
+		ProviderName:      outcome.ProviderName,
+		Retryable:         outcome.Retryable,
 		PrivacyDecisionID: outcome.PrivacyDecisionID,
 		PrivacyResult:     outcome.PrivacyResult,
-		ResendReason:     req.Reason,
-		ActorPrincipalID: principalID,
+		BlockCode:         outcome.BlockCode,
+		ResendReason:      req.Reason,
+		ActorPrincipalID:  principalID,
 	}, getCorrelationID(r), tenantID, http.StatusOK)
 }

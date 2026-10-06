@@ -159,7 +159,11 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 		}
 		if tag.RowsAffected() == 1 {
 			created = true
-			return nil
+			prepared, err := events.CommunicationPrepared(n.CorrelationID, *n)
+			if err != nil {
+				return err
+			}
+			return enqueue(ctx, tx, tenantID, prepared)
 		}
 
 		// Conflict: this communication already exists — fetch it so the caller

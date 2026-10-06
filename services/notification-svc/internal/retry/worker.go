@@ -8,6 +8,7 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/ncd"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
 
@@ -409,7 +410,7 @@ func (w *Worker) reresolve(ctx context.Context, n *domain.Notification) bool {
 	addr, err := w.recipient.ResolveEmail(ctx, n.TenantID, n.CreatedByPrincipalID, n.RecipientPrincipalID)
 	if err != nil {
 		w.conclude(ctx, n, domain.DeliveryOutcome{
-			Reason:    "recipient resolution failed: " + err.Error(),
+			Reason:    ncd.Format(ncd.RecipientUnresolved) + ": recipient resolution failed: " + err.Error(),
 			Retryable: w.settled != nil && !w.settled(err),
 		})
 		return false
@@ -545,5 +546,5 @@ func AttemptOutcome(o domain.DeliveryOutcome) string { return attemptOutcome(o) 
 // retryMeta describes a worker attempt for its durable attempt row.
 func retryMeta(o domain.DeliveryOutcome) domain.AttemptMeta {
 	return domain.AttemptMeta{Origin: domain.AttemptOriginRetry, ProviderName: o.ProviderName, Retryable: o.Retryable,
-		PrivacyDecisionID: o.PrivacyDecisionID, PrivacyResult: o.PrivacyResult}
+		PrivacyDecisionID: o.PrivacyDecisionID, PrivacyResult: o.PrivacyResult, BlockCode: o.BlockCode}
 }

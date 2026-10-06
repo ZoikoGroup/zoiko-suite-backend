@@ -70,6 +70,15 @@ func recordAttempt(ctx context.Context, tx pgx.Tx, n domain.Notification, outcom
 	if err := enqueue(ctx, tx, n.TenantID, ev); err != nil {
 		return err
 	}
+	if meta.BlockCode != "" {
+		blocked, err := events.CommunicationBlocked(n.CorrelationID, n, meta.BlockCode, n.DeliveryAttempts, meta.Retryable, meta.PrivacyDecisionID)
+		if err != nil {
+			return err
+		}
+		if err := enqueue(ctx, tx, n.TenantID, blocked); err != nil {
+			return err
+		}
+	}
 	if outcome == domain.AttemptOutcomeUnknown {
 		ev, err := events.AttemptUnknown(n.CorrelationID, n, a, attemptedAt.Add(UnknownResolutionWindow))
 		if err != nil {

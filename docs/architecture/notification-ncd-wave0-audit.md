@@ -117,7 +117,7 @@ Status key: **BUILT** (verified in code), **PARTIAL**, **GAP** (not built), **UN
 | Authorization actions | BUILT | `NOTIFICATION_SEND`, `_VIEW`, `_RESOLVE_OUTCOME`, `_SUPPRESS` |
 | Event outbox | BUILT | `event_outbox` (000010) |
 | Events from spec 10.2 | PARTIAL | `delivery.attempt.created`, `delivery.attempt.unknown` exist; `communication.*`, `endpoint.suppressed`, `notice.*` do not |
-| Stable error codes NCD-001..020 | GAP | service has its own codes |
+| Stable error codes NCD-001..020 | PARTIAL (Wave 3, section 19) | catalogue matches the standard; 15 of 20 produced, 5 declared unproduced with reasons |
 | Channels | PARTIAL | EMAIL and IN_APP work; SMS withdrawn; WEBHOOK refused (correctly out of scope); push absent |
 | Declared record handoff to DRC; WFC escalation | GAP | none |
 | Callers | GAP | **no other service sends a notification** (known-gaps 97c) |
@@ -448,3 +448,37 @@ Decisions taken with the owner: core lifecycle first, **recipient-only** acknowl
 **Reading the matrix honestly:** the build is strongest where the work was inside this service (intents, templates, privacy gate, preferences, suppression, evidence, notices) and weakest where the standard depends on other services or on channels and queue controls that do not exist here yet.
 
 **A defect the full run found (fixed in migration 000026):** a notice's lifecycle transitions are written in one transaction, so they share a timestamp (`now()` is the transaction start) and the history ordered by time then by a random id could come back in the wrong order. The lifecycle test passed once and failed on a later run. History rows now carry an identity sequence and are read in that order, with a test that creates 15 notices and checks every one, and the lifecycle test was run eight times in a row.
+
+## 19. Wave 3 slice 7: stable error codes and the missing canonical events (section 10.2 and 10.3)
+
+**Stable codes (`internal/ncd`).** The 20 codes of 10.3 are a catalogue whose names are checked against the standard's table written out literally in a test. A code is stamped only where the service genuinely produces that condition, and the stable code rides **beside** the service's own error code (`reason_code` and `reason` added to the error body; `error_code` unchanged), never replacing it. A guard test requires every code to be either produced somewhere in the service source or listed as unproduced with a reason, and found one that was neither (NCD-015) before it was wired.
+
+| Produced | Where |
+|---|---|
+| NCD-001, 002 | intent not found, not effective or retired (API) |
+| NCD-003 | unpublished template, retired template (API) |
+| NCD-004 | missing, unexpected or invalid template variables (API) |
+| NCD-005 | a template published in another locale but not the one asked for; no other language is substituted (API and reason) |
+| NCD-006 | unresolved recipient (delivery reason on first send, resend, retry and notice dispatch) |
+| NCD-008 | privacy gate refusals (reason and block code) |
+| NCD-009 | marketing or lifecycle class refused on the direct path (reason and block code) |
+| NCD-010 | suppression policy refusal, muted channel (reason and block code), channel decision |
+| NCD-011, 012, 013 | channel decision, quiet-hour deferral, no provider route / unsupported channel |
+| NCD-014 | delivery outcome unknown (API) |
+| NCD-015 | a notice deadline passes before delivery is evidenced |
+| NCD-016 | a response arrives before delivery is evidenced |
+| NCD-017 | an acknowledgement that does not fit, or that an operator tries to make |
+
+**Declared unproduced (and why):** NCD-007 (no endpoint verification state), NCD-018 (no review step for regulated notices), NCD-019 (a repeated source event is replayed as the original, not refused), NCD-020 (no cross-tenant or external-party recipient concept; RLS makes another tenant's recipient simply not exist). NCD-009 is produced only by the direct path's refusal of marketing classes; marketing permission itself still lives in the ledger pipeline.
+
+**Events (migration 000027).** Five of the spec's nine canonical events were missing; four are now emitted, each in the transaction that makes it true and none carrying content or an address:
+
+* `communication.prepared`: when a communication is created, with its content hash and intent version. A ledger-registered communication names its ledger intent. Existing outbox tests were updated to account for the extra creation event.
+* `communication.blocked`: for each withheld attempt, with the stable reason code (and the privacy decision id when there is one).
+* `delivery.evidence.recorded`: once per new evidence fact (a replayed callback is not new).
+* `endpoint.suppressed`: when a suppression is new or its reason changes, never for an unchanged repeat. The endpoint is a **hash**, so the topic cannot become a list of suppressed people's addresses.
+* `notice.deadline.at_risk`: raised **once** for a notice still lacking delivery evidence or a response within 24 hours of its deadline, saying which. A passed deadline is an expiry or exception, not "at risk".
+
+**Not emitted, deliberately:** `communication.correction.issued` (notices have `notice.corrected`, which names notice versions; the spec's event names communication ids, which a notice only has after dispatch), and `communication.record.declared` (no DRC). The Wave 0 list of "intent events" is not part of 10.2 and is not built.
+
+**Not done:** the catalogue is stamped on API errors and reasons; there is no machine-readable catalogue endpoint, and the generic failures (store unavailable, bad JSON) deliberately carry no stable code. Delivery reasons still carry the code as text (and as a block code on the event) rather than a dedicated column on the attempt row.

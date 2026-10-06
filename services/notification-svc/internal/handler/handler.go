@@ -8,8 +8,8 @@ import (
 	"errors"
 	"net/http"
 	"net/mail"
-	"strings"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,6 +20,7 @@ import (
 	"zoiko.io/notification-svc/internal/identity"
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/ncd"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
@@ -208,8 +209,8 @@ type Deps struct {
 	Evidence EvidenceStore
 	// Notices stores regulated notices (NCD-05). Optional: without it, and the intent registry, the routes answer 503.
 	Notices NoticeStore
-	Metrics        *telemetry.Domain
-	Log            *zap.Logger
+	Metrics *telemetry.Domain
+	Log     *zap.Logger
 }
 
 func New(d Deps) *Handler {
@@ -482,6 +483,14 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	if usingGovernedTemplate {
 		published, err := h.store.GetPublishedVersion(r.Context(), req.TemplateID, req.Locale)
 		if err != nil {
+			// A template that is published in another locale but not this one is an unapproved
+			// LOCALE (NCD-005), never silently replaced by another language; one with nothing
+			// published is simply not published (NCD-003).
+			if errors.Is(err, domain.ErrTemplateVersionNotFound) && h.otherLocalePublished(r.Context(), req.TemplateID, req.Locale) {
+				writeError(w, http.StatusUnprocessableEntity, "locale_not_approved",
+					"NCD-005 LOCALE_NOT_APPROVED: the template has no approved version in locale "+req.Locale+"; another language is never substituted")
+				return
+			}
 			h.handleTemplateError(w, err)
 			return
 		}
@@ -616,7 +625,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// would name the mail server rather than the missing address.
 	var outcome domain.DeliveryOutcome
 	if resolveErr != nil {
-		outcome.Reason = "recipient resolution failed: " + resolveErr.Error()
+		outcome.Reason = ncd.Format(ncd.RecipientUnresolved) + ": recipient resolution failed: " + resolveErr.Error()
 		outcome.Retryable = !identity.IsSettled(resolveErr)
 	} else {
 		var ok bool
@@ -626,12 +635,13 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.recordAttemptOutcome(w, r, notification, outcome, domain.AttemptMeta{
-		Origin:           domain.AttemptOriginRequest,
-		ProviderName:     outcome.ProviderName,
-		Retryable:        outcome.Retryable,
+		Origin:            domain.AttemptOriginRequest,
+		ProviderName:      outcome.ProviderName,
+		Retryable:         outcome.Retryable,
 		PrivacyDecisionID: outcome.PrivacyDecisionID,
 		PrivacyResult:     outcome.PrivacyResult,
-		ActorPrincipalID: principalID,
+		BlockCode:         outcome.BlockCode,
+		ActorPrincipalID:  principalID,
 	}, correlationID, tenantID, http.StatusCreated)
 }
 
@@ -1242,14 +1252,14 @@ func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 type createVersionRequest struct {
-	Locale                string   `json:"locale"`
-	Content               string   `json:"content"`
-	VariableSchema        []string `json:"variable_schema,omitempty"`
+	Locale         string   `json:"locale"`
+	Content        string   `json:"content"`
+	VariableSchema []string `json:"variable_schema,omitempty"`
 	// Subject is the reviewed subject text, placeholders only; SubjectVariables are
 	// the variables the author declares safe to appear in it (a subset of
 	// variable_schema). Omit both to leave the subject to the sender (legacy).
-	Subject          string   `json:"subject,omitempty"`
-	SubjectVariables []string `json:"subject_variables,omitempty"`
+	Subject               string   `json:"subject,omitempty"`
+	SubjectVariables      []string `json:"subject_variables,omitempty"`
 	BrandingMetadata      string   `json:"branding_metadata,omitempty"`
 	AccessibilityMetadata string   `json:"accessibility_metadata,omitempty"`
 }
@@ -1703,10 +1713,17 @@ func getCorrelationID(r *http.Request) string {
 func writeError(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	body := map[string]string{
 		"error_code":    code,
 		"error_message": msg,
-	})
+	}
+	// Where the condition is exactly one the standard names, the stable code (section 10.3)
+	// rides beside the service's own. Added, never substituted: existing callers keep working.
+	if stable, ok := ncd.ForAPIError(code); ok {
+		body["reason_code"] = stable
+		body["reason"] = ncd.Names[stable]
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -1913,4 +1930,20 @@ func purposeScopedKey(tenantID string, req domain.SendNotificationRequest, purpo
 	sum := sha256.Sum256([]byte(tenantID + "\x1f" + req.LegalEntityID + "\x1f" + req.CorrelationID + "\x1f" +
 		purpose + "\x1f" + req.RecipientPrincipalID + "\x1f" + req.Channel))
 	return "psk-" + hex.EncodeToString(sum[:])
+}
+
+// otherLocalePublished reports whether the template has an approved, published version in some
+// locale other than the one asked for, which is what makes a missing locale an unapproved
+// locale rather than an unpublished template.
+func (h *Handler) otherLocalePublished(ctx context.Context, templateID, locale string) bool {
+	locales, err := h.store.ListLocales(ctx, templateID)
+	if err != nil {
+		return false
+	}
+	for _, l := range locales {
+		if l.Locale != locale && l.PublishedVersionID != nil {
+			return true
+		}
+	}
+	return false
 }

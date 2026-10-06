@@ -177,3 +177,21 @@ func TestNoticeLifecycleNeverClaimsLegalService(t *testing.T) {
 		}
 	}
 }
+
+func TestNoticeDeadlineBeforeDeliveryCarriesNCD015(t *testing.T) {
+	d := t0
+	n := &Notice{Status: NoticeDeliveryInProgess, AckRequirement: AckReceipt, DeadlineAt: &d}
+	p, ok := DecideNoticeProgress(n, StatusSent, "", nil, d)
+	if !ok || p.To != NoticeException || !strings.HasPrefix(p.Reason, "NCD-015 DELIVERY_EXPIRED:") {
+		t.Fatalf("got %+v ok=%v", p, ok)
+	}
+}
+
+func TestResponseBeforeEvidenceIsBothAStateErrorAndNCD016(t *testing.T) {
+	if !errors.Is(ErrNoticeEvidenceInsufficient, ErrNoticeState) {
+		t.Error("it must still be a state error for callers that only know that")
+	}
+	if !strings.Contains(ErrNoticeEvidenceInsufficient.Error(), "NCD-016 EVIDENCE_INSUFFICIENT") {
+		t.Errorf("message = %q", ErrNoticeEvidenceInsufficient.Error())
+	}
+}

@@ -228,13 +228,13 @@ func applyNoticeProgressTx(ctx context.Context, tx pgx.Tx, n *domain.Notice, now
 		}
 		prog, ok := domain.DecideNoticeProgress(n, notifStatus, notifFailure, facts, now)
 		if !ok {
-			return nil
+			return warnIfAtRiskTx(ctx, tx, n, now)
 		}
 		if err := transitionNoticeTx(ctx, tx, n, prog.To, "system", prog.Reason, nil); err != nil {
 			return err
 		}
 	}
-	return nil
+	return warnIfAtRiskTx(ctx, tx, n, now)
 }
 
 // RefreshNotice advances a notice from the delivery facts that now exist. It is safe to call
@@ -291,6 +291,9 @@ func (s *PgStore) RecordNoticeAck(ctx context.Context, noticeID, actor, action, 
 			return nil
 		case domain.NoticeSatisfiedByPolicy:
 			refuse = domain.ErrAckNotRequired
+			return nil
+		case domain.NoticeReady, domain.NoticeDeliveryInProgess:
+			refuse = domain.ErrNoticeEvidenceInsufficient
 			return nil
 		default:
 			refuse = fmt.Errorf("%w: status is %s", domain.ErrNoticeState, n.Status)
@@ -402,4 +405,40 @@ func (s *PgStore) FindOpenNotices(ctx context.Context, limit int) ([]OpenNotice,
 		return nil, err
 	}
 	return out, tx.Commit(ctx)
+}
+
+// NoticeAtRiskWindow is how close to its deadline a notice that still lacks delivery
+// evidence or a response is announced as at risk (notice.deadline.at_risk). The workflow that
+// owns the deadline decides what to do; this only makes sure it is told, once.
+const NoticeAtRiskWindow = 24 * time.Hour
+
+// warnIfAtRiskTx raises notice.deadline.at_risk once for a notice that is still waiting on
+// delivery evidence or a response and is inside the window. A notice whose deadline has
+// already passed is not "at risk": it is expired or an exception, and says so itself.
+func warnIfAtRiskTx(ctx context.Context, tx pgx.Tx, n *domain.Notice, now time.Time) error {
+	if n.DeadlineAt == nil || !n.DeadlineAt.After(now) || n.DeadlineAt.Sub(now) > NoticeAtRiskWindow {
+		return nil
+	}
+	var deficiency string
+	switch n.Status {
+	case domain.NoticeDeliveryInProgess:
+		deficiency = "DELIVERY_NOT_EVIDENCED"
+	case domain.NoticeAckPending:
+		deficiency = "ACKNOWLEDGEMENT_PENDING"
+	default:
+		return nil
+	}
+	tag, err := tx.Exec(ctx, `UPDATE regulated_notices SET at_risk_notified_at = $1
+		WHERE notice_id::text = $2 AND tenant_id = $3 AND at_risk_notified_at IS NULL`, now, n.NoticeID, n.TenantID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	ev, err := events.NoticeDeadlineAtRisk(*n, deficiency)
+	if err != nil {
+		return err
+	}
+	return enqueue(ctx, tx, n.TenantID, ev)
 }

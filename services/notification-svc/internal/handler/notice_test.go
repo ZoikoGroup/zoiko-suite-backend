@@ -95,6 +95,8 @@ func (s *stubNotices) RecordNoticeAck(_ context.Context, id, actor, action, comm
 	case domain.NoticeAckPending:
 	case domain.NoticeAcknowledged, domain.NoticeDeclined, domain.NoticeDisputed:
 		return n, nil, domain.ErrNoticeAlreadyAnswered
+	case domain.NoticeReady, domain.NoticeDeliveryInProgess:
+		return n, nil, domain.ErrNoticeEvidenceInsufficient
 	default:
 		return n, nil, domain.ErrNoticeState
 	}

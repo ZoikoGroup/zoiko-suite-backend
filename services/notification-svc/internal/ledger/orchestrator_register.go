@@ -47,6 +47,9 @@ func (o *Orchestrator) registerCommunication(ctx context.Context, tenantID strin
 		PurposeContext:         templateKey,
 		IdempotencyKey:         "ledger:" + dedupKey,
 		CommunicationClass:     string(intent.CommunicationClass),
+		// In memory only (the link is written below): lets the creation event name the ledger
+		// intent the register row belongs to, as every later event does.
+		MessageIntentID: intent.MessageIntentID,
 	}
 	created, err := o.register.CreateNotification(ctx, row)
 	if err != nil {

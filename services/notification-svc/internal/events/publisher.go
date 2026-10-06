@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/ncd"
 )
 
 // Contract constants. Keep in step with asyncapi.yaml and with the
@@ -436,4 +437,91 @@ func NoticeEvent(eventType string, n domain.Notice, actor, reason string) (Outbo
 		payload["deadline_at"] = n.DeadlineAt.UTC().Format(time.RFC3339)
 	}
 	return Build(eventType, "notice-"+n.NoticeID, n.TenantID, n.LegalEntityID, actor, n.NoticeID, payload)
+}
+
+// ZS-SVC-Y-001 section 10.2 events added in migration 000027. As everywhere in this package
+// they carry no subject, body or address: a recipient endpoint is only ever a hash.
+const (
+	TypeCommunicationPrepared = "communication.prepared"
+	TypeCommunicationBlocked  = "communication.blocked"
+	TypeEvidenceRecorded      = "delivery.evidence.recorded"
+	TypeEndpointSuppressed    = "endpoint.suppressed"
+	TypeNoticeDeadlineAtRisk  = "notice.deadline.at_risk"
+)
+
+// CommunicationPrepared announces that a communication now exists, pinned to its exact
+// content and intent version, before any delivery is attempted.
+func CommunicationPrepared(correlationID string, n domain.Notification) (Outbound, error) {
+	return buildFor(n, TypeCommunicationPrepared, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+		"notification_id":       n.NotificationID,
+		"rendered_content_hash": n.RenderedContentHash,
+		"channel":               n.Channel,
+		"template_version_id":   n.TemplateVersionID,
+	})
+}
+
+// CommunicationBlocked announces that a delivery was withheld, with the stable reason code
+// (section 10.3). It is emitted for every withheld attempt, so a deferral that is retried
+// says so each time.
+func CommunicationBlocked(correlationID string, n domain.Notification, reasonCode string, attemptNumber int, retryable bool, privacyDecisionID string) (Outbound, error) {
+	p := map[string]any{
+		"notification_id": n.NotificationID,
+		"reason_code":     reasonCode,
+		"reason":          ncdName(reasonCode),
+		"attempt_number":  attemptNumber,
+		"retryable":       retryable,
+	}
+	if privacyDecisionID != "" {
+		p["privacy_decision_id"] = privacyDecisionID
+	}
+	return buildFor(n, TypeCommunicationBlocked, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, p)
+}
+
+// EvidenceRecorded announces a normalized evidence fact for an attempt.
+func EvidenceRecorded(ev domain.DeliveryEvidence, legalEntityID string) (Outbound, error) {
+	return Build(TypeEvidenceRecorded, "evidence-"+ev.AttemptID, ev.TenantID, legalEntityID, "system", ev.NotificationID, map[string]any{
+		"attempt_id":       ev.AttemptID,
+		"communication_id": ev.NotificationID,
+		"evidence_type":    "PROVIDER_CALLBACK",
+		"normalized_state": ev.Fact,
+		"strength":         ev.Strength,
+		"observed_at":      ev.OccurredAt.UTC().Format(time.RFC3339),
+		"provider":         ev.Provider,
+	})
+}
+
+// EndpointSuppressed announces that an endpoint may no longer be used for a scope. The
+// endpoint is a hash: the topic must not become a list of suppressed people's addresses.
+func EndpointSuppressed(tenantID, endpointRef, scope, reason, provider string, effectiveAt time.Time) (Outbound, error) {
+	return Build(TypeEndpointSuppressed, "suppression-"+endpointRef, tenantID, "", "system", endpointRef, map[string]any{
+		"endpoint_ref": endpointRef,
+		"scope":        scope,
+		"reason":       reason,
+		"source":       provider,
+		"effective_at": effectiveAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// NoticeDeadlineAtRisk announces that a notice's deadline is near and what it still lacks.
+func NoticeDeadlineAtRisk(n domain.Notice, deficiency string) (Outbound, error) {
+	p := map[string]any{
+		"notice_id":  n.NoticeID,
+		"lineage_id": n.LineageID,
+		"status":     n.Status,
+		"deficiency": deficiency,
+	}
+	if n.NotificationID != nil {
+		p["communication_id"] = *n.NotificationID
+	}
+	if n.DeadlineAt != nil {
+		p["deadline_at"] = n.DeadlineAt.UTC().Format(time.RFC3339)
+	}
+	return Build(TypeNoticeDeadlineAtRisk, "notice-"+n.NoticeID, n.TenantID, n.LegalEntityID, "system", n.NoticeID, p)
+}
+
+func ncdName(code string) string {
+	if name, ok := ncd.Names[code]; ok {
+		return name
+	}
+	return ""
 }

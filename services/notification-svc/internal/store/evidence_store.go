@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/webhook"
 )
@@ -27,9 +28,10 @@ func (s *PgStore) RecordDeliveryEvidence(ctx context.Context, ev *domain.Deliver
 	}
 	var inserted bool
 	err := s.withRLS(ctx, ev.TenantID, func(tx pgx.Tx) error {
-		var notificationID string
-		if err := tx.QueryRow(ctx, `SELECT notification_id::text FROM notification_delivery_attempts
-			WHERE attempt_id::text = $1 AND tenant_id = $2`, ev.AttemptID, ev.TenantID).Scan(&notificationID); err != nil {
+		var notificationID, legalEntityID string
+		if err := tx.QueryRow(ctx, `SELECT a.notification_id::text, n.legal_entity_id FROM notification_delivery_attempts a
+			JOIN notifications n ON n.notification_id = a.notification_id AND n.tenant_id = a.tenant_id
+			WHERE a.attempt_id::text = $1 AND a.tenant_id = $2`, ev.AttemptID, ev.TenantID).Scan(&notificationID, &legalEntityID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return webhook.ErrAttemptNotFound
 			}
@@ -46,7 +48,15 @@ func (s *PgStore) RecordDeliveryEvidence(ctx context.Context, ev *domain.Deliver
 			return err
 		}
 		inserted = tag.RowsAffected() == 1
-		return nil
+		if !inserted {
+			return nil
+		}
+		ev.NotificationID = notificationID
+		out, err := events.EvidenceRecorded(*ev, legalEntityID)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, ev.TenantID, out)
 	})
 	if err != nil {
 		return false, err

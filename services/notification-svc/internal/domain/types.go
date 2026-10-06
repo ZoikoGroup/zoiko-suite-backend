@@ -28,12 +28,12 @@ type Notification struct {
 	//   REQUEST          — supplied verbatim by the calling service
 	RecipientAddressSource string `json:"recipient_address_source,omitempty"`
 
-	Channel string `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
-	From    string `json:"from,omitempty"`
+	Channel string            `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
+	From    string            `json:"from,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
-	Subject string `json:"subject"`
-	Body    string `json:"body"`
-	Status  string `json:"status"` // PENDING, SENT, FAILED
+	Subject string            `json:"subject"`
+	Body    string            `json:"body"`
+	Status  string            `json:"status"` // PENDING, SENT, FAILED
 
 	SourceEventType string `json:"source_event_type,omitempty"`
 	SourceReference string `json:"source_reference,omitempty"`
@@ -302,6 +302,10 @@ type DeliveryOutcome struct {
 	// attempt, whether it permitted the send or stopped it (migration 000022).
 	PrivacyDecisionID string
 	PrivacyResult     string
+
+	// BlockCode is the stable reason code (ZS-SVC-Y-001 10.3, for example NCD-008) when a guard
+	// withheld this delivery, so the attempt record can announce communication.blocked.
+	BlockCode string
 }
 
 // AddressSource values for Notification.RecipientAddressSource.
@@ -413,15 +417,16 @@ const (
 // resend — why. The transition that records the attempt's effect writes it,
 // in the same transaction.
 type AttemptMeta struct {
-	Origin           string
-	ProviderName     string
-	Retryable        bool
-	ResendReason     string
+	Origin       string
+	ProviderName string
+	Retryable    bool
+	ResendReason string
 	// PrivacyDecisionID and PrivacyResult are the privacy decision that governed this
 	// attempt (migration 000022), recorded for a refusal as well as a permission.
 	PrivacyDecisionID string
 	PrivacyResult     string
-	ActorPrincipalID string
+	BlockCode         string
+	ActorPrincipalID  string
 }
 
 // DeliveryAttempt is one durable provider submission on the direct-send path.

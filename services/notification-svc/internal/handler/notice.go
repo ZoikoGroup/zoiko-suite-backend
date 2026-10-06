@@ -12,6 +12,7 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/identity"
+	"zoiko.io/notification-svc/internal/ncd"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
 
@@ -79,6 +80,8 @@ func (h *Handler) writeNoticeError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "notice_already_answered", err.Error())
 	case errors.Is(err, domain.ErrAckNotRequired):
 		writeError(w, http.StatusConflict, "acknowledgement_not_required", err.Error())
+	case errors.Is(err, domain.ErrNoticeEvidenceInsufficient):
+		writeError(w, http.StatusConflict, "evidence_insufficient", err.Error())
 	case errors.Is(err, domain.ErrNoticeState):
 		writeError(w, http.StatusConflict, "notice_state", err.Error())
 	default:
@@ -300,7 +303,7 @@ func (h *Handler) DispatchNotice(w http.ResponseWriter, r *http.Request) {
 		dw := &discardWriter{}
 		var outcome domain.DeliveryOutcome
 		if resolveErr != nil {
-			outcome.Reason = "recipient resolution failed: " + resolveErr.Error()
+			outcome.Reason = ncd.Format(ncd.RecipientUnresolved) + ": recipient resolution failed: " + resolveErr.Error()
 			outcome.Retryable = !identity.IsSettled(resolveErr)
 		} else {
 			var delivered bool
@@ -313,7 +316,7 @@ func (h *Handler) DispatchNotice(w http.ResponseWriter, r *http.Request) {
 		}
 		h.recordAttemptOutcome(dw, r, notification, outcome, domain.AttemptMeta{
 			Origin: domain.AttemptOriginRequest, ProviderName: outcome.ProviderName, Retryable: outcome.Retryable,
-			PrivacyDecisionID: outcome.PrivacyDecisionID, PrivacyResult: outcome.PrivacyResult, ActorPrincipalID: principalID,
+			PrivacyDecisionID: outcome.PrivacyDecisionID, PrivacyResult: outcome.PrivacyResult, BlockCode: outcome.BlockCode, ActorPrincipalID: principalID,
 		}, "notice-"+notice.NoticeID, tenantID, http.StatusCreated)
 	}
 	h.respondNotice(w, r, notice.NoticeID, http.StatusAccepted)
@@ -393,6 +396,10 @@ func (h *Handler) AcknowledgeNotice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, _, err := h.notices.RecordNoticeAck(r.Context(), chi.URLParam(r, "noticeID"), principalID, req.Action, req.Comment, time.Now().UTC())
+	if errors.Is(err, domain.ErrNoticeInvalid) {
+		writeError(w, http.StatusBadRequest, "acknowledgement_invalid", err.Error())
+		return
+	}
 	if err != nil {
 		h.writeNoticeError(w, err)
 		return
