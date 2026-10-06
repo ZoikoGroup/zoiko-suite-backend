@@ -28,12 +28,12 @@ type Notification struct {
 	//   REQUEST          — supplied verbatim by the calling service
 	RecipientAddressSource string `json:"recipient_address_source,omitempty"`
 
-	Channel string `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
-	From    string `json:"from,omitempty"`
+	Channel string            `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
+	From    string            `json:"from,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
-	Subject string `json:"subject"`
-	Body    string `json:"body"`
-	Status  string `json:"status"` // PENDING, SENT, FAILED
+	Subject string            `json:"subject"`
+	Body    string            `json:"body"`
+	Status  string            `json:"status"` // PENDING, SENT, FAILED
 
 	SourceEventType string `json:"source_event_type,omitempty"`
 	SourceReference string `json:"source_reference,omitempty"`

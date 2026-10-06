@@ -514,7 +514,11 @@ func main() {
 	}
 	go ncdSvc.Run(workerCtx, ncdInterval)
 	if senderAuthMonitor != nil {
+		setSenderAuth := telemetry.RegisterSenderAuth("notification-svc", prometheus.DefaultRegisterer)
+		healthy, _ := senderAuthMonitor.Healthy()
+		setSenderAuth(healthy)
 		go senderAuthMonitor.Run(workerCtx, cfg.SenderAuthCheckInterval, func(healthy bool, why string) {
+			setSenderAuth(healthy)
 			if healthy {
 				log.Info("sender authentication restored — email stream released (NP-55)")
 			} else {

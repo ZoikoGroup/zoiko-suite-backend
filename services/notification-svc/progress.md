@@ -1,5 +1,39 @@
 # notification-svc — Progress
 
+## Status: 6 Oct 2026 — in-service audit gaps closed, full spec matrix scored
+
+The five gaps the 5 Oct audit left inside this service are closed. Detail, the
+before/after scores and the list of gaps that wait on other services are in
+`docs/audit_files/Identity, Scope & Foundation-audit-2026-09-23.md`, section 7/9,
+"Follow-up, 6 October 2026".
+
+- **G-12** Migration `000024`: `ncd_exceptions` gets a platform-read policy, so
+  open exceptions reach the backlog gauges (`notification_ncd_open_exceptions{kind}`,
+  `..._open_exception_oldest_age_seconds`). Negative control recorded; live
+  gauges matched the database exactly. Applied to the dev DB with `migrate.py`.
+- **G-14** The legacy store suite runs as `zoiko_app_test NOSUPERUSER NOBYPASSRLS`.
+  That alone proved nothing: every legacy query also filters on `tenant_id`, so
+  with the tenant policies opened to everyone the suite still passed.
+  `TestLegacyTables_RLSIsolatesTenantsAsTheAppRole` reads all 13 legacy tenant
+  tables (found from the catalog) directly, and fails under that control.
+- **G-13** `RUNBOOK.md` (the ten §13.2 runbooks) and twelve alerts in
+  `deployments/prometheus-rules.yml` (promtool: valid). New gauge
+  `notification_sender_auth_healthy`, registered only where DKIM is configured.
+- **G-10** `CERTIFICATION_MATRIX.md`: all 110 NP/INV/TC rows scored. 95 met,
+  12 partial, 3 not met: 86% (92% weighted). 95% on the 100 rows this service
+  can close alone. Five tests added for rows that were correct but unproven
+  (NP-10, NP-39, NP-56 with a negative control, NP-60, INV-06).
+- **G-16** 9 files reformatted. The rest of `gofmt -l`'s Windows list is CRLF
+  in the working copy only.
+
+414 tests pass across 19 packages, 0 fail, 0 skip (store 132). Live check 69/69.
+
+**Correction:** PRV and DRC exist (privacy-decision-svc, document-vault-svc).
+This service does not call them yet. That, not a missing service, is why gaps
+G-1 and G-2 remain open.
+
+---
+
 ## Status: 5 Oct 2026 re-audit — six defects fixed and proven live
 
 The 30 Sep audit scored 37 API and table rows. The re-audit also read the spec's NP and INV

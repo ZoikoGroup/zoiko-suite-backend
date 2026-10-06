@@ -224,3 +224,20 @@ func TestNCDHTTP_ProviderEventsNeedSignature(t *testing.T) {
 		t.Fatalf("a signed callback for no attempt is accepted and left UNMATCHED: %d %s", rr.Code, rr.Body.String())
 	}
 }
+
+// NP-60 / INV-25: unsubscribe and complaint handling cannot be switched off
+// from below. No request body that reaches the plane has such a switch, and
+// an attempt to supply one is refused rather than silently ignored.
+func TestNCDHTTP_UnsubscribeHandlingCannotBeDisabled(t *testing.T) {
+	h, _, tenant := ncdServer(t)
+	for path, body := range map[string]map[string]any{
+		"/v1/preferences": {"muted_channels": []string{}, "disable_unsubscribe": true},
+		"/v1/communication-intents": {"legal_entity_id": "le-1", "intent_code": "promo", "display_name": "Promo",
+			"purpose_class": "MARKETING", "domain_owner": "growth", "sensitivity": "S1", "urgency": "U1",
+			"evidence_class": "E1", "allowed_channels": []string{"EMAIL"}, "complaint_handling": "off"},
+	} {
+		if code, out := call(t, h, "POST", path, tenant, "alice", body, ""); code != http.StatusBadRequest {
+			t.Errorf("%s with an unsubscribe/complaint switch must be 400, got %d %v", path, code, out)
+		}
+	}
+}

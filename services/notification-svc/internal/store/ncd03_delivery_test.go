@@ -165,6 +165,12 @@ func TestNCD03_TimeoutBecomesUnknownAndNeverBlindResends(t *testing.T) {
 	if rec.backlog.UnknownAttempts < 1 || rec.backlog.OldestUnknown <= 0 {
 		t.Fatalf("the backlog must show the stuck UNKNOWN attempt and its age, got %+v", rec.backlog)
 	}
+	// ...and the exception it raised, which RLS hid from the snapshot until
+	// 000024 gave ncd_exceptions the same platform-read policy (§13.1). It was
+	// raised in this same pass, so its age is legitimately zero here.
+	if rec.backlog.OpenExceptions["UNKNOWN_UNRESOLVED"] < 1 {
+		t.Fatalf("the backlog must show the open UNKNOWN_UNRESOLVED exception and its age, got %+v", rec.backlog)
+	}
 	// Reconciling the ORIGINAL attempt to FAILED permits the governed
 	// fallback, which goes to IN_APP under the same communication.
 	h.email.outcome = nil

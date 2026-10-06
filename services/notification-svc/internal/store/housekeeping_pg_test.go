@@ -202,7 +202,7 @@ func TestHousekeepingStore_StaleIntents_Expiry(t *testing.T) {
 // delete concluded intents, and the cascade took their renders, attempts and
 // events with them. The database now refuses the DELETE on every evidence table.
 func TestHousekeepingStore_DeliveryEvidenceIsNeverDeleted(t *testing.T) {
-	pool := openTestPool(t)
+	pool, admin := openTestPools(t)
 	s := store.New(pool)
 	ctx := context.Background()
 
@@ -272,7 +272,7 @@ func TestHousekeepingStore_DeliveryEvidenceIsNeverDeleted(t *testing.T) {
 	for _, table := range []string{"message_intents", "message_renders", "delivery_attempts", "delivery_events",
 		"notifications", "notification_delivery_attempts"} {
 		var has bool
-		require.NoError(t, pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_trigger
+		require.NoError(t, admin.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_trigger
 			WHERE tgrelid = $1::regclass AND tgname = 'trg_reject_evidence_delete' AND tgenabled <> 'D')`, table).Scan(&has))
 		assert.True(t, has, "%s must refuse DELETE", table)
 	}
@@ -283,12 +283,12 @@ func TestHousekeepingStore_DeliveryEvidenceIsNeverDeleted(t *testing.T) {
 		`DELETE FROM message_renders WHERE render_id = '` + oldRenderID + `'`,
 		`DELETE FROM delivery_attempts WHERE provider_attempt_id = '` + oldAttemptID + `'`,
 	} {
-		_, err := pool.Exec(ctx, stmt)
+		_, err := admin.Exec(ctx, stmt)
 		if err == nil {
 			t.Errorf("must be refused: %s", stmt)
 		}
 	}
 	var n int
-	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM delivery_attempts WHERE provider_attempt_id = $1`, oldAttemptID).Scan(&n))
+	require.NoError(t, admin.QueryRow(ctx, `SELECT count(*) FROM delivery_attempts WHERE provider_attempt_id = $1`, oldAttemptID).Scan(&n))
 	assert.Equal(t, 1, n, "the attempt evidence must survive")
 }

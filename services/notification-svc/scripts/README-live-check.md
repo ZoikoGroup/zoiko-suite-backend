@@ -14,8 +14,8 @@ docker start zoiko-postgres mailpit
 ```
 
 The `notification` database must be at the latest migration
-(`deployments/migrations/`, currently `000023`). The service does not migrate
-on start, and the database has no migration table. Check for the newest
+(`deployments/migrations/`, currently `000024`). The service does not migrate
+on start; apply pending migrations with `python deployments/migrate.py up --db notification`. Check for the newest
 migration's objects, for example the `trg_reject_evidence_delete` trigger.
 
 ## 2. Stand-ins for authorization-svc and identity-context-svc

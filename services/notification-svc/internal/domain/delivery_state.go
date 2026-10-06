@@ -82,11 +82,11 @@ type notificationAlias Notification
 func (n Notification) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		notificationAlias
-		Status          string `json:"status"`
-		DeliveryState   string `json:"delivery_state"`
-		StoredStatus    string `json:"stored_status"`
-		EvidenceClaim   string `json:"evidence_claim"`
-		LegallyServed   string `json:"legally_served"`
+		Status        string `json:"status"`
+		DeliveryState string `json:"delivery_state"`
+		StoredStatus  string `json:"stored_status"`
+		EvidenceClaim string `json:"evidence_claim"`
+		LegallyServed string `json:"legally_served"`
 	}{
 		notificationAlias: notificationAlias(n),
 		Status:            DeliveryStateOf(n),

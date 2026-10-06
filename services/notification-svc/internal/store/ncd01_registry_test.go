@@ -42,6 +42,9 @@ func TestNCD01_IntentPolicyInvariants(t *testing.T) {
 		"mandatory marketing":          func(i *ncd.IntentInput) { i.PurposeClass = ncd.PurposeMarketing; i.Mandatory = true },
 		"regulated below E2":           func(i *ncd.IntentInput) { i.PurposeClass = ncd.PurposeRegulated },
 		"override without mandatory":   func(i *ncd.IntentInput) { i.PurposeClass = ncd.PurposeOperational; i.PreferenceOverrideAllowed = true },
+		// INV-06: purpose is declared, never inferred from channel or audience.
+		"no purpose class":      func(i *ncd.IntentInput) {},
+		"unknown purpose class": func(i *ncd.IntentInput) { i.PurposeClass = "PROBABLY_FINE" },
 		"unknown channel": func(i *ncd.IntentInput) {
 			i.PurposeClass = ncd.PurposeOperational
 			i.AllowedChannels = []string{"PIGEON"}

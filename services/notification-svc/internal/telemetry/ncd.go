@@ -39,6 +39,13 @@ type NCD struct {
 	NoticesPastDeadline       prometheus.Gauge
 	RecordDeclarationsPending prometheus.Gauge
 	RecordPendingOldestAge    prometheus.Gauge
+	OpenExceptions            *prometheus.GaugeVec
+	OpenExceptionOldestAge    prometheus.Gauge
+
+	// seenKinds remembers every exception kind ever reported, so a kind
+	// whose exceptions were all resolved drops to 0 instead of holding its
+	// last count (a stale gauge is an alert that never clears).
+	seenKinds map[string]bool
 }
 
 var _ ncd.Metrics = (*NCD)(nil)
@@ -73,9 +80,17 @@ func NewNCD(serviceName string, reg prometheus.Registerer) *NCD {
 		NoticesPastDeadline:       gauge("notification_ncd_notices_past_deadline", "Regulated notices at their deadline without a concluded disposition (§13.2 deadline risk)."),
 		RecordDeclarationsPending: gauge("notification_ncd_record_declarations_pending", "Regulated notices whose DRC record declaration is still pending (§13.1 record handoff)."),
 		RecordPendingOldestAge:    gauge("notification_ncd_record_pending_oldest_age_seconds", "Age of the oldest pending DRC record declaration."),
+		OpenExceptions: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name:        "notification_ncd_open_exceptions",
+			Help:        "Unresolved exceptions by kind (§13.1, §13.2): the plane's human work queue.",
+			ConstLabels: labels,
+		}, []string{"kind"}),
+		OpenExceptionOldestAge: gauge("notification_ncd_open_exception_oldest_age_seconds", "Age of the oldest unresolved exception of any kind."),
+		seenKinds:              map[string]bool{},
 	}
 	reg.MustRegister(m.AttemptsTotal, m.SubmitDuration, m.CallbacksTotal, m.UnknownAttempts, m.UnknownOldestAgeSeconds,
-		m.QueuedJobs, m.QueuedOldestAgeSeconds, m.NoticesPastDeadline, m.RecordDeclarationsPending, m.RecordPendingOldestAge)
+		m.QueuedJobs, m.QueuedOldestAgeSeconds, m.NoticesPastDeadline, m.RecordDeclarationsPending, m.RecordPendingOldestAge,
+		m.OpenExceptions, m.OpenExceptionOldestAge)
 	return m
 }
 
@@ -99,4 +114,32 @@ func (m *NCD) Backlog(b ncd.Backlog) {
 	m.NoticesPastDeadline.Set(float64(b.NoticesPastDeadline))
 	m.RecordDeclarationsPending.Set(float64(b.RecordDeclarationsPending))
 	m.RecordPendingOldestAge.Set(b.OldestRecordPending.Seconds())
+	for kind := range b.OpenExceptions {
+		m.seenKinds[kind] = true
+	}
+	for kind := range m.seenKinds {
+		m.OpenExceptions.WithLabelValues(kind).Set(float64(b.OpenExceptions[kind]))
+	}
+	m.OpenExceptionOldestAge.Set(b.OldestOpenException.Seconds())
+}
+
+// RegisterSenderAuth exports the NP-55 sender-authentication state as
+// notification_sender_auth_healthy (1 healthy, 0 email held) and returns its
+// setter. Call it only when this service signs (DKIM configured): where the
+// provider signs there is no monitor, and an always-0 gauge would page for a
+// hold that is not happening.
+func RegisterSenderAuth(serviceName string, reg prometheus.Registerer) func(healthy bool) {
+	g := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:        "notification_sender_auth_healthy",
+		Help:        "1 while DKIM/DMARC/SPF authenticate this service's mail; 0 while email is held for a broken sender domain (§11.1, NP-55).",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	})
+	reg.MustRegister(g)
+	return func(healthy bool) {
+		if healthy {
+			g.Set(1)
+		} else {
+			g.Set(0)
+		}
+	}
 }

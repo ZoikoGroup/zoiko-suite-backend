@@ -127,6 +127,32 @@ func (n *NCDStore) Backlog(ctx context.Context, now time.Time) (ncd.Backlog, err
 			Scan(&b.UnknownAttempts, &unknownAge, &b.QueuedJobs, &queuedAge, &b.NoticesPastDeadline,
 				&b.RecordDeclarationsPending, &recordAge)
 	})
+	if err != nil {
+		return b, err
+	}
+	var exceptionAge float64
+	b.OpenExceptions = map[string]int{}
+	err = n.withPlatformScope(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT kind, count(*), EXTRACT(EPOCH FROM $1 - min(created_at))::float8
+			FROM ncd_exceptions WHERE resolved_at IS NULL GROUP BY kind`, now)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var kind string
+			var count int
+			var age float64
+			if err := rows.Scan(&kind, &count, &age); err != nil {
+				return err
+			}
+			b.OpenExceptions[kind] = count
+			exceptionAge = max(exceptionAge, age)
+		}
+		return rows.Err()
+	})
+	b.OldestOpenException = time.Duration(exceptionAge * float64(time.Second))
 	b.OldestUnknown = time.Duration(unknownAge * float64(time.Second))
 	b.OldestQueued = time.Duration(queuedAge * float64(time.Second))
 	b.OldestRecordPending = time.Duration(recordAge * float64(time.Second))

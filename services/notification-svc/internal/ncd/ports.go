@@ -110,6 +110,11 @@ type Backlog struct {
 	NoticesPastDeadline       int
 	RecordDeclarationsPending int
 	OldestRecordPending       time.Duration
+	// OpenExceptions counts unresolved exceptions by kind (a fixed, closed
+	// set: the CHECK on ncd_exceptions.kind), so a misdelivery incident can
+	// page while a pending record handoff only tickets.
+	OpenExceptions      map[string]int
+	OldestOpenException time.Duration
 }
 
 // Metrics records the plane's operational signals (§13.1). Implementations

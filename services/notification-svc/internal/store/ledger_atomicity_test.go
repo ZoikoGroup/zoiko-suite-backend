@@ -19,7 +19,7 @@ import (
 // TestLedger_CreateMessageIntent_Idempotent verifies that duplicate creation with
 // the same (tenant_id, deduplication_key) succeeds idempotently and returns the existing record.
 func TestLedger_CreateMessageIntent_Idempotent(t *testing.T) {
-	pool := openTestPool(t)
+	pool, admin := openTestPools(t)
 	s := store.New(pool)
 	ctx := context.Background()
 
@@ -90,7 +90,7 @@ func TestLedger_CreateMessageIntent_Idempotent(t *testing.T) {
 
 	// Verify database contains exactly 1 row
 	var count int
-	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM message_intents WHERE tenant_id = $1 AND deduplication_key = $2",
+	err = admin.QueryRow(ctx, "SELECT COUNT(*) FROM message_intents WHERE tenant_id = $1 AND deduplication_key = $2",
 		tenantID, dedupKey).Scan(&count)
 	if err != nil {
 		t.Fatalf("failed to count intents: %v", err)
@@ -445,7 +445,7 @@ func TestLedger_Traceability_IntentToRenderToAttemptToEvent(t *testing.T) {
 // TestLedger_TransactionRollback verifies that when an operation fails inside a transaction,
 // uncommitted ledger records are completely rolled back and leave no orphaned state.
 func TestLedger_TransactionRollback(t *testing.T) {
-	pool := openTestPool(t)
+	pool, admin := openTestPools(t)
 	ctx := context.Background()
 
 	tenantID := "tenant-" + uuid.NewString()
@@ -491,7 +491,7 @@ func TestLedger_TransactionRollback(t *testing.T) {
 
 	// Verify intent does NOT exist in database
 	var cnt int
-	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM message_intents WHERE message_intent_id = $1", intentID).Scan(&cnt)
+	err = admin.QueryRow(ctx, "SELECT COUNT(*) FROM message_intents WHERE message_intent_id = $1", intentID).Scan(&cnt)
 	if err != nil {
 		t.Fatalf("count failed: %v", err)
 	}

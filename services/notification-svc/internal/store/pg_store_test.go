@@ -22,10 +22,28 @@ import (
 	"zoiko.io/notification-svc/internal/store"
 )
 
-// openTestPool connects to a real Postgres and reapplies the migration from a
-// clean slate. Skips (not fails) if TEST_DATABASE_URL isn't set â€” same
+// openTestPool connects to a real Postgres, reapplies every migration from a
+// clean slate, and returns a pool connected as an unprivileged role.
+//
+// The schema is built as whoever TEST_DATABASE_URL names (usually a
+// superuser), but the tests run as zoiko_app_test: NOSUPERUSER NOBYPASSRLS,
+// not the tables' owner. A superuser bypasses row-level security even when it
+// is FORCEd, so a suite connected as one passes against a policy that hides
+// every row, or that hides none — which is how configuration-feature-flag-svc
+// shipped a 503 on every tenant write. The NCD suite already ran this way; the
+// legacy tables are now held to the same bar (audit gap G-14). Tests that need
+// to read past RLS on purpose take openTestPools' admin pool.
+//
+// Skips (not fails) if TEST_DATABASE_URL isn't set â€” same
 // convention as every other service in this platform.
 func openTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	app, _ := openTestPools(t)
+	return app
+}
+
+// openTestPools is openTestPool plus the admin pool that built the schema.
+func openTestPools(t *testing.T) (app, admin *pgxpool.Pool) {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -83,19 +101,28 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		}
 	}
 
-	const appRole = "zoiko_app_test"
+	const appRole, appPassword = "zoiko_app_test", "app-test"
 	if _, err := pool.Exec(ctx, `DO $do$ BEGIN
 		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '`+appRole+`') THEN
 			CREATE ROLE `+appRole+` NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 		END IF;
 	END $do$;
+	ALTER ROLE `+appRole+` LOGIN PASSWORD '`+appPassword+`' NOSUPERUSER NOBYPASSRLS;
 	GRANT USAGE ON SCHEMA public TO `+appRole+`;
 	GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO `+appRole+`;
+	GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO `+appRole+`;
 	`); err != nil {
 		t.Fatalf("setup test role %s: %v", appRole, err)
 	}
 
-	return pool
+	u, _ := url.Parse(dsn)
+	u.User = url.UserPassword(appRole, appPassword)
+	app, err = pgxpool.New(ctx, u.String())
+	if err != nil {
+		t.Fatalf("connect as %s: %v", appRole, err)
+	}
+	t.Cleanup(app.Close)
+	return app, pool
 }
 
 // requireThrowawayDatabase refuses to run against anything not recognisably

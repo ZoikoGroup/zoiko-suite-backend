@@ -419,8 +419,6 @@ type stubPublisher struct {
 	templateCreated, templateApproved, templatePublished, templateRetired int
 }
 
-
-
 type stubAuthZ struct {
 	err   error
 	calls []string // actionType per call, in order
