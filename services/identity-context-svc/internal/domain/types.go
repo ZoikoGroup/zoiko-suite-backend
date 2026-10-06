@@ -496,3 +496,9 @@ var ErrAuthorizationDenied = errors.New("authorization denied")
 
 // ErrAuthorizationServiceUnavailable is returned when authorization-svc cannot be reached.
 var ErrAuthorizationServiceUnavailable = errors.New("authorization service unavailable")
+
+// ErrUnknownPrincipal is returned when a projected role assignment names a
+// principal this service has never seen. principal_role_assignments has a
+// foreign key to principals; such a principal cannot hold a session here, so
+// there is nothing for the projection to serve and the event is skipped.
+var ErrUnknownPrincipal = errors.New("principal not known to identity-context-svc")

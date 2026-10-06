@@ -156,6 +156,14 @@ var (
 		"role.created":              true,
 		"role.updated":              true,
 		"permission.bundle.updated": true,
+		// access-control-svc's governance surface (Authorization Standard
+		// §9, §23). Assignments it provisions are written through this
+		// service's admin API, which invalidates the writing replica; these
+		// reach every OTHER replica, whose cached grant sources would
+		// otherwise keep a revoked assignment live until the TTL.
+		"iam.role.published":     true,
+		"iam.assignment.granted": true,
+		"iam.assignment.revoked": true,
 
 		// tenant-entity-registry-svc — the entities grants are scoped to.
 		// entity.status.changed matters because a DORMANT, SUSPENDED or

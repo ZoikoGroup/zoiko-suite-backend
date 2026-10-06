@@ -32,6 +32,16 @@ type RoleDirectory interface {
 	FindPrincipalIDsByRole(ctx context.Context, roleID, tenantID string, now time.Time) ([]string, error)
 }
 
+// RoleAssignmentProjector maintains the principal_role_assignments projection
+// from access-control-svc's governed assignment events. Optional: a
+// RoleDirectory that also implements it (the PgStore does) is fed; one that
+// does not is left alone. See store.UpsertRoleAssignment for why the
+// projection needs a feed at all.
+type RoleAssignmentProjector interface {
+	UpsertRoleAssignment(ctx context.Context, tenantID string, a domain.PrincipalRoleAssignment) error
+	EndRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error
+}
+
 // RiskSignalWriter is the write half of the risk cache. Kept separate from the
 // read interface the resolver holds, so the architectural invariant that
 // Resolve() never writes a signal is expressed in the types.
@@ -309,7 +319,8 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 	}
 
 	switch ev.EventType {
-	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated":
+	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated",
+		"iam.assignment.revoked":
 		if c.stale(ev) {
 			return
 		}
@@ -325,6 +336,10 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 		c.handleAuthorityDelegated(ctx, ev)
 	case "role.updated":
 		c.handleRoleUpdated(ctx, ev)
+	case "iam.assignment.revoked":
+		c.handleAssignmentRevoked(ctx, ev)
+	case "iam.assignment.granted":
+		c.handleAssignmentGranted(ctx, ev)
 	case "entity.updated":
 		c.handleEntityUpdated(ctx, ev)
 	case "session.risk.changed", "risk.signal.updated":
@@ -446,6 +461,106 @@ func (c *Consumer) handleRoleUpdated(ctx context.Context, ev inbound) {
 		zap.Int("sessions_revoked", total),
 		zap.String("correlation_id", ev.CorrelationID),
 	)
+}
+
+// handleAssignmentRevoked revokes every session of the principal whose
+// assignment ended (access-control-svc, Authorization Standard §9 / §19).
+//
+// role.updated cannot do this job: it resolves the role's holders NOW, and a
+// principal whose assignment was just revoked is no longer among them, so the
+// one session that most needs ending was the one it could never find. The
+// subject is payload.principal_id; ev.ActorID is the revoker and is never used.
+func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) {
+	var p struct {
+		PrincipalID       string `json:"principal_id"`
+		TargetPrincipalID string `json:"target_principal_id"`
+		RoleID            string `json:"role_id"`
+		AssignmentID      string `json:"assignment_id"`
+	}
+	_ = json.Unmarshal(ev.Payload, &p)
+	principalID := firstNonEmpty(p.PrincipalID, p.TargetPrincipalID)
+	if principalID == "" {
+		c.log.Error("iam.assignment.revoked names no principal — cannot revoke",
+			zap.String("event_id", ev.EventID))
+		return
+	}
+	if !c.requireTenant(ev) || !c.claim(ctx, ev.EventID) {
+		return
+	}
+	// Close the projection first, so the re-resolve the eviction forces does
+	// not frame the revoked role back into the next envelope.
+	if proj, ok := c.roles.(RoleAssignmentProjector); ok && p.AssignmentID != "" {
+		if err := proj.EndRoleAssignment(ctx, ev.TenantID, p.AssignmentID, c.now()); err != nil {
+			c.log.Error("failed to close projected role assignment",
+				zap.String("assignment_id", p.AssignmentID), zap.Error(err))
+		}
+	}
+	n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
+	if err != nil {
+		c.log.Error("failed to revoke sessions after assignment revocation",
+			zap.String("principal_id", principalID),
+			zap.String("role_id", p.RoleID),
+			zap.String("correlation_id", ev.CorrelationID),
+			zap.Error(err))
+		return
+	}
+	c.log.Warn("assignment revoked — sessions revoked",
+		zap.String("principal_id", principalID),
+		zap.String("role_id", p.RoleID),
+		zap.Int("sessions_revoked", n),
+		zap.String("correlation_id", ev.CorrelationID))
+}
+
+// handleAssignmentGranted projects a governed assignment into
+// principal_role_assignments, so the next resolve frames the role and a later
+// role.updated finds this principal among its holders. Revokes nothing: a new
+// assignment only adds access.
+func (c *Consumer) handleAssignmentGranted(ctx context.Context, ev inbound) {
+	proj, ok := c.roles.(RoleAssignmentProjector)
+	if !ok {
+		return
+	}
+	var p struct {
+		AssignmentID  string    `json:"assignment_id"`
+		PrincipalID   string    `json:"principal_id"`
+		RoleID        string    `json:"role_id"`
+		LegalEntityID string    `json:"legal_entity_id"`
+		EffectiveFrom time.Time `json:"effective_from"`
+		// EffectiveTo is the assignment's end date when it was granted with
+		// one. Projected, so a resolve after it stops framing the role even
+		// before the expiry's iam.assignment.revoked arrives.
+		EffectiveTo time.Time `json:"effective_to"`
+	}
+	_ = json.Unmarshal(ev.Payload, &p)
+	if p.AssignmentID == "" || p.PrincipalID == "" || p.RoleID == "" {
+		c.log.Error("iam.assignment.granted is missing assignment_id, principal_id or role_id — not projected",
+			zap.String("event_id", ev.EventID))
+		return
+	}
+	if !c.requireTenant(ev) || !c.claim(ctx, ev.EventID) {
+		return
+	}
+	a := domain.PrincipalRoleAssignment{
+		AssignmentID: p.AssignmentID, PrincipalID: p.PrincipalID, RoleID: p.RoleID,
+		EffectiveFrom: p.EffectiveFrom, EffectiveTo: p.EffectiveTo, AssignedBy: ev.ActorID,
+	}
+	if a.EffectiveFrom.IsZero() {
+		a.EffectiveFrom = c.now()
+	}
+	if p.LegalEntityID != "" {
+		a.LegalEntityID = &p.LegalEntityID
+	}
+	switch err := proj.UpsertRoleAssignment(ctx, ev.TenantID, a); {
+	case errors.Is(err, domain.ErrUnknownPrincipal):
+		c.log.Info("iam.assignment.granted for a principal with no identity here — nothing to project",
+			zap.String("principal_id", p.PrincipalID))
+	case err != nil:
+		c.log.Error("failed to project role assignment",
+			zap.String("assignment_id", p.AssignmentID), zap.Error(err))
+	default:
+		c.log.Info("iam.assignment.granted — role assignment projected",
+			zap.String("principal_id", p.PrincipalID), zap.String("role_id", p.RoleID))
+	}
 }
 
 // handleEntityUpdated revokes sessions scoped to the changed legal entity.

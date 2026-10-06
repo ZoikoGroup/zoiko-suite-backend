@@ -13,7 +13,7 @@
     act on the demo legal entity"; it does not answer "does that legal entity
     exist". Nothing had ever registered the demo tenant or entity in
     tenant-entity-registry-svc, and no service noticed until
-    accounts-receivable-svc started reconciling the legal entity on a write — at
+    accounts-receivable-svc started reconciling the legal entity on a write -- at
     which point every invoice is refused with legal_entity_not_in_tenant no matter
     what this script grants. The two are separate scripts because they seed
     different services, and a fresh stack needs both.
@@ -65,7 +65,10 @@ param(
     [string] $AuthzUrl = "http://localhost:8089",
 
     [Parameter(ParameterSetName = "Gateway", Mandatory)]
-    [string] $GatewayUrl
+    [string] $GatewayUrl,
+
+    # The Postgres container the IAM bootstrap writes through (development only).
+    [string] $PgContainer = "zoiko-postgres"
 )
 
 $ErrorActionPreference = "Stop"
@@ -316,7 +319,7 @@ $BUNDLES = @(
         # (SRB on role SR_1255) had been left in the dev database by some
         # earlier ad-hoc seeding. On a fresh volume, in CI, or on anyone else's
         # machine, nothing granted SCHEMA_PUBLISH and every registration was a
-        # 403 — the whole write path dead, with the page still rendering
+        # 403 -- the whole write path dead, with the page still rendering
         # normally. A grant that exists only in one developer's database is
         # indistinguishable from a working feature right up until someone else
         # tries it.
@@ -527,6 +530,10 @@ $BUNDLES = @(
             "iam.permission_bundle.manage",
             "iam.assignment.grant",
             "iam.assignment.revoke",
+            # Security approval of a CRITICAL-risk assignment request in
+            # access-control-svc (its migration 000013). The demo approver
+            # approves the audit's CRITICAL requests, so it holds this.
+            "iam.assignment.approve_privileged",
             "iam.sod_rule.manage",
             "iam.abac_rule.manage",
             "iam.delegation.grant",
@@ -629,7 +636,7 @@ if ($PSCmdlet.ParameterSetName -eq "Gateway") {
     $AUTHZ = $AuthzUrl.TrimEnd('/')
 }
 
-# §4 canonical envelope (ZS-ARCH-SVC-001 §4). Every request to the service has
+# section 4 canonical envelope (ZS-ARCH-SVC-001 section 4). Every request to the service has
 # carried these headers since envelope enforcement made admin writes fail
 # closed with 401 `envelope_incomplete`; this script predates that and was
 # seeding a volume that its own writes could never populate. The header set
@@ -640,11 +647,12 @@ if ($PSCmdlet.ParameterSetName -eq "Gateway") {
 # representative of a real read-path call.
 function New-AuthzEnvelope {
     param(
-        [Parameter(Mandatory)] [string] $Path
+        [Parameter(Mandatory)] [string] $Path,
+        [string] $Actor = $PRINCIPAL_ID
     )
     $headers = @{
         "X-Tenant-Id"       = $TENANT_ID
-        "X-Principal-Id"    = $PRINCIPAL_ID
+        "X-Principal-Id"    = $Actor
         "X-Legal-Entity-Id" = $LEGAL_ENTITY
         "X-Correlation-ID"  = [guid]::NewGuid().ToString()
         "X-Request-Id"      = [guid]::NewGuid().ToString()
@@ -662,12 +670,17 @@ function New-AuthzEnvelope {
 function Invoke-Authz {
     param(
         [Parameter(Mandatory)] [string] $Path,
-        [Parameter(Mandatory)] $Body
+        [Parameter(Mandatory)] $Body,
+        # Who makes the call. Role assignments to the demo principal are made by
+        # the approver: authorization-svc refuses a principal assigning a role to
+        # themselves (self_grant_not_allowed, section 10.1 "no self-grant of protected
+        # privilege").
+        [string] $Actor = $PRINCIPAL_ID
     )
     $json = $Body | ConvertTo-Json -Compress -Depth 5
     try {
         $response = Invoke-WebRequest -Uri "$AUTHZ$Path" -Method POST -Body $json `
-            -ContentType "application/json" -Headers (New-AuthzEnvelope -Path $Path) `
+            -ContentType "application/json" -Headers (New-AuthzEnvelope -Path $Path -Actor $Actor) `
             -UseBasicParsing -TimeoutSec 10
         return @{ status = [int] $response.StatusCode; body = $response.Content | ConvertFrom-Json }
     } catch {
@@ -683,10 +696,11 @@ function Invoke-Authz {
 function Get-Decision {
     param(
         [Parameter(Mandatory)] [string] $Action,
-        [Parameter(Mandatory)] [string] $Scope
+        [Parameter(Mandatory)] [string] $Scope,
+        [string] $Principal = $PRINCIPAL_ID
     )
     $result = Invoke-Authz -Path "/v1/authorize" -Body @{
-        principal_id    = $PRINCIPAL_ID
+        principal_id    = $Principal
         legal_entity_id = $Scope
         action_type     = $Action
     }
@@ -731,6 +745,48 @@ if ($missing.Count -eq 0) {
 } else {
     Write-Host "$($missing.Count) of $($ALL_ACTIONS.Count) actions missing: $($missing -join ', ')" -ForegroundColor Yellow
 
+    # -- Bootstrap: the admin API is gated by the grants this script creates --
+    #
+    # Since 30 Sep every /v1/admin/* route requires an iam.* action (iam.role.
+    # manage, iam.permission_bundle.manage, ...) held through a TENANT-scope
+    # assignment. On a database where nobody holds them yet -- any fresh or
+    # rebuilt volume -- the first call below is refused 403 and nothing can ever
+    # be granted through the API: the grant that opens the gate can only be
+    # made through the gate. This writes the minimum directly into
+    # authorization_svc (role, the IAM_ADMIN_FULL bundle, the tenant-scope
+    # assignment), idempotently, and the API does the rest. DEVELOPMENT ONLY:
+    # a real deployment's first IAM administrator is a governed act, not this.
+    # The approver is bootstrapped as well: it makes the demo principal's own
+    # role assignments below, which the demo principal may not make itself.
+    if ((Get-Decision -Action "iam.role.manage" -Scope $TENANT_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.assignment.grant" -Scope $TENANT_ID -Principal $APPROVER_ID).decision_outcome -ne "GRANTED") {
+        Write-Host "0  bootstrap the IAM admin grant directly (the admin API refuses everyone until one exists)" -NoNewline
+        $iamActions = ($BUNDLES | Where-Object { $_.Code -eq "IAM_ADMIN_FULL" }).Actions | ConvertTo-Json -Compress
+        $sql = @"
+INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
+VALUES ('$ROLE_ID', '$TENANT_ID', '$ROLE_CODE', 'Console Demo Operator', 'LEGAL_ENTITY', true, 'seed-bootstrap')
+ON CONFLICT DO NOTHING;
+INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
+VALUES ('$ROLE_ID', 'IAM_ADMIN_FULL', '$iamActions'::jsonb, true)
+ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$PRINCIPAL_ID', '$ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$PRINCIPAL_ID' AND role_id = '$ROLE_ID' AND legal_entity_id = '$TENANT_ID');
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$APPROVER_ID', '$ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$APPROVER_ID' AND role_id = '$ROLE_ID' AND legal_entity_id = '$TENANT_ID');
+"@
+        $sql | docker exec -i $PgContainer psql -U postgres -d authorization_svc -v ON_ERROR_STOP=1 -q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "IAM bootstrap into authorization_svc failed (container $PgContainer)" }
+        # A write made behind the service's back is not seen by its grant cache
+        # until the entry expires (AUTHZ_CACHE_TTL_SECONDS, default 5), and the
+        # probe above has just cached "nothing granted".
+        Start-Sleep -Seconds 6
+        Write-Host "  -> done" -ForegroundColor Green
+    }
+
     # Re-creating an existing role is NOT idempotent, despite what this script
     # used to claim: authorization-svc answers 503 `store_unavailable` (its own
     # instance of the platform-wide habit of reporting a constraint violation as
@@ -770,12 +826,12 @@ if ($missing.Count -eq 0) {
     foreach ($scope in @(@{ Id = $LEGAL_ENTITY; Label = "legal entity" }, @{ Id = $TENANT_ID; Label = "tenant" })) {
         Write-Host "$step  assign role to $PRINCIPAL_ID on the $($scope.Label)" -NoNewline
         try {
-            $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+            $assignment = Invoke-Authz -Actor $APPROVER_ID -Path "/v1/admin/role-assignments" -Body @{
                 principal_id    = $PRINCIPAL_ID
                 role_id         = $ROLE_ID
                 legal_entity_id = $scope.Id
                 effective_from  = "2020-01-01T00:00:00Z"
-                assigned_by     = $PRINCIPAL_ID
+                assigned_by     = $APPROVER_ID
             }
             Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
         } catch {
@@ -802,12 +858,12 @@ if ($missing.Count -eq 0) {
     # is in place.
     Write-Host "$step  assign role to $PRINCIPAL_ID on the platform scope" -NoNewline
     try {
-        $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+        $assignment = Invoke-Authz -Actor $APPROVER_ID -Path "/v1/admin/role-assignments" -Body @{
             principal_id    = $PRINCIPAL_ID
             role_id         = $ROLE_ID
             legal_entity_id = $PLATFORM_SCOPE
             effective_from  = "2020-01-01T00:00:00Z"
-            assigned_by     = $PRINCIPAL_ID
+            assigned_by     = $APPROVER_ID
         }
         Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
     } catch {

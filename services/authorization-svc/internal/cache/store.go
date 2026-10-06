@@ -667,6 +667,33 @@ func (s *Store) ListRoleAssignments(ctx context.Context, tenantID, principalID, 
 	return s.inner.ListRoleAssignments(ctx, tenantID, principalID, roleID, activeOnly)
 }
 
+// QueryRoleAssignments is a paged read for access reviews; not cached.
+func (s *Store) QueryRoleAssignments(ctx context.Context, q domain.AssignmentQuery) ([]domain.PrincipalRoleAssignment, error) {
+	if f, ok := s.inner.(interface {
+		QueryRoleAssignments(ctx context.Context, q domain.AssignmentQuery) ([]domain.PrincipalRoleAssignment, error)
+	}); ok {
+		return f.QueryRoleAssignments(ctx, q)
+	}
+	return nil, domain.ErrStoreUnavailable
+}
+
+// ScheduleRoleAssignmentEnd moves an assignment's end earlier, so cached grant
+// sources are invalidated like any revoke: a cached grant must not outlive the
+// end the store now records.
+func (s *Store) ScheduleRoleAssignmentEnd(ctx context.Context, assignmentID, tenantID string, at time.Time) (*domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		ScheduleRoleAssignmentEnd(ctx context.Context, assignmentID, tenantID string, at time.Time) (*domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	a, err := f.ScheduleRoleAssignmentEnd(ctx, assignmentID, tenantID, at)
+	if err == nil {
+		s.invalidateGrantSources(tenantID)
+	}
+	return a, err
+}
+
 func (s *Store) FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error) {
 	return s.inner.FindDelegatedAuthorityByID(ctx, delegatedAuthorityID, tenantID)
 }

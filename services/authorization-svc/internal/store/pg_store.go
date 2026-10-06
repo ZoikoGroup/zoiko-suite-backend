@@ -671,8 +671,8 @@ func (s *PgStore) CreateRoleAssignment(ctx context.Context, params domain.Create
 	}
 
 	const query = `
-		INSERT INTO principal_role_assignments (principal_role_assignment_id, principal_id, role_id, legal_entity_id, book_id, org_unit_id, effective_from, assigned_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO principal_role_assignments (principal_role_assignment_id, principal_id, role_id, legal_entity_id, book_id, org_unit_id, effective_from, assigned_by, effective_to)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING ` + assignmentColumns + `;`
 
 	// Scoped to the role's tenant, for the reason CreatePermissionBundle
@@ -684,7 +684,7 @@ func (s *PgStore) CreateRoleAssignment(ctx context.Context, params domain.Create
 		var scanErr error
 		a, scanErr = scanAssignment(tx.QueryRow(ctx, query,
 			params.PrincipalRoleAssignmentID, params.PrincipalID, params.RoleID,
-			params.LegalEntityID, params.BookID, params.OrgUnitID, params.EffectiveFrom, params.AssignedBy))
+			params.LegalEntityID, params.BookID, params.OrgUnitID, params.EffectiveFrom, params.AssignedBy, params.EffectiveTo))
 		return scanErr
 	})
 	if err != nil {
@@ -728,6 +728,113 @@ func (s *PgStore) RevokeRoleAssignment(ctx context.Context, assignmentID, tenant
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return a, nil
+}
+
+// ScheduleRoleAssignmentEnd ends an assignment at a future instant
+// (Authorization Standard §9 "Revocation: immediate or effective-dated
+// removal"). It only ever brings an end EARLIER: an assignment already ending
+// before at keeps its end, so scheduling can never extend access. Scoped to
+// tenantID through the role, exactly as RevokeRoleAssignment is; an assignment
+// that has already ended is ErrRoleAssignmentNotFound.
+func (s *PgStore) ScheduleRoleAssignmentEnd(ctx context.Context, assignmentID, tenantID string, at time.Time) (*domain.PrincipalRoleAssignment, error) {
+	const query = `
+		UPDATE principal_role_assignments
+		SET effective_to = LEAST(COALESCE(effective_to, 'infinity'::timestamptz), $3)
+		WHERE principal_role_assignment_id = $1
+		  AND (effective_to IS NULL OR effective_to > NOW())
+		  AND role_id IN (SELECT role_id FROM roles WHERE tenant_id = $2)
+		RETURNING ` + assignmentColumns + `;`
+
+	var a *domain.PrincipalRoleAssignment
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		a, scanErr = scanAssignment(tx.QueryRow(ctx, query, assignmentID, tenantID, at))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrRoleAssignmentNotFound
+		}
+		s.log.Error("pg ScheduleRoleAssignmentEnd failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return a, nil
+}
+
+// maxAssignmentPage caps one page of QueryRoleAssignments.
+const maxAssignmentPage = 500
+
+// QueryRoleAssignments is ListRoleAssignments with paging and, on request,
+// usage. ListRoleAssignments stops at 500 rows with nothing to say so, which
+// made an access review over a role with more holders than that silently
+// review only some of them; an offset lets a caller read every page.
+//
+// IncludeUsage adds, per row, the last GRANTED decision whose basis names the
+// row's role ("rbac:role=CODE[,CODE...]") for that principal, and the
+// principal's projected status. Read for reviews (§24 dormancy and orphan
+// detection), never for a decision.
+func (s *PgStore) QueryRoleAssignments(ctx context.Context, q domain.AssignmentQuery) ([]domain.PrincipalRoleAssignment, error) {
+	limit := q.Limit
+	if limit <= 0 || limit > maxAssignmentPage {
+		limit = maxAssignmentPage
+	}
+	offset := q.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	usage := `NULL::timestamptz, ''`
+	if q.IncludeUsage {
+		usage = `
+		       (SELECT max(d.decided_at) FROM access_decision_log d
+		         WHERE d.principal_id = a.principal_id
+		           AND d.decision_outcome = 'GRANTED'
+		           AND d.decision_basis LIKE 'rbac:role=%'
+		           AND r.role_code = ANY (string_to_array(substring(d.decision_basis FROM 'rbac:role=(.*)$'), ','))),
+		       COALESCE((SELECT ps.status FROM principal_status_projection ps
+		                  WHERE ps.principal_id = a.principal_id AND ps.tenant_id::text = r.tenant_id::text), 'ACTIVE')`
+	}
+	query := `
+		SELECT a.principal_role_assignment_id, a.principal_id, a.role_id, a.legal_entity_id, a.book_id, a.org_unit_id,
+		       a.effective_from, a.effective_to, a.assigned_by, a.created_at, ` + usage + `
+		  FROM principal_role_assignments a
+		  JOIN roles r ON r.role_id = a.role_id
+		 WHERE r.tenant_id = $1
+		   AND ($2 = '' OR a.principal_id = $2)
+		   AND ($3 = '' OR a.role_id::text = $3)`
+	if q.ActiveOnly {
+		query += `
+		   AND a.effective_from <= NOW()
+		   AND (a.effective_to IS NULL OR a.effective_to > NOW())`
+	}
+	query += `
+		 ORDER BY a.created_at DESC, a.principal_role_assignment_id
+		 LIMIT $4 OFFSET $5;`
+
+	var out []domain.PrincipalRoleAssignment
+	err := s.withRLS(ctx, q.TenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, q.TenantID, q.PrincipalID, q.RoleID, limit, offset)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a domain.PrincipalRoleAssignment
+			var status string
+			if scanErr := rows.Scan(&a.PrincipalRoleAssignmentID, &a.PrincipalID, &a.RoleID,
+				&a.LegalEntityID, &a.BookID, &a.OrgUnitID, &a.EffectiveFrom, &a.EffectiveTo, &a.AssignedBy, &a.CreatedAt,
+				&a.LastGrantedAt, &status); scanErr != nil {
+				return scanErr
+			}
+			a.PrincipalStatus = status
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg QueryRoleAssignments failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
 }
 
 // ListRoleAssignments implements Store.
@@ -974,7 +1081,7 @@ func (s *PgStore) FindGrantedActionsInTenant(ctx context.Context, principalID, t
 // with no action subset confers every action.
 func (s *PgStore) FindDelegationCeilings(ctx context.Context, principalID, legalEntityID, tenantID, actionType string) ([]domain.DelegationCeiling, error) {
 	const query = `
-		SELECT COALESCE(da.source_delegation_id, da.delegated_authority_id::text),
+		SELECT COALESCE(da.source_delegation_id, da.delegated_authority_id::text), da.delegator_principal_id,
 		       da.delegation_limit_minor, da.delegation_limit_currency, da.delegation_limit_quantity
 		  FROM delegated_authorities da
 		 WHERE da.delegate_principal_id = $1
@@ -993,7 +1100,7 @@ func (s *PgStore) FindDelegationCeilings(ctx context.Context, principalID, legal
 		defer rows.Close()
 		for rows.Next() {
 			var c domain.DelegationCeiling
-			if err := rows.Scan(&c.SourceDelegationID, &c.LimitMinor, &c.LimitCurrency, &c.LimitQuantity); err != nil {
+			if err := rows.Scan(&c.SourceDelegationID, &c.DelegatorPrincipalID, &c.LimitMinor, &c.LimitCurrency, &c.LimitQuantity); err != nil {
 				return err
 			}
 			out = append(out, c)

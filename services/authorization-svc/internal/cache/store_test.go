@@ -774,3 +774,28 @@ func TestCache_DisabledCacheStillAcceptsInvalidation(t *testing.T) {
 		t.Fatalf("status read %d times with caching disabled, want 2", inner.principalStatusCalls)
 	}
 }
+
+// ORG-06 negative case 12: "revoked delegation still cached in authorization
+// path → revoke cache/deny". A revocation, expiry or suspension projected
+// through this process must drop the cached delegations at once, not after the
+// TTL; with a one-minute TTL here, only invalidation can make the second read
+// reach the store.
+func TestCache_RevokedDelegationIsNotServedFromCache(t *testing.T) {
+	ctx := context.Background()
+	inner := &countingStore{actions: []string{"PAYMENT_APPROVE"}, basis: "delegation:d-1"}
+	c := newCache(inner, time.Minute)
+
+	_, _, _ = c.FindDelegatedActions(ctx, "delegate-1", "e-1", tenantA)
+	_, _, _ = c.FindDelegatedActions(ctx, "delegate-1", "e-1", tenantA)
+	if inner.delegateCalls != 1 {
+		t.Fatalf("warm-up: delegations read %d times, want 1 (cached)", inner.delegateCalls)
+	}
+	if _, err := c.RevokeProjectedDelegation(ctx, "delegated-authority-svc", "d-1", tenantA, 2); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _ = c.FindDelegatedActions(ctx, "delegate-1", "e-1", tenantA)
+	if inner.delegateCalls != 2 {
+		t.Errorf("after a revocation the delegation was served from cache (store reads %d, want 2)", inner.delegateCalls)
+	}
+}
+

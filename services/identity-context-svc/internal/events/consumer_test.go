@@ -48,11 +48,40 @@ func (f *fakeRevoker) EvictAllForEntity(_ context.Context, legalEntityID, tenant
 }
 
 type fakeRoles struct {
-	byRole map[string][]string
+	byRole    map[string][]string
+	projected map[string]domain.PrincipalRoleAssignment
+	ended     []string
 }
 
 func (f *fakeRoles) FindPrincipalIDsByRole(_ context.Context, roleID, _ string, _ time.Time) ([]string, error) {
 	return f.byRole[roleID], nil
+}
+
+// The projection: a granted assignment makes its principal a holder of the
+// role, an ended one removes it, exactly as the real table would.
+func (f *fakeRoles) UpsertRoleAssignment(_ context.Context, _ string, a domain.PrincipalRoleAssignment) error {
+	if f.projected == nil {
+		f.projected = map[string]domain.PrincipalRoleAssignment{}
+	}
+	f.projected[a.AssignmentID] = a
+	f.byRole[a.RoleID] = append(f.byRole[a.RoleID], a.PrincipalID)
+	return nil
+}
+
+func (f *fakeRoles) EndRoleAssignment(_ context.Context, _, assignmentID string, _ time.Time) error {
+	f.ended = append(f.ended, assignmentID)
+	a, ok := f.projected[assignmentID]
+	if !ok {
+		return nil
+	}
+	var kept []string
+	for _, p := range f.byRole[a.RoleID] {
+		if p != a.PrincipalID {
+			kept = append(kept, p)
+		}
+	}
+	f.byRole[a.RoleID] = kept
+	return nil
 }
 
 type fakeRisk struct {
@@ -224,6 +253,62 @@ func TestRoleUpdatedRevokesEveryHolder(t *testing.T) {
 	require.Len(t, h.sessions.principals, 2)
 	assert.Equal(t, "p-1", h.sessions.principals[0].id)
 	assert.Equal(t, "p-2", h.sessions.principals[1].id)
+}
+
+// The subject of a revoked assignment is no longer a holder of the role, so
+// role.updated cannot find them; iam.assignment.revoked names them directly.
+func TestAssignmentRevokedRevokesTheSubjectNotTheRevoker(t *testing.T) {
+	h := newHarness()
+	raw, err := json.Marshal(map[string]any{
+		"event_id": "e1", "event_type": "iam.assignment.revoked", "tenant_id": "tenant-1",
+		"actor_id": "p-revoker", "correlation_id": "corr-1",
+		"payload": map[string]any{"principal_id": "p-subject", "role_id": "role-9"},
+	})
+	require.NoError(t, err)
+	h.consumer.Handle(context.Background(), raw)
+
+	require.Len(t, h.sessions.principals, 1)
+	assert.Equal(t, "p-subject", h.sessions.principals[0].id)
+}
+
+// The projection had no feed, so role.updated resolved no holders. A governed
+// grant now makes the principal a holder: retiring the role then ends their
+// sessions; revoking the assignment closes the projection.
+func TestAssignmentGrantedFeedsRoleUpdatedRevocation(t *testing.T) {
+	h := newHarness()
+	h.consumer.Handle(context.Background(), event(t, "iam.assignment.granted", "g1", "tenant-1",
+		map[string]any{"assignment_id": "a-1", "principal_id": "p-7", "role_id": "role-5", "legal_entity_id": "ent-1"}))
+	require.Contains(t, h.roles.projected, "a-1")
+	assert.Empty(t, h.sessions.principals, "a grant only adds access")
+
+	h.consumer.Handle(context.Background(), event(t, "role.updated", "u1", "tenant-1", map[string]any{"role_id": "role-5"}))
+	require.Len(t, h.sessions.principals, 1)
+	assert.Equal(t, "p-7", h.sessions.principals[0].id)
+
+	h.consumer.Handle(context.Background(), event(t, "iam.assignment.revoked", "r1", "tenant-1",
+		map[string]any{"assignment_id": "a-1", "principal_id": "p-7", "role_id": "role-5"}))
+	assert.Equal(t, []string{"a-1"}, h.roles.ended)
+	assert.Empty(t, h.roles.byRole["role-5"], "a revoked assignment is no longer a holder")
+}
+
+// An assignment granted with an end date is projected with it, so the
+// resolver stops framing the role at that instant rather than at whenever the
+// expiry's iam.assignment.revoked is consumed.
+func TestAssignmentGrantedProjectsEndDate(t *testing.T) {
+	h := newHarness()
+	end := time.Date(2030, 3, 31, 17, 0, 0, 0, time.UTC)
+	h.consumer.Handle(context.Background(), event(t, "iam.assignment.granted", "g2", "tenant-1",
+		map[string]any{"assignment_id": "a-2", "principal_id": "p-8", "role_id": "role-5", "effective_to": end}))
+	require.Contains(t, h.roles.projected, "a-2")
+	assert.True(t, h.roles.projected["a-2"].EffectiveTo.Equal(end), "end date not projected: %v", h.roles.projected["a-2"].EffectiveTo)
+}
+
+func TestAssignmentRevokedWithoutPrincipalRevokesNobody(t *testing.T) {
+	h := newHarness()
+	h.consumer.Handle(context.Background(), event(t, "iam.assignment.revoked", "e1", "tenant-1",
+		map[string]any{"role_id": "role-9"}))
+
+	assert.Empty(t, h.sessions.principals, "never fall back to actor_id: that is the revoker")
 }
 
 func TestEntityUpdatedRevokesEntityScopedSessions(t *testing.T) {

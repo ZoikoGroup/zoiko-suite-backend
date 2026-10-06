@@ -11,7 +11,7 @@ asyncapi: 2.6.0
 
 info:
   title: access-control-svc events
-  version: "1.1.0"
+  version: "1.3.0"
   description: |
     Role and permission-bundle lifecycle events, published to
     `zoiko.access-control.events` through a **transactional outbox**.
@@ -72,6 +72,12 @@ channels:
           - $ref: '#/components/messages/RoleCreated'
           - $ref: '#/components/messages/RoleUpdated'
           - $ref: '#/components/messages/PermissionBundleUpdated'
+          - $ref: '#/components/messages/RolePublished'
+          - $ref: '#/components/messages/AssignmentRequested'
+          - $ref: '#/components/messages/AssignmentGranted'
+          - $ref: '#/components/messages/AssignmentRevoked'
+          - $ref: '#/components/messages/AccessReviewStarted'
+          - $ref: '#/components/messages/AccessReviewCompleted'
 
 components:
   messages:
@@ -143,6 +149,92 @@ components:
             properties:
               event_type: { const: permission.bundle.updated }
               payload: { $ref: '#/components/schemas/BundleUpdatedPayload' }
+
+    RolePublished:
+      name: iam.role.published
+      title: A role version was activated (§23)
+      summary: |
+        Emitted when a role is instantiated from a system role template version and when it is
+        upgraded to a newer one, alongside role.created / role.updated.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.role.published }
+              payload: { $ref: '#/components/schemas/RolePublishedPayload' }
+
+    AssignmentRequested:
+      name: iam.assignment.requested
+      title: An assignment request awaits an independent approver
+      summary: |
+        HIGH/CRITICAL risk or a self-request. Nothing is granted yet.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.assignment.requested }
+              payload: { $ref: '#/components/schemas/AssignmentPayload' }
+
+    AssignmentGranted:
+      name: iam.assignment.granted
+      title: An access assignment became effective (§23)
+      summary: |
+        Provisioned in authorization-svc under the request id before this is enqueued.
+        Carries `effective_to` when the assignment was granted with an end date;
+        identity-context-svc projects it as the assignment's end.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.assignment.granted }
+              payload: { $ref: '#/components/schemas/AssignmentPayload' }
+
+    AssignmentRevoked:
+      name: iam.assignment.revoked
+      title: An access assignment was revoked (§23)
+      summary: |
+        From a revoke command, a REVOKE review decision, or the expiry sweep once an
+        assignment's `effective_to` has passed ("revoked/expired"; `status` is then
+        EXPIRED for an end set at grant time, REVOKED for one scheduled by a revoke,
+        and `actor_id` is the scheduler or `system:assignment-expiry`). `principal_id` is the SUBJECT;
+        identity-context-svc ends every session of that principal on it (role.updated
+        cannot: the subject is no longer a holder of the role).
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.assignment.revoked }
+              payload: { $ref: '#/components/schemas/AssignmentPayload' }
+
+    AccessReviewStarted:
+      name: iam.access_review.started
+      title: A certification campaign was started (§23, §24)
+      summary: |
+        Carries the campaign and the number of items snapshotted.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.access_review.started }
+              payload: { $ref: '#/components/schemas/AccessReviewPayload' }
+
+    AccessReviewCompleted:
+      name: iam.access_review.completed
+      title: A certification campaign was completed (§23, §24)
+      summary: |
+        Carries the outcome summary (decisions, revocations, expired STANDARD items).
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.access_review.completed }
+              payload: { $ref: '#/components/schemas/AccessReviewPayload' }
 
   schemas:
     Envelope:
@@ -242,3 +334,43 @@ components:
         active_flag:
           type: boolean
           description: False means detached — withdrawn, contents kept.
+
+    RolePublishedPayload:
+      type: object
+      required: [role_id, role_code, template_code, template_version, permitted_actions]
+      properties:
+        role_id: { type: string, format: uuid }
+        role_code: { type: string }
+        template_code: { type: string }
+        template_version: { type: integer }
+        permitted_actions: { type: array, items: { type: string } }
+
+    AssignmentPayload:
+      type: object
+      required: [principal_id, role_id]
+      properties:
+        request_id: { type: string, format: uuid }
+        assignment_id: { type: string, format: uuid }
+        principal_id: { type: string, description: The subject of the assignment. Never the actor. }
+        target_principal_id: { type: string }
+        role_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
+        risk_tier: { type: string, enum: [STANDARD, HIGH, CRITICAL] }
+        status: { type: string }
+        approval_reason: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time, description: 'The end date, when the assignment has one.' }
+        revocation_reason: { type: string }
+        review_item_id: { type: string, format: uuid }
+        campaign_id: { type: string, format: uuid }
+
+    AccessReviewPayload:
+      type: object
+      required: [campaign_id, campaign_name, review_type]
+      properties:
+        campaign_id: { type: string, format: uuid }
+        campaign_name: { type: string }
+        review_type: { type: string, enum: [PERIODIC, EVENT_TRIGGERED, PRIVILEGED] }
+        due_at: { type: string, format: date-time }
+        items: { type: integer }
+        summary: { type: object, additionalProperties: { type: integer } }

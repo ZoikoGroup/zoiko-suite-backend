@@ -65,6 +65,27 @@ type PrincipalRoleAssignment struct {
 
 	AssignedBy string    `json:"assigned_by"`
 	CreatedAt  time.Time `json:"created_at"`
+
+	// Filled only when a list asks for usage (include_usage=true), for access
+	// reviews (Authorization Standard §24 "Dormancy", "Orphan detection").
+	// LastGrantedAt is the latest GRANTED decision whose basis names this
+	// assignment's role for this principal; nil means none is on record.
+	// PrincipalStatus is the subject's projected status (ACTIVE when no
+	// status has ever been projected for them).
+	LastGrantedAt   *time.Time `json:"last_granted_at,omitempty"`
+	PrincipalStatus string     `json:"principal_status,omitempty"`
+}
+
+// AssignmentQuery is a paged assignment read. Limit is capped by the store;
+// Offset pages past it, so a caller that needs every row can have them.
+type AssignmentQuery struct {
+	TenantID     string
+	PrincipalID  string
+	RoleID       string
+	ActiveOnly   bool
+	IncludeUsage bool
+	Limit        int
+	Offset       int
 }
 
 // DelegatedAuthority grants a delegate principal the ability to act within
@@ -485,7 +506,11 @@ type CreateRoleAssignmentParams struct {
 	BookID        *string
 	OrgUnitID     *string
 	EffectiveFrom time.Time
-	AssignedBy    string
+	// EffectiveTo is optional: nil is open-ended. When set it must be after
+	// EffectiveFrom (Authorization Standard §9: an assignment carries
+	// "effective dates", and §22 the same of access_assignment).
+	EffectiveTo *time.Time
+	AssignedBy  string
 }
 
 type CreateDelegatedAuthorityParams struct {
@@ -552,9 +577,12 @@ type ProjectDelegationParams struct {
 // authority it confers (delegated-authority-svc authority_limit_*).
 type DelegationCeiling struct {
 	SourceDelegationID string
-	LimitMinor         *int64
-	LimitCurrency      *string
-	LimitQuantity      *int64
+	// DelegatorPrincipalID is whose authority the delegation transmits. The
+	// delegation can confer no more than that principal's own limits allow.
+	DelegatorPrincipalID string
+	LimitMinor           *int64
+	LimitCurrency        *string
+	LimitQuantity        *int64
 }
 
 type CreateSoDRuleParams struct {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -909,6 +910,9 @@ type createAssignmentRequest struct {
 	BookID        string    `json:"book_id,omitempty"`
 	OrgUnitID     string    `json:"org_unit_id,omitempty"`
 	EffectiveFrom time.Time `json:"effective_from"`
+	// EffectiveTo is optional; omit it for an open-ended assignment. When set
+	// it must be after effective_from and in the future.
+	EffectiveTo *time.Time `json:"effective_to,omitempty"`
 }
 
 func (req createAssignmentRequest) missingField() string {
@@ -950,6 +954,13 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	}
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		return
+	}
+	if req.EffectiveTo != nil && (!req.EffectiveTo.After(req.EffectiveFrom) || !req.EffectiveTo.After(time.Now())) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_effective_to",
+			"message": "effective_to must be after effective_from and in the future",
+		})
 		return
 	}
 
@@ -998,7 +1009,8 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	assignment, err := h.store.CreateRoleAssignment(r.Context(), domain.CreateRoleAssignmentParams{
 		// assigned_by is always the verified caller, never the request body.
 		PrincipalRoleAssignmentID: req.PrincipalRoleAssignmentID, PrincipalID: req.PrincipalID, RoleID: req.RoleID,
-		LegalEntityID: legalEntityID, BookID: bookID, OrgUnitID: orgUnitID, EffectiveFrom: req.EffectiveFrom, AssignedBy: principalID,
+		LegalEntityID: legalEntityID, BookID: bookID, OrgUnitID: orgUnitID, EffectiveFrom: req.EffectiveFrom, EffectiveTo: req.EffectiveTo,
+		AssignedBy: principalID,
 	})
 	if err != nil {
 		switch {
@@ -1015,9 +1027,22 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, assignment)
 }
 
+// assignmentEndScheduler is the store capability behind an effective-dated
+// revoke. Optional so a store without it answers 503 rather than revoking at
+// once, which would end access earlier than the caller asked.
+type assignmentEndScheduler interface {
+	ScheduleRoleAssignmentEnd(ctx context.Context, assignmentID, tenantID string, at time.Time) (*domain.PrincipalRoleAssignment, error)
+}
+
 // RevokeRoleAssignment handles POST /v1/admin/role-assignments/{assignment_id}/revoke.
 //
-// Response: 200 revoked / 403 unauthorized / 404 not found or already ended / 503 unavailable.
+// An empty body (or {}) revokes now. {"effective_to": "<RFC 3339>"} in the
+// future schedules the end instead (Authorization Standard §9 "Revocation:
+// immediate or effective-dated removal"); a schedule only ever brings an end
+// earlier, never later.
+//
+// Response: 200 revoked or scheduled / 400 invalid effective_to / 403 unauthorized /
+// 404 not found or already ended / 503 unavailable.
 func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	assignmentID := chi.URLParam(r, "assignment_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -1032,6 +1057,42 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	}
 	// Require iam.assignment.revoke to revoke role assignments
 	if !h.requirePermission(w, r, principalID, tenantScope, "iam.assignment.revoke") {
+		return
+	}
+
+	var body struct {
+		EffectiveTo *time.Time `json:"effective_to"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+			return
+		}
+	}
+	if body.EffectiveTo != nil {
+		if !body.EffectiveTo.After(time.Now()) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_effective_to",
+				"message": "effective_to must be in the future; omit it to revoke now",
+			})
+			return
+		}
+		scheduler, ok := h.store.(assignmentEndScheduler)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		assignment, err := scheduler.ScheduleRoleAssignmentEnd(r.Context(), assignmentID, tenantScope, body.EffectiveTo.UTC())
+		if err != nil {
+			if errors.Is(err, domain.ErrRoleAssignmentNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
+				return
+			}
+			h.log.Error("RevokeRoleAssignment: schedule failed", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		writeJSON(w, http.StatusOK, assignment)
 		return
 	}
 
@@ -2589,6 +2650,19 @@ func (h *Handler) recordAndAnswerWithReason(
 
 // ── GET /v1/admin/role-assignments ──────────────────────────────────────────
 
+// assignmentPager is the store capability behind the paged list.
+type assignmentPager interface {
+	QueryRoleAssignments(ctx context.Context, q domain.AssignmentQuery) ([]domain.PrincipalRoleAssignment, error)
+}
+
+// atoiOrZero parses an optional non-negative query integer; "" is 0.
+func atoiOrZero(v string) (int, error) {
+	if v == "" {
+		return 0, nil
+	}
+	return strconv.Atoi(v)
+}
+
 // ListRoleAssignments handles GET /v1/admin/role-assignments — read the
 // grants that actually exist.
 //
@@ -2622,6 +2696,39 @@ func (h *Handler) ListRoleAssignments(w http.ResponseWriter, r *http.Request) {
 	principalFilter := strings.TrimSpace(r.URL.Query().Get("principal_id"))
 	roleFilter := strings.TrimSpace(r.URL.Query().Get("role_id"))
 	activeOnly := r.URL.Query().Get("include_expired") != "true"
+
+	// Paged / usage form: limit, offset, include_usage=true. The plain form
+	// stops at 500 rows without saying so; a caller that must see every
+	// assignment (an access review) pages with offset until a short page.
+	qs := r.URL.Query()
+	if qs.Has("limit") || qs.Has("offset") || qs.Get("include_usage") == "true" {
+		limit, lErr := atoiOrZero(qs.Get("limit"))
+		offset, oErr := atoiOrZero(qs.Get("offset"))
+		if lErr != nil || oErr != nil || limit < 0 || offset < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_paging", "message": "limit and offset must be non-negative integers"})
+			return
+		}
+		pager, ok := h.store.(assignmentPager)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		page, err := pager.QueryRoleAssignments(r.Context(), domain.AssignmentQuery{
+			TenantID: tenantScope, PrincipalID: principalFilter, RoleID: roleFilter, ActiveOnly: activeOnly,
+			IncludeUsage: qs.Get("include_usage") == "true", Limit: limit, Offset: offset,
+		})
+		if err != nil {
+			h.log.Error("ListRoleAssignments: store unavailable",
+				zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if page == nil {
+			page = []domain.PrincipalRoleAssignment{}
+		}
+		writeJSON(w, http.StatusOK, page)
+		return
+	}
 
 	// A malformed role_id must not read as an outage — same posture as
 	// validScope on the authorize path. role_id is compared as ::text in the

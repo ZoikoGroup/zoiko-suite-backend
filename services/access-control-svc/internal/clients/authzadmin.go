@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -156,8 +158,8 @@ func (c *AuthzAdminClient) listPermissionBundles(ctx context.Context, roleID str
 
 	if resp.StatusCode >= 300 {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("authorization-svc admin API returned %d for GET %s: %s",
-			resp.StatusCode, path, string(detail))
+		return nil, classify(resp.StatusCode, fmt.Errorf("authorization-svc admin API returned %d for GET %s: %s",
+			resp.StatusCode, path, string(detail)))
 	}
 	var bundles []adminPermissionBundle
 	if err := json.NewDecoder(resp.Body).Decode(&bundles); err != nil {
@@ -223,8 +225,187 @@ func (c *AuthzAdminClient) post(ctx context.Context, path string, body []byte, s
 		// "authorization-svc is unwell". Without it both read as an outage,
 		// which is what hid the missing envelope for as long as it did.
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("authorization-svc admin API returned %d for POST %s: %s",
-			resp.StatusCode, path, string(detail))
+		return classify(resp.StatusCode, fmt.Errorf("authorization-svc admin API returned %d for POST %s: %s",
+			resp.StatusCode, path, string(detail)))
+	}
+	return nil
+}
+
+// classify marks a 403 as a refusal of the caller rather than an outage.
+//
+// Since 30 Sep authorization-svc gates its admin writes on iam.* actions
+// (iam.role.manage, iam.permission_bundle.manage) at TENANT scope, and this
+// service provisions AS the caller. A caller holding ROLE_MANAGE but not those
+// grants passes this service's own check and is then refused there. That 403
+// used to leave here as 503 authz_admin_unavailable, which pages on-call for
+// an outage when the fix is a missing grant.
+func classify(status int, err error) error {
+	if status == http.StatusForbidden {
+		return fmt.Errorf("%w: %v", domain.ErrProvisioningForbidden, err)
+	}
+	return err
+}
+
+// ── role assignments (POST/GET /v1/admin/role-assignments) ──────────────────
+//
+// authorization-svc holds the access assignment and enforces it; this service
+// provisions the assignment a governed request (or a review decision) has
+// cleared. authorization-svc requires iam.assignment.grant / .revoke at tenant
+// scope for the CALLER and refuses a self-grant, so the provisioning principal
+// is always the approver, never the subject.
+
+type createAssignmentBody struct {
+	PrincipalRoleAssignmentID string     `json:"principal_role_assignment_id,omitempty"`
+	PrincipalID               string     `json:"principal_id"`
+	RoleID                    string     `json:"role_id"`
+	LegalEntityID             string     `json:"legal_entity_id,omitempty"`
+	EffectiveFrom             time.Time  `json:"effective_from"`
+	EffectiveTo               *time.Time `json:"effective_to,omitempty"`
+}
+
+// CreateRoleAssignment provisions principalID into roleID and returns
+// authorization-svc's assignment id. assignmentID is sent as the id to use, so
+// the two id spaces are joined by construction. effectiveTo nil is open-ended;
+// set, authorization-svc ends the assignment at that instant.
+func (c *AuthzAdminClient) CreateRoleAssignment(ctx context.Context, assignmentID, principalID, roleID, legalEntityID string, effectiveFrom time.Time, effectiveTo *time.Time, s Scope) (string, error) {
+	var end *time.Time
+	if effectiveTo != nil {
+		u := effectiveTo.UTC()
+		end = &u
+	}
+	body, _ := json.Marshal(createAssignmentBody{
+		PrincipalRoleAssignmentID: assignmentID,
+		PrincipalID:               principalID,
+		RoleID:                    roleID,
+		LegalEntityID:             legalEntityID,
+		EffectiveFrom:             effectiveFrom.UTC(),
+		EffectiveTo:               end,
+	})
+	var out domain.AuthzAssignment
+	if err := c.postJSON(ctx, "/v1/admin/role-assignments", body, s, &out); err != nil {
+		return "", err
+	}
+	if out.PrincipalRoleAssignmentID == "" {
+		return "", fmt.Errorf("authorization-svc admin API created an assignment without an id")
+	}
+	return out.PrincipalRoleAssignmentID, nil
+}
+
+// RevokeRoleAssignment ends an assignment. A 404 (already ended, or never
+// there) is domain.ErrAuthzAssignmentAbsent so the caller can decide whether
+// that is the outcome it wanted.
+func (c *AuthzAdminClient) RevokeRoleAssignment(ctx context.Context, assignmentID string, s Scope) error {
+	err := c.post(ctx, fmt.Sprintf("/v1/admin/role-assignments/%s/revoke", assignmentID), []byte(`{}`), s)
+	if err != nil && strings.Contains(err.Error(), "returned 404") {
+		return fmt.Errorf("%w: %v", domain.ErrAuthzAssignmentAbsent, err)
+	}
+	return err
+}
+
+// ScheduleRoleAssignmentEnd ends an assignment at a future instant there
+// (an effective-dated revoke). 404 is domain.ErrAuthzAssignmentAbsent.
+func (c *AuthzAdminClient) ScheduleRoleAssignmentEnd(ctx context.Context, assignmentID string, at time.Time, s Scope) error {
+	body, _ := json.Marshal(map[string]time.Time{"effective_to": at.UTC()})
+	err := c.post(ctx, fmt.Sprintf("/v1/admin/role-assignments/%s/revoke", assignmentID), body, s)
+	if err != nil && strings.Contains(err.Error(), "returned 404") {
+		return fmt.Errorf("%w: %v", domain.ErrAuthzAssignmentAbsent, err)
+	}
+	return err
+}
+
+// assignmentPageSize is the page this client asks for; authorization-svc caps
+// a page at 500.
+const assignmentPageSize = 500
+
+// ListRoleAssignments reads EVERY active assignment of one role, with usage
+// (last GRANTED decision, subject status) for the review signals.
+//
+// It pages. The plain list stops at 500 rows without saying so, and a review
+// campaign built on it would have reviewed the first 500 holders of a role and
+// silently left the rest unreviewed and, through the review, unremovable.
+func (c *AuthzAdminClient) ListRoleAssignments(ctx context.Context, roleID string, s Scope) ([]domain.AuthzAssignment, error) {
+	var all []domain.AuthzAssignment
+	for offset := 0; ; offset += assignmentPageSize {
+		page, err := c.listAssignmentPage(ctx, roleID, offset, s)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < assignmentPageSize {
+			return all, nil
+		}
+	}
+}
+
+func (c *AuthzAdminClient) listAssignmentPage(ctx context.Context, roleID string, offset int, s Scope) ([]domain.AuthzAssignment, error) {
+	path := fmt.Sprintf("/v1/admin/role-assignments?role_id=%s&include_usage=true&limit=%d&offset=%d",
+		url.QueryEscape(roleID), assignmentPageSize, offset)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	setReadHeaders(req, s)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("authorization-svc admin API unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, classify(resp.StatusCode, fmt.Errorf("authorization-svc admin API returned %d for GET %s: %s",
+			resp.StatusCode, path, string(detail)))
+	}
+	var out []domain.AuthzAssignment
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("authorization-svc admin API returned an unreadable assignment list: %w", err)
+	}
+	return out, nil
+}
+
+func setReadHeaders(req *http.Request, s Scope) {
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Principal-Id", s.PrincipalID)
+	req.Header.Set("X-Tenant-Id", s.TenantID)
+	correlationID := s.CorrelationID
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	req.Header.Set("X-Correlation-ID", correlationID)
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "system")
+}
+
+// postJSON is post plus a decoded response body.
+func (c *AuthzAdminClient) postJSON(ctx context.Context, path string, body []byte, s Scope, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", s.PrincipalID)
+	req.Header.Set("X-Tenant-Id", s.TenantID)
+	req.Header.Set("X-Legal-Entity-Id", s.LegalEntityID)
+	correlationID := s.CorrelationID
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	req.Header.Set("X-Correlation-ID", correlationID)
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("Idempotency-Key", uuid.NewString())
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("authorization-svc admin API unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return classify(resp.StatusCode, fmt.Errorf("authorization-svc admin API returned %d for POST %s: %s",
+			resp.StatusCode, path, string(detail)))
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out); err != nil {
+		return fmt.Errorf("authorization-svc admin API returned an unreadable body for POST %s: %w", path, err)
 	}
 	return nil
 }

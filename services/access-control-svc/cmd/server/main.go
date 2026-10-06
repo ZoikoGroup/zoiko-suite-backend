@@ -30,8 +30,10 @@ import (
 	"zoiko.io/access-control-svc/internal/domain"
 	svcenvelope "zoiko.io/access-control-svc/internal/envelope"
 	"zoiko.io/access-control-svc/internal/events"
+	"zoiko.io/access-control-svc/internal/expiry"
 	"zoiko.io/access-control-svc/internal/handler"
 	"zoiko.io/access-control-svc/internal/health"
+	"zoiko.io/access-control-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/access-control-svc/internal/middleware"
 	"zoiko.io/access-control-svc/internal/mtls"
 	"zoiko.io/access-control-svc/internal/outbox"
@@ -352,7 +354,11 @@ func main() {
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	authzAdminClient := clients.NewAuthzAdminClient(cfg.AuthZServiceURL)
 	sodClient := clients.NewSoDClient(authzBaseURL)
-	protectedActionsClient := clients.NewProtectedActionsClient(authzBaseURL)
+	// The protected-action catalogue is this service's own table, not a call:
+	// the route the old client called (GET /v1/protected-permissions) exists
+	// nowhere in the estate.
+	protectedCatalogue := store.NewProtectedCatalogue(pgStore)
+	permissionTaxonomy := store.NewPermissionCatalogue(pgStore)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -372,8 +378,15 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, authzClient, authzAdminClient, sodClient, protectedActionsClient, domainMetrics, log)
+	// After the envelope check (a write without a key is already refused
+	// there), so this only ever sees writes that carry one. See
+	// internal/idempotency for why the header is now honoured, not just
+	// required.
+	r.Use(idempotency.Middleware(pgStore, log))
+
+	h := handler.New(pgStore, authzClient, authzAdminClient, sodClient, protectedCatalogue, permissionTaxonomy, domainMetrics, log)
 	handler.RegisterRoutes(r, h)
+	handler.RegisterGovernanceRoutes(r, handler.NewGov(h, pgStore, authzAdminClient))
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	//
@@ -400,6 +413,13 @@ func main() {
 	defer stopRelay()
 	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
 	go relay.Run(relayCtx)
+
+	// ── 6c. Assignment expiry sweep ───────────────────────────────────────────
+	//
+	// Closes governed assignments whose effective_to has passed and enqueues
+	// iam.assignment.revoked, so the sessions holding them end. Stopped with
+	// the relay; see internal/expiry.
+	go expiry.New(pgStore, domainMetrics, log).Run(relayCtx)
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
