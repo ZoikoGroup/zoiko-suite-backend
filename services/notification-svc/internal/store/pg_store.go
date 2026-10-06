@@ -13,6 +13,7 @@ import (
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/quota"
 )
 
 // mapPgError translates the Postgres failures that are really caller mistakes
@@ -80,6 +81,10 @@ func scanNotification(s scannable, n *domain.Notification) error {
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// quotaLimits is nil unless send quotas are on (WithQuota); nowFn is the clock they use.
+	quotaLimits *quota.Limits
+	nowFn       func() time.Time
 }
 
 func New(pool *pgxpool.Pool) *PgStore {
@@ -167,6 +172,11 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 		}
 		if tag.RowsAffected() == 1 {
 			created = true
+			if s.quotaLimits != nil && quota.Counting(ctx) {
+				if err := s.consumeQuotaTx(ctx, tx, n); err != nil {
+					return err
+				}
+			}
 			prepared, err := events.CommunicationPrepared(n.CorrelationID, *n)
 			if err != nil {
 				return err
@@ -528,7 +538,10 @@ func (s *PgStore) FindDueRetries(ctx context.Context, now time.Time, limit int) 
 		WHERE status = 'PENDING'
 		  AND next_attempt_at IS NOT NULL
 		  AND next_attempt_at <= $1
-		ORDER BY next_attempt_at
+		-- Security first, then transactional, then operational (ZS-SVC-Y-001 6.5, backpressure
+		-- preserves priority): when more is due than one batch can send, a password reset is not
+		-- stuck behind a pile of reminders. Within a priority, oldest first. Nothing is dropped.
+		ORDER BY CASE communication_class WHEN 'S0' THEN 0 WHEN 'A1' THEN 2 ELSE 1 END, next_attempt_at
 		LIMIT $2
 	`, now, limit)
 	if err != nil {

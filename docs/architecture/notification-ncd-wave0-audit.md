@@ -86,7 +86,7 @@ Status key: **BUILT** (verified in code), **PARTIAL**, **GAP** (not built), **UN
 | Provider bindings (XIC), tenant and region | GAP | one configured SMTP set; no binding registry |
 | `not_before`, `expires_at`, cancel | BUILT (Wave 3, section 20) | direct path, EMAIL; queued sends, expiry at the submit gate and by sweep, cancel before submission |
 | Governed multi-channel fallback keeping evidence class | GAP | none |
-| Rate, abuse, storm controls; bulk preview | GAP | no rate limiting found **(search)** |
+| Rate, abuse, storm controls; bulk preview | PARTIAL (Wave 3, section 21) | per tenant, recipient and intent quotas with protected security capacity and priority ordering; no bulk preview, no per-provider quota, no circuit breaker |
 | Provider idempotency token | GAP | none found |
 
 ### NCD-04 Evidence, bounce, complaint
@@ -178,9 +178,9 @@ Basis: code and test names read; **not run**. Counts are at the end.
 | 48 Promo module in transactional template | PARTIAL (step 5) | the class is explicit, fixed at creation and judged by the shared engine; no content check for promotional blocks yet |
 | 49 Bulk query spans tenants | PARTIAL | RLS; no bulk API |
 | 50 Audience changes preview to send | GAP | no bulk |
-| 51 Rate limit backlog | UNVERIFIED | no rate controls found |
+| 51 Rate limit backlog | PARTIAL (Wave 3, section 21) | an overflow is refused outright with Retry-After, never silently dropped; a backlog is served by priority and expiry is enforced |
 | 52 Job expires before submit | BUILT (Wave 3, section 20) | expires_at; never submitted; EXPIRED with NCD-015 |
-| 53 Security alert vs marketing blast | GAP | no priority classes on queue |
+| 53 Security alert vs marketing blast | BUILT (Wave 3, section 21) | protected security quota; due work ordered S0, T0, A1 |
 | 54 Template provider assets unavailable | BUILT | templates embedded locally |
 | 55 DMARC/DKIM breaks | GAP | no monitoring |
 | 56 Suppression table unavailable | BUILT (Wave 1) | both paths fail closed, tested |
@@ -211,7 +211,7 @@ Basis: code and test names read; **not run**. Counts are at the end.
 
 ## 7. Tally
 
-NP matrix, 60 scenarios, **Wave 0 baseline: 10 BUILT, 17 PARTIAL, 30 GAP, 3 UNVERIFIED. Current (sections 18 and 20): 33 BUILT, 12 PARTIAL, 12 GAP, 3 UNVERIFIED.** The audit does not claim any scenario is certified; BUILT means the behaviour is present in code and, where noted, tested.
+NP matrix, 60 scenarios, **Wave 0 baseline: 10 BUILT, 17 PARTIAL, 30 GAP, 3 UNVERIFIED. Current (sections 18, 20 and 21): 34 BUILT, 13 PARTIAL, 11 GAP, 2 UNVERIFIED.** The audit does not claim any scenario is certified; BUILT means the behaviour is present in code and, where noted, tested.
 The 30 gaps are concentrated in the parts that depend on services the NCD does not yet call (PRV, PDC, DRC, XIC bindings, MDM) and in NCD-05, which is not built.
 
 ## 8. Wave 1 progress
@@ -500,3 +500,23 @@ Decisions taken with the owner: the job is an **identity and timing on the commu
 * **Backed-off retries can still run past `expires_at`** before the sweep catches them (within one worker interval); the submit gate and the guard make sure nothing is actually sent late.
 * **No rate, storm or priority controls, no provider idempotency token, no editing or rescheduling:** a queued send is cancelled and re-created.
 * **Cancel is not offered after submission,** by design; an ambiguous or sent message follows the resolve and resend routes.
+
+## 21. Wave 3 slice 9: send quotas, protected security capacity and priority order (NCD-03 6.5, NP-51, NP-53)
+
+Decisions taken with the owner: **refuse with 429 and `Retry-After`** (not queue), **counters in Postgres** (shared by every replica), **no circuit breaker yet**. Migration 000029.
+
+* **Budgets:** a direct send draws on up to three counters in fixed windows: **per tenant and channel** (per minute), **per recipient** (per hour) and **per intent** (per minute, for intent-bound sends). Defaults are 600 a minute per tenant, 20 an hour per person and 300 a minute per intent; each is configurable (`NOTIFICATION_QUOTA_*`) and zero removes that budget.
+* **Protected security capacity:** security (S0) messages draw on **their own** tenant, recipient and intent counters, so a flood of reminders cannot use up a password reset's capacity (NP-53), and a person's security allowance (default 60 an hour) is separate from and higher than their routine one. They are still **bounded**, against abusive loops. Proven by a negative control: sharing the counter fails both the unit test and NP-53.
+* **A refusal is explicit and consumes nothing:** counting happens inside the same transaction that creates the communication, so a send over any budget returns **429** with `Retry-After`, a `quota_exceeded` error naming the budget, and **creates nothing**: no row, no event, no count. Hammering a full budget does not extend the lockout. A **replay** of an already-created send is neither counted nor refused.
+* **Opt-in per caller:** only the direct send API is counted. **Notice dispatch is deliberately not** (a regulated notice must not be refused for volume it did not cause), nor are ledger register rows (counted by their own path).
+* **Off by default** (`NOTIFICATION_QUOTA_ENABLED`): the right limits depend on the largest legitimate batch an environment sends (a payroll run, say), so quotas are turned on deliberately with limits that fit.
+* **Priority order (backpressure):** due work is found **security first, then transactional (an unclassified send counts as T0), then operational**, oldest first within a priority, so a backlog never leaves an urgent message waiting behind reminders. Nothing is dropped; expiry (section 20) still applies.
+* **Housekeeping:** counters older than a day are removed whenever a new tenant window opens.
+* **Tests:** the pure budget rules and windows, real-Postgres tests for every refusal path (per recipient, per intent, per tenant, protected pool, replays, opt-in, window rollover and cleanup, quotas off), the priority order including a batch of one, the 429 and `Retry-After` handler behaviour, config, migration 000029 down/up, and NP-51 and NP-53 in the matrix.
+
+**Not built, deliberately:**
+* **No bulk recipient expansion or count preview** (there is no bulk API); **no per-provider quota** and **no provider circuit breaker** (the next piece, with provider bindings).
+* **Fixed windows, not sliding:** a sender can use a full budget at the end of one window and again at the start of the next (up to twice the rate across a boundary).
+* **A refused send leaves no event,** because no communication exists to attach one to; refusals are visible to the caller and in the log, not on the topic.
+* **No stable NCD code** for a quota refusal: the standard's list has none, so the service's own `quota_exceeded` is used.
+* **The worker's own retries are not counted:** only creation is. Backed-off retries are bounded by the retry policy.

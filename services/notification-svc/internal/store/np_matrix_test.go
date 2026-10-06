@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/preference"
 	"zoiko.io/notification-svc/internal/privacy"
+	"zoiko.io/notification-svc/internal/quota"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/webhook"
 )
@@ -220,6 +222,27 @@ func TestNP_Matrix(t *testing.T) {
 		assert.Error(t, err, "an ambiguous attempt must be resolved before any resend")
 	})
 
+	t.Run("NP-51 a rate limit never silently drops work and a backlog keeps its priority", func(t *testing.T) {
+		qs := store.New(pool).WithQuota(quota.Limits{TenantPerMinute: 1})
+		require.NoError(t, send(qs, "np-51", "corr-np-51-a", "p1", "A1"))
+		err := send(qs, "np-51", "corr-np-51-b", "p2", "A1")
+		ex := exceeded(t, err)
+		assert.GreaterOrEqual(t, int(ex.RetryAfter.Seconds()), 1, "the caller is told when to retry")
+		assert.Equal(t, 1, countRows(t, qs, "np-51"), "an overflow is refused outright, never half-accepted or quietly lost")
+		// The backlog that does exist is served security first (see TestPriority_DueSecurityMessagesAreFoundBeforeRoutineOnes).
+	})
+
+	t.Run("NP-53 a security alert is not starved by a routine blast", func(t *testing.T) {
+		qs := store.New(pool).WithQuota(quota.Limits{TenantPerMinute: 2, TenantS0PerMinute: 3})
+		for i := 0; i < 2; i++ {
+			require.NoError(t, send(qs, "np-53", fmt.Sprintf("blast-%d", i), fmt.Sprintf("b%d", i), "A1"))
+		}
+		exceeded(t, send(qs, "np-53", "blast-over", "b9", "A1"))
+		for i := 0; i < 3; i++ { // the whole of the security allowance
+			require.NoError(t, send(qs, "np-53", fmt.Sprintf("alert-%d", i), fmt.Sprintf("victim%d", i), "S0"), "the protected pool is untouched by the blast")
+		}
+	})
+
 	t.Run("NP-52 a job that expires before it is submitted is never submitted", func(t *testing.T) {
 		n := queuedNotification(t, s, "np-52", "corr-np-52", nil, tp(time.Hour))
 		ok, err := s.ExpireNotification(tenantCtx("np-52"), n.NotificationID, "np-52", time.Now().Add(2*time.Hour))
@@ -387,8 +410,6 @@ func TestNP_Matrix(t *testing.T) {
 	skipNP(t, "NP-47 purchased list, no consent", "needs an audience-level consent check beyond the per-message privacy gate")
 	skipNP(t, "NP-48 promotional block in a transactional template", "the class is explicit and judged, but there is no content check for promotional blocks")
 	skipNP(t, "NP-49 and NP-50 bulk across tenants, audience drift preview to send", "no bulk API or audience preview")
-	skipNP(t, "NP-51 rate-limit backlog", "no rate controls")
-	skipNP(t, "NP-53 security alert versus marketing blast", "no priority classes on the delivery queue")
 	skipNP(t, "NP-55 DMARC or DKIM break", "no sender-authentication monitoring (operational)")
 	skipNP(t, "NP-58 DRC declaration fails", "no DRC integration")
 	skipNP(t, "NP-59 provider corrects a status later", "later corrections append facts but do not reopen a notice or re-evaluate status")

@@ -21,6 +21,7 @@ import (
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/ncd"
+	"zoiko.io/notification-svc/internal/quota"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
@@ -625,7 +626,16 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		notification.NextAttemptAt = req.NotBefore
 	}
 
-	created, err := h.store.CreateNotification(r.Context(), notification)
+	// Counted against the send quotas (ZS-SVC-Y-001 6.5) in the same transaction that creates it.
+	created, err := h.store.CreateNotification(quota.WithCounting(r.Context()), notification)
+	var exceeded *quota.ExceededError
+	if errors.As(err, &exceeded) {
+		h.log.Warn("send refused: quota exceeded",
+			zap.String("tenant_id", tenantID), zap.String("dimension", exceeded.Dimension), zap.Int("limit", exceeded.Limit))
+		w.Header().Set("Retry-After", strconv.Itoa(int(exceeded.RetryAfter.Seconds())))
+		writeError(w, http.StatusTooManyRequests, "quota_exceeded", exceeded.Error())
+		return
+	}
 	if err != nil {
 		h.log.Error("failed to create notification", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

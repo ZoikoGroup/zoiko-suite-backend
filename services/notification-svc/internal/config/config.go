@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"zoiko.io/notification-svc/internal/quota"
 )
 
 type Config struct {
@@ -67,6 +69,14 @@ type Config struct {
 	PrivacyEnforcement bool
 	PrivacyDecisionURL string
 	PrivacyTimeout     time.Duration
+
+	// QuotaEnabled turns on the send quotas (ZS-SVC-Y-001 6.5): per tenant, recipient and intent,
+	// with protected capacity for security messages. NOTIFICATION_QUOTA_ENABLED, default false,
+	// because the right limits depend on the largest legitimate batch an environment sends (a
+	// payroll run, say), so it is turned on deliberately with limits that fit. Each limit has its
+	// own variable; zero removes that budget.
+	QuotaEnabled bool
+	QuotaLimits  quota.Limits
 
 	WebhookSecrets map[string][]string
 	// WebhookTolerance is how far a callback timestamp may differ from the clock.
@@ -282,6 +292,15 @@ func Load() (*Config, error) {
 		PrivacyEnforcement: env("NOTIFICATION_PRIVACY_ENFORCEMENT", "false") == "true",
 		PrivacyDecisionURL: env("PRIVACY_DECISION_URL", ""),
 		PrivacyTimeout:     envDuration("PRIVACY_DECISION_TIMEOUT", 3*time.Second),
+
+		QuotaEnabled: env("NOTIFICATION_QUOTA_ENABLED", "false") == "true",
+		QuotaLimits: quota.Limits{
+			TenantPerMinute:    envInt("NOTIFICATION_QUOTA_TENANT_PER_MINUTE", quota.DefaultLimits.TenantPerMinute),
+			TenantS0PerMinute:  envInt("NOTIFICATION_QUOTA_TENANT_S0_PER_MINUTE", quota.DefaultLimits.TenantS0PerMinute),
+			RecipientPerHour:   envInt("NOTIFICATION_QUOTA_RECIPIENT_PER_HOUR", quota.DefaultLimits.RecipientPerHour),
+			RecipientS0PerHour: envInt("NOTIFICATION_QUOTA_RECIPIENT_S0_PER_HOUR", quota.DefaultLimits.RecipientS0PerHour),
+			IntentPerMinute:    envInt("NOTIFICATION_QUOTA_INTENT_PER_MINUTE", quota.DefaultLimits.IntentPerMinute),
+		},
 
 		SecondaryEmail: EmailConfig{
 			Provider:       env("SMTP_SECONDARY_PROVIDER", ""),

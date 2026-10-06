@@ -18,6 +18,7 @@ import (
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/quota"
 	"zoiko.io/notification-svc/internal/retry"
 )
 
@@ -28,6 +29,8 @@ type stubStore struct {
 	ledgerOwned map[string]bool   // ids produced by the ledger pipeline (not resendable through the direct path)
 	byCorr      map[string]string // correlation_id -> notification_id
 	lastFilter  domain.ListFilter
+	createErr   error // returned by CreateNotification when set (a quota refusal, say)
+	countedCtx  bool  // whether CreateNotification saw a context that asks to be counted
 	scheduled   []scheduledRetry
 
 	templates                map[string]*domain.TemplateDefinition
@@ -59,7 +62,11 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreateNotification(_ context.Context, n *domain.Notification) (bool, error) {
+func (s *stubStore) CreateNotification(ctx context.Context, n *domain.Notification) (bool, error) {
+	s.countedCtx = quota.Counting(ctx)
+	if s.createErr != nil {
+		return false, s.createErr
+	}
 	// Keyed the way the real store is (migration 000012): on the purpose-scoped
 	// idempotency key when there is one, on the correlation id otherwise.
 	key := "corr:" + n.CorrelationID

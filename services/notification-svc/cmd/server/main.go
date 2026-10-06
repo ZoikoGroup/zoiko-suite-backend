@@ -116,6 +116,10 @@ func main() {
 
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
 	pgStore := store.New(pool)
+	if cfg.QuotaEnabled {
+		pgStore.WithQuota(cfg.QuotaLimits)
+		log.Info("send quotas are on", zap.Any("limits", cfg.QuotaLimits))
+	}
 
 	// A deployment says "no broker" with an explicitly empty KAFKA_BROKERS;
 	// the publisher then logs instead of writing, rather than blocking every

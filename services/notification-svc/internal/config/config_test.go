@@ -83,3 +83,24 @@ func TestPrivacyEnforcementIsOffByDefaultAndNeedsItsAuthority(t *testing.T) {
 		t.Fatalf("explicit opt-in with an authority must load: %v", err)
 	}
 }
+
+func TestSendQuotasAreOffByDefaultAndEachLimitIsConfigurable(t *testing.T) {
+	t.Setenv("NOTIFICATION_WEBHOOK_SECRETS", "")
+	t.Setenv("NOTIFICATION_QUOTA_ENABLED", "")
+	cfg, err := Load()
+	if err != nil || cfg.QuotaEnabled {
+		t.Fatalf("quotas refuse sends and must be opt-in: enabled=%v err=%v", cfg != nil && cfg.QuotaEnabled, err)
+	}
+	if cfg.QuotaLimits.RecipientPerHour != 20 || cfg.QuotaLimits.TenantS0PerMinute != 200 {
+		t.Fatalf("the defaults are the documented ones, got %+v", cfg.QuotaLimits)
+	}
+	t.Setenv("NOTIFICATION_QUOTA_ENABLED", "true")
+	t.Setenv("NOTIFICATION_QUOTA_TENANT_PER_MINUTE", "5000")
+	t.Setenv("NOTIFICATION_QUOTA_INTENT_PER_MINUTE", "0")
+	if cfg, err = Load(); err != nil || !cfg.QuotaEnabled {
+		t.Fatalf("explicit opt-in must enable it: %v", err)
+	}
+	if cfg.QuotaLimits.TenantPerMinute != 5000 || cfg.QuotaLimits.IntentPerMinute != 0 {
+		t.Fatalf("limits not read from the environment: %+v", cfg.QuotaLimits)
+	}
+}
