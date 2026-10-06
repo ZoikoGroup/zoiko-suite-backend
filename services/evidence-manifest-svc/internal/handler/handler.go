@@ -2,11 +2,14 @@
 package handler
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -158,8 +161,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/evidence-manifests", func(r chi.Router) {
 		r.Post("/", h.GenerateManifest)
 		r.Get("/", h.ListManifests)
+		r.Post("/verify", h.VerifyManifest)
 		r.Get("/{manifestID}", h.GetManifest)
 		r.Get("/{manifestID}/records", h.ListRecords)
+		r.Post("/{manifestID}/verify", h.VerifyManifest)
+		r.Get("/{manifestID}/download", h.DownloadManifestZip)
 	})
 	r.Route("/v1/audit-populations", func(r chi.Router) {
 		r.Post("/", h.DefinePopulation)
@@ -449,6 +455,184 @@ func (h *Handler) ListRecords(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, records)
+}
+
+// ── POST /v1/evidence-manifests/verify & /{manifestID}/verify ────────────────
+
+type verifyManifestRequest struct {
+	ManifestID     string `json:"manifest_id"`
+	ChecksumSHA256 string `json:"checksum_sha256,omitempty"`
+}
+
+type verifyManifestResponse struct {
+	ManifestID       string    `json:"manifest_id"`
+	Status           string    `json:"status"`
+	ChecksumSHA256   string    `json:"checksum_sha256"`
+	ComputedChecksum string    `json:"computed_checksum"`
+	Valid            bool      `json:"valid"`
+	RecordCount      int       `json:"record_count"`
+	VerifiedAt       time.Time `json:"verified_at"`
+}
+
+// VerifyManifest recalculates the SHA-256 cryptographic checksum across all
+// records stored for this manifest and asserts identity against the recorded
+// checksum_sha256, validating tamper-evidence.
+func (h *Handler) VerifyManifest(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	manifestID := chi.URLParam(r, "manifestID")
+	var expectedChecksum string
+	if manifestID == "" {
+		var req verifyManifestRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+			return
+		}
+		manifestID = req.ManifestID
+		expectedChecksum = req.ChecksumSHA256
+	}
+	if manifestID == "" {
+		writeError(w, http.StatusBadRequest, "missing_manifest_id", "manifest_id is required")
+		return
+	}
+
+	m, err := h.store.FindManifestByID(r.Context(), manifestID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, principalID, m.LegalEntityID, EvidenceManifestRead) {
+		return
+	}
+
+	if m.Status != domain.StatusGenerated {
+		writeError(w, http.StatusBadRequest, "invalid_manifest_state",
+			fmt.Sprintf("cannot verify manifest in status %s — only GENERATED manifests have a fixed cryptographic checksum", m.Status))
+		return
+	}
+
+	records, err := h.store.ListRecords(r.Context(), manifestID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+
+	hasher := sha256.New()
+	for _, rec := range records {
+		hasher.Write([]byte(rec.SourceType))
+		hasher.Write([]byte(rec.SourceRecordID))
+		hasher.Write(rec.RecordSnapshot)
+	}
+	computed := hex.EncodeToString(hasher.Sum(nil))
+
+	storedChecksum := ""
+	if m.ChecksumSHA256 != nil {
+		storedChecksum = *m.ChecksumSHA256
+	}
+
+	valid := (computed == storedChecksum)
+	if expectedChecksum != "" && computed != expectedChecksum {
+		valid = false
+	}
+
+	writeJSON(w, http.StatusOK, verifyManifestResponse{
+		ManifestID:       manifestID,
+		Status:           string(m.Status),
+		ChecksumSHA256:   storedChecksum,
+		ComputedChecksum: computed,
+		Valid:            valid,
+		RecordCount:      len(records),
+		VerifiedAt:       time.Now().UTC(),
+	})
+}
+
+// ── GET /v1/evidence-manifests/{manifestID}/download ─────────────────────────
+
+// DownloadManifestZip bundles the manifest metadata and all individual record
+// snapshots into an exportable zip archive for regulatory/audit discovery.
+func (h *Handler) DownloadManifestZip(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	manifestID := chi.URLParam(r, "manifestID")
+	if manifestID == "" {
+		writeError(w, http.StatusBadRequest, "missing_manifest_id", "manifest_id is required")
+		return
+	}
+
+	m, err := h.store.FindManifestByID(r.Context(), manifestID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, principalID, m.LegalEntityID, EvidenceManifestRead) {
+		return
+	}
+
+	records, err := h.store.ListRecords(r.Context(), manifestID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+
+	// 1. manifest.json
+	manifestJSON, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "packaging_failed", err.Error())
+		return
+	}
+	mw, err := zw.Create("manifest.json")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "packaging_failed", err.Error())
+		return
+	}
+	if _, err := mw.Write(manifestJSON); err != nil {
+		writeError(w, http.StatusInternalServerError, "packaging_failed", err.Error())
+		return
+	}
+
+	// 2. checksum.sha256
+	storedChecksum := ""
+	if m.ChecksumSHA256 != nil {
+		storedChecksum = *m.ChecksumSHA256
+	}
+	cw, err := zw.Create("checksum.sha256")
+	if err == nil {
+		_, _ = cw.Write([]byte(storedChecksum + "\n"))
+	}
+
+	// 3. records index and snapshots
+	recordsJSON, err := json.MarshalIndent(records, "", "  ")
+	if err == nil {
+		if rw, err := zw.Create("records/records.json"); err == nil {
+			_, _ = rw.Write(recordsJSON)
+		}
+	}
+
+	for i, rec := range records {
+		entryName := fmt.Sprintf("records/%03d_%s_%s.json", i+1, rec.SourceType, rec.SourceRecordID)
+		if sw, err := zw.Create(entryName); err == nil {
+			_, _ = sw.Write(rec.RecordSnapshot)
+		}
+	}
+
+	if err := zw.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, "packaging_failed", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"evidence-manifest-%s.zip\"", manifestID))
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

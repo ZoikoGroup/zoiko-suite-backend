@@ -44,6 +44,12 @@ const (
 	ModelProviderRegister       = "MODEL_PROVIDER_REGISTER"
 	PolicyChangePropose         = "POLICY_CHANGE_PROPOSE"
 	PolicyChangeDecide          = "POLICY_CHANGE_DECIDE"
+	// PolicyChangeRead gates GetPolicyChangeApproval/ListPolicyChangeApprovals
+	// — §4.3 of the audit documents both as requiring platformScopeID, but
+	// neither handler ever called authorize() at all. Named following the
+	// same _READ convention already used for every other resource type in
+	// this file (UseCaseRead, AIExecutionRead, OutputDispositionRead).
+	PolicyChangeRead = "POLICY_CHANGE_READ"
 
 	// AIG-01
 	UseCaseCreate     = "AI_USE_CASE_CREATE"
@@ -1069,6 +1075,13 @@ func (h *Handler) ProposePolicyChange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetPolicyChangeApproval(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, PolicyChangeRead) {
+		return
+	}
 	p, err := h.store.GetPolicyChangeApproval(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		if errors.Is(err, domain.ErrPolicyChangeApprovalNotFound) {
@@ -1175,6 +1188,13 @@ func (h *Handler) ListModelProviders(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListPolicyChangeApprovals(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, PolicyChangeRead) {
+		return
+	}
 	approvals, err := h.store.ListPolicyChangeApprovals(r.Context())
 	if err != nil {
 		h.logger.Error("list policy change approvals failed", zap.Error(err))

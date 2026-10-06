@@ -909,7 +909,13 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "audit-event-store-svc"
-      KAFKA_TOPICS: "zoiko.identity.events,zoiko.entity.events,zoiko.workflow.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # AUD-01 requires this service to ingest every platform domain event, not
+      # just identity/entity/workflow — handleGenericDomainEvent (consumer.go)
+      # already stores any canonical-envelope event generically; this list was
+      # the missing half: without a Reader subscribed to a topic, no event on
+      # it is ever received regardless of how generic the handler is.
+      KAFKA_TOPICS: "zoiko.access-control.events,zoiko.accounts-payable.events,zoiko.accounts-receivable.events,zoiko.ai-governance.events,zoiko.asset.events,zoiko.authorization.events,zoiko.bank-reconciliation.events,zoiko.benefits.events,zoiko.board-resolutions.events,zoiko.capability-registry.events,zoiko.clause.events,zoiko.close.events,zoiko.comments-collaboration.events,zoiko.commercial-account.events,zoiko.compensation.events,zoiko.compliance.events,zoiko.configuration.events,zoiko.consolidation.events,zoiko.contract.events,zoiko.corporate-actions.events,zoiko.corporate-tax.events,zoiko.counterparty.events,zoiko.decision-support.events,zoiko.delegated-authority.events,zoiko.employee.events,zoiko.entity.events,zoiko.evidence-requirements.events,zoiko.evidence.events,zoiko.expense-claim.events,zoiko.financial-control.events,zoiko.general-ledger.events,zoiko.goods-service-receipt.events,zoiko.governance.events,zoiko.identity.events,zoiko.intercompany.events,zoiko.inventory.events,zoiko.invoice-approval.events,zoiko.jurisdiction.events,zoiko.kill-switch-registry.events,zoiko.leaveabsence.events,zoiko.metric-registry.events,zoiko.notification.events,zoiko.obligation-tracking.events,zoiko.obligations.events,zoiko.offboarding.events,zoiko.orgstructure.events,zoiko.payable-open-item.events,zoiko.payee-banking-identity.events,zoiko.payment-authorization.events,zoiko.payment-initiation.events,zoiko.payment-proposal.events,zoiko.payment-run.events,zoiko.payment-status.events,zoiko.payroll.events,zoiko.payrollexceptions.events,zoiko.payrolltax.events,zoiko.performance-review.events,zoiko.policy.events,zoiko.privacy-consent.events,zoiko.privacy-decision.events,zoiko.privacy-purpose-registry.events,zoiko.privacy-rights.events,zoiko.privacy-transfer.events,zoiko.procurement-workflow.events,zoiko.project.events,zoiko.purchase-order.events,zoiko.purchase-request.events,zoiko.retention-registry.events,zoiko.secretvault.events,zoiko.source-authority.events,zoiko.spend-controls.events,zoiko.supplier-financial-profile.events,zoiko.supplier-recovery.events,zoiko.tax-determination.events,zoiko.tax-rules.events,zoiko.treasury.events,zoiko.vat-gst.events,zoiko.vendor-due-diligence.events,zoiko.workflow.events"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -3695,7 +3701,16 @@ services:
       - "8144:8144"
     environment:
       PORT: "8144"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/commercial_account?sslmode=disable"
+      # zoiko_app, not the postgres superuser: commercial_account has no
+      # dedicated app_ role of its own (absent from create-app-roles.sh's
+      # SERVICES list), so it uses the shared least-privilege runtime role
+      # init-db.sh provisions for every database that doesn't claim one.
+      # zoiko_app is NOSUPERUSER NOBYPASSRLS, which is what makes this
+      # database's tenant RLS policies (migration 000005_add_rls.up.sql)
+      # actually apply instead of being silently inert to a superuser
+      # connection — same fix already applied to the 5 privacy-domain
+      # services.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/commercial_account?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3730,7 +3745,19 @@ services:
       - "8145:8145"
     environment:
       PORT: "8145"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/capability_registry?sslmode=disable"
+      # zoiko_app, not the postgres superuser. This database has no RLS
+      # policies (capabilities/market_releases/releases/etc. are a
+      # deliberate platform-wide registry with no tenant_id column — see
+      # the audit's own note on this), so there is no bypassed-RLS
+      # vulnerability here the way there was for the 5 privacy services
+      # and commercial-account-svc. This flip is purely the same
+      # least-privilege hardening those fixes used: capability_registry
+      # has no dedicated app_ role of its own, zoiko_app already has
+      # complete grants on all 7 tables here, and running as an ordinary,
+      # non-superuser role is still strictly safer defense-in-depth
+      # (limits blast radius of a SQL-injection or migration mistake)
+      # even with no RLS to activate.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/capability_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3767,7 +3794,16 @@ services:
       - "8146:8146"
     environment:
       PORT: "8146"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/ai_governance?sslmode=disable"
+      # zoiko_app, not the postgres superuser: ai_governance has no
+      # dedicated app_ role of its own, and this database genuinely has
+      # active RLS policies (ai_runs, ai_use_cases, ai_executions,
+      # ai_incidents, ai_output_dispositions, automation_policies,
+      # automation_actions, ai_impact_assessments — confirmed live via
+      # pg_class) that a superuser connection silently bypasses — the
+      # same platform-wide issue already fixed for the 5 privacy services
+      # and commercial-account-svc. zoiko_app already has complete grants
+      # on all 13 tables here.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/ai_governance?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3932,7 +3968,15 @@ services:
       - "8151:8151"
     environment:
       PORT: "8151"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_purpose_registry?sslmode=disable"
+      # zoiko_app, not the postgres superuser: privacy_purpose_registry has no
+      # dedicated app_ role of its own (absent from create-app-roles.sh's
+      # SERVICES list), so it uses the shared least-privilege runtime role
+      # init-db.sh provisions for every database that doesn't claim one — see
+      # that script's "Runtime role: zoiko_app" section. zoiko_app is
+      # NOSUPERUSER NOBYPASSRLS, which is what makes this database's
+      # tenant_isolation_policy actually apply instead of being silently
+      # inert to a superuser connection.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_purpose_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-purpose-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3970,7 +4014,9 @@ services:
       - "8152:8152"
     environment:
       PORT: "8152"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_consent?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_consent?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-consent.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4017,7 +4063,9 @@ services:
       - "8153:8153"
     environment:
       PORT: "8153"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_decision?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_decision?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-decision.events"
       PURPOSE_REGISTRY_URL: "http://privacy-purpose-registry-svc:8151"
@@ -4071,7 +4119,9 @@ services:
       - "8154:8154"
     environment:
       PORT: "8154"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_rights?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_rights?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-rights.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4115,7 +4165,9 @@ services:
       - "8155:8155"
     environment:
       PORT: "8155"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_transfer?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_transfer?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-transfer.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"

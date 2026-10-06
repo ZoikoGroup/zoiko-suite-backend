@@ -143,6 +143,10 @@ func (h *Handler) ApproveSampleDesign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	principalID, _ := h.requirePrincipal(w, r)
+	if design.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_approval_forbidden", "maker-checker violation: principal cannot approve their own sample design")
+		return
+	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_correlation_id", "")
@@ -351,6 +355,8 @@ func (h *Handler) SupersedeSample(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) writeSamplingErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, domain.ErrSelfApprovalForbidden):
+		writeError(w, http.StatusForbidden, "self_approval_forbidden", "maker-checker violation: principal cannot approve their own sample design")
 	case errors.Is(err, domain.ErrSampleDesignNotFound):
 		writeError(w, http.StatusNotFound, "sample_design_not_found", "")
 	case errors.Is(err, domain.ErrSampleDesignInvalidState):

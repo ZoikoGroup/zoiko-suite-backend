@@ -1,6 +1,7 @@
 package handler_test
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -663,5 +664,171 @@ func TestListManifests_InvalidPagination_Returns400(t *testing.T) {
 		r.ServeHTTP(rec, req)
 		assert.Equal(t, http.StatusBadRequest, rec.Code, "expected 400 for query %s", query)
 	}
+}
+
+// ── VerifyManifest & DownloadManifestZip Tests ──────────────────────────────
+
+func TestVerifyManifest_Success(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	gov.getResult = &aggregator.SourceRecord{SourceType: domain.SourceGovernanceDecision, SourceRecordID: "gd-1", RawJSON: []byte(`{"id":"gd-1"}`)}
+
+	s := newStubStore()
+	r := newRouter(s, gov, acc, wf, pub)
+
+	// 1. Generate a manifest
+	createBody, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioAudit,
+		GovernanceDecisionIDs: []string{"gd-1"},
+	})
+	seedReq := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(createBody))
+	seedReq.Header.Set("X-Tenant-Id", "t1")
+	seedReq.Header.Set("X-Principal-Id", "principal-test-01")
+	seedRec := httptest.NewRecorder()
+	r.ServeHTTP(seedRec, seedReq)
+	require.Equal(t, http.StatusCreated, seedRec.Code)
+
+	var generated domain.EvidenceManifest
+	require.NoError(t, json.Unmarshal(seedRec.Body.Bytes(), &generated))
+	require.NotEmpty(t, generated.ManifestID)
+	require.NotNil(t, generated.ChecksumSHA256)
+
+	// 2. Call POST /v1/evidence-manifests/verify
+	verifyBody, _ := json.Marshal(map[string]string{
+		"manifest_id": generated.ManifestID,
+	})
+	verifyReq := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests/verify", bytes.NewReader(verifyBody))
+	verifyReq.Header.Set("X-Tenant-Id", "t1")
+	verifyReq.Header.Set("X-Principal-Id", "principal-test-01")
+	verifyRec := httptest.NewRecorder()
+	r.ServeHTTP(verifyRec, verifyReq)
+
+	require.Equal(t, http.StatusOK, verifyRec.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(verifyRec.Body.Bytes(), &resp))
+	assert.Equal(t, generated.ManifestID, resp["manifest_id"])
+	assert.Equal(t, true, resp["valid"])
+	assert.Equal(t, *generated.ChecksumSHA256, resp["checksum_sha256"])
+	assert.Equal(t, *generated.ChecksumSHA256, resp["computed_checksum"])
+	assert.Equal(t, float64(1), resp["record_count"])
+
+	// 3. Call POST /v1/evidence-manifests/{manifestID}/verify
+	verifyPathReq := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests/"+generated.ManifestID+"/verify", nil)
+	verifyPathReq.Header.Set("X-Tenant-Id", "t1")
+	verifyPathReq.Header.Set("X-Principal-Id", "principal-test-01")
+	verifyPathRec := httptest.NewRecorder()
+	r.ServeHTTP(verifyPathRec, verifyPathReq)
+	require.Equal(t, http.StatusOK, verifyPathRec.Code)
+
+	var pathResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(verifyPathRec.Body.Bytes(), &pathResp))
+	assert.Equal(t, true, pathResp["valid"])
+}
+
+func TestVerifyManifest_NotFound_Returns404(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	r := newRouter(newStubStore(), gov, acc, wf, pub)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests/non-existent-id/verify", nil)
+	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestVerifyManifest_Unauthenticated_Returns401(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	r := newRouter(newStubStore(), gov, acc, wf, pub)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests/manifest-1/verify", nil)
+	req.Header.Set("X-Tenant-Id", "t1")
+	// omit X-Principal-Id
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+}
+
+func TestDownloadManifestZip_Success(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	gov.getResult = &aggregator.SourceRecord{SourceType: domain.SourceGovernanceDecision, SourceRecordID: "gd-1", RawJSON: []byte(`{"id":"gd-1"}`)}
+
+	s := newStubStore()
+	r := newRouter(s, gov, acc, wf, pub)
+
+	// Generate manifest
+	createBody, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioAudit,
+		GovernanceDecisionIDs: []string{"gd-1"},
+	})
+	seedReq := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(createBody))
+	seedReq.Header.Set("X-Tenant-Id", "t1")
+	seedReq.Header.Set("X-Principal-Id", "principal-test-01")
+	seedRec := httptest.NewRecorder()
+	r.ServeHTTP(seedRec, seedReq)
+	require.Equal(t, http.StatusCreated, seedRec.Code)
+
+	// Download zip
+	dlReq := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests/manifest-1/download", nil)
+	dlReq.Header.Set("X-Tenant-Id", "t1")
+	dlReq.Header.Set("X-Principal-Id", "principal-test-01")
+	dlRec := httptest.NewRecorder()
+	r.ServeHTTP(dlRec, dlReq)
+
+	require.Equal(t, http.StatusOK, dlRec.Code)
+	assert.Equal(t, "application/zip", dlRec.Header().Get("Content-Type"))
+	assert.Contains(t, dlRec.Header().Get("Content-Disposition"), "attachment; filename=\"evidence-manifest-manifest-1.zip\"")
+
+	// Read and verify zip structure
+	zipReader, err := zip.NewReader(bytes.NewReader(dlRec.Body.Bytes()), int64(dlRec.Body.Len()))
+	require.NoError(t, err)
+
+	filesFound := map[string]bool{}
+	for _, f := range zipReader.File {
+		filesFound[f.Name] = true
+	}
+
+	assert.True(t, filesFound["manifest.json"], "manifest.json should be in zip")
+	assert.True(t, filesFound["checksum.sha256"], "checksum.sha256 should be in zip")
+	assert.True(t, filesFound["records/records.json"], "records/records.json should be in zip")
+	assert.True(t, filesFound["records/001_GOVERNANCE_DECISION_gd-1.json"], "record snapshot should be in zip")
+}
+
+func TestApproveSampleDesign_SelfApproval_Forbidden403(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	s := newStubStore()
+	r := newRouter(s, gov, acc, wf, pub)
+
+	// Seed design created by principal-maker
+	s.sampleDesign = &domain.SampleDesign{
+		DesignID:             "design-1",
+		TenantID:             "t1",
+		PopulationID:         "pop-1",
+		Objective:            "Test objective",
+		ParamSetID:           "param-1",
+		SampleSize:           25,
+		Status:               domain.SampleDesignDraft,
+		CreatedByPrincipalID: "principal-maker",
+	}
+	s.population = &domain.AuditPopulation{
+		PopulationID:  "pop-1",
+		TenantID:      "t1",
+		LegalEntityID: "e1",
+		Status:        domain.PopulationFrozen,
+	}
+
+	// Maker attempts self-approval
+	req := httptest.NewRequest(http.MethodPost, "/v1/sample-designs/design-1/approve", nil)
+	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-maker") // same principal!
+	req.Header.Set("X-Correlation-ID", "corr-approve-1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	var errResp map[string]string
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errResp))
+	assert.Equal(t, "self_approval_forbidden", errResp["error"])
 }
 

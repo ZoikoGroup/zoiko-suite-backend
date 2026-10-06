@@ -29,6 +29,13 @@ const (
 	PrivacyConsentRecord   = "PRIVACY_CONSENT_RECORD"
 	PrivacyConsentWithdraw = "PRIVACY_CONSENT_WITHDRAW"
 	PrivacyPreferenceSet   = "PRIVACY_PREFERENCE_SET"
+	// PrivacyNoticePresentationRecord gates recordPresentationInternal —
+	// distinct from the four PrivacyNotice* lifecycle actions above, which
+	// govern the notice's own draft/approve/publish/withdraw state.
+	// Recording a presentation receipt is a separate capability: it is
+	// evidence that a notice version was actually shown to a subject, not
+	// a change to the notice itself.
+	PrivacyNoticePresentationRecord = "PRIVACY_NOTICE_PRESENTATION_RECORD"
 )
 
 const platformScopeID = "00000000-0000-0000-0000-00000000f001"
@@ -41,7 +48,7 @@ type AuthzChecker interface {
 // internal/purposeregistry's package doc comment for why this can't be a
 // trusted opaque string.
 type PurposeChecker interface {
-	IsPublished(ctx context.Context, purposeID string) (bool, error)
+	IsPublished(ctx context.Context, tenantID, purposeID string) (bool, error)
 }
 
 type Handler struct {
@@ -524,8 +531,16 @@ func (h *Handler) recordPresentationInternal(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	principalID := r.Header.Get("X-Principal-Id")
+	if !h.authorize(w, r, principalID, verifiedTenant, PrivacyNoticePresentationRecord) {
+		return
+	}
+
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, verifiedTenant, principalID, bodyBytes)
 	if handled {
 		return
@@ -602,7 +617,7 @@ func (h *Handler) RecordConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	published, err := h.purposes.IsPublished(r.Context(), req.PurposeID)
+	published, err := h.purposes.IsPublished(r.Context(), tenantID, req.PurposeID)
 	if err != nil {
 		h.log.Error("RecordConsent: purpose registry unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "purpose registry unavailable")

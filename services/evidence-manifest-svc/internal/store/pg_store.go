@@ -32,6 +32,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -231,13 +232,24 @@ func (s *PgStore) finalize(ctx context.Context, manifestID, query, arg2 string) 
 			&m.ManifestID, &m.TenantID, &m.LegalEntityID, &m.ScenarioType, &m.RequestedBy, &m.Status,
 			&m.ChecksumSHA256, &m.FailureReason, &m.RequestedAt, &m.GeneratedAt)
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if isNotFound(err) {
 		return nil, domain.ErrManifestNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
 	}
 	return &m, nil
+}
+
+func isNotFound(err error) bool {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+		return true
+	}
+	return false
 }
 
 // FindManifestByID reads one manifest, scoped to the caller's tenant.
@@ -256,7 +268,7 @@ func (s *PgStore) FindManifestByID(ctx context.Context, manifestID string) (*dom
 			&m.ManifestID, &m.TenantID, &m.LegalEntityID, &m.ScenarioType, &m.RequestedBy, &m.Status,
 			&m.ChecksumSHA256, &m.FailureReason, &m.RequestedAt, &m.GeneratedAt)
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if isNotFound(err) {
 		return nil, domain.ErrManifestNotFound
 	}
 	if err != nil {
@@ -348,6 +360,9 @@ func (s *PgStore) ListRecords(ctx context.Context, manifestID string) ([]domain.
 		}
 		return rows.Err()
 	})
+	if isNotFound(err) {
+		return []domain.ManifestRecord{}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("evidence manifest store unavailable: %w", err)
 	}

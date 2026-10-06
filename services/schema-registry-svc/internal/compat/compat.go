@@ -1,13 +1,10 @@
 // Package compat enforces the "controlled schema evolution discipline"
 // required by docs/architecture/04-data-model.md §2.12.
 //
-// Scope (v1, documented): analysis is top-level only — it reads a schema's
-// `properties` map (field name -> declared `type`) and `required` list.
-// Nested object/array structure is not analyzed. This is a deliberate v1
-// boundary, not an accident: it catches the violations that actually break
-// existing producers/consumers (a field silently vanishing, being
-// downgraded from required, or changing type) without building a full
-// JSON Schema diff engine nobody asked for yet.
+// Analysis recurses into nested object properties and array item schemas, not
+// just the top-level `properties`/`required` pair, so a breaking change buried
+// inside a nested object or an array's item schema is caught the same way a
+// top-level one is. See checkProperties.
 package compat
 
 import (

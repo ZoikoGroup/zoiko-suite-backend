@@ -4,13 +4,13 @@
 // 03-microservices.md §19): this registry stores the PAYLOAD shape of each
 // event type only — the shared envelope fields (event_type, emitted_at,
 // schema_version, source_service) are common across every publisher already
-// and are not schema-registry-managed. Compatibility analysis is top-level
-// only (properties + required); nested object/array evolution is not
-// analyzed — a documented v1 limit, not an oversight.
+// and are not schema-registry-managed. Compatibility analysis recurses into
+// nested object properties and array item schemas (see internal/compat); it
+// is not limited to the top-level properties/required pair.
 //
 // Mutation-rights gating (05-security.md §14.6 "event-contract mutation
-// rights") is deferred to chunk 2, which wires this service to
-// authorization-svc the same way tenant-entity-registry-svc already does.
+// rights") is wired to authorization-svc (internal/authz), the same way
+// tenant-entity-registry-svc does.
 package domain
 
 import (

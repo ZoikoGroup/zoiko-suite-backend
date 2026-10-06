@@ -34,6 +34,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
+	"zoiko.io/audit-event-store-svc/internal/authz"
 	"zoiko.io/audit-event-store-svc/internal/config"
 	"zoiko.io/audit-event-store-svc/internal/consumer"
 	svcenvelope "zoiko.io/audit-event-store-svc/internal/envelope"
@@ -159,7 +160,8 @@ func main() {
 
 	// AUD-10 archive/verify API — this service's first business HTTP
 	// endpoint set (see internal/handler's own package doc).
-	archiveHandler := handler.New(pgStore, log)
+	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	archiveHandler := handler.New(pgStore, authzClient, log)
 	handler.RegisterRoutes(router, archiveHandler)
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────

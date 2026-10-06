@@ -1049,6 +1049,78 @@ func TestPolicyChangeApproval_BlocksSelfApproval(t *testing.T) {
 	}
 }
 
+// TestGetPolicyChangeApproval_RequiresAuth and
+// TestListPolicyChangeApprovals_RequiresAuth prove these two reads are now
+// gated the same way §4.3 always documented them ("platformScopeID
+// required") and the same way every other resource's reads in this file
+// already are — previously neither called requirePrincipal or authorize at
+// all, so proposer/decider identities and proposed policy changes were
+// readable by anyone with no principal and no grant.
+func TestGetPolicyChangeApproval_RequiresAuth(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+
+	wPropose := httptest.NewRecorder()
+	r.ServeHTTP(wPropose, buildRequest(http.MethodPost, "/v1/policy-change-approvals", domain.ProposePolicyChangeRequest{
+		TargetPolicyRef: "policy-svc:obligation-rule-43",
+		ProposedChange:  "auth-gap regression fixture",
+	}))
+	if wPropose.Code != http.StatusCreated {
+		t.Fatalf("expected 201 proposing policy change, got %d — %s", wPropose.Code, wPropose.Body.String())
+	}
+	var change domain.PolicyChangeApproval
+	_ = json.NewDecoder(wPropose.Body).Decode(&change)
+
+	noPrincipal := httptest.NewRequest(http.MethodGet, "/v1/policy-change-approvals/"+change.PolicyChangeApprovalID, nil)
+	wNoPrincipal := httptest.NewRecorder()
+	r.ServeHTTP(wNoPrincipal, noPrincipal)
+	if wNoPrincipal.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no principal, got %d — %s", wNoPrincipal.Code, wNoPrincipal.Body.String())
+	}
+
+	logger, _ := zap.NewDevelopment()
+	denied := New(newStubStore(), &stubPublisher{}, &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, &stubKillSwitch{}, logger)
+	rDenied := newTestRouter(denied)
+	wDenied := httptest.NewRecorder()
+	rDenied.ServeHTTP(wDenied, buildRequest(http.MethodGet, "/v1/policy-change-approvals/"+change.PolicyChangeApprovalID, nil))
+	if wDenied.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for an unauthorized principal, got %d — %s", wDenied.Code, wDenied.Body.String())
+	}
+
+	wOK := httptest.NewRecorder()
+	r.ServeHTTP(wOK, buildRequest(http.MethodGet, "/v1/policy-change-approvals/"+change.PolicyChangeApprovalID, nil))
+	if wOK.Code != http.StatusOK {
+		t.Fatalf("expected 200 for an authorized principal, got %d — %s", wOK.Code, wOK.Body.String())
+	}
+}
+
+func TestListPolicyChangeApprovals_RequiresAuth(t *testing.T) {
+	h := newTestHandler()
+	r := newTestRouter(h)
+
+	noPrincipal := httptest.NewRequest(http.MethodGet, "/v1/policy-change-approvals", nil)
+	wNoPrincipal := httptest.NewRecorder()
+	r.ServeHTTP(wNoPrincipal, noPrincipal)
+	if wNoPrincipal.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no principal, got %d — %s", wNoPrincipal.Code, wNoPrincipal.Body.String())
+	}
+
+	logger, _ := zap.NewDevelopment()
+	denied := New(newStubStore(), &stubPublisher{}, &stubAuthz{err: authzpkg.ErrAuthorizationDenied}, &stubKillSwitch{}, logger)
+	rDenied := newTestRouter(denied)
+	wDenied := httptest.NewRecorder()
+	rDenied.ServeHTTP(wDenied, buildRequest(http.MethodGet, "/v1/policy-change-approvals", nil))
+	if wDenied.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for an unauthorized principal, got %d — %s", wDenied.Code, wDenied.Body.String())
+	}
+
+	wOK := httptest.NewRecorder()
+	r.ServeHTTP(wOK, buildRequest(http.MethodGet, "/v1/policy-change-approvals", nil))
+	if wOK.Code != http.StatusOK {
+		t.Fatalf("expected 200 for an authorized principal, got %d — %s", wOK.Code, wOK.Body.String())
+	}
+}
+
 // allowlistTool creates an automation policy that would otherwise allow
 // role/tool/action for testTenantA — shared setup for the kill-switch
 // tests below, which all care about what happens to an ALREADY-allowed
