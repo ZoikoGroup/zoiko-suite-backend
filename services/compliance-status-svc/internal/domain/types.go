@@ -9,6 +9,10 @@ var (
 	ErrStatusRecordNotFound = errors.New("compliance status record not found")
 	ErrGapNotFound          = errors.New("compliance gap not found")
 	ErrGapAlreadyResolved   = errors.New("compliance gap is already resolved")
+
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
 )
 
 type OverallStatus string
