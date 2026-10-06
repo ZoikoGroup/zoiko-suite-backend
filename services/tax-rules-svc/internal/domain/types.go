@@ -8,6 +8,10 @@ import (
 var (
 	ErrTaxRuleNotFound   = errors.New("tax rule not found")
 	ErrDuplicateRuleCode = errors.New("tax rule with code already exists")
+
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
 )
 
 type TaxCategory string

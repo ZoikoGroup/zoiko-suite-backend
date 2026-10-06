@@ -9,6 +9,10 @@ var (
 	ErrTaxDeterminationNotFound = errors.New("tax determination not found")
 	ErrAlreadyOverridden        = errors.New("tax determination is already overridden")
 
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
+
 	// ── TAX-03 input contract ────────────────────────────────────────────
 
 	ErrInvalidSupplyKind = errors.New("supply_kind must be one of GOODS, SERVICES, DIGITAL_SERVICES")

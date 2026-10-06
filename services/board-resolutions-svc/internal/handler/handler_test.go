@@ -21,6 +21,8 @@ import (
 type stubStore struct {
 	meetings    map[string]*domain.BoardMeeting
 	resolutions map[string]*domain.BoardResolution
+	roster      map[string]map[string]bool
+	votes       map[string][]domain.CastVoteRecord
 
 	lastMeetingFilter    domain.MeetingFilter
 	lastResolutionFilter domain.ResolutionFilter
@@ -30,6 +32,8 @@ func newStubStore() *stubStore {
 	return &stubStore{
 		meetings:    make(map[string]*domain.BoardMeeting),
 		resolutions: make(map[string]*domain.BoardResolution),
+		roster:      make(map[string]map[string]bool),
+		votes:       make(map[string][]domain.CastVoteRecord),
 	}
 }
 
@@ -87,35 +91,129 @@ func (s *stubStore) ListResolutions(_ context.Context, f domain.ResolutionFilter
 	return out, nil
 }
 
-func (s *stubStore) RecordVotes(_ context.Context, id string, req *domain.RecordVotesRequest) (*domain.BoardResolution, error) {
+func (s *stubStore) OpenVoting(_ context.Context, id string, voterPrincipalIDs []string, quorumThreshold int) (*domain.BoardResolution, error) {
 	r, ok := s.resolutions[id]
 	if !ok {
 		return nil, domain.ErrResolutionNotFound
 	}
-	if r.Status.IsFinal() {
-		return nil, domain.ErrResolutionAlreadyFinalized
+	if len(voterPrincipalIDs) == 0 {
+		return nil, domain.ErrEmptyRoster
 	}
-	r.VotesFor = req.VotesFor
-	r.VotesAgainst = req.VotesAgainst
-	r.Abstentions = req.Abstentions
+	if quorumThreshold < 1 || quorumThreshold > len(voterPrincipalIDs) {
+		return nil, domain.ErrInvalidQuorumThreshold
+	}
+	if r.Status != domain.ResolutionStatusProposed {
+		if r.Status.IsFinal() {
+			return nil, domain.ErrResolutionAlreadyFinalized
+		}
+		return nil, domain.ErrResolutionNotOpen
+	}
+	roster := make(map[string]bool, len(voterPrincipalIDs))
+	for _, v := range voterPrincipalIDs {
+		roster[v] = true
+	}
+	s.roster[id] = roster
+	q := quorumThreshold
+	r.Status = domain.ResolutionStatusOpen
+	r.QuorumThreshold = &q
 	return r, nil
 }
 
-func (s *stubStore) PassResolution(_ context.Context, id, passedBy string, req *domain.PassResolutionRequest) (*domain.BoardResolution, error) {
+func (s *stubStore) CastVote(_ context.Context, id, voterPrincipalID string, vote domain.Vote, castBy string) (*domain.CastVoteRecord, error) {
 	r, ok := s.resolutions[id]
 	if !ok {
 		return nil, domain.ErrResolutionNotFound
 	}
-	if r.Status.IsFinal() {
-		return nil, domain.ErrResolutionAlreadyFinalized
+	if r.Status != domain.ResolutionStatusOpen {
+		return nil, domain.ErrResolutionNotOpen
 	}
-	if r.CreatedBy == passedBy {
+	if !s.roster[id][voterPrincipalID] {
+		return nil, domain.ErrNotEligibleVoter
+	}
+	for _, v := range s.votes[id] {
+		if v.VoterPrincipalID == voterPrincipalID {
+			return nil, domain.ErrAlreadyVoted
+		}
+	}
+	rec := domain.CastVoteRecord{ResolutionID: id, VoterPrincipalID: voterPrincipalID, Vote: vote, CastBy: castBy}
+	s.votes[id] = append(s.votes[id], rec)
+	switch vote {
+	case domain.VoteFor:
+		r.VotesFor++
+	case domain.VoteAgainst:
+		r.VotesAgainst++
+	case domain.VoteAbstain:
+		r.Abstentions++
+	}
+	return &rec, nil
+}
+
+func (s *stubStore) CloseVoting(_ context.Context, id, closedBy string, req *domain.CloseVotingRequest) (*domain.BoardResolution, error) {
+	r, ok := s.resolutions[id]
+	if !ok {
+		return nil, domain.ErrResolutionNotFound
+	}
+	if r.Status != domain.ResolutionStatusOpen {
+		return nil, domain.ErrResolutionNotOpen
+	}
+	if r.CreatedBy == closedBy {
 		return nil, domain.ErrSelfApprovalNotAllowed
 	}
-	r.Status = domain.ResolutionStatusPassed
-	r.PassedBy = &passedBy
-	r.DocumentVaultID = req.DocumentVaultID
+	votesCast := len(s.votes[id])
+	threshold := 0
+	if r.QuorumThreshold != nil {
+		threshold = *r.QuorumThreshold
+	}
+	if votesCast >= threshold && r.VotesFor > r.VotesAgainst {
+		r.Status = domain.ResolutionStatusPassed
+		r.PassedBy = &closedBy
+		r.DocumentVaultID = req.DocumentVaultID
+	} else {
+		r.Status = domain.ResolutionStatusFailed
+	}
 	return r, nil
+}
+
+func (s *stubStore) SupersedeResolution(_ context.Context, id string, req *domain.SupersedeResolutionRequest) (*domain.BoardResolution, error) {
+	r, ok := s.resolutions[id]
+	if !ok {
+		return nil, domain.ErrResolutionNotFound
+	}
+	if r.Status != domain.ResolutionStatusPassed {
+		return nil, domain.ErrResolutionNotPassed
+	}
+	r.Status = domain.ResolutionStatusSuperseded
+	r.SupersededBy = &req.SupersededBy
+	return r, nil
+}
+
+func (s *stubStore) GetVoterRoster(_ context.Context, id string) ([]domain.VoterRosterEntry, error) {
+	var out []domain.VoterRosterEntry
+	for v := range s.roster[id] {
+		out = append(out, domain.VoterRosterEntry{ResolutionID: id, VoterPrincipalID: v})
+	}
+	return out, nil
+}
+
+func (s *stubStore) GetVoteLedger(_ context.Context, id string) ([]domain.CastVoteRecord, error) {
+	return s.votes[id], nil
+}
+
+func (s *stubStore) GetQuorumEvidence(_ context.Context, id string) (*domain.QuorumEvidence, error) {
+	r, ok := s.resolutions[id]
+	if !ok {
+		return nil, domain.ErrResolutionNotFound
+	}
+	threshold := 0
+	if r.QuorumThreshold != nil {
+		threshold = *r.QuorumThreshold
+	}
+	votesCast := len(s.votes[id])
+	return &domain.QuorumEvidence{
+		ResolutionID: id, RosterSize: len(s.roster[id]), QuorumThreshold: threshold,
+		VotesCast: votesCast, VotesFor: r.VotesFor, VotesAgainst: r.VotesAgainst, Abstentions: r.Abstentions,
+		QuorumMet: votesCast >= threshold,
+	}, nil
 }
 
 type stubPublisher struct{ published []string }
@@ -255,19 +353,38 @@ func TestCreateMeeting(t *testing.T) {
 	}
 }
 
-func TestPassResolution(t *testing.T) {
+// openAndVote drives a resolution through OpenVoting and a single FOR vote so
+// tests exercising CloseVoting don't each re-derive the setup.
+func openAndVote(t *testing.T, r chi.Router, resolutionID, voterID string) {
+	t.Helper()
+	wOpen := httptest.NewRecorder()
+	r.ServeHTTP(wOpen, buildRequest(http.MethodPost, "/v1/resolutions/"+resolutionID+"/open-voting",
+		domain.OpenVotingRequest{VoterPrincipalIDs: []string{voterID}, QuorumThreshold: 1}))
+	if wOpen.Code != http.StatusOK {
+		t.Fatalf("setup: open-voting: expected 200, got %d — %s", wOpen.Code, wOpen.Body.String())
+	}
+	wVote := httptest.NewRecorder()
+	r.ServeHTTP(wVote, buildRequestAs(http.MethodPost, "/v1/resolutions/"+resolutionID+"/vote",
+		domain.CastVoteRequest{Vote: domain.VoteFor}, voterID, testTenant))
+	if wVote.Code != http.StatusOK {
+		t.Fatalf("setup: vote: expected 200, got %d — %s", wVote.Code, wVote.Body.String())
+	}
+}
+
+func TestCloseVoting(t *testing.T) {
 	r, _ := newDefaultRouter()
 	created := createResolution(t, r, "drafter-001")
+	openAndVote(t, r, created.ResolutionID, "director-001")
 
 	// A different principal closes it — the drafter may not.
-	wPass := httptest.NewRecorder()
-	r.ServeHTTP(wPass, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass",
-		domain.PassResolutionRequest{}, "chairperson-001", testTenant))
-	if wPass.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d — %s", wPass.Code, wPass.Body.String())
+	wClose := httptest.NewRecorder()
+	r.ServeHTTP(wClose, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/close-voting",
+		domain.CloseVotingRequest{}, "chairperson-001", testTenant))
+	if wClose.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — %s", wClose.Code, wClose.Body.String())
 	}
 	var passed domain.BoardResolution
-	_ = json.NewDecoder(wPass.Body).Decode(&passed)
+	_ = json.NewDecoder(wClose.Body).Decode(&passed)
 	if passed.Status != domain.ResolutionStatusPassed {
 		t.Errorf("expected PASSED, got %s", passed.Status)
 	}
@@ -276,46 +393,106 @@ func TestPassResolution(t *testing.T) {
 	}
 }
 
-func TestPassResolution_EvidenceMissing_Returns422(t *testing.T) {
+func TestCloseVoting_EvidenceMissing_Returns422(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{},
 		&stubEvidenceReq{err: evidencereq.ErrEvidenceMissing})
 	created := createResolution(t, r, "drafter-001")
+	openAndVote(t, r, created.ResolutionID, "director-001")
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass",
-		domain.PassResolutionRequest{}, "chairperson-001", testTenant))
+	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/close-voting",
+		domain.CloseVotingRequest{}, "chairperson-001", testTenant))
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 when required evidence is missing, got %d — %s", w.Code, w.Body.String())
 	}
 }
 
-func TestPassResolution_EvidenceServiceUnavailable_Returns503(t *testing.T) {
+func TestCloseVoting_EvidenceServiceUnavailable_Returns503(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{},
 		&stubEvidenceReq{err: evidencereq.ErrServiceUnavailable})
 	created := createResolution(t, r, "drafter-001")
+	openAndVote(t, r, created.ResolutionID, "director-001")
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass",
-		domain.PassResolutionRequest{}, "chairperson-001", testTenant))
+	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/close-voting",
+		domain.CloseVotingRequest{}, "chairperson-001", testTenant))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when evidence-requirements-svc is unavailable, got %d — %s", w.Code, w.Body.String())
 	}
 }
 
 // Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3): the
-// resolution's drafter may not be the one who passes it.
-func TestPassResolution_BySameCreator_Returns403(t *testing.T) {
+// resolution's drafter may not be the one who closes voting on it.
+func TestCloseVoting_BySameCreator_Returns403(t *testing.T) {
 	r, _ := newDefaultRouter()
 	created := createResolution(t, r, testPrincipal)
 	if created.CreatedBy != testPrincipal {
 		t.Fatalf("expected created_by to be the authenticated principal, got %s", created.CreatedBy)
 	}
+	openAndVote(t, r, created.ResolutionID, "director-001")
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass",
-		domain.PassResolutionRequest{}))
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/close-voting",
+		domain.CloseVotingRequest{}))
 	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 passing a resolution created by the same principal, got %d — %s", w.Code, w.Body.String())
+		t.Fatalf("expected 403 closing voting on a resolution created by the same principal, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+// Quorum and voter eligibility are evaluated against a frozen as-of
+// entitlement population (LEG-04 §6.1) — a non-roster principal must not be
+// able to vote at all.
+func TestCastVote_NonRosterVoter_Returns403(t *testing.T) {
+	r, _ := newDefaultRouter()
+	created := createResolution(t, r, "drafter-001")
+	wOpen := httptest.NewRecorder()
+	r.ServeHTTP(wOpen, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/open-voting",
+		domain.OpenVotingRequest{VoterPrincipalIDs: []string{"director-001"}, QuorumThreshold: 1}))
+	if wOpen.Code != http.StatusOK {
+		t.Fatalf("setup: open-voting: expected 200, got %d", wOpen.Code)
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/vote",
+		domain.CastVoteRequest{Vote: domain.VoteFor}, "not-a-director", testTenant))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a non-roster voter, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCastVote_InvalidValue_Returns400(t *testing.T) {
+	r, _ := newDefaultRouter()
+	created := createResolution(t, r, "drafter-001")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/vote",
+		map[string]string{"vote": "MAYBE"}))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an invalid vote value, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestOpenVoting_EmptyRoster_Returns400(t *testing.T) {
+	r, _ := newDefaultRouter()
+	created := createResolution(t, r, "drafter-001")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/open-voting",
+		domain.OpenVotingRequest{VoterPrincipalIDs: nil, QuorumThreshold: 1}))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an empty roster, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSupersedeResolution_NotPassed_Returns409(t *testing.T) {
+	r, _ := newDefaultRouter()
+	created := createResolution(t, r, "drafter-001")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/supersede",
+		domain.SupersedeResolutionRequest{SupersededBy: "res-999"}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 superseding a non-PASSED resolution, got %d — %s", w.Code, w.Body.String())
 	}
 }
 
@@ -376,20 +553,6 @@ func TestCreateMeeting_CreatedByIsTheAuthenticatedPrincipal(t *testing.T) {
 	}
 }
 
-// passed_by is the record of who put a board resolution into force. It used to
-// be whatever string the body carried.
-func TestPassResolution_PassedByIsTheAuthenticatedPrincipal(t *testing.T) {
-	r, _ := newDefaultRouter()
-	created := createResolution(t, r, "drafter-001")
-
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass",
-		domain.PassResolutionRequest{PassedBy: "the-chairperson-who-was-not-here"}, "chairperson-001", testTenant))
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for a passed_by naming another principal, got %d — %s", w.Code, w.Body.String())
-	}
-}
-
 // Every request must carry a tenant. The middleware used to substitute the
 // literal tenant "default", so unscoped callers shared one bucket.
 func TestRequests_WithoutTenantScope_Are401(t *testing.T) {
@@ -408,8 +571,9 @@ func TestRequests_WithoutTenantScope_Are401(t *testing.T) {
 		{"create resolution", http.MethodPost, "/v1/resolutions", domain.CreateResolutionRequest{
 			LegalEntityID: "le-001", Title: "T", Content: "C",
 			Category: domain.ResolutionCategoryGovernance, EffectiveFrom: "2026-01-01"}},
-		{"vote", http.MethodPost, "/v1/resolutions/res-1/vote", domain.RecordVotesRequest{}},
-		{"pass", http.MethodPost, "/v1/resolutions/res-1/pass", domain.PassResolutionRequest{}},
+		{"open-voting", http.MethodPost, "/v1/resolutions/res-1/open-voting", domain.OpenVotingRequest{}},
+		{"vote", http.MethodPost, "/v1/resolutions/res-1/vote", domain.CastVoteRequest{}},
+		{"close-voting", http.MethodPost, "/v1/resolutions/res-1/close-voting", domain.CloseVotingRequest{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -464,18 +628,6 @@ func TestCreateResolution_MissingLegalEntity_Is400NotAnAuthzFailure(t *testing.T
 	}
 }
 
-func TestRecordVotes_NegativeCounts_AreRejected(t *testing.T) {
-	r, _ := newDefaultRouter()
-	created := createResolution(t, r, "drafter-001")
-
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/vote",
-		domain.RecordVotesRequest{VotesFor: 3, VotesAgainst: -5}))
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for a negative vote count, got %d — %s", w.Code, w.Body.String())
-	}
-}
-
 // A misspelled field used to be discarded silently.
 func TestCreateResolution_UnknownField_IsRejected(t *testing.T) {
 	r, _ := newDefaultRouter()
@@ -522,19 +674,18 @@ func TestLists_ArePagedAndValidated(t *testing.T) {
 	}
 }
 
-// A REJECTED resolution could be passed into force: the closing action's
-// finalized check listed only PASSED and RESCINDED.
-func TestPassResolution_AlreadyRejected_Returns409(t *testing.T) {
+// A FAILED resolution's voting must not be re-closed into force.
+func TestCloseVoting_AlreadyFailed_Returns409(t *testing.T) {
 	store := newStubStore()
 	r := newTestRouter(store, &stubPublisher{}, &stubAuthz{}, &stubEvidenceReq{})
 	created := createResolution(t, r, "drafter-001")
-	store.resolutions[created.ResolutionID].Status = domain.ResolutionStatusRejected
+	store.resolutions[created.ResolutionID].Status = domain.ResolutionStatusFailed
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass",
-		domain.PassResolutionRequest{}, "chairperson-001", testTenant))
+	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/close-voting",
+		domain.CloseVotingRequest{}, "chairperson-001", testTenant))
 	if w.Code != http.StatusConflict {
-		t.Fatalf("expected 409 passing a REJECTED resolution, got %d — %s", w.Code, w.Body.String())
+		t.Fatalf("expected 409 closing voting on a FAILED resolution, got %d — %s", w.Code, w.Body.String())
 	}
 }
 
@@ -543,6 +694,10 @@ func TestWrites_AreAuthorized(t *testing.T) {
 	authz := &stubAuthz{}
 	r := newTestRouter(store, &stubPublisher{}, authz, &stubEvidenceReq{})
 	created := createResolution(t, r, "drafter-001")
+	store.roster[created.ResolutionID] = map[string]bool{"director-001": true}
+	q := 1
+	store.resolutions[created.ResolutionID].Status = domain.ResolutionStatusOpen
+	store.resolutions[created.ResolutionID].QuorumThreshold = &q
 
 	// Every mutating route, asserted as a table rather than one test each, so
 	// a new route added without a check is visible here.
@@ -555,10 +710,12 @@ func TestWrites_AreAuthorized(t *testing.T) {
 		{"create resolution", http.MethodPost, "/v1/resolutions", "RESOLUTION_CREATE", domain.CreateResolutionRequest{
 			LegalEntityID: "le-001", Title: "T", Content: "C",
 			Category: domain.ResolutionCategoryGovernance, EffectiveFrom: "2026-01-01"}},
+		{"open-voting", http.MethodPost, "/v1/resolutions/" + created.ResolutionID + "/open-voting", "RESOLUTION_OPEN_VOTING",
+			domain.OpenVotingRequest{VoterPrincipalIDs: []string{"director-001"}, QuorumThreshold: 1}},
 		{"vote", http.MethodPost, "/v1/resolutions/" + created.ResolutionID + "/vote", "RESOLUTION_VOTE",
-			domain.RecordVotesRequest{VotesFor: 1}},
-		{"pass", http.MethodPost, "/v1/resolutions/" + created.ResolutionID + "/pass", "RESOLUTION_PASS",
-			domain.PassResolutionRequest{}},
+			domain.CastVoteRequest{Vote: domain.VoteFor}},
+		{"close-voting", http.MethodPost, "/v1/resolutions/" + created.ResolutionID + "/close-voting", "RESOLUTION_CLOSE_VOTING",
+			domain.CloseVotingRequest{}},
 	}
 
 	for _, tc := range cases {
@@ -581,14 +738,15 @@ func TestWrites_AreAuthorized(t *testing.T) {
 
 // The category travels to evidence-requirements-svc as the domain_code — the
 // gate is only meaningful if it asks about the right domain.
-func TestPassResolution_SendsTheResolutionsCategoryAsDomainCode(t *testing.T) {
+func TestCloseVoting_SendsTheResolutionsCategoryAsDomainCode(t *testing.T) {
 	er := &stubEvidenceReq{}
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, er)
 	created := createResolution(t, r, "drafter-001")
+	openAndVote(t, r, created.ResolutionID, "director-001")
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass",
-		domain.PassResolutionRequest{}, "chairperson-001", testTenant))
+	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/close-voting",
+		domain.CloseVotingRequest{}, "chairperson-001", testTenant))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d — %s", w.Code, w.Body.String())
 	}
@@ -598,14 +756,15 @@ func TestPassResolution_SendsTheResolutionsCategoryAsDomainCode(t *testing.T) {
 	}
 }
 
-func TestPassResolution_PublishesResolutionPassed(t *testing.T) {
+func TestCloseVoting_PublishesResolutionPassed(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouter(newStubStore(), pub, &stubAuthz{}, &stubEvidenceReq{})
 	created := createResolution(t, r, "drafter-001")
+	openAndVote(t, r, created.ResolutionID, "director-001")
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass",
-		domain.PassResolutionRequest{}, "chairperson-001", testTenant))
+	r.ServeHTTP(w, buildRequestAs(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/close-voting",
+		domain.CloseVotingRequest{}, "chairperson-001", testTenant))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d — %s", w.Code, w.Body.String())
 	}
