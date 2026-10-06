@@ -32,6 +32,9 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	tenantID := middleware.GetTenantID(ctx)
+	if tenantID == "" {
+		return domain.ErrTenantMissing
+	}
 	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }
