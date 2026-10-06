@@ -331,7 +331,7 @@ func (s *PgStore) ListNoticeTransitions(ctx context.Context, noticeID string) ([
 	out := []domain.NoticeTransition{}
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT event_id::text, notice_id::text, COALESCE(from_status, ''), to_status, actor_principal_id, reason, occurred_at
-			FROM regulated_notice_events WHERE tenant_id = $1 AND notice_id::text = $2 ORDER BY occurred_at, event_id`, tenantID, noticeID)
+			FROM regulated_notice_events WHERE tenant_id = $1 AND notice_id::text = $2 ORDER BY seq`, tenantID, noticeID)
 		if err != nil {
 			return err
 		}

@@ -314,3 +314,34 @@ func TestMigration000025_DownThenUp(t *testing.T) {
 		WHERE table_name IN ('regulated_notices','regulated_notice_events','notice_acknowledgements')`).Scan(&n))
 	assert.Equal(t, 3, n)
 }
+
+func TestMigration000026_DownThenUp(t *testing.T) {
+	pool := openTestPool(t)
+	for _, f := range []string{"000026_notice_event_sequence.down.sql", "000026_notice_event_sequence.up.sql"} {
+		b, err := os.ReadFile("../../deployments/migrations/" + f)
+		require.NoError(t, err)
+		_, err = pool.Exec(context.Background(), string(b))
+		require.NoError(t, err, f)
+	}
+	var n int
+	require.NoError(t, pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_name = 'regulated_notice_events' AND column_name = 'seq'`).Scan(&n))
+	assert.Equal(t, 1, n)
+}
+
+// The transitions of one transaction share a timestamp; the history must still come back in
+// the order they happened, every time.
+func TestNotice_HistoryOrderIsStableWithinOneTransaction(t *testing.T) {
+	s := store.New(openTestPool(t))
+	tenant := "tenant-notice-order"
+	iv := regulatedIntentVersion(t, s, tenant, "legal.order")
+	for i := 0; i < 15; i++ {
+		n, err := s.CreateNotice(tenantCtx(tenant), noticeParams(iv, domain.AckNone, time.Time{}))
+		require.NoError(t, err)
+		history, err := s.ListNoticeTransitions(tenantCtx(tenant), n.NoticeID)
+		require.NoError(t, err)
+		require.Len(t, history, 2)
+		assert.Equal(t, "PREPARED", history[0].ToStatus, "notice %d", i)
+		assert.Equal(t, "READY", history[1].ToStatus, "notice %d", i)
+	}
+}

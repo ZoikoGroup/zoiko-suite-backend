@@ -211,7 +211,7 @@ Basis: code and test names read; **not run**. Counts are at the end.
 
 ## 7. Tally
 
-NP matrix, 60 scenarios: **10 BUILT, 17 PARTIAL, 30 GAP, 3 UNVERIFIED**. The audit does not claim any scenario is certified; BUILT means the behaviour is present in code and, where noted, tested.
+NP matrix, 60 scenarios, **Wave 0 baseline: 10 BUILT, 17 PARTIAL, 30 GAP, 3 UNVERIFIED. Current (section 18): 32 BUILT, 12 PARTIAL, 13 GAP, 3 UNVERIFIED.** The audit does not claim any scenario is certified; BUILT means the behaviour is present in code and, where noted, tested.
 The 30 gaps are concentrated in the parts that depend on services the NCD does not yet call (PRV, PDC, DRC, XIC bindings, MDM) and in NCD-05, which is not built.
 
 ## 8. Wave 1 progress
@@ -429,3 +429,22 @@ Decisions taken with the owner: core lifecycle first, **recipient-only** acknowl
 * **A bounce that arrives after delivery was evidenced is recorded as evidence but does not reopen the notice** (the lifecycle only moves forward); it is visible in the bundle.
 * **No maker-checker on creating or dispatching a notice,** and no approval flow for operator-evidenced acknowledgement (refused outright for now).
 * **One response per version,** so a recipient cannot acknowledge and then dispute the same version; the dispute route is the response itself.
+
+## 18. Wave 3 slice 6: the executable negative-path matrix and re-score
+
+`TestNP_Matrix` (`internal/store/np_matrix_test.go`, real Postgres) runs the matrix: **33 scenarios are asserted**, and **22 are listed as skips that state why they are not built**, so the test run itself shows what is missing. Five more are covered by earlier tests (NP-32, 46, 54, 56, 57). Two negative controls were run: removing the ambiguous-message-id guard and the recipient-only acknowledgement check each failed exactly the scenarios that depend on them (NP-27, NP-39, NP-41), and the originals were restored.
+
+**Current tally: 32 BUILT, 12 PARTIAL, 13 GAP, 3 UNVERIFIED** (baseline 10, 17, 30, 3). "BUILT" means the refusal is present in code and asserted by a test; it does not mean the scenario is certified.
+
+| Status | Scenarios |
+|---|---|
+| BUILT | 02, 03, 04, 05, 06, 07, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 26, 27, 32, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 54, 56 |
+| PARTIAL | 08 (variables refuse control characters; free-text subjects are only stripped at SMTP), 09 (no regulated-content class), 12 (RLS only, no external-party concept), 23 (retries, no provider idempotency token), 28 (SMTP failover, no certified-equivalent set), 33 (token audience binding unverified), 35 (provider acceptance is distinct for notices; the SENT status is still named for acceptance), 44 (a different recipient is refused as a correction; no incident path), 48 (class is explicit and judged; no promotional-content check), 49 (RLS; no bulk API), 57 (outcome recorded on a detached context; sweep; outbox), 60 (no such setting; no explicit guard test) |
+| UNVERIFIED | 25 (callback before the API response), 51 (rate backlog, no rate controls found), 59 (provider corrects a status later) |
+| GAP | 01, 10, 11, 29, 30, 31, 34, 47, 50, 52, 53, 55, 58 |
+
+**What the remaining gaps have in common:** attachments and DRC (10, 34, 58), delivery-side controls the service does not have (29, 30, 52, 53, 55: fallback, residency, expiry, priority queues, sender-authentication monitoring), bulk and audience handling (47, 50), SMS sensitivity (31), regulated free-text recipients (11) and an architecture guard against direct provider SDK use (01).
+
+**Reading the matrix honestly:** the build is strongest where the work was inside this service (intents, templates, privacy gate, preferences, suppression, evidence, notices) and weakest where the standard depends on other services or on channels and queue controls that do not exist here yet.
+
+**A defect the full run found (fixed in migration 000026):** a notice's lifecycle transitions are written in one transaction, so they share a timestamp (`now()` is the transaction start) and the history ordered by time then by a random id could come back in the wrong order. The lifecycle test passed once and failed on a later run. History rows now carry an identity sequence and are read in that order, with a test that creates 15 notices and checks every one, and the lifecycle test was run eight times in a row.
