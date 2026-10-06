@@ -107,7 +107,8 @@ Status key: **BUILT** (verified in code), **PARTIAL**, **GAP** (not built), **UN
 ### NCD-05 Regulated notice and acknowledgment
 | Item | Status |
 |---|---|
-| Entire service (notice package, lifecycle, acknowledgment, correction and supersession, WFC and DRC handoff) | GAP. Only `read_at` for in-app notices exists, which is a read marker and not an acknowledgment |
+| Notice package, lifecycle, acknowledgment, correction and supersession | PARTIAL (Wave 3, section 17) | built; recipient-only acknowledgement, no operator acknowledgement |
+| WFC deadline and escalation handoff; DRC record declaration; PDC rule lookup; e-signature | GAP | no calls to those services; deadline and policy reference are supplied by the caller |
 
 ### Cross-cutting
 | Item | Status | Evidence |
@@ -407,3 +408,24 @@ A preference is a state dimension of its own: it selects when and whether a rout
 * **Evidence is not yet used to change a notification's status** (a bounce after SENT does not move it), and not yet emitted as an event.
 * **No reconciliation job, reputation metrics, circuit breakers or authentication-posture monitoring** (the rest of NCD-04 7.4).
 * **No late-callback ordering rule** (a callback before the API response is stored if the attempt exists, otherwise dead-lettered for retry).
+
+## 17. Wave 3 slice 5: regulated notices, acknowledgement and corrections (NCD-05, sections 8.1 to 8.5)
+
+Decisions taken with the owner: core lifecycle first, **recipient-only** acknowledgement, **operator acknowledgement refused**.
+
+* **Package (8.1):** `regulated_notices` (migration 000025), one row per exact version: frozen subject, body and locale with a content hash, the intent version it is sent under, recipient (capacity SELF only), the policy basis reference (a PDC rule reference, required and opaque), effective date, acknowledgement requirement (NONE, RECEIPT, ACCEPTANCE_DECLINE) and the deadline. Content is immutable by trigger; only the status and two links move. A notice needs an intent of **evidence class E3 or E4** that allows email, in the same legal entity, on a direct-path purpose class.
+* **Lifecycle (Figure 8):** PREPARED, READY, DELIVERY_IN_PROGRESS, DELIVERY_EVIDENCED, then SATISFIED_BY_POLICY (nothing required) or ACK_PENDING, then ACKNOWLEDGED, DECLINED, DISPUTED or EXPIRED; EXCEPTION for a delivery that cannot be evidenced. The allowed edges are enforced in the database. Every transition writes an append-only history row and an outbox event in the same transaction (notice.dispatched, delivery_evidenced, exception, acknowledged, declined, disputed, expired, corrected), carrying the content hash and never the content.
+* **Evidence threshold:** a provider accepting the message (notification SENT) is **not** enough. The receiving mail server's acceptance (MAILBOX_ACCEPTED, from the previous slice) is required, a bounce or a failed delivery is an EXCEPTION, and a deadline that passes first is an EXCEPTION. SATISFIED_BY_POLICY is described as policy satisfaction, "not a finding of legal service". No status or message anywhere claims legal service (8.5), and the evidence bundle says so.
+* **Acknowledgement (8.3):** `POST /v1/notices/{id}/acknowledgement` by the authenticated principal, who must be the recipient, for that exact version. The body cannot name an actor or a method (strict decode, and the database allows only AUTHENTICATED_ACTION). Email opens and link clicks are never acknowledgements. One response per version. An operator, or anyone else, gets 403 `operator_acknowledgement_refused`; there is no route for it. No response by the deadline moves the notice to EXPIRED and announces it; **no acknowledgement is ever fabricated**, and a late response is refused while the expiry it hit is still recorded.
+* **Corrections (8.4):** `POST /v1/notices/{id}/corrections` creates version N+1 in the same lineage, naming the prior and a required reason. The prior row is untouched, says it was superseded, and stays readable; a superseded version that was never sent cannot be sent. A correction goes to the same recipient (a different recipient is a new notice, and a mistaken one is a privacy incident to assess, not a correction). Whether a clock restarts is the caller's explicit decision: omit `deadline_at` to keep the existing one.
+* **Delivery is the ordinary governed send:** `POST /v1/notices/{id}/dispatch` reuses the send path itself (kill switch, suppression, privacy gate, preferences, retries, attempt records). The delivery's identity is derived from the notice, so an interrupted dispatch can be repeated without a second delivery; a repeated dispatch sends nothing.
+* **Reads:** the recipient may read their own notice (they cannot respond to one they cannot see); anyone else needs NOTIFICATION_VIEW. `GET /v1/notices/{id}/evidence` is the evidence bundle (notice, history, attempts, provider facts, response) and needs NOTIFICATION_VIEW even for the recipient. A background sweeper (every minute) applies the same progress rule so deadlines and late callbacks are acted on without anyone reading the notice.
+* **Tests:** pure rules (validation, acknowledgement matrix, the evidence threshold, no legal-service wording), real-Postgres lifecycle (every path including expiry, bounce, no-response-needed, correction, the database refusing content edits, skipped edges, deletes and non-recipient or non-authenticated acknowledgement rows, cross-tenant), the handler API, the sweeper, migration 000025 down/up, and one end-to-end test through the real handlers, store and callback processor with only the mail provider faked.
+
+**Not built, deliberately:**
+* **No DRC record declaration, WFC deadline ownership or escalation, PDC rule resolution, or e-signature link.** The deadline, the acknowledgement requirement and the policy reference are supplied by the caller and stored, not validated against those services. An EXCEPTION or EXPIRED notice raises an event but nothing consumes it yet.
+* **Notice wording is not template-governed:** content is supplied by the caller and frozen and hashed, so what was served is provable, but it does not pass through template review. No attachments (DRC versions) in the package.
+* **Only email, only SELF capacity:** no representative or role recipients, no fallback to a second channel or manual service, and EXCEPTION is terminal (the remedy is a correction or a new notice).
+* **A bounce that arrives after delivery was evidenced is recorded as evidence but does not reopen the notice** (the lifecycle only moves forward); it is visible in the bundle.
+* **No maker-checker on creating or dispatching a notice,** and no approval flow for operator-evidenced acknowledgement (refused outright for now).
+* **One response per version,** so a recipient cannot acknowledge and then dispute the same version; the dispute route is the response itself.

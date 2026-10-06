@@ -377,3 +377,63 @@ func buildFor(n domain.Notification, eventType, correlationID, tenantID, legalEn
 	}
 	return Build(eventType, correlationID, tenantID, legalEntityID, actorID, key, payload)
 }
+
+// ZS-SVC-Y-001 NCD-05 notice events (migration 000025). Like every event here they carry
+// no subject, body or address: a consumer that needs content reads the notice under its own
+// authorization. They carry the content hash, so a consumer can tell WHICH exact version.
+const (
+	TypeNoticeDispatched        = "notice.dispatched"
+	TypeNoticeDeliveryEvidenced = "notice.delivery_evidenced"
+	TypeNoticeException         = "notice.exception"
+	TypeNoticeAcknowledged      = "notice.acknowledged"
+	TypeNoticeDeclined          = "notice.declined"
+	TypeNoticeDisputed          = "notice.disputed"
+	TypeNoticeExpired           = "notice.expired"
+	TypeNoticeCorrected         = "notice.corrected"
+)
+
+// NoticeEventFor maps a notice's new status to the event that announces it, if any.
+func NoticeEventFor(status string) (string, bool) {
+	switch status {
+	case domain.NoticeDeliveryInProgess:
+		return TypeNoticeDispatched, true
+	case domain.NoticeDeliveryEvidenced:
+		return TypeNoticeDeliveryEvidenced, true
+	case domain.NoticeException:
+		return TypeNoticeException, true
+	case domain.NoticeAcknowledged:
+		return TypeNoticeAcknowledged, true
+	case domain.NoticeDeclined:
+		return TypeNoticeDeclined, true
+	case domain.NoticeDisputed:
+		return TypeNoticeDisputed, true
+	case domain.NoticeExpired:
+		return TypeNoticeExpired, true
+	}
+	return "", false
+}
+
+// NoticeEvent seals a notice event. Status names where the notice now is, never that legal
+// service happened.
+func NoticeEvent(eventType string, n domain.Notice, actor, reason string) (Outbound, error) {
+	payload := map[string]any{
+		"notice_id":         n.NoticeID,
+		"lineage_id":        n.LineageID,
+		"version_number":    n.VersionNumber,
+		"status":            n.Status,
+		"ack_requirement":   n.AckRequirement,
+		"content_hash":      n.ContentHash,
+		"intent_version_id": n.IntentVersionID,
+		"reason":            reason,
+	}
+	if n.NotificationID != nil {
+		payload["communication_id"] = *n.NotificationID
+	}
+	if n.SupersedesNoticeID != nil {
+		payload["supersedes_notice_id"] = *n.SupersedesNoticeID
+	}
+	if n.DeadlineAt != nil {
+		payload["deadline_at"] = n.DeadlineAt.UTC().Format(time.RFC3339)
+	}
+	return Build(eventType, "notice-"+n.NoticeID, n.TenantID, n.LegalEntityID, actor, n.NoticeID, payload)
+}

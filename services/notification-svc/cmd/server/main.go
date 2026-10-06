@@ -34,6 +34,7 @@ import (
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
 	"zoiko.io/notification-svc/internal/outbox"
+	"zoiko.io/notification-svc/internal/notice"
 	"zoiko.io/notification-svc/internal/policy"
 	"zoiko.io/notification-svc/internal/privacy"
 	"zoiko.io/notification-svc/internal/retry"
@@ -401,6 +402,7 @@ func main() {
 		Intents:        pgStore,
 		Preferences:    pgStore,
 		Evidence:       pgStore,
+		Notices:        pgStore,
 		Log:            log,
 	})
 	handler.RegisterRoutes(r, h)
@@ -467,6 +469,9 @@ func main() {
 		log,
 	)
 	go housekeepingWorker.Start(workerCtx)
+
+	// ── 6b2. Regulated notice sweeper (NCD-05): delivery evidence and deadlines ─
+	go notice.NewWorker(pgStore, time.Minute, 100, log).Start(workerCtx)
 
 	// ── 6c. Webhook DLQ Reprocessor Worker ───────────────────────────────────
 	if cfg.WebhookDLQ.Enabled {

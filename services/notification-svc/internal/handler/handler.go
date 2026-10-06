@@ -170,6 +170,7 @@ type Handler struct {
 	intents        IntentStore
 	preferences    PreferenceStore
 	evidence       EvidenceStore
+	notices        NoticeStore
 	// metrics may be nil (tests); every observation is nil-safe.
 	metrics *telemetry.Domain
 
@@ -205,6 +206,8 @@ type Deps struct {
 	Preferences PreferenceStore
 	// Evidence reads normalized delivery evidence (NCD-04). Optional: without it the route answers 503.
 	Evidence EvidenceStore
+	// Notices stores regulated notices (NCD-05). Optional: without it, and the intent registry, the routes answer 503.
+	Notices NoticeStore
 	Metrics        *telemetry.Domain
 	Log            *zap.Logger
 }
@@ -223,6 +226,7 @@ func New(d Deps) *Handler {
 		intents:        d.Intents,
 		preferences:    d.Preferences,
 		evidence:       d.Evidence,
+		notices:        d.Notices,
 		metrics:        d.Metrics,
 		log:            d.Log,
 	}
@@ -276,6 +280,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 	registerIntentRoutes(r, h)
 	registerPreferenceRoutes(r, h)
+	registerNoticeRoutes(r, h)
 	r.Post("/v1/channel-decision", h.ChannelDecision)
 
 	r.Route("/v1/document-templates", func(r chi.Router) {
