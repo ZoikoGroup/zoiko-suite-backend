@@ -49,6 +49,10 @@ func (a *scopedAuthZ) CheckAllowed(_ context.Context, principalID, _, actionType
 	return nil
 }
 
+func (a *scopedAuthZ) CheckHeldInOwnRight(ctx context.Context, principalID, entity, action string) error {
+	return a.CheckAllowed(ctx, principalID, entity, action)
+}
+
 func (a *scopedAuthZ) CheckAllowedAtLimit(_ context.Context, principalID, _, actionType, _, _ string) error {
 	return a.CheckAllowed(context.Background(), principalID, "", actionType+"@limit")
 }

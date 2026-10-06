@@ -171,9 +171,22 @@ func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGran
 			}
 			return enqueue(ctx, tx, events.EventDelegated, *d)
 		}
-		// Replay: find the existing grant using the composite idempotency key
+		// Replay: find the existing grant using the composite idempotency key.
+		// It is a replay only if it is the SAME grant. ORG-06 scopes
+		// idempotency by principal + scope + validity, and the delegate is not
+		// in the unique key, so a reused correlation_id naming another
+		// delegate (or delegator, or ceiling) used to come back as a 200
+		// "replay" of a delegation the caller never asked for.
 		row := tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND correlation_id = $2 AND created_by_principal_id = $3 AND action_type = $4 AND legal_entity_id = $5 AND effective_from = $6 AND effective_to = $7", tenantID, d.CorrelationID, d.CreatedByPrincipalID, d.ActionType, d.LegalEntityID, d.EffectiveFrom, d.EffectiveTo)
-		return scanDelegation(row, d)
+		var existing domain.DelegationGrant
+		if err := scanDelegation(row, &existing); err != nil {
+			return err
+		}
+		if !sameGrant(&existing, d) {
+			return domain.ErrCorrelationReused
+		}
+		*d = existing
+		return nil
 	})
 	if err != nil {
 		return false, mapPgError(err)
@@ -639,4 +652,14 @@ func (s *PgStore) OutboxDepth(ctx context.Context) (pending int64, oldestAge tim
 		return nil
 	})
 	return pending, oldestAge, err
+}
+
+// sameGrant compares what a delegation confers: the parties and the ceiling.
+// The id, timestamps and reason may differ on a genuine retry.
+func sameGrant(a, b *domain.DelegationGrant) bool {
+	eqI := func(x, y *int64) bool { return (x == nil && y == nil) || (x != nil && y != nil && *x == *y) }
+	eqS := func(x, y *string) bool { return (x == nil && y == nil) || (x != nil && y != nil && *x == *y) }
+	return a.DelegatorPrincipalID == b.DelegatorPrincipalID && a.DelegatePrincipalID == b.DelegatePrincipalID &&
+		eqI(a.AuthorityLimitCents, b.AuthorityLimitCents) && eqS(a.AuthorityLimitCurrency, b.AuthorityLimitCurrency) &&
+		eqI(a.AuthorityLimitQuantity, b.AuthorityLimitQuantity)
 }

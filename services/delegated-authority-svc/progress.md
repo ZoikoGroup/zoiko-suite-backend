@@ -1,5 +1,27 @@
 # delegated-authority-svc — implementation progress
 
+## 6 Oct 2026 — independent re-audit: three defects in the 5 Oct remediation, fixed
+
+The 5 Oct "23 of 23" was 20 of 23 in fact. Detail in
+`docs/audit_files/Identity, Scope & Foundation-audit-2026-09-23.md`, section 8/9, "Re-audit, 6 October 2026".
+
+- `authority.expired` carried no `version`, so authorization-svc's replay guard discarded every
+  expiry. Every event now carries `version`, `effective_at` and `recorded_at` (asyncapi 1.2.0).
+- The maker of an on-behalf grant could extend or resume it alone. Extend and resume now apply
+  activation's segregation (`approval_not_segregated`).
+- An uncapped delegation escaped the delegator's own authority limit at decision time. Fixed in
+  authorization-svc: the delegator's limits apply to every delegation-based decision.
+
+106 tests (0 skip) here, 388 in authorization-svc. Live: `live_lifecycle_check.py` 20/20 (delegates
+now unique per run), `live_kafka_projection_check.py` 22/22.
+
+**Second pass, same day: four more.** A reused correlation_id naming another delegate returned the
+first grant as a 200 replay (now 409 `correlation_reused`); a delegator with no limit could not
+delegate a CAPPED grant (limit no longer required); re-delegating authority held only by delegation
+is refused (403 `delegator_authority_delegated`, migration 000011); GET by id no longer reveals which
+ids exist, and parties may read their own grant. Every event carries `evidence_ref`. The true 5 Oct
+state was 19/23 (83%). Now 109 tests (0 skip); live lifecycle 24/24, Kafka 23/23.
+
 Tracked against `docs/architecture/03-microservices.md` §9.3 and the data-model
 rules in `docs/architecture/04-data-model.md` §6.3. There is no dedicated
 `ZS-SVC-*` specification document for this service — §9.3 is four lines, and

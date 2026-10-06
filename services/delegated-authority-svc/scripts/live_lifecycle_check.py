@@ -27,6 +27,11 @@ sys.stdout.reconfigure(encoding="utf-8")
 T = "7a000000-0000-4000-8000-000000000001"
 E = "7e000000-0000-4000-8000-000000000001"
 RUN = uuid.uuid4().hex[:6]
+# Delegates are unique per run. Grants last two days, so fixed names collided
+# with a previous run's still-ACTIVE grants and the (correct) overlap rule
+# refused them, which read as a regression. carol stays fixed: the seeded SoD
+# rule depends on her role.
+BOB, DAVE = "bob-" + RUN, "dave-" + RUN
 fails = passes = 0
 
 
@@ -80,7 +85,7 @@ def grant(delegator, delegate, action, caller, **extra):
 
 print(f"run {RUN} against {args.base}")
 print("── the regression: create through the REAL SoD engine")
-s, d, _ = grant("alice", "bob", "PO_ISSUE", "alice")
+s, d, _ = grant("alice", BOB, "PO_ISSUE", "alice")
 check("delegator's own grant is created ACTIVE (SoD answered by the real /v1/sod/validate)",
       s == 201 and d.get("status") == "ACTIVE" and d.get("approval_method") == "DELEGATOR_SELF", (s, d))
 gid = d.get("delegation_id")
@@ -89,9 +94,9 @@ s, d, _ = grant("alice", "carol", "PAYMENT_APPROVE", "alice")
 check("SoD: carol holds PAYMENT_RELEASE, so PAYMENT_APPROVE is refused", s == 403 and d.get("error_code") == "sod_conflict", (s, d))
 
 print("── ORG-06 negative case 11: the delegator's own limit (500.00 USD)")
-s, d, _ = grant("alice", "bob", "PAYMENT_APPROVE", "alice", authority_limit_cents=90000, authority_limit_currency="USD")
+s, d, _ = grant("alice", BOB, "PAYMENT_APPROVE", "alice", authority_limit_cents=90000, authority_limit_currency="USD")
 check("a 900.00 USD ceiling above alice's 500.00 is refused", s == 403 and d.get("error_code") == "delegator_exceeds_limit", (s, d))
-s, d, _ = grant("alice", "bob", "PAYMENT_APPROVE", "alice", authority_limit_cents=40000, authority_limit_currency="USD")
+s, d, _ = grant("alice", BOB, "PAYMENT_APPROVE", "alice", authority_limit_cents=40000, authority_limit_currency="USD")
 check("a 400.00 USD ceiling within alice's own is granted", s == 201 and d.get("authority_limit_cents") == 40000, (s, d))
 
 print("── extend, suspend, resume, revoke — versions and reasons")
@@ -104,7 +109,7 @@ s, d, _ = req("POST", f"/v1/delegations/{gid}/suspend", "alice", {"reason": "x"}
 check("no version is 428", s == 428, (s, d))
 s, d, _ = req("POST", f"/v1/delegations/{gid}/suspend?expected_version=2", "alice", {"reason": "investigation"})
 check("suspend", s == 200 and d.get("status") == "SUSPENDED" and d.get("suspension_reason") == "investigation", (s, d))
-s, d, _ = req("POST", f"/v1/delegations/{gid}/resume?expected_version=3", "bob")
+s, d, _ = req("POST", f"/v1/delegations/{gid}/resume?expected_version=3", BOB)
 check("the delegate cannot resume their own grant", s == 403, (s, d))
 s, d, _ = req("POST", f"/v1/delegations/{gid}/resume?expected_version=3", "alice")
 check("resume (re-checked against the real authorization-svc)", s == 200 and d.get("status") == "ACTIVE", (s, d))
@@ -115,13 +120,32 @@ s, d, h = req("POST", f"/v1/delegations/{gid}/revoke?expected_version=4", "alice
 check("Idempotency-Key replays the first answer (cross-service finding 2)", s == 200 and h.get("X-Idempotent-Replay") == "true", (s, h.get("X-Idempotent-Replay")))
 
 print("── Proposed → Active: maker-checker")
-s, d, _ = grant("alice", "dave", "PO_ISSUE", "admin2")
+s, d, _ = grant("alice", DAVE, "PO_ISSUE", "admin2")
 pid = d.get("delegation_id")
 check("an administrator's grant on alice's behalf is only PROPOSED", s == 201 and d.get("status") == "PROPOSED", (s, d))
 s, d, _ = req("POST", f"/v1/delegations/{pid}/activate?expected_version=1", "admin2")
 check("the maker cannot approve their own proposal", s == 403 and d.get("error_code") == "approval_not_segregated", (s, d))
 s, d, _ = req("POST", f"/v1/delegations/{pid}/activate?expected_version=1", "alice")
 check("the delegator approves it", s == 200 and d.get("status") == "ACTIVE" and d.get("approval_method") == "DELEGATOR_APPROVAL", (s, d))
+s, d, _ = req("POST", f"/v1/delegations/{pid}/extend?expected_version=2", "admin2",
+              {"new_effective_to": iso(now + timedelta(days=4)), "correlation_id": uuid.uuid4().hex, "reason": "longer"})
+check("its maker cannot then extend it alone (self-approval, 6 Oct)", s == 403 and d.get("error_code") == "approval_not_segregated", (s, d))
+
+print("── re-audit 6 Oct (second pass)")
+corr = f"{RUN}-reuse"
+body = {"legal_entity_id": E, "delegator_principal_id": "alice", "action_type": "PO_ISSUE",
+        "effective_from": iso(now), "effective_to": iso(now + timedelta(days=1)), "correlation_id": corr, "reason": "reuse probe"}
+s, d, _ = req("POST", "/v1/delegations/", "alice", dict(body, delegate_principal_id="erin-" + RUN))
+check("a grant under a fresh correlation_id", s == 201, (s, d))
+s, d, _ = req("POST", "/v1/delegations/", "alice", dict(body, delegate_principal_id="frank-" + RUN))
+check("the same correlation_id naming another delegate is 409 correlation_reused, not a replay of erin's grant",
+      s == 409 and d.get("error_code") == "correlation_reused", (s, d))
+s, d, _ = grant("admin2", "gina-" + RUN, "PAYMENT_APPROVE", "admin2", authority_limit_cents=10000, authority_limit_currency="USD")
+check("admin2 (no authority limit of their own) may delegate a NARROWER 100.00 USD ceiling",
+      s == 201 and d.get("status") == "ACTIVE", (s, d))
+s, d, _ = req("GET", f"/v1/delegations/{gid}", "mallory-" + RUN)
+s2, d2, _ = req("GET", f"/v1/delegations/{uuid.uuid4()}", "mallory-" + RUN)
+check("a refused read is indistinguishable from a missing id", s == 404 and (s, d) == (s2, d2), ((s, d), (s2, d2)))
 
 print("── what the database recorded")
 out, _ = sql(f"SELECT string_agg(transition, ',' ORDER BY version) FROM delegation_history WHERE delegation_id = '{gid}'")

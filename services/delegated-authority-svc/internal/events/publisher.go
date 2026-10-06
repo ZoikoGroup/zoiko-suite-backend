@@ -143,6 +143,19 @@ func BuildFor(eventType string, d domain.DelegationGrant, actor, reason string) 
 	default:
 		return "", nil, fmt.Errorf("events: unknown event type %q", eventType)
 	}
+	// ORG-06 event envelope: object_version, effective_at and recorded_at on
+	// every event. The version orders a grant's events for consumers;
+	// authorization-svc ignores one older than its projection, so an event
+	// without it (authority.expired, until this was added) reads as version 0
+	// and is discarded.
+	payload["version"] = d.Version
+	payload["effective_at"] = effectiveAt(eventType, d)
+	payload["recorded_at"] = d.UpdatedAt
+	// evidence_ref names the append-only delegation_history row written in
+	// the same transaction as this event: (delegation_id, version) is unique
+	// there, and every transition — the sweeper's expiry included — writes
+	// one. It carries actor, reason, approval and the grant as it then stood.
+	payload["evidence_ref"] = EvidenceRef(d.DelegationID, d.Version)
 	if actor != "" {
 		actorID = actor
 	}
@@ -179,6 +192,35 @@ func BuildFor(eventType string, d domain.DelegationGrant, actor, reason string) 
 	// they could be reordered across partitions, and a consumer could act on a
 	// revocation before it knows the grant exists.
 	return d.DelegationID, body, nil
+}
+
+// effectiveAt is when the change takes effect, as distinct from when it was
+// recorded: a grant takes effect at effective_from, lapses at effective_to
+// (which the sweeper may record later), and a revocation or suspension takes
+// effect when it is made.
+func effectiveAt(eventType string, d domain.DelegationGrant) time.Time {
+	switch eventType {
+	case EventDelegated:
+		if d.EffectiveFrom.After(d.UpdatedAt) {
+			return d.EffectiveFrom
+		}
+	case EventExpired:
+		return d.EffectiveTo
+	case EventRevoked:
+		if d.RevokedAt != nil {
+			return *d.RevokedAt
+		}
+	case EventSuspended:
+		if d.SuspendedAt != nil {
+			return *d.SuspendedAt
+		}
+	}
+	return d.UpdatedAt
+}
+
+// EvidenceRef is the evidence reference for one version of a delegation.
+func EvidenceRef(delegationID string, version int64) string {
+	return fmt.Sprintf("delegation_history/%s/v%d", delegationID, version)
 }
 
 func deref(s *string) string {

@@ -307,3 +307,82 @@ func TestListAsOf(t *testing.T) {
 		t.Errorf("PROPOSED is a status now and must be filterable, got %d", rr.Code)
 	}
 }
+
+// Self-approval prohibited (ORG-06 SoD). A grant made on someone else's
+// behalf needs an independent approver to become ACTIVE. Its maker could then
+// widen it alone: extending its window, or resuming it after an independent
+// suspension, each needed nothing but DELEGATION_ADMINISTER. The maker and the
+// delegate are held to the same segregation on both as on activation.
+func TestExtendAndResume_MakerCannotWidenTheirOwnProposal(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubAuthZ{}, nil)
+	d := propose(t, r, "admin-1")
+	rr := transition(r, d.DelegationID, "activate", d.Version, "admin-2", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("independent activation: %d %s", rr.Code, rr.Body.String())
+	}
+	act := decodeGrant(t, rr)
+	extend := func(who string, version int64) *httptest.ResponseRecorder {
+		return transition(r, d.DelegationID, "extend", version, who, map[string]any{
+			"new_effective_to": act.EffectiveTo.Add(24 * time.Hour), "correlation_id": uuid.NewString(), "reason": "longer"})
+	}
+	if rr := extend("admin-1", act.Version); rr.Code != http.StatusForbidden {
+		t.Fatalf("the maker extending their own proposal must be 403, got %d %s", rr.Code, rr.Body.String())
+	}
+	if n := len(s.refusals); n == 0 || s.refusals[n-1] != "approval_not_segregated" {
+		t.Errorf("the refused extension must leave durable evidence, got %v", s.refusals)
+	}
+	rr = extend("admin-2", act.Version)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("an independent administrator may extend: %d %s", rr.Code, rr.Body.String())
+	}
+	ext := decodeGrant(t, rr)
+
+	rr = transition(r, d.DelegationID, "suspend", ext.Version, "admin-2", map[string]any{"reason": "investigation"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("suspend: %d %s", rr.Code, rr.Body.String())
+	}
+	sus := decodeGrant(t, rr)
+	if rr := transition(r, d.DelegationID, "resume", sus.Version, "admin-1", nil); rr.Code != http.StatusForbidden {
+		t.Fatalf("the maker resuming their own proposal must be 403, got %d %s", rr.Code, rr.Body.String())
+	}
+	if rr := transition(r, d.DelegationID, "resume", sus.Version, "delegator-1", nil); rr.Code != http.StatusOK {
+		t.Fatalf("the delegator may resume: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ORG-06: delegation "can narrow or transmit authority but cannot manufacture
+// authority". A delegator holding the action only by delegation is refused,
+// and the refusal is durable evidence.
+func TestRedelegatingDelegatedAuthorityIsRefused(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubAuthZ{delegatedOnly: "delegator-1"}, nil)
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "delegator-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d %s", rr.Code, rr.Body.String())
+	}
+	if n := len(s.refusals); n == 0 || s.refusals[n-1] != "delegator_authority_delegated" {
+		t.Errorf("the refusal must be recorded, got %v", s.refusals)
+	}
+}
+
+// GET /v1/delegations/{id}: a refused read must be indistinguishable from a
+// missing id, and a party to the grant may read it without DELEGATION_VIEW.
+func TestGetDelegation_RefusalLooksLikeAbsenceAndPartiesMayRead(t *testing.T) {
+	s := newStubStore()
+	az := newScopedAuthZ("stranger|DELEGATION_VIEW")
+	r := newRouterAuthz(s, az)
+	d := createActiveDelegation(t, r)
+
+	refused := doReq(r, http.MethodGet, "/v1/delegations/"+d.DelegationID, nil, "stranger")
+	missing := doReq(r, http.MethodGet, "/v1/delegations/"+uuid.NewString(), nil, "stranger")
+	if refused.Code != http.StatusNotFound || refused.Code != missing.Code || refused.Body.String() != missing.Body.String() {
+		t.Fatalf("a refused read must look like a missing id: refused %d %s, missing %d %s",
+			refused.Code, refused.Body.String(), missing.Code, missing.Body.String())
+	}
+	for _, party := range []string{"delegator-1", "delegate-1"} {
+		if rr := doReq(r, http.MethodGet, "/v1/delegations/"+d.DelegationID, nil, party); rr.Code != http.StatusOK {
+			t.Errorf("%s is party to the grant and may read it, got %d", party, rr.Code)
+		}
+	}
+}

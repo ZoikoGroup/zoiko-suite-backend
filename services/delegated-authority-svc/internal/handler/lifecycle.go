@@ -162,6 +162,11 @@ func (h *Handler) CreateDelegation(w http.ResponseWriter, r *http.Request) {
 
 	created, err := h.store.CreateDelegation(r.Context(), d)
 	if err != nil {
+		if errors.Is(err, domain.ErrCorrelationReused) {
+			h.countGrant(telemetry.GrantInvalidRequest)
+			writeError(w, http.StatusConflict, "correlation_reused", err.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrOverlapConflict) {
 			h.countGrant(telemetry.GrantOverlapConflict)
 			refuse("overlap_conflict")
@@ -203,8 +208,15 @@ type grantFacts struct {
 // the grant was first made. It returns the refusal code, the HTTP status and
 // the error; an empty code means the authority could not be consulted.
 func (h *Handler) authorizeGrant(ctx context.Context, g grantFacts) (string, int, error) {
-	if err := h.authz.CheckAllowed(ctx, g.delegator, g.legalEntityID, g.actionType); err != nil {
+	// The delegator must hold the action in their own right: authority held
+	// only by delegation confers nothing when passed on (authorization-svc
+	// resolves a delegation through the delegator's own roles), so it is
+	// refused here rather than recorded as a grant that grants nothing.
+	if err := h.authz.CheckHeldInOwnRight(ctx, g.delegator, g.legalEntityID, g.actionType); err != nil {
 		h.countAuthz("DELEGATED_ACTION", err)
+		if errors.Is(err, domain.ErrDelegatorAuthorityDelegated) {
+			return "delegator_authority_delegated", http.StatusForbidden, err
+		}
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
 			return "delegator_lacks_authority", http.StatusForbidden, domain.ErrDelegatorLacksAuthority
 		}
@@ -340,6 +352,21 @@ func (h *Handler) keepWithinDelegator(w http.ResponseWriter, r *http.Request, d 
 	return true
 }
 
+// segregatedFromMaker refuses the maker of an on-behalf grant acting alone to
+// widen it. Such a grant needed an independent approver to become ACTIVE;
+// without this its maker could extend it, or resume it after somebody else
+// suspended it, holding nothing but DELEGATION_ADMINISTER — approving their
+// own proposal after all (ORG-06 "self-approval prohibited"). The delegator,
+// whose authority it is, is not held to this; callers check that first.
+func (h *Handler) segregatedFromMaker(w http.ResponseWriter, r *http.Request, d *domain.DelegationGrant, caller string) bool {
+	if caller != d.CreatedByPrincipalID {
+		return true
+	}
+	h.recordRefusedEscalation(r.Context(), "approval_not_segregated", requestOf(d, d.EffectiveTo), caller, r)
+	writeError(w, http.StatusForbidden, "approval_not_segregated", string(domain.ErrApprovalNotSegregated))
+	return false
+}
+
 func requestOf(d *domain.DelegationGrant, to time.Time) *domain.CreateDelegationRequest {
 	return &domain.CreateDelegationRequest{LegalEntityID: d.LegalEntityID, DelegatorPrincipalID: d.DelegatorPrincipalID,
 		DelegatePrincipalID: d.DelegatePrincipalID, ActionType: d.ActionType, EffectiveFrom: d.EffectiveFrom, EffectiveTo: to,
@@ -408,6 +435,9 @@ func (h *Handler) ResumeDelegation(w http.ResponseWriter, r *http.Request) {
 	if caller != d.DelegatorPrincipalID {
 		if caller == d.DelegatePrincipalID {
 			writeError(w, http.StatusForbidden, "self_dealing", "the delegate may not resume their own delegation")
+			return
+		}
+		if !h.segregatedFromMaker(w, r, d, caller) {
 			return
 		}
 		if err := h.checkAllowed(r.Context(), caller, d.LegalEntityID, actionDelegationAdminister); err != nil {
@@ -489,6 +519,9 @@ func (h *Handler) ExtendDelegation(w http.ResponseWriter, r *http.Request) {
 	if caller != d.DelegatorPrincipalID {
 		if caller == d.DelegatePrincipalID {
 			writeError(w, http.StatusForbidden, "self_dealing", "the delegate may not extend their own delegation")
+			return
+		}
+		if !h.segregatedFromMaker(w, r, d, caller) {
 			return
 		}
 		if err := h.checkAllowed(r.Context(), caller, d.LegalEntityID, actionDelegationAdminister); err != nil {

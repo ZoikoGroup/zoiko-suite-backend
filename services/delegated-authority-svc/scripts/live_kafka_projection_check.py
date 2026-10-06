@@ -12,12 +12,14 @@ Needs: Kafka on localhost:9092 with the topic created; authorization-svc on
 scripts/live_seed_authz.sql; delegated-authority-svc on --base publishing to
 that topic. Exit code = number of failures.
 """
-import argparse, json, sys, time, urllib.error, urllib.request, uuid
+import argparse, json, subprocess, sys, time, urllib.error, urllib.request, uuid
 from datetime import datetime, timedelta, timezone
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--base", default="http://localhost:18136")
 ap.add_argument("--authz", default="http://localhost:18089")
+ap.add_argument("--authz-db", default="authorization_live_scratch",
+                help="authorization-svc's (scratch) database, read to see the projection itself")
 args = ap.parse_args()
 sys.stdout.reconfigure(encoding="utf-8")
 T, E = "7a000000-0000-4000-8000-000000000001", "7e000000-0000-4000-8000-000000000001"
@@ -82,6 +84,13 @@ out, basis = authorize(bob, "PAYMENT_APPROVE", {"amount": "350", "currency": "GB
 check("350 GBP (~449 USD at reference rates) is over the 400 USD cap; a caller fx_rate=0.0001 cannot shrink it",
       out == "DENIED" and "delegation_limit" in basis, (out, basis))
 
+s, d = call(args.base, "POST", "/v1/delegations/", "admin2", {
+    "legal_entity_id": E, "delegator_principal_id": bob, "delegate_principal_id": "frank-" + bob, "action_type": "PAYMENT_APPROVE",
+    "effective_from": iso(now), "effective_to": iso(now + timedelta(hours=1)),
+    "correlation_id": uuid.uuid4().hex, "reason": "re-delegation probe"})
+check("bob holds PAYMENT_APPROVE only by delegation, so it cannot be delegated onward (403 delegator_authority_delegated)",
+      s == 403 and d.get("error_code") == "delegator_authority_delegated", (s, d))
+
 print("── extension, suspension, resume, revocation reach the decision")
 newto = iso(now + timedelta(hours=5))
 s, d = call(args.base, "POST", f"/v1/delegations/{gid}/extend?expected_version=1", "alice",
@@ -99,6 +108,43 @@ s, d = call(args.base, "POST", f"/v1/delegations/{gid}/revoke?expected_version=4
 check("revoke", s == 200, (s, d))
 check("a revoked delegation is DENIED",
       until(lambda: authorize(bob, "PAYMENT_APPROVE", {"amount": "10", "currency": "USD"})[0] == "DENIED"))
+
+print("── an UNCAPPED delegation cannot exceed the delegator's own limit (ORG-06 negative case 11)")
+dave = "dave-" + uuid.uuid4().hex[:6]
+s, g2 = call(args.base, "POST", "/v1/delegations/", "alice", {
+    "legal_entity_id": E, "delegator_principal_id": "alice", "delegate_principal_id": dave, "action_type": "PAYMENT_APPROVE",
+    "effective_from": iso(now - timedelta(minutes=1)), "effective_to": iso(now + timedelta(hours=1)),
+    "correlation_id": uuid.uuid4().hex, "reason": "uncapped live check"})
+check("alice (own limit 500.00 USD) delegates PAYMENT_APPROVE to dave with NO ceiling", s == 201 and g2.get("status") == "ACTIVE", (s, g2))
+check("dave may approve 300 USD, within alice's own limit",
+      until(lambda: authorize(dave, "PAYMENT_APPROVE", {"amount": "300", "currency": "USD"})[0] == "GRANTED"))
+out, basis = authorize(dave, "PAYMENT_APPROVE", {"amount": "600", "currency": "USD"})
+check("600 USD is over alice's own 500 USD limit: DENIED although the delegation sets no ceiling",
+      out == "DENIED" and "delegation_limit:delegator" in basis, (out, basis))
+call(args.base, "POST", f"/v1/delegations/{g2.get('delegation_id')}/revoke?expected_version=1", "alice", {"reason": "cleanup"})
+
+
+def projection(delegation_id):
+    q = ("SELECT revocation_status || ':' || source_version FROM delegated_authorities "
+         f"WHERE source_delegation_id = '{delegation_id}'")
+    out = subprocess.run(["docker", "exec", "zoiko-postgres", "psql", "-U", "postgres", "-d", args.authz_db, "-tAc", q],
+                         capture_output=True, text=True).stdout.strip()
+    return out
+
+
+print("── an expiry reaches authorization-svc's projection (authority.expired carries its version)")
+erin = "erin-" + uuid.uuid4().hex[:6]
+s, g3 = call(args.base, "POST", "/v1/delegations/", "alice", {
+    "legal_entity_id": E, "delegator_principal_id": "alice", "delegate_principal_id": erin, "action_type": "PO_ISSUE",
+    "effective_from": iso(datetime.now(timezone.utc) - timedelta(minutes=1)),
+    "effective_to": iso(datetime.now(timezone.utc) + timedelta(seconds=8)),
+    "correlation_id": uuid.uuid4().hex, "reason": "expiry live check"})
+check("a delegation ending in 8 seconds", s == 201, (s, g3))
+gid3 = g3.get("delegation_id")
+check("it is projected ACTIVE", bool(until(lambda: projection(gid3).startswith("ACTIVE:"))), projection(gid3))
+ended = until(lambda: projection(gid3).startswith("REVOKED:"), timeout=60)
+check("after the sweeper expires it, the projection records it as ended (it used to stay ACTIVE: version 0 was ignored)",
+      bool(ended), projection(gid3))
 
 print("── GOV-04 maker-checker: /v1/sod/evaluate as identity-context-svc calls it")
 

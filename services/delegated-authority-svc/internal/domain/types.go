@@ -344,6 +344,19 @@ var (
 	// delegations for the same action on the same entity at the same time.
 	ErrOverlapConflict = errorString("delegation would create an overlapping active delegation for the same action")
 
+	// ErrCorrelationReused is a correlation_id already used for a DIFFERENT
+	// grant: same scope, but another delegator, delegate or limit. Answering
+	// it as a replay would hand the caller someone else's delegation as if it
+	// were the one they asked for.
+	ErrCorrelationReused = errorString("correlation_id was already used for a different delegation")
+
+	// ErrDelegatorAuthorityDelegated: the delegator holds the action only
+	// through a delegation to them. authorization-svc confers through a
+	// delegation only what the delegator holds in their own right, so a grant
+	// of it would confer nothing; it is refused rather than recorded as if it
+	// did.
+	ErrDelegatorAuthorityDelegated = errorString("the delegator holds this authority only by delegation and cannot delegate it onward")
+
 	// ErrInvalidPaging is returned for an out-of-range limit or offset.
 	ErrInvalidPaging = errorString("limit must be between 1 and 500 and offset must not be negative")
 

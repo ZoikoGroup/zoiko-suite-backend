@@ -28,7 +28,7 @@ asyncapi: 2.6.0
 
 info:
   title: delegated-authority-svc events
-  version: "1.1.0"
+  version: "1.3.0"
   description: |
     Lifecycle events for the delegated-authority register.
 
@@ -245,6 +245,10 @@ components:
     DelegatedPayload:
       type: object
       required:
+        - version
+        - effective_at
+        - recorded_at
+        - evidence_ref
         - delegation_id
         - legal_entity_id
         - delegator_principal_id
@@ -253,6 +257,27 @@ components:
         - effective_from
         - effective_to
       properties:
+        version:
+          type: integer
+          format: int64
+          description: |
+            The grant's version after this change (ORG-06 object_version).
+            Consumers order a grant's events by it and ignore one older than
+            what they hold; authority.expired used to omit it and was discarded.
+        effective_at:
+          type: string
+          format: date-time
+          description: When the change takes effect (a lapse at effective_to, a revocation when made).
+        recorded_at:
+          type: string
+          format: date-time
+          description: When the change was recorded; may be later than effective_at.
+        evidence_ref:
+          type: string
+          example: delegation_history/1b4e28ba-2fa1-11d2-883f-0016d3cca427/v3
+          description: |
+            The append-only delegation_history row for this version, written in
+            the same transaction as the event (ORG-06 evidence_ref).
         delegation_id: { type: string, format: uuid }
         legal_entity_id: { type: string }
         delegator_principal_id: { type: string }
@@ -275,12 +300,37 @@ components:
     RevokedPayload:
       type: object
       required:
+        - version
+        - effective_at
+        - recorded_at
+        - evidence_ref
         - delegation_id
         - legal_entity_id
         - delegator_principal_id
         - delegate_principal_id
         - action_type
       properties:
+        version:
+          type: integer
+          format: int64
+          description: |
+            The grant's version after this change (ORG-06 object_version).
+            Consumers order a grant's events by it and ignore one older than
+            what they hold; authority.expired used to omit it and was discarded.
+        effective_at:
+          type: string
+          format: date-time
+          description: When the change takes effect (a lapse at effective_to, a revocation when made).
+        recorded_at:
+          type: string
+          format: date-time
+          description: When the change was recorded; may be later than effective_at.
+        evidence_ref:
+          type: string
+          example: delegation_history/1b4e28ba-2fa1-11d2-883f-0016d3cca427/v3
+          description: |
+            The append-only delegation_history row for this version, written in
+            the same transaction as the event (ORG-06 evidence_ref).
         delegation_id: { type: string, format: uuid }
         legal_entity_id: { type: string }
         delegator_principal_id: { type: string }
@@ -290,6 +340,10 @@ components:
     ExpiredPayload:
       type: object
       required:
+        - version
+        - effective_at
+        - recorded_at
+        - evidence_ref
         - delegation_id
         - legal_entity_id
         - delegator_principal_id
@@ -297,6 +351,27 @@ components:
         - action_type
         - effective_to
       properties:
+        version:
+          type: integer
+          format: int64
+          description: |
+            The grant's version after this change (ORG-06 object_version).
+            Consumers order a grant's events by it and ignore one older than
+            what they hold; authority.expired used to omit it and was discarded.
+        effective_at:
+          type: string
+          format: date-time
+          description: When the change takes effect (a lapse at effective_to, a revocation when made).
+        recorded_at:
+          type: string
+          format: date-time
+          description: When the change was recorded; may be later than effective_at.
+        evidence_ref:
+          type: string
+          example: delegation_history/1b4e28ba-2fa1-11d2-883f-0016d3cca427/v3
+          description: |
+            The append-only delegation_history row for this version, written in
+            the same transaction as the event (ORG-06 evidence_ref).
         delegation_id: { type: string, format: uuid }
         legal_entity_id: { type: string }
         delegator_principal_id: { type: string }
@@ -313,6 +388,10 @@ components:
     ExtendedPayload:
       type: object
       required:
+        - version
+        - effective_at
+        - recorded_at
+        - evidence_ref
         - delegation_id
         - legal_entity_id
         - delegator_principal_id
@@ -321,11 +400,34 @@ components:
         - effective_from
         - effective_to
       properties:
+        version:
+          type: integer
+          format: int64
+          description: |
+            The grant's version after this change (ORG-06 object_version).
+            Consumers order a grant's events by it and ignore one older than
+            what they hold; authority.expired used to omit it and was discarded.
+        effective_at:
+          type: string
+          format: date-time
+          description: When the change takes effect (a lapse at effective_to, a revocation when made).
+        recorded_at:
+          type: string
+          format: date-time
+          description: When the change was recorded; may be later than effective_at.
+        evidence_ref:
+          type: string
+          example: delegation_history/1b4e28ba-2fa1-11d2-883f-0016d3cca427/v3
+          description: |
+            The append-only delegation_history row for this version, written in
+            the same transaction as the event (ORG-06 evidence_ref).
         delegation_id: { type: string, format: uuid }
         legal_entity_id: { type: string }
         delegator_principal_id: { type: string }
         delegate_principal_id: { type: string }
         action_type: { type: string }
         effective_from: { type: string, format: date-time }
-        effective_to: { type: string, format: date-time }
-        description: The new effective_to after extension
+        effective_to:
+          type: string
+          format: date-time
+          description: The new effective_to after extension

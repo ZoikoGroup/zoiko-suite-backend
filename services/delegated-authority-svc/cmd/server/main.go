@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -141,24 +142,49 @@ func (a *httpAuthzClient) storeCache(key string, decision error) {
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
 func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	return a.authorize(ctx, principalID, legalEntityID, actionType, nil, actionType)
+	_, err := a.authorize(ctx, principalID, legalEntityID, actionType, nil, actionType)
+	return err
+}
+
+// CheckHeldInOwnRight asks whether principalID holds actionType through their
+// own grants, not only through a delegation to them. authorization-svc checks
+// role grants first and answers basis "delegated:from=…" only when a delegation
+// is the sole source, and it confers through a delegation only what the
+// delegator holds in their own right — so authority held by delegation cannot
+// be passed on. Never cached: it is asked once per grant decision.
+func (a *httpAuthzClient) CheckHeldInOwnRight(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	basis, err := a.authorize(ctx, principalID, legalEntityID, actionType, nil, actionType+":own-right")
+	// A delegation's own ceiling is evaluated only when a delegation is the
+	// grant's sole source, so a denial on "delegation_limit:…" (a capped
+	// delegation asked about with no amount) means the same as a grant on
+	// "delegated:…": the principal holds this only by delegation.
+	if strings.HasPrefix(basis, "delegated:") || strings.HasPrefix(basis, "delegation_limit:") {
+		return domain.ErrDelegatorAuthorityDelegated
+	}
+	return err
 }
 
 // CheckAllowedAtLimit asks whether principalID may perform actionType at the
 // given monetary ceiling: authorization-svc evaluates the principal's own
 // authority limits against the amount (ORG-06 negative case 11, "delegator
-// grants higher limit than own authority → reject"). The limit is required, so
-// a principal with no limit configured for the action is refused rather than
-// treated as unlimited. Never cached — the answer depends on the amount.
+// grants higher limit than own authority → reject"). Never cached — the
+// answer depends on the amount.
+//
+// The limit is NOT required. It used to be, so a delegator with no limit for
+// the action was refused any CAPPED delegation while the same delegator's
+// uncapped one went through: delegating less was refused and delegating more
+// allowed. A principal with no limit is held to what authorization-svc holds
+// them to when they act themselves, and a ceiling within that narrows.
 func (a *httpAuthzClient) CheckAllowedAtLimit(ctx context.Context, principalID, legalEntityID, actionType, amount, currency string) error {
-	return a.authorize(ctx, principalID, legalEntityID, actionType, map[string]string{
-		"amount":                   amount,
-		"currency":                 currency,
-		"authority_limit_required": "true",
+	_, err := a.authorize(ctx, principalID, legalEntityID, actionType, map[string]string{
+		"amount":   amount,
+		"currency": currency,
 	}, actionType+":limit:"+amount+currency)
+	return err
 }
 
-func (a *httpAuthzClient) authorize(ctx context.Context, principalID, legalEntityID, actionType string, attributes map[string]string, idemSuffix string) error {
+// authorize returns the decision's basis, for a denial as well as a grant.
+func (a *httpAuthzClient) authorize(ctx context.Context, principalID, legalEntityID, actionType string, attributes map[string]string, idemSuffix string) (string, error) {
 	body := map[string]any{
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
@@ -171,7 +197,7 @@ func (a *httpAuthzClient) authorize(ctx context.Context, principalID, legalEntit
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/authorize", bytes.NewReader(reqBody))
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -182,24 +208,25 @@ func (a *httpAuthzClient) authorize(ctx context.Context, principalID, legalEntit
 	resp, err := a.client.Do(req)
 	if err != nil {
 		a.log.Error("failed to call authorization-svc", zap.Error(err))
-		return domain.ErrAuthzServiceUnavailable
+		return "", domain.ErrAuthzServiceUnavailable
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return domain.ErrAuthzServiceUnavailable
+		return "", domain.ErrAuthzServiceUnavailable
 	}
 
 	var res struct {
 		DecisionOutcome string `json:"decision_outcome"`
+		DecisionBasis   string `json:"decision_basis"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return err
+		return "", err
 	}
 	if res.DecisionOutcome != "GRANTED" {
-		return domain.ErrAuthorizationDenied
+		return res.DecisionBasis, domain.ErrAuthorizationDenied
 	}
-	return nil
+	return res.DecisionBasis, nil
 }
 
 // Ping reports whether authorization-svc is reachable, for readiness.

@@ -57,6 +57,9 @@ type AuthZClient interface {
 	// CheckAllowedAtLimit asks whether the principal may perform the action at
 	// the given monetary ceiling, with an authority limit required.
 	CheckAllowedAtLimit(ctx context.Context, principalID, legalEntityID, actionType, amount, currency string) error
+	// CheckHeldInOwnRight is CheckAllowed that also refuses, with
+	// ErrDelegatorAuthorityDelegated, an action held only by delegation.
+	CheckHeldInOwnRight(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
 // SoDClient checks whether a proposed delegation would create a
@@ -307,7 +310,21 @@ func (h *Handler) GetDelegation(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreErr(w, err)
 		return
 	}
+	// A party to the grant may read it, as the list already allows; anyone
+	// else needs DELEGATION_VIEW on its entity. A refused read is answered
+	// exactly like a missing one. It used to be 403 for an id that exists and
+	// 404 for one that does not, so any caller in the tenant could learn which
+	// delegation ids were real.
+	if principalID == d.DelegatorPrincipalID || principalID == d.DelegatePrincipalID || principalID == d.CreatedByPrincipalID {
+		h.countRead(telemetry.ReadScopeSelf)
+		writeJSON(w, http.StatusOK, d)
+		return
+	}
 	if err := h.checkAllowed(r.Context(), principalID, d.LegalEntityID, actionDelegationView); err != nil {
+		if errors.Is(err, domain.ErrAuthorizationDenied) {
+			writeError(w, http.StatusNotFound, "not_found", string(domain.ErrDelegationNotFound))
+			return
+		}
 		h.writeAuthzErr(w, err)
 		return
 	}

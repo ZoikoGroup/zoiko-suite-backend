@@ -272,12 +272,16 @@ func TestCreateDelegationIsIdempotentOnCorrelationID(t *testing.T) {
 	_, err := s.CreateDelegation(ctx, d)
 	require.NoError(t, err)
 
-	// A retried submission carries the same idempotency scope — migration
-	// 000008: tenant, correlation, creator, action, entity and effective
-	// window — and may differ in anything outside it (here the delegation id
-	// and the delegate). A replay is not a fresh grant and must neither write
-	// nor overwrite.
-	replay := grant("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbba", "corr-a2", testEntityA, principalSelf, principalThird, from, to)
+	// The same correlation_id naming ANOTHER delegate is not a retry of this
+	// grant. It used to be answered as one: a 200 carrying a delegation to
+	// principalOther, to a caller who had asked for principalThird.
+	other := grant("cccccccc-cccc-cccc-cccc-cccccccccccc", "corr-a2", testEntityA, principalSelf, principalThird, from, to)
+	_, err = s.CreateDelegation(ctx, other)
+	require.ErrorIs(t, err, domain.ErrCorrelationReused)
+
+	// A genuine retry carries the same grant; only its id may differ. A
+	// replay is not a fresh grant and must neither write nor overwrite.
+	replay := grant("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbba", "corr-a2", testEntityA, principalSelf, principalOther, from, to)
 	created, err := s.CreateDelegation(ctx, replay)
 	require.NoError(t, err)
 	require.False(t, created, "a replay must not report a real insert")

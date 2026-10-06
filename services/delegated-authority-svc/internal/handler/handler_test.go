@@ -231,6 +231,8 @@ func (s *stubStore) CheckOverlap(_ context.Context, _, _, delegatePrincipalID, a
 // from the caller's own authz check (which always succeeds here).
 type stubAuthZ struct {
 	delegatorDenied string // principal_id that should be denied
+	// delegatedOnly holds every action only by delegation to them.
+	delegatedOnly string
 	// limitDenied makes every CheckAllowedAtLimit answer DENIED: the
 	// delegator's own authority limit is below the delegated ceiling.
 	limitDenied bool
@@ -241,6 +243,16 @@ func (a *stubAuthZ) CheckAllowedAtLimit(_ context.Context, principalID, _, _, am
 	a.limitAsked = append(a.limitAsked, principalID+"@"+amount+" "+currency)
 	if a.limitDenied {
 		return domain.ErrAuthorizationDenied
+	}
+	return nil
+}
+
+func (a *stubAuthZ) CheckHeldInOwnRight(ctx context.Context, principalID, entity, action string) error {
+	if err := a.CheckAllowed(ctx, principalID, entity, action); err != nil {
+		return err
+	}
+	if a.delegatedOnly != "" && principalID == a.delegatedOnly {
+		return domain.ErrDelegatorAuthorityDelegated
 	}
 	return nil
 }

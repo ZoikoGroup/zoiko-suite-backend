@@ -37,7 +37,7 @@ openapi: 3.0.3
 
 info:
   title: delegated-authority-svc
-  version: "1.1.0"
+  version: "1.2.0"
   description: |
     Time-bound, scope-bound delegated authority chains.
 
@@ -110,15 +110,18 @@ paths:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '200':
           description: |
-            Replay. A grant with this `(tenant_id, correlation_id)` already
-            exists and is returned unchanged.
+            Replay. The same grant (same maker, action, entity, window,
+            delegator, delegate and ceiling) under this `correlation_id`
+            already exists and is returned unchanged. The same
+            `correlation_id` naming a different grant is a 409
+            `correlation_reused`, never a replay.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DelegationGrant' }
         '400':
           description: |
-            `missing_fields`, `invalid_json`, `delegate_is_delegator` or
-            `invalid_time_window`.
+            `missing_fields` (including a missing `reason`), `invalid_json`,
+            `delegate_is_delegator`, `invalid_time_window` or `invalid_limit`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -143,7 +146,16 @@ paths:
               authority to themselves.
             - `delegator_lacks_authority` — the delegator does not hold what is
               being delegated. This is the §9.3 invariant.
+            - `delegator_authority_delegated` — the delegator holds it only by
+              delegation. authorization-svc confers through a delegation only
+              what the delegator holds in their own right, so it cannot be
+              passed on.
+            - `delegator_exceeds_limit` — the ceiling is above the delegator's
+              own authority limit (ORG-06 negative case 11).
+            - `sod_conflict` — the delegate would hold conflicting duties.
             - `forbidden` — the caller lacks `DELEGATION_CREATE`.
+
+            Every one of these is recorded in `refused_escalations`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -160,6 +172,16 @@ paths:
                   value:
                     error_code: delegator_lacks_authority
                     error_message: delegator does not hold the authority being delegated
+        '409':
+          description: |
+            `overlap_conflict` — the delegate already holds this action on this
+            entity for an overlapping window (half-open `[from, to)`; adjacent
+            windows do not overlap).
+            `correlation_reused` — this `correlation_id` was already used for a
+            different grant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -255,7 +277,11 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '404':
           description: |
-            `not_found`. A **malformed** id answers 404 too, not 503: the value
+            `not_found`. A read the caller may not make is answered exactly
+            the same way, so an id cannot be probed for existence. A party to
+            the grant (delegator, delegate or maker) may always read it; anyone
+            else needs `DELEGATION_VIEW` on its entity.
+            A **malformed** id answers 404 too, not 503: the value
             reaches Postgres as `22P02 invalid_text_representation`, and a
             string that cannot name a row is exactly what 404 means. Reporting
             it as an outage sent whoever was on call to look at a healthy
@@ -373,7 +399,13 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
-          description: '`forbidden` — not the delegator and lacks `DELEGATION_ADMINISTER`.'
+          description: |
+            `forbidden` — not the delegator and lacks `DELEGATION_ADMINISTER`.
+            `self_dealing` — the delegate extending their own grant.
+            `approval_not_segregated` — the grant's maker extending it alone.
+            `delegator_lacks_authority`, `delegator_authority_delegated`,
+            `delegator_exceeds_limit` or `sod_conflict` — the extended grant
+            would exceed the delegator.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -543,7 +575,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
-          description: '`self_dealing`, `delegator_lacks_authority`, `delegator_exceeds_limit`, `sod_conflict` or `forbidden`.'
+          description: '`self_dealing`, `approval_not_segregated` (the grant''s maker resuming it alone), `delegator_lacks_authority`, `delegator_authority_delegated`, `delegator_exceeds_limit`, `sod_conflict` or `forbidden`.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -97,14 +97,14 @@ func authzClient(t *testing.T, f *fakeAuthz) *httpAuthzClient {
 }
 
 // ORG-06 negative case 11: the delegator is asked about the ceiling being
-// delegated, with the limit required.
+// delegated. The limit is not required: a delegator with none may narrow.
 func TestAuthzClient_CheckAllowedAtLimitSendsTheCeiling(t *testing.T) {
 	f := &fakeAuthz{authzReply: `{"decision_outcome":"GRANTED"}`}
 	if err := authzClient(t, f).CheckAllowedAtLimit(context.Background(), "delegator", "le-1", "PAYMENT_APPROVE", "500.00", "USD"); err != nil {
 		t.Fatal(err)
 	}
 	attrs, _ := f.authzBody["attributes"].(map[string]any)
-	if attrs["amount"] != "500.00" || attrs["currency"] != "USD" || attrs["authority_limit_required"] != "true" {
+	if attrs["amount"] != "500.00" || attrs["currency"] != "USD" || attrs["authority_limit_required"] != nil {
 		t.Fatalf("attributes = %v", attrs)
 	}
 	f.authzReply = `{"decision_outcome":"DENIED"}`
@@ -120,5 +120,28 @@ func TestAuthzClient_PlainCheckSendsNoAttributes(t *testing.T) {
 	}
 	if _, ok := f.authzBody["attributes"]; ok {
 		t.Fatalf("a plain authorization must not carry limit attributes: %v", f.authzBody)
+	}
+}
+
+// A delegator who holds the action only by delegation cannot pass it on:
+// authorization-svc's basis "delegated:from=…" says so.
+func TestAuthzClient_HeldInOwnRightReadsTheBasis(t *testing.T) {
+	f := &fakeAuthz{authzReply: `{"decision_outcome":"GRANTED","decision_basis":"rbac:role=FIN"}`}
+	if err := authzClient(t, f).CheckHeldInOwnRight(context.Background(), "p", "le-1", "PAYMENT_APPROVE"); err != nil {
+		t.Fatalf("a role grant is held in own right: %v", err)
+	}
+	f.authzReply = `{"decision_outcome":"GRANTED","decision_basis":"delegated:from=cfo"}`
+	if err := authzClient(t, f).CheckHeldInOwnRight(context.Background(), "p", "le-1", "PAYMENT_APPROVE"); !errors.Is(err, domain.ErrDelegatorAuthorityDelegated) {
+		t.Fatalf("authority held by delegation must be refused, got %v", err)
+	}
+	// A CAPPED delegation asked about with no amount is denied on the
+	// delegation's ceiling, a layer that runs only for delegation-based grants.
+	f.authzReply = `{"decision_outcome":"DENIED","decision_basis":"delegation_limit:amount_required"}`
+	if err := authzClient(t, f).CheckHeldInOwnRight(context.Background(), "p", "le-1", "PAYMENT_APPROVE"); !errors.Is(err, domain.ErrDelegatorAuthorityDelegated) {
+		t.Fatalf("a capped delegation is still authority held by delegation, got %v", err)
+	}
+	f.authzReply = `{"decision_outcome":"DENIED","decision_basis":"no_grant"}`
+	if err := authzClient(t, f).CheckHeldInOwnRight(context.Background(), "p", "le-1", "PAYMENT_APPROVE"); !errors.Is(err, domain.ErrAuthorizationDenied) {
+		t.Fatalf("no grant at all is a denial, got %v", err)
 	}
 }
