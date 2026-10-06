@@ -22,6 +22,10 @@ import (
 type Store interface {
 	FindDueRetries(ctx context.Context, now time.Time, limit int) ([]domain.DueRetry, error)
 	ClaimRetry(ctx context.Context, id, tenantID string) (bool, error)
+	// The expiry pair (ZS-SVC-Y-001 6.1, NCD-015): a communication past expires_at is never
+	// submitted. FindExpiredQueued lists queued rows past it; ExpireNotification concludes one.
+	FindExpiredQueued(ctx context.Context, now time.Time, limit int) ([]domain.DueRetry, error)
+	ExpireNotification(ctx context.Context, id, tenantID string, now time.Time) (bool, error)
 	// The stranded-delivery pair. A notification left in flight — PENDING
 	// with nothing scheduled — is invisible to FindDueRetries and nothing
 	// else in the service would ever touch it again.
@@ -150,6 +154,7 @@ func (w *Worker) RunOnce(ctx context.Context) int {
 	// sets a schedule; the delivery itself always goes through the ordinary
 	// path below, so there is one code path that actually sends.
 	w.SweepStranded(ctx)
+	w.ExpireOverdue(ctx)
 
 	due, err := w.store.FindDueRetries(ctx, time.Now().UTC(), w.batchSize)
 	if err != nil {
@@ -356,6 +361,16 @@ func (w *Worker) attempt(ctx context.Context, d domain.DueRetry) bool {
 		return false
 	}
 
+	// The submit gate for expiry: whatever the schedule says, a communication past its
+	// expires_at is never handed to a provider. A stale reminder is worse than none.
+	if n.ExpiresAt != nil && !time.Now().UTC().Before(*n.ExpiresAt) {
+		if _, err := w.store.ExpireNotification(tctx, n.NotificationID, n.TenantID, time.Now().UTC()); err != nil {
+			w.log.Error("retry worker: could not expire an overdue communication",
+				zap.String("notification_id", n.NotificationID), zap.Error(err))
+		}
+		return true
+	}
+
 	// A first attempt that failed because identity-context-svc was unreachable
 	// left no address on the record. Re-attempting the transport with an empty
 	// To would fail forever, so the resolution is retried first — it is the
@@ -434,7 +449,7 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 	now := time.Now().UTC()
 
 	if outcome.Delivered {
-		if err := w.store.CompleteDelivery(ctx, n.NotificationID, "SENT", "", outcome.ProviderResponse, &now, n.CorrelationID, retryMeta(outcome)); err != nil {
+		if err := w.store.CompleteDelivery(ctx, n.NotificationID, "SENT", "", outcome.ProviderResponse, &now, n.CorrelationID, w.meta(n, outcome)); err != nil {
 			w.log.Error("retry worker: delivered but could not record it",
 				zap.String("notification_id", n.NotificationID), zap.Error(err))
 			return
@@ -459,7 +474,7 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 	// a duplicate if the message did go out. See
 	// domain.DeliveryOutcome.Unknown's own doc comment.
 	if outcome.Unknown {
-		if err := w.store.MarkOutcomeUnknown(ctx, n.NotificationID, n.TenantID, outcome.Reason, now, n.CorrelationID, retryMeta(outcome)); err != nil {
+		if err := w.store.MarkOutcomeUnknown(ctx, n.NotificationID, n.TenantID, outcome.Reason, now, n.CorrelationID, w.meta(n, outcome)); err != nil {
 			w.log.Error("retry worker: could not record ambiguous delivery outcome",
 				zap.String("notification_id", n.NotificationID), zap.Error(err))
 			return
@@ -475,7 +490,7 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 
 	if outcome.Retryable {
 		if next, ok := w.policy.NextAttemptFor(now, attemptsMade, outcome.DeferUntil); ok {
-			if err := w.store.ScheduleRetry(ctx, n.NotificationID, n.TenantID, outcome.Reason, now, next, retryMeta(outcome)); err != nil {
+			if err := w.store.ScheduleRetry(ctx, n.NotificationID, n.TenantID, outcome.Reason, now, next, w.meta(n, outcome)); err != nil {
 				w.log.Error("retry worker: could not reschedule",
 					zap.String("notification_id", n.NotificationID), zap.Error(err))
 			}
@@ -497,7 +512,7 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 			itoa(attemptsMade) + " of " + itoa(w.policy.MaxAttempts) + ")"
 	}
 
-	if err := w.store.CompleteDelivery(ctx, n.NotificationID, "FAILED", outcome.Reason, "", &now, n.CorrelationID, retryMeta(outcome)); err != nil {
+	if err := w.store.CompleteDelivery(ctx, n.NotificationID, "FAILED", outcome.Reason, "", &now, n.CorrelationID, w.meta(n, outcome)); err != nil {
 		w.log.Error("retry worker: could not record terminal failure",
 			zap.String("notification_id", n.NotificationID), zap.Error(err))
 		return
@@ -547,4 +562,41 @@ func AttemptOutcome(o domain.DeliveryOutcome) string { return attemptOutcome(o) 
 func retryMeta(o domain.DeliveryOutcome) domain.AttemptMeta {
 	return domain.AttemptMeta{Origin: domain.AttemptOriginRetry, ProviderName: o.ProviderName, Retryable: o.Retryable,
 		PrivacyDecisionID: o.PrivacyDecisionID, PrivacyResult: o.PrivacyResult, BlockCode: o.BlockCode}
+}
+
+// ExpireOverdue concludes queued communications that passed their expires_at without being
+// submitted, and returns how many it expired.
+func (w *Worker) ExpireOverdue(ctx context.Context) int {
+	overdue, err := w.store.FindExpiredQueued(ctx, time.Now().UTC(), w.batchSize)
+	if err != nil {
+		w.log.Error("retry worker: failed to poll for expired communications", zap.Error(err))
+		return 0
+	}
+	expired := 0
+	for _, d := range overdue {
+		tctx := svcmiddleware.WithTenant(ctx, d.TenantID)
+		ok, err := w.store.ExpireNotification(tctx, d.NotificationID, d.TenantID, time.Now().UTC())
+		if err != nil {
+			w.log.Error("retry worker: could not expire a communication",
+				zap.String("notification_id", d.NotificationID), zap.Error(err))
+			continue
+		}
+		if ok {
+			expired++
+			w.metrics.ObserveConclusion("EMAIL", domain.StatusExpired)
+			w.log.Warn("retry worker: communication expired before it was submitted",
+				zap.String("notification_id", d.NotificationID))
+		}
+	}
+	return expired
+}
+
+// meta describes a worker attempt for its durable attempt row. The first attempt of a send
+// that waited for not_before is labelled scheduled, not retry: nothing had been tried before.
+func (w *Worker) meta(n *domain.Notification, o domain.DeliveryOutcome) domain.AttemptMeta {
+	m := retryMeta(o)
+	if n.DeliveryAttempts == 0 {
+		m.Origin = domain.AttemptOriginScheduled
+	}
+	return m
 }

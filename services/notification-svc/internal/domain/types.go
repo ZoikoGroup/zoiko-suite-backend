@@ -116,6 +116,17 @@ type Notification struct {
 	// under (migration 000021), fixed at creation. Empty when the send used no intent.
 	IntentVersionID string `json:"intent_version_id,omitempty"`
 
+	// JobID is the delivery job this communication runs under (ZS-SVC-Y-001 6.1): a stable
+	// identity every attempt carries. NotBefore and ExpiresAt are server-authoritative timing:
+	// nothing is submitted before the first or after the second. Cancelled* records who withdrew
+	// a queued communication and why.
+	JobID        string     `json:"job_id,omitempty"`
+	NotBefore    *time.Time `json:"not_before,omitempty"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
+	CancelledBy  string     `json:"cancelled_by,omitempty"`
+	CancelledAt  *time.Time `json:"cancelled_at,omitempty"`
+	CancelReason string     `json:"cancel_reason,omitempty"`
+
 	// Resend summary (migration 000014). The full reasoned chain is in the
 	// attempt records; these say how often and why most recently.
 	ResendCount             int        `json:"resend_count"`
@@ -133,6 +144,8 @@ const (
 	StatusSent           = "SENT"
 	StatusFailed         = "FAILED"
 	StatusPendingUnknown = "PENDING_UNKNOWN"
+	StatusCancelled      = "CANCELLED" // withdrawn before submission
+	StatusExpired        = "EXPIRED"   // passed expires_at before submission (NCD-015)
 )
 
 // Retrying reports whether delivery has not concluded and another attempt is
@@ -176,6 +189,12 @@ type ResolveDeliveryOutcomeParams struct {
 }
 
 type SendNotificationRequest struct {
+	// NotBefore and ExpiresAt are the server-authoritative timing of the delivery job
+	// (ZS-SVC-Y-001 6.1), for EMAIL only. A future NotBefore queues the send for that
+	// time; ExpiresAt is the instant after which it is never submitted (NCD-015).
+	NotBefore *time.Time `json:"not_before,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
 	RecipientPrincipalID string `json:"recipient_principal_id"`
 	LegalEntityID        string `json:"legal_entity_id"`
 	Channel              string `json:"channel"`
@@ -399,9 +418,10 @@ var (
 
 // Attempt origins.
 const (
-	AttemptOriginRequest = "request" // the synchronous attempt inside POST /v1/notifications
-	AttemptOriginRetry   = "retry"   // a later attempt by the retry worker
-	AttemptOriginResend  = "resend"  // an explicit, reasoned resend (POST /{id}/resend)
+	AttemptOriginRequest   = "request"   // the synchronous attempt inside POST /v1/notifications
+	AttemptOriginRetry     = "retry"     // a later attempt by the retry worker
+	AttemptOriginResend    = "resend"    // an explicit, reasoned resend (POST /{id}/resend)
+	AttemptOriginScheduled = "scheduled" // the first attempt of a send that waited for not_before
 )
 
 // Attempt outcomes — what one attempt achieved, not the notification's status.
@@ -434,6 +454,7 @@ type DeliveryAttempt struct {
 	AttemptID        string    `json:"attempt_id"`
 	TenantID         string    `json:"tenant_id"`
 	NotificationID   string    `json:"notification_id"`
+	JobID            string    `json:"job_id,omitempty"`
 	AttemptNumber    int       `json:"attempt_number"`
 	Origin           string    `json:"origin"`
 	Channel          string    `json:"channel"`

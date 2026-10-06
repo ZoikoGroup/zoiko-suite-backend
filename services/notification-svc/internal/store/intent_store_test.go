@@ -287,7 +287,7 @@ func TestIntent_RetirementEndsTheFutureNotTheHistory(t *testing.T) {
 func TestMigration000020_DownThenUp(t *testing.T) {
 	pool := openTestPool(t)
 	// 000025, 000022 and 000021 depend on 000020, so they are rolled back first and re-applied last.
-	for _, f := range []string{"000027_more_canonical_events.down.sql", "000026_notice_event_sequence.down.sql", "000025_regulated_notices.down.sql", "000022_privacy_binding_and_evidence.down.sql", "000021_intent_binding.down.sql", "000020_communication_intents.down.sql", "000020_communication_intents.up.sql", "000021_intent_binding.up.sql", "000022_privacy_binding_and_evidence.up.sql", "000025_regulated_notices.up.sql", "000026_notice_event_sequence.up.sql", "000027_more_canonical_events.up.sql"} {
+	for _, f := range []string{"000028_scheduling_cancel_expiry.down.sql", "000027_more_canonical_events.down.sql", "000026_notice_event_sequence.down.sql", "000025_regulated_notices.down.sql", "000022_privacy_binding_and_evidence.down.sql", "000021_intent_binding.down.sql", "000020_communication_intents.down.sql", "000020_communication_intents.up.sql", "000021_intent_binding.up.sql", "000022_privacy_binding_and_evidence.up.sql", "000025_regulated_notices.up.sql", "000026_notice_event_sequence.up.sql", "000027_more_canonical_events.up.sql", "000028_scheduling_cancel_expiry.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)
 		_, err = pool.Exec(context.Background(), string(b))

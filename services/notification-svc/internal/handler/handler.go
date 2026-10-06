@@ -44,6 +44,8 @@ type Store interface {
 	MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time, correlationID string, meta domain.AttemptMeta) error
 	// ListAttempts backs GET /{id}/attempts — the durable per-attempt chain.
 	ListAttempts(ctx context.Context, notificationID string) ([]domain.DeliveryAttempt, error)
+	// CancelNotification withdraws a queued communication (ZS-SVC-Y-001 6.6).
+	CancelNotification(ctx context.Context, id, tenantID, actor, reason string, at time.Time) (*domain.Notification, error)
 	// BeginSubmission marks a notification as being handed to a provider,
 	// committed before the call (migration 000013).
 	BeginSubmission(ctx context.Context, id, tenantID string, at time.Time) error
@@ -274,6 +276,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/read", h.MarkRead)
 		r.Get("/{id}/delivery-status", h.GetDeliveryStatus)
 		r.Get("/{id}/attempts", h.ListAttempts)
+		r.Post("/{id}/cancel", h.CancelNotification)
 		r.Get("/{id}/evidence", h.ListEvidence)
 		r.Post("/{id}/resend", h.ResendNotification)
 		r.Post("/{id}/resolve-delivery-outcome", h.ResolveDeliveryOutcome)
@@ -432,6 +435,10 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 				" on the direct send path; marketing (M1) and lifecycle (L1) mail use the ledger pipeline")
 		return
 	}
+	if err := domain.ValidateSchedule(req.Channel, req.NotBefore, req.ExpiresAt, time.Now().UTC()); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_schedule", err.Error())
+		return
+	}
 
 	// A caller-supplied address is checked here, at the boundary, for the same
 	// reason the channel is: it is a fact about the request, knowable without
@@ -579,7 +586,14 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// failure must not collapse source operational workflows", and a payroll
 	// run that finalized correctly must not be told it failed because an
 	// employee has no email address on file.
-	address, addressSource, resolveErr := h.resolveRecipient(r.Context(), tenantID, principalID, req)
+	queued := domain.Queued(req.NotBefore, now)
+	var address, addressSource string
+	var resolveErr error
+	if !queued {
+		// A queued send resolves its recipient when it is sent, so the endpoint it goes to is the
+		// current one (6.6), not whatever it was days before.
+		address, addressSource, resolveErr = h.resolveRecipient(r.Context(), tenantID, principalID, req)
+	}
 
 	notification := &domain.Notification{
 		NotificationID:         uuid.NewString(),
@@ -604,6 +618,11 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey:         idempotencyKey,
 		CommunicationClass:     req.CommunicationClass,
 		IntentVersionID:        intentVersionID,
+		NotBefore:              req.NotBefore,
+		ExpiresAt:              req.ExpiresAt,
+	}
+	if queued {
+		notification.NextAttemptAt = req.NotBefore
 	}
 
 	created, err := h.store.CreateNotification(r.Context(), notification)
@@ -616,6 +635,13 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	if !created {
 		// Replay: this correlation_id was already processed.
 		writeJSON(w, http.StatusOK, notification)
+		return
+	}
+
+	// A send queued for a future not_before is created and left for the worker, which sends it
+	// when due through the same guarded path as any other attempt. Nothing is sent now.
+	if queued {
+		writeJSON(w, http.StatusCreated, notification)
 		return
 	}
 

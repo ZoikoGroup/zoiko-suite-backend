@@ -220,6 +220,19 @@ func TestNP_Matrix(t *testing.T) {
 		assert.Error(t, err, "an ambiguous attempt must be resolved before any resend")
 	})
 
+	t.Run("NP-52 a job that expires before it is submitted is never submitted", func(t *testing.T) {
+		n := queuedNotification(t, s, "np-52", "corr-np-52", nil, tp(time.Hour))
+		ok, err := s.ExpireNotification(tenantCtx("np-52"), n.NotificationID, "np-52", time.Now().Add(2*time.Hour))
+		require.NoError(t, err)
+		assert.True(t, ok)
+		got, err := s.GetNotification(tenantCtx("np-52"), n.NotificationID)
+		require.NoError(t, err)
+		assert.Equal(t, domain.StatusExpired, got.Status)
+		assert.Contains(t, got.FailureReason, "NCD-015 DELIVERY_EXPIRED")
+		_, err = s.BeginResend(tenantCtx("np-52"), n.NotificationID, "np-52", "agent", "send anyway", time.Now())
+		assert.Error(t, err, "an expired communication cannot be revived by a resend")
+	})
+
 	// ── NCD-04 evidence ────────────────────────────────────────────────────────────────
 	t.Run("NP-24 callback duplicated", func(t *testing.T) {
 		n := sentDirect(t, s, "np-24", "corr-np-24", "<np-24@example.com>")
@@ -375,7 +388,6 @@ func TestNP_Matrix(t *testing.T) {
 	skipNP(t, "NP-48 promotional block in a transactional template", "the class is explicit and judged, but there is no content check for promotional blocks")
 	skipNP(t, "NP-49 and NP-50 bulk across tenants, audience drift preview to send", "no bulk API or audience preview")
 	skipNP(t, "NP-51 rate-limit backlog", "no rate controls")
-	skipNP(t, "NP-52 job expires before submit", "no expires_at on a communication")
 	skipNP(t, "NP-53 security alert versus marketing blast", "no priority classes on the delivery queue")
 	skipNP(t, "NP-55 DMARC or DKIM break", "no sender-authentication monitoring (operational)")
 	skipNP(t, "NP-58 DRC declaration fails", "no DRC integration")

@@ -82,9 +82,9 @@ Status key: **BUILT** (verified in code), **PARTIAL**, **GAP** (not built), **UN
 | Reasoned resend preserving the chain | BUILT | 000014, `resend_handler.go` |
 | Retry with backoff, stranded sweep | BUILT | `internal/retry` |
 | Secondary-provider failover | PARTIAL | SMTP primary/secondary; "pre-certified equivalent" not modelled |
-| `communication_id` / job / attempt split | GAP | F-02; `communication_id` appears in events as the notification id |
+| `communication_id` / job / attempt split | PARTIAL (Wave 3, section 20) | a stable `job_id` on every communication and every attempt, carried in `delivery.attempt.created`; no separate job table until fallback exists |
 | Provider bindings (XIC), tenant and region | GAP | one configured SMTP set; no binding registry |
-| `not_before`, `expires_at`, cancel | GAP | none |
+| `not_before`, `expires_at`, cancel | BUILT (Wave 3, section 20) | direct path, EMAIL; queued sends, expiry at the submit gate and by sweep, cancel before submission |
 | Governed multi-channel fallback keeping evidence class | GAP | none |
 | Rate, abuse, storm controls; bulk preview | GAP | no rate limiting found **(search)** |
 | Provider idempotency token | GAP | none found |
@@ -179,7 +179,7 @@ Basis: code and test names read; **not run**. Counts are at the end.
 | 49 Bulk query spans tenants | PARTIAL | RLS; no bulk API |
 | 50 Audience changes preview to send | GAP | no bulk |
 | 51 Rate limit backlog | UNVERIFIED | no rate controls found |
-| 52 Job expires before submit | GAP | no `expires_at` |
+| 52 Job expires before submit | BUILT (Wave 3, section 20) | expires_at; never submitted; EXPIRED with NCD-015 |
 | 53 Security alert vs marketing blast | GAP | no priority classes on queue |
 | 54 Template provider assets unavailable | BUILT | templates embedded locally |
 | 55 DMARC/DKIM breaks | GAP | no monitoring |
@@ -211,7 +211,7 @@ Basis: code and test names read; **not run**. Counts are at the end.
 
 ## 7. Tally
 
-NP matrix, 60 scenarios, **Wave 0 baseline: 10 BUILT, 17 PARTIAL, 30 GAP, 3 UNVERIFIED. Current (section 18): 32 BUILT, 12 PARTIAL, 13 GAP, 3 UNVERIFIED.** The audit does not claim any scenario is certified; BUILT means the behaviour is present in code and, where noted, tested.
+NP matrix, 60 scenarios, **Wave 0 baseline: 10 BUILT, 17 PARTIAL, 30 GAP, 3 UNVERIFIED. Current (sections 18 and 20): 33 BUILT, 12 PARTIAL, 12 GAP, 3 UNVERIFIED.** The audit does not claim any scenario is certified; BUILT means the behaviour is present in code and, where noted, tested.
 The 30 gaps are concentrated in the parts that depend on services the NCD does not yet call (PRV, PDC, DRC, XIC bindings, MDM) and in NCD-05, which is not built.
 
 ## 8. Wave 1 progress
@@ -482,3 +482,21 @@ Decisions taken with the owner: core lifecycle first, **recipient-only** acknowl
 **Not emitted, deliberately:** `communication.correction.issued` (notices have `notice.corrected`, which names notice versions; the spec's event names communication ids, which a notice only has after dispatch), and `communication.record.declared` (no DRC). The Wave 0 list of "intent events" is not part of 10.2 and is not built.
 
 **Not done:** the catalogue is stamped on API errors and reasons; there is no machine-readable catalogue endpoint, and the generic failures (store unavailable, bad JSON) deliberately carry no stable code. Delivery reasons still carry the code as text (and as a block code on the event) rather than a dedicated column on the attempt row.
+
+## 20. Wave 3 slice 8: delivery job timing, expiry and cancellation (NCD-03 6.1, 6.6, NP-52)
+
+Decisions taken with the owner: the job is an **identity and timing on the communication** (no separate job table yet, because today a job mirrors its communication one to one); **EXPIRED and CANCELLED are new terminal statuses**; cancelling needs **NOTIFICATION_SEND** on the legal entity (no new grant to roll out). Migration 000028; rollback order 000028, 000027, 000026, 000025, 000022, 000021, 000020.
+
+* **Job identity:** every communication has a stable `job_id`, copied onto each attempt row and carried in `delivery.attempt.created` (a field the standard's payload requires). Existing rows were given one.
+* **Scheduling:** `POST /v1/notifications` takes optional `not_before` and `expires_at` (EMAIL only; at most 90 days ahead; expiry must be in the future and after the start; a past `not_before` simply sends now). A queued send is created PENDING and due at `not_before`, and **nothing is sent or resolved now**: the existing worker sends it when due through the same guarded path as any attempt, and resolves the recipient **at that time** so the endpoint is current (6.6). Its first attempt is labelled `scheduled`, not `retry`.
+* **Expiry (NCD-015):** a communication past `expires_at` is never handed to a provider. It is enforced at three layers: the worker's submit gate, a sweep of queued rows, and the direct-send guard (which also covers the first attempt and resends). An expired communication is concluded EXPIRED with the NCD-015 reason, announced as `notification.failed` (so an escalation waiting on a failure hears) and `communication.blocked`, and cannot be retried or resent. A message already being submitted is never expired: that is UNKNOWN territory, not expiry.
+* **Cancel:** `POST /v1/notifications/{id}/cancel` with a required reason, **only for a queued communication**. A communication that has been claimed by a worker, is being submitted, has been sent or has concluded is refused with 409, decided atomically in one statement, so a cancellation can never describe a message that was in fact sent (checked by a negative control: loosening that statement fails the test). It records who, when and why, and emits `communication.cancelled`, deliberately **not** `notification.failed`, since a withdrawal someone chose is not a failure.
+* **Database rules:** expiry must follow the start; a CANCELLED row must name who, when and why; an EXPIRED row must have an expiry and a reason.
+* **Tests:** timing validation, the handler (queued, invalid timing, cancel paths and authorization), the guard's expiry gate, worker unit tests (submit-gate expiry, sweep), real-Postgres tests for queued creation and due-ness, job id on attempts and events, every cancel refusal, expiry and its idempotence, the in-flight and concluded guards, the database rules, and a **real worker against a real database** (a due send goes out labelled scheduled, one not yet due waits, an expired one is never sent), plus NP-52 in the matrix and migration 000028 down/up.
+
+**Not built, deliberately:**
+* **No separate job table and no governed fallback** (a second channel under the same job): that is what a job table is for, and it needs provider bindings and a fallback policy first.
+* **Scheduling is for direct EMAIL sends:** not the ledger pipeline, not in-app, not notices (a notice's deadline is its own clock).
+* **Backed-off retries can still run past `expires_at`** before the sweep catches them (within one worker interval); the submit gate and the guard make sure nothing is actually sent late.
+* **No rate, storm or priority controls, no provider idempotency token, no editing or rescheduling:** a queued send is cancelled and re-created.
+* **Cancel is not offered after submission,** by design; an ambiguous or sent message follows the resolve and resend routes.

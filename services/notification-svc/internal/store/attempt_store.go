@@ -45,19 +45,19 @@ func recordAttempt(ctx context.Context, tx pgx.Tx, n domain.Notification, outcom
 			attempt_id, tenant_id, notification_id, attempt_number, origin, channel,
 			provider_name, outcome, provider_response, failure_reason, retryable,
 			resend_reason, actor_principal_id, attempted_at, provider_message_id,
-			privacy_decision_id, privacy_result
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+			privacy_decision_id, privacy_result, job_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::uuid)
 	`, attemptID, n.TenantID, n.NotificationID, n.DeliveryAttempts, origin, n.Channel,
 		nullIfEmpty(meta.ProviderName), outcome, nullIfEmpty(providerResponse), nullIfEmpty(failureReason),
 		meta.Retryable, nullIfEmpty(meta.ResendReason), nullIfEmpty(actor), attemptedAt, nullIfEmpty(providerMessageID),
-		nullIfEmpty(meta.PrivacyDecisionID), nullIfEmpty(meta.PrivacyResult))
+		nullIfEmpty(meta.PrivacyDecisionID), nullIfEmpty(meta.PrivacyResult), nullIfEmpty(n.JobID))
 	if err != nil {
 		return fmt.Errorf("record delivery attempt %d: %w", n.DeliveryAttempts, err)
 	}
 
 	// §10.2 attempt events, in the same transaction as the row they describe.
 	a := domain.DeliveryAttempt{
-		AttemptID: attemptID, TenantID: n.TenantID, NotificationID: n.NotificationID,
+		AttemptID: attemptID, TenantID: n.TenantID, NotificationID: n.NotificationID, JobID: n.JobID,
 		AttemptNumber: n.DeliveryAttempts, Origin: origin, Channel: n.Channel, ProviderName: meta.ProviderName,
 		Outcome: outcome, ProviderResponse: providerResponse, FailureReason: failureReason,
 		Retryable: meta.Retryable, ResendReason: meta.ResendReason, ActorPrincipalID: actor, AttemptedAt: attemptedAt,
@@ -108,7 +108,7 @@ func (s *PgStore) ListAttempts(ctx context.Context, notificationID string) ([]do
 			       COALESCE(provider_name, ''), outcome, COALESCE(provider_response, ''),
 			       COALESCE(failure_reason, ''), retryable, COALESCE(resend_reason, ''),
 			       COALESCE(actor_principal_id, ''), attempted_at, recorded_at,
-			       COALESCE(privacy_decision_id, ''), COALESCE(privacy_result, '')
+			       COALESCE(privacy_decision_id, ''), COALESCE(privacy_result, ''), COALESCE(job_id::text, '')
 			FROM notification_delivery_attempts
 			WHERE tenant_id = $1 AND notification_id = $2
 			ORDER BY attempt_number
@@ -122,7 +122,7 @@ func (s *PgStore) ListAttempts(ctx context.Context, notificationID string) ([]do
 			if err := rows.Scan(&a.AttemptID, &a.TenantID, &a.NotificationID, &a.AttemptNumber, &a.Origin, &a.Channel,
 				&a.ProviderName, &a.Outcome, &a.ProviderResponse, &a.FailureReason, &a.Retryable,
 				&a.ResendReason, &a.ActorPrincipalID, &a.AttemptedAt, &a.RecordedAt,
-				&a.PrivacyDecisionID, &a.PrivacyResult); err != nil {
+				&a.PrivacyDecisionID, &a.PrivacyResult, &a.JobID); err != nil {
 				return err
 			}
 			out = append(out, a)

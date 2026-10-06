@@ -326,6 +326,9 @@ func AttemptCreated(correlationID string, n domain.Notification, a domain.Delive
 		"recipient_address_source": n.RecipientAddressSource,
 	}
 	// The privacy decision that governed this attempt, when one did (omitted, never blank).
+	if a.JobID != "" {
+		p["job_id"] = a.JobID // the delivery job this attempt belongs to (6.1)
+	}
 	if a.PrivacyDecisionID != "" {
 		p["privacy_decision_id"] = a.PrivacyDecisionID
 	}
@@ -524,4 +527,20 @@ func ncdName(code string) string {
 		return name
 	}
 	return ""
+}
+
+// TypeCommunicationCancelled announces that a queued communication was withdrawn before it was
+// ever submitted (ZS-SVC-Y-001 6.6, "preserve cancellation evidence"). It says who and why; it
+// is not a failure, so it is deliberately not notification.failed (an escalation chain waiting
+// on a failure must not fire for a withdrawal someone chose).
+const TypeCommunicationCancelled = "communication.cancelled"
+
+// CommunicationCancelled seals communication.cancelled.
+func CommunicationCancelled(correlationID string, n domain.Notification) (Outbound, error) {
+	return buildFor(n, TypeCommunicationCancelled, correlationID, n.TenantID, n.LegalEntityID, n.CancelledBy, n.NotificationID, map[string]any{
+		"notification_id": n.NotificationID,
+		"job_id":          n.JobID,
+		"cancelled_by":    n.CancelledBy,
+		"reason":          n.CancelReason,
+	})
 }

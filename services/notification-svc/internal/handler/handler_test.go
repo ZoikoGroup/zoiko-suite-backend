@@ -1547,3 +1547,18 @@ func (s *stubStore) SetRecipientAddress(_ context.Context, id, _, address, sourc
 	}
 	return nil
 }
+
+// CancelNotification behaves like the real store: only a queued (PENDING, scheduled) row is
+// withdrawn; anything submitted, claimed or concluded is refused.
+func (s *stubStore) CancelNotification(_ context.Context, id, _, actor, reason string, at time.Time) (*domain.Notification, error) {
+	n, ok := s.byID[id]
+	if !ok {
+		return nil, domain.ErrNotificationNotFound
+	}
+	if n.Status != domain.StatusPending || n.NextAttemptAt == nil {
+		return nil, domain.ErrCancelNotAllowed
+	}
+	n.Status, n.NextAttemptAt, n.SentAt = domain.StatusCancelled, nil, &at
+	n.CancelledBy, n.CancelledAt, n.CancelReason = actor, &at, reason
+	return n, nil
+}

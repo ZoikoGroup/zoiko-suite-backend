@@ -155,6 +155,18 @@ func (g *DirectSendGuard) Deliver(ctx context.Context, n domain.Notification) do
 		return g.inner.Deliver(ctx, n)
 	}
 
+	// The last gate for expiry (NCD-015): the first attempt, every retry and every resend pass
+	// here, and a communication past its expires_at is never handed to a provider.
+	if n.ExpiresAt != nil && !g.now().Before(*n.ExpiresAt) {
+		g.log.Warn("direct send refused: the communication has expired; the provider was not called",
+			zap.String("notification_id", n.NotificationID), zap.Time("expires_at", *n.ExpiresAt))
+		return domain.DeliveryOutcome{
+			Reason:    ncd.Format(ncd.DeliveryExpired) + ": the communication passed its expires_at before it was submitted",
+			Retryable: false,
+			BlockCode: ncd.DeliveryExpired,
+		}
+	}
+
 	if engaged, reason := g.killSwitch.Check(ctx, n.TenantID, n.TemplateID); engaged {
 		g.log.Warn("direct send held by kill switch; the provider was not called",
 			zap.String("notification_id", n.NotificationID), zap.String("tenant_id", n.TenantID), zap.String("reason", reason))
