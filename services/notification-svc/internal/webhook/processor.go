@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/ledger"
 )
 
@@ -21,6 +22,8 @@ var (
 type WebhookStore interface {
 	LookupAttemptByProviderMessageID(ctx context.Context, providerMessageID string) (*AttemptLookupResult, error)
 	RecordDeliveryEventIdempotent(ctx context.Context, event *ledger.DeliveryEvent) (bool, error)
+	// RecordDeliveryEvidence appends a normalized evidence fact for a direct-send attempt.
+	RecordDeliveryEvidence(ctx context.Context, ev *domain.DeliveryEvidence) (bool, error)
 	AddSuppression(ctx context.Context, supp *ledger.EmailSuppression) error
 	RouteToDLQ(ctx context.Context, item *DLQItem) error
 	GetDLQItem(ctx context.Context, tenantID, dlqID string) (*DLQItem, error)
@@ -130,6 +133,26 @@ func (p *Processor) ProcessEvent(ctx context.Context, ev *WebhookEvent) error {
 			if err != nil {
 				if errors.Is(err, ErrAttemptNotFound) || err.Error() == "attempt not found" {
 					// Expected when provider message ID does not match any known attempt
+				} else if errors.Is(err, ErrAmbiguousAttempt) {
+					// Never apply a callback to a guessed attempt (NP-27): terminal DLQ entry
+					// for a person to resolve, and no suppression or event is written.
+					p.log.Error("provider message id matches more than one attempt; callback not applied",
+						zap.String("provider", ev.Provider), zap.String("lookup_id", lookupID))
+					_ = p.store.RouteToDLQ(ctx, &DLQItem{
+						DLQID:        uuid.NewString(),
+						TenantID:     "SYSTEM_UNRESOLVED",
+						ProviderName: ev.Provider,
+						EventType:    string(ev.EventType),
+						RawPayload:   ev.RawPayload,
+						ErrorReason:  "ambiguous: provider message id matches more than one attempt; not applied",
+						IsRetryable:  false,
+						Status:       DLQStatusFailed,
+						ReceivedAt:   time.Now().UTC(),
+					})
+					if p.metrics != nil {
+						p.metrics.RecordDLQ(ev.Provider, "ambiguous")
+					}
+					return nil
 				} else {
 					p.log.Error("failed to lookup attempt by provider message id; routing to retryable DLQ",
 						zap.String("lookup_id", lookupID),
@@ -191,6 +214,27 @@ func (p *Processor) ProcessEvent(ctx context.Context, ev *WebhookEvent) error {
 			)
 			p.routeRetryableDLQ(ctx, ev, err)
 			return err
+		}
+	}
+
+	// 2b. A direct send has no ledger rows to hang a delivery event on. Its callback becomes
+	// a normalized evidence fact on the exact attempt (NCD-04 7.1), so a delivered, bounced
+	// or complained-about direct message is visible on the notification, with stated limits.
+	if ev.ProviderAttemptID != "" && ev.MessageIntentID == "" {
+		if fact, strength, ok := domain.NormalizeEvidence(string(ev.EventType), string(ev.BounceType)); ok {
+			de := &domain.DeliveryEvidence{
+				TenantID: ev.TenantID, AttemptID: ev.ProviderAttemptID, SourceEventID: ev.EventID, Provider: ev.Provider,
+				Fact: fact, Strength: strength, Diagnostic: ev.DiagnosticCode, OccurredAt: ev.OccurredAt,
+			}
+			if de.OccurredAt.IsZero() {
+				de.OccurredAt = time.Now().UTC()
+			}
+			if _, err := p.store.RecordDeliveryEvidence(ctx, de); err != nil {
+				p.log.Error("failed to record delivery evidence; routing to DLQ",
+					zap.String("event_id", ev.EventID), zap.String("tenant_id", ev.TenantID), zap.Error(err))
+				p.routeRetryableDLQ(ctx, ev, err)
+				return err
+			}
 		}
 	}
 

@@ -169,6 +169,7 @@ type Handler struct {
 	suppressions   SuppressionStore
 	intents        IntentStore
 	preferences    PreferenceStore
+	evidence       EvidenceStore
 	// metrics may be nil (tests); every observation is nil-safe.
 	metrics *telemetry.Domain
 
@@ -202,6 +203,8 @@ type Deps struct {
 	// Preferences is the recipient preference store (NCD-02). Optional: without it the
 	// preference routes answer 503.
 	Preferences PreferenceStore
+	// Evidence reads normalized delivery evidence (NCD-04). Optional: without it the route answers 503.
+	Evidence EvidenceStore
 	Metrics        *telemetry.Domain
 	Log            *zap.Logger
 }
@@ -219,6 +222,7 @@ func New(d Deps) *Handler {
 		suppressions:   d.Suppressions,
 		intents:        d.Intents,
 		preferences:    d.Preferences,
+		evidence:       d.Evidence,
 		metrics:        d.Metrics,
 		log:            d.Log,
 	}
@@ -265,6 +269,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/read", h.MarkRead)
 		r.Get("/{id}/delivery-status", h.GetDeliveryStatus)
 		r.Get("/{id}/attempts", h.ListAttempts)
+		r.Get("/{id}/evidence", h.ListEvidence)
 		r.Post("/{id}/resend", h.ResendNotification)
 		r.Post("/{id}/resolve-delivery-outcome", h.ResolveDeliveryOutcome)
 	})

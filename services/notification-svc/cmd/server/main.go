@@ -400,6 +400,7 @@ func main() {
 		Suppressions:   pgStore,
 		Intents:        pgStore,
 		Preferences:    pgStore,
+		Evidence:       pgStore,
 		Log:            log,
 	})
 	handler.RegisterRoutes(r, h)

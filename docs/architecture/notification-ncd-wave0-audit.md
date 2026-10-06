@@ -96,8 +96,8 @@ Status key: **BUILT** (verified in code), **PARTIAL**, **GAP** (not built), **UN
 | Duplicate callback idempotent | BUILT | `TestWebhook_DuplicateEvent_Idempotent` |
 | Hard bounce, complaint, unsubscribe create suppression | BUILT | webhook tests; soft bounce does not suppress |
 | Callback authentication | BUILT (Wave 1) | per-provider HMAC, replay window, fail-closed |
-| Provider message id to one attempt | GAP | F-10 |
-| Normalized evidence vocabulary and strength | PARTIAL | statuses recorded; spec vocabulary (`MAILBOX_ACCEPTED`, `OPEN_SIGNAL` ...) and confidence not modelled |
+| Provider message id to one attempt | BUILT (Wave 3) | direct: unique index (000015); a lookup that matches two attempts is refused, never guessed (section 16) |
+| Normalized evidence vocabulary and strength | PARTIAL (Wave 3) | email facts with strength and stated limits recorded for direct sends (000024, section 16); SMS, push, in-app and human-response facts not built |
 | Callback before API response, late corrections | UNVERIFIED | |
 | Reconciliation job; reputation metrics; circuit breakers | GAP | metrics exist; no reconciliation or breaker found **(search)** |
 | DKIM / SPF / DMARC posture monitoring | GAP | none; operational |
@@ -391,3 +391,19 @@ A preference is a state dimension of its own: it selects when and whether a rout
 * **Privacy permission is not part of the answer.** It needs an activity and purpose from an intent and a remote call, and is enforced at send; a channel listed as eligible can still be refused by the privacy gate.
 * **No fallback rules or evidence requirement** in the output (the spec lists both), and no `/revalidate`.
 * **Email is the only channel with endpoint and suppression facts;** IN_APP has none to check.
+
+## 16. Wave 3 slice 4: callback attribution and delivery evidence (NCD-04 7.1, NP-27, F-10)
+
+* **A callback is never applied to a guess.** Direct attempts already had a unique provider message id (000015). The lookup is now strict across both attempt tables: if an id matches more than one attempt (for example two tenants' ledger attempts), it returns `ErrAmbiguousAttempt` instead of taking "the newest". The processor dead-letters such a callback terminally (reason "ambiguous", no retry), writes no event, and suppresses nobody. A register-linked ledger send writes its message id to both tables; that is one communication and the ledger row is authoritative, so only a match inside one table counts as ambiguous. A unique index on the ledger table was **not** added: a violation would fail the attempt insert after the provider had accepted the message and lose that evidence, which is worse than a lookup that refuses.
+* **Direct sends now have an evidence trail.** A provider callback about a direct send used to leave no trace on the notification (the ledger event insert does not apply to it). Migration 000024 adds `notification_delivery_evidence`: one normalized fact per callback, tied to the exact attempt, idempotent per provider event, tenant-isolated, **append-only** (a trigger refuses update and delete, so a late correction is a later fact). The notification is taken from the attempt, never from the caller.
+* **Vocabulary (spec 7.1):** DELIVERED becomes MAILBOX_ACCEPTED, a hard or unclassified bounce BOUNCED, a soft or transient bounce DEFERRED, DROPPED becomes REJECTED, plus COMPLAINT and UNSUBSCRIBED. Each has a strength (PROVIDER_LEVEL, MAILBOX_LEVEL, RECIPIENT_SIGNAL) and stated limits ("accepted by the mail server; does not prove the recipient saw it"). No fact can mean read, opened or acknowledged: the database CHECK refuses it, and open or click telemetry is not accepted. Only a 200-character diagnostic is kept, never the raw payload, since complaint feedback can contain personal data.
+* **API:** `GET /v1/notifications/{id}/evidence` (NOTIFICATION_VIEW), returning the facts with limits and an explicit notice that none proves human notice.
+* **Failure handling:** a failed evidence write is retried through the DLQ with the rest of the callback, so nothing is half-applied.
+* **Tests:** processor (each event type, replay, ledger path unaffected, write failure, ambiguity), vocabulary, real-Postgres store (end-to-end callback to fact, replay, tenant isolation, append-only, refusal of an attempt in another tenant, of ACKNOWLEDGED, minimization), endpoint, migration 000024 down/up.
+
+**Not built, deliberately:**
+* **Ledger and register attempts get no evidence rows:** their callbacks still go to the ledger delivery events, so a register-linked send's evidence lives on the ledger side only.
+* **No SMS, push or in-app facts, and no human-response facts** (ACKNOWLEDGED, DECLINED, DISPUTED): those belong to NCD-05 and need an authenticated actor.
+* **Evidence is not yet used to change a notification's status** (a bounce after SENT does not move it), and not yet emitted as an event.
+* **No reconciliation job, reputation metrics, circuit breakers or authentication-posture monitoring** (the rest of NCD-04 7.4).
+* **No late-callback ordering rule** (a callback before the API response is stored if the attempt exists, otherwise dead-lettered for retry).
