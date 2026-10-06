@@ -353,3 +353,43 @@ func TestDirectGuard_RecipientPreferences(t *testing.T) {
 		assert.Zero(t, pg.calls)
 	})
 }
+
+// Every withholding carries the stable code (ZS-SVC-Y-001 10.3) in its reason and as a
+// BlockCode, which is what announces communication.blocked.
+func TestDirectGuard_WithholdingsCarryStableCodes(t *testing.T) {
+	night := time.Date(2026, 1, 10, 23, 30, 0, 0, time.UTC)
+	quiet := &domain.RecipientPreferences{TimeZone: "Europe/London", QuietStart: ptr("22:00"), QuietEnd: ptr("07:00"), MutedChannels: []string{}}
+	routine := func() domain.Notification { n := email(); n.CommunicationClass = "A1"; return n }
+
+	t.Run("policy refusal is NCD-010", func(t *testing.T) {
+		p := &fakePolicy{decision: ledger.PolicyDecision{Allowed: false, RuleName: "HARD_BOUNCE", Reason: "bounced"}}
+		out := guard(t, &fakeInner{}, p, &fakeKill{}).Deliver(context.Background(), email())
+		assert.Equal(t, "NCD-010", out.BlockCode)
+		assert.True(t, strings.HasPrefix(out.Reason, "NCD-010 CHANNEL_SUPPRESSED:"), out.Reason)
+	})
+	t.Run("marketing on the direct path is NCD-009", func(t *testing.T) {
+		n := email()
+		n.CommunicationClass = "M1"
+		out := guard(t, &fakeInner{}, allowed(), &fakeKill{}).Deliver(context.Background(), n)
+		assert.Equal(t, "NCD-009", out.BlockCode)
+		assert.True(t, strings.HasPrefix(out.Reason, "NCD-009 MARKETING_PERMISSION_BLOCKED:"), out.Reason)
+	})
+	t.Run("privacy refusal is NCD-008", func(t *testing.T) {
+		pg := &fakePrivacy{out: privacy.Outcome{Applies: true, Verdict: privacy.Verdict{Result: "BLOCK", DecisionID: "d", Reason: "NCD-008 blocked"}}}
+		out := guard(t, &fakeInner{}, allowed(), &fakeKill{}).WithPrivacyGate(pg).Deliver(context.Background(), email())
+		assert.Equal(t, "NCD-008", out.BlockCode)
+	})
+	t.Run("mute is NCD-010 and quiet hours are NCD-012", func(t *testing.T) {
+		muted := &domain.RecipientPreferences{TimeZone: "UTC", MutedChannels: []string{"EMAIL"}}
+		g := guard(t, &fakeInner{}, allowed(), &fakeKill{}).WithPreferences(&fakePrefs{p: muted})
+		g.now = func() time.Time { return night }
+		assert.Equal(t, "NCD-010", g.Deliver(context.Background(), routine()).BlockCode)
+
+		g = guard(t, &fakeInner{}, allowed(), &fakeKill{}).WithPreferences(&fakePrefs{p: quiet})
+		g.now = func() time.Time { return night }
+		assert.Equal(t, "NCD-012", g.Deliver(context.Background(), routine()).BlockCode)
+	})
+	t.Run("a delivered message has no block code", func(t *testing.T) {
+		assert.Empty(t, guard(t, &fakeInner{}, allowed(), &fakeKill{}).Deliver(context.Background(), email()).BlockCode)
+	})
+}

@@ -18,6 +18,7 @@ import (
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/quota"
 	"zoiko.io/notification-svc/internal/retry"
 )
 
@@ -28,6 +29,8 @@ type stubStore struct {
 	ledgerOwned map[string]bool   // ids produced by the ledger pipeline (not resendable through the direct path)
 	byCorr      map[string]string // correlation_id -> notification_id
 	lastFilter  domain.ListFilter
+	createErr   error // returned by CreateNotification when set (a quota refusal, say)
+	countedCtx  bool  // whether CreateNotification saw a context that asks to be counted
 	scheduled   []scheduledRetry
 
 	templates                map[string]*domain.TemplateDefinition
@@ -59,7 +62,11 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreateNotification(_ context.Context, n *domain.Notification) (bool, error) {
+func (s *stubStore) CreateNotification(ctx context.Context, n *domain.Notification) (bool, error) {
+	s.countedCtx = quota.Counting(ctx)
+	if s.createErr != nil {
+		return false, s.createErr
+	}
 	// Keyed the way the real store is (migration 000012): on the purpose-scoped
 	// idempotency key when there is one, on the correlation id otherwise.
 	key := "corr:" + n.CorrelationID
@@ -1546,4 +1553,19 @@ func (s *stubStore) SetRecipientAddress(_ context.Context, id, _, address, sourc
 		n.RecipientAddress, n.RecipientAddressSource = address, source
 	}
 	return nil
+}
+
+// CancelNotification behaves like the real store: only a queued (PENDING, scheduled) row is
+// withdrawn; anything submitted, claimed or concluded is refused.
+func (s *stubStore) CancelNotification(_ context.Context, id, _, actor, reason string, at time.Time) (*domain.Notification, error) {
+	n, ok := s.byID[id]
+	if !ok {
+		return nil, domain.ErrNotificationNotFound
+	}
+	if n.Status != domain.StatusPending || n.NextAttemptAt == nil {
+		return nil, domain.ErrCancelNotAllowed
+	}
+	n.Status, n.NextAttemptAt, n.SentAt = domain.StatusCancelled, nil, &at
+	n.CancelledBy, n.CancelledAt, n.CancelReason = actor, &at, reason
+	return n, nil
 }

@@ -28,12 +28,12 @@ type Notification struct {
 	//   REQUEST          — supplied verbatim by the calling service
 	RecipientAddressSource string `json:"recipient_address_source,omitempty"`
 
-	Channel string `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
-	From    string `json:"from,omitempty"`
+	Channel string            `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
+	From    string            `json:"from,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
-	Subject string `json:"subject"`
-	Body    string `json:"body"`
-	Status  string `json:"status"` // PENDING, SENT, FAILED
+	Subject string            `json:"subject"`
+	Body    string            `json:"body"`
+	Status  string            `json:"status"` // PENDING, SENT, FAILED
 
 	SourceEventType string `json:"source_event_type,omitempty"`
 	SourceReference string `json:"source_reference,omitempty"`
@@ -116,6 +116,17 @@ type Notification struct {
 	// under (migration 000021), fixed at creation. Empty when the send used no intent.
 	IntentVersionID string `json:"intent_version_id,omitempty"`
 
+	// JobID is the delivery job this communication runs under (ZS-SVC-Y-001 6.1): a stable
+	// identity every attempt carries. NotBefore and ExpiresAt are server-authoritative timing:
+	// nothing is submitted before the first or after the second. Cancelled* records who withdrew
+	// a queued communication and why.
+	JobID        string     `json:"job_id,omitempty"`
+	NotBefore    *time.Time `json:"not_before,omitempty"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
+	CancelledBy  string     `json:"cancelled_by,omitempty"`
+	CancelledAt  *time.Time `json:"cancelled_at,omitempty"`
+	CancelReason string     `json:"cancel_reason,omitempty"`
+
 	// Resend summary (migration 000014). The full reasoned chain is in the
 	// attempt records; these say how often and why most recently.
 	ResendCount             int        `json:"resend_count"`
@@ -133,6 +144,8 @@ const (
 	StatusSent           = "SENT"
 	StatusFailed         = "FAILED"
 	StatusPendingUnknown = "PENDING_UNKNOWN"
+	StatusCancelled      = "CANCELLED" // withdrawn before submission
+	StatusExpired        = "EXPIRED"   // passed expires_at before submission (NCD-015)
 )
 
 // Retrying reports whether delivery has not concluded and another attempt is
@@ -176,6 +189,12 @@ type ResolveDeliveryOutcomeParams struct {
 }
 
 type SendNotificationRequest struct {
+	// NotBefore and ExpiresAt are the server-authoritative timing of the delivery job
+	// (ZS-SVC-Y-001 6.1), for EMAIL only. A future NotBefore queues the send for that
+	// time; ExpiresAt is the instant after which it is never submitted (NCD-015).
+	NotBefore *time.Time `json:"not_before,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
 	RecipientPrincipalID string `json:"recipient_principal_id"`
 	LegalEntityID        string `json:"legal_entity_id"`
 	Channel              string `json:"channel"`
@@ -302,6 +321,10 @@ type DeliveryOutcome struct {
 	// attempt, whether it permitted the send or stopped it (migration 000022).
 	PrivacyDecisionID string
 	PrivacyResult     string
+
+	// BlockCode is the stable reason code (ZS-SVC-Y-001 10.3, for example NCD-008) when a guard
+	// withheld this delivery, so the attempt record can announce communication.blocked.
+	BlockCode string
 }
 
 // AddressSource values for Notification.RecipientAddressSource.
@@ -395,9 +418,10 @@ var (
 
 // Attempt origins.
 const (
-	AttemptOriginRequest = "request" // the synchronous attempt inside POST /v1/notifications
-	AttemptOriginRetry   = "retry"   // a later attempt by the retry worker
-	AttemptOriginResend  = "resend"  // an explicit, reasoned resend (POST /{id}/resend)
+	AttemptOriginRequest   = "request"   // the synchronous attempt inside POST /v1/notifications
+	AttemptOriginRetry     = "retry"     // a later attempt by the retry worker
+	AttemptOriginResend    = "resend"    // an explicit, reasoned resend (POST /{id}/resend)
+	AttemptOriginScheduled = "scheduled" // the first attempt of a send that waited for not_before
 )
 
 // Attempt outcomes — what one attempt achieved, not the notification's status.
@@ -413,15 +437,16 @@ const (
 // resend — why. The transition that records the attempt's effect writes it,
 // in the same transaction.
 type AttemptMeta struct {
-	Origin           string
-	ProviderName     string
-	Retryable        bool
-	ResendReason     string
+	Origin       string
+	ProviderName string
+	Retryable    bool
+	ResendReason string
 	// PrivacyDecisionID and PrivacyResult are the privacy decision that governed this
 	// attempt (migration 000022), recorded for a refusal as well as a permission.
 	PrivacyDecisionID string
 	PrivacyResult     string
-	ActorPrincipalID string
+	BlockCode         string
+	ActorPrincipalID  string
 }
 
 // DeliveryAttempt is one durable provider submission on the direct-send path.
@@ -429,6 +454,7 @@ type DeliveryAttempt struct {
 	AttemptID        string    `json:"attempt_id"`
 	TenantID         string    `json:"tenant_id"`
 	NotificationID   string    `json:"notification_id"`
+	JobID            string    `json:"job_id,omitempty"`
 	AttemptNumber    int       `json:"attempt_number"`
 	Origin           string    `json:"origin"`
 	Channel          string    `json:"channel"`

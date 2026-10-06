@@ -8,6 +8,11 @@ import (
 
 var (
 	ErrAttemptNotFound = errors.New("attempt not found")
+
+	// ErrAmbiguousAttempt: a provider message id matches more than one attempt. A callback
+	// is never applied to a guess (ZS-SVC-Y-001 NP-27): attaching a bounce to the wrong
+	// attempt would suppress, or acknowledge, the wrong person.
+	ErrAmbiguousAttempt = errors.New("provider message id matches more than one attempt")
 )
 
 // NormalizedEventType defines the standardized delivery feedback event types.

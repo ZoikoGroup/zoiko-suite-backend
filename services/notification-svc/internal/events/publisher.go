@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/ncd"
 )
 
 // Contract constants. Keep in step with asyncapi.yaml and with the
@@ -325,6 +326,9 @@ func AttemptCreated(correlationID string, n domain.Notification, a domain.Delive
 		"recipient_address_source": n.RecipientAddressSource,
 	}
 	// The privacy decision that governed this attempt, when one did (omitted, never blank).
+	if a.JobID != "" {
+		p["job_id"] = a.JobID // the delivery job this attempt belongs to (6.1)
+	}
 	if a.PrivacyDecisionID != "" {
 		p["privacy_decision_id"] = a.PrivacyDecisionID
 	}
@@ -376,4 +380,167 @@ func buildFor(n domain.Notification, eventType, correlationID, tenantID, legalEn
 		payload["intent_version_id"] = n.IntentVersionID
 	}
 	return Build(eventType, correlationID, tenantID, legalEntityID, actorID, key, payload)
+}
+
+// ZS-SVC-Y-001 NCD-05 notice events (migration 000025). Like every event here they carry
+// no subject, body or address: a consumer that needs content reads the notice under its own
+// authorization. They carry the content hash, so a consumer can tell WHICH exact version.
+const (
+	TypeNoticeDispatched        = "notice.dispatched"
+	TypeNoticeDeliveryEvidenced = "notice.delivery_evidenced"
+	TypeNoticeException         = "notice.exception"
+	TypeNoticeAcknowledged      = "notice.acknowledged"
+	TypeNoticeDeclined          = "notice.declined"
+	TypeNoticeDisputed          = "notice.disputed"
+	TypeNoticeExpired           = "notice.expired"
+	TypeNoticeCorrected         = "notice.corrected"
+)
+
+// NoticeEventFor maps a notice's new status to the event that announces it, if any.
+func NoticeEventFor(status string) (string, bool) {
+	switch status {
+	case domain.NoticeDeliveryInProgess:
+		return TypeNoticeDispatched, true
+	case domain.NoticeDeliveryEvidenced:
+		return TypeNoticeDeliveryEvidenced, true
+	case domain.NoticeException:
+		return TypeNoticeException, true
+	case domain.NoticeAcknowledged:
+		return TypeNoticeAcknowledged, true
+	case domain.NoticeDeclined:
+		return TypeNoticeDeclined, true
+	case domain.NoticeDisputed:
+		return TypeNoticeDisputed, true
+	case domain.NoticeExpired:
+		return TypeNoticeExpired, true
+	}
+	return "", false
+}
+
+// NoticeEvent seals a notice event. Status names where the notice now is, never that legal
+// service happened.
+func NoticeEvent(eventType string, n domain.Notice, actor, reason string) (Outbound, error) {
+	payload := map[string]any{
+		"notice_id":         n.NoticeID,
+		"lineage_id":        n.LineageID,
+		"version_number":    n.VersionNumber,
+		"status":            n.Status,
+		"ack_requirement":   n.AckRequirement,
+		"content_hash":      n.ContentHash,
+		"intent_version_id": n.IntentVersionID,
+		"reason":            reason,
+	}
+	if n.NotificationID != nil {
+		payload["communication_id"] = *n.NotificationID
+	}
+	if n.SupersedesNoticeID != nil {
+		payload["supersedes_notice_id"] = *n.SupersedesNoticeID
+	}
+	if n.DeadlineAt != nil {
+		payload["deadline_at"] = n.DeadlineAt.UTC().Format(time.RFC3339)
+	}
+	return Build(eventType, "notice-"+n.NoticeID, n.TenantID, n.LegalEntityID, actor, n.NoticeID, payload)
+}
+
+// ZS-SVC-Y-001 section 10.2 events added in migration 000027. As everywhere in this package
+// they carry no subject, body or address: a recipient endpoint is only ever a hash.
+const (
+	TypeCommunicationPrepared = "communication.prepared"
+	TypeCommunicationBlocked  = "communication.blocked"
+	TypeEvidenceRecorded      = "delivery.evidence.recorded"
+	TypeEndpointSuppressed    = "endpoint.suppressed"
+	TypeNoticeDeadlineAtRisk  = "notice.deadline.at_risk"
+)
+
+// CommunicationPrepared announces that a communication now exists, pinned to its exact
+// content and intent version, before any delivery is attempted.
+func CommunicationPrepared(correlationID string, n domain.Notification) (Outbound, error) {
+	return buildFor(n, TypeCommunicationPrepared, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+		"notification_id":       n.NotificationID,
+		"rendered_content_hash": n.RenderedContentHash,
+		"channel":               n.Channel,
+		"template_version_id":   n.TemplateVersionID,
+	})
+}
+
+// CommunicationBlocked announces that a delivery was withheld, with the stable reason code
+// (section 10.3). It is emitted for every withheld attempt, so a deferral that is retried
+// says so each time.
+func CommunicationBlocked(correlationID string, n domain.Notification, reasonCode string, attemptNumber int, retryable bool, privacyDecisionID string) (Outbound, error) {
+	p := map[string]any{
+		"notification_id": n.NotificationID,
+		"reason_code":     reasonCode,
+		"reason":          ncdName(reasonCode),
+		"attempt_number":  attemptNumber,
+		"retryable":       retryable,
+	}
+	if privacyDecisionID != "" {
+		p["privacy_decision_id"] = privacyDecisionID
+	}
+	return buildFor(n, TypeCommunicationBlocked, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, p)
+}
+
+// EvidenceRecorded announces a normalized evidence fact for an attempt.
+func EvidenceRecorded(ev domain.DeliveryEvidence, legalEntityID string) (Outbound, error) {
+	return Build(TypeEvidenceRecorded, "evidence-"+ev.AttemptID, ev.TenantID, legalEntityID, "system", ev.NotificationID, map[string]any{
+		"attempt_id":       ev.AttemptID,
+		"communication_id": ev.NotificationID,
+		"evidence_type":    "PROVIDER_CALLBACK",
+		"normalized_state": ev.Fact,
+		"strength":         ev.Strength,
+		"observed_at":      ev.OccurredAt.UTC().Format(time.RFC3339),
+		"provider":         ev.Provider,
+	})
+}
+
+// EndpointSuppressed announces that an endpoint may no longer be used for a scope. The
+// endpoint is a hash: the topic must not become a list of suppressed people's addresses.
+func EndpointSuppressed(tenantID, endpointRef, scope, reason, provider string, effectiveAt time.Time) (Outbound, error) {
+	return Build(TypeEndpointSuppressed, "suppression-"+endpointRef, tenantID, "", "system", endpointRef, map[string]any{
+		"endpoint_ref": endpointRef,
+		"scope":        scope,
+		"reason":       reason,
+		"source":       provider,
+		"effective_at": effectiveAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// NoticeDeadlineAtRisk announces that a notice's deadline is near and what it still lacks.
+func NoticeDeadlineAtRisk(n domain.Notice, deficiency string) (Outbound, error) {
+	p := map[string]any{
+		"notice_id":  n.NoticeID,
+		"lineage_id": n.LineageID,
+		"status":     n.Status,
+		"deficiency": deficiency,
+	}
+	if n.NotificationID != nil {
+		p["communication_id"] = *n.NotificationID
+	}
+	if n.DeadlineAt != nil {
+		p["deadline_at"] = n.DeadlineAt.UTC().Format(time.RFC3339)
+	}
+	return Build(TypeNoticeDeadlineAtRisk, "notice-"+n.NoticeID, n.TenantID, n.LegalEntityID, "system", n.NoticeID, p)
+}
+
+func ncdName(code string) string {
+	if name, ok := ncd.Names[code]; ok {
+		return name
+	}
+	return ""
+}
+
+// TypeCommunicationCancelled announces that a queued communication was withdrawn before it was
+// ever submitted (ZS-SVC-Y-001 6.6, "preserve cancellation evidence"). It says who and why; it
+// is not a failure, so it is deliberately not notification.failed (an escalation chain waiting
+// on a failure must not fire for a withdrawal someone chose).
+const TypeCommunicationCancelled = "communication.cancelled"
+
+// CommunicationCancelled seals communication.cancelled.
+func CommunicationCancelled(correlationID string, n domain.Notification) (Outbound, error) {
+	return buildFor(n, TypeCommunicationCancelled, correlationID, n.TenantID, n.LegalEntityID, n.CancelledBy, n.NotificationID, map[string]any{
+		"notification_id": n.NotificationID,
+		"job_id":          n.JobID,
+		"cancelled_by":    n.CancelledBy,
+		"reason":          n.CancelReason,
+	})
 }

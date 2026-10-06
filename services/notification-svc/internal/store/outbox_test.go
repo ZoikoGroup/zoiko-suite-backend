@@ -149,9 +149,10 @@ func TestOutbox_ClaimMarksPublishedOnlyWhenTheCallbackSucceeds(t *testing.T) {
 	// event can be diagnosed from the table rather than from logs.
 	boom := errors.New("broker unreachable")
 	if err := s.ClaimOutbox(context.Background(), 10, func(recs []store.OutboxRecord) error {
-		// Two: notification.sent and its delivery.attempt.created (000014).
-		if len(recs) != 2 {
-			t.Errorf("claimed %d records, want 2", len(recs))
+		// Three: communication.prepared (written at creation), notification.sent and its
+		// delivery.attempt.created (000014).
+		if len(recs) != 3 {
+			t.Errorf("claimed %d records, want 3", len(recs))
 		}
 		return boom
 	}); !errors.Is(err, boom) {
@@ -177,8 +178,8 @@ func TestOutbox_ClaimMarksPublishedOnlyWhenTheCallbackSucceeds(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("second ClaimOutbox: %v", err)
 	}
-	if claimed != 2 {
-		t.Fatalf("re-claimed %d records, want the two unpublished ones", claimed)
+	if claimed != 3 {
+		t.Fatalf("re-claimed %d records, want the three unpublished ones", claimed)
 	}
 	if readOutbox(t, pool)[0].PublishedAt == nil {
 		t.Error("a successful publish must mark the event published")
@@ -244,9 +245,10 @@ func TestOutbox_DepthReportsBacklogAndAge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OutboxDepth: %v", err)
 	}
-	// Six: each conclusion enqueues notification.sent and delivery.attempt.created.
-	if pending != 6 {
-		t.Errorf("pending = %d, want 6", pending)
+	// Nine: each notification enqueues communication.prepared at creation, then
+	// notification.sent and delivery.attempt.created when it concludes.
+	if pending != 9 {
+		t.Errorf("pending = %d, want 9", pending)
 	}
 	if age <= 0 {
 		t.Error("a non-empty outbox must report the age of its oldest entry")
@@ -290,7 +292,7 @@ func readOutbox(t *testing.T, pool *pgxpool.Pool) []outboxRow {
 		-- The per-attempt delivery.attempt.* events (migration 000014) ride
 		-- alongside every conclusion; these tests are about the notification
 		-- and template events, and attempt events have their own test.
-		WHERE event_type NOT LIKE 'delivery.attempt.%'
+		WHERE event_type NOT LIKE 'delivery.attempt.%' AND event_type <> 'communication.prepared'
 		ORDER BY outbox_id`)
 	if err != nil {
 		t.Fatalf("read outbox: %v", err)
@@ -481,7 +483,7 @@ func TestOutbox_TenantIsolatedOutsideTheRelayHatch(t *testing.T) {
 			t.Fatalf("set %s: %v", setting, err)
 		}
 		var c int
-		if err := tx.QueryRow(ctx, "SELECT count(*) FROM event_outbox WHERE event_type NOT LIKE 'delivery.attempt.%'").Scan(&c); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT count(*) FROM event_outbox WHERE event_type NOT LIKE 'delivery.attempt.%' AND event_type <> 'communication.prepared'").Scan(&c); err != nil {
 			t.Fatalf("count: %v", err)
 		}
 		return c

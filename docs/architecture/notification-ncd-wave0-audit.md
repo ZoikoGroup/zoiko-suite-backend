@@ -82,11 +82,11 @@ Status key: **BUILT** (verified in code), **PARTIAL**, **GAP** (not built), **UN
 | Reasoned resend preserving the chain | BUILT | 000014, `resend_handler.go` |
 | Retry with backoff, stranded sweep | BUILT | `internal/retry` |
 | Secondary-provider failover | PARTIAL | SMTP primary/secondary; "pre-certified equivalent" not modelled |
-| `communication_id` / job / attempt split | GAP | F-02; `communication_id` appears in events as the notification id |
+| `communication_id` / job / attempt split | PARTIAL (Wave 3, section 20) | a stable `job_id` on every communication and every attempt, carried in `delivery.attempt.created`; no separate job table until fallback exists |
 | Provider bindings (XIC), tenant and region | GAP | one configured SMTP set; no binding registry |
-| `not_before`, `expires_at`, cancel | GAP | none |
+| `not_before`, `expires_at`, cancel | BUILT (Wave 3, section 20) | direct path, EMAIL; queued sends, expiry at the submit gate and by sweep, cancel before submission |
 | Governed multi-channel fallback keeping evidence class | GAP | none |
-| Rate, abuse, storm controls; bulk preview | GAP | no rate limiting found **(search)** |
+| Rate, abuse, storm controls; bulk preview | PARTIAL (Wave 3, section 21) | per tenant, recipient and intent quotas with protected security capacity and priority ordering; no bulk preview, no per-provider quota, no circuit breaker |
 | Provider idempotency token | GAP | none found |
 
 ### NCD-04 Evidence, bounce, complaint
@@ -96,8 +96,8 @@ Status key: **BUILT** (verified in code), **PARTIAL**, **GAP** (not built), **UN
 | Duplicate callback idempotent | BUILT | `TestWebhook_DuplicateEvent_Idempotent` |
 | Hard bounce, complaint, unsubscribe create suppression | BUILT | webhook tests; soft bounce does not suppress |
 | Callback authentication | BUILT (Wave 1) | per-provider HMAC, replay window, fail-closed |
-| Provider message id to one attempt | GAP | F-10 |
-| Normalized evidence vocabulary and strength | PARTIAL | statuses recorded; spec vocabulary (`MAILBOX_ACCEPTED`, `OPEN_SIGNAL` ...) and confidence not modelled |
+| Provider message id to one attempt | BUILT (Wave 3) | direct: unique index (000015); a lookup that matches two attempts is refused, never guessed (section 16) |
+| Normalized evidence vocabulary and strength | PARTIAL (Wave 3) | email facts with strength and stated limits recorded for direct sends (000024, section 16); SMS, push, in-app and human-response facts not built |
 | Callback before API response, late corrections | UNVERIFIED | |
 | Reconciliation job; reputation metrics; circuit breakers | GAP | metrics exist; no reconciliation or breaker found **(search)** |
 | DKIM / SPF / DMARC posture monitoring | GAP | none; operational |
@@ -107,7 +107,8 @@ Status key: **BUILT** (verified in code), **PARTIAL**, **GAP** (not built), **UN
 ### NCD-05 Regulated notice and acknowledgment
 | Item | Status |
 |---|---|
-| Entire service (notice package, lifecycle, acknowledgment, correction and supersession, WFC and DRC handoff) | GAP. Only `read_at` for in-app notices exists, which is a read marker and not an acknowledgment |
+| Notice package, lifecycle, acknowledgment, correction and supersession | PARTIAL (Wave 3, section 17) | built; recipient-only acknowledgement, no operator acknowledgement |
+| WFC deadline and escalation handoff; DRC record declaration; PDC rule lookup; e-signature | GAP | no calls to those services; deadline and policy reference are supplied by the caller |
 
 ### Cross-cutting
 | Item | Status | Evidence |
@@ -116,7 +117,7 @@ Status key: **BUILT** (verified in code), **PARTIAL**, **GAP** (not built), **UN
 | Authorization actions | BUILT | `NOTIFICATION_SEND`, `_VIEW`, `_RESOLVE_OUTCOME`, `_SUPPRESS` |
 | Event outbox | BUILT | `event_outbox` (000010) |
 | Events from spec 10.2 | PARTIAL | `delivery.attempt.created`, `delivery.attempt.unknown` exist; `communication.*`, `endpoint.suppressed`, `notice.*` do not |
-| Stable error codes NCD-001..020 | GAP | service has its own codes |
+| Stable error codes NCD-001..020 | PARTIAL (Wave 3, section 19) | catalogue matches the standard; 15 of 20 produced, 5 declared unproduced with reasons |
 | Channels | PARTIAL | EMAIL and IN_APP work; SMS withdrawn; WEBHOOK refused (correctly out of scope); push absent |
 | Declared record handoff to DRC; WFC escalation | GAP | none |
 | Callers | GAP | **no other service sends a notification** (known-gaps 97c) |
@@ -177,9 +178,9 @@ Basis: code and test names read; **not run**. Counts are at the end.
 | 48 Promo module in transactional template | PARTIAL (step 5) | the class is explicit, fixed at creation and judged by the shared engine; no content check for promotional blocks yet |
 | 49 Bulk query spans tenants | PARTIAL | RLS; no bulk API |
 | 50 Audience changes preview to send | GAP | no bulk |
-| 51 Rate limit backlog | UNVERIFIED | no rate controls found |
-| 52 Job expires before submit | GAP | no `expires_at` |
-| 53 Security alert vs marketing blast | GAP | no priority classes on queue |
+| 51 Rate limit backlog | PARTIAL (Wave 3, section 21) | an overflow is refused outright with Retry-After, never silently dropped; a backlog is served by priority and expiry is enforced |
+| 52 Job expires before submit | BUILT (Wave 3, section 20) | expires_at; never submitted; EXPIRED with NCD-015 |
+| 53 Security alert vs marketing blast | BUILT (Wave 3, section 21) | protected security quota; due work ordered S0, T0, A1 |
 | 54 Template provider assets unavailable | BUILT | templates embedded locally |
 | 55 DMARC/DKIM breaks | GAP | no monitoring |
 | 56 Suppression table unavailable | BUILT (Wave 1) | both paths fail closed, tested |
@@ -210,7 +211,7 @@ Basis: code and test names read; **not run**. Counts are at the end.
 
 ## 7. Tally
 
-NP matrix, 60 scenarios: **10 BUILT, 17 PARTIAL, 30 GAP, 3 UNVERIFIED**. The audit does not claim any scenario is certified; BUILT means the behaviour is present in code and, where noted, tested.
+NP matrix, 60 scenarios, **Wave 0 baseline: 10 BUILT, 17 PARTIAL, 30 GAP, 3 UNVERIFIED. Current (sections 18, 20 and 21): 34 BUILT, 13 PARTIAL, 11 GAP, 2 UNVERIFIED.** The audit does not claim any scenario is certified; BUILT means the behaviour is present in code and, where noted, tested.
 The 30 gaps are concentrated in the parts that depend on services the NCD does not yet call (PRV, PDC, DRC, XIC bindings, MDM) and in NCD-05, which is not built.
 
 ## 8. Wave 1 progress
@@ -391,3 +392,131 @@ A preference is a state dimension of its own: it selects when and whether a rout
 * **Privacy permission is not part of the answer.** It needs an activity and purpose from an intent and a remote call, and is enforced at send; a channel listed as eligible can still be refused by the privacy gate.
 * **No fallback rules or evidence requirement** in the output (the spec lists both), and no `/revalidate`.
 * **Email is the only channel with endpoint and suppression facts;** IN_APP has none to check.
+
+## 16. Wave 3 slice 4: callback attribution and delivery evidence (NCD-04 7.1, NP-27, F-10)
+
+* **A callback is never applied to a guess.** Direct attempts already had a unique provider message id (000015). The lookup is now strict across both attempt tables: if an id matches more than one attempt (for example two tenants' ledger attempts), it returns `ErrAmbiguousAttempt` instead of taking "the newest". The processor dead-letters such a callback terminally (reason "ambiguous", no retry), writes no event, and suppresses nobody. A register-linked ledger send writes its message id to both tables; that is one communication and the ledger row is authoritative, so only a match inside one table counts as ambiguous. A unique index on the ledger table was **not** added: a violation would fail the attempt insert after the provider had accepted the message and lose that evidence, which is worse than a lookup that refuses.
+* **Direct sends now have an evidence trail.** A provider callback about a direct send used to leave no trace on the notification (the ledger event insert does not apply to it). Migration 000024 adds `notification_delivery_evidence`: one normalized fact per callback, tied to the exact attempt, idempotent per provider event, tenant-isolated, **append-only** (a trigger refuses update and delete, so a late correction is a later fact). The notification is taken from the attempt, never from the caller.
+* **Vocabulary (spec 7.1):** DELIVERED becomes MAILBOX_ACCEPTED, a hard or unclassified bounce BOUNCED, a soft or transient bounce DEFERRED, DROPPED becomes REJECTED, plus COMPLAINT and UNSUBSCRIBED. Each has a strength (PROVIDER_LEVEL, MAILBOX_LEVEL, RECIPIENT_SIGNAL) and stated limits ("accepted by the mail server; does not prove the recipient saw it"). No fact can mean read, opened or acknowledged: the database CHECK refuses it, and open or click telemetry is not accepted. Only a 200-character diagnostic is kept, never the raw payload, since complaint feedback can contain personal data.
+* **API:** `GET /v1/notifications/{id}/evidence` (NOTIFICATION_VIEW), returning the facts with limits and an explicit notice that none proves human notice.
+* **Failure handling:** a failed evidence write is retried through the DLQ with the rest of the callback, so nothing is half-applied.
+* **Tests:** processor (each event type, replay, ledger path unaffected, write failure, ambiguity), vocabulary, real-Postgres store (end-to-end callback to fact, replay, tenant isolation, append-only, refusal of an attempt in another tenant, of ACKNOWLEDGED, minimization), endpoint, migration 000024 down/up.
+
+**Not built, deliberately:**
+* **Ledger and register attempts get no evidence rows:** their callbacks still go to the ledger delivery events, so a register-linked send's evidence lives on the ledger side only.
+* **No SMS, push or in-app facts, and no human-response facts** (ACKNOWLEDGED, DECLINED, DISPUTED): those belong to NCD-05 and need an authenticated actor.
+* **Evidence is not yet used to change a notification's status** (a bounce after SENT does not move it), and not yet emitted as an event.
+* **No reconciliation job, reputation metrics, circuit breakers or authentication-posture monitoring** (the rest of NCD-04 7.4).
+* **No late-callback ordering rule** (a callback before the API response is stored if the attempt exists, otherwise dead-lettered for retry).
+
+## 17. Wave 3 slice 5: regulated notices, acknowledgement and corrections (NCD-05, sections 8.1 to 8.5)
+
+Decisions taken with the owner: core lifecycle first, **recipient-only** acknowledgement, **operator acknowledgement refused**.
+
+* **Package (8.1):** `regulated_notices` (migration 000025), one row per exact version: frozen subject, body and locale with a content hash, the intent version it is sent under, recipient (capacity SELF only), the policy basis reference (a PDC rule reference, required and opaque), effective date, acknowledgement requirement (NONE, RECEIPT, ACCEPTANCE_DECLINE) and the deadline. Content is immutable by trigger; only the status and two links move. A notice needs an intent of **evidence class E3 or E4** that allows email, in the same legal entity, on a direct-path purpose class.
+* **Lifecycle (Figure 8):** PREPARED, READY, DELIVERY_IN_PROGRESS, DELIVERY_EVIDENCED, then SATISFIED_BY_POLICY (nothing required) or ACK_PENDING, then ACKNOWLEDGED, DECLINED, DISPUTED or EXPIRED; EXCEPTION for a delivery that cannot be evidenced. The allowed edges are enforced in the database. Every transition writes an append-only history row and an outbox event in the same transaction (notice.dispatched, delivery_evidenced, exception, acknowledged, declined, disputed, expired, corrected), carrying the content hash and never the content.
+* **Evidence threshold:** a provider accepting the message (notification SENT) is **not** enough. The receiving mail server's acceptance (MAILBOX_ACCEPTED, from the previous slice) is required, a bounce or a failed delivery is an EXCEPTION, and a deadline that passes first is an EXCEPTION. SATISFIED_BY_POLICY is described as policy satisfaction, "not a finding of legal service". No status or message anywhere claims legal service (8.5), and the evidence bundle says so.
+* **Acknowledgement (8.3):** `POST /v1/notices/{id}/acknowledgement` by the authenticated principal, who must be the recipient, for that exact version. The body cannot name an actor or a method (strict decode, and the database allows only AUTHENTICATED_ACTION). Email opens and link clicks are never acknowledgements. One response per version. An operator, or anyone else, gets 403 `operator_acknowledgement_refused`; there is no route for it. No response by the deadline moves the notice to EXPIRED and announces it; **no acknowledgement is ever fabricated**, and a late response is refused while the expiry it hit is still recorded.
+* **Corrections (8.4):** `POST /v1/notices/{id}/corrections` creates version N+1 in the same lineage, naming the prior and a required reason. The prior row is untouched, says it was superseded, and stays readable; a superseded version that was never sent cannot be sent. A correction goes to the same recipient (a different recipient is a new notice, and a mistaken one is a privacy incident to assess, not a correction). Whether a clock restarts is the caller's explicit decision: omit `deadline_at` to keep the existing one.
+* **Delivery is the ordinary governed send:** `POST /v1/notices/{id}/dispatch` reuses the send path itself (kill switch, suppression, privacy gate, preferences, retries, attempt records). The delivery's identity is derived from the notice, so an interrupted dispatch can be repeated without a second delivery; a repeated dispatch sends nothing.
+* **Reads:** the recipient may read their own notice (they cannot respond to one they cannot see); anyone else needs NOTIFICATION_VIEW. `GET /v1/notices/{id}/evidence` is the evidence bundle (notice, history, attempts, provider facts, response) and needs NOTIFICATION_VIEW even for the recipient. A background sweeper (every minute) applies the same progress rule so deadlines and late callbacks are acted on without anyone reading the notice.
+* **Tests:** pure rules (validation, acknowledgement matrix, the evidence threshold, no legal-service wording), real-Postgres lifecycle (every path including expiry, bounce, no-response-needed, correction, the database refusing content edits, skipped edges, deletes and non-recipient or non-authenticated acknowledgement rows, cross-tenant), the handler API, the sweeper, migration 000025 down/up, and one end-to-end test through the real handlers, store and callback processor with only the mail provider faked.
+
+**Not built, deliberately:**
+* **No DRC record declaration, WFC deadline ownership or escalation, PDC rule resolution, or e-signature link.** The deadline, the acknowledgement requirement and the policy reference are supplied by the caller and stored, not validated against those services. An EXCEPTION or EXPIRED notice raises an event but nothing consumes it yet.
+* **Notice wording is not template-governed:** content is supplied by the caller and frozen and hashed, so what was served is provable, but it does not pass through template review. No attachments (DRC versions) in the package.
+* **Only email, only SELF capacity:** no representative or role recipients, no fallback to a second channel or manual service, and EXCEPTION is terminal (the remedy is a correction or a new notice).
+* **A bounce that arrives after delivery was evidenced is recorded as evidence but does not reopen the notice** (the lifecycle only moves forward); it is visible in the bundle.
+* **No maker-checker on creating or dispatching a notice,** and no approval flow for operator-evidenced acknowledgement (refused outright for now).
+* **One response per version,** so a recipient cannot acknowledge and then dispute the same version; the dispute route is the response itself.
+
+## 18. Wave 3 slice 6: the executable negative-path matrix and re-score
+
+`TestNP_Matrix` (`internal/store/np_matrix_test.go`, real Postgres) runs the matrix: **33 scenarios are asserted**, and **22 are listed as skips that state why they are not built**, so the test run itself shows what is missing. Five more are covered by earlier tests (NP-32, 46, 54, 56, 57). Two negative controls were run: removing the ambiguous-message-id guard and the recipient-only acknowledgement check each failed exactly the scenarios that depend on them (NP-27, NP-39, NP-41), and the originals were restored.
+
+**Current tally: 32 BUILT, 12 PARTIAL, 13 GAP, 3 UNVERIFIED** (baseline 10, 17, 30, 3). "BUILT" means the refusal is present in code and asserted by a test; it does not mean the scenario is certified.
+
+| Status | Scenarios |
+|---|---|
+| BUILT | 02, 03, 04, 05, 06, 07, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 26, 27, 32, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 54, 56 |
+| PARTIAL | 08 (variables refuse control characters; free-text subjects are only stripped at SMTP), 09 (no regulated-content class), 12 (RLS only, no external-party concept), 23 (retries, no provider idempotency token), 28 (SMTP failover, no certified-equivalent set), 33 (token audience binding unverified), 35 (provider acceptance is distinct for notices; the SENT status is still named for acceptance), 44 (a different recipient is refused as a correction; no incident path), 48 (class is explicit and judged; no promotional-content check), 49 (RLS; no bulk API), 57 (outcome recorded on a detached context; sweep; outbox), 60 (no such setting; no explicit guard test) |
+| UNVERIFIED | 25 (callback before the API response), 51 (rate backlog, no rate controls found), 59 (provider corrects a status later) |
+| GAP | 01, 10, 11, 29, 30, 31, 34, 47, 50, 52, 53, 55, 58 |
+
+**What the remaining gaps have in common:** attachments and DRC (10, 34, 58), delivery-side controls the service does not have (29, 30, 52, 53, 55: fallback, residency, expiry, priority queues, sender-authentication monitoring), bulk and audience handling (47, 50), SMS sensitivity (31), regulated free-text recipients (11) and an architecture guard against direct provider SDK use (01).
+
+**Reading the matrix honestly:** the build is strongest where the work was inside this service (intents, templates, privacy gate, preferences, suppression, evidence, notices) and weakest where the standard depends on other services or on channels and queue controls that do not exist here yet.
+
+**A defect the full run found (fixed in migration 000026):** a notice's lifecycle transitions are written in one transaction, so they share a timestamp (`now()` is the transaction start) and the history ordered by time then by a random id could come back in the wrong order. The lifecycle test passed once and failed on a later run. History rows now carry an identity sequence and are read in that order, with a test that creates 15 notices and checks every one, and the lifecycle test was run eight times in a row.
+
+## 19. Wave 3 slice 7: stable error codes and the missing canonical events (section 10.2 and 10.3)
+
+**Stable codes (`internal/ncd`).** The 20 codes of 10.3 are a catalogue whose names are checked against the standard's table written out literally in a test. A code is stamped only where the service genuinely produces that condition, and the stable code rides **beside** the service's own error code (`reason_code` and `reason` added to the error body; `error_code` unchanged), never replacing it. A guard test requires every code to be either produced somewhere in the service source or listed as unproduced with a reason, and found one that was neither (NCD-015) before it was wired.
+
+| Produced | Where |
+|---|---|
+| NCD-001, 002 | intent not found, not effective or retired (API) |
+| NCD-003 | unpublished template, retired template (API) |
+| NCD-004 | missing, unexpected or invalid template variables (API) |
+| NCD-005 | a template published in another locale but not the one asked for; no other language is substituted (API and reason) |
+| NCD-006 | unresolved recipient (delivery reason on first send, resend, retry and notice dispatch) |
+| NCD-008 | privacy gate refusals (reason and block code) |
+| NCD-009 | marketing or lifecycle class refused on the direct path (reason and block code) |
+| NCD-010 | suppression policy refusal, muted channel (reason and block code), channel decision |
+| NCD-011, 012, 013 | channel decision, quiet-hour deferral, no provider route / unsupported channel |
+| NCD-014 | delivery outcome unknown (API) |
+| NCD-015 | a notice deadline passes before delivery is evidenced |
+| NCD-016 | a response arrives before delivery is evidenced |
+| NCD-017 | an acknowledgement that does not fit, or that an operator tries to make |
+
+**Declared unproduced (and why):** NCD-007 (no endpoint verification state), NCD-018 (no review step for regulated notices), NCD-019 (a repeated source event is replayed as the original, not refused), NCD-020 (no cross-tenant or external-party recipient concept; RLS makes another tenant's recipient simply not exist). NCD-009 is produced only by the direct path's refusal of marketing classes; marketing permission itself still lives in the ledger pipeline.
+
+**Events (migration 000027).** Five of the spec's nine canonical events were missing; four are now emitted, each in the transaction that makes it true and none carrying content or an address:
+
+* `communication.prepared`: when a communication is created, with its content hash and intent version. A ledger-registered communication names its ledger intent. Existing outbox tests were updated to account for the extra creation event.
+* `communication.blocked`: for each withheld attempt, with the stable reason code (and the privacy decision id when there is one).
+* `delivery.evidence.recorded`: once per new evidence fact (a replayed callback is not new).
+* `endpoint.suppressed`: when a suppression is new or its reason changes, never for an unchanged repeat. The endpoint is a **hash**, so the topic cannot become a list of suppressed people's addresses.
+* `notice.deadline.at_risk`: raised **once** for a notice still lacking delivery evidence or a response within 24 hours of its deadline, saying which. A passed deadline is an expiry or exception, not "at risk".
+
+**Not emitted, deliberately:** `communication.correction.issued` (notices have `notice.corrected`, which names notice versions; the spec's event names communication ids, which a notice only has after dispatch), and `communication.record.declared` (no DRC). The Wave 0 list of "intent events" is not part of 10.2 and is not built.
+
+**Not done:** the catalogue is stamped on API errors and reasons; there is no machine-readable catalogue endpoint, and the generic failures (store unavailable, bad JSON) deliberately carry no stable code. Delivery reasons still carry the code as text (and as a block code on the event) rather than a dedicated column on the attempt row.
+
+## 20. Wave 3 slice 8: delivery job timing, expiry and cancellation (NCD-03 6.1, 6.6, NP-52)
+
+Decisions taken with the owner: the job is an **identity and timing on the communication** (no separate job table yet, because today a job mirrors its communication one to one); **EXPIRED and CANCELLED are new terminal statuses**; cancelling needs **NOTIFICATION_SEND** on the legal entity (no new grant to roll out). Migration 000028; rollback order 000028, 000027, 000026, 000025, 000022, 000021, 000020.
+
+* **Job identity:** every communication has a stable `job_id`, copied onto each attempt row and carried in `delivery.attempt.created` (a field the standard's payload requires). Existing rows were given one.
+* **Scheduling:** `POST /v1/notifications` takes optional `not_before` and `expires_at` (EMAIL only; at most 90 days ahead; expiry must be in the future and after the start; a past `not_before` simply sends now). A queued send is created PENDING and due at `not_before`, and **nothing is sent or resolved now**: the existing worker sends it when due through the same guarded path as any attempt, and resolves the recipient **at that time** so the endpoint is current (6.6). Its first attempt is labelled `scheduled`, not `retry`.
+* **Expiry (NCD-015):** a communication past `expires_at` is never handed to a provider. It is enforced at three layers: the worker's submit gate, a sweep of queued rows, and the direct-send guard (which also covers the first attempt and resends). An expired communication is concluded EXPIRED with the NCD-015 reason, announced as `notification.failed` (so an escalation waiting on a failure hears) and `communication.blocked`, and cannot be retried or resent. A message already being submitted is never expired: that is UNKNOWN territory, not expiry.
+* **Cancel:** `POST /v1/notifications/{id}/cancel` with a required reason, **only for a queued communication**. A communication that has been claimed by a worker, is being submitted, has been sent or has concluded is refused with 409, decided atomically in one statement, so a cancellation can never describe a message that was in fact sent (checked by a negative control: loosening that statement fails the test). It records who, when and why, and emits `communication.cancelled`, deliberately **not** `notification.failed`, since a withdrawal someone chose is not a failure.
+* **Database rules:** expiry must follow the start; a CANCELLED row must name who, when and why; an EXPIRED row must have an expiry and a reason.
+* **Tests:** timing validation, the handler (queued, invalid timing, cancel paths and authorization), the guard's expiry gate, worker unit tests (submit-gate expiry, sweep), real-Postgres tests for queued creation and due-ness, job id on attempts and events, every cancel refusal, expiry and its idempotence, the in-flight and concluded guards, the database rules, and a **real worker against a real database** (a due send goes out labelled scheduled, one not yet due waits, an expired one is never sent), plus NP-52 in the matrix and migration 000028 down/up.
+
+**Not built, deliberately:**
+* **No separate job table and no governed fallback** (a second channel under the same job): that is what a job table is for, and it needs provider bindings and a fallback policy first.
+* **Scheduling is for direct EMAIL sends:** not the ledger pipeline, not in-app, not notices (a notice's deadline is its own clock).
+* **Backed-off retries can still run past `expires_at`** before the sweep catches them (within one worker interval); the submit gate and the guard make sure nothing is actually sent late.
+* **No rate, storm or priority controls, no provider idempotency token, no editing or rescheduling:** a queued send is cancelled and re-created.
+* **Cancel is not offered after submission,** by design; an ambiguous or sent message follows the resolve and resend routes.
+
+## 21. Wave 3 slice 9: send quotas, protected security capacity and priority order (NCD-03 6.5, NP-51, NP-53)
+
+Decisions taken with the owner: **refuse with 429 and `Retry-After`** (not queue), **counters in Postgres** (shared by every replica), **no circuit breaker yet**. Migration 000029.
+
+* **Budgets:** a direct send draws on up to three counters in fixed windows: **per tenant and channel** (per minute), **per recipient** (per hour) and **per intent** (per minute, for intent-bound sends). Defaults are 600 a minute per tenant, 20 an hour per person and 300 a minute per intent; each is configurable (`NOTIFICATION_QUOTA_*`) and zero removes that budget.
+* **Protected security capacity:** security (S0) messages draw on **their own** tenant, recipient and intent counters, so a flood of reminders cannot use up a password reset's capacity (NP-53), and a person's security allowance (default 60 an hour) is separate from and higher than their routine one. They are still **bounded**, against abusive loops. Proven by a negative control: sharing the counter fails both the unit test and NP-53.
+* **A refusal is explicit and consumes nothing:** counting happens inside the same transaction that creates the communication, so a send over any budget returns **429** with `Retry-After`, a `quota_exceeded` error naming the budget, and **creates nothing**: no row, no event, no count. Hammering a full budget does not extend the lockout. A **replay** of an already-created send is neither counted nor refused.
+* **Opt-in per caller:** only the direct send API is counted. **Notice dispatch is deliberately not** (a regulated notice must not be refused for volume it did not cause), nor are ledger register rows (counted by their own path).
+* **Off by default** (`NOTIFICATION_QUOTA_ENABLED`): the right limits depend on the largest legitimate batch an environment sends (a payroll run, say), so quotas are turned on deliberately with limits that fit.
+* **Priority order (backpressure):** due work is found **security first, then transactional (an unclassified send counts as T0), then operational**, oldest first within a priority, so a backlog never leaves an urgent message waiting behind reminders. Nothing is dropped; expiry (section 20) still applies.
+* **Housekeeping:** counters older than a day are removed whenever a new tenant window opens.
+* **Tests:** the pure budget rules and windows, real-Postgres tests for every refusal path (per recipient, per intent, per tenant, protected pool, replays, opt-in, window rollover and cleanup, quotas off), the priority order including a batch of one, the 429 and `Retry-After` handler behaviour, config, migration 000029 down/up, and NP-51 and NP-53 in the matrix.
+
+**Not built, deliberately:**
+* **No bulk recipient expansion or count preview** (there is no bulk API); **no per-provider quota** and **no provider circuit breaker** (the next piece, with provider bindings).
+* **Fixed windows, not sliding:** a sender can use a full budget at the end of one window and again at the start of the next (up to twice the rate across a boundary).
+* **A refused send leaves no event,** because no communication exists to attach one to; refusals are visible to the caller and in the log, not on the topic.
+* **No stable NCD code** for a quota refusal: the standard's list has none, so the service's own `quota_exceeded` is used.
+* **The worker's own retries are not counted:** only creation is. Backed-off retries are bounded by the retry policy.

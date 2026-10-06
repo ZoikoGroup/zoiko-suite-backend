@@ -11,6 +11,7 @@ import (
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/ncd"
 	"zoiko.io/notification-svc/internal/preference"
 	"zoiko.io/notification-svc/internal/privacy"
 )
@@ -91,13 +92,13 @@ func (g *DirectSendGuard) applyPreferences(ctx context.Context, n domain.Notific
 	d := preference.Evaluate(p, string(class), n.Channel, g.now())
 	switch d.Effect {
 	case preference.Mute:
-		return domain.DeliveryOutcome{Reason: d.Reason}, true
+		return domain.DeliveryOutcome{Reason: d.Reason, BlockCode: ncd.ChannelSuppressed}, true
 	case preference.Defer:
 		g.log.Info("direct send deferred by recipient quiet hours; the provider was not called",
 			zap.String("notification_id", n.NotificationID), zap.Time("until", d.Until))
-		return domain.DeliveryOutcome{Reason: d.Reason, Retryable: true, DeferUntil: d.Until}, true
+		return domain.DeliveryOutcome{Reason: d.Reason, Retryable: true, DeferUntil: d.Until, BlockCode: ncd.QuietHourDeferred}, true
 	case preference.Unusable:
-		return domain.DeliveryOutcome{Reason: d.Reason, Retryable: true}, true
+		return domain.DeliveryOutcome{Reason: d.Reason, Retryable: true, BlockCode: ncd.QuietHourDeferred}, true
 	}
 	return domain.DeliveryOutcome{}, false
 }
@@ -154,6 +155,18 @@ func (g *DirectSendGuard) Deliver(ctx context.Context, n domain.Notification) do
 		return g.inner.Deliver(ctx, n)
 	}
 
+	// The last gate for expiry (NCD-015): the first attempt, every retry and every resend pass
+	// here, and a communication past its expires_at is never handed to a provider.
+	if n.ExpiresAt != nil && !g.now().Before(*n.ExpiresAt) {
+		g.log.Warn("direct send refused: the communication has expired; the provider was not called",
+			zap.String("notification_id", n.NotificationID), zap.Time("expires_at", *n.ExpiresAt))
+		return domain.DeliveryOutcome{
+			Reason:    ncd.Format(ncd.DeliveryExpired) + ": the communication passed its expires_at before it was submitted",
+			Retryable: false,
+			BlockCode: ncd.DeliveryExpired,
+		}
+	}
+
 	if engaged, reason := g.killSwitch.Check(ctx, n.TenantID, n.TemplateID); engaged {
 		g.log.Warn("direct send held by kill switch; the provider was not called",
 			zap.String("notification_id", n.NotificationID), zap.String("tenant_id", n.TenantID), zap.String("reason", reason))
@@ -172,8 +185,9 @@ func (g *DirectSendGuard) Deliver(ctx context.Context, n domain.Notification) do
 		g.log.Error("direct send refused: class is not permitted on the direct path; the provider was not called",
 			zap.String("notification_id", n.NotificationID), zap.String("class", string(class)))
 		return domain.DeliveryOutcome{
-			Reason:    fmt.Sprintf("communication class %q is not permitted on the direct send path; use the ledger pipeline", class),
+			Reason:    ncd.Format(ncd.MarketingPermissionBlock) + fmt.Sprintf(": communication class %q is not permitted on the direct send path; use the ledger pipeline", class),
 			Retryable: false,
+			BlockCode: ncd.MarketingPermissionBlock,
 		}
 	}
 
@@ -199,8 +213,9 @@ func (g *DirectSendGuard) Deliver(ctx context.Context, n domain.Notification) do
 			zap.String("notification_id", n.NotificationID), zap.String("tenant_id", n.TenantID),
 			zap.String("class", string(class)), zap.String("rule", decision.RuleName), zap.String("reason", decision.Reason))
 		return domain.DeliveryOutcome{
-			Reason:    "refused by delivery policy (" + decision.RuleName + "): " + decision.Reason,
+			Reason:    ncd.Format(ncd.ChannelSuppressed) + ": refused by delivery policy (" + decision.RuleName + "): " + decision.Reason,
 			Retryable: false,
+			BlockCode: ncd.ChannelSuppressed,
 		}
 	}
 
@@ -222,6 +237,7 @@ func (g *DirectSendGuard) Deliver(ctx context.Context, n domain.Notification) do
 			Retryable:         pv.Retryable,
 			PrivacyDecisionID: pv.DecisionID,
 			PrivacyResult:     pv.Result,
+			BlockCode:         ncd.PrivacyPermissionBlocked,
 		}
 	}
 	out := g.inner.Deliver(ctx, n)

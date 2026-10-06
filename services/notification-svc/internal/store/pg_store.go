@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/quota"
 )
 
 // mapPgError translates the Postgres failures that are really caller mistakes
@@ -53,7 +55,8 @@ const notificationColumns = `
 	COALESCE(template_id, ''), COALESCE(template_version_id, ''), COALESCE(rendered_content_hash, ''),
 	COALESCE(purpose_context, ''), COALESCE(idempotency_key, ''),
 	resend_count, COALESCE(last_resend_reason, ''), last_resent_at, COALESCE(last_resent_by_principal_id, ''),
-	COALESCE(communication_class, ''), COALESCE(message_intent_id::text, ''), COALESCE(intent_version_id::text, '')`
+	COALESCE(communication_class, ''), COALESCE(message_intent_id::text, ''), COALESCE(intent_version_id::text, ''),
+	job_id::text, not_before, expires_at, COALESCE(cancelled_by, ''), cancelled_at, COALESCE(cancel_reason, '')`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface{ Scan(dest ...any) error }
@@ -72,11 +75,16 @@ func scanNotification(s scannable, n *domain.Notification) error {
 		&n.PurposeContext, &n.IdempotencyKey,
 		&n.ResendCount, &n.LastResendReason, &n.LastResentAt, &n.LastResentByPrincipalID,
 		&n.CommunicationClass, &n.MessageIntentID, &n.IntentVersionID,
+		&n.JobID, &n.NotBefore, &n.ExpiresAt, &n.CancelledBy, &n.CancelledAt, &n.CancelReason,
 	)
 }
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// quotaLimits is nil unless send quotas are on (WithQuota); nowFn is the clock they use.
+	quotaLimits *quota.Limits
+	nowFn       func() time.Time
 }
 
 func New(pool *pgxpool.Pool) *PgStore {
@@ -126,6 +134,9 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 		return false, domain.ErrIdentityMissing
 	}
 
+	if n.JobID == "" {
+		n.JobID = uuid.NewString()
+	}
 	conflict := `ON CONFLICT (tenant_id, correlation_id) WHERE idempotency_key IS NULL DO NOTHING`
 	replay := `SELECT ` + notificationColumns + ` FROM notifications
 		WHERE tenant_id = $1 AND correlation_id = $2 AND idempotency_key IS NULL`
@@ -145,21 +156,32 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 				channel, subject, body, status, source_event_type, source_reference,
 				correlation_id, created_by_principal_id, created_at,
 				template_id, template_version_id, rendered_content_hash,
-				purpose_context, idempotency_key, communication_class, intent_version_id
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+				purpose_context, idempotency_key, communication_class, intent_version_id,
+				job_id, not_before, expires_at, next_attempt_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::uuid,$24,$25,$26)
 			`+conflict,
 			n.NotificationID, tenantID, n.LegalEntityID, n.RecipientPrincipalID,
 			nullIfEmpty(n.RecipientAddress), nullIfEmpty(n.RecipientAddressSource),
 			n.Channel, n.Subject, n.Body, n.Status, n.SourceEventType, n.SourceReference,
 			n.CorrelationID, n.CreatedByPrincipalID, n.CreatedAt,
 			nullIfEmpty(n.TemplateID), nullIfEmpty(n.TemplateVersionID), nullIfEmpty(n.RenderedContentHash),
-			nullIfEmpty(n.PurposeContext), nullIfEmpty(n.IdempotencyKey), nullIfEmpty(n.CommunicationClass), nullIfEmpty(n.IntentVersionID))
+			nullIfEmpty(n.PurposeContext), nullIfEmpty(n.IdempotencyKey), nullIfEmpty(n.CommunicationClass), nullIfEmpty(n.IntentVersionID),
+			n.JobID, n.NotBefore, n.ExpiresAt, n.NextAttemptAt)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 1 {
 			created = true
-			return nil
+			if s.quotaLimits != nil && quota.Counting(ctx) {
+				if err := s.consumeQuotaTx(ctx, tx, n); err != nil {
+					return err
+				}
+			}
+			prepared, err := events.CommunicationPrepared(n.CorrelationID, *n)
+			if err != nil {
+				return err
+			}
+			return enqueue(ctx, tx, tenantID, prepared)
 		}
 
 		// Conflict: this communication already exists — fetch it so the caller
@@ -516,7 +538,10 @@ func (s *PgStore) FindDueRetries(ctx context.Context, now time.Time, limit int) 
 		WHERE status = 'PENDING'
 		  AND next_attempt_at IS NOT NULL
 		  AND next_attempt_at <= $1
-		ORDER BY next_attempt_at
+		-- Security first, then transactional, then operational (ZS-SVC-Y-001 6.5, backpressure
+		-- preserves priority): when more is due than one batch can send, a password reset is not
+		-- stuck behind a pile of reminders. Within a priority, oldest first. Nothing is dropped.
+		ORDER BY CASE communication_class WHEN 'S0' THEN 0 WHEN 'A1' THEN 2 ELSE 1 END, next_attempt_at
 		LIMIT $2
 	`, now, limit)
 	if err != nil {

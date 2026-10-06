@@ -115,6 +115,10 @@ type stubStore struct {
 	beginSubmissionErr error
 	markedUnknown      []string
 
+	// The expiry pair (NCD-015).
+	overdue []domain.DueRetry
+	expired []string
+
 	claimFails  bool
 	tenantsSeen []string
 
@@ -521,4 +525,20 @@ func TestNextAttemptFor_AHoldIsDueWhenItsDeferralEndsNotAfterABackoff(t *testing
 	if b.Before(now) {
 		t.Fatalf("retry scheduled in the past: %v", b)
 	}
+}
+
+func (s *stubStore) FindExpiredQueued(_ context.Context, _ time.Time, _ int) ([]domain.DueRetry, error) {
+	return s.overdue, nil
+}
+
+// ExpireNotification behaves like the real one: only a PENDING row whose expires_at has
+// passed is concluded; anything else is left alone, without error.
+func (s *stubStore) ExpireNotification(_ context.Context, id, _ string, now time.Time) (bool, error) {
+	n, ok := s.byID[id]
+	if !ok || n.Status != domain.StatusPending || n.ExpiresAt == nil || n.ExpiresAt.After(now) {
+		return false, nil
+	}
+	n.Status = domain.StatusExpired
+	s.expired = append(s.expired, id)
+	return true, nil
 }
