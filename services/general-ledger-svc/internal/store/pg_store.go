@@ -30,9 +30,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
-	"zoiko.io/general-ledger-svc/internal/outbox"
 )
 
 // DefaultListLimit bounds ListJournals when the caller names no limit. A
@@ -129,10 +130,63 @@ func mapPgError(err error) error {
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+
+	// eventRegion is the residencyregion stamped on every journal event.
+	// Empty means no region was configured, and every event-emitting write
+	// then fails (envelope.New refuses it) rather than emitting an event
+	// with a guessed region.
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
-	return &PgStore{pool: pool, log: log}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (config EVENT_RESIDENCY_REGION).
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// enqueueJournalEvent writes one journal lifecycle event to the transactional
+// outbox inside tx, the transaction that made the change it reports.
+//
+// fact is the past-tense lifecycle fact (created, validated, posted,
+// reversed). The canonical type is com.zoikosuite.accounting.journal.<fact>
+// (ZS-EVENT-001 §5.1); the pre-standard "journal.<fact>" is kept as the
+// legacy event_type so nothing filtering on the old name breaks.
+func (s *PgStore) enqueueJournalEvent(ctx context.Context, tx pgx.Tx, fact, tenantID, legalEntityID, journalID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.journal." + fact,
+		LegacyType:      "journal." + fact,
+		Service:         "general-ledger-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "journal",
+		AggregateID:     journalID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		// Journal facts are financial records of a tenant's books.
+		Classification: envelope.Confidential,
+		Data:           data,
+	})
+	if err != nil {
+		return fmt.Errorf("build journal.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue journal.%s event: %w", fact, err)
+	}
+	return nil
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
@@ -326,34 +380,14 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 			return nil
 		}
 
-		env, envErr := outbox.NewVariantAEnvelope(
-			"journal.created",
-			h.CorrelationID,
-			h.TenantID,
-			h.LegalEntityID,
-			h.CreatedByPrincipalID,
-			map[string]any{
+		if err := s.enqueueJournalEvent(ctx, tx, "created", h.TenantID, h.LegalEntityID,
+			h.JournalID, h.CreatedByPrincipalID, h.CorrelationID, map[string]any{
 				"journal_id":      h.JournalID,
 				"tenant_id":       h.TenantID,
 				"legal_entity_id": h.LegalEntityID,
 				"fiscal_period":   h.FiscalPeriod,
-			},
-		)
-		if envErr != nil {
-			return fmt.Errorf("build journal.created envelope: %w", envErr)
-		}
-		actorID := h.CreatedByPrincipalID
-		if err := outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "JOURNAL",
-			AggregateID:   h.JournalID,
-			EventType:     "journal.created",
-			TenantID:      h.TenantID,
-			LegalEntityID: h.LegalEntityID,
-			ActorID:       &actorID,
-			CorrelationID: h.CorrelationID,
-			Payload:       env,
-		}); err != nil {
-			return fmt.Errorf("insert outbox event for journal.created: %w", err)
+			}); err != nil {
+			return err
 		}
 
 		return nil
@@ -427,31 +461,12 @@ func (s *PgStore) ReverseJournal(
 			origLegalEntityID = reversing.LegalEntityID
 		}
 
-		env, envErr := outbox.NewVariantAEnvelope(
-			"journal.reversed",
-			origCorrelationID,
-			tenantID,
-			origLegalEntityID,
-			actorPrincipalID,
-			map[string]any{
+		if err := s.enqueueJournalEvent(ctx, tx, "reversed", tenantID, origLegalEntityID,
+			originalJournalID, actorPrincipalID, origCorrelationID, map[string]any{
 				"journal_id":           originalJournalID,
 				"reversing_journal_id": reversing.JournalID,
-			},
-		)
-		if envErr != nil {
-			return fmt.Errorf("build journal.reversed envelope: %w", envErr)
-		}
-		if err := outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "JOURNAL",
-			AggregateID:   originalJournalID,
-			EventType:     "journal.reversed",
-			TenantID:      tenantID,
-			LegalEntityID: origLegalEntityID,
-			ActorID:       &actorPrincipalID,
-			CorrelationID: origCorrelationID,
-			Payload:       env,
-		}); err != nil {
-			return fmt.Errorf("insert outbox event for journal.reversed: %w", err)
+			}); err != nil {
+			return err
 		}
 
 		// AK-INV-003 / AK-INV-001: the reversing journal is born FINALIZED, so
@@ -639,31 +654,11 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 		}
 
 		if toStatus == domain.JournalStatusValidated {
-			env, envErr := outbox.NewVariantAEnvelope(
-				"journal.validated",
-				correlationID,
-				tenantID,
-				legalEntityID,
-				actorPrincipalID,
-				map[string]any{
+			if err := s.enqueueJournalEvent(ctx, tx, "validated", tenantID, legalEntityID,
+				journalID, actorPrincipalID, correlationID, map[string]any{
 					"journal_id": journalID,
-				},
-			)
-			if envErr != nil {
-				return fmt.Errorf("build journal.validated envelope: %w", envErr)
-			}
-			actorID := actorPrincipalID
-			if err := outbox.Insert(ctx, tx, outbox.Event{
-				AggregateType: "JOURNAL",
-				AggregateID:   journalID,
-				EventType:     "journal.validated",
-				TenantID:      tenantID,
-				LegalEntityID: legalEntityID,
-				ActorID:       &actorID,
-				CorrelationID: correlationID,
-				Payload:       env,
-			}); err != nil {
-				return fmt.Errorf("insert outbox event for journal.validated: %w", err)
+				}); err != nil {
+				return err
 			}
 		} else if toStatus == domain.JournalStatusFinalized {
 			// ACC-05: every journal that reaches FINALIZED appends its
@@ -675,31 +670,11 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 				return err
 			}
 
-			env, envErr := outbox.NewVariantAEnvelope(
-				"journal.posted",
-				correlationID,
-				tenantID,
-				legalEntityID,
-				actorPrincipalID,
-				map[string]any{
+			if err := s.enqueueJournalEvent(ctx, tx, "posted", tenantID, legalEntityID,
+				journalID, actorPrincipalID, correlationID, map[string]any{
 					"journal_id": journalID,
-				},
-			)
-			if envErr != nil {
-				return fmt.Errorf("build journal.posted envelope: %w", envErr)
-			}
-			actorID := actorPrincipalID
-			if err := outbox.Insert(ctx, tx, outbox.Event{
-				AggregateType: "JOURNAL",
-				AggregateID:   journalID,
-				EventType:     "journal.posted",
-				TenantID:      tenantID,
-				LegalEntityID: legalEntityID,
-				ActorID:       &actorID,
-				CorrelationID: correlationID,
-				Payload:       env,
-			}); err != nil {
-				return fmt.Errorf("insert outbox event for journal.posted: %w", err)
+				}); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -751,11 +726,11 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 	}
 	type entryRow struct {
 		lineID, accountCode, legalEntityID, bookID, fiscalPeriod, currencyCode, correlationID string
-		lineNumber                                                                             int
-		debit, credit                                                                          float64
-		dimensions                                                                              domain.Dimensions
-		transactionDate, postingDate                                                            domain.Date
-		sourceEventID                                                                           *string
+		lineNumber                                                                            int
+		debit, credit                                                                         float64
+		dimensions                                                                            domain.Dimensions
+		transactionDate, postingDate                                                          domain.Date
+		sourceEventID                                                                         *string
 	}
 	var entries []entryRow
 	for rows.Next() {

@@ -27,7 +27,7 @@ func newW4Fixture(t *testing.T) *w4Fixture {
 	tenant := uuid.New().String()
 	return &w4Fixture{
 		cpFixture: &cpFixture{
-			s:      store.New(pool, zap.NewNop()),
+			s:      store.New(pool, zap.NewNop(), store.WithEventRegion("uk")),
 			tenant: tenant,
 			entity: uuid.New().String(),
 			ctx:    svcmiddleware.WithTenant(context.Background(), tenant),
@@ -567,8 +567,8 @@ func (f *w4Fixture) outboxCount(t *testing.T, journalID, eventType string) int {
 	t.Helper()
 	var n int
 	if err := f.pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM outbox_events WHERE tenant_id=$1 AND aggregate_id=$2 AND event_type=$3`,
-		f.tenant, journalID, eventType).Scan(&n); err != nil {
+		`SELECT COUNT(*) FROM eventing_outbox WHERE tenant_id=$1 AND aggregate_id=$2 AND event_type=$3`,
+		f.tenant, journalID, "com.zoikosuite.accounting."+eventType).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n

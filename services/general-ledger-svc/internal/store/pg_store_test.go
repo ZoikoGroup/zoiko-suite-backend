@@ -49,7 +49,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		account_mappings, chart_of_accounts,
 		posting_executions,
 		ledger_entries, ledger_balances,
-		outbox_events
+		outbox_events, eventing_outbox
 		CASCADE;`)
 
 	// Every *.up.sql, sorted, rather than a list written out here.
@@ -136,7 +136,7 @@ func requireThrowawayDatabase(t *testing.T, dsn string) {
 
 func TestPgStore_CreateJournal_And_GetJournal(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -188,7 +188,7 @@ func TestPgStore_CreateJournal_And_GetJournal(t *testing.T) {
 // produces, and it must resolve to the original journal, never a duplicate.
 func TestPgStore_CreateJournal_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -260,7 +260,7 @@ func TestPgStore_CreateJournal_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 
 func TestPgStore_SumLines(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -306,7 +306,7 @@ func TestPgStore_SumLines(t *testing.T) {
 
 func TestPgStore_TransitionJournal_WrongFromStatus_Rejected(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -344,7 +344,7 @@ func TestPgStore_TransitionJournal_WrongFromStatus_Rejected(t *testing.T) {
 
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()
@@ -442,7 +442,7 @@ func newReversingHeader(tenantID, originalID, correlationID string, original *do
 // asserting on the struct is what let this survive.
 func TestPgStore_ReverseJournal_PersistsReversalLink(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -525,7 +525,7 @@ func TestPgStore_ReverseJournal_PersistsReversalLink(t *testing.T) {
 // books holding a posting AND its inverse as live entries.
 func TestPgStore_ReverseJournal_NotFinalized_RollsBackBothHalves(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -593,7 +593,7 @@ func TestPgStore_ReverseJournal_NotFinalized_RollsBackBothHalves(t *testing.T) {
 // while the ledger has it FINALIZED.
 func TestPgStore_CreateJournal_Retry_ResolvesFullStoredHeader(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -680,7 +680,7 @@ func TestPgStore_CreateJournal_Retry_ResolvesFullStoredHeader(t *testing.T) {
 
 func TestPgStore_GetJournalByCorrelationID(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	otherTenant := uuid.New().String()
@@ -740,7 +740,7 @@ func TestPgStore_GetJournalByCorrelationID(t *testing.T) {
 // a typo in a URL reported to an operator as infrastructure being down.
 func TestPgStore_MalformedUUID_IsAbsentNotAnOutage(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -766,7 +766,7 @@ func TestPgStore_MalformedUUID_IsAbsentNotAnOutage(t *testing.T) {
 
 func TestPgStore_ListJournals_RespectsLimit(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)

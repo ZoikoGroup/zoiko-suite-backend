@@ -1575,8 +1575,9 @@ services:
   # enforces tenant isolation, same posture as tenant-entity-registry-svc.
   general-ledger-svc:
     build:
-      context: ../services/general-ledger-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: general-ledger-svc/Dockerfile
     container_name: general-ledger-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1592,6 +1593,8 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.general-ledger.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
