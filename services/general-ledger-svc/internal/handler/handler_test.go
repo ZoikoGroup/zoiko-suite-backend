@@ -1403,3 +1403,7 @@ type postingsCall struct {
 	tenantID string
 	query    domain.AccountPostingsQuery
 }
+
+func (c *stubClose) CheckPeriodOpenAt(ctx context.Context, tenantID string, ref close.PeriodRef) error {
+	return c.CheckPeriodOpen(ctx, tenantID, ref.LegalEntityID, ref.PeriodName)
+}

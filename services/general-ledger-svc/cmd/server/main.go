@@ -24,6 +24,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
@@ -39,6 +40,7 @@ import (
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 	"zoiko.io/general-ledger-svc/internal/mtls"
 	"zoiko.io/general-ledger-svc/internal/outbox"
+	"zoiko.io/general-ledger-svc/internal/periodgate"
 	"zoiko.io/general-ledger-svc/internal/store"
 	"zoiko.io/general-ledger-svc/internal/telemetry"
 )
@@ -159,7 +161,15 @@ func main() {
 		authzClient = authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 	}
 
-	closeClient := close.NewHTTPClient(cfg.CloseServiceURL, log)
+	legacyClose := close.NewHTTPClient(cfg.CloseServiceURL, log)
+	// REF-05 shadow gate (phase 2): off => closeClient IS legacyClose (no gate
+	// client, no outbound request, no metrics); shadow => compare-only wrapper
+	// that always returns the legacy result. "enforce" never reaches here:
+	// config.Load rejects it.
+	closeClient := periodgate.Wrap(periodgate.Settings{
+		Mode: cfg.PeriodGateMode, URL: cfg.AccountingPeriodURL, Timeout: cfg.PeriodGateShadowTimeout,
+	}, legacyClose, prometheus.DefaultRegisterer, log)
+	log.Info("period gate configured", zap.String("mode", cfg.PeriodGateMode))
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()

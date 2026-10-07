@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	"zoiko.io/general-ledger-svc/internal/handler"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
@@ -561,4 +562,8 @@ func TestPostAccountingEvent_MalformedDate_Returns400(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
 	}
+}
+
+func (c *countingClose) CheckPeriodOpenAt(ctx context.Context, tenantID string, ref close.PeriodRef) error {
+	return c.CheckPeriodOpen(ctx, tenantID, ref.LegalEntityID, ref.PeriodName)
 }
