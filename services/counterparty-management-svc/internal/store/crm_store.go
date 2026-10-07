@@ -50,6 +50,9 @@ type CRMStore interface {
 // exception-escalation-svc's findingSetRLS/taskSetRLS already use.
 func (s *PgStore) crmSetRLS(ctx context.Context, tx pgx.Tx) error {
 	tenantID := middleware.GetTenantID(ctx)
+	if tenantID == "" {
+		return domain.ErrTenantMissing
+	}
 	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }
