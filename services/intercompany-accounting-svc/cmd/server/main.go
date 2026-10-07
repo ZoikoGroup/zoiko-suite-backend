@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
@@ -28,6 +29,7 @@ import (
 	"zoiko.io/intercompany-accounting-svc/internal/events"
 	"zoiko.io/intercompany-accounting-svc/internal/handler"
 	"zoiko.io/intercompany-accounting-svc/internal/health"
+	"zoiko.io/intercompany-accounting-svc/internal/entityregistry"
 	"zoiko.io/intercompany-accounting-svc/internal/ledger"
 	svcmiddleware "zoiko.io/intercompany-accounting-svc/internal/middleware"
 	"zoiko.io/intercompany-accounting-svc/internal/mtls"
@@ -138,6 +140,20 @@ func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, leg
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	tenantID := legalEntityID
+	if env, ok := svcenvelope.FromContext(ctx); ok && env.TenantID != "" {
+		tenantID = env.TenantID
+	}
+	if tenantID == "" || tenantID == "00000000-0000-0000-0000-00000000f001" {
+		tenantID = "11111111-1111-1111-1111-111111111111"
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Request-Id", uuid.New().String())
+	req.Header.Set("X-Source-Channel", "web")
+	req.Header.Set("Idempotency-Key", uuid.New().String())
 
 	resp, err := a.client.Do(req)
 	if err != nil {
@@ -264,6 +280,7 @@ func main() {
 	}
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	ledgerClient := ledger.NewClient(cfg.LedgerServiceURL, log)
+	entityRegistryClient := entityregistry.NewClient(cfg.TenantRegistryURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -283,7 +300,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, ledgerClient, log)
+	h := handler.New(pgStore, publisher, authzClient, ledgerClient, log).WithEntityRegistry(entityRegistryClient)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

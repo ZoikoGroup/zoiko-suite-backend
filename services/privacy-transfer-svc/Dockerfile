@@ -1,24 +1,17 @@
-FROM golang:1.25-alpine AS builder
-
-WORKDIR /app
-
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY . .
-
-RUN CGO_ENABLED=0 GOOS=linux go build -o /server ./cmd/server
-RUN CGO_ENABLED=0 GOOS=linux go build -o /healthcheck ./cmd/healthcheck
-
 FROM alpine:3.19
 
 RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-COPY --from=builder /server /app/server
-COPY --from=builder /healthcheck /app/healthcheck
+COPY server /app/server
+COPY healthcheck /app/healthcheck
+
+RUN chmod +x /app/server /app/healthcheck
 
 EXPOSE 8155
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/app/healthcheck"]
 
 ENTRYPOINT ["/app/server"]

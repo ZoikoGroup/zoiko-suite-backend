@@ -73,6 +73,7 @@ capability_registry:capability-registry
 ai_governance:ai-governance
 kill_switch_registry:kill-switch-registry
 retention_registry:retention-registry
+comments_collaboration:comments-collaboration
 privacy_purpose_registry:privacy-purpose-registry
 privacy_consent:privacy-consent
 privacy_decision:privacy-decision
@@ -98,6 +99,7 @@ authorization_svc:authorization
 workflow:workflow
 configuration_feature_flag:configuration-feature-flag
 secret_vault_integration:secret-vault-integration
+search_indexer:search-indexer
 obligations:obligations
 schema_registry:schema-registry
 document_vault:document-vault
@@ -119,8 +121,12 @@ decision_support:decision-support
 treasury:treasury
 financial_close:financial-close
 bank_reconciliation:bank-reconciliation
+financial_control:financial-control
 intercompany_accounting:intercompany-accounting
 consolidation_svc:consolidation
+asset_management:asset-management
+inventory_management:inventory-management
+project_accounting:project-accounting
 invoice_approval:invoice-approval
 employee_master:employee-master
 employment_contracts:employment-contracts
@@ -224,17 +230,18 @@ echo "Granting least-privilege runtime access to zoiko_app (databases with no pe
 zoiko_app_granted=0
 zoiko_app_skipped=0
 for db in \
-    access_control accounts_payable accounts_receivable ai_governance audit_event_store \
+    access_control accounts_payable accounts_receivable ai_governance asset_management audit_event_store \
+    inventory_management project_accounting \
     authorization_svc bank_reconciliation benefits board_resolutions capability_registry \
     clause_template commercial_account compensation configuration_feature_flag consolidation_svc \
     contract_lifecycle corporate_actions corporate_tax counterparty_management decision_support \
     delegated_authority document_vault employee_master employment_contracts evidence_manifest \
-    evidence_requirements expense_claim financial_close general_ledger goods_service_receipt governance_decision_log identity_context \
+    evidence_requirements expense_claim financial_close financial_control general_ledger goods_service_receipt governance_decision_log identity_context \
     intercompany_accounting invoice_approval jurisdiction_rules kill_switch_registry leave_absence \
     metric_registry notification obligation_tracking obligations offboarding_severance org_structure \
     payable_open_item payee_banking_identity payment_authorization payment_initiation_adapter payment_proposal payment_run payment_status payroll_exceptions payroll_run payroll_tax performance_review policy privacy_consent \
     privacy_decision privacy_purpose_registry privacy_rights privacy_transfer procurement_workflow \
-    purchase_order purchase_request retention_registry schema_registry secret_vault_integration \
+    purchase_order purchase_request retention_registry schema_registry search_indexer secret_vault_integration \
     source_authority spend_controls supplier_financial_profile supplier_recovery tax_determination tax_rules tenant_entity_registry treasury \
     vat_gst vendor_due_diligence workflow workflow_history workforce_compliance; do
     if [ "$(psql -tAX --username "$POSTGRES_USER" --dbname postgres \

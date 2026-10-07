@@ -29,6 +29,38 @@ type Config struct {
 	APServiceURL             string
 	ARServiceURL             string
 	VaultServiceURL          string
+	// AssetServiceURL is asset-management-svc — ACC-06's own third
+	// subledger source (ASSETS), satisfying the AST/INV/PRJ domain
+	// spec's own §9 "Assets → GL" reconciliation assertion.
+	AssetServiceURL string
+	// InventoryServiceURL is inventory-management-svc — ACC-06's own
+	// INVENTORY_QUANTITY source, satisfying the AST/INV/PRJ domain
+	// spec's own §9 "Inventory quantity" assertion.
+	InventoryServiceURL string
+	// ProjectServiceURL is project-accounting-svc — ACC-06's own
+	// PROJECT_REVENUE source, satisfying the AST/INV/PRJ domain spec's
+	// own §9 "Project revenue/WIP → GL" assertion.
+	ProjectServiceURL string
+	// FinancialControlServiceURL is financial-control-svc, whose close gate
+	// (ZS-CONTROL-001 s22 Period-End Close Certification) period close can
+	// depend on.
+	FinancialControlServiceURL string
+	// CloseGateMode is "off" (default: the gate is never consulted) or
+	// "enforce" (close fails closed unless the gate is open). Any unrecognised
+	// FINCTRL_CLOSE_GATE_MODE value is treated as "enforce" so a typo cannot
+	// silently disable a control; CloseGateModeInvalid records that it happened.
+	CloseGateMode        string
+	CloseGateModeInvalid bool
+
+	// AssetEventsTopic/InventoryEventsTopic/ProjectEventsTopic are the
+	// three Kafka topics this service's own ACC-18 lineage consumer
+	// subscribes to — asset-management-svc's, inventory-management-svc's
+	// and project-accounting-svc's own events topics, NOT this service's
+	// own (Kafka.Topic, zoiko.close.events). Satisfies the AST/INV/PRJ
+	// domain spec's own §9 "source-to-report" assertion.
+	AssetEventsTopic     string
+	InventoryEventsTopic string
+	ProjectEventsTopic   string
 
 	// CloseSigningKey is the HMAC secret the close evidence signature is
 	// computed with. There is deliberately NO default: the signature used to be
@@ -88,6 +120,8 @@ func Load() (*Config, error) {
 		return nil, ErrSigningKeyMissing{}
 	}
 
+	gateMode, gateModeInvalid := normalizeCloseGateMode(os.Getenv("FINCTRL_CLOSE_GATE_MODE"))
+
 	return &Config{
 		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8104),
@@ -114,9 +148,33 @@ func Load() (*Config, error) {
 		// 8094 is the port document-vault-svc listens on. This defaulted to
 		// 8092, which nothing in this platform serves.
 		VaultServiceURL:      env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		AssetServiceURL:      env("ASSET_SERVICE_URL", "http://asset-management-svc:8167"),
+		InventoryServiceURL:  env("INVENTORY_SERVICE_URL", "http://inventory-management-svc:8168"),
+		ProjectServiceURL:    env("PROJECT_SERVICE_URL", "http://project-accounting-svc:8169"),
+		AssetEventsTopic:     env("ASSET_EVENTS_TOPIC", "zoiko.asset.events"),
+		InventoryEventsTopic: env("INVENTORY_EVENTS_TOPIC", "zoiko.inventory.events"),
+		ProjectEventsTopic:   env("PROJECT_EVENTS_TOPIC", "zoiko.project.events"),
 		CloseSigningKey:      signingKey,
+
+		FinancialControlServiceURL: env("FINCTRL_SERVICE_URL", "http://financial-control-svc:8171"),
+		CloseGateMode:              gateMode,
+		CloseGateModeInvalid:       gateModeInvalid,
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
+}
+
+// normalizeCloseGateMode maps FINCTRL_CLOSE_GATE_MODE to "off" or "enforce".
+// Unset/empty/"off" is off; anything else is enforce (fail closed on a typo),
+// and unrecognised values are reported via the second return.
+func normalizeCloseGateMode(raw string) (mode string, invalid bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "off":
+		return "off", false
+	case "enforce":
+		return "enforce", false
+	default:
+		return "enforce", true
+	}
 }
 
 func env(key, def string) string {

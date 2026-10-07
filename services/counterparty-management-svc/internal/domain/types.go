@@ -8,6 +8,9 @@ import (
 var (
 	ErrCounterpartyNotFound      = errors.New("counterparty not found")
 	ErrInvalidCounterpartyStatus = errors.New("invalid counterparty status transition")
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
 )
 
 type CounterpartyType string

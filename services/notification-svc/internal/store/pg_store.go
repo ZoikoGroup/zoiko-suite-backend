@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 )
 
@@ -47,7 +48,11 @@ const notificationColumns = `
 	COALESCE(source_event_type, ''), COALESCE(source_reference, ''),
 	correlation_id, COALESCE(failure_reason, ''), COALESCE(provider_response, ''),
 	created_by_principal_id, created_at, sent_at, read_at,
-	delivery_attempts, next_attempt_at, last_attempt_at`
+	delivery_attempts, next_attempt_at, last_attempt_at,
+	unknown_at, resolved_at, COALESCE(resolved_by_principal_id, ''), COALESCE(resolution_note, ''),
+	COALESCE(template_id, ''), COALESCE(template_version_id, ''), COALESCE(rendered_content_hash, ''),
+	COALESCE(purpose_context, ''), COALESCE(idempotency_key, ''),
+	resend_count, COALESCE(last_resend_reason, ''), last_resent_at, COALESCE(last_resent_by_principal_id, '')`
 
 // scannable is satisfied by both pgx.Row and pgx.Rows.
 type scannable interface{ Scan(dest ...any) error }
@@ -61,6 +66,10 @@ func scanNotification(s scannable, n *domain.Notification) error {
 		&n.CorrelationID, &n.FailureReason, &n.ProviderResponse,
 		&n.CreatedByPrincipalID, &n.CreatedAt, &n.SentAt, &n.ReadAt,
 		&n.DeliveryAttempts, &n.NextAttemptAt, &n.LastAttemptAt,
+		&n.UnknownAt, &n.ResolvedAt, &n.ResolvedByPrincipalID, &n.ResolutionNote,
+		&n.TemplateID, &n.TemplateVersionID, &n.RenderedContentHash,
+		&n.PurposeContext, &n.IdempotencyKey,
+		&n.ResendCount, &n.LastResendReason, &n.LastResentAt, &n.LastResentByPrincipalID,
 	)
 }
 
@@ -96,12 +105,34 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 }
 
 // CreateNotification inserts a new notification in PENDING status, idempotent
-// on (tenant_id, correlation_id): a retry finds the existing row instead of
-// sending a second notification for the same request.
+// on its dedup key: a retry finds the existing row instead of sending a second
+// notification for the same communication.
+//
+// Two keys, by ruling (migration 000012):
+//   - n.IdempotencyKey set (a purpose-scoped send): unique on
+//     (tenant_id, idempotency_key). Two communications that share a
+//     correlation id but differ in purpose, recipient or channel stay distinct.
+//   - n.IdempotencyKey empty (no purpose named): unique on
+//     (tenant_id, correlation_id), exactly as before 000012.
+//
+// Each ON CONFLICT names its own partial unique index, so dedup is decided
+// atomically by the database. A check-then-insert would let two concurrent
+// requests both pass the check and both send.
 func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return false, domain.ErrIdentityMissing
+	}
+
+	conflict := `ON CONFLICT (tenant_id, correlation_id) WHERE idempotency_key IS NULL DO NOTHING`
+	replay := `SELECT ` + notificationColumns + ` FROM notifications
+		WHERE tenant_id = $1 AND correlation_id = $2 AND idempotency_key IS NULL`
+	replayKey := n.CorrelationID
+	if n.IdempotencyKey != "" {
+		conflict = `ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`
+		replay = `SELECT ` + notificationColumns + ` FROM notifications
+			WHERE tenant_id = $1 AND idempotency_key = $2`
+		replayKey = n.IdempotencyKey
 	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -110,13 +141,17 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 				notification_id, tenant_id, legal_entity_id, recipient_principal_id,
 				recipient_address, recipient_address_source,
 				channel, subject, body, status, source_event_type, source_reference,
-				correlation_id, created_by_principal_id, created_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-			ON CONFLICT (tenant_id, correlation_id) DO NOTHING
-		`, n.NotificationID, tenantID, n.LegalEntityID, n.RecipientPrincipalID,
+				correlation_id, created_by_principal_id, created_at,
+				template_id, template_version_id, rendered_content_hash,
+				purpose_context, idempotency_key
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+			`+conflict,
+			n.NotificationID, tenantID, n.LegalEntityID, n.RecipientPrincipalID,
 			nullIfEmpty(n.RecipientAddress), nullIfEmpty(n.RecipientAddressSource),
 			n.Channel, n.Subject, n.Body, n.Status, n.SourceEventType, n.SourceReference,
-			n.CorrelationID, n.CreatedByPrincipalID, n.CreatedAt)
+			n.CorrelationID, n.CreatedByPrincipalID, n.CreatedAt,
+			nullIfEmpty(n.TemplateID), nullIfEmpty(n.TemplateVersionID), nullIfEmpty(n.RenderedContentHash),
+			nullIfEmpty(n.PurposeContext), nullIfEmpty(n.IdempotencyKey))
 		if err != nil {
 			return err
 		}
@@ -125,14 +160,10 @@ func (s *PgStore) CreateNotification(ctx context.Context, n *domain.Notification
 			return nil
 		}
 
-		// Conflict: a notification for this (tenant_id, correlation_id)
-		// already exists — fetch it so the caller replays the original
-		// send outcome instead of sending a second, divergent one.
-		row := tx.QueryRow(ctx, `
-			SELECT `+notificationColumns+`
-			FROM notifications WHERE tenant_id = $1 AND correlation_id = $2
-		`, tenantID, n.CorrelationID)
-		return scanNotification(row, n)
+		// Conflict: this communication already exists — fetch it so the caller
+		// replays the original send outcome instead of sending a second,
+		// divergent one.
+		return scanNotification(tx.QueryRow(ctx, replay, tenantID, replayKey), n)
 	})
 	if err != nil {
 		return false, err
@@ -229,29 +260,43 @@ func (s *PgStore) ListNotifications(ctx context.Context, f domain.ListFilter) ([
 }
 
 // CompleteDelivery records the final SENT/FAILED status, the delivery
-// timestamp and whatever the provider offered as acceptance evidence,
-// mirroring spend-controls-svc's CompleteCheck pattern: creation and
-// status-transition are separate operations.
+// timestamp and whatever the provider offered as acceptance evidence, and —
+// in the same transaction — enqueues notification.sent or notification.failed
+// in event_outbox.
 //
-// The guard on status is what makes the transition one-way. Without it a
-// second delivery attempt — or a replayed request that slipped past the
-// idempotency index — could move a concluded notification back through SENT,
-// rewriting sent_at and the evidence with a later attempt's. A notification
-// concludes once.
-func (s *PgStore) CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error {
+// The guard on status is what makes the transition one-way: a second attempt,
+// or a replay that slipped past the idempotency index, cannot move a concluded
+// notification back through SENT. A notification concludes once, and because
+// the event is enqueued only when the UPDATE matched, it emits once too.
+//
+// The event is sealed here, from the row the UPDATE RETURNS, rather than by the
+// caller from what it expects the row to be — so delivery_attempts, sent_at and
+// the rest on the wire are the committed values, not a prediction of them.
+//
+// THE TRADE, STATED. Because the enqueue shares the transaction, a failure to
+// enqueue fails the conclusion, by which time the provider has already
+// accepted the message; the row stays PENDING in flight, the stranded sweep
+// eventually reclaims it, and the recipient may get a second copy. That is
+// still the right way round: the enqueue can only fail on a deploy fault
+// (event_outbox missing, or its CHECK rejecting the type), which affects every
+// send equally and should be loud. Committing the conclusion and dropping the
+// event is the failure that is silent and indistinguishable from success.
+func (s *PgStore) CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, correlationID string, meta domain.AttemptMeta) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
+		var n domain.Notification
+		err := scanNotification(tx.QueryRow(ctx, `
 			UPDATE notifications
 			SET status            = $1,
 			    failure_reason    = $2,
 			    provider_response = $3,
 			    sent_at           = $4,
 			    delivery_attempts = delivery_attempts + 1,
+			    submitting_since  = NULL,
 			    last_attempt_at   = $4,
 			    -- Cleared unconditionally. A concluded notification with a
 			    -- retry still scheduled would have the worker re-send a message
@@ -260,15 +305,137 @@ func (s *PgStore) CompleteDelivery(ctx context.Context, id, newStatus, failureRe
 			    -- combination too; this is what keeps the schema satisfied.
 			    next_attempt_at   = NULL
 			WHERE notification_id = $5 AND tenant_id = $6 AND status = 'PENDING'
-		`, newStatus, nullIfEmpty(failureReason), nullIfEmpty(providerResponse), sentAt, id, tenantID)
+			RETURNING `+notificationColumns,
+			newStatus, nullIfEmpty(failureReason), nullIfEmpty(providerResponse), sentAt, id, tenantID), &n)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No transition happened, so no event describes one.
+			return domain.ErrNotificationNotFound
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
+		outcome := domain.AttemptOutcomeFailed
+		if n.Status == domain.StatusSent {
+			outcome = domain.AttemptOutcomeAccepted
+		}
+		attemptedAt := time.Now().UTC()
+		if sentAt != nil {
+			attemptedAt = *sentAt
+		}
+		if err := recordAttempt(ctx, tx, n, outcome, providerResponse, failureReason, attemptedAt, meta); err != nil {
+			return err
+		}
+		ev, err := concludedEvent(correlationID, n, failureReason)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, tenantID, ev)
+	})
+}
+
+// concludedEvent seals the event for a notification that has just reached
+// SENT or FAILED.
+func concludedEvent(correlationID string, n domain.Notification, failureReason string) (events.Outbound, error) {
+	if n.Status == domain.StatusSent {
+		return events.Sent(correlationID, n)
+	}
+	return events.Failed(correlationID, n, failureReason)
+}
+
+// MarkOutcomeUnknown records a delivery attempt whose outcome is
+// genuinely ambiguous — see domain.DeliveryOutcome.Unknown's own doc
+// comment — and enqueues notification.outcome_unknown in the same
+// transaction. Guarded on status = 'PENDING' like CompleteDelivery: a
+// notification that concluded (or already went ambiguous) while this
+// attempt was in flight must not be overwritten. sentAt is set exactly
+// like a concluded attempt — the attempt DID happen, only its outcome is
+// unknown — and next_attempt_at is cleared so the ordinary retry worker
+// (which only ever claims status = 'PENDING' rows) never touches this
+// row again automatically; only ResolveDeliveryOutcome moves it further.
+func (s *PgStore) MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time, correlationID string, meta domain.AttemptMeta) error {
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var n domain.Notification
+		err := scanNotification(tx.QueryRow(ctx, `
+			UPDATE notifications
+			SET status            = 'PENDING_UNKNOWN',
+			    failure_reason    = $1,
+			    sent_at           = $2,
+			    unknown_at        = $2,
+			    delivery_attempts = delivery_attempts + 1,
+			    submitting_since  = NULL,
+			    last_attempt_at   = $2,
+			    next_attempt_at   = NULL
+			WHERE notification_id = $3 AND tenant_id = $4 AND status = 'PENDING'
+			RETURNING `+notificationColumns,
+			nullIfEmpty(reason), attemptedAt, id, tenantID), &n)
+		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrNotificationNotFound
 		}
-		return nil
+		if err != nil {
+			return err
+		}
+		if err := recordAttempt(ctx, tx, n, domain.AttemptOutcomeUnknown, "", reason, attemptedAt, meta); err != nil {
+			return err
+		}
+		ev, err := events.OutcomeUnknown(correlationID, n, reason)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, tenantID, ev)
 	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	return nil
+}
+
+// ResolveDeliveryOutcome settles a PENDING_UNKNOWN notification to its
+// real conclusion — the doc's own "original notification attempt must be
+// resolved." Guarded on status = 'PENDING_UNKNOWN': only a genuinely
+// ambiguous attempt has something to resolve. sent_at is left exactly as
+// it was set when the attempt was made — resolving later clarifies what
+// happened, it does not change when the attempt occurred.
+//
+// Enqueues the event the original attempt would have emitted —
+// notification.sent or notification.failed, carrying resolved_at — in the same
+// transaction. The spec names no separate "resolved" event.
+func (s *PgStore) ResolveDeliveryOutcome(ctx context.Context, p domain.ResolveDeliveryOutcomeParams, resolvedAt time.Time) error {
+	if p.TenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		var n domain.Notification
+		err := scanNotification(tx.QueryRow(ctx, `
+			UPDATE notifications
+			SET status                   = $1::text,
+			    failure_reason           = CASE WHEN $1::text = 'FAILED' THEN $2 ELSE '' END,
+			    provider_response        = COALESCE(NULLIF($3, ''), provider_response),
+			    resolved_at              = $4,
+			    resolved_by_principal_id = $5,
+			    resolution_note          = $2
+			WHERE notification_id = $6 AND tenant_id = $7 AND status = 'PENDING_UNKNOWN'
+			RETURNING `+notificationColumns,
+			p.ResolvedStatus, p.ResolutionNote, nullIfEmpty(p.ProviderResponse), resolvedAt,
+			p.ActorPrincipalID, p.NotificationID, p.TenantID), &n)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotificationNotFound
+		}
+		if err != nil {
+			return err
+		}
+		ev, err := concludedEvent(p.CorrelationID, n, p.ResolutionNote)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, p.TenantID, ev)
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	return nil
 }
 
 // ScheduleRetry records a failed attempt that is worth making again.
@@ -280,27 +447,34 @@ func (s *PgStore) CompleteDelivery(ctx context.Context, id, newStatus, failureRe
 // Guarded on status = 'PENDING' like CompleteDelivery: a notification that
 // concluded while this attempt was in flight must not be dragged back into the
 // retry queue.
-func (s *PgStore) ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error {
+func (s *PgStore) ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time, meta domain.AttemptMeta) error {
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
+		var n domain.Notification
+		err := scanNotification(tx.QueryRow(ctx, `
 			UPDATE notifications
 			SET failure_reason    = $1,
 			    delivery_attempts = delivery_attempts + 1,
+			    submitting_since  = NULL,
 			    last_attempt_at   = $2,
 			    next_attempt_at   = $3
 			WHERE notification_id = $4 AND tenant_id = $5 AND status = 'PENDING'
-		`, nullIfEmpty(failureReason), attemptedAt, nextAttemptAt, id, tenantID)
+			RETURNING `+notificationColumns,
+			nullIfEmpty(failureReason), attemptedAt, nextAttemptAt, id, tenantID), &n)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotificationNotFound
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrNotificationNotFound
-		}
-		return nil
+		// The failed attempt is recorded even though the notification has not
+		// concluded: RETRYING is what that one submission achieved, and the
+		// next attempt's record must not overwrite it.
+		meta.Retryable = true
+		return recordAttempt(ctx, tx, n, domain.AttemptOutcomeRetrying, "", failureReason, attemptedAt, meta)
 	})
 	if err != nil {
 		return mapPgError(err)
@@ -364,6 +538,146 @@ func (s *PgStore) FindDueRetries(ctx context.Context, now time.Time, limit int) 
 		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
 	return due, nil
+}
+
+// FindStrandedDeliveries lists notifications that are in flight and have been
+// for longer than any attempt could plausibly take, across every tenant.
+//
+// WHAT A STRANDED ROW IS. PENDING with next_attempt_at NULL means "in flight
+// right now" (domain.Notification says so, and ClaimRetry creates that state
+// deliberately). Nothing ever moves such a row on its own: FindDueRetries
+// requires next_attempt_at IS NOT NULL, so a notification left in flight is
+// invisible to the retry path forever — never delivered, never failed, never
+// re-attempted, and showing in the register as PENDING, which reads as
+// progress rather than as a problem.
+//
+// FOUR WAYS A ROW GETS THERE, all of them real:
+//
+//  1. The process dies between CreateNotification and the statement that
+//     concludes or reschedules the send.
+//  2. ScheduleRetry itself fails. The handler answers 503 and returns, leaving
+//     the row it just created in flight.
+//  3. CompleteDelivery fails, identically.
+//  4. The request context is cancelled mid-attempt. Both the delivery call and
+//     the store write that records its outcome run on r.Context(), and the
+//     server's WriteTimeout is 15s, so a provider that takes longer than the
+//     request lives means the outcome cannot be written.
+//
+// Measured on the dev database on 2026-09-08: five notifications from
+// 2026-09-02 in exactly this state, delivery_attempts = 0, six days old, with
+// no mechanism in the service that would ever have touched them again.
+// internal/retry's own RunOnce comment said a claimed row left "PENDING with
+// nothing scheduled ... is what the sweep below is for". There was no sweep.
+//
+// SAFETY, which is the whole reason for the staleBefore parameter. A row that
+// is genuinely being attempted right now looks identical to a stranded one —
+// the difference is only how long it has looked that way. Reviving a row
+// another replica is mid-SMTP on would send the message twice. staleBefore
+// must therefore be older than the longest attempt the service can make: the
+// SMTP provider's own timeout defaults to 10s and the HTTP server's
+// WriteTimeout is 15s, so an attempt cannot outlive ~30s, and the default
+// threshold is 15 minutes — two orders of magnitude of headroom.
+//
+// COALESCE(last_attempt_at, created_at) is the in-flight-since clock: a row
+// stranded before its first attempt has no last_attempt_at at all, which is
+// the majority of the case above and would be skipped by a predicate on
+// last_attempt_at alone.
+//
+// Same tenant posture as FindDueRetries, for the same reasons: platform-scope
+// SELECT only, transaction-local, and a projection of nothing but the id and
+// the tenant, so no subject, body or recipient address crosses the hatch.
+func (s *PgStore) FindStrandedDeliveries(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
+		return nil, fmt.Errorf("set platform scope: %w", err)
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT notification_id, tenant_id, submitting_since IS NOT NULL
+		FROM notifications
+		WHERE status = 'PENDING'
+		  AND next_attempt_at IS NULL
+		  AND COALESCE(submitting_since, last_attempt_at, created_at) <= $1
+		ORDER BY COALESCE(submitting_since, last_attempt_at, created_at)
+		LIMIT $2
+	`, staleBefore, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	var stranded []domain.DueRetry
+	for rows.Next() {
+		var d domain.DueRetry
+		if err := rows.Scan(&d.NotificationID, &d.TenantID, &d.Submitted); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		stranded = append(stranded, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+	return stranded, nil
+}
+
+// ReviveStranded puts a stranded notification back on the retry schedule,
+// returning whether this caller was the one that did it.
+//
+// It schedules rather than concludes, deliberately. The service does not know
+// whether a stranded attempt reached the provider — that is exactly the
+// information the crash destroyed — so the choice is between a notice that may
+// arrive twice and one that certainly never arrives. For a governed
+// notification the first is the right way to be wrong, and the staleness
+// threshold keeps it rare; SENT rows are never touched, so a delivery that DID
+// record its success is never re-sent.
+//
+// Tenant-scoped, like every other write in the retry path: the platform-scope
+// hatch is read-only and buys the worker the ability to FIND work, never to
+// change it.
+//
+// The staleness predicate is repeated inside the UPDATE and is the claim. A
+// row that stopped being stranded between the find and this statement — a
+// replica concluded it, or a fresh attempt updated last_attempt_at — no longer
+// matches, so this affects zero rows and says so, rather than dragging a
+// live notification back onto the schedule. Same shape as ClaimRetry, where
+// the row itself is the claim and no advisory lock is needed.
+func (s *PgStore) ReviveStranded(ctx context.Context, id, tenantID string, staleBefore, nextAttemptAt time.Time) (bool, error) {
+	if tenantID == "" {
+		return false, domain.ErrIdentityMissing
+	}
+
+	var revived bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			UPDATE notifications SET next_attempt_at = $1
+			WHERE notification_id = $2
+			  AND tenant_id = $3
+			  AND status = 'PENDING'
+			  AND next_attempt_at IS NULL
+			  -- Never a row that was handed to a provider: that one is
+			  -- MarkStrandedUnknown's (migration 000013).
+			  AND submitting_since IS NULL
+			  AND COALESCE(last_attempt_at, created_at) <= $4
+		`, nextAttemptAt, id, tenantID, staleBefore)
+		if err != nil {
+			return err
+		}
+		revived = res.RowsAffected() == 1
+		return nil
+	})
+	if err != nil {
+		return false, mapPgError(err)
+	}
+	return revived, nil
 }
 
 // SetRecipientAddress fills in an address a first attempt could not resolve,
@@ -521,9 +835,20 @@ func (s *PgStore) CountUnread(ctx context.Context, recipientPrincipalID string) 
 // The columns it guards are nullable and read back through COALESCE, so an
 // empty string and NULL are indistinguishable on the way out. They are not
 // indistinguishable to a CHECK constraint: notifications_failed_has_reason
-// tests `failure_reason IS NOT NULL AND failure_reason <> ''`, and a partial
-// index or a future NOT NULL would treat '' as a present value. Storing the
-// absence as absence keeps the column honest.
+// tests
+//
+//	failure_reason IS NOT NULL AND failure_reason <> ''
+//
+// and a partial index or a future NOT NULL would treat the empty string as a
+// present value. Storing the absence as absence keeps the column honest.
+//
+// The SQL is in an indented block rather than inline, and that is not
+// cosmetic. gofmt normalises doc comments (Go 1.19+) and rewrites a bare pair
+// of single quotes into a typographic closing quote — so written inline, this
+// comment silently became `failure_reason <> ”`, which is not valid SQL and no
+// longer describes the constraint. It is why this file failed gofmt for as long
+// as it did: the only way to make it pass was to let gofmt corrupt the one
+// sentence explaining the function. An indented block is preserved verbatim.
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil

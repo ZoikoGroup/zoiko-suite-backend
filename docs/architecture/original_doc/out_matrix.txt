@@ -1,0 +1,12 @@
+TABLE 2
+Opening balances follow the kernel | ACC-17 migration accounting still validates mappings, control accounts, period and reconciliation before ACC-04 posting.
+TABLE 4
+ACC-17 | Migration accounting batch/crosswalk/certification | Bypass of ACC-04/05
+TABLE 70
+Service ID / owner | ACC-17 — Accounting & Record-to-Report; accountable engineering/product/control owner recorded in service registry.
+TABLE 78
+ACC-17 | OpeningPostingCommitted; MigrationAccountingCertified | ACC-05/06/14, migration ops
+TABLE 79
+MigrationAccountingBatch | ACC-17 | source extract, crosswalk, mappings, opening posting, reconciliation, certificate
+TABLE 83
+7 | ACC-17 | Integrate opening-balance/migration accounting after the full posting/control chain is proven.

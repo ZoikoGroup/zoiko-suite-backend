@@ -20,15 +20,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 
-	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
+	"zoiko.io/jurisdiction-rules-svc/internal/envelope"
 )
 
 // AuthorizationClient is the contract for authorizing mutations.
@@ -39,11 +40,15 @@ import (
 // tenant or legal entity of its own, so callers pass the configured
 // platform scope (see Config.AuthZPlatformScopeID); authorization-svc
 // rejects an empty legal_entity_id outright.
+//
+// envelope carries the canonical request context (tenant, correlation, request
+// id, source channel, idempotency key) for attribution in authorization-svc's
+// decision log. May be nil for internal/legacy calls.
 type AuthorizationClient interface {
 	// Authorize returns nil if the action is permitted.
 	// Returns ErrUnauthorized if denied; ErrAuthZUnavailable if the service
 	// is unreachable or answers in a way that cannot be read as a decision.
-	Authorize(ctx context.Context, principalID, scopeID, resource, action string) error
+	Authorize(ctx context.Context, principalID, scopeID, resource, action string, envelope *envelope.Envelope) error
 }
 
 // Sentinel errors — mapped to HTTP status codes in handlers.
@@ -66,7 +71,7 @@ func NewStubAuthZClient(log *zap.Logger) *StubAuthZClient {
 	return &StubAuthZClient{log: log}
 }
 
-func (c *StubAuthZClient) Authorize(_ context.Context, principalID, _, resource, action string) error {
+func (c *StubAuthZClient) Authorize(_ context.Context, principalID, _, resource, action string, _ *envelope.Envelope) error {
 	c.log.Debug("authz stub — permitted (wire real AuthZ before production)",
 		zap.String("principal_id", principalID),
 		zap.String("resource", resource),
@@ -139,9 +144,14 @@ func NewHTTPAuthZClientWithHTTPClient(baseURL string, httpClient *http.Client, l
 // fields are required — an empty one is answered with 400, which this
 // client treats as unavailable (fail-closed), not as a denial.
 type authorizeRequest struct {
-	PrincipalID   string `json:"principal_id"`
-	LegalEntityID string `json:"legal_entity_id"`
-	ActionType    string `json:"action_type"`
+	PrincipalID     string `json:"principal_id"`
+	LegalEntityID   string `json:"legal_entity_id"`
+	ActionType      string `json:"action_type"`
+	TenantID        string `json:"tenant_id,omitempty"`
+	RequestID       string `json:"request_id,omitempty"`
+	CorrelationID   string `json:"correlation_id,omitempty"`
+	SourceChannel   string `json:"source_channel,omitempty"`
+	IdempotencyKey  string `json:"idempotency_key,omitempty"`
 }
 
 // authorizeResponse matches authorization-svc's response. Both GRANTED and
@@ -160,14 +170,14 @@ func ActionType(resource, action string) string {
 	return strings.ToUpper(resource + "_" + action)
 }
 
-func (c *HTTPAuthZClient) Authorize(ctx context.Context, principalID, scopeID, resource, action string) error {
+func (c *HTTPAuthZClient) Authorize(ctx context.Context, principalID, scopeID, resource, action string, envelope *envelope.Envelope) error {
 	key := principalID + "|" + scopeID + "|" + resource + "|" + action
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.authorizeLive(ctx, principalID, scopeID, resource, action)
+	err := c.authorizeLive(ctx, principalID, scopeID, resource, action, envelope)
 
 	if err == nil || errors.Is(err, ErrUnauthorized) {
 		c.storeCache(key, err)
@@ -215,14 +225,24 @@ func (c *HTTPAuthZClient) storeCache(key string, decision error) {
 }
 
 // authorizeLive is the real, uncached call to authorization-svc.
-func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeID, resource, action string) error {
+func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeID, resource, action string, envelope *envelope.Envelope) error {
 	actionType := ActionType(resource, action)
 
-	body, err := json.Marshal(authorizeRequest{
+	reqBody := authorizeRequest{
 		PrincipalID:   principalID,
 		LegalEntityID: scopeID,
 		ActionType:    actionType,
-	})
+	}
+
+	if envelope != nil {
+		reqBody.TenantID = envelope.TenantID
+		reqBody.RequestID = envelope.RequestID
+		reqBody.CorrelationID = envelope.CorrelationID
+		reqBody.SourceChannel = string(envelope.SourceChannel)
+		reqBody.IdempotencyKey = envelope.IdempotencyKey
+	}
+
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return fmt.Errorf("marshal authorize request: %w", err)
 	}
@@ -232,44 +252,6 @@ func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeI
 		return ErrAuthZUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
-
-	// authorization-svc validates the same canonical envelope contract this
-	// service does and answers 401 envelope_incomplete without it — which
-	// this client folded into the indistinguishable ErrAuthZUnavailable, so
-	// a missing header on every single admin write read as authorization-svc
-	// being down rather than a fixable gap in this client. Same defect,
-	// same fix as board-resolutions-svc's internal/authz.Client and
-	// internal/evidencereq.Client.
-	//
-	// The values are the CALLER's, taken from the envelope this service's own
-	// middleware already parsed into the request's context — minting fresh
-	// ones would satisfy the contract and lose the only thing it is for: a
-	// decision in access_decision_log traceable to the request that caused
-	// it.
-	req.Header.Set("X-Principal-Id", principalID)
-	req.Header.Set("X-Legal-Entity-Id", scopeID)
-
-	authzRequestID := middleware.GetReqID(ctx)
-	authzSourceChannel := "system"
-	if env, ok := svcenvelope.FromContext(ctx); ok {
-		if env.TenantID != "" {
-			req.Header.Set("X-Tenant-Id", env.TenantID)
-		}
-		if env.RequestID != "" {
-			authzRequestID = env.RequestID
-		}
-		if env.SourceChannel != "" {
-			authzSourceChannel = string(env.SourceChannel)
-		}
-		if env.CorrelationID != "" {
-			req.Header.Set("X-Correlation-ID", env.CorrelationID)
-		}
-	}
-	req.Header.Set("X-Request-Id", authzRequestID)
-	req.Header.Set("X-Source-Channel", authzSourceChannel)
-	// One decision per (request, action): an inbound request may authorize
-	// several actions, and each is its own decision to record.
-	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -323,16 +305,67 @@ var devPlaceholderURLs = map[string]bool{
 	"http://jurisdiction-svc:8082": true,
 }
 
-// NewClient constructs an AuthorizationClient based on environment and config.
-// Production-startup guard: in production or staging (ENV=production|staging)
-// a placeholder or empty baseURL is a fatal misconfiguration rather than a
-// silent fallback to StubAuthZClient.
-func NewClient(env string, baseURL string, log *zap.Logger) (AuthorizationClient, error) {
-	isProdOrStaging := strings.EqualFold(env, "production") || strings.EqualFold(env, "staging")
-	isPlaceholder := devPlaceholderURLs[strings.TrimRight(baseURL, "/")]
+// reservedHostSuffixes are the domains RFC 2606 and RFC 6761 reserve for
+// documentation and testing. Nothing deployed lives on one.
+var reservedHostSuffixes = []string{
+	".example.com", ".example.net", ".example.org",
+	".example", ".invalid", ".test",
+}
 
-	if isProdOrStaging && isPlaceholder {
-		return nil, fmt.Errorf("security violation: cannot use StubAuthZClient or placeholder AuthZServiceURL (%q) in %s environment", baseURL, env)
+// nonProductionURL reports why baseURL cannot be a deployed authorization-svc,
+// or "" if it might be one.
+//
+// It is a POSITIVE test for addresses that are provably local or reserved,
+// never a guess at what a real hostname looks like. An unrecognised host is
+// assumed real: a false positive here is a refusal to boot in production,
+// which is a worse failure than the one this guard exists to prevent.
+func nonProductionURL(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "not a parseable URL"
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "not an absolute URL with a host"
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		switch {
+		case ip.IsLoopback():
+			return "a loopback address"
+		case ip.IsUnspecified():
+			return "an unspecified address"
+		}
+		return ""
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return "a loopback address"
+	}
+	for _, suffix := range reservedHostSuffixes {
+		if host == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(host, suffix) {
+			return "a reserved documentation or test domain"
+		}
+	}
+	return ""
+}
+
+// NewClient constructs an AuthorizationClient based on environment and config.
+// Production-startup guard: in production/staging a placeholder or empty
+// baseURL is a fatal misconfiguration rather than a silent fallback to
+// StubAuthZClient. "development" and "local" may use loopback addresses
+// for a local authorization-svc; only "local" permits the stub.
+func NewClient(env string, baseURL string, log *zap.Logger) (AuthorizationClient, error) {
+	isLocal := strings.EqualFold(env, "local")
+	isDevOrLocal := isLocal || strings.EqualFold(env, "development")
+	trimmed := strings.TrimRight(baseURL, "/")
+	isPlaceholder := devPlaceholderURLs[trimmed]
+
+	if !isDevOrLocal {
+		if isPlaceholder {
+			return nil, fmt.Errorf("security violation: cannot use StubAuthZClient or placeholder AuthZServiceURL (%q) in %s environment", baseURL, env)
+		}
+		if reason := nonProductionURL(trimmed); reason != "" {
+			return nil, fmt.Errorf("security violation: AUTHZ_SERVICE_URL (%q) is %s and cannot address authorization-svc in %s environment", baseURL, reason, env)
+		}
 	}
 
 	if !isPlaceholder {
@@ -340,6 +373,7 @@ func NewClient(env string, baseURL string, log *zap.Logger) (AuthorizationClient
 		return NewHTTPAuthZClient(baseURL, log), nil
 	}
 
+	// Only local development gets the stub
 	log.Warn("using STUB authorization client — wire real AuthZ before production",
 		zap.String("authz_service_url", baseURL),
 	)

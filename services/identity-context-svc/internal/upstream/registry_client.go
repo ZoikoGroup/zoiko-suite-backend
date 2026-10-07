@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -39,6 +40,10 @@ var ErrUpstreamRead = errors.New("upstream read failed")
 // unbounded number of sockets if that ever stops being true.
 const maxConcurrentBundleLookups = 8
 
+// tenantRegistryHealthPath is the liveness path tenant-entity-registry-svc
+// actually serves. See Ping.
+const tenantRegistryHealthPath = "/healthz"
+
 // RegistryClient implements UpstreamRegistry against real Tier 0 service HTTP APIs.
 //
 // All methods are fail-closed: a network error is surfaced as an error,
@@ -65,6 +70,61 @@ func NewRegistryClient(cfg *config.Config, log *zap.Logger) *RegistryClient {
 			Timeout: 3 * time.Second, // strict timeout — hot path must not hang
 		},
 	}
+}
+
+// Name identifies this dependency in the readiness probe.
+func (c *RegistryClient) Name() string { return "tenant_registry" }
+
+// Ping reports whether the tenant registry is answering.
+//
+// This closes the "TODO: add upstream Tenant Registry liveness check" that sat
+// in the health handler. It matters more than it looks: the registry is a
+// fail-closed dependency of Dimension 2, so a registry that is down means
+// EVERY resolution returns 503 while this service's own probe reports healthy
+// and the pod stays in the load balancer. The readiness probe should say what
+// the request path already knows.
+//
+// It asks for the registry's own health endpoint rather than a tenant, because
+// a readiness probe must not need a tenant scope to answer and must not be
+// affected by whether any particular tenant exists.
+//
+// THE PATH IS /healthz, NOT /health, AND THE DIFFERENCE IS NOT COSMETIC.
+// tenant-entity-registry-svc serves /healthz and /readyz; this service serves
+// /health. Two conventions, one estate. Asking the registry for /health gets a
+// 404, which this function reports as "unreachable" — so the probe declared a
+// perfectly healthy registry down, /health here returned 503 forever, and a
+// Kubernetes pod would never have gone ready. Verified against the running
+// container, and against tenant-svc's own compose healthcheck, which uses
+// /healthz.
+//
+// The registry's path is not derivable from this service's own, so anything
+// that changes it has to change here too. tenantRegistryHealthPath exists to
+// give that one place a name, and registryHealthPathIsTheOneTheRegistryServes
+// asserts it: the tests that let this through used a stub answering every
+// path, which proved the request was made and nothing about where it went.
+func (c *RegistryClient) Ping(ctx context.Context) error {
+	url := strings.TrimRight(c.cfg.TenantRegistryURL, "/") + tenantRegistryHealthPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("build registry health request: %w", err)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("tenant registry unreachable: %w", err)
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+
+	// Any 2xx counts. A registry answering 503 from its OWN degraded probe is
+	// still reachable, and cascading its degradation into this service's
+	// readiness would take the whole identity tier out because one downstream
+	// dependency of a downstream dependency is slow.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("tenant registry health returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // tenantView is the subset of tenant-entity-registry-svc's Tenant this service

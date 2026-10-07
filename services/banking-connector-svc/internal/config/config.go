@@ -18,6 +18,10 @@ type Config struct {
 	AuthzMTLSEnabled         bool
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
+
+	// BNK-02 dependencies — see internal/clients's own package docs.
+	VaultServiceURL    string
+	TreasuryServiceURL string
 }
 
 func Load() *Config {
@@ -31,6 +35,9 @@ func Load() *Config {
 		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: getEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+
+		VaultServiceURL:    getEnv("VAULT_SERVICE_URL", "http://secret-vault-integration-svc:8087"),
+		TreasuryServiceURL: getEnv("TREASURY_SERVICE_URL", "http://treasury-svc:8103"),
 	}
 }
 

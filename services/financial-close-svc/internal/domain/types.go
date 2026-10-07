@@ -54,8 +54,11 @@ type SubledgerControlRun struct {
 type RunSubledgerControlRequest struct {
 	LegalEntityID            string `json:"legal_entity_id"`
 	FiscalPeriod             string `json:"fiscal_period"`
-	Subledger                string `json:"subledger"` // AP | AR
+	Subledger                string `json:"subledger"` // AP | AR | ASSETS
 	ControlAccountMappingKey string `json:"control_account_mapping_key"`
+	// BookID is required only when Subledger is ASSETS — see
+	// ErrBookIDRequiredForAssets.
+	BookID string `json:"book_id,omitempty"`
 }
 
 // Accrual schedule lifecycle states (ACC-07's state model, verbatim from
@@ -130,6 +133,26 @@ type RecognitionInstance struct {
 
 type RunAccrualRecognitionRequest struct {
 	FiscalPeriod string `json:"fiscal_period"`
+}
+
+// RecognitionReversal is ACC-07's own closure of its "Auto-reversal
+// duplicates" negative path — permanent evidence that one recognized
+// instance was reversed, and (via migration 000012's
+// UNIQUE(recognition_instance_id)) that it was reversed exactly once.
+// Append-only, same doctrine as RecognitionInstance itself.
+type RecognitionReversal struct {
+	RecognitionReversalID string    `json:"recognition_reversal_id"`
+	TenantID              string    `json:"tenant_id"`
+	ScheduleID            string    `json:"schedule_id"`
+	RecognitionInstanceID string    `json:"recognition_instance_id"`
+	ReversingJournalID    string    `json:"reversing_journal_id"`
+	Reason                string    `json:"reason"`
+	ReversedAt            time.Time `json:"reversed_at"`
+	ReversedByPrincipalID string    `json:"reversed_by_principal_id"`
+}
+
+type ReverseAccrualRecognitionRequest struct {
+	Reason string `json:"reason"`
 }
 
 // Prepayment schedule lifecycle states (ACC-08's state model, verbatim
@@ -281,6 +304,20 @@ type AllocationRule struct {
 
 type CreateAllocationRuleRequest struct {
 	LegalEntityID     string             `json:"legal_entity_id"`
+	Name              string             `json:"name"`
+	SourceAccountCode string             `json:"source_account_code"`
+	Drivers           []AllocationDriver `json:"drivers"`
+}
+
+// SupersedeAllocationRuleRequest is ACC-09's own SupersedeAllocationRule
+// command input — the spec's own "Commands" field names it (though it has
+// no dedicated wireframe row) alongside the state model's own "Rule:
+// Draft→Approved→Active→Superseded." Closes a real gap: without it,
+// nothing stopped two concurrently ACTIVE rules from existing for the
+// same source_account_code — the schema's own
+// idx_allocation_rules_current_version UNIQUE(rule_id) WHERE effective_to
+// IS NULL was built for exactly this and had never been exercised.
+type SupersedeAllocationRuleRequest struct {
 	Name              string             `json:"name"`
 	SourceAccountCode string             `json:"source_account_code"`
 	Drivers           []AllocationDriver `json:"drivers"`
@@ -482,6 +519,12 @@ type MigrationBatch struct {
 	Entries                []MigrationCrosswalkEntry `json:"entries,omitempty"`
 }
 
+// Crosswalk entry open-item types — see migration 000013's doc comment.
+const (
+	MigrationCrosswalkTypeAROpenItem = "AR_OPEN_ITEM"
+	MigrationCrosswalkTypeAPOpenItem = "AP_OPEN_ITEM"
+)
+
 // MigrationCrosswalkEntry is one source-to-target line — permanent
 // evidence (migration 000009), never mutated.
 type MigrationCrosswalkEntry struct {
@@ -492,6 +535,15 @@ type MigrationCrosswalkEntry struct {
 	TargetAccountCode string  `json:"target_account_code"`
 	DebitAmount       float64 `json:"debit_amount"`
 	CreditAmount      float64 `json:"credit_amount"`
+
+	// SourceReferenceType/PartyID are ACC-17's own closure of "Open AR
+	// included both in history and opening state" (see migration 000013's
+	// doc comment) — set only when this entry represents a real open AR
+	// or AP item being migrated, so ValidateOpeningBalances knows to check
+	// it against the subledger's own live history. Nil for an ordinary GL
+	// balance line, which has no such history to double-book against.
+	SourceReferenceType *string `json:"source_reference_type,omitempty"`
+	PartyID             *string `json:"party_id,omitempty"`
 }
 
 type CreateMigrationBatchRequest struct {
@@ -624,12 +676,67 @@ type PostedJournalRef struct {
 // LineageCompletenessReport is ACC-18's own VerifyLineageCompleteness
 // result — Gaps lists every posted journal with NO recorded lineage
 // edge, the spec's own negative path, "Missing journal-source link,"
-// surfaced explicitly rather than silently ignored.
+// surfaced explicitly rather than silently ignored. QuarantinedCount
+// counts gaps deliberately excluded from Gaps via QuarantineBrokenLineage
+// — visible here so a quarantine can never quietly make a batch look
+// more complete than it really is.
 type LineageCompletenessReport struct {
-	LegalEntityID string             `json:"legal_entity_id"`
-	CheckedCount  int                `json:"checked_count"`
-	Gaps          []PostedJournalRef `json:"gaps"`
-	Complete      bool               `json:"complete"`
+	LegalEntityID    string             `json:"legal_entity_id"`
+	CheckedCount     int                `json:"checked_count"`
+	Gaps             []PostedJournalRef `json:"gaps"`
+	QuarantinedCount int                `json:"quarantined_count"`
+	Complete         bool               `json:"complete"`
+}
+
+// TracePathVerification is ACC-18's own permanent evidence that a
+// specific trace path was checked and what the result was — the spec's
+// own "verification results" ownership, made real (migration 000014).
+type TracePathVerification struct {
+	VerificationID        string    `json:"verification_id"`
+	TenantID              string    `json:"tenant_id"`
+	LegalEntityID         string    `json:"legal_entity_id"`
+	FromType              string    `json:"from_type"`
+	FromID                string    `json:"from_id"`
+	ToType                string    `json:"to_type"`
+	ToID                  string    `json:"to_id"`
+	Verified              bool      `json:"verified"`
+	VerifiedAt            time.Time `json:"verified_at"`
+	VerifiedByPrincipalID string    `json:"verified_by_principal_id"`
+}
+
+type VerifyTracePathRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	FromType      string `json:"from_type"`
+	FromID        string `json:"from_id"`
+	ToType        string `json:"to_type"`
+	ToID          string `json:"to_id"`
+}
+
+// QuarantinedLineageGap is ACC-18's own permanent record that a specific
+// gap was deliberately accepted as known rather than fixed — the ONLY
+// mechanism that stops a gap from reappearing in
+// LineageCompletenessReport.Gaps, so a quarantine is always evidenced and
+// reasoned (migration 000014).
+type QuarantinedLineageGap struct {
+	QuarantineID             string    `json:"quarantine_id"`
+	TenantID                 string    `json:"tenant_id"`
+	LegalEntityID            string    `json:"legal_entity_id"`
+	FromType                 string    `json:"from_type"`
+	FromID                   string    `json:"from_id"`
+	ToType                   string    `json:"to_type"`
+	ToID                     string    `json:"to_id"`
+	Reason                   string    `json:"reason"`
+	QuarantinedAt            time.Time `json:"quarantined_at"`
+	QuarantinedByPrincipalID string    `json:"quarantined_by_principal_id"`
+}
+
+type QuarantineBrokenLineageRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	FromType      string `json:"from_type"`
+	FromID        string `json:"from_id"`
+	ToType        string `json:"to_type"`
+	ToID          string `json:"to_id"`
+	Reason        string `json:"reason"`
 }
 
 type CloseEvidence struct {
@@ -662,22 +769,46 @@ type ReadinessCheckResponse struct {
 	BlockingIssues []string `json:"blocking_issues"`
 }
 
+// CloseGateItem is one mandatory control's state in financial-control-svc's
+// close gate.
+type CloseGateItem struct {
+	ControlCode string `json:"control_code"`
+	Status      string `json:"status"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+// CloseGateResponse mirrors financial-control-svc's
+// GET /controls/v1/close-gate wire shape. Configured is false when the entity
+// has no mandatory controls at all (an open gate then proves nothing).
+type CloseGateResponse struct {
+	Open          bool            `json:"open"`
+	Configured    bool            `json:"configured"`
+	BlockingCount int             `json:"blocking_count"`
+	Items         []CloseGateItem `json:"items"`
+}
+
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
 
 var (
-	ErrFiscalPeriodNotFound    = errorString("fiscal period not found")
-	ErrPeriodAlreadyLocked     = errorString("fiscal period is already locked")
-	ErrStoreUnavailable        = errorString("financial close store unavailable")
-	ErrAuthorizationDenied     = errorString("authorization denied for financial close action")
-	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
-	ErrIdentityMissing         = errorString("caller identity missing")
-	ErrReadinessChecksFailed   = errorString("period close blocked: unresolved balance sheet or ledger discrepancies")
-	ErrGLServiceUnavailable    = errorString("general-ledger-svc unavailable")
-	ErrAPServiceUnavailable    = errorString("accounts-payable-svc unavailable")
-	ErrARServiceUnavailable    = errorString("accounts-receivable-svc unavailable")
-	ErrVaultServiceUnavailable = errorString("document-vault-svc unavailable")
+	ErrFiscalPeriodNotFound        = errorString("fiscal period not found")
+	ErrPeriodAlreadyLocked         = errorString("fiscal period is already locked")
+	ErrStoreUnavailable            = errorString("financial close store unavailable")
+	ErrAuthorizationDenied         = errorString("authorization denied for financial close action")
+	ErrAuthzServiceUnavailable     = errorString("authorization-svc unavailable")
+	ErrIdentityMissing             = errorString("caller identity missing")
+	ErrReadinessChecksFailed       = errorString("period close blocked: unresolved balance sheet or ledger discrepancies")
+	ErrGLServiceUnavailable        = errorString("general-ledger-svc unavailable")
+	ErrAPServiceUnavailable        = errorString("accounts-payable-svc unavailable")
+	ErrARServiceUnavailable        = errorString("accounts-receivable-svc unavailable")
+	ErrVaultServiceUnavailable     = errorString("document-vault-svc unavailable")
+	ErrAssetServiceUnavailable     = errorString("asset-management-svc unavailable")
+	ErrInventoryServiceUnavailable = errorString("inventory-management-svc unavailable")
+	ErrProjectServiceUnavailable   = errorString("project-accounting-svc unavailable")
+	// ErrFinancialControlUnavailable: financial-control-svc could not answer the
+	// close-gate question. Under enforce mode the close fails closed on it.
+	ErrFinancialControlUnavailable = errorString("financial-control-svc unavailable")
 
 	// ErrLedgerPageTruncated is returned when the ledger answered with a full
 	// page, so there may be journals this service never saw. A trial balance
@@ -712,7 +843,26 @@ var (
 	// than logged and swallowed, same posture as ErrEvidenceNotRecorded.
 	ErrReopenEventNotRecorded = errorString("period reopened but the reopen event could not be recorded")
 
-	ErrInvalidSubledger = errorString("subledger must be AP or AR")
+	// ErrInvalidSubledger — extended beyond AP/AR to ASSETS,
+	// DEPRECIATION_COMPLETENESS, INVENTORY_QUANTITY, INVENTORY_VALUE,
+	// PROJECT_REVENUE and STOCK_COUNT, satisfying the AST/INV/PRJ domain
+	// spec's own §9 "Subledger Reconciliation & Control Framework,"
+	// which names this same run/exception mechanism as the vehicle for
+	// its "Assets → GL," "Depreciation completeness," "Inventory
+	// quantity," "Inventory value → GL," "Project revenue/WIP → GL" and
+	// "Stock count" assertions. No new reconciliation engine was built
+	// for that spec — this existing ACC-06 run gained new sources.
+	ErrInvalidSubledger = errorString("subledger must be AP, AR, ASSETS, DEPRECIATION_COMPLETENESS, INVENTORY_QUANTITY, INVENTORY_VALUE, PROJECT_REVENUE or STOCK_COUNT")
+
+	// ErrBookIDRequiredForAssets is ASSETS-subledger's own extra required
+	// field — a fixed asset can carry more than one depreciation book
+	// (e.g. tax vs GAAP), and net book value is only meaningful against
+	// one caller-declared book at a time. No "primary GL book" concept
+	// exists anywhere in asset-management-svc's own schema, the same
+	// "deliberate bootstrap gap, safety-favoring direction" posture used
+	// throughout the AST/INV/PRJ build — the caller must say which book.
+	ErrBookIDRequiredForAssets = errorString("book_id is required when subledger is ASSETS")
+
 	// ErrControlAccountMappingNotFound is returned when
 	// control_account_mapping_key names no current mapping — ACC-06 must
 	// never guess which GL account a subledger reconciles against.
@@ -763,6 +913,10 @@ var (
 
 	ErrJournalPostingFailed = errorString("general-ledger-svc rejected the accrual recognition journal")
 
+	ErrRecognitionInstanceNotFound = errorString("no recognition instance found for this schedule and fiscal_period")
+
+	ErrReversalReasonRequired = errorString("reason is required to reverse an accrual recognition")
+
 	ErrPrepaymentNotFound          = errorString("prepayment schedule not found")
 	ErrInvalidPrepaymentTransition = errorString("prepayment schedule is not in a status that allows this action")
 	ErrInvalidPrepaymentAmount     = errorString("total_amount must be positive and period_count must be at least 1")
@@ -803,6 +957,13 @@ var (
 
 	ErrInvalidAllocationRuleTransition = errorString("allocation rule is not in a status that allows this action")
 	ErrInvalidAllocationRunTransition  = errorString("allocation run is not in a status that allows this action")
+
+	// ErrNoCurrentRuleToSupersede is SupersedeAllocationRule's own guard —
+	// only a rule's currently-effective version, in APPROVED or ACTIVE
+	// status, can be superseded. A DRAFT current version has nothing live
+	// to replace (amend it directly instead); an already-SUPERSEDED rule_id
+	// has no current version at all.
+	ErrNoCurrentRuleToSupersede = errorString("allocation rule has no current APPROVED or ACTIVE version to supersede")
 
 	// ErrSourceBalanceNotFound is returned when general-ledger-svc's own
 	// trial balance has no line for the rule's source_account_code — ACC-09
@@ -865,6 +1026,19 @@ var (
 	ErrMigrationTargetAccountInvalid = errorString("crosswalk entry target_account_code is not a real, active account")
 
 	ErrMigrationPeriodLocked = errorString("cannot post opening balances into a LOCKED fiscal period")
+
+	// ErrOpenItemAlreadyExistsInHistory is the spec's own negative path,
+	// "Open AR included both in history and opening state" — a crosswalk
+	// entry flagged AR_OPEN_ITEM/AP_OPEN_ITEM whose invoice_number already
+	// exists in accounts-receivable-svc's/accounts-payable-svc's own real
+	// history would double-book that receivable/payable: once via its
+	// real, live invoice and again via this migration's opening balance.
+	ErrOpenItemAlreadyExistsInHistory = errorString("crosswalk entry's open item already exists in the subledger's own history")
+
+	ErrPartyIDRequiredForOpenItem = errorString("party_id is required when source_reference_type is set")
+
+	ErrLineageQuarantineReasonRequired = errorString("reason is required to quarantine a lineage gap")
+	ErrLineageAsOfRequired             = errorString("as_of is required and must be RFC3339")
 
 	ErrReconciliationMismatch = errorString("posted journal balances do not match the batch's own crosswalk totals")
 )

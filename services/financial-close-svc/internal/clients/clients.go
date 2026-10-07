@@ -1,19 +1,19 @@
 package clients
 
 import (
-	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
 
 	"go.uber.org/zap"
 	"zoiko.io/financial-close-svc/internal/domain"
@@ -44,13 +44,20 @@ type cachedDecision struct {
 }
 
 type Clients struct {
-	authzURL  string
-	ledgerURL string
-	apURL     string
-	arURL     string
-	vaultURL  string
-	http      *http.Client
-	log       *zap.Logger
+	authzURL     string
+	ledgerURL    string
+	apURL        string
+	arURL        string
+	vaultURL     string
+	assetURL     string
+	inventoryURL string
+	projectURL   string
+	http         *http.Client
+	log          *zap.Logger
+
+	// financialControlURL is financial-control-svc, set via
+	// WithFinancialControlURL so the New constructors keep their signatures.
+	financialControlURL string
 
 	// authzHTTP, when set, is used instead of http for calls to
 	// authorization-svc only — the mTLS pilot's Transport carries this
@@ -64,34 +71,40 @@ type Clients struct {
 	cacheWrites int
 }
 
-func New(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger) *Clients {
+func New(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL, projectURL string, log *zap.Logger) *Clients {
 	return &Clients{
-		authzURL:  authzURL,
-		ledgerURL: ledgerURL,
-		apURL:     apURL,
-		arURL:     arURL,
-		vaultURL:  vaultURL,
-		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
-		log:       log,
-		cache:     make(map[string]cachedDecision),
+		authzURL:     authzURL,
+		ledgerURL:    ledgerURL,
+		apURL:        apURL,
+		arURL:        arURL,
+		vaultURL:     vaultURL,
+		assetURL:     assetURL,
+		inventoryURL: inventoryURL,
+		projectURL:   projectURL,
+		http:         &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
+		log:          log,
+		cache:        make(map[string]cachedDecision),
 	}
 }
 
 // NewWithAuthzHTTPClient is New but with a caller-supplied *http.Client used
 // solely for calls to authorization-svc — used for the mTLS pilot. Every
-// other outbound client (GL/AP/AR/vault) built here is unaffected and keeps
-// using the plain, non-mTLS http.Client.
-func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
+// other outbound client (GL/AP/AR/vault/asset/inventory/project) built here
+// is unaffected and keeps using the plain, non-mTLS http.Client.
+func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL, projectURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
 	return &Clients{
-		authzURL:  authzURL,
-		ledgerURL: ledgerURL,
-		apURL:     apURL,
-		arURL:     arURL,
-		vaultURL:  vaultURL,
-		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
-		authzHTTP: authzHTTPClient,
-		log:       log,
-		cache:     make(map[string]cachedDecision),
+		authzURL:     authzURL,
+		ledgerURL:    ledgerURL,
+		apURL:        apURL,
+		arURL:        arURL,
+		vaultURL:     vaultURL,
+		assetURL:     assetURL,
+		inventoryURL: inventoryURL,
+		projectURL:   projectURL,
+		http:         &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
+		authzHTTP:    authzHTTPClient,
+		log:          log,
+		cache:        make(map[string]cachedDecision),
 	}
 }
 
@@ -494,6 +507,52 @@ func (c *Clients) PostAccrualRecognitionJournal(ctx context.Context, tenantID, l
 	return journal.JournalID, nil
 }
 
+// glReverseJournalResponse mirrors general-ledger-svc's own
+// domain.JournalWithLines — only the field this client needs.
+type glReverseJournalResponse struct {
+	JournalID string `json:"journal_id"`
+}
+
+// ReverseGLJournal is ACC-07's own closure of "Auto-reversal duplicates" —
+// it calls general-ledger-svc's real ReverseJournal (the same primitive
+// ACC-04/ACC-05/ACC-12 all use), which is itself idempotent on
+// correlation_id: a retried reversal for the same journal returns the
+// SAME reversing journal rather than a second one. correlationID here is
+// the caller's own idempotency anchor, distinct from the recognition's
+// own correlation_id (schedule_id+fiscal_period) — reversing a posting is
+// a different idempotent operation from creating it.
+func (c *Clients) ReverseGLJournal(ctx context.Context, tenantID, principalID, journalID, reason, correlationID string) (reversingJournalID string, err error) {
+	payload, err := json.Marshal(map[string]string{"reason": reason, "correlation_id": correlationID})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/journals/"+journalID+"/reverse", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", domain.ErrJournalPostingFailed
+	}
+	var out glReverseJournalResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if out.JournalID == "" {
+		return "", domain.ErrGLServiceUnavailable
+	}
+	return out.JournalID, nil
+}
+
 func (c *Clients) createGLJournal(ctx context.Context, tenantID, principalID string, body glCreateJournalRequest) (*glJournalCreateResponse, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -783,8 +842,51 @@ type apInvoice struct {
 	Status    string `json:"status"`
 	// DueDate is the only business date accounts-payable-svc carries — there is
 	// no invoice_date column — so it is what places an invoice in a period.
-	DueDate time.Time `json:"due_date"`
-	Amount  float64   `json:"amount"`
+	DueDate       time.Time `json:"due_date"`
+	Amount        float64   `json:"amount"`
+	InvoiceNumber string    `json:"invoice_number"`
+	VendorID      string    `json:"vendor_id"`
+}
+
+// CheckAPInvoiceExists is CheckARInvoiceExists' own mirror for accounts-
+// payable-svc — ACC-17's "Open AR included both in history and opening
+// state" negative path applies identically to AP per the spec's own
+// Dependencies field ("AR/AP/Bank/Tax source domains").
+func (c *Clients) CheckAPInvoiceExists(ctx context.Context, tenantID, legalEntityID, vendorID, invoiceNumber string) (bool, error) {
+	u, err := url.Parse(c.apURL + "/v1/invoices")
+	if err != nil {
+		return false, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("vendor_id", vendorID)
+	q.Set("limit", strconv.Itoa(subledgerPageLimit))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, domain.ErrAPServiceUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, domain.ErrAPServiceUnavailable
+	}
+	var list []apInvoice
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return false, err
+	}
+	for _, inv := range list {
+		if inv.InvoiceNumber == invoiceNumber {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // subledgerPageLimit is the largest page AP/AR will serve one request
@@ -940,10 +1042,54 @@ func day(t time.Time) time.Time {
 // ---------------------------------------------------------------------------
 
 type arInvoice struct {
-	InvoiceID string    `json:"invoice_id"`
-	Status    string    `json:"status"`
-	DueDate   time.Time `json:"due_date"`
-	Amount    float64   `json:"amount"`
+	InvoiceID     string    `json:"invoice_id"`
+	Status        string    `json:"status"`
+	DueDate       time.Time `json:"due_date"`
+	Amount        float64   `json:"amount"`
+	InvoiceNumber string    `json:"invoice_number"`
+	CustomerID    string    `json:"customer_id"`
+}
+
+// CheckARInvoiceExists is ACC-17's own closure of "Open AR included both
+// in history and opening state" — it asks accounts-receivable-svc's real
+// register whether this customer already has a real, live invoice under
+// this invoice_number, rather than trusting the migration operator's own
+// crosswalk to be free of items that already exist elsewhere.
+func (c *Clients) CheckARInvoiceExists(ctx context.Context, tenantID, legalEntityID, customerID, invoiceNumber string) (bool, error) {
+	u, err := url.Parse(c.arURL + "/v1/invoices")
+	if err != nil {
+		return false, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("customer_id", customerID)
+	q.Set("limit", strconv.Itoa(subledgerPageLimit))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, domain.ErrARServiceUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, domain.ErrARServiceUnavailable
+	}
+	var list []arInvoice
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return false, err
+	}
+	for _, inv := range list {
+		if inv.InvoiceNumber == invoiceNumber {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // GetARSubledgerTotal sums the OUTSTANDING (not yet PAID) balance of every
@@ -995,6 +1141,328 @@ func (c *Clients) GetARSubledgerTotal(ctx context.Context, tenantID, legalEntity
 		}
 	}
 	return total, nil
+}
+
+// assetNetBookValueResponse mirrors asset-management-svc's own
+// GET /v1/assets/net-book-value wire shape — only the field this client
+// needs.
+type assetNetBookValueResponse struct {
+	NetBookValueTotal float64 `json:"net_book_value_total"`
+}
+
+// GetAssetNetBookValueTotal asks asset-management-svc for the real, live
+// sum of cost_basis minus latest accumulated depreciation across every
+// ACTIVE depreciation schedule for one legal entity and one caller-
+// declared book — the ASSETS half of ACC-06, extended to satisfy the
+// AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
+// assertion. Not period-bounded, same posture as GetAPSubledgerTotal/
+// GetARSubledgerTotal: a control account balance is a point-in-time
+// total, not scoped to a fiscal period's own transactions.
+func (c *Clients) GetAssetNetBookValueTotal(ctx context.Context, tenantID, legalEntityID, bookID string) (float64, error) {
+	u, err := url.Parse(c.assetURL + "/v1/assets/net-book-value")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("book_id", bookID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch net book value from asset-management-svc", zap.Error(err))
+		return 0, domain.ErrAssetServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrAssetServiceUnavailable
+	}
+
+	var out assetNetBookValueResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.NetBookValueTotal, nil
+}
+
+// assetDepreciationCompletenessResponse mirrors asset-management-svc's
+// own GET /v1/depreciation-schedules/completeness wire shape.
+type assetDepreciationCompletenessResponse struct {
+	CoveredCount  int `json:"covered_count"`
+	EligibleCount int `json:"eligible_count"`
+}
+
+// GetAssetDepreciationCompleteness is ACC-06's DEPRECIATION_COMPLETENESS
+// source — a coverage check, not a balance, satisfying the AST/INV/PRJ
+// domain spec's own §9 "Depreciation completeness" assertion.
+func (c *Clients) GetAssetDepreciationCompleteness(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (covered, eligible int, err error) {
+	u, err := url.Parse(c.assetURL + "/v1/depreciation-schedules/completeness")
+	if err != nil {
+		return 0, 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("fiscal_period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch depreciation completeness from asset-management-svc", zap.Error(err))
+		return 0, 0, domain.ErrAssetServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, domain.ErrAssetServiceUnavailable
+	}
+
+	var out assetDepreciationCompletenessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, 0, err
+	}
+	return out.CoveredCount, out.EligibleCount, nil
+}
+
+// inventoryNegativeOnHandResponse mirrors inventory-management-svc's own
+// GET /v1/on-hand/negative-count wire shape.
+type inventoryNegativeOnHandResponse struct {
+	NegativeOnHandCount int `json:"negative_on_hand_count"`
+}
+
+// GetInventoryNegativeOnHandCount is ACC-06's INVENTORY_QUANTITY
+// source — satisfies the AST/INV/PRJ domain spec's own §9 "Inventory
+// quantity" assertion. Like DEPRECIATION_COMPLETENESS, this is an
+// integrity check with no GL side, not a balance comparison.
+func (c *Clients) GetInventoryNegativeOnHandCount(ctx context.Context, tenantID, legalEntityID string) (int, error) {
+	u, err := url.Parse(c.inventoryURL + "/v1/on-hand/negative-count")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch negative on-hand count from inventory-management-svc", zap.Error(err))
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+
+	var out inventoryNegativeOnHandResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.NegativeOnHandCount, nil
+}
+
+// WithFinancialControlURL sets the financial-control-svc base URL used by
+// GetCloseGate and returns c for chaining.
+func (c *Clients) WithFinancialControlURL(u string) *Clients {
+	c.financialControlURL = u
+	return c
+}
+
+// GetCloseGate asks financial-control-svc whether the mandatory controls for
+// the entity/period are certified (ZS-CONTROL-001 s22). Any transport error,
+// non-200 status or undecodable body is ErrFinancialControlUnavailable: "could
+// not ask" must never be read as "gate open". The principal is forwarded as
+// X-Principal-Id, same as CompileTrialBalance; like the other non-authz
+// service-to-service calls it uses the plain http client (mTLS is pilot-only
+// for authorization-svc).
+func (c *Clients) GetCloseGate(ctx context.Context, tenantID, principalID, legalEntityID, periodID string) (*domain.CloseGateResponse, error) {
+	u, err := url.Parse(c.financialControlURL + "/controls/v1/close-gate")
+	if err != nil {
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("period_id", periodID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch close gate from financial-control-svc", zap.Error(err))
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.log.Error("financial-control-svc close gate returned non-200", zap.Int("status", resp.StatusCode))
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+
+	var out domain.CloseGateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		c.log.Error("failed to decode close gate from financial-control-svc", zap.Error(err))
+		return nil, domain.ErrFinancialControlUnavailable
+	}
+	return &out, nil
+}
+
+// inventoryUnapprovedVarianceResponse mirrors inventory-management-svc's
+// own GET /v1/stock-counts/unapproved-variance-count wire shape.
+type inventoryUnapprovedVarianceResponse struct {
+	UnapprovedVarianceCount int `json:"unapproved_variance_count"`
+}
+
+// GetInventoryUnapprovedVarianceCount is ACC-06's STOCK_COUNT source —
+// an integrity check with no GL side, satisfying the AST/INV/PRJ domain
+// spec's own §9 "Stock count" assertion the same way
+// GetInventoryNegativeOnHandCount satisfies "Inventory quantity."
+func (c *Clients) GetInventoryUnapprovedVarianceCount(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (int, error) {
+	u, err := url.Parse(c.inventoryURL + "/v1/stock-counts/unapproved-variance-count")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("fiscal_period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch unapproved variance count from inventory-management-svc", zap.Error(err))
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+
+	var out inventoryUnapprovedVarianceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.UnapprovedVarianceCount, nil
+}
+
+// inventoryValueTotalResponse mirrors inventory-management-svc's own
+// GET /v1/valuation/inventory-value-total wire shape.
+type inventoryValueTotalResponse struct {
+	InventoryValueTotal float64 `json:"inventory_value_total"`
+}
+
+// GetInventoryValueTotal is ACC-06's INVENTORY_VALUE source — a REAL GL
+// balance comparison (unlike INVENTORY_QUANTITY/DEPRECIATION_COMPLETENESS),
+// satisfying the AST/INV/PRJ domain spec's own §9 "Inventory value → GL"
+// assertion the same way GetAssetNetBookValueTotal satisfies "Assets →
+// GL": a live sum of open cost-layer value, reconciled against a
+// caller-resolved GL control account.
+func (c *Clients) GetInventoryValueTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error) {
+	u, err := url.Parse(c.inventoryURL + "/v1/valuation/inventory-value-total")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch inventory value total from inventory-management-svc", zap.Error(err))
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+
+	var out inventoryValueTotalResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.InventoryValueTotal, nil
+}
+
+// projectPostedRevenueResponse mirrors project-accounting-svc's own
+// GET /v1/recognition/posted-revenue wire shape.
+type projectPostedRevenueResponse struct {
+	PostedRevenueTotal float64 `json:"posted_revenue_total"`
+}
+
+// GetProjectPostedRevenueTotal is ACC-06's PROJECT_REVENUE source — a
+// REAL GL balance comparison, satisfying the AST/INV/PRJ domain spec's
+// own §9 "Project revenue/WIP → GL" assertion the same way
+// GetAssetNetBookValueTotal/GetInventoryValueTotal satisfy their own
+// GL-comparison assertions: a live sum of only-actually-posted revenue,
+// reconciled against a caller-resolved GL revenue control account.
+func (c *Clients) GetProjectPostedRevenueTotal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (float64, error) {
+	u, err := url.Parse(c.projectURL + "/v1/recognition/posted-revenue")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("fiscal_period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch posted revenue total from project-accounting-svc", zap.Error(err))
+		return 0, domain.ErrProjectServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrProjectServiceUnavailable
+	}
+
+	var out projectPostedRevenueResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.PostedRevenueTotal, nil
 }
 
 // GetUnsettledARInvoicesCount counts receivables belonging to THIS period that
@@ -1092,6 +1560,49 @@ func (c *Clients) UploadCloseEvidence(ctx context.Context, tenantID, legalEntity
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Principal-Id", principalID) // the creator recorded on the document
 	req.Header.Set("X-Tenant-Id", tenantID)       // tenant scope, as every other call here sends
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	// document-vault-svc validates the same canonical envelope contract this
+	// service does and answers 400 envelope_incomplete without it — and because
+	// every non-2xx below maps to ErrVaultServiceUnavailable, a missing header
+	// surfaced as a 503 blaming the vault for a fault in this client, so the
+	// close died at its final step with nothing wrong downstream. Same defect
+	// and same fix as the authorization-svc call above.
+	//
+	// The values are the CALLER's, taken from the envelope the middleware
+	// already parsed into this request's context. Minting fresh ones would
+	// satisfy the contract and lose the only thing it is for: close evidence
+	// traceable to the close that produced it.
+	vaultRequestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when the envelope carries one.
+	vaultSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.RequestID != "" {
+			vaultRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			vaultSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	if req.Header.Get("X-Correlation-ID") == "" {
+		req.Header.Set("X-Correlation-ID", vaultRequestID)
+	}
+	req.Header.Set("X-Request-Id", vaultRequestID)
+	req.Header.Set("X-Source-Channel", vaultSourceChannel)
+	// The trial balance is governed financial content, so the vault requires a
+	// stated reason for access before it will hold it.
+	req.Header.Set("X-Purpose-Context", "financial_close_evidence")
+	// One evidence document per (close attempt, period): a retry of the SAME
+	// close must not file a second trial balance, while a genuinely new attempt
+	// carries a new request id and is a distinct document.
+	req.Header.Set("Idempotency-Key", vaultRequestID+":close-evidence:"+periodName)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -1101,6 +1612,9 @@ func (c *Clients) UploadCloseEvidence(ctx context.Context, tenantID, legalEntity
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		// The status is logged because the two failure modes need different
+		// responses and the error type alone cannot tell them apart: a 4xx is a
+		// fault in this request, a 5xx is the vault genuinely being down.
 		c.log.Error("document-vault-svc returned non-200/201 status", zap.Int("status", resp.StatusCode))
 		return "", domain.ErrVaultServiceUnavailable
 	}

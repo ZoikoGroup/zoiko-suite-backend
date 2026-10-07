@@ -40,53 +40,38 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	dbPort := uint32(16101 + uint32(os.Getpid()%499))
+	ctx := context.Background()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
 
-	// V16, not PostgresVersion("16.1.0").
-	//
-	// This was the only hardcoded patch version in the estate; the other ten
-	// embedded-postgres suites all use the V16 constant, which in
-	// embedded-postgres v1.34.0 resolves to 16.9.0. A hardcoded patch is a
-	// standing bet that that exact build stays published for every platform the
-	// suite runs on -- and the binaries come from a remote Maven repository, so
-	// losing the bet is a CI failure with no code change on our side. That is
-	// the same class of breakage recorded against PR #105 and described in
-	// workflow-history-svc's main_integration_test.go.
-	//
-	// It survived this long because 16.1.0 does still publish a windows-amd64
-	// artifact, so the suite passes on a developer machine and fails only on
-	// the linux-amd64 runner. Tracking the constant means the version moves
-	// with the library, which is the only thing that can promise the artifact
-	// exists.
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database("financial_close_isolation_test").
-			Username("postgres").
-			Password("postgres").
-			// Isolate the extracted runtime. Left at the default, every suite in
-			// the estate shares ~/.embedded-postgres-go/extracted, and the
-			// library's own extraction error tells you to set this. See the same
-			// change in workflow-history-svc for the failure it produces.
-			RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-financial-close-%d", dbPort))),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
+	if dsn == "" {
+		dbPort := uint32(16101 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				Version(embeddedpostgres.V16).
+				Port(dbPort).
+				Database("financial_close_isolation_test").
+				Username("postgres").
+				Password("postgres").
+				RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-financial-close-%d", dbPort))),
+		)
+		if err := pg.Start(); err != nil {
+			fmt.Printf("failed to start embedded postgres: %v\n", err)
+			os.Exit(1)
+		}
+		dsn = fmt.Sprintf(
+			"host=localhost port=%d dbname=financial_close_isolation_test user=postgres password=postgres sslmode=disable",
+			dbPort,
+		)
 	}
 
-	dsn := fmt.Sprintf(
-		"host=localhost port=%d dbname=financial_close_isolation_test user=postgres password=postgres sslmode=disable",
-		dbPort,
-	)
-
-	ctx := context.Background()
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect to postgres: %v\n", err)
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -99,34 +84,39 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
-	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE.
-	//
-	// This applied 000001 alone, so the force_rls and
-	// policy_empty_tenant_is_null migrations that came later were never present
-	// -- a suite whose whole purpose is tenant isolation ran against a schema
-	// where the isolation had not been applied, and would pass with the policies
-	// absent altogether. A named file only stays correct while somebody
-	// remembers to edit it, and nobody did.
-	//
-	// filepath.Glob returns lexically sorted names and the 000001_/000002_
-	// prefixes make lexical order the migration order.
+	_, _ = testPool.Exec(ctx, `DROP TABLE IF EXISTS
+		close_evidences, fiscal_periods, period_reopen_events,
+		subledger_control_runs,
+		accrual_recognition_reversals, accrual_recognition_instances, accrual_schedules,
+		prepayment_recognition_instances, prepayment_schedules,
+		allocation_run_result_lines, allocation_runs, allocation_rule_drivers, allocation_rules,
+		fx_revaluation_items, fx_revaluation_runs,
+		migration_crosswalk_entries, migration_batches,
+		financial_snapshots,
+		lineage_edges, lineage_projection_status, lineage_trace_verifications, lineage_quarantined_gaps
+		CASCADE;`)
+
 	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
 	if err != nil {
 		fmt.Printf("failed to glob migrations: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 	if len(migrations) == 0 {
-		// Fatal, not a quiet skip: no migrations means no schema, and every
-		// assertion below would then fail for a reason unrelated to isolation.
 		fmt.Println("no *.up.sql found -- the suite would run against an empty schema")
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 	sort.Strings(migrations)
@@ -136,13 +126,17 @@ func TestMain(m *testing.M) {
 		if readErr != nil {
 			fmt.Printf("failed to read migration %s: %v\n", filepath.Base(migration), readErr)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
 			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(migration), err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 	}
@@ -152,7 +146,9 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	testPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 

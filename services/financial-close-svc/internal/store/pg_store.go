@@ -579,6 +579,111 @@ func (s *PgStore) CreateRecognitionInstance(ctx context.Context, inst *domain.Re
 	return created, nil
 }
 
+// GetRecognitionInstanceByPeriod is ReverseAccrualRecognition's own lookup
+// — it must reverse a specific, already-recognized period, not "whichever
+// instance happens to be latest."
+func (s *PgStore) GetRecognitionInstanceByPeriod(ctx context.Context, scheduleID, fiscalPeriod string) (*domain.RecognitionInstance, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var inst *domain.RecognitionInstance
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+recognitionInstanceColumns+` FROM accrual_recognition_instances WHERE schedule_id = $1 AND fiscal_period = $2`, scheduleID, fiscalPeriod)
+		var err error
+		inst, err = scanRecognitionInstance(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrRecognitionInstanceNotFound
+		}
+		return mapPgError(err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return inst, nil
+}
+
+const recognitionReversalColumns = `
+	recognition_reversal_id, tenant_id, schedule_id, recognition_instance_id,
+	reversing_journal_id, reason, reversed_at, reversed_by_principal_id`
+
+func scanRecognitionReversal(row pgx.Row) (*domain.RecognitionReversal, error) {
+	var rev domain.RecognitionReversal
+	if err := row.Scan(
+		&rev.RecognitionReversalID, &rev.TenantID, &rev.ScheduleID, &rev.RecognitionInstanceID,
+		&rev.ReversingJournalID, &rev.Reason, &rev.ReversedAt, &rev.ReversedByPrincipalID,
+	); err != nil {
+		return nil, err
+	}
+	return &rev, nil
+}
+
+// GetRecognitionReversalByInstance answers "has this recognition already
+// been reversed" — checked BEFORE calling general-ledger-svc, so a
+// replayed reverse request never even attempts a second GL reversal call.
+func (s *PgStore) GetRecognitionReversalByInstance(ctx context.Context, recognitionInstanceID string) (*domain.RecognitionReversal, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var rev *domain.RecognitionReversal
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+recognitionReversalColumns+` FROM accrual_recognition_reversals WHERE recognition_instance_id = $1`, recognitionInstanceID)
+		var err error
+		rev, err = scanRecognitionReversal(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // not found is not an error here — caller checks rev == nil
+		}
+		return mapPgError(err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rev, nil
+}
+
+// CreateRecognitionReversal inserts a permanent reversal record. Idempotent
+// on the UNIQUE(recognition_instance_id) constraint (migration 000012): a
+// replayed reverse call — including a race between two concurrent callers
+// — returns created=false and the EXISTING reversal rather than a second
+// row, closing the spec's own "Auto-reversal duplicates" negative path at
+// the database level, not just via the handler's own pre-check.
+func (s *PgStore) CreateRecognitionReversal(ctx context.Context, rev *domain.RecognitionReversal) (created bool, err error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return false, domain.ErrIdentityMissing
+	}
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, txErr := tx.Exec(ctx, `
+			INSERT INTO accrual_recognition_reversals (
+				recognition_reversal_id, tenant_id, schedule_id, recognition_instance_id,
+				reversing_journal_id, reason, reversed_at, reversed_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (recognition_instance_id) DO NOTHING
+		`, rev.RecognitionReversalID, tenantID, rev.ScheduleID, rev.RecognitionInstanceID,
+			rev.ReversingJournalID, rev.Reason, rev.ReversedAt, rev.ReversedByPrincipalID)
+		if txErr != nil {
+			return mapPgError(txErr)
+		}
+		if tag.RowsAffected() == 0 {
+			created = false
+			row := tx.QueryRow(ctx, `SELECT `+recognitionReversalColumns+` FROM accrual_recognition_reversals WHERE recognition_instance_id = $1`, rev.RecognitionInstanceID)
+			existing, scanErr := scanRecognitionReversal(row)
+			if scanErr != nil {
+				return scanErr
+			}
+			*rev = *existing
+			return nil
+		}
+		created = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return created, nil
+}
+
 func (s *PgStore) ListRecognitionInstances(ctx context.Context, scheduleID string) ([]domain.RecognitionInstance, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -1049,6 +1154,60 @@ func (s *PgStore) ActivateAllocationRule(ctx context.Context, ruleVersionID stri
 	})
 }
 
+// SupersedeAllocationRule is ACC-09's own SupersedeAllocationRule command
+// — one transaction that end-dates the rule_id's current APPROVED/ACTIVE
+// version (status -> SUPERSEDED, effective_to -> now) and inserts the
+// replacement as a new DRAFT version one higher, under the SAME rule_id.
+//
+// The guarded UPDATE's own WHERE clause (status IN ('APPROVED','ACTIVE')
+// AND effective_to IS NULL) is the first line of defense against
+// superseding a rule with nothing current to replace; the migration's own
+// idx_allocation_rules_current_version UNIQUE(rule_id) WHERE effective_to
+// IS NULL is the second, database-enforced one — even a race between two
+// concurrent supersede attempts cannot leave two current versions.
+func (s *PgStore) SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var currentVersion int
+		err := tx.QueryRow(ctx, `
+			UPDATE allocation_rules SET status = $1, effective_to = $2
+			WHERE rule_id = $3 AND effective_to IS NULL AND status IN ($4, $5)
+			RETURNING version
+		`, domain.AllocationRuleStatusSuperseded, supersededAt, ruleID,
+			domain.AllocationRuleStatusApproved, domain.AllocationRuleStatusActive,
+		).Scan(&currentVersion)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNoCurrentRuleToSupersede
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+
+		newVersion.Version = currentVersion + 1
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO allocation_rules (
+				rule_version_id, rule_id, version, tenant_id, legal_entity_id, name,
+				source_account_code, status, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`, newVersion.RuleVersionID, ruleID, newVersion.Version, tenantID, newVersion.LegalEntityID, newVersion.Name,
+			newVersion.SourceAccountCode, domain.AllocationRuleStatusDraft, newVersion.CreatedAt, newVersion.CreatedByPrincipalID); err != nil {
+			return mapPgError(err)
+		}
+		for _, d := range newVersion.Drivers {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO allocation_rule_drivers (rule_version_id, recipient_account_code, weight_percentage)
+				VALUES ($1, $2, $3)
+			`, newVersion.RuleVersionID, d.RecipientAccountCode, d.WeightPercentage); err != nil {
+				return mapPgError(err)
+			}
+		}
+		return nil
+	})
+}
+
 const allocationRunColumns = `
 	run_id, tenant_id, legal_entity_id, rule_id, rule_version_id, fiscal_period,
 	source_account_code, source_amount, status, journal_id, failure_reason,
@@ -1437,10 +1596,10 @@ func (s *PgStore) CreateMigrationBatch(ctx context.Context, b *domain.MigrationB
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO migration_crosswalk_entries (
 					entry_id, tenant_id, batch_id, source_reference_id, source_account_code,
-					target_account_code, debit_amount, credit_amount
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+					target_account_code, debit_amount, credit_amount, source_reference_type, party_id
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			`, e.EntryID, tenantID, b.BatchID, e.SourceReferenceID, e.SourceAccountCode,
-				e.TargetAccountCode, e.DebitAmount, e.CreditAmount); err != nil {
+				e.TargetAccountCode, e.DebitAmount, e.CreditAmount, e.SourceReferenceType, e.PartyID); err != nil {
 				return mapPgError(err)
 			}
 		}
@@ -1492,7 +1651,8 @@ func (s *PgStore) GetMigrationBatch(ctx context.Context, batchID string) (*domai
 			return mapPgError(err)
 		}
 		rows, err := tx.Query(ctx, `
-			SELECT entry_id, batch_id, source_reference_id, source_account_code, target_account_code, debit_amount, credit_amount
+			SELECT entry_id, batch_id, source_reference_id, source_account_code, target_account_code,
+			       debit_amount, credit_amount, source_reference_type, party_id
 			FROM migration_crosswalk_entries WHERE batch_id = $1 ORDER BY source_reference_id
 		`, batchID)
 		if err != nil {
@@ -1501,7 +1661,8 @@ func (s *PgStore) GetMigrationBatch(ctx context.Context, batchID string) (*domai
 		defer rows.Close()
 		for rows.Next() {
 			var e domain.MigrationCrosswalkEntry
-			if err := rows.Scan(&e.EntryID, &e.BatchID, &e.SourceReferenceID, &e.SourceAccountCode, &e.TargetAccountCode, &e.DebitAmount, &e.CreditAmount); err != nil {
+			if err := rows.Scan(&e.EntryID, &e.BatchID, &e.SourceReferenceID, &e.SourceAccountCode, &e.TargetAccountCode,
+				&e.DebitAmount, &e.CreditAmount, &e.SourceReferenceType, &e.PartyID); err != nil {
 				return err
 			}
 			b.Entries = append(b.Entries, e)
@@ -1796,6 +1957,117 @@ func (s *PgStore) ListLineageEdgesTo(ctx context.Context, toType, toID string) (
 				return err
 			}
 			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListLineageEdgesToAsOf is GetLineageAsOf's own read — the same
+// authoritative source as ListLineageEdgesTo, restricted to edges
+// recorded at or before asOf. lineage_edges is append-only, so
+// "recorded_at <= asOf" is a real, stable point-in-time view: an edge
+// recorded later can never retroactively appear in an earlier snapshot.
+func (s *PgStore) ListLineageEdgesToAsOf(ctx context.Context, toType, toID string, asOf time.Time) ([]domain.LineageEdge, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.LineageEdge
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT edge_id, tenant_id, legal_entity_id, from_type, from_id, to_type, to_id, recorded_at
+			FROM lineage_edges WHERE tenant_id = $1 AND to_type = $2 AND to_id = $3 AND recorded_at <= $4 ORDER BY recorded_at
+		`, tenantID, toType, toID, asOf)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e domain.LineageEdge
+			if err := rows.Scan(&e.EdgeID, &e.TenantID, &e.LegalEntityID, &e.FromType, &e.FromID, &e.ToType, &e.ToID, &e.RecordedAt); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CreateTracePathVerification inserts a permanent record of one
+// VerifyTracePath check — see migration 000014's doc comment.
+func (s *PgStore) CreateTracePathVerification(ctx context.Context, v *domain.TracePathVerification) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO lineage_trace_verifications (
+				verification_id, tenant_id, legal_entity_id, from_type, from_id, to_type, to_id,
+				verified, verified_at, verified_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`, v.VerificationID, tenantID, v.LegalEntityID, v.FromType, v.FromID, v.ToType, v.ToID,
+			v.Verified, v.VerifiedAt, v.VerifiedByPrincipalID)
+		return mapPgError(err)
+	})
+}
+
+// CreateQuarantinedLineageGap inserts a permanent record of one
+// QuarantineBrokenLineage decision. Idempotent on the migration's own
+// UNIQUE(tenant_id, from_type, from_id, to_type, to_id) constraint — a
+// repeated quarantine of the same gap is a no-op, not a duplicate.
+func (s *PgStore) CreateQuarantinedLineageGap(ctx context.Context, g *domain.QuarantinedLineageGap) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO lineage_quarantined_gaps (
+				quarantine_id, tenant_id, legal_entity_id, from_type, from_id, to_type, to_id,
+				reason, quarantined_at, quarantined_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (tenant_id, from_type, from_id, to_type, to_id) DO NOTHING
+		`, g.QuarantineID, tenantID, g.LegalEntityID, g.FromType, g.FromID, g.ToType, g.ToID,
+			g.Reason, g.QuarantinedAt, g.QuarantinedByPrincipalID)
+		return mapPgError(err)
+	})
+}
+
+// ListQuarantinedLineageGaps is buildCompletenessReport's own filter
+// source — a gap named here is excluded from LineageCompletenessReport's
+// Gaps (but counted in QuarantinedCount), never silently dropped.
+func (s *PgStore) ListQuarantinedLineageGaps(ctx context.Context, legalEntityID string) ([]domain.QuarantinedLineageGap, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.QuarantinedLineageGap
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT quarantine_id, tenant_id, legal_entity_id, from_type, from_id, to_type, to_id,
+			       reason, quarantined_at, quarantined_by_principal_id
+			FROM lineage_quarantined_gaps WHERE tenant_id = $1 AND legal_entity_id = $2
+		`, tenantID, legalEntityID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var g domain.QuarantinedLineageGap
+			if err := rows.Scan(&g.QuarantineID, &g.TenantID, &g.LegalEntityID, &g.FromType, &g.FromID, &g.ToType, &g.ToID,
+				&g.Reason, &g.QuarantinedAt, &g.QuarantinedByPrincipalID); err != nil {
+				return err
+			}
+			out = append(out, g)
 		}
 		return rows.Err()
 	})

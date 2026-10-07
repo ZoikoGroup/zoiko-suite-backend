@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,6 +32,9 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	tenantID := middleware.GetTenantID(ctx)
+	if tenantID == "" {
+		return domain.ErrTenantMissing
+	}
 	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }
@@ -71,6 +75,9 @@ func (s *PgStore) CreateVATReturn(ctx context.Context, r *domain.VATReturn) erro
 		r.NetTaxPayable, r.Currency, string(r.Status), r.EffectiveFrom, r.EffectiveTo, r.CreatedBy, r.CreatedAt, r.UpdatedAt,
 	)
 	if err != nil {
+		if strings.Contains(err.Error(), "23505") || strings.Contains(err.Error(), "uk_vat_returns_period") {
+			return domain.ErrVATReturnConflict
+		}
 		return fmt.Errorf("insert vat return: %w", err)
 	}
 
@@ -93,7 +100,7 @@ func (s *PgStore) GetVATReturn(ctx context.Context, id string) (*domain.VATRetur
 	err = tx.QueryRow(ctx, `
 		SELECT return_id, tenant_id, legal_entity_id, jurisdiction_id, tax_registration_number,
 		       tax_period, total_sales_amount, total_purchase_amount, output_tax_amount, input_tax_amount,
-		       net_tax_payable, currency, status, filed_at, filed_by, effective_from, effective_to,
+		       net_tax_payable, currency, status, filed_at, filed_by, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM vat_returns WHERE return_id = $1 AND tenant_id = $2`, id, tenantID,
 	).Scan(
@@ -127,7 +134,7 @@ func (s *PgStore) ListVATReturns(ctx context.Context, legalEntityID, jurisdictio
 	rows, err := tx.Query(ctx, `
 		SELECT return_id, tenant_id, legal_entity_id, jurisdiction_id, tax_registration_number,
 		       tax_period, total_sales_amount, total_purchase_amount, output_tax_amount, input_tax_amount,
-		       net_tax_payable, currency, status, filed_at, filed_by, effective_from, effective_to,
+		       net_tax_payable, currency, status, filed_at, filed_by, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM vat_returns
 		WHERE tenant_id = $4

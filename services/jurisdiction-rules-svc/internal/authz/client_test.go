@@ -26,7 +26,7 @@ func TestNewClient_LocalEnvironment_UsesStub(t *testing.T) {
 	if client == nil {
 		t.Fatal("expected client, got nil")
 	}
-	if err := client.Authorize(context.Background(), "principal-1", "scope-1", "res", "act"); err != nil {
+	if err := client.Authorize(context.Background(), "principal-1", "scope-1", "res", "act", nil); err != nil {
 		t.Errorf("expected stub to permit, got %v", err)
 	}
 }
@@ -80,7 +80,7 @@ func TestHTTPClient_Granted(t *testing.T) {
 	defer srv.Close()
 
 	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
-	if err := c.Authorize(context.Background(), "principal-1", "scope-1", "jurisdiction_rule", "transition"); err != nil {
+	if err := c.Authorize(context.Background(), "principal-1", "scope-1", "jurisdiction_rule", "transition", nil); err != nil {
 		t.Fatalf("expected permit, got %v", err)
 	}
 
@@ -143,7 +143,7 @@ func TestHTTPClient_Denied(t *testing.T) {
 	defer srv.Close()
 
 	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
-	err := c.Authorize(context.Background(), "principal-1", "scope-1", "jurisdiction", "create")
+	err := c.Authorize(context.Background(), "principal-1", "scope-1", "jurisdiction", "create", nil)
 	if !errors.Is(err, authz.ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized for a DENIED decision, got %v", err)
 	}
@@ -190,7 +190,7 @@ func TestHTTPClient_FailsClosed(t *testing.T) {
 			defer srv.Close()
 
 			c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
-			err := c.Authorize(context.Background(), "principal-1", "scope-1", "jurisdiction", "create")
+			err := c.Authorize(context.Background(), "principal-1", "scope-1", "jurisdiction", "create", nil)
 			if err == nil {
 				t.Fatal("FAIL: authorization was permitted without a positive decision")
 			}
@@ -207,7 +207,7 @@ func TestHTTPClient_UnreachableFailsClosed(t *testing.T) {
 	srv.Close() // nothing is listening now
 
 	c := authz.NewHTTPAuthZClient(url, zap.NewNop())
-	err := c.Authorize(context.Background(), "principal-1", "scope-1", "jurisdiction", "create")
+	err := c.Authorize(context.Background(), "principal-1", "scope-1", "jurisdiction", "create", nil)
 	if !errors.Is(err, authz.ErrAuthZUnavailable) {
 		t.Fatalf("expected ErrAuthZUnavailable for an unreachable service, got %v", err)
 	}

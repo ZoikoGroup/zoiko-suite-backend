@@ -27,11 +27,11 @@
 //   - PreferenceAssertion is deliberately a separate table with no
 //     relationship to ConsentReceipt at the schema level (PRV-I12:
 //     preferences never automatically become consent or lawful basis).
-//   - PRV-03 (the runtime purpose-binding decision endpoint most other
-//     services would actually call before processing personal data) is
-//     NOT built. This service lets a caller ask "what did this subject
-//     say about this purpose" — it does not yet provide the single
-//     "am I allowed right now" decision PRV-03 would centralize.
+//   - PRV-03 (privacy-decision-svc) provides runtime purpose-binding
+//     decisions that callers evaluate before processing personal data.
+//     This service (PRV-02) provides the authoritative evidence store
+//     and derived status resolution ("what did this subject assert about
+//     this purpose") which PRV-03 queries at runtime.
 package domain
 
 import "time"
@@ -103,6 +103,9 @@ type PresentationReceipt struct {
 	Channel               string    `json:"channel"`
 	Locale                string    `json:"locale"`
 	CreatedAt             time.Time `json:"created_at"`
+	SessionRef            *string   `json:"session_ref,omitempty"`
+	TemplateVersion       *string   `json:"template_version,omitempty"`
+	DeliveryEvidence      *string   `json:"delivery_evidence,omitempty"`
 }
 
 // ── Consent ──────────────────────────────────────────────────────────────────
@@ -129,20 +132,44 @@ const (
 	ConsentStatusWithdrawn    ConsentStatus = "WITHDRAWN"
 )
 
+// ConsentRequest is the documented object (§10.1) representing the request
+// context presented to the subject: exact purpose, scope, data/recipient/technology
+// context, required/optional status, notice version, policy package. Distinct
+// from the receipt itself.
+type ConsentRequest struct {
+	PurposeID         string `json:"purpose_id"`
+	Scope             string `json:"scope,omitempty"`
+	DataContext       string `json:"data_context,omitempty"`
+	RecipientContext  string `json:"recipient_context,omitempty"`
+	TechnologyContext string `json:"technology_context,omitempty"`
+	RequiredStatus    string `json:"required_status,omitempty"` // REQUIRED | OPTIONAL
+	NoticeVersionID   string `json:"notice_version_id,omitempty"`
+	PolicyPackage     string `json:"policy_package,omitempty"`
+}
+
 // ConsentReceipt is append-only evidence of one grant/deny event —
 // PRV-I07: purpose/scope specific, never a universal boolean. Never
 // updated or deleted once written (migration 000002's trigger).
+// Includes Proxy / Authorized Representative evidence (§11.1) and
+// Affirmative-action evidence (§10.1).
 type ConsentReceipt struct {
-	ConsentReceiptID string        `json:"consent_receipt_id"`
-	TenantID         *string       `json:"tenant_id,omitempty"`
-	SubjectRef       string        `json:"subject_ref"`
-	PurposeID        string        `json:"purpose_id"`
-	NoticeVersionID  *string       `json:"notice_version_id,omitempty"`
-	Action           ConsentAction `json:"action"`
-	CaptureChannel   string        `json:"capture_channel"`
-	ActorPrincipalID string        `json:"actor_principal_id"`
-	CorrelationID    string        `json:"correlation_id,omitempty"`
-	CreatedAt        time.Time     `json:"created_at"`
+	ConsentReceiptID             string          `json:"consent_receipt_id"`
+	TenantID                     *string         `json:"tenant_id,omitempty"`
+	SubjectRef                   string          `json:"subject_ref"`
+	PurposeID                    string          `json:"purpose_id"`
+	NoticeVersionID              *string         `json:"notice_version_id,omitempty"`
+	Action                       ConsentAction   `json:"action"`
+	CaptureChannel               string          `json:"capture_channel"`
+	ActorPrincipalID             string          `json:"actor_principal_id"`
+	CorrelationID                string          `json:"correlation_id,omitempty"`
+	CreatedAt                    time.Time       `json:"created_at"`
+	IsProxy                      bool            `json:"is_proxy"`
+	RepresentativeSubjectRef     *string         `json:"representative_subject_ref,omitempty"`
+	RepresentativeAuthorityRef   *string         `json:"representative_authority_ref,omitempty"`
+	RepresentativeEvidence       *string         `json:"representative_evidence,omitempty"`
+	AffirmativeActionType        string          `json:"affirmative_action_type"`
+	AffirmativeEvidence          *string         `json:"affirmative_evidence,omitempty"`
+	ConsentRequest               *ConsentRequest `json:"consent_request,omitempty"`
 }
 
 // WithdrawalReceipt is append-only evidence that a specific ConsentReceipt
@@ -219,18 +246,28 @@ type CreateNoticeVersionRequest struct {
 }
 
 type RecordPresentationRequest struct {
-	SubjectRef string `json:"subject_ref"`
-	Channel    string `json:"channel"`
-	Locale     string `json:"locale"`
+	SubjectRef       string `json:"subject_ref"`
+	Channel          string `json:"channel"`
+	Locale           string `json:"locale"`
+	SessionRef       string `json:"session_ref,omitempty"`
+	TemplateVersion  string `json:"template_version,omitempty"`
+	DeliveryEvidence string `json:"delivery_evidence,omitempty"`
 }
 
 type RecordConsentRequest struct {
-	TenantID        string `json:"tenant_id,omitempty"`
-	SubjectRef      string `json:"subject_ref"`
-	PurposeID       string `json:"purpose_id"`
-	NoticeVersionID string `json:"notice_version_id,omitempty"`
-	Action          string `json:"action"`
-	CaptureChannel  string `json:"capture_channel"`
+	TenantID                   string          `json:"tenant_id,omitempty"`
+	SubjectRef                 string          `json:"subject_ref"`
+	PurposeID                  string          `json:"purpose_id"`
+	NoticeVersionID            string          `json:"notice_version_id,omitempty"`
+	Action                     string          `json:"action"`
+	CaptureChannel             string          `json:"capture_channel"`
+	IsProxy                    bool            `json:"is_proxy,omitempty"`
+	RepresentativeSubjectRef   string          `json:"representative_subject_ref,omitempty"`
+	RepresentativeAuthorityRef string          `json:"representative_authority_ref,omitempty"`
+	RepresentativeEvidence     string          `json:"representative_evidence,omitempty"`
+	AffirmativeActionType      string          `json:"affirmative_action_type,omitempty"`
+	AffirmativeEvidence        string          `json:"affirmative_evidence,omitempty"`
+	ConsentRequest             *ConsentRequest `json:"consent_request,omitempty"`
 }
 
 type WithdrawConsentRequest struct {
@@ -245,6 +282,18 @@ type SetPreferenceRequest struct {
 	Source           string `json:"source"`
 }
 
+// ── Idempotency (§18.1) ──────────────────────────────────────────────────────
+
+type IdempotencyRecord struct {
+	Key          string
+	TenantID     string
+	Endpoint     string
+	RequestHash  string
+	ResponseCode int
+	ResponseBody []byte
+	CreatedAt    time.Time
+}
+
 // ── sentinel errors ──────────────────────────────────────────────────────────
 
 type errorString string
@@ -252,11 +301,16 @@ type errorString string
 func (e errorString) Error() string { return string(e) }
 
 var (
-	ErrNoticeNotFound          = errorString("notice not found")
-	ErrNoticeVersionNotFound   = errorString("notice version not found")
-	ErrInvalidNoticeTransition = errorString("invalid notice version status transition")
-	ErrConsentReceiptNotFound  = errorString("consent receipt not found")
-	ErrAlreadyWithdrawn        = errorString("consent receipt is already withdrawn")
-	ErrPurposeNotRegistered    = errorString("purpose is not a registered, published purpose")
-	ErrStoreUnavailable        = errorString("privacy-consent store unavailable")
+	ErrNoticeNotFound                    = errorString("notice not found")
+	ErrNoticeVersionNotFound             = errorString("notice version not found")
+	ErrInvalidNoticeTransition           = errorString("invalid notice version status transition")
+	ErrConsentReceiptNotFound            = errorString("consent receipt not found")
+	ErrAlreadyWithdrawn                  = errorString("consent receipt is already withdrawn")
+	ErrPurposeNotRegistered              = errorString("purpose is not a registered, published purpose")
+	ErrStoreUnavailable                  = errorString("privacy-consent store unavailable")
+	ErrIdempotencyConflict               = errorString("idempotency key reused with different request payload")
+	ErrRepresentativeAuthorityRequired   = errorString("proxy consent requires representative_subject_ref and representative_authority_ref")
+	ErrNoticeSelfApprovalForbidden       = errorString("creator of notice version cannot approve it")
+	ErrNoticeSelfPublishForbidden        = errorString("creator of notice version cannot publish it")
+	ErrNoticeApproverCannotPublish       = errorString("approver of notice version cannot also publish it")
 )

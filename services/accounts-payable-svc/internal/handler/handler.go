@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -25,6 +26,7 @@ type Store interface {
 	GetInvoice(ctx context.Context, invoiceID string) (*domain.VendorInvoice, error)
 	ListInvoices(ctx context.Context, filter domain.ListInvoicesFilter) ([]domain.VendorInvoice, error)
 	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string) error
+	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -48,7 +50,17 @@ const (
 	actionValidateInvoice = "AP_INVOICE_VALIDATE"
 	actionApproveInvoice  = "AP_INVOICE_APPROVE"
 	actionRequestPayment  = "AP_PAYMENT_REQUEST"
+
+	// actionReadControlPopulation gates ZS-CONTROL-001 §9 population reads, checked
+	// against the requested legal entity.
+	actionReadControlPopulation = "AP_CONTROL_POPULATION_READ"
 )
+
+// maxListLimit caps how many rows a single register read may return, matching
+// accounts-receivable-svc's register practice. The console asks for a bounded
+// page (400); anything larger is refused with a 400 rather than honoured with
+// a full-table scan.
+const maxListLimit = 500
 
 // PurchaseOrderVerifier validates AP-05's PO reference against
 // purchase-order-svc. An interface rather than the concrete client so tests can
@@ -110,6 +122,7 @@ func linesFromRequest(in []domain.CreateVendorInvoiceLineInput) []domain.VendorI
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Get("/v1/control-populations/{population}", h.ControlPopulation)
 	r.Route("/v1/invoices", func(r chi.Router) {
 		r.Post("/", h.CreateInvoice)
 		r.Get("/", h.ListInvoices)
@@ -254,7 +267,6 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishVendorInvoiceReceived(r.Context(), *inv)
 	writeJSON(w, http.StatusCreated, inv)
 }
 
@@ -311,11 +323,39 @@ func (h *Handler) ListInvoices(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
 		return
 	}
+	// limit/offset bound the register read the same way accounts-receivable-svc's
+	// list does: the console always asks for a page, the service caps the page at
+	// 500, and a runaway request refuses rather than dies or silently ignores the
+	// bound the caller asked for.
+	limit := 0
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "invalid_field", "limit must be a positive integer")
+			return
+		}
+		if n > maxListLimit {
+			writeError(w, http.StatusBadRequest, "invalid_field", fmt.Sprintf("limit may not exceed %d", maxListLimit))
+			return
+		}
+		limit = n
+	}
+	offset := 0
+	if raw := q.Get("offset"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_field", "offset must be a non-negative integer")
+			return
+		}
+		offset = n
+	}
 	filter := domain.ListInvoicesFilter{
 		TenantID:      tenantID,
 		LegalEntityID: legalEntityID,
 		VendorID:      q.Get("vendor_id"),
 		Status:        q.Get("status"),
+		Limit:         limit,
+		Offset:        offset,
 	}
 	invoices, err := h.store.ListInvoices(r.Context(), filter)
 	if err != nil {
@@ -395,7 +435,6 @@ func (h *Handler) ValidateInvoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	h.publisher.PublishVendorInvoiceValidated(r.Context(), *inv)
 	writeJSON(w, http.StatusOK, inv)
 }
 
@@ -457,12 +496,28 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	h.publisher.PublishVendorInvoiceApproved(r.Context(), *inv)
-
-	if payable, err := h.payables.CreatePayableFromApprovedSource(r.Context(), inv.TenantID, principalID, payableopenitem.CreatePayableRequest{
+	// vendor.invoice.approved is written to the outbox inside TransitionInvoice
+	// (ZS-STATE-001), so it is not published here as well.
+	//
+	// AP-08's /ap08/payables is a governed write: correlation_id, request_id and
+	// source_channel are mandatory envelope headers on the outbound call, and an
+	// idempotency key makes a replay of this approval safe at AP-08's boundary the
+	// same way it is safe at ours. The inbound headers this request carried are
+	// forwarded; if no idempotency key came in, the invoice itself is a stable one
+	// (AP-08 also dedups on the invoice as source_reference, so a resend cannot
+	// double-post).
+	createReq := payableopenitem.CreatePayableRequest{
 		LegalEntityID: inv.LegalEntityID, SourceType: payableopenitem.SourceSupplierInvoice, SourceReference: inv.InvoiceID,
 		PayeeRef: inv.VendorID, OriginalAmount: inv.Amount, Currency: inv.CurrencyCode, DueDate: inv.DueDate,
-	}); err != nil {
+	}
+	envelope := payableopenitem.Envelope{
+		CorrelationID:  r.Header.Get("X-Correlation-ID"),
+		RequestID:      r.Header.Get("X-Request-Id"),
+		SourceChannel:  r.Header.Get("X-Source-Channel"),
+		IdempotencyKey: firstNonEmpty(r.Header.Get("Idempotency-Key"), "ap-payable-"+inv.InvoiceID),
+	}
+
+	if payable, err := h.payables.CreatePayableFromApprovedSource(r.Context(), inv.TenantID, principalID, envelope, createReq); err != nil {
 		h.log.Warn("ApproveInvoice: AP-08 payable creation failed — approval stands", zap.String("invoice_id", inv.InvoiceID), zap.Error(err))
 	} else {
 		h.log.Info("ApproveInvoice: AP-08 payable created", zap.String("invoice_id", inv.InvoiceID), zap.String("payable_id", payable.PayableID))
@@ -537,7 +592,6 @@ func (h *Handler) RequestPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
-	h.publisher.PublishPaymentRequested(r.Context(), *inv)
 	writeJSON(w, http.StatusOK, inv)
 }
 
@@ -679,6 +733,17 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 func isUUID(s string) bool {
 	_, err := uuid.Parse(s)
 	return err == nil
+}
+
+// firstNonEmpty returns the first non-empty argument — used to prefer an
+// inbound governed header over a locally derived fallback.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // requirePrincipal reads the caller's identity from X-Principal-Id — set by

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"zoiko.io/workflow-svc/internal/handler"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
@@ -43,6 +45,153 @@ type stubStore struct {
 	cancelInstance     *domain.WorkflowInstance
 	cancelTransitioned bool
 	cancelErr          error
+
+	invalidateInstance     *domain.WorkflowInstance
+	invalidateTransitioned bool
+	invalidateErr          error
+
+	verifyReleaseResult *domain.ReleaseVerificationResult
+	verifyReleaseErr    error
+
+	auditEngagement        *domain.AuditEngagement
+	auditCreateCreated     bool
+	auditCreateErr         error
+	auditGetErr            error
+	auditSubmitChanged     bool
+	auditSubmitErr         error
+	auditTransitionChanged bool
+	auditTransitionErr     error
+
+	auditPlan          *domain.AuditPlan
+	auditPlanCreated   bool
+	auditPlanCreateErr error
+	auditPlanGetErr    error
+
+	materialityRecord *domain.MaterialityRecord
+	materialityErr    error
+
+	riskAssessment  *domain.RiskAssessment
+	riskCreated     bool
+	riskCreateErr   error
+	riskGetErr      error
+	risks           []*domain.RiskAssessment
+	listRisksErr    error
+	linkAssertErr   error
+	designRespErr   error
+	assessChanged   bool
+	assessErr       error
+	markSigErr      error
+	approvePlanErr  error
+	approveChanged  bool
+	fieldworkPlanOK bool
+	fieldworkRiskOK bool
+	fieldworkErr    error
+
+	workpaper           *domain.Workpaper
+	workpaperCreated    bool
+	workpaperCreateErr  error
+	workpaperGetErr     error
+	workpapers          []*domain.Workpaper
+	listWorkpapersErr   error
+	recordProcedureErr  error
+	recordResultErr     error
+	recordConclusionErr error
+	addCrossRefErr      error
+	linkEvidenceErr     error
+	markPreparedChanged bool
+	markPreparedErr     error
+	lockChanged         bool
+	lockErr             error
+	addendum            *domain.WorkpaperAddendum
+	addendumErr         error
+	workpapersLockedOK  bool
+	workpapersLockedErr error
+
+	reviewScope        *domain.ReviewScope
+	reviewScopeCreated bool
+	openReviewErr      error
+	reviewScopeGetErr  error
+	reviewAssignment   *domain.ReviewAssignment
+	assignReviewerErr  error
+	reviewNote         *domain.ReviewNote
+	raiseNoteErr       error
+	respondNoteErr     error
+	resolveNoteErr     error
+	signOff            *domain.SignOff
+	signOffErr         error
+	withdrawSignOffErr error
+	qualityReview      *domain.QualityReviewRecord
+	qualityCreated     bool
+	startQualityErr    error
+	completeQualityErr error
+	reportSignOffsOK   bool
+	reportNotesOK      bool
+	reportGatesErr     error
+
+	completionGates    []domain.CompletionGate
+	completionGatesErr error
+
+	form             *domain.FormDefinition
+	formCreated      bool
+	formCreateErr    error
+	formGetErr       error
+	publishFormErr   error
+	retireFormErr    error
+	submission       *domain.FormSubmission
+	saveDraftErr     error
+	submitFormErr    error
+	validateSubErr   error
+	getSubmissionErr error
+
+	supersedeSubmissionErr  error
+	formRoute               *domain.FormSubmissionRoute
+	routeToDomainErr        error
+	submissionVersion       *domain.FormSubmissionVersionInfo
+	getSubmissionVersionErr error
+	validationResult        *domain.ValidationResult
+	getValidationResultErr  error
+	pendingSubmissions      []*domain.FormSubmission
+	listPendingErr          error
+}
+
+func (s *stubStore) CreateForm(_ context.Context, _ domain.CreateFormParams) (*domain.FormDefinition, bool, error) {
+	return s.form, s.formCreated, s.formCreateErr
+}
+func (s *stubStore) GetForm(_ context.Context, _, _ string) (*domain.FormDefinition, error) {
+	return s.form, s.formGetErr
+}
+func (s *stubStore) PublishForm(_ context.Context, _ domain.PublishFormParams) (*domain.FormDefinition, error) {
+	return s.form, s.publishFormErr
+}
+func (s *stubStore) RetireForm(_ context.Context, _ domain.RetireFormParams) (*domain.FormDefinition, error) {
+	return s.form, s.retireFormErr
+}
+func (s *stubStore) SaveDraft(_ context.Context, _ domain.SaveDraftParams) (*domain.FormSubmission, error) {
+	return s.submission, s.saveDraftErr
+}
+func (s *stubStore) SubmitForm(_ context.Context, _ domain.SubmitFormParams) (*domain.FormSubmission, error) {
+	return s.submission, s.submitFormErr
+}
+func (s *stubStore) ValidateSubmission(_ context.Context, _ domain.ValidateSubmissionParams) (*domain.FormSubmission, error) {
+	return s.submission, s.validateSubErr
+}
+func (s *stubStore) GetSubmission(_ context.Context, _, _ string) (*domain.FormSubmission, error) {
+	return s.submission, s.getSubmissionErr
+}
+func (s *stubStore) SupersedeSubmission(_ context.Context, _ domain.SupersedeSubmissionParams) (*domain.FormSubmission, error) {
+	return s.submission, s.supersedeSubmissionErr
+}
+func (s *stubStore) RouteToDomain(_ context.Context, _ domain.RouteToDomainParams) (*domain.FormSubmissionRoute, error) {
+	return s.formRoute, s.routeToDomainErr
+}
+func (s *stubStore) GetSubmissionVersion(_ context.Context, _, _ string) (*domain.FormSubmissionVersionInfo, error) {
+	return s.submissionVersion, s.getSubmissionVersionErr
+}
+func (s *stubStore) GetValidationResult(_ context.Context, _, _ string) (*domain.ValidationResult, error) {
+	return s.validationResult, s.getValidationResultErr
+}
+func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, _, _ int) ([]*domain.FormSubmission, error) {
+	return s.pendingSubmissions, s.listPendingErr
 }
 
 func (s *stubStore) CreateWorkflow(_ context.Context, _ domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
@@ -64,21 +213,159 @@ func (s *stubStore) FindCurrentStage(_ context.Context, _ string) (*domain.Workf
 func (s *stubStore) SubmitAction(_ context.Context, _ domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
 	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
 }
+func (s *stubStore) SubmitQuorumVote(_ context.Context, _ domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
+	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
+}
 func (s *stubStore) EscalateWorkflow(_ context.Context, _, _ string) (*domain.WorkflowInstance, bool, error) {
 	return s.escalateInstance, s.escalateTransitioned, s.escalateErr
 }
 func (s *stubStore) CancelWorkflow(_ context.Context, _, _ string) (*domain.WorkflowInstance, bool, error) {
 	return s.cancelInstance, s.cancelTransitioned, s.cancelErr
 }
+func (s *stubStore) InvalidateWorkflow(_ context.Context, _ domain.InvalidateWorkflowParams) (*domain.WorkflowInstance, bool, error) {
+	return s.invalidateInstance, s.invalidateTransitioned, s.invalidateErr
+}
+func (s *stubStore) VerifyRelease(_ context.Context, _ domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error) {
+	return s.verifyReleaseResult, s.verifyReleaseErr
+}
+func (s *stubStore) CreateAuditEngagement(_ context.Context, _ domain.CreateAuditEngagementParams) (*domain.AuditEngagement, bool, error) {
+	return s.auditEngagement, s.auditCreateCreated, s.auditCreateErr
+}
+func (s *stubStore) GetAuditEngagement(_ context.Context, _, _ string) (*domain.AuditEngagement, error) {
+	return s.auditEngagement, s.auditGetErr
+}
+func (s *stubStore) SubmitAuditEngagementAcceptance(_ context.Context, _ domain.SubmitAuditEngagementAcceptanceParams) (*domain.AuditEngagement, bool, error) {
+	return s.auditEngagement, s.auditSubmitChanged, s.auditSubmitErr
+}
+func (s *stubStore) TransitionAuditEngagement(_ context.Context, _ domain.TransitionAuditEngagementParams) (*domain.AuditEngagement, bool, error) {
+	return s.auditEngagement, s.auditTransitionChanged, s.auditTransitionErr
+}
+func (s *stubStore) AmendAuditEngagementScope(_ context.Context, _ domain.AmendAuditEngagementScopeParams) (*domain.AuditEngagement, bool, error) {
+	return s.auditEngagement, s.auditTransitionChanged, s.auditTransitionErr
+}
+func (s *stubStore) GetAuditEngagementCompletionGates(_ context.Context, _, _, _ string) ([]domain.CompletionGate, error) {
+	return s.completionGates, s.completionGatesErr
+}
+func (s *stubStore) CreateAuditPlan(_ context.Context, _ domain.CreateAuditPlanParams) (*domain.AuditPlan, bool, error) {
+	return s.auditPlan, s.auditPlanCreated, s.auditPlanCreateErr
+}
+func (s *stubStore) GetAuditPlan(_ context.Context, _, _ string) (*domain.AuditPlan, error) {
+	return s.auditPlan, s.auditPlanGetErr
+}
+func (s *stubStore) GetAuditPlanByEngagement(_ context.Context, _, _ string) (*domain.AuditPlan, error) {
+	return s.auditPlan, s.auditPlanGetErr
+}
+func (s *stubStore) RecordMateriality(_ context.Context, _ domain.RecordMaterialityParams) (*domain.MaterialityRecord, error) {
+	return s.materialityRecord, s.materialityErr
+}
+func (s *stubStore) IdentifyRisk(_ context.Context, _ domain.IdentifyRiskParams) (*domain.RiskAssessment, bool, error) {
+	return s.riskAssessment, s.riskCreated, s.riskCreateErr
+}
+func (s *stubStore) GetRiskAssessment(_ context.Context, _, _ string) (*domain.RiskAssessment, error) {
+	return s.riskAssessment, s.riskGetErr
+}
+func (s *stubStore) ListRisksByPlan(_ context.Context, _, _ string) ([]*domain.RiskAssessment, error) {
+	return s.risks, s.listRisksErr
+}
+func (s *stubStore) LinkAssertion(_ context.Context, _ domain.LinkAssertionParams) error {
+	return s.linkAssertErr
+}
+func (s *stubStore) DesignAuditResponse(_ context.Context, _ domain.DesignAuditResponseParams) error {
+	return s.designRespErr
+}
+func (s *stubStore) AssessRisk(_ context.Context, _ domain.AssessRiskParams) (*domain.RiskAssessment, bool, error) {
+	return s.riskAssessment, s.assessChanged, s.assessErr
+}
+func (s *stubStore) MarkSignificantRisk(_ context.Context, _ domain.MarkSignificantRiskParams) (*domain.RiskAssessment, error) {
+	return s.riskAssessment, s.markSigErr
+}
+func (s *stubStore) ApprovePlan(_ context.Context, _ domain.ApprovePlanParams) (*domain.AuditPlan, bool, error) {
+	return s.auditPlan, s.approveChanged, s.approvePlanErr
+}
+func (s *stubStore) GetAuditEngagementFieldworkGates(_ context.Context, _, _ string) (bool, bool, error) {
+	return s.fieldworkPlanOK, s.fieldworkRiskOK, s.fieldworkErr
+}
+func (s *stubStore) CreateWorkpaper(_ context.Context, _ domain.CreateWorkpaperParams) (*domain.Workpaper, bool, error) {
+	return s.workpaper, s.workpaperCreated, s.workpaperCreateErr
+}
+func (s *stubStore) GetWorkpaper(_ context.Context, _, _ string) (*domain.Workpaper, error) {
+	return s.workpaper, s.workpaperGetErr
+}
+func (s *stubStore) ListWorkpapersByEngagement(_ context.Context, _, _ string) ([]*domain.Workpaper, error) {
+	return s.workpapers, s.listWorkpapersErr
+}
+func (s *stubStore) RecordProcedure(_ context.Context, _ domain.RecordProcedureParams) error {
+	return s.recordProcedureErr
+}
+func (s *stubStore) RecordResult(_ context.Context, _ domain.RecordResultParams) error {
+	return s.recordResultErr
+}
+func (s *stubStore) RecordConclusion(_ context.Context, _ domain.RecordConclusionParams) error {
+	return s.recordConclusionErr
+}
+func (s *stubStore) AddWorkpaperCrossReference(_ context.Context, _ domain.AddWorkpaperCrossReferenceParams) error {
+	return s.addCrossRefErr
+}
+func (s *stubStore) LinkWorkpaperEvidence(_ context.Context, _ domain.LinkWorkpaperEvidenceParams) error {
+	return s.linkEvidenceErr
+}
+func (s *stubStore) MarkWorkpaperPrepared(_ context.Context, _ domain.MarkWorkpaperPreparedParams) (*domain.Workpaper, bool, error) {
+	return s.workpaper, s.markPreparedChanged, s.markPreparedErr
+}
+func (s *stubStore) LockWorkpaper(_ context.Context, _ domain.LockWorkpaperParams) (*domain.Workpaper, bool, error) {
+	return s.workpaper, s.lockChanged, s.lockErr
+}
+func (s *stubStore) AddPostLockAddendum(_ context.Context, _ domain.AddPostLockAddendumParams) (*domain.WorkpaperAddendum, error) {
+	return s.addendum, s.addendumErr
+}
+func (s *stubStore) GetAuditEngagementRequiredWorkpapersLocked(_ context.Context, _, _ string) (bool, error) {
+	return s.workpapersLockedOK, s.workpapersLockedErr
+}
+func (s *stubStore) OpenReview(_ context.Context, _ domain.OpenReviewParams) (*domain.ReviewScope, bool, error) {
+	return s.reviewScope, s.reviewScopeCreated, s.openReviewErr
+}
+func (s *stubStore) GetReviewScope(_ context.Context, _, _ string) (*domain.ReviewScope, error) {
+	return s.reviewScope, s.reviewScopeGetErr
+}
+func (s *stubStore) AssignReviewer(_ context.Context, _ domain.AssignReviewerParams) (*domain.ReviewAssignment, error) {
+	return s.reviewAssignment, s.assignReviewerErr
+}
+func (s *stubStore) RaiseReviewNote(_ context.Context, _ domain.RaiseReviewNoteParams) (*domain.ReviewNote, error) {
+	return s.reviewNote, s.raiseNoteErr
+}
+func (s *stubStore) RespondToReviewNote(_ context.Context, _ domain.RespondToReviewNoteParams) (*domain.ReviewNote, error) {
+	return s.reviewNote, s.respondNoteErr
+}
+func (s *stubStore) ResolveReviewNote(_ context.Context, _ domain.ResolveReviewNoteParams) (*domain.ReviewNote, error) {
+	return s.reviewNote, s.resolveNoteErr
+}
+func (s *stubStore) SignOff(_ context.Context, _ domain.SignOffParams) (*domain.SignOff, error) {
+	return s.signOff, s.signOffErr
+}
+func (s *stubStore) WithdrawSignOff(_ context.Context, _ domain.WithdrawSignOffParams) (*domain.SignOff, error) {
+	return s.signOff, s.withdrawSignOffErr
+}
+func (s *stubStore) StartQualityReview(_ context.Context, _ domain.StartQualityReviewParams) (*domain.QualityReviewRecord, bool, error) {
+	return s.qualityReview, s.qualityCreated, s.startQualityErr
+}
+func (s *stubStore) CompleteQualityReview(_ context.Context, _ domain.CompleteQualityReviewParams) (*domain.QualityReviewRecord, bool, error) {
+	return s.qualityReview, false, s.completeQualityErr
+}
+func (s *stubStore) GetAuditEngagementReportGates(_ context.Context, _, _ string) (bool, bool, error) {
+	return s.reportSignOffsOK, s.reportNotesOK, s.reportGatesErr
+}
 
 // ── stub publisher ───────────────────────────────────────────────────────────
 
 type stubPublisher struct {
-	startedCalls   int
-	grantedCalls   int
-	rejectedCalls  int
-	escalatedCalls int
-	completedCalls int
+	startedCalls     int
+	grantedCalls     int
+	rejectedCalls    int
+	escalatedCalls   int
+	completedCalls   int
+	invalidatedCalls int
+	auditEvents      []string
+	formEvents       []string
 }
 
 func (p *stubPublisher) PublishWorkflowStarted(_ context.Context, _ domain.WorkflowInstance) error {
@@ -101,12 +388,41 @@ func (p *stubPublisher) PublishWorkflowCompleted(_ context.Context, _ domain.Wor
 	p.completedCalls++
 	return nil
 }
+func (p *stubPublisher) PublishWorkflowInvalidated(_ context.Context, _ domain.WorkflowInstance, _ string) error {
+	p.invalidatedCalls++
+	return nil
+}
+func (p *stubPublisher) PublishAuditEngagementEvent(_ context.Context, eventType string, _ domain.AuditEngagement, _, _ string) error {
+	p.auditEvents = append(p.auditEvents, eventType)
+	return nil
+}
+func (p *stubPublisher) PublishFormPublished(_ context.Context, _ domain.FormDefinition, _, _ string) error {
+	p.formEvents = append(p.formEvents, "form.published")
+	return nil
+}
+func (p *stubPublisher) PublishFormEvent(_ context.Context, eventType string, _ domain.FormSubmission, _, _ string) error {
+	p.formEvents = append(p.formEvents, eventType)
+	return nil
+}
 
 // ── stub authz client ────────────────────────────────────────────────────────
 
 type stubAuthz struct{ err error }
 
 func (a *stubAuthz) CheckApprovalAllowed(_ context.Context, _, _ string) error { return a.err }
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error      { return a.err }
+
+type stubDocuments struct {
+	version int
+	err     error
+}
+
+func (d *stubDocuments) VerifyDocument(_ context.Context, _, _, _, _, _ string) (int, error) {
+	if d.version == 0 && d.err == nil {
+		return 1, nil
+	}
+	return d.version, d.err
+}
 
 func newTestRouter(s *stubStore) chi.Router {
 	return newTestRouterFull(s, &stubPublisher{}, &stubAuthz{})
@@ -115,7 +431,7 @@ func newTestRouter(s *stubStore) chi.Router {
 func newTestRouterFull(s *stubStore, p *stubPublisher, a *stubAuthz) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, p, a, zap.NewNop())
+	h := handler.New(s, p, a, &stubDocuments{}, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -157,8 +473,10 @@ func TestCreateWorkflow_Created(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
-	if pub.startedCalls != 1 {
-		t.Errorf("expected workflow.started published once, got %d", pub.startedCalls)
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.startedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got %d", pub.startedCalls)
 	}
 }
 
@@ -264,11 +582,10 @@ func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if pub.grantedCalls != 1 {
-		t.Errorf("expected approval.granted published once, got %d", pub.grantedCalls)
-	}
-	if pub.completedCalls != 0 {
-		t.Errorf("expected workflow.completed NOT published (not final stage), got %d", pub.completedCalls)
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.grantedCalls != 0 || pub.completedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got granted=%d completed=%d", pub.grantedCalls, pub.completedCalls)
 	}
 }
 
@@ -290,8 +607,10 @@ func TestSubmitAction_FinalApprove_PublishesCompleted(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	if pub.grantedCalls != 1 || pub.completedCalls != 1 {
-		t.Errorf("expected granted+completed published once each, got granted=%d completed=%d", pub.grantedCalls, pub.completedCalls)
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.grantedCalls != 0 || pub.completedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got granted=%d completed=%d", pub.grantedCalls, pub.completedCalls)
 	}
 }
 
@@ -404,6 +723,48 @@ func TestSubmitAction_InvalidAction(t *testing.T) {
 	}
 }
 
+func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
+	// Negative Control per ZS-STATE-001 §4 step 4 & §18 T-01:
+	// Attempt an illegal transition edge: CANCELLED -> APPROVE (target APPROVED).
+	// Terminal state cannot be transitioned forward.
+	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID: "w-cancelled",
+			LegalEntityID:      "le-1",
+			WorkflowStatus:     "CANCELLED",
+		},
+	}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
+
+	body := `{"action":"APPROVE"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-cancelled/actions", bytes.NewBufferString(body)), "approver-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for illegal edge CANCELLED -> APPROVED, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+
+	if resp["error"] != "invalid_transition" {
+		t.Errorf("expected error = 'invalid_transition', got %v", resp["error"])
+	}
+	// Assert mapped to canonical governed reason code from envelope/reason.go
+	if resp["reason_code"] != string(svcenvelope.ReasonRejectPolicyNotMet) {
+		t.Errorf("expected reason_code = %q, got %v", svcenvelope.ReasonRejectPolicyNotMet, resp["reason_code"])
+	}
+	if resp["reason_family"] != string(svcenvelope.ReasonFamilyReject) {
+		t.Errorf("expected reason_family = %q, got %v", svcenvelope.ReasonFamilyReject, resp["reason_family"])
+	}
+	if resp["exception_class"] != string(svcenvelope.ExceptionClassBusinessRule) {
+		t.Errorf("expected exception_class = %q, got %v", svcenvelope.ExceptionClassBusinessRule, resp["exception_class"])
+	}
+}
+
 // ── Escalate / Cancel ────────────────────────────────────────────────────────
 
 func TestEscalateWorkflow_InvalidTransition(t *testing.T) {
@@ -506,5 +867,356 @@ func TestGetWorkflow_NoTenantScope_Refused(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with no X-Tenant-Id, got %d", w.Code)
+	}
+}
+
+// ── Subject Binding Tests ───────────────────────────────────────────────────
+
+func validSubjectFingerprint() string {
+	b := svcenvelope.NewFingerprintBuilder()
+	b.Set("invoice_id", "inv-100")
+	b.SetAmount("total", 1250.50, "USD")
+	return b.Build()
+}
+
+func TestCreateWorkflow_WithSubjectBinding_Success(t *testing.T) {
+	fp := validSubjectFingerprint()
+	subjType := "SUPPLIER_INVOICE"
+	subjID := "inv-100"
+	subjVer := 1
+
+	store := &stubStore{
+		instance: &domain.WorkflowInstance{
+			WorkflowInstanceID: "w-subj-1",
+			WorkflowStatus:     domain.WorkflowStatusPending,
+			SubjectType:        &subjType,
+			SubjectID:          &subjID,
+			SubjectVersion:     &subjVer,
+			SubjectFingerprint: &fp,
+		},
+		stages: []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}},
+	}
+	r := newTestRouter(store)
+
+	body := fmt.Sprintf(`{
+		"tenant_id":"t-1",
+		"legal_entity_id":"le-1",
+		"workflow_type":"INVOICE_APPROVAL",
+		"subject_type":"%s",
+		"subject_id":"%s",
+		"subject_version":1,
+		"subject_fingerprint":"%s",
+		"stages":[{"approver_principal_id":"approver-1"}]
+	}`, subjType, subjID, fp)
+
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body)), "requester-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 created, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateWorkflow_InvalidFingerprint_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{
+		"tenant_id":"t-1",
+		"legal_entity_id":"le-1",
+		"workflow_type":"INVOICE_APPROVAL",
+		"subject_type":"SUPPLIER_INVOICE",
+		"subject_id":"inv-100",
+		"subject_fingerprint":"md5:invalid-format",
+		"stages":[{"approver_principal_id":"approver-1"}]
+	}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body)), "requester-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid fingerprint, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateWorkflow_NegativeSubjectVersion_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{
+		"tenant_id":"t-1",
+		"legal_entity_id":"le-1",
+		"workflow_type":"INVOICE_APPROVAL",
+		"subject_version":-1,
+		"stages":[{"approver_principal_id":"approver-1"}]
+	}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body)), "requester-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for negative subject version, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateWorkflow_MissingSubjectField_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	// Has subject_type but missing subject_id
+	body := `{
+		"tenant_id":"t-1",
+		"legal_entity_id":"le-1",
+		"workflow_type":"INVOICE_APPROVAL",
+		"subject_type":"SUPPLIER_INVOICE",
+		"stages":[{"approver_principal_id":"approver-1"}]
+	}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body)), "requester-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for partial subject identity, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── InvalidateWorkflow Tests ────────────────────────────────────────────────
+
+func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
+	fp := validSubjectFingerprint()
+	subjType := "SUPPLIER_INVOICE"
+	subjID := "inv-1"
+	code := "CONTROL_FAILURE"
+
+	store := &stubStore{
+		invalidateInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID:     "w-1",
+			WorkflowStatus:         domain.WorkflowStatusInvalidated,
+			SubjectType:            &subjType,
+			SubjectID:              &subjID,
+			SubjectFingerprint:     &fp,
+			InvalidationReasonCode: &code,
+		},
+		invalidateTransitioned: true,
+	}
+	pub := &stubPublisher{}
+	r := newTestRouterFull(store, pub, &stubAuthz{})
+
+	body := `{"reason_code":"CONTROL_FAILURE","narrative":"material vendor bank account changed"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.invalidatedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got %d", pub.invalidatedCalls)
+	}
+}
+
+func TestInvalidateWorkflow_Approved_Success(t *testing.T) {
+	code := "CANCEL_CUSTOMER_REQUEST"
+	store := &stubStore{
+		invalidateInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID:     "w-approved-1",
+			WorkflowStatus:         domain.WorkflowStatusInvalidated,
+			InvalidationReasonCode: &code,
+		},
+		invalidateTransitioned: true,
+	}
+	pub := &stubPublisher{}
+	r := newTestRouterFull(store, pub, &stubAuthz{})
+
+	body := `{"reason_code":"CANCEL_CUSTOMER_REQUEST"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-approved-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.invalidatedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got %d", pub.invalidatedCalls)
+	}
+}
+
+func TestInvalidateWorkflow_IdempotentReplay_DoesNotRepublish(t *testing.T) {
+	code := "CONTROL_FAILURE"
+	store := &stubStore{
+		invalidateInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID:     "w-1",
+			WorkflowStatus:         domain.WorkflowStatusInvalidated,
+			InvalidationReasonCode: &code,
+		},
+		invalidateTransitioned: false, // already invalidated
+	}
+	pub := &stubPublisher{}
+	r := newTestRouterFull(store, pub, &stubAuthz{})
+
+	body := `{"reason_code":"CONTROL_FAILURE"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if pub.invalidatedCalls != 0 {
+		t.Errorf("expected no publish on idempotent replay, got %d", pub.invalidatedCalls)
+	}
+}
+
+func TestInvalidateWorkflow_InvalidReasonCode_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{"reason_code":"NON_GOVERNED_CUSTOM_REASON"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for ungoverned reason code, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvalidateWorkflow_MissingReasonCode_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{"narrative":"missing reason code"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing reason code, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvalidateWorkflow_TerminalState_Conflict(t *testing.T) {
+	store := &stubStore{invalidateErr: domain.ErrInvalidTransition}
+	r := newTestRouter(store)
+
+	body := `{"reason_code":"CONTROL_FAILURE"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 conflict, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+	if resp["reason_code"] != string(svcenvelope.ReasonRejectPolicyNotMet) {
+		t.Errorf("expected reason_code = %q, got %v", svcenvelope.ReasonRejectPolicyNotMet, resp["reason_code"])
+	}
+	if resp["reason_family"] != string(svcenvelope.ReasonFamilyReject) {
+		t.Errorf("expected reason_family = %q, got %v", svcenvelope.ReasonFamilyReject, resp["reason_family"])
+	}
+}
+
+// ── VerifyRelease Tests ─────────────────────────────────────────────────────
+
+func TestVerifyRelease_ApprovedMatching_CanRelease(t *testing.T) {
+	fp := validSubjectFingerprint()
+	store := &stubStore{
+		verifyReleaseResult: &domain.ReleaseVerificationResult{
+			WorkflowInstanceID: "w-appr-1",
+			CanRelease:         true,
+			Status:             "VALID",
+			WorkflowStatus:     domain.WorkflowStatusApproved,
+			SubjectFingerprint: &fp,
+		},
+	}
+	r := newTestRouter(store)
+
+	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s","expected_subject_version":1}`, fp)
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-appr-1/verify-release", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+	var res domain.ReleaseVerificationResult
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if !res.CanRelease || res.Status != "VALID" {
+		t.Errorf("expected can_release=true, got %+v", res)
+	}
+}
+
+func TestVerifyRelease_FingerprintMismatch_Conflict(t *testing.T) {
+	reason := domain.ErrSubjectFingerprintMismatch.Error()
+	store := &stubStore{
+		verifyReleaseResult: &domain.ReleaseVerificationResult{
+			WorkflowInstanceID: "w-appr-1",
+			CanRelease:         false,
+			Status:             "INVALID",
+			Reason:             &reason,
+			WorkflowStatus:     domain.WorkflowStatusApproved,
+		},
+	}
+	r := newTestRouter(store)
+
+	// Caller presents modified fingerprint
+	liveFp := validSubjectFingerprint()
+	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s"}`, liveFp)
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-appr-1/verify-release", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+	var res domain.ReleaseVerificationResult
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if res.CanRelease || res.Status != "INVALID" {
+		t.Errorf("expected can_release=false and status=INVALID, got %+v", res)
+	}
+}
+
+func TestVerifyRelease_UnboundSubject_FailsSafely(t *testing.T) {
+	reason := domain.ErrWorkflowUnboundSubject.Error()
+	store := &stubStore{
+		verifyReleaseResult: &domain.ReleaseVerificationResult{
+			WorkflowInstanceID: "w-legacy-1",
+			CanRelease:         false,
+			Status:             "INVALID",
+			Reason:             &reason,
+			WorkflowStatus:     domain.WorkflowStatusApproved,
+		},
+	}
+	r := newTestRouter(store)
+
+	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s"}`, validSubjectFingerprint())
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-legacy-1/verify-release", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for unbound subject, got %d", w.Code)
+	}
+	var res domain.ReleaseVerificationResult
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if res.CanRelease {
+		t.Errorf("expected can_release=false for unbound subject, got %+v", res)
+	}
+}
+
+func TestVerifyRelease_InvalidFingerprintFormat_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{"current_subject_fingerprint":"bad-fingerprint"}`
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/verify-release", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad fingerprint, got %d", w.Code)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/obligations-svc/internal/domain"
+	"zoiko.io/obligations-svc/internal/middleware"
 )
 
 // envelope is this platform's event contract (Doc 03 §19): every published
@@ -24,12 +25,24 @@ import (
 // closed) thread actor_id through explicitly from the handler's
 // already-verified principalID.
 type envelope struct {
-	EventID       string          `json:"event_id"`
-	EventType     string          `json:"event_type"`
-	EventVersion  string          `json:"event_version"`
-	EmittedAt     time.Time       `json:"emitted_at"`
-	SchemaVersion string          `json:"schema_version"`
-	SourceService string          `json:"source_service"`
+	EventID       string    `json:"event_id"`
+	EventType     string    `json:"event_type"`
+	EventVersion  string    `json:"event_version"`
+	EmittedAt     time.Time `json:"emitted_at"`
+	SchemaVersion string    `json:"schema_version"`
+	SourceService string    `json:"source_service"`
+	// TenantID is read from the request context in emit, not passed in.
+	//
+	// It was missing entirely until search-indexer-svc needed it, and its
+	// absence was load-bearing in a way the comment above understated: a
+	// downstream consumer that must scope a record to a tenant had no
+	// trusted tenant to scope it BY, and the only alternatives were a
+	// privileged cross-tenant read to resolve legal_entity_id, or dropping
+	// the record. The platform event contract (Doc 03 §19) lists tenant ID
+	// as mandatory, and every handler here has already refused a request
+	// that carried no verified tenant (requireTenant) — so the value was
+	// available at the point of publication all along.
+	TenantID      string          `json:"tenant_id,omitempty"`
 	LegalEntityID string          `json:"legal_entity_id,omitempty"`
 	Jurisdiction  string          `json:"jurisdiction,omitempty"`
 	ActorID       string          `json:"actor_id,omitempty"`
@@ -130,6 +143,12 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID, legalEnt
 		EmittedAt:     time.Now().UTC(),
 		SchemaVersion: "1.0",
 		SourceService: "obligations-svc",
+		// From the verified request context, never from the payload. The
+		// handler put it there from the gateway-set X-Tenant-Id after
+		// refusing every request that lacked one, so this is the same
+		// trusted value the store scoped its write by — not a second,
+		// weaker assertion of the same fact.
+		TenantID:      middleware.TenantFromContext(ctx),
 		LegalEntityID: legalEntityID,
 		Jurisdiction:  jurisdiction,
 		ActorID:       actorID,

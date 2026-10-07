@@ -30,15 +30,39 @@ import (
 	"zoiko.io/identity-context-svc/internal/config"
 	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/credential"
+	"zoiko.io/identity-context-svc/internal/domain"
 	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
+	"zoiko.io/identity-context-svc/internal/idempotency"
+	"zoiko.io/identity-context-svc/internal/outbox"
+	"zoiko.io/identity-context-svc/internal/retention"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/siem"
+	"zoiko.io/identity-context-svc/internal/sod"
 	"zoiko.io/identity-context-svc/internal/store"
 	"zoiko.io/identity-context-svc/internal/telemetry"
 	"zoiko.io/identity-context-svc/internal/upstream"
 )
+
+// kafkaWriterAdapter bridges the relay's broker-agnostic MessageWriter to
+// kafka-go's concrete *kafka.Writer.
+//
+// The adapter exists so package outbox does not import kafka-go: a test fake
+// for the relay would otherwise drag the whole broker client in with it, and
+// the relay's logic — claim, publish, mark, back off — has nothing to do with
+// which broker is on the other end.
+type kafkaWriterAdapter struct{ w *kafka.Writer }
+
+func (a kafkaWriterAdapter) WriteMessages(ctx context.Context, msgs ...outbox.KafkaMessage) error {
+	out := make([]kafka.Message, len(msgs))
+	for i, m := range msgs {
+		// Topic is set on the Writer itself, not per message — kafka-go
+		// rejects a Message that also specifies one when the Writer has it.
+		out[i] = kafka.Message{Key: m.Key, Value: m.Value}
+	}
+	return a.w.WriteMessages(ctx, out...)
+}
 
 func main() {
 	// ── Logger (structured JSON, production-grade) ────────────────────────
@@ -96,6 +120,12 @@ func main() {
 
 	metrics := telemetry.NewMetrics("identity-context-svc")
 
+	// GOV-01 instruments. These are the numbers the golden-signals dashboard
+	// cannot infer from request rates — most importantly the outbox depth,
+	// because a stopped relay produces no errors and no latency while every
+	// governance event this service emits piles up in a table.
+	govMetrics := telemetry.NewGovMetrics("identity-context-svc")
+
 	// ── Postgres pool ─────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
 	if err != nil {
@@ -137,9 +167,19 @@ func main() {
 		Topic:                  cfg.Kafka.Topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
+		// BatchTimeout is how long the writer holds a PARTIALLY FULL batch
+		// before flushing it, and kafka-go's default is one second. Every
+		// synchronous WriteMessages that does not fill a batch therefore
+		// waits a second before returning. That is the whole cost: the
+		// outbox relay measured 1.03 events/second against a 14,800-event
+		// backlog until the relay was changed to send its batch in one call
+		// and this was brought down to match.
+		//
+		// 20ms bounds the wait for the batches that do not fill — the tail of
+		// a drain, and the single-event publishes on the resolve path.
+		BatchTimeout: 20 * time.Millisecond,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
-
 
 	// ── Domain dependencies ───────────────────────────────────────────────
 	principalRepo := store.New(pool, log)
@@ -168,19 +208,60 @@ func main() {
 
 	kafkaReader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: cfg.Kafka.Brokers,
-		Topic:   cfg.Kafka.Topic,
-		GroupID: cfg.Kafka.GroupID,
-		// Errors are surfaced through ReadMessage rather than kafka-go's own
-		// logger, so the consumer decides the level. Without this a missing
-		// broker prints to stderr once per dial attempt, outside zap.
+		// GroupTopics, not Topic. The reader used to be pointed at this
+		// service's OWN publish topic, while every revocation it handles is
+		// published by another service on that service's topic — so
+		// authority.revoked, role.updated and entity.updated never arrived.
+		// Topic and GroupTopics are mutually exclusive in kafka-go.
+		GroupTopics: cfg.Kafka.ConsumeTopics,
+		GroupID:     cfg.Kafka.GroupID,
+		// kafka-go defaults this to false, so a member assigned zero partitions
+		// at join never re-checks and blocks in ReadMessage forever while the
+		// group reports Stable — a dead consumer that looks idle.
+		WatchPartitionChanges: true,
+		// WARN, not DEBUG. This logger is the only place consumer-group
+		// failures (JoinGroup, coordinator moves, empty metadata) surface —
+		// ReadMessage does not return them — and zap.NewProduction drops DEBUG,
+		// so at DEBUG a consumer that never joined produced no output at all.
 		ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
-			log.Debug("kafka reader: " + fmt.Sprintf(msg, args...))
+			log.Warn("kafka reader: " + fmt.Sprintf(msg, args...))
 		}),
 	})
-	consumer := events.NewConsumer(log, sessionCache, principalRepo, riskCache, events.NewRedisDeduper(rdb))
+	consumer := events.NewConsumer(log, sessionCache, principalRepo, riskCache, principalRepo, events.NewRedisDeduper(rdb)).
+		// A session lives at most the envelope TTL, so a revocation older than
+		// that cannot reach a live session issued before it. Without this the
+		// first deploy after subscribing to the producer topics above would
+		// replay their whole history against today's sessions. One minute of
+		// clock-skew allowance between producer and consumer.
+		WithRevocationHorizon(time.Duration(cfg.EnvelopeJWTTTLSeconds)*time.Second + time.Minute)
 	go consumer.Run(consumerCtx, kafkaReader)
 	upstreamRegistry := upstream.NewRegistryClient(cfg, log)
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+
+	// ── Transactional outbox ──────────────────────────────────────────────
+	//
+	// The publisher no longer writes to Kafka. It writes to event_outbox, in
+	// the same Postgres the business facts land in, and the relay drains that
+	// to the broker. See package outbox: the previous fire-and-forget
+	// goroutines lost events on a broker blip or a SIGTERM, with the business
+	// write already committed and the caller already holding an envelope.
+	outboxStore := outbox.NewStore(pool, log)
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, outboxStore)
+
+	relayCfg := outbox.DefaultRelayConfig()
+	relayCfg.BatchSize = cfg.OutboxRelayBatchSize
+	relayCfg.PollInterval = time.Duration(cfg.OutboxRelayPollMillis) * time.Millisecond
+	relay := outbox.NewRelay(pool, kafkaWriterAdapter{kafkaWriter}, relayCfg, log)
+
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	go relay.Run(relayCtx)
+
+	// Sampled rather than incremented at the enqueue site: the depth is a
+	// property of the TABLE, and several replicas share one outbox. A per-process
+	// counter would miss a backlog left behind by a replica that has since been
+	// replaced, which is exactly the case worth alerting on.
+	go telemetry.SampleOutbox(relayCtx, relay, govMetrics, 30*time.Second, log)
+
 	verifier := auth.NewJWTVerifier(cfg)
 	signer, err := auth.NewJWTSigner(cfg)
 
@@ -217,6 +298,10 @@ func main() {
 
 	siemClient := siem.New(cfg.SIEMServiceURL, "identity-context-svc", log)
 
+	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
+	// so without this a SIGTERM would discard security events already accepted.
+	defer siemClient.Close()
+
 	// ── AuthZ client ───────────────────────────────────────────────────────
 	// Fail fast rather than starting and 503-ing every guarded route. An empty
 	// base URL builds requests that always fail, so CheckAllowed refuses —
@@ -228,6 +313,16 @@ func main() {
 	authzClient, err := authz.NewClient(cfg.AuthzEnv, cfg.AuthzServiceURL, log)
 	if err != nil {
 		log.Fatal("failed to initialize authz client", zap.Error(err))
+	}
+
+	// ── GOV-04 segregation of duties ──────────────────────────────────────
+	// Paired with the authz client above: a deployment that wired a real
+	// GOV-03 but a stubbed GOV-04 would satisfy "authorization enforced" while
+	// having no segregation control at all. NewChecker refuses the stub in
+	// staging and production for exactly that reason.
+	sodChecker, err := sod.NewChecker(cfg.Environment, cfg.SoDServiceURL, log)
+	if err != nil {
+		log.Fatal("failed to initialize segregation-of-duties checker", zap.Error(err))
 	}
 
 	// ── Resolver ──────────────────────────────────────────────────────────
@@ -242,7 +337,26 @@ func main() {
 		verifier,
 		signer,
 		siemClient,
-	)
+	).
+		// Negative path #2: an unknown or foreign ingress cannot fall back to
+		// another tenant. The checker can only ever refuse — it never supplies
+		// a tenant, so a forged host header grants nothing.
+		WithIngressChecker(identityctx.NewIngressChecker(
+			principalRepo,
+			identityctx.IngressPolicy(cfg.IngressPolicy),
+			log,
+		// Without a TTL every binding reads FRESH forever, so §4's STALE state
+		// was unreachable in any deployment. Labels only — STALE is admitted.
+		).WithBindingTTL(time.Duration(cfg.IngressBindingTTLSeconds) * time.Second)).
+		// Residency has been recorded on every session since migration 000005
+		// and never enforced. Empty allow-list keeps enforcement off.
+		WithResidencyPolicy(identityctx.NewResidencyPolicy(
+			cfg.DeploymentRegion,
+			cfg.AllowedResidencyPolicies,
+			log,
+		)).
+		WithRetention(time.Duration(cfg.SessionEvidenceRetentionDays) * 24 * time.Hour).
+		WithMetrics(govMetrics)
 
 	// ── Authenticator ─────────────────────────────────────────────────────
 	// The credential exchange that precedes resolution. principalRepo satisfies
@@ -277,7 +391,47 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	// §4's Engineering Interaction Wireframe classifies ResolveTenantContext as
+	// a QUERY. The envelope contract's default rule is "any non-GET/HEAD/OPTIONS
+	// is a material state change", which made this POST a material write and so
+	// demanded an Idempotency-Key — a replay key for an operation the spec says
+	// changes nothing the caller owns.
+	//
+	// Worse, it is circular in the same way /v1/authenticate is: resolve is the
+	// endpoint that MINTS the envelope every other service consumes, so
+	// requiring a complete envelope as INPUT can only ever be satisfied by a
+	// caller asserting the values this endpoint exists to establish.
+	//
+	// Declassifying it does NOT open it up. The handler still refuses a request
+	// with no bearer token (401 CONTEXT_UNRESOLVED), the tenant still comes from
+	// the verified token rather than any header, and a support context asserted
+	// on it is now verified. The envelope is still parsed, reported and
+	// propagated — it simply is not a precondition for obtaining one.
+	envelopePolicy := svcenvelope.ServicePolicy()
+	envelopePolicy.MaterialWrite = func(req *http.Request) bool {
+		if req.URL.Path == "/v1/context/resolve" {
+			return false
+		}
+		switch req.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			return false
+		default:
+			return true
+		}
+	}
+	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
+
+	// Replay protection, AFTER the envelope contract.
+	//
+	// Order is load-bearing. The envelope is what establishes the tenant an
+	// idempotency key is scoped to, and a request refused for an incomplete
+	// envelope must not first claim a key — otherwise a malformed retry
+	// storm would fill the table with claims for commands that never ran.
+	//
+	// §4 has always required Idempotency-Key on every COMMAND and the
+	// envelope has always enforced its presence. Nothing read it until now:
+	// replaying POST /v1/context/support minted a second break-glass grant.
+	r.Use(idempotency.Middleware(principalRepo, log))
 
 	// Structured request logging
 	r.Use(func(next http.Handler) http.Handler {
@@ -295,15 +449,101 @@ func main() {
 		})
 	})
 
-	// Health probe (no auth required)
-	r.Handle("/health", metrics.WrapReadinessHandler(health.NewHandler(rdb, pool)))
+	// Health probe (no auth required).
+	//
+	// The outbox depth is the one number worth alerting on in this
+	// architecture: everything else about the service can look healthy while
+	// governance events pile up in a table, because a stopped relay is
+	// invisible from the request path.
+	//
+	// The tenant registry probe closes the long-standing TODO here. It is a
+	// fail-closed dependency of Dimension 2, so a registry outage means every
+	// resolution 503s — the readiness probe should say what the request path
+	// already knows rather than keeping the pod in rotation.
+	r.Handle("/health", metrics.WrapReadinessHandler(
+		health.NewHandler(rdb, pool).
+			WithOutbox(relay, cfg.OutboxRelayBatchSize*100).
+			WithUpstream(upstreamRegistry),
+	))
 	r.Handle("/metrics", promhttp.Handler())
 
 	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(signer.PublicKey(), cfg.JWTKeyID))
 
+	// ── GOV-01 command services ───────────────────────────────────────────
+	supportService := identityctx.NewSupportService(
+		principalRepo,
+		publisher,
+		sodChecker,
+		siemClient,
+		identityctx.SupportPolicy{
+			MaxTTL:                 time.Duration(cfg.SupportContextMaxTTLSeconds) * time.Second,
+			DefaultTTL:             time.Duration(cfg.SupportContextDefaultTTLSeconds) * time.Second,
+			MinJustificationLength: identityctx.DefaultSupportPolicy().MinJustificationLength,
+		},
+		log,
+	).WithMetrics(govMetrics)
+
+	// Resolution must be able to CHECK an asserted elevation, not merely record
+	// it. X-Support-Context-Id is client-supplied and is not sanitized at the
+	// edge, so without this the resolver stamped whatever the caller sent onto
+	// the session evidence. Wired here rather than passed to NewResolver
+	// because supportService depends on the publisher and SoD checker, which
+	// are built after the resolver.
+	resolver.WithSupportVerifier(supportService)
+
+	// ── Break-glass reconciliation (§1) ───────────────────────────────────
+	//
+	// SupportService.Reconcile has always documented a "reconciler goroutine in
+	// cmd/server". There was none. An elevation expired, nobody was told, and
+	// the SupportContextsUnreviewed gauge — which exists — was never set by
+	// anything, so no alert on it could fire.
+	//
+	// Cross-tenant by construction: a sweep has no tenant, and a per-tenant
+	// version would only cover tenants somebody thought to ask about.
+	reconcileCtx, stopReconciler := context.WithCancel(context.Background())
+	defer stopReconciler()
+	// SUPPORT_REVIEW_INTERVAL_MINUTES was already declared, already loaded, and
+	// read by nothing — the config knob for this control shipped before the
+	// control did. Zero still means "deliberately disabled", as its own comment
+	// says, and RunReconciler logs loudly when it is.
+	go supportService.RunReconciler(
+		reconcileCtx,
+		time.Duration(cfg.SupportReviewIntervalMinutes)*time.Minute,
+		500,
+	)
+
+	cacheService := identityctx.NewContextCacheService(
+		principalRepo,
+		sessionCache,
+		publisher,
+		siemClient,
+		log,
+	)
+
 	// Domain routes (all under /v1/)
-	h := identityctx.NewHandler(resolver, authenticator, sessionCache, principalRepo, authzClient, log)
+	h := identityctx.NewHandler(resolver, authenticator, sessionCache, principalRepo, authzClient, log).
+		WithEnvironment(domain.Environment(cfg.Environment)).
+		WithSupport(supportService).
+		WithContextCache(cacheService)
 	identityctx.RegisterRoutes(r, h)
+
+	// ── Retention / disposition sweep (GOV-09) ────────────────────────────
+	//
+	// Refuses to dispose of anything a GOV-10 legal hold covers, and reports
+	// what it held back separately from what it disposed. See package
+	// retention for why those two numbers must not be collapsed.
+	retentionWorker := retention.New(principalRepo, publisher, retention.Config{
+		Interval:        time.Duration(cfg.RetentionSweepIntervalMinutes) * time.Minute,
+		BatchSize:       500,
+		OutboxRetention: time.Duration(cfg.OutboxRetentionDays) * 24 * time.Hour,
+		// Seven days comfortably outlives any sane client retry budget while
+		// keeping the replay table bounded. Without a purge the table only
+		// grows, since every command ever issued leaves a row.
+		IdempotencyRetention: 7 * 24 * time.Hour,
+	}, log).WithMetrics(govMetrics)
+	retentionCtx, stopRetention := context.WithCancel(context.Background())
+	defer stopRetention()
+	go retentionWorker.Run(retentionCtx)
 
 	// ── Server ────────────────────────────────────────────────────────────
 	srv := &http.Server{
@@ -338,20 +578,49 @@ func main() {
 	}
 	log.Info("stopping event consumer")
 	stopConsumer()
+	log.Info("stopping retention worker")
+	stopRetention()
 
-	// Bounded. Drain used to block forever on a goroutine that never returned,
-	// which made a clean stop indistinguishable from a hang and left the
-	// process dependent on the orchestrator's SIGKILL. The budget is shorter
-	// than the shutdown context above so a stuck publish is reported here
-	// rather than surfacing as a killed container.
+	// ── Final outbox drain ────────────────────────────────────────────────
+	//
+	// The relay loop is stopped first so it is not competing for the same
+	// rows, then ONE deterministic pass runs to deliver whatever the handlers
+	// enqueued in their last seconds.
+	//
+	// This is best-effort by design, and it is fine that it is: unlike the old
+	// goroutine drain, nothing is LOST if it fails. The events are committed
+	// in Postgres and the next process to start delivers them. That is the
+	// whole point of the outbox — shutdown stopped being a correctness
+	// problem and became a latency one.
+	log.Info("stopping outbox relay")
+	stopRelay()
+
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer drainCancel()
+
+	if n, err := relay.DrainOnce(drainCtx); err != nil {
+		log.Warn("final outbox drain incomplete — events remain durable and will be delivered on next start",
+			zap.Error(err))
+	} else if n > 0 {
+		log.Info("final outbox drain delivered pending events", zap.Int("events", n))
+	}
+	if pending, err := relay.PendingCount(drainCtx); err == nil && pending > 0 {
+		log.Info("outbox has undelivered events — they survive this shutdown",
+			zap.Int("pending", pending))
+	}
+
+	// The remaining goroutines are the SIEM streams and the few event publishes
+	// that still run detached — the enqueue is now a Postgres write rather than
+	// a broker round trip, so these complete in milliseconds instead of
+	// blocking on an unreachable Kafka. Bounded regardless: a stop that never
+	// completes is indistinguishable from a crash in every dashboard that
+	// watches for clean termination.
 	log.Info("draining in-flight event goroutines")
 	if err := resolver.Drain(drainCtx); err != nil {
-		log.Warn("resolver drain incomplete — in-flight events may be lost", zap.Error(err))
+		log.Warn("resolver drain incomplete", zap.Error(err))
 	}
 	if err := authenticator.Drain(drainCtx); err != nil {
-		log.Warn("authenticator drain incomplete — in-flight events may be lost", zap.Error(err))
+		log.Warn("authenticator drain incomplete", zap.Error(err))
 	}
 	log.Info("identity-context-svc stopped")
 }

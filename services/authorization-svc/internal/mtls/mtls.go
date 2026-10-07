@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ServerIdentity is this service's provisioned mTLS material: its own
@@ -80,7 +82,35 @@ func ProvisionServerIdentity(ctx context.Context, mtlsServiceURL, serviceName, p
 		return nil, fmt.Errorf("build provision request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-ID", platformScopeID)
+
+	// THE CANONICAL INPUT CONTRACT APPLIES TO THIS CALL TOO.
+	//
+	// mtls-management-svc enforces the estate envelope on every route, and
+	// this request carried only Content-Type and a tenant header. It was
+	// refused 401 envelope_incomplete before the bootstrap-token branch was
+	// ever reached — so authorization-svc could not provision its identity,
+	// called log.Fatal, and crash-looped. The symptom
+	// ("mtls-management-svc returned 401") reads like a rejected credential,
+	// which is why it was mistaken for one: the token was correct all along
+	// and was never looked at.
+	//
+	// actor_subject_id is X-Workload-Id, not X-Principal-Id. This is a
+	// service provisioning its own certificate during startup; there is no
+	// human subject, and inventing one would put a fictional principal into
+	// mtls-management-svc's evidence.
+	req.Header.Set("X-Tenant-Id", platformScopeID)
+	req.Header.Set("X-Legal-Entity-Id", platformScopeID)
+	req.Header.Set("X-Workload-Id", serviceName)
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Correlation-ID", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("X-Purpose-Context", "service_identity_provisioning")
+	// Issuing a certificate is a material state change, so the contract wants
+	// an idempotency key. A fresh one per attempt is correct here: a retry
+	// after a failed provision must be allowed to mint a new leaf, not replay
+	// the answer to a call whose result never arrived.
+	req.Header.Set("Idempotency-Key", uuid.NewString())
+
 	if bootstrapToken != "" {
 		req.Header.Set("X-Mtls-Bootstrap-Token", bootstrapToken)
 	}

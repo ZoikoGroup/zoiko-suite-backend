@@ -40,6 +40,23 @@ type stubStore struct {
 	getErr        error
 	listErr       error
 	transitionErr error
+
+	popPage  *domain.ControlPopulationPage
+	popErr   error
+	popQuery domain.ControlPopulationQuery
+	popCalls int
+}
+
+func (s *stubStore) ControlPopulation(_ context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error) {
+	s.popCalls++
+	s.popQuery = q
+	if s.popErr != nil {
+		return nil, s.popErr
+	}
+	if s.popPage != nil {
+		return s.popPage, nil
+	}
+	return &domain.ControlPopulationPage{Records: []domain.ControlRecord{}}, nil
 }
 
 func newStubStore() *stubStore {
@@ -138,7 +155,7 @@ type stubPayables struct {
 	calls int
 }
 
-func (p *stubPayables) CreatePayableFromApprovedSource(_ context.Context, _, _ string, req payableopenitem.CreatePayableRequest) (*payableopenitem.PayableOpenItem, error) {
+func (p *stubPayables) CreatePayableFromApprovedSource(_ context.Context, _, _ string, _ payableopenitem.Envelope, req payableopenitem.CreatePayableRequest) (*payableopenitem.PayableOpenItem, error) {
 	p.calls++
 	if p.fail {
 		return nil, payableopenitem.ErrPayableServiceUnavailable
@@ -488,8 +505,8 @@ func TestCreateInvoice_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t *testi
 	if retryInv.InvoiceID != firstInv.InvoiceID {
 		t.Fatalf("retried call resolved to a different invoice_id (%s) than the original (%s)", retryInv.InvoiceID, firstInv.InvoiceID)
 	}
-	if pub.received != 1 {
-		t.Fatalf("expected exactly 1 PublishVendorInvoiceReceived call, got %d — replay must not re-publish", pub.received)
+	if pub.received != 0 {
+		t.Fatalf("expected 0 synchronous PublishVendorInvoiceReceived calls (handled by transactional outbox), got %d", pub.received)
 	}
 }
 
@@ -521,8 +538,8 @@ func TestValidateInvoice_FromReceived_Succeeds(t *testing.T) {
 	if s.invoices["i1"].Status != domain.InvoiceStatusValidated {
 		t.Fatalf("expected status VALIDATED, got %s", s.invoices["i1"].Status)
 	}
-	if pub.validated != 1 {
-		t.Fatalf("expected vendor.invoice.validated to be published once, got %d", pub.validated)
+	if pub.validated != 0 {
+		t.Fatalf("expected zero synchronous vendor.invoice.validated calls (handled by outbox), got %d", pub.validated)
 	}
 }
 
@@ -539,8 +556,8 @@ func TestApproveInvoice_FromValidated_Succeeds(t *testing.T) {
 	if s.invoices["i1"].Status != domain.InvoiceStatusApproved {
 		t.Fatalf("expected status APPROVED, got %s", s.invoices["i1"].Status)
 	}
-	if pub.approved != 1 {
-		t.Fatalf("expected vendor.invoice.approved to be published once, got %d", pub.approved)
+	if pub.approved != 0 {
+		t.Fatalf("expected zero synchronous vendor.invoice.approved calls (handled by outbox), got %d", pub.approved)
 	}
 }
 
@@ -634,8 +651,8 @@ func TestRequestPayment_FromApproved_Succeeds(t *testing.T) {
 	if s.invoices["i1"].Status != domain.InvoiceStatusPaymentRequested {
 		t.Fatalf("expected status PAYMENT_REQUESTED, got %s", s.invoices["i1"].Status)
 	}
-	if pub.paymentRequested != 1 {
-		t.Fatalf("expected payment.requested to be published once, got %d", pub.paymentRequested)
+	if pub.paymentRequested != 0 {
+		t.Fatalf("expected zero synchronous payment.requested calls (handled by outbox), got %d", pub.paymentRequested)
 	}
 }
 
@@ -887,4 +904,55 @@ func newRouterWithPO(s *stubStore, p *stubPublisher, a *stubAuthZ, po *stubPO) c
 // newRouterWithPay exercises the AP-08 open-item posting path.
 func newRouterWithPay(s *stubStore, p *stubPublisher, a *stubAuthZ, payables *stubPayables) chi.Router {
 	return newRouterWith(s, p, a, &stubPO{}, payables)
+}
+
+// TestNoSynchronousHandlerPublishing verifies that HTTP handlers do not publish
+// directly to Kafka; publication is deferred to the transactional outbox relay.
+func TestNoSynchronousHandlerPublishing(t *testing.T) {
+	pub := &stubPublisher{}
+	s := newStubStore()
+	r := newRouter(s, pub, &stubAuthZ{})
+
+	// 1. CreateInvoice
+	req := validCreateReq()
+	docID := "doc-123"
+	req.InvoiceDocumentID = &docID
+	createResp := doRequest(r, http.MethodPost, "/v1/invoices/", req, "creator-1")
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on create, got %d: %s", createResp.Code, createResp.Body.String())
+	}
+	var inv domain.VendorInvoice
+	if err := json.NewDecoder(createResp.Body).Decode(&inv); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if pub.received != 0 {
+		t.Fatalf("expected 0 synchronous PublishVendorInvoiceReceived calls, got %d", pub.received)
+	}
+
+	// 2. ValidateInvoice
+	valResp := doRequest(r, http.MethodPost, "/v1/invoices/"+inv.InvoiceID+"/validate", nil, "validator-1")
+	if valResp.Code != http.StatusOK {
+		t.Fatalf("expected 200 on validate, got %d: %s", valResp.Code, valResp.Body.String())
+	}
+	if pub.validated != 0 {
+		t.Fatalf("expected 0 synchronous PublishVendorInvoiceValidated calls, got %d", pub.validated)
+	}
+
+	// 3. ApproveInvoice
+	appResp := doRequest(r, http.MethodPost, "/v1/invoices/"+inv.InvoiceID+"/approve", nil, "approver-1")
+	if appResp.Code != http.StatusOK {
+		t.Fatalf("expected 200 on approve, got %d: %s", appResp.Code, appResp.Body.String())
+	}
+	if pub.approved != 0 {
+		t.Fatalf("expected 0 synchronous PublishVendorInvoiceApproved calls, got %d", pub.approved)
+	}
+
+	// 4. RequestPayment
+	payResp := doRequest(r, http.MethodPost, "/v1/invoices/"+inv.InvoiceID+"/request-payment", nil, "payer-1")
+	if payResp.Code != http.StatusOK {
+		t.Fatalf("expected 200 on request-payment, got %d: %s", payResp.Code, payResp.Body.String())
+	}
+	if pub.paymentRequested != 0 {
+		t.Fatalf("expected 0 synchronous PublishPaymentRequested calls, got %d", pub.paymentRequested)
+	}
 }

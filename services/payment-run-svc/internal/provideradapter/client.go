@@ -37,6 +37,13 @@ type PrepareAndSubmitRequest struct {
 	ExecutionDate        time.Time
 	PayerAccountVerified bool
 	IdempotencyKey       string
+	// AuthorizationID/AuthorizationFingerprint/AuthorizationSource carry
+	// AP-10's own real, service-computed fingerprint through to BNK-06 for
+	// independent re-verification there (Wave 11a) — never trusted by
+	// BNK-06 as given.
+	AuthorizationID          string
+	AuthorizationFingerprint string
+	AuthorizationSource      string
 }
 
 // Attempt is the subset of BNK-06's own PaymentInitiationAttempt (PascalCase
@@ -58,6 +65,9 @@ type prepareRequestBody struct {
 	ExecutionDate        time.Time `json:"ExecutionDate"`
 	PayerAccountVerified bool      `json:"PayerAccountVerified"`
 	IdempotencyKey       string    `json:"IdempotencyKey"`
+	AuthorizationID          string `json:"AuthorizationID"`
+	AuthorizationFingerprint string `json:"AuthorizationFingerprint"`
+	AuthorizationSource      string `json:"AuthorizationSource"`
 }
 
 type HTTPClient struct {
@@ -121,6 +131,9 @@ func (c *HTTPClient) PrepareAndSubmit(ctx context.Context, tenantID, principalID
 		ExecutionDate:        req.ExecutionDate,
 		PayerAccountVerified: req.PayerAccountVerified,
 		IdempotencyKey:       req.IdempotencyKey,
+		AuthorizationID:          req.AuthorizationID,
+		AuthorizationFingerprint: req.AuthorizationFingerprint,
+		AuthorizationSource:      req.AuthorizationSource,
 	}, &prepared); err != nil {
 		return nil, err
 	}

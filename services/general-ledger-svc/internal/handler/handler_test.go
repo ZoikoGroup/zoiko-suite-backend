@@ -56,17 +56,35 @@ type stubStore struct {
 
 	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
 	setMappingErr   error
+
+	ledgerEntries      []domain.LedgerEntry
+	postingsPage       *domain.AccountPostingsPage
+	postingsErr        error
+	postingsCalls      []postingsCall
+	wave4              wave4Stub
+	wave5              wave5Stub
+	ledgerBalance      *domain.LedgerBalance
+	rebuildCalled      bool
+	lastRebuildRequest domain.RebuildBalanceProjectionRequest
+
+	postingExecutions map[string]*domain.PostingExecution // by execution_id
+	bySourceEvent     map[string]string                   // "tenant|source_event_id" -> execution_id
+	createExecErr     error
+	markCommittedErr  error
+	markFailedErr     error
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		journals:        map[string]*domain.JournalHeader{},
-		lines:           map[string][]domain.JournalLine{},
-		byCorrelation:   map[string]string{},
-		trialBalances:   map[string]*domain.TrialBalanceSnapshot{},
-		accounts:        map[string]*domain.Account{},
-		accountsByCode:  map[string]*domain.Account{},
-		currentMappings: map[string]*domain.AccountMapping{},
+		journals:          map[string]*domain.JournalHeader{},
+		lines:             map[string][]domain.JournalLine{},
+		byCorrelation:     map[string]string{},
+		trialBalances:     map[string]*domain.TrialBalanceSnapshot{},
+		accounts:          map[string]*domain.Account{},
+		accountsByCode:    map[string]*domain.Account{},
+		currentMappings:   map[string]*domain.AccountMapping{},
+		postingExecutions: map[string]*domain.PostingExecution{},
+		bySourceEvent:     map[string]string{},
 	}
 }
 
@@ -309,6 +327,170 @@ func (s *stubStore) ListAccountMappings(_ context.Context, tenantID string) ([]d
 	return out, nil
 }
 
+func (s *stubStore) CreatePostingExecution(_ context.Context, e *domain.PostingExecution) error {
+	if s.createExecErr != nil {
+		return s.createExecErr
+	}
+	s.postingExecutions[e.ExecutionID] = e
+	if e.SourceEventID != nil {
+		s.bySourceEvent[e.TenantID+"|"+*e.SourceEventID] = e.ExecutionID
+	}
+	return nil
+}
+
+func (s *stubStore) GetPostingExecution(_ context.Context, tenantID, executionID string) (*domain.PostingExecution, error) {
+	e, ok := s.postingExecutions[executionID]
+	if !ok {
+		return nil, domain.ErrPostingExecutionNotFound
+	}
+	return e, nil
+}
+
+func (s *stubStore) GetPostingExecutionBySource(_ context.Context, tenantID, sourceEventID string) (*domain.PostingExecution, error) {
+	executionID, ok := s.bySourceEvent[tenantID+"|"+sourceEventID]
+	if !ok {
+		return nil, domain.ErrPostingExecutionNotFound
+	}
+	return s.postingExecutions[executionID], nil
+}
+
+func (s *stubStore) MarkPostingExecutionCommitted(_ context.Context, tenantID, executionID, journalID string, committedAt time.Time) error {
+	if s.markCommittedErr != nil {
+		return s.markCommittedErr
+	}
+	e, ok := s.postingExecutions[executionID]
+	if !ok {
+		return domain.ErrPostingExecutionNotFound
+	}
+	e.Status, e.JournalID, e.CommittedAt, e.FailureReason = domain.PostingExecutionStatusCommitted, &journalID, &committedAt, nil
+	return nil
+}
+
+func (s *stubStore) MarkPostingExecutionFailed(_ context.Context, tenantID, executionID, status, reason string) error {
+	if s.markFailedErr != nil {
+		return s.markFailedErr
+	}
+	e, ok := s.postingExecutions[executionID]
+	if !ok {
+		return domain.ErrPostingExecutionNotFound
+	}
+	e.Status, e.FailureReason = status, &reason
+	return nil
+}
+
+func (s *stubStore) SubmitJournalForApproval(_ context.Context, _, journalID, principalID string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusDraft {
+		return domain.ErrInvalidApprovalTransition
+	}
+	now := time.Now().UTC()
+	h.ApprovalStatus, h.SubmittedAt, h.SubmittedByPrincipalID = domain.ApprovalStatusPendingApproval, &now, &principalID
+	return nil
+}
+
+func (s *stubStore) ApproveJournal(_ context.Context, _, journalID, principalID, fingerprint string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusPendingApproval {
+		return domain.ErrInvalidApprovalTransition
+	}
+	now := time.Now().UTC()
+	h.ApprovalStatus, h.ApprovedAt, h.ApprovedByPrincipalID, h.ApprovalFingerprint = domain.ApprovalStatusApproved, &now, &principalID, &fingerprint
+	return nil
+}
+
+func (s *stubStore) RejectJournal(_ context.Context, _, journalID, principalID, reason string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusPendingApproval {
+		return domain.ErrInvalidApprovalTransition
+	}
+	now := time.Now().UTC()
+	h.ApprovalStatus, h.RejectedAt, h.RejectedByPrincipalID, h.RejectionReason = domain.ApprovalStatusRejected, &now, &principalID, &reason
+	return nil
+}
+
+func (s *stubStore) RequestJournalPosting(_ context.Context, _, journalID, principalID string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusApproved {
+		return domain.ErrInvalidApprovalTransition
+	}
+	now := time.Now().UTC()
+	h.ApprovalStatus, h.PostingRequestedAt, h.PostingRequestedByPrincipalID = domain.ApprovalStatusPostingRequested, &now, &principalID
+	return nil
+}
+
+func (s *stubStore) MarkJournalPosted(_ context.Context, _, journalID string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusPostingRequested {
+		return domain.ErrInvalidApprovalTransition
+	}
+	h.ApprovalStatus = domain.ApprovalStatusPosted
+	return nil
+}
+
+func (s *stubStore) AmendDraftJournal(_ context.Context, _, journalID string, updated *domain.JournalHeader, lines []domain.JournalLine) error {
+	h, ok := s.journals[journalID]
+	if !ok || (h.ApprovalStatus != domain.ApprovalStatusDraft && h.ApprovalStatus != domain.ApprovalStatusPendingApproval) {
+		return domain.ErrInvalidApprovalTransition
+	}
+	h.Description, h.JournalType, h.TransactionDate, h.PostingDate = updated.Description, updated.JournalType, updated.TransactionDate, updated.PostingDate
+	h.CurrencyCode, h.BookID, h.ReportingBasis, h.EvidenceRefs = updated.CurrencyCode, updated.BookID, updated.ReportingBasis, updated.EvidenceRefs
+	h.ApprovalStatus = domain.ApprovalStatusDraft
+	for i := range lines {
+		lines[i].JournalID = journalID
+		lines[i].LineNumber = i + 1
+	}
+	s.lines[journalID] = lines
+	return nil
+}
+
+func (s *stubStore) QueryLedger(_ context.Context, _ string, filter domain.QueryLedgerFilter, _ int) ([]domain.LedgerEntry, error) {
+	var out []domain.LedgerEntry
+	for _, e := range s.ledgerEntries {
+		if e.LegalEntityID != filter.LegalEntityID {
+			continue
+		}
+		if filter.MaxEntrySeq != nil && e.EntrySeq > *filter.MaxEntrySeq {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func (s *stubStore) QueryAccountPostings(_ context.Context, tenantID string, q domain.AccountPostingsQuery) (*domain.AccountPostingsPage, error) {
+	s.postingsCalls = append(s.postingsCalls, postingsCall{tenantID: tenantID, query: q})
+	if s.postingsErr != nil {
+		return nil, s.postingsErr
+	}
+	if s.postingsPage != nil {
+		return s.postingsPage, nil
+	}
+	return &domain.AccountPostingsPage{}, nil
+}
+
+func (s *stubStore) QuerySourceEntries(_ context.Context, _, sourceEventID string) ([]domain.LedgerEntry, error) {
+	var out []domain.LedgerEntry
+	for _, e := range s.ledgerEntries {
+		if e.SourceEventID != nil && *e.SourceEventID == sourceEventID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) QueryAccountBalance(_ context.Context, _ string, _ domain.QueryAccountBalanceRequest) (*domain.LedgerBalance, error) {
+	if s.ledgerBalance != nil {
+		return s.ledgerBalance, nil
+	}
+	return &domain.LedgerBalance{}, nil
+}
+
+func (s *stubStore) RebuildDerivedBalanceProjection(_ context.Context, _ string, req domain.RebuildBalanceProjectionRequest) error {
+	s.rebuildCalled = true
+	s.lastRebuildRequest = req
+	return nil
+}
+
 // Compile-time proof the stub still satisfies the contract the handler
 // depends on — a stub that has silently fallen behind the interface is how a
 // green test suite stops meaning anything.
@@ -531,8 +713,8 @@ func TestCreateJournal_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t *testi
 	if len(s.journals) != 1 {
 		t.Fatalf("expected exactly 1 journal to exist in the store after a retry, got %d", len(s.journals))
 	}
-	if pub.created != 1 {
-		t.Fatalf("expected journal.created to publish exactly once (not on the replay), got %d", pub.created)
+	if pub.created != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.created)
 	}
 }
 
@@ -567,8 +749,8 @@ func TestValidateJournal_Balanced_Succeeds(t *testing.T) {
 	if s.journals["j1"].Status != domain.JournalStatusValidated {
 		t.Fatalf("expected status VALIDATED, got %s", s.journals["j1"].Status)
 	}
-	if pub.validated != 1 {
-		t.Fatalf("expected journal.validated to be published once, got %d", pub.validated)
+	if pub.validated != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.validated)
 	}
 }
 
@@ -600,8 +782,8 @@ func TestPostJournal_FromValidated_Succeeds(t *testing.T) {
 	if s.journals["j1"].Status != domain.JournalStatusFinalized {
 		t.Fatalf("expected status FINALIZED, got %s", s.journals["j1"].Status)
 	}
-	if pub.posted != 1 {
-		t.Fatalf("expected journal.posted to be published once, got %d", pub.posted)
+	if pub.posted != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.posted)
 	}
 }
 
@@ -660,8 +842,8 @@ func TestReverseJournal_Finalized_CreatesInvertedReversingJournal(t *testing.T) 
 	if s.lines["j1"][0].DebitAmount != 100 {
 		t.Fatalf("original journal's lines must never be mutated by a reversal")
 	}
-	if pub.reversed != 1 {
-		t.Fatalf("expected journal.reversed to be published once, got %d", pub.reversed)
+	if pub.reversed != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.reversed)
 	}
 }
 
@@ -893,8 +1075,8 @@ func TestReverseJournal_RetriedCorrelationID_ReturnsStoredReversalNotAFreshID(t 
 		t.Fatalf("the retry returned journal_id %s, but the stored reversal is %s — a fresh id for a row that was never written",
 			second.JournalID, first.JournalID)
 	}
-	if pub.reversed != 1 {
-		t.Fatalf("journal.reversed must publish once across a retry, got %d", pub.reversed)
+	if pub.reversed != 0 {
+		t.Fatalf("Invariant I-13: handler must not publish synchronously to Kafka, got %d", pub.reversed)
 	}
 }
 
@@ -1214,4 +1396,10 @@ func TestGetAccountMapping_NotFound_Returns404(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rec.Code)
 	}
+}
+
+// postingsCall records one QueryAccountPostings invocation.
+type postingsCall struct {
+	tenantID string
+	query    domain.AccountPostingsQuery
 }

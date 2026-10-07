@@ -25,6 +25,10 @@ type stubStore struct {
 	snapshots     map[string][]domain.BalanceSnapshot
 	contributions map[string][]domain.BalanceContribution
 	contribErr    error
+
+	adjustments  map[string]*domain.ConsolidationAdjustment
+	groupHasRun  map[string]bool
+	hasSnapshot  map[string]bool
 }
 
 func newStubStore() *stubStore {
@@ -32,6 +36,9 @@ func newStubStore() *stubStore {
 		runs:          make(map[string]*domain.ConsolidationRun),
 		snapshots:     make(map[string][]domain.BalanceSnapshot),
 		contributions: make(map[string][]domain.BalanceContribution),
+		adjustments:   make(map[string]*domain.ConsolidationAdjustment),
+		groupHasRun:   make(map[string]bool),
+		hasSnapshot:   make(map[string]bool),
 	}
 }
 
@@ -108,6 +115,76 @@ func (s *stubStore) ListContributionsByRun(_ context.Context, runID string) ([]d
 	return c, nil
 }
 
+func (s *stubStore) GroupEntityHasRun(_ context.Context, groupLegalEntityID string) (bool, error) {
+	return s.groupHasRun[groupLegalEntityID], nil
+}
+
+func (s *stubStore) HasSnapshotForPeriod(_ context.Context, groupLegalEntityID, fiscalPeriod string) (bool, error) {
+	return s.hasSnapshot[groupLegalEntityID+"|"+fiscalPeriod], nil
+}
+
+func (s *stubStore) CreateAdjustment(_ context.Context, a *domain.ConsolidationAdjustment) error {
+	s.adjustments[a.ConsolidationAdjustmentID] = a
+	return nil
+}
+
+func (s *stubStore) GetAdjustment(_ context.Context, id string) (*domain.ConsolidationAdjustment, error) {
+	a, ok := s.adjustments[id]
+	if !ok {
+		return nil, domain.ErrAdjustmentNotFound
+	}
+	return a, nil
+}
+
+func (s *stubStore) ListAdjustments(_ context.Context, groupLegalEntityID, fiscalPeriod string) ([]domain.ConsolidationAdjustment, error) {
+	var out []domain.ConsolidationAdjustment
+	for _, a := range s.adjustments {
+		if groupLegalEntityID != "" && a.GroupLegalEntityID != groupLegalEntityID {
+			continue
+		}
+		if fiscalPeriod != "" && a.FiscalPeriod != fiscalPeriod {
+			continue
+		}
+		out = append(out, *a)
+	}
+	return out, nil
+}
+
+func (s *stubStore) ApproveAdjustment(_ context.Context, id, principalID string) error {
+	a, ok := s.adjustments[id]
+	if !ok || a.Status != domain.AdjustmentStatusPendingApproval {
+		return domain.ErrInvalidAdjustmentTransition
+	}
+	now := time.Now().UTC()
+	a.Status, a.ApprovedAt, a.ApprovedByPrincipalID = domain.AdjustmentStatusApproved, &now, &principalID
+	return nil
+}
+
+func (s *stubStore) MarkAdjustmentPosted(_ context.Context, id, principalID, journalID string) error {
+	a, ok := s.adjustments[id]
+	if !ok || a.Status != domain.AdjustmentStatusApproved {
+		return domain.ErrInvalidAdjustmentTransition
+	}
+	now := time.Now().UTC()
+	a.Status, a.PostedAt, a.PostedByPrincipalID, a.ConsolidationBookJournalID = domain.AdjustmentStatusPosted, &now, &principalID, &journalID
+	return nil
+}
+
+func (s *stubStore) ReverseAdjustment(_ context.Context, id, principalID, reason string, supersededBy *string) error {
+	a, ok := s.adjustments[id]
+	if !ok || a.Status != domain.AdjustmentStatusPosted {
+		return domain.ErrInvalidAdjustmentTransition
+	}
+	now := time.Now().UTC()
+	a.Status, a.ReversedAt, a.ReversedByPrincipalID, a.ReversalReason, a.SupersededByAdjustmentID =
+		domain.AdjustmentStatusReversed, &now, &principalID, &reason, supersededBy
+	return nil
+}
+
+// Compile-time proof the stub still satisfies the contract the handler
+// depends on.
+var _ handler.Store = (*stubStore)(nil)
+
 type stubPublisher struct {
 	started, completed, exceptions int
 }
@@ -139,6 +216,11 @@ type stubClients struct {
 	// same way, lets a test simulate one specific journal's lookup failing.
 	journalLines    map[string][]clients.JournalLine
 	journalLinesErr map[string]error
+
+	postJournalID  string
+	postErr        error
+	reverseErr     error
+	lastPostedLegalEntityID string
 }
 
 func (c *stubClients) FetchTrialBalance(_ context.Context, _, legalEntityID, _ string) (map[string]float64, error) {
@@ -166,6 +248,21 @@ func (c *stubClients) FetchJournalLines(_ context.Context, _, journalID string) 
 		return nil, err
 	}
 	return c.journalLines[journalID], nil
+}
+
+func (c *stubClients) PostConsolidationAdjustmentJournal(_ context.Context, _, _, legalEntityID, _, _, _, _ string, _ []clients.JournalLine) (string, error) {
+	c.lastPostedLegalEntityID = legalEntityID
+	if c.postErr != nil {
+		return "", c.postErr
+	}
+	if c.postJournalID != "" {
+		return c.postJournalID, nil
+	}
+	return "journal-generated", nil
+}
+
+func (c *stubClients) ReverseConsolidationAdjustmentJournal(_ context.Context, _, _, _, _ string) error {
+	return c.reverseErr
 }
 
 // ── router factory ─────────────────────────────────────────────────────────────

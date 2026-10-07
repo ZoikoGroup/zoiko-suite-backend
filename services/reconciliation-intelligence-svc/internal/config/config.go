@@ -12,6 +12,11 @@ type Config struct {
 	AuthzURL     string
 	LogLevel     string
 
+	// FinancialControlURL is financial-control-svc's base URL — the
+	// governed, versioned TolerancePolicy registry PerformIntelligentReconciliation
+	// fetches its write-off tolerances from (ZS-SVC-Z-001 INV-09).
+	FinancialControlURL string
+
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
 	// Disabled by default — AuthzURL (plain HTTP) keeps being used unless
@@ -28,14 +33,16 @@ func Load() *Config {
 	kafkaTopic := getEnv("KAFKA_TOPIC", "zoiko.reconciliation-intelligence.events")
 	authzURL := getEnv("AUTHZ_SERVICE_URL", "http://localhost:8089")
 	logLevel := getEnv("LOG_LEVEL", "info")
+	financialControlURL := getEnv("FINANCIAL_CONTROL_SERVICE_URL", "http://financial-control-svc:8171")
 
 	return &Config{
-		Port:         port,
-		DatabaseURL:  dbURL,
-		KafkaBrokers: kafkaBrokers,
-		KafkaTopic:   kafkaTopic,
-		AuthzURL:     authzURL,
-		LogLevel:     logLevel,
+		Port:                port,
+		DatabaseURL:         dbURL,
+		KafkaBrokers:        kafkaBrokers,
+		KafkaTopic:          kafkaTopic,
+		AuthzURL:            authzURL,
+		LogLevel:            logLevel,
+		FinancialControlURL: financialControlURL,
 
 		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

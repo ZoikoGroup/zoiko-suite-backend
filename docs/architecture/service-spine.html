@@ -1,0 +1,1350 @@
+<title>Zoiko Suite Service Spine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+:root{
+  --paper:#F3F5F7;
+  --surface:#FFFFFF;
+  --surface-2:#EAEEF2;
+  --ink:#141A21;
+  --ink-2:#39434F;
+  --muted:#5E6A79;
+  --faint:#8B95A3;
+  --rule:#D5DBE3;
+  --rule-soft:#E3E8EE;
+  --spine:#0C6C77;
+  --spine-ink:#075159;
+  --spine-wash:#E2EFF0;
+  --ok:#1C6A4B;
+  --ok-wash:#E1EFE7;
+  --warn:#8A5A00;
+  --warn-wash:#F5EBD8;
+  --stop:#94382C;
+  --stop-wash:#F6E5E1;
+  --shadow:0 1px 2px rgba(20,26,33,.05), 0 8px 24px -16px rgba(20,26,33,.22);
+  --mono:"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans:"IBM Plex Sans", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  --cond:"IBM Plex Sans Condensed","IBM Plex Sans", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#0C1014;
+    --surface:#141A20;
+    --surface-2:#1B222A;
+    --ink:#E7EBEF;
+    --ink-2:#C2CAD3;
+    --muted:#939EAB;
+    --faint:#6D7885;
+    --rule:#252D36;
+    --rule-soft:#1E252D;
+    --spine:#45B2BD;
+    --spine-ink:#7FCED6;
+    --spine-wash:#10282C;
+    --ok:#54B786;
+    --ok-wash:#122318;
+    --warn:#D6A344;
+    --warn-wash:#251D0D;
+    --stop:#D67F6D;
+    --stop-wash:#26140F;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0C1014;
+  --surface:#141A20;
+  --surface-2:#1B222A;
+  --ink:#E7EBEF;
+  --ink-2:#C2CAD3;
+  --muted:#939EAB;
+  --faint:#6D7885;
+  --rule:#252D36;
+  --rule-soft:#1E252D;
+  --spine:#45B2BD;
+  --spine-ink:#7FCED6;
+  --spine-wash:#10282C;
+  --ok:#54B786;
+  --ok-wash:#122318;
+  --warn:#D6A344;
+  --warn-wash:#251D0D;
+  --stop:#D67F6D;
+  --stop-wash:#26140F;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--paper);
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:15px;
+  line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1200px;margin:0 auto;padding:0 28px 96px}
+@media (max-width:640px){.wrap{padding:0 16px 64px}}
+
+a{color:var(--spine-ink);text-decoration:none;border-bottom:1px solid color-mix(in srgb, var(--spine) 35%, transparent)}
+a:hover{border-bottom-color:var(--spine)}
+:focus-visible{outline:2px solid var(--spine);outline-offset:2px;border-radius:2px}
+
+h1,h2,h3,h4{font-family:var(--cond);font-weight:600;text-wrap:balance;margin:0;letter-spacing:-.005em}
+p{margin:0}
+code,.mono{font-family:var(--mono);font-variant-ligatures:none}
+
+/* ── masthead ────────────────────────────────────────────────── */
+.mast{padding:52px 0 0;border-bottom:1px solid var(--rule)}
+.eyebrow{
+  font-family:var(--cond);font-size:11.5px;font-weight:600;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--spine);
+}
+.mast h1{font-size:clamp(34px,5.2vw,54px);line-height:1.02;margin:14px 0 0;font-weight:700}
+.mast .lede{
+  margin-top:16px;max-width:64ch;color:var(--ink-2);font-size:16.5px;line-height:1.62;
+}
+.mast .meta{
+  margin-top:20px;font-family:var(--mono);font-size:12px;color:var(--faint);
+  display:flex;flex-wrap:wrap;gap:6px 18px;
+}
+
+.counts{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));
+  gap:0;margin:34px 0 0;border-top:1px solid var(--rule);
+}
+.count{padding:16px 18px 18px;border-right:1px solid var(--rule-soft)}
+.count:last-child{border-right:0}
+.count b{
+  display:block;font-family:var(--cond);font-size:31px;font-weight:700;line-height:1;
+  font-variant-numeric:tabular-nums;letter-spacing:-.02em;
+}
+.count span{
+  display:block;margin-top:7px;font-family:var(--cond);font-size:11px;font-weight:500;
+  letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+}
+@media (max-width:640px){.counts{grid-template-columns:repeat(2,1fr)}.count{border-bottom:1px solid var(--rule-soft)}}
+
+/* ── section rail ────────────────────────────────────────────── */
+.rail{
+  position:sticky;top:0;z-index:20;background:color-mix(in srgb, var(--paper) 92%, transparent);
+  backdrop-filter:blur(8px);border-bottom:1px solid var(--rule);margin-top:0;
+}
+.rail-in{
+  max-width:1200px;margin:0 auto;padding:0 28px;display:flex;gap:0;
+  overflow-x:auto;scrollbar-width:thin;
+}
+.rail a{
+  flex:0 0 auto;padding:11px 14px;font-family:var(--cond);font-size:12.5px;font-weight:600;
+  letter-spacing:.02em;color:var(--muted);border:0;border-bottom:2px solid transparent;
+  white-space:nowrap;
+}
+.rail a:hover{color:var(--ink);border-bottom-color:var(--rule)}
+.rail a .n{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-right:6px}
+@media (max-width:640px){.rail-in{padding:0 16px}}
+
+section{padding-top:56px;scroll-margin-top:56px}
+.shead{display:flex;align-items:baseline;gap:14px;border-bottom:1px solid var(--rule);padding-bottom:12px}
+.shead .num{
+  font-family:var(--mono);font-size:12px;font-weight:500;color:var(--spine);
+  padding-top:5px;flex:0 0 auto;
+}
+.shead h2{font-size:clamp(21px,2.6vw,27px);font-weight:700;line-height:1.15}
+.shead .sub{margin-left:auto;font-family:var(--mono);font-size:11.5px;color:var(--faint);flex:0 0 auto;text-align:right}
+@media (max-width:640px){.shead{flex-wrap:wrap;gap:6px}.shead .sub{margin-left:0;width:100%;text-align:left}}
+.note{margin-top:14px;max-width:72ch;color:var(--ink-2);font-size:14.5px}
+.note + .note{margin-top:9px}
+.note strong{color:var(--ink);font-weight:600}
+
+/* ── the spine (runtime flow) ────────────────────────────────── */
+.spine{margin-top:28px;position:relative;padding-left:0}
+.stage{
+  display:grid;grid-template-columns:44px 1fr;gap:0;
+  border-left:2px solid var(--rule);
+}
+.stage:first-child{border-left-color:transparent}
+.stage-mark{
+  position:relative;margin-left:-2px;
+}
+.stage-mark i{
+  position:absolute;top:15px;left:-6px;width:11px;height:11px;border-radius:50%;
+  background:var(--paper);border:2px solid var(--spine);
+}
+.stage-mark .sn{
+  position:absolute;top:9px;left:16px;font-family:var(--mono);font-size:11px;
+  font-weight:600;color:var(--spine);
+}
+.stage-body{padding:8px 0 26px 8px}
+.stage h3{font-size:17px;font-weight:700;line-height:1.25}
+.stage p{margin-top:5px;color:var(--ink-2);font-size:14.5px;max-width:70ch}
+.stage .svcs{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
+.stage.gate{border-left-color:var(--spine)}
+.stage.gate .stage-mark i{background:var(--spine)}
+.gatetag{
+  display:inline-block;margin-left:9px;vertical-align:2px;font-family:var(--cond);font-size:10.5px;
+  font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--spine);
+  background:var(--spine-wash);padding:2px 7px;border-radius:3px;
+}
+
+.chip{
+  display:inline-block;font-family:var(--mono);font-size:11.5px;padding:2.5px 7px;
+  background:var(--surface);border:1px solid var(--rule);border-radius:3px;color:var(--ink-2);
+  white-space:nowrap;
+}
+.chip.key{border-color:var(--spine);color:var(--spine-ink);background:var(--spine-wash);font-weight:500}
+.chip.infra{color:var(--faint);border-style:dashed}
+
+/* ── envelope grid ──────────────────────────────────────────── */
+.env{
+  margin-top:26px;display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));
+  gap:1px;background:var(--rule-soft);border:1px solid var(--rule-soft);
+}
+.env div{background:var(--surface);padding:9px 12px}
+.env code{font-size:12px;font-weight:500;color:var(--ink);display:block}
+.env em{
+  font-style:normal;display:block;margin-top:2px;font-size:11.5px;color:var(--muted);
+  font-family:var(--cond);letter-spacing:.01em;
+}
+.env div.req code{color:var(--spine-ink)}
+.env div.req{background:var(--spine-wash)}
+
+/* ── boot tiers ─────────────────────────────────────────────── */
+.tiers{margin-top:26px;display:flex;flex-direction:column;gap:1px;background:var(--rule-soft);border:1px solid var(--rule)}
+.tier{background:var(--surface);display:grid;grid-template-columns:150px 1fr;gap:0}
+.tier-h{
+  padding:14px 16px;border-right:1px solid var(--rule-soft);
+}
+.tier-h b{
+  display:block;font-family:var(--cond);font-size:12px;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--spine);
+}
+.tier-h span{display:block;margin-top:4px;font-family:var(--mono);font-size:11px;color:var(--faint)}
+.tier-h em{
+  display:block;margin-top:7px;font-style:normal;font-size:12.5px;color:var(--muted);
+  font-family:var(--cond);line-height:1.35;
+}
+.tier-b{padding:13px 16px;display:flex;flex-wrap:wrap;gap:5px;align-content:flex-start}
+@media (max-width:640px){.tier{grid-template-columns:1fr}.tier-h{border-right:0;border-bottom:1px solid var(--rule-soft)}}
+
+/* ── chains ─────────────────────────────────────────────────── */
+.chains{margin-top:26px;display:grid;gap:1px;background:var(--rule-soft);border:1px solid var(--rule)}
+.chain{background:var(--surface);padding:14px 16px}
+.chain b{
+  font-family:var(--cond);font-size:12px;font-weight:700;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--muted);display:block;margin-bottom:9px;
+}
+.flow{display:flex;flex-wrap:wrap;align-items:center;gap:5px}
+.flow .ar{color:var(--spine);font-family:var(--mono);font-size:12px;padding:0 1px}
+.flow .side{font-family:var(--cond);font-size:11.5px;color:var(--faint);letter-spacing:.04em;margin-left:4px}
+
+/* ── phase table ────────────────────────────────────────────── */
+.tblwrap{margin-top:26px;overflow-x:auto;border:1px solid var(--rule);background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+thead th{
+  text-align:left;font-family:var(--cond);font-size:11px;font-weight:600;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--muted);padding:11px 13px;border-bottom:1px solid var(--rule);
+  background:var(--surface-2);white-space:nowrap;position:sticky;top:0;z-index:2;
+}
+tbody td{padding:9px 13px;border-bottom:1px solid var(--rule-soft);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--surface-2)}
+td.m{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+td.num{font-family:var(--mono);font-size:12.5px;font-variant-numeric:tabular-nums;text-align:right}
+td.deps{font-family:var(--mono);font-size:11.5px;color:var(--muted);line-height:1.5;min-width:230px}
+.phase-cell{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--spine-ink)}
+.dash{color:var(--faint)}
+
+.pill{
+  display:inline-block;font-family:var(--cond);font-size:10.5px;font-weight:600;letter-spacing:.06em;
+  text-transform:uppercase;padding:2px 7px;border-radius:2px;white-space:nowrap;
+}
+.pill.main{background:var(--ok-wash);color:var(--ok)}
+.pill.ph{background:var(--warn-wash);color:var(--warn)}
+
+/* ── register controls ──────────────────────────────────────── */
+.ctrls{
+  margin-top:24px;display:flex;flex-wrap:wrap;gap:9px;align-items:center;
+  padding:13px 14px;background:var(--surface);border:1px solid var(--rule);
+}
+.ctrls input[type=search],.ctrls select{
+  font-family:var(--sans);font-size:13px;padding:6px 9px;background:var(--paper);
+  color:var(--ink);border:1px solid var(--rule);border-radius:3px;
+}
+.ctrls input[type=search]{min-width:190px;flex:1 1 190px}
+.ctrls label{
+  font-family:var(--cond);font-size:11px;font-weight:600;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--muted);
+}
+.ctrls .hit{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--faint)}
+th.s{cursor:pointer;user-select:none}
+th.s:hover{color:var(--ink)}
+th.s::after{content:"";font-family:var(--mono);font-size:9px;margin-left:5px;color:var(--spine)}
+th.s.asc::after{content:"▲"}
+th.s.desc::after{content:"▼"}
+.grp td{
+  background:var(--surface-2);font-family:var(--cond);font-size:11.5px;font-weight:700;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--spine);padding:8px 13px;
+}
+.grp td span{color:var(--faint);font-weight:500;letter-spacing:.04em;margin-left:8px;font-family:var(--mono);font-size:10.5px;text-transform:none}
+
+/* ── two-col blocks ────────────────────────────────────────── */
+.cols{margin-top:26px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
+.block{border:1px solid var(--rule);background:var(--surface);padding:16px 17px}
+.block h4{
+  font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+  padding-bottom:9px;border-bottom:1px solid var(--rule-soft);
+}
+.block .body{margin-top:11px}
+.kv{display:flex;flex-direction:column;gap:0}
+.kv > div{display:flex;gap:12px;padding:6px 0;border-bottom:1px solid var(--rule-soft);font-size:13.5px}
+.kv > div:last-child{border-bottom:0}
+.kv dt,.kv .k{font-family:var(--mono);font-size:12px;color:var(--ink-2);flex:0 0 auto}
+.kv .v{margin-left:auto;text-align:right;color:var(--muted);font-size:12.5px;font-family:var(--cond)}
+.taglist{display:flex;flex-wrap:wrap;gap:5px}
+ol.steps{margin:0;padding-left:20px;font-size:14px;color:var(--ink-2)}
+ol.steps li{margin-bottom:7px;padding-left:3px}
+ol.steps li:last-child{margin-bottom:0}
+ol.steps code{font-size:12px;background:var(--surface-2);padding:1px 5px;border-radius:2px}
+
+.callout{
+  margin-top:22px;border-left:3px solid var(--warn);background:var(--warn-wash);
+  padding:13px 16px;font-size:14px;color:var(--ink-2);max-width:82ch;
+}
+.callout b{color:var(--ink);font-weight:600;font-family:var(--cond)}
+.callout.spine-c{border-left-color:var(--spine);background:var(--spine-wash)}
+
+.foot{
+  margin-top:64px;padding-top:18px;border-top:1px solid var(--rule);
+  font-family:var(--mono);font-size:11.5px;color:var(--faint);
+  display:flex;flex-wrap:wrap;gap:6px 20px;
+}
+
+/* ── implementation order tree ──────────────────────────────── */
+.order{margin-top:26px;border:1px solid var(--rule);background:var(--surface)}
+.ostage + .ostage{border-top:1px solid var(--rule)}
+.ostage-h{
+  display:flex;align-items:baseline;gap:13px;flex-wrap:wrap;padding:12px 16px;
+  background:var(--surface-2);border-bottom:1px solid var(--rule);
+  position:sticky;top:38px;z-index:5;
+}
+.ostage-h b{
+  font-family:var(--cond);font-size:12px;font-weight:700;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--spine);
+}
+.ostage-h span{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.ostage-h em{
+  font-style:normal;font-family:var(--cond);font-size:12.5px;color:var(--muted);
+  margin-left:auto;text-align:right;
+}
+.ostep{display:grid;grid-template-columns:52px 1fr}
+.ostep + .ostep{border-top:1px solid var(--rule-soft)}
+.ostep:hover{background:var(--surface-2)}
+.ostep > .i{
+  font-family:var(--mono);font-size:12px;color:var(--faint);text-align:right;
+  padding:10px 11px 10px 0;font-variant-numeric:tabular-nums;
+  border-right:1px solid var(--rule-soft);
+}
+.ostep > .b{padding:9px 15px;min-width:0}
+.ostep .hd{display:flex;align-items:baseline;flex-wrap:wrap;gap:7px}
+.ostep .nm{font-family:var(--mono);font-size:13.5px;font-weight:500;color:var(--ink)}
+.ostep .ub{
+  font-family:var(--cond);font-size:10.5px;font-weight:600;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--spine-ink);background:var(--spine-wash);
+  padding:1.5px 6px;border-radius:2px;
+}
+.ostep .ub.hot{background:var(--spine);color:var(--surface)}
+:root[data-theme="dark"] .ostep .ub.hot{color:#0C1014}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .ostep .ub.hot{color:#0C1014}}
+.ostep .dom{
+  font-family:var(--cond);font-size:11px;font-weight:500;letter-spacing:.05em;color:var(--muted);
+}
+.ostep .pt{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.ostep .po{
+  font-family:var(--cond);font-size:10.5px;font-weight:600;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--warn);background:var(--warn-wash);
+  padding:1.5px 6px;border-radius:2px;
+}
+.ostep .needs{margin-top:4px;font-size:11.5px;line-height:1.75}
+.ostep .needs > b{
+  font-family:var(--cond);font-weight:600;letter-spacing:.09em;text-transform:uppercase;
+  font-size:9.5px;color:var(--faint);margin-right:7px;
+}
+.nd{
+  font-family:var(--mono);font-size:11.5px;color:var(--ink-2);
+  border-bottom:1px solid var(--rule);padding-bottom:1px;
+}
+.nd + .nd{margin-left:6px}
+.nd.inf{border-bottom:1px dotted var(--warn);color:var(--muted)}
+.nd.none{color:var(--faint);border-bottom:0;font-style:normal}
+@media (max-width:640px){
+  .ostage-h{position:static}
+  .ostep{grid-template-columns:40px 1fr}
+  .ostage-h em{margin-left:0;text-align:left;width:100%}
+}
+
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div class="eyebrow">Zoiko Suite · Backend Architecture Register</div>
+    <h1>The Service Spine</h1>
+    <p class="lede">
+      All 102 services in one order you can build straight down, plus what each one is waiting on.
+      Build phases come from the spec; <strong>the step order in §01 comes from the real
+      <code>depends_on</code> graph in <code>deployments/docker-compose.yml</code></strong> — the two are not
+      the same, and the second one is the one that actually stops a stack from starting.
+    </p>
+    <div class="meta">
+      <span>102 Go services</span><span>·</span>
+      <span>zoiko-suite-backend @ master</span><span>·</span>
+      <span>compiled from compose + migrations + docs/architecture</span><span>·</span>
+      <span>3 Sep 2026</span>
+    </div>
+    <div class="counts">
+      <div class="count"><b>102</b><span>Services</span></div>
+      <div class="count"><b>11</b><span>Tier 0</span></div>
+      <div class="count"><b>6</b><span>Stages</span></div>
+      <div class="count"><b>8</b><span>Build phases</span></div>
+      <div class="count"><b>22</b><span>Envelope headers</span></div>
+      <div class="count"><b>69</b><span>Depend on authz</span></div>
+      <div class="count"><b>20</b><span>Not in main stack</span></div>
+    </div>
+  </header>
+
+  <nav class="rail" aria-label="Sections">
+    <div class="rail-in">
+      <a href="#order"><span class="n">01</span>Order 1&ndash;102</a>
+      <a href="#path"><span class="n">02</span>Request path</a>
+      <a href="#envelope"><span class="n">03</span>Envelope</a>
+      <a href="#chains"><span class="n">04</span>Chains</a>
+      <a href="#phases"><span class="n">05</span>Build phases</a>
+      <a href="#register"><span class="n">06</span>Service register</a>
+      <a href="#gaps"><span class="n">07</span>Not wired</a>
+      <a href="#access"><span class="n">08</span>Access model</a>
+      <a href="#console"><span class="n">09</span>Console</a>
+      <a href="#runbook"><span class="n">10</span>Runbook</a>
+    </div>
+  </nav>
+
+  <!-- ═══ 01 IMPLEMENTATION ORDER ═════════════════════ -->
+  <section id="order">
+    <div class="shead">
+      <div class="num">01</div>
+      <h2>Implementation order &mdash; 1 to 102</h2>
+      <div class="sub">topological sort of the real dependency graph</div>
+    </div>
+    <p class="note">
+      Start at step 1 and work down. This is a genuine topological order: <strong>no service appears before
+      something it depends on</strong>, so you can stop at any step and everything built so far stands up on
+      its own. Within a stage the order is by how much each service unblocks, so the work that removes the
+      most downstream blockage comes first.
+    </p>
+    <p class="note">
+      Stages are the layers of the graph, not the spec's phases &mdash; everything inside one stage is
+      independent of everything else inside it and can be built in parallel by separate people. The
+      <em>needs</em> line under each service is its declared <code>depends_on</code> set with
+      <code>postgres</code> and <code>kafka</code> omitted.
+    </p>
+    <p class="note">
+      Two things to read carefully. A <span class="nd inf" style="font-size:11.5px">dotted prerequisite</span>
+      is inferred, not declared: the 20 services that live only in
+      <code>docker-compose.phase5/6/7.yml</code> have no edges into the main graph, so their position comes
+      from the service that owns the data they read. And every service is named by its directory under
+      <code>services/</code>.
+    </p>
+
+    <div class="callout spine-c">
+      <b>Step 1 is not negotiable.</b> <code>authorization-svc</code> unblocks 84 of the other 101 services
+      and they all fail closed. Building anything else first gives you a service that cannot authorize a
+      single write, which presents as a 503 rather than as a missing dependency.
+    </div>
+
+    <div class="order">
+      <div class="ostage">
+      <div class="ostage-h"><b>Stage 0</b><span>steps 1&ndash;8 &middot; 8 services</span><em>Infrastructure only. Nothing else can start.</em></div>
+      <div class="ostep"><div class="i">1</div><div class="b"><div class="hd"><span class="nm">authorization-svc</span><span class="ub hot">unblocks 84</span><span class="dom">Governance</span><span class="pt">:8089</span></div><div class="needs"><b>needs</b><span class="nd none">postgres &middot; kafka only</span></div></div></div>
+      <div class="ostep"><div class="i">2</div><div class="b"><div class="hd"><span class="nm">governance-decision-log-svc</span><span class="ub">unblocks 3</span><span class="dom">Governance</span><span class="pt">:8083</span></div><div class="needs"><b>needs</b><span class="nd none">postgres &middot; kafka only</span></div></div></div>
+      <div class="ostep"><div class="i">3</div><div class="b"><div class="hd"><span class="nm">policy-svc</span><span class="ub">unblocks 3</span><span class="dom">Governance</span><span class="pt">:8085</span></div><div class="needs"><b>needs</b><span class="nd none">postgres &middot; kafka only</span></div></div></div>
+      <div class="ostep"><div class="i">4</div><div class="b"><div class="hd"><span class="nm">jurisdiction-rules-svc</span><span class="ub">unblocks 2</span><span class="dom">Governance</span><span class="pt">:8082</span></div><div class="needs"><b>needs</b><span class="nd none">postgres &middot; kafka only</span></div></div></div>
+      <div class="ostep"><div class="i">5</div><div class="b"><div class="hd"><span class="nm">identity-context-svc</span><span class="ub">unblocks 2</span><span class="dom">Foundation</span><span class="pt">:8080</span></div><div class="needs"><b>needs</b><span class="nd none">postgres &middot; kafka only</span></div></div></div>
+      <div class="ostep"><div class="i">6</div><div class="b"><div class="hd"><span class="nm">audit-event-store-svc</span><span class="ub">unblocks 2</span><span class="dom">Evidence &amp; Audit</span><span class="pt">:8084</span></div><div class="needs"><b>needs</b><span class="nd none">postgres &middot; kafka only</span></div></div></div>
+      <div class="ostep"><div class="i">7</div><div class="b"><div class="hd"><span class="nm">secret-vault-integration-svc</span><span class="ub">unblocks 1</span><span class="dom">Foundation</span><span class="pt">:8087</span></div><div class="needs"><b>needs</b><span class="nd none">postgres &middot; kafka only</span></div></div></div>
+      <div class="ostep"><div class="i">8</div><div class="b"><div class="hd"><span class="nm">configuration-feature-flag-svc</span><span class="dom">Foundation</span><span class="pt">:8086</span></div><div class="needs"><b>needs</b><span class="nd none">postgres &middot; kafka only</span></div></div></div>
+      </div>
+      <div class="ostage">
+      <div class="ostage-h"><b>Stage 1</b><span>steps 9&ndash;42 &middot; 34 services</span><em>Need the spine. The domain masters live here.</em></div>
+      <div class="ostep"><div class="i">9</div><div class="b"><div class="hd"><span class="nm">employee-master-svc</span><span class="ub hot">unblocks 14</span><span class="dom">Workforce</span><span class="pt">:8108</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">10</div><div class="b"><div class="hd"><span class="nm">general-ledger-svc</span><span class="ub hot">unblocks 11</span><span class="dom">Finance</span><span class="pt">:8098</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">11</div><div class="b"><div class="hd"><span class="nm">obligations-svc</span><span class="ub">unblocks 4</span><span class="dom">Governance</span><span class="pt">:8088</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">12</div><div class="b"><div class="hd"><span class="nm">workflow-svc</span><span class="ub">unblocks 4</span><span class="dom">Governance</span><span class="pt">:8090</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">13</div><div class="b"><div class="hd"><span class="nm">tenant-entity-registry-svc</span><span class="ub">unblocks 4</span><span class="dom">Foundation</span><span class="pt">:8081</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">14</div><div class="b"><div class="hd"><span class="nm">tax-rules-svc</span><span class="ub">unblocks 4</span><span class="dom">Tax &amp; Compliance</span><span class="pt">:8125</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">15</div><div class="b"><div class="hd"><span class="nm">payable-open-item-svc</span><span class="ub">unblocks 4</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8164</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">16</div><div class="b"><div class="hd"><span class="nm">privacy-purpose-registry-svc</span><span class="ub">unblocks 3</span><span class="dom">Privacy</span><span class="pt">:8151</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">17</div><div class="b"><div class="hd"><span class="nm">schema-registry-svc</span><span class="ub">unblocks 2</span><span class="dom">Foundation</span><span class="pt">:8093</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">18</div><div class="b"><div class="hd"><span class="nm">counterparty-management-svc</span><span class="ub">unblocks 2</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8124</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">19</div><div class="b"><div class="hd"><span class="nm">supplier-financial-profile-svc</span><span class="ub">unblocks 2</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8156</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">20</div><div class="b"><div class="hd"><span class="nm">notification-svc</span><span class="ub">unblocks 1</span><span class="dom">Foundation</span><span class="pt">:8133</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">21</div><div class="b"><div class="hd"><span class="nm">retention-registry-svc</span><span class="ub">unblocks 1</span><span class="dom">Privacy</span><span class="pt">:8148</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">22</div><div class="b"><div class="hd"><span class="nm">obligation-tracking-svc</span><span class="ub">unblocks 1</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8121</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">23</div><div class="b"><div class="hd"><span class="nm">purchase-request-svc</span><span class="ub">unblocks 1</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8100</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">24</div><div class="b"><div class="hd"><span class="nm">spend-controls-svc</span><span class="ub">unblocks 1</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8131</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">25</div><div class="b"><div class="hd"><span class="nm">payment-initiation-adapter-svc</span><span class="ub">unblocks 1</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8162</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">26</div><div class="b"><div class="hd"><span class="nm">payment-status-svc</span><span class="ub">unblocks 1</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8163</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">27</div><div class="b"><div class="hd"><span class="nm">metric-registry-svc</span><span class="ub">unblocks 1</span><span class="dom">Intelligence</span><span class="pt">:8149</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">28</div><div class="b"><div class="hd"><span class="nm">access-control-svc</span><span class="dom">Foundation</span><span class="pt">:8137</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">29</div><div class="b"><div class="hd"><span class="nm">delegated-authority-svc</span><span class="dom">Foundation</span><span class="pt">:8136</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">30</div><div class="b"><div class="hd"><span class="nm">carta-svc</span><span class="dom">Security &amp; Trust</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">identity-context-svc</span></div></div></div>
+      <div class="ostep"><div class="i">31</div><div class="b"><div class="hd"><span class="nm">key-management-svc</span><span class="dom">Security &amp; Trust</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">secret-vault-integration-svc</span></div></div></div>
+      <div class="ostep"><div class="i">32</div><div class="b"><div class="hd"><span class="nm">kill-switch-registry-svc</span><span class="dom">Security &amp; Trust</span><span class="pt">:8147</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">33</div><div class="b"><div class="hd"><span class="nm">mtls-management-svc</span><span class="dom">Security &amp; Trust</span><span class="pt">:8140</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">34</div><div class="b"><div class="hd"><span class="nm">siem-integration-svc</span><span class="dom">Security &amp; Trust</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd inf">audit-event-store-svc</span> <span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">35</div><div class="b"><div class="hd"><span class="nm">privacy-rights-svc</span><span class="dom">Privacy</span><span class="pt">:8154</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">36</div><div class="b"><div class="hd"><span class="nm">clause-template-svc</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8120</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">37</div><div class="b"><div class="hd"><span class="nm">contract-lifecycle-svc</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8119</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">governance-decision-log-svc</span></div></div></div>
+      <div class="ostep"><div class="i">38</div><div class="b"><div class="hd"><span class="nm">ai-governance-svc</span><span class="dom">Commercial &amp; Platform</span><span class="pt">:8146</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">39</div><div class="b"><div class="hd"><span class="nm">capability-registry-svc</span><span class="dom">Commercial &amp; Platform</span><span class="pt">:8145</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">40</div><div class="b"><div class="hd"><span class="nm">commercial-account-svc</span><span class="dom">Commercial &amp; Platform</span><span class="pt">:8144</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">41</div><div class="b"><div class="hd"><span class="nm">source-authority-svc</span><span class="dom">Commercial &amp; Platform</span><span class="pt">:8150</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span></div></div></div>
+      <div class="ostep"><div class="i">42</div><div class="b"><div class="hd"><span class="nm">decision-support-svc</span><span class="dom">Intelligence</span><span class="pt">:8138</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">governance-decision-log-svc</span></div></div></div>
+      </div>
+      <div class="ostage">
+      <div class="ostage-h"><b>Stage 2</b><span>steps 43&ndash;77 &middot; 35 services</span><em>Need a domain master. The widest stage.</em></div>
+      <div class="ostep"><div class="i">43</div><div class="b"><div class="hd"><span class="nm">connectivity-api-bridge-svc</span><span class="ub">unblocks 5</span><span class="dom">Integration</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd inf">schema-registry-svc</span></div></div></div>
+      <div class="ostep"><div class="i">44</div><div class="b"><div class="hd"><span class="nm">document-vault-svc</span><span class="ub">unblocks 4</span><span class="dom">Evidence &amp; Audit</span><span class="pt">:8094</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">tenant-entity-registry-svc</span></div></div></div>
+      <div class="ostep"><div class="i">45</div><div class="b"><div class="hd"><span class="nm">accounts-payable-svc</span><span class="ub">unblocks 3</span><span class="dom">Finance</span><span class="pt">:8099</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">payable-open-item-svc</span></div></div></div>
+      <div class="ostep"><div class="i">46</div><div class="b"><div class="hd"><span class="nm">bank-reconciliation-svc</span><span class="ub">unblocks 3</span><span class="dom">Finance</span><span class="pt">:8102</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">general-ledger-svc</span></div></div></div>
+      <div class="ostep"><div class="i">47</div><div class="b"><div class="hd"><span class="nm">tax-determination-svc</span><span class="ub">unblocks 3</span><span class="dom">Tax &amp; Compliance</span><span class="pt">:8126</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">tax-rules-svc</span></div></div></div>
+      <div class="ostep"><div class="i">48</div><div class="b"><div class="hd"><span class="nm">accounts-receivable-svc</span><span class="ub">unblocks 2</span><span class="dom">Finance</span><span class="pt">:8101</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">general-ledger-svc</span> <span class="nd">tenant-entity-registry-svc</span></div></div></div>
+      <div class="ostep"><div class="i">49</div><div class="b"><div class="hd"><span class="nm">purchase-order-svc</span><span class="ub">unblocks 2</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8129</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">purchase-request-svc</span></div></div></div>
+      <div class="ostep"><div class="i">50</div><div class="b"><div class="hd"><span class="nm">workflow-history-svc</span><span class="ub">unblocks 1</span><span class="dom">Evidence &amp; Audit</span><span class="pt">:8097</span></div><div class="needs"><b>needs</b><span class="nd">workflow-svc</span></div></div></div>
+      <div class="ostep"><div class="i">51</div><div class="b"><div class="hd"><span class="nm">privacy-consent-svc</span><span class="ub">unblocks 1</span><span class="dom">Privacy</span><span class="pt">:8152</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">privacy-purpose-registry-svc</span></div></div></div>
+      <div class="ostep"><div class="i">52</div><div class="b"><div class="hd"><span class="nm">intercompany-accounting-svc</span><span class="ub">unblocks 1</span><span class="dom">Finance</span><span class="pt">:8105</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">general-ledger-svc</span></div></div></div>
+      <div class="ostep"><div class="i">53</div><div class="b"><div class="hd"><span class="nm">employment-contracts-svc</span><span class="ub">unblocks 1</span><span class="dom">Workforce</span><span class="pt">:8109</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span></div></div></div>
+      <div class="ostep"><div class="i">54</div><div class="b"><div class="hd"><span class="nm">vat-gst-svc</span><span class="ub">unblocks 1</span><span class="dom">Tax &amp; Compliance</span><span class="pt">:8127</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">tax-rules-svc</span></div></div></div>
+      <div class="ostep"><div class="i">55</div><div class="b"><div class="hd"><span class="nm">payee-banking-identity-svc</span><span class="ub">unblocks 1</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8166</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">counterparty-management-svc</span></div></div></div>
+      <div class="ostep"><div class="i">56</div><div class="b"><div class="hd"><span class="nm">gateway-auth-svc</span><span class="dom">Foundation</span><span class="pt">:8092</span></div><div class="needs"><b>needs</b><span class="nd">identity-context-svc</span> <span class="nd">tenant-entity-registry-svc</span></div></div></div>
+      <div class="ostep"><div class="i">57</div><div class="b"><div class="hd"><span class="nm">search-indexer-svc</span><span class="dom">Foundation</span><span class="pt">:8096</span></div><div class="needs"><b>needs</b><span class="nd">obligations-svc</span> <span class="nd">tenant-entity-registry-svc</span></div></div></div>
+      <div class="ostep"><div class="i">58</div><div class="b"><div class="hd"><span class="nm">migration-integrity-svc</span><span class="dom">Security &amp; Trust</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">schema-registry-svc</span></div></div></div>
+      <div class="ostep"><div class="i">59</div><div class="b"><div class="hd"><span class="nm">privacy-transfer-svc</span><span class="dom">Privacy</span><span class="pt">:8155</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">privacy-purpose-registry-svc</span></div></div></div>
+      <div class="ostep"><div class="i">60</div><div class="b"><div class="hd"><span class="nm">benefits-svc</span><span class="dom">Workforce</span><span class="pt">:8112</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span></div></div></div>
+      <div class="ostep"><div class="i">61</div><div class="b"><div class="hd"><span class="nm">compensation-svc</span><span class="dom">Workforce</span><span class="pt">:8111</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span></div></div></div>
+      <div class="ostep"><div class="i">62</div><div class="b"><div class="hd"><span class="nm">leave-absence-svc</span><span class="dom">Workforce</span><span class="pt">:8115</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span></div></div></div>
+      <div class="ostep"><div class="i">63</div><div class="b"><div class="hd"><span class="nm">offboarding-severance-svc</span><span class="dom">Workforce</span><span class="pt">:8117</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span> <span class="nd">jurisdiction-rules-svc</span></div></div></div>
+      <div class="ostep"><div class="i">64</div><div class="b"><div class="hd"><span class="nm">org-structure-svc</span><span class="dom">Workforce</span><span class="pt">:8116</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span></div></div></div>
+      <div class="ostep"><div class="i">65</div><div class="b"><div class="hd"><span class="nm">payroll-exceptions-svc</span><span class="dom">Workforce</span><span class="pt">:8114</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span></div></div></div>
+      <div class="ostep"><div class="i">66</div><div class="b"><div class="hd"><span class="nm">payroll-tax-svc</span><span class="dom">Workforce</span><span class="pt">:8113</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span></div></div></div>
+      <div class="ostep"><div class="i">67</div><div class="b"><div class="hd"><span class="nm">performance-review-svc</span><span class="dom">Workforce</span><span class="pt">:8139</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span></div></div></div>
+      <div class="ostep"><div class="i">68</div><div class="b"><div class="hd"><span class="nm">workforce-compliance-svc</span><span class="dom">Workforce</span><span class="pt">:8118</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span> <span class="nd">jurisdiction-rules-svc</span></div></div></div>
+      <div class="ostep"><div class="i">69</div><div class="b"><div class="hd"><span class="nm">vendor-due-diligence-svc</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8135</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">counterparty-management-svc</span></div></div></div>
+      <div class="ostep"><div class="i">70</div><div class="b"><div class="hd"><span class="nm">compliance-status-svc</span><span class="dom">Tax &amp; Compliance</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">obligation-tracking-svc</span> <span class="nd inf">obligations-svc</span></div></div></div>
+      <div class="ostep"><div class="i">71</div><div class="b"><div class="hd"><span class="nm">corporate-tax-svc</span><span class="dom">Tax &amp; Compliance</span><span class="pt">:8128</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">tax-rules-svc</span></div></div></div>
+      <div class="ostep"><div class="i">72</div><div class="b"><div class="hd"><span class="nm">exception-escalation-svc</span><span class="dom">Tax &amp; Compliance</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">notification-svc</span> <span class="nd inf">workflow-svc</span></div></div></div>
+      <div class="ostep"><div class="i">73</div><div class="b"><div class="hd"><span class="nm">withholding-tax-svc</span><span class="dom">Tax &amp; Compliance</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">tax-rules-svc</span></div></div></div>
+      <div class="ostep"><div class="i">74</div><div class="b"><div class="hd"><span class="nm">anomaly-detection-svc</span><span class="dom">Intelligence</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd inf">audit-event-store-svc</span> <span class="nd">authorization-svc</span> <span class="nd inf">general-ledger-svc</span></div></div></div>
+      <div class="ostep"><div class="i">75</div><div class="b"><div class="hd"><span class="nm">compliance-risk-scoring-svc</span><span class="dom">Intelligence</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">obligations-svc</span> <span class="nd inf">policy-svc</span></div></div></div>
+      <div class="ostep"><div class="i">76</div><div class="b"><div class="hd"><span class="nm">forecasting-svc</span><span class="dom">Intelligence</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">employee-master-svc</span> <span class="nd inf">general-ledger-svc</span></div></div></div>
+      <div class="ostep"><div class="i">77</div><div class="b"><div class="hd"><span class="nm">reporting-orchestration-svc</span><span class="dom">Intelligence</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">general-ledger-svc</span> <span class="nd inf">metric-registry-svc</span></div></div></div>
+      </div>
+      <div class="ostage">
+      <div class="ostage-h"><b>Stage 3</b><span>steps 78&ndash;96 &middot; 19 services</span><em>Aggregate across domains — close, consolidate, assemble.</em></div>
+      <div class="ostep"><div class="i">78</div><div class="b"><div class="hd"><span class="nm">evidence-requirements-svc</span><span class="ub">unblocks 2</span><span class="dom">Governance</span><span class="pt">:8130</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">document-vault-svc</span></div></div></div>
+      <div class="ostep"><div class="i">79</div><div class="b"><div class="hd"><span class="nm">filing-preparation-svc</span><span class="ub">unblocks 2</span><span class="dom">Tax &amp; Compliance</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">tax-determination-svc</span> <span class="nd inf">vat-gst-svc</span></div></div></div>
+      <div class="ostep"><div class="i">80</div><div class="b"><div class="hd"><span class="nm">payment-proposal-svc</span><span class="ub">unblocks 1</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8159</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">payable-open-item-svc</span> <span class="nd">supplier-financial-profile-svc</span> <span class="nd">tax-determination-svc</span></div></div></div>
+      <div class="ostep"><div class="i">81</div><div class="b"><div class="hd"><span class="nm">evidence-manifest-svc</span><span class="dom">Evidence &amp; Audit</span><span class="pt">:8095</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">governance-decision-log-svc</span> <span class="nd">workflow-history-svc</span> <span class="nd">workflow-svc</span></div></div></div>
+      <div class="ostep"><div class="i">82</div><div class="b"><div class="hd"><span class="nm">privacy-decision-svc</span><span class="dom">Privacy</span><span class="pt">:8153</span></div><div class="needs"><b>needs</b><span class="nd">privacy-consent-svc</span> <span class="nd">privacy-purpose-registry-svc</span> <span class="nd">retention-registry-svc</span></div></div></div>
+      <div class="ostep"><div class="i">83</div><div class="b"><div class="hd"><span class="nm">consolidation-svc</span><span class="dom">Finance</span><span class="pt">:8106</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">general-ledger-svc</span> <span class="nd">intercompany-accounting-svc</span></div></div></div>
+      <div class="ostep"><div class="i">84</div><div class="b"><div class="hd"><span class="nm">financial-close-svc</span><span class="dom">Finance</span><span class="pt">:8104</span></div><div class="needs"><b>needs</b><span class="nd">accounts-payable-svc</span> <span class="nd">accounts-receivable-svc</span> <span class="nd">authorization-svc</span> <span class="nd">document-vault-svc</span> <span class="nd">general-ledger-svc</span></div></div></div>
+      <div class="ostep"><div class="i">85</div><div class="b"><div class="hd"><span class="nm">treasury-svc</span><span class="dom">Finance</span><span class="pt">:8103</span></div><div class="needs"><b>needs</b><span class="nd">accounts-payable-svc</span> <span class="nd">accounts-receivable-svc</span> <span class="nd">authorization-svc</span> <span class="nd">general-ledger-svc</span> <span class="nd">obligations-svc</span></div></div></div>
+      <div class="ostep"><div class="i">86</div><div class="b"><div class="hd"><span class="nm">payroll-run-svc</span><span class="dom">Workforce</span><span class="pt">:8110</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">employee-master-svc</span> <span class="nd">employment-contracts-svc</span></div></div></div>
+      <div class="ostep"><div class="i">87</div><div class="b"><div class="hd"><span class="nm">invoice-approval-svc</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8107</span></div><div class="needs"><b>needs</b><span class="nd">accounts-payable-svc</span> <span class="nd">authorization-svc</span> <span class="nd">workflow-svc</span></div></div></div>
+      <div class="ostep"><div class="i">88</div><div class="b"><div class="hd"><span class="nm">procurement-workflow-svc</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8134</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">purchase-order-svc</span> <span class="nd">spend-controls-svc</span></div></div></div>
+      <div class="ostep"><div class="i">89</div><div class="b"><div class="hd"><span class="nm">expense-claim-svc</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8158</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">document-vault-svc</span> <span class="nd">employee-master-svc</span> <span class="nd">payable-open-item-svc</span> <span class="nd">policy-svc</span> <span class="nd">tax-determination-svc</span></div></div></div>
+      <div class="ostep"><div class="i">90</div><div class="b"><div class="hd"><span class="nm">goods-service-receipt-svc</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8157</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">general-ledger-svc</span> <span class="nd">purchase-order-svc</span></div></div></div>
+      <div class="ostep"><div class="i">91</div><div class="b"><div class="hd"><span class="nm">supplier-recovery-svc</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8165</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">bank-reconciliation-svc</span> <span class="nd">payable-open-item-svc</span></div></div></div>
+      <div class="ostep"><div class="i">92</div><div class="b"><div class="hd"><span class="nm">reconciliation-intelligence-svc</span><span class="dom">Intelligence</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">bank-reconciliation-svc</span> <span class="nd inf">general-ledger-svc</span></div></div></div>
+      <div class="ostep"><div class="i">93</div><div class="b"><div class="hd"><span class="nm">banking-connector-svc</span><span class="dom">Integration</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd inf">bank-reconciliation-svc</span> <span class="nd inf">connectivity-api-bridge-svc</span></div></div></div>
+      <div class="ostep"><div class="i">94</div><div class="b"><div class="hd"><span class="nm">esignature-integration-svc</span><span class="dom">Integration</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd inf">connectivity-api-bridge-svc</span> <span class="nd inf">document-vault-svc</span></div></div></div>
+      <div class="ostep"><div class="i">95</div><div class="b"><div class="hd"><span class="nm">external-data-feed-svc</span><span class="dom">Integration</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd inf">connectivity-api-bridge-svc</span></div></div></div>
+      <div class="ostep"><div class="i">96</div><div class="b"><div class="hd"><span class="nm">hris-connector-svc</span><span class="dom">Integration</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd inf">connectivity-api-bridge-svc</span> <span class="nd inf">employee-master-svc</span></div></div></div>
+      </div>
+      <div class="ostage">
+      <div class="ostage-h"><b>Stage 4</b><span>steps 97&ndash;101 &middot; 5 services</span><em>Need an aggregator plus evidence.</em></div>
+      <div class="ostep"><div class="i">97</div><div class="b"><div class="hd"><span class="nm">payment-authorization-svc</span><span class="ub">unblocks 1</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8160</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">payee-banking-identity-svc</span> <span class="nd">payment-proposal-svc</span> <span class="nd">policy-svc</span> <span class="nd">supplier-financial-profile-svc</span></div></div></div>
+      <div class="ostep"><div class="i">98</div><div class="b"><div class="hd"><span class="nm">board-resolutions-svc</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8122</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">evidence-requirements-svc</span></div></div></div>
+      <div class="ostep"><div class="i">99</div><div class="b"><div class="hd"><span class="nm">corporate-actions-svc</span><span class="dom">Legal &amp; Commercial</span><span class="pt">:8123</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">evidence-requirements-svc</span></div></div></div>
+      <div class="ostep"><div class="i">100</div><div class="b"><div class="hd"><span class="nm">filing-tracker-svc</span><span class="dom">Tax &amp; Compliance</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd inf">filing-preparation-svc</span></div></div></div>
+      <div class="ostep"><div class="i">101</div><div class="b"><div class="hd"><span class="nm">tax-authority-interface-svc</span><span class="dom">Integration</span><span class="po">phase compose only</span></div><div class="needs"><b>needs</b><span class="nd inf">connectivity-api-bridge-svc</span> <span class="nd inf">filing-preparation-svc</span></div></div></div>
+      </div>
+      <div class="ostage">
+      <div class="ostage-h"><b>Stage 5</b><span>steps 102&ndash;102 &middot; 1 services</span><em>The deepest path in the platform.</em></div>
+      <div class="ostep"><div class="i">102</div><div class="b"><div class="hd"><span class="nm">payment-run-svc</span><span class="dom">Payments &amp; P2P</span><span class="pt">:8161</span></div><div class="needs"><b>needs</b><span class="nd">authorization-svc</span> <span class="nd">payment-authorization-svc</span> <span class="nd">payment-initiation-adapter-svc</span> <span class="nd">payment-status-svc</span></div></div></div>
+      </div>
+      </div>
+  </section>
+
+  <!-- ═══ 02 REQUEST PATH ═══════════════════════════════════════ -->
+  <section id="path">
+    <div class="shead">
+      <div class="num">02</div>
+      <h2>What happens to one request</h2>
+      <div class="sub">docs/architecture/01-backend.md §04</div>
+    </div>
+    <p class="note">
+      The canonical execution model for any material action — a payroll release, a contract execution, a
+      payment run. The governance plane sits between every channel and every domain service, and the spec's
+      claim is that it cannot be circumvented by UI flow, internal API, integration, or scheduled automation.
+      Stages 3 and 4 are the gate; everything above them is context assembly and everything below is consequence.
+    </p>
+
+    <div class="spine">
+      <div class="stage">
+        <div class="stage-mark"><i></i><span class="sn">1</span></div>
+        <div class="stage-body">
+          <h3>Request intake</h3>
+          <p>UI, API, scheduled workflow or system event. Traefik edge does residency steering into a regional
+          pool before anything else sees the request.</p>
+          <div class="svcs">
+            <span class="chip infra">gateway :8091</span>
+            <span class="chip infra">eu-pool / us-pool / uk-pool</span>
+            <span class="chip infra">quarantine-terminator</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="stage">
+        <div class="stage-mark"><i></i><span class="sn">2</span></div>
+        <div class="stage-body">
+          <h3>Identity resolution</h3>
+          <p>Resolves authenticated principal, tenant, active legal entity, jurisdictional context, role
+          profile, delegated authority and session trust posture. This is where the envelope in §03 gets
+          populated — downstream services read it and never re-derive it.</p>
+          <div class="svcs">
+            <span class="chip key">identity-context-svc :8080</span>
+            <span class="chip key">gateway-auth-svc :8092</span>
+            <span class="chip">tenant-entity-registry-svc :8081</span>
+            <span class="chip">delegated-authority-svc :8136</span>
+            <span class="chip">jurisdiction-rules-svc :8082</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="stage gate">
+        <div class="stage-mark"><i></i><span class="sn">3</span></div>
+        <div class="stage-body">
+          <h3>Governance evaluation<span class="gatetag">the gate</span></h3>
+          <p>Policy thresholds, SoD constraints, approval matrices, jurisdictional obligations, documentation
+          requirements and workflow state. <code>POST /v1/authorize</code> unions every active permission bundle
+          on every role the principal holds and answers <code>PERMITTED</code> or <code>DENIED</code>.</p>
+          <div class="svcs">
+            <span class="chip key">authorization-svc :8089</span>
+            <span class="chip">policy-svc :8085</span>
+            <span class="chip">workflow-svc :8090</span>
+            <span class="chip">obligations-svc :8088</span>
+            <span class="chip">evidence-requirements-svc :8130</span>
+            <span class="chip">carta-svc</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="stage gate">
+        <div class="stage-mark"><i></i><span class="sn">4</span></div>
+        <div class="stage-body">
+          <h3>Execution authorization<span class="gatetag">fail closed</span></h3>
+          <p>Authorized → the domain service proceeds. Not authorized → denied, escalated, or converted into an
+          approval workflow. Silent failure is prohibited, so a service that cannot reach authorization-svc
+          returns 503 rather than proceeding.</p>
+          <div class="svcs">
+            <span class="chip key">authorization-svc</span>
+            <span class="chip">kill-switch-registry-svc :8147</span>
+            <span class="chip">exception-escalation-svc</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="stage">
+        <div class="stage-mark"><i></i><span class="sn">5</span></div>
+        <div class="stage-body">
+          <h3>Transaction &amp; event commit</h3>
+          <p>The domain service writes governed state under RLS and emits typed append-only domain events to
+          Kafka. Events are facts, not commands — no consumer may treat one as an instruction.</p>
+          <div class="svcs">
+            <span class="chip">any of the 80 domain services</span>
+            <span class="chip infra">postgres · one database per service</span>
+            <span class="chip infra">kafka</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="stage">
+        <div class="stage-mark"><i></i><span class="sn">6</span></div>
+        <div class="stage-body">
+          <h3>Evidence generation</h3>
+          <p>Captures actor, action, entity, jurisdiction basis, rule set applied, approvals present,
+          referenced documents, timestamps and provenance links. The audit store's hash chain is deliberately
+          global, not per-tenant, so the chain stays verifiable end to end.</p>
+          <div class="svcs">
+            <span class="chip key">audit-event-store-svc :8084</span>
+            <span class="chip">governance-decision-log-svc :8083</span>
+            <span class="chip">workflow-history-svc :8097</span>
+            <span class="chip">evidence-manifest-svc :8095</span>
+            <span class="chip">document-vault-svc :8094</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="stage">
+        <div class="stage-mark"><i></i><span class="sn">7</span></div>
+        <div class="stage-body">
+          <h3>Intelligence update</h3>
+          <p>Analytical, forecasting, anomaly and risk services consume the event stream and update derived
+          layers <em>without mutating source truth</em>. Everything here is a projection; none of it is a
+          system of record.</p>
+          <div class="svcs">
+            <span class="chip">anomaly-detection-svc</span>
+            <span class="chip">forecasting-svc</span>
+            <span class="chip">compliance-risk-scoring-svc</span>
+            <span class="chip">reconciliation-intelligence-svc</span>
+            <span class="chip">decision-support-svc :8138</span>
+            <span class="chip">reporting-orchestration-svc</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 03 ENVELOPE ═══════════════════════════════════════════ -->
+  <section id="envelope">
+    <div class="shead">
+      <div class="num">03</div>
+      <h2>The canonical envelope</h2>
+      <div class="sub">services/_contract/envelope</div>
+    </div>
+    <p class="note">
+      The one contract shared by all 102 services. Every inter-service call forwards these headers; a service
+      that drops them gets a 401 from authorization-svc and fails closed. The four highlighted below are
+      required on every request — the rest are conditional on the operation.
+      <code>X-Purpose-Context</code> is enforced on 28 services handling personal, bank, tax, payroll or
+      privileged content.
+    </p>
+    <div class="env">
+      <div class="req"><code>X-Tenant-Id</code><em>Tenant boundary — never from the body</em></div>
+      <div class="req"><code>X-Principal-Id</code><em>Actor attribution</em></div>
+      <div class="req"><code>X-Correlation-ID</code><em>Idempotency + trace join key</em></div>
+      <div class="req"><code>X-Operation</code><em>Action being attempted</em></div>
+      <div><code>X-Legal-Entity-Id</code><em>Active legal entity scope</em></div>
+      <div><code>X-Jurisdiction-Context</code><em>Rule set selection</em></div>
+      <div><code>X-Purpose-Context</code><em>Privacy purpose — 28 services</em></div>
+      <div><code>X-Workload-Id</code><em>Machine principal</em></div>
+      <div><code>X-Book-Id</code><em>Accounting book</em></div>
+      <div><code>X-Reporting-Basis</code><em>Statutory vs management</em></div>
+      <div><code>X-Request-Id</code><em>Per-hop id</em></div>
+      <div><code>X-Causation-Id</code><em>Event lineage parent</em></div>
+      <div><code>X-Source-Channel</code><em>UI / API / batch</em></div>
+      <div><code>X-Source-System</code><em>Originating system</em></div>
+      <div><code>X-External-Reference</code><em>Caller's own key</em></div>
+      <div><code>X-Occurred-At</code><em>When it happened</em></div>
+      <div><code>X-Effective-At</code><em>When it takes effect</em></div>
+      <div><code>X-Timezone</code><em>Interpretation of local dates</em></div>
+      <div><code>X-Expected-Version</code><em>Optimistic concurrency</em></div>
+      <div><code>X-Workflow-Instance-Id</code><em>Approval binding</em></div>
+      <div><code>X-Approval-Reference</code><em>Proof of approval</em></div>
+      <div><code>X-Evidence-Refs</code><em>Supporting documents</em></div>
+    </div>
+    <div class="callout spine-c">
+      <b>Why this matters for ordering.</b> Nothing downstream works until stage 2 populates the envelope.
+      A service brought up without identity-context-svc and tenant-entity-registry-svc reachable will
+      authenticate nothing, so its authorization calls 401 and every gated write returns 503 — which reads
+      like a broken service rather than a missing dependency.
+    </div>
+  </section>
+
+  <!-- ═══ 04 CHAINS ═════════════════════════════════════════════ -->
+  <section id="chains">
+    <div class="shead">
+      <div class="num">04</div>
+      <h2>The interconnected chains</h2>
+      <div class="sub">where order is not optional</div>
+    </div>
+    <p class="note">
+      Six places where services form a real sequence rather than a flat fan-out. Each arrow is a declared
+      <code>depends_on</code> edge. If you are testing one of these domains end to end, start at the left —
+      seeding the middle of a chain produces records with nothing to reference.
+      <code>authorization-svc</code> is implied on every node and omitted for legibility.
+    </p>
+    <div class="chains">
+      <div class="chain">
+        <b>Payments — the deepest chain, 5 tiers</b>
+        <div class="flow">
+          <span class="chip">payable-open-item-svc</span><span class="ar">→</span>
+          <span class="chip">payment-proposal-svc</span><span class="ar">→</span>
+          <span class="chip">payment-authorization-svc</span><span class="ar">→</span>
+          <span class="chip key">payment-run-svc</span>
+          <span class="side">+ payee-banking-identity · supplier-financial-profile · tax-determination · policy · payment-initiation-adapter · payment-status</span>
+        </div>
+      </div>
+      <div class="chain">
+        <b>Payroll</b>
+        <div class="flow">
+          <span class="chip key">employee-master-svc</span><span class="ar">→</span>
+          <span class="chip">employment-contracts-svc</span><span class="ar">→</span>
+          <span class="chip">payroll-run-svc</span>
+          <span class="side">employee-master also feeds 10 more: compensation · benefits · payroll-tax · payroll-exceptions · leave-absence · org-structure · performance-review · offboarding-severance · workforce-compliance · expense-claim</span>
+        </div>
+      </div>
+      <div class="chain">
+        <b>Finance — general-ledger is the hub</b>
+        <div class="flow">
+          <span class="chip key">general-ledger-svc</span><span class="ar">→</span>
+          <span class="chip">accounts-payable-svc</span><span class="ar">·</span>
+          <span class="chip">accounts-receivable-svc</span><span class="ar">·</span>
+          <span class="chip">intercompany-accounting-svc</span><span class="ar">→</span>
+          <span class="chip">treasury-svc</span><span class="ar">·</span>
+          <span class="chip">financial-close-svc</span><span class="ar">·</span>
+          <span class="chip">consolidation-svc</span>
+        </div>
+      </div>
+      <div class="chain">
+        <b>Procure-to-pay</b>
+        <div class="flow">
+          <span class="chip">purchase-request-svc</span><span class="ar">→</span>
+          <span class="chip">purchase-order-svc</span><span class="ar">→</span>
+          <span class="chip">goods-service-receipt-svc</span><span class="ar">·</span>
+          <span class="chip">procurement-workflow-svc</span>
+          <span class="side">+ spend-controls · vendor-due-diligence ← counterparty-management</span>
+        </div>
+      </div>
+      <div class="chain">
+        <b>Privacy</b>
+        <div class="flow">
+          <span class="chip key">privacy-purpose-registry-svc</span><span class="ar">→</span>
+          <span class="chip">privacy-consent-svc</span><span class="ar">→</span>
+          <span class="chip">privacy-decision-svc</span>
+          <span class="side">+ retention-registry · privacy-transfer · privacy-rights</span>
+        </div>
+      </div>
+      <div class="chain">
+        <b>Evidence assembly</b>
+        <div class="flow">
+          <span class="chip">workflow-svc</span><span class="ar">→</span>
+          <span class="chip">workflow-history-svc</span><span class="ar">→</span>
+          <span class="chip">evidence-manifest-svc</span>
+          <span class="ar">←</span><span class="chip">governance-decision-log-svc</span>
+          <span class="side">document-vault → evidence-requirements → board-resolutions · corporate-actions</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="cols">
+      <div class="block">
+        <h4>Most depended on (fan-in)</h4>
+        <div class="body kv">
+          <div><span class="k">authorization-svc</span><span class="v">69 services</span></div>
+          <div><span class="k">employee-master-svc</span><span class="v">12</span></div>
+          <div><span class="k">general-ledger-svc</span><span class="v">7</span></div>
+          <div><span class="k">tenant-entity-registry-svc</span><span class="v">4</span></div>
+          <div><span class="k">payable-open-item-svc</span><span class="v">4</span></div>
+          <div><span class="k">governance-decision-log-svc</span><span class="v">3</span></div>
+          <div><span class="k">workflow-svc</span><span class="v">3</span></div>
+          <div><span class="k">document-vault-svc</span><span class="v">3</span></div>
+          <div><span class="k">accounts-payable-svc</span><span class="v">3</span></div>
+          <div><span class="k">tax-rules-svc</span><span class="v">3</span></div>
+        </div>
+      </div>
+      <div class="block">
+        <h4>Most dependencies (fan-out)</h4>
+        <div class="body kv">
+          <div><span class="k">expense-claim-svc</span><span class="v">6 upstreams</span></div>
+          <div><span class="k">treasury-svc</span><span class="v">5</span></div>
+          <div><span class="k">financial-close-svc</span><span class="v">5</span></div>
+          <div><span class="k">payment-authorization-svc</span><span class="v">5</span></div>
+          <div><span class="k">evidence-manifest-svc</span><span class="v">4</span></div>
+          <div><span class="k">payment-proposal-svc</span><span class="v">4</span></div>
+          <div><span class="k">payment-run-svc</span><span class="v">4</span></div>
+          <div><span class="k">procurement-workflow-svc</span><span class="v">3</span></div>
+          <div><span class="k">consolidation-svc</span><span class="v">3</span></div>
+          <div><span class="k">payroll-run-svc</span><span class="v">3</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 05 PHASES ═════════════════════════════════════════════ -->
+  <section id="phases">
+    <div class="shead">
+      <div class="num">05</div>
+      <h2>Build phases 0–7</h2>
+      <div class="sub">docs/architecture/06-blueprint.md §07</div>
+    </div>
+    <p class="note">
+      The spec's delivery model, and the order the codebase was actually written in — phases 5, 6 and 7 still
+      have their own compose files and <code>init-db-phase*.sh</code> scripts. The build doctrine behind it is
+      <em>foundations before features, tier 0 before tier 1, evidence before automation claims</em>.
+    </p>
+
+    <div class="tblwrap">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:78px">Phase</th>
+            <th>Objective</th>
+            <th style="width:56px;text-align:right">Svcs</th>
+            <th>Exit criterion that gates the next phase</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="phase-cell">0</td>
+            <td><b>Program foundation</b><br><span class="dash">Delivery discipline, SDLC controls, schema governance, event taxonomy</span></td>
+            <td class="num">—</td>
+            <td>No unresolved ambiguity on the tenant / entity / jurisdiction / residency model</td>
+          </tr>
+          <tr>
+            <td class="phase-cell">1</td>
+            <td><b>The Sovereign Spine</b><br><span class="dash">Non-bypassable governance plane + Day-0 residency routing</span></td>
+            <td class="num">10</td>
+            <td>No material request can bypass the governance path; region-aware routing technically proven</td>
+          </tr>
+          <tr>
+            <td class="phase-cell">2</td>
+            <td><b>Evidence, audit &amp; data truth</b><br><span class="dash">Immutable record patterns, document versioning, object storage model</span></td>
+            <td class="num">4</td>
+            <td>Canonical audit event model in place before domain expansion</td>
+          </tr>
+          <tr>
+            <td class="phase-cell">3</td>
+            <td><b>The financial engine</b><br><span class="dash">Ledger core + shadow ledger for parallel-run pilots</span></td>
+            <td class="num">10</td>
+            <td>Postings reproducible from source facts</td>
+          </tr>
+          <tr>
+            <td class="phase-cell">4</td>
+            <td><b>The workforce engine</b><br><span class="dash">Payroll core + shadow payroll for legacy parallel run</span></td>
+            <td class="num">11</td>
+            <td>Payroll finalization produces a recomputable hash over locked totals</td>
+          </tr>
+          <tr>
+            <td class="phase-cell">5</td>
+            <td><b>Legal, tax &amp; compliance</b><br><span class="dash">The phase where the product departs from ERP orthodoxy</span></td>
+            <td class="num">15</td>
+            <td>Every obligation links to a source clause or rule basis</td>
+          </tr>
+          <tr>
+            <td class="phase-cell">6</td>
+            <td><b>Trust, intelligence &amp; migration integrity</b><br><span class="dash">CARTA, SIEM, BYOK/HYOK, mTLS, anomaly &amp; forecasting</span></td>
+            <td class="num">10</td>
+            <td>Intelligence outputs explainable and governed; migration evidence available</td>
+          </tr>
+          <tr>
+            <td class="phase-cell">7</td>
+            <td><b>Extensibility &amp; sovereign readiness</b><br><span class="dash">ZoikoSchema-governed connectors — banking, HRIS, tax authority, e-sign</span></td>
+            <td class="num">6</td>
+            <td>External connectivity cannot silently alter governance truth</td>
+          </tr>
+          <tr>
+            <td class="phase-cell dash">—</td>
+            <td><b>Post-blueprint</b><br><span class="dash">Built beyond the 7-phase spec — privacy suite, payments chain, P2P, commercial platform, access control</span></td>
+            <td class="num">36</td>
+            <td class="dash">No phase gate; these come from Doc 07 and the later standards register</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <b>36 of 102 services are not named in any spec phase.</b> They are the largest single block in the
+      codebase and include the entire privacy suite (6), the payment chain (7), P2P and supplier services (5),
+      and the commercial platform (4). Treat the phase model as the history of how the spine was built, not as
+      a complete map of what exists.
+    </div>
+  </section>
+
+  <!-- ═══ 06 REGISTER ═══════════════════════════════════════════ -->
+  <section id="register">
+    <div class="shead">
+      <div class="num">06</div>
+      <h2>Service register</h2>
+      <div class="sub">102 services · sortable, filterable</div>
+    </div>
+    <p class="note">
+      Every service with its port, boot tier, declared upstreams, migration count and test-file count.
+      <strong>Migrations</strong> is a reasonable proxy for how much schema evolution a service has been
+      through; <strong>tests</strong> counts test files, not cases. Sort by tier to get the boot order,
+      by fan-in to find the load-bearing services.
+    </p>
+
+    <div class="ctrls">
+      <input type="search" id="q" placeholder="Search service, group or upstream…" aria-label="Search services">
+      <label for="fg">Domain</label>
+      <select id="fg"><option value="">All</option></select>
+      <label for="fp">Phase</label>
+      <select id="fp"><option value="">All</option></select>
+      <label for="fw">Stack</label>
+      <select id="fw">
+        <option value="">All</option>
+        <option value="main">Main compose</option>
+        <option value="phase">Phase compose only</option>
+      </select>
+      <label for="gb">Group by</label>
+      <select id="gb">
+        <option value="tier">Boot tier</option>
+        <option value="group">Domain</option>
+        <option value="phase">Phase</option>
+        <option value="">Nothing</option>
+      </select>
+      <span class="hit" id="hit"></span>
+    </div>
+
+    <div class="tblwrap">
+      <table id="reg">
+        <thead>
+          <tr>
+            <th class="s" data-k="n">Service</th>
+            <th class="s" data-k="port" style="width:66px">Port</th>
+            <th class="s" data-k="tier" style="width:56px">Tier</th>
+            <th class="s" data-k="phase" style="width:62px">Phase</th>
+            <th class="s" data-k="group" style="width:150px">Domain</th>
+            <th>Declared upstreams</th>
+            <th class="s" data-k="fanin" style="width:62px;text-align:right">Fan-in</th>
+            <th class="s" data-k="mig" style="width:56px;text-align:right">Migr</th>
+            <th class="s" data-k="tests" style="width:56px;text-align:right">Tests</th>
+            <th class="s" data-k="wired" style="width:100px">Stack</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ═══ 07 NOT WIRED ══════════════════════════════════════════ -->
+  <section id="gaps">
+    <div class="shead">
+      <div class="num">07</div>
+      <h2>Built, but not in the main stack</h2>
+      <div class="sub">20 services</div>
+    </div>
+    <p class="note">
+      These have handlers, stores, migrations and passing tests — but they appear only in
+      <code>docker-compose.phase5/6/7.yml</code>, each of which stands up its own Postgres and Kafka. They are
+      not reachable from the main stack, so an end-to-end flow that expects them will fail on connection, not
+      on authorization. Bringing one into <code>docker-compose.yml</code> is the remaining step.
+    </p>
+    <div class="cols">
+      <div class="block">
+        <h4>Phase 5 · legal, tax &amp; compliance <span class="dash">— 5</span></h4>
+        <div class="body taglist">
+          <span class="chip">withholding-tax-svc</span>
+          <span class="chip">filing-preparation-svc</span>
+          <span class="chip">filing-tracker-svc</span>
+          <span class="chip">compliance-status-svc</span>
+          <span class="chip">exception-escalation-svc</span>
+        </div>
+      </div>
+      <div class="block">
+        <h4>Phase 6 · trust &amp; intelligence <span class="dash">— 9</span></h4>
+        <div class="body taglist">
+          <span class="chip">anomaly-detection-svc</span>
+          <span class="chip">forecasting-svc</span>
+          <span class="chip">compliance-risk-scoring-svc</span>
+          <span class="chip">reconciliation-intelligence-svc</span>
+          <span class="chip">reporting-orchestration-svc</span>
+          <span class="chip">migration-integrity-svc</span>
+          <span class="chip">siem-integration-svc</span>
+          <span class="chip">carta-svc</span>
+          <span class="chip">key-management-svc</span>
+        </div>
+      </div>
+      <div class="block">
+        <h4>Phase 7 · integration connectors <span class="dash">— 6</span></h4>
+        <div class="body taglist">
+          <span class="chip">connectivity-api-bridge-svc</span>
+          <span class="chip">banking-connector-svc</span>
+          <span class="chip">hris-connector-svc</span>
+          <span class="chip">tax-authority-interface-svc</span>
+          <span class="chip">esignature-integration-svc</span>
+          <span class="chip">external-data-feed-svc</span>
+        </div>
+      </div>
+    </div>
+    <div class="callout">
+      <b>carta-svc is the one to notice.</b> The runtime flow in §02 places continuous trust scoring inside the
+      governance gate, and the security spec makes session trust re-scoring mandatory for high-risk actions —
+      but carta-svc is reachable only from the phase-6 stack, so today the gate is RBAC and ABAC without the
+      continuous-trust leg. Same shape for <code>key-management-svc</code> against the BYOK/HYOK requirement.
+    </div>
+  </section>
+
+  <!-- ═══ 08 ACCESS ═════════════════════════════════════════════ -->
+  <section id="access">
+    <div class="shead">
+      <div class="num">08</div>
+      <h2>Access model</h2>
+      <div class="sub">roles at three different layers</div>
+    </div>
+    <p class="note">
+      "Role" means three unrelated things in this codebase, and conflating them is the fastest way to a wrong
+      conclusion about who can do what.
+    </p>
+    <div class="cols">
+      <div class="block">
+        <h4>1 · Canonical RBAC roles <span class="dash">— 12 designed, 0 built</span></h4>
+        <div class="body">
+          <div class="taglist">
+            <span class="chip">Organization Owner</span>
+            <span class="chip">ZoikoSuite Admin</span>
+            <span class="chip">Governance / Compliance Admin</span>
+            <span class="chip">Finance / Controller</span>
+            <span class="chip">Legal / Compliance Reviewer</span>
+            <span class="chip">Control Owner</span>
+            <span class="chip">Evidence Contributor</span>
+            <span class="chip">CIO / Integration Admin</span>
+            <span class="chip">AI / Automation Admin</span>
+            <span class="chip">Auditor / Read Only</span>
+            <span class="chip">Support Agent</span>
+            <span class="chip">Zoiko Platform Ops</span>
+          </div>
+          <p class="note" style="margin-top:12px;font-size:13.5px">
+            From the SoD matrix in <code>zoiko_suite_doc7.txt</code> §26. None exists as a constant, enum or
+            seed row — roles are runtime data in <code>authorization_svc.roles</code>, so the count in any
+            tenant is however many an admin creates. Only two role codes have rows today, both test seeds:
+            <code>SERVICECTL_TEST_ADMIN</code> and <code>CONSOLE_DEMO_OPERATOR</code>. The first holds every
+            HR action across four services at once, which its own seed file calls "the opposite of
+            segregation of duties".
+          </p>
+        </div>
+      </div>
+      <div class="block">
+        <h4>2 · Postgres roles <span class="dash">— 21 provisioned</span></h4>
+        <div class="body">
+          <p class="note" style="margin-top:0;font-size:13.5px">
+            <code>deployments/scripts/create-app-roles.sh</code> creates one
+            <code>NOSUPERUSER NOBYPASSRLS</code> role per finished service, so the RLS policies actually bind.
+            All 21 are wired in compose. The other ~60 services still connect as the shared
+            <code>zoiko_app</code> — their tenant isolation rests only on the explicit
+            <code>tenant_id = $n</code> predicate in each store, with the policy inert behind it.
+          </p>
+          <div class="kv" style="margin-top:12px">
+            <div><span class="k">app_* per-service roles</span><span class="v">21</span></div>
+            <div><span class="k">zoiko_app (shared)</span><span class="v">~60 services</span></div>
+            <div><span class="k">Test roles</span><span class="v">zoiko_app_test</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="block">
+        <h4>3 · Domain role fields <span class="dash">— not platform roles</span></h4>
+        <div class="body kv">
+          <div><span class="k">PrivacyRole</span><span class="v">3 · CONTROLLER / PROCESSOR / JOINT_CONTROLLER</span></div>
+          <div><span class="k">signer_role</span><span class="v">free text, "DATA ONLY"</span></div>
+          <div><span class="k">assigned_to_role</span><span class="v">free text</span></div>
+          <div><span class="k">escalated_to_role</span><span class="v">free text</span></div>
+          <div><span class="k">role_scope_type</span><span class="v">2 · TENANT / LEGAL_ENTITY</span></div>
+          <div><span class="k">RoleStatus</span><span class="v">2 · ACTIVE / RETIRED</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 09 CONSOLE ════════════════════════════════════════════ -->
+  <section id="console">
+    <div class="shead">
+      <div class="num">09</div>
+      <h2>The console on top</h2>
+      <div class="sub">zoiko-suite-frontend-platform · Next.js</div>
+    </div>
+    <p class="note">
+      27 pages over 38 API modules, all under <code>/admin</code> behind one <code>/login</code>. Access is
+      enforced entirely by the services: the console renders every section and surfaces whatever 401 or 403
+      comes back — there is no role-based navigation gating in the frontend.
+    </p>
+    <div class="cols">
+      <div class="block">
+        <h4>Admin sections <span class="dash">— 27 routes</span></h4>
+        <div class="body taglist">
+          <span class="chip">access-control</span><span class="chip">identity</span>
+          <span class="chip">tenants</span><span class="chip">delegations</span>
+          <span class="chip">policies</span><span class="chip">governance</span>
+          <span class="chip">jurisdictions</span><span class="chip">obligations</span>
+          <span class="chip">compliance</span><span class="chip">audit-events</span>
+          <span class="chip">evidence</span><span class="chip">documents</span>
+          <span class="chip">retention</span><span class="chip">schemas</span>
+          <span class="chip">secrets</span><span class="chip">finance</span>
+          <span class="chip">payroll</span><span class="chip">hr</span>
+          <span class="chip">tax</span><span class="chip">legal</span>
+          <span class="chip">legal/[contractId]</span><span class="chip">purchase-requests</span>
+          <span class="chip">commercial-ops</span><span class="chip">ai-governance</span>
+          <span class="chip">notifications</span><span class="chip">settings</span>
+          <span class="chip">login</span>
+        </div>
+      </div>
+      <div class="block">
+        <h4>Where the envelope is set</h4>
+        <div class="body">
+          <div class="kv">
+            <div><span class="k">lib/api/envelope.ts</span><span class="v">header assembly</span></div>
+            <div><span class="k">lib/api/client.ts</span><span class="v">fetch wrapper</span></div>
+            <div><span class="k">proxy.ts</span><span class="v">route matcher</span></div>
+            <div><span class="k">lib/api/identity.ts</span><span class="v">principal + session</span></div>
+          </div>
+          <p class="note" style="margin-top:12px;font-size:13.5px">
+            Server actions attach <code>source_module: "ADMIN_CONSOLE"</code> to writes, which is what
+            distinguishes console-originated changes in the audit trail from API and batch ones.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 10 RUNBOOK ════════════════════════════════════════════ -->
+  <section id="runbook">
+    <div class="shead">
+      <div class="num">10</div>
+      <h2>Standing the stack up</h2>
+      <div class="sub">the order, condensed</div>
+    </div>
+    <div class="cols">
+      <div class="block">
+        <h4>Sequence</h4>
+        <div class="body">
+          <ol class="steps">
+            <li>Infrastructure — <code>postgres</code>, <code>kafka</code>, <code>redis</code>,
+              <code>minio</code>, <code>opensearch</code>, <code>otel-collector</code>.</li>
+            <li><code>init-db.sh</code> — one database per service, then run every service's migrations
+              <em>as the owner</em>.</li>
+            <li><code>create-app-roles.sh</code> — <strong>after</strong> migrations. It grants on tables that
+              exist now and sets <code>ALTER DEFAULT PRIVILEGES</code> so later migrations stay reachable.
+              Run it before and a service sees a missing-grant failure that looks like a missing row.</li>
+            <li>Steps 1–102 in order, per §01. <code>authorization-svc</code> first, always.</li>
+            <li><code>seed-rbac.sql</code>, then <code>seed-rbac-hr.sql</code> — the second reuses the first's
+              role, tenant and principal, so order matters. Both need
+              <code>app.tenant_id</code> set first or RLS refuses the insert.</li>
+            <li><code>gateway</code> last — it depends on the regional pools and gateway-auth-svc.</li>
+          </ol>
+        </div>
+      </div>
+      <div class="block">
+        <h4>Traps worth knowing</h4>
+        <div class="body">
+          <ol class="steps">
+            <li><b>A superuser bypasses RLS unconditionally</b>, <code>FORCE</code> included. An isolation test
+              over the <code>postgres</code> connection proves only the application predicate — it never
+              touches the policy. Use a purpose-created ordinary role.</li>
+            <li><b>Always run a negative control.</b> Remove the migration; the test must fail. An
+              over-restrictive policy is a real failure mode too — one hid every global config default and
+              turned applicable config into "not found".</li>
+            <li><b>Three services need a deliberate cross-tenant exemption</b> —
+              <code>audit-event-store-svc</code> (global hash chain), <code>authorization-svc</code>
+              (<code>FindGrantedActions</code>), <code>secret-vault-integration-svc</code> (admin rotate).
+              Check for a legitimate cross-tenant caller before writing the policy, not after.</li>
+            <li><b>Test harnesses that name migrations individually silently skip new ones.</b> Confirm the
+              suite globs <code>*.up.sql</code> before trusting a green run.</li>
+            <li><b>Verification loop per service:</b> <code>gofmt -w .</code> → <code>go build ./...</code> →
+              <code>go vet ./...</code> → <code>go test ./... -count=1</code>.</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="foot">
+    <span>Compiled from deployments/docker-compose.yml, services/*/deployments/migrations, services/_contract/envelope, docs/architecture/</span>
+    <span>·</span>
+    <span>Stages and step order are computed, not documented — re-derive after any depends_on change</span>
+  </div>
+</div>
+
+<script>
+const DATA = [{"n":"access-control-svc","port":"8137","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Foundation","mig":2,"tests":3,"wired":"main","fanin":0},{"n":"accounts-payable-svc","port":"8099","tier":2,"deps":["authorization-svc","payable-open-item-svc"],"phase":"3","group":"Finance","mig":6,"tests":6,"wired":"main","fanin":3},{"n":"accounts-receivable-svc","port":"8101","tier":2,"deps":["authorization-svc","general-ledger-svc","tenant-entity-registry-svc"],"phase":"3","group":"Finance","mig":5,"tests":6,"wired":"main","fanin":2},{"n":"ai-governance-svc","port":"8146","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Commercial & Platform","mig":2,"tests":4,"wired":"main","fanin":0},{"n":"anomaly-detection-svc","port":"","tier":null,"deps":[],"phase":"6","group":"Intelligence","mig":1,"tests":2,"wired":"phase","fanin":0},{"n":"audit-event-store-svc","port":"8084","tier":0,"deps":[],"phase":"2","group":"Evidence & Audit","mig":3,"tests":4,"wired":"main","fanin":0},{"n":"authorization-svc","port":"8089","tier":0,"deps":[],"phase":"1","group":"Governance","mig":6,"tests":4,"wired":"main","fanin":69},{"n":"bank-reconciliation-svc","port":"8102","tier":2,"deps":["authorization-svc","general-ledger-svc"],"phase":"3","group":"Finance","mig":5,"tests":7,"wired":"main","fanin":1},{"n":"banking-connector-svc","port":"","tier":null,"deps":[],"phase":"7","group":"Integration","mig":2,"tests":5,"wired":"phase","fanin":0},{"n":"benefits-svc","port":"8112","tier":2,"deps":["authorization-svc","employee-master-svc"],"phase":"4","group":"Workforce","mig":2,"tests":3,"wired":"main","fanin":0},{"n":"board-resolutions-svc","port":"8122","tier":4,"deps":["authorization-svc","evidence-requirements-svc"],"phase":"5","group":"Legal & Commercial","mig":2,"tests":5,"wired":"main","fanin":0},{"n":"capability-registry-svc","port":"8145","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Commercial & Platform","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"carta-svc","port":"","tier":null,"deps":[],"phase":"6","group":"Security & Trust","mig":0,"tests":4,"wired":"phase","fanin":0},{"n":"clause-template-svc","port":"8120","tier":1,"deps":["authorization-svc"],"phase":"5","group":"Legal & Commercial","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"commercial-account-svc","port":"8144","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Commercial & Platform","mig":5,"tests":6,"wired":"main","fanin":0},{"n":"compensation-svc","port":"8111","tier":2,"deps":["authorization-svc","employee-master-svc"],"phase":"4","group":"Workforce","mig":3,"tests":4,"wired":"main","fanin":0},{"n":"compliance-risk-scoring-svc","port":"","tier":null,"deps":[],"phase":"6","group":"Intelligence","mig":1,"tests":4,"wired":"phase","fanin":0},{"n":"compliance-status-svc","port":"","tier":null,"deps":[],"phase":"5","group":"Tax & Compliance","mig":1,"tests":2,"wired":"phase","fanin":0},{"n":"configuration-feature-flag-svc","port":"8086","tier":0,"deps":[],"phase":"1","group":"Foundation","mig":2,"tests":4,"wired":"main","fanin":0},{"n":"connectivity-api-bridge-svc","port":"","tier":null,"deps":[],"phase":"7","group":"Integration","mig":2,"tests":4,"wired":"phase","fanin":0},{"n":"consolidation-svc","port":"8106","tier":3,"deps":["authorization-svc","general-ledger-svc","intercompany-accounting-svc"],"phase":"3","group":"Finance","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"contract-lifecycle-svc","port":"8119","tier":1,"deps":["authorization-svc","governance-decision-log-svc"],"phase":"5","group":"Legal & Commercial","mig":2,"tests":2,"wired":"main","fanin":0},{"n":"corporate-actions-svc","port":"8123","tier":4,"deps":["authorization-svc","evidence-requirements-svc"],"phase":"5","group":"Legal & Commercial","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"corporate-tax-svc","port":"8128","tier":2,"deps":["authorization-svc","tax-rules-svc"],"phase":"5","group":"Tax & Compliance","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"counterparty-management-svc","port":"8124","tier":1,"deps":["authorization-svc"],"phase":"5","group":"Legal & Commercial","mig":1,"tests":2,"wired":"main","fanin":2},{"n":"decision-support-svc","port":"8138","tier":1,"deps":["authorization-svc","governance-decision-log-svc"],"phase":"-","group":"Intelligence","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"delegated-authority-svc","port":"8136","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Foundation","mig":2,"tests":3,"wired":"main","fanin":0},{"n":"document-vault-svc","port":"8094","tier":2,"deps":["authorization-svc","tenant-entity-registry-svc"],"phase":"2","group":"Evidence & Audit","mig":2,"tests":5,"wired":"main","fanin":3},{"n":"employee-master-svc","port":"8108","tier":1,"deps":["authorization-svc"],"phase":"4","group":"Workforce","mig":2,"tests":4,"wired":"main","fanin":12},{"n":"employment-contracts-svc","port":"8109","tier":2,"deps":["authorization-svc","employee-master-svc"],"phase":"4","group":"Workforce","mig":2,"tests":3,"wired":"main","fanin":1},{"n":"esignature-integration-svc","port":"","tier":null,"deps":[],"phase":"7","group":"Integration","mig":2,"tests":4,"wired":"phase","fanin":0},{"n":"evidence-manifest-svc","port":"8095","tier":3,"deps":["authorization-svc","governance-decision-log-svc","workflow-history-svc","workflow-svc"],"phase":"2","group":"Evidence & Audit","mig":4,"tests":8,"wired":"main","fanin":0},{"n":"evidence-requirements-svc","port":"8130","tier":3,"deps":["authorization-svc","document-vault-svc"],"phase":"-","group":"Governance","mig":3,"tests":4,"wired":"main","fanin":2},{"n":"exception-escalation-svc","port":"","tier":null,"deps":[],"phase":"5","group":"Tax & Compliance","mig":1,"tests":2,"wired":"phase","fanin":0},{"n":"expense-claim-svc","port":"8158","tier":3,"deps":["authorization-svc","document-vault-svc","employee-master-svc","payable-open-item-svc","policy-svc","tax-determination-svc"],"phase":"-","group":"Payments & P2P","mig":3,"tests":2,"wired":"main","fanin":0},{"n":"external-data-feed-svc","port":"","tier":null,"deps":[],"phase":"7","group":"Integration","mig":2,"tests":4,"wired":"phase","fanin":0},{"n":"filing-preparation-svc","port":"","tier":null,"deps":[],"phase":"5","group":"Tax & Compliance","mig":1,"tests":2,"wired":"phase","fanin":0},{"n":"filing-tracker-svc","port":"","tier":null,"deps":[],"phase":"5","group":"Tax & Compliance","mig":1,"tests":2,"wired":"phase","fanin":0},{"n":"financial-close-svc","port":"8104","tier":3,"deps":["accounts-payable-svc","accounts-receivable-svc","authorization-svc","document-vault-svc","general-ledger-svc"],"phase":"3","group":"Finance","mig":2,"tests":8,"wired":"main","fanin":0},{"n":"forecasting-svc","port":"","tier":null,"deps":[],"phase":"6","group":"Intelligence","mig":1,"tests":4,"wired":"phase","fanin":0},{"n":"gateway-auth-svc","port":"8092","tier":2,"deps":["identity-context-svc","tenant-entity-registry-svc"],"phase":"-","group":"Foundation","mig":0,"tests":3,"wired":"main","fanin":0},{"n":"general-ledger-svc","port":"8098","tier":1,"deps":["authorization-svc"],"phase":"3","group":"Finance","mig":6,"tests":6,"wired":"main","fanin":7},{"n":"goods-service-receipt-svc","port":"8157","tier":3,"deps":["authorization-svc","general-ledger-svc","purchase-order-svc"],"phase":"-","group":"Payments & P2P","mig":3,"tests":2,"wired":"main","fanin":0},{"n":"governance-decision-log-svc","port":"8083","tier":0,"deps":[],"phase":"1","group":"Governance","mig":6,"tests":3,"wired":"main","fanin":3},{"n":"hris-connector-svc","port":"","tier":null,"deps":[],"phase":"7","group":"Integration","mig":2,"tests":4,"wired":"phase","fanin":0},{"n":"identity-context-svc","port":"8080","tier":0,"deps":[],"phase":"1","group":"Foundation","mig":6,"tests":15,"wired":"main","fanin":1},{"n":"intercompany-accounting-svc","port":"8105","tier":2,"deps":["authorization-svc","general-ledger-svc"],"phase":"3","group":"Finance","mig":2,"tests":3,"wired":"main","fanin":1},{"n":"invoice-approval-svc","port":"8107","tier":3,"deps":["accounts-payable-svc","authorization-svc","workflow-svc"],"phase":"3","group":"Legal & Commercial","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"jurisdiction-rules-svc","port":"8082","tier":0,"deps":[],"phase":"1","group":"Governance","mig":4,"tests":7,"wired":"main","fanin":2},{"n":"key-management-svc","port":"","tier":null,"deps":[],"phase":"6","group":"Security & Trust","mig":0,"tests":4,"wired":"phase","fanin":0},{"n":"kill-switch-registry-svc","port":"8147","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Security & Trust","mig":2,"tests":3,"wired":"main","fanin":0},{"n":"leave-absence-svc","port":"8115","tier":2,"deps":["authorization-svc","employee-master-svc"],"phase":"4","group":"Workforce","mig":3,"tests":4,"wired":"main","fanin":0},{"n":"metric-registry-svc","port":"8149","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Intelligence","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"migration-integrity-svc","port":"","tier":null,"deps":[],"phase":"6","group":"Security & Trust","mig":1,"tests":4,"wired":"phase","fanin":0},{"n":"mtls-management-svc","port":"8140","tier":0,"deps":[],"phase":"6","group":"Security & Trust","mig":0,"tests":4,"wired":"main","fanin":0},{"n":"notification-svc","port":"8133","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Foundation","mig":4,"tests":13,"wired":"main","fanin":0},{"n":"obligation-tracking-svc","port":"8121","tier":1,"deps":["authorization-svc"],"phase":"5","group":"Legal & Commercial","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"obligations-svc","port":"8088","tier":1,"deps":["authorization-svc"],"phase":"1","group":"Governance","mig":4,"tests":5,"wired":"main","fanin":2},{"n":"offboarding-severance-svc","port":"8117","tier":2,"deps":["authorization-svc","employee-master-svc","jurisdiction-rules-svc"],"phase":"4","group":"Workforce","mig":2,"tests":3,"wired":"main","fanin":0},{"n":"org-structure-svc","port":"8116","tier":2,"deps":["authorization-svc","employee-master-svc"],"phase":"4","group":"Workforce","mig":2,"tests":3,"wired":"main","fanin":0},{"n":"payable-open-item-svc","port":"8164","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Payments & P2P","mig":3,"tests":2,"wired":"main","fanin":4},{"n":"payee-banking-identity-svc","port":"8166","tier":2,"deps":["authorization-svc","counterparty-management-svc"],"phase":"-","group":"Payments & P2P","mig":3,"tests":2,"wired":"main","fanin":1},{"n":"payment-authorization-svc","port":"8160","tier":4,"deps":["authorization-svc","payee-banking-identity-svc","payment-proposal-svc","policy-svc","supplier-financial-profile-svc"],"phase":"-","group":"Payments & P2P","mig":4,"tests":2,"wired":"main","fanin":1},{"n":"payment-initiation-adapter-svc","port":"8162","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Payments & P2P","mig":3,"tests":2,"wired":"main","fanin":1},{"n":"payment-proposal-svc","port":"8159","tier":3,"deps":["authorization-svc","payable-open-item-svc","supplier-financial-profile-svc","tax-determination-svc"],"phase":"-","group":"Payments & P2P","mig":3,"tests":2,"wired":"main","fanin":1},{"n":"payment-run-svc","port":"8161","tier":5,"deps":["authorization-svc","payment-authorization-svc","payment-initiation-adapter-svc","payment-status-svc"],"phase":"-","group":"Payments & P2P","mig":4,"tests":2,"wired":"main","fanin":0},{"n":"payment-status-svc","port":"8163","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Payments & P2P","mig":3,"tests":2,"wired":"main","fanin":1},{"n":"payroll-exceptions-svc","port":"8114","tier":2,"deps":["authorization-svc","employee-master-svc"],"phase":"4","group":"Workforce","mig":2,"tests":3,"wired":"main","fanin":0},{"n":"payroll-run-svc","port":"8110","tier":3,"deps":["authorization-svc","employee-master-svc","employment-contracts-svc"],"phase":"4","group":"Workforce","mig":4,"tests":4,"wired":"main","fanin":0},{"n":"payroll-tax-svc","port":"8113","tier":2,"deps":["authorization-svc","employee-master-svc"],"phase":"4","group":"Workforce","mig":2,"tests":3,"wired":"main","fanin":0},{"n":"performance-review-svc","port":"8139","tier":2,"deps":["authorization-svc","employee-master-svc"],"phase":"-","group":"Workforce","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"policy-svc","port":"8085","tier":0,"deps":[],"phase":"1","group":"Governance","mig":5,"tests":5,"wired":"main","fanin":2},{"n":"privacy-consent-svc","port":"8152","tier":2,"deps":["authorization-svc","privacy-purpose-registry-svc"],"phase":"-","group":"Privacy","mig":3,"tests":2,"wired":"main","fanin":1},{"n":"privacy-decision-svc","port":"8153","tier":3,"deps":["privacy-consent-svc","privacy-purpose-registry-svc","retention-registry-svc"],"phase":"-","group":"Privacy","mig":3,"tests":1,"wired":"main","fanin":0},{"n":"privacy-purpose-registry-svc","port":"8151","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Privacy","mig":3,"tests":2,"wired":"main","fanin":3},{"n":"privacy-rights-svc","port":"8154","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Privacy","mig":3,"tests":2,"wired":"main","fanin":0},{"n":"privacy-transfer-svc","port":"8155","tier":2,"deps":["authorization-svc","privacy-purpose-registry-svc"],"phase":"-","group":"Privacy","mig":3,"tests":2,"wired":"main","fanin":0},{"n":"procurement-workflow-svc","port":"8134","tier":3,"deps":["authorization-svc","purchase-order-svc","spend-controls-svc"],"phase":"-","group":"Legal & Commercial","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"purchase-order-svc","port":"8129","tier":2,"deps":["authorization-svc","purchase-request-svc"],"phase":"-","group":"Legal & Commercial","mig":3,"tests":4,"wired":"main","fanin":2},{"n":"purchase-request-svc","port":"8100","tier":1,"deps":["authorization-svc"],"phase":"3","group":"Legal & Commercial","mig":4,"tests":5,"wired":"main","fanin":1},{"n":"reconciliation-intelligence-svc","port":"","tier":null,"deps":[],"phase":"6","group":"Intelligence","mig":1,"tests":6,"wired":"phase","fanin":0},{"n":"reporting-orchestration-svc","port":"","tier":null,"deps":[],"phase":"6","group":"Intelligence","mig":1,"tests":5,"wired":"phase","fanin":0},{"n":"retention-registry-svc","port":"8148","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Privacy","mig":3,"tests":5,"wired":"main","fanin":1},{"n":"schema-registry-svc","port":"8093","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Foundation","mig":3,"tests":6,"wired":"main","fanin":0},{"n":"search-indexer-svc","port":"8096","tier":2,"deps":["obligations-svc","tenant-entity-registry-svc"],"phase":"-","group":"Foundation","mig":0,"tests":0,"wired":"main","fanin":0},{"n":"secret-vault-integration-svc","port":"8087","tier":0,"deps":[],"phase":"1","group":"Foundation","mig":3,"tests":3,"wired":"main","fanin":0},{"n":"siem-integration-svc","port":"","tier":null,"deps":[],"phase":"6","group":"Security & Trust","mig":0,"tests":4,"wired":"phase","fanin":0},{"n":"source-authority-svc","port":"8150","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Commercial & Platform","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"spend-controls-svc","port":"8131","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Legal & Commercial","mig":2,"tests":4,"wired":"main","fanin":1},{"n":"supplier-financial-profile-svc","port":"8156","tier":1,"deps":["authorization-svc"],"phase":"-","group":"Payments & P2P","mig":3,"tests":2,"wired":"main","fanin":2},{"n":"supplier-recovery-svc","port":"8165","tier":3,"deps":["authorization-svc","bank-reconciliation-svc","payable-open-item-svc"],"phase":"-","group":"Payments & P2P","mig":3,"tests":2,"wired":"main","fanin":0},{"n":"tax-authority-interface-svc","port":"","tier":null,"deps":[],"phase":"7","group":"Integration","mig":2,"tests":5,"wired":"phase","fanin":0},{"n":"tax-determination-svc","port":"8126","tier":2,"deps":["authorization-svc","tax-rules-svc"],"phase":"5","group":"Tax & Compliance","mig":3,"tests":3,"wired":"main","fanin":2},{"n":"tax-rules-svc","port":"8125","tier":1,"deps":["authorization-svc"],"phase":"5","group":"Tax & Compliance","mig":1,"tests":2,"wired":"main","fanin":3},{"n":"tenant-entity-registry-svc","port":"8081","tier":1,"deps":["authorization-svc"],"phase":"1","group":"Foundation","mig":5,"tests":6,"wired":"main","fanin":4},{"n":"treasury-svc","port":"8103","tier":3,"deps":["accounts-payable-svc","accounts-receivable-svc","authorization-svc","general-ledger-svc","obligations-svc"],"phase":"3","group":"Finance","mig":2,"tests":5,"wired":"main","fanin":0},{"n":"vat-gst-svc","port":"8127","tier":2,"deps":["authorization-svc","tax-rules-svc"],"phase":"5","group":"Tax & Compliance","mig":1,"tests":2,"wired":"main","fanin":0},{"n":"vendor-due-diligence-svc","port":"8135","tier":2,"deps":["authorization-svc","counterparty-management-svc"],"phase":"-","group":"Legal & Commercial","mig":3,"tests":3,"wired":"main","fanin":0},{"n":"withholding-tax-svc","port":"","tier":null,"deps":[],"phase":"5","group":"Tax & Compliance","mig":1,"tests":2,"wired":"phase","fanin":0},{"n":"workflow-history-svc","port":"8097","tier":2,"deps":["workflow-svc"],"phase":"2","group":"Evidence & Audit","mig":3,"tests":4,"wired":"main","fanin":1},{"n":"workflow-svc","port":"8090","tier":1,"deps":["authorization-svc"],"phase":"1","group":"Governance","mig":4,"tests":3,"wired":"main","fanin":3},{"n":"workforce-compliance-svc","port":"8118","tier":2,"deps":["authorization-svc","employee-master-svc","jurisdiction-rules-svc"],"phase":"4","group":"Workforce","mig":2,"tests":3,"wired":"main","fanin":0}];
+
+const rowsEl = document.getElementById('rows');
+const hitEl  = document.getElementById('hit');
+const q  = document.getElementById('q');
+const fg = document.getElementById('fg');
+const fp = document.getElementById('fp');
+const fw = document.getElementById('fw');
+const gb = document.getElementById('gb');
+
+// populate filters from the data itself
+const uniq = (k) => [...new Set(DATA.map(r => r[k]))].filter(v => v && v !== '-').sort();
+uniq('group').forEach(v => fg.add(new Option(v, v)));
+uniq('phase').forEach(v => fp.add(new Option('Phase ' + v, v)));
+
+let sortKey = 'tier', sortDir = 1;
+
+const GROUP_LABEL = {
+  tier:  v => v === null ? 'Not in main compose' : 'Tier ' + v,
+  group: v => v,
+  phase: v => v === '-' ? 'Post-blueprint (no spec phase)' : 'Phase ' + v
+};
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function render(){
+  const term = q.value.trim().toLowerCase();
+  let rows = DATA.filter(r => {
+    if (fg.value && r.group !== fg.value) return false;
+    if (fp.value && r.phase !== fp.value) return false;
+    if (fw.value && r.wired !== fw.value) return false;
+    if (term) {
+      const hay = (r.n + ' ' + r.group + ' ' + r.deps.join(' ')).toLowerCase();
+      if (!hay.includes(term)) return false;
+    }
+    return true;
+  });
+
+  rows.sort((a, b) => {
+    let x = a[sortKey], y = b[sortKey];
+    if (x === null) x = 99; if (y === null) y = 99;
+    if (x === '' ) x = '~'; if (y === '') y = '~';
+    if (typeof x === 'number' && typeof y === 'number') return (x - y) * sortDir || a.n.localeCompare(b.n);
+    return String(x).localeCompare(String(y)) * sortDir || a.n.localeCompare(b.n);
+  });
+
+  const key = gb.value;
+  let html = '', last = Symbol();
+  for (const r of rows) {
+    if (key) {
+      const g = r[key];
+      if (g !== last) {
+        last = g;
+        const n = rows.filter(z => z[key] === g).length;
+        html += '<tr class="grp"><td colspan="10">' + esc(GROUP_LABEL[key](g)) +
+                '<span>' + n + (n === 1 ? ' service' : ' services') + '</span></td></tr>';
+      }
+    }
+    html += '<tr>' +
+      '<td class="m">' + esc(r.n) + '</td>' +
+      '<td class="m">' + (r.port ? esc(r.port) : '<span class="dash">—</span>') + '</td>' +
+      '<td class="num">' + (r.tier === null ? '<span class="dash">—</span>' : r.tier) + '</td>' +
+      '<td class="num">' + (r.phase === '-' ? '<span class="dash">—</span>' : esc(r.phase)) + '</td>' +
+      '<td>' + esc(r.group) + '</td>' +
+      '<td class="deps">' + (r.deps.length ? esc(r.deps.join(' · ')) : '<span class="dash">infrastructure only</span>') + '</td>' +
+      '<td class="num">' + (r.fanin || '<span class="dash">0</span>') + '</td>' +
+      '<td class="num">' + (r.mig || '<span class="dash">0</span>') + '</td>' +
+      '<td class="num">' + r.tests + '</td>' +
+      '<td>' + (r.wired === 'main'
+          ? '<span class="pill main">Main</span>'
+          : '<span class="pill ph">Phase only</span>') + '</td>' +
+    '</tr>';
+  }
+  rowsEl.innerHTML = html;
+  hitEl.textContent = rows.length + ' of ' + DATA.length + ' services';
+}
+
+document.querySelectorAll('th.s').forEach(th => {
+  th.tabIndex = 0;
+  const go = () => {
+    const k = th.dataset.k;
+    sortDir = (k === sortKey) ? -sortDir : 1;
+    sortKey = k;
+    document.querySelectorAll('th.s').forEach(o => o.classList.remove('asc', 'desc'));
+    th.classList.add(sortDir === 1 ? 'asc' : 'desc');
+    render();
+  };
+  th.addEventListener('click', go);
+  th.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
+});
+[q, fg, fp, fw, gb].forEach(el => el.addEventListener('input', render));
+
+document.querySelector('th.s[data-k="tier"]').classList.add('asc');
+render();
+</script>

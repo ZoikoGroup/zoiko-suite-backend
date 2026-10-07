@@ -29,6 +29,8 @@ type Notification struct {
 	RecipientAddressSource string `json:"recipient_address_source,omitempty"`
 
 	Channel string `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
+	From    string `json:"from,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 	Subject string `json:"subject"`
 	Body    string `json:"body"`
 	Status  string `json:"status"` // PENDING, SENT, FAILED
@@ -69,7 +71,53 @@ type Notification struct {
 	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
 
 	LastAttemptAt *time.Time `json:"last_attempt_at,omitempty"`
+
+	// UnknownAt is set when this notification enters PENDING_UNKNOWN — the
+	// attempt happened (SentAt is set too, same as any concluded attempt)
+	// but the outcome is genuinely ambiguous. Nil for every other status.
+	UnknownAt *time.Time `json:"unknown_at,omitempty"`
+
+	// ResolvedAt/ResolvedByPrincipalID/ResolutionNote are
+	// ResolveDeliveryOutcome's own evidence — who settled an ambiguous
+	// attempt, when, and why. Set exactly once, moving Status to SENT or
+	// FAILED.
+	ResolvedAt            *time.Time `json:"resolved_at,omitempty"`
+	ResolvedByPrincipalID string     `json:"resolved_by_principal_id,omitempty"`
+	ResolutionNote        string     `json:"resolution_note,omitempty"`
+
+	// TemplateID/TemplateVersionID/RenderedContentHash are the doc's own
+	// evidence/lineage requirement ("template/version, rendered hash"),
+	// captured at send time. Empty for a notification sent from free-text
+	// subject/body or the static catalogue (internal/templates), which
+	// name no governed BIZ-03 template version to cite.
+	TemplateID          string `json:"template_id,omitempty"`
+	TemplateVersionID   string `json:"template_version_id,omitempty"`
+	RenderedContentHash string `json:"rendered_content_hash,omitempty"`
+
+	// PurposeContext and IdempotencyKey are the §3.4 purpose-scoped dedup key
+	// (migration 000012). Both empty for a send that named no purpose, which is
+	// then deduplicated on (tenant_id, correlation_id) exactly as before.
+	PurposeContext string `json:"purpose_context,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+
+	// Resend summary (migration 000014). The full reasoned chain is in the
+	// attempt records; these say how often and why most recently.
+	ResendCount             int        `json:"resend_count"`
+	LastResendReason        string     `json:"last_resend_reason,omitempty"`
+	LastResentAt            *time.Time `json:"last_resent_at,omitempty"`
+	LastResentByPrincipalID string     `json:"last_resent_by_principal_id,omitempty"`
 }
+
+// Status values for Notification.Status. Named here so new code has a
+// single source of truth to reference; existing call sites' raw string
+// literals ("PENDING", "SENT", "FAILED") are left as they were — this
+// does not rename anything already written.
+const (
+	StatusPending        = "PENDING"
+	StatusSent           = "SENT"
+	StatusFailed         = "FAILED"
+	StatusPendingUnknown = "PENDING_UNKNOWN"
+)
 
 // Retrying reports whether delivery has not concluded and another attempt is
 // scheduled. Kept as a method so the console and the service agree on what the
@@ -88,6 +136,27 @@ func (n Notification) Retrying() bool {
 type DueRetry struct {
 	NotificationID string
 	TenantID       string
+
+	// Submitted is set only by FindStrandedDeliveries: the stranded row
+	// carries a submitting_since marker (migration 000013), so it was handed
+	// to a provider and its outcome was lost. It must become PENDING_UNKNOWN,
+	// never be blindly re-sent (§6.2).
+	Submitted bool
+}
+
+// ResolveDeliveryOutcomeParams — BIZ-10's own ResolveDeliveryOutcome
+// command. ResolvedStatus must be StatusSent or StatusFailed — the two
+// conclusions a real delivery attempt could have reached. ProviderResponse
+// is optional (the resolver may have new acceptance evidence — a provider
+// support ticket confirming the message DID go out — or none at all if
+// resolving to FAILED).
+type ResolveDeliveryOutcomeParams struct {
+	NotificationID, TenantID, ActorPrincipalID string
+	ResolvedStatus                             string
+	ResolutionNote                             string
+	ProviderResponse                           string
+	// CorrelationID is carried onto the event the resolution enqueues.
+	CorrelationID string
 }
 
 type SendNotificationRequest struct {
@@ -99,6 +168,17 @@ type SendNotificationRequest struct {
 	SourceEventType      string `json:"source_event_type,omitempty"`
 	SourceReference      string `json:"source_reference,omitempty"`
 	CorrelationID        string `json:"correlation_id"`
+
+	// PurposeContext scopes deduplication to the business purpose of the
+	// communication (§3.4). OPTIONAL: when absent (and the X-Purpose-Context
+	// envelope header is absent too) a send is deduplicated on correlation_id
+	// alone, exactly as before. When present, two communications that share a
+	// correlation_id but differ in purpose, recipient or channel stay distinct.
+	PurposeContext string `json:"purpose_context,omitempty"`
+
+	// IdempotencyKey lets a caller supply the purpose-scoped key it derived
+	// from the originating business event itself; otherwise one is derived.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 
 	// RecipientAddress overrides recipient resolution for channels that need
 	// an endpoint. Left empty — the normal case — the address is resolved from
@@ -115,10 +195,20 @@ type SendNotificationRequest struct {
 	// Template names a catalogue template to render instead of supplying
 	// subject and body directly. Variables fills its placeholders.
 	//
-	// The two forms are mutually exclusive: accepting both would leave it
-	// ambiguous which one actually reached the recipient.
-	Template  string            `json:"template,omitempty"`
-	Variables map[string]string `json:"variables,omitempty"`
+	// TemplateID (with Locale) names a governed BIZ-03 template instead —
+	// its currently PUBLISHED version for that locale is rendered as the
+	// body. BIZ-03 templates carry no subject field (a document/form
+	// template has no notion of one), so Subject is still supplied
+	// directly even when TemplateID is used — only Body comes from the
+	// render.
+	//
+	// Exactly one of (Template), (TemplateID+Locale), (Subject/Body) may
+	// be used per send — accepting more than one would leave it ambiguous
+	// which content actually reached the recipient.
+	Template   string            `json:"template,omitempty"`
+	TemplateID string            `json:"template_id,omitempty"`
+	Locale     string            `json:"locale,omitempty"`
+	Variables  map[string]string `json:"variables,omitempty"`
 }
 
 // ListFilter carries every constraint on a register read, including the
@@ -165,6 +255,19 @@ type DeliveryOutcome struct {
 	// SMTP 4xx). Nothing re-attempts on it yet; recording it is what makes a
 	// retry worker possible without re-litigating every historical failure.
 	Retryable bool
+
+	// Unknown marks an outcome that is neither a confirmed acceptance nor a
+	// safely-retryable or terminal failure — the message may or may not
+	// have reached the provider, and guessing either way risks a duplicate
+	// send (guessing "not sent") or a silently dropped notice (guessing
+	// "sent"). Invariant #25: "ambiguous external outcomes SHALL remain
+	// Pending/Unknown rather than being guessed." Mutually exclusive with
+	// Delivered and Retryable — a caller sets at most one of the three.
+	Unknown bool
+
+	// ProviderName records the name of the provider that actually handled or refused
+	// the attempt (e.g. "smtp-primary", "smtp-secondary", "ses").
+	ProviderName string
 }
 
 // AddressSource values for Notification.RecipientAddressSource.
@@ -176,12 +279,12 @@ const (
 // Channels this service accepts. IN_APP is terminal inside the platform; the
 // other three hand off to a provider outside it.
 const (
-	ChannelEmail   = "EMAIL"
+	ChannelEmail = "EMAIL"
 	// ChannelSMS is NOT accepted for new notifications — the handler's
 	// supportedChannels omits it, so a send naming it is refused at the
 	// request boundary. The constant remains because historical rows carry the
 	// value and the delivery router still has to answer for them truthfully.
-	ChannelSMS = "SMS"
+	ChannelSMS     = "SMS"
 	ChannelInApp   = "IN_APP"
 	ChannelWebhook = "WEBHOOK"
 )
@@ -224,4 +327,80 @@ var (
 	// says which of the two happened, and so a retry worker can tell a
 	// notification worth re-attempting from one that never will be.
 	ErrIdentityServiceUnavailable = errorString("identity-context-svc unavailable")
+
+	// ErrNotPendingUnknown is ResolveDeliveryOutcome's own guard — only a
+	// notification actually in PENDING_UNKNOWN has an ambiguous attempt to
+	// resolve.
+	ErrNotPendingUnknown = errorString("notification is not in PENDING_UNKNOWN — there is no ambiguous outcome to resolve")
+
+	// ErrInvalidResolvedStatus guards ResolveDeliveryOutcome's own target
+	// status — an ambiguous attempt resolves to exactly the two conclusions
+	// a real attempt could have reached, SENT or FAILED.
+	ErrInvalidResolvedStatus = errorString("resolved_status must be SENT or FAILED")
+
+	ErrResolutionNoteRequired = errorString("resolution_note is required")
+
+	// ErrDeliveryOutcomeUnknown is the doc's own named stable error,
+	// DELIVERY_OUTCOME_UNKNOWN: "Provider state ambiguous; original
+	// notification attempt must be resolved." Surfaced on
+	// GetDeliveryStatus for a PENDING_UNKNOWN notification — not a request
+	// failure, a reportable code describing the notification's own state.
+	ErrDeliveryOutcomeUnknown = errorString("provider state ambiguous; original notification attempt must be resolved")
+
+	// ErrResendReasonRequired — §3.4: a user-initiated resend carries an
+	// explicit reason.
+	ErrResendReasonRequired = errorString("a resend requires a reason")
+
+	// ErrNotResendable — only a SENT or FAILED notification can be resent. A
+	// PENDING one is still being attempted; a PENDING_UNKNOWN one must be
+	// resolved first (§6.2: UNKNOWN never authorizes a blind second send).
+	ErrNotResendable = errorString("only a SENT or FAILED notification can be resent")
 )
+
+// ── Durable delivery attempts (ZS-SVC-Y-001 §3.4, §6.2; migration 000011) ──
+
+// Attempt origins.
+const (
+	AttemptOriginRequest = "request" // the synchronous attempt inside POST /v1/notifications
+	AttemptOriginRetry   = "retry"   // a later attempt by the retry worker
+	AttemptOriginResend  = "resend"  // an explicit, reasoned resend (POST /{id}/resend)
+)
+
+// Attempt outcomes — what one attempt achieved, not the notification's status.
+const (
+	AttemptOutcomeAccepted = "ACCEPTED" // a provider accepted it (never "delivered", §3.3)
+	AttemptOutcomeFailed   = "FAILED"   // refused, and no further attempt follows
+	AttemptOutcomeRetrying = "RETRYING" // refused, another attempt is scheduled
+	AttemptOutcomeUnknown  = "UNKNOWN"  // genuinely ambiguous; must be resolved, never blindly re-sent
+)
+
+// AttemptMeta is what the caller knows about an attempt that the notification
+// row does not: where it was made, which provider handled it, and — for a
+// resend — why. The transition that records the attempt's effect writes it,
+// in the same transaction.
+type AttemptMeta struct {
+	Origin           string
+	ProviderName     string
+	Retryable        bool
+	ResendReason     string
+	ActorPrincipalID string
+}
+
+// DeliveryAttempt is one durable provider submission on the direct-send path.
+type DeliveryAttempt struct {
+	AttemptID        string    `json:"attempt_id"`
+	TenantID         string    `json:"tenant_id"`
+	NotificationID   string    `json:"notification_id"`
+	AttemptNumber    int       `json:"attempt_number"`
+	Origin           string    `json:"origin"`
+	Channel          string    `json:"channel"`
+	ProviderName     string    `json:"provider_name,omitempty"`
+	Outcome          string    `json:"outcome"`
+	ProviderResponse string    `json:"provider_response,omitempty"`
+	FailureReason    string    `json:"failure_reason,omitempty"`
+	Retryable        bool      `json:"retryable"`
+	ResendReason     string    `json:"resend_reason,omitempty"`
+	ActorPrincipalID string    `json:"actor_principal_id,omitempty"`
+	AttemptedAt      time.Time `json:"attempted_at"`
+	RecordedAt       time.Time `json:"recorded_at"`
+}

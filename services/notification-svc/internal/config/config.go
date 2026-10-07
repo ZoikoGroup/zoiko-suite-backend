@@ -36,6 +36,27 @@ type Config struct {
 	MTLSManagementServiceURL string
 
 	OTELExporterEndpoint string
+
+	// ActionTokenSecret is the HMAC-SHA256 signing key for action link tokens
+	// (ZS-COMMS-EMAIL-001 §6). Must be at least 16 bytes.
+	// Sourced from ACTION_TOKEN_SECRET. An empty value disables the action
+	// gateway — tokens cannot be generated or verified without it.
+	ActionTokenSecret string
+
+	// SecondaryEmail is an optional failover SMTP provider. When configured,
+	// the router fails over to it after a transient primary failure (§13 P1-12).
+	// All secondary vars default to empty (disabled).
+	SecondaryEmail EmailConfig
+
+	// WebhookDLQ configures the periodic background worker that reprocesses
+	// retryable webhook DLQ records.
+	WebhookDLQ WebhookDLQConfig
+}
+
+type WebhookDLQConfig struct {
+	Enabled   bool
+	Interval  time.Duration
+	BatchSize int
 }
 
 type DBConfig struct {
@@ -89,6 +110,24 @@ type RetryConfig struct {
 	// how many it takes per poll.
 	Interval  time.Duration
 	BatchSize int
+
+	// StrandedAfter is how long a notification may sit in flight — PENDING
+	// with nothing scheduled — before the worker treats it as abandoned and
+	// puts it back on the schedule.
+	//
+	// It must exceed the longest attempt this service can make, or the sweep
+	// could reschedule a send another replica is still working on and the
+	// recipient gets the notice twice. The SMTP provider's own timeout
+	// defaults to 10s and the HTTP server's WriteTimeout is 15s, so a real
+	// attempt cannot outlive roughly 30 seconds; 15 minutes is generous
+	// headroom that still recovers a stranded notice the same hour rather
+	// than never.
+	//
+	// Zero disables the sweep and is a true off switch, not a "sweep
+	// everything immediately" — which is the dangerous reading of 0 here, and
+	// the reason it is handled explicitly rather than falling through to a
+	// default.
+	StrandedAfter time.Duration
 }
 
 // EmailConfig describes the outbound mail provider.
@@ -138,6 +177,14 @@ type EmailConfig struct {
 // Configured reports whether a mail provider is set up.
 func (e EmailConfig) Configured() bool { return e.Provider != "" }
 
+// ActionLinkBaseURL returns the externally-reachable base URL for the action
+// link gateway. Set ACTION_LINK_BASE_URL explicitly when the service is behind
+// a reverse proxy with a different hostname than its listen address.
+// If unset, an empty string is returned and the Signer generates relative URLs.
+func (c *Config) ActionLinkBaseURL() string {
+	return env("ACTION_LINK_BASE_URL", "")
+}
+
 func Load() (*Config, error) {
 	cfg := &Config{
 		Env:  env("ENV", "local"),
@@ -182,11 +229,39 @@ func Load() (*Config, error) {
 			MaxDelay:    envDuration("NOTIFICATION_RETRY_MAX_DELAY", 8*time.Minute),
 			Interval:    envDuration("NOTIFICATION_RETRY_INTERVAL", 10*time.Second),
 			BatchSize:   envInt("NOTIFICATION_RETRY_BATCH_SIZE", 50),
+			// Deliberately NOT gated on Enabled. Retry being switched off
+			// means "do not re-attempt a failed delivery", and the handler
+			// concludes those as FAILED so none of them sits in flight. A
+			// stranded row is a different thing — an attempt that never got
+			// to report any outcome at all — and abandoning it because
+			// retries are off would leave the exact silent non-delivery this
+			// sweep exists to end.
+			StrandedAfter: envDuration("NOTIFICATION_STRANDED_AFTER", 15*time.Minute),
 		},
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+
+		ActionTokenSecret: env("ACTION_TOKEN_SECRET", ""),
+
+		SecondaryEmail: EmailConfig{
+			Provider:       env("SMTP_SECONDARY_PROVIDER", ""),
+			Host:           env("SMTP_SECONDARY_HOST", ""),
+			Port:           envInt("SMTP_SECONDARY_PORT", 587),
+			Username:       env("SMTP_SECONDARY_USERNAME", ""),
+			Password:       env("SMTP_SECONDARY_PASSWORD", ""),
+			From:           env("SMTP_SECONDARY_FROM", ""),
+			TLSMode:        env("SMTP_SECONDARY_TLS_MODE", "starttls"),
+			AllowCleartext: env("SMTP_SECONDARY_ALLOW_CLEARTEXT", "false") == "true",
+			VerifyOnStart:  env("SMTP_SECONDARY_VERIFY_ON_START", "true") == "true",
+		},
+
+		WebhookDLQ: WebhookDLQConfig{
+			Enabled:   env("NOTIFICATION_WEBHOOK_DLQ_ENABLED", "true") == "true",
+			Interval:  envDuration("NOTIFICATION_WEBHOOK_DLQ_INTERVAL", 1*time.Minute),
+			BatchSize: envInt("NOTIFICATION_WEBHOOK_DLQ_BATCH_SIZE", 50),
+		},
 	}
 
 	// Load returned a nil error unconditionally, so every default above was

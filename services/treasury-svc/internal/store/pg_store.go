@@ -46,29 +46,60 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 	return fallback
 }
 
-// CreateBankAccount registers a new bank account.
-func (s *PgStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccount) error {
+const bankAccountColumns = `
+	bank_account_id, tenant_id, legal_entity_id, account_name,
+	masked_account_number, bank_identifier, currency_code, account_status,
+	branch_ref, country, account_type, requested_operational_use, token_version,
+	created_by_principal_id, created_at, updated_at`
+
+func scanBankAccount(row pgx.Row, acct *domain.BankAccount) error {
+	return row.Scan(&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
+		&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
+		&acct.BranchRef, &acct.Country, &acct.AccountType, &acct.RequestedOperationalUse, &acct.TokenVersion,
+		&acct.CreatedByPrincipalID, &acct.CreatedAt, &acct.UpdatedAt)
+}
+
+// CreateBankAccount registers a new bank account. Idempotent on
+// (tenant_id, correlation_id) when a correlation_id is supplied — a
+// retried request returns the original row (created=false) rather than a
+// second account.
+func (s *PgStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccount) (bool, error) {
 	tenantID := tenantFromCtxOrFallback(ctx, acct.TenantID)
 	now := time.Now().UTC()
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	created := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
 			INSERT INTO bank_accounts (
 				bank_account_id, tenant_id, legal_entity_id, account_name,
 				masked_account_number, bank_identifier, currency_code, account_status,
+				branch_ref, country, account_type, requested_operational_use,
+				correlation_id, created_by_principal_id,
 				created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		`, acct.BankAccountID, tenantID, acct.LegalEntityID, acct.AccountName,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id <> '' DO NOTHING
+			RETURNING `+bankAccountColumns,
+			acct.BankAccountID, tenantID, acct.LegalEntityID, acct.AccountName,
 			acct.MaskedAccountNumber, acct.BankIdentifier, acct.CurrencyCode, acct.AccountStatus,
+			acct.BranchRef, acct.Country, acct.AccountType, acct.RequestedOperationalUse,
+			acct.CorrelationID, acct.CreatedByPrincipalID,
 			now, now)
-		if err != nil {
+		if err := scanBankAccount(row, acct); err == nil {
+			created = true
+			// The initial history entry — without this, GetBankAccountAsOf
+			// has no row to return for any timestamp before the first
+			// amendment, even though the account genuinely existed then.
+			return s.recordAccountHistory(ctx, tx, acct, acct.CreatedByPrincipalID)
+		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		acct.TenantID = tenantID
-		acct.CreatedAt = now
-		acct.UpdatedAt = now
-		return nil
+		// Conflict: a prior call with the same correlation_id already
+		// created the account. Re-select it so the caller gets the real
+		// row back rather than the half-populated one it sent in.
+		return scanBankAccount(tx.QueryRow(ctx, `SELECT `+bankAccountColumns+`
+			FROM bank_accounts WHERE tenant_id = $1 AND correlation_id = $2`, tenantID, acct.CorrelationID), acct)
 	})
+	return created, err
 }
 
 // GetBankAccount retrieves a bank account by ID, tenant-scoped.
@@ -80,18 +111,11 @@ func (s *PgStore) GetBankAccount(ctx context.Context, bankAccountID string) (*do
 
 	var acct domain.BankAccount
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `
-			SELECT bank_account_id, tenant_id, legal_entity_id, account_name,
-			       masked_account_number, bank_identifier, currency_code, account_status,
-			       created_at, updated_at
+		row := tx.QueryRow(ctx, `SELECT `+bankAccountColumns+`
 			FROM bank_accounts
 			WHERE bank_account_id = $1 AND tenant_id = $2
 		`, bankAccountID, tenantID)
-		return row.Scan(
-			&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
-			&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
-			&acct.CreatedAt, &acct.UpdatedAt,
-		)
+		return scanBankAccount(row, &acct)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -111,10 +135,7 @@ func (s *PgStore) ListBankAccounts(ctx context.Context, legalEntityID string) ([
 
 	var out []domain.BankAccount
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT bank_account_id, tenant_id, legal_entity_id, account_name,
-			       masked_account_number, bank_identifier, currency_code, account_status,
-			       created_at, updated_at
+		rows, err := tx.Query(ctx, `SELECT `+bankAccountColumns+`
 			FROM bank_accounts
 			WHERE tenant_id = $1 AND ($2 = '' OR legal_entity_id = $2)
 			ORDER BY created_at DESC
@@ -126,11 +147,7 @@ func (s *PgStore) ListBankAccounts(ctx context.Context, legalEntityID string) ([
 
 		for rows.Next() {
 			var acct domain.BankAccount
-			if err := rows.Scan(
-				&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
-				&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
-				&acct.CreatedAt, &acct.UpdatedAt,
-			); err != nil {
+			if err := scanBankAccount(rows, &acct); err != nil {
 				return err
 			}
 			out = append(out, acct)
@@ -282,117 +299,11 @@ func (s *PgStore) GetLiquidityThreshold(ctx context.Context, legalEntityID, curr
 	return &threshold, nil
 }
 
-// ExecuteTransfer processes a cash transfer between two bank accounts under RLS.
-// ExecuteTransfer moves funds between two bank accounts by writing a new
-// cash_balances row for each leg.
-//
-// Idempotent on (tenant_id, correlation_id): the transfer's own two
-// cash_balances rows deliberately share one correlation_id, so uniqueness
-// can't live on that table — it lives on the transfers table instead, one
-// row per transfer intent. A retried call hits that table's partial unique
-// index and is rejected as a no-op BEFORE either balance leg is written,
-// so a retry can never double-debit the source or double-credit the
-// target. Returns created=false when the transfer already existed.
-func (s *PgStore) ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) (created bool, err error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return false, domain.ErrIdentityMissing
-	}
-
-	// Store-layer invariant: amount must be strictly positive. The handler rejects
-	// non-positive amounts first, but we assert here too so this store method is safe
-	// to call from any future code path without relying on the handler as the sole gate.
-	if amount <= 0 {
-		return false, domain.ErrInvalidAmount
-	}
-
-	now := time.Now().UTC()
-
-	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			INSERT INTO transfers (
-				tenant_id, source_bank_account_id, target_bank_account_id, amount, currency_code, correlation_id
-			) VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
-		`, tenantID, srcAcctID, tgtAcctID, amount, currencyCode, correlationID)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			created = false
-			return nil
-		}
-		created = true
-
-		// Retrieve and lock both accounts to prevent concurrency race
-		var srcAcct, tgtAcct domain.BankAccount
-		err = tx.QueryRow(ctx, `
-			SELECT bank_account_id, tenant_id, legal_entity_id, currency_code, account_status
-			FROM bank_accounts WHERE bank_account_id = $1 AND tenant_id = $2 FOR UPDATE
-		`, srcAcctID, tenantID).Scan(&srcAcct.BankAccountID, &srcAcct.TenantID, &srcAcct.LegalEntityID, &srcAcct.CurrencyCode, &srcAcct.AccountStatus)
-		if err != nil {
-			return fmt.Errorf("retrieve source account: %w", err)
-		}
-
-		err = tx.QueryRow(ctx, `
-			SELECT bank_account_id, tenant_id, legal_entity_id, currency_code, account_status
-			FROM bank_accounts WHERE bank_account_id = $1 AND tenant_id = $2 FOR UPDATE
-		`, tgtAcctID, tenantID).Scan(&tgtAcct.BankAccountID, &tgtAcct.TenantID, &tgtAcct.LegalEntityID, &tgtAcct.CurrencyCode, &tgtAcct.AccountStatus)
-		if err != nil {
-			return fmt.Errorf("retrieve target account: %w", err)
-		}
-
-		if srcAcct.CurrencyCode != currencyCode || tgtAcct.CurrencyCode != currencyCode {
-			return fmt.Errorf("currency mismatch: expected %s", currencyCode)
-		}
-		if srcAcct.AccountStatus != "ACTIVE" || tgtAcct.AccountStatus != "ACTIVE" {
-			return fmt.Errorf("accounts must be ACTIVE")
-		}
-
-		// Retrieve latest balances
-		var srcBal, tgtBal float64
-		err = tx.QueryRow(ctx, `
-			SELECT available_balance FROM cash_balances 
-			WHERE bank_account_id = $1 AND tenant_id = $2 
-			ORDER BY as_of_timestamp DESC LIMIT 1
-		`, srcAcctID, tenantID).Scan(&srcBal)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-
-		err = tx.QueryRow(ctx, `
-			SELECT available_balance FROM cash_balances 
-			WHERE bank_account_id = $1 AND tenant_id = $2 
-			ORDER BY as_of_timestamp DESC LIMIT 1
-		`, tgtAcctID, tenantID).Scan(&tgtBal)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-
-		if srcBal < amount {
-			return fmt.Errorf("insufficient funds on source account: available=%f, transfer=%f", srcBal, amount)
-		}
-
-		// Write new balance records
-		_, err = tx.Exec(ctx, `
-			INSERT INTO cash_balances (
-				balance_id, tenant_id, bank_account_id, ledger_balance, available_balance, as_of_timestamp, correlation_id, created_at
-			) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7)
-		`, tenantID, srcAcctID, srcBal-amount, srcBal-amount, now, correlationID, now)
-		if err != nil {
-			return err
-		}
-
-		_, err = tx.Exec(ctx, `
-			INSERT INTO cash_balances (
-				balance_id, tenant_id, bank_account_id, ledger_balance, available_balance, as_of_timestamp, correlation_id, created_at
-			) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7)
-		`, tenantID, tgtAcctID, tgtBal+amount, tgtBal+amount, now, correlationID, now)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-	return created, err
-}
+// ExecuteTransfer (the old BNK-09 implementation) is removed — it only
+// moved two internal cash_balances rows and called nothing external. It
+// is replaced wholesale by internal/store/bnk09_store.go's real
+// maker-checker flow (CreateTreasuryTransfer -> ApproveTreasuryTransfer ->
+// ExecuteTreasuryTransfer, the last driven from the handler layer), which
+// calls payment-initiation-adapter-svc, and for cross-entity transfers,
+// general-ledger-svc and intercompany-accounting-svc. cash_balances
+// mutation is no longer part of the transfer path.

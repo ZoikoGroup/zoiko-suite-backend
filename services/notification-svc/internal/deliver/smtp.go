@@ -175,7 +175,14 @@ func (p *SMTPProvider) Send(ctx context.Context, msg Message) (string, error) {
 		return "", fmt.Errorf("recipient address %q is not valid: %w", msg.To, err)
 	}
 
-	messageID := fmt.Sprintf("<%s@%s>", uuid.NewString(), p.messageIDDomain())
+	mailFrom := p.from.Address
+	if strings.TrimSpace(msg.From) != "" {
+		if parsed, err := mail.ParseAddress(msg.From); err == nil {
+			mailFrom = parsed.Address
+		}
+	}
+
+	messageID := fmt.Sprintf("<%s@%s>", uuid.NewString(), p.messageIDDomain(mailFrom))
 	raw, err := p.buildMessage(msg, *to, messageID)
 	if err != nil {
 		return "", err
@@ -203,8 +210,8 @@ func (p *SMTPProvider) Send(ctx context.Context, msg Message) (string, error) {
 		return "", err
 	}
 
-	if err := client.Mail(p.from.Address); err != nil {
-		return "", classifySMTPError(fmt.Errorf("MAIL FROM %s: %w", p.from.Address, err))
+	if err := client.Mail(mailFrom); err != nil {
+		return "", classifySMTPError(fmt.Errorf("MAIL FROM %s: %w", mailFrom, err))
 	}
 	if err := client.Rcpt(to.Address); err != nil {
 		return "", classifySMTPError(fmt.Errorf("RCPT TO: %w", err))
@@ -217,11 +224,21 @@ func (p *SMTPProvider) Send(ctx context.Context, msg Message) (string, error) {
 	if _, err := w.Write(raw); err != nil {
 		return "", Retryable(fmt.Errorf("writing message body: %w", err))
 	}
-	// Close is where the server's accept-or-reject verdict arrives. An error
-	// here means the message was NOT accepted, which is why it is checked
-	// rather than deferred.
+	// Close is where the server's accept-or-reject verdict arrives — the
+	// client has just sent the terminating "." and is waiting on the
+	// server's 250-or-rejection reply. A protocol-level reply (a real SMTP
+	// response code) is unambiguous either way, classified exactly like
+	// every other step below. But a bare network fault RIGHT HERE — the
+	// connection dropping before any reply arrives — is not: the "." may
+	// have reached the server and been accepted a moment before the
+	// connection died, or may never have arrived at all. Treating that as
+	// "not accepted" (the old assumption this comment used to make) risks
+	// a duplicate send on retry if the message did go out; treating it as
+	// "accepted" risks silently losing a notice if it did not. Neither
+	// guess is safe, so this one specific fault is classified Unknown
+	// instead — see domain.DeliveryOutcome.Unknown's own doc comment.
 	if err := w.Close(); err != nil {
-		return "", classifySMTPError(fmt.Errorf("completing DATA: %w", err))
+		return "", classifyDataVerdictError(fmt.Errorf("completing DATA: %w", err))
 	}
 
 	return fmt.Sprintf("smtp %s accepted; message-id=%s", p.addr(), messageID), nil
@@ -303,9 +320,13 @@ func (p *SMTPProvider) addr() string { return net.JoinHostPort(p.host, fmt.Sprin
 // messageIDDomain takes the domain of the From address, so the Message-ID is
 // rooted in a domain this platform actually sends as. Falling back to the SMTP
 // host would generate ids under the relay's domain, which is not ours.
-func (p *SMTPProvider) messageIDDomain() string {
-	if at := strings.LastIndex(p.from.Address, "@"); at >= 0 && at+1 < len(p.from.Address) {
-		return p.from.Address[at+1:]
+func (p *SMTPProvider) messageIDDomain(fromAddr ...string) string {
+	target := p.from.Address
+	if len(fromAddr) > 0 && strings.TrimSpace(fromAddr[0]) != "" {
+		target = fromAddr[0]
+	}
+	if at := strings.LastIndex(target, "@"); at >= 0 && at+1 < len(target) {
+		return target[at+1:]
 	}
 	return p.host
 }
@@ -370,7 +391,12 @@ func (p *SMTPProvider) buildMessage(msg Message, to mail.Address, messageID stri
 	// stripped first.
 	subject := mime.QEncoding.Encode("utf-8", sanitizeHeaderValue(msg.Subject))
 
-	fmt.Fprintf(&b, "From: %s\r\n", p.from.String())
+	fromHeader := p.from.String()
+	if strings.TrimSpace(msg.From) != "" {
+		fromHeader = sanitizeHeaderValue(msg.From)
+	}
+
+	fmt.Fprintf(&b, "From: %s\r\n", fromHeader)
 	fmt.Fprintf(&b, "To: %s\r\n", to.String())
 	fmt.Fprintf(&b, "Subject: %s\r\n", subject)
 	fmt.Fprintf(&b, "Date: %s\r\n", time.Now().UTC().Format(time.RFC1123Z))
@@ -379,6 +405,9 @@ func (p *SMTPProvider) buildMessage(msg Message, to mail.Address, messageID stri
 		// The same correlation id the notification row carries, so a mail in
 		// the relay's logs can be tied to the send that produced it.
 		fmt.Fprintf(&b, "X-Zoiko-Correlation-Id: %s\r\n", sanitizeHeaderValue(msg.CorrelationID))
+	}
+	for k, v := range msg.Headers {
+		fmt.Fprintf(&b, "%s: %s\r\n", sanitizeHeaderValue(k), sanitizeHeaderValue(v))
 	}
 	// Transactional mail. Without this, a bulk-mail auto-responder can reply
 	// to a password reset and loop.
@@ -429,6 +458,31 @@ func classifySMTPError(err error) error {
 	// being wrong differs: a retried permanent failure wastes an attempt, an
 	// un-retried transient one silently loses a notice.
 	return Retryable(err)
+}
+
+// classifyDataVerdictError classifies an error at the one call site where
+// the server's accept-or-reject verdict for THIS message is what a
+// network fault would obscure — see that call site's own doc comment. A
+// real protocol-level reply is unambiguous, classified exactly like
+// classifySMTPError; a bare network fault right here is classified
+// Unknown instead of Retryable, since the message may already have been
+// accepted.
+func classifyDataVerdictError(err error) error {
+	var proto *textproto.Error
+	if errors.As(err, &proto) {
+		if proto.Code >= 400 && proto.Code < 500 {
+			return Retryable(err)
+		}
+		return err // 5xx: the server has refused this message for good.
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return Unknown(err)
+	}
+	// An unrecognised failure at the verdict boundary gets the same
+	// benefit of the doubt as a network fault: it is not proof of either
+	// acceptance or rejection.
+	return Unknown(err)
 }
 
 // isLoopbackHost reports whether a host refers to this machine.

@@ -166,6 +166,30 @@ $BUNDLES = @(
         Actions = @("PERIOD_CLOSE_CONFIG", "PERIOD_CLOSE_VIEW", "PERIOD_CLOSE_INITIATE")
     },
     @{
+        # financial-control-svc (ZS-CONTROL-001). DEFINE / APPROVE_RULE / EXECUTE / CERTIFY /
+        # EXCEPTION_WAIVE / REPERFORM are deliberately separate actions: a real tenant should grant
+        # them through separate roles. The service itself also refuses a certifier who created or
+        # took part in a run, and a waiver from the exception's own owner, whatever is granted here.
+        Code    = "FINCTRL_FULL"
+        Service = "financial-control-svc"
+        Actions = @("FINCTRL_DEFINE", "FINCTRL_APPROVE_RULE", "FINCTRL_POLICY_MANAGE", "FINCTRL_RUN_CREATE",
+                    "FINCTRL_READ", "FINCTRL_EXECUTE", "FINCTRL_EXCEPTION_ASSIGN", "FINCTRL_CERTIFY",
+                    "FINCTRL_EXCEPTION_RESOLVE", "FINCTRL_EXCEPTION_WAIVE", "FINCTRL_REPERFORM",
+                    "FINCTRL_EVIDENCE_EXPORT")
+    },
+    @{
+        # The source services authorize the HUMAN caller of a control population (the control service
+        # forwards the caller's identity), so whoever executes a control needs the read action of every
+        # source that control reads. One action per source service, exactly as their handlers declare.
+        Code    = "FINCTRL_POPULATION_READ"
+        Service = "financial-control-svc"
+        Actions = @("AR_CONTROL_POPULATION_READ", "AP_CONTROL_POPULATION_READ", "GL_CONTROL_POPULATION_READ",
+                    "BANKING_CONTROL_POPULATION_READ", "PAYROLL_CONTROL_POPULATION_READ",
+                    "INVENTORY_CONTROL_POPULATION_READ", "INTERCOMPANY_CONTROL_POPULATION_READ",
+                    "CONSOLIDATION_CONTROL_POPULATION_READ", "FINANCIAL_CLOSE_CONTROL_POPULATION_READ",
+                    "PAYEE_BANKING_CONTROL_POPULATION_READ", "TAX_AUTHORITY_CONTROL_POPULATION_READ")
+    },
+    @{
         # spend-controls-svc separates setting a limit from spending against it,
         # and checks VIEW on its two read routes as well -- the reads are
         # authorized unconditionally, so without VIEW the console's registers
@@ -208,9 +232,27 @@ $BUNDLES = @(
         # configuration-feature-flag-svc authorizes config and flag writes
         # against authzPlatformScopeID -- a config value or flag shapes
         # platform behaviour, so it is a platform action, not an entity one.
+        #
+        # FOUR actions, not two. A config entry or flag written with no
+        # tenant_id is the environment-wide DEFAULT: it applies to every tenant
+        # that has not set its own value. Writing one and writing your own
+        # organisation's value are not the same act, and used to be the same
+        # grant -- so a principal provisioned to manage one organisation could
+        # change what every other organisation reads. RLS cannot catch it
+        # either: a global row genuinely belongs to no tenant, so the policy's
+        # WITH CHECK admits a NULL tenant_id unconditionally.
+        #
+        # Both are in this bundle because this seeds a DEVELOPMENT stack,
+        # exactly as RETENTION_FULL pairs create and release -- in a real
+        # deployment "change my organisation's settings" and "change the
+        # default for everyone" are the pair you would want held by different
+        # people.
         Code    = "CONFIG_FULL"
         Service = "configuration-feature-flag-svc"
-        Actions = @("CONFIGURATION_WRITE", "FEATURE_FLAG_WRITE")
+        Actions = @(
+            "CONFIGURATION_WRITE", "CONFIGURATION_GLOBAL_WRITE",
+            "FEATURE_FLAG_WRITE", "FEATURE_FLAG_GLOBAL_WRITE"
+        )
     },
     @{
         # notification-svc authorizes sends against the target legal entity
@@ -350,6 +392,29 @@ $BUNDLES = @(
         Actions = @("DELEGATION_CREATE", "DELEGATION_VIEW", "DELEGATION_REVOKE")
     },
     @{
+        # SUPERSEDE is separate from CREATE on purpose, and the split is the
+        # whole point of the pair. Recording a new precedence rule adds a
+        # ranking; ending one CHANGES WHICH SOURCE THE PLATFORM BELIEVES for a
+        # field family, silently and everywhere, from the moment it takes
+        # effect. Someone who may propose a ranking should not automatically be
+        # able to switch the platform's system of record.
+        #
+        # VIEW is separate from both because the register is the platform's
+        # trust topology -- which connected systems are believed over which --
+        # and reading it is a disclosure even though the rows belong to no
+        # tenant. It ran no authorization at all until this pass.
+        #
+        # NORMALIZED_FACT_VIEW is separate again: unlike the rules, facts are
+        # tenant business data and the route returns raw fact values.
+        Code    = "SOURCE_AUTHORITY_FULL"
+        Service = "source-authority-svc"
+        Actions = @(
+            "SOURCE_AUTHORITY_MAP_CREATE", "SOURCE_AUTHORITY_MAP_VIEW",
+            "SOURCE_AUTHORITY_MAP_SUPERSEDE",
+            "NORMALIZED_FACT_RECORD", "NORMALIZED_FACT_VIEW"
+        )
+    },
+    @{
         Code    = "JURISDICTION_FULL"
         Service = "jurisdiction-rules-svc"
         Actions = @(
@@ -389,6 +454,39 @@ $BUNDLES = @(
         Code    = "RETENTION_FULL"
         Service = "retention-registry-svc"
         Actions = @("RETENTION_POLICY_CREATE", "LEGAL_HOLD_CREATE", "LEGAL_HOLD_RELEASE")
+    },
+    @{
+        # search-indexer-svc (ZS-SVC-AB-001 ESR-01..ESR-05). Its CONTROL plane
+        # -- registering a source, drafting and publishing a contract, building
+        # and activating an index generation -- authorizes against the PLATFORM
+        # scope, not a legal entity: a search contract describes a shape shared
+        # by every tenant, and a generation is one physical index serving all of
+        # them, so a tenant-scoped grant must not be able to change what every
+        # other tenant can search.
+        #
+        # SEARCH_GENERATION_ACTIVATE is a separate action from
+        # SEARCH_GENERATION_CREATE on purpose. Building a generation is routine
+        # and touches nothing anyone is querying; ACTIVATING one changes what
+        # every caller sees in a single atomic alias swap. They are in the same
+        # bundle here because this seeds a DEVELOPMENT stack, exactly as
+        # RETENTION_FULL pairs create and release -- in a real deployment they
+        # are the pair you would want held by different people.
+        #
+        # SEARCH_EXPORT is in this bundle and is NOT implied by the ability to
+        # search. INV-29: "search exports/downloads require separate export
+        # authorization; search permission does not imply bulk-exfiltration
+        # permission." A principal that can search but holds no SEARCH_EXPORT
+        # gets a correct ESR-016 from /v1/search-exports.
+        #
+        # SEARCH_RESTRICTION_APPLY is the erasure/disposition path PRV and DRC
+        # call to remove search visibility for a specific record.
+        Code    = "SEARCH_FULL"
+        Service = "search-indexer-svc"
+        Actions = @(
+            "SEARCH_SOURCE_REGISTER", "SEARCH_CONTRACT_CREATE", "SEARCH_CONTRACT_TRANSITION",
+            "SEARCH_GENERATION_CREATE", "SEARCH_GENERATION_ACTIVATE",
+            "SEARCH_RESTRICTION_APPLY", "SEARCH_EXPORT"
+        )
     }
 )
 
@@ -412,7 +510,12 @@ $PLATFORM_SCOPED_ACTION_CODES = @(
     # retention-registry-svc falls back to the platform scope when a hold or
     # policy names no tenant -- the console offers that as a "platform-wide"
     # checkbox, so the grant has to exist on that scope too.
-    "RETENTION_FULL")
+    "RETENTION_FULL",
+    # search-indexer-svc's whole control plane authorizes against the platform
+    # scope. A grant made only on the legal entity would be invisible to every
+    # one of its checks -- silently, and fail-closed, so it would read as
+    # "no_grant" rather than as a scope mismatch.
+    "SEARCH_FULL")
 $PLATFORM_SCOPED_ACTIONS = $BUNDLES |
     Where-Object { $PLATFORM_SCOPED_ACTION_CODES -contains $_.Code } |
     ForEach-Object { $_.Actions }
@@ -423,31 +526,46 @@ if ($PSCmdlet.ParameterSetName -eq "Gateway") {
     $AUTHZ = $AuthzUrl.TrimEnd('/')
 }
 
+# §4 canonical envelope (ZS-ARCH-SVC-001 §4). Every request to the service has
+# carried these headers since envelope enforcement made admin writes fail
+# closed with 401 `envelope_incomplete`; this script predates that and was
+# seeding a volume that its own writes could never populate. The header set
+# here mirrors what the console and access-control-svc actually send.
+#
+# Non-writes (/v1/authorize probes) omit Idempotency-Key: the service classifies
+# that path as non-material, so it requires no idempotency key and the probe stays
+# representative of a real read-path call.
+function New-AuthzEnvelope {
+    param(
+        [Parameter(Mandatory)] [string] $Path
+    )
+    $headers = @{
+        "X-Tenant-Id"       = $TENANT_ID
+        "X-Principal-Id"    = $PRINCIPAL_ID
+        "X-Legal-Entity-Id" = $LEGAL_ENTITY
+        "X-Correlation-ID"  = [guid]::NewGuid().ToString()
+        "X-Request-Id"      = [guid]::NewGuid().ToString()
+        "X-Source-System"   = "console-seed"
+        "X-Source-Channel"  = "api"
+    }
+    if ($Path -ne "/v1/authorize") {
+        $headers["Idempotency-Key"] = [guid]::NewGuid().ToString()
+        $headers["X-Occurred-At"]   = [DateTime]::UtcNow.ToString("o")
+        $headers["X-Operation"]     = "admin_seed"
+    }
+    return $headers
+}
+
 function Invoke-Authz {
     param(
         [Parameter(Mandatory)] [string] $Path,
         [Parameter(Mandatory)] $Body
     )
     $json = $Body | ConvertTo-Json -Compress -Depth 5
-    # authorization-svc's envelope middleware now rejects every request missing
-    # this header set (tenant authority, an identified actor, request tracing,
-    # a source channel, and a replay-protection key) with 401
-    # envelope_incomplete -- this script predates that middleware. The legal
-    # entity mirrors the body's own scope when the call carries one (Get-Decision
-    # probes different scopes per call), falling back to the demo legal entity
-    # for admin calls that scope themselves some other way.
-    $legalEntityHeader = if ($Body.legal_entity_id) { $Body.legal_entity_id } else { $LEGAL_ENTITY }
-    $headers = @{
-        "X-Tenant-Id"       = $TENANT_ID
-        "X-Principal-Id"    = $PRINCIPAL_ID
-        "X-Legal-Entity-Id" = $legalEntityHeader
-        "X-Request-Id"      = [guid]::NewGuid().ToString()
-        "X-Source-Channel"  = "system"
-        "Idempotency-Key"   = [guid]::NewGuid().ToString()
-    }
     try {
-        $response = Invoke-WebRequest -Uri "$AUTHZ$Path" -Method POST -Body $json -Headers $headers `
-            -ContentType "application/json" -UseBasicParsing -TimeoutSec 10
+        $response = Invoke-WebRequest -Uri "$AUTHZ$Path" -Method POST -Body $json `
+            -ContentType "application/json" -Headers (New-AuthzEnvelope -Path $Path) `
+            -UseBasicParsing -TimeoutSec 10
         return @{ status = [int] $response.StatusCode; body = $response.Content | ConvertFrom-Json }
     } catch {
         $status = if ($_.Exception.Response) { [int] $_.Exception.Response.StatusCode.value__ } else { 0 }

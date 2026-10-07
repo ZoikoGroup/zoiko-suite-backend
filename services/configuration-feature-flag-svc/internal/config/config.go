@@ -1,9 +1,11 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for configuration-feature-flag-svc.
@@ -36,6 +38,18 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// SweepInterval is how often the expiry sweep runs. The sweep flips
+	// expired kill switches and expires overdue emergency changes and emits
+	// config.emergency.expired for each; it is background bookkeeping, so the
+	// default is a minute, not the request path's cadence.
+	SweepInterval time.Duration
+
+	// SweepEnvironments is the list of environments the expiry sweep covers.
+	// Environments are free-form strings in the data model — there is no
+	// environments table to enumerate them from — so the sweep must be told
+	// which ones carry time-boxed objects.
+	SweepEnvironments []string
 }
 
 // KafkaConfig holds event backbone connection parameters.
@@ -64,9 +78,21 @@ func (d DBConfig) DSN() string {
 		" sslmode=" + d.SSLMode
 }
 
+// ErrPlatformScopeMissing is returned when AUTHZ_PLATFORM_SCOPE_ID is unset
+// outside local development.
+//
+// It is fatal rather than defaulted because of how the failure presents
+// otherwise. Every write authorizes against this value as the legal_entity_id,
+// and authorization-svc rejects an empty one outright — so an unset variable
+// does not disable the check, it makes every single write fail with an error
+// about authorization being unavailable, while every read keeps working. The
+// cause is a missing environment variable and the symptom is what a dependency
+// outage looks like.
+var ErrPlatformScopeMissing = errors.New("AUTHZ_PLATFORM_SCOPE_ID is required: every write authorizes against it as the legal_entity_id, and authorization-svc refuses an empty one — leaving it unset fails every write with an error that reads as an authorization-svc outage")
+
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
-	return &Config{
+	cfg := &Config{
 		Env:                  env("ENV", "local"),
 		Port:                 envInt("PORT", 8086),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
@@ -89,7 +115,19 @@ func Load() (*Config, error) {
 			Password: env("DB_PASSWORD", ""),
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
-	}, nil
+		SweepInterval:     envDuration("SWEEP_INTERVAL", time.Minute),
+		SweepEnvironments: envList("SWEEP_ENVIRONMENTS", []string{"staging", "production"}),
+	}
+
+	// Local development is allowed to omit it — a single-service run with no
+	// authorization-svc at all is a normal state there, and authz.NewClient
+	// already refuses a placeholder URL outside local. Anywhere that claims to
+	// be a deployment must name the scope.
+	if cfg.AuthZPlatformScopeID == "" && !strings.EqualFold(cfg.Env, "local") {
+		return nil, ErrPlatformScopeMissing
+	}
+
+	return cfg, nil
 }
 
 func env(key, def string) string {
@@ -126,4 +164,16 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
 }
