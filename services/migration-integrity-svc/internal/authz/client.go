@@ -22,6 +22,16 @@ var (
 	// ErrAuthorizationDenied is returned when authorization-svc explicitly
 	// denies the requested action.
 	ErrAuthorizationDenied = errors.New("authorization denied")
+	// ErrTenantMissing is returned when ctx carries no verified tenant.
+	// middleware.GetTenantID returns "" rather than a fabricated default
+	// precisely so a caller missing tenant scope fails instead of silently
+	// resolving against some other tenant's RLS rows (see tenant.go's doc
+	// comment on the "default-tenant" incident this mirrors). Substituting a
+	// placeholder tenant here for the authorization call would reopen the
+	// same hole one layer up: the decision would be evaluated, and
+	// potentially GRANTED, against a tenant the caller was never verified
+	// to belong to.
+	ErrTenantMissing = errors.New("no verified tenant in context")
 )
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
@@ -143,7 +153,7 @@ func (c *Client) storeCache(key string, decision error) {
 func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
 	tenantID := middleware.GetTenantID(ctx)
 	if tenantID == "" {
-		tenantID = "11111111-1111-1111-1111-111111111111"
+		return ErrTenantMissing
 	}
 
 	reqBody, err := json.Marshal(map[string]string{

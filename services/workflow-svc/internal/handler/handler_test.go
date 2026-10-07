@@ -20,11 +20,11 @@ import (
 
 // Test UUID constants - valid UUID v4 format
 const (
-	testWorkflowID      = "550e8400-e29b-41d4-a716-446655440000"
-	testWorkflowID2     = "550e8400-e29b-41d4-a716-446655440001"
-	testCancelledID     = "550e8400-e29b-41d4-a716-446655440002"
-	testApprovedID      = "550e8400-e29b-41d4-a716-446655440003"
-	testLegacyID        = "550e8400-e29b-41d4-a716-446655440004"
+	testWorkflowID  = "550e8400-e29b-41d4-a716-446655440000"
+	testWorkflowID2 = "550e8400-e29b-41d4-a716-446655440001"
+	testCancelledID = "550e8400-e29b-41d4-a716-446655440002"
+	testApprovedID  = "550e8400-e29b-41d4-a716-446655440003"
+	testLegacyID    = "550e8400-e29b-41d4-a716-446655440004"
 )
 
 // ── stub store ────────────────────────────────────────────────────────────────
@@ -220,6 +220,9 @@ func (s *stubStore) FindCurrentStage(_ context.Context, _ string) (*domain.Workf
 	return s.currentStage, s.currentStageErr
 }
 func (s *stubStore) SubmitAction(_ context.Context, _ domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
+	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
+}
+func (s *stubStore) SubmitQuorumVote(_ context.Context, _ domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
 	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
 }
 func (s *stubStore) EscalateWorkflow(_ context.Context, _, _ string) (*domain.WorkflowInstance, bool, error) {

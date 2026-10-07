@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/ncdcode"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
 
@@ -81,6 +82,10 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	n, err := h.store.BeginResend(r.Context(), id, tenantID, principalID, req.Reason, time.Now().UTC())
+	if errors.Is(err, domain.ErrResendLedgerOwned) {
+		writeError(w, http.StatusConflict, "ledger_communication_not_resendable", err.Error())
+		return
+	}
 	if errors.Is(err, domain.ErrNotResendable) {
 		// A race: another resend (or a resolution) moved it first.
 		writeError(w, http.StatusConflict, "not_resendable", err.Error())
@@ -101,7 +106,7 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 			RecipientPrincipalID: n.RecipientPrincipalID, Channel: n.Channel,
 		})
 		if resolveErr != nil {
-			outcome.Reason = "recipient resolution failed: " + resolveErr.Error()
+			outcome.Reason = ncdcode.Format(ncdcode.RecipientUnresolved) + ": recipient resolution failed: " + resolveErr.Error()
 		} else if err := h.store.SetRecipientAddress(r.Context(), n.NotificationID, tenantID, addr, source); err != nil {
 			outcome.Reason = "resolved a recipient address but could not record it: " + err.Error()
 		} else {
@@ -116,10 +121,13 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.recordAttemptOutcome(w, r, n, outcome, domain.AttemptMeta{
-		Origin:           domain.AttemptOriginResend,
-		ProviderName:     outcome.ProviderName,
-		Retryable:        outcome.Retryable,
-		ResendReason:     req.Reason,
-		ActorPrincipalID: principalID,
+		Origin:            domain.AttemptOriginResend,
+		ProviderName:      outcome.ProviderName,
+		Retryable:         outcome.Retryable,
+		PrivacyDecisionID: outcome.PrivacyDecisionID,
+		PrivacyResult:     outcome.PrivacyResult,
+		BlockCode:         outcome.BlockCode,
+		ResendReason:      req.Reason,
+		ActorPrincipalID:  principalID,
 	}, getCorrelationID(r), tenantID, http.StatusOK)
 }

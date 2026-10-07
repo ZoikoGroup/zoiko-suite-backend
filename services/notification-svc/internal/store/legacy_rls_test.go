@@ -12,6 +12,7 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/ledger"
+	"zoiko.io/notification-svc/internal/quota"
 	"zoiko.io/notification-svc/internal/store"
 )
 
@@ -87,6 +88,26 @@ func TestLegacyTables_RLSIsolatesTenantsAsTheAppRole(t *testing.T) {
 			VALUES ($1, $2, 'smtp', '{}', 'rls test')`, uuid.NewString(), tenantA)
 		return err
 	})
+
+	// The register-side tables merged from main on 7 Oct (intent registry,
+	// regulated notices and their events and acknowledgements, delivery
+	// evidence, preferences, send quotas), seeded through their real write
+	// paths as the app role.
+	iv := regulatedIntentVersion(t, s, tenantA, "legal.rls_"+uuid.NewString()[:8])
+	notice, err := s.CreateNotice(actx, noticeParams(iv, domain.AckReceipt, now.Add(72*time.Hour)))
+	must(t, err)
+	_, noticeAttempt := deliverNotice(t, s, tenantA, notice, "<rls-"+uuid.NewString()+"@example.com>")
+	mailboxAccepted(t, s, tenantA, noticeAttempt, domain.EvidenceMailboxAccepted)
+	_, err = s.RefreshNotice(actx, notice.NoticeID, now)
+	must(t, err)
+	_, _, err = s.RecordNoticeAck(actx, notice.NoticeID, noticeRecipient, domain.ActionAcknowledge, "rls", time.Now())
+	must(t, err)
+	quietStart, quietEnd := "22:00", "07:00"
+	_, err = s.SetPreferences(actx, domain.SetPreferencesParams{PrincipalID: "usr-1", TimeZone: "Europe/London",
+		QuietStart: &quietStart, QuietEnd: &quietEnd, MutedChannels: []string{}, UpdatedBy: "usr-1"})
+	must(t, err)
+	// Counters are written only when quotas are on, so count through a quota-enabled store.
+	must(t, send(store.New(app).WithQuota(quota.Limits{RecipientPerHour: 100}), tenantA, "corr-rls-quota-"+uuid.NewString(), "usr-quota", "T0"))
 
 	// ── Every legacy tenant table, from the catalog ──────────────────────────
 	tables := legacyTenantTables(t, admin)

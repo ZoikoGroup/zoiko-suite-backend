@@ -126,6 +126,7 @@ func main() {
 	handler.RegisterEvidenceRoutes(r, h, pgStore)
 	handler.RegisterRecordsRoutes(r, h, pgStore)
 	handler.RegisterRetentionRoutes(r, h, pgStore)
+	handler.RegisterPreservationRoutes(r, h, pgStore)
 
 	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
 	// are stated together. ReadTimeout bounds a whole request, so a client that

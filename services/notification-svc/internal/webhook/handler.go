@@ -1,11 +1,9 @@
 package webhook
 
 import (
-	"errors"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -14,14 +12,17 @@ import (
 // Handler handles incoming ESP webhook HTTP requests.
 type Handler struct {
 	processor *Processor
+	verifier  *Verifier
 	log       *zap.Logger
-	// secretFor resolves a provider's signing secret (see auth.go).
-	secretFor func(provider string) string
-	now       func() time.Time
 }
 
-// SetSecretLookup replaces the secret source (tests, secret stores).
-func (h *Handler) SetSecretLookup(f func(provider string) string) { h.secretFor = f }
+// WithVerifier sets the callback authenticator. Without one the handler refuses
+// every callback (503): an unauthenticated state-changing ingress is never the
+// default (ZS-SVC-Y-001 INV-27).
+func (h *Handler) WithVerifier(v *Verifier) *Handler {
+	h.verifier = v
+	return h
+}
 
 func NewHandler(processor *Processor, log *zap.Logger) *Handler {
 	if log == nil {
@@ -30,8 +31,6 @@ func NewHandler(processor *Processor, log *zap.Logger) *Handler {
 	return &Handler{
 		processor: processor,
 		log:       log,
-		secretFor: EnvSecret,
-		now:       time.Now,
 	}
 }
 
@@ -47,27 +46,43 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		provider = "generic"
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 2*1024*1024)) // 2MB limit
+	const maxBody = 2 * 1024 * 1024 // 2MB limit
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
 		h.log.Warn("failed to read webhook body", zap.Error(err))
 		http.Error(w, `{"error":"unable to read body"}`, http.StatusBadRequest)
 		return
 	}
 	defer r.Body.Close()
-
-	if len(body) == 0 {
-		http.Error(w, `{"error":"empty webhook payload"}`, http.StatusBadRequest)
+	if len(body) > maxBody {
+		http.Error(w, `{"error":"webhook payload too large"}`, http.StatusRequestEntityTooLarge)
 		return
 	}
 
-	// Authenticate before anything is parsed or written (INV-27).
-	if err := verify(h.secretFor(provider), r.Header.Get("X-Webhook-Timestamp"), r.Header.Get("X-Webhook-Signature"), body, h.now()); err != nil {
-		h.log.Warn("webhook rejected", zap.String("provider", provider), zap.String("remote", r.RemoteAddr), zap.Error(err))
-		status := http.StatusUnauthorized
-		if errors.Is(err, errSecretUnset) {
-			status = http.StatusServiceUnavailable
+	// Authenticate before anything is parsed, recorded or routed to the DLQ: a
+	// forged callback must not change delivery state, create a suppression or
+	// even occupy the DLQ (INV-27, NP-26). Every failure is the same 401 so the
+	// response does not say which part was wrong; the reason is logged.
+	if h.verifier == nil {
+		h.log.Error("webhook refused: no verifier configured; ingress is closed", zap.String("provider", provider))
+		http.Error(w, `{"status":"error","message":"webhook ingress is not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+	if err := h.verifier.Verify(provider, r.Header.Get(SignatureHeader), body); err != nil {
+		h.log.Warn("webhook refused: signature verification failed",
+			zap.String("provider", provider),
+			zap.String("reason", err.Error()),
+			zap.String("remote_addr", r.RemoteAddr),
+		)
+		if h.processor != nil && h.processor.metrics != nil {
+			h.processor.metrics.RecordWebhookEvent(provider, "signature_rejected")
 		}
-		http.Error(w, `{"status":"error","message":"`+err.Error()+`"}`, status)
+		http.Error(w, `{"status":"error","message":"invalid webhook signature"}`, http.StatusUnauthorized)
+		return
+	}
+
+	if len(body) == 0 {
+		http.Error(w, `{"error":"empty webhook payload"}`, http.StatusBadRequest)
 		return
 	}
 

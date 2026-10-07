@@ -23,11 +23,27 @@ type Store interface {
 	CreateResolution(ctx context.Context, r *domain.BoardResolution) error
 	GetResolution(ctx context.Context, id string) (*domain.BoardResolution, error)
 	ListResolutions(ctx context.Context, f domain.ResolutionFilter) ([]domain.BoardResolution, error)
-	RecordVotes(ctx context.Context, id string, req *domain.RecordVotesRequest) (*domain.BoardResolution, error)
-	// PassResolution finalizes the resolution as PASSED, attributed to
-	// passedBy — the authenticated principal, established by the handler, not
-	// a name carried in the request body.
-	PassResolution(ctx context.Context, id, passedBy string, req *domain.PassResolutionRequest) (*domain.BoardResolution, error)
+
+	// OpenVoting freezes the voter roster and quorum threshold and moves the
+	// resolution PROPOSED -> OPEN. LEG-04 §6.1: quorum/eligibility are
+	// evaluated against this frozen population, not whoever happens to vote.
+	OpenVoting(ctx context.Context, id string, voterPrincipalIDs []string, quorumThreshold int) (*domain.BoardResolution, error)
+	// CastVote records one roster member's vote. Refuses a non-roster voter
+	// and a second vote from the same voter.
+	CastVote(ctx context.Context, id, voterPrincipalID string, vote domain.Vote, castBy string) (*domain.CastVoteRecord, error)
+	// CloseVoting tallies the vote ledger against the frozen roster/threshold
+	// and resolves PASSED or FAILED. closedBy is the authenticated principal,
+	// checked against CreatedBy for segregation of duties the same way
+	// PassResolution used to.
+	CloseVoting(ctx context.Context, id, closedBy string, req *domain.CloseVotingRequest) (*domain.BoardResolution, error)
+	// SupersedeResolution marks a PASSED resolution SUPERSEDED, recording
+	// what superseded it. A later resolution replacing an earlier one does
+	// not retroactively edit the earlier one's content or vote ledger.
+	SupersedeResolution(ctx context.Context, id string, req *domain.SupersedeResolutionRequest) (*domain.BoardResolution, error)
+
+	GetVoterRoster(ctx context.Context, id string) ([]domain.VoterRosterEntry, error)
+	GetVoteLedger(ctx context.Context, id string) ([]domain.CastVoteRecord, error)
+	GetQuorumEvidence(ctx context.Context, id string) (*domain.QuorumEvidence, error)
 }
 
 // effectiveDateColumns is the SELECT fragment for the two effective-date
@@ -52,6 +68,7 @@ const meetingColumns = `meeting_id, tenant_id, legal_entity_id, title, scheduled
 
 const resolutionColumns = `resolution_id, meeting_id, tenant_id, legal_entity_id, resolution_number, title, content, category,
 	       status, votes_for, votes_against, abstentions, passed_at, passed_by, document_vault_id,
+	       quorum_threshold, voting_opened_at, voting_closed_at, superseded_by,
 	       ` + effectiveDateColumns + `, created_by, created_at, updated_at`
 
 // mapPgError translates the Postgres failures that are really caller mistakes
@@ -346,6 +363,7 @@ func scanResolution(ctx context.Context, tx pgx.Tx, id, tenantID string, forUpda
 	err := tx.QueryRow(ctx, query, id, tenantID).Scan(
 		&r.ResolutionID, &r.MeetingID, &r.TenantID, &r.LegalEntityID, &r.ResolutionNumber, &r.Title, &r.Content, &category,
 		&status, &r.VotesFor, &r.VotesAgainst, &r.Abstentions, &r.PassedAt, &r.PassedBy, &r.DocumentVaultID,
+		&r.QuorumThreshold, &r.VotingOpenedAt, &r.VotingClosedAt, &r.SupersededBy,
 		&r.EffectiveFrom, &r.EffectiveTo, &r.CreatedBy, &r.CreatedAt, &r.UpdatedAt,
 	)
 	if err != nil {
@@ -393,6 +411,7 @@ func (s *PgStore) ListResolutions(ctx context.Context, f domain.ResolutionFilter
 		if err := rows.Scan(
 			&r.ResolutionID, &r.MeetingID, &r.TenantID, &r.LegalEntityID, &r.ResolutionNumber, &r.Title, &r.Content, &cat,
 			&stat, &r.VotesFor, &r.VotesAgainst, &r.Abstentions, &r.PassedAt, &r.PassedBy, &r.DocumentVaultID,
+			&r.QuorumThreshold, &r.VotingOpenedAt, &r.VotingClosedAt, &r.SupersededBy,
 			&r.EffectiveFrom, &r.EffectiveTo, &r.CreatedBy, &r.CreatedAt, &r.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -409,14 +428,22 @@ func (s *PgStore) ListResolutions(ctx context.Context, f domain.ResolutionFilter
 	return out, nil
 }
 
-// RecordVotes tallies a resolution's votes.
+// OpenVoting freezes the voter roster and quorum threshold and moves the
+// resolution PROPOSED -> OPEN.
 //
-// The status check and the write now share one transaction and one row lock.
-// They used to be two: GetResolution opened its own transaction, committed,
-// and only then did a second transaction UPDATE — so two concurrent requests
-// both read PROPOSED and both wrote, and a tally could be applied to a
-// resolution another request had finalized in between.
-func (s *PgStore) RecordVotes(ctx context.Context, id string, req *domain.RecordVotesRequest) (*domain.BoardResolution, error) {
+// The roster is written inside the same transaction and row lock as the
+// status transition: a resolution read as PROPOSED by two concurrent
+// OpenVoting calls must not both succeed in writing a roster, since the
+// second write would silently redefine "frozen" for a resolution that was
+// already open for voting under the first roster.
+func (s *PgStore) OpenVoting(ctx context.Context, id string, voterPrincipalIDs []string, quorumThreshold int) (*domain.BoardResolution, error) {
+	if len(voterPrincipalIDs) == 0 {
+		return nil, domain.ErrEmptyRoster
+	}
+	if quorumThreshold < 1 || quorumThreshold > len(voterPrincipalIDs) {
+		return nil, domain.ErrInvalidQuorumThreshold
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -431,20 +458,39 @@ func (s *PgStore) RecordVotes(ctx context.Context, id string, req *domain.Record
 	if err != nil {
 		return nil, err
 	}
-	if r.Status.IsFinal() {
-		return nil, domain.ErrResolutionAlreadyFinalized
+	if r.Status != domain.ResolutionStatusProposed {
+		if r.Status.IsFinal() {
+			return nil, domain.ErrResolutionAlreadyFinalized
+		}
+		return nil, domain.ErrResolutionNotOpen
 	}
 
-	r.VotesFor = req.VotesFor
-	r.VotesAgainst = req.VotesAgainst
-	r.Abstentions = req.Abstentions
-	r.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	seen := make(map[string]bool, len(voterPrincipalIDs))
+	for _, voterID := range voterPrincipalIDs {
+		if voterID == "" || seen[voterID] {
+			continue
+		}
+		seen[voterID] = true
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO board_resolution_voter_roster (resolution_id, tenant_id, voter_principal_id, frozen_at)
+			VALUES ($1,$2,$3,$4)`,
+			id, tenantID, voterID, now,
+		); err != nil {
+			return nil, mapPgError(err)
+		}
+	}
+
+	r.Status = domain.ResolutionStatusOpen
+	r.QuorumThreshold = &quorumThreshold
+	r.VotingOpenedAt = &now
+	r.UpdatedAt = now
 
 	_, err = tx.Exec(ctx, `
 		UPDATE board_resolutions
-		SET votes_for=$1, votes_against=$2, abstentions=$3, updated_at=$4
+		SET status=$1, quorum_threshold=$2, voting_opened_at=$3, updated_at=$4
 		WHERE resolution_id=$5 AND tenant_id=$6`,
-		r.VotesFor, r.VotesAgainst, r.Abstentions, r.UpdatedAt, id, tenantID,
+		string(r.Status), quorumThreshold, r.VotingOpenedAt, r.UpdatedAt, id, tenantID,
 	)
 	if err != nil {
 		return nil, mapPgError(err)
@@ -456,19 +502,10 @@ func (s *PgStore) RecordVotes(ctx context.Context, id string, req *domain.Record
 	return r, nil
 }
 
-// PassResolution finalizes a resolution as PASSED.
-//
-// Two fixes beyond the shared transaction: the finalized check now covers
-// REJECTED as well. It listed only PASSED and RESCINDED, so a resolution the
-// board had already rejected could be passed into force afterwards — the one
-// transition the status is there to prevent. RecordVotes had the complete list
-// all along; only the closing action was missing it.
-//
-// passed_by is the authenticated principal, passed in by the handler. It used
-// to be whatever string the request body carried, which made the attribution
-// on a finalized board resolution — the record of who put it into force —
-// self-declared by the caller.
-func (s *PgStore) PassResolution(ctx context.Context, id, passedBy string, req *domain.PassResolutionRequest) (*domain.BoardResolution, error) {
+// CastVote records one roster member's vote. One row per (resolution, voter)
+// — the primary key refuses a second vote from the same voter rather than
+// overwriting it.
+func (s *PgStore) CastVote(ctx context.Context, id, voterPrincipalID string, vote domain.Vote, castBy string) (*domain.CastVoteRecord, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -483,30 +520,133 @@ func (s *PgStore) PassResolution(ctx context.Context, id, passedBy string, req *
 	if err != nil {
 		return nil, err
 	}
-	if r.Status.IsFinal() {
-		return nil, domain.ErrResolutionAlreadyFinalized
+	if r.Status != domain.ResolutionStatusOpen {
+		return nil, domain.ErrResolutionNotOpen
 	}
 
-	// Re-check segregation of duties against the locked row. The handler
-	// checks it too, on the read it did before calling out to
-	// evidence-requirements-svc — but that read is stale by the time the write
-	// happens, and this is the check the doctrine actually rests on.
-	if r.CreatedBy == passedBy {
-		return nil, domain.ErrSelfApprovalNotAllowed
+	var onRoster bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM board_resolution_voter_roster WHERE resolution_id=$1 AND tenant_id=$2 AND voter_principal_id=$3)`,
+		id, tenantID, voterPrincipalID,
+	).Scan(&onRoster); err != nil {
+		return nil, mapPgError(err)
+	}
+	if !onRoster {
+		return nil, domain.ErrNotEligibleVoter
+	}
+
+	var alreadyVoted bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM board_resolution_votes WHERE resolution_id=$1 AND tenant_id=$2 AND voter_principal_id=$3)`,
+		id, tenantID, voterPrincipalID,
+	).Scan(&alreadyVoted); err != nil {
+		return nil, mapPgError(err)
+	}
+	if alreadyVoted {
+		return nil, domain.ErrAlreadyVoted
 	}
 
 	now := time.Now().UTC()
-	r.Status = domain.ResolutionStatusPassed
-	r.PassedBy = &passedBy
-	r.PassedAt = &now
-	r.DocumentVaultID = req.DocumentVaultID
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO board_resolution_votes (resolution_id, tenant_id, voter_principal_id, vote, cast_at, cast_by)
+		VALUES ($1,$2,$3,$4,$5,$6)`,
+		id, tenantID, voterPrincipalID, string(vote), now, castBy,
+	); err != nil {
+		return nil, mapPgError(err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &domain.CastVoteRecord{
+		ResolutionID: id, VoterPrincipalID: voterPrincipalID, Vote: vote, CastAt: now, CastBy: castBy,
+	}, nil
+}
+
+// CloseVoting tallies the vote ledger against the frozen roster/threshold and
+// resolves PASSED or FAILED.
+//
+// closedBy carries the same segregation-of-duties check PassResolution used
+// to make directly: the resolution's own drafter may not be the principal who
+// closes voting on it, because closing is what finalizes the result into
+// force, same as the old PassResolution was.
+func (s *PgStore) CloseVoting(ctx context.Context, id, closedBy string, req *domain.CloseVotingRequest) (*domain.BoardResolution, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tenantID, err := s.setRLS(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := scanResolution(ctx, tx, id, tenantID, true)
+	if err != nil {
+		return nil, err
+	}
+	if r.Status != domain.ResolutionStatusOpen {
+		return nil, domain.ErrResolutionNotOpen
+	}
+	if r.CreatedBy == closedBy {
+		return nil, domain.ErrSelfApprovalNotAllowed
+	}
+
+	var votesFor, votesAgainst, abstentions, votesCast int
+	rows, err := tx.Query(ctx,
+		`SELECT vote FROM board_resolution_votes WHERE resolution_id=$1 AND tenant_id=$2`, id, tenantID)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		votesCast++
+		switch domain.Vote(v) {
+		case domain.VoteFor:
+			votesFor++
+		case domain.VoteAgainst:
+			votesAgainst++
+		case domain.VoteAbstain:
+			abstentions++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	quorumThreshold := 0
+	if r.QuorumThreshold != nil {
+		quorumThreshold = *r.QuorumThreshold
+	}
+	quorumMet := votesCast >= quorumThreshold
+
+	now := time.Now().UTC()
+	r.VotesFor, r.VotesAgainst, r.Abstentions = votesFor, votesAgainst, abstentions
+	r.VotingClosedAt = &now
 	r.UpdatedAt = now
+
+	if quorumMet && votesFor > votesAgainst {
+		r.Status = domain.ResolutionStatusPassed
+		r.PassedBy = &closedBy
+		r.PassedAt = &now
+		r.DocumentVaultID = req.DocumentVaultID
+	} else {
+		r.Status = domain.ResolutionStatusFailed
+	}
 
 	_, err = tx.Exec(ctx, `
 		UPDATE board_resolutions
-		SET status=$1, passed_by=$2, passed_at=$3, document_vault_id=$4, updated_at=$5
-		WHERE resolution_id=$6 AND tenant_id=$7`,
-		string(r.Status), r.PassedBy, r.PassedAt, r.DocumentVaultID, r.UpdatedAt, id, tenantID,
+		SET status=$1, votes_for=$2, votes_against=$3, abstentions=$4, voting_closed_at=$5,
+		    passed_by=$6, passed_at=$7, document_vault_id=$8, updated_at=$9
+		WHERE resolution_id=$10 AND tenant_id=$11`,
+		string(r.Status), r.VotesFor, r.VotesAgainst, r.Abstentions, r.VotingClosedAt,
+		r.PassedBy, r.PassedAt, r.DocumentVaultID, r.UpdatedAt, id, tenantID,
 	)
 	if err != nil {
 		return nil, mapPgError(err)
@@ -516,4 +656,169 @@ func (s *PgStore) PassResolution(ctx context.Context, id, passedBy string, req *
 		return nil, err
 	}
 	return r, nil
+}
+
+// SupersedeResolution marks a PASSED resolution SUPERSEDED. It does not touch
+// the resolution's content or vote ledger — superseding records that a later
+// resolution replaced this one's force, not that this one never happened.
+func (s *PgStore) SupersedeResolution(ctx context.Context, id string, req *domain.SupersedeResolutionRequest) (*domain.BoardResolution, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tenantID, err := s.setRLS(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := scanResolution(ctx, tx, id, tenantID, true)
+	if err != nil {
+		return nil, err
+	}
+	if r.Status != domain.ResolutionStatusPassed {
+		return nil, domain.ErrResolutionNotPassed
+	}
+
+	now := time.Now().UTC()
+	r.Status = domain.ResolutionStatusSuperseded
+	r.SupersededBy = &req.SupersededBy
+	r.UpdatedAt = now
+
+	_, err = tx.Exec(ctx, `
+		UPDATE board_resolutions
+		SET status=$1, superseded_by=$2, updated_at=$3
+		WHERE resolution_id=$4 AND tenant_id=$5`,
+		string(r.Status), r.SupersededBy, r.UpdatedAt, id, tenantID,
+	)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (s *PgStore) GetVoterRoster(ctx context.Context, id string) ([]domain.VoterRosterEntry, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tenantID, err := s.setRLS(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := tx.Query(ctx,
+		`SELECT resolution_id, voter_principal_id, frozen_at FROM board_resolution_voter_roster
+		 WHERE resolution_id=$1 AND tenant_id=$2 ORDER BY voter_principal_id`, id, tenantID)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	defer rows.Close()
+
+	var out []domain.VoterRosterEntry
+	for rows.Next() {
+		var e domain.VoterRosterEntry
+		if err := rows.Scan(&e.ResolutionID, &e.VoterPrincipalID, &e.FrozenAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	_ = tx.Commit(ctx)
+	return out, nil
+}
+
+func (s *PgStore) GetVoteLedger(ctx context.Context, id string) ([]domain.CastVoteRecord, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tenantID, err := s.setRLS(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := tx.Query(ctx,
+		`SELECT resolution_id, voter_principal_id, vote, cast_at, cast_by FROM board_resolution_votes
+		 WHERE resolution_id=$1 AND tenant_id=$2 ORDER BY cast_at`, id, tenantID)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	defer rows.Close()
+
+	var out []domain.CastVoteRecord
+	for rows.Next() {
+		var rec domain.CastVoteRecord
+		var v string
+		if err := rows.Scan(&rec.ResolutionID, &rec.VoterPrincipalID, &v, &rec.CastAt, &rec.CastBy); err != nil {
+			return nil, err
+		}
+		rec.Vote = domain.Vote(v)
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	_ = tx.Commit(ctx)
+	return out, nil
+}
+
+func (s *PgStore) GetQuorumEvidence(ctx context.Context, id string) (*domain.QuorumEvidence, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tenantID, err := s.setRLS(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := scanResolution(ctx, tx, id, tenantID, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var rosterSize int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM board_resolution_voter_roster WHERE resolution_id=$1 AND tenant_id=$2`,
+		id, tenantID,
+	).Scan(&rosterSize); err != nil {
+		return nil, mapPgError(err)
+	}
+
+	var votesCast int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM board_resolution_votes WHERE resolution_id=$1 AND tenant_id=$2`,
+		id, tenantID,
+	).Scan(&votesCast); err != nil {
+		return nil, mapPgError(err)
+	}
+
+	quorumThreshold := 0
+	if r.QuorumThreshold != nil {
+		quorumThreshold = *r.QuorumThreshold
+	}
+
+	_ = tx.Commit(ctx)
+	return &domain.QuorumEvidence{
+		ResolutionID:    id,
+		RosterSize:      rosterSize,
+		QuorumThreshold: quorumThreshold,
+		VotesCast:       votesCast,
+		VotesFor:        r.VotesFor,
+		VotesAgainst:    r.VotesAgainst,
+		Abstentions:     r.Abstentions,
+		QuorumMet:       votesCast >= quorumThreshold,
+	}, nil
 }

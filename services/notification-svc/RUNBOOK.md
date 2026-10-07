@@ -128,7 +128,8 @@ claims weaker, not wrong, and only the callback rate shows it.
    authentication. The `outcome` label carries the code. A signature failure
    almost always means the secret was rotated on one side only:
    `NCD_CALLBACK_SECRET_<BINDING>` for the plane, or
-   `NOTIFICATION_WEBHOOK_SECRET[_<PROVIDER>]` for the legacy webhook. Both fail
+   `NOTIFICATION_WEBHOOK_SECRETS` (JSON, provider to a list of secrets, so the
+   new one can be added before the old is removed) for the legacy webhook. Both fail
    closed: no secret means every callback is refused (INV-27).
 3. Reconcile from the provider's own event log once callbacks resume. Replays
    are deduplicated per tenant and binding, and a late bounce still suppresses

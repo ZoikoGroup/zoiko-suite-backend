@@ -10,6 +10,10 @@ var (
 	ErrDraftAlreadyFinal  = errors.New("filing draft is already finalized")
 	ErrValidationBlocked  = errors.New("filing draft evidence validation failed")
 	ErrMissingRequiredDoc = errors.New("missing required evidence document")
+
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
 )
 
 type ValidationStatus string

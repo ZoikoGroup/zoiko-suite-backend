@@ -12,6 +12,7 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
 	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
 	"zoiko.io/reconciliation-intelligence-svc/internal/events"
+	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/health"
 	customMiddleware "zoiko.io/reconciliation-intelligence-svc/internal/middleware"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
@@ -24,18 +25,20 @@ const (
 )
 
 type Handler struct {
-	store     store.Store
-	publisher *events.Publisher
-	authz     *authz.Client
-	logger    *zap.Logger
+	store            store.Store
+	publisher        *events.Publisher
+	authz            *authz.Client
+	financialControl *financialcontrol.Client
+	logger           *zap.Logger
 }
 
-func NewHandler(s store.Store, p *events.Publisher, a *authz.Client, l *zap.Logger) *Handler {
+func NewHandler(s store.Store, p *events.Publisher, a *authz.Client, fc *financialcontrol.Client, l *zap.Logger) *Handler {
 	return &Handler{
-		store:     s,
-		publisher: p,
-		authz:     a,
-		logger:    l,
+		store:            s,
+		publisher:        p,
+		authz:            a,
+		financialControl: fc,
+		logger:           l,
 	}
 }
 
@@ -99,7 +102,25 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	matched, unmatched, rate, items := domain.PerformIntelligentReconciliation(&req, "", tenantID)
+	// ZS-SVC-Z-001 INV-09: tolerance must be explicit and versioned.
+	// Both governed tolerances are fetched from financial-control-svc
+	// before any recommendation is produced — an unreachable service or
+	// a legal entity with no policy configured yet refuses the whole
+	// analyze call rather than falling back to a guessed default.
+	amountMismatchTolerance, err := h.financialControl.GetActiveAbsoluteTolerance(
+		r.Context(), tenantID, principalID, req.LegalEntityID, domain.MetricAmountMismatchWriteOffTolerance)
+	if err != nil {
+		h.writeToleranceErr(w, err, domain.MetricAmountMismatchWriteOffTolerance)
+		return
+	}
+	missingReferenceTolerance, err := h.financialControl.GetActiveAbsoluteTolerance(
+		r.Context(), tenantID, principalID, req.LegalEntityID, domain.MetricMissingReferenceTolerance)
+	if err != nil {
+		h.writeToleranceErr(w, err, domain.MetricMissingReferenceTolerance)
+		return
+	}
+
+	matched, unmatched, rate, items := domain.PerformIntelligentReconciliation(&req, "", tenantID, amountMismatchTolerance, missingReferenceTolerance)
 
 	job := &domain.ReconciliationJob{
 		LegalEntityID:       req.LegalEntityID,
@@ -284,4 +305,20 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	}
 	h.logger.Error("authorization check failed", zap.Error(err))
 	h.respondError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+// writeToleranceErr responds to a failure resolving a governed tolerance
+// policy (ZS-SVC-Z-001 INV-09). ErrToleranceNotConfigured is a 424
+// (Failed Dependency) — the request itself was fine, but the legal
+// entity has no governed policy for this metric yet, which is a
+// configuration gap for an operator to close, not a transient outage.
+// Any other failure is treated as financial-control-svc being
+// unreachable — 503, fail closed, never a guessed default.
+func (h *Handler) writeToleranceErr(w http.ResponseWriter, err error, metric string) {
+	if errors.Is(err, financialcontrol.ErrToleranceNotConfigured) {
+		h.respondError(w, http.StatusFailedDependency, "no governed tolerance policy configured for metric "+metric)
+		return
+	}
+	h.logger.Error("financial-control-svc tolerance lookup failed", zap.String("metric", metric), zap.Error(err))
+	h.respondError(w, http.StatusServiceUnavailable, "financial-control-svc unavailable")
 }

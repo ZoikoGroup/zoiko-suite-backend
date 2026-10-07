@@ -90,3 +90,19 @@ func TestResend_FailedThenAccepted(t *testing.T) {
 		t.Fatalf("submitted=%v sent events=%d, want one of each", s.submitted, pub.sent)
 	}
 }
+
+// A communication produced by the ledger pipeline is not resent through the direct
+// path: the register row lacks the stream's sender identity.
+func TestResend_LedgerOwnedCommunicationIsRefused(t *testing.T) {
+	s := seededForResend(domain.StatusFailed)
+	s.ledgerOwned = map[string]bool{"n-r": true}
+	del := &stubDeliverer{delivered: true}
+	r := newRouterWith(s, &stubPublisher{}, &stubAuthZ{}, del, "tenant-abc")
+	rr := doReq(r, http.MethodPost, "/v1/notifications/n-r/resend", map[string]any{"reason": "customer asked"}, "p-1")
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "ledger_communication_not_resendable") {
+		t.Fatalf("want 409 ledger_communication_not_resendable, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if del.seen != nil {
+		t.Fatal("the provider was called for a ledger-owned communication")
+	}
+}

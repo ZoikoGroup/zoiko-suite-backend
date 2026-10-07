@@ -45,11 +45,12 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS board_resolutions, board_meetings CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS board_resolution_votes, board_resolution_voter_roster, board_resolutions, board_meetings CASCADE;`)
 
 	for _, name := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_force_rls_and_constraints.up.sql",
+		"000003_quorum_and_vote_ledger.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", name))
 		if err != nil {
@@ -280,9 +281,10 @@ func TestPgStore_CreateResolution_RejectsAnotherTenantsMeeting(t *testing.T) {
 	}
 }
 
-// The closing action's finalized check listed only PASSED and RESCINDED, so a
-// resolution the board had REJECTED could still be passed into force.
-func TestPgStore_PassResolution_RejectedCannotBePassed(t *testing.T) {
+// Quorum and voter eligibility are evaluated against a frozen as-of
+// entitlement population (LEG-04 §6.1) — a non-roster principal must not be
+// able to vote at all.
+func TestPgStore_CastVote_RefusesNonRosterVoter(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.NewPgStore(pool)
 	ctx := tenantCtx("tenant-a")
@@ -291,32 +293,17 @@ func TestPgStore_PassResolution_RejectedCannotBePassed(t *testing.T) {
 	if err := s.CreateResolution(ctx, r); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	// scopedWrite, not scoped: this statement is test SETUP the assertion below
-	// depends on, so it has to commit. The read-only helper rolls back, which
-	// left the resolution PENDING and made PassResolution correct to allow it —
-	// the test then reported a service defect that did not exist. Unscoped it
-	// was worse still: the UPDATE matched no rows and returned no error at all.
-	// Hence the row count is asserted rather than assumed.
-	scopedWrite(t, pool, "tenant-a", func(tx pgx.Tx) {
-		tag, err := tx.Exec(context.Background(),
-			`UPDATE board_resolutions SET status='REJECTED' WHERE resolution_id=$1`, r.ResolutionID)
-		if err != nil {
-			t.Fatalf("set REJECTED: %v", err)
-		}
-		if tag.RowsAffected() != 1 {
-			t.Fatalf("set REJECTED changed %d rows, want 1", tag.RowsAffected())
-		}
-	})
-
-	_, err := s.PassResolution(ctx, r.ResolutionID, "chairperson-1", &domain.PassResolutionRequest{})
-	if !errors.Is(err, domain.ErrResolutionAlreadyFinalized) {
-		t.Fatalf("passing a REJECTED resolution returned %v, want ErrResolutionAlreadyFinalized", err)
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1", "director-2"}, 2); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "not-a-director", domain.VoteFor, "not-a-director"); !errors.Is(err, domain.ErrNotEligibleVoter) {
+		t.Fatalf("non-roster vote returned %v, want ErrNotEligibleVoter", err)
 	}
 }
 
-// Passing twice must be refused the second time. The status check and the
-// write used to sit in two separate transactions.
-func TestPgStore_PassResolution_IsIdempotentlyRefusedOnceFinal(t *testing.T) {
+// A voter may cast at most one vote on a resolution — a vote is evidence
+// once cast, not a mutable field.
+func TestPgStore_CastVote_RefusesDoubleVote(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.NewPgStore(pool)
 	ctx := tenantCtx("tenant-a")
@@ -325,27 +312,172 @@ func TestPgStore_PassResolution_IsIdempotentlyRefusedOnceFinal(t *testing.T) {
 	if err := s.CreateResolution(ctx, r); err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1"}, 1); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.VoteFor, "director-1"); err != nil {
+		t.Fatalf("first vote: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.VoteAgainst, "director-1"); !errors.Is(err, domain.ErrAlreadyVoted) {
+		t.Fatalf("second vote returned %v, want ErrAlreadyVoted", err)
+	}
+}
 
-	passed, err := s.PassResolution(ctx, r.ResolutionID, "chairperson-1", &domain.PassResolutionRequest{})
+// A vote may only be cast while the resolution is OPEN.
+func TestPgStore_CastVote_RefusedBeforeVotingOpens(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool)
+	ctx := tenantCtx("tenant-a")
+
+	r := newResolution("le-us", "drafter-1")
+	if err := s.CreateResolution(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.VoteFor, "director-1"); !errors.Is(err, domain.ErrResolutionNotOpen) {
+		t.Fatalf("vote before OpenVoting returned %v, want ErrResolutionNotOpen", err)
+	}
+}
+
+// OpenVoting refuses an empty roster and a threshold outside [1, roster size]
+// — a resolution cannot be opened for voting against an unachievable or
+// nonexistent entitlement population.
+func TestPgStore_OpenVoting_ValidatesRosterAndThreshold(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool)
+	ctx := tenantCtx("tenant-a")
+
+	r := newResolution("le-us", "drafter-1")
+	if err := s.CreateResolution(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, nil, 1); !errors.Is(err, domain.ErrEmptyRoster) {
+		t.Fatalf("empty roster returned %v, want ErrEmptyRoster", err)
+	}
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1"}, 2); !errors.Is(err, domain.ErrInvalidQuorumThreshold) {
+		t.Fatalf("threshold above roster size returned %v, want ErrInvalidQuorumThreshold", err)
+	}
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1"}, 0); !errors.Is(err, domain.ErrInvalidQuorumThreshold) {
+		t.Fatalf("zero threshold returned %v, want ErrInvalidQuorumThreshold", err)
+	}
+}
+
+// The actual headline fix: a resolution with fewer votes cast than the
+// frozen quorum threshold must resolve FAILED on close, even if every vote
+// cast was FOR. Before this, nothing checked the tally against anything.
+func TestPgStore_CloseVoting_FailsWhenQuorumNotMet(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool)
+	ctx := tenantCtx("tenant-a")
+
+	r := newResolution("le-us", "drafter-1")
+	if err := s.CreateResolution(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1", "director-2", "director-3"}, 2); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.VoteFor, "director-1"); err != nil {
+		t.Fatalf("vote: %v", err)
+	}
+
+	res, err := s.CloseVoting(ctx, r.ResolutionID, "chairperson-1", &domain.CloseVotingRequest{})
 	if err != nil {
-		t.Fatalf("first pass: %v", err)
+		t.Fatalf("close voting: %v", err)
 	}
-	if passed.Status != domain.ResolutionStatusPassed {
-		t.Fatalf("status is %s, want PASSED", passed.Status)
+	if res.Status != domain.ResolutionStatusFailed {
+		t.Fatalf("status is %s, want FAILED (1 of 3 voted, quorum threshold 2)", res.Status)
 	}
-	if passed.PassedBy == nil || *passed.PassedBy != "chairperson-1" {
-		t.Fatalf("passed_by is %v, want the principal the handler established", passed.PassedBy)
+}
+
+// Quorum met and a FOR majority resolves PASSED, attributed to the closer.
+func TestPgStore_CloseVoting_PassesWhenQuorumMetAndForMajority(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool)
+	ctx := tenantCtx("tenant-a")
+
+	r := newResolution("le-us", "drafter-1")
+	if err := s.CreateResolution(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1", "director-2", "director-3"}, 2); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.VoteFor, "director-1"); err != nil {
+		t.Fatalf("vote 1: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-2", domain.VoteFor, "director-2"); err != nil {
+		t.Fatalf("vote 2: %v", err)
 	}
 
-	if _, err := s.PassResolution(ctx, r.ResolutionID, "chairperson-2", &domain.PassResolutionRequest{}); !errors.Is(err, domain.ErrResolutionAlreadyFinalized) {
-		t.Fatalf("second pass returned %v, want ErrResolutionAlreadyFinalized", err)
+	res, err := s.CloseVoting(ctx, r.ResolutionID, "chairperson-1", &domain.CloseVotingRequest{})
+	if err != nil {
+		t.Fatalf("close voting: %v", err)
+	}
+	if res.Status != domain.ResolutionStatusPassed {
+		t.Fatalf("status is %s, want PASSED", res.Status)
+	}
+	if res.PassedBy == nil || *res.PassedBy != "chairperson-1" {
+		t.Fatalf("passed_by is %v, want the principal who closed voting", res.PassedBy)
+	}
+}
+
+// Quorum met but AGAINST >= FOR resolves FAILED, not PASSED.
+func TestPgStore_CloseVoting_FailsWhenAgainstMajority(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool)
+	ctx := tenantCtx("tenant-a")
+
+	r := newResolution("le-us", "drafter-1")
+	if err := s.CreateResolution(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1", "director-2"}, 2); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.VoteFor, "director-1"); err != nil {
+		t.Fatalf("vote 1: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-2", domain.VoteAgainst, "director-2"); err != nil {
+		t.Fatalf("vote 2: %v", err)
+	}
+
+	res, err := s.CloseVoting(ctx, r.ResolutionID, "chairperson-1", &domain.CloseVotingRequest{})
+	if err != nil {
+		t.Fatalf("close voting: %v", err)
+	}
+	if res.Status != domain.ResolutionStatusFailed {
+		t.Fatalf("status is %s, want FAILED (1-1 tie)", res.Status)
+	}
+}
+
+// Closing twice must be refused the second time.
+func TestPgStore_CloseVoting_RefusedOnceFinal(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool)
+	ctx := tenantCtx("tenant-a")
+
+	r := newResolution("le-us", "drafter-1")
+	if err := s.CreateResolution(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1"}, 1); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.VoteFor, "director-1"); err != nil {
+		t.Fatalf("vote: %v", err)
+	}
+	if _, err := s.CloseVoting(ctx, r.ResolutionID, "chairperson-1", &domain.CloseVotingRequest{}); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	if _, err := s.CloseVoting(ctx, r.ResolutionID, "chairperson-2", &domain.CloseVotingRequest{}); !errors.Is(err, domain.ErrResolutionNotOpen) {
+		t.Fatalf("second close returned %v, want ErrResolutionNotOpen", err)
 	}
 }
 
 // Segregation of duties is re-checked against the locked row, because the
 // handler's own check runs against a read that is stale by the time the write
 // happens.
-func TestPgStore_PassResolution_SelfApprovalIsRefusedAtTheWrite(t *testing.T) {
+func TestPgStore_CloseVoting_SelfApprovalIsRefusedAtTheWrite(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.NewPgStore(pool)
 	ctx := tenantCtx("tenant-a")
@@ -354,13 +486,16 @@ func TestPgStore_PassResolution_SelfApprovalIsRefusedAtTheWrite(t *testing.T) {
 	if err := s.CreateResolution(ctx, r); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.PassResolution(ctx, r.ResolutionID, "drafter-1", &domain.PassResolutionRequest{}); !errors.Is(err, domain.ErrSelfApprovalNotAllowed) {
-		t.Fatalf("self-pass returned %v, want ErrSelfApprovalNotAllowed", err)
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1"}, 1); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CloseVoting(ctx, r.ResolutionID, "drafter-1", &domain.CloseVotingRequest{}); !errors.Is(err, domain.ErrSelfApprovalNotAllowed) {
+		t.Fatalf("self-close returned %v, want ErrSelfApprovalNotAllowed", err)
 	}
 }
 
-// A finalized resolution cannot be re-tallied.
-func TestPgStore_RecordVotes_RefusedOnceFinal(t *testing.T) {
+// Only a PASSED resolution may be superseded.
+func TestPgStore_SupersedeResolution_RefusedUnlessPassed(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.NewPgStore(pool)
 	ctx := tenantCtx("tenant-a")
@@ -369,14 +504,72 @@ func TestPgStore_RecordVotes_RefusedOnceFinal(t *testing.T) {
 	if err := s.CreateResolution(ctx, r); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.RecordVotes(ctx, r.ResolutionID, &domain.RecordVotesRequest{VotesFor: 5, VotesAgainst: 1}); err != nil {
-		t.Fatalf("tally: %v", err)
+	if _, err := s.SupersedeResolution(ctx, r.ResolutionID, &domain.SupersedeResolutionRequest{SupersededBy: "res-999"}); !errors.Is(err, domain.ErrResolutionNotPassed) {
+		t.Fatalf("supersede of a PROPOSED resolution returned %v, want ErrResolutionNotPassed", err)
 	}
-	if _, err := s.PassResolution(ctx, r.ResolutionID, "chairperson-1", &domain.PassResolutionRequest{}); err != nil {
-		t.Fatalf("pass: %v", err)
+}
+
+func TestPgStore_SupersedeResolution_MarksSupersededAndRecordsReplacement(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool)
+	ctx := tenantCtx("tenant-a")
+
+	r := newResolution("le-us", "drafter-1")
+	if err := s.CreateResolution(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.RecordVotes(ctx, r.ResolutionID, &domain.RecordVotesRequest{VotesFor: 99}); !errors.Is(err, domain.ErrResolutionAlreadyFinalized) {
-		t.Fatalf("re-tallying a PASSED resolution returned %v, want ErrResolutionAlreadyFinalized", err)
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1"}, 1); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.VoteFor, "director-1"); err != nil {
+		t.Fatalf("vote: %v", err)
+	}
+	if _, err := s.CloseVoting(ctx, r.ResolutionID, "chairperson-1", &domain.CloseVotingRequest{}); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	res, err := s.SupersedeResolution(ctx, r.ResolutionID, &domain.SupersedeResolutionRequest{SupersededBy: "res-999"})
+	if err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+	if res.Status != domain.ResolutionStatusSuperseded {
+		t.Fatalf("status is %s, want SUPERSEDED", res.Status)
+	}
+	if res.SupersededBy == nil || *res.SupersededBy != "res-999" {
+		t.Fatalf("superseded_by is %v, want res-999", res.SupersededBy)
+	}
+}
+
+// GetQuorumEvidence reports the frozen roster size, threshold, and tally —
+// the read surface LEG-04 names explicitly.
+func TestPgStore_GetQuorumEvidence_ReportsFrozenStateAndTally(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.NewPgStore(pool)
+	ctx := tenantCtx("tenant-a")
+
+	r := newResolution("le-us", "drafter-1")
+	if err := s.CreateResolution(ctx, r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1", "director-2", "director-3"}, 2); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.VoteFor, "director-1"); err != nil {
+		t.Fatalf("vote 1: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-2", domain.VoteAgainst, "director-2"); err != nil {
+		t.Fatalf("vote 2: %v", err)
+	}
+
+	ev, err := s.GetQuorumEvidence(ctx, r.ResolutionID)
+	if err != nil {
+		t.Fatalf("get quorum evidence: %v", err)
+	}
+	if ev.RosterSize != 3 || ev.QuorumThreshold != 2 || ev.VotesCast != 2 {
+		t.Fatalf("evidence = %+v, want roster 3, threshold 2, cast 2", ev)
+	}
+	if !ev.QuorumMet {
+		t.Fatalf("quorum should be met: 2 cast >= threshold 2")
 	}
 }
 
@@ -390,11 +583,14 @@ func TestPgStore_Transitions_AreTenantScoped(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if _, err := s.RecordVotes(tenantCtx("tenant-b"), r.ResolutionID, &domain.RecordVotesRequest{VotesFor: 1}); !errors.Is(err, domain.ErrResolutionNotFound) {
+	if _, err := s.OpenVoting(tenantCtx("tenant-b"), r.ResolutionID, []string{"director-1"}, 1); !errors.Is(err, domain.ErrResolutionNotFound) {
+		t.Fatalf("cross-tenant open voting returned %v, want ErrResolutionNotFound", err)
+	}
+	if _, err := s.CastVote(tenantCtx("tenant-b"), r.ResolutionID, "director-1", domain.VoteFor, "director-1"); !errors.Is(err, domain.ErrResolutionNotFound) {
 		t.Fatalf("cross-tenant vote returned %v, want ErrResolutionNotFound", err)
 	}
-	if _, err := s.PassResolution(tenantCtx("tenant-b"), r.ResolutionID, "chairperson-1", &domain.PassResolutionRequest{}); !errors.Is(err, domain.ErrResolutionNotFound) {
-		t.Fatalf("cross-tenant pass returned %v, want ErrResolutionNotFound", err)
+	if _, err := s.CloseVoting(tenantCtx("tenant-b"), r.ResolutionID, "chairperson-1", &domain.CloseVotingRequest{}); !errors.Is(err, domain.ErrResolutionNotFound) {
+		t.Fatalf("cross-tenant close returned %v, want ErrResolutionNotFound", err)
 	}
 }
 
@@ -456,8 +652,9 @@ func TestPgStore_MalformedDate_IsAFieldErrorNotAnOutage(t *testing.T) {
 	}
 }
 
-// Negative vote counts were accepted and stored.
-func TestPgStore_NegativeVotesAreRefusedByTheSchema(t *testing.T) {
+// An unknown vote value is refused by the schema's CHECK constraint, not
+// silently stored.
+func TestPgStore_CastVote_UnknownVoteValueRejectedBySchema(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.NewPgStore(pool)
 	ctx := tenantCtx("tenant-a")
@@ -466,7 +663,10 @@ func TestPgStore_NegativeVotesAreRefusedByTheSchema(t *testing.T) {
 	if err := s.CreateResolution(ctx, r); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.RecordVotes(ctx, r.ResolutionID, &domain.RecordVotesRequest{VotesAgainst: -5}); err == nil {
-		t.Fatal("the schema accepted a negative vote count")
+	if _, err := s.OpenVoting(ctx, r.ResolutionID, []string{"director-1"}, 1); err != nil {
+		t.Fatalf("open voting: %v", err)
+	}
+	if _, err := s.CastVote(ctx, r.ResolutionID, "director-1", domain.Vote("MAYBE"), "director-1"); err == nil {
+		t.Fatal("the schema accepted an unknown vote value")
 	}
 }

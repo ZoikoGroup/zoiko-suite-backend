@@ -11,6 +11,7 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
 	"zoiko.io/reconciliation-intelligence-svc/internal/events"
+	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
 )
@@ -27,13 +28,38 @@ func newGrantingAuthzServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// newFixedToleranceServer stands in for financial-control-svc in tests:
+// it always answers with one TolerancePolicy whose absolute_tolerance
+// is "50" for MetricAmountMismatchWriteOffTolerance and "10" for
+// MetricMissingReferenceTolerance — the same values the heuristic used
+// to have hardcoded, so existing test expectations ($X above/below $50
+// or $10) continue to hold without each test needing its own fake
+// policy setup.
+func newFixedToleranceServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metric := r.URL.Query().Get("metric")
+		tolerance := "50"
+		if metric == domain.MetricMissingReferenceTolerance {
+			tolerance = "10"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"items": []map[string]any{{"tolerance_version": 1, "absolute_tolerance": tolerance}},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func setupTestRouter(t *testing.T) http.Handler {
 	logger := zap.NewNop()
 	memStore := store.NewMemoryStore()
 	publisher := events.NewPublisher([]string{"localhost:9092"}, "zoiko.reconciliation-intelligence.events", logger)
 	authzSrv := newGrantingAuthzServer(t)
 	authzClient := authz.NewClient(authzSrv.URL, logger)
-	h := handler.NewHandler(memStore, publisher, authzClient, logger)
+	financialControlSrv := newFixedToleranceServer(t)
+	financialControlClient := financialcontrol.NewClient(financialControlSrv.URL, logger)
+	h := handler.NewHandler(memStore, publisher, authzClient, financialControlClient, logger)
 
 	return handler.NewRouter(h)
 }

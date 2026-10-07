@@ -1,6 +1,7 @@
 package templates_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -18,9 +19,20 @@ func TestRender_AllTemplates(t *testing.T) {
 		"reason":             "Registration documents were incomplete",
 	}
 
+	// Each template is given exactly the variables it declares: an undeclared
+	// variable is refused (NP-07), so one shared map of everything no longer renders.
+	declared := map[string]map[string]string{}
+	for _, e := range templates.Catalogue() {
+		m := map[string]string{}
+		for _, k := range append(append([]string{}, e.Required...), e.Optional...) {
+			m[k] = vars[k]
+		}
+		declared[e.Name] = m
+	}
+
 	for _, name := range templates.Names() {
 		t.Run(name, func(t *testing.T) {
-			subject, body, err := templates.Render(name, vars)
+			subject, body, err := templates.Render(name, declared[name])
 			if err != nil {
 				t.Fatalf("render: %v", err)
 			}
@@ -255,6 +267,35 @@ func TestCatalogue_IsSortedAndDefensivelyCopied(t *testing.T) {
 			if key == "clobbered" {
 				t.Fatalf("%s: Required is shared with package state, not copied", entry.Name)
 			}
+		}
+	}
+}
+
+// NP-07: a variable the template does not declare is refused, not ignored.
+func TestRender_UndeclaredVariableIsRefused(t *testing.T) {
+	_, _, err := templates.Render(templates.Approved, map[string]string{
+		"organization_name": "Acme",
+		"login_url":         "https://app.example.com/login",
+		"injected":          "x",
+		"another":           "y",
+	})
+	var unexpected templates.ErrUnexpectedVariables
+	if !errors.As(err, &unexpected) {
+		t.Fatalf("want ErrUnexpectedVariables, got %v", err)
+	}
+	if strings.Join(unexpected.Unexpected, ",") != "another,injected" {
+		t.Errorf("the refusal should name every undeclared variable, sorted: %v", unexpected.Unexpected)
+	}
+}
+
+// An optional variable is declared, so supplying it is fine and omitting it is too.
+func TestRender_OptionalVariableIsAccepted(t *testing.T) {
+	for _, vars := range []map[string]string{
+		{"organization_name": "Acme"},
+		{"organization_name": "Acme", "reason": "Incomplete documents"},
+	} {
+		if _, _, err := templates.Render(templates.Rejected, vars); err != nil {
+			t.Errorf("rejected with %v: %v", vars, err)
 		}
 	}
 }

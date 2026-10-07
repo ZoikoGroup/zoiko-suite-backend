@@ -10,6 +10,10 @@ var (
 	ErrAlreadyRemitted      = errors.New("withholding tax obligation is already remitted")
 	ErrAlreadyCancelled     = errors.New("withholding tax obligation is already cancelled")
 	ErrInvalidPaymentAmount = errors.New("payment amount must be greater than zero")
+
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
 )
 
 type ObligationStatus string

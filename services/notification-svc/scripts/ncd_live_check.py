@@ -8,7 +8,7 @@ NCD-01 … NCD-05 and the §3.3/§3.4 rules, and reads the database through
 exit code is the number of failures.
 
 Needs: the service up with NCD_CALLBACK_SECRET_SMTP_PRIMARY and
-NOTIFICATION_WEBHOOK_SECRET set (the values below), an authorization service
+NOTIFICATION_WEBHOOK_SECRETS set (the values below), an authorization service
 that grants every principal except "mallory", and an identity service that
 knows every principal except "ghost". scripts/README-live-check.md says how.
 
@@ -17,7 +17,7 @@ knows every principal except "ghost". scripts/README-live-check.md says how.
 import argparse, hashlib, hmac, json, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 
 CALLBACK_SECRET = "live-callback-secret"
-WEBHOOK_SECRET = "live-webhook-secret"
+WEBHOOK_SECRET = "live-webhook-secret-0123456789"
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--base", default="http://localhost:8133")

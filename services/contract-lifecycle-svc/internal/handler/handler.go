@@ -33,11 +33,15 @@ type AuthZClient interface {
 
 // Action types passed to authorization-svc for each write route.
 const (
-	actionContractCreate    = "CONTRACT_CREATE"
-	actionContractUpdate    = "CONTRACT_UPDATE"
-	actionContractSubmit    = "CONTRACT_SUBMIT_FOR_APPROVAL"
-	actionContractActivate  = "CONTRACT_ACTIVATE"
-	actionContractTerminate = "CONTRACT_TERMINATE"
+	actionContractCreate         = "CONTRACT_CREATE"
+	actionContractUpdate         = "CONTRACT_UPDATE"
+	actionContractSubmitReview   = "CONTRACT_SUBMIT_REVIEW"
+	actionContractApprove        = "CONTRACT_APPROVE"
+	actionContractSendForSig     = "CONTRACT_SEND_FOR_SIGNATURE"
+	actionContractRecordExec     = "CONTRACT_RECORD_EXECUTION"
+	actionContractAmend          = "CONTRACT_AMEND"
+	actionContractRenew          = "CONTRACT_RENEW"
+	actionContractTerminate      = "CONTRACT_TERMINATE"
 )
 
 // Handler holds all dependencies for the HTTP layer.
@@ -61,8 +65,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/", h.ListContracts)
 		r.Get("/{id}", h.GetContract)
 		r.Put("/{id}", h.UpdateContract)
-		r.Post("/{id}/submit", h.SubmitForApproval)
-		r.Post("/{id}/activate", h.ActivateContract)
+		r.Post("/{id}/submit-review", h.SubmitReview)
+		r.Post("/{id}/approve", h.ApproveContract)
+		r.Post("/{id}/send-for-signature", h.SendForSignature)
+		r.Post("/{id}/record-execution", h.RecordExecution)
+		r.Post("/{id}/amend", h.AmendContract)
+		r.Post("/{id}/renew", h.RenewContract)
 		r.Post("/{id}/terminate", h.TerminateContract)
 		r.Get("/{id}/versions", h.ListContractVersions)
 	})
@@ -108,8 +116,7 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.CreateContract(r.Context(), c); err != nil {
-		h.logger.Error("create contract failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to create contract")
+		h.writeLifecycleErr(w, "failed to create contract", err)
 		return
 	}
 
@@ -125,11 +132,7 @@ func (h *Handler) GetContract(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	c, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, domain.ErrContractNotFound) {
-			writeError(w, http.StatusNotFound, "contract not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to get contract")
+		h.writeLifecycleErr(w, "failed to get contract", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, c)
@@ -139,7 +142,7 @@ func (h *Handler) ListContracts(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	contracts, err := h.store.ListContracts(r.Context(), legalEntityID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list contracts")
+		h.writeLifecycleErr(w, "failed to list contracts", err)
 		return
 	}
 	if contracts == nil {
@@ -154,15 +157,11 @@ func (h *Handler) UpdateContract(w http.ResponseWriter, r *http.Request) {
 
 	existing, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, domain.ErrContractNotFound) {
-			writeError(w, http.StatusNotFound, "contract not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to fetch contract")
+		h.writeLifecycleErr(w, "failed to fetch contract", err)
 		return
 	}
-	if existing.Status != domain.ContractStatusDraft && existing.Status != domain.ContractStatusPendingApproval {
-		writeError(w, http.StatusConflict, "only DRAFT or PENDING_APPROVAL contracts can be updated")
+	if existing.Status != domain.ContractStatusDraft && existing.Status != domain.ContractStatusReview {
+		writeError(w, http.StatusConflict, "only DRAFT or REVIEW contracts can be updated")
 		return
 	}
 
@@ -201,7 +200,7 @@ func (h *Handler) UpdateContract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.UpdateContract(r.Context(), existing, req.ChangeSummary); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to update contract")
+		h.writeLifecycleErr(w, "failed to update contract", err)
 		return
 	}
 
@@ -213,21 +212,13 @@ func (h *Handler) UpdateContract(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, existing)
 }
 
-func (h *Handler) SubmitForApproval(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) SubmitReview(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
 	existing, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, domain.ErrContractNotFound) {
-			writeError(w, http.StatusNotFound, "contract not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to fetch contract")
-		return
-	}
-	if existing.Status != domain.ContractStatusDraft {
-		writeError(w, http.StatusConflict, "only DRAFT contracts can be submitted for approval")
+		h.writeLifecycleErr(w, "failed to fetch contract", err)
 		return
 	}
 
@@ -235,35 +226,36 @@ func (h *Handler) SubmitForApproval(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractSubmit); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractSubmitReview); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	if err := h.store.UpdateContractStatus(r.Context(), id, domain.ContractStatusPendingApproval, ""); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to submit contract")
+	c, err := h.store.SubmitReview(r.Context(), id, principalID)
+	if err != nil {
+		h.writeLifecycleErr(w, "failed to submit contract for review", err)
 		return
 	}
-	existing.Status = domain.ContractStatusPendingApproval
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.submitted_for_approval", ContractID: id, TenantID: tenantID,
-		LegalEntityID: existing.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: existing,
+		EventType: "contract.submitted_for_review", ContractID: id, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: c,
 	})
-	writeJSON(w, http.StatusOK, existing)
+	writeJSON(w, http.StatusOK, c)
 }
 
-func (h *Handler) ActivateContract(w http.ResponseWriter, r *http.Request) {
+// ApproveContract moves REVIEW -> APPROVED, the point past which the
+// version is immutable (LEG-05 §7.1). Segregation of Duties
+// (docs/original_doc/zoiko_suite_doc1.txt §12.3, and LEG-05's own
+// "self-approval blocked" requirement): the principal who submitted the
+// contract for review may not be the one who approves it.
+func (h *Handler) ApproveContract(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
-	var req domain.ActivateContractRequest
+	var req domain.ApproveContractRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.SignedBy == "" {
-		writeError(w, http.StatusBadRequest, "signed_by is required")
 		return
 	}
 	if req.GovernanceDecisionID == "" {
@@ -273,11 +265,7 @@ func (h *Handler) ActivateContract(w http.ResponseWriter, r *http.Request) {
 
 	existing, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, domain.ErrContractNotFound) {
-			writeError(w, http.StatusNotFound, "contract not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to fetch contract")
+		h.writeLifecycleErr(w, "failed to fetch contract", err)
 		return
 	}
 
@@ -285,36 +273,184 @@ func (h *Handler) ActivateContract(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractActivate); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractApprove); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
+	if existing.SubmittedBy != nil && *existing.SubmittedBy == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
+		return
+	}
 
-	// A contract must not go ACTIVE on a signature alone — verify the
+	// A contract must not go APPROVED on reviewer say-so alone — verify the
 	// governance decision the caller cites was actually GRANTED for this
 	// legal entity and this action, not just that some decision ID exists.
-	if err := h.governanceLog.VerifyGranted(r.Context(), tenantID, req.GovernanceDecisionID, existing.LegalEntityID, actionContractActivate); err != nil {
+	if err := h.governanceLog.VerifyGranted(r.Context(), tenantID, req.GovernanceDecisionID, existing.LegalEntityID, actionContractApprove); err != nil {
 		h.writeGovernanceLogErr(w, err)
 		return
 	}
 
-	c, err := h.store.ActivateContract(r.Context(), id, &req)
+	c, err := h.store.ApproveContract(r.Context(), id, principalID, req.GovernanceDecisionID)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrContractNotFound):
-			writeError(w, http.StatusNotFound, "contract not found")
-		case errors.Is(err, domain.ErrContractAlreadyActive):
-			writeError(w, http.StatusConflict, "contract is already active")
-		case errors.Is(err, domain.ErrContractTerminated):
-			writeError(w, http.StatusConflict, "contract is terminated")
-		default:
-			writeError(w, http.StatusInternalServerError, "failed to activate contract")
-		}
+		h.writeLifecycleErr(w, "failed to approve contract", err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "contract.approved", ContractID: id, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: c,
+	})
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (h *Handler) SendForSignature(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tenantID := middleware.GetTenantID(r.Context())
+
+	existing, err := h.store.GetContract(r.Context(), id)
+	if err != nil {
+		h.writeLifecycleErr(w, "failed to fetch contract", err)
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractSendForSig); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	c, err := h.store.SendForSignature(r.Context(), id, principalID)
+	if err != nil {
+		h.writeLifecycleErr(w, "failed to send contract for signature", err)
+		return
+	}
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "contract.activated", ContractID: id, TenantID: tenantID,
+		EventType: "contract.sent_for_signature", ContractID: id, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: c,
+	})
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (h *Handler) RecordExecution(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tenantID := middleware.GetTenantID(r.Context())
+
+	var req domain.RecordExecutionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.SignedBy == "" {
+		writeError(w, http.StatusBadRequest, "signed_by is required")
+		return
+	}
+
+	existing, err := h.store.GetContract(r.Context(), id)
+	if err != nil {
+		h.writeLifecycleErr(w, "failed to fetch contract", err)
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractRecordExec); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	c, err := h.store.RecordExecution(r.Context(), id, &req)
+	if err != nil {
+		h.writeLifecycleErr(w, "failed to record contract execution", err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "contract.executed", ContractID: id, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: c,
+	})
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (h *Handler) AmendContract(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tenantID := middleware.GetTenantID(r.Context())
+
+	var req domain.AmendContractRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	existing, err := h.store.GetContract(r.Context(), id)
+	if err != nil {
+		h.writeLifecycleErr(w, "failed to fetch contract", err)
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractAmend); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	c, err := h.store.AmendContract(r.Context(), id, &req)
+	if err != nil {
+		h.writeLifecycleErr(w, "failed to amend contract", err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "contract.amended", ContractID: id, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: c,
+	})
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (h *Handler) RenewContract(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tenantID := middleware.GetTenantID(r.Context())
+
+	var req domain.RenewContractRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.NewEffectiveTo == "" {
+		writeError(w, http.StatusBadRequest, "new_effective_to is required (YYYY-MM-DD)")
+		return
+	}
+
+	existing, err := h.store.GetContract(r.Context(), id)
+	if err != nil {
+		h.writeLifecycleErr(w, "failed to fetch contract", err)
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractRenew); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	c, err := h.store.RenewContract(r.Context(), id, &req)
+	if err != nil {
+		h.writeLifecycleErr(w, "failed to renew contract", err)
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "contract.renewed", ContractID: id, TenantID: tenantID,
 		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
 		Payload: c,
 	})
@@ -337,11 +473,7 @@ func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 
 	existing, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, domain.ErrContractNotFound) {
-			writeError(w, http.StatusNotFound, "contract not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to fetch contract")
+		h.writeLifecycleErr(w, "failed to fetch contract", err)
 		return
 	}
 
@@ -356,14 +488,7 @@ func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 
 	c, err := h.store.TerminateContract(r.Context(), id, &req)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrContractNotFound):
-			writeError(w, http.StatusNotFound, "contract not found")
-		case errors.Is(err, domain.ErrContractTerminated):
-			writeError(w, http.StatusConflict, "contract is already terminated")
-		default:
-			writeError(w, http.StatusInternalServerError, "failed to terminate contract")
-		}
+		h.writeLifecycleErr(w, "failed to terminate contract", err)
 		return
 	}
 
@@ -379,7 +504,7 @@ func (h *Handler) ListContractVersions(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	versions, err := h.store.ListContractVersions(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list contract versions")
+		h.writeLifecycleErr(w, "failed to list contract versions", err)
 		return
 	}
 	if versions == nil {
@@ -410,6 +535,28 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+// writeLifecycleErr maps a store lifecycle-transition failure to the status
+// it deserves, shared by every command that advances status.
+func (h *Handler) writeLifecycleErr(w http.ResponseWriter, what string, err error) {
+	switch {
+	case errors.Is(err, domain.ErrTenantMissing):
+		writeError(w, http.StatusUnauthorized, "tenant scope missing")
+	case errors.Is(err, domain.ErrContractNotFound):
+		writeError(w, http.StatusNotFound, "contract not found")
+	case errors.Is(err, domain.ErrContractTerminated):
+		writeError(w, http.StatusConflict, "contract is already terminated")
+	case errors.Is(err, domain.ErrWrongLifecycleStatus):
+		writeError(w, http.StatusConflict, domain.ErrWrongLifecycleStatus.Error())
+	case errors.Is(err, domain.ErrSelfApprovalNotAllowed):
+		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
+	case errors.Is(err, domain.ErrSignatureNotSent):
+		writeError(w, http.StatusConflict, domain.ErrSignatureNotSent.Error())
+	default:
+		h.logger.Error(what, zap.Error(err))
+		writeError(w, http.StatusInternalServerError, what)
+	}
 }
 
 func (h *Handler) writeGovernanceLogErr(w http.ResponseWriter, err error) {

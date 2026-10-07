@@ -74,8 +74,10 @@ for m, p in routes:
     if p.startswith(UNSIGNED):
         op["description"] = (
             "Exempt from the 4-envelope: the caller carries no ZoikoSuite identity. Authenticated by HMAC-SHA256 over "
-            "'<timestamp>.<body>' (X-NCD-Signature / X-Webhook-Signature with X-NCD-Timestamp / X-Webhook-Timestamp), "
-            "inside a 5-minute replay window. With no secret configured every request is refused (INV-27).")
+            "'<timestamp>.<body>' inside a 5-minute replay window: the NCD plane's provider events with "
+            "X-NCD-Signature and X-NCD-Timestamp, the legacy webhook with X-Zoiko-Signature: t=<unix>,v1=<hex> "
+            "(several v1 values allowed during a secret rotation). With no secret configured every request is "
+            "refused (INV-27).")
     else:
         op["parameters"] += [{"$ref": "#/components/parameters/" + h} for h in ("TenantId", "PrincipalId", "CorrelationId")]
         if m != "get":

@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -9,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/ledger"
 )
 
@@ -55,6 +59,14 @@ func (s *PgStore) AddSuppression(ctx context.Context, supp *ledger.EmailSuppress
 	normEmail := strings.ToLower(strings.TrimSpace(supp.RecipientEmail))
 
 	return s.withRLS(ctx, supp.TenantID, func(tx pgx.Tx) error {
+		// An unchanged repeat (a provider re-sending the same bounce) is not news.
+		var existing string
+		prior := tx.QueryRow(ctx, `SELECT reason FROM email_suppressions WHERE tenant_id = $1 AND recipient_email = $2 AND source_stream = $3`,
+			supp.TenantID, normEmail, supp.SourceStream).Scan(&existing)
+		if prior != nil && !errors.Is(prior, pgx.ErrNoRows) {
+			return prior
+		}
+		changed := errors.Is(prior, pgx.ErrNoRows) || existing != string(supp.Reason)
 		const insertSQL = `
 			INSERT INTO email_suppressions (
 				suppression_id, tenant_id, recipient_email, reason, source_stream,
@@ -75,7 +87,19 @@ func (s *PgStore) AddSuppression(ctx context.Context, supp *ledger.EmailSuppress
 		if err != nil {
 			return fmt.Errorf("insert email_suppression: %w", err)
 		}
-		return nil
+		if !changed {
+			return nil
+		}
+		sum := sha256.Sum256([]byte(normEmail))
+		provider := ""
+		if supp.ProviderName != nil {
+			provider = *supp.ProviderName
+		}
+		ev, err := events.EndpointSuppressed(supp.TenantID, hex.EncodeToString(sum[:]), supp.SourceStream, string(supp.Reason), provider, supp.CreatedAt)
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, tx, supp.TenantID, ev)
 	})
 }
 

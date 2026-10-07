@@ -42,6 +42,18 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	return app
 }
 
+// openAdminTestPool is the admin pool alone. It is for tests that probe the
+// schema itself (down/up migrations, triggers, CHECKs) with raw SQL: as the
+// app role, DDL is refused and a raw UPDATE under RLS touches no rows, so a
+// "the database refused it" probe would pass or fail for the wrong reason.
+// Tenant isolation is proven separately, as the app role
+// (TestLegacyTables_RLSIsolatesTenantsAsTheAppRole, rls_enforcement_test.go).
+func openAdminTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	_, admin := openTestPools(t)
+	return admin
+}
+
 // openTestPools is openTestPool plus the admin pool that built the schema.
 func openTestPools(t *testing.T) (app, admin *pgxpool.Pool) {
 	t.Helper()
@@ -61,7 +73,7 @@ func openTestPools(t *testing.T) (app, admin *pgxpool.Pool) {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS notification_delivery_attempts, event_outbox, webhook_dlq, action_tokens, email_suppressions, delivery_events, delivery_attempts, message_renders, message_intents, template_versions, template_definitions, notifications CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS send_quota_counters, notice_acknowledgements, regulated_notice_events, regulated_notices, notification_delivery_evidence, recipient_preferences, communication_intent_versions, communication_intents, notification_delivery_attempts, event_outbox, webhook_dlq, action_tokens, email_suppressions, delivery_events, delivery_attempts, message_renders, message_intents, template_versions, template_definitions, notifications CASCADE;`)
 
 	// Every migration, in order — discovered, not listed.
 	//

@@ -2008,7 +2008,9 @@ services:
       #   NCD plane:     POST /v1/provider-events/smtp-primary
       #   legacy route:  POST /v1/notifications/webhooks/{provider}
       NCD_CALLBACK_SECRET_SMTP_PRIMARY: "${NCD_CALLBACK_SECRET_SMTP_PRIMARY:-dev-ncd-callback-secret}"
-      NOTIFICATION_WEBHOOK_SECRET: "${NOTIFICATION_WEBHOOK_SECRET:-dev-webhook-secret}"
+      # JSON: provider -> list of secrets (several, so one can be rotated);
+      # each at least 16 bytes. Signed as X-Zoiko-Signature: t=<unix>,v1=<hmac>.
+      NOTIFICATION_WEBHOOK_SECRETS: '${NOTIFICATION_WEBHOOK_SECRETS:-{"smtp":["dev-webhook-secret-0123456789"]}}'
 
       # One-click unsubscribe (RFC 8058). The link's sealed token is the
       # receiver's only credential; without a secret the service refuses to

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -120,5 +121,114 @@ func TestClient_TenantlessContext_SendsNoHeader(t *testing.T) {
 	}
 	if sawHeader {
 		t.Fatal("a tenant-less context must send NO X-Tenant-Id header, not an empty or invented one")
+	}
+}
+
+// These tests pin the X-Principal-Id forwarding, which was ALSO missing
+// entirely — found while wiring WorkflowHistoryClient.ListByEntityAndDateRange.
+// workflow-history-svc requires X-Principal-Id on every route, including
+// the per-instance history endpoint ListByInstanceID already called, so
+// that call was silently 401ing against a real workflow-history-svc the
+// whole time — masked because the only tests covering it used a stub that
+// never checked for the header. See aggregator.forwardIdentity's doc
+// comment.
+
+func TestWorkflowHistoryClient_ListByInstanceID_ForwardsPrincipalHeader(t *testing.T) {
+	var gotPrincipal string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPrincipal = r.Header.Get("X-Principal-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	c := aggregator.NewWorkflowHistoryClient(srv.URL, zap.NewNop())
+	ctx := svcmiddleware.WithPrincipal(context.Background(), "principal-a")
+	if _, err := c.ListByInstanceID(ctx, "wf-1"); err != nil {
+		t.Fatalf("ListByInstanceID: %v", err)
+	}
+	if gotPrincipal != "principal-a" {
+		t.Fatalf("expected X-Principal-Id to be forwarded as %q, got %q", "principal-a", gotPrincipal)
+	}
+}
+
+func TestAllClients_ForwardPrincipalHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(baseURL string, ctx context.Context) error
+	}{
+		{"governance GetByID", func(baseURL string, ctx context.Context) error {
+			_, err := aggregator.NewGovernanceDecisionClient(baseURL, zap.NewNop()).GetByID(ctx, "gd-1")
+			return err
+		}},
+		{"governance List", func(baseURL string, ctx context.Context) error {
+			_, err := aggregator.NewGovernanceDecisionClient(baseURL, zap.NewNop()).ListByEntityAndDateRange(ctx, "e1", nil, nil)
+			return err
+		}},
+		{"workflow", func(baseURL string, ctx context.Context) error {
+			_, err := aggregator.NewWorkflowClient(baseURL, zap.NewNop()).GetByID(ctx, "wf-1")
+			return err
+		}},
+		{"access decision", func(baseURL string, ctx context.Context) error {
+			_, err := aggregator.NewAccessDecisionClient(baseURL, zap.NewNop()).GetByID(ctx, "ad-1")
+			return err
+		}},
+		{"workflow history cross-workflow", func(baseURL string, ctx context.Context) error {
+			_, err := aggregator.NewWorkflowHistoryClient(baseURL, zap.NewNop()).ListByEntityAndDateRange(ctx, "e1", time.Now(), time.Now())
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPrincipal string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPrincipal = r.Header.Get("X-Principal-Id")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[]`))
+			}))
+			defer srv.Close()
+
+			ctx := svcmiddleware.WithPrincipal(context.Background(), "principal-a")
+			if err := tc.call(srv.URL, ctx); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if gotPrincipal != "principal-a" {
+				t.Fatalf("%s: expected X-Principal-Id %q, got %q", tc.name, "principal-a", gotPrincipal)
+			}
+		})
+	}
+}
+
+// TestWorkflowHistoryClient_ListByEntityAndDateRange_SendsRequiredParams
+// pins the cross-workflow query shape (legal_entity_id, from, to all
+// required, unlike GovernanceDecisionClient's optional from/to) and the
+// event_id-per-record decoding, mirroring ListByInstanceID's own shape.
+func TestWorkflowHistoryClient_ListByEntityAndDateRange_SendsRequiredParams(t *testing.T) {
+	var gotEntity, gotFrom, gotTo string
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEntity = r.URL.Query().Get("legal_entity_id")
+		gotFrom = r.URL.Query().Get("from")
+		gotTo = r.URL.Query().Get("to")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"event_id":"evt-1"},{"event_id":"evt-2"}]`))
+	}))
+	defer srv.Close()
+
+	c := aggregator.NewWorkflowHistoryClient(srv.URL, zap.NewNop())
+	ctx := svcmiddleware.WithTenant(context.Background(), "tenant-a")
+	recs, err := c.ListByEntityAndDateRange(ctx, "entity-1", from, to)
+	if err != nil {
+		t.Fatalf("ListByEntityAndDateRange: %v", err)
+	}
+	if gotEntity != "entity-1" {
+		t.Fatalf("expected legal_entity_id=entity-1, got %q", gotEntity)
+	}
+	if gotFrom != from.Format(time.RFC3339) || gotTo != to.Format(time.RFC3339) {
+		t.Fatalf("expected from/to %s/%s, got %s/%s", from.Format(time.RFC3339), to.Format(time.RFC3339), gotFrom, gotTo)
+	}
+	if len(recs) != 2 || recs[0].SourceRecordID != "evt-1" || recs[1].SourceRecordID != "evt-2" {
+		t.Fatalf("expected 2 records evt-1/evt-2, got %+v", recs)
 	}
 }

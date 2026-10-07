@@ -100,6 +100,33 @@ type Notification struct {
 	PurposeContext string `json:"purpose_context,omitempty"`
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 
+	// CommunicationClass is what KIND of message this is (S0 security, T0
+	// transactional, A1 operational, L1 lifecycle, M1 marketing), fixed when the row
+	// is created (migration 000019). Empty means the sender stated none and the
+	// message is judged as T0.
+	CommunicationClass string `json:"communication_class,omitempty"`
+
+	// MessageIntentID is the ledger intent this notification was produced from, when
+	// there is one (migration 000016); empty for a direct send. With the notification
+	// id (the communication id) it is how one communication is recognised from both
+	// send paths.
+	MessageIntentID string `json:"message_intent_id,omitempty"`
+
+	// IntentVersionID is the exact communication intent version the message was sent
+	// under (migration 000021), fixed at creation. Empty when the send used no intent.
+	IntentVersionID string `json:"intent_version_id,omitempty"`
+
+	// JobID is the delivery job this communication runs under (ZS-SVC-Y-001 6.1): a stable
+	// identity every attempt carries. NotBefore and ExpiresAt are server-authoritative timing:
+	// nothing is submitted before the first or after the second. Cancelled* records who withdrew
+	// a queued communication and why.
+	JobID        string     `json:"job_id,omitempty"`
+	NotBefore    *time.Time `json:"not_before,omitempty"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
+	CancelledBy  string     `json:"cancelled_by,omitempty"`
+	CancelledAt  *time.Time `json:"cancelled_at,omitempty"`
+	CancelReason string     `json:"cancel_reason,omitempty"`
+
 	// Resend summary (migration 000014). The full reasoned chain is in the
 	// attempt records; these say how often and why most recently.
 	ResendCount             int        `json:"resend_count"`
@@ -117,6 +144,8 @@ const (
 	StatusSent           = "SENT"
 	StatusFailed         = "FAILED"
 	StatusPendingUnknown = "PENDING_UNKNOWN"
+	StatusCancelled      = "CANCELLED" // withdrawn before submission
+	StatusExpired        = "EXPIRED"   // passed expires_at before submission (NCD-015)
 )
 
 // Retrying reports whether delivery has not concluded and another attempt is
@@ -160,6 +189,12 @@ type ResolveDeliveryOutcomeParams struct {
 }
 
 type SendNotificationRequest struct {
+	// NotBefore and ExpiresAt are the server-authoritative timing of the delivery job
+	// (ZS-SVC-Y-001 6.1), for EMAIL only. A future NotBefore queues the send for that
+	// time; ExpiresAt is the instant after which it is never submitted (NCD-015).
+	NotBefore *time.Time `json:"not_before,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
 	RecipientPrincipalID string `json:"recipient_principal_id"`
 	LegalEntityID        string `json:"legal_entity_id"`
 	Channel              string `json:"channel"`
@@ -179,6 +214,13 @@ type SendNotificationRequest struct {
 	// IdempotencyKey lets a caller supply the purpose-scoped key it derived
 	// from the originating business event itself; otherwise one is derived.
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
+
+	// CommunicationClass states what KIND of message this is. The direct path
+	// accepts S0 (security), T0 (transactional) and A1 (operational); marketing (M1)
+	// and lifecycle (L1) mail must use the ledger pipeline, which carries the stream
+	// sender identity and one-click unsubscribe headers this path does not. Empty is
+	// treated as T0.
+	CommunicationClass string `json:"communication_class,omitempty"`
 
 	// RecipientAddress overrides recipient resolution for channels that need
 	// an endpoint. Left empty — the normal case — the address is resolved from
@@ -256,6 +298,12 @@ type DeliveryOutcome struct {
 	// retry worker possible without re-litigating every historical failure.
 	Retryable bool
 
+	// DeferUntil, when set on a Retryable outcome, is when the next attempt is due
+	// instead of the usual backoff: the message is being held on purpose (a recipient's
+	// quiet hours, NCD-012), not failing, so it must not be retried every 30 seconds
+	// until its attempts run out.
+	DeferUntil time.Time
+
 	// Unknown marks an outcome that is neither a confirmed acceptance nor a
 	// safely-retryable or terminal failure — the message may or may not
 	// have reached the provider, and guessing either way risks a duplicate
@@ -268,6 +316,15 @@ type DeliveryOutcome struct {
 	// ProviderName records the name of the provider that actually handled or refused
 	// the attempt (e.g. "smtp-primary", "smtp-secondary", "ses").
 	ProviderName string
+
+	// PrivacyDecisionID and PrivacyResult are set when a privacy decision governed this
+	// attempt, whether it permitted the send or stopped it (migration 000022).
+	PrivacyDecisionID string
+	PrivacyResult     string
+
+	// BlockCode is the stable reason code (ZS-SVC-Y-001 10.3, for example NCD-008) when a guard
+	// withheld this delivery, so the attempt record can announce communication.blocked.
+	BlockCode string
 }
 
 // AddressSource values for Notification.RecipientAddressSource.
@@ -361,9 +418,10 @@ var (
 
 // Attempt origins.
 const (
-	AttemptOriginRequest = "request" // the synchronous attempt inside POST /v1/notifications
-	AttemptOriginRetry   = "retry"   // a later attempt by the retry worker
-	AttemptOriginResend  = "resend"  // an explicit, reasoned resend (POST /{id}/resend)
+	AttemptOriginRequest   = "request"   // the synchronous attempt inside POST /v1/notifications
+	AttemptOriginRetry     = "retry"     // a later attempt by the retry worker
+	AttemptOriginResend    = "resend"    // an explicit, reasoned resend (POST /{id}/resend)
+	AttemptOriginScheduled = "scheduled" // the first attempt of a send that waited for not_before
 )
 
 // Attempt outcomes — what one attempt achieved, not the notification's status.
@@ -379,11 +437,16 @@ const (
 // resend — why. The transition that records the attempt's effect writes it,
 // in the same transaction.
 type AttemptMeta struct {
-	Origin           string
-	ProviderName     string
-	Retryable        bool
-	ResendReason     string
-	ActorPrincipalID string
+	Origin       string
+	ProviderName string
+	Retryable    bool
+	ResendReason string
+	// PrivacyDecisionID and PrivacyResult are the privacy decision that governed this
+	// attempt (migration 000022), recorded for a refusal as well as a permission.
+	PrivacyDecisionID string
+	PrivacyResult     string
+	BlockCode         string
+	ActorPrincipalID  string
 }
 
 // DeliveryAttempt is one durable provider submission on the direct-send path.
@@ -391,6 +454,7 @@ type DeliveryAttempt struct {
 	AttemptID        string    `json:"attempt_id"`
 	TenantID         string    `json:"tenant_id"`
 	NotificationID   string    `json:"notification_id"`
+	JobID            string    `json:"job_id,omitempty"`
 	AttemptNumber    int       `json:"attempt_number"`
 	Origin           string    `json:"origin"`
 	Channel          string    `json:"channel"`
@@ -403,4 +467,7 @@ type DeliveryAttempt struct {
 	ActorPrincipalID string    `json:"actor_principal_id,omitempty"`
 	AttemptedAt      time.Time `json:"attempted_at"`
 	RecordedAt       time.Time `json:"recorded_at"`
+	// The privacy decision that governed this attempt, when one did.
+	PrivacyDecisionID string `json:"privacy_decision_id,omitempty"`
+	PrivacyResult     string `json:"privacy_result,omitempty"`
 }
