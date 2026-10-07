@@ -705,6 +705,44 @@ func (s *stubStore) ListModelReleases(context.Context) ([]domain.AIModelRelease,
 	return list, nil
 }
 
+func (s *stubStore) CreateDisposition(context.Context, domain.CreateDispositionRequest, string) (*domain.OutputDisposition, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) GetDisposition(context.Context, string) (*domain.OutputDisposition, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) DecideDisposition(context.Context, string, domain.DecideDispositionRequest, string) (*domain.OutputDisposition, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) SupersedeDisposition(context.Context, string, domain.SupersedeDispositionRequest, string) (*domain.OutputDisposition, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+
+func (s *stubStore) CreateEvaluation(context.Context, domain.CreateEvaluationRequest, string) (*domain.AIEvaluation, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) GetEvaluation(context.Context, string) (*domain.AIEvaluation, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) ReportIncident(context.Context, domain.ReportIncidentRequest, string) (*domain.AIIncident, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) GetIncident(context.Context, string) (*domain.AIIncident, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) ContainIncident(context.Context, string, domain.ContainIncidentRequest) (*domain.AIIncident, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) ResolveIncident(context.Context, string, domain.ResolveIncidentRequest) (*domain.AIIncident, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) CloseIncident(context.Context, string, domain.CloseIncidentRequest, string) (*domain.AIIncident, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+func (s *stubStore) ReactivateRelease(context.Context, string, domain.ReactivateReleaseRequest, string) (*domain.AIModelRelease, error) {
+	return nil, errors.New("not implemented in stubStore")
+}
+
 var _ store.Store = (*stubStore)(nil)
 
 type stubPublisher struct {

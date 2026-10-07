@@ -27,6 +27,17 @@
 //     not just the workflow-svc snapshot. This is not a new opt-in field:
 //     an instance's own history is intrinsically part of its evidence, the
 //     same way a governance decision's evidence was never optional either.
+//   - UPDATE 2: the "distinct, broader discovery surface" the first UPDATE
+//     deliberately left unfabricated — workflow-history-svc's
+//     cross-workflow query (GET /v1/workflows/history) — is now wired too,
+//     via WorkflowHistoryFrom/To on GenerateManifestRequest. The per-
+//     instance wiring above also had a real, separate bug found while
+//     adding this: X-Principal-Id was never forwarded to ANY aggregator
+//     client, so calls to workflow-history-svc (which requires it on
+//     every route) were silently 401ing against the real service despite
+//     passing tests, because the only tests covering them used a stub
+//     that never checked for the header. Both fixed together — see
+//     internal/aggregator's forwardIdentity doc comment.
 //   - audit-event-store-svc exposes NO query API whatsoever (health probes
 //     only) — it is a pure Kafka consumer. It is NOT included in v1 manifests;
 //     this is a deferred gap, not an oversight (see ManifestSection below).
@@ -131,6 +142,17 @@ type GenerateManifestRequest struct {
 	GovernanceDecisionIDs []string `json:"governance_decision_ids,omitempty"`
 	AccessDecisionIDs     []string `json:"access_decision_ids,omitempty"`
 	WorkflowInstanceIDs   []string `json:"workflow_instance_ids,omitempty"`
+
+	// WorkflowHistoryFrom/To scope an auto-discovery query against
+	// workflow-history-svc's cross-workflow endpoint (GET
+	// /v1/workflows/history) — the same "list produces many records"
+	// shape as GovernanceDecisionsFrom/To, closing the gap
+	// workflow-history-svc's own package doc named directly (see
+	// internal/aggregator.WorkflowHistoryClient's doc comment). Unlike
+	// the governance fields, both must be set together or not at all —
+	// that endpoint requires both from and to, not either.
+	WorkflowHistoryFrom *time.Time `json:"workflow_history_from,omitempty"`
+	WorkflowHistoryTo   *time.Time `json:"workflow_history_to,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

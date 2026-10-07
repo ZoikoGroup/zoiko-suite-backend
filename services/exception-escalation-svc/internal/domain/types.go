@@ -10,6 +10,10 @@ var (
 	ErrCaseAlreadyClosed     = errors.New("exception case is already closed")
 	ErrEscalationNotFound    = errors.New("escalation record not found")
 
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
+
 	// ErrSelfApprovalNotAllowed enforces the platform's Segregation of Duties
 	// doctrine (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal
 	// who created a record may not be the same principal who approves,

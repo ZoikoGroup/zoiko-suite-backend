@@ -14,6 +14,10 @@ var (
 	// who created a record may not be the same principal who approves,
 	// executes, or resolves it.
 	ErrSelfApprovalNotAllowed = errors.New("principal may not approve or decide on their own submission")
+
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
 )
 
 type ActionType string

@@ -11,6 +11,10 @@ var (
 	ErrAnomalyRecordNotFound   = errors.New("anomaly record not found")
 	ErrAnomalyRuleNotFound     = errors.New("anomaly rule not found")
 	ErrInvalidStatusTransition = errors.New("invalid status transition")
+
+	// ErrTenantMissing means the request carried no X-Tenant-ID. It is an
+	// unauthenticated request, not an empty tenant named "tenant-default-001".
+	ErrTenantMissing = errors.New("tenant scope missing")
 )
 
 type Severity string

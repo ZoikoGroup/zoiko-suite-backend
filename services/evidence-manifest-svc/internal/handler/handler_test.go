@@ -279,14 +279,25 @@ func (s *stubWorkflow) GetByID(_ context.Context, id string) (*aggregator.Source
 // Defaults to an empty history (no error) so existing tests that never
 // configure it keep exercising the real path unaffected.
 type stubWorkflowHistory struct {
-	result []aggregator.SourceRecord
-	err    error
-	calls  int
+	result      []aggregator.SourceRecord
+	err         error
+	calls       int
+	rangeResult []aggregator.SourceRecord
+	rangeErr    error
+	rangeCalls  int
+	gotFrom     time.Time
+	gotTo       time.Time
 }
 
 func (s *stubWorkflowHistory) ListByInstanceID(_ context.Context, _ string) ([]aggregator.SourceRecord, error) {
 	s.calls++
 	return s.result, s.err
+}
+
+func (s *stubWorkflowHistory) ListByEntityAndDateRange(_ context.Context, _ string, from, to time.Time) ([]aggregator.SourceRecord, error) {
+	s.rangeCalls++
+	s.gotFrom, s.gotTo = from, to
+	return s.rangeResult, s.rangeErr
 }
 
 // ── stub publisher ───────────────────────────────────────────────────────────
@@ -530,6 +541,65 @@ func TestGenerateManifest_WorkflowHistoryUnavailable_FailsClosed(t *testing.T) {
 
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Empty(t, s.records["manifest-1"], "no partial records must be persisted when workflow-history-svc is unavailable")
+}
+
+// TestGenerateManifest_WorkflowHistoryTimeWindow_AutoDiscovers closes the
+// "distinct, broader discovery surface" workflow-history-svc's own
+// package doc deliberately left unwired when per-instance history was
+// added — the cross-workflow query, scoped by legal entity and time
+// window rather than a known instance ID.
+func TestGenerateManifest_WorkflowHistoryTimeWindow_AutoDiscovers(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	wfh := &stubWorkflowHistory{rangeResult: []aggregator.SourceRecord{
+		{SourceType: domain.SourceWorkflowHistory, SourceRecordID: "evt-9", RawJSON: []byte(`{"event_id":"evt-9"}`)},
+	}}
+
+	s := newStubStore()
+	r := newRouterWithWorkflowHistory(s, gov, acc, wf, wfh, pub, &stubAuthz{})
+
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)
+	body, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioLegalDiscovery,
+		WorkflowHistoryFrom: &from, WorkflowHistoryTo: &to,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.Len(t, s.records["manifest-1"], 1)
+	if wfh.rangeCalls != 1 {
+		t.Fatalf("expected exactly one ListByEntityAndDateRange call, got %d", wfh.rangeCalls)
+	}
+	if !wfh.gotFrom.Equal(from) || !wfh.gotTo.Equal(to) {
+		t.Fatalf("expected from/to %v/%v, got %v/%v", from, to, wfh.gotFrom, wfh.gotTo)
+	}
+}
+
+// TestGenerateManifest_WorkflowHistoryFrom_WithoutTo_Refused pins the
+// validation that workflow-history-svc's cross-workflow endpoint requires
+// both from and to — supplying only one must be refused with a clear
+// 400, not an opaque downstream failure.
+func TestGenerateManifest_WorkflowHistoryFrom_WithoutTo_Refused(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	s := newStubStore()
+	r := newRouter(s, gov, acc, wf, pub)
+
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	body, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioLegalDiscovery,
+		WorkflowHistoryFrom: &from,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
 // ── GetManifest / ListRecords ────────────────────────────────────────────────

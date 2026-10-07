@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/mail"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -19,6 +20,8 @@ import (
 	"zoiko.io/notification-svc/internal/identity"
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/ncd"
+	"zoiko.io/notification-svc/internal/quota"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
@@ -42,6 +45,8 @@ type Store interface {
 	MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time, correlationID string, meta domain.AttemptMeta) error
 	// ListAttempts backs GET /{id}/attempts — the durable per-attempt chain.
 	ListAttempts(ctx context.Context, notificationID string) ([]domain.DeliveryAttempt, error)
+	// CancelNotification withdraws a queued communication (ZS-SVC-Y-001 6.6).
+	CancelNotification(ctx context.Context, id, tenantID, actor, reason string, at time.Time) (*domain.Notification, error)
 	// BeginSubmission marks a notification as being handed to a provider,
 	// committed before the call (migration 000013).
 	BeginSubmission(ctx context.Context, id, tenantID string, at time.Time) error
@@ -166,6 +171,10 @@ type Handler struct {
 	ledgerStore    ledger.LedgerStore
 	webhookHandler *webhook.Handler
 	suppressions   SuppressionStore
+	intents        IntentStore
+	preferences    PreferenceStore
+	evidence       EvidenceStore
+	notices        NoticeStore
 	// metrics may be nil (tests); every observation is nil-safe.
 	metrics *telemetry.Domain
 
@@ -192,8 +201,19 @@ type Deps struct {
 	LedgerStore    ledger.LedgerStore
 	WebhookHandler *webhook.Handler
 	Suppressions   SuppressionStore
-	Metrics        *telemetry.Domain
-	Log            *zap.Logger
+	// Intents is the communication intent registry (NCD-01). Optional: without it the
+	// registry routes answer 503 and a template bound to an intent cannot be sent
+	// (fail closed).
+	Intents IntentStore
+	// Preferences is the recipient preference store (NCD-02). Optional: without it the
+	// preference routes answer 503.
+	Preferences PreferenceStore
+	// Evidence reads normalized delivery evidence (NCD-04). Optional: without it the route answers 503.
+	Evidence EvidenceStore
+	// Notices stores regulated notices (NCD-05). Optional: without it, and the intent registry, the routes answer 503.
+	Notices NoticeStore
+	Metrics *telemetry.Domain
+	Log     *zap.Logger
 }
 
 func New(d Deps) *Handler {
@@ -207,6 +227,10 @@ func New(d Deps) *Handler {
 		ledgerStore:    d.LedgerStore,
 		webhookHandler: d.WebhookHandler,
 		suppressions:   d.Suppressions,
+		intents:        d.Intents,
+		preferences:    d.Preferences,
+		evidence:       d.Evidence,
+		notices:        d.Notices,
 		metrics:        d.Metrics,
 		log:            d.Log,
 	}
@@ -253,9 +277,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/read", h.MarkRead)
 		r.Get("/{id}/delivery-status", h.GetDeliveryStatus)
 		r.Get("/{id}/attempts", h.ListAttempts)
+		r.Post("/{id}/cancel", h.CancelNotification)
+		r.Get("/{id}/evidence", h.ListEvidence)
 		r.Post("/{id}/resend", h.ResendNotification)
 		r.Post("/{id}/resolve-delivery-outcome", h.ResolveDeliveryOutcome)
 	})
+
+	registerIntentRoutes(r, h)
+	registerPreferenceRoutes(r, h)
+	registerNoticeRoutes(r, h)
+	r.Post("/v1/channel-decision", h.ChannelDecision)
 
 	r.Route("/v1/document-templates", func(r chi.Router) {
 		r.Post("/", h.CreateTemplate)
@@ -359,6 +390,9 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 			// or an empty login link.
 			writeError(w, http.StatusBadRequest, "missing_template_variables", e.Error())
 			return
+		case templates.ErrUnexpectedVariables:
+			writeError(w, http.StatusBadRequest, "unexpected_template_variables", e.Error())
+			return
 		default:
 			h.log.Error("failed to render notification template",
 				zap.String("template", req.Template), zap.Error(err))
@@ -379,7 +413,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.RecipientPrincipalID == "" || req.LegalEntityID == "" || req.Channel == "" ||
-		req.Subject == "" || req.CorrelationID == "" {
+		(req.Subject == "" && !usingGovernedTemplate) || req.CorrelationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields",
 			"recipient_principal_id, legal_entity_id, channel, correlation_id are required, plus either subject or template")
 		return
@@ -389,6 +423,21 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	if !supportedChannels[req.Channel] {
 		writeError(w, http.StatusBadRequest, "unsupported_channel",
 			"channel must be one of EMAIL, IN_APP, WEBHOOK")
+		return
+	}
+
+	// The class decides which suppressions and preferences may block the message
+	// (INV-06), so it is stated, validated and fixed at creation. Marketing and
+	// lifecycle mail are not a direct send: they need the ledger pipeline's stream
+	// identity and one-click unsubscribe (INV-07).
+	if req.CommunicationClass != "" && !domain.ValidDirectPathClass(req.CommunicationClass) {
+		writeError(w, http.StatusBadRequest, "invalid_communication_class",
+			"communication_class must be one of "+strings.Join(domain.DirectPathClasses, ", ")+
+				" on the direct send path; marketing (M1) and lifecycle (L1) mail use the ledger pipeline")
+		return
+	}
+	if err := domain.ValidateSchedule(req.Channel, req.NotBefore, req.ExpiresAt, time.Now().UTC()); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_schedule", err.Error())
 		return
 	}
 
@@ -438,10 +487,18 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// requirement ("template/version, rendered hash") onto the notification
 	// row — empty for free-text/static-catalogue sends, which cite no
 	// governed version.
-	var templateVersionID, renderedHash string
+	var templateVersionID, renderedHash, intentVersionID string
 	if usingGovernedTemplate {
 		published, err := h.store.GetPublishedVersion(r.Context(), req.TemplateID, req.Locale)
 		if err != nil {
+			// A template that is published in another locale but not this one is an unapproved
+			// LOCALE (NCD-005), never silently replaced by another language; one with nothing
+			// published is simply not published (NCD-003).
+			if errors.Is(err, domain.ErrTemplateVersionNotFound) && h.otherLocalePublished(r.Context(), req.TemplateID, req.Locale) {
+				writeError(w, http.StatusUnprocessableEntity, "locale_not_approved",
+					"NCD-005 LOCALE_NOT_APPROVED: the template has no approved version in locale "+req.Locale+"; another language is never substituted")
+				return
+			}
 			h.handleTemplateError(w, err)
 			return
 		}
@@ -454,12 +511,45 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 				"the published template belongs to a different legal_entity_id than this notification is being sent under")
 			return
 		}
+		// A template bound to a communication intent is sent under the intent version in
+		// force NOW, and under nothing else (NCD-01, INV-04): the purpose class comes from
+		// the intent, the channel must be one it allows, every variable must satisfy its
+		// typed contract, and the message is pinned to the exact version.
+		tmplDef, derr := h.store.GetTemplate(r.Context(), req.TemplateID)
+		if derr != nil {
+			h.handleTemplateError(w, derr)
+			return
+		}
+		if tmplDef.IntentID != nil {
+			iv, ok := h.enforceIntent(w, r, *tmplDef.IntentID, published, &req)
+			if !ok {
+				return
+			}
+			intentVersionID = iv.VersionID
+		}
+		// A version that carries a subject OWNS it: the subject was reviewed and
+		// frozen with the body, and a caller-supplied one would send reviewed
+		// wording under unreviewed text (F-05). A version without one is legacy and
+		// still needs the caller's.
+		if published.Subject != nil && req.Subject != "" {
+			writeError(w, http.StatusBadRequest, "conflicting_content",
+				"this template version defines its own subject; do not supply one")
+			return
+		}
+		if published.Subject == nil && req.Subject == "" {
+			writeError(w, http.StatusBadRequest, "missing_fields",
+				"subject is required: this template version does not define one")
+			return
+		}
 		rendered, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{
 			VersionID: published.VersionID, Variables: req.Variables,
 		})
 		if err != nil {
 			h.handleTemplateError(w, err)
 			return
+		}
+		if published.Subject != nil {
+			req.Subject = rendered.RenderedSubject
 		}
 		req.Body = rendered.RenderedContent
 		templateVersionID = published.VersionID
@@ -497,7 +587,14 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// failure must not collapse source operational workflows", and a payroll
 	// run that finalized correctly must not be told it failed because an
 	// employee has no email address on file.
-	address, addressSource, resolveErr := h.resolveRecipient(r.Context(), tenantID, principalID, req)
+	queued := domain.Queued(req.NotBefore, now)
+	var address, addressSource string
+	var resolveErr error
+	if !queued {
+		// A queued send resolves its recipient when it is sent, so the endpoint it goes to is the
+		// current one (6.6), not whatever it was days before.
+		address, addressSource, resolveErr = h.resolveRecipient(r.Context(), tenantID, principalID, req)
+	}
 
 	notification := &domain.Notification{
 		NotificationID:         uuid.NewString(),
@@ -520,9 +617,25 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		RenderedContentHash:    renderedHash,
 		PurposeContext:         purpose,
 		IdempotencyKey:         idempotencyKey,
+		CommunicationClass:     req.CommunicationClass,
+		IntentVersionID:        intentVersionID,
+		NotBefore:              req.NotBefore,
+		ExpiresAt:              req.ExpiresAt,
+	}
+	if queued {
+		notification.NextAttemptAt = req.NotBefore
 	}
 
-	created, err := h.store.CreateNotification(r.Context(), notification)
+	// Counted against the send quotas (ZS-SVC-Y-001 6.5) in the same transaction that creates it.
+	created, err := h.store.CreateNotification(quota.WithCounting(r.Context()), notification)
+	var exceeded *quota.ExceededError
+	if errors.As(err, &exceeded) {
+		h.log.Warn("send refused: quota exceeded",
+			zap.String("tenant_id", tenantID), zap.String("dimension", exceeded.Dimension), zap.Int("limit", exceeded.Limit))
+		w.Header().Set("Retry-After", strconv.Itoa(int(exceeded.RetryAfter.Seconds())))
+		writeError(w, http.StatusTooManyRequests, "quota_exceeded", exceeded.Error())
+		return
+	}
 	if err != nil {
 		h.log.Error("failed to create notification", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -535,13 +648,20 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A send queued for a future not_before is created and left for the worker, which sends it
+	// when due through the same guarded path as any other attempt. Nothing is sent now.
+	if queued {
+		writeJSON(w, http.StatusCreated, notification)
+		return
+	}
+
 	// A notification whose recipient could not be resolved is never handed to
 	// a provider. Attempting it would produce a second, misleading failure
 	// from the transport ("empty To") on top of the real one, and the record
 	// would name the mail server rather than the missing address.
 	var outcome domain.DeliveryOutcome
 	if resolveErr != nil {
-		outcome.Reason = "recipient resolution failed: " + resolveErr.Error()
+		outcome.Reason = ncd.Format(ncd.RecipientUnresolved) + ": recipient resolution failed: " + resolveErr.Error()
 		outcome.Retryable = !identity.IsSettled(resolveErr)
 	} else {
 		var ok bool
@@ -551,10 +671,13 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.recordAttemptOutcome(w, r, notification, outcome, domain.AttemptMeta{
-		Origin:           domain.AttemptOriginRequest,
-		ProviderName:     outcome.ProviderName,
-		Retryable:        outcome.Retryable,
-		ActorPrincipalID: principalID,
+		Origin:            domain.AttemptOriginRequest,
+		ProviderName:      outcome.ProviderName,
+		Retryable:         outcome.Retryable,
+		PrivacyDecisionID: outcome.PrivacyDecisionID,
+		PrivacyResult:     outcome.PrivacyResult,
+		BlockCode:         outcome.BlockCode,
+		ActorPrincipalID:  principalID,
 	}, correlationID, tenantID, http.StatusCreated)
 }
 
@@ -647,7 +770,7 @@ func (h *Handler) recordAttemptOutcome(w http.ResponseWriter, r *http.Request, n
 	// it up — which is the whole difference between classifying a failure and
 	// doing something about it.
 	if !outcome.Delivered && outcome.Retryable {
-		if next, ok := h.retryPolicy.NextAttempt(attemptedAt, attemptNumber); ok {
+		if next, ok := h.retryPolicy.NextAttemptFor(attemptedAt, attemptNumber, outcome.DeferUntil); ok {
 			if err := h.store.ScheduleRetry(outcomeCtx, notification.NotificationID,
 				tenantID, outcome.Reason, attemptedAt, next, meta); err != nil {
 				h.log.Error("failed to schedule delivery retry", zap.Error(err))
@@ -1099,6 +1222,8 @@ type createTemplateRequest struct {
 	LegalEntityID   string `json:"legal_entity_id"`
 	Name            string `json:"name"`
 	BusinessPurpose string `json:"business_purpose"`
+	// IntentID optionally binds the template to a communication intent, for good (NCD-01).
+	IntentID string `json:"intent_id,omitempty"`
 }
 
 // CreateTemplate creates a new template definition — BIZ-03's own
@@ -1125,10 +1250,14 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tmpl, err := h.store.CreateTemplate(r.Context(), domain.CreateTemplateParams{
-		LegalEntityID: req.LegalEntityID, Name: req.Name, BusinessPurpose: req.BusinessPurpose, OwnerPrincipalID: principalID,
+		LegalEntityID: req.LegalEntityID, Name: req.Name, BusinessPurpose: req.BusinessPurpose, OwnerPrincipalID: principalID, IntentID: req.IntentID,
 		CorrelationID: getCorrelationID(r),
 	})
 	if err != nil {
+		if isIntentBindingError(err) {
+			h.writeIntentError(w, err)
+			return
+		}
 		h.log.Error("failed to create template", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
@@ -1159,9 +1288,14 @@ func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 type createVersionRequest struct {
-	Locale                string   `json:"locale"`
-	Content               string   `json:"content"`
-	VariableSchema        []string `json:"variable_schema,omitempty"`
+	Locale         string   `json:"locale"`
+	Content        string   `json:"content"`
+	VariableSchema []string `json:"variable_schema,omitempty"`
+	// Subject is the reviewed subject text, placeholders only; SubjectVariables are
+	// the variables the author declares safe to appear in it (a subset of
+	// variable_schema). Omit both to leave the subject to the sender (legacy).
+	Subject               string   `json:"subject,omitempty"`
+	SubjectVariables      []string `json:"subject_variables,omitempty"`
 	BrandingMetadata      string   `json:"branding_metadata,omitempty"`
 	AccessibilityMetadata string   `json:"accessibility_metadata,omitempty"`
 }
@@ -1198,6 +1332,7 @@ func (h *Handler) CreateVersion(w http.ResponseWriter, r *http.Request) {
 
 	version, err := h.store.CreateVersion(r.Context(), domain.CreateVersionParams{
 		TemplateID: templateID, Locale: req.Locale, Content: req.Content, VariableSchema: req.VariableSchema,
+		Subject: req.Subject, SubjectVariables: req.SubjectVariables,
 		BrandingMetadata: req.BrandingMetadata, AccessibilityMetadata: req.AccessibilityMetadata,
 		CreatedByPrincipalID: principalID,
 	})
@@ -1395,7 +1530,7 @@ func (h *Handler) RenderPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{VersionID: versionID, Variables: req.Variables})
+	result, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{VersionID: versionID, Variables: req.Variables, Placeholders: true})
 	if err != nil {
 		h.handleTemplateError(w, err)
 		return
@@ -1490,6 +1625,10 @@ func (h *Handler) handleTemplateError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "self_approval_forbidden", err.Error())
 	case errors.Is(err, domain.ErrTemplateContentInvalid):
 		writeError(w, http.StatusBadRequest, "invalid_content", err.Error())
+	case errors.Is(err, domain.ErrSubjectInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_subject", err.Error())
+	case isIntentBindingError(err):
+		h.writeIntentError(w, err)
 	case errors.Is(err, domain.ErrTemplateLocaleRequired):
 		writeError(w, http.StatusBadRequest, "missing_fields", err.Error())
 	case errors.Is(err, domain.ErrTemplateVersionsBelongToDifferentTemplates):
@@ -1498,6 +1637,11 @@ func (h *Handler) handleTemplateError(w http.ResponseWriter, err error) {
 		var missing domain.ErrTemplateVariablesMissing
 		if errors.As(err, &missing) {
 			writeError(w, http.StatusBadRequest, "missing_variables", missing.Error())
+			return
+		}
+		var unexpected domain.ErrTemplateVariablesUnexpected
+		if errors.As(err, &unexpected) {
+			writeError(w, http.StatusBadRequest, "unexpected_variables", unexpected.Error())
 			return
 		}
 		h.log.Error("template store error", zap.Error(err))
@@ -1605,10 +1749,17 @@ func getCorrelationID(r *http.Request) string {
 func writeError(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	body := map[string]string{
 		"error_code":    code,
 		"error_message": msg,
-	})
+	}
+	// Where the condition is exactly one the standard names, the stable code (section 10.3)
+	// rides beside the service's own. Added, never substituted: existing callers keep working.
+	if stable, ok := ncd.ForAPIError(code); ok {
+		body["reason_code"] = stable
+		body["reason"] = ncd.Names[stable]
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -1815,4 +1966,20 @@ func purposeScopedKey(tenantID string, req domain.SendNotificationRequest, purpo
 	sum := sha256.Sum256([]byte(tenantID + "\x1f" + req.LegalEntityID + "\x1f" + req.CorrelationID + "\x1f" +
 		purpose + "\x1f" + req.RecipientPrincipalID + "\x1f" + req.Channel))
 	return "psk-" + hex.EncodeToString(sum[:])
+}
+
+// otherLocalePublished reports whether the template has an approved, published version in some
+// locale other than the one asked for, which is what makes a missing locale an unapproved
+// locale rather than an unpublished template.
+func (h *Handler) otherLocalePublished(ctx context.Context, templateID, locale string) bool {
+	locales, err := h.store.ListLocales(ctx, templateID)
+	if err != nil {
+		return false
+	}
+	for _, l := range locales {
+		if l.Locale != locale && l.PublishedVersionID != nil {
+			return true
+		}
+	}
+	return false
 }

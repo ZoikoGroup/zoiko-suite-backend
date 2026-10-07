@@ -85,6 +85,7 @@ type WorkflowSource interface {
 // doc named directly — see aggregator.WorkflowHistoryClient's doc comment.
 type WorkflowHistorySource interface {
 	ListByInstanceID(ctx context.Context, workflowInstanceID string) ([]aggregator.SourceRecord, error)
+	ListByEntityAndDateRange(ctx context.Context, legalEntityID string, from, to time.Time) ([]aggregator.SourceRecord, error)
 }
 
 // Action constants passed to authorization-svc as action_type.
@@ -229,8 +230,16 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.GovernanceDecisionsFrom == nil && req.GovernanceDecisionsTo == nil &&
-		len(req.GovernanceDecisionIDs) == 0 && len(req.AccessDecisionIDs) == 0 && len(req.WorkflowInstanceIDs) == 0 {
+		len(req.GovernanceDecisionIDs) == 0 && len(req.AccessDecisionIDs) == 0 && len(req.WorkflowInstanceIDs) == 0 &&
+		req.WorkflowHistoryFrom == nil && req.WorkflowHistoryTo == nil {
 		writeError(w, http.StatusBadRequest, "no_records_requested", domain.ErrNoRecordsRequested.Error())
+		return
+	}
+	// workflow-history-svc's cross-workflow endpoint requires both from and
+	// to — a caller supplying only one gets a clear 400 here rather than an
+	// opaque source_service_unavailable from the downstream call.
+	if (req.WorkflowHistoryFrom == nil) != (req.WorkflowHistoryTo == nil) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "workflow_history_from and workflow_history_to must both be set, or neither")
 		return
 	}
 
@@ -261,7 +270,12 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	records, err := h.collectRecords(r.Context(), req)
+	// Principal is carried via context, same as tenant, so every aggregator
+	// client can forward it to source services that require it (see
+	// aggregator.forwardIdentity) without threading it through every call
+	// signature individually.
+	ctx := svcmiddleware.WithPrincipal(r.Context(), principalID)
+	records, err := h.collectRecords(ctx, req)
 	if err != nil {
 		// Fail closed: a manifest that can't fully assemble is FAILED, not
 		// silently partial — a partial manifest that LOOKS complete is worse
@@ -350,6 +364,13 @@ func (h *Handler) collectRecords(ctx context.Context, req domain.GenerateManifes
 			return nil, err
 		}
 		out = append(out, historyRecs...)
+	}
+	if req.WorkflowHistoryFrom != nil && req.WorkflowHistoryTo != nil {
+		recs, err := h.workflowHistory.ListByEntityAndDateRange(ctx, req.LegalEntityID, *req.WorkflowHistoryFrom, *req.WorkflowHistoryTo)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, recs...)
 	}
 	return out, nil
 }

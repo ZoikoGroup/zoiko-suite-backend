@@ -38,6 +38,9 @@ const (
 type spec struct {
 	subject  string
 	required []string
+	// optional variables may be omitted (the template renders without them). Any
+	// variable that is neither required nor optional is refused, not ignored.
+	optional []string
 }
 
 var specs = map[string]spec{
@@ -53,6 +56,7 @@ var specs = map[string]spec{
 		// reason is optional: the template omits the callout block when absent.
 		subject:  "Your organization registration was not approved",
 		required: []string{"organization_name"},
+		optional: []string{"reason"},
 	},
 	Suspended: {
 		subject:  "Your organization has been suspended",
@@ -108,6 +112,18 @@ func (e ErrMissingVariables) Error() string {
 	return fmt.Sprintf("template %q requires %s", e.Template, strings.Join(e.Missing, ", "))
 }
 
+// ErrUnexpectedVariables is returned when a caller supplies a variable the
+// template does not declare (ZS-SVC-Y-001 NP-07). Silently ignoring it would let a
+// caller believe a value reached the recipient when it did not.
+type ErrUnexpectedVariables struct {
+	Template   string
+	Unexpected []string
+}
+
+func (e ErrUnexpectedVariables) Error() string {
+	return fmt.Sprintf("template %q does not declare %s", e.Template, strings.Join(e.Unexpected, ", "))
+}
+
 // Names lists the catalogue, sorted, for error messages and discovery.
 func Names() []string {
 	out := make([]string, 0, len(specs))
@@ -124,6 +140,8 @@ type Entry struct {
 	Name     string   `json:"name"`
 	Subject  string   `json:"subject"`
 	Required []string `json:"required_variables"`
+	// Optional variables may be omitted; any other variable is refused.
+	Optional []string `json:"optional_variables"`
 }
 
 // Catalogue describes every template, sorted by name.
@@ -143,7 +161,9 @@ func Catalogue() []Entry {
 	for name, s := range specs {
 		required := make([]string, len(s.required))
 		copy(required, s.required)
-		out = append(out, Entry{Name: name, Subject: s.subject, Required: required})
+		optional := make([]string, len(s.optional))
+		copy(optional, s.optional)
+		out = append(out, Entry{Name: name, Subject: s.subject, Required: required, Optional: optional})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -157,6 +177,24 @@ func Render(name string, vars map[string]string) (subject, body string, err erro
 	s, ok := specs[name]
 	if !ok {
 		return "", "", ErrUnknownTemplate{Name: name}
+	}
+
+	declared := make(map[string]bool, len(s.required)+len(s.optional))
+	for _, k := range s.required {
+		declared[k] = true
+	}
+	for _, k := range s.optional {
+		declared[k] = true
+	}
+	var unexpected []string
+	for k := range vars {
+		if !declared[k] {
+			unexpected = append(unexpected, k)
+		}
+	}
+	if len(unexpected) > 0 {
+		sort.Strings(unexpected)
+		return "", "", ErrUnexpectedVariables{Template: name, Unexpected: unexpected}
 	}
 
 	var missing []string

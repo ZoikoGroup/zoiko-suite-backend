@@ -33,10 +33,12 @@ type EvidenceReqClient interface {
 }
 
 const (
-	actionMeetingCreate    = "MEETING_CREATE"
-	actionResolutionCreate = "RESOLUTION_CREATE"
-	actionResolutionVote   = "RESOLUTION_VOTE"
-	actionResolutionPass   = "RESOLUTION_PASS"
+	actionMeetingCreate       = "MEETING_CREATE"
+	actionResolutionCreate    = "RESOLUTION_CREATE"
+	actionResolutionOpenVote  = "RESOLUTION_OPEN_VOTING"
+	actionResolutionVote      = "RESOLUTION_VOTE"
+	actionResolutionClose     = "RESOLUTION_CLOSE_VOTING"
+	actionResolutionSupersede = "RESOLUTION_SUPERSEDE"
 )
 
 type Handler struct {
@@ -167,6 +169,18 @@ func (h *Handler) writeStoreErr(w http.ResponseWriter, what string, err error) {
 		writeError(w, http.StatusConflict, "resolution is already finalized")
 	case errors.Is(err, domain.ErrSelfApprovalNotAllowed):
 		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
+	case errors.Is(err, domain.ErrResolutionNotOpen):
+		writeError(w, http.StatusConflict, domain.ErrResolutionNotOpen.Error())
+	case errors.Is(err, domain.ErrNotEligibleVoter):
+		writeError(w, http.StatusForbidden, domain.ErrNotEligibleVoter.Error())
+	case errors.Is(err, domain.ErrAlreadyVoted):
+		writeError(w, http.StatusConflict, domain.ErrAlreadyVoted.Error())
+	case errors.Is(err, domain.ErrEmptyRoster):
+		writeError(w, http.StatusBadRequest, domain.ErrEmptyRoster.Error())
+	case errors.Is(err, domain.ErrInvalidQuorumThreshold):
+		writeError(w, http.StatusBadRequest, domain.ErrInvalidQuorumThreshold.Error())
+	case errors.Is(err, domain.ErrResolutionNotPassed):
+		writeError(w, http.StatusConflict, domain.ErrResolutionNotPassed.Error())
 	default:
 		h.logger.Error(what, zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, what)
@@ -200,8 +214,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.CreateResolution)
 		r.Get("/", h.ListResolutions)
 		r.Get("/{id}", h.GetResolution)
-		r.Post("/{id}/vote", h.RecordVotes)
-		r.Post("/{id}/pass", h.PassResolution)
+		r.Post("/{id}/open-voting", h.OpenVoting)
+		r.Post("/{id}/vote", h.CastVote)
+		r.Post("/{id}/close-voting", h.CloseVoting)
+		r.Post("/{id}/supersede", h.SupersedeResolution)
+		r.Get("/{id}/roster", h.GetVoterRoster)
+		r.Get("/{id}/votes", h.GetVoteLedger)
+		r.Get("/{id}/quorum", h.GetQuorumEvidence)
 	})
 }
 
@@ -421,7 +440,12 @@ func (h *Handler) ListResolutions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) RecordVotes(w http.ResponseWriter, r *http.Request) {
+// OpenVoting freezes the voter roster and quorum threshold (LEG-04 §6.1:
+// "Quorum and voter eligibility are evaluated against a frozen as-of
+// entitlement population") and moves the resolution PROPOSED -> OPEN. The
+// roster is caller-asserted — see migration 000003's doc comment for why
+// this is not yet sourced from a director/shareholder register.
+func (h *Handler) OpenVoting(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -433,14 +457,52 @@ func (h *Handler) RecordVotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req domain.RecordVotesRequest
+	var req domain.OpenVotingRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	// A vote tally is a count of people. Negative counts were accepted and
-	// stored, so a resolution could carry -5 votes against.
-	if req.VotesFor < 0 || req.VotesAgainst < 0 || req.Abstentions < 0 {
-		writeError(w, http.StatusBadRequest, "vote counts may not be negative")
+
+	existing, err := h.store.GetResolution(r.Context(), id)
+	if err != nil {
+		h.writeStoreErr(w, "failed to get resolution", err)
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionResolutionOpenVote); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	res, err := h.store.OpenVoting(r.Context(), id, req.VoterPrincipalIDs, req.QuorumThreshold)
+	if err != nil {
+		h.writeStoreErr(w, "failed to open voting", err)
+		return
+	}
+
+	h.publish(r.Context(), "resolution.voting_opened", id, tenantID, res.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"), res)
+	writeJSON(w, http.StatusOK, res)
+}
+
+// CastVote records one roster member's vote. Only an OPEN resolution accepts
+// votes, only a roster member may cast one, and a voter may cast at most one.
+func (h *Handler) CastVote(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.CastVoteRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !req.Vote.IsValid() {
+		writeError(w, http.StatusBadRequest, "vote must be one of FOR, AGAINST, ABSTAIN")
 		return
 	}
 
@@ -455,17 +517,25 @@ func (h *Handler) RecordVotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.store.RecordVotes(r.Context(), id, &req)
+	// The voter is the authenticated caller — CastVote does not accept a
+	// voter_principal_id in the body a caller could cast on someone else's
+	// behalf. LEG-04 §Authorization/SoD: "secretary may administer but
+	// cannot fabricate vote/consent" — administering means operating this
+	// endpoint on the roster member's own instruction, not submitting a
+	// vote attributed to a principal who never called it.
+	rec, err := h.store.CastVote(r.Context(), id, principalID, req.Vote, principalID)
 	if err != nil {
-		h.writeStoreErr(w, "failed to record votes", err)
+		h.writeStoreErr(w, "failed to cast vote", err)
 		return
 	}
 
-	h.publish(r.Context(), "resolution.votes_recorded", id, tenantID, res.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"), res)
-	writeJSON(w, http.StatusOK, res)
+	h.publish(r.Context(), "resolution.vote_cast", id, tenantID, existing.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"), rec)
+	writeJSON(w, http.StatusOK, rec)
 }
 
-func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
+// CloseVoting tallies the vote ledger against the frozen roster/threshold and
+// resolves the resolution PASSED or FAILED.
+func (h *Handler) CloseVoting(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -477,16 +547,8 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req domain.PassResolutionRequest
+	var req domain.CloseVotingRequest
 	if !decodeJSON(w, r, &req) {
-		return
-	}
-	// passed_by is no longer read from the body — the pass is attributed to
-	// the authenticated principal. It stays accepted so the console's existing
-	// payload is not a 400, but it must name the caller: see
-	// requireSelfAttribution for why a self-declared attribution defeated the
-	// segregation-of-duties check entirely.
-	if !requireSelfAttribution(w, "passed_by", req.PassedBy, principalID) {
 		return
 	}
 
@@ -496,17 +558,16 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionResolutionPass); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionResolutionClose); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
 	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
-	// PassResolution is the distinct closing action that finalizes a
-	// resolution as PASSED — the resolution's drafter/creator may not be
-	// the principal who closes it. (RecordVotes only tallies aggregate
-	// vote counts and does not finalize status, so the doctrine's
-	// self-approval check belongs here, not there.)
+	// closing voting is the action that finalizes a resolution into force —
+	// the resolution's drafter/creator may not be the principal who closes
+	// it. Checked here (pre-evidence-check) and again inside the store
+	// against the locked row, same two-layer pattern PassResolution used.
 	if existing.CreatedBy == principalID {
 		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
 		return
@@ -522,14 +583,12 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 	// correlation_id (a genuine retry must replay, not re-evaluate) — falling
 	// back to a fixed per-resolution value made every retry-after-attaching-
 	// evidence permanently replay the FIRST attempt's result, even after
-	// real evidence was attached. Caught live: a resolution blocked on the
-	// first pass attempt stayed blocked forever on retry until this was
-	// fixed. Each call without a caller-supplied X-Correlation-ID is a
-	// distinct real-world attempt, not a retry — retries are exactly what
-	// the header is for, and callers who want retry-safety must supply it.
+	// real evidence was attached. Each call without a caller-supplied
+	// X-Correlation-ID is a distinct real-world attempt, not a retry —
+	// retries are exactly what the header is for.
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
-		correlationID = "resolution-pass-" + uuid.New().String()
+		correlationID = "resolution-close-" + uuid.New().String()
 	}
 	var artifacts []evidencereq.Artifact
 	if req.DocumentVaultID != nil && *req.DocumentVaultID != "" {
@@ -538,20 +597,128 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 			ReferenceID:  *req.DocumentVaultID,
 		})
 	}
+	// Evidence sufficiency gates the PASSED outcome, not the close action
+	// itself — a resolution that fails quorum/majority must still be
+	// allowed to resolve to FAILED without supplying passage evidence it
+	// will never need.
 	if err := h.evidenceReq.EvaluateSufficient(r.Context(), tenantID, existing.LegalEntityID,
-		string(existing.Category), actionResolutionPass, correlationID, principalID, artifacts); err != nil {
+		string(existing.Category), actionResolutionClose, correlationID, principalID, artifacts); err != nil {
 		h.writeEvidenceErr(w, err)
 		return
 	}
 
-	res, err := h.store.PassResolution(r.Context(), id, principalID, &req)
+	res, err := h.store.CloseVoting(r.Context(), id, principalID, &req)
 	if err != nil {
-		h.writeStoreErr(w, "failed to pass resolution", err)
+		h.writeStoreErr(w, "failed to close voting", err)
 		return
 	}
 
-	h.publish(r.Context(), "resolution.passed", id, tenantID, res.LegalEntityID, principalID, correlationID, res)
+	eventType := "resolution.failed"
+	if res.Status == domain.ResolutionStatusPassed {
+		eventType = "resolution.passed"
+	}
+	h.publish(r.Context(), eventType, id, tenantID, res.LegalEntityID, principalID, correlationID, res)
 	writeJSON(w, http.StatusOK, res)
+}
+
+// SupersedeResolution marks a PASSED resolution SUPERSEDED. LEG-04 names
+// SupersedeResolution as a distinct command — this is deliberately a thin
+// status transition, not a re-vote: the resolution that supersedes it goes
+// through CreateResolution/OpenVoting/CloseVoting on its own.
+func (h *Handler) SupersedeResolution(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req domain.SupersedeResolutionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.SupersededBy == "" {
+		writeError(w, http.StatusBadRequest, "superseded_by is required")
+		return
+	}
+
+	existing, err := h.store.GetResolution(r.Context(), id)
+	if err != nil {
+		h.writeStoreErr(w, "failed to get resolution", err)
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionResolutionSupersede); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	res, err := h.store.SupersedeResolution(r.Context(), id, &req)
+	if err != nil {
+		h.writeStoreErr(w, "failed to supersede resolution", err)
+		return
+	}
+
+	h.publish(r.Context(), "resolution.superseded", id, tenantID, res.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"), res)
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (h *Handler) GetVoterRoster(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	roster, err := h.store.GetVoterRoster(r.Context(), id)
+	if err != nil {
+		h.writeStoreErr(w, "failed to get voter roster", err)
+		return
+	}
+	if roster == nil {
+		roster = []domain.VoterRosterEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"roster": roster})
+}
+
+func (h *Handler) GetVoteLedger(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	ledger, err := h.store.GetVoteLedger(r.Context(), id)
+	if err != nil {
+		h.writeStoreErr(w, "failed to get vote ledger", err)
+		return
+	}
+	if ledger == nil {
+		ledger = []domain.CastVoteRecord{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"votes": ledger})
+}
+
+func (h *Handler) GetQuorumEvidence(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	ev, err := h.store.GetQuorumEvidence(r.Context(), id)
+	if err != nil {
+		h.writeStoreErr(w, "failed to get quorum evidence", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ev)
 }
 
 // publish emits a domain event and reports a failure rather than discarding

@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/ncd"
 )
 
 // Contract constants. Keep in step with asyncapi.yaml and with the
@@ -130,7 +131,7 @@ func Build(eventType, correlationID, tenantID, legalEntityID, actorID, key strin
 // consumer. A consumer that needs content reads the register under its own
 // authorization.
 func Sent(correlationID string, n domain.Notification) (Outbound, error) {
-	return Build(TypeSent, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+	return buildFor(n, TypeSent, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
 		"notification_id":        n.NotificationID,
 		"tenant_id":              n.TenantID,
 		"legal_entity_id":        n.LegalEntityID,
@@ -164,7 +165,7 @@ func Failed(correlationID string, n domain.Notification, reason string) (Outboun
 		now := time.Now().UTC()
 		failedAt = &now
 	}
-	return Build(TypeFailed, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+	return buildFor(n, TypeFailed, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
 		"notification_id":        n.NotificationID,
 		"tenant_id":              n.TenantID,
 		"legal_entity_id":        n.LegalEntityID,
@@ -181,7 +182,7 @@ func Failed(correlationID string, n domain.Notification, reason string) (Outboun
 
 // OutcomeUnknown seals notification.outcome_unknown (BIZ-10).
 func OutcomeUnknown(correlationID string, n domain.Notification, reason string) (Outbound, error) {
-	return Build(TypeOutcomeUnknown, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+	return buildFor(n, TypeOutcomeUnknown, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
 		"notification_id":        n.NotificationID,
 		"tenant_id":              n.TenantID,
 		"legal_entity_id":        n.LegalEntityID,
@@ -309,7 +310,7 @@ func (p *Publisher) Publish(ctx context.Context, msgs []kafka.Message) error {
 // Keyed on the notification, so every attempt of one communication shares a
 // partition with its notification.* events and arrives in order.
 func AttemptCreated(correlationID string, n domain.Notification, a domain.DeliveryAttempt) (Outbound, error) {
-	return Build(TypeAttemptCreated, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, map[string]any{
+	p := map[string]any{
 		"attempt_id":               a.AttemptID,
 		"communication_id":         n.NotificationID,
 		"notification_id":          n.NotificationID,
@@ -323,19 +324,223 @@ func AttemptCreated(correlationID string, n domain.Notification, a domain.Delive
 		"attempted_at":             a.AttemptedAt,
 		"payload_hash":             n.RenderedContentHash,
 		"recipient_address_source": n.RecipientAddressSource,
-	})
+	}
+	// The privacy decision that governed this attempt, when one did (omitted, never blank).
+	if a.JobID != "" {
+		p["job_id"] = a.JobID // the delivery job this attempt belongs to (6.1)
+	}
+	if a.PrivacyDecisionID != "" {
+		p["privacy_decision_id"] = a.PrivacyDecisionID
+	}
+	if a.PrivacyResult != "" {
+		p["privacy_result"] = a.PrivacyResult
+	}
+	return buildFor(n, TypeAttemptCreated, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, p)
 }
 
 // AttemptUnknown seals delivery.attempt.unknown (§10.2): an attempt whose
 // outcome is ambiguous, with the cause and the deadline by which a person is
 // expected to resolve it.
 func AttemptUnknown(correlationID string, n domain.Notification, a domain.DeliveryAttempt, resolutionDueAt time.Time) (Outbound, error) {
-	return Build(TypeAttemptUnknown, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, map[string]any{
+	return buildFor(n, TypeAttemptUnknown, correlationID, n.TenantID, n.LegalEntityID, a.ActorPrincipalID, n.NotificationID, map[string]any{
 		"attempt_id":        a.AttemptID,
 		"communication_id":  n.NotificationID,
 		"notification_id":   n.NotificationID,
 		"ambiguity_cause":   a.FailureReason,
 		"resolution_due_at": resolutionDueAt,
 		"reason_code":       "NCD-014",
+	})
+}
+
+// buildFor seals an event about one notification and stamps it with the identity of
+// the communication (ZS-SVC-Y-001 INV-02, identity plan step 6).
+//
+// Every notification.* and delivery.attempt.* event names the communication the same
+// way, whichever send path produced it:
+//
+//	communication_id    the stable id of this logical communication (the register id)
+//	notification_id     the same value, kept for consumers written before communication_id
+//	message_intent_id   the ledger intent it was produced from, when there is one
+//	communication_class what kind of message it is (S0/T0/A1/L1/M1), when stated
+//	intent_version_id   the exact communication intent version it was sent under, when it used one
+//
+// The additions are additive: no existing field changes meaning or moves, so a
+// consumer of the earlier shape keeps working. An absent intent or class is omitted,
+// never sent as an empty string, so "not linked" is distinguishable from a blank id.
+func buildFor(n domain.Notification, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) (Outbound, error) {
+	payload["communication_id"] = n.NotificationID
+	if n.MessageIntentID != "" {
+		payload["message_intent_id"] = n.MessageIntentID
+	}
+	if n.CommunicationClass != "" {
+		payload["communication_class"] = n.CommunicationClass
+	}
+	// The exact intent version the message was sent under (INV-04), when it used one.
+	if n.IntentVersionID != "" {
+		payload["intent_version_id"] = n.IntentVersionID
+	}
+	return Build(eventType, correlationID, tenantID, legalEntityID, actorID, key, payload)
+}
+
+// ZS-SVC-Y-001 NCD-05 notice events (migration 000025). Like every event here they carry
+// no subject, body or address: a consumer that needs content reads the notice under its own
+// authorization. They carry the content hash, so a consumer can tell WHICH exact version.
+const (
+	TypeNoticeDispatched        = "notice.dispatched"
+	TypeNoticeDeliveryEvidenced = "notice.delivery_evidenced"
+	TypeNoticeException         = "notice.exception"
+	TypeNoticeAcknowledged      = "notice.acknowledged"
+	TypeNoticeDeclined          = "notice.declined"
+	TypeNoticeDisputed          = "notice.disputed"
+	TypeNoticeExpired           = "notice.expired"
+	TypeNoticeCorrected         = "notice.corrected"
+)
+
+// NoticeEventFor maps a notice's new status to the event that announces it, if any.
+func NoticeEventFor(status string) (string, bool) {
+	switch status {
+	case domain.NoticeDeliveryInProgess:
+		return TypeNoticeDispatched, true
+	case domain.NoticeDeliveryEvidenced:
+		return TypeNoticeDeliveryEvidenced, true
+	case domain.NoticeException:
+		return TypeNoticeException, true
+	case domain.NoticeAcknowledged:
+		return TypeNoticeAcknowledged, true
+	case domain.NoticeDeclined:
+		return TypeNoticeDeclined, true
+	case domain.NoticeDisputed:
+		return TypeNoticeDisputed, true
+	case domain.NoticeExpired:
+		return TypeNoticeExpired, true
+	}
+	return "", false
+}
+
+// NoticeEvent seals a notice event. Status names where the notice now is, never that legal
+// service happened.
+func NoticeEvent(eventType string, n domain.Notice, actor, reason string) (Outbound, error) {
+	payload := map[string]any{
+		"notice_id":         n.NoticeID,
+		"lineage_id":        n.LineageID,
+		"version_number":    n.VersionNumber,
+		"status":            n.Status,
+		"ack_requirement":   n.AckRequirement,
+		"content_hash":      n.ContentHash,
+		"intent_version_id": n.IntentVersionID,
+		"reason":            reason,
+	}
+	if n.NotificationID != nil {
+		payload["communication_id"] = *n.NotificationID
+	}
+	if n.SupersedesNoticeID != nil {
+		payload["supersedes_notice_id"] = *n.SupersedesNoticeID
+	}
+	if n.DeadlineAt != nil {
+		payload["deadline_at"] = n.DeadlineAt.UTC().Format(time.RFC3339)
+	}
+	return Build(eventType, "notice-"+n.NoticeID, n.TenantID, n.LegalEntityID, actor, n.NoticeID, payload)
+}
+
+// ZS-SVC-Y-001 section 10.2 events added in migration 000027. As everywhere in this package
+// they carry no subject, body or address: a recipient endpoint is only ever a hash.
+const (
+	TypeCommunicationPrepared = "communication.prepared"
+	TypeCommunicationBlocked  = "communication.blocked"
+	TypeEvidenceRecorded      = "delivery.evidence.recorded"
+	TypeEndpointSuppressed    = "endpoint.suppressed"
+	TypeNoticeDeadlineAtRisk  = "notice.deadline.at_risk"
+)
+
+// CommunicationPrepared announces that a communication now exists, pinned to its exact
+// content and intent version, before any delivery is attempted.
+func CommunicationPrepared(correlationID string, n domain.Notification) (Outbound, error) {
+	return buildFor(n, TypeCommunicationPrepared, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, map[string]any{
+		"notification_id":       n.NotificationID,
+		"rendered_content_hash": n.RenderedContentHash,
+		"channel":               n.Channel,
+		"template_version_id":   n.TemplateVersionID,
+	})
+}
+
+// CommunicationBlocked announces that a delivery was withheld, with the stable reason code
+// (section 10.3). It is emitted for every withheld attempt, so a deferral that is retried
+// says so each time.
+func CommunicationBlocked(correlationID string, n domain.Notification, reasonCode string, attemptNumber int, retryable bool, privacyDecisionID string) (Outbound, error) {
+	p := map[string]any{
+		"notification_id": n.NotificationID,
+		"reason_code":     reasonCode,
+		"reason":          ncdName(reasonCode),
+		"attempt_number":  attemptNumber,
+		"retryable":       retryable,
+	}
+	if privacyDecisionID != "" {
+		p["privacy_decision_id"] = privacyDecisionID
+	}
+	return buildFor(n, TypeCommunicationBlocked, correlationID, n.TenantID, n.LegalEntityID, n.CreatedByPrincipalID, n.NotificationID, p)
+}
+
+// EvidenceRecorded announces a normalized evidence fact for an attempt.
+func EvidenceRecorded(ev domain.DeliveryEvidence, legalEntityID string) (Outbound, error) {
+	return Build(TypeEvidenceRecorded, "evidence-"+ev.AttemptID, ev.TenantID, legalEntityID, "system", ev.NotificationID, map[string]any{
+		"attempt_id":       ev.AttemptID,
+		"communication_id": ev.NotificationID,
+		"evidence_type":    "PROVIDER_CALLBACK",
+		"normalized_state": ev.Fact,
+		"strength":         ev.Strength,
+		"observed_at":      ev.OccurredAt.UTC().Format(time.RFC3339),
+		"provider":         ev.Provider,
+	})
+}
+
+// EndpointSuppressed announces that an endpoint may no longer be used for a scope. The
+// endpoint is a hash: the topic must not become a list of suppressed people's addresses.
+func EndpointSuppressed(tenantID, endpointRef, scope, reason, provider string, effectiveAt time.Time) (Outbound, error) {
+	return Build(TypeEndpointSuppressed, "suppression-"+endpointRef, tenantID, "", "system", endpointRef, map[string]any{
+		"endpoint_ref": endpointRef,
+		"scope":        scope,
+		"reason":       reason,
+		"source":       provider,
+		"effective_at": effectiveAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// NoticeDeadlineAtRisk announces that a notice's deadline is near and what it still lacks.
+func NoticeDeadlineAtRisk(n domain.Notice, deficiency string) (Outbound, error) {
+	p := map[string]any{
+		"notice_id":  n.NoticeID,
+		"lineage_id": n.LineageID,
+		"status":     n.Status,
+		"deficiency": deficiency,
+	}
+	if n.NotificationID != nil {
+		p["communication_id"] = *n.NotificationID
+	}
+	if n.DeadlineAt != nil {
+		p["deadline_at"] = n.DeadlineAt.UTC().Format(time.RFC3339)
+	}
+	return Build(TypeNoticeDeadlineAtRisk, "notice-"+n.NoticeID, n.TenantID, n.LegalEntityID, "system", n.NoticeID, p)
+}
+
+func ncdName(code string) string {
+	if name, ok := ncd.Names[code]; ok {
+		return name
+	}
+	return ""
+}
+
+// TypeCommunicationCancelled announces that a queued communication was withdrawn before it was
+// ever submitted (ZS-SVC-Y-001 6.6, "preserve cancellation evidence"). It says who and why; it
+// is not a failure, so it is deliberately not notification.failed (an escalation chain waiting
+// on a failure must not fire for a withdrawal someone chose).
+const TypeCommunicationCancelled = "communication.cancelled"
+
+// CommunicationCancelled seals communication.cancelled.
+func CommunicationCancelled(correlationID string, n domain.Notification) (Outbound, error) {
+	return buildFor(n, TypeCommunicationCancelled, correlationID, n.TenantID, n.LegalEntityID, n.CancelledBy, n.NotificationID, map[string]any{
+		"notification_id": n.NotificationID,
+		"job_id":          n.JobID,
+		"cancelled_by":    n.CancelledBy,
+		"reason":          n.CancelReason,
 	})
 }
