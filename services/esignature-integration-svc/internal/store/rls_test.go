@@ -40,7 +40,18 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS signature_envelopes CASCADE;`)
+	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS completion_evidence CASCADE;
+		DROP TABLE IF EXISTS participants CASCADE;
+		DROP TABLE IF EXISTS provider_attempts CASCADE;
+		DROP TABLE IF EXISTS signature_envelopes CASCADE;
+		DROP TABLE IF EXISTS signature_profiles CASCADE;
+		DROP FUNCTION IF EXISTS reject_completion_evidence_mutation() CASCADE;
+		DROP FUNCTION IF EXISTS reject_participant_invalid_transition() CASCADE;
+		DROP FUNCTION IF EXISTS reject_provider_attempt_invalid_transition() CASCADE;
+		DROP FUNCTION IF EXISTS reject_signature_envelope_invalid_transition() CASCADE;
+		DROP FUNCTION IF EXISTS reject_signature_profile_mutation() CASCADE;
+	`)
 
 	// Every migration in filename order, never one hardcoded name — a
 	// suite that names migrations individually silently skips new ones,

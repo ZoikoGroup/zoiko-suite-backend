@@ -19,6 +19,11 @@ type Config struct {
 	// action submission — see internal/authz.HTTPClient.
 	AuthorizationServiceURL string
 
+	// DocumentVaultServiceURL is used to verify acceptance evidence before an
+	// audit engagement can enter acceptance review. The returned version is
+	// pinned in the engagement record; workflow-svc never owns evidence bytes.
+	DocumentVaultServiceURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -69,6 +74,7 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.workflow.events"),
 		},
 		AuthorizationServiceURL: env("AUTHORIZATION_SERVICE_URL", "http://authorization-svc:8089"),
+		DocumentVaultServiceURL: env("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
 		OTELExporterEndpoint:    env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }

@@ -67,9 +67,12 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
-      # Local-file vault stand-in (AES-256 at rest). Throwaway dev key only.
+      # Local-file vault stand-in (AES-256 at rest). Throwaway dev key only:
+      # a published sequential pattern, and VAULT_KEK_PROVIDER=local (the only
+      # path that reads it) is refused in staging/production. Allowlisted for
+      # secret scanning on that basis — a real key never belongs in this file.
       VAULT_LOCAL_STORE_PATH: /tmp/secret_store.local
-      VAULT_MASTER_KEY_HEX: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      VAULT_MASTER_KEY_HEX: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" # gitleaks:allow
       # No Kafka/OTEL/AuthZ for the limited run. Point these at their own
       # containers if you want the full event backbone / authorization gate.
       KAFKA_BROKERS: ""

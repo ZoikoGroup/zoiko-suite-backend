@@ -104,9 +104,36 @@ type stubStore struct {
 	completed []string // "id:STATUS"
 	scheduled []string // "id:reason"
 	addresses map[string]string
+	unknown   []string // "id:reason"
+
+	// events records what the real store would enqueue in event_outbox with
+	// each transition (migration 000010). The worker no longer publishes, so
+	// "one event per conclusion" is now a property of the store transition.
+	events *stubPublisher
+
+	submitted          []string
+	beginSubmissionErr error
+	markedUnknown      []string
+
+	// The expiry pair (NCD-015).
+	overdue []domain.DueRetry
+	expired []string
 
 	claimFails  bool
 	tenantsSeen []string
+
+	// The stranded-sweep half.
+	stranded      []domain.DueRetry
+	revived       map[string]bool
+	revivedOrder  []string
+	reviveFails   bool
+	strandedFails bool
+	// staleSeen records the cutoff the worker asked for, so a test can assert
+	// the sweep uses a threshold in the past rather than sweeping everything.
+	staleSeen []time.Time
+	// reviveTenants records the tenant installed on the context for each
+	// revive, the same property tenantsSeen pins for the claim.
+	reviveTenants []string
 }
 
 func newStubStore() *stubStore {
@@ -114,11 +141,33 @@ func newStubStore() *stubStore {
 		byID:      map[string]*domain.Notification{},
 		claimed:   map[string]bool{},
 		addresses: map[string]string{},
+		revived:   map[string]bool{},
 	}
 }
 
 func (s *stubStore) FindDueRetries(_ context.Context, _ time.Time, _ int) ([]domain.DueRetry, error) {
 	return s.due, nil
+}
+
+func (s *stubStore) FindStrandedDeliveries(_ context.Context, staleBefore time.Time, _ int) ([]domain.DueRetry, error) {
+	s.staleSeen = append(s.staleSeen, staleBefore)
+	if s.strandedFails {
+		return nil, errors.New("stranded poll exploded")
+	}
+	return s.stranded, nil
+}
+
+func (s *stubStore) ReviveStranded(ctx context.Context, id, tenantID string, _, _ time.Time) (bool, error) {
+	s.reviveTenants = append(s.reviveTenants, svcmiddleware.TenantFromContext(ctx))
+	if s.reviveFails {
+		return false, errors.New("revive exploded")
+	}
+	if s.revived[id] {
+		return false, nil
+	}
+	s.revived[id] = true
+	s.revivedOrder = append(s.revivedOrder, id)
+	return true, nil
 }
 
 func (s *stubStore) ClaimRetry(ctx context.Context, id, tenantID string) (bool, error) {
@@ -144,15 +193,22 @@ func (s *stubStore) GetNotification(_ context.Context, id string) (*domain.Notif
 	return n, nil
 }
 
-func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, _, _ string, _ *time.Time) error {
+func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, _, _ string, _ *time.Time, _ string, _ domain.AttemptMeta) error {
 	s.completed = append(s.completed, id+":"+newStatus)
 	if n, ok := s.byID[id]; ok {
 		n.Status = newStatus
 	}
+	if s.events != nil {
+		if newStatus == "SENT" {
+			s.events.sent++
+		} else {
+			s.events.failed++
+		}
+	}
 	return nil
 }
 
-func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, _, next time.Time) error {
+func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, _, next time.Time, _ domain.AttemptMeta) error {
 	s.scheduled = append(s.scheduled, id+":"+failureReason)
 	if n, ok := s.byID[id]; ok {
 		n.DeliveryAttempts++
@@ -169,6 +225,18 @@ func (s *stubStore) SetRecipientAddress(_ context.Context, id, _, address, _ str
 	return nil
 }
 
+func (s *stubStore) MarkOutcomeUnknown(_ context.Context, id, _, reason string, attemptedAt time.Time, _ string, _ domain.AttemptMeta) error {
+	s.unknown = append(s.unknown, id+":"+reason)
+	if n, ok := s.byID[id]; ok {
+		n.Status = "PENDING_UNKNOWN"
+		n.UnknownAt = &attemptedAt
+	}
+	if s.events != nil {
+		s.events.unknown++
+	}
+	return nil
+}
+
 type stubDeliverer struct {
 	outcome domain.DeliveryOutcome
 	calls   int
@@ -181,12 +249,9 @@ func (d *stubDeliverer) Deliver(_ context.Context, n domain.Notification) domain
 	return d.outcome
 }
 
-type stubPublisher struct{ sent, failed int }
+// stubPublisher counts the events the stub store enqueues, by type.
+type stubPublisher struct{ sent, failed, unknown int }
 
-func (p *stubPublisher) PublishSent(context.Context, string, domain.Notification) { p.sent++ }
-func (p *stubPublisher) PublishFailed(context.Context, string, domain.Notification, string) {
-	p.failed++
-}
 
 type stubResolver struct {
 	email string
@@ -201,7 +266,8 @@ func newWorker(s *stubStore, d *stubDeliverer, p *stubPublisher, res retry.Recip
 	settled := func(err error) bool {
 		return errors.Is(err, domain.ErrPrincipalNotFound) || errors.Is(err, domain.ErrPrincipalHasNoAddress)
 	}
-	return retry.NewWorker(s, d, p, res, settled, retry.Options{Policy: pol}, zap.NewNop())
+	s.events = p
+	return retry.NewWorker(s, d, nil, res, settled, retry.Options{Policy: pol}, zap.NewNop())
 }
 
 func seed(s *stubStore, id, tenant string, attempts int) {
@@ -256,6 +322,39 @@ func TestWorkerReschedulesTransientFailureWithoutPublishing(t *testing.T) {
 	}
 	if p.sent != 0 || p.failed != 0 {
 		t.Fatalf("published sent=%d failed=%d, want nothing published for a pending retry", p.sent, p.failed)
+	}
+}
+
+// TestWorkerMarksOutcomeUnknownWithoutRetryingOrPublishingSentOrFailed
+// proves an ambiguous re-attempt is never silently retried (which risks
+// a duplicate send if the message did go out) and never reported as a
+// settled sent/failed outcome — only PublishOutcomeUnknown fires.
+func TestWorkerMarksOutcomeUnknownWithoutRetryingOrPublishingSentOrFailed(t *testing.T) {
+	s := newStubStore()
+	seed(s, "n1", "tenant-a", 1)
+	d := &stubDeliverer{outcome: domain.DeliveryOutcome{Reason: "connection dropped at verdict", Unknown: true, Retryable: true}}
+	p := &stubPublisher{}
+
+	newWorker(s, d, p, nil, retry.Policy{MaxAttempts: 5, BaseDelay: time.Second, MaxDelay: time.Minute}).
+		RunOnce(context.Background())
+
+	if len(s.unknown) != 1 {
+		t.Fatalf("unknown = %v, want one entry", s.unknown)
+	}
+	if len(s.scheduled) != 0 {
+		t.Fatalf("scheduled = %v, want nothing rescheduled — Unknown must never be silently retried", s.scheduled)
+	}
+	if len(s.completed) != 0 {
+		t.Fatalf("completed = %v, want nothing concluded SENT/FAILED", s.completed)
+	}
+	if p.sent != 0 || p.failed != 0 {
+		t.Fatalf("published sent=%d failed=%d, want neither for an ambiguous outcome", p.sent, p.failed)
+	}
+	if p.unknown != 1 {
+		t.Fatalf("published unknown=%d, want 1", p.unknown)
+	}
+	if n := s.byID["n1"]; n.Status != "PENDING_UNKNOWN" {
+		t.Fatalf("notification status = %q, want PENDING_UNKNOWN", n.Status)
 	}
 }
 
@@ -380,4 +479,66 @@ func TestWorkerSkipsWhatItCannotClaim(t *testing.T) {
 	if len(s.completed) != 0 {
 		t.Fatalf("completed = %v, want nothing", s.completed)
 	}
+}
+
+func (s *stubStore) BeginSubmission(_ context.Context, id, _ string, _ time.Time) error {
+	if s.beginSubmissionErr != nil {
+		return s.beginSubmissionErr
+	}
+	s.submitted = append(s.submitted, id)
+	return nil
+}
+
+func (s *stubStore) MarkStrandedUnknown(_ context.Context, id, _ string, _, at time.Time) (bool, error) {
+	n, ok := s.byID[id]
+	if !ok || n.Status != "PENDING" {
+		return false, nil
+	}
+	n.Status = "PENDING_UNKNOWN"
+	n.UnknownAt = &at
+	s.markedUnknown = append(s.markedUnknown, id)
+	if s.events != nil {
+		s.events.unknown++
+	}
+	return true, nil
+}
+
+func TestNextAttemptFor_AHoldIsDueWhenItsDeferralEndsNotAfterABackoff(t *testing.T) {
+	now := time.Now().UTC()
+	p := retry.DefaultPolicy
+	until := now.Add(6 * time.Hour)
+	next, ok := p.NextAttemptFor(now, 1, until)
+	if !ok || !next.Equal(until) {
+		t.Fatalf("a deferral is due at its own time, got %v ok=%v", next, ok)
+	}
+	// A zero deferral behaves exactly like NextAttempt.
+	a, ok1 := p.NextAttemptFor(now, 1, time.Time{})
+	if !ok1 || !a.After(now) || a.After(now.Add(2*p.BaseDelay)) {
+		t.Fatalf("no deferral means the usual backoff, got %v", a)
+	}
+	// A deferral never extends past exhaustion: attempts still run out.
+	if _, ok := p.NextAttemptFor(now, p.MaxAttempts, until); ok {
+		t.Fatal("a held message with no attempts left is concluded, not looped")
+	}
+	// A deferral already in the past never makes the retry sooner than the backoff.
+	b, _ := p.NextAttemptFor(now, 1, now.Add(-time.Hour))
+	if b.Before(now) {
+		t.Fatalf("retry scheduled in the past: %v", b)
+	}
+}
+
+func (s *stubStore) FindExpiredQueued(_ context.Context, _ time.Time, _ int) ([]domain.DueRetry, error) {
+	return s.overdue, nil
+}
+
+// ExpireNotification behaves like the real one: only a PENDING row whose expires_at has
+// passed is concluded; anything else is left alone, without error.
+func (s *stubStore) ExpireNotification(_ context.Context, id, _ string, now time.Time) (bool, error) {
+	n, ok := s.byID[id]
+	if !ok || n.Status != domain.StatusPending || n.ExpiresAt == nil || n.ExpiresAt.After(now) {
+		return false, nil
+	}
+	n.Status = domain.StatusExpired
+	s.expired = append(s.expired, id)
+	return true, nil
 }

@@ -1,11 +1,15 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"zoiko.io/notification-svc/internal/quota"
 )
 
 type Config struct {
@@ -36,6 +40,63 @@ type Config struct {
 	MTLSManagementServiceURL string
 
 	OTELExporterEndpoint string
+
+	// ActionTokenSecret is the HMAC-SHA256 signing key for action link tokens
+	// (ZS-COMMS-EMAIL-001 §6). Must be at least 16 bytes.
+	// Sourced from ACTION_TOKEN_SECRET. An empty value disables the action
+	// gateway — tokens cannot be generated or verified without it.
+	ActionTokenSecret string
+
+	// WebhookSecrets are the per-provider HMAC secrets that authenticate provider
+	// callbacks (ZS-SVC-Y-001 INV-27). Sourced from NOTIFICATION_WEBHOOK_SECRETS,
+	// a JSON object of provider name to a list of secrets (several so a secret can
+	// be rotated): {"ses":["new-secret-......","old-secret-......"]}. Each secret
+	// must be at least 16 bytes. A provider with no entry has every callback
+	// refused; an empty value therefore closes the webhook ingress entirely.
+	// LedgerRegisterEnabled makes every ledger-pipeline delivery also a register
+	// row (the notifications table) linked to its intent, so one communication has
+	// one identity (ZS-SVC-Y-001 INV-02; plan step 3). Sourced from
+	// NOTIFICATION_LEDGER_REGISTER_ENABLED, default false: it makes the pipeline
+	// write twice and changes where ledger deliveries are visible, so it is turned
+	// on deliberately, per environment.
+	LedgerRegisterEnabled bool
+
+	// PrivacyEnforcement makes the direct send path ask privacy-decision-svc before an
+	// intent-bound email goes out, and fail closed when the answer is anything but PERMIT
+	// (ZS-SVC-Y-001 INV-30, NP-17). NOTIFICATION_PRIVACY_ENFORCEMENT, default false: it
+	// starts refusing sends whose intent has no privacy binding, so it is turned on
+	// deliberately, once intents carry one. It needs PRIVACY_DECISION_URL.
+	PrivacyEnforcement bool
+	PrivacyDecisionURL string
+	PrivacyTimeout     time.Duration
+
+	// QuotaEnabled turns on the send quotas (ZS-SVC-Y-001 6.5): per tenant, recipient and intent,
+	// with protected capacity for security messages. NOTIFICATION_QUOTA_ENABLED, default false,
+	// because the right limits depend on the largest legitimate batch an environment sends (a
+	// payroll run, say), so it is turned on deliberately with limits that fit. Each limit has its
+	// own variable; zero removes that budget.
+	QuotaEnabled bool
+	QuotaLimits  quota.Limits
+
+	WebhookSecrets map[string][]string
+	// WebhookTolerance is how far a callback timestamp may differ from the clock.
+	// Sourced from NOTIFICATION_WEBHOOK_TOLERANCE (default 5m).
+	WebhookTolerance time.Duration
+
+	// SecondaryEmail is an optional failover SMTP provider. When configured,
+	// the router fails over to it after a transient primary failure (§13 P1-12).
+	// All secondary vars default to empty (disabled).
+	SecondaryEmail EmailConfig
+
+	// WebhookDLQ configures the periodic background worker that reprocesses
+	// retryable webhook DLQ records.
+	WebhookDLQ WebhookDLQConfig
+}
+
+type WebhookDLQConfig struct {
+	Enabled   bool
+	Interval  time.Duration
+	BatchSize int
 }
 
 type DBConfig struct {
@@ -89,6 +150,24 @@ type RetryConfig struct {
 	// how many it takes per poll.
 	Interval  time.Duration
 	BatchSize int
+
+	// StrandedAfter is how long a notification may sit in flight — PENDING
+	// with nothing scheduled — before the worker treats it as abandoned and
+	// puts it back on the schedule.
+	//
+	// It must exceed the longest attempt this service can make, or the sweep
+	// could reschedule a send another replica is still working on and the
+	// recipient gets the notice twice. The SMTP provider's own timeout
+	// defaults to 10s and the HTTP server's WriteTimeout is 15s, so a real
+	// attempt cannot outlive roughly 30 seconds; 15 minutes is generous
+	// headroom that still recovers a stranded notice the same hour rather
+	// than never.
+	//
+	// Zero disables the sweep and is a true off switch, not a "sweep
+	// everything immediately" — which is the dangerous reading of 0 here, and
+	// the reason it is handled explicitly rather than falling through to a
+	// default.
+	StrandedAfter time.Duration
 }
 
 // EmailConfig describes the outbound mail provider.
@@ -138,6 +217,14 @@ type EmailConfig struct {
 // Configured reports whether a mail provider is set up.
 func (e EmailConfig) Configured() bool { return e.Provider != "" }
 
+// ActionLinkBaseURL returns the externally-reachable base URL for the action
+// link gateway. Set ACTION_LINK_BASE_URL explicitly when the service is behind
+// a reverse proxy with a different hostname than its listen address.
+// If unset, an empty string is returned and the Signer generates relative URLs.
+func (c *Config) ActionLinkBaseURL() string {
+	return env("ACTION_LINK_BASE_URL", "")
+}
+
 func Load() (*Config, error) {
 	cfg := &Config{
 		Env:  env("ENV", "local"),
@@ -182,12 +269,66 @@ func Load() (*Config, error) {
 			MaxDelay:    envDuration("NOTIFICATION_RETRY_MAX_DELAY", 8*time.Minute),
 			Interval:    envDuration("NOTIFICATION_RETRY_INTERVAL", 10*time.Second),
 			BatchSize:   envInt("NOTIFICATION_RETRY_BATCH_SIZE", 50),
+			// Deliberately NOT gated on Enabled. Retry being switched off
+			// means "do not re-attempt a failed delivery", and the handler
+			// concludes those as FAILED so none of them sits in flight. A
+			// stranded row is a different thing — an attempt that never got
+			// to report any outcome at all — and abandoning it because
+			// retries are off would leave the exact silent non-delivery this
+			// sweep exists to end.
+			StrandedAfter: envDuration("NOTIFICATION_STRANDED_AFTER", 15*time.Minute),
 		},
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+
+		ActionTokenSecret: env("ACTION_TOKEN_SECRET", ""),
+
+		WebhookTolerance: envDuration("NOTIFICATION_WEBHOOK_TOLERANCE", 5*time.Minute),
+
+		LedgerRegisterEnabled: env("NOTIFICATION_LEDGER_REGISTER_ENABLED", "false") == "true",
+
+		PrivacyEnforcement: env("NOTIFICATION_PRIVACY_ENFORCEMENT", "false") == "true",
+		PrivacyDecisionURL: env("PRIVACY_DECISION_URL", ""),
+		PrivacyTimeout:     envDuration("PRIVACY_DECISION_TIMEOUT", 3*time.Second),
+
+		QuotaEnabled: env("NOTIFICATION_QUOTA_ENABLED", "false") == "true",
+		QuotaLimits: quota.Limits{
+			TenantPerMinute:    envInt("NOTIFICATION_QUOTA_TENANT_PER_MINUTE", quota.DefaultLimits.TenantPerMinute),
+			TenantS0PerMinute:  envInt("NOTIFICATION_QUOTA_TENANT_S0_PER_MINUTE", quota.DefaultLimits.TenantS0PerMinute),
+			RecipientPerHour:   envInt("NOTIFICATION_QUOTA_RECIPIENT_PER_HOUR", quota.DefaultLimits.RecipientPerHour),
+			RecipientS0PerHour: envInt("NOTIFICATION_QUOTA_RECIPIENT_S0_PER_HOUR", quota.DefaultLimits.RecipientS0PerHour),
+			IntentPerMinute:    envInt("NOTIFICATION_QUOTA_INTENT_PER_MINUTE", quota.DefaultLimits.IntentPerMinute),
+		},
+
+		SecondaryEmail: EmailConfig{
+			Provider:       env("SMTP_SECONDARY_PROVIDER", ""),
+			Host:           env("SMTP_SECONDARY_HOST", ""),
+			Port:           envInt("SMTP_SECONDARY_PORT", 587),
+			Username:       env("SMTP_SECONDARY_USERNAME", ""),
+			Password:       env("SMTP_SECONDARY_PASSWORD", ""),
+			From:           env("SMTP_SECONDARY_FROM", ""),
+			TLSMode:        env("SMTP_SECONDARY_TLS_MODE", "starttls"),
+			AllowCleartext: env("SMTP_SECONDARY_ALLOW_CLEARTEXT", "false") == "true",
+			VerifyOnStart:  env("SMTP_SECONDARY_VERIFY_ON_START", "true") == "true",
+		},
+
+		WebhookDLQ: WebhookDLQConfig{
+			Enabled:   env("NOTIFICATION_WEBHOOK_DLQ_ENABLED", "true") == "true",
+			Interval:  envDuration("NOTIFICATION_WEBHOOK_DLQ_INTERVAL", 1*time.Minute),
+			BatchSize: envInt("NOTIFICATION_WEBHOOK_DLQ_BATCH_SIZE", 50),
+		},
 	}
+
+	// A malformed secret list is refused outright rather than ignored: ignoring it
+	// would close the webhook ingress (every callback refused) with nothing to say
+	// why, and a short secret would silently weaken the signature.
+	secrets, err := parseWebhookSecrets(os.Getenv("NOTIFICATION_WEBHOOK_SECRETS"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.WebhookSecrets = secrets
 
 	// Load returned a nil error unconditionally, so every default above was
 	// also a production default: an empty DB password, and an authz URL that
@@ -242,7 +383,41 @@ func Load() (*Config, error) {
 			return nil, errors.New("invalid production config: " + strings.Join(missing, ", "))
 		}
 	}
+	// Enforcement without an authority to ask would refuse every send, silently.
+	if cfg.PrivacyEnforcement && cfg.PrivacyDecisionURL == "" {
+		return nil, errors.New("NOTIFICATION_PRIVACY_ENFORCEMENT is on but PRIVACY_DECISION_URL is not set")
+	}
 	return cfg, nil
+}
+
+// minWebhookSecret mirrors webhook.MinSecretLength; config does not import the
+// webhook package, so the number is repeated and a test pins them together.
+const minWebhookSecret = 16
+
+// parseWebhookSecrets reads NOTIFICATION_WEBHOOK_SECRETS. Empty is valid and means
+// "no provider may call back".
+func parseWebhookSecrets(raw string) (map[string][]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out map[string][]string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, fmt.Errorf("invalid NOTIFICATION_WEBHOOK_SECRETS: must be a JSON object of provider to a list of secrets: %w", err)
+	}
+	for provider, list := range out {
+		if strings.TrimSpace(provider) == "" {
+			return nil, errors.New("invalid NOTIFICATION_WEBHOOK_SECRETS: empty provider name")
+		}
+		if len(list) == 0 {
+			return nil, fmt.Errorf("invalid NOTIFICATION_WEBHOOK_SECRETS: provider %q has no secrets", provider)
+		}
+		for _, s := range list {
+			if len(s) < minWebhookSecret {
+				return nil, fmt.Errorf("invalid NOTIFICATION_WEBHOOK_SECRETS: a secret for provider %q is shorter than %d bytes", provider, minWebhookSecret)
+			}
+		}
+	}
+	return out, nil
 }
 
 func brokers() []string {

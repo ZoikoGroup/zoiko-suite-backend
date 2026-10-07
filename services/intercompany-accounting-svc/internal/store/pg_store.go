@@ -91,6 +91,25 @@ func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEnt
 	return created, err
 }
 
+const intercompanyEntryColumns = `
+	intercompany_entry_id, tenant_id, source_legal_entity_id, target_legal_entity_id,
+	source_journal_id, target_journal_id, amount, currency_code, match_status,
+	mismatch_reason, acknowledged_at, acknowledged_by_principal_id,
+	disputed_at, disputed_by_principal_id, dispute_reason,
+	resolved_at, resolved_by_principal_id, resolution_note,
+	created_at, updated_at`
+
+func scanIntercompanyEntry(row pgx.Row, entry *domain.IntercompanyEntry) error {
+	return row.Scan(
+		&entry.IntercompanyEntryID, &entry.TenantID, &entry.SourceLegalEntityID, &entry.TargetLegalEntityID,
+		&entry.SourceJournalID, &entry.TargetJournalID, &entry.Amount, &entry.CurrencyCode, &entry.MatchStatus,
+		&entry.MismatchReason, &entry.AcknowledgedAt, &entry.AcknowledgedByPrincipalID,
+		&entry.DisputedAt, &entry.DisputedByPrincipalID, &entry.DisputeReason,
+		&entry.ResolvedAt, &entry.ResolvedByPrincipalID, &entry.ResolutionNote,
+		&entry.CreatedAt, &entry.UpdatedAt,
+	)
+}
+
 func (s *PgStore) GetEntry(ctx context.Context, id string) (*domain.IntercompanyEntry, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -99,17 +118,11 @@ func (s *PgStore) GetEntry(ctx context.Context, id string) (*domain.Intercompany
 
 	var entry domain.IntercompanyEntry
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT intercompany_entry_id, tenant_id, source_legal_entity_id, target_legal_entity_id,
-			       source_journal_id, target_journal_id, amount, currency_code, match_status,
-			       mismatch_reason, created_at, updated_at
+		return scanIntercompanyEntry(tx.QueryRow(ctx, `
+			SELECT `+intercompanyEntryColumns+`
 			FROM intercompany_entries
 			WHERE intercompany_entry_id = $1 AND tenant_id = $2
-		`, id, tenantID).Scan(
-			&entry.IntercompanyEntryID, &entry.TenantID, &entry.SourceLegalEntityID, &entry.TargetLegalEntityID,
-			&entry.SourceJournalID, &entry.TargetJournalID, &entry.Amount, &entry.CurrencyCode, &entry.MatchStatus,
-			&entry.MismatchReason, &entry.CreatedAt, &entry.UpdatedAt,
-		)
+		`, id, tenantID), &entry)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrEntryNotFound
@@ -118,6 +131,84 @@ func (s *PgStore) GetEntry(ctx context.Context, id string) (*domain.Intercompany
 		return nil, err
 	}
 	return &entry, nil
+}
+
+// AcknowledgeCounterparty is ACC-11's own AcknowledgeCounterparty command
+// — moves a pair from OPEN ("UNMATCHED") to AWAITING_COUNTERPARTY. Guarded
+// to only ever succeed from UNMATCHED, matching the spec's own state model
+// order.
+func (s *PgStore) AcknowledgeCounterparty(ctx context.Context, id, principalID string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
+		res, err := tx.Exec(ctx, `
+			UPDATE intercompany_entries
+			SET match_status = $1, acknowledged_at = $2, acknowledged_by_principal_id = $3, updated_at = $2
+			WHERE intercompany_entry_id = $4 AND tenant_id = $5 AND match_status = $6
+		`, domain.MatchStatusAwaitingCounterparty, now, principalID, id, tenantID, domain.MatchStatusUnmatched)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrInvalidPairTransition
+		}
+		return nil
+	})
+}
+
+// DisputeIntercompany is ACC-11's own DisputeIntercompany command — moves
+// a pair from MISMATCH to DISPUTED. Only reachable from MISMATCH: there
+// is nothing to dispute about a pair that already matched or was never
+// even checked.
+func (s *PgStore) DisputeIntercompany(ctx context.Context, id, principalID, reason string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
+		res, err := tx.Exec(ctx, `
+			UPDATE intercompany_entries
+			SET match_status = $1, disputed_at = $2, disputed_by_principal_id = $3, dispute_reason = $4, updated_at = $2
+			WHERE intercompany_entry_id = $5 AND tenant_id = $6 AND match_status = $7
+		`, domain.MatchStatusDisputed, now, principalID, reason, id, tenantID, domain.MatchStatusMismatch)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrInvalidPairTransition
+		}
+		return nil
+	})
+}
+
+// ResolveMismatch is ACC-11's own ResolveMismatch command — moves a pair
+// from DISPUTED to RESOLVED, the spec's own terminal outcome for a
+// disputed pair. Never re-runs matching itself: a resolution is a human
+// decision recorded as evidence, not an automatic recheck.
+func (s *PgStore) ResolveMismatch(ctx context.Context, id, principalID, resolutionNote string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
+		res, err := tx.Exec(ctx, `
+			UPDATE intercompany_entries
+			SET match_status = $1, resolved_at = $2, resolved_by_principal_id = $3, resolution_note = $4, updated_at = $2
+			WHERE intercompany_entry_id = $5 AND tenant_id = $6 AND match_status = $7
+		`, domain.MatchStatusResolved, now, principalID, resolutionNote, id, tenantID, domain.MatchStatusDisputed)
+		if err != nil {
+			return err
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrInvalidPairTransition
+		}
+		return nil
+	})
 }
 
 func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityID string) ([]domain.IntercompanyEntry, error) {
@@ -129,9 +220,7 @@ func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityI
 	var out []domain.IntercompanyEntry
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		query := `
-			SELECT intercompany_entry_id, tenant_id, source_legal_entity_id, target_legal_entity_id,
-			       source_journal_id, target_journal_id, amount, currency_code, match_status,
-			       mismatch_reason, created_at, updated_at
+			SELECT ` + intercompanyEntryColumns + `
 			FROM intercompany_entries
 			WHERE tenant_id = $1
 		`
@@ -155,11 +244,7 @@ func (s *PgStore) ListEntries(ctx context.Context, sourceEntityID, targetEntityI
 
 		for rows.Next() {
 			var entry domain.IntercompanyEntry
-			if err := rows.Scan(
-				&entry.IntercompanyEntryID, &entry.TenantID, &entry.SourceLegalEntityID, &entry.TargetLegalEntityID,
-				&entry.SourceJournalID, &entry.TargetJournalID, &entry.Amount, &entry.CurrencyCode, &entry.MatchStatus,
-				&entry.MismatchReason, &entry.CreatedAt, &entry.UpdatedAt,
-			); err != nil {
+			if err := scanIntercompanyEntry(rows, &entry); err != nil {
 				return err
 			}
 			out = append(out, entry)

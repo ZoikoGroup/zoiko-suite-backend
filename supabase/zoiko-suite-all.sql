@@ -6909,3 +6909,572 @@ END;
 
 END
 $guard$;
+
+
+-- ============================================================================
+-- FILE: 0034_authorization_svc_delegation_and_abac.sql
+-- ============================================================================
+
+-- 0034_authorization_svc_delegation_and_abac.sql
+-- authorization-svc → schema `authorization_svc`. Creates one table.
+--
+-- The changes authorization-svc's own 000008_fix_delegation_evaluation and
+-- 000010_add_abac_rules make, in the form this project applies them. Same end
+-- state; whichever runs first, the other is a no-op.
+--
+-- ── Part 1: delegated access has granted nothing since 0031 ─────────────────
+--
+-- 0031 gave delegated_authorities row security and said, deliberately:
+--
+--   "No platform_scope hatch, unlike roles: nothing needs to discover which
+--    tenant owns an unknown delegation_id."
+--
+-- The reasoning behind that — quoting the service's own 000006 — was that
+-- "FindDelegatedActions is reached from /v1/authorize which resolves one". That
+-- second half is false, and it is why layer 2 of /v1/authorize has granted
+-- nothing at all on this project.
+--
+-- /v1/authorize resolves a tenant scope that is legitimately EMPTY for most
+-- callers: roughly 57 of the ~60 services calling it do not forward
+-- X-Tenant-Id yet, which is the entire reason resolveTenantScope has a
+-- no-tenant branch and warns on every use of it. On that branch the service
+-- runs under app.platform_scope, which `roles`, `permission_bundles` and
+-- `principal_role_assignments` all honour (0028 relies on exactly this) — and
+-- which this table did not. app_authorization is NOSUPERUSER NOBYPASSRLS, so
+-- the policy binds, and the delegation lookup matched zero rows.
+--
+-- It failed CLOSED, which is why nothing broke visibly: a delegate was denied
+-- with basis `no_grant`, indistinguishable from having no delegation at all.
+--
+-- Measured on Postgres 16 as a NOBYPASSRLS role, one ACTIVE, in-date,
+-- correctly-tenanted delegation present:
+--
+--   no tenant, no platform scope   -> 0 rows   (the behaviour being fixed)
+--   tenant installed               -> 1 row
+--   platform scope only            -> 0 rows   (no hatch to honour)
+--
+-- The hatch below changes the third line. USING only, never WITH CHECK — a
+-- read may have to resolve cross-tenant on the /v1/authorize path, but nothing
+-- may legitimately WRITE a delegation outside the caller's verified tenant, and
+-- CreateDelegatedAuthority goes through the handler's requireTenant first.
+-- Same asymmetry 0028 uses.
+--
+-- The hatch grants visibility, not authority: the service's own
+-- FindDelegatedActions query binds each delegator's roles to the delegation's
+-- OWN tenant_id, so platform-wide visibility does not become platform-wide
+-- grant resolution.
+--
+-- ── Part 1b: delegated_actions, and an over-grant it closes ─────────────────
+--
+-- scope_type has always accepted 'ACTION_SUBSET' and authority_limit_type /
+-- authority_limit_value have always been stored, and NOTHING ever read any of
+-- them: the evaluation unioned the delegator's entire effective grant set
+-- regardless. A delegation recorded as a subset therefore conferred the
+-- delegator's FULL authority — silent, because the row looks correctly
+-- restricted in the register.
+--
+-- delegated_actions is what the evaluation intersects against. NULL means the
+-- delegator's full authority, which is what every existing row means, so no
+-- backfill is needed and no row's meaning changes.
+--
+-- source_service / source_delegation_id are where the AUTHORITATIVE Delegated
+-- Authority Service's authority.delegated events land. Doc 03 §9.3 names that
+-- service as the owner of this concept (tracker item 81), and this is how the
+-- two stop being rival write models: it stays authoritative for the lifecycle,
+-- and this table becomes the evaluation read-model /v1/authorize resolves
+-- against. It delegates ONE action_type per grant, which has no representation
+-- here until delegated_actions exists.
+--
+-- ── Part 2: abac_rules ──────────────────────────────────────────────────────
+--
+-- The attribute-condition layer the spec assigns this service. The table ships
+-- EMPTY: every concrete rule is a business decision, and with no rows the layer
+-- is a no-op. What is added is the mechanism, not a guess at the policy — the
+-- same shape sod_rules already has.
+--
+-- Deny-only by construction: a rule can remove an action the RBAC/delegation
+-- layers granted and can never add one.
+
+DO $guard$
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'authorization_svc') THEN
+    RAISE NOTICE 'schema authorization_svc absent; skipping 0034 — re-run it after deployments/supabase has created the schema';
+    RETURN;
+END IF;
+
+-- ── Part 1: the platform-scope read hatch ───────────────────────────────────
+--
+-- app.current_tenant_id() rather than current_setting directly, matching 0031:
+-- on this database a caller may arrive through PostgREST with a JWT instead of
+-- through a service calling set_config, and only the helper resolves both.
+--
+-- app.platform_scope IS read with current_setting, because it is never a JWT
+-- claim — it is set only by PgStore.withPlatformScope, inside one transaction,
+-- and there is no equivalent for a PostgREST caller by design. A JWT holder
+-- must not be able to claim platform scope.
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.delegated_authorities$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.delegated_authorities
+    FOR ALL
+    USING (
+        tenant_id::text = app.current_tenant_id()
+        OR current_setting('app.platform_scope', true) = 'true'
+    )
+    WITH CHECK (tenant_id::text = app.current_tenant_id())
+$stmt$;
+
+-- ── Part 1b: the subset and projection columns ──────────────────────────────
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities ADD COLUMN IF NOT EXISTS delegated_actions JSONB$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities ADD COLUMN IF NOT EXISTS source_service TEXT$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities ADD COLUMN IF NOT EXISTS source_delegation_id TEXT$stmt$;
+
+EXECUTE $stmt$
+COMMENT ON COLUMN authorization_svc.delegated_authorities.delegated_actions IS
+    'JSON array of action codes this delegation confers, intersected with the delegator''s own effective grants at evaluation time. NULL means the delegator''s full authority (the meaning of every row written before this column existed). A delegation can never confer an action the delegator does not hold.'
+$stmt$;
+
+-- UNIQUE where present, not a primary key: locally-authored rows have no
+-- upstream id and must stay insertable, and a partial index is how "unique
+-- when present" is expressed. It is what the projection's ON CONFLICT targets,
+-- so without it a Kafka redelivery would multiply one upstream delegation into
+-- several rows that /v1/authorize would union into a duplicate grant.
+EXECUTE $stmt$
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delegations_source_unique
+    ON authorization_svc.delegated_authorities (source_service, source_delegation_id)
+    WHERE source_delegation_id IS NOT NULL
+$stmt$;
+
+-- ── Part 2: abac_rules ──────────────────────────────────────────────────────
+
+EXECUTE $stmt$
+CREATE TABLE IF NOT EXISTS authorization_svc.abac_rules (
+    abac_rule_id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id                UUID,
+    rule_code                VARCHAR(128) NOT NULL,
+    action_type              VARCHAR(128) NOT NULL,
+    effect                   VARCHAR(16)  NOT NULL,
+    attribute_key            VARCHAR(128) NOT NULL,
+    operator                 VARCHAR(32)  NOT NULL,
+    attribute_value          TEXT,
+    active_flag              BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    created_by_principal_id  TEXT         NOT NULL
+)
+$stmt$;
+
+-- Two partial indexes rather than one UNIQUE(tenant_id, rule_code): NULLs are
+-- distinct in a Postgres unique index, so a single constraint would let the
+-- same PLATFORM-WIDE rule_code be created any number of times.
+EXECUTE $stmt$
+CREATE UNIQUE INDEX IF NOT EXISTS idx_abac_rules_tenant_code_unique
+    ON authorization_svc.abac_rules (tenant_id, rule_code) WHERE tenant_id IS NOT NULL
+$stmt$;
+EXECUTE $stmt$
+CREATE UNIQUE INDEX IF NOT EXISTS idx_abac_rules_global_code_unique
+    ON authorization_svc.abac_rules (rule_code) WHERE tenant_id IS NULL
+$stmt$;
+EXECUTE $stmt$
+CREATE INDEX IF NOT EXISTS idx_abac_rules_action
+    ON authorization_svc.abac_rules (action_type) WHERE active_flag
+$stmt$;
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.abac_rules ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.abac_rules FORCE  ROW LEVEL SECURITY$stmt$;
+
+-- sod_rules' shape from 0028, and for the same reasons. A NULL-tenant rule is
+-- platform-wide and must be visible in every scope; the WITH CHECK admits NULL
+-- only for a caller with NO tenant, so one tenant cannot author a rule that
+-- binds every other one. Authoring a platform-wide rule is gated in the
+-- handler by a distinct platform-scope grant
+-- (handler.ActionABACRuleManageGlobal).
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.abac_rules$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.abac_rules
+    FOR ALL
+    USING (
+        tenant_id IS NULL
+        OR tenant_id::text = app.current_tenant_id()
+    )
+    WITH CHECK (
+        (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
+        OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
+    )
+$stmt$;
+
+-- The app role needs DML on the new table, and on this project the grants are
+-- per-role rather than from a script. Guarded because the role name differs
+-- between a Supabase project (app_authorization) and a bare Postgres one.
+IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_authorization') THEN
+    EXECUTE $stmt$GRANT SELECT, INSERT, UPDATE, DELETE ON authorization_svc.abac_rules TO app_authorization$stmt$;
+END IF;
+IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'zoiko_backend') THEN
+    EXECUTE $stmt$GRANT SELECT, INSERT, UPDATE, DELETE ON authorization_svc.abac_rules TO zoiko_backend$stmt$;
+END IF;
+
+-- ── Verification ────────────────────────────────────────────────────────────
+
+DECLARE unprotected int; seeded int;
+BEGIN
+    SELECT count(*) INTO unprotected
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'authorization_svc' AND c.relkind = 'r'
+       AND NOT (c.relrowsecurity AND c.relforcerowsecurity);
+    IF unprotected > 0 THEN
+        RAISE EXCEPTION
+            '% authorization_svc tables lack forced row security after 0034 — abac_rules was meant to arrive with it', unprotected;
+    END IF;
+
+    -- The layer must ship as a no-op. A seeded rule here would be this
+    -- migration declaring business policy, which is precisely what the design
+    -- refuses to do.
+    SELECT count(*) INTO seeded FROM authorization_svc.abac_rules;
+    IF seeded > 0 THEN
+        RAISE EXCEPTION
+            'abac_rules holds % rows immediately after creation — the ABAC layer must ship empty so it changes no decision until somebody declares a rule', seeded;
+    END IF;
+
+    RAISE NOTICE '0034 applied: delegated access can resolve for tenantless callers, action subsets are representable, abac_rules exists and is empty.';
+END;
+
+END
+$guard$;
+
+
+-- ============================================================================
+-- FILE: 0035_access_decision_log_partitioning.sql
+-- ============================================================================
+
+-- 0035_access_decision_log_partitioning.sql
+-- authorization-svc → schema `authorization_svc`. Rebuilds one table.
+--
+-- The change authorization-svc's own 000009_partition_access_decision_log
+-- makes, in the form this project applies it. Same end state; the policy is
+-- this project's (app.current_tenant_id()) rather than the compose one.
+--
+-- ── WHY ─────────────────────────────────────────────────────────────────────
+--
+-- access_decision_log takes ONE ROW PER AUTHORIZATION EVALUATION,
+-- platform-wide, and 000001 wrote it as append-only by design: "No UPDATE or
+-- DELETE statement should ever target this." Both statements are true and
+-- together they describe a table that grows without bound with no sanctioned
+-- way to ever shrink. On a managed project that is not only disk — it is the
+-- insert latency on the platform's hottest write, paid on every request
+-- forever, against indexes that grow with it.
+--
+-- DETACH PARTITION removes a month from the live table without issuing a
+-- single DELETE, so append-only survives: nothing here ever deletes a
+-- decision, it only stops carrying old ones in the hot table. A DELETE-based
+-- retention job would rewrite the very evidence the critical constraint ("no
+-- material action executes without an authorization decision artifact") exists
+-- to preserve.
+--
+-- ── THE DEFAULT PARTITION IS NOT OPTIONAL ───────────────────────────────────
+--
+-- A partitioned table with no partition covering an inserted row REJECTS the
+-- insert. Here that is not a data error: RecordAccessDecision is the last step
+-- before /v1/authorize answers, so a failed insert is a 503. The month after
+-- the last one anybody created would take authorization offline platform-wide,
+-- at midnight, with an error about a partition range.
+--
+-- access_decision_log_default catches every such row.
+--
+-- ── THIS ONE REBUILDS A TABLE, SO READ THE GUARDS ───────────────────────────
+--
+-- Unlike every other migration in this directory this is not additive: it
+-- creates a partitioned table, copies every row across, compares the counts,
+-- and only then drops the original. If the counts disagree it raises and the
+-- whole thing rolls back with the original untouched.
+--
+-- It also detects an already-partitioned table and returns, so a project where
+-- deployments/supabase has already applied the service's 000009 sees a no-op
+-- rather than an error.
+
+DO $guard$
+DECLARE
+    is_partitioned bool;
+    before_count   bigint;
+    after_count    bigint;
+    m              date;
+    i              int;
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'authorization_svc') THEN
+    RAISE NOTICE 'schema authorization_svc absent; skipping 0035 — re-run it after deployments/supabase has created the schema';
+    RETURN;
+END IF;
+
+SELECT c.relkind = 'p' INTO is_partitioned
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'authorization_svc' AND c.relname = 'access_decision_log';
+
+IF is_partitioned IS NULL THEN
+    RAISE NOTICE 'authorization_svc.access_decision_log absent; skipping 0035';
+    RETURN;
+END IF;
+
+IF is_partitioned THEN
+    RAISE NOTICE 'authorization_svc.access_decision_log is already partitioned; 0035 is a no-op';
+    RETURN;
+END IF;
+
+-- ── the partition helper, kept permanently ──────────────────────────────────
+--
+-- The retention job needs it every month, and an operator pre-creating next
+-- quarter's partitions should not hand-write the bound arithmetic. Idempotent.
+--
+-- SET search_path = '' and fully-qualified names, matching this project's
+-- other functions: a SECURITY INVOKER function whose search_path is the
+-- caller's would resolve `access_decision_log` to whatever schema the caller
+-- happens to be in.
+EXECUTE $stmt$
+CREATE OR REPLACE FUNCTION authorization_svc.create_access_decision_log_partition(month_start DATE)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+DECLARE
+    from_ts   DATE := date_trunc('month', month_start)::date;
+    to_ts     DATE := (date_trunc('month', month_start) + INTERVAL '1 month')::date;
+    part_name TEXT := 'access_decision_log_' || to_char(from_ts, 'YYYY_MM');
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'authorization_svc' AND c.relname = part_name
+    ) THEN
+        RETURN part_name;
+    END IF;
+
+    EXECUTE format(
+        'CREATE TABLE authorization_svc.%I PARTITION OF authorization_svc.access_decision_log FOR VALUES FROM (%L) TO (%L)',
+        part_name, from_ts, to_ts);
+
+    -- The parent's policy covers everything routed THROUGH the parent, which
+    -- is all of the service's traffic. Enabled on the partition as well so a
+    -- query naming the partition directly -- an operator, a reporting tool,
+    -- PostgREST -- is bound by the same tenant predicate. A partition is an
+    -- ordinary table and inherits no policy of its own; without this, each new
+    -- month would be an unprotected copy of a protected table, reachable
+    -- through PostgREST on this project.
+    EXECUTE format('ALTER TABLE authorization_svc.%I ENABLE ROW LEVEL SECURITY', part_name);
+    EXECUTE format('ALTER TABLE authorization_svc.%I FORCE  ROW LEVEL SECURITY', part_name);
+    EXECUTE format(
+        'CREATE POLICY tenant_isolation_policy ON authorization_svc.%I FOR ALL'
+        ' USING (tenant_id IS NULL OR tenant_id::text = app.current_tenant_id())'
+        ' WITH CHECK ((tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())'
+        '             OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL))',
+        part_name);
+
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_authorization') THEN
+        EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON authorization_svc.%I TO app_authorization', part_name);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'zoiko_backend') THEN
+        EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON authorization_svc.%I TO zoiko_backend', part_name);
+    END IF;
+
+    RETURN part_name;
+END
+$fn$
+$stmt$;
+
+-- ── the swap ────────────────────────────────────────────────────────────────
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.access_decision_log RENAME TO access_decision_log_pre_partition$stmt$;
+
+-- Postgres requires a partitioned table's unique constraints to include every
+-- partition-key column, so the key becomes (access_decision_id, decided_at).
+-- The rationale read (FindAccessDecisionByID) filters on
+-- (access_decision_id, tenant_id) with no date, so it is served by an explicit
+-- single-column index rather than by the key.
+EXECUTE $stmt$
+CREATE TABLE authorization_svc.access_decision_log (
+    access_decision_id       UUID         NOT NULL DEFAULT gen_random_uuid(),
+    principal_id             TEXT         NOT NULL,
+    legal_entity_id          UUID         NOT NULL,
+    action_type              VARCHAR(128) NOT NULL,
+    decision_outcome         VARCHAR(16)  NOT NULL,
+    decision_basis           TEXT         NOT NULL,
+    tenant_id                UUID,
+    correlation_id           TEXT,
+    decided_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (access_decision_id, decided_at)
+) PARTITION BY RANGE (decided_at)
+$stmt$;
+
+-- The catch-all, created FIRST so there is never an instant where an insert
+-- could find no home.
+EXECUTE $stmt$CREATE TABLE authorization_svc.access_decision_log_default PARTITION OF authorization_svc.access_decision_log DEFAULT$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.access_decision_log_default ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.access_decision_log_default FORCE  ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.access_decision_log_default
+    FOR ALL
+    USING (tenant_id IS NULL OR tenant_id::text = app.current_tenant_id())
+    WITH CHECK ((tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
+                OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL))
+$stmt$;
+
+-- Every month present in the existing data, so the copy lands in real
+-- partitions rather than piling into the default one...
+FOR m IN
+    SELECT DISTINCT date_trunc('month', decided_at)::date
+      FROM authorization_svc.access_decision_log_pre_partition
+     ORDER BY 1
+LOOP
+    PERFORM authorization_svc.create_access_decision_log_partition(m);
+END LOOP;
+
+-- ...and the current month plus the next three, so a project that never
+-- schedules the retention job has a runway rather than an outage.
+FOR i IN 0..3 LOOP
+    PERFORM authorization_svc.create_access_decision_log_partition((CURRENT_DATE + (i || ' month')::interval)::date);
+END LOOP;
+
+EXECUTE $stmt$
+INSERT INTO authorization_svc.access_decision_log (
+    access_decision_id, principal_id, legal_entity_id, action_type,
+    decision_outcome, decision_basis, tenant_id, correlation_id, decided_at)
+SELECT
+    access_decision_id, principal_id, legal_entity_id, action_type,
+    decision_outcome, decision_basis, tenant_id, correlation_id, decided_at
+FROM authorization_svc.access_decision_log_pre_partition
+$stmt$;
+
+SELECT count(*) INTO before_count FROM authorization_svc.access_decision_log_pre_partition;
+SELECT count(*) INTO after_count  FROM authorization_svc.access_decision_log;
+IF before_count <> after_count THEN
+    RAISE EXCEPTION
+        'access_decision_log partition copy lost rows: % before, % after. Rolled back; the original table is untouched.',
+        before_count, after_count;
+END IF;
+
+EXECUTE $stmt$DROP TABLE authorization_svc.access_decision_log_pre_partition$stmt$;
+
+-- ── indexes on the parent, which propagate to every partition ───────────────
+
+EXECUTE $stmt$CREATE INDEX idx_access_decision_log_principal ON authorization_svc.access_decision_log (principal_id, decided_at DESC)$stmt$;
+EXECUTE $stmt$CREATE INDEX idx_access_decision_log_entity    ON authorization_svc.access_decision_log (legal_entity_id, decided_at DESC)$stmt$;
+EXECUTE $stmt$CREATE INDEX idx_access_decision_log_tenant    ON authorization_svc.access_decision_log (tenant_id, decided_at DESC)$stmt$;
+EXECUTE $stmt$CREATE INDEX idx_access_decision_log_id        ON authorization_svc.access_decision_log (access_decision_id)$stmt$;
+
+-- ── the parent's policy, restored to 0028's form ────────────────────────────
+--
+-- Identical to what 0028 installed, and NULL is admitted on the USING side for
+-- the same concrete reason: RecordAccessDecision uses RETURNING, Postgres
+-- applies the SELECT side of a FOR ALL policy to an INSERT ... RETURNING, and a
+-- USING clause excluding NULL would make recording a tenantless decision fail
+-- outright — a 503 on every request from a caller that sends no X-Tenant-Id,
+-- which is most of them. Tenant isolation on the READ path is the store's
+-- explicit `tenant_id = $2` predicate; this policy is the backstop.
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.access_decision_log ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.access_decision_log FORCE  ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.access_decision_log
+    FOR ALL
+    USING (
+        tenant_id IS NULL
+        OR tenant_id::text = app.current_tenant_id()
+    )
+    WITH CHECK (
+        (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
+        OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
+    )
+$stmt$;
+
+IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_authorization') THEN
+    EXECUTE $stmt$GRANT SELECT, INSERT, UPDATE, DELETE ON authorization_svc.access_decision_log TO app_authorization$stmt$;
+END IF;
+IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'zoiko_backend') THEN
+    EXECUTE $stmt$GRANT SELECT, INSERT, UPDATE, DELETE ON authorization_svc.access_decision_log TO zoiko_backend$stmt$;
+END IF;
+
+-- ── retention ───────────────────────────────────────────────────────────────
+--
+-- DETACHes every whole month that ends on or before cutoff and reports what it
+-- detached. It does NOT drop anything: a detached partition is an ordinary
+-- table in the same schema, which is the point — the operator archives it and
+-- drops it as a separate, deliberate act.
+--
+-- The default partition is never detached, whatever the cutoff: it holds rows
+-- whose dates nobody anticipated, so its contents are not "everything before
+-- cutoff", and detaching it would remove the safety net the parent depends on.
+EXECUTE $stmt$
+CREATE OR REPLACE FUNCTION authorization_svc.detach_access_decision_log_partitions_before(cutoff DATE)
+RETURNS TABLE (partition_name TEXT, row_count BIGINT)
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+DECLARE
+    part RECORD;
+    n    BIGINT;
+BEGIN
+    FOR part IN
+        SELECT c.relname AS relname,
+               pg_get_expr(c.relpartbound, c.oid) AS bound
+          FROM pg_class c
+          JOIN pg_inherits i ON i.inhrelid = c.oid
+          JOIN pg_class p ON p.oid = i.inhparent
+          JOIN pg_namespace n ON n.oid = p.relnamespace
+         WHERE n.nspname = 'authorization_svc'
+           AND p.relname = 'access_decision_log'
+           AND c.relname <> 'access_decision_log_default'
+         ORDER BY c.relname
+    LOOP
+        CONTINUE WHEN part.bound IS NULL;
+        CONTINUE WHEN part.bound LIKE '%DEFAULT%';
+        CONTINUE WHEN substring(part.bound from 'TO \(''([0-9-]{10})')::date > cutoff;
+
+        EXECUTE format('SELECT count(*) FROM authorization_svc.%I', part.relname) INTO n;
+        EXECUTE format('ALTER TABLE authorization_svc.access_decision_log DETACH PARTITION authorization_svc.%I', part.relname);
+
+        partition_name := part.relname;
+        row_count := n;
+        RETURN NEXT;
+    END LOOP;
+END
+$fn$
+$stmt$;
+
+EXECUTE $stmt$
+CREATE OR REPLACE VIEW authorization_svc.access_decision_log_retention_status AS
+SELECT
+    c.relname                                     AS partition_name,
+    pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
+    (c.relname = 'access_decision_log_default')   AS is_default,
+    pg_get_expr(c.relpartbound, c.oid)            AS partition_bound
+  FROM pg_class c
+  JOIN pg_inherits i ON i.inhrelid = c.oid
+  JOIN pg_class p ON p.oid = i.inhparent
+  JOIN pg_namespace n ON n.oid = p.relnamespace
+ WHERE n.nspname = 'authorization_svc'
+   AND p.relname = 'access_decision_log'
+ ORDER BY c.relname
+$stmt$;
+
+-- ── Verification ────────────────────────────────────────────────────────────
+
+DECLARE unprotected int;
+BEGIN
+    -- Every partition, and the parent, must carry forced row security. A
+    -- partition without it is an unprotected copy of a protected table, and on
+    -- this project PostgREST can reach it.
+    SELECT count(*) INTO unprotected
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'authorization_svc'
+       AND c.relkind IN ('r', 'p')
+       AND NOT (c.relrowsecurity AND c.relforcerowsecurity);
+    IF unprotected > 0 THEN
+        RAISE EXCEPTION
+            '% authorization_svc tables or partitions lack forced row security after 0035', unprotected;
+    END IF;
+
+    RAISE NOTICE '0035 applied: % decision artifacts now live in monthly partitions, with a default partition and a DETACH-based retention function.',
+        after_count;
+END;
+
+END
+$guard$;

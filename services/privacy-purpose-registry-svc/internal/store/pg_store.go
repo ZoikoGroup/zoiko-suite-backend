@@ -50,6 +50,7 @@ type Store interface {
 	CreateActivity(ctx context.Context, tenantID string, req domain.CreateActivityRequest, principalID string) (*domain.ProcessingActivity, *domain.ProcessingActivityVersion, error)
 	CreateActivityVersion(ctx context.Context, activityID string, req domain.CreateActivityVersionRequest, principalID string) (*domain.ProcessingActivityVersion, error)
 	FindActivityVersion(ctx context.Context, activityID, versionID string) (*domain.ProcessingActivityVersion, error)
+	FindLatestActivityVersion(ctx context.Context, activityID string) (*domain.ProcessingActivityVersion, error)
 	ResolveActivityAsOf(ctx context.Context, activityID string, asOf time.Time) (*domain.ProcessingActivityVersion, error)
 	ListActiveActivities(ctx context.Context, role, jurisdiction string) ([]domain.ProcessingActivityVersion, error)
 
@@ -57,6 +58,9 @@ type Store interface {
 	TransitionActivity(ctx context.Context, activityID, versionID string, from, to domain.ActivityVersionStatus) (*domain.ProcessingActivityVersion, error)
 	RejectActivity(ctx context.Context, activityID, versionID, reason string) (*domain.ProcessingActivityVersion, error)
 	ActivateActivity(ctx context.Context, activityID, versionID string, effectiveFrom time.Time) (*domain.ProcessingActivityVersion, error)
+
+	GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error)
+	SaveIdempotency(ctx context.Context, record domain.IdempotencyRecord) error
 }
 
 type PgStore struct {
@@ -355,25 +359,35 @@ func (s *PgStore) IsPurposePublished(ctx context.Context, purposeID string) (boo
 const activityVersionColumns = `
 	activity_version_id, activity_id, privacy_role, owner, purpose_ids, subject_classes,
 	data_categories, sources, recipients, jurisdictions, retention_rule_refs, transfer_refs,
+	notice_consent_dependency, dpia_tia_status,
 	version_status, validation_findings, rejection_reason, effective_from, supersedes_version_id,
 	created_at, created_by_principal_id`
 
 const activityVersionColumnsJoined = `
 	av.activity_version_id, av.activity_id, av.privacy_role, av.owner, av.purpose_ids, av.subject_classes,
 	av.data_categories, av.sources, av.recipients, av.jurisdictions, av.retention_rule_refs, av.transfer_refs,
+	av.notice_consent_dependency, av.dpia_tia_status,
 	av.version_status, av.validation_findings, av.rejection_reason, av.effective_from, av.supersedes_version_id,
 	av.created_at, av.created_by_principal_id`
 
 func scanActivityVersion(row pgx.Row) (*domain.ProcessingActivityVersion, error) {
 	v := &domain.ProcessingActivityVersion{}
 	var purposeIDs, subjectClasses, dataCategories, sources, recipients, jurisdictions, retentionRuleRefs, transferRefs, findingsRaw []byte
+	var noticeConsent, dpiaTia *string
 	err := row.Scan(&v.ActivityVersionID, &v.ActivityID, &v.PrivacyRole, &v.Owner,
 		&purposeIDs, &subjectClasses, &dataCategories, &sources, &recipients, &jurisdictions,
 		&retentionRuleRefs, &transferRefs,
+		&noticeConsent, &dpiaTia,
 		&v.VersionStatus, &findingsRaw, &v.RejectionReason, &v.EffectiveFrom, &v.SupersedesVersionID,
 		&v.CreatedAt, &v.CreatedByPrincipalID)
 	if err != nil {
 		return nil, err
+	}
+	if noticeConsent != nil {
+		v.NoticeConsentDependency = domain.NoticeConsentDependency(*noticeConsent)
+	}
+	if dpiaTia != nil {
+		v.DPIATIAStatus = domain.DPIATIAStatus(*dpiaTia)
 	}
 	unmarshalSlice(purposeIDs, &v.PurposeIDs)
 	unmarshalSlice(subjectClasses, &v.SubjectClasses)
@@ -426,11 +440,12 @@ func (s *PgStore) CreateActivity(ctx context.Context, tenantID string, req domai
 		var err error
 		version, err = scanActivityVersion(tx.QueryRow(ctx, `
 			INSERT INTO processing_activity_versions (`+activityVersionColumns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'DRAFT', NULL, NULL, NULL, NULL, NOW(), $13)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'DRAFT', NULL, NULL, NULL, NULL, NOW(), $15)
 			RETURNING `+activityVersionColumns,
 			versionID, activityID, req.PrivacyRole, req.Owner,
 			cols.purposeIDs, cols.subjectClasses, cols.dataCategories, cols.sources, cols.recipients,
-			cols.jurisdictions, cols.retentionRuleRefs, cols.transferRefs, principalID,
+			cols.jurisdictions, cols.retentionRuleRefs, cols.transferRefs,
+			strPtrOrNil(req.NoticeConsentDependency), strPtrOrNil(req.DPIATIAStatus), principalID,
 		))
 		return err
 	})
@@ -464,11 +479,12 @@ func (s *PgStore) CreateActivityVersion(ctx context.Context, activityID string, 
 		var err error
 		version, err = scanActivityVersion(tx.QueryRow(ctx, `
 			INSERT INTO processing_activity_versions (`+activityVersionColumns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'DRAFT', NULL, NULL, NULL, $13, NOW(), $14)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'DRAFT', NULL, NULL, NULL, $15, NOW(), $16)
 			RETURNING `+activityVersionColumns,
 			versionID, activityID, req.PrivacyRole, req.Owner,
 			cols.purposeIDs, cols.subjectClasses, cols.dataCategories, cols.sources, cols.recipients,
-			cols.jurisdictions, cols.retentionRuleRefs, cols.transferRefs, req.ParentVersionID, principalID,
+			cols.jurisdictions, cols.retentionRuleRefs, cols.transferRefs,
+			strPtrOrNil(req.NoticeConsentDependency), strPtrOrNil(req.DPIATIAStatus), req.ParentVersionID, principalID,
 		))
 		return err
 	})
@@ -696,3 +712,77 @@ func (s *PgStore) ActivateActivity(ctx context.Context, activityID, versionID st
 	}
 	return version, nil
 }
+
+func (s *PgStore) FindLatestActivityVersion(ctx context.Context, activityID string) (*domain.ProcessingActivityVersion, error) {
+	var version *domain.ProcessingActivityVersion
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var err error
+		version, err = scanActivityVersion(tx.QueryRow(ctx, `
+			SELECT `+activityVersionColumnsJoined+`
+			FROM processing_activity_versions av
+			JOIN processing_activities a ON a.activity_id = av.activity_id
+			WHERE av.activity_id = $1
+			ORDER BY av.created_at DESC, av.sequence_no DESC
+			LIMIT 1`,
+			activityID,
+		))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
+		return nil, domain.ErrActivityNotFound
+	}
+	if err != nil {
+		s.log.Error("pg FindLatestActivityVersion failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return version, nil
+}
+
+func (s *PgStore) GetIdempotency(ctx context.Context, tenantID, principalID, key string) (*domain.IdempotencyRecord, error) {
+	var rec domain.IdempotencyRecord
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var tID *string
+		if tenantID != "" {
+			tID = &tenantID
+		}
+		return tx.QueryRow(ctx, `
+			SELECT idempotency_key, tenant_id, principal_id, operation, request_hash, response_status, response_body, created_at
+			FROM purpose_registry_idempotency_keys
+			WHERE COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid) = COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+			  AND principal_id = $2 AND idempotency_key = $3`,
+			strPtrOrNil(tenantID), principalID, key,
+		).Scan(&rec.IdempotencyKey, &tID, &rec.PrincipalID, &rec.Operation, &rec.RequestHash, &rec.ResponseStatus, &rec.ResponseBody, &rec.CreatedAt)
+	})
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
+		return nil, nil
+	}
+	if err != nil {
+		s.log.Error("pg GetIdempotency failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return &rec, nil
+}
+
+func (s *PgStore) SaveIdempotency(ctx context.Context, record domain.IdempotencyRecord) error {
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var tenantStr string
+		if record.TenantID != nil {
+			tenantStr = *record.TenantID
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO purpose_registry_idempotency_keys
+				(idempotency_key, tenant_id, principal_id, operation, request_hash, response_status, response_body, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+			ON CONFLICT (COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid), principal_id, idempotency_key)
+			DO NOTHING`,
+			record.IdempotencyKey, strPtrOrNil(tenantStr), record.PrincipalID, record.Operation, record.RequestHash, record.ResponseStatus, record.ResponseBody,
+		)
+		return err
+	})
+	if err != nil {
+		s.log.Error("pg SaveIdempotency failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+

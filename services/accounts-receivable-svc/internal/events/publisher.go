@@ -90,11 +90,46 @@ func (p *Publisher) PublishReceivableOverdue(ctx context.Context, inv domain.Cus
 
 // PublishPaymentReceived publishes payment.received event.
 func (p *Publisher) PublishPaymentReceived(ctx context.Context, inv domain.CustomerInvoice) {
-	p.emit(ctx, "payment.received", inv.CorrelationID, inv.TenantID, inv.LegalEntityID, deref(inv.PaymentReceivedByPrincipalID), inv.InvoiceID, map[string]any{
+	payload := map[string]any{
 		"invoice_id":    inv.InvoiceID,
 		"amount":        inv.Amount,
 		"currency_code": inv.CurrencyCode,
-	})
+		"payment_received_by_principal_id": deref(inv.PaymentReceivedByPrincipalID),
+	}
+	// AR-08 cash application rides on the event so a consumer can reconcile the
+	// customer's remittance without re-reading the receivable.
+	if inv.PaymentDate != nil {
+		payload["payment_date"] = inv.PaymentDate.Time
+	}
+	if inv.PaymentReference != nil {
+		payload["payment_reference"] = *inv.PaymentReference
+	}
+	p.emit(ctx, "payment.received", inv.CorrelationID, inv.TenantID, inv.LegalEntityID, deref(inv.PaymentReceivedByPrincipalID), inv.InvoiceID, payload)
+}
+
+// PublishOutbox publishes a pre-serialized outbox event envelope to Kafka with X-Event-ID header.
+func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	msg := kafka.Message{
+		Topic: p.topic,
+		Key:   []byte(aggregateID),
+		Value: payload,
+		Headers: []kafka.Header{
+			{
+				Key:   "X-Event-ID",
+				Value: []byte(outboxEventID),
+			},
+		},
+	}
+	if err := p.producer.WriteMessages(ctx, msg); err != nil {
+		p.log.Error("failed to publish outbox event",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.String("topic", p.topic),
+			zap.Error(err),
+		)
+		return fmt.Errorf("kafka write: %w", err)
+	}
+	return nil
 }
 
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {

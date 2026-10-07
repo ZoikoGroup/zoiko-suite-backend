@@ -31,11 +31,13 @@ import (
 
 	"zoiko.io/workflow-svc/internal/authz"
 	"zoiko.io/workflow-svc/internal/config"
+	"zoiko.io/workflow-svc/internal/documentvault"
 	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"zoiko.io/workflow-svc/internal/events"
 	"zoiko.io/workflow-svc/internal/handler"
 	"zoiko.io/workflow-svc/internal/health"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
+	"zoiko.io/workflow-svc/internal/outbox"
 	"zoiko.io/workflow-svc/internal/store"
 	"zoiko.io/workflow-svc/internal/telemetry"
 )
@@ -58,6 +60,7 @@ func main() {
 		zap.Int("port", cfg.Port),
 		zap.String("db_host", cfg.DB.Host),
 		zap.String("authorization_service_url", cfg.AuthorizationServiceURL),
+		zap.String("document_vault_service_url", cfg.DocumentVaultServiceURL),
 	)
 
 	shutdownTracing, err := telemetry.InitTracing(context.Background(), "workflow-svc", cfg.OTELExporterEndpoint)
@@ -116,6 +119,7 @@ func main() {
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	authzClient := authz.NewHTTPClient(cfg.AuthorizationServiceURL, log)
+	documentVaultClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, log)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -134,8 +138,16 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	h := handler.New(pgStore, publisher, authzClient, documentVaultClient, log)
 	handler.RegisterRoutes(r, h)
+
+	// Outbox relay (ZS-STATE-001 Invariant I-13 / doc7 item 32):
+	// Asynchronously polls outbox_events and publishes to Kafka with FOR UPDATE SKIP LOCKED,
+	// guaranteeing multi-replica safety and durable at-least-once delivery.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	relay := outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, log)
+	go relay.Start(relayCtx)
 
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
@@ -168,6 +180,7 @@ func main() {
 		log.Info("shutdown signal received", zap.String("signal", sig.String()))
 	}
 
+	relayCancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

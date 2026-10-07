@@ -1,0 +1,387 @@
+openapi: "3.1.0"
+info:
+  title: Gateway Auth Service
+  version: "1.0"
+  description: |
+    Traefik's ForwardAuth target. Every gated request in the estate is sent
+    here first; a 2xx lets it through and anything else is returned to the
+    client verbatim, so the protected backend never sees an unverified request.
+
+    **Service Class:** Platform Foundation Service
+    **Deployment Tier:** Tier 0
+    **Architecture ref:** docs/architecture/05-security.md, ZS-SVC-A-001 §4
+    (GOV-01 tenant context resolution), Doc 05 §3.11 (continuous risk),
+    GTRM decision doc §6.2/§11 (token/hostname tenant binding)
+
+    ## This is not a REST API
+
+    There is one functional endpoint and no resource model. `/verify` is called
+    by the router, not by application code, and it authorises the request it is
+    *given a description of* rather than acting on a body of its own. A client
+    never calls it directly — that is what `X-Forwarded-Method` and
+    `X-Forwarded-Uri` are for.
+
+    Spelling it as OpenAPI is still worth it, because the contract that matters
+    here is entirely in headers: which ones are read, which ones are produced,
+    and which of the produced ones Traefik is configured to copy onward. That
+    last point has no other written home, and a header this service sets but
+    the middleware does not list is dropped silently.
+
+    ## Stateless
+
+    No database, no migrations, no message broker, no events. It holds an
+    in-memory JWKS cache and an in-memory tenant-context cache, both of which
+    are rebuildable and neither of which is authoritative. Nothing here needs
+    backup or restore.
+
+    ## Fail closed, in both directions
+
+    An unverifiable caller is refused. A dependency that cannot answer is also
+    a refusal, never an assumption:
+
+    - JWKS unreachable and no cached key → `401`.
+    - Tenant registry unreachable → `503`, not `403`. Nothing was decided, so
+      telling the caller it was refused would be false.
+    - Tenant registry refuses → `403`, and re-authenticating will not help.
+
+    ## What it produces
+
+    On success it sets the identity and server-resolved context headers listed
+    under `VerifySuccess`. Traefik copies only the headers named in the
+    ForwardAuth middleware's `authResponseHeaders` (see
+    `deployments/docker-compose.yml`); a header set here and missing from that
+    list never reaches the backend, and nothing warns you.
+
+servers:
+  - url: http://localhost:8092
+    description: Local development (direct port)
+  - url: http://gateway-auth-svc:8092
+    description: In-cluster, called by Traefik's ForwardAuth middleware
+
+tags:
+  - name: ForwardAuth
+    description: The endpoint Traefik calls before routing a gated request.
+  - name: Health
+    description: Liveness, readiness and metrics. Not gated.
+
+paths:
+  /verify:
+    description: |
+      Accepts every method, because ForwardAuth replays the client's original
+      method onto this endpoint. Restricting it to GET would refuse
+      authorisation for every POST in the estate.
+    get:
+      tags: [ForwardAuth]
+      summary: Authorise one request
+      operationId: verify
+      description: |
+        The decision pipeline, in order. Each stage can refuse, and the
+        refusals are deliberately distinguishable — `X-Auth-Denial-Reason`
+        names which one fired.
+
+        1. **Bearer credential present.** The scheme is matched
+           case-insensitively (RFC 7235 §2.1). → `401 no_token`
+        2. **Signature, expiry, issuer, audience and `kid`.** RS256 only; the
+           key comes from identity-context-svc's JWKS.
+           → `401 invalid_token`
+        3. **Claims complete.** A verified token with no principal or no
+           tenant is identity-context-svc minting a malformed envelope, not a
+           caller error, and is counted separately.
+           → `401 incomplete_claims`
+        4. **Token tenant vs. hostname-resolved tenant.** When
+           `X-Zoiko-Resolved-Tenant-Id` is present and disagrees with the
+           token's claim, the request is refused even though the token itself
+           verified — this is the spoofing shape GTRM §6.2 names. Streamed to
+           SIEM at CRITICAL. → `403 tenant_hostname_mismatch`
+        5. **Continuous risk assessment** (carta-svc, optional). `ISOLATE` and
+           `DENY` block. `STEP_UP_MFA` does **not** — there is no step-up flow
+           downstream to redirect to, and hard-blocking with no way to recover
+           would be a silent lockout. → `403 carta_blocked`
+        6. **GOV-01 tenant context resolution** (tenant-entity-registry-svc,
+           optional). A valid token proves who is asking; it does not prove
+           the tenant may transact, nor that the legal entity named in it
+           belongs to that tenant. → `403 tenant_context_denied` /
+           `503 tenant_context_unresolved`
+
+        Stages 5 and 6 are skipped entirely when their service URL is unset,
+        which leaves the gateway verifying tokens exactly as it did before
+        rather than failing closed on a dependency the deployment never
+        configured.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Authorization"
+        - $ref: "#/components/parameters/ForwardedMethod"
+        - $ref: "#/components/parameters/ForwardedUri"
+        - $ref: "#/components/parameters/ForwardedFor"
+        - $ref: "#/components/parameters/ResolvedTenantId"
+      responses:
+        "200":
+          description: |
+            Authorised. The response body is empty; everything this endpoint
+            produces is in the headers.
+          headers:
+            X-Principal-Id:
+              $ref: "#/components/headers/PrincipalId"
+            X-Tenant-Id:
+              $ref: "#/components/headers/TenantId"
+            X-Legal-Entity-Id:
+              $ref: "#/components/headers/LegalEntityId"
+            X-Correlation-Id:
+              $ref: "#/components/headers/CorrelationId"
+            X-Jurisdiction-Context:
+              $ref: "#/components/headers/JurisdictionContext"
+            X-Timezone:
+              $ref: "#/components/headers/Timezone"
+            X-Residency-Policy-Id:
+              $ref: "#/components/headers/ResidencyPolicyId"
+            X-Tenant-Context-Stale:
+              $ref: "#/components/headers/TenantContextStale"
+        "401":
+          description: |
+            The caller could not be verified. One of `no_token`,
+            `invalid_token` or `incomplete_claims`, named in
+            `X-Auth-Denial-Reason`.
+
+            **A JWKS outage also lands here**, and deliberately so — the caller
+            genuinely cannot be verified. The status does not distinguish it;
+            `gateway_auth_jwks_errors_total{operation="fetch"}` does, and that
+            is what alerting reads.
+          headers:
+            X-Auth-Denial-Reason:
+              $ref: "#/components/headers/DenialReason"
+          content:
+            text/plain:
+              schema: { type: string }
+              examples:
+                noToken: { value: "missing bearer token" }
+                invalid: { value: "invalid token" }
+        "403":
+          description: |
+            Verified, and refused anyway. One of `tenant_hostname_mismatch`,
+            `carta_blocked` or `tenant_context_denied`.
+
+            Re-authenticating changes none of them.
+          headers:
+            X-Auth-Denial-Reason:
+              $ref: "#/components/headers/DenialReason"
+            X-Carta-Decision:
+              $ref: "#/components/headers/CartaDecision"
+            X-Tenant-Context:
+              $ref: "#/components/headers/TenantContext"
+          content:
+            text/plain:
+              schema: { type: string }
+              examples:
+                spoofing:
+                  value: "token tenant does not match the hostname-resolved tenant"
+                risk:
+                  value: "access denied by continuous risk assessment"
+                tenant:
+                  value: "tenant context denied"
+        "503":
+          description: |
+            `tenant_context_unresolved` — the tenant registry could not be
+            reached, so no decision exists.
+
+            A `403` here would tell the caller it had been refused when in
+            fact nothing could be determined. Carries `Retry-After`.
+          headers:
+            X-Auth-Denial-Reason:
+              $ref: "#/components/headers/DenialReason"
+            X-Tenant-Context:
+              $ref: "#/components/headers/TenantContext"
+            Retry-After:
+              schema: { type: string, example: "5" }
+          content:
+            text/plain:
+              schema: { type: string }
+              example: "tenant context could not be resolved"
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness
+      operationId: liveness
+      description: |
+        200 whenever the process is up; checks nothing. Do **not** gate traffic
+        or container health on this — an unreachable JWKS endpoint leaves the
+        process perfectly alive while it refuses every request in the estate.
+        The compose healthcheck used to point here and reported exactly that
+        state as healthy.
+      security: []
+      responses:
+        "200":
+          description: The process is running.
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness
+      operationId: readiness
+      description: |
+        Pings identity-context-svc's JWKS endpoint. This is what the
+        container's `HEALTHCHECK` runs and what traffic should be gated on,
+        because a gateway that cannot fetch a verification key cannot do its
+        one job.
+      security: []
+      responses:
+        "200":
+          description: JWKS reachable; ready to verify.
+        "503":
+          description: JWKS unreachable. Every gated request is failing closed.
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus exposition
+      operationId: metrics
+      description: |
+        Domain counters under `gateway_auth_`, plus the platform baseline. Six
+        alert rules read these — see `deployments/prometheus-rules.yml` and
+        `RUNBOOK.md`, which has one section per alert.
+
+        Every label combination is pre-initialised at zero. On this service
+        that is not tidiness: the labels that should stay at zero forever are
+        the security ones, and a series that does not exist is indistinguishable
+        from a series reading zero — so an alert on "any spoofing attempt"
+        would evaluate against nothing at all until the first one happened.
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format.
+          content:
+            text/plain: {}
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        The signed identity envelope minted by identity-context-svc. RS256,
+        verified against its JWKS. This service reads tokens; it never mints
+        one.
+
+  parameters:
+    Authorization:
+      name: Authorization
+      in: header
+      required: true
+      schema: { type: string }
+      description: |
+        `Bearer <identity envelope>`. The scheme is matched case-insensitively
+        per RFC 7235 §2.1 — `bearer`, `Bearer` and `BEARER` are all accepted.
+      example: "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6..."
+    ForwardedMethod:
+      name: X-Forwarded-Method
+      in: header
+      required: false
+      schema: { type: string }
+      description: |
+        The method of the request being authorised. Set by Traefik.
+
+        Preferred over the probe's own method because it survives any proxy in
+        front that normalises the probe. It decides the **write posture** for
+        GOV-01 resolution: anything other than GET/HEAD/OPTIONS is a material
+        write and may not be served from a stale tenant context.
+    ForwardedUri:
+      name: X-Forwarded-Uri
+      in: header
+      required: false
+      schema: { type: string }
+      description: The URI being authorised. Logged, and passed to risk assessment.
+    ForwardedFor:
+      name: X-Forwarded-For
+      in: header
+      required: false
+      schema: { type: string }
+      description: |
+        Client IP for risk assessment. Preferred over the socket address,
+        which from here is always the gateway container's own.
+    ResolvedTenantId:
+      name: X-Zoiko-Resolved-Tenant-Id
+      in: header
+      required: false
+      schema: { type: string }
+      description: |
+        The tenant the caller's **hostname** resolved to, set by GTRM's
+        per-tenant Traefik middleware after stripping any externally-supplied
+        copy — a client cannot forge it.
+
+        When present and different from the token's `tenant_id`, the request is
+        refused. Its absence is not suspicious: it means this route has not
+        been onboarded onto GTRM-resolved routing yet, so no comparison is
+        made — an honest pass rather than a fabricated one.
+
+  headers:
+    PrincipalId:
+      description: The verified principal, from the token's `principal.principal_id`.
+      schema: { type: string }
+    TenantId:
+      description: The verified tenant, from the token's `tenant_id`.
+      schema: { type: string }
+    LegalEntityId:
+      description: From the token's `legal_entity_id`. May be empty.
+      schema: { type: string }
+    CorrelationId:
+      description: Propagated from the token when it carries one.
+      schema: { type: string }
+    JurisdictionContext:
+      description: |
+        Server-resolved, from the tenant registry — not from the caller.
+        Provenance class S: a client may request context but cannot override
+        the result. Traefik overwrites whatever the client sent under this
+        name, which is what makes the override real. Omitted when GOV-01
+        resolution is disabled.
+      schema: { type: string }
+    Timezone:
+      description: Server-resolved operating timezone. Same provenance as above.
+      schema: { type: string }
+    ResidencyPolicyId:
+      description: Server-resolved data-residency policy. Same provenance as above.
+      schema: { type: string }
+    TenantContextStale:
+      description: |
+        `true` when the context came from a cache the registry could not
+        confirm. Only ever set on non-material reads — a write is refused
+        rather than served from a stale context.
+      schema: { type: string, enum: ["true"] }
+    DenialReason:
+      description: |
+        Why the request was refused, on every refusal. Traefik returns an
+        unsuccessful ForwardAuth reply to the client verbatim, so this reaches
+        the caller and is what lets a console tell the gateway's own refusal
+        apart from the backend service's.
+      schema:
+        type: string
+        enum:
+          - no_token
+          - invalid_token
+          - incomplete_claims
+          - tenant_hostname_mismatch
+          - carta_blocked
+          - tenant_context_denied
+          - tenant_context_unresolved
+    CartaDecision:
+      description: |
+        The continuous-risk decision, set **only** when carta-svc actually made
+        one.
+
+        It used to be set by a shared helper that the tenant/hostname mismatch
+        also called, so a token-spoofing rejection was reported as a decision
+        the risk engine had made — attributing a refusal to a component that
+        had not been consulted, and sending anyone reading the header to
+        carta-svc's logs for a decision that was never there.
+      schema: { type: string, enum: [ISOLATE, DENY] }
+    TenantContext:
+      description: |
+        The GOV-01 signal. `denied` — the registry refused; re-authenticating
+        will not help. `unresolved` — the registry could not be reached, so no
+        decision exists and nothing was written; retry.
+
+        The console reads this to tell a GOV-01 refusal apart from the backend
+        service's own 403/503, which mean entirely different things and have
+        different fixes.
+      schema: { type: string, enum: [denied, unresolved] }

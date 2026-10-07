@@ -45,6 +45,9 @@ type stubStore struct {
 	recognitions         map[string][]domain.RecognitionInstance // scheduleID -> instances
 	createRecognitionErr error
 	listRecognitionsErr  error
+	reversals            map[string]*domain.RecognitionReversal // recognitionInstanceID -> reversal
+	createReversalErr    error
+	getReversalErr       error
 	activateErr          error
 	completeErr          error
 
@@ -58,15 +61,16 @@ type stubStore struct {
 	activatePrepaymentErr   error
 	completePrepaymentErr   error
 
-	allocationRules map[string]*domain.AllocationRule // keyed by rule_id (current version)
-	allocationRuns  map[string]*domain.AllocationRun  // keyed by run_id
-	createRuleErr   error
-	approveRuleErr  error
-	createRunErr2   error
-	markCalcErr     error
-	markPostedErr   error
-	markFailedErr   error
-	resultLinesErr  error
+	allocationRules  map[string]*domain.AllocationRule // keyed by rule_id (current version)
+	allocationRuns   map[string]*domain.AllocationRun  // keyed by run_id
+	createRuleErr    error
+	approveRuleErr   error
+	supersedeRuleErr error
+	createRunErr2    error
+	markCalcErr      error
+	markPostedErr    error
+	markFailedErr    error
+	resultLinesErr   error
 
 	fxRuns          map[string]*domain.FXRevaluationRun
 	createFXRunErr  error
@@ -81,12 +85,14 @@ type stubStore struct {
 	createSnapshotErr     error
 	transitionSnapshotErr error
 
-	lineageEdges      []domain.LineageEdge
-	recordEdgeErr     error
-	postedJournalRefs []domain.PostedJournalRef
-	postedRefsErr     error
-	projectionStatus  map[string]*domain.LineageProjectionStatus
-	upsertStatusErr   error
+	lineageEdges           []domain.LineageEdge
+	tracePathVerifications []domain.TracePathVerification
+	quarantinedLineageGaps []domain.QuarantinedLineageGap
+	recordEdgeErr          error
+	postedJournalRefs      []domain.PostedJournalRef
+	postedRefsErr          error
+	projectionStatus       map[string]*domain.LineageProjectionStatus
+	upsertStatusErr        error
 }
 
 func newStubStore() *stubStore {
@@ -349,6 +355,42 @@ func (s *stubStore) ListRecognitionInstances(_ context.Context, scheduleID strin
 	return s.recognitions[scheduleID], nil
 }
 
+func (s *stubStore) GetRecognitionInstanceByPeriod(_ context.Context, scheduleID, fiscalPeriod string) (*domain.RecognitionInstance, error) {
+	for _, inst := range s.recognitions[scheduleID] {
+		if inst.FiscalPeriod == fiscalPeriod {
+			cp := inst
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrRecognitionInstanceNotFound
+}
+
+func (s *stubStore) GetRecognitionReversalByInstance(_ context.Context, recognitionInstanceID string) (*domain.RecognitionReversal, error) {
+	if s.getReversalErr != nil {
+		return nil, s.getReversalErr
+	}
+	if s.reversals == nil {
+		return nil, nil
+	}
+	return s.reversals[recognitionInstanceID], nil
+}
+
+func (s *stubStore) CreateRecognitionReversal(_ context.Context, rev *domain.RecognitionReversal) (bool, error) {
+	if s.createReversalErr != nil {
+		return false, s.createReversalErr
+	}
+	if s.reversals == nil {
+		s.reversals = make(map[string]*domain.RecognitionReversal)
+	}
+	if existing, ok := s.reversals[rev.RecognitionInstanceID]; ok {
+		*rev = *existing
+		return false, nil
+	}
+	cp := *rev
+	s.reversals[rev.RecognitionInstanceID] = &cp
+	return true, nil
+}
+
 func (s *stubStore) CreatePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule) error {
 	if s.createPrepaymentErr != nil {
 		return s.createPrepaymentErr
@@ -517,6 +559,23 @@ func (s *stubStore) ApproveAllocationRule(_ context.Context, ruleVersionID, prin
 		}
 	}
 	return domain.ErrAllocationRuleNotFound
+}
+
+func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error {
+	if s.supersedeRuleErr != nil {
+		return s.supersedeRuleErr
+	}
+	current, ok := s.allocationRules[ruleID]
+	if !ok || (current.Status != domain.AllocationRuleStatusApproved && current.Status != domain.AllocationRuleStatusActive) {
+		return domain.ErrNoCurrentRuleToSupersede
+	}
+	newVersion.Version = current.Version + 1
+	newVersion.RuleID = ruleID
+	newVersion.TenantID = current.TenantID
+	newVersion.Status = domain.AllocationRuleStatusDraft
+	cp := *newVersion
+	s.allocationRules[ruleID] = &cp
+	return nil
 }
 
 func (s *stubStore) ActivateAllocationRule(_ context.Context, ruleVersionID string) error {
@@ -869,6 +928,41 @@ func (s *stubStore) ListLineageEdgesTo(_ context.Context, toType, toID string) (
 	return out, nil
 }
 
+func (s *stubStore) ListLineageEdgesToAsOf(_ context.Context, toType, toID string, asOf time.Time) ([]domain.LineageEdge, error) {
+	var out []domain.LineageEdge
+	for _, e := range s.lineageEdges {
+		if e.ToType == toType && e.ToID == toID && !e.RecordedAt.After(asOf) {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) CreateTracePathVerification(_ context.Context, v *domain.TracePathVerification) error {
+	s.tracePathVerifications = append(s.tracePathVerifications, *v)
+	return nil
+}
+
+func (s *stubStore) CreateQuarantinedLineageGap(_ context.Context, g *domain.QuarantinedLineageGap) error {
+	for _, existing := range s.quarantinedLineageGaps {
+		if existing.FromType == g.FromType && existing.FromID == g.FromID && existing.ToType == g.ToType && existing.ToID == g.ToID {
+			return nil
+		}
+	}
+	s.quarantinedLineageGaps = append(s.quarantinedLineageGaps, *g)
+	return nil
+}
+
+func (s *stubStore) ListQuarantinedLineageGaps(_ context.Context, legalEntityID string) ([]domain.QuarantinedLineageGap, error) {
+	var out []domain.QuarantinedLineageGap
+	for _, g := range s.quarantinedLineageGaps {
+		if g.LegalEntityID == legalEntityID {
+			out = append(out, g)
+		}
+	}
+	return out, nil
+}
+
 func (s *stubStore) ListPostedJournalRefs(_ context.Context, legalEntityID string) ([]domain.PostedJournalRef, error) {
 	if s.postedRefsErr != nil {
 		return nil, s.postedRefsErr
@@ -939,18 +1033,45 @@ type stubClients struct {
 	apPeriodStart, apPeriodEnd time.Time
 	arPeriodStart, arPeriodEnd time.Time
 
-	controlAccountCodes map[string]string // mapping key -> account code
-	mappingErr          error
-	apSubledgerTotal    float64
-	apSubledgerErr      error
-	arSubledgerTotal    float64
-	arSubledgerErr      error
+	checkARInvoiceErr  error
+	checkAPInvoiceErr  error
+	existingARInvoices map[string]bool // "customerID|invoiceNumber" -> exists
+	existingAPInvoices map[string]bool // "vendorID|invoiceNumber" -> exists
+
+	controlAccountCodes  map[string]string // mapping key -> account code
+	mappingErr           error
+	apSubledgerTotal     float64
+	apSubledgerErr       error
+	arSubledgerTotal     float64
+	arSubledgerErr       error
+	assetNBVTotal        float64
+	assetNBVErr          error
+	depCoveredCount      int
+	depEligibleCount     int
+	depCompletenessErr   error
+	invNegativeCount     int
+	invNegativeErr       error
+	invValueTotal        float64
+	invValueErr          error
+	projRevenueTotal     float64
+	projRevenueErr       error
+	stockUnapprovedCount int
+	stockUnapprovedErr   error
+
+	closeGate      *domain.CloseGateResponse
+	closeGateErr   error
+	closeGateCalls int
 
 	postJournalErr   error
 	postedJournalID  string
 	lastPostedAmount float64
 	lastPostedPeriod string
 	postJournalCalls int
+
+	reverseJournalErr        error
+	reversingJournalID       string
+	reverseJournalCalls      int
+	lastReverseCorrelationID string
 
 	accountStatuses      map[string]string // account_code -> status
 	accountStatusErr     error
@@ -991,6 +1112,20 @@ func (c *stubClients) GetUnsettledARInvoicesCount(_ context.Context, _, _ string
 	c.arPeriodStart, c.arPeriodEnd = periodStart, periodEnd
 	return c.unsettledAR, c.arErr
 }
+
+func (c *stubClients) CheckARInvoiceExists(_ context.Context, _, _, customerID, invoiceNumber string) (bool, error) {
+	if c.checkARInvoiceErr != nil {
+		return false, c.checkARInvoiceErr
+	}
+	return c.existingARInvoices[customerID+"|"+invoiceNumber], nil
+}
+
+func (c *stubClients) CheckAPInvoiceExists(_ context.Context, _, _, vendorID, invoiceNumber string) (bool, error) {
+	if c.checkAPInvoiceErr != nil {
+		return false, c.checkAPInvoiceErr
+	}
+	return c.existingAPInvoices[vendorID+"|"+invoiceNumber], nil
+}
 func (c *stubClients) UploadCloseEvidence(_ context.Context, _, _, _ string, _ map[string]float64, _ string) (string, error) {
 	if c.uploadErr != nil {
 		return "", c.uploadErr
@@ -1014,6 +1149,47 @@ func (c *stubClients) GetAPSubledgerTotal(_ context.Context, _, _ string) (float
 
 func (c *stubClients) GetARSubledgerTotal(_ context.Context, _, _ string) (float64, error) {
 	return c.arSubledgerTotal, c.arSubledgerErr
+}
+
+func (c *stubClients) GetAssetNetBookValueTotal(_ context.Context, _, _, _ string) (float64, error) {
+	return c.assetNBVTotal, c.assetNBVErr
+}
+
+func (c *stubClients) GetAssetDepreciationCompleteness(_ context.Context, _, _, _ string) (int, int, error) {
+	return c.depCoveredCount, c.depEligibleCount, c.depCompletenessErr
+}
+
+func (c *stubClients) GetInventoryNegativeOnHandCount(_ context.Context, _, _ string) (int, error) {
+	return c.invNegativeCount, c.invNegativeErr
+}
+
+func (c *stubClients) GetCloseGate(_ context.Context, _, _, _, _ string) (*domain.CloseGateResponse, error) {
+	c.closeGateCalls++
+	return c.closeGate, c.closeGateErr
+}
+
+func (c *stubClients) GetInventoryValueTotal(_ context.Context, _, _ string) (float64, error) {
+	return c.invValueTotal, c.invValueErr
+}
+
+func (c *stubClients) GetProjectPostedRevenueTotal(_ context.Context, _, _, _ string) (float64, error) {
+	return c.projRevenueTotal, c.projRevenueErr
+}
+
+func (c *stubClients) GetInventoryUnapprovedVarianceCount(_ context.Context, _, _, _ string) (int, error) {
+	return c.stockUnapprovedCount, c.stockUnapprovedErr
+}
+
+func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, _, _, correlationID string) (string, error) {
+	c.reverseJournalCalls++
+	c.lastReverseCorrelationID = correlationID
+	if c.reverseJournalErr != nil {
+		return "", c.reverseJournalErr
+	}
+	if c.reversingJournalID != "" {
+		return c.reversingJournalID, nil
+	}
+	return "reversing-journal-generated", nil
 }
 
 func (c *stubClients) PostAccrualRecognitionJournal(_ context.Context, _, _, fiscalPeriod, _, _, _, _, _ string, amount float64) (string, error) {
@@ -1655,6 +1831,406 @@ func TestRunSubledgerControl_ARMismatch_RecordsExceptionAndPublishes(t *testing.
 	}
 	if pub.lastControlExceptionRun.ControlRunID != run.ControlRunID {
 		t.Errorf("published exception does not match the persisted run")
+	}
+}
+
+// TestRunSubledgerControl_AssetsMatched_RecordsRun proves ACC-06's own
+// AP/AR reconciliation mechanism now serves the AST/INV/PRJ domain
+// spec's own §9 "Assets → GL" assertion, via the same real
+// compare-and-diff logic, not a new engine.
+func TestRunSubledgerControl_AssetsMatched_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"FIXED_ASSET_CONTROL": "1500-FA"},
+		assetNBVTotal:       500000.00,
+		trialBalances:       map[string]float64{"1500-FA": 500000.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID:            "le-1",
+		FiscalPeriod:             "2026-08",
+		Subledger:                "ASSETS",
+		ControlAccountMappingKey: "FIXED_ASSET_CONTROL",
+		BookID:                   "GAAP",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+	if run.Subledger != "ASSETS" {
+		t.Errorf("expected ASSETS, got %q", run.Subledger)
+	}
+}
+
+// TestRunSubledgerControl_DepreciationCompletenessMatched_RecordsRun
+// proves ACC-06's own run mechanism now also serves the AST/INV/PRJ
+// domain spec's own §9 "Depreciation completeness" assertion — a
+// coverage check, not a GL balance comparison, so no control account is
+// ever resolved for this subledger type.
+func TestRunSubledgerControl_DepreciationCompletenessMatched_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{depCoveredCount: 5, depEligibleCount: 5}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "DEPRECIATION_COMPLETENESS",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+	if run.SubledgerTotalAmount != 5 || run.GLControlBalanceAmount != 5 {
+		t.Errorf("expected covered=5 eligible=5, got %v / %v", run.SubledgerTotalAmount, run.GLControlBalanceAmount)
+	}
+}
+
+func TestRunSubledgerControl_DepreciationCompletenessGap_RecordsExceptionAndPublishes(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{depCoveredCount: 3, depEligibleCount: 5}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "DEPRECIATION_COMPLETENESS",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "EXCEPTION" {
+		t.Errorf("expected EXCEPTION (2 schedules not covered), got %q", run.Status)
+	}
+	if pub.controlException != 1 {
+		t.Fatalf("expected exception published exactly once, got %d", pub.controlException)
+	}
+}
+
+// TestRunSubledgerControl_DepreciationCompleteness_NoMappingKeyRequired
+// proves the mapping-key requirement is skipped for this subledger type
+// — it has no GL side to resolve a control account against.
+func TestRunSubledgerControl_DepreciationCompleteness_NoMappingKeyRequired(t *testing.T) {
+	cl := &stubClients{depCoveredCount: 1, depEligibleCount: 1}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, cl)
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "DEPRECIATION_COMPLETENESS",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (no mapping key needed), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRunSubledgerControl_InventoryQuantityClean_RecordsRun proves
+// ACC-06's own run mechanism now also serves the AST/INV/PRJ domain
+// spec's own §9 "Inventory quantity" assertion — an integrity check
+// (negative on-hand), never a balance comparison, with no control
+// account ever resolved.
+func TestRunSubledgerControl_InventoryQuantityClean_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{invNegativeCount: 0}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_QUANTITY"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+}
+
+func TestRunSubledgerControl_InventoryQuantityViolation_RecordsExceptionAndPublishes(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{invNegativeCount: 2}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_QUANTITY"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "EXCEPTION" {
+		t.Errorf("expected EXCEPTION (2 negative combinations found), got %q", run.Status)
+	}
+	if run.SubledgerTotalAmount != 2 || run.GLControlBalanceAmount != 0 {
+		t.Errorf("expected actual=2 expected=0, got %v / %v", run.SubledgerTotalAmount, run.GLControlBalanceAmount)
+	}
+	if pub.controlException != 1 {
+		t.Fatalf("expected exception published exactly once, got %d", pub.controlException)
+	}
+}
+
+func TestRunSubledgerControl_InventoryQuantity_NoMappingKeyRequired(t *testing.T) {
+	cl := &stubClients{invNegativeCount: 0}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, cl)
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_QUANTITY"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (no mapping key needed), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRunSubledgerControl_InventoryValueMatched_RecordsRun proves
+// ACC-06's own run mechanism now also serves the AST/INV/PRJ domain
+// spec's own §9 "Inventory value → GL" assertion — a REAL GL balance
+// comparison, unlike DEPRECIATION_COMPLETENESS/INVENTORY_QUANTITY, so it
+// follows the exact same control-account/trial-balance path as
+// Assets → GL.
+func TestRunSubledgerControl_InventoryValueMatched_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"INVENTORY_CONTROL": "1300-INV"},
+		invValueTotal:       150.00,
+		trialBalances:       map[string]float64{"1300-INV": 150.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_VALUE",
+		ControlAccountMappingKey: "INVENTORY_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+}
+
+func TestRunSubledgerControl_InventoryValueMismatch_RecordsExceptionAndPublishes(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"INVENTORY_CONTROL": "1300-INV"},
+		invValueTotal:       150.00,
+		trialBalances:       map[string]float64{"1300-INV": 100.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_VALUE",
+		ControlAccountMappingKey: "INVENTORY_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "EXCEPTION" {
+		t.Errorf("expected EXCEPTION, got %q", run.Status)
+	}
+	if run.DifferenceAmount != 50.00 {
+		t.Errorf("expected difference 50.00, got %v", run.DifferenceAmount)
+	}
+	if pub.controlException != 1 {
+		t.Fatalf("expected exception published exactly once, got %d", pub.controlException)
+	}
+}
+
+func TestRunSubledgerControl_InventoryValueMissingMappingKey_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_VALUE"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (INVENTORY_VALUE is a real GL comparison, mapping key required), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRunSubledgerControl_ProjectRevenueMatched_RecordsRun proves
+// ACC-06's own run mechanism now also serves the AST/INV/PRJ domain
+// spec's own §9 "Project revenue/WIP → GL" assertion — a REAL GL
+// balance comparison, same control-account/trial-balance path as
+// AP/AR/ASSETS/INVENTORY_VALUE.
+func TestRunSubledgerControl_ProjectRevenueMatched_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"PROJECT_REVENUE_CONTROL": "4000-PRJ"},
+		projRevenueTotal:    700.00,
+		trialBalances:       map[string]float64{"4000-PRJ": 700.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "PROJECT_REVENUE",
+		ControlAccountMappingKey: "PROJECT_REVENUE_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+}
+
+func TestRunSubledgerControl_ProjectRevenueMismatch_RecordsExceptionAndPublishes(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"PROJECT_REVENUE_CONTROL": "4000-PRJ"},
+		projRevenueTotal:    700.00,
+		trialBalances:       map[string]float64{"4000-PRJ": 650.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "PROJECT_REVENUE",
+		ControlAccountMappingKey: "PROJECT_REVENUE_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "EXCEPTION" {
+		t.Errorf("expected EXCEPTION, got %q", run.Status)
+	}
+	if run.DifferenceAmount != 50.00 {
+		t.Errorf("expected difference 50.00, got %v", run.DifferenceAmount)
+	}
+	if pub.controlException != 1 {
+		t.Fatalf("expected exception published exactly once, got %d", pub.controlException)
+	}
+}
+
+func TestRunSubledgerControl_ProjectRevenueMissingMappingKey_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "PROJECT_REVENUE"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (PROJECT_REVENUE is a real GL comparison, mapping key required), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRunSubledgerControl_StockCountClean_RecordsRun proves ACC-06's own
+// run mechanism now also serves the AST/INV/PRJ domain spec's own §9
+// "Stock count" assertion — an integrity check, never a balance
+// comparison, with no control account ever resolved.
+func TestRunSubledgerControl_StockCountClean_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{stockUnapprovedCount: 0}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "STOCK_COUNT"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+}
+
+func TestRunSubledgerControl_StockCountViolation_RecordsExceptionAndPublishes(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{stockUnapprovedCount: 3}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "STOCK_COUNT"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "EXCEPTION" {
+		t.Errorf("expected EXCEPTION (3 unapproved variances found), got %q", run.Status)
+	}
+	if run.SubledgerTotalAmount != 3 || run.GLControlBalanceAmount != 0 {
+		t.Errorf("expected actual=3 expected=0, got %v / %v", run.SubledgerTotalAmount, run.GLControlBalanceAmount)
+	}
+	if pub.controlException != 1 {
+		t.Fatalf("expected exception published exactly once, got %d", pub.controlException)
+	}
+}
+
+func TestRunSubledgerControl_StockCount_NoMappingKeyRequired(t *testing.T) {
+	cl := &stubClients{stockUnapprovedCount: 0}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, cl)
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "STOCK_COUNT"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (no mapping key needed), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRunSubledgerControl_APMissingMappingKey_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "AP"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 missing control_account_mapping_key, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRunSubledgerControl_AssetsMissingBookID_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID:            "le-1",
+		FiscalPeriod:             "2026-08",
+		Subledger:                "ASSETS",
+		ControlAccountMappingKey: "FIXED_ASSET_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 book_id required, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

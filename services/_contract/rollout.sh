@@ -25,20 +25,20 @@ SERVICES_DIR="$PWD/.."
 # already carry legal_entity_id in internal/domain — this reflects the platform as
 # built, not an aspiration.
 ENTITY_SCOPED="access-control-svc accounts-payable-svc accounts-receivable-svc \
-anomaly-detection-svc authorization-svc bank-reconciliation-svc banking-connector-svc \
-benefits-svc board-resolutions-svc carta-svc clause-template-svc commercial-account-svc \
+anomaly-detection-svc asset-management-svc authorization-svc bank-reconciliation-svc banking-connector-svc \
+benefits-svc board-resolutions-svc carta-svc clause-template-svc comments-collaboration-svc commercial-account-svc \
 compensation-svc compliance-risk-scoring-svc compliance-status-svc \
 connectivity-api-bridge-svc consolidation-svc contract-lifecycle-svc \
 corporate-actions-svc corporate-tax-svc counterparty-management-svc decision-support-svc \
 delegated-authority-svc document-vault-svc employee-master-svc employment-contracts-svc \
 esignature-integration-svc evidence-manifest-svc evidence-requirements-svc \
 exception-escalation-svc external-data-feed-svc filing-preparation-svc filing-tracker-svc \
-financial-close-svc forecasting-svc general-ledger-svc governance-decision-log-svc \
-hris-connector-svc identity-context-svc invoice-approval-svc key-management-svc \
+financial-close-svc financial-control-svc forecasting-svc general-ledger-svc governance-decision-log-svc \
+hris-connector-svc identity-context-svc inventory-management-svc invoice-approval-svc key-management-svc \
 leave-absence-svc migration-integrity-svc mtls-management-svc notification-svc \
 obligation-tracking-svc obligations-svc offboarding-severance-svc org-structure-svc \
 payroll-run-svc payroll-tax-svc performance-review-svc policy-svc procurement-workflow-svc \
-purchase-order-svc purchase-request-svc reconciliation-intelligence-svc \
+project-accounting-svc purchase-order-svc purchase-request-svc reconciliation-intelligence-svc \
 reporting-orchestration-svc siem-integration-svc spend-controls-svc \
 tax-authority-interface-svc tax-determination-svc treasury-svc \
 vat-gst-svc vendor-due-diligence-svc withholding-tax-svc workflow-svc workforce-compliance-svc"
@@ -62,14 +62,14 @@ vat-gst-svc vendor-due-diligence-svc withholding-tax-svc workflow-svc workforce-
 # §4 requires purpose_context "for governed sensitive access", and §15 (INV-15)
 # forbids emitting that content into telemetry — capturing WHY it was accessed is
 # what makes the access reviewable afterwards.
-SENSITIVE="document-vault-svc employee-master-svc compensation-svc benefits-svc \
+SENSITIVE="document-vault-svc comments-collaboration-svc employee-master-svc compensation-svc benefits-svc \
 payroll-run-svc payroll-tax-svc payroll-exceptions-svc offboarding-severance-svc \
 leave-absence-svc performance-review-svc employment-contracts-svc carta-svc \
 key-management-svc secret-vault-integration-svc mtls-management-svc \
 counterparty-management-svc vendor-due-diligence-svc banking-connector-svc \
 treasury-svc corporate-tax-svc vat-gst-svc withholding-tax-svc tax-determination-svc \
 tax-authority-interface-svc evidence-manifest-svc governance-decision-log-svc \
-audit-event-store-svc hris-connector-svc"
+audit-event-store-svc hris-connector-svc search-indexer-svc"
 
 # Services that post to, or report from, an accounting book (INV-03).
 #
@@ -82,7 +82,8 @@ audit-event-store-svc hris-connector-svc"
 # carries book_id today so callers can begin sending it; flipping these to
 # Required is a one-line change per service once REF-06 ships.
 ACCOUNTING="general-ledger-svc accounts-payable-svc accounts-receivable-svc \
-consolidation-svc intercompany-accounting-svc financial-close-svc migration-integrity-svc \
+asset-management-svc consolidation-svc intercompany-accounting-svc financial-close-svc financial-control-svc migration-integrity-svc \
+inventory-management-svc project-accounting-svc \
 reporting-orchestration-svc metric-registry-svc corporate-tax-svc vat-gst-svc \
 withholding-tax-svc tax-determination-svc payroll-tax-svc treasury-svc \
 bank-reconciliation-svc reconciliation-intelligence-svc"
@@ -109,6 +110,17 @@ bank-reconciliation-svc reconciliation-intelligence-svc"
 #
 # Format: "<svc>:<path>[,<path>...]" — one entry per service.
 EXEMPT_PATHS="gateway-auth-svc:/verify identity-context-svc:/v1/authenticate"
+
+# Services whose POST routes resolve or evaluate but change nothing (a body-
+# carrying read). They still get the full envelope; only the idempotency_key
+# obligation drops, because the material-write gate would otherwise demand one
+# for a read that can safely be repeated. Kept beside EXEMPT_PATHS on purpose:
+# this is NOT a validation bypass — tenant_id, actor_subject_id and friends are
+# still required — it only reclassifies the request as a non-write.
+#
+# Format: "<svc>:<path>[,<path>...]" — the literal wildcard {key} is matched
+# as a prefix/suffix rule in the generated MaterialWrite hook.
+POST_READ="configuration-feature-flag-svc:/v1/config/resolve,/v1/flags/{key}/evaluate"
 
 in_list() {
 	local needle="$1" hay="$2" item
@@ -152,7 +164,8 @@ for svc in "${targets[@]}"; do
 		continue
 	fi
 	mkdir -p "$dest"
-	cp "$SRC/envelope.go" "$SRC/policy.go" "$SRC/middleware.go" "$SRC/resolver.go" "$SRC/reporter.go" "$dest/"
+	cp "$SRC/envelope.go" "$SRC/policy.go" "$SRC/middleware.go" "$SRC/resolver.go" "$SRC/reporter.go" \
+		"$SRC/reason.go" "$SRC/fingerprint.go" "$SRC/transition.go" "$dest/"
 
 	legal_entity="NotRequired"
 	in_list "$svc" "$ENTITY_SCOPED" && legal_entity="RequiredOnWrite"
@@ -178,13 +191,42 @@ for svc in "${targets[@]}"; do
 	// Flip to Required once REF-06 ships."
 	fi
 
+	# POST routes that carry a body but change nothing (resolve/evaluate). They
+	# reclassify those routes as non-writes so the idempotency key is not
+	# demanded of a repeatable read; see POST_READ above.
+	go_imports=""
+	read_post_block=""
+	if in_list "$svc" "$POST_READ"; then
+		go_imports='
+import (
+	"net/http"
+	"strings"
+)
+'
+		read_post_block='
+		// POST endpoints that resolve or evaluate and change nothing get the
+		// full envelope except the idempotency_key, which the material-write
+		// gate would otherwise demand for a read. A resolve/evaluate can be
+		// repeated safely. Matches POST_READ in services/_contract/rollout.sh.
+		MaterialWrite: func(r *http.Request) bool {
+			switch {
+			case r.URL.Path == "/v1/config/resolve":
+				return false
+			case strings.HasPrefix(r.URL.Path, "/v1/flags/") && strings.HasSuffix(r.URL.Path, "/evaluate"):
+				return false
+			}
+			return defaultMaterialWrite(r)
+		},
+'
+	fi
+
 	cat > "$dest/contract.go" <<CONTRACT
 // Code generated by services/_contract/rollout.sh. DO NOT EDIT.
 //
 // Regenerate with: services/_contract/rollout.sh $svc
 
 package envelope
-
+$go_imports
 // ServicePolicy is this service's §4 conditional-field policy.
 //
 // The unconditionally mandatory fields — tenant_id, actor_subject_id,
@@ -202,7 +244,7 @@ func ServicePolicy() Policy {
 
 		$book_note
 		BookID: NotRequired,
-$exempt_block	}
+$exempt_block$read_post_block	}
 }
 CONTRACT
 

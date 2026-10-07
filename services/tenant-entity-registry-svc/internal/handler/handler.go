@@ -78,6 +78,9 @@ type Service interface {
 	GetTaxIdentityBundle(ctx context.Context, bundleID string) (*domain.TaxIdentityBundle, error)
 	ListTaxIdentityBundles(ctx context.Context, legalEntityID string) ([]*domain.TaxIdentityBundle, error)
 	TransitionTaxIdentityBundleStatus(ctx context.Context, bundleID string, req domain.TransitionTaxIdentityBundleStatusRequest) error
+
+	// ORG-02/ORG-03 named commands and read surfaces — see org_handler.go.
+	ORGService
 }
 
 // Handler holds all HTTP handler methods.
@@ -91,10 +94,44 @@ func New(s Service, log *zap.Logger) *Handler {
 	return &Handler{svc: s, log: log}
 }
 
+// hostTenantGuard is §8 NP3 for the whole /v1 surface: a request arriving on a
+// hostname bound to tenant A that claims tenant B (X-Tenant-Id) is refused
+// before any handler runs.
+//
+// It used to run only inside ExecuteTenantCommand and ChangeDefaultLocale, so
+// on the other 44 routes — GET /v1/tenants/{B}, every entity read and write —
+// a request on A's host claiming B was served in full (found live on 28 Sep
+// 2026). Those two handlers keep their own check, which compares the PATH
+// tenant; this compares the verified request tenant. A request with no tenant
+// (ResolveTenantByHost, provisioning bootstrap) or on an unbound host passes.
+func (h *Handler) hostTenantGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if claimed := domain.TenantFromContext(r.Context()); claimed != "" {
+			if err := h.svc.VerifyHostTenant(r.Context(), r.Host, claimed); err != nil {
+				h.writeErr(w, r, err)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // RegisterRoutes mounts all endpoints under a chi Router.
 // Route convention: /v1/<resource> — URI-versioned per API-first doctrine.
-func RegisterRoutes(r chi.Router, h *Handler) {
+//
+// mws run inside /v1 AFTER the NP3 host guard — cmd/server passes the
+// Idempotency-Key middleware here so a replay is never answered for a request
+// the guard would refuse.
+func RegisterRoutes(r chi.Router, h *Handler, mws ...func(http.Handler) http.Handler) {
 	r.Route("/v1", func(r chi.Router) {
+		// §8 NP3 on every route, before any handler reads data.
+		r.Use(h.hostTenantGuard)
+		r.Use(mws...)
+
+		// ORG-02/ORG-03 surfaces, registered inside this same /v1 group so
+		// chi's static-before-parameter matching applies across all of them.
+		registerORGRoutes(r, h)
+
 		// ── Tenants ─────────────────────────────────────────────────────────
 		r.Post("/tenants", h.ProvisionTenant)
 		r.Get("/tenants/{tenantID}", h.GetTenant)
@@ -155,6 +192,12 @@ func (h *Handler) ProvisionTenant(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
+	// A repeated onboarding key returns the tenant it already created:
+	// 200, not 201, because nothing was created by THIS request.
+	if t.IdempotentReplay {
+		writeJSON(w, http.StatusOK, t)
+		return
+	}
 	writeJSON(w, http.StatusCreated, t)
 }
 
@@ -200,6 +243,11 @@ func (h *Handler) CreateEntity(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	// The envelope's correlation id when the body names none, so the
+	// event this write emits can be traced back to the request.
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
 	e, err := h.svc.CreateEntity(r.Context(), req)
 	if err != nil {
 		h.writeErr(w, r, err)
@@ -230,6 +278,11 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateWorkspaceRequest
 	if !decode(w, r, &req) {
 		return
+	}
+	// The envelope's correlation id when the body names none, so the
+	// event this write emits can be traced back to the request.
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
 	}
 	ws, err := h.svc.CreateWorkspace(r.Context(), req)
 	if err != nil {
@@ -297,6 +350,11 @@ func (h *Handler) UpdateEntity(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	// The envelope's correlation id when the body names none, so the
+	// event this write emits can be traced back to the request.
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
 	e, err := h.svc.UpdateEntity(r.Context(), chi.URLParam(r, "entityID"), req)
 	if err != nil {
 		h.writeErr(w, r, err)
@@ -338,6 +396,11 @@ func (h *Handler) CreateHierarchy(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	// The envelope's correlation id when the body names none, so the
+	// event this write emits can be traced back to the request.
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
+	}
 	hier, err := h.svc.CreateHierarchy(r.Context(), req)
 	if err != nil {
 		h.writeErr(w, r, err)
@@ -375,6 +438,11 @@ func (h *Handler) AssignJurisdiction(w http.ResponseWriter, r *http.Request) {
 	var req domain.AssignJurisdictionRequest
 	if !decode(w, r, &req) {
 		return
+	}
+	// The envelope's correlation id when the body names none, so the
+	// event this write emits can be traced back to the request.
+	if req.CorrelationID == "" {
+		req.CorrelationID = correlationID(r)
 	}
 	a, err := h.svc.AssignJurisdiction(r.Context(), chi.URLParam(r, "entityID"), req)
 	if err != nil {
@@ -498,6 +566,35 @@ func (h *Handler) TransitionTaxIdentityBundleStatus(w http.ResponseWriter, r *ht
 
 func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	corrID := correlationID(r)
+
+	// ORG-02/ORG-03 sentinels first. They must be checked ahead of the switch
+	// below because several of them wrap ErrConflict-adjacent meanings that a
+	// broader case would otherwise absorb, losing the distinction between
+	// "your version is stale" and "this tenant may not transact at all".
+	// Not a failure: a maker-checker command was filed rather than executed.
+	var pending *registry.PendingApprovalError
+	if errors.As(err, &pending) {
+		writeJSON(w, http.StatusAccepted, pendingApprovalResponse{
+			Status:          "PENDING_APPROVAL",
+			ApprovalRequest: pending.Request,
+		})
+		return
+	}
+
+	// Every refusal carries its §3 typed code (errcodes.go).
+	writeErrJSON := func(w http.ResponseWriter, status int, msg, corrID string) {
+		code, ok := errorCodeFor(err)
+		if !ok {
+			code = codeForStatus(status)
+		}
+		writeErrCoded(w, status, code, msg, corrID)
+	}
+
+	if status, msg, ok := mapORGError(err); ok {
+		writeErrJSON(w, status, msg, corrID)
+		return
+	}
+
 	switch {
 	case errors.Is(err, registry.ErrNotFound):
 		writeErrJSON(w, http.StatusNotFound, "not found", corrID)
@@ -521,14 +618,16 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		writeErrJSON(w, http.StatusConflict, err.Error(), corrID)
 	default:
 		h.log.Error("unhandled service error", zap.Error(err), zap.String("correlation_id", corrID))
-		writeErrJSON(w, http.StatusInternalServerError, "internal server error", corrID)
+		writeErrCoded(w, http.StatusInternalServerError, CodeInternal, "internal server error", corrID)
 	}
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 type errorResponse struct {
-	Error         string `json:"error"`
+	Error string `json:"error"`
+	// ErrorCode is the stable §3 typed code; Error is prose and may change.
+	ErrorCode     string `json:"error_code"`
 	CorrelationID string `json:"correlation_id,omitempty"`
 }
 
@@ -538,8 +637,14 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// writeErrJSON writes a refusal that has no service error behind it; the code
+// follows from the status.
 func writeErrJSON(w http.ResponseWriter, status int, msg, corrID string) {
-	writeJSON(w, status, errorResponse{Error: msg, CorrelationID: corrID})
+	writeErrCoded(w, status, codeForStatus(status), msg, corrID)
+}
+
+func writeErrCoded(w http.ResponseWriter, status int, code, msg, corrID string) {
+	writeJSON(w, status, errorResponse{Error: msg, ErrorCode: code, CorrelationID: corrID})
 }
 
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {

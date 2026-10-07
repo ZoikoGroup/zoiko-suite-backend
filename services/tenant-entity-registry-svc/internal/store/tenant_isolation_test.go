@@ -26,6 +26,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +40,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
 )
 
@@ -46,38 +50,69 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	// Start embedded Postgres
-	dbPort := uint32(15701 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly — see the doc comment on
-			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
-			// main_integration_test.go for why: the unpinned default floats
-			// to whatever major the library calls "latest," and that patch
-			// build can stop resolving from the remote binary repo with no
-			// code change on our side (this is what broke PR #105's CI).
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database("ter_isolation_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
+	ctx := context.Background()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
+
+	if dsn == "" {
+		// Start embedded Postgres
+		dbPort := uint32(15701 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				// Version pinned explicitly — see the doc comment on
+				// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+				// main_integration_test.go for why: the unpinned default floats
+				// to whatever major the library calls "latest," and that patch
+				// build can stop resolving from the remote binary repo with no
+				// code change on our side (this is what broke PR #105's CI).
+				Version(embeddedpostgres.V16).
+				Port(dbPort).
+				Database("ter_isolation_test").
+				Username("postgres").
+				Password("postgres").
+				// Isolate runtime path so concurrent suites don't collide
+				RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-ter-%d", dbPort))),
+		)
+
+		var err error
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err = pg.Start(); err == nil {
+				break
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+
+		if err != nil {
+			// If embedded postgres fails to start (e.g. transient remote binary download rate-limiting in CI),
+			// fall back to the CI-provided Postgres container if reachable.
+			ciDSN := "postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable"
+			fallbackPool, pingErr := pgxpool.New(ctx, ciDSN)
+			if pingErr == nil && fallbackPool.Ping(ctx) == nil {
+				fallbackPool.Close()
+				dsn = ciDSN
+				pg = nil
+			} else {
+				if fallbackPool != nil {
+					fallbackPool.Close()
+				}
+				fmt.Printf("failed to start embedded postgres: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			dsn = fmt.Sprintf(
+				"host=localhost port=%d dbname=ter_isolation_test user=postgres password=postgres sslmode=disable",
+				dbPort,
+			)
+		}
 	}
 
-	dsn := fmt.Sprintf(
-		"host=localhost port=%d dbname=ter_isolation_test user=postgres password=postgres sslmode=disable",
-		dbPort,
-	)
-
-	ctx := context.Background()
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect to postgres: %v\n", err)
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -91,30 +126,71 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
-	// Run migrations
-	migrations := []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_tenant_id_to_junction_tables.up.sql",
-		"000003_add_residency_region_to_policies.up.sql",
-		"000004_add_data_classification.up.sql",
-		"000005_add_workspaces.up.sql",
-	}
-	for _, mig := range migrations {
-		sql, err := os.ReadFile("../../deployments/migrations/" + mig)
-		if err != nil {
-			fmt.Printf("failed to read migration %s: %v\n", mig, err)
-			testPool.Close()
+	// A reused database (CI runs the race-test step against the same testdb
+	// first) still holds every table the migrations create. A hand-written
+	// DROP list only covered the first five migrations' tables, so 000006 then
+	// failed with "already exists". Every table in the schema is dropped
+	// instead — and only on a database whose name marks it as disposable.
+	if !isThrowawayDatabase(ctx, testPool) {
+		fmt.Println("refusing to reset: the target database's name does not contain \"test\"")
+		testPool.Close()
+		if pg != nil {
 			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+	if _, err := testPool.Exec(ctx, `DO $$
+		DECLARE t record;
+		BEGIN
+			FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+				EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', t.tablename);
+			END LOOP;
+		END $$;`); err != nil {
+		fmt.Printf("failed to reset test schema: %v\n", err)
+		testPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+
+	// Run migrations. Discovered from the directory, NOT listed inline: a
+	// hand-written list silently skips the migration added after it was
+	// written, and every test in this file then runs against a schema missing
+	// those tables while still reporting ok. backend-completion-tracker.md
+	// records this estate hitting that exact trap once already.
+	migrations, globErr := filepath.Glob("../../deployments/migrations/*.up.sql")
+	if globErr != nil || len(migrations) == 0 {
+		fmt.Printf("no migrations found: %v\n", globErr)
+		testPool.Close()
+		if pg != nil {
+			_ = pg.Stop()
+		}
+		os.Exit(1)
+	}
+	sort.Strings(migrations)
+	for _, mig := range migrations {
+		sql, readErr := os.ReadFile(mig)
+		if readErr != nil {
+			fmt.Printf("failed to read migration %s: %v\n", mig, readErr)
+			testPool.Close()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-			fmt.Printf("failed to apply migration %s: %v\n", mig, err)
+			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(mig), err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 	}
@@ -124,7 +200,9 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	testPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 
@@ -350,10 +428,11 @@ func TestPgStore_TenantIsolation_EndDateHierarchy(t *testing.T) {
 	ctxB := domain.WithTenant(ctx, b.tenantID)
 	endDate := time.Now().UTC()
 
-	// EndDateHierarchy returns no error even on 0 rows (it's idempotent).
-	// The proof is in whether the row was actually modified.
+	// Under RLS tenant A's row does not exist for tenant B, so the attempt is
+	// refused as not-found (it used to report success on 0 rows). The real
+	// proof is still below: the row was not modified.
 	err := s.EndDateHierarchy(ctxB, a.hierarchyID, endDate, "attacker", "corr-x")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, registry.ErrNotFound)
 
 	// Verify: tenant A's hierarchy's effective_to should still be NULL.
 	rows, err := s.ListHierarchiesByEntity(
@@ -399,8 +478,9 @@ func TestPgStore_TenantIsolation_EndDateJurisdictionAssignment(t *testing.T) {
 	b := setupIsolationFixture(t, s, "ISO-B-EndDateAssignment")
 
 	ctxB := domain.WithTenant(ctx, b.tenantID)
+	// Refused as not-found: under RLS tenant A's row does not exist for B.
 	err := s.EndDateJurisdictionAssignment(ctxB, a.assignmentID, time.Now().UTC(), "attacker", "corr-x")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, registry.ErrNotFound)
 
 	// Verify: tenant A's assignment is still active (effective_to = NULL).
 	ctxA := domain.WithTenant(context.Background(), a.tenantID)
@@ -531,4 +611,15 @@ func TestPgStore_TenantIsolation_TransitionTenantLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, tenant)
 	assert.Equal(t, domain.TenantLifecycleOnboarding, tenant.LifecycleState, "ISOLATION FAILURE: tenant B transitioned tenant A's lifecycle state")
+}
+
+// isThrowawayDatabase reports whether the connected database is recognisably
+// disposable. The reset above drops every table, so it must never run against
+// a database that holds real tenants.
+func isThrowawayDatabase(ctx context.Context, pool *pgxpool.Pool) bool {
+	var name string
+	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&name); err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(name), "test")
 }

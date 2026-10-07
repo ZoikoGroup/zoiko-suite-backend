@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"zoiko.io/migration-integrity-svc/internal/middleware"
 )
 
 var (
@@ -20,6 +22,16 @@ var (
 	// ErrAuthorizationDenied is returned when authorization-svc explicitly
 	// denies the requested action.
 	ErrAuthorizationDenied = errors.New("authorization denied")
+	// ErrTenantMissing is returned when ctx carries no verified tenant.
+	// middleware.GetTenantID returns "" rather than a fabricated default
+	// precisely so a caller missing tenant scope fails instead of silently
+	// resolving against some other tenant's RLS rows (see tenant.go's doc
+	// comment on the "default-tenant" incident this mirrors). Substituting a
+	// placeholder tenant here for the authorization call would reopen the
+	// same hole one layer up: the decision would be evaluated, and
+	// potentially GRANTED, against a tenant the caller was never verified
+	// to belong to.
+	ErrTenantMissing = errors.New("no verified tenant in context")
 )
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
@@ -139,10 +151,16 @@ func (c *Client) storeCache(key string, decision error) {
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
 func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	tenantID := middleware.GetTenantID(ctx)
+	if tenantID == "" {
+		return ErrTenantMissing
+	}
+
 	reqBody, err := json.Marshal(map[string]string{
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
 		"action_type":     actionType,
+		"tenant_id":       tenantID,
 	})
 	if err != nil {
 		return err
@@ -153,6 +171,14 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Actor-Subject-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Request-Id", "authz-req-"+uuid.New().String())
+	req.Header.Set("X-Correlation-Id", "authz-corr-"+uuid.New().String())
+	req.Header.Set("X-Source-Channel", "web")
+	req.Header.Set("Idempotency-Key", "authz-idemp-"+uuid.New().String())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

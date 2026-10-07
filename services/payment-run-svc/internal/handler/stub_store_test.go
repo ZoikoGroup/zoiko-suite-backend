@@ -63,7 +63,8 @@ func (s *stubStore) CreateRun(_ context.Context, tenantID string, req domain.Cre
 	for _, ins := range instructions {
 		created := domain.RunInstruction{
 			InstructionID: uuid.New().String(), TenantID: run.TenantID, RunID: run.RunID,
-			AuthorizationID: ins.AuthorizationID, PayeeRef: ins.PayeeRef, NetAmount: ins.NetAmount,
+			AuthorizationID: ins.AuthorizationID, AuthorizationFingerprint: ins.AuthorizationFingerprint,
+			PayeeRef: ins.PayeeRef, NetAmount: ins.NetAmount,
 			Currency: ins.Currency, Status: domain.InstructionPending, CreatedAt: now,
 		}
 		s.instructions[created.InstructionID] = &created

@@ -76,7 +76,7 @@ var generatedServices = []Service{
 		DBName: "audit_event_store",
 		Env: map[string]string{
 			"KAFKA_GROUP_ID": "audit-event-store-svc",
-			"KAFKA_TOPICS":   "zoiko.identity.events,zoiko.entity.events",
+			"KAFKA_TOPICS":   "zoiko.identity.events,zoiko.entity.events,zoiko.workflow.events",
 		},
 	},
 	{

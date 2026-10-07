@@ -107,6 +107,10 @@ func (h *Handler) CreateVATReturn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.CreateVATReturn(r.Context(), vret); err != nil {
+		if errors.Is(err, domain.ErrVATReturnConflict) {
+			writeError(w, http.StatusConflict, "vat return for this period already exists")
+			return
+		}
 		h.logger.Error("create vat return failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create vat return")
 		return
@@ -128,6 +132,7 @@ func (h *Handler) GetVATReturn(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "vat return not found")
 			return
 		}
+		h.logger.Error("failed to get vat return", zap.Error(err), zap.String("return_id", id))
 		writeError(w, http.StatusInternalServerError, "failed to get vat return")
 		return
 	}
@@ -140,6 +145,7 @@ func (h *Handler) ListVATReturns(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 	returns, err := h.store.ListVATReturns(r.Context(), legalEntityID, jurisdictionID, status)
 	if err != nil {
+		h.logger.Error("failed to list vat returns", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to list vat returns")
 		return
 	}
@@ -159,6 +165,7 @@ func (h *Handler) UpdateVATReturn(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "vat return not found")
 			return
 		}
+		h.logger.Error("failed to fetch vat return for update", zap.Error(err), zap.String("return_id", id))
 		writeError(w, http.StatusInternalServerError, "failed to fetch vat return")
 		return
 	}
@@ -180,6 +187,7 @@ func (h *Handler) UpdateVATReturn(w http.ResponseWriter, r *http.Request) {
 	existing.InputTaxAmount = req.InputTaxAmount
 
 	if err := h.store.UpdateVATReturn(r.Context(), existing); err != nil {
+		h.logger.Error("failed to update vat return", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to update vat return")
 		return
 	}
@@ -212,6 +220,7 @@ func (h *Handler) FileVATReturn(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "vat return not found")
 			return
 		}
+		h.logger.Error("failed to fetch vat return for filing", zap.Error(err), zap.String("return_id", id))
 		writeError(w, http.StatusInternalServerError, "failed to fetch vat return")
 		return
 	}

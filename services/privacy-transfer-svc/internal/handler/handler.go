@@ -2,10 +2,15 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -51,26 +56,33 @@ func New(st store.Store, pub events.Publisher, az AuthzChecker, purposes Purpose
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
-	r.Route("/privacy/processor-relationships", func(r chi.Router) {
-		r.Post("/", h.CreateRelationship)
-		r.Get("/", h.ListRelationships)
-		r.Get("/{relationshipID}", h.GetRelationship)
-		r.Post("/{relationshipID}/status", h.UpdateRelationshipStatus)
-		r.Post("/{relationshipID}/subprocessors", h.AttachSubprocessor)
-		r.Get("/{relationshipID}/subprocessors", h.ListSubprocessors)
-	})
-	r.Route("/privacy/transfer-mechanisms", func(r chi.Router) {
-		r.Post("/", h.CreateMechanism)
-		r.Get("/{mechanismID}", h.GetMechanism)
-	})
-	r.Route("/privacy/transfer-assessments", func(r chi.Router) {
-		r.Post("/", h.RecordAssessment)
-		r.Get("/", h.GetLatestAssessment)
-	})
-	r.Route("/privacy/transfer-decisions", func(r chi.Router) {
-		r.Post("/", h.EvaluateTransfer)
-		r.Get("/{decisionID}", h.GetDecision)
-	})
+	mountRoutes := func(prefix string) {
+		r.Route(prefix+"/processor-relationships", func(r chi.Router) {
+			r.Post("/", h.CreateRelationship)
+			r.Get("/", h.ListRelationships)
+			r.Get("/{relationshipID}", h.GetRelationship)
+			r.Post("/{relationshipID}/status", h.UpdateRelationshipStatus)
+			r.Post("/{relationshipID}/subprocessors", h.AttachSubprocessor)
+			r.Get("/{relationshipID}/subprocessors", h.ListSubprocessors)
+		})
+		r.Route(prefix+"/transfer-mechanisms", func(r chi.Router) {
+			r.Post("/", h.CreateMechanism)
+			r.Get("/{mechanismID}", h.GetMechanism)
+		})
+		r.Route(prefix+"/transfer-assessments", func(r chi.Router) {
+			r.Post("/", h.RecordAssessment)
+			r.Get("/", h.GetLatestAssessment)
+			r.Post("/evaluate-triggers", h.EvaluateTriggers)
+			r.Get("/triggers", h.EvaluateTriggers)
+		})
+		r.Route(prefix+"/transfer-decisions", func(r chi.Router) {
+			r.Post("/", h.EvaluateTransfer)
+			r.Get("/{decisionID}", h.GetDecision)
+		})
+	}
+
+	mountRoutes("/privacy")
+	mountRoutes("/v1/privacy")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -81,6 +93,72 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func readBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return body, nil
+}
+
+func hashBody(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func (h *Handler) checkIdempotency(w http.ResponseWriter, r *http.Request, tenantID, principalID string, body []byte) (*domain.IdempotencyRecord, bool, string, string) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		key = r.Header.Get("X-Idempotency-Key")
+	}
+	if key == "" {
+		return nil, false, "", ""
+	}
+	reqHash := hashBody(body)
+	existing, err := h.store.GetIdempotency(r.Context(), tenantID, key)
+	if err != nil {
+		h.log.Warn("idempotency lookup error", zap.Error(err))
+		return nil, false, key, reqHash
+	}
+	if existing != nil {
+		if existing.RequestHash != reqHash {
+			writeError(w, http.StatusConflict, domain.ErrIdempotencyConflict.Error())
+			return existing, true, key, reqHash
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Idempotency-Replay", "true")
+		w.WriteHeader(existing.ResponseCode)
+		_, _ = w.Write(existing.ResponseBody)
+		return existing, true, key, reqHash
+	}
+	return nil, false, key, reqHash
+}
+
+func (h *Handler) writeJSONWithIdempotency(ctx context.Context, w http.ResponseWriter, tenantID, principalID, endpoint, key, reqHash string, status int, v interface{}) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal response")
+		return
+	}
+	if key != "" {
+		_ = h.store.SaveIdempotency(ctx, domain.IdempotencyRecord{
+			IdempotencyKey: key,
+			TenantID:       tenantID,
+			Endpoint:       endpoint,
+			RequestHash:    reqHash,
+			ResponseCode:   status,
+			ResponseBody:   body,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -115,8 +193,13 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 // purpose_activity_refs, if supplied, are validated against a REAL call
 // to privacy-purpose-registry-svc — each must resolve to ACTIVE.
 func (h *Handler) CreateRelationship(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := readBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
 	var req domain.CreateProcessorRelationshipRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -140,6 +223,12 @@ func (h *Handler) CreateRelationship(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.authorize(w, r, principalID, tenantID, PrivacyTransferRelationshipManage) {
+		return
+	}
+
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
 		return
 	}
 
@@ -167,7 +256,7 @@ func (h *Handler) CreateRelationship(w http.ResponseWriter, r *http.Request) {
 		EventType: "privacy.processor_relationship.created", EntityID: relationship.RelationshipID, TenantID: tenantID,
 		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: relationship,
 	})
-	writeJSON(w, http.StatusCreated, relationship)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateRelationship", idemKey, reqHash, http.StatusCreated, relationship)
 }
 
 func (h *Handler) GetRelationship(w http.ResponseWriter, r *http.Request) {
@@ -200,8 +289,13 @@ func (h *Handler) ListRelationships(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateRelationshipStatus(w http.ResponseWriter, r *http.Request) {
 	relationshipID := chi.URLParam(r, "relationshipID")
+	bodyBytes, err := readBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
 	var req domain.UpdateRelationshipStatusRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -232,6 +326,12 @@ func (h *Handler) UpdateRelationshipStatus(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
+		return
+	}
+
 	updated, err := h.store.UpdateRelationshipStatus(r.Context(), relationshipID, req.Status)
 	if err != nil {
 		if errors.Is(err, domain.ErrRelationshipNotFound) {
@@ -242,15 +342,20 @@ func (h *Handler) UpdateRelationshipStatus(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, updated)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "UpdateRelationshipStatus", idemKey, reqHash, http.StatusOK, updated)
 }
 
 // ── subprocessors ────────────────────────────────────────────────────────────
 
 func (h *Handler) AttachSubprocessor(w http.ResponseWriter, r *http.Request) {
 	relationshipID := chi.URLParam(r, "relationshipID")
+	bodyBytes, err := readBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
 	var req domain.AttachSubprocessorRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -281,6 +386,12 @@ func (h *Handler) AttachSubprocessor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
+		return
+	}
+
 	sp, err := h.store.AttachSubprocessor(r.Context(), relationshipID, req, principalID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRelationshipNotFound) {
@@ -291,7 +402,7 @@ func (h *Handler) AttachSubprocessor(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	writeJSON(w, http.StatusCreated, sp)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "AttachSubprocessor", idemKey, reqHash, http.StatusCreated, sp)
 }
 
 func (h *Handler) ListSubprocessors(w http.ResponseWriter, r *http.Request) {
@@ -311,8 +422,13 @@ func (h *Handler) ListSubprocessors(w http.ResponseWriter, r *http.Request) {
 // ── transfer mechanisms ──────────────────────────────────────────────────────
 
 func (h *Handler) CreateMechanism(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := readBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
 	var req domain.CreateTransferMechanismRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -343,13 +459,19 @@ func (h *Handler) CreateMechanism(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
+		return
+	}
+
 	mechanism, err := h.store.CreateMechanism(r.Context(), tenantID, req, principalID)
 	if err != nil {
 		h.log.Error("CreateMechanism: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	writeJSON(w, http.StatusCreated, mechanism)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "CreateMechanism", idemKey, reqHash, http.StatusCreated, mechanism)
 }
 
 func (h *Handler) GetMechanism(w http.ResponseWriter, r *http.Request) {
@@ -370,8 +492,13 @@ func (h *Handler) GetMechanism(w http.ResponseWriter, r *http.Request) {
 // ── transfer assessments ─────────────────────────────────────────────────────
 
 func (h *Handler) RecordAssessment(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := readBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
 	var req domain.RecordTransferAssessmentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -406,13 +533,19 @@ func (h *Handler) RecordAssessment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
+		return
+	}
+
 	assessment, err := h.store.RecordAssessment(r.Context(), tenantID, req, principalID)
 	if err != nil {
 		h.log.Error("RecordAssessment: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	writeJSON(w, http.StatusCreated, assessment)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "RecordAssessment", idemKey, reqHash, http.StatusCreated, assessment)
 }
 
 func (h *Handler) GetLatestAssessment(w http.ResponseWriter, r *http.Request) {
@@ -448,8 +581,13 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	bodyBytes, err := readBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
 	var req domain.EvaluateTransferRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -466,6 +604,12 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 	tenantID := req.TenantID
 	if tenantID == "" {
 		tenantID = verifiedTenant
+	}
+
+	// Check idempotency (§18.1)
+	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
+	if handled {
+		return
 	}
 
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -488,7 +632,7 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 		EventType: "privacy.transfer_decision.evaluated", EntityID: decision.DecisionID, TenantID: tenantID,
 		ActorID: principalID, CorrelationID: correlationID, Payload: decision,
 	})
-	writeJSON(w, http.StatusOK, decision)
+	h.writeJSONWithIdempotency(r.Context(), w, tenantID, principalID, "EvaluateTransfer", idemKey, reqHash, http.StatusOK, decision)
 }
 
 // evaluate is §17.2's fail-closed doctrine encoded literally: "If a
@@ -503,47 +647,103 @@ func (h *Handler) evaluate(ctx context.Context, req *domain.EvaluateTransferRequ
 	relationship, err := h.store.FindRelationship(ctx, req.RelationshipID)
 	if err != nil {
 		if errors.Is(err, domain.ErrRelationshipNotFound) {
-			return domain.ResultBlocked, []string{domain.ReasonRelationshipNotActive}
+			return domain.ResultBlocked, makeReasons(domain.ReasonRelationshipNotActive, "PROCESSOR_RELATIONSHIP_NOT_ACTIVE")
 		}
 		h.log.Error("evaluate: relationship lookup failed", zap.Error(err))
-		return domain.ResultReviewRequired, []string{domain.ReasonDependencyUnavailable}
+		return domain.ResultReviewRequired, makeReasons(domain.ReasonDependencyUnavailable, "DEPENDENCY_UNAVAILABLE")
 	}
 	if relationship.Status != domain.RelationshipActive {
-		return domain.ResultBlocked, []string{domain.ReasonRelationshipNotActive}
+		return domain.ResultBlocked, makeReasons(domain.ReasonRelationshipNotActive, "PROCESSOR_RELATIONSHIP_NOT_ACTIVE")
 	}
 
 	mechanism, err := h.store.FindMechanism(ctx, req.TransferMechanismID)
 	if err != nil {
 		if errors.Is(err, domain.ErrMechanismNotFound) {
-			return domain.ResultBlocked, []string{domain.ReasonMechanismNotFound}
+			return domain.ResultBlocked, makeReasons(domain.ReasonMechanismNotFound, "TRANSFER_MECHANISM_NOT_FOUND")
 		}
 		h.log.Error("evaluate: mechanism lookup failed", zap.Error(err))
-		return domain.ResultReviewRequired, []string{domain.ReasonDependencyUnavailable}
+		return domain.ResultReviewRequired, makeReasons(domain.ReasonDependencyUnavailable, "DEPENDENCY_UNAVAILABLE")
 	}
 	now := time.Now().UTC()
 	if !mechanism.ValidAsOf(now) {
-		return domain.ResultBlocked, []string{domain.ReasonMechanismExpired}
+		return domain.ResultBlocked, makeReasons(domain.ReasonMechanismExpired, "TRANSFER_MECHANISM_INVALID_OR_EXPIRED")
+	}
+	if mechanism.ValidUntil != nil {
+		decision.ExpiresAt = mechanism.ValidUntil
 	}
 
+	var latestAssessment *domain.TransferAssessment
 	if req.AssessmentRequired {
 		assessment, err := h.store.FindLatestAssessment(ctx, req.RelationshipID)
 		if err != nil {
 			h.log.Error("evaluate: assessment lookup failed", zap.Error(err))
-			return domain.ResultReviewRequired, []string{domain.ReasonDependencyUnavailable}
+			return domain.ResultReviewRequired, makeReasons(domain.ReasonDependencyUnavailable, "DEPENDENCY_UNAVAILABLE")
 		}
 		if assessment == nil {
-			return domain.ResultReviewRequired, []string{domain.ReasonAssessmentMissing}
+			return domain.ResultReviewRequired, makeReasons(domain.ReasonAssessmentMissing, "ASSESSMENT_REQUIRED_NOT_FOUND")
 		}
 		decision.AssessmentID = &assessment.AssessmentID
+		latestAssessment = assessment
+
 		switch assessment.Outcome {
 		case domain.AssessmentReject:
-			return domain.ResultBlocked, []string{domain.ReasonAssessmentRejected}
+			return domain.ResultBlocked, makeReasons(domain.ReasonAssessmentRejected, "ASSESSMENT_REJECTED")
 		case domain.AssessmentRemediate:
-			return domain.ResultReviewRequired, []string{domain.ReasonAssessmentRemediate}
+			return domain.ResultReviewRequired, makeReasons(domain.ReasonAssessmentRemediate, "ASSESSMENT_REQUIRES_REMEDIATION")
 		}
+
+		// §17.1 Mandatory Reassessment Trigger 8: Expiry review date reached
 		if assessment.ExpiredAsOf(now) {
-			return domain.ResultReviewRequired, []string{domain.ReasonAssessmentExpired}
+			return domain.ResultReviewRequired, makeReasons(domain.ReasonAssessmentExpired, "ASSESSMENT_EXPIRED")
 		}
+		if assessment.ReviewTriggerAt != nil {
+			if decision.ExpiresAt == nil || assessment.ReviewTriggerAt.Before(*decision.ExpiresAt) {
+				decision.ExpiresAt = assessment.ReviewTriggerAt
+			}
+		}
+
+		// §17.1 Mandatory Reassessment Trigger 4: Changed transfer mechanism since assessment
+		if mechanism.CreatedAt.After(assessment.CreatedAt) {
+			return domain.ResultReviewRequired, makeReasons("PRV-016: REASSESSMENT_TRIGGER_CHANGED_TRANSFER_MECHANISM", "CHANGED_TRANSFER_MECHANISM_OR_INSTRUCTION")
+		}
+	}
+
+	// §17.1 Mandatory Reassessment Trigger 3: New destination jurisdiction outside declared scope
+	if req.DestinationJurisdiction != "" && len(relationship.Jurisdictions) > 0 && !contains(relationship.Jurisdictions, req.DestinationJurisdiction) {
+		return domain.ResultReviewRequired, makeReasons("PRV-016: REASSESSMENT_TRIGGER_NEW_DESTINATION_JURISDICTION", "NEW_PROCESSOR_OR_DESTINATION_JURISDICTION")
+	}
+
+	// §17.1 Mandatory Reassessment Trigger 6: New minors context
+	if (contains(req.SubjectClasses, "MINORS") || contains(req.SubjectClasses, "CHILDREN")) && !contains(relationship.SubjectClasses, "MINORS") && !contains(relationship.SubjectClasses, "CHILDREN") {
+		return domain.ResultReviewRequired, makeReasons("PRV-016: REASSESSMENT_TRIGGER_NEW_MINORS_CONTEXT", "NEW_MINORS_CONTEXT")
+	}
+
+	// §17.1 Mandatory Reassessment Trigger 1/2/5/7: Explicit declared trigger
+	if req.ReassessmentTrigger != "" {
+		code := "PRV-016: REASSESSMENT_TRIGGER_" + req.ReassessmentTrigger
+		return domain.ResultReviewRequired, makeReasons(code, req.ReassessmentTrigger)
+	}
+
+	// §16.1 & §18: Evaluate CONDITIONAL outcome vs AUTHORIZED
+	var conds []string
+	if latestAssessment != nil {
+		if latestAssessment.TechnicalMeasures != "" {
+			conds = append(conds, "Technical: "+latestAssessment.TechnicalMeasures)
+		}
+		if latestAssessment.OrganizationalMeasures != "" {
+			conds = append(conds, "Organizational: "+latestAssessment.OrganizationalMeasures)
+		}
+	}
+	if req.Conditions != "" {
+		conds = append(conds, req.Conditions)
+	}
+	if req.EnforceConditions && mechanism.Conditions != "" {
+		conds = append(conds, mechanism.Conditions)
+	}
+
+	if len(conds) > 0 {
+		decision.Conditions = strings.Join(conds, "; ")
+		return domain.ResultConditional, []string{}
 	}
 
 	return domain.ResultAuthorized, []string{}
@@ -562,4 +762,212 @@ func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
+}
+
+// EvaluateTriggers evaluates all 8 mandatory reassessment triggers (§17.1) for a relationship.
+func (h *Handler) EvaluateTriggers(w http.ResponseWriter, r *http.Request) {
+	var req domain.EvaluateTriggersRequest
+	if r.Method == http.MethodPost {
+		bodyBytes, err := readBody(r)
+		if err == nil && len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &req)
+		}
+	}
+	if req.RelationshipID == "" {
+		req.RelationshipID = r.URL.Query().Get("relationship_id")
+	}
+	if req.RelationshipID == "" {
+		writeError(w, http.StatusBadRequest, "relationship_id is required")
+		return
+	}
+	if req.TransferMechanismID == "" {
+		req.TransferMechanismID = r.URL.Query().Get("transfer_mechanism_id")
+	}
+	if req.DestinationJurisdiction == "" {
+		req.DestinationJurisdiction = r.URL.Query().Get("destination_jurisdiction")
+	}
+	if req.DeclaredTrigger == "" {
+		req.DeclaredTrigger = r.URL.Query().Get("declared_trigger")
+	}
+
+	relationship, err := h.store.FindRelationship(r.Context(), req.RelationshipID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRelationshipNotFound) {
+			writeError(w, http.StatusNotFound, "processor relationship not found")
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
+
+	assessment, _ := h.store.FindLatestAssessment(r.Context(), req.RelationshipID)
+
+	var mechanism *domain.TransferMechanism
+	if req.TransferMechanismID != "" {
+		mechanism, _ = h.store.FindMechanism(r.Context(), req.TransferMechanismID)
+	}
+
+	now := time.Now().UTC()
+	var evals []domain.TriggerEvaluation
+	var activeTriggers []string
+
+	// Trigger 1: New purpose or sensitive category
+	t1 := domain.TriggerEvaluation{
+		Trigger:     domain.TriggerNewPurposeOrSensitiveCategory,
+		Description: "New purpose, materially expanded purpose or new sensitive/special data category",
+		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_NEW_PURPOSE_OR_SENSITIVE_CATEGORY",
+	}
+	for _, cat := range req.DataCategories {
+		if containsSensitive(cat) && !contains(relationship.DataCategories, cat) {
+			t1.Triggered = true
+			break
+		}
+	}
+	if req.DeclaredTrigger == domain.TriggerNewPurposeOrSensitiveCategory {
+		t1.Triggered = true
+	}
+	if t1.Triggered {
+		activeTriggers = append(activeTriggers, t1.Trigger)
+	}
+	evals = append(evals, t1)
+
+	// Trigger 2: New automated decisioning
+	t2 := domain.TriggerEvaluation{
+		Trigger:     domain.TriggerAutomatedDecisioning,
+		Description: "New automated decisioning/profiling or materially increased effect on individuals",
+		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_AUTOMATED_DECISIONING",
+		Triggered:   req.DeclaredTrigger == domain.TriggerAutomatedDecisioning,
+	}
+	if t2.Triggered {
+		activeTriggers = append(activeTriggers, t2.Trigger)
+	}
+	evals = append(evals, t2)
+
+	// Trigger 3: New processor or destination jurisdiction
+	t3 := domain.TriggerEvaluation{
+		Trigger:     domain.TriggerNewProcessorOrJurisdiction,
+		Description: "New processor/subprocessor or destination jurisdiction/region",
+		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_NEW_DESTINATION_JURISDICTION",
+	}
+	if req.DestinationJurisdiction != "" && len(relationship.Jurisdictions) > 0 && !contains(relationship.Jurisdictions, req.DestinationJurisdiction) {
+		t3.Triggered = true
+	}
+	if req.DeclaredTrigger == domain.TriggerNewProcessorOrJurisdiction {
+		t3.Triggered = true
+	}
+	if t3.Triggered {
+		activeTriggers = append(activeTriggers, t3.Trigger)
+	}
+	evals = append(evals, t3)
+
+	// Trigger 4: Changed transfer mechanism or instruction
+	t4 := domain.TriggerEvaluation{
+		Trigger:     domain.TriggerChangedTransferMechanism,
+		Description: "Changed transfer mechanism, legal validity, processing instruction or recipient category",
+		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_CHANGED_TRANSFER_MECHANISM",
+	}
+	if mechanism != nil && assessment != nil && mechanism.CreatedAt.After(assessment.CreatedAt) {
+		t4.Triggered = true
+	}
+	if req.DeclaredTrigger == domain.TriggerChangedTransferMechanism {
+		t4.Triggered = true
+	}
+	if t4.Triggered {
+		activeTriggers = append(activeTriggers, t4.Trigger)
+	}
+	evals = append(evals, t4)
+
+	// Trigger 5: Material architecture change
+	t5 := domain.TriggerEvaluation{
+		Trigger:     domain.TriggerMaterialArchitectureChange,
+		Description: "Material architecture change affecting data access, observability, model training or re-identification risk",
+		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_MATERIAL_ARCHITECTURE_CHANGE",
+		Triggered:   req.DeclaredTrigger == domain.TriggerMaterialArchitectureChange,
+	}
+	if t5.Triggered {
+		activeTriggers = append(activeTriggers, t5.Trigger)
+	}
+	evals = append(evals, t5)
+
+	// Trigger 6: New minors context
+	t6 := domain.TriggerEvaluation{
+		Trigger:     domain.TriggerNewMinorsContext,
+		Description: "New children/minors context or materially changed age-assurance model",
+		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_NEW_MINORS_CONTEXT",
+	}
+	if (contains(req.SubjectClasses, "MINORS") || contains(req.SubjectClasses, "CHILDREN")) && !contains(relationship.SubjectClasses, "MINORS") && !contains(relationship.SubjectClasses, "CHILDREN") {
+		t6.Triggered = true
+	}
+	if req.DeclaredTrigger == domain.TriggerNewMinorsContext {
+		t6.Triggered = true
+	}
+	if t6.Triggered {
+		activeTriggers = append(activeTriggers, t6.Trigger)
+	}
+	evals = append(evals, t6)
+
+	// Trigger 7: Security or privacy incident
+	t7 := domain.TriggerEvaluation{
+		Trigger:     domain.TriggerSecurityPrivacyIncident,
+		Description: "Privacy/security incident revealing an unmodeled risk or control failure",
+		ReasonCode:  "PRV-016: REASSESSMENT_TRIGGER_SECURITY_PRIVACY_INCIDENT",
+		Triggered:   req.DeclaredTrigger == domain.TriggerSecurityPrivacyIncident,
+	}
+	if t7.Triggered {
+		activeTriggers = append(activeTriggers, t7.Trigger)
+	}
+	evals = append(evals, t7)
+
+	// Trigger 8: Expiry review date reached
+	t8 := domain.TriggerEvaluation{
+		Trigger:     domain.TriggerExpiryReviewDateReached,
+		Description: "Expiry/review date reached or PDC legal-rule package marks prior authorization stale",
+		ReasonCode:  "PRV-016: ASSESSMENT_EXPIRED",
+	}
+	if assessment != nil && assessment.ExpiredAsOf(now) {
+		t8.Triggered = true
+	}
+	if req.DeclaredTrigger == domain.TriggerExpiryReviewDateReached {
+		t8.Triggered = true
+	}
+	if t8.Triggered {
+		activeTriggers = append(activeTriggers, t8.Trigger)
+	}
+	evals = append(evals, t8)
+
+	resp := domain.EvaluateTriggersResponse{
+		RelationshipID:     req.RelationshipID,
+		ReassessmentNeeded: len(activeTriggers) > 0,
+		ActiveTriggers:     activeTriggers,
+		TriggerEvaluations: evals,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func contains(list []string, item string) bool {
+	for _, s := range list {
+		if strings.EqualFold(s, item) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSensitive(cat string) bool {
+	upper := strings.ToUpper(cat)
+	return strings.Contains(upper, "HEALTH") ||
+		strings.Contains(upper, "BIOMETRIC") ||
+		strings.Contains(upper, "GENETIC") ||
+		strings.Contains(upper, "SPECIAL") ||
+		strings.Contains(upper, "CRIMINAL") ||
+		strings.Contains(upper, "SEXUAL") ||
+		strings.Contains(upper, "RELIGIOUS") ||
+		strings.Contains(upper, "POLITICAL")
+}
+
+func makeReasons(code, symbol string) []string {
+	if code == symbol || symbol == "" {
+		return []string{code}
+	}
+	return []string{code, symbol}
 }

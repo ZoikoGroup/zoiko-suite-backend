@@ -9,6 +9,10 @@ var (
 	ErrTaxReturnNotFound = errors.New("corporate tax return not found")
 	ErrAlreadySubmitted  = errors.New("corporate tax return is already submitted")
 	ErrInvalidTaxYear    = errors.New("invalid tax year")
+
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
 )
 
 // FilingStatus represents the lifecycle of a corporate tax return.

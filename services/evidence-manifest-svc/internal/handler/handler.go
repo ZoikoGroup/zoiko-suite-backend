@@ -26,6 +26,34 @@ type Store interface {
 	FinalizeFailed(ctx context.Context, manifestID, reason string) (*domain.EvidenceManifest, error)
 	FindManifestByID(ctx context.Context, manifestID string) (*domain.EvidenceManifest, error)
 	ListRecords(ctx context.Context, manifestID string) ([]domain.ManifestRecord, error)
+
+	// AUD-03 Audit Population — see internal/store/population_store.go's
+	// own doc comments for the enforcement mechanisms.
+	DefinePopulation(ctx context.Context, params domain.DefinePopulationParams) (*domain.AuditPopulation, bool, error)
+	GetAuditPopulation(ctx context.Context, tenantID, populationID string) (*domain.AuditPopulation, error)
+	ListAuditPopulationsByEngagement(ctx context.Context, tenantID, engagementID string) ([]*domain.AuditPopulation, error)
+	BuildPopulation(ctx context.Context, params domain.BuildPopulationParams) (*domain.AuditPopulation, bool, error)
+	ValidatePopulation(ctx context.Context, params domain.ValidatePopulationParams) (*domain.AuditPopulation, bool, error)
+	FreezePopulation(ctx context.Context, params domain.FreezePopulationParams) (*domain.AuditPopulation, bool, error)
+	SupersedePopulation(ctx context.Context, params domain.SupersedePopulationParams) (*domain.AuditPopulation, bool, error)
+	QuarantinePopulation(ctx context.Context, params domain.QuarantinePopulationParams) (*domain.AuditPopulation, bool, error)
+	AddControlledDelta(ctx context.Context, params domain.AddControlledDeltaParams) (*domain.AuditPopulation, bool, error)
+	GetControlTotals(ctx context.Context, tenantID, populationID string) ([]*domain.PopulationControlTotal, error)
+
+	// AUD-04 Sampling — see internal/store/sampling_store.go's own doc
+	// comments for the enforcement mechanisms.
+	CreateSamplingParameterSet(ctx context.Context, params domain.CreateSamplingParameterSetParams) (*domain.SamplingParameterSet, error)
+	CreateSampleDesign(ctx context.Context, params domain.CreateSampleDesignParams) (*domain.SampleDesign, bool, error)
+	GetSampleDesign(ctx context.Context, tenantID, designID string) (*domain.SampleDesign, error)
+	ApproveSampleDesign(ctx context.Context, params domain.ApproveSampleDesignParams) (*domain.SampleDesign, bool, error)
+	SelectSample(ctx context.Context, params domain.SelectSampleParams) (*domain.SampleSelection, []*domain.SampleItem, bool, error)
+	ReproduceSelection(ctx context.Context, tenantID, selectionID string) (bool, error)
+	GetItemResults(ctx context.Context, tenantID, designID string) ([]*domain.SampleItem, error)
+	RecordItemResult(ctx context.Context, params domain.RecordItemResultParams) (*domain.SampleItem, bool, error)
+	RecordNonresponse(ctx context.Context, params domain.RecordNonresponseParams) (*domain.SampleItem, bool, error)
+	AddAlternativeProcedure(ctx context.Context, params domain.AddAlternativeProcedureParams) (*domain.SampleItem, bool, error)
+	EvaluateSample(ctx context.Context, params domain.EvaluateSampleParams) (*domain.SampleEvaluation, bool, error)
+	SupersedeSample(ctx context.Context, params domain.SupersedeSampleParams) (*domain.SampleDesign, bool, error)
 }
 
 type Publisher interface {
@@ -52,6 +80,7 @@ type WorkflowSource interface {
 // doc named directly — see aggregator.WorkflowHistoryClient's doc comment.
 type WorkflowHistorySource interface {
 	ListByInstanceID(ctx context.Context, workflowInstanceID string) ([]aggregator.SourceRecord, error)
+	ListByEntityAndDateRange(ctx context.Context, legalEntityID string, from, to time.Time) ([]aggregator.SourceRecord, error)
 }
 
 // Action constants passed to authorization-svc as action_type.
@@ -130,6 +159,36 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{manifestID}", h.GetManifest)
 		r.Get("/{manifestID}/records", h.ListRecords)
 	})
+	r.Route("/v1/audit-populations", func(r chi.Router) {
+		r.Post("/", h.DefinePopulation)
+		r.Get("/{population_id}", h.GetAuditPopulation)
+		r.Post("/{population_id}/build", h.BuildPopulation)
+		r.Post("/{population_id}/validate", h.ValidatePopulation)
+		r.Post("/{population_id}/freeze", h.FreezePopulation)
+		r.Post("/{population_id}/supersede", h.SupersedePopulation)
+		r.Post("/{population_id}/quarantine", h.QuarantinePopulation)
+		r.Post("/{population_id}/delta", h.AddControlledDelta)
+		r.Get("/{population_id}/control-totals", h.GetControlTotals)
+	})
+	r.Get("/v1/audit/engagements/{engagement_id}/populations", h.ListAuditPopulations)
+	r.Route("/v1/sampling-parameter-sets", func(r chi.Router) {
+		r.Post("/", h.CreateSamplingParameterSet)
+	})
+	r.Route("/v1/sample-designs", func(r chi.Router) {
+		r.Post("/", h.CreateSampleDesign)
+		r.Get("/{design_id}", h.GetSampleDesign)
+		r.Post("/{design_id}/approve", h.ApproveSampleDesign)
+		r.Post("/{design_id}/select", h.SelectSample)
+		r.Get("/{design_id}/items", h.GetItemResults)
+		r.Post("/{design_id}/evaluate", h.EvaluateSample)
+		r.Post("/{design_id}/supersede", h.SupersedeSample)
+		r.Get("/{design_id}/selections/{selection_id}/reproduce", h.GetSelectionMethod)
+	})
+	r.Route("/v1/sample-items", func(r chi.Router) {
+		r.Post("/{item_id}/result", h.RecordItemResult)
+		r.Post("/{item_id}/nonresponse", h.RecordNonresponse)
+		r.Post("/{item_id}/alternative-procedure", h.AddAlternativeProcedure)
+	})
 }
 
 // ── POST /v1/evidence-manifests ──────────────────────────────────────────────
@@ -162,8 +221,16 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.GovernanceDecisionsFrom == nil && req.GovernanceDecisionsTo == nil &&
-		len(req.GovernanceDecisionIDs) == 0 && len(req.AccessDecisionIDs) == 0 && len(req.WorkflowInstanceIDs) == 0 {
+		len(req.GovernanceDecisionIDs) == 0 && len(req.AccessDecisionIDs) == 0 && len(req.WorkflowInstanceIDs) == 0 &&
+		req.WorkflowHistoryFrom == nil && req.WorkflowHistoryTo == nil {
 		writeError(w, http.StatusBadRequest, "no_records_requested", domain.ErrNoRecordsRequested.Error())
+		return
+	}
+	// workflow-history-svc's cross-workflow endpoint requires both from and
+	// to — a caller supplying only one gets a clear 400 here rather than an
+	// opaque source_service_unavailable from the downstream call.
+	if (req.WorkflowHistoryFrom == nil) != (req.WorkflowHistoryTo == nil) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "workflow_history_from and workflow_history_to must both be set, or neither")
 		return
 	}
 
@@ -194,7 +261,12 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	records, err := h.collectRecords(r.Context(), req)
+	// Principal is carried via context, same as tenant, so every aggregator
+	// client can forward it to source services that require it (see
+	// aggregator.forwardIdentity) without threading it through every call
+	// signature individually.
+	ctx := svcmiddleware.WithPrincipal(r.Context(), principalID)
+	records, err := h.collectRecords(ctx, req)
 	if err != nil {
 		// Fail closed: a manifest that can't fully assemble is FAILED, not
 		// silently partial — a partial manifest that LOOKS complete is worse
@@ -283,6 +355,13 @@ func (h *Handler) collectRecords(ctx context.Context, req domain.GenerateManifes
 			return nil, err
 		}
 		out = append(out, historyRecs...)
+	}
+	if req.WorkflowHistoryFrom != nil && req.WorkflowHistoryTo != nil {
+		recs, err := h.workflowHistory.ListByEntityAndDateRange(ctx, req.LegalEntityID, *req.WorkflowHistoryFrom, *req.WorkflowHistoryTo)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, recs...)
 	}
 	return out, nil
 }

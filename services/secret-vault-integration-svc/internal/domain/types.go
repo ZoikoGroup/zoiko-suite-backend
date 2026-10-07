@@ -113,6 +113,54 @@ type SecretLease struct {
 	CreatedAt     time.Time `json:"created_at"`
 }
 
+// SharedSecretException is one registered, evidence-backed, time-boxed
+// exception that makes a secret material reachable outside normal
+// workload access rules (context.md §9 "shared-secret exception
+// register"). Integrity-chain protected against tampering. Status:
+// ACTIVE | REVOKED | EXPIRED.
+type SharedSecretException struct {
+	ExceptionID string `json:"exception_id"`
+
+	// SecretPath is the opaque reference in the underlying vault backend
+	// that the exception unlocks.
+	SecretPath string `json:"secret_path"`
+
+	// Reason is a short human-readable justification, required at
+	// creation.
+	Reason string `json:"reason"`
+
+	// EvidenceReference is a link/pointer to the evidence artifact that
+	// authorizes this exception (ticket, incident record). Required.
+	EvidenceReference string `json:"evidence_reference"`
+
+	// ApprovedByPrincipalID is the operator that registered the exception.
+	ApprovedByPrincipalID string `json:"approved_by_principal_id"`
+
+	// TenantID is nil for a global exception. Tenant-scoped rows are only
+	// visible/legible to that tenant.
+	TenantID *string `json:"tenant_id"`
+
+	ExpiresAt time.Time `json:"expires_at"`
+	Status    string    `json:"status"`
+
+	CreatedAt   time.Time   `json:"created_at"`
+	RevokedAt   *time.Time  `json:"revoked_at"`
+	RevokedBy   *string     `json:"revoked_by"`
+}
+
+// DueRotation is one rotation due now: a scheduled secret policy version
+// whose next_rotation_at has passed.
+type DueRotation struct {
+	SecretPolicyID        string `json:"secret_policy_id"`
+	SecretPolicyVersionID string `json:"secret_policy_version_id"`
+	SecretPath            string `json:"secret_path"`
+	SecretClass           string `json:"secret_class"`
+	IntervalSeconds       int    `json:"interval_seconds"`
+	// NextRotationAt is the due time as listed; the sweeper claims the row
+	// against it (compare-and-swap) and derives its request id from it.
+	NextRotationAt time.Time `json:"next_rotation_at"`
+}
+
 // SecretAccessAuditLog is one immutable evidence record of a request,
 // grant, denial, revocation, or rotation. Append-only — no UPDATE, no
 // DELETE, ever, same guarantee as governance-decision-log-svc's
@@ -126,9 +174,20 @@ type SecretAccessAuditLog struct {
 	SecretClass string `json:"secret_class"`
 	SecretPath  string `json:"secret_path"`
 
-	RequestedByPrincipalID string  `json:"requested_by_principal_id"`
-	TenantID               *string `json:"tenant_id"`
-	LegalEntityID          *string `json:"legal_entity_id"`
+	// RequestedByPrincipalID is the SUBJECT of this record: the principal
+	// whose access to the material the entry concerns.
+	RequestedByPrincipalID string `json:"requested_by_principal_id"`
+
+	// ActedByPrincipalID is the ACTOR: the authenticated caller that
+	// performed the act. Equal to RequestedByPrincipalID for
+	// REQUESTED/GRANTED/DENIED, where subject and actor are the same
+	// principal, and genuinely different for REVOKED — an operator ending
+	// somebody else's lease. Nil only on rows written before migration
+	// 000004, which never captured it.
+	ActedByPrincipalID *string `json:"acted_by_principal_id"`
+
+	TenantID      *string `json:"tenant_id"`
+	LegalEntityID *string `json:"legal_entity_id"`
 
 	// LeaseID is nil for REQUESTED/DENIED — nothing was granted to
 	// reference.
@@ -171,6 +230,17 @@ type CreateSecretPolicyVersionParams struct {
 	EffectiveFrom           time.Time
 	EffectiveTo             *time.Time
 	CreatedByPrincipalID    string
+	// RotationIntervalSeconds, when > 0, schedules this version for
+	// automated material rotation every interval (Gap 5a).
+	RotationIntervalSeconds int
+}
+
+// ListSharedSecretExceptionsFilter holds input parameters for listing the
+// shared-secret exception register.
+type ListSharedSecretExceptionsFilter struct {
+	TenantID *string
+	Status   string // "" means all statuses.
+	SecretPath string
 }
 
 // BrokerParams holds input parameters for POST /v1/secrets/broker.
@@ -221,7 +291,11 @@ type RecordAuditEntryParams struct {
 	SecretClass            string
 	SecretPath             string
 	RequestedByPrincipalID string
-	TenantID               *string
+	// ActedByPrincipalID is the authenticated caller performing the act.
+	// Leave nil only where there is genuinely no actor to name; every
+	// handler in this service has one.
+	ActedByPrincipalID *string
+	TenantID           *string
 	LegalEntityID          *string
 	LeaseID                *string
 	SecretPolicyVersionID  *string
@@ -254,6 +328,18 @@ var ErrConflict = errorString("conflict: record already exists with differing at
 // Callers must fail-closed — treat as unavailable, never as "not found"
 // or, worse, as an implicit grant.
 var ErrStoreUnavailable = errorString("secret vault store unavailable")
+
+// ErrSharedSecretExceptionNotFound is returned when an exception_id does
+// not exist.
+var ErrSharedSecretExceptionNotFound = errorString("shared secret exception not found")
+
+// ErrSharedSecretExceptionExpired is returned when acting on an exception
+// whose expires_at has passed.
+var ErrSharedSecretExceptionExpired = errorString("shared secret exception expired")
+
+// ErrRotationScheduleNotFound is returned when a secret_policy_version has
+// no rotation schedule row.
+var ErrRotationScheduleNotFound = errorString("rotation schedule not found")
 
 type errorString string
 

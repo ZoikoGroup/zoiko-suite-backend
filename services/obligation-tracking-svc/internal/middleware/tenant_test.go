@@ -1,0 +1,61 @@
+package middleware
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+// TestTenantContextMiddleware_MissingHeader_Refuses pins the fix for a real
+// bug: this middleware used to substitute the literal tenant "default" when
+// X-Tenant-Id was absent, and GetTenantID returned the same literal as its
+// own fallback — the same bug already found and fixed in
+// board-resolutions-svc, contract-lifecycle-svc and clause-template-svc
+// this session. Compounded here by the store carrying no explicit
+// tenant_id predicate of its own (see migration 000002's doc comment), a
+// header-less caller's obligations pooled together inside an RLS policy
+// that never actually applied to this connection.
+func TestTenantContextMiddleware_MissingHeader_Refuses(t *testing.T) {
+	var sawTenant string
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawTenant = GetTenantID(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/obligations", nil)
+	w := httptest.NewRecorder()
+	TenantContextMiddleware(next).ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without X-Tenant-Id, got %d", w.Code)
+	}
+	if sawTenant != "" {
+		t.Fatalf("handler must never be reached without a tenant, but saw tenant %q", sawTenant)
+	}
+}
+
+func TestTenantContextMiddleware_WithHeader_PassesThrough(t *testing.T) {
+	var sawTenant string
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawTenant = GetTenantID(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/obligations", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-a")
+	w := httptest.NewRecorder()
+	TenantContextMiddleware(next).ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with a real tenant, got %d", w.Code)
+	}
+	if sawTenant != "tenant-a" {
+		t.Fatalf("expected the handler to see tenant-a, got %q", sawTenant)
+	}
+}
+
+func TestGetTenantID_NoContext_ReturnsEmpty(t *testing.T) {
+	if got := GetTenantID(httptest.NewRequest(http.MethodGet, "/", nil).Context()); got != "" {
+		t.Fatalf("expected empty string for a context with no tenant, got %q", got)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/notification-svc/internal/actionlink"
 	"zoiko.io/notification-svc/internal/authz"
 	"zoiko.io/notification-svc/internal/config"
 	"zoiko.io/notification-svc/internal/deliver"
@@ -26,12 +28,19 @@ import (
 	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/health"
+	"zoiko.io/notification-svc/internal/housekeeping"
 	"zoiko.io/notification-svc/internal/identity"
+	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
+	"zoiko.io/notification-svc/internal/outbox"
+	"zoiko.io/notification-svc/internal/notice"
+	"zoiko.io/notification-svc/internal/policy"
+	"zoiko.io/notification-svc/internal/privacy"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
+	"zoiko.io/notification-svc/internal/webhook"
 )
 
 // platformScopeID mirrors authorization-svc's own constant of the same
@@ -75,6 +84,10 @@ func main() {
 	}()
 
 	metrics := telemetry.NewMetrics("notification-svc")
+	// What the service DOES, as opposed to how it is called — see
+	// telemetry/domain.go for why the HTTP metrics alone cannot tell a service
+	// delivering every notice from one delivering none.
+	domainMetrics := telemetry.NewDomain("notification-svc")
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
@@ -103,6 +116,10 @@ func main() {
 
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
 	pgStore := store.New(pool)
+	if cfg.QuotaEnabled {
+		pgStore.WithQuota(cfg.QuotaLimits)
+		log.Info("send quotas are on", zap.Any("limits", cfg.QuotaLimits))
+	}
 
 	// A deployment says "no broker" with an explicitly empty KAFKA_BROKERS;
 	// the publisher then logs instead of writing, rather than blocking every
@@ -164,10 +181,10 @@ func main() {
 			zap.String("set", "NOTIFICATION_EMAIL_PROVIDER=smtp with SMTP_HOST and NOTIFICATION_EMAIL_FROM"))
 	case "smtp":
 		p, err := deliver.NewSMTPProvider(deliver.SMTPConfig{
-			Host:     cfg.Email.Host,
-			Port:     cfg.Email.Port,
-			Username: cfg.Email.Username,
-			Password: cfg.Email.Password,
+			Host:           cfg.Email.Host,
+			Port:           cfg.Email.Port,
+			Username:       cfg.Email.Username,
+			Password:       cfg.Email.Password,
 			From:           cfg.Email.From,
 			TLSMode:        deliver.TLSMode(cfg.Email.TLSMode),
 			AllowCleartext: cfg.Email.AllowCleartext,
@@ -217,9 +234,38 @@ func main() {
 			zap.String("supported", "smtp"))
 	}
 
-	deliverer := deliver.NewRouter(emailProvider, log)
+	// Secondary SMTP provider for failover (optional).
+	// When SMTP_SECONDARY_PROVIDER is set, the router fails over to it after
+	// a transient primary failure (ZS-COMMS-EMAIL-001 §13 P1-12).
+	var secondaryEmailProvider deliver.Provider
+	if cfg.SecondaryEmail.Configured() && cfg.SecondaryEmail.Provider == "smtp" {
+		sp, err := deliver.NewSMTPProvider(deliver.SMTPConfig{
+			Host:           cfg.SecondaryEmail.Host,
+			Port:           cfg.SecondaryEmail.Port,
+			Username:       cfg.SecondaryEmail.Username,
+			Password:       cfg.SecondaryEmail.Password,
+			From:           cfg.SecondaryEmail.From,
+			TLSMode:        deliver.TLSMode(cfg.SecondaryEmail.TLSMode),
+			AllowCleartext: cfg.SecondaryEmail.AllowCleartext,
+		})
+		if err != nil {
+			log.Fatal("secondary email provider configuration is invalid", zap.Error(err))
+		}
+		secondaryEmailProvider = sp
+		log.Info("secondary smtp failover provider configured",
+			zap.String("host", cfg.SecondaryEmail.Host),
+			zap.Int("port", cfg.SecondaryEmail.Port))
+	}
 
-	// â”€â”€ 4b. Retry policy and worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	var deliverer *deliver.Router
+	if secondaryEmailProvider != nil {
+		deliverer = deliver.NewFailoverRouter(emailProvider, secondaryEmailProvider, log)
+	} else {
+		deliverer = deliver.NewRouter(emailProvider, log)
+	}
+	deliverer.SetMetrics(metrics)
+
+	// ── 4b. Retry policy and worker ──────────────────────────────────────────
 	//
 	// One policy, shared. The handler writes the first schedule when a send
 	// fails transiently and the worker extends it from there, so they cannot
@@ -237,6 +283,46 @@ func main() {
 	}
 	retryPolicy = retryPolicy.Normalize()
 
+	// ── 4c. Phase 1 Delivery Ledger & Template Compiler ───────────────────────
+	compiler := ledger.NewCompiler()
+	for _, seed := range ledger.DefaultSeedDefinitions() {
+		if err := compiler.Register(seed); err != nil {
+			log.Fatal("failed to register seed template", zap.String("key", seed.TemplateKey), zap.Error(err))
+		}
+	}
+	killSwitch := ledger.NewKillSwitchManager(log)
+	policyEngine := policy.NewPrecedenceEngine(pgStore, log)
+	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log).
+		WithPolicyResolver(policyEngine).
+		WithMetrics(metrics)
+
+	// One communication, one identity (plan step 3): with the flag on, each ledger
+	// delivery also creates a linked register row. Off by default.
+	if cfg.LedgerRegisterEnabled {
+		orchestrator.WithRegister(pgStore)
+		log.Info("ledger pipeline will record each delivery in the communication register")
+	}
+
+	// The direct send path (POST /v1/notifications, the retry worker, a resend)
+	// reaches the provider through a guard that applies the suppression list and
+	// the kill switch immediately before submission (ZS-SVC-Y-001 INV-24). The
+	// ledger orchestrator above keeps the unwrapped deliverer because it applies
+	// its own, class-aware policy before rendering.
+	directDeliverer, err := policy.NewDirectSendGuard(deliverer, policyEngine, killSwitch, log)
+	if err != nil {
+		log.Fatal("failed to construct the direct send guard", zap.Error(err))
+	}
+	directDeliverer.WithPreferences(pgStore)
+	if cfg.PrivacyEnforcement {
+		gate, gerr := privacy.NewGate(privacy.NewClient(cfg.PrivacyDecisionURL, cfg.PrivacyTimeout, log), pgStore, log)
+		if gerr != nil {
+			log.Fatal("failed to construct the privacy gate", zap.Error(gerr))
+		}
+		directDeliverer.WithPrivacyGate(gate)
+		log.Info("privacy enforcement is on: intent-bound emails are sent only on a PERMIT decision",
+			zap.String("privacy_decision_url", cfg.PrivacyDecisionURL))
+	}
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -253,21 +339,87 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	envelopePolicy := svcenvelope.ServicePolicy()
+	envelopePolicy.Exempt = func(req *http.Request) bool {
+		if req.URL.Path == "/healthz" || req.URL.Path == "/readyz" || req.URL.Path == "/health" {
+			return true
+		}
+		if strings.HasPrefix(req.URL.Path, "/v1/notifications/webhooks/") || strings.HasPrefix(req.URL.Path, "/v1/notifications/actions/") {
+			return true
+		}
+		// RFC 8058 one-click unsubscribe: originates from mail clients with no
+		// ZoikoSuite auth headers. The action token in the body is the anchor.
+		if req.URL.Path == "/v1/notifications/unsubscribe" {
+			return true
+		}
+		return false
+	}
+	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
+
+	webhookProcessor := webhook.NewProcessor(pgStore, log)
+	webhookProcessor.SetMetrics(metrics)
+	// Provider callbacks are authenticated with per-provider HMAC secrets
+	// (ZS-SVC-Y-001 INV-27, NP-26). With none configured every callback is refused:
+	// the route is envelope-exempt, so there is no other gate in front of it.
+	webhookVerifier := webhook.NewVerifier(cfg.WebhookSecrets, cfg.WebhookTolerance)
+	if len(webhookVerifier.Providers()) == 0 {
+		log.Warn("NOTIFICATION_WEBHOOK_SECRETS is empty: every provider callback will be refused; " +
+			"delivery receipts, bounces and complaints will not be recorded until a secret is configured")
+	} else {
+		log.Info("webhook callback authentication enabled", zap.Strings("providers", webhookVerifier.Providers()))
+	}
+	webhookHandler := webhook.NewHandler(webhookProcessor, log).WithVerifier(webhookVerifier)
+
+	// ── 4d. Action Link Gateway (optional) ──────────────────────────────────────────
+	//
+	// The gateway is only constructed when ACTION_TOKEN_SECRET is set.
+	// An empty secret means tokens cannot be signed or verified, so the gateway
+	// would refuse every request — better to log a warning and leave it disabled.
+	var actionGateway *actionlink.Gateway
+	if cfg.ActionTokenSecret != "" {
+		signer, err := actionlink.NewSigner([]byte(cfg.ActionTokenSecret), cfg.ActionLinkBaseURL())
+		if err != nil {
+			log.Fatal("action link signer initialization failed", zap.Error(err))
+		}
+		gw, err := actionlink.NewGateway(pgStore, signer, log)
+		if err != nil {
+			log.Fatal("action link gateway initialization failed", zap.Error(err))
+		}
+		actionGateway = gw
+		log.Info("action link gateway enabled")
+	} else {
+		log.Warn("ACTION_TOKEN_SECRET not set — action link gateway disabled; " +
+			"set ACTION_TOKEN_SECRET to enable single-use action links")
+	}
 
 	h := handler.New(handler.Deps{
-		Store:       pgStore,
-		Publisher:   publisher,
-		AuthZ:       authzClient,
-		Deliverer:   deliverer,
-		Recipient:   identityClient,
-		RetryPolicy: retryPolicy,
-		Log:         log,
+		Store:          pgStore,
+		Metrics:        domainMetrics,
+		AuthZ:          authzClient,
+		Deliverer:      directDeliverer,
+		Recipient:      identityClient,
+		RetryPolicy:    retryPolicy,
+		Orchestrator:   orchestrator,
+		LedgerStore:    pgStore,
+		WebhookHandler: webhookHandler,
+		Suppressions:   pgStore,
+		Intents:        pgStore,
+		Preferences:    pgStore,
+		Evidence:       pgStore,
+		Notices:        pgStore,
+		Log:            log,
 	})
 	handler.RegisterRoutes(r, h)
 
+	// Register action gateway routes if configured. These are exempt from the
+	// envelope middleware (set above) because they serve end-user browsers
+	// and mail clients, not internal ZoikoSuite services.
+	if actionGateway != nil {
+		actionGateway.RegisterRoutes(r)
+	}
+
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
-	// â”€â”€ 6a. Delivery retry worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	// ── 6a. Delivery retry worker ─────────────────────────────────────────────
 	//
 	// Started even when retry is disabled, deliberately. Turning the policy off
 	// stops new schedules being written; it does not un-schedule the
@@ -278,13 +430,65 @@ func main() {
 	defer stopWorker()
 
 	retryWorker := retry.NewWorker(
-		pgStore, deliverer, publisher, identityClient, identity.IsSettled,
+		pgStore, directDeliverer, domainMetrics, identityClient, identity.IsSettled,
 		retry.Options{
-			Interval:  cfg.Retry.Interval,
-			BatchSize: cfg.Retry.BatchSize,
-			Policy:    retryPolicy,
+			Interval:      cfg.Retry.Interval,
+			BatchSize:     cfg.Retry.BatchSize,
+			Policy:        retryPolicy,
+			StrandedAfter: cfg.Retry.StrandedAfter,
 		}, log)
 	go retryWorker.Start(workerCtx)
+
+	// ── 6a'. Outbox relay ────────────────────────────────────────────────────
+	//
+	// Every event this service emits is committed into event_outbox by the
+	// same transaction that records the fact it describes (migration 000010),
+	// and this loop is what carries them to Kafka. Before it existed the
+	// handler and the worker each wrote to the broker directly after
+	// committing and logged the error if that failed, so a broker hiccup at the
+	// moment a notice concluded lost the only record that it had gone out —
+	// silently, with a 201 and a healthy-looking register.
+	//
+	// Started unconditionally, including when KAFKA_BROKERS is empty. A
+	// deployment with no broker still enqueues (the enqueue is part of the
+	// write's transaction and cannot be conditional), so without a relay the
+	// outbox would grow without bound behind a healthy-looking service.
+	// Publisher.Publish treats a nil producer as a successful dry-run write,
+	// which is what makes that drain correct rather than merely quiet.
+	//
+	// Shares workerCtx with the retry worker, so both stop on the same cancel.
+	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
+	go relay.Run(workerCtx)
+
+	// ── 6b. Delivery Ledger Housekeeping Worker ──────────────────────────────
+	housekeepingWorker := housekeeping.NewWorker(
+		pgStore,
+		housekeeping.Options{
+			Interval:             10 * time.Minute,
+			BatchSize:            50,
+			TokenRetention:       30 * 24 * time.Hour,
+			LedgerRetention:      90 * 24 * time.Hour,
+			StaleIntentThreshold: 24 * time.Hour,
+		},
+		log,
+	)
+	go housekeepingWorker.Start(workerCtx)
+
+	// ── 6b2. Regulated notice sweeper (NCD-05): delivery evidence and deadlines ─
+	go notice.NewWorker(pgStore, time.Minute, 100, log).Start(workerCtx)
+
+	// ── 6c. Webhook DLQ Reprocessor Worker ───────────────────────────────────
+	if cfg.WebhookDLQ.Enabled {
+		dlqWorker := webhook.NewDLQWorker(
+			webhookProcessor,
+			webhook.DLQWorkerOptions{
+				Interval:  cfg.WebhookDLQ.Interval,
+				BatchSize: cfg.WebhookDLQ.BatchSize,
+			},
+			log,
+		)
+		go dlqWorker.Start(workerCtx)
+	}
 
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)

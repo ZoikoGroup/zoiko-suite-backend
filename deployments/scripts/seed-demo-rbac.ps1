@@ -166,6 +166,30 @@ $BUNDLES = @(
         Actions = @("PERIOD_CLOSE_CONFIG", "PERIOD_CLOSE_VIEW", "PERIOD_CLOSE_INITIATE")
     },
     @{
+        # financial-control-svc (ZS-CONTROL-001). DEFINE / APPROVE_RULE / EXECUTE / CERTIFY /
+        # EXCEPTION_WAIVE / REPERFORM are deliberately separate actions: a real tenant should grant
+        # them through separate roles. The service itself also refuses a certifier who created or
+        # took part in a run, and a waiver from the exception's own owner, whatever is granted here.
+        Code    = "FINCTRL_FULL"
+        Service = "financial-control-svc"
+        Actions = @("FINCTRL_DEFINE", "FINCTRL_APPROVE_RULE", "FINCTRL_POLICY_MANAGE", "FINCTRL_RUN_CREATE",
+                    "FINCTRL_READ", "FINCTRL_EXECUTE", "FINCTRL_EXCEPTION_ASSIGN", "FINCTRL_CERTIFY",
+                    "FINCTRL_EXCEPTION_RESOLVE", "FINCTRL_EXCEPTION_WAIVE", "FINCTRL_REPERFORM",
+                    "FINCTRL_EVIDENCE_EXPORT")
+    },
+    @{
+        # The source services authorize the HUMAN caller of a control population (the control service
+        # forwards the caller's identity), so whoever executes a control needs the read action of every
+        # source that control reads. One action per source service, exactly as their handlers declare.
+        Code    = "FINCTRL_POPULATION_READ"
+        Service = "financial-control-svc"
+        Actions = @("AR_CONTROL_POPULATION_READ", "AP_CONTROL_POPULATION_READ", "GL_CONTROL_POPULATION_READ",
+                    "BANKING_CONTROL_POPULATION_READ", "PAYROLL_CONTROL_POPULATION_READ",
+                    "INVENTORY_CONTROL_POPULATION_READ", "INTERCOMPANY_CONTROL_POPULATION_READ",
+                    "CONSOLIDATION_CONTROL_POPULATION_READ", "FINANCIAL_CLOSE_CONTROL_POPULATION_READ",
+                    "PAYEE_BANKING_CONTROL_POPULATION_READ", "TAX_AUTHORITY_CONTROL_POPULATION_READ")
+    },
+    @{
         # spend-controls-svc separates setting a limit from spending against it,
         # and checks VIEW on its two read routes as well -- the reads are
         # authorized unconditionally, so without VIEW the console's registers
@@ -208,9 +232,27 @@ $BUNDLES = @(
         # configuration-feature-flag-svc authorizes config and flag writes
         # against authzPlatformScopeID -- a config value or flag shapes
         # platform behaviour, so it is a platform action, not an entity one.
+        #
+        # FOUR actions, not two. A config entry or flag written with no
+        # tenant_id is the environment-wide DEFAULT: it applies to every tenant
+        # that has not set its own value. Writing one and writing your own
+        # organisation's value are not the same act, and used to be the same
+        # grant -- so a principal provisioned to manage one organisation could
+        # change what every other organisation reads. RLS cannot catch it
+        # either: a global row genuinely belongs to no tenant, so the policy's
+        # WITH CHECK admits a NULL tenant_id unconditionally.
+        #
+        # Both are in this bundle because this seeds a DEVELOPMENT stack,
+        # exactly as RETENTION_FULL pairs create and release -- in a real
+        # deployment "change my organisation's settings" and "change the
+        # default for everyone" are the pair you would want held by different
+        # people.
         Code    = "CONFIG_FULL"
         Service = "configuration-feature-flag-svc"
-        Actions = @("CONFIGURATION_WRITE", "FEATURE_FLAG_WRITE")
+        Actions = @(
+            "CONFIGURATION_WRITE", "CONFIGURATION_GLOBAL_WRITE",
+            "FEATURE_FLAG_WRITE", "FEATURE_FLAG_GLOBAL_WRITE"
+        )
     },
     @{
         # notification-svc authorizes sends against the target legal entity
@@ -350,12 +392,100 @@ $BUNDLES = @(
         Actions = @("DELEGATION_CREATE", "DELEGATION_VIEW", "DELEGATION_REVOKE")
     },
     @{
+        # SUPERSEDE is separate from CREATE on purpose, and the split is the
+        # whole point of the pair. Recording a new precedence rule adds a
+        # ranking; ending one CHANGES WHICH SOURCE THE PLATFORM BELIEVES for a
+        # field family, silently and everywhere, from the moment it takes
+        # effect. Someone who may propose a ranking should not automatically be
+        # able to switch the platform's system of record.
+        #
+        # VIEW is separate from both because the register is the platform's
+        # trust topology -- which connected systems are believed over which --
+        # and reading it is a disclosure even though the rows belong to no
+        # tenant. It ran no authorization at all until this pass.
+        #
+        # NORMALIZED_FACT_VIEW is separate again: unlike the rules, facts are
+        # tenant business data and the route returns raw fact values.
+        Code    = "SOURCE_AUTHORITY_FULL"
+        Service = "source-authority-svc"
+        Actions = @(
+            "SOURCE_AUTHORITY_MAP_CREATE", "SOURCE_AUTHORITY_MAP_VIEW",
+            "SOURCE_AUTHORITY_MAP_SUPERSEDE",
+            "NORMALIZED_FACT_RECORD", "NORMALIZED_FACT_VIEW"
+        )
+    },
+    @{
         Code    = "JURISDICTION_FULL"
         Service = "jurisdiction-rules-svc"
         Actions = @(
             "JURISDICTION_CREATE", "JURISDICTION_DEACTIVATE",
             "JURISDICTION_RULE_CREATE", "JURISDICTION_RULE_TRANSITION",
             "JURISDICTION_RULE_RECORD_DRIFT"
+        )
+    },
+    @{
+        # ZS-JUR-001 Wave 2 runtime resolver: what a CALLING service (tax
+        # determination, invoicing, filing) needs. Deliberately separate from
+        # the registry/admin bundle: a caller can resolve a rule and read its
+        # decision evidence, and cannot author, sign or certify anything.
+        Code    = "JURISDICTION_RESOLVER_CALLER"
+        Service = "jurisdiction-rules-svc"
+        Actions = @(
+            "RULE_RESOLUTION_RESOLVE", "RULE_DECISION_VIEW",
+            "OBLIGATION_CALCULATION_CALCULATE", "REGULATORY_CALCULATION_EXECUTE", "PAYROLL_PARAMETERS_RESOLVE", "RETENTION_RULE_RESOLVE", "ACCOUNTING_MAPPING_RESOLVE", "SUBMISSION_PROFILE_RESOLVE", "REGULATORY_SUBMISSION_CREATE", "REGULATORY_SUBMISSION_VIEW", "REGULATORY_SUBMISSION_RECORD_EVENT", "JURISDICTION_SUPPORT_VIEW"
+        )
+    },
+    @{
+        # ZS-JUR-001 Wave 0 registries. The demo bundle grants every action to
+        # one role; real tenants must split authoring (create), independent
+        # review/approval (REVIEW, APPROVE) and pack submission across roles.
+        # The service additionally refuses a reviewer/approver who authored
+        # the record, so one demo principal can create but not self-approve.
+        Code    = "JURISDICTION_PACK_REGISTRY_FULL"
+        Service = "jurisdiction-rules-svc"
+        Actions = @(
+            "REGULATORY_REGIME_CREATE",
+            "REGULATORY_SOURCE_CREATE", "REGULATORY_SOURCE_REVIEW", "REGULATORY_SOURCE_SUPERSEDE",
+            "INTERPRETATION_RECORD_CREATE", "INTERPRETATION_RECORD_APPROVE",
+            "JURISDICTION_PACK_CREATE",
+            "JURISDICTION_PACK_VERSION_CREATE", "JURISDICTION_PACK_VERSION_SUBMIT",
+            # Wave 1: compile, sign and verify are separate capabilities, as are
+            # registering/retiring/revoking trusted signing keys. Grant them to
+            # different roles in real environments.
+            "JURISDICTION_PACK_VERSION_COMPILE", "JURISDICTION_PACK_VERSION_SIGN", "JURISDICTION_PACK_VERSION_VERIFY",
+            "PACK_SIGNING_KEY_REGISTER", "PACK_SIGNING_KEY_RETIRE", "PACK_SIGNING_KEY_REVOKE",
+            # Wave 3: test authoring, test execution, independent review and
+            # certification are separate capabilities. The service also refuses
+            # a reviewer/certifier who built the version, so even this single
+            # demo role cannot certify its own work with one principal.
+            "JURISDICTION_PACK_VERSION_AUTHOR_TESTS", "JURISDICTION_PACK_VERSION_EXECUTE_TESTS",
+            "JURISDICTION_PACK_VERSION_REVIEW", "JURISDICTION_PACK_VERSION_CERTIFY",
+            # Wave 2: dropping the resolver's verified-artifact cache is an
+            # operator action (after a key revocation or a withdrawal).
+            "RESOLVER_CACHE_INVALIDATE",
+            # Wave 7: release and rollout are separate capabilities, as is the
+            # emergency stop and hotfix declaration. Grant publish, deploy,
+            # rollback and block/unblock to different roles in real
+            # environments; the demo bundle gives one role all of them.
+            "JURISDICTION_PACK_VERSION_PUBLISH", "JURISDICTION_PACK_VERSION_WITHDRAW",
+            "JURISDICTION_PACK_VERSION_BLOCK", "JURISDICTION_PACK_VERSION_UNBLOCK",
+            "JURISDICTION_PACK_VERSION_DEPLOY", "JURISDICTION_PACK_VERSION_ROLLBACK",
+            "JURISDICTION_PACK_VERSION_DECLARE_HOTFIX", "JURISDICTION_PACK_VERSION_COMPLETE_RETROSPECTIVE",
+            "DEPLOYMENT_REGION_CREATE", "DEPLOYMENT_RING_CREATE",
+            "SOURCE_CHANGE_NOTICE_CREATE", "SOURCE_CHANGE_NOTICE_REVIEW", "SOURCE_CHANGE_NOTICE_CLOSE",
+            "PACK_OPS_METRICS_VIEW",
+            # Wave 4 (calendar half): authoring, sourcing and publishing of
+            # calendars and obligation rules are separate capabilities, and the
+            # service refuses a publisher who authored the same record.
+            "REGULATORY_CALENDAR_CREATE", "REGULATORY_CALENDAR_VERSION_CREATE",
+            "REGULATORY_CALENDAR_VERSION_SET_SOURCES", "REGULATORY_CALENDAR_VERSION_PUBLISH",
+            "OBLIGATION_RULE_CREATE", "OBLIGATION_RULE_SET_PROVENANCE", "OBLIGATION_RULE_PUBLISH",
+            # Wave 4 (tax half): typed calculation parameters (rates, bands, rounding).
+            "JURISDICTION_RULE_SET_PARAMETERS",
+            # Wave 8: jurisdiction rollout governance (portfolio, readiness evidence, expert approval, launch).
+            "JURISDICTION_ROLLOUT_CREATE", "JURISDICTION_ROLLOUT_SEED", "JURISDICTION_ROLLOUT_VIEW", "JURISDICTION_ROLLOUT_SET_OWNER", "JURISDICTION_ROLLOUT_LINK_PACKS",
+            "JURISDICTION_ROLLOUT_ATTEST", "JURISDICTION_ROLLOUT_EXPERT_APPROVE", "JURISDICTION_ROLLOUT_TRANSITION", "JURISDICTION_SUPPORT_VIEW",
+            "JURISDICTION_RULE_SET_PROVENANCE"
         )
     },
     @{
@@ -389,6 +519,39 @@ $BUNDLES = @(
         Code    = "RETENTION_FULL"
         Service = "retention-registry-svc"
         Actions = @("RETENTION_POLICY_CREATE", "LEGAL_HOLD_CREATE", "LEGAL_HOLD_RELEASE")
+    },
+    @{
+        # search-indexer-svc (ZS-SVC-AB-001 ESR-01..ESR-05). Its CONTROL plane
+        # -- registering a source, drafting and publishing a contract, building
+        # and activating an index generation -- authorizes against the PLATFORM
+        # scope, not a legal entity: a search contract describes a shape shared
+        # by every tenant, and a generation is one physical index serving all of
+        # them, so a tenant-scoped grant must not be able to change what every
+        # other tenant can search.
+        #
+        # SEARCH_GENERATION_ACTIVATE is a separate action from
+        # SEARCH_GENERATION_CREATE on purpose. Building a generation is routine
+        # and touches nothing anyone is querying; ACTIVATING one changes what
+        # every caller sees in a single atomic alias swap. They are in the same
+        # bundle here because this seeds a DEVELOPMENT stack, exactly as
+        # RETENTION_FULL pairs create and release -- in a real deployment they
+        # are the pair you would want held by different people.
+        #
+        # SEARCH_EXPORT is in this bundle and is NOT implied by the ability to
+        # search. INV-29: "search exports/downloads require separate export
+        # authorization; search permission does not imply bulk-exfiltration
+        # permission." A principal that can search but holds no SEARCH_EXPORT
+        # gets a correct ESR-016 from /v1/search-exports.
+        #
+        # SEARCH_RESTRICTION_APPLY is the erasure/disposition path PRV and DRC
+        # call to remove search visibility for a specific record.
+        Code    = "SEARCH_FULL"
+        Service = "search-indexer-svc"
+        Actions = @(
+            "SEARCH_SOURCE_REGISTER", "SEARCH_CONTRACT_CREATE", "SEARCH_CONTRACT_TRANSITION",
+            "SEARCH_GENERATION_CREATE", "SEARCH_GENERATION_ACTIVATE",
+            "SEARCH_RESTRICTION_APPLY", "SEARCH_EXPORT"
+        )
     }
 )
 
@@ -408,11 +571,16 @@ $ALL_ACTIONS = $BUNDLES | ForEach-Object { $_.Actions } | Sort-Object -Unique
 # platform scope. It then reported success and had granted nothing.
 $PLATFORM_SCOPED_ACTION_CODES = @(
     "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL",
-    "SCHEMA_FULL", "JURISDICTION_FULL",
+    "SCHEMA_FULL", "JURISDICTION_FULL", "JURISDICTION_PACK_REGISTRY_FULL", "JURISDICTION_RESOLVER_CALLER",
     # retention-registry-svc falls back to the platform scope when a hold or
     # policy names no tenant -- the console offers that as a "platform-wide"
     # checkbox, so the grant has to exist on that scope too.
-    "RETENTION_FULL")
+    "RETENTION_FULL",
+    # search-indexer-svc's whole control plane authorizes against the platform
+    # scope. A grant made only on the legal entity would be invisible to every
+    # one of its checks -- silently, and fail-closed, so it would read as
+    # "no_grant" rather than as a scope mismatch.
+    "SEARCH_FULL")
 $PLATFORM_SCOPED_ACTIONS = $BUNDLES |
     Where-Object { $PLATFORM_SCOPED_ACTION_CODES -contains $_.Code } |
     ForEach-Object { $_.Actions }
@@ -421,6 +589,36 @@ if ($PSCmdlet.ParameterSetName -eq "Gateway") {
     $AUTHZ = "$($GatewayUrl.TrimEnd('/'))/authorization-svc"
 } else {
     $AUTHZ = $AuthzUrl.TrimEnd('/')
+}
+
+# §4 canonical envelope (ZS-ARCH-SVC-001 §4). Every request to the service has
+# carried these headers since envelope enforcement made admin writes fail
+# closed with 401 `envelope_incomplete`; this script predates that and was
+# seeding a volume that its own writes could never populate. The header set
+# here mirrors what the console and access-control-svc actually send.
+#
+# Non-writes (/v1/authorize probes) omit Idempotency-Key: the service classifies
+# that path as non-material, so it requires no idempotency key and the probe stays
+# representative of a real read-path call.
+function New-AuthzEnvelope {
+    param(
+        [Parameter(Mandatory)] [string] $Path
+    )
+    $headers = @{
+        "X-Tenant-Id"       = $TENANT_ID
+        "X-Principal-Id"    = $PRINCIPAL_ID
+        "X-Legal-Entity-Id" = $LEGAL_ENTITY
+        "X-Correlation-ID"  = [guid]::NewGuid().ToString()
+        "X-Request-Id"      = [guid]::NewGuid().ToString()
+        "X-Source-System"   = "console-seed"
+        "X-Source-Channel"  = "api"
+    }
+    if ($Path -ne "/v1/authorize") {
+        $headers["Idempotency-Key"] = [guid]::NewGuid().ToString()
+        $headers["X-Occurred-At"]   = [DateTime]::UtcNow.ToString("o")
+        $headers["X-Operation"]     = "admin_seed"
+    }
+    return $headers
 }
 
 function Invoke-Authz {

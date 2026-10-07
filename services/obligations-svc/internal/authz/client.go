@@ -27,6 +27,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/obligations-svc/internal/domain"
+	svcenvelope "zoiko.io/obligations-svc/internal/envelope"
 )
 
 // Client is the narrow interface the handler depends on.
@@ -136,6 +137,39 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 	// reusing it would make an unrelated authorize call collide with the
 	// material write's own idempotency record.
 	req.Header.Set("Idempotency-Key", uuid.NewString())
+
+	// authorization-svc's resolveTenantScope prefers the verified X-Tenant-Id
+	// header over the request body, and — per its own doc comment — silently
+	// narrows to global-only SoD rules when neither is present, rather than
+	// refusing. Forwarding it here is what makes this tenant's
+	// segregation-of-duties rules actually apply to decisions made through
+	// this service, not just the globally-applicable ones. Same defect,
+	// same fix as board-resolutions-svc.
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := middleware.GetReqID(ctx)
+	authzSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if correlationID == "" && env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 )
 
 // ---------------------------------------------------------------------------
@@ -93,26 +94,11 @@ type Store interface {
 	// TransitionTaxIdentityBundleStatus applies a status transition on a bundle header.
 	// Must be idempotent.
 	TransitionTaxIdentityBundleStatus(ctx context.Context, bundleID string, newStatus domain.TaxIdentityBundleStatus, actorID, correlationID string) error
-}
 
-// ---------------------------------------------------------------------------
-// EventPublisher — append-only domain event publishing contract.
-// ---------------------------------------------------------------------------
-
-// EventPublisher emits append-only domain events to the event backbone.
-// All publish calls are fire-and-forget from the service's perspective.
-// DB writes are NOT rolled back on publish failure — an outbox pattern
-// handles redelivery.
-type EventPublisher interface {
-	PublishTenantCreated(ctx context.Context, tenant *domain.Tenant, correlationID string)
-	PublishEntityCreated(ctx context.Context, entity *domain.LegalEntity, correlationID string)
-	PublishEntityUpdated(ctx context.Context, entity *domain.LegalEntity, correlationID string)
-	PublishEntityStatusChanged(ctx context.Context, tenantID, legalEntityID, actorID string, previousStatus, newStatus domain.EntityStatus, correlationID string)
-	PublishEntityHierarchyChanged(ctx context.Context, hierarchy *domain.EntityHierarchy, changeType string, correlationID string)
-	PublishEntityJurisdictionChanged(ctx context.Context, assignment *domain.EntityJurisdictionAssignment, changeType string, correlationID string)
-	PublishWorkspaceCreated(ctx context.Context, workspace *domain.Workspace, correlationID string)
-	PublishWorkspaceUpdated(ctx context.Context, workspace *domain.Workspace, correlationID string)
-	PublishWorkspaceStatusChanged(ctx context.Context, tenantID, workspaceID, actorID string, previousStatus, newStatus domain.WorkspaceStatus, correlationID string)
+	// ORG-02/ORG-03 surfaces — see ORGStore at the bottom of this file.
+	ORGStore
+	ApprovalStore
+	ORGGapStore
 }
 
 // ---------------------------------------------------------------------------
@@ -151,4 +137,196 @@ type JurisdictionValidator interface {
 	// Returns jurisdiction.ErrJurisdictionNotFound if the ID does not exist.
 	// Returns jurisdiction.ErrValidatorUnavailable if the service is unreachable — callers fail-closed.
 	ValidateExists(ctx context.Context, jurisdictionID string) error
+}
+
+// ---------------------------------------------------------------------------
+// ORG-02 / ORG-03 store contract
+//
+// Added for the Organization / Legal Entity specification §4.2, §4.3, §8 and
+// §9.2. Kept as its own interface, embedded into Store below, for two reasons:
+// the ORG surface is coherent on its own and reads as one thing, and a reader
+// asking "what did the ORG completion add" gets an answer without diffing.
+// ---------------------------------------------------------------------------
+
+// TenantCommandParams is one named ORG-02 lifecycle command, ready to apply.
+// HomeRegionChange is an approved ChangeHomeRegion, as the store applies it.
+type HomeRegionChange struct {
+	TenantID          string
+	ResidencyRegionID string
+	DecisionRef       string
+	Reason            string
+	ActorID           string
+	ExpectedVersion   int64
+	CorrelationID     string
+	Approval          domain.ApprovalDecision
+}
+
+// HomeRegionChangeResult is what the store reports back.
+type HomeRegionChangeResult struct {
+	FromRegionID *string `json:"from_region_id"`
+	ToRegionID   string  `json:"to_region_id"`
+	NewVersion   int64   `json:"record_version"`
+}
+
+type TenantCommandParams struct {
+	TenantID    string
+	Command     domain.TenantCommand
+	TargetState domain.TenantLifecycleState
+	// AllowedFrom are the lifecycle states this command may be invoked from.
+	// Passed to the store rather than checked before it so the state-machine
+	// test and the write are a single atomic statement — the same race-free
+	// shape TransitionEntityStatus already uses.
+	AllowedFrom []domain.TenantLifecycleState
+	// ExpectedVersion is always non-zero by the time it reaches the store: the
+	// service substitutes the version it read when the caller supplied none,
+	// which turns its read-then-write into a compare-and-swap.
+	ExpectedVersion int64
+	Reason          string
+	ActorID         string
+	ApprovedBy      string
+	CorrelationID   string
+	// Approval, when set, is the verified decision that released this
+	// command. The store marks it APPROVED in the same transaction as the
+	// lifecycle change, guarded on the request still being PENDING and
+	// unexpired, so two approvers racing cannot both release it.
+	Approval *domain.ApprovalDecision
+}
+
+// TenantCommandResult reports what a successful command did.
+type TenantCommandResult struct {
+	FromState  domain.TenantLifecycleState `json:"from_state"`
+	ToState    domain.TenantLifecycleState `json:"to_state"`
+	NewVersion int64                       `json:"record_version"`
+	// Status is the tenant's status column after the command. Suspension moves
+	// it in step with lifecycle_state, because a SUSPENDED tenant whose status
+	// still reads ACTIVE is exactly the inconsistency §8 NP4 turns on.
+	Status domain.TenantStatus `json:"status"`
+}
+
+// ORGStore is the data-access contract for the ORG-02/ORG-03 surfaces.
+//
+// Every write here takes an *outbox.Record and is responsible for writing it
+// in the SAME transaction as the business fact. A nil record means "no event",
+// which is legitimate; an implementation that accepts a non-nil record and
+// does not write it transactionally is not implementing this interface.
+type ORGStore interface {
+	// ── ORG-02: named commands ──────────────────────────────────────────────
+
+	ExecuteTenantCommand(ctx context.Context, p TenantCommandParams, ev *outbox.Record) (*TenantCommandResult, error)
+	// ChangeHomeRegion applies an approved ChangeHomeRegion atomically: the
+	// approval decision, the default residency policy's region, the tenant's
+	// version, the lineage row and the event.
+	ChangeHomeRegion(ctx context.Context, p HomeRegionChange, ev *outbox.Record) (*HomeRegionChangeResult, error)
+	ChangeDefaultLocale(ctx context.Context, tenantID, locale, timezone, reason, actorID, correlationID string, expectedVersion int64, ev *outbox.Record) (*domain.Tenant, error)
+
+	// ── ORG-02: read surfaces ───────────────────────────────────────────────
+
+	ListTenantLifecycleHistory(ctx context.Context, tenantID string) ([]*domain.TenantLifecycleEvent, error)
+	GetTenantDefaults(ctx context.Context, tenantID string) (*domain.TenantDefaults, error)
+
+	// ── ORG-02: host bindings (ResolveTenantByHost, §8 NP3) ─────────────────
+
+	BindTenantHost(ctx context.Context, b *domain.TenantHostBinding) error
+	// ResolveTenantByHost is deliberately NOT tenant-scoped: it is the lookup
+	// that establishes which tenant a request belongs to. Returns (nil, nil)
+	// for an unknown hostname.
+	ResolveTenantByHost(ctx context.Context, hostname string) (*domain.ResolvedTenantByHost, error)
+	ListTenantHostBindings(ctx context.Context, tenantID string) ([]*domain.TenantHostBinding, error)
+
+	// ── ORG-03: profile versions ────────────────────────────────────────────
+
+	CreateInitialProfileVersion(ctx context.Context, v *domain.LegalEntityProfileVersion) error
+	AmendLegalProfile(ctx context.Context, legalEntityID string, next *domain.LegalEntityProfileVersion, expectedVersion int64, ev *outbox.Record) (*domain.LegalEntityProfileVersion, error)
+	ListEntityProfileVersions(ctx context.Context, legalEntityID string) ([]*domain.LegalEntityProfileVersion, error)
+	GetEntityProfileAsOf(ctx context.Context, legalEntityID string, asOf time.Time) (*domain.EntityAsOf, error)
+	FindEntitiesByRegistryNumber(ctx context.Context, registrationNumber, jurisdictionID string) ([]*domain.LegalEntity, error)
+
+	// ── ORG-03: registry conflict quarantine (§8 NP5) ───────────────────────
+
+	// FindActiveEntityByRegistry returns the ACTIVE entity already holding this
+	// registry identity in this jurisdiction, or (nil, nil) if there is none.
+	FindActiveEntityByRegistry(ctx context.Context, registrationNumber, jurisdictionID string) (*domain.LegalEntity, error)
+	RecordRegistryConflict(ctx context.Context, c *domain.EntityRegistryConflict) error
+	ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error)
+	ResolveRegistryConflict(ctx context.Context, conflictID string, status domain.RegistryConflictStatus, note, actorID string) error
+	// GetRegistryConflict returns one conflict, or (nil, nil) if absent.
+	GetRegistryConflict(ctx context.Context, conflictID string) (*domain.EntityRegistryConflict, error)
+	// ResolveRegistryConflictApproved records a resolution released by an
+	// independent approval, in the same transaction as the approval decision.
+	ResolveRegistryConflictApproved(ctx context.Context, conflictID string, status domain.RegistryConflictStatus, note, resolvedBy string, d domain.ApprovalDecision) error
+}
+
+// ---------------------------------------------------------------------------
+// Approval store — verified maker-checker (ORG-02 §4.2, ORG-03 §4.3)
+// ---------------------------------------------------------------------------
+
+// ApprovalStore is the data-access contract for approval requests.
+type ApprovalStore interface {
+	// CreateApprovalRequest files a PENDING request. Any PENDING request for
+	// the same subject whose TTL has passed is marked EXPIRED first, in the
+	// same transaction, so an abandoned proposal cannot block the subject
+	// forever. A live PENDING request for the subject returns ErrApprovalPending.
+	CreateApprovalRequest(ctx context.Context, a *domain.ApprovalRequest) error
+	// GetApprovalRequest returns one request, or (nil, nil) if absent.
+	GetApprovalRequest(ctx context.Context, approvalRequestID string) (*domain.ApprovalRequest, error)
+	// ListApprovalRequests lists the caller's tenant's requests, newest first.
+	// pendingOnly excludes decided and expired ones.
+	ListApprovalRequests(ctx context.Context, pendingOnly bool) ([]*domain.ApprovalRequest, error)
+	// LatestApprovalForSubject returns the most recent request for a subject,
+	// or (nil, nil) if there has never been one.
+	LatestApprovalForSubject(ctx context.Context, subjectType domain.ApprovalSubjectType, subjectID string) (*domain.ApprovalRequest, error)
+	// DecideApprovalRequest moves a PENDING request to status on its own —
+	// for REJECTED, STALE and EXPIRED, and for APPROVED where approval
+	// releases no further write (tenant creation). Returns
+	// ErrApprovalNotPending if the request is no longer PENDING (or, for
+	// APPROVED, has expired).
+	DecideApprovalRequest(ctx context.Context, d domain.ApprovalDecision, status domain.ApprovalStatus) error
+}
+
+// ---------------------------------------------------------------------------
+// ORG gap store — onboarding idempotency, FailedProvisioning, entity
+// verification and non-destructive merge (migration 000008)
+// ---------------------------------------------------------------------------
+
+// ProvisioningCompletion is the follow-on provisioning step: filing the
+// creation approval and enqueueing tenant.created, in one transaction.
+type ProvisioningCompletion struct {
+	TenantID string
+	Approval *domain.ApprovalRequest
+	Event    *outbox.Record
+	// FromFailed is RetryProvisioning: the same step, plus moving the tenant
+	// FAILED_PROVISIONING → ONBOARDING and recording the command, atomically.
+	FromFailed      bool
+	ExpectedVersion int64
+	ActorID         string
+	Reason          string
+	CorrelationID   string
+}
+
+// EntityVerification is an approved DRAFT → VERIFIED transition.
+type EntityVerification struct {
+	LegalEntityID   string
+	VerifiedBy      string
+	EvidenceRef     string
+	ExpectedVersion int64
+	Decision        domain.ApprovalDecision
+}
+
+// ORGGapStore is the data-access contract for the 000008 surfaces.
+type ORGGapStore interface {
+	// ResolveOnboardingKey returns the tenant a key produced and the request
+	// fingerprint it was produced from, or ("", "", nil) for an unused key.
+	// Not tenant-scoped: a replay does not know its tenant.
+	ResolveOnboardingKey(ctx context.Context, key string) (tenantID, fingerprint string, err error)
+	CompleteProvisioning(ctx context.Context, p ProvisioningCompletion) error
+	// MarkProvisioningFailed moves an ONBOARDING tenant to FAILED_PROVISIONING
+	// and records why.
+	MarkProvisioningFailed(ctx context.Context, tenantID, reason, actorID string) error
+
+	VerifyLegalEntity(ctx context.Context, v EntityVerification, ev *outbox.Record) error
+	ActivateLegalEntity(ctx context.Context, legalEntityID, actorID string, expectedVersion int64, ev *outbox.Record) error
+
+	MergeEntities(ctx context.Context, m *domain.EntityMergeRecord, d domain.ApprovalDecision, expectedVersion int64, ev *outbox.Record) error
+	UnmergeEntity(ctx context.Context, duplicateID, unmergedBy, reason string, d domain.ApprovalDecision, expectedVersion int64, ev *outbox.Record) error
+	ListEntityMergeRecords(ctx context.Context, legalEntityID string) ([]*domain.EntityMergeRecord, error)
 }

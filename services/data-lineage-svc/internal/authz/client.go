@@ -1,0 +1,232 @@
+package authz
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
+	"go.uber.org/zap"
+
+	svcenvelope "zoiko.io/data-lineage-svc/internal/envelope"
+)
+
+// ErrAuthorizationDenied is returned when authorization-svc explicitly denies the action.
+var ErrAuthorizationDenied = errors.New("authorization denied")
+
+// ErrAuthzServiceUnavailable is returned when authorization-svc could not be reached or
+// returned an unexpected response. Callers must treat this as a denial (fail closed).
+var ErrAuthzServiceUnavailable = errors.New("authorization service unavailable")
+
+// decisionCacheTTL bounds how long a GRANTED/DENIED decision from
+// authorization-svc may be reused locally before it is asked again — see
+// board-resolutions-svc's identical constant for the full doc-05 §6.5
+// rationale this mirrors.
+const decisionCacheTTL = 5 * time.Second
+
+type cachedDecision struct {
+	deniedErr error
+	expiresAt time.Time
+}
+
+// Client calls authorization-svc's real POST /v1/authorize.
+//
+// This replaces a client that called POST /v1/authorization/check — a
+// route that does not exist anywhere in authorization-svc (it registers
+// exactly one route, AuthorizePath = "/v1/authorize"). Every call 404'd
+// unconditionally, and CheckAllowed's own fail-closed handling turned
+// every non-200 into a denial, so every authz-gated action in this
+// service was permanently refused in every environment. Found and fixed
+// alongside the identical defect in data-lineage-svc, data-quality-svc
+// and semantic-model-svc — same bug, same root cause (a client that was
+// never actually wired to the real downstream contract), same fix
+// pattern already proven in board-resolutions-svc (and, per that
+// client's own comment, HR and notification services before it).
+type Client struct {
+	httpClient *http.Client
+	baseURL    string
+	logger     *zap.Logger
+
+	cacheMu     sync.Mutex
+	cache       map[string]cachedDecision
+	cacheWrites int
+}
+
+func NewClient(baseURL string, logger *zap.Logger) *Client {
+	return &Client{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     logger,
+		cache:      make(map[string]cachedDecision),
+	}
+}
+
+// NewClientWithHTTPClient is NewClient but with a caller-supplied
+// *http.Client — used for an mTLS-enabled deployment, where the client's
+// Transport already carries this service's leaf certificate and trusts
+// authorization-svc's CA.
+func NewClientWithHTTPClient(baseURL string, logger *zap.Logger, httpClient *http.Client) *Client {
+	return &Client{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		httpClient: httpClient,
+		logger:     logger,
+		cache:      make(map[string]cachedDecision),
+	}
+}
+
+type authorizeRequest struct {
+	PrincipalID   string `json:"principal_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	ActionType    string `json:"action_type"`
+}
+
+type authorizeResponse struct {
+	DecisionOutcome string `json:"decision_outcome"`
+}
+
+// CheckAllowed calls authorization-svc's POST /v1/authorize and fails closed: any
+// transport error, non-200 response, decode error, or non-GRANTED decision results
+// in a non-nil error (ErrAuthorizationDenied for explicit denial, otherwise
+// ErrAuthzServiceUnavailable).
+func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType
+
+	if decision, hit := c.lookupCache(key); hit {
+		return decision
+	}
+
+	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+
+	// Cache the decision itself (GRANTED or DENIED), never an unavailable
+	// outcome — see the doc comment on decisionCacheTTL.
+	if err == nil || errors.Is(err, ErrAuthorizationDenied) {
+		c.storeCache(key, err)
+	}
+
+	return err
+}
+
+// lookupCache returns the cached decision for key and whether it is still
+// within decisionCacheTTL. An expired entry is evicted on read.
+func (c *Client) lookupCache(key string) (error, bool) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	d, ok := c.cache[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(d.expiresAt) {
+		delete(c.cache, key)
+		return nil, false
+	}
+	return d.deniedErr, true
+}
+
+// storeCache records a real GRANTED/DENIED decision. Every 1000th write
+// sweeps expired entries so a long-lived instance with many distinct
+// (principal, entity, action) combinations doesn't grow the map
+// unboundedly between reads of the same key.
+func (c *Client) storeCache(key string, decision error) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	c.cache[key] = cachedDecision{deniedErr: decision, expiresAt: time.Now().Add(decisionCacheTTL)}
+
+	c.cacheWrites++
+	if c.cacheWrites%1000 == 0 {
+		now := time.Now()
+		for k, v := range c.cache {
+			if now.After(v.expiresAt) {
+				delete(c.cache, k)
+			}
+		}
+	}
+}
+
+// checkAllowedLive is the real, uncached call to authorization-svc.
+func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	body, err := json.Marshal(authorizeRequest{
+		PrincipalID:   principalID,
+		LegalEntityID: legalEntityID,
+		ActionType:    actionType,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/authorize", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// authorization-svc's resolveTenantScope prefers the verified
+	// X-Tenant-Id header over the request body, and — per its own doc
+	// comment — silently narrows to global-only SoD rules when neither is
+	// present, rather than refusing. Forwarding it here is what makes this
+	// tenant's segregation-of-duties rules actually apply to decisions
+	// made through this service, not just the globally-applicable ones.
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when the envelope carries one.
+	authzSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	// One decision per (request, action): an inbound request may authorize
+	// several actions, and each is its own decision to record.
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("authorization call failed", zap.Error(err))
+		}
+		return ErrAuthzServiceUnavailable
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		if c.logger != nil {
+			c.logger.Error("authorization service error", zap.Int("status", resp.StatusCode))
+		}
+		return ErrAuthzServiceUnavailable
+	}
+
+	var res authorizeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		if c.logger != nil {
+			c.logger.Error("failed to decode authorization response", zap.Error(err))
+		}
+		return ErrAuthzServiceUnavailable
+	}
+
+	if res.DecisionOutcome != "GRANTED" {
+		return ErrAuthorizationDenied
+	}
+	return nil
+}

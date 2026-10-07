@@ -26,7 +26,7 @@ func TestAuthorize_OwnObjectSoD_Denied_PublishesSoDEvent(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"AP_INVOICE_APPROVE","resource_owner_principal_id":"p-1"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"AP_INVOICE_APPROVE","resource_owner_principal_id":"p-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -62,7 +62,7 @@ func TestAuthorize_DifferentOwner_NotBlocked(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"AP_INVOICE_APPROVE","resource_owner_principal_id":"p-2"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"AP_INVOICE_APPROVE","resource_owner_principal_id":"p-2"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -87,7 +87,7 @@ func TestAuthorize_NoResourceOwnerSupplied_SkipsOwnObjectCheck(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"AP_INVOICE_APPROVE"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"AP_INVOICE_APPROVE"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -111,7 +111,7 @@ func TestAuthorize_OwnObject_StoreUnavailable_FailsClosed(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"AP_INVOICE_APPROVE","resource_owner_principal_id":"p-1"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"AP_INVOICE_APPROVE","resource_owner_principal_id":"p-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

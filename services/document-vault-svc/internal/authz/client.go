@@ -16,17 +16,17 @@
 package authz
 
 import (
-	svcenvelope "zoiko.io/document-vault-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/document-vault-svc/internal/envelope"
 
 	"go.uber.org/zap"
 
@@ -50,6 +50,29 @@ const (
 	ActionDocumentDownload      = "DOCUMENT_DOWNLOAD"
 	ActionDocumentVersionCreate = "DOCUMENT_VERSION_CREATE"
 	ActionDocumentAccessLogRead = "DOCUMENT_ACCESS_LOG_READ"
+	// ActionDocumentDeclareRecord/ActionDocumentSupersede gate BIZ-01 Wave
+	// 2's DeclareRecord/SupersedeDocument — distinct from ordinary version
+	// creation, since declaring or superseding a record is a heavier-weight
+	// action than uploading a new version.
+	ActionDocumentDeclareRecord = "DOCUMENT_DECLARE_RECORD"
+	ActionDocumentSupersede     = "DOCUMENT_SUPERSEDE"
+	// ActionDocumentArchive/ActionDocumentRequestDisposition gate BIZ-01
+	// Wave 3's MoveToArchive/RequestDisposition.
+	ActionDocumentArchive            = "DOCUMENT_ARCHIVE"
+	ActionDocumentRequestDisposition = "DOCUMENT_REQUEST_DISPOSITION"
+	// ActionDocumentLink gates LinkDocument — reading links back is
+	// covered by the existing ActionDocumentRead, same as any other
+	// metadata about a document.
+	ActionDocumentLink = "DOCUMENT_LINK"
+	// ActionClassifyRecord/ActionConfirmClassification gate BIZ-02's
+	// ClassifyRecord/ConfirmClassification — reading classification back
+	// is covered by the existing ActionDocumentRead.
+	ActionClassifyRecord        = "CLASSIFY_RECORD"
+	ActionConfirmClassification = "CONFIRM_CLASSIFICATION"
+	// ActionReclassifyRecord/ActionSupersedeClassification gate BIZ-02
+	// Wave 2's Reclassify/SupersedeClassification.
+	ActionReclassifyRecord        = "RECLASSIFY_RECORD"
+	ActionSupersedeClassification = "SUPERSEDE_CLASSIFICATION"
 )
 
 // Client is the interface the handler depends on, so tests can substitute a

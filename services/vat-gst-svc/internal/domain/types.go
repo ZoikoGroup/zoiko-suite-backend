@@ -8,6 +8,11 @@ import (
 var (
 	ErrVATReturnNotFound = errors.New("vat return not found")
 	ErrAlreadyFiled      = errors.New("vat return is already filed")
+	ErrVATReturnConflict = errors.New("vat return for this period already exists")
+
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
 )
 
 type FilingStatus string

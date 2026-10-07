@@ -26,6 +26,39 @@ type stubStore struct {
 	manifests map[string]*domain.EvidenceManifest
 	records   map[string][]domain.ManifestRecord
 	createErr error
+
+	// AUD-03 population stub state — a simple fixture, not a full
+	// in-memory simulation of the real CAS/reconciliation logic (that is
+	// covered by real-Postgres tests in internal/store).
+	population       *domain.AuditPopulation
+	populations      []*domain.AuditPopulation
+	popChanged       bool
+	popErr           error
+	popGetErr        error
+	listPopErr       error
+	controlTotals    []*domain.PopulationControlTotal
+	controlTotalsErr error
+
+	// AUD-04 sampling stub state — a simple fixture, not a simulation of
+	// the real algorithm/CAS logic (covered by real-Postgres tests).
+	paramSet        *domain.SamplingParameterSet
+	paramSetErr     error
+	sampleDesign    *domain.SampleDesign
+	designChanged   bool
+	designErr       error
+	designGetErr    error
+	sampleSelection *domain.SampleSelection
+	sampleItems     []*domain.SampleItem
+	selectErr       error
+	reproducible    bool
+	reproduceErr    error
+	itemResultsErr  error
+	sampleItem      *domain.SampleItem
+	itemChanged     bool
+	itemErr         error
+	evaluation      *domain.SampleEvaluation
+	evalChanged     bool
+	evalErr         error
 }
 
 func newStubStore() *stubStore {
@@ -105,6 +138,73 @@ func (s *stubStore) ListRecords(ctx context.Context, manifestID string) ([]domai
 	return s.records[manifestID], nil
 }
 
+func (s *stubStore) DefinePopulation(_ context.Context, _ domain.DefinePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) GetAuditPopulation(_ context.Context, _, _ string) (*domain.AuditPopulation, error) {
+	return s.population, s.popGetErr
+}
+func (s *stubStore) ListAuditPopulationsByEngagement(_ context.Context, _, _ string) ([]*domain.AuditPopulation, error) {
+	return s.populations, s.listPopErr
+}
+func (s *stubStore) BuildPopulation(_ context.Context, _ domain.BuildPopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) ValidatePopulation(_ context.Context, _ domain.ValidatePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) FreezePopulation(_ context.Context, _ domain.FreezePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) SupersedePopulation(_ context.Context, _ domain.SupersedePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) QuarantinePopulation(_ context.Context, _ domain.QuarantinePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) AddControlledDelta(_ context.Context, _ domain.AddControlledDeltaParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) GetControlTotals(_ context.Context, _, _ string) ([]*domain.PopulationControlTotal, error) {
+	return s.controlTotals, s.controlTotalsErr
+}
+func (s *stubStore) CreateSamplingParameterSet(_ context.Context, _ domain.CreateSamplingParameterSetParams) (*domain.SamplingParameterSet, error) {
+	return s.paramSet, s.paramSetErr
+}
+func (s *stubStore) CreateSampleDesign(_ context.Context, _ domain.CreateSampleDesignParams) (*domain.SampleDesign, bool, error) {
+	return s.sampleDesign, s.designChanged, s.designErr
+}
+func (s *stubStore) GetSampleDesign(_ context.Context, _, _ string) (*domain.SampleDesign, error) {
+	return s.sampleDesign, s.designGetErr
+}
+func (s *stubStore) ApproveSampleDesign(_ context.Context, _ domain.ApproveSampleDesignParams) (*domain.SampleDesign, bool, error) {
+	return s.sampleDesign, s.designChanged, s.designErr
+}
+func (s *stubStore) SelectSample(_ context.Context, _ domain.SelectSampleParams) (*domain.SampleSelection, []*domain.SampleItem, bool, error) {
+	return s.sampleSelection, s.sampleItems, s.designChanged, s.selectErr
+}
+func (s *stubStore) ReproduceSelection(_ context.Context, _, _ string) (bool, error) {
+	return s.reproducible, s.reproduceErr
+}
+func (s *stubStore) GetItemResults(_ context.Context, _, _ string) ([]*domain.SampleItem, error) {
+	return s.sampleItems, s.itemResultsErr
+}
+func (s *stubStore) RecordItemResult(_ context.Context, _ domain.RecordItemResultParams) (*domain.SampleItem, bool, error) {
+	return s.sampleItem, s.itemChanged, s.itemErr
+}
+func (s *stubStore) RecordNonresponse(_ context.Context, _ domain.RecordNonresponseParams) (*domain.SampleItem, bool, error) {
+	return s.sampleItem, s.itemChanged, s.itemErr
+}
+func (s *stubStore) AddAlternativeProcedure(_ context.Context, _ domain.AddAlternativeProcedureParams) (*domain.SampleItem, bool, error) {
+	return s.sampleItem, s.itemChanged, s.itemErr
+}
+func (s *stubStore) EvaluateSample(_ context.Context, _ domain.EvaluateSampleParams) (*domain.SampleEvaluation, bool, error) {
+	return s.evaluation, s.evalChanged, s.evalErr
+}
+func (s *stubStore) SupersedeSample(_ context.Context, _ domain.SupersedeSampleParams) (*domain.SampleDesign, bool, error) {
+	return s.sampleDesign, s.designChanged, s.designErr
+}
+
 // ── stub aggregator sources ──────────────────────────────────────────────────
 
 type stubGovernance struct {
@@ -144,14 +244,25 @@ func (s *stubWorkflow) GetByID(_ context.Context, id string) (*aggregator.Source
 // Defaults to an empty history (no error) so existing tests that never
 // configure it keep exercising the real path unaffected.
 type stubWorkflowHistory struct {
-	result []aggregator.SourceRecord
-	err    error
-	calls  int
+	result      []aggregator.SourceRecord
+	err         error
+	calls       int
+	rangeResult []aggregator.SourceRecord
+	rangeErr    error
+	rangeCalls  int
+	gotFrom     time.Time
+	gotTo       time.Time
 }
 
 func (s *stubWorkflowHistory) ListByInstanceID(_ context.Context, _ string) ([]aggregator.SourceRecord, error) {
 	s.calls++
 	return s.result, s.err
+}
+
+func (s *stubWorkflowHistory) ListByEntityAndDateRange(_ context.Context, _ string, from, to time.Time) ([]aggregator.SourceRecord, error) {
+	s.rangeCalls++
+	s.gotFrom, s.gotTo = from, to
+	return s.rangeResult, s.rangeErr
 }
 
 // ── stub publisher ───────────────────────────────────────────────────────────
@@ -390,6 +501,65 @@ func TestGenerateManifest_WorkflowHistoryUnavailable_FailsClosed(t *testing.T) {
 
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Empty(t, s.records["manifest-1"], "no partial records must be persisted when workflow-history-svc is unavailable")
+}
+
+// TestGenerateManifest_WorkflowHistoryTimeWindow_AutoDiscovers closes the
+// "distinct, broader discovery surface" workflow-history-svc's own
+// package doc deliberately left unwired when per-instance history was
+// added — the cross-workflow query, scoped by legal entity and time
+// window rather than a known instance ID.
+func TestGenerateManifest_WorkflowHistoryTimeWindow_AutoDiscovers(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	wfh := &stubWorkflowHistory{rangeResult: []aggregator.SourceRecord{
+		{SourceType: domain.SourceWorkflowHistory, SourceRecordID: "evt-9", RawJSON: []byte(`{"event_id":"evt-9"}`)},
+	}}
+
+	s := newStubStore()
+	r := newRouterWithWorkflowHistory(s, gov, acc, wf, wfh, pub, &stubAuthz{})
+
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)
+	body, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioLegalDiscovery,
+		WorkflowHistoryFrom: &from, WorkflowHistoryTo: &to,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.Len(t, s.records["manifest-1"], 1)
+	if wfh.rangeCalls != 1 {
+		t.Fatalf("expected exactly one ListByEntityAndDateRange call, got %d", wfh.rangeCalls)
+	}
+	if !wfh.gotFrom.Equal(from) || !wfh.gotTo.Equal(to) {
+		t.Fatalf("expected from/to %v/%v, got %v/%v", from, to, wfh.gotFrom, wfh.gotTo)
+	}
+}
+
+// TestGenerateManifest_WorkflowHistoryFrom_WithoutTo_Refused pins the
+// validation that workflow-history-svc's cross-workflow endpoint requires
+// both from and to — supplying only one must be refused with a clear
+// 400, not an opaque downstream failure.
+func TestGenerateManifest_WorkflowHistoryFrom_WithoutTo_Refused(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	s := newStubStore()
+	r := newRouter(s, gov, acc, wf, pub)
+
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	body, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioLegalDiscovery,
+		WorkflowHistoryFrom: &from,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
 // ── GetManifest / ListRecords ────────────────────────────────────────────────

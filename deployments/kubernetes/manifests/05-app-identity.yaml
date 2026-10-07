@@ -75,6 +75,9 @@ spec:
           value: "identity-context-svc"
         - name: KAFKA_EVENTS_TOPIC
           value: "zoiko.identity.events"
+        # Read side: the producer topics of every handled event (see config.DefaultConsumeTopics).
+        - name: KAFKA_CONSUME_TOPICS
+          value: "zoiko.identity.events,zoiko.delegated-authority.events,zoiko.access-control.events,zoiko.entity.events"
         - name: JWT_SIGNING_SECRET
           valueFrom:
             secretKeyRef:

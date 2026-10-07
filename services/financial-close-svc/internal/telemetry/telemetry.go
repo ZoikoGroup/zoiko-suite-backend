@@ -11,12 +11,25 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var consumeTracer = otel.Tracer("financial-close-svc/kafka-consumer")
+
+// StartConsumeSpan opens one OTel span per consumed Kafka message — the
+// same "Observability Baseline" posture (03-microservices.md §3.8) this
+// platform's other Kafka consumers (workflow-history-svc,
+// audit-event-store-svc) already apply.
+func StartConsumeSpan(ctx context.Context, topic, eventID string) (context.Context, trace.Span) {
+	return consumeTracer.Start(ctx, "kafka.consume "+topic,
+		trace.WithAttributes(attribute.String("messaging.destination", topic), attribute.String("event_id", eventID)))
+}
 
 func InitTracing(ctx context.Context, serviceName, otlpEndpoint string) (func(context.Context) error, error) {
 	endpoint := strings.TrimPrefix(strings.TrimPrefix(otlpEndpoint, "https://"), "http://")
@@ -45,9 +58,10 @@ func InitTracing(ctx context.Context, serviceName, otlpEndpoint string) (func(co
 }
 
 type Metrics struct {
-	HTTPRequestsTotal   *prometheus.CounterVec
-	HTTPRequestDuration *prometheus.HistogramVec
-	ReadinessUp         prometheus.Gauge
+	HTTPRequestsTotal     *prometheus.CounterVec
+	HTTPRequestDuration   *prometheus.HistogramVec
+	ReadinessUp           prometheus.Gauge
+	MessagesConsumedTotal *prometheus.CounterVec
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -68,8 +82,18 @@ func NewMetrics(serviceName string) *Metrics {
 			Help:        "1 if the last /readyz check succeeded, 0 otherwise.",
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
+		// MessagesConsumedTotal is the lineage Kafka consumer's own
+		// observability — one increment per message, labeled by topic and
+		// outcome ("ok" | "dead_lettered" | "store_error"), same
+		// three-outcome shape workflow-history-svc's own Runner already
+		// established.
+		MessagesConsumedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "messages_consumed_total",
+			Help:        "Total Kafka messages consumed, labeled by topic and outcome.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}, []string{"topic", "outcome"}),
 	}
-	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp)
+	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp, m.MessagesConsumedTotal)
 	return m
 }
 

@@ -1,0 +1,341 @@
+asyncapi: 2.6.0
+
+# search-indexer-svc's event contract.
+#
+# READ THIS FIRST, because the direction is the unusual part: this service is
+# primarily a CONSUMER. It subscribes to whatever topics its registered search
+# sources declare, projects those events into searchable documents, and
+# publishes only facts ABOUT THE SEARCH PLANE — never a tenant's content.
+#
+# It used to consume nothing at all. It polled obligations-svc over HTTP, a
+# design that could not work (backend tracker row 65a: the poll was headerless
+# against an endpoint requiring a verified tenant, so every cycle 401'd) and
+# could not be repaired by adding a header, because the poll was deliberately
+# cross-tenant. Doc 03 §37 and Doc 04 §9.8 place search indexes as event-driven
+# derivative projections precisely so that no cross-tenant read privilege is
+# needed: an event envelope already carries the tenant that produced it.
+
+info:
+  title: search-indexer-svc events
+  version: "1.0.0"
+  description: |
+    ZS-SVC-AB-001 §11.2 canonical events, plus the consumption contract every
+    source must satisfy to be indexable.
+
+    **Nothing this service publishes carries indexed content.** A query digest
+    may travel; a query may not (INV-17). A `source_ref` may travel; the
+    document behind it may not. The consumers are SRE, audit, DQC and the
+    privacy/records services, none of which needs the content to do its job.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: kafka:9094
+    protocol: kafka
+    description: Local development broker
+
+channels:
+  # ── Consumed ──────────────────────────────────────────────────────────────
+
+  "zoiko.{domain}.events":
+    description: |
+      **Consumed.** The set of topics is NOT configured — it is resolved at
+      runtime from the `event_topic` of every registered search source, and
+      re-resolved every 30 seconds, so onboarding a domain is a `POST
+      /v1/search-sources` rather than a redeploy.
+
+      One kafka-go Reader per topic, in its own goroutine, because a Reader
+      with a GroupID accepts exactly one topic and a comma-joined string
+      matches nothing at all.
+    parameters:
+      domain:
+        description: The owning domain, e.g. `obligations`, `contract`, `purchase-request`.
+        schema: { type: string }
+    subscribe:
+      operationId: consumeDomainEvent
+      summary: Project a domain event into a searchable document
+      description: |
+        The event is projected ONLY if:
+
+        * a registered source claims its `source_type` (the first segment of
+          `event_type` — `obligation.created` → `obligation`), and
+        * that source has a PUBLISHED contract, and
+        * that scope has an ACTIVE generation, and
+        * **the envelope carries a `tenant_id`**.
+
+        The last is not negotiable. INV-02: "every projection document carries
+        trusted tenant identity; tenant is never inferred solely from user
+        query text." An event with no tenant is QUARANTINED — committed so it
+        does not block the partition, copied to the DLQ so the source owner
+        can see what was emitted, and never indexed under a guessed tenant.
+
+        Outcomes, and what each does to the Kafka offset:
+
+        | Outcome | Committed | Why |
+        |---|---|---|
+        | `ok` | yes | Projected |
+        | `skipped` | yes | No projector claims this event type — not a failure |
+        | `stale` | yes | The ledger refused it as older; retrying loses again |
+        | `quarantined` | yes + DLQ | A contract violation does not become valid on a retry |
+        | `error` | no → retry ×3 → DLQ | Transient; the partition must not block forever |
+      message:
+        $ref: "#/components/messages/DomainEvent"
+
+  # ── Published ─────────────────────────────────────────────────────────────
+
+  "zoiko.search.events":
+    description: |
+      **Published.** A dedicated topic rather than publishing onto each
+      source's topic: these are facts about the search plane, and putting them
+      on, say, the obligations topic would make every obligations consumer
+      parse events about index generations.
+
+      The Kafka key is the SCOPE, so every event about one search surface
+      lands on one partition and therefore arrives in order. A consumer
+      reading `generation.ready` after `generation.activated` for the same
+      scope would otherwise be routine rather than a bug.
+    publish:
+      operationId: publishSearchPlaneEvent
+      summary: ESR-01..ESR-05 search-plane facts
+      message:
+        oneOf:
+          - $ref: "#/components/messages/GenerationReady"
+          - $ref: "#/components/messages/GenerationActivated"
+          - $ref: "#/components/messages/CheckpointAdvanced"
+          - $ref: "#/components/messages/RestrictionPropagated"
+          - $ref: "#/components/messages/RestrictionFailed"
+          - $ref: "#/components/messages/SearchDegraded"
+          - $ref: "#/components/messages/SecurityFilterDenied"
+          - $ref: "#/components/messages/ReindexFailed"
+
+  "zoiko.{domain}.events.dlq":
+    description: |
+      **Published.** Dead letters, carrying the original message unchanged
+      plus `X-DLQ-*` headers naming the reason, the source coordinates and
+      the time. The original headers — including `X-Event-ID` — are preserved
+      so a DLQ record stays correlatable back to its source.
+
+      Quarantined messages are copied here even though they are also
+      committed: the commit unblocks the partition, and the DLQ copy is the
+      evidence a source owner needs to see what their producer emitted, which
+      is otherwise gone once the retention window passes.
+    parameters:
+      domain: { schema: { type: string } }
+    publish:
+      operationId: deadLetter
+      message:
+        $ref: "#/components/messages/DomainEvent"
+
+components:
+  messageTraits:
+    envelope:
+      headers:
+        type: object
+        properties:
+          X-Event-ID:
+            type: string
+            description: |
+              Always set on published messages. A consumer dedupes on this
+              rather than falling back to `topic:partition:offset`, which
+              cannot absorb a producer-side retry landing on a different
+              offset.
+
+  messages:
+    DomainEvent:
+      name: DomainEvent
+      title: A consumed domain event
+      summary: The platform envelope (Doc 03 §19) as the producers actually emit it
+      description: |
+        These are the WIRE names, taken from the producers themselves rather
+        than from Doc 03 — the two differ in this estate, and grepping the
+        producers is the only reliable way to know a topic's real shape.
+
+        `tenant_id` is the field that matters and the field that was missing.
+        Most producers carry it; obligations-svc did not until this service
+        needed it, and that omission is now fixed at the producer rather than
+        worked around here.
+      payload:
+        type: object
+        required: [event_id, event_type, emitted_at, payload]
+        properties:
+          event_id: { type: string }
+          event_type:
+            type: string
+            description: |
+              `<source_type>.<action>`. The first segment binds the event to a
+              registered source — the convention every producer here follows,
+              and what removes the need for a per-event mapping table.
+            example: obligation.created
+          event_version: { type: string }
+          emitted_at: { type: string, format: date-time }
+          schema_version: { type: string }
+          source_service: { type: string }
+          tenant_id:
+            type: string
+            description: |
+              **Required for the event to be projectable.** Absent, the event
+              is quarantined rather than indexed (INV-02).
+          legal_entity_id: { type: string }
+          jurisdiction: { type: string }
+          actor_id: { type: string }
+          correlation_id: { type: string }
+          payload:
+            type: object
+            description: |
+              Domain fields. Only those the PUBLISHED contract registered are
+              projected; everything else is ignored (INV-08), and a field the
+              contract marked SECRET_PROHIBITED fails the whole projection if
+              it is present at all (INV-09, NP-10).
+
+    GenerationReady:
+      name: esr.index_generation.ready
+      title: A generation passed validation and is not yet serving
+      summary: Consumers — CFG/router, SRE, audit
+      traits: [{ $ref: "#/components/messageTraits/envelope" }]
+      payload:
+        type: object
+        properties:
+          scope_name: { type: string }
+          generation_id: { type: string, format: uuid }
+          contract_id: { type: string, format: uuid }
+          partition: { type: string }
+          validation_digest:
+            type: string
+            description: TC-09 — what was actually checked before activation.
+
+    GenerationActivated:
+      name: esr.index_generation.activated
+      title: An alias cutover completed
+      summary: Consumers — SRE, evidence
+      description: |
+        Carries BOTH generations. §8.3's alias-drift detection compares the
+        serving generation against the desired signed generation and needs the
+        pair to do it.
+      traits: [{ $ref: "#/components/messageTraits/envelope" }]
+      payload:
+        type: object
+        properties:
+          scope_name: { type: string }
+          previous_generation: { type: string }
+          new_generation: { type: string }
+          activated_by_actor_id: { type: string }
+          activation_time: { type: string, format: date-time }
+
+    CheckpointAdvanced:
+      name: esr.index_checkpoint.advanced
+      title: Ingestion progress
+      summary: Consumers — DQC, SRE
+      traits: [{ $ref: "#/components/messageTraits/envelope" }]
+      payload:
+        type: object
+        properties:
+          scope_name: { type: string }
+          source_partition: { type: string }
+          watermark: { type: integer }
+          lag_ms: { type: integer }
+          generation_id: { type: string }
+          freshness:
+            type: string
+            enum: [UNKNOWN, CURRENT, LAGGING, STALE]
+
+    RestrictionPropagated:
+      name: esr.restriction.propagated
+      title: A restriction was PROVEN invisible
+      summary: Consumers — PRV, DRC, the owning domain, evidence
+      description: |
+        Emitted at VERIFIED, never at APPLIED. §2.2: APPLIED is not VERIFIED
+        until search visibility has been tested, and PRV/DRC consume this as
+        evidence that an erasure or restriction obligation has been met in the
+        search plane — so emitting it on a write that has not been checked
+        would tell a privacy service a thing was done when it had only been
+        attempted.
+      traits: [{ $ref: "#/components/messageTraits/envelope" }]
+      payload:
+        type: object
+        properties:
+          scope_name: { type: string }
+          source_type: { type: string }
+          source_id: { type: string }
+          reason: { type: string }
+          source_event_id: { type: string }
+          verified_at:
+            type: string
+            format: date-time
+            description: TC-08 — when invisibility was proven.
+
+    RestrictionFailed:
+      name: esr.restriction.failed
+      title: A restriction could not be propagated or verified
+      summary: Consumers — WFC incident, SRE, Security
+      description: |
+        §8.2 allows the affected scope to be blocked or degraded rather than
+        continuing known over-disclosure, so the payload carries the age and
+        the blast radius that decision needs.
+      traits: [{ $ref: "#/components/messageTraits/envelope" }]
+      payload:
+        type: object
+        properties:
+          scope_name: { type: string }
+          source_type: { type: string }
+          source_id: { type: string }
+          reason: { type: string }
+          age_seconds:
+            type: number
+            description: How long the content has been discoverable since the restriction took effect.
+          blast_radius: { type: integer }
+
+    SearchDegraded:
+      name: esr.search.degraded
+      title: A scope answered incompletely
+      summary: Consumers — NCD, SRE, operations
+      traits: [{ $ref: "#/components/messageTraits/envelope" }]
+      payload:
+        type: object
+        properties:
+          scope_name: { type: string }
+          partitions: { type: array, items: { type: string } }
+          cause: { type: string }
+          completeness_state:
+            type: string
+            enum: [COMPLETE, PARTIAL, DEGRADED, UNKNOWN]
+
+    SecurityFilterDenied:
+      name: esr.security_filter.denied
+      title: The query planner refused a request
+      summary: Consumers — Security, audit
+      description: |
+        The actor is HASHED, not named — §11.2 specifies "actor/workload hash"
+        for this event and not for the others. The reason is the consumer:
+        this stream goes to Security for abuse detection, where the question
+        is "is one actor doing this repeatedly", which a stable keyed hash
+        answers — rather than "who is it", which belongs in the tenant-scoped
+        evidence table behind an authorization check.
+
+        The hash is HMAC-keyed, not a bare SHA-256: the input space is UUIDs a
+        determined reader could enumerate offline, so an unkeyed hash of a
+        principal id is a principal id with extra steps.
+      traits: [{ $ref: "#/components/messageTraits/envelope" }]
+      payload:
+        type: object
+        properties:
+          scope_name: { type: string }
+          reason_code:
+            type: string
+            description: A §11.3 code, e.g. ESR-003 QUERY_OPERATOR_FORBIDDEN.
+          actor_hash: { type: string }
+
+    ReindexFailed:
+      name: esr.reindex.failed
+      title: A generation failed to build or validate
+      summary: Consumers — WFC, SRE, Search Platform
+      traits: [{ $ref: "#/components/messageTraits/envelope" }]
+      payload:
+        type: object
+        properties:
+          scope_name: { type: string }
+          generation_id: { type: string, format: uuid }
+          validation_stage:
+            type: string
+            enum: [BUILD, VALIDATION]
+          reason: { type: string }

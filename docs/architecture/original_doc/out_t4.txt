@@ -1,0 +1,19 @@
+Service | Authoritative ownership | Must never own / bypass
+ACC-01 | Posting account master/hierarchy/restrictions | Journal state, posting consequence, report presentation
+ACC-02 | Effective-dated account mapping | Ledger entry, source business fact
+ACC-03 | Journal proposal/lifecycle | Append-only ledger truth
+ACC-04 | Posting execution/calculation/rule consequence | Source business fact, tax determination
+ACC-05 | Posted ledger entries/balances | Draft journals or source workflow
+ACC-06 | Subledger-to-GL control runs/exceptions | Underlying subledger/ledger values
+ACC-07 | Accrual schedules/instances | Direct ledger writes
+ACC-08 | Prepayment/deferral schedules | Direct ledger writes
+ACC-09 | Allocation rules/runs | Source population or ledger truth
+ACC-10 | FX revaluation runs/item calculations | FX reference master or ledger write bypass
+ACC-11 | Intercompany pair/match state | Local entity source accounting
+ACC-12 | Consolidation adjustment lifecycle | Entity statutory ledgers
+ACC-13 | Consolidation run/group balances/provenance | Source entity balances
+ACC-14 | Period close/reopen control state | Posted accounting entries
+ACC-15 | Trial-balance datasets/watermarks | Ledger truth
+ACC-16 | Signed financial snapshots/manifests | Mutable live balances
+ACC-17 | Migration accounting batch/crosswalk/certification | Bypass of ACC-04/05
+ACC-18 | Lineage graph/index | Underlying accounting/business facts

@@ -1,17 +1,51 @@
 # Configuration & Feature Flag Service — Progress & Phase Plan
 
-Status: **100% aligned to the approved 3-batch build task — all three
-batches written, built, tested, manually verified via Postman, AND the
-real Dockerfile image built and round-trip tested, 2026-07-08.** Docker
-Desktop was not running when this was first written; once started, the
-full verification loop was actually executed in this sandbox (no host Go
-toolchain needed): `golang:1.25-alpine` container bind-mounting the source
-for the automated/dev-mode checks, and the actual multi-stage `Dockerfile`
-image separately built and run for the final packaging proof — see
-"Docker image build — closed" below. The only thing outside this task's
-scope that remains undone is adding this service to
-`deployments/docker-compose.yml`'s unified stack (§7.7 in `context.md`),
-which was never part of the original 3-batch spec.
+Status: **ESR complete — `scripts/audit.sh` 146/146 (100%) against a running
+stack, 22 Sep 2026.** See `RELEASE_CERTIFICATE.md` for what was verified,
+against what, and what was deliberately not done.
+
+## Enterprise Service Readiness pass — 22 Sep 2026
+
+Brought this service up to the standard set by `access-control-svc` and
+`delegated-authority-svc`: real contracts, a runbook, alert rules, domain
+telemetry, a transactional outbox, and an e2e-tested console surface.
+
+**Four defects fixed, all of the same family — each produced an entirely
+ordinary-looking response:**
+
+1. **Events were fire-and-forget after commit.** A broker hiccup left the change
+   recorded, the operator told it was saved, and every consumer still reading the
+   superseded value — which is valid data, so undetectable downstream. Replaced
+   with a transactional outbox (`000003`) plus `internal/outbox` relay.
+2. **A tenant-scoped write and an environment-wide write were the same grant**,
+   so a principal provisioned for one organisation could change what every other
+   organisation reads. Split into `*_GLOBAL_WRITE` actions, seeded into
+   `CONFIG_FULL`.
+3. **Readiness pinged only the database**, so with `authorization-svc` down the
+   container reported ready while 100% of writes answered 503 and every read
+   worked.
+4. **No domain metrics at all**, so none of the above was measurable or
+   alertable.
+
+Plus: `AUTHZ_PLATFORM_SCOPE_ID` now validated at startup (unset made every write
+fail with an error that read as an outage); the store suite no longer leaves the
+schema broken behind it; the event partition key is the aggregate rather than the
+correlation id; `scope_is_global` added to both payloads; three gated-route tests
+that asserted nothing about their payloads fixed; a pre-existing `gofmt` failure
+in `internal/authz/client.go` cleared.
+
+**Added:** `openapi.yaml`, `asyncapi.yaml`, `RUNBOOK.md`,
+`RELEASE_CERTIFICATE.md`, `scripts/audit.sh`, `scripts/spec_query.py`,
+`internal/telemetry/domain.go`, `internal/outbox/`, 7 Prometheus alert rules,
+`e2e/configuration.spec.ts` (16 specs) and `e2e/mock/configuration-service.mjs`
+in the console.
+
+**Tests:** 81 Go tests passing, 0 failing, 0 skipped (24 → 81). 16 Playwright
+specs passing.
+
+---
+
+## Original build record (2026-07-08)
 
 **Verification actually performed (2026-07-08):**
 1. `go mod tidy && go vet ./... && go build ./cmd/server` → clean, no

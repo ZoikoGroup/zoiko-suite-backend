@@ -17,9 +17,12 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
+	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
 
 // Client is the narrow interface the handler depends on.
@@ -31,6 +34,10 @@ type Client interface {
 	// callers must fail-closed on the latter, same as every other
 	// synchronous cross-service call in this platform.
 	CheckApprovalAllowed(ctx context.Context, principalID, legalEntityID string) error
+	// CheckAllowed is used by typed workflow-domain modules for actions other
+	// than generic stage approval. It deliberately still delegates the decision
+	// to authorization-svc; a workflow module must not self-authorize.
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
 // HTTPClient implements Client against a real authorization-svc instance.
@@ -69,7 +76,15 @@ type authorizeResponse struct {
 const approvalActionType = "WORKFLOW_APPROVE"
 
 func (c *HTTPClient) CheckApprovalAllowed(ctx context.Context, principalID, legalEntityID string) error {
-	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: approvalActionType})
+	return c.checkAllowed(ctx, principalID, legalEntityID, approvalActionType)
+}
+
+func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	return c.checkAllowed(ctx, principalID, legalEntityID, actionType)
+}
+
+func (c *HTTPClient) checkAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType})
 	if err != nil {
 		return fmt.Errorf("marshal authorize request: %w", err)
 	}
@@ -79,6 +94,44 @@ func (c *HTTPClient) CheckApprovalAllowed(ctx context.Context, principalID, lega
 		return domain.ErrAuthorizationServiceUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := ""
+	authzSourceChannel := "web"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+		if env.IdempotencyKey != "" {
+			req.Header.Set("Idempotency-Key", env.IdempotencyKey)
+		}
+	}
+	if req.Header.Get("X-Tenant-Id") == "" {
+		if tid := svcmiddleware.TenantFromContext(ctx); tid != "" {
+			req.Header.Set("X-Tenant-Id", tid)
+		}
+	}
+	if authzRequestID == "" {
+		authzRequestID = uuid.New().String()
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	if req.Header.Get("Idempotency-Key") == "" {
+		req.Header.Set("Idempotency-Key", "authz-"+authzRequestID)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

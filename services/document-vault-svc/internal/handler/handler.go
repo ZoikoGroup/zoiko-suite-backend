@@ -8,8 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -18,18 +21,37 @@ import (
 	"zoiko.io/document-vault-svc/internal/domain"
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 	"zoiko.io/document-vault-svc/internal/residency"
+	"zoiko.io/document-vault-svc/internal/scan"
 	"zoiko.io/document-vault-svc/internal/storage"
 )
 
 type Store interface {
-	CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion) error
-	AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion) (*domain.Document, error)
+	CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion, correlationID string) error
+	AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, error)
+	DeclareRecord(ctx context.Context, p domain.DeclareRecordParams, correlationID string) (*domain.Document, error)
+	SupersedeDocument(ctx context.Context, p domain.SupersedeDocumentParams, correlationID string) (*domain.Document, error)
+	MoveToArchive(ctx context.Context, p domain.MoveToArchiveParams, correlationID string) (*domain.Document, error)
+	RequestDisposition(ctx context.Context, p domain.RequestDispositionParams, correlationID string) (*domain.Document, error)
+	GetAsOfDocument(ctx context.Context, documentID string, asOf time.Time) (*domain.Document, *domain.DocumentVersion, error)
+	LinkDocument(ctx context.Context, p domain.LinkDocumentParams) (*domain.DocumentLink, error)
+	ListDocumentLinks(ctx context.Context, documentID string) ([]domain.DocumentLink, error)
+	ClassifyRecord(ctx context.Context, p domain.ClassifyRecordParams) (*domain.RecordClassification, error)
+	FindClassificationByID(ctx context.Context, classificationID string) (*domain.RecordClassification, error)
+	ConfirmClassification(ctx context.Context, p domain.ConfirmClassificationParams) (*domain.RecordClassification, error)
+	GetClassification(ctx context.Context, documentID string) (*domain.RecordClassification, error)
+	Reclassify(ctx context.Context, p domain.ReclassifyParams) (*domain.RecordClassification, error)
+	SupersedeClassification(ctx context.Context, p domain.SupersedeClassificationParams) (*domain.RecordClassification, error)
+	GetAsOfClassification(ctx context.Context, documentID string, asOf time.Time) (*domain.RecordClassification, error)
+	ListClassificationHistory(ctx context.Context, documentID string) ([]domain.RecordClassification, error)
+	ListUnclassified(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.Document, error)
+	ExplainPolicyMapping(ctx context.Context, classificationID string) (*domain.PolicyMappingExplanation, error)
 	FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error)
 	FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error)
 	ListDocuments(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.Document, error)
 	RecordAccess(ctx context.Context, log *domain.DocumentAccessLog) error
 	ListAccessLog(ctx context.Context, documentID string, limit, offset int) ([]domain.DocumentAccessLog, error)
+	RecordQuarantinedVersionUpload(ctx context.Context, documentID, attemptedByPrincipalID, reason, correlationID string) error
 }
 
 type Handler struct {
@@ -37,11 +59,12 @@ type Handler struct {
 	storage   storage.Backend
 	residency residency.Validator
 	authz     authz.Client
+	scanner   scan.Scanner
 	log       *zap.Logger
 }
 
-func New(store Store, storageBackend storage.Backend, residencyValidator residency.Validator, authzClient authz.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, storage: storageBackend, residency: residencyValidator, authz: authzClient, log: log}
+func New(store Store, storageBackend storage.Backend, residencyValidator residency.Validator, authzClient authz.Client, scanner scan.Scanner, log *zap.Logger) *Handler {
+	return &Handler{store: store, storage: storageBackend, residency: residencyValidator, authz: authzClient, scanner: scanner, log: log}
 }
 
 // maxBodyBytes caps a request body.
@@ -68,6 +91,24 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{documentID}/versions", h.AddVersion)
 		r.Get("/{documentID}/versions", h.ListVersions)
 		r.Get("/{documentID}/access-log", h.ListAccessLog)
+		r.Post("/{documentID}/declare-record", h.DeclareRecord)
+		r.Post("/{documentID}/supersede", h.SupersedeDocument)
+		r.Post("/{documentID}/archive", h.MoveToArchive)
+		r.Post("/{documentID}/request-disposition", h.RequestDisposition)
+		r.Get("/{documentID}/verify-digest", h.VerifyDigest)
+		r.Get("/{documentID}/as-of", h.GetAsOfDocument)
+		r.Post("/{documentID}/links", h.LinkDocument)
+		r.Get("/{documentID}/links", h.GetLinkedObjects)
+		r.Post("/{documentID}/classify", h.ClassifyRecord)
+		r.Post("/classifications/{classificationID}/confirm", h.ConfirmClassification)
+		r.Get("/{documentID}/classification", h.GetClassification)
+		r.Post("/{documentID}/reclassify", h.Reclassify)
+		r.Post("/classifications/{classificationID}/supersede", h.SupersedeClassification)
+		r.Post("/bulk-classify", h.BulkClassify)
+		r.Get("/{documentID}/classification/as-of", h.GetAsOfClassification)
+		r.Get("/{documentID}/classification/history", h.ListClassificationHistory)
+		r.Get("/unclassified", h.ListUnclassified)
+		r.Get("/classifications/{classificationID}/policy-mapping", h.ExplainPolicyMapping)
 	})
 }
 
@@ -118,6 +159,21 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(content) == 0 {
 		writeError(w, http.StatusBadRequest, "empty_content", domain.ErrEmptyContent.Error())
+		return
+	}
+
+	// Malware/type scan gate (BIZ-01's own "Malware/type/hash failure
+	// quarantines upload" failure semantics) — before anything is
+	// persisted. No document exists yet at this point, so a quarantine
+	// here is reject-only: there is no aggregate to tie a recorded event
+	// to (see internal/scan's own package doc on the current NoOpScanner).
+	if result, err := h.scanner.Scan(r.Context(), content, req.ContentType); err != nil {
+		h.log.Error("CreateDocument: scan unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "scan_unavailable", "")
+		return
+	} else if !result.Clean {
+		h.log.Warn("CreateDocument: upload quarantined", zap.String("reason", result.Reason))
+		writeError(w, http.StatusUnprocessableEntity, "upload_quarantined", result.Reason)
 		return
 	}
 
@@ -174,7 +230,7 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: actor,
 	}
 
-	if err := h.store.CreateDocument(r.Context(), doc, firstVersion); err != nil {
+	if err := h.store.CreateDocument(r.Context(), doc, firstVersion, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.log.Error("CreateDocument: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
@@ -208,6 +264,829 @@ func (h *Handler) GetDocument(w http.ResponseWriter, r *http.Request) {
 
 	h.recordAccess(r, actor, documentID, nil, domain.AccessMetadata)
 	writeJSON(w, http.StatusOK, doc)
+}
+
+// ── POST /v1/documents/{documentID}/declare-record ──────────────────────────
+
+// DeclareRecord marks the document's current version the authoritative
+// declared record — BIZ-01's own central concept, distinct from ordinary
+// versioning. See domain.CanDeclareRecord's own doc comment: this is a
+// one-time action, not a repeatable one.
+func (h *Handler) DeclareRecord(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentDeclareRecord) {
+		return
+	}
+
+	updated, err := h.store.DeclareRecord(r.Context(), domain.DeclareRecordParams{
+		DocumentID: documentID, DeclaredByPrincipalID: actor,
+	}, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── POST /v1/documents/{documentID}/supersede ────────────────────────────────
+
+type supersedeDocumentRequest struct {
+	SupersededByDocumentID string `json:"superseded_by_document_id"`
+}
+
+// SupersedeDocument marks documentID as superseded by an already-existing
+// document — the replacement is created first via the normal
+// CreateDocument path, then linked here. Forward link only, set exactly
+// once (migration 000005's own trigger).
+func (h *Handler) SupersedeDocument(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req supersedeDocumentRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.SupersededByDocumentID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "superseded_by_document_id")
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentSupersede) {
+		return
+	}
+
+	updated, err := h.store.SupersedeDocument(r.Context(), domain.SupersedeDocumentParams{
+		DocumentID: documentID, SupersededByDocumentID: req.SupersededByDocumentID, ActorPrincipalID: actor,
+	}, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── POST /v1/documents/{documentID}/archive ──────────────────────────────────
+
+type moveToArchiveRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// MoveToArchive marks the document ARCHIVED — see domain.CanArchive.
+func (h *Handler) MoveToArchive(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req moveToArchiveRequest
+	_ = decodeJSONOptional(r, &req)
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentArchive) {
+		return
+	}
+
+	updated, err := h.store.MoveToArchive(r.Context(), domain.MoveToArchiveParams{
+		DocumentID: documentID, ArchivedByPrincipalID: actor, Reason: req.Reason,
+	}, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── POST /v1/documents/{documentID}/request-disposition ─────────────────────
+
+type requestDispositionRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// RequestDisposition records a disposition request only — see
+// domain.Document.DispositionRequestedAt's own doc comment. It never
+// purges anything; DATA-GOV owns that decision.
+func (h *Handler) RequestDisposition(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req requestDispositionRequest
+	_ = decodeJSONOptional(r, &req)
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRequestDisposition) {
+		return
+	}
+
+	updated, err := h.store.RequestDisposition(r.Context(), domain.RequestDispositionParams{
+		DocumentID: documentID, RequestedByPrincipalID: actor, Reason: req.Reason,
+	}, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── GET /v1/documents/{documentID}/verify-digest ─────────────────────────────
+
+// VerifyDigest re-verifies a version's stored checksum against the actual
+// bytes on disk — a pass/fail integrity check, never the content itself
+// (that stays GetContent's own DOWNLOAD-gated disclosure). Defaults to
+// the document's current version; ?version=N checks a specific one.
+func (h *Handler) VerifyDigest(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	version := doc.CurrentVersion
+	if q := r.URL.Query().Get("version"); q != "" {
+		v, err := strconv.Atoi(q)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_version", q)
+			return
+		}
+		version = v
+	}
+
+	v, err := h.store.FindVersion(r.Context(), documentID, version)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+
+	_, err = h.storage.Get(r.Context(), v.StorageKey, v.ChecksumSHA256)
+	result := domain.DigestVerification{DocumentID: documentID, Version: version, ChecksumSHA256: v.ChecksumSHA256, Verified: true}
+	if errors.Is(err, storage.ErrIntegrityFailure) {
+		h.log.Error("VerifyDigest: INTEGRITY FAILURE", zap.String("document_id", documentID), zap.Int("version", version))
+		result.Verified = false
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if err != nil {
+		h.log.Error("VerifyDigest: storage unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// ── GET /v1/documents/{documentID}/as-of ─────────────────────────────────────
+
+type asOfDocumentResponse struct {
+	Document domain.Document        `json:"document"`
+	Version  domain.DocumentVersion `json:"version_as_of"`
+}
+
+// GetAsOfDocument reconstructs which version was current as of a given
+// time — see store.PgStore.GetAsOfDocument's own doc comment on the real
+// limit: only the version lineage is reconstructable, not historical
+// status/declaration/supersession (no history table backs those fields
+// yet).
+func (h *Handler) GetAsOfDocument(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	asOfRaw := r.URL.Query().Get("as_of")
+	if asOfRaw == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "as_of")
+		return
+	}
+	asOf, err := time.Parse(time.RFC3339, asOfRaw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_as_of", "as_of must be an RFC3339 timestamp")
+		return
+	}
+
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	asOfDoc, asOfVersion, err := h.store.GetAsOfDocument(r.Context(), documentID, asOf)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, asOfDocumentResponse{Document: *asOfDoc, Version: *asOfVersion})
+}
+
+// ── POST /v1/documents/{documentID}/links ────────────────────────────────────
+
+type linkDocumentRequest struct {
+	LinkedObjectType string `json:"linked_object_type"`
+	LinkedObjectID   string `json:"linked_object_id"`
+}
+
+// LinkDocument records a link to another business object — see
+// domain.DocumentLink's own doc comment. The caller (whatever service
+// attached this document to something) invokes this explicitly; nothing
+// here infers a link on its own.
+func (h *Handler) LinkDocument(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req linkDocumentRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LinkedObjectType == "" || req.LinkedObjectID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "linked_object_type and linked_object_id are required")
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentLink) {
+		return
+	}
+
+	link, err := h.store.LinkDocument(r.Context(), domain.LinkDocumentParams{
+		DocumentID: documentID, LinkedObjectType: req.LinkedObjectType, LinkedObjectID: req.LinkedObjectID,
+		LinkedByPrincipalID: actor, CorrelationID: r.Header.Get("X-Correlation-ID"),
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, link)
+}
+
+// ── GET /v1/documents/{documentID}/links ─────────────────────────────────────
+
+// GetLinkedObjects handles the doc's own GetLinkedObjects query — every
+// business object this document has ever been linked to.
+func (h *Handler) GetLinkedObjects(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	links, err := h.store.ListDocumentLinks(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if links == nil {
+		links = []domain.DocumentLink{}
+	}
+	writeJSON(w, http.StatusOK, links)
+}
+
+// ── POST /v1/documents/{documentID}/classify ─────────────────────────────────
+
+type classifyRecordRequest struct {
+	ClassificationValue domain.Classification       `json:"classification_value"`
+	Source              domain.ClassificationSource `json:"source"`
+	Confidence          *float64                    `json:"confidence,omitempty"`
+	RuleModelVersion    string                      `json:"rule_model_version,omitempty"`
+	SourceEvidence      string                      `json:"source_evidence,omitempty"`
+}
+
+// ClassifyRecord proposes a classification for a document — BIZ-02's own
+// ClassifyRecord command. Lands CANDIDATE; requires ConfirmClassification
+// (by a different principal, for a human proposal) before it governs
+// anything.
+func (h *Handler) ClassifyRecord(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req classifyRecordRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !req.ClassificationValue.Valid() {
+		writeError(w, http.StatusBadRequest, "invalid_classification", string(req.ClassificationValue))
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionClassifyRecord) {
+		return
+	}
+
+	classification, err := h.store.ClassifyRecord(r.Context(), domain.ClassifyRecordParams{
+		DocumentID: documentID, ClassificationValue: req.ClassificationValue, Source: req.Source,
+		Confidence: req.Confidence, RuleModelVersion: req.RuleModelVersion, SourceEvidence: req.SourceEvidence,
+		ProposedByPrincipalID: actor, CorrelationID: r.Header.Get("X-Correlation-ID"),
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, classification)
+}
+
+// ── POST /v1/documents/classifications/{classificationID}/confirm ───────────
+
+// ConfirmClassification moves a CANDIDATE classification to CONFIRMED —
+// BIZ-02's own ConfirmClassification command. Fetched (read-only) BEFORE
+// authorization and BEFORE the mutation — the same fetch-then-authorize
+// order every other handler in this service uses — so an unauthorized
+// caller can never cause the confirm to actually run before being
+// refused. The self-confirmation (maker-checker) check itself happens
+// in the store layer, where the proposal's own principal is compared.
+func (h *Handler) ConfirmClassification(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	classificationID := chi.URLParam(r, "classificationID")
+
+	existing, err := h.store.FindClassificationByID(r.Context(), classificationID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionConfirmClassification) {
+		return
+	}
+
+	updated, err := h.store.ConfirmClassification(r.Context(), domain.ConfirmClassificationParams{
+		ClassificationID: classificationID, ConfirmedByPrincipalID: actor,
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── GET /v1/documents/{documentID}/classification ────────────────────────────
+
+// GetClassification returns the document's current (non-superseded)
+// classification — BIZ-02's own GetClassification query.
+func (h *Handler) GetClassification(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	classification, err := h.store.GetClassification(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, classification)
+}
+
+// ── POST /v1/documents/{documentID}/reclassify ───────────────────────────────
+
+// Reclassify proposes a replacement classification value for a document
+// that already has a CONFIRMED/RESTRICTED classification — BIZ-02's own
+// Reclassify command. Lands CANDIDATE, same as ClassifyRecord's initial
+// proposal; requires SupersedeClassification (by a different principal,
+// for a human proposal) before it governs anything.
+func (h *Handler) Reclassify(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req classifyRecordRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !req.ClassificationValue.Valid() {
+		writeError(w, http.StatusBadRequest, "invalid_classification", string(req.ClassificationValue))
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionReclassifyRecord) {
+		return
+	}
+
+	classification, err := h.store.Reclassify(r.Context(), domain.ReclassifyParams{
+		DocumentID: documentID, ClassificationValue: req.ClassificationValue, Source: req.Source,
+		Confidence: req.Confidence, RuleModelVersion: req.RuleModelVersion, SourceEvidence: req.SourceEvidence,
+		ProposedByPrincipalID: actor, CorrelationID: r.Header.Get("X-Correlation-ID"),
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, classification)
+}
+
+// ── POST /v1/documents/classifications/{classificationID}/supersede ─────────
+
+type supersedeClassificationRequest struct {
+	NewClassificationID string `json:"new_classification_id"`
+}
+
+// SupersedeClassification confirms a Reclassify proposal and marks the
+// classification it replaces as SUPERSEDED — BIZ-02's own
+// SupersedeClassification command. The classificationID in the URL is
+// the PREVIOUS (currently governing) classification; the replacement is
+// named in the body. Fetched (read-only) BEFORE authorization and BEFORE
+// the mutation, same fetch-then-authorize order as every other handler
+// in this service.
+func (h *Handler) SupersedeClassification(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req supersedeClassificationRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	classificationID := chi.URLParam(r, "classificationID")
+
+	existing, err := h.store.FindClassificationByID(r.Context(), classificationID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionSupersedeClassification) {
+		return
+	}
+
+	updated, err := h.store.SupersedeClassification(r.Context(), domain.SupersedeClassificationParams{
+		PreviousClassificationID: classificationID, NewClassificationID: req.NewClassificationID, ActorPrincipalID: actor,
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── POST /v1/documents/bulk-classify ─────────────────────────────────────────
+
+// maxBulkClassifyDocuments bounds a single BulkClassify call — each
+// listed document is its own sequential authorization round-trip and its
+// own database transaction, so an unbounded list turns one HTTP request
+// into an unbounded amount of work. Matches maxPageLimit's existing cap
+// on this service's other unbounded-list surface.
+const maxBulkClassifyDocuments = maxPageLimit
+
+type bulkClassifyRequest struct {
+	DocumentIDs         []string                    `json:"document_ids"`
+	ClassificationValue domain.Classification       `json:"classification_value"`
+	Source              domain.ClassificationSource `json:"source"`
+	Confidence          *float64                    `json:"confidence,omitempty"`
+	RuleModelVersion    string                      `json:"rule_model_version,omitempty"`
+	SourceEvidence      string                      `json:"source_evidence,omitempty"`
+}
+
+type bulkClassifyResult struct {
+	DocumentID     string                       `json:"document_id"`
+	Classification *domain.RecordClassification `json:"classification,omitempty"`
+	Error          string                       `json:"error,omitempty"`
+}
+
+// BulkClassify applies ClassifyRecord independently to each listed
+// document — BIZ-02's own BulkClassify command. Each document gets its
+// own authorization decision and its own transaction (via the existing
+// FindDocumentByID + ClassifyRecord path); one document's failure —
+// not found, already confirmed, denied — never blocks the others in the
+// same call. The response is always 200 with a per-document result
+// list, never a single pass/fail for the whole batch, so a caller must
+// inspect each entry rather than infer success from the status code.
+func (h *Handler) BulkClassify(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req bulkClassifyRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.DocumentIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "empty_document_ids", "")
+		return
+	}
+	if len(req.DocumentIDs) > maxBulkClassifyDocuments {
+		writeError(w, http.StatusBadRequest, "too_many_documents",
+			fmt.Sprintf("at most %d documents per call", maxBulkClassifyDocuments))
+		return
+	}
+	if !req.ClassificationValue.Valid() {
+		writeError(w, http.StatusBadRequest, "invalid_classification", string(req.ClassificationValue))
+		return
+	}
+
+	results := make([]bulkClassifyResult, 0, len(req.DocumentIDs))
+	for _, documentID := range req.DocumentIDs {
+		results = append(results, h.classifyOneForBulk(r, actor, documentID, req))
+	}
+	writeJSON(w, http.StatusOK, results)
+}
+
+// classifyOneForBulk runs ClassifyRecord for one document within a
+// BulkClassify call. It deliberately never writes to the response
+// itself — h.authorize can't be reused here, because it writes the
+// denial straight to the (shared, single) ResponseWriter, which is only
+// correct for a handler with one outcome. Each document's outcome is
+// captured as data instead, and only the final aggregate response is
+// written once, after every document has been attempted.
+func (h *Handler) classifyOneForBulk(r *http.Request, actor, documentID string, req bulkClassifyRequest) bulkClassifyResult {
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		return bulkClassifyResult{DocumentID: documentID, Error: h.classificationErrorCode(err)}
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, doc.LegalEntityID, authz.ActionClassifyRecord); err != nil {
+		return bulkClassifyResult{DocumentID: documentID, Error: h.authzErrorCode(err)}
+	}
+	classification, err := h.store.ClassifyRecord(r.Context(), domain.ClassifyRecordParams{
+		DocumentID: documentID, ClassificationValue: req.ClassificationValue, Source: req.Source,
+		Confidence: req.Confidence, RuleModelVersion: req.RuleModelVersion, SourceEvidence: req.SourceEvidence,
+		ProposedByPrincipalID: actor, CorrelationID: r.Header.Get("X-Correlation-ID"),
+	})
+	if err != nil {
+		return bulkClassifyResult{DocumentID: documentID, Error: h.classificationErrorCode(err)}
+	}
+	return bulkClassifyResult{DocumentID: documentID, Classification: classification}
+}
+
+// classificationErrorCode maps a classification store error to the same
+// short code handleStoreError would write for it, for the per-document
+// results BulkClassify returns instead of a single HTTP status.
+func (h *Handler) classificationErrorCode(err error) string {
+	switch {
+	case errors.Is(err, domain.ErrDocumentNotFound):
+		return "document_not_found"
+	case errors.Is(err, domain.ErrInvalidClassificationSource):
+		return "invalid_source"
+	case errors.Is(err, domain.ErrAIConfidenceRequired):
+		return "confidence_required"
+	case errors.Is(err, domain.ErrHumanConfidenceNotAllowed):
+		return "confidence_not_allowed"
+	case errors.Is(err, domain.ErrClassificationNotCandidate):
+		return "not_candidate"
+	default:
+		h.log.Error("store error (bulk classify)", zap.Error(err))
+		return "store_unavailable"
+	}
+}
+
+// authzErrorCode mirrors h.authorize's own decision mapping without
+// writing to the response — see classifyOneForBulk's own comment on why.
+func (h *Handler) authzErrorCode(err error) string {
+	if errors.Is(err, domain.ErrAuthorizationDenied) {
+		return "forbidden"
+	}
+	h.log.Error("authorization check failed — failing closed (bulk classify)", zap.Error(err))
+	return "authz_unavailable"
+}
+
+// ── GET /v1/documents/{documentID}/classification/as-of ──────────────────────
+
+// GetAsOfClassification returns whichever classification governed the
+// document at a given point in time — BIZ-02's own GetAsOfClassification
+// query. Same as_of/RFC3339 query-param contract as GetAsOfDocument.
+func (h *Handler) GetAsOfClassification(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	asOfRaw := r.URL.Query().Get("as_of")
+	if asOfRaw == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "as_of")
+		return
+	}
+	asOf, err := time.Parse(time.RFC3339, asOfRaw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_as_of", "as_of must be an RFC3339 timestamp")
+		return
+	}
+
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	classification, err := h.store.GetAsOfClassification(r.Context(), documentID, asOf)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, classification)
+}
+
+// ── GET /v1/documents/{documentID}/classification/history ────────────────────
+
+// ListClassificationHistory returns every classification decision ever
+// proposed for a document — BIZ-02's own ListClassificationHistory
+// query, the full audit trail behind the current classification.
+func (h *Handler) ListClassificationHistory(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	history, err := h.store.ListClassificationHistory(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if history == nil {
+		history = []domain.RecordClassification{}
+	}
+	writeJSON(w, http.StatusOK, history)
+}
+
+// ── GET /v1/documents/unclassified ────────────────────────────────────────────
+
+// ListUnclassified returns the legal entity's classification governance
+// backlog — documents that have never had a classification CONFIRMED —
+// BIZ-02's own ListUnclassified query. Same legal_entity_id-required and
+// pagination contract as ListDocuments.
+func (h *Handler) ListUnclassified(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field",
+			"legal_entity_id is required — documents are authorized per legal entity")
+		return
+	}
+	limit, offset, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, actor, legalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	docs, err := h.store.ListUnclassified(r.Context(), legalEntityID, limit, offset)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if docs == nil {
+		docs = []domain.Document{}
+	}
+	writeJSON(w, http.StatusOK, docs)
+}
+
+// ── GET /v1/documents/classifications/{classificationID}/policy-mapping ──────
+
+// ExplainPolicyMapping returns what decided a classification — BIZ-02's
+// own ExplainPolicyMapping query. See store.PgStore.ExplainPolicyMapping's
+// own doc comment: this is an honest report of the classification's
+// recorded inputs, not a fabricated policy engine — no
+// confidence-threshold/policy-mapping owner exists in this codebase yet.
+func (h *Handler) ExplainPolicyMapping(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	classificationID := chi.URLParam(r, "classificationID")
+	existing, err := h.store.FindClassificationByID(r.Context(), classificationID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	explanation, err := h.store.ExplainPolicyMapping(r.Context(), classificationID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, explanation)
 }
 
 // ── GET /v1/documents ────────────────────────────────────────────────────────
@@ -350,6 +1229,23 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Malware/type scan gate — same as CreateDocument's, but this time
+	// the document already exists, so a quarantine is recorded as a real
+	// event (document.version_upload_quarantined) rather than only
+	// rejected. Still nothing is persisted to storage or document_versions.
+	if result, err := h.scanner.Scan(r.Context(), content, req.ContentType); err != nil {
+		h.log.Error("AddVersion: scan unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "scan_unavailable", "")
+		return
+	} else if !result.Clean {
+		h.log.Warn("AddVersion: upload quarantined", zap.String("document_id", documentID), zap.String("reason", result.Reason))
+		if err := h.store.RecordQuarantinedVersionUpload(r.Context(), documentID, actor, result.Reason, r.Header.Get("X-Correlation-ID")); err != nil {
+			h.log.Error("AddVersion: failed to record quarantine event", zap.Error(err))
+		}
+		writeError(w, http.StatusUnprocessableEntity, "upload_quarantined", result.Reason)
+		return
+	}
+
 	tempKey := newStorageKey()
 	checksum, err := h.storage.Put(r.Context(), tempKey, content)
 	if err != nil {
@@ -366,7 +1262,7 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: actor,
 	}
 
-	doc, err := h.store.AddVersion(r.Context(), documentID, v)
+	doc, err := h.store.AddVersion(r.Context(), documentID, v, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		h.handleStoreError(w, err)
 		return
@@ -480,6 +1376,40 @@ func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "document_not_found", "")
 	case errors.Is(err, domain.ErrDocumentVersionNotFound):
 		writeError(w, http.StatusNotFound, "version_not_found", "")
+	case errors.Is(err, domain.ErrDocumentAlreadyDeclared):
+		writeError(w, http.StatusConflict, "already_declared", err.Error())
+	case errors.Is(err, domain.ErrDocumentNotActive):
+		writeError(w, http.StatusConflict, "document_not_active", err.Error())
+	case errors.Is(err, domain.ErrDocumentAlreadySuperseded):
+		writeError(w, http.StatusConflict, "already_superseded", err.Error())
+	case errors.Is(err, domain.ErrSupersedingDocumentNotFound):
+		writeError(w, http.StatusBadRequest, "superseding_document_not_found", err.Error())
+	case errors.Is(err, domain.ErrCannotSupersedeSelf):
+		writeError(w, http.StatusBadRequest, "cannot_supersede_self", err.Error())
+	case errors.Is(err, domain.ErrDocumentNotArchivable):
+		writeError(w, http.StatusConflict, "not_archivable", err.Error())
+	case errors.Is(err, domain.ErrDispositionAlreadyRequested):
+		writeError(w, http.StatusConflict, "disposition_already_requested", err.Error())
+	case errors.Is(err, domain.ErrDuplicateLink):
+		writeError(w, http.StatusConflict, "duplicate_link", err.Error())
+	case errors.Is(err, domain.ErrClassificationNotFound):
+		writeError(w, http.StatusNotFound, "classification_not_found", "")
+	case errors.Is(err, domain.ErrInvalidClassificationSource):
+		writeError(w, http.StatusBadRequest, "invalid_source", err.Error())
+	case errors.Is(err, domain.ErrAIConfidenceRequired):
+		writeError(w, http.StatusBadRequest, "confidence_required", err.Error())
+	case errors.Is(err, domain.ErrHumanConfidenceNotAllowed):
+		writeError(w, http.StatusBadRequest, "confidence_not_allowed", err.Error())
+	case errors.Is(err, domain.ErrClassificationSelfConfirmation):
+		writeError(w, http.StatusForbidden, "self_confirmation_forbidden", err.Error())
+	case errors.Is(err, domain.ErrClassificationNotCandidate):
+		writeError(w, http.StatusConflict, "not_candidate", err.Error())
+	case errors.Is(err, domain.ErrClassificationNotConfirmed):
+		writeError(w, http.StatusConflict, "not_confirmed", err.Error())
+	case errors.Is(err, domain.ErrClassificationAlreadySuperseded):
+		writeError(w, http.StatusConflict, "already_superseded", err.Error())
+	case errors.Is(err, domain.ErrClassificationDocumentMismatch):
+		writeError(w, http.StatusBadRequest, "document_mismatch", err.Error())
 	default:
 		h.log.Error("store error", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
@@ -573,6 +1503,21 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// decodeJSONOptional is decodeJSON for a command whose body is entirely
+// optional (e.g. an archive/disposition reason) — an empty body is not an
+// error, malformed JSON still is.
+func decodeJSONOptional(r *http.Request, dst any) error {
+	if r.ContentLength == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
 
 func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok bool) {
