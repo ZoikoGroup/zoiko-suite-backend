@@ -135,6 +135,7 @@ var _ supplierprofile.Client = (*stubSupplier)(nil)
 
 type stubPayee struct {
 	destinations map[string]payeeidentity.Destination
+	failWith     error // when set, every lookup fails with it (ORG-10 outage / transport fault)
 }
 
 func newStubPayee() *stubPayee {
@@ -146,6 +147,9 @@ func (p *stubPayee) set(legalEntityID, payeeRef, destinationID string) {
 }
 
 func (p *stubPayee) GetActiveDestination(_ context.Context, _, _, legalEntityID, payeeRef string) (*payeeidentity.Destination, error) {
+	if p.failWith != nil {
+		return nil, p.failWith
+	}
 	d, ok := p.destinations[legalEntityID+"|"+payeeRef]
 	if !ok {
 		return nil, domain.ErrNoActiveDestination

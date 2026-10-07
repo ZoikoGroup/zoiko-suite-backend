@@ -176,14 +176,23 @@ func (h *Handler) RequestPaymentAuthorization(w http.ResponseWriter, r *http.Req
 			continue
 		}
 		snap := domain.PayeeSnapshot{PayeeRef: item.PayeeRef, PayeeSnapshotAt: *item.PayeeSnapshotAt}
-		// payee-banking-identity-svc (ORG-10) — best-effort at request time:
-		// a payee with no ORG-10 coverage yet is a real, expected absence,
-		// not a failure (see internal/domain's package doc). Only a
-		// genuine ORG-10 outage is logged; either way the request proceeds.
-		if dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, principalID, proposal.LegalEntityID, item.PayeeRef); err == nil {
+		// payee-banking-identity-svc (ORG-10). A payee with no ORG-10
+		// coverage yet is a real, expected absence, not a failure (see
+		// internal/domain's package doc): the request proceeds unpinned. Any
+		// other error is an ORG-10 outage or transport fault, and failing
+		// OPEN there would create an authorization with an empty
+		// DestinationID that every later re-check skips — so it fails
+		// CLOSED, before anything is persisted.
+		dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, principalID, proposal.LegalEntityID, item.PayeeRef)
+		switch {
+		case err == nil:
 			snap.DestinationID = dest.DestinationID
-		} else if !errors.Is(err, domain.ErrNoActiveDestination) {
-			h.log.Warn("RequestPaymentAuthorization: payee-banking-identity-svc lookup failed — proceeding without a pinned destination", zap.Error(err))
+		case errors.Is(err, domain.ErrNoActiveDestination):
+			// no ORG-10 coverage: unpinned by policy
+		default:
+			h.log.Error("RequestPaymentAuthorization: payee-banking-identity-svc lookup failed — failing closed, no authorization created", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, domain.ErrPayeeDestinationServiceUnavailable.Error())
+			return
 		}
 		snapshots = append(snapshots, snap)
 	}
@@ -266,7 +275,22 @@ func (h *Handler) verifyStillEligible(w http.ResponseWriter, r *http.Request, pr
 			return false
 		}
 		if snap.DestinationID == "" {
-			continue // no ORG-10 coverage was on file at request time — nothing to re-check
+			// No destination was pinned. That is only acceptable if ORG-10
+			// still has no coverage for this payee: an unpinned snapshot must
+			// never silently pass once a destination exists, nor when ORG-10
+			// cannot be asked.
+			_, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, principalID, a.LegalEntityID, snap.PayeeRef)
+			if errors.Is(err, domain.ErrNoActiveDestination) {
+				continue
+			}
+			if err != nil {
+				h.log.Error("verifyStillEligible: payee-banking-identity-svc lookup failed for unpinned payee", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, domain.ErrPayeeDestinationServiceUnavailable.Error())
+				return false
+			}
+			_, _ = h.store.InvalidateAuthorization(r.Context(), a.AuthorizationID, "payee gained an active banking destination after authorization was requested without one pinned")
+			writeError(w, http.StatusConflict, domain.ErrPayeeDestinationChanged.Error())
+			return false
 		}
 		dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, principalID, a.LegalEntityID, snap.PayeeRef)
 		if errors.Is(err, domain.ErrNoActiveDestination) {
@@ -585,6 +609,11 @@ func (h *Handler) ValidateAuthorization(w http.ResponseWriter, r *http.Request) 
 				reasons = append(reasons, "payee "+snap.PayeeRef+" identity has changed")
 			}
 			if snap.DestinationID == "" {
+				// Mirrors verifyStillEligible: unpinned is valid only while ORG-10 still has no coverage.
+				if _, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, r.Header.Get("X-Principal-Id"), a.LegalEntityID, snap.PayeeRef); !errors.Is(err, domain.ErrNoActiveDestination) {
+					valid = false
+					reasons = append(reasons, "payee "+snap.PayeeRef+" has no pinned destination and its ORG-10 status could not be confirmed as uncovered")
+				}
 				continue
 			}
 			dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, r.Header.Get("X-Principal-Id"), a.LegalEntityID, snap.PayeeRef)
