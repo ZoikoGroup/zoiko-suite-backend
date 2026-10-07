@@ -63,13 +63,22 @@ func TestMain(m *testing.M) {
 	dbPort := uint32(15801 + uint32(os.Getpid()%499))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly — see the doc comment on
-			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
-			// main_integration_test.go for why: the unpinned default floats
-			// to whatever major the library calls "latest," and that patch
-			// build can stop resolving from the remote binary repo with no
-			// code change on our side (this is what broke PR #105's CI).
-			Version(embeddedpostgres.V16).
+			// Version pinned explicitly to a literal patch string, NOT the
+			// library's own embeddedpostgres.V16 alias — see the doc comment
+			// on embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+			// main_integration_test.go for why floating is dangerous (this
+			// is what broke PR #105's CI). V16 itself turned out to be the
+			// same hazard one layer down: it is a constant baked into
+			// embedded-postgres v1.34.0 (the latest release) that resolves
+			// to "16.9.0", a specific patch chosen by that library's authors
+			// — not by us — and we cannot bump our way to a newer pin
+			// without the library releasing one. CI failed on exactly this
+			// ("no version found matching 16.9.0") even though 16.9.0 is
+			// still a real, resolvable artifact; pinning our own literal
+			// string here means a future resolution hiccup is something we
+			// control by editing this line, not something that requires
+			// waiting on an upstream library release.
+			Version(embeddedpostgres.PostgresVersion("16.15.0")).
 			Port(dbPort).
 			Database("pr_isolation_test").
 			Username("postgres").
