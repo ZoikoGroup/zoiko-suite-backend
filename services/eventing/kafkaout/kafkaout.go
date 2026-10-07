@@ -13,7 +13,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -40,8 +39,8 @@ type Config struct {
 // Writer is an outbox.Writer over kafka-go.
 type Writer struct {
 	w            *kafka.Writer
-	client       *kafka.Client
-	addr         net.Addr
+	brokers      []string
+	dialer       *kafka.Dialer
 	topic        string
 	probeTimeout time.Duration
 }
@@ -78,8 +77,8 @@ func New(cfg Config) (*Writer, error) {
 			// one attempt past the lease.
 			MaxAttempts: 1,
 		},
-		client:       &kafka.Client{Addr: addr, Timeout: cfg.ProbeTimeout},
-		addr:         addr,
+		brokers:      cfg.Brokers,
+		dialer:       &kafka.Dialer{Timeout: cfg.ProbeTimeout},
 		topic:        cfg.Topic,
 		probeTimeout: cfg.ProbeTimeout,
 	}, nil
@@ -134,37 +133,53 @@ func isPermanent(err error) bool {
 	return false
 }
 
-// Probe asks the broker for the topic's metadata and requires every partition
-// to have a leader: a produce request can only succeed if the partition it
-// lands on has one.
+// Probe dials a broker and asks it, over that fresh connection, for the
+// topic's partitions; every partition must have a leader, because a produce
+// request can only succeed on a partition that has one.
+//
+// It deliberately does NOT use kafka.Client.Metadata. kafka-go's Transport
+// answers metadata requests from its own cache, so after one successful probe
+// every later probe "succeeds" without touching the network — a paused broker
+// read as healthy, and the relay charged a whole outage to the events'
+// retry budgets. A new connection per probe is the cost of a probe that
+// actually observes the broker; probes only run after a failed write.
 func (k *Writer) Probe(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, k.probeTimeout)
 	defer cancel()
-	resp, err := k.client.Metadata(ctx, &kafka.MetadataRequest{Addr: k.addr, Topics: []string{k.topic}})
+	var lastErr error
+	for _, broker := range k.brokers {
+		if lastErr = k.probeBroker(ctx, broker); lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
+}
+
+func (k *Writer) probeBroker(ctx context.Context, broker string) error {
+	conn, err := k.dialer.DialContext(ctx, "tcp", broker)
 	if err != nil {
-		return fmt.Errorf("kafkaout: metadata: %w", err)
+		return fmt.Errorf("kafkaout: dial %s: %w", broker, err)
 	}
-	for _, t := range resp.Topics {
-		if t.Name != k.topic {
-			continue
-		}
-		if t.Error != nil {
-			return fmt.Errorf("kafkaout: topic %s: %w", k.topic, t.Error)
-		}
-		if len(t.Partitions) == 0 {
-			return fmt.Errorf("kafkaout: topic %s has no partitions", k.topic)
-		}
-		for _, p := range t.Partitions {
-			if p.Error != nil {
-				return fmt.Errorf("kafkaout: topic %s partition %d: %w", k.topic, p.ID, p.Error)
-			}
-			if p.Leader.ID < 0 {
-				return fmt.Errorf("kafkaout: topic %s partition %d has no leader", k.topic, p.ID)
-			}
-		}
-		return nil
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
 	}
-	return fmt.Errorf("kafkaout: topic %s not in metadata response", k.topic)
+	partitions, err := conn.ReadPartitions(k.topic)
+	if err != nil {
+		return fmt.Errorf("kafkaout: topic %s metadata from %s: %w", k.topic, broker, err)
+	}
+	if len(partitions) == 0 {
+		return fmt.Errorf("kafkaout: topic %s has no partitions", k.topic)
+	}
+	for _, p := range partitions {
+		if p.Error != nil {
+			return fmt.Errorf("kafkaout: topic %s partition %d: %w", k.topic, p.ID, p.Error)
+		}
+		if p.Leader.ID < 0 {
+			return fmt.Errorf("kafkaout: topic %s partition %d has no leader", k.topic, p.ID)
+		}
+	}
+	return nil
 }
 
 // Close flushes and closes the producer.

@@ -60,12 +60,12 @@ CREATE TABLE eventing_outbox (
         (publish_state <> 'claimed' OR claimed_until IS NOT NULL)
 );
 
--- The dispatcher's claim scan: only rows that can still be delivered.
-CREATE INDEX eventing_outbox_due_idx ON eventing_outbox (next_attempt_at, created_at)
-    WHERE publish_state IN ('pending', 'failed');
-CREATE INDEX eventing_outbox_lease_idx ON eventing_outbox (claimed_until)
-    WHERE publish_state = 'claimed';
--- Backlog age and quarantine counts are first-class signals (ZS-EVENT-001 §6.1).
+-- Everything not yet delivered, oldest first. Serves the dispatcher's claim
+-- scan and the backlog signals; published rows (which accumulate until
+-- retention removes them) are outside it, so neither query slows as history
+-- grows.
+CREATE INDEX eventing_outbox_backlog_idx ON eventing_outbox (created_at)
+    WHERE publish_state IN ('pending', 'failed', 'claimed');
 CREATE INDEX eventing_outbox_quarantined_idx ON eventing_outbox (created_at)
     WHERE publish_state = 'quarantined';
 `

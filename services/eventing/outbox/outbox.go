@@ -399,8 +399,9 @@ func (r *Relay) claim(ctx context.Context) ([]claimed, error) {
 			WITH due AS (
 			    SELECT outbox_id
 			      FROM eventing_outbox
-			     WHERE (publish_state IN ('pending', 'failed') AND next_attempt_at <= now())
-			        OR (publish_state = 'claimed' AND claimed_until <= now())
+			     WHERE publish_state IN ('pending', 'failed', 'claimed')
+			       AND CASE WHEN publish_state = 'claimed' THEN claimed_until <= now()
+			                ELSE next_attempt_at <= now() END
 			     ORDER BY created_at
 			     LIMIT $1
 			     FOR UPDATE SKIP LOCKED
@@ -596,12 +597,16 @@ func (r *Relay) ReadStats(ctx context.Context) (Stats, error) {
 	var s Stats
 	var ageSeconds float64
 	err := r.inRelayTx(ctx, func(tx pgx.Tx) error {
+		// Each subquery's predicate matches a partial index, so the cost
+		// tracks the backlog, not the table's published history.
 		return tx.QueryRow(ctx, `
-			SELECT count(*) FILTER (WHERE publish_state IN ('pending', 'failed', 'claimed')),
-			       count(*) FILTER (WHERE publish_state = 'quarantined'),
-			       COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)
-			           FILTER (WHERE publish_state IN ('pending', 'failed', 'claimed'))), 0)
-			  FROM eventing_outbox`).Scan(&s.Backlog, &s.Quarantined, &ageSeconds)
+			SELECT (SELECT count(*) FROM eventing_outbox
+			         WHERE publish_state IN ('pending', 'failed', 'claimed')),
+			       (SELECT count(*) FROM eventing_outbox
+			         WHERE publish_state = 'quarantined'),
+			       (SELECT COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0)
+			          FROM eventing_outbox
+			         WHERE publish_state IN ('pending', 'failed', 'claimed'))`).Scan(&s.Backlog, &s.Quarantined, &ageSeconds)
 	})
 	if err != nil {
 		return Stats{}, fmt.Errorf("outbox: stats: %w", err)
