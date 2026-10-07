@@ -175,8 +175,8 @@ SPEC_CODES=$(Q openapi-error-codes openapi.yaml)
 MISSING=0
 # handler.go, governance.go (writeError, g.refuse and the fail() mapping) and
 # the Idempotency-Key middleware.
-EMITTED=$( { grep -ohE 'writeError\(w, [^,]+, "[a-z_]+"' internal/handler/handler.go internal/handler/governance.go | grep -oE '"[a-z_]+"$';
-  grep -ohE 'http\.Status[A-Za-z]+, "[a-z_]+"' internal/handler/governance.go | grep -oE '"[a-z_]+"$';
+EMITTED=$( { grep -ohE 'writeError\(w, [^,]+, "[a-z_]+"' internal/handler/handler.go internal/handler/governance.go internal/handler/groups.go internal/handler/subject_links.go | grep -oE '"[a-z_]+"$';
+  grep -ohE 'http\.Status[A-Za-z]+, "[a-z_]+"' internal/handler/governance.go internal/handler/groups.go internal/handler/subject_links.go | grep -oE '"[a-z_]+"$';
   grep -ohE 'code = [^,]+, "[a-z_]+"' internal/handler/governance.go | grep -oE '"[a-z_]+"$';
   grep -ohE 'writeErr\(w, [^,]+, "[A-Za-z_]+"' internal/idempotency/middleware.go | grep -oE '"[A-Za-z_]+"$'; } | tr -d '"' | sort -u)
 for c in $EMITTED; do

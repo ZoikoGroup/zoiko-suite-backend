@@ -1351,6 +1351,35 @@ in the group.
    `POST /internal/authorization/decisions`, while the code uses `/v1/authorize`. Is either
    binding (group C4)?
 
+## Gap closure, 7 October 2026
+
+Every in-service gap was fixed against the documents (Doc 03 §8.3, GOV-03 / 04 / 12,
+ZS-IAM-001). The ❓ items were decided from those documents: this service is the GOV-04
+SoD authority (exceptions with compensating controls, never self-approved, always
+expiring); it holds maker-checker for privileged assignments (GOV-12, §9, A20); and
+access-control-svc authors the role catalogue, which this service enforces. The detail
+is in `services/authorization-svc/progress.md` ("Governance Platform audit closure") and
+`ADMIN-API.md`. Uncommitted; migrations 000020–000027 must be applied before the build.
+
+| | ✅ | ⚠️ | ❌ | Full | Weighted |
+|---|---|---|---|---|---|
+| 28 Sep audit | 29 | 20 | 19 | 42.6% | 57.4% |
+| **7 Oct, after fixes** | **58** | **10** | **0** | **85.3%** | **92.6%** |
+
+All 19 ❌ are closed. The 10 ⚠️ left each wait on something outside the service:
+
+- the console sending `reason` (then `AUTHZ_COMMAND_CONTRACT=enforce`), which covers 2 rows;
+- the ~86 tenantless `/v1/authorize` callers sending `X-Tenant-Id`, which covers 3 rows;
+- the mTLS / gateway identity rollout, which covers 2 rows;
+- an employee-to-principal mapping (`employment.changed`);
+- per-service grant seeding;
+- a version component in the cache key (invalidation already broadcasts).
+
+The integration suites found one regression in this pass, and it is fixed:
+`GET /v1/access-decisions` answered 503 once the evidence columns were added. Both
+store suites now pass on a fully migrated database (13/13 as the app role, 66/66 as the
+owner).
+
 ---
 
 # 6/7 — workflow-svc (:8090) vs Doc 03 §8.4, GOV-06 and R-001 WFC-02 / WFC-03

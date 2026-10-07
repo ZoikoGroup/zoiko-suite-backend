@@ -2,9 +2,10 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -16,7 +17,6 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"zoiko.io/authorization-svc/internal/abac"
 	"zoiko.io/authorization-svc/internal/domain"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
 	"zoiko.io/authorization-svc/internal/siem"
@@ -25,7 +25,7 @@ import (
 // AuthorizationStore is the narrow interface the handler depends on.
 type AuthorizationStore interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
-	SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error)
+	SetRoleActive(ctx context.Context, roleID, tenantID string, active bool, expectedVersion int64) (*domain.Role, error)
 	FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error)
 	// CreatePermissionBundle returns whether the row was CREATED or an
 	// existing bundle_code was REPLACED. The upsert overwrites
@@ -38,7 +38,7 @@ type AuthorizationStore interface {
 	// and pb.active_flag sits in FindGrantedActions' JOIN with nothing able to
 	// set it — the SetSoDRuleActive defect on the granting side.
 	ListPermissionBundles(ctx context.Context, roleID, tenantID string) ([]domain.PermissionBundle, error)
-	SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool) (*domain.PermissionBundle, error)
+	SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool, expectedVersion int64) (*domain.PermissionBundle, error)
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 	ListRoleAssignments(ctx context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error)
@@ -56,13 +56,13 @@ type AuthorizationStore interface {
 	// reachable by no route at all — a conflict rule could be created and
 	// never retired, on the one object whose blast radius is every principal
 	// holding the pair.
-	SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error)
+	SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool, expectedVersion int64) (*domain.SoDRule, error)
 
 	// ABAC — the attribute-condition layer. CreateABACRule/SetABACRuleActive/
 	// ListABACRules are the admin surface; FindABACRules is the evaluation
 	// read, called on the /v1/authorize path.
 	CreateABACRule(ctx context.Context, params domain.CreateABACRuleParams) (*domain.ABACRule, error)
-	SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool) (*domain.ABACRule, error)
+	SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool, expectedVersion int64) (*domain.ABACRule, error)
 	ListABACRules(ctx context.Context, tenantID, actionType string) ([]domain.ABACRule, error)
 	FindABACRules(ctx context.Context, actionType, tenantID string) ([]domain.ABACRule, error)
 
@@ -102,6 +102,10 @@ type AuthorizationStore interface {
 	// service and that one disagree about who is suspended. Only
 	// internal/events.LifecycleConsumer holds the writing interface.
 	FindPrincipalStatus(ctx context.Context, principalID, tenantID string) (string, error)
+
+	// FindEntityStatus is the legal entity's projected standing, "" when the
+	// registry has published none (negative control layer 0.1).
+	FindEntityStatus(ctx context.Context, legalEntityID, tenantID string) (string, error)
 
 	// Privileged Access Management (JIT Elevation - ZS-IAM-001 §13 & §21).
 	CreatePrivilegedSession(ctx context.Context, params domain.CreatePrivilegedSessionParams) (*domain.PrivilegedSession, error)
@@ -167,6 +171,23 @@ type Handler struct {
 	// scope. When true, missing tenant returns 400. When false (default),
 	// tenantless requests are allowed with a warning.
 	enforceTenantOnAuthorize bool
+
+	// decisionEvents, when set, moves decision events to the transactional
+	// outbox: the store writes them with the decision and a relay publishes
+	// them, so a Kafka outage delays them instead of losing them. Nil keeps the
+	// direct publish. See UseOutbox.
+	decisionEvents func(domain.AccessDecisionLog) ([]domain.OutboxMessage, error)
+
+	// commandContract is the §16 enforcement mode for privileged and
+	// destructive commands — see SetCommandContract.
+	commandContract CommandContractMode
+}
+
+// UseOutbox routes authorization.granted / .denied and sod.violation.detected
+// through outbox_events, built by build (events.DecisionEvents), instead of
+// publishing them directly after the decision is recorded.
+func (h *Handler) UseOutbox(build func(domain.AccessDecisionLog) ([]domain.OutboxMessage, error)) {
+	h.decisionEvents = build
 }
 
 func New(store AuthorizationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, siemClient *siem.Client, platformScopeEntityID string, enforceTenantOnAuthorize bool, log *zap.Logger) *Handler {
@@ -183,6 +204,7 @@ func New(store AuthorizationStore, publisher EventPublisher, jurisdictionValidat
 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Use(correlationIDMiddleware)
+	r.Use(auditMiddleware)
 
 	r.Post("/v1/admin/roles", h.CreateRole)
 	r.Get("/v1/admin/roles", h.ListRoles)
@@ -195,6 +217,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/role-assignments", h.CreateRoleAssignment)
 	r.Get("/v1/admin/role-assignments", h.ListRoleAssignments)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/revoke", h.RevokeRoleAssignment)
+	// Maker-checker on privileged assignments (GOV-12; ZS-IAM-001 §9, A20).
+	r.Post("/v1/admin/role-assignments/{assignment_id}/approve", h.ApproveRoleAssignment)
+	r.Post("/v1/admin/role-assignments/{assignment_id}/reject", h.RejectRoleAssignment)
+
+	// GOV-03 commands (and the spec's illustrative contract surface).
+	r.Post("/v1/admin/authorization-cache/invalidate", h.InvalidateAuthorizationCache)
+	r.Post("/internal/v1/gov03/commands/invalidateAuthorizationCache", h.InvalidateAuthorizationCache)
+	r.Post("/v1/admin/subjects/{principal_id}/effective-access/recompute", h.RecomputeSubjectEffectiveAccess)
+	r.Post("/internal/v1/gov03/commands/recomputeSubjectEffectiveAccess", h.RecomputeSubjectEffectiveAccess)
 	r.Post("/v1/admin/delegated-authorities", h.CreateDelegatedAuthority)
 	r.Get("/v1/admin/delegated-authorities", h.ListDelegatedAuthorities)
 	r.Post("/v1/admin/delegated-authorities/{delegation_id}/revoke", h.RevokeDelegatedAuthority)
@@ -202,6 +233,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/admin/sod-rules", h.ListSoDRules)
 	r.Post("/v1/admin/sod-rules/{sod_rule_id}/retire", h.RetireSoDRule)
 	r.Post("/v1/admin/sod-rules/{sod_rule_id}/reactivate", h.ReactivateSoDRule)
+	// GOV-04 compensating-control exceptions.
+	r.Post("/v1/admin/sod-exceptions", h.RequestSoDException)
+	r.Get("/v1/admin/sod-exceptions", h.ListSoDExceptions)
+	r.Post("/v1/admin/sod-exceptions/{sod_exception_id}/approve", h.ApproveSoDException)
+	r.Post("/v1/admin/sod-exceptions/{sod_exception_id}/reject", h.RejectSoDException)
+	r.Post("/v1/admin/sod-exceptions/{sod_exception_id}/revoke", h.RevokeSoDException)
+	r.Get("/v1/sod/conflicting-permissions", h.ListConflictingPermissions)
 	r.Post("/v1/admin/abac-rules", h.CreateABACRule)
 	r.Get("/v1/admin/abac-rules", h.ListABACRules)
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/retire", h.RetireABACRule)
@@ -346,6 +384,39 @@ func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed, verifiedTe
 	return false
 }
 
+// refuseOwnRole reports whether principalID holds an assignment of roleID that
+// has not ended — current or future-dated — writing a 403 if so, or a 503 if
+// that cannot be established.
+//
+// CreateRoleAssignment refuses assigning a role to yourself, but widening a
+// role you already hold is the same elevation by another route (ZS-IAM-001
+// §10.2 "Own access elevation"): a holder of iam.permission_bundle.manage could
+// add any action to their own role, or reactivate a bundle or role that was
+// retired to take access away from them. Retiring is not checked — narrowing
+// your own access elevates nothing.
+func (h *Handler) refuseOwnRole(w http.ResponseWriter, r *http.Request, principalID, roleID, tenantID string) bool {
+	held, err := h.store.ListRoleAssignments(r.Context(), tenantID, principalID, roleID, false)
+	if err != nil {
+		h.log.Error("own-role check failed — refusing",
+			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
+			zap.String("role_id", roleID),
+			zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return true
+	}
+	now := time.Now()
+	for _, a := range held {
+		if a.EffectiveTo == nil || a.EffectiveTo.After(now) {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error":   "self_grant_not_allowed",
+				"message": "a principal cannot change the permissions of a role they hold",
+			})
+			return true
+		}
+	}
+	return false
+}
+
 // requirePermission confirms the caller holds actionType in their tenant scope,
 // and records the decision like any other.
 //
@@ -410,8 +481,12 @@ func (h *Handler) requirePermission(w http.ResponseWriter, r *http.Request, prin
 //
 // Fails closed in both directions: an unset platform-scope entity id refuses
 // every platform-wide act rather than waving them through, and a store error
-// is a refusal, not an allow. A grant here is a distinct grant — it is
-// deliberately NOT satisfied by any tenant-level role.
+// is a refusal, not an allow. A grant here is an assignment on the
+// platform-scope entity itself: a tenant-wide assignment (legal_entity_id NULL)
+// does not match it (see FindGrantedActionsScoped), and making or ending an
+// assignment on that entity itself requires a platform-scope grant (see
+// CreateRoleAssignment and RevokeRoleAssignment). The assigned role may be
+// owned by any tenant — this query runs with no tenant filter.
 func (h *Handler) requirePlatformAction(w http.ResponseWriter, r *http.Request, principalID, actionType string) bool {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -632,9 +707,30 @@ func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active b
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": roleID})
 		return
 	}
+	if active && h.refuseOwnRole(w, r, principalID, roleID, tenantScope) {
+		return
+	}
+	if active {
+		actions, err := h.roleActiveActions(r.Context(), roleID, tenantScope)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if h.refuseToxicForHolders(w, r, roleID, tenantScope, actions) {
+			return
+		}
+	}
 
-	role, err = h.store.SetRoleActive(r.Context(), roleID, tenantScope, active)
+	expectedVersion, ok := h.readCommand(w, &r)
+	if !ok {
+		return
+	}
+	role, err = h.store.SetRoleActive(r.Context(), roleID, tenantScope, active, expectedVersion)
 	if err != nil {
+		if errors.Is(err, domain.ErrVersionConflict) {
+			writeVersionConflict(w)
+			return
+		}
 		if errors.Is(err, domain.ErrRoleNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found"})
 			return
@@ -666,6 +762,10 @@ func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active b
 type createBundleRequest struct {
 	BundleCode       string   `json:"bundle_code"`
 	PermittedActions []string `json:"permitted_actions"`
+	// ExpectedVersion is optional: when set, replacing an existing bundle
+	// succeeds only if it is still at that version (409 otherwise), so a
+	// concurrent edit is not silently overwritten.
+	ExpectedVersion int64 `json:"expected_version,omitempty"`
 }
 
 // CreatePermissionBundle handles POST /v1/admin/roles/{role_id}/permission-bundles.
@@ -722,11 +822,29 @@ func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": roleID})
 		return
 	}
+	if h.refuseOwnRole(w, r, principalID, roleID, tenantScope) {
+		return
+	}
+	// ZS-IAM-001 §9: a tenant custom role "cannot include protected
+	// platform-admin permissions". Such a bundle is authored only with the
+	// platform-scope grant, never a tenant administrator's.
+	if protected := anyProtectedPlatform(req.PermittedActions); len(protected) > 0 &&
+		!h.requirePlatformAction(w, r, principalID, "iam.permission_bundle.manage") {
+		return
+	}
+	if h.refuseToxicForHolders(w, r, roleID, tenantScope, req.PermittedActions) {
+		return
+	}
 
 	bundle, created, err := h.store.CreatePermissionBundle(r.Context(), domain.CreatePermissionBundleParams{
 		RoleID: roleID, BundleCode: req.BundleCode, PermittedActions: req.PermittedActions,
+		ExpectedVersion: req.ExpectedVersion,
 	})
 	if err != nil {
+		if errors.Is(err, domain.ErrVersionConflict) {
+			writeVersionConflict(w)
+			return
+		}
 		if errors.Is(err, domain.ErrRoleNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": roleID})
 			return
@@ -795,11 +913,17 @@ func (h *Handler) ListPermissionBundles(w http.ResponseWriter, r *http.Request) 
 	roleID := chi.URLParam(r, "role_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// ZS-IAM-001 §21 "no broad IAM discovery beyond administrable scope":
+	// the register is readable with the Appendix A read permission.
+	if !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.role.read") {
 		return
 	}
 
@@ -854,6 +978,13 @@ func (h *Handler) ReactivatePermissionBundle(w http.ResponseWriter, r *http.Requ
 	h.setPermissionBundleActive(w, r, true)
 }
 
+// permissionBundleFinder is the store capability behind the own-role check on
+// bundle reactivation. Optional, like assignmentEndScheduler: a store without
+// it answers 503 rather than reactivating unchecked.
+type permissionBundleFinder interface {
+	FindPermissionBundleByID(ctx context.Context, permissionBundleID, tenantID string) (*domain.PermissionBundle, error)
+}
+
 func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Request, active bool) {
 	bundleID := chi.URLParam(r, "permission_bundle_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -871,8 +1002,43 @@ func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	bundle, err := h.store.SetPermissionBundleActive(r.Context(), bundleID, tenantScope, active)
+	// Reactivating restores what a role grants, so it is refused to a holder
+	// of that role. The bundle's role is only known by reading it first.
+	if active {
+		finder, ok := h.store.(permissionBundleFinder)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		existing, err := finder.FindPermissionBundleByID(r.Context(), bundleID, tenantScope)
+		if err != nil {
+			if errors.Is(err, domain.ErrPermissionBundleNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "permission_bundle_not_found"})
+				return
+			}
+			h.log.Error("setPermissionBundleActive: bundle lookup failed",
+				zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if h.refuseOwnRole(w, r, principalID, existing.RoleID, tenantScope) {
+			return
+		}
+		if h.refuseToxicForHolders(w, r, existing.RoleID, tenantScope, existing.PermittedActions) {
+			return
+		}
+	}
+
+	expectedVersion, ok := h.readCommand(w, &r)
+	if !ok {
+		return
+	}
+	bundle, err := h.store.SetPermissionBundleActive(r.Context(), bundleID, tenantScope, active, expectedVersion)
 	if err != nil {
+		if errors.Is(err, domain.ErrVersionConflict) {
+			writeVersionConflict(w)
+			return
+		}
 		if errors.Is(err, domain.ErrPermissionBundleNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "permission_bundle_not_found"})
 			return
@@ -913,6 +1079,9 @@ type createAssignmentRequest struct {
 	// EffectiveTo is optional; omit it for an open-ended assignment. When set
 	// it must be after effective_from and in the future.
 	EffectiveTo *time.Time `json:"effective_to,omitempty"`
+	// ApprovalReference names the governed request a privileged grant was
+	// approved under (access-control-svc's request id), recorded as evidence.
+	ApprovalReference string `json:"approval_reference,omitempty"`
 }
 
 func (req createAssignmentRequest) missingField() string {
@@ -993,6 +1162,33 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An assignment on the platform-scope entity confers platform authority —
+	// requirePlatformAction reads it across tenants — so making one is a
+	// platform act: tenant-scope iam.assignment.grant is not enough. Without
+	// this, a tenant administrator could bind a role of their own tenant to the
+	// platform entity and its holder could author SoD and ABAC rules for every
+	// tenant.
+	if h.isPlatformScopeEntity(req.LegalEntityID) &&
+		!h.requirePlatformAction(w, r, principalID, "iam.assignment.grant") {
+		return
+	}
+
+	// Static SoD at grant time (ZS-IAM-001 §10: "deny an assignment"). A
+	// conflicting pair used to be assignable and was caught only when the
+	// action was evaluated — by which point the toxic combination was already
+	// held. Refused here when the role's actions conflict with what the
+	// assignee holds where the assignment applies, or with each other.
+	if conflicts, ok := h.assignmentSoDConflicts(w, r, req, role.RoleID, tenantScope); !ok {
+		return
+	} else if len(conflicts) > 0 {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":     "sod_conflict",
+			"message":   "the role's actions conflict with a segregation-of-duties rule for this principal",
+			"conflicts": conflicts,
+		})
+		return
+	}
+
 	var legalEntityID *string
 	if req.LegalEntityID != "" {
 		legalEntityID = &req.LegalEntityID
@@ -1006,12 +1202,43 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		orgUnitID = &req.OrgUnitID
 	}
 
-	assignment, err := h.store.CreateRoleAssignment(r.Context(), domain.CreateRoleAssignmentParams{
+	// Maker-checker on privileged grants (ZS-IAM-001 §9 / A20, GOV-12). A
+	// role carrying access or platform administration, or any assignment on
+	// the platform-scope entity, takes effect only with an independent
+	// approver: the caller, if they hold iam.assignment.approve_privileged
+	// (how access-control-svc provisions what its security approver cleared),
+	// otherwise a second principal through /approve.
+	params := domain.CreateRoleAssignmentParams{
 		// assigned_by is always the verified caller, never the request body.
 		PrincipalRoleAssignmentID: req.PrincipalRoleAssignmentID, PrincipalID: req.PrincipalID, RoleID: req.RoleID,
 		LegalEntityID: legalEntityID, BookID: bookID, OrgUnitID: orgUnitID, EffectiveFrom: req.EffectiveFrom, EffectiveTo: req.EffectiveTo,
 		AssignedBy: principalID,
-	})
+	}
+	if req.ApprovalReference != "" {
+		params.ApprovalReference = &req.ApprovalReference
+	}
+	roleActions, err := h.roleActiveActions(r.Context(), role.RoleID, tenantScope)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if anyPrivileged(roleActions) || h.isPlatformScopeEntity(req.LegalEntityID) {
+		approver, err := h.holdsPrivilegedApproval(r, principalID, tenantScope, req.LegalEntityID)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if approver {
+			params.ApprovalStatus = domain.ApprovalApproved
+			params.ApprovedBy = &principalID
+		} else {
+			expires := time.Now().UTC().Add(PendingApprovalWindow)
+			params.ApprovalStatus = domain.ApprovalPending
+			params.ApprovalExpiresAt = &expires
+		}
+	}
+
+	assignment, err := h.store.CreateRoleAssignment(r.Context(), params)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrRoleNotFound):
@@ -1024,7 +1251,105 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if params.ApprovalStatus == domain.ApprovalPending {
+		// 202: recorded, not yet in force — it grants nothing until approved.
+		writeJSON(w, http.StatusAccepted, assignment)
+		return
+	}
 	writeJSON(w, http.StatusCreated, assignment)
+}
+
+// assignmentSoDConflicts returns the static SoD conflicts assigning roleID to
+// req.PrincipalID would create, writing a 503 and reporting false if that
+// cannot be established.
+//
+// Held is read where the assignment applies: at its legal entity (what
+// /v1/authorize would evaluate there, RBAC and delegated), or — for a
+// tenant-wide assignment, which applies in every entity — everything the
+// principal holds anywhere in the tenant. Candidates are the actions of the
+// role's active bundles.
+func (h *Handler) assignmentSoDConflicts(w http.ResponseWriter, r *http.Request, req createAssignmentRequest, roleID, tenantScope string) ([]sodConflict, bool) {
+	fail := func(err error) ([]sodConflict, bool) {
+		h.log.Error("CreateRoleAssignment: SoD check failed — refusing",
+			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return nil, false
+	}
+
+	bundles, err := h.store.ListPermissionBundles(r.Context(), roleID, tenantScope)
+	if err != nil {
+		return fail(err)
+	}
+	var candidates []string
+	for _, b := range bundles {
+		if b.ActiveFlag {
+			candidates = append(candidates, b.PermittedActions...)
+		}
+	}
+	candidates = dedupeSorted(candidates)
+	if len(candidates) == 0 {
+		return nil, true
+	}
+
+	var held []string
+	if req.LegalEntityID == "" {
+		all, err := h.heldActionsInTenant(r, req.PrincipalID, tenantScope)
+		if err != nil {
+			return fail(err)
+		}
+		for a := range all {
+			held = append(held, a)
+		}
+	} else {
+		entity, tenant := req.LegalEntityID, tenantScope
+		if h.isPlatformScopeEntity(entity) {
+			entity, tenant = h.platformScopeEntityID, ""
+		}
+		rbac, _, err := h.store.FindGrantedActions(r.Context(), req.PrincipalID, entity, tenant)
+		if err != nil {
+			return fail(err)
+		}
+		delegated, _, err := h.store.FindDelegatedActions(r.Context(), req.PrincipalID, entity, tenant)
+		if err != nil {
+			return fail(err)
+		}
+		held = append(rbac, delegated...)
+	}
+
+	conflicts, err := h.sodConflictsFor(r.Context(), dedupeSorted(held), candidates, tenantScope)
+	if err != nil {
+		return fail(err)
+	}
+	return conflicts, true
+}
+
+func writeVersionConflict(w http.ResponseWriter) {
+	writeJSON(w, http.StatusConflict, map[string]string{
+		"error":   "version_conflict",
+		"message": "the object has changed since expected_version; re-read it and retry",
+	})
+}
+
+// roleAssignmentFinder is the store capability behind the platform-scope check
+// on revoke. Optional; a store without it answers 503 rather than revoking
+// unchecked.
+type roleAssignmentFinder interface {
+	FindRoleAssignmentByID(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
+}
+
+// isPlatformScopeEntity reports whether id names the platform-scope entity.
+// Parsed, not string-compared: legal_entity_id is a UUID column, so "…F001",
+// "{…f001}" and the unhyphenated form all store as the platform-scope id.
+func (h *Handler) isPlatformScopeEntity(id string) bool {
+	if id == "" || h.platformScopeEntityID == "" {
+		return false
+	}
+	if strings.EqualFold(id, h.platformScopeEntityID) {
+		return true
+	}
+	got, gotErr := uuid.Parse(id)
+	want, wantErr := uuid.Parse(h.platformScopeEntityID)
+	return gotErr == nil && wantErr == nil && got == want
 }
 
 // assignmentEndScheduler is the store capability behind an effective-dated
@@ -1062,6 +1387,7 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		EffectiveTo *time.Time `json:"effective_to"`
+		commandFields
 	}
 	if r.Body != nil {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
@@ -1069,6 +1395,35 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if !h.applyReason(w, &r, body.reason()) {
+		return
+	}
+
+	// Ending a platform-scope assignment withdraws platform authority, so it
+	// is a platform act too — otherwise any tenant administrator could strip
+	// the platform's own rule authors.
+	if h.platformScopeEntityID != "" {
+		finder, ok := h.store.(roleAssignmentFinder)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		existing, err := finder.FindRoleAssignmentByID(r.Context(), assignmentID, tenantScope)
+		if err != nil {
+			if errors.Is(err, domain.ErrRoleAssignmentNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
+				return
+			}
+			h.log.Error("RevokeRoleAssignment: assignment lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if existing.LegalEntityID != nil && h.isPlatformScopeEntity(*existing.LegalEntityID) &&
+			!h.requirePlatformAction(w, r, principalID, "iam.assignment.revoke") {
+			return
+		}
+	}
+
 	if body.EffectiveTo != nil {
 		if !body.EffectiveTo.After(time.Now()) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -1140,6 +1495,11 @@ type createDelegationRequest struct {
 	DelegatedActions []string   `json:"delegated_actions,omitempty"`
 	EffectiveFrom    time.Time  `json:"effective_from"`
 	EffectiveTo      *time.Time `json:"effective_to,omitempty"`
+
+	// ZS-IAM-001 §11: the purpose (absence, named operational cover...) and,
+	// where policy needs one, the independent approval it was granted under.
+	Reason            string `json:"reason,omitempty"`
+	ApprovalReference string `json:"approval_reference,omitempty"`
 }
 
 // ScopeTypeActionSubset is the scope_type value that declares a delegation to
@@ -1231,6 +1591,38 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
+	// §11 "protected privileges normally non-delegable": access and platform
+	// administration cannot be named in a delegation (and never flow through
+	// one of full authority — FindDelegatedActionsScoped filters them).
+	for _, a := range req.DelegatedActions {
+		if domain.IsPrivilegedAction(a) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "protected_privilege_not_delegable",
+				"field":   "delegated_actions",
+				"message": a + " is a protected privilege and cannot be delegated",
+			})
+			return
+		}
+	}
+	// §11 "effective_from / effective_to: mandatory finite period".
+	if req.EffectiveTo != nil && !req.EffectiveTo.After(req.EffectiveFrom) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_effective_to", "message": "effective_to must be after effective_from"})
+		return
+	}
+	if req.EffectiveTo == nil {
+		if h.commandContract == CommandContractEnforce {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "effective_to",
+				"message": "a delegation must have a finite period (ZS-IAM-001 §11)"})
+			return
+		}
+		end := req.EffectiveFrom.Add(DefaultDelegationTerm)
+		req.EffectiveTo = &end
+		w.Header().Set(HeaderCommandContract, "violated")
+	}
+	// §11 reason: required; in warn mode admitted and marked.
+	if !h.applyReason(w, &r, req.Reason) {
+		return
+	}
 
 	var legalEntityID *string
 	if req.LegalEntityID != "" {
@@ -1253,6 +1645,7 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 		AuthorityLimitType: req.AuthorityLimitType, AuthorityLimitValue: req.AuthorityLimitValue,
 		DelegatedActions: req.DelegatedActions,
 		EffectiveFrom:    req.EffectiveFrom, EffectiveTo: req.EffectiveTo,
+		Reason: optionalString(req.Reason), ApprovalReference: optionalString(req.ApprovalReference),
 	})
 	if err != nil {
 		h.log.Error("CreateDelegatedAuthority: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
@@ -1307,6 +1700,9 @@ func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 			"error":   "only_delegator_may_revoke",
 			"message": "only the principal who granted this delegation may revoke it",
 		})
+		return
+	}
+	if _, ok := h.readCommand(w, &r); !ok {
 		return
 	}
 
@@ -1478,6 +1874,75 @@ func (h *Handler) ReactivateSoDRule(w http.ResponseWriter, r *http.Request) {
 	h.setSoDRuleActive(w, r, true)
 }
 
+// refuseInterestedSoDRetire reports whether principalID holds either action of
+// the tenant's SoD rule sodRuleID, writing a 403 if so (or a 503 if that cannot
+// be established). A rule not visible to the tenant is left to
+// SetSoDRuleActive, which answers 404 for it.
+func (h *Handler) refuseInterestedSoDRetire(w http.ResponseWriter, r *http.Request, principalID, sodRuleID, tenantID string) bool {
+	rules, err := h.store.ListSoDRules(r.Context(), tenantID)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return true
+	}
+	var rule *domain.SoDRule
+	for i := range rules {
+		if rules[i].SoDRuleID == sodRuleID {
+			rule = &rules[i]
+			break
+		}
+	}
+	if rule == nil {
+		return false
+	}
+	held, err := h.heldActionsInTenant(r, principalID, tenantID)
+	if err != nil {
+		h.log.Error("sod retire: held-action lookup failed — refusing",
+			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return true
+	}
+	if held[rule.ActionA] || held[rule.ActionB] {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "sod_self_interest",
+			"message": "a principal holding an action this rule constrains cannot retire it",
+		})
+		return true
+	}
+	return false
+}
+
+// heldActionsInTenant is every action principalID holds, or will hold, through
+// any role assignment in tenantID that has not ended — across all legal
+// entities, books and org units, since a rule constrains the principal
+// wherever they hold the action. Retired roles and bundles still count:
+// reactivation is one call away, and refuseOwnRole only stops this principal
+// making that call, not a colleague.
+func (h *Handler) heldActionsInTenant(r *http.Request, principalID, tenantID string) (map[string]bool, error) {
+	assignments, err := h.store.ListRoleAssignments(r.Context(), tenantID, principalID, "", false)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	held := map[string]bool{}
+	seenRole := map[string]bool{}
+	for _, a := range assignments {
+		if (a.EffectiveTo != nil && !a.EffectiveTo.After(now)) || seenRole[a.RoleID] {
+			continue
+		}
+		seenRole[a.RoleID] = true
+		bundles, err := h.store.ListPermissionBundles(r.Context(), a.RoleID, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		for _, b := range bundles {
+			for _, act := range b.PermittedActions {
+				held[act] = true
+			}
+		}
+	}
+	return held, nil
+}
+
 func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, active bool) {
 	sodRuleID := chi.URLParam(r, "sod_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -1495,8 +1960,25 @@ func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, activ
 		return
 	}
 
-	rule, err := h.store.SetSoDRuleActive(r.Context(), sodRuleID, tenantScope, active)
+	// An interested party may not switch a conflict rule off: a principal
+	// holding either of the rule's actions is the one it constrains — holding
+	// both, it denies them now; holding one, it is what stops them acquiring
+	// the other (ZS-IAM-001 §10.1). Reactivating is not checked; it only
+	// restores a denial.
+	if !active && h.refuseInterestedSoDRetire(w, r, principalID, sodRuleID, tenantScope) {
+		return
+	}
+
+	expectedVersion, ok := h.readCommand(w, &r)
+	if !ok {
+		return
+	}
+	rule, err := h.store.SetSoDRuleActive(r.Context(), sodRuleID, tenantScope, active, expectedVersion)
 	if err != nil {
+		if errors.Is(err, domain.ErrVersionConflict) {
+			writeVersionConflict(w)
+			return
+		}
 		if errors.Is(err, domain.ErrSoDRuleNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "sod_rule_not_found"})
 			return
@@ -1696,11 +2178,17 @@ func (h *Handler) CreateABACRule(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListABACRules(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// ZS-IAM-001 §21 "no broad IAM discovery beyond administrable scope":
+	// the register is readable with the Appendix A read permission.
+	if !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.policy.read") {
 		return
 	}
 
@@ -1759,8 +2247,16 @@ func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, acti
 	// PLATFORM-WIDE rule answers 404 here rather than being retired from one
 	// tenant's console. That is deliberate and is the point: a rule binding
 	// every tenant must not be disableable by any one of them.
-	rule, err := h.store.SetABACRuleActive(r.Context(), abacRuleID, tenantScope, active)
+	expectedVersion, ok := h.readCommand(w, &r)
+	if !ok {
+		return
+	}
+	rule, err := h.store.SetABACRuleActive(r.Context(), abacRuleID, tenantScope, active, expectedVersion)
 	if err != nil {
+		if errors.Is(err, domain.ErrVersionConflict) {
+			writeVersionConflict(w)
+			return
+		}
 		if errors.Is(err, domain.ErrABACRuleNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "abac_rule_not_found"})
 			return
@@ -1846,6 +2342,12 @@ type authorizeRequest struct {
 	PrincipalType       string `json:"principal_type,omitempty"`
 	Audience            string `json:"audience,omitempty"`
 	InitiatingSubjectID string `json:"initiating_subject_id,omitempty"`
+
+	// The target (ZS-IAM-001 §8.1). Optional; recorded in the decision
+	// evidence (GOV-03 "resource") when supplied.
+	ResourceType    string `json:"resource_type,omitempty"`
+	ResourceID      string `json:"resource_id,omitempty"`
+	ResourceVersion string `json:"resource_version,omitempty"`
 }
 
 // PlatformScopeSentinel is the legal_entity_id a caller sends to have a
@@ -1891,11 +2393,25 @@ const PlatformScopeSentinel = "PLATFORM"
 // suspended principal is not a duty conflict.
 const principalStatusBasisPrefix = "principal_status:"
 
+// entityStatusBasisPrefix is the basis of a denial because the legal entity is
+// SUSPENDED or DISSOLVED: "entity_status:DISSOLVED".
+const entityStatusBasisPrefix = "entity_status:"
+
 type authorizeResponse struct {
+	// DecisionOutcome is the original contract — GRANTED | DENIED | STEP_UP —
+	// and stays as it was for every existing caller. REQUIRE_APPROVAL is
+	// DENIED here: a caller that only reads this field must not proceed.
 	DecisionOutcome  string `json:"decision_outcome"`
 	DecisionBasis    string `json:"decision_basis"`
 	AccessDecisionID string `json:"access_decision_id"`
 	Reason           string `json:"reason,omitempty"`
+
+	// The ZS-IAM-001 §8.2 canonical decision, added alongside (not instead).
+	Decision         string   `json:"decision"`
+	PolicySetVersion string   `json:"policy_set_version"`
+	Obligations      []string `json:"obligations"`
+	ReasonCodes      []string `json:"reason_codes"`
+	ExpiresAt        string   `json:"expires_at,omitempty"`
 }
 
 // Authorize handles POST /v1/authorize — the core evaluation endpoint.
@@ -1976,7 +2492,13 @@ type authorizeResponse struct {
 // outage. A body that CONTRADICTS the header is refused outright — that is
 // not an old caller, it is a caller trying to be evaluated in someone else's
 // scope.
-func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bodyTenantID string) (string, bool) {
+//
+// A question about the platform-scope entity is tenantless by design — a
+// platform grant is held there by a role of any tenant — so it is admitted
+// without a tenant even when enforceTenantOnAuthorize is set. Without that
+// exemption, enforcement could not be switched on at all: every platform-scope
+// check (decision log, configuration, vault) sends no tenant.
+func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bodyTenantID, evaluationEntityID string) (string, bool) {
 	headerTenantID := r.Header.Get("X-Tenant-Id")
 
 	if headerTenantID != "" {
@@ -2006,6 +2528,9 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bod
 
 	// No tenant anywhere: only globally-applicable SoD rules can be
 	// considered.
+	if h.isPlatformScopeEntity(evaluationEntityID) {
+		return "", true
+	}
 	if h.enforceTenantOnAuthorize {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error":   "missing_tenant_scope",
@@ -2016,8 +2541,15 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bod
 
 	// Warned at every call so "this tenant's SoD rules never
 	// fired" is diagnosable from the logs rather than from an incident.
-	h.log.Warn("authorize: no tenant scope supplied — only global SoD rules will be evaluated",
-		zap.String("correlation_id", r.Header.Get("X-Correlation-ID")))
+	// The caller is named so the remaining tenantless callers can be listed and
+	// migrated: a tenantless question about an ordinary entity is evaluated
+	// against every tenant's roles, and AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE can
+	// only be switched on once this log is silent.
+	h.log.Warn("authorize: no tenant scope supplied — evaluated across tenants; only global SoD rules apply",
+		zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
+		zap.String("source_system", r.Header.Get("X-Source-System")),
+		zap.String("user_agent", r.UserAgent()),
+		zap.String("legal_entity_id", evaluationEntityID))
 	return "", true
 }
 
@@ -2053,83 +2585,8 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenantScope, ok := h.resolveTenantScope(w, r, req.TenantID)
+	tenantScope, ok := h.resolveTenantScope(w, r, req.TenantID, evaluationEntityID)
 	if !ok {
-		return
-	}
-
-	// ── Workload Identity Validation (ZS-IAM-001 §16, Scenarios A18 & A19) ───
-	isWorkload := strings.EqualFold(req.PrincipalType, "WORKLOAD") ||
-		(req.Attributes != nil && strings.EqualFold(req.Attributes["principal_type"], "WORKLOAD")) ||
-		(req.Attributes != nil && req.Attributes["workload_id"] != "")
-
-	if isWorkload {
-		workloadID := req.PrincipalID
-		if req.Attributes != nil && req.Attributes["workload_id"] != "" {
-			workloadID = req.Attributes["workload_id"]
-		}
-
-		binding, err := h.store.FindWorkloadBinding(r.Context(), workloadID, tenantScope)
-		if err != nil || binding == nil {
-			// Scenario A19: Workload attempts to invent or widen tenant context outside its trusted binding.
-			h.siem.Stream(r.Context(), tenantScope, "security.workload.unbound_tenant", siem.SeverityHigh,
-				fmt.Sprintf("Workload %s attempted access with unbound tenant %s", workloadID, tenantScope))
-			h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID,
-				"DENIED", "workload:tenant_context_unbound", "UNBOUND_TENANT_CONTEXT")
-			return
-		}
-
-		if !binding.ActiveFlag {
-			h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID,
-				"DENIED", "workload:inactive_binding", "WORKLOAD_BINDING_INACTIVE")
-			return
-		}
-
-		aud := req.Audience
-		if aud == "" && req.Attributes != nil {
-			aud = req.Attributes["audience"]
-			if aud == "" {
-				aud = req.Attributes["aud"]
-			}
-		}
-		if aud == "" {
-			aud = r.Header.Get("X-Audience")
-			if aud == "" {
-				aud = r.Header.Get("X-Token-Audience")
-			}
-		}
-
-		if binding.AllowedAudience != "" && binding.AllowedAudience != "*" {
-			if aud == "" || aud != binding.AllowedAudience {
-				// Scenario A18: Workload presents a valid credential but the audience is incorrect.
-				h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID,
-					"DENIED", "workload:audience_mismatch", "TOKEN_AUDIENCE_MISMATCH")
-				return
-			}
-		}
-	}
-
-	// ── layer 0: is this still an active principal? ─────────────────────────
-	//
-	// Before RBAC, because no grant can be exercised by a principal
-	// identity-context-svc has suspended, and running the grant lookup first
-	// would only mean computing a basis nobody is entitled to. The denial IS
-	// recorded — a suspended principal being refused is exactly the evidence
-	// §8.3 requires — so this returns through the same record-and-publish path
-	// as every other outcome rather than short-circuiting the artifact.
-	//
-	// No projected row means ACTIVE, so on a deployment that has seen no
-	// status event this layer changes nothing. See
-	// domain.PrincipalStatusProjection.
-	principalStatus, err := h.store.FindPrincipalStatus(r.Context(), req.PrincipalID, tenantScope)
-	if err != nil {
-		h.log.Error("Authorize: store unavailable (principal status lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		return
-	}
-	if principalStatus != domain.PrincipalStatusActive {
-		h.recordAndAnswer(w, r, req, evaluationEntityID, tenantScope, correlationID,
-			"DENIED", principalStatusBasisPrefix+principalStatus)
 		return
 	}
 
@@ -2140,512 +2597,225 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		req.OrgUnitID = r.Header.Get("X-Org-Unit-Id")
 	}
 
-	rbacActions, rbacBasis, err := h.store.FindGrantedActionsScoped(r.Context(), req.PrincipalID, evaluationEntityID, tenantScope, req.BookID, req.OrgUnitID)
+	authnAge := 0
+	if req.Attributes != nil && req.Attributes["authn_age_seconds"] != "" {
+		authnAge, _ = strconv.Atoi(req.Attributes["authn_age_seconds"])
+	} else if rawAge := r.Header.Get("X-Authn-Age-Seconds"); rawAge != "" {
+		authnAge, _ = strconv.Atoi(rawAge)
+	}
+	aud := req.Audience
+	if aud == "" {
+		aud = r.Header.Get("X-Audience")
+		if aud == "" {
+			aud = r.Header.Get("X-Token-Audience")
+		}
+	}
+	risk := ""
+	if req.Attributes != nil {
+		risk = req.Attributes["risk"]
+	}
+
+	// The same pipeline the canonical decision API and available-actions run
+	// — see evaluateCore for why there is exactly one.
+	in := evalContext{
+		PrincipalID:         req.PrincipalID,
+		PrincipalType:       req.PrincipalType,
+		TenantID:            tenantScope,
+		LegalEntityID:       req.LegalEntityID,
+		BookID:              req.BookID,
+		OrgUnitID:           req.OrgUnitID,
+		ResourceType:        req.ResourceType,
+		ResourceID:          req.ResourceID,
+		ResourceVersion:     req.ResourceVersion,
+		ActionType:          req.ActionType,
+		ResourceOwnerID:     req.ResourceOwnerPrincipalID,
+		Attributes:          req.Attributes,
+		Environment:         domain.EnvironmentContext{AuthnAgeSeconds: authnAge, Assurance: r.Header.Get("X-Assurance-Level"), Risk: risk, Audience: aud},
+		PrivilegedSessionID: req.PrivilegedSessionID,
+		BreakGlassSessionID: req.BreakGlassSessionID,
+		SupportSessionID:    req.SupportSessionID,
+		CorrelationID:       correlationID,
+		InitiatingSubjectID: req.InitiatingSubjectID,
+		SkipAvailable:       true,
+	}
+	res, err := h.evaluateCore(r.Context(), in, evaluationEntityID)
 	if err != nil {
-		// Fail-closed: the store is unreachable, so no decision can be made
-		// or recorded. Returning 503 here (rather than a recorded DENIED)
-		// is deliberate — the caller must treat "cannot evaluate" and
-		// "evaluated and denied" as distinct outcomes, per the same
-		// posture as every other service's ErrStoreUnavailable handling.
-		h.log.Error("Authorize: store unavailable (rbac lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
+		// Fail closed: "cannot evaluate" is a 503, never a recorded outcome.
+		h.log.Error("Authorize: evaluation failed", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
 
-	granted := contains(rbacActions, req.ActionType)
-	basis := rbacBasis
-	allHeldActions := append([]string{}, rbacActions...)
-	// grantedViaDelegation: the action is held only through a delegation, so
-	// the delegation's own ceiling applies (Layer 5.9 below).
-	grantedViaDelegation := false
-
-	if !granted {
-		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActionsScoped(r.Context(), req.PrincipalID, evaluationEntityID, tenantScope, req.BookID, req.OrgUnitID)
-		if err != nil {
-			h.log.Error("Authorize: store unavailable (delegation lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-			return
-		}
-		allHeldActions = append(allHeldActions, delegatedActions...)
-		if contains(delegatedActions, req.ActionType) {
-			granted = true
-			basis = delegatedBasis
-			grantedViaDelegation = true
-		}
-	}
-
-	// Layer 3 — Privileged Access Management (JIT Elevation - ZS-IAM-001 §13 & §21).
-	// When standing RBAC and delegation do not grant the action, a valid time-bound
-	// JIT privileged session can provide elevation for requested actions.
-	if !granted && req.PrivilegedSessionID != "" {
-		ps, err := h.store.FindPrivilegedSessionByID(r.Context(), req.PrivilegedSessionID, tenantScope)
-		if err != nil {
-			if errors.Is(err, domain.ErrPrivilegedSessionNotFound) {
-				h.log.Warn("Authorize: privileged session not found or outside tenant scope",
-					zap.String("privileged_session_id", req.PrivilegedSessionID),
-					zap.String("correlation_id", correlationID))
-			} else {
-				h.log.Error("Authorize: store unavailable (privileged session lookup)",
-					zap.String("correlation_id", correlationID), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-				return
-			}
-		} else if ps != nil {
-			if ps.PrincipalID == req.PrincipalID && ps.Status == domain.PrivilegedSessionStatusActive && time.Now().UTC().Before(ps.ExpiresAt) {
-				if contains(ps.RequestedActions, req.ActionType) || contains(ps.RequestedActions, "*") {
-					granted = true
-					basis = fmt.Sprintf("pam:session=%s:ticket=%s", ps.SessionID, ps.TicketRef)
-					allHeldActions = append(allHeldActions, req.ActionType)
-				}
-			}
-		}
-	}
-
-	// Layer 3.1 — Break-Glass Emergency Elevation (ZS-IAM-001 §14 & §21).
-	// Exception elevation for declared incidents.
-	if !granted && req.BreakGlassSessionID != "" {
-		bg, err := h.store.FindBreakGlassSessionByID(r.Context(), req.BreakGlassSessionID, tenantScope)
-		if err != nil {
-			if errors.Is(err, domain.ErrBreakGlassSessionNotFound) {
-				h.log.Warn("Authorize: break-glass session not found or outside tenant scope",
-					zap.String("break_glass_session_id", req.BreakGlassSessionID),
-					zap.String("correlation_id", correlationID))
-			} else {
-				h.log.Error("Authorize: store unavailable (break-glass session lookup)",
-					zap.String("correlation_id", correlationID), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-				return
-			}
-		} else if bg != nil {
-			// Scenario A17: session must be ACTIVE and not expired mid-operation
-			if bg.Status == domain.BreakGlassSessionStatusActive && time.Now().UTC().Before(bg.ExpiresAt) {
-				if bg.PrincipalID == req.PrincipalID && bg.IncidentID != "" {
-					if contains(bg.RequestedActions, req.ActionType) || contains(bg.RequestedActions, "*") {
-						granted = true
-						basis = fmt.Sprintf("break_glass:session=%s:incident=%s", bg.SessionID, bg.IncidentID)
-						allHeldActions = append(allHeldActions, req.ActionType)
-					}
-				}
-			}
-		}
-	}
-
-	// Layer 3.2 — Tenant Support Session (ZS-IAM-001 §15 & §21).
-	// Purpose-bound diagnostic / support access with operator attribution.
-	if !granted && req.SupportSessionID != "" {
-		ss, err := h.store.FindSupportSessionByID(r.Context(), req.SupportSessionID, tenantScope)
-		if err != nil {
-			if errors.Is(err, domain.ErrSupportSessionNotFound) {
-				h.log.Warn("Authorize: support session not found or outside tenant scope",
-					zap.String("support_session_id", req.SupportSessionID),
-					zap.String("correlation_id", correlationID))
-			} else {
-				h.log.Error("Authorize: store unavailable (support session lookup)",
-					zap.String("correlation_id", correlationID), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-				return
-			}
-		} else if ss != nil {
-			if ss.Status == domain.SupportSessionStatusActive && time.Now().UTC().Before(ss.ExpiresAt) {
-				// Operator attribution: principal must be the authorized support operator
-				if ss.SupportOperatorID == req.PrincipalID {
-					isExportAction := strings.HasSuffix(req.ActionType, ".export") || req.ActionType == "export" || strings.Contains(req.ActionType, "export")
-					isMutationAction := strings.HasSuffix(req.ActionType, ".create") || strings.HasSuffix(req.ActionType, ".edit") || strings.HasSuffix(req.ActionType, ".post") || strings.HasSuffix(req.ActionType, ".delete") || strings.HasSuffix(req.ActionType, ".release") || strings.HasSuffix(req.ActionType, ".revoke")
-
-					// Scenario A14: Support user bulk export is DENIED by default unless explicitly granted
-					if isExportAction && !ss.AllowBulkExport && !contains(ss.AllowedActions, req.ActionType) {
-						h.recordAndAnswer(w, r, req, evaluationEntityID, tenantScope, correlationID,
-							"DENIED", "support:bulk_export_prohibited")
-						return
-					}
-
-					// Read-only violation check
-					if ss.ReadOnly && isMutationAction && !contains(ss.AllowedActions, req.ActionType) {
-						h.recordAndAnswer(w, r, req, evaluationEntityID, tenantScope, correlationID,
-							"DENIED", "support:read_only_session")
-						return
-					}
-
-					if contains(ss.AllowedActions, req.ActionType) || contains(ss.AllowedActions, "*") || (!ss.ReadOnly && len(ss.AllowedActions) == 0) || (ss.ReadOnly && !isMutationAction) {
-						granted = true
-						basis = fmt.Sprintf("support:session=%s:operator=%s:ticket=%s", ss.SessionID, ss.SupportOperatorID, ss.TicketRef)
-						allHeldActions = append(allHeldActions, req.ActionType)
-					}
-				}
-			}
-		}
-	}
-
-	outcome := "DENIED"
-	if !granted {
-		basis = "no_grant"
-	} else {
-		// SoD check: does holding req.ActionType alongside anything else
-		// this principal already holds violate a Separation-of-Duties rule?
-		others := removeAll(allHeldActions, req.ActionType)
-		conflicting, hasConflict, err := h.store.CheckSoDConflict(r.Context(), others, req.ActionType, tenantScope)
-		if err != nil {
-			h.log.Error("Authorize: store unavailable (sod check)", zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-			return
-		}
-		if hasConflict {
-			outcome = "DENIED"
-			basis = "sod:conflict_with=" + conflicting
-		} else {
-			outcome = "GRANTED"
-		}
-
-		// Dynamic (own-object) SoD: only reachable once static SoD has
-		// already granted, and only evaluated when the caller supplied a
-		// resource owner — a request with no ResourceOwnerPrincipalID has
-		// nothing to compare against and behaves exactly as before this
-		// layer existed.
-		if outcome == "GRANTED" && req.ResourceOwnerPrincipalID != "" && req.ResourceOwnerPrincipalID == req.PrincipalID {
-			// tenantScope, NOT req.TenantID. This read used the raw BODY
-			// tenant while every other layer used the resolved scope, so a
-			// caller that correctly forwarded X-Tenant-Id and left tenant_id
-			// out of the body — which is the convention resolveTenantScope
-			// exists to encourage — had this check run with an empty tenant.
-			// CheckOwnObjectSoD's predicate is
-			// `tenant_id IS NULL OR tenant_id = NULLIF($2,'')`, so an empty
-			// tenant narrows it to platform-wide rules and a tenant's own
-			// own-object rule silently never fired for its best-behaved
-			// callers. Same class of bug resolveTenantScope was written to fix,
-			// one layer further down.
-			isOwnObjectForbidden, err := h.store.CheckOwnObjectSoD(r.Context(), req.ActionType, tenantScope)
-			if err != nil {
-				h.log.Error("Authorize: store unavailable (own-object sod check)", zap.String("correlation_id", correlationID), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-				return
-			}
-			if isOwnObjectForbidden {
-				outcome = "DENIED"
-				basis = "sod:own_object_forbidden"
-			}
-		}
-
-		// Dynamic SoD — Supplier bank change proximity (Scenario A06, §10.2)
-		if outcome == "GRANTED" && isReleaseAction(req.ActionType) && req.Attributes != nil {
-			bankChangedBy := req.Attributes["supplier_bank_changed_by"]
-			if bankChangedBy == "" {
-				bankChangedBy = req.Attributes["bank_account_changed_by"]
-			}
-			coolingViolation := req.Attributes["cooling_window_violation"] == "true" ||
-				req.Attributes["supplier_bank_cooling_window_active"] == "true" ||
-				req.Attributes["cooling_window_conflict"] == "true" ||
-				req.Attributes["supplier_bank_cooling_active"] == "true" ||
-				req.Attributes["cooling_window_active"] == "true"
-
-			if !coolingViolation && req.Attributes["supplier_bank_changed_at"] != "" {
-				coolingViolation = checkCoolingWindowActive(req.Attributes["supplier_bank_changed_at"])
-			}
-
-			if (bankChangedBy == req.PrincipalID && coolingViolation) || req.Attributes["cooling_window_conflict"] == "true" {
-				outcome = "DENIED"
-				basis = "sod:cooling_window_conflict"
-			}
-		}
-
-		// Dynamic SoD — Requestor self-approval (§10.2)
-		if outcome == "GRANTED" && isApprovalAction(req.ActionType) && req.Attributes != nil {
-			requestorID := req.Attributes["requestor_id"]
-			if requestorID == "" {
-				requestorID = req.Attributes["expense.requestor_id"]
-			}
-			if requestorID != "" && requestorID == req.PrincipalID {
-				outcome = "DENIED"
-				basis = "sod:requestor_self_approval"
-			}
-		}
-
-		// Dynamic SoD — Own access elevation (§10.2)
-		if outcome == "GRANTED" && isGrantAction(req.ActionType) && req.Attributes != nil {
-			targetSubjectID := req.Attributes["target_subject_id"]
-			if targetSubjectID == "" {
-				targetSubjectID = req.Attributes["target_principal_id"]
-			}
-			if targetSubjectID != "" && targetSubjectID == req.PrincipalID {
-				outcome = "DENIED"
-				basis = "sod:own_access_elevation"
-			}
-		}
-
-		// Dynamic SoD — Prior rejected reviewer (§10.2 Pattern 5)
-		if outcome == "GRANTED" && isApprovalAction(req.ActionType) && req.Attributes != nil {
-			priorRejectedBy := req.Attributes["prior_rejected_by"]
-			if priorRejectedBy == "" {
-				priorRejectedBy = req.Attributes["rejected_by"]
-			}
-			isResubmission := req.Attributes["is_resubmission"] == "true" || req.Attributes["resubmitted"] == "true" || priorRejectedBy != ""
-			if priorRejectedBy != "" && priorRejectedBy == req.PrincipalID && isResubmission {
-				outcome = "DENIED"
-				basis = "sod:prior_rejected_reviewer"
-			}
-		}
-
-		// Dynamic SoD — Related-party conflict (§10.2 Pattern 6)
-		if outcome == "GRANTED" && req.Attributes != nil {
-			relatedPartySubject := req.Attributes["related_party_subject_id"]
-			if relatedPartySubject == "" {
-				relatedPartySubject = req.Attributes["vendor_related_party_subject_id"]
-			}
-			isRelatedParty := req.Attributes["is_related_party"] == "true" || req.Attributes["related_party_conflict"] == "true" ||
-				(relatedPartySubject != "" && relatedPartySubject == req.PrincipalID)
-			if isRelatedParty {
-				outcome = "DENIED"
-				basis = "sod:related_party_conflict"
-			}
-		}
-
-		// Layer 5 — ABAC. Attribute conditions declared in abac_rules, only
-		// reachable once every earlier layer has already granted, and
-		// DENY-ONLY: a rule can take away what RBAC or delegation conferred,
-		// never add to it (see internal/abac and domain.ABACRule).
-		//
-		// The store read happens whether or not the caller sent attributes,
-		// because whether a rule exists is a property of the ACTION, not of
-		// the request — skipping the read when Attributes is empty is exactly
-		// how a caller would bypass a REQUIRE rule by sending no attributes.
-		// With no rules declared it is one cached, almost always empty read.
-		if outcome == "GRANTED" {
-			rules, err := h.store.FindABACRules(r.Context(), req.ActionType, tenantScope)
-			if err != nil {
-				h.log.Error("Authorize: store unavailable (abac lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-				return
-			}
-			if denial, denied := abac.Evaluate(rules, req.Attributes); denied {
-				outcome = "DENIED"
-				basis = denial.Basis()
-				if denial.Unevaluable {
-					// A defect in the RULE, not in the request: the effect or
-					// operator is one this build cannot execute, so the rule
-					// denies its action for every principal until it is fixed.
-					// Logged at Error so it surfaces as an operator problem
-					// rather than as a run of ordinary denials.
-					h.log.Error("Authorize: abac rule could not be evaluated — it denies this action for every principal until corrected",
-						zap.String("rule_code", denial.RuleCode),
-						zap.String("action_type", req.ActionType),
-						zap.String("correlation_id", correlationID))
-				}
-			}
-		}
-
-		// Layer 5.9 — the ceiling of the delegation the grant rests on (ORG-06).
-		if outcome == "GRANTED" && grantedViaDelegation {
-			denied, ceilingBasis, _, err := h.evaluateDelegationCeiling(r.Context(), evalContext{
-				PrincipalID: req.PrincipalID, TenantID: tenantScope, LegalEntityID: evaluationEntityID,
-				ActionType: req.ActionType, Attributes: req.Attributes, CorrelationID: correlationID,
-			}, evaluationEntityID)
-			if err != nil {
-				h.log.Error("Authorize: store unavailable (delegation ceiling)", zap.String("correlation_id", correlationID), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-				return
-			}
-			if denied {
-				outcome = "DENIED"
-				basis = ceilingBasis
-			}
-		}
-
-		// Layer 6.0 — Monetary Authority Limits & FX Conversion (Phase 3.6 & 3.7, Scenario A09)
-		if outcome == "GRANTED" {
-			evalCtx := evalContext{
-				PrincipalID:   req.PrincipalID,
-				TenantID:      tenantScope,
-				LegalEntityID: evaluationEntityID,
-				BookID:        req.BookID,
-				OrgUnitID:     req.OrgUnitID,
-				ActionType:    req.ActionType,
-				Attributes:    req.Attributes,
-				CorrelationID: correlationID,
-			}
-			limitDenied, limitBasis, _, _, _, err := h.evaluateAuthorityLimits(r.Context(), evalCtx, evaluationEntityID)
-			if err != nil {
-				h.log.Error("Authorize: store unavailable (authority limit check)", zap.String("correlation_id", correlationID), zap.Error(err))
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-				return
-			}
-			if limitDenied {
-				outcome = "DENIED"
-				basis = limitBasis
-			}
-		}
-
-		// Layer 6.1 — Quorum / Dual Approval (Phase 3.8)
-		if outcome == "GRANTED" {
-			evalCtx := evalContext{
-				PrincipalID:   req.PrincipalID,
-				TenantID:      tenantScope,
-				LegalEntityID: evaluationEntityID,
-				ActionType:    req.ActionType,
-				Attributes:    req.Attributes,
-				CorrelationID: correlationID,
-			}
-			if qDenied, qBasis, _, _, _ := h.evaluateQuorum(evalCtx); qDenied {
-				outcome = "DENIED"
-				basis = qBasis
-			}
-		}
-
-		// Layer 6.2 — Execution-Time Fact-Hash Revalidation (Phase 3.9, Scenario A10)
-		if outcome == "GRANTED" {
-			evalCtx := evalContext{
-				PrincipalID:   req.PrincipalID,
-				TenantID:      tenantScope,
-				LegalEntityID: evaluationEntityID,
-				ActionType:    req.ActionType,
-				Attributes:    req.Attributes,
-				CorrelationID: correlationID,
-			}
-			if rDenied, rBasis, _, _, _ := h.evaluateExecutionRevalidation(evalCtx); rDenied {
-				outcome = "DENIED"
-				basis = rBasis
-			}
-		}
-
-		// Layer 7 — Stage 7 Assurance / Step-Up (Scenario A26, ZS-IAM-001 §7 Stage 7, §8.2)
-		if outcome == "GRANTED" {
-			authnAge := 0
-			if req.Attributes != nil && req.Attributes["authn_age_seconds"] != "" {
-				authnAge, _ = strconv.Atoi(req.Attributes["authn_age_seconds"])
-			} else if rawAge := r.Header.Get("X-Authn-Age-Seconds"); rawAge != "" {
-				authnAge, _ = strconv.Atoi(rawAge)
-			}
-			env := domain.EnvironmentContext{
-				AuthnAgeSeconds: authnAge,
-				Assurance:       r.Header.Get("X-Assurance-Level"),
-			}
-			if isStepUpRequired(req.ActionType, req.Attributes, env) {
-				outcome = domain.OutcomeStepUp
-				basis = "assurance:recent_authn_required"
-			}
-		}
-
-		// Layer 8 — Domain Guards: Resource Lifecycle State (ZS-STATE-001)
-		if outcome == "GRANTED" && req.Attributes != nil {
-			status := getResourceLifecycleStatus(req.Attributes)
-			if isTerminalLifecycleState(status) && isMutationOrApprovalAction(req.ActionType) {
-				outcome = "DENIED"
-				basis = "state:terminal_status=" + status
-			}
-		}
-	}
-
-	h.recordAndAnswer(w, r, req, evaluationEntityID, tenantScope, correlationID, outcome, basis)
-}
-
-// recordAndAnswer writes the decision artifact, publishes, streams to SIEM and
-// answers the caller. Every outcome leaves Authorize through here.
-//
-// Extracted when layer 0 (the principal-status gate) was added, because that
-// layer produces a denial before any of the grant lookups have run. Inlining a
-// second copy of this tail is how one of the two paths eventually stops
-// publishing authorization.denied, or stops recording the artifact at all —
-// which is the critical constraint ("no material action executes without an
-// authorization decision artifact") being broken by a refactor rather than by a
-// decision.
-func (h *Handler) recordAndAnswer(
-	w http.ResponseWriter,
-	r *http.Request,
-	req authorizeRequest,
-	evaluationEntityID, tenantScope, correlationID string,
-	outcome, basis string,
-) {
-	h.recordAndAnswerWithReason(w, r, req, evaluationEntityID, tenantScope, correlationID, outcome, basis, "")
-}
-
-func (h *Handler) recordAndAnswerWithReason(
-	w http.ResponseWriter,
-	r *http.Request,
-	req authorizeRequest,
-	evaluationEntityID, tenantScope, correlationID string,
-	outcome, basis, reason string,
-) {
-	decision, err := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
-		PrincipalID: req.PrincipalID,
-		// The RESOLVED entity, not the sentinel the caller may have sent.
-		// legal_entity_id is UUID NOT NULL in access_decision_log, so writing
-		// "PLATFORM" would fail the insert — and the evidence has to name the
-		// scope the decision was actually evaluated in, which is what a later
-		// audit of a platform-wide act needs to see.
-		LegalEntityID: evaluationEntityID,
-		ActionType:    req.ActionType,
-		Outcome:       outcome,
-		Basis:         basis,
-		CorrelationID: correlationID,
-		TenantID:      tenantScope,
-	})
-	if err != nil {
-		h.log.Error("Authorize: failed to record access decision", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	decision, ok := h.recordDecision(w, r, in, evaluationEntityID, res)
+	if !ok {
 		return
 	}
-
-	if outcome == "GRANTED" {
-		if pubErr := h.publisher.PublishAuthorizationGranted(r.Context(), *decision); pubErr != nil {
-			h.log.Error("Authorize: failed to publish authorization.granted", zap.String("correlation_id", correlationID), zap.Error(pubErr))
-		}
-	} else {
-		if pubErr := h.publisher.PublishAuthorizationDenied(r.Context(), *decision); pubErr != nil {
-			h.log.Error("Authorize: failed to publish authorization.denied", zap.String("correlation_id", correlationID), zap.Error(pubErr))
-		}
-		// Doc 05 §13.2 names "authorization grants/denials" as a required
-		// SIEM signal. Only DENIED streams here — GRANTED is the overwhelming
-		// majority outcome on this endpoint (it's called on nearly every
-		// mutating request platform-wide), and streaming every success would
-		// bury the actionable signal in noise rather than surface it.
-		severity := siem.SeverityMedium
-		// Any "sod:" basis is a SoD violation now, not just the static
-		// conflict_with= shape — own-object denials share the same prefix
-		// convention so they get the same elevated severity and event.
-		isSoD := strings.HasPrefix(basis, "sod:")
-		if isSoD {
-			severity = siem.SeverityHigh
-		}
-		// A suspended or disabled principal whose credentials are still being
-		// used to attempt material actions is a stronger signal than an
-		// ordinary "no grant" — the account has been stood down and something
-		// is still acting as it. Same elevation as an SoD violation, and
-		// deliberately not folded into the sod: prefix, because it publishes
-		// no sod.violation.detected: nothing here is a duty conflict.
-		if strings.HasPrefix(basis, principalStatusBasisPrefix) || basis == "workload:tenant_context_unbound" {
-			severity = siem.SeverityHigh
-		}
-		h.siem.Stream(r.Context(), tenantScope, "authorization.denied", severity,
-			"Authorization denied for principal "+req.PrincipalID+", action "+req.ActionType+": "+basis)
-		if basis == "workload:tenant_context_unbound" {
-			h.siem.Stream(r.Context(), tenantScope, "security.workload.unbound_tenant", siem.SeverityHigh,
-				fmt.Sprintf("Workload %s attempted access with unbound tenant %s", req.PrincipalID, tenantScope))
-		}
-		if isSoD {
-			// conflict_with= names the other held action; an own-object
-			// denial has no "other action" — the conflict is the action
-			// itself against a resource the principal also owns.
-			conflictingAction := req.ActionType
-			if strings.HasPrefix(basis, "sod:conflict_with=") {
-				conflictingAction = basis[len("sod:conflict_with="):]
-			}
-			if pubErr := h.publisher.PublishSoDViolationDetected(r.Context(), *decision, conflictingAction); pubErr != nil {
-				h.log.Error("Authorize: failed to publish sod.violation.detected", zap.String("correlation_id", correlationID), zap.Error(pubErr))
-			}
-		}
-	}
+	h.emitDecisionTelemetry(r.Context(), req.ActionType, req.PrincipalID, evaluationEntityID, tenantScope, correlationID, res, decision)
 
 	h.log.Info("authorization evaluated",
 		zap.String("principal_id", req.PrincipalID),
 		zap.String("action_type", req.ActionType),
-		zap.String("outcome", outcome),
-		zap.String("basis", basis),
+		zap.String("decision", res.Decision),
+		zap.String("basis", res.Basis),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusOK, authorizeResponse{
-		DecisionOutcome:  outcome,
-		DecisionBasis:    basis,
+	resp := authorizeResponse{
+		DecisionOutcome:  res.Outcome,
+		DecisionBasis:    res.Basis,
 		AccessDecisionID: decision.AccessDecisionID,
-		Reason:           reason,
-	})
+		Decision:         res.Decision,
+		PolicySetVersion: decision.PolicySetVersion,
+		Obligations:      nonNil(res.Obligations),
+		ReasonCodes:      nonNil(res.ReasonCodes),
+	}
+	// reason was only ever set for the workload refusals; kept to that.
+	if strings.HasPrefix(res.Basis, "workload:") {
+		resp.Reason = res.Reason
+	}
+	if decision.ExpiresAt != nil {
+		resp.ExpiresAt = decision.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// decisionTTL bounds how long a PEP may rely on a decision (§8.2 expires_at).
+const decisionTTL = 5 * time.Minute
+
+// delegationSourceFinder is the store capability that names the delegation
+// a delegated grant rests on, for the §11 attribution rule. Optional; a store
+// without it refuses rather than record a delegated decision unattributed.
+type delegationSourceFinder interface {
+	FindDelegationSource(ctx context.Context, delegatePrincipalID, legalEntityID, tenantID, bookID, orgUnitID, actionType string) (delegatorPrincipalID, delegationID string, err error)
+}
+
+// grantingAssignmentFinder names the assignments behind an RBAC grant.
+type grantingAssignmentFinder interface {
+	FindGrantingAssignments(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID, actionType string) ([]domain.GrantingAssignment, error)
+}
+
+// recordDecision writes the decision artifact with its full evidence. Every
+// decision leaves /v1/authorize and the canonical API through here, so "no
+// material action executes without an authorization decision artifact" holds
+// on both. Writes a 503 and returns false if the artifact cannot be written.
+func (h *Handler) recordDecision(w http.ResponseWriter, r *http.Request, in evalContext, evaluationEntityID string, res *evalResult) (*domain.AccessDecisionLog, bool) {
+	expires := time.Now().UTC().Add(decisionTTL)
+	params := domain.RecordAccessDecisionParams{
+		PrincipalID: in.PrincipalID,
+		// The RESOLVED entity, not the PLATFORM sentinel — legal_entity_id is
+		// UUID NOT NULL, and the evidence must name the scope evaluated.
+		LegalEntityID:    evaluationEntityID,
+		ActionType:       in.ActionType,
+		Outcome:          res.Outcome,
+		Basis:            res.Basis,
+		CorrelationID:    in.CorrelationID,
+		TenantID:         in.TenantID,
+		Events:           h.decisionEvents,
+		Decision:         res.Decision,
+		Obligations:      res.Obligations,
+		ReasonCodes:      res.ReasonCodes,
+		MatchedGrants:    res.MatchedGrants,
+		ResourceType:     in.ResourceType,
+		ResourceID:       in.ResourceID,
+		ResourceVersion:  in.ResourceVersion,
+		AttributesDigest: attributesDigest(in.Attributes),
+		SessionAssurance: in.Environment.Assurance,
+		ExpiresAt:        &expires,
+	}
+	// §11: "Every delegated action records both actor_subject_id and
+	// on_behalf_of_subject_id / delegation_id." The basis named only the
+	// first delegator, which need not be the one whose authority was used.
+	if strings.HasPrefix(res.Basis, "delegated:") && res.Outcome == domain.OutcomeGranted {
+		finder, ok := h.store.(delegationSourceFinder)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return nil, false
+		}
+		delegator, delegationID, err := finder.FindDelegationSource(r.Context(), in.PrincipalID, evaluationEntityID, in.TenantID, in.BookID, in.OrgUnitID, in.ActionType)
+		if err != nil {
+			h.log.Error("decision: delegation attribution failed — refusing", zap.String("correlation_id", in.CorrelationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return nil, false
+		}
+		params.OnBehalfOf, params.DelegationID = delegator, delegationID
+	}
+	// §20 "assignment references": which assignment, through which role,
+	// conferred an RBAC grant — "assignment:<id>" and "role:<code>" — so use
+	// is attributed to the assignment that granted it, not to every role whose
+	// code appears in the basis (access reviews' DORMANT, §24).
+	if strings.HasPrefix(res.Basis, "rbac:") && res.Outcome == domain.OutcomeGranted {
+		finder, ok := h.store.(grantingAssignmentFinder)
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return nil, false
+		}
+		granting, err := finder.FindGrantingAssignments(r.Context(), in.PrincipalID, evaluationEntityID, in.TenantID, in.BookID, in.OrgUnitID, in.ActionType)
+		if err != nil {
+			h.log.Error("decision: assignment attribution failed — refusing", zap.String("correlation_id", in.CorrelationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return nil, false
+		}
+		refs := make([]string, 0, 2*len(granting))
+		for _, g := range granting {
+			refs = append(refs, "assignment:"+g.AssignmentID, "role:"+g.RoleCode)
+		}
+		params.MatchedGrants = append(refs, nonRBAC(res.MatchedGrants)...)
+	}
+
+	decision, err := h.store.RecordAccessDecision(r.Context(), params)
+	if err != nil {
+		h.log.Error("failed to record access decision", zap.String("correlation_id", in.CorrelationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return nil, false
+	}
+	return decision, true
+}
+
+// attributesDigest is a SHA-256 over the attribute map in key order, so the
+// evidence proves what was evaluated without retaining the values (§25).
+func attributesDigest(attrs map[string]string) string {
+	if len(attrs) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(attrs))
+	for k := range attrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	sum := sha256.New()
+	for _, k := range keys {
+		sum.Write([]byte(k))
+		sum.Write([]byte{0})
+		sum.Write([]byte(attrs[k]))
+		sum.Write([]byte{0})
+	}
+	return "sha256:" + hex.EncodeToString(sum.Sum(nil))
+}
+
+// nonRBAC keeps the matched-grant entries that are not the RBAC basis string
+// (e.g. sod_exception references), which assignment references replace.
+func nonRBAC(grants []string) []string {
+	var out []string
+	for _, g := range grants {
+		if !strings.HasPrefix(g, "rbac:") {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+func optionalString(v string) *string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	return &v
+}
+
+func nonNil(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
 }
 
 // ── GET /v1/admin/role-assignments ──────────────────────────────────────────
@@ -2685,11 +2855,17 @@ func atoiOrZero(v string) (int, error) {
 func (h *Handler) ListRoleAssignments(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// ZS-IAM-001 §21 "no broad IAM discovery beyond administrable scope":
+	// the register is readable with the Appendix A read permission.
+	if !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.assignment.read") {
 		return
 	}
 
@@ -2763,11 +2939,17 @@ func (h *Handler) ListRoleAssignments(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListSoDRules(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// ZS-IAM-001 §21 "no broad IAM discovery beyond administrable scope":
+	// the register is readable with the Appendix A read permission.
+	if !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.sod_rule.read") {
 		return
 	}
 
@@ -2811,11 +2993,17 @@ func (h *Handler) ListSoDRules(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListRoles(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// ZS-IAM-001 §21 "no broad IAM discovery beyond administrable scope":
+	// the register is readable with the Appendix A read permission.
+	if !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.role.read") {
 		return
 	}
 
@@ -2859,11 +3047,17 @@ func (h *Handler) ListRoles(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListDelegatedAuthorities(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// ZS-IAM-001 §21 "no broad IAM discovery beyond administrable scope":
+	// the register is readable with the Appendix A read permission.
+	if !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.delegation.read") {
 		return
 	}
 
@@ -2911,7 +3105,8 @@ func (h *Handler) GetAccessDecision(w http.ResponseWriter, r *http.Request) {
 	accessDecisionID := chi.URLParam(r, "access_decision_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
@@ -2928,6 +3123,21 @@ func (h *Handler) GetAccessDecision(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("GetAccessDecision: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
+	}
+	// Same restriction as the listing (see ListAccessDecisions). Somebody
+	// else's decision without iam.policy.read is 404, not 403: confirming
+	// that a decision about another principal exists is itself disclosure.
+	fullRead, err := h.holdsPermission(r, callerPrincipal, tenantScope, PermissionPolicyRead)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if !fullRead {
+		if d.PrincipalID != callerPrincipal {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "access_decision_not_found"})
+			return
+		}
+		redactDecision(d)
 	}
 	writeJSON(w, http.StatusOK, d)
 }
@@ -2977,7 +3187,7 @@ func removeAll(list []string, target string) []string {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
+	if err := json.NewEncoder(w).Encode(withErrorClass(status, v)); err != nil {
 		_ = err
 	}
 }
@@ -3060,15 +3270,20 @@ func (h *Handler) CreatePrivilegedSession(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) ListPrivilegedSessions(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID := r.URL.Query().Get("principal_id")
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
-
-	principalID := r.URL.Query().Get("principal_id")
+	// Your own sessions are yours to see; anybody else's — or the whole
+	// register — needs the permission that administers them.
+	if principalID != callerPrincipal && !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.pam.manage") {
+		return
+	}
 	activeOnly := r.URL.Query().Get("active_only") == "true"
 
 	sessions, err := h.store.ListPrivilegedSessions(r.Context(), tenantScope, principalID, activeOnly)
@@ -3212,7 +3427,8 @@ func (h *Handler) CreateBreakGlassSession(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) GetBreakGlassSession(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
@@ -3236,20 +3452,38 @@ func (h *Handler) GetBreakGlassSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
+	// The session's own principal, or whoever administers sessions; anybody
+	// else gets 404 — the session's existence is not theirs to learn.
+	if bg.PrincipalID != callerPrincipal {
+		allowed, err := h.holdsPermission(r, callerPrincipal, tenantScope, "iam.break_glass.manage")
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if !allowed {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "break_glass_session_not_found", "session_id": sessionID})
+			return
+		}
+	}
 
 	writeJSON(w, http.StatusOK, bg)
 }
 
 func (h *Handler) ListBreakGlassSessions(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID := r.URL.Query().Get("principal_id")
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
-
-	principalID := r.URL.Query().Get("principal_id")
+	// Your own sessions are yours to see; anybody else's — or the whole
+	// register — needs the permission that administers them.
+	if principalID != callerPrincipal && !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.break_glass.manage") {
+		return
+	}
 	activeOnly := r.URL.Query().Get("active_only") == "true"
 
 	sessions, err := h.store.ListBreakGlassSessions(r.Context(), tenantScope, principalID, activeOnly)
@@ -3395,7 +3629,8 @@ func (h *Handler) CreateSupportSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetSupportSession(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
@@ -3419,16 +3654,35 @@ func (h *Handler) GetSupportSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
+	// The session's own principal, or whoever administers sessions; anybody
+	// else gets 404 — the session's existence is not theirs to learn.
+	if ss.SupportOperatorID != callerPrincipal {
+		allowed, err := h.holdsPermission(r, callerPrincipal, tenantScope, "iam.support.manage")
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return
+		}
+		if !allowed {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "support_session_not_found", "session_id": sessionID})
+			return
+		}
+	}
 
 	writeJSON(w, http.StatusOK, ss)
 }
 
 func (h *Handler) ListSupportSessions(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
+		return
+	}
+	// ZS-IAM-001 §21 "no broad IAM discovery beyond administrable scope":
+	// the register is readable with the Appendix A read permission.
+	if !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.support.manage") {
 		return
 	}
 

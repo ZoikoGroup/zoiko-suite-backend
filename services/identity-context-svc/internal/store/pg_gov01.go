@@ -317,11 +317,13 @@ func (s *PgStore) InsertSupportContextWithEvent(
 			INSERT INTO support_contexts (
 				support_context_id, tenant_id, support_principal_id, subject_principal_id,
 				reason_code, justification, ticket_ref, approver_principal_id,
-				granted_at, expires_at, evidence_id, correlation_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+				granted_at, expires_at, evidence_id, correlation_id,
+				requested_by_principal_id, approval_status, requested_ttl_seconds)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULLIF($13::text, ''),$14,NULLIF($15::int, 0))`,
 			sc.SupportContextID, sc.TenantID, sc.SupportPrincipalID, sc.SubjectPrincipalID,
 			sc.ReasonCode, sc.Justification, sc.TicketRef, sc.ApproverPrincipalID,
 			sc.GrantedAt, sc.ExpiresAt, sc.EvidenceID, sc.CorrelationID,
+			sc.RequestedByPrincipalID, approvalStatusOrApproved(sc.ApprovalStatus), sc.RequestedTTLSeconds,
 		)
 		if err != nil {
 			return fmt.Errorf("insert support_context: %w", err)
@@ -374,6 +376,7 @@ func (s *PgStore) FindLiveSupportContext(
 			 WHERE support_principal_id = $1
 			   AND tenant_id            = $2
 			   AND revoked_at IS NULL
+			   AND approval_status = 'APPROVED'
 			   AND granted_at <= $3
 			   AND expires_at  > $3
 			 ORDER BY granted_at DESC
@@ -450,6 +453,7 @@ func (s *PgStore) FindUnreviewedExpiredSupportContexts(
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, supportContextColumns+`
 			 WHERE tenant_id = $1
+			   AND approval_status = 'APPROVED'
 			   AND reviewed_at IS NULL
 			   AND (expires_at <= $2 OR revoked_at IS NOT NULL)
 			 ORDER BY expires_at
@@ -508,6 +512,7 @@ func (s *PgStore) FindUnreviewedExpiredSupportContextsAllTenants(
 
 	rows, err := tx.Query(ctx, supportContextColumns+`
 		 WHERE reviewed_at IS NULL
+		   AND approval_status = 'APPROVED'
 		   AND (expires_at <= $1 OR revoked_at IS NOT NULL)
 		 ORDER BY expires_at
 		 LIMIT $2`, before, limit)
@@ -573,7 +578,8 @@ const supportContextColumns = `
 	SELECT support_context_id, tenant_id, support_principal_id, subject_principal_id,
 	       reason_code, justification, ticket_ref, approver_principal_id,
 	       granted_at, expires_at, revoked_at, revocation_reason,
-	       reviewed_at, reviewed_by, evidence_id, correlation_id
+	       reviewed_at, reviewed_by, evidence_id, correlation_id,
+	       COALESCE(requested_by_principal_id, ''), approval_status, approved_at, COALESCE(requested_ttl_seconds, 0)
 	  FROM support_contexts`
 
 // rowScanner is satisfied by both pgx.Row and pgx.Rows.
@@ -587,7 +593,51 @@ func scanSupportContext(r rowScanner, sc *domain.SupportContext) error {
 		&sc.ReasonCode, &sc.Justification, &sc.TicketRef, &sc.ApproverPrincipalID,
 		&sc.GrantedAt, &sc.ExpiresAt, &sc.RevokedAt, &sc.RevocationReason,
 		&sc.ReviewedAt, &sc.ReviewedBy, &sc.EvidenceID, &sc.CorrelationID,
+		&sc.RequestedByPrincipalID, &sc.ApprovalStatus, &sc.ApprovedAt, &sc.RequestedTTLSeconds,
 	)
+}
+
+func approvalStatusOrApproved(s string) string {
+	if s == "" {
+		return domain.SupportApproved
+	}
+	return s
+}
+
+// ApproveSupportContextWithEvent records the named approver's approval and
+// starts the grant's window, atomically with its attached event. Only a
+// PENDING, unrevoked request naming this approver changes; reports whether
+// one did, so a racing second approval is answered, not doubled.
+func (s *PgStore) ApproveSupportContextWithEvent(
+	ctx context.Context,
+	supportContextID, tenantID, approverPrincipalID string,
+	grantedAt, expiresAt time.Time,
+	rec outbox.Record,
+) (bool, error) {
+	if tenantID == "" {
+		return false, errors.New("ApproveSupportContextWithEvent: tenant_id is required")
+	}
+	var changed bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE support_contexts
+			   SET approval_status = 'APPROVED', approved_at = $1, granted_at = $1, expires_at = $2
+			 WHERE support_context_id = $3
+			   AND tenant_id = $4
+			   AND approver_principal_id = $5
+			   AND approval_status = 'PENDING_APPROVAL'
+			   AND revoked_at IS NULL`,
+			grantedAt, expiresAt, supportContextID, tenantID, approverPrincipalID)
+		if err != nil {
+			return fmt.Errorf("approve support_context: %w", err)
+		}
+		changed = tag.RowsAffected() > 0
+		if !changed || rec.EventID == "" {
+			return nil
+		}
+		return s.outboxEnqueueTx(ctx, tx, rec)
+	})
+	return changed, err
 }
 
 // ---------------------------------------------------------------------------

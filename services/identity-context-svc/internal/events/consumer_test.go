@@ -117,6 +117,11 @@ type fakeDeduper struct {
 
 func newFakeDeduper() *fakeDeduper { return &fakeDeduper{seen: map[string]struct{}{}} }
 
+func (f *fakeDeduper) Release(_ context.Context, eventID string) error {
+	delete(f.seen, eventID)
+	return nil
+}
+
 func (f *fakeDeduper) Claim(_ context.Context, eventID string) (bool, error) {
 	if f.err != nil {
 		return false, f.err

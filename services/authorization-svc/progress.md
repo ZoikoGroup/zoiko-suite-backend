@@ -1909,8 +1909,13 @@ person spends their time on the wrong half.
 
 ## Still open after this pass
 
-Nothing left inside this service. What remains is cross-service, and each item
-is now blocked on something nameable rather than merely unfinished:
+> **Corrected 7 Oct 2026:** "nothing left inside this service" was not true.
+> The Governance Platform audit of 28 Sep found tenant-scope self-escalation,
+> a tenant path to platform scope, unauthorised admin reads, lost consumer
+> applies and more, all inside this service — see the 7 Oct pass at the end of
+> this file.
+
+What was then believed to remain was cross-service:
 
 - **86 callers still send no envelope.** They work, every call is logged with the
   missing fields, and the doctrinal end state is to migrate them and set
@@ -2063,3 +2068,130 @@ Unchanged from the eighth pass. Nothing inside the service; the remainder is
 cross-service and each item is blocked on something nameable — the 86-caller
 envelope migration, the employee-to-principal mapping that
 `employee.terminated` needs, and tracker rows 79 and 81.
+
+---
+
+# Governance Platform audit closure — 2026-10-07
+
+Worked against `docs/audit_files/Governance Platform-audit-2026-09-28.md`
+(authorization-svc section), with every open question decided by the
+documents themselves: Doc 03 §8.3, the Governance Control Plane spec
+(GOV-03, GOV-04, GOV-12, §2, §16–§18) and ZS-IAM-001. Uncommitted at the time
+of writing. The admin and governance contract is now in `ADMIN-API.md`.
+
+## Deploy order — migrations first
+
+000020–000027 must be applied **before** this build starts. Role, bundle,
+SoD and ABAC reads select `version` (000022) and the decision insert writes
+the 000023 columns, so an old schema answers 503 on `/v1/authorize`.
+
+| Migration | What |
+|---|---|
+| 000020 | transactional outbox for decision events |
+| 000021 | Idempotency-Key store |
+| 000022 | versions + append-only `authz_config_history` (triggers) |
+| 000023 | decision evidence columns; `access_decision_log` append-only (trigger) |
+| 000024 | `entity_status_projection` |
+| 000025 | assignment approval state; delegation reason / approval_reference; who / why / correlation on history |
+| 000026 | §23 IAM events from triggers into the outbox |
+| 000027 | GOV-04 `sod_exceptions` |
+
+## What changed, by spec clause
+
+- **One decision engine.** `/v1/authorize` ran its own copy of the pipeline;
+  it now uses `evaluateCore`, as the canonical API and available-actions do.
+  Available actions are classified by that same pipeline (GOV-03 #4), session
+  lookups fail closed everywhere, and the canonical API returns `PERMIT`, not
+  `ALLOW` (§8.2).
+- **Decision record (GOV-03 Evidence, §20).** decision, policy_set_version
+  (`cfg.<history id>`, a real watermark — the canonical API reported a
+  constant), obligations, reason codes, matched grants, resource, attributes
+  digest (never values, §25), session assurance, on_behalf_of / delegation_id
+  for delegated grants (§11), expires_at. `/v1/authorize` returns the §8.2
+  fields beside `decision_outcome`, which is unchanged for callers.
+- **Negative controls.** SUSPENDED / DISSOLVED entity denies (DORMANT permits
+  with `ENTITY_DORMANT_REVIEW`); an own-object rule with no preparer supplied is
+  `REQUIRE_APPROVAL` (GOV-04 "never silently assume no conflict"); a missing
+  principal-status table is a refusal, not ACTIVE (invariant #3).
+- **Explanation restricted (GOV-03, §25).** The decision log needs
+  `iam.policy.read`; without it a caller sees their own decisions with the
+  basis redacted. Admin registers need their Appendix A read permission.
+  `available-actions`, `/v1/me/capabilities` and the access-review routes take
+  identity from the verified headers only — the query fallbacks let anyone act
+  or read as anyone.
+- **Maker-checker (§9, A20, GOV-12).** A privileged assignment by a caller
+  without `iam.assignment.approve_privileged` is PENDING_APPROVAL and grants
+  nothing until an independent checker approves; 72 h window.
+- **§9 protected permissions** in a bundle need the platform grant; a role or
+  bundle change that would give a holder an SoD conflict is refused.
+- **§11 delegation.** Protected privileges never flow through a delegation;
+  finite period; reason and approval_reference recorded.
+- **§16.** reason_code / purpose on destructive commands
+  (`AUTHZ_COMMAND_CONTRACT=warn|enforce`), recorded in history with actor and
+  correlation; `error_class` beside every error code.
+- **Events (§23, GOV-03).** iam.role / assignment / delegation / sod_policy /
+  policy_set events from triggers; `authorization.cache.invalidated`.
+- **Caches.** The lifecycle consumer's shared group gave each invalidating
+  event to ONE replica; a per-replica invalidator now broadcasts.
+- **GOV-03 commands** InvalidateAuthorizationCache, RecomputeSubjectEffectiveAccess.
+- **GOV-04 exceptions** with compensating controls: never self-approved
+  (also a DB CHECK), always expire, stop applying the instant they do.
+
+## Still open — outside this service
+
+- ~~access-control-svc: send `reason_code` / `approval_reference`~~ — **done
+  7 Oct** (see below). `AUTHZ_COMMAND_CONTRACT=enforce` now waits only on the
+  console.
+- **Console**: send `reason` and `effective_to` on delegation create.
+- **The ~86 tenantless `/v1/authorize` callers** must send `X-Tenant-Id`; then
+  `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE=true` (platform-scope questions are
+  already exempt).
+- **PEPs for own-object actions** (e.g. `workpaper.approve`) must send the
+  preparer, or receive `REQUIRE_APPROVAL`.
+- **Workload identity on `/v1/authorize`** ("internal only") needs the
+  platform mTLS rollout.
+- **employee.terminated** still needs an employee → principal mapping.
+
+## 7 Oct, later: access-control-svc side, integration suites, re-score
+
+- **S9-1:** decisions record `matched_grants` = `assignment:<id>` of the
+  assignment(s) that granted them (`FindGrantingAssignments`, cached). Usage is
+  attributed by `matched_grants @>`, so a used role no longer marks the
+  principal's other roles as used (`TestSecondPassIT_UsageAttributedToGrantingAssignment`).
+- **Approver scope:** `holdsPrivilegedApproval` checks the approver at the
+  assignment's own entity (platform scope for platform grants), not the tenant.
+- **Regression fixed — `GET /v1/access-decisions` returned 503.**
+  `accessDecisionColumns` grew the 000023 evidence columns, but
+  `ListAccessDecisions` still scanned 9 by hand ("22 and 9"). It now uses
+  `scanAccessDecision`. Found by the legacy store suite.
+- **The legacy store suite runs again.** `setupTestDB` listed 18 migrations
+  and refused to run against 27; 000019–000027 were added, and their tables
+  were added to its DROP list. `TestFindPrincipalStatus_MissingTableIsInertNotAnOutage`
+  asserted the old fail-OPEN behaviour and is now `…MissingTableFailsClosed`.
+  000013's down migration no longer claims it can be reverted live.
+- **Verified:** on a scratch postgres:16 with 000001–000027 applied, the
+  `AUTHZ_IT_DSN` suite passes 13/13 as the NOBYPASSRLS app role, and the
+  `TEST_DATABASE_URL` suite passes 66/66 as owner. Unit suites, build and vet
+  pass.
+
+### Score (Governance Platform audit, 68 scored rows; the 4 ❓ are unscored)
+
+| | ✅ | ⚠️ | ❌ | Full | Weighted |
+|---|---|---|---|---|---|
+| 28 Sep audit | 29 | 20 | 19 | 42.6% | 57.4% |
+| **7 Oct** | **58** | **10** | **0** | **85.3%** | **92.6%** |
+
+The 10 ⚠️ that remain, each waiting outside this service:
+
+| Row | Why it is still partial |
+|---|---|
+| purpose / reason_code on destructive commands | enforced only under `AUTHZ_COMMAND_CONTRACT=enforce`; compose stays `warn` until the console sends them |
+| Delegation approval_reference and reason | the same switch |
+| Trusted tenant resolved before authorization | `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE` waits on the ~86 tenantless callers |
+| A client-supplied tenant is never authoritative | the same callers (body fallback while not enforcing) |
+| subject_id / tenant authenticated, server-resolved | headers are trusted until the mTLS / gateway rollout |
+| Only internal PEPs call the evaluation endpoint | the same rollout |
+| Cache key includes assignment and policy versions | generation counters plus per-replica broadcast invalidation; no version in the key |
+| Denials are evidentially retrievable | tenantless decisions stay invisible until the callers send a tenant |
+| Consume employment.changed | `principal.status.changed` is consumed; `employee.*` has no employee-to-principal mapping here (access-control-svc now holds an administered one for reviews) |
+| Action names callers use but nothing grants | grants are seeded per service; 000019 seeds only the SoD baseline |

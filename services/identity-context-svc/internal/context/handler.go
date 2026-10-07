@@ -256,6 +256,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		// The review half of §1's "followed by reconciliation/review". The
 		// reconciler goroutine reports what is pending; this closes one.
 		r.Post("/context/support/{supportContextID}/review", h.ReviewSupportContext)
+		// The approver's own call: an attach is only a request (S1-1).
+		r.Post("/context/support/{supportContextID}/approve", h.ApproveSupportContext)
 
 		r.Get("/principals/{principalID}", h.GetPrincipal)
 		r.Get("/principals/{principalID}/roles", h.GetPrincipalRoles)
@@ -297,6 +299,18 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 		req.SourceChannel = string(env.SourceChannel)
 		req.WorkloadID = env.WorkloadID
 		req.CausationID = env.CausationID
+	}
+
+	// ResolveTenantContext is a GOV-01 query: "correlation required" (S1-3 /
+	// R-1). The body's correlation_id wins; the header is taken when the body
+	// has none, so a header-only caller no longer stores a session with an
+	// empty correlation, and a request with neither is refused.
+	if strings.TrimSpace(req.CorrelationID) == "" {
+		correlationID, ok := h.requireCorrelation(w, r)
+		if !ok {
+			return
+		}
+		req.CorrelationID = correlationID
 	}
 
 	result, err := h.resolver.Resolve(r.Context(), req)

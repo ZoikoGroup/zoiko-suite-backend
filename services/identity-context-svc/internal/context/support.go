@@ -31,6 +31,7 @@ type SupportContextStore interface {
 	// sweep would only ever cover tenants somebody thought to ask about.
 	FindUnreviewedExpiredSupportContextsAllTenants(ctx context.Context, before time.Time, limit int) ([]domain.SupportContext, error)
 	MarkSupportContextReviewedWithEvent(ctx context.Context, supportContextID, tenantID, reviewer string, at time.Time, rec outbox.Record) (bool, error)
+	ApproveSupportContextWithEvent(ctx context.Context, supportContextID, tenantID, approverPrincipalID string, grantedAt, expiresAt time.Time, rec outbox.Record) (bool, error)
 }
 
 // SupportPolicy bounds what a support elevation may be.
@@ -44,6 +45,9 @@ type SupportPolicy struct {
 	// MinJustificationLength stops "asdf" satisfying the evidence obligation.
 	// A justification nobody can act on is not evidence, it is a checkbox.
 	MinJustificationLength int
+	// ApprovalWindow is how long a request may wait for its approver. A
+	// request approved a day later is approving a situation that has moved.
+	ApprovalWindow time.Duration
 }
 
 // DefaultSupportPolicy is deliberately tight. Widening it is a decision
@@ -53,6 +57,7 @@ func DefaultSupportPolicy() SupportPolicy {
 		MaxTTL:                 4 * time.Hour,
 		DefaultTTL:             1 * time.Hour,
 		MinJustificationLength: 20,
+		ApprovalWindow:         1 * time.Hour,
 	}
 }
 
@@ -156,7 +161,9 @@ func (s *SupportService) Attach(
 	if req.ApproverPrincipalID == "" {
 		return nil, fmt.Errorf("%w: approver_principal_id is required — there is no single-party form of this command", ErrRequestInvalid)
 	}
-	if req.ApproverPrincipalID == req.SupportPrincipalID {
+	if req.ApproverPrincipalID == req.SupportPrincipalID || req.ApproverPrincipalID == callerPrincipalID {
+		// The caller naming themselves passed this check before (S1-1): the
+		// approver is the person who approves, so it cannot be the requester.
 		return nil, domain.ErrSupportSelfApproval
 	}
 	if !domain.ValidSupportReason(req.ReasonCode) {
@@ -221,30 +228,121 @@ func (s *SupportService) Attach(
 
 	now := time.Now().UTC()
 	sc := domain.SupportContext{
-		SupportContextID:    "sup-" + ulid.Make().String(),
-		TenantID:            req.TenantID,
-		SupportPrincipalID:  req.SupportPrincipalID,
-		SubjectPrincipalID:  req.SubjectPrincipalID,
-		ReasonCode:          req.ReasonCode,
-		Justification:       strings.TrimSpace(req.Justification),
-		TicketRef:           req.TicketRef,
-		ApproverPrincipalID: req.ApproverPrincipalID,
-		GrantedAt:           now,
-		ExpiresAt:           now.Add(ttl),
-		EvidenceID:          "ev-" + ulid.Make().String(),
-		CorrelationID:       req.CorrelationID,
+		SupportContextID:       "sup-" + ulid.Make().String(),
+		TenantID:               req.TenantID,
+		SupportPrincipalID:     req.SupportPrincipalID,
+		SubjectPrincipalID:     req.SubjectPrincipalID,
+		ReasonCode:             req.ReasonCode,
+		Justification:          strings.TrimSpace(req.Justification),
+		TicketRef:              req.TicketRef,
+		ApproverPrincipalID:    req.ApproverPrincipalID,
+		RequestedByPrincipalID: callerPrincipalID,
+		ApprovalStatus:         domain.SupportPendingApproval,
+		RequestedTTLSeconds:    int(ttl / time.Second),
+		// Placeholders until approval restarts them; a pending request is
+		// never Live and never returned by FindLiveSupportContext.
+		GrantedAt:     now,
+		ExpiresAt:     now.Add(ttl),
+		EvidenceID:    "ev-" + ulid.Make().String(),
+		CorrelationID: req.CorrelationID,
 	}
+
+	// No attached event yet: nothing is granted. The request is the row.
+	if err := s.store.InsertSupportContextWithEvent(ctx, sc, outbox.Record{}); err != nil {
+		return nil, fmt.Errorf("persist support request: %w", err)
+	}
+	s.siem.Stream(ctx, sc.TenantID, "identity.support_context.requested",
+		siem.SeverityHigh,
+		fmt.Sprintf("Support context %s requested by %s for %s in tenant %s, awaiting approval by %s (ticket %s): %s",
+			sc.SupportContextID, callerPrincipalID, sc.SupportPrincipalID, sc.TenantID,
+			sc.ApproverPrincipalID, sc.TicketRef, sc.Justification))
+	s.log.Warn("SUPPORT CONTEXT REQUESTED — awaiting approval",
+		zap.String("support_context_id", sc.SupportContextID),
+		zap.String("tenant_id", sc.TenantID),
+		zap.String("support_principal_id", sc.SupportPrincipalID),
+		zap.String("requested_by", callerPrincipalID),
+		zap.String("approver_principal_id", sc.ApproverPrincipalID))
+	return &sc, nil
+}
+
+// Approve is the named approver's own act (GOV-01 §1 "independently
+// approved"; S1-1 / R-2). Only the approver the request names may approve,
+// never its requester or its grantee; GOV-04 is asked again with the real
+// checker; and the window starts now, so time spent waiting for approval is
+// not time the grant was usable.
+func (s *SupportService) Approve(
+	ctx context.Context,
+	supportContextID, tenantID, callerPrincipalID, correlationID string,
+) (*domain.SupportContext, error) {
+	found, err := s.store.FindSupportContext(ctx, supportContextID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("read support context: %w", err)
+	}
+	if found == nil || found.RevokedAt != nil {
+		return nil, domain.ErrSupportContextNotFound
+	}
+	// A copy: the approval is applied by the store's conditional write, never
+	// by mutating what the read returned.
+	cp := *found
+	sc := &cp
+	if sc.ApprovalStatus != domain.SupportPendingApproval {
+		return nil, domain.ErrSupportNotPending
+	}
+	if callerPrincipalID == sc.RequestedByPrincipalID || callerPrincipalID == sc.SupportPrincipalID {
+		return nil, fmt.Errorf("%w: %w", sod.ErrConflict, domain.ErrSupportSelfApproval)
+	}
+	if callerPrincipalID != sc.ApproverPrincipalID {
+		return nil, domain.ErrSupportNotApprover
+	}
+	now := time.Now().UTC()
+	window := s.policy.ApprovalWindow
+	if window <= 0 {
+		window = DefaultSupportPolicy().ApprovalWindow
+	}
+	if now.Sub(sc.GrantedAt) > window {
+		return nil, domain.ErrSupportApprovalLapsed
+	}
+
+	if s.sod != nil {
+		if _, err := s.sod.CheckConflict(ctx, sod.Request{
+			TenantID:           tenantID,
+			ActionType:         ActionAttachSupportContext,
+			MakerPrincipalID:   sc.RequestedByPrincipalID,
+			CheckerPrincipalID: callerPrincipalID,
+			SubjectPrincipalID: sc.SupportPrincipalID,
+			CorrelationID:      firstNonEmptyString(correlationID, sc.CorrelationID),
+		}); err != nil {
+			if errors.Is(err, sod.ErrConflict) {
+				s.countSoD("conflict")
+			} else {
+				s.countSoD("unavailable")
+			}
+			return nil, err
+		}
+		s.countSoD("no_conflict")
+	}
+
+	ttl := time.Duration(sc.RequestedTTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = s.policy.DefaultTTL
+	}
+	approvedAt := now
+	sc.ApprovalStatus, sc.ApprovedAt, sc.GrantedAt, sc.ExpiresAt = domain.SupportApproved, &approvedAt, now, now.Add(ttl)
 
 	rec, err := events.Render(
 		events.EventSupportContextAttached,
-		sc.TenantID, "", sc.ApproverPrincipalID, sc.CorrelationID, sc.SupportContextID,
-		supportAttachedPayload(sc))
+		sc.TenantID, "", callerPrincipalID, firstNonEmptyString(correlationID, sc.CorrelationID), sc.SupportContextID,
+		supportAttachedPayload(*sc))
 	if err != nil {
 		return nil, fmt.Errorf("render support attached event: %w", err)
 	}
-
-	if err := s.store.InsertSupportContextWithEvent(ctx, sc, rec); err != nil {
-		return nil, fmt.Errorf("persist support context: %w", err)
+	changed, err := s.store.ApproveSupportContextWithEvent(ctx, sc.SupportContextID, tenantID, callerPrincipalID, sc.GrantedAt, sc.ExpiresAt, rec)
+	if err != nil {
+		return nil, fmt.Errorf("persist support approval: %w", err)
+	}
+	if !changed {
+		// Raced: approved or revoked between the read and the write.
+		return nil, domain.ErrSupportNotPending
 	}
 
 	// A privileged elevation into a customer tenant is the single highest
@@ -253,24 +351,28 @@ func (s *SupportService) Attach(
 	// team never saw is the scenario the control exists to prevent.
 	s.siem.Stream(ctx, sc.TenantID, "identity.support_context.attached",
 		siem.SeverityCritical,
-		fmt.Sprintf("Support context %s granted to %s in tenant %s until %s (approver %s, ticket %s): %s",
+		fmt.Sprintf("Support context %s granted to %s in tenant %s until %s (requested by %s, approved by %s, ticket %s): %s",
 			sc.SupportContextID, sc.SupportPrincipalID, sc.TenantID,
-			sc.ExpiresAt.Format(time.RFC3339), sc.ApproverPrincipalID, sc.TicketRef, sc.Justification))
-
+			sc.ExpiresAt.Format(time.RFC3339), sc.RequestedByPrincipalID, callerPrincipalID, sc.TicketRef, sc.Justification))
 	if s.metrics != nil {
 		s.metrics.SupportContextsGranted.WithLabelValues(sc.ReasonCode).Inc()
 	}
-
-	s.log.Warn("SUPPORT CONTEXT ATTACHED",
+	s.log.Warn("SUPPORT CONTEXT APPROVED — grant live",
 		zap.String("support_context_id", sc.SupportContextID),
 		zap.String("tenant_id", sc.TenantID),
 		zap.String("support_principal_id", sc.SupportPrincipalID),
-		zap.String("approver_principal_id", sc.ApproverPrincipalID),
-		zap.String("ticket_ref", sc.TicketRef),
-		zap.Time("expires_at", sc.ExpiresAt),
-		zap.String("evidence_id", sc.EvidenceID))
+		zap.String("approver_principal_id", callerPrincipalID),
+		zap.Time("expires_at", sc.ExpiresAt))
+	return sc, nil
+}
 
-	return &sc, nil
+func firstNonEmptyString(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // Revoke ends a grant early. Idempotent: revoking an already-revoked context

@@ -1232,6 +1232,13 @@ services:
       # through ANOTHER replica can still authorize. 0 disables caching
       # entirely. See internal/cache's package comment before raising it.
       AUTHZ_CACHE_TTL_SECONDS: "5"
+      # Governance Control Plane §16 / ZS-IAM-001 §11 on admin commands:
+      # purpose / reason_code on privileged and destructive commands, a finite
+      # end date on a delegation. "warn" admits a command without them, marks
+      # it X-Command-Contract: violated and bounds an open delegation to 90
+      # days; "enforce" refuses. Stays warn until the console and
+      # access-control-svc send the fields.
+      AUTHZ_COMMAND_CONTRACT: "warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # siem-integration-svc lives in docker-compose.phase6.yml — reachable
       # only when that file is up alongside this one. Streaming degrades to
@@ -2215,6 +2222,14 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.access-control.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # This service's identity in authorization-svc: it executes the REVOKE an
+      # access reviewer decides, holding only iam.assignment.revoke (seeded by
+      # seed-demo-rbac.ps1). The reviewer is recorded as the decider.
+      ACS_SERVICE_PRINCIPAL_ID: "svc-access-control"
+      # S9-C2: HR lifecycle events (employee-master, offboarding) open an
+      # EVENT_TRIGGERED review of the linked subject, reviewed by their manager
+      # when linked, else by this principal. Unset turns the consumer off.
+      ACS_EVENT_REVIEW_DEFAULT_REVIEWER: "5eed0000-0000-4000-8000-00000000a001"
     depends_on:
       postgres:
         condition: service_healthy

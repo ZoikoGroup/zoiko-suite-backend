@@ -56,6 +56,35 @@ type Scope struct {
 	TenantID      string
 	LegalEntityID string
 	CorrelationID string
+
+	// The Governance Control Plane §16 command fields authorization-svc records
+	// with every privileged or destructive change (and refuses without, under
+	// AUTHZ_COMMAND_CONTRACT=enforce). ReasonCode defaults per command when
+	// empty — see commandBody — so no call this client makes is reasonless.
+	// Purpose is the human reason, where the caller gave one.
+	ReasonCode string
+	Purpose    string
+	// ApprovalReference names the governed request a grant was approved
+	// under (this service's request id), recorded with the assignment there.
+	ApprovalReference string
+}
+
+// commandBody is the §16 body of a destructive command: reason_code (the
+// caller's, or defaultCode) and purpose, plus any extra fields.
+func commandBody(s Scope, defaultCode string, extra map[string]any) []byte {
+	code := s.ReasonCode
+	if code == "" {
+		code = defaultCode
+	}
+	body := map[string]any{"reason_code": code}
+	if s.Purpose != "" {
+		body["purpose"] = s.Purpose
+	}
+	for k, v := range extra {
+		body[k] = v
+	}
+	b, _ := json.Marshal(body)
+	return b
 }
 
 // CreateRole calls POST /v1/admin/roles. Idempotent server-side on
@@ -74,11 +103,11 @@ func (c *AuthzAdminClient) CreateRole(ctx context.Context, roleID, roleCode, rol
 
 // SetRoleActive calls POST /v1/admin/roles/{roleID}/retire or /reactivate.
 func (c *AuthzAdminClient) SetRoleActive(ctx context.Context, roleID string, active bool, s Scope) error {
-	action := "retire"
+	action, code := "retire", "ROLE_DEFINITION_RETIRED"
 	if active {
-		action = "reactivate"
+		action, code = "reactivate", "ROLE_DEFINITION_REACTIVATED"
 	}
-	return c.post(ctx, fmt.Sprintf("/v1/admin/roles/%s/%s", roleID, action), []byte(`{}`), s)
+	return c.post(ctx, fmt.Sprintf("/v1/admin/roles/%s/%s", roleID, action), commandBody(s, code, nil), s)
 }
 
 // CreatePermissionBundle calls POST /v1/admin/roles/{roleID}/permission-bundles.
@@ -120,11 +149,11 @@ func (c *AuthzAdminClient) SetPermissionBundleActive(ctx context.Context, roleID
 		if b.BundleCode != bundleCode {
 			continue
 		}
-		action := "retire"
+		action, code := "retire", "PERMISSION_BUNDLE_RETIRED"
 		if active {
-			action = "reactivate"
+			action, code = "reactivate", "PERMISSION_BUNDLE_REACTIVATED"
 		}
-		return c.post(ctx, fmt.Sprintf("/v1/admin/permission-bundles/%s/%s", b.PermissionBundleID, action), []byte(`{}`), s)
+		return c.post(ctx, fmt.Sprintf("/v1/admin/permission-bundles/%s/%s", b.PermissionBundleID, action), commandBody(s, code, nil), s)
 	}
 	return domain.ErrAuthzBundleNotFound
 }
@@ -261,6 +290,7 @@ type createAssignmentBody struct {
 	LegalEntityID             string     `json:"legal_entity_id,omitempty"`
 	EffectiveFrom             time.Time  `json:"effective_from"`
 	EffectiveTo               *time.Time `json:"effective_to,omitempty"`
+	ApprovalReference         string     `json:"approval_reference,omitempty"`
 }
 
 // CreateRoleAssignment provisions principalID into roleID and returns
@@ -280,6 +310,7 @@ func (c *AuthzAdminClient) CreateRoleAssignment(ctx context.Context, assignmentI
 		LegalEntityID:             legalEntityID,
 		EffectiveFrom:             effectiveFrom.UTC(),
 		EffectiveTo:               end,
+		ApprovalReference:         s.ApprovalReference,
 	})
 	var out domain.AuthzAssignment
 	if err := c.postJSON(ctx, "/v1/admin/role-assignments", body, s, &out); err != nil {
@@ -288,6 +319,13 @@ func (c *AuthzAdminClient) CreateRoleAssignment(ctx context.Context, assignmentI
 	if out.PrincipalRoleAssignmentID == "" {
 		return "", fmt.Errorf("authorization-svc admin API created an assignment without an id")
 	}
+	// authorization-svc answers 202 PENDING_APPROVAL when it does not accept
+	// the provisioning principal as the independent approver of a privileged
+	// role. Reported, not swallowed: recording it PROVISIONED here would claim
+	// access that is not in force.
+	if out.ApprovalStatus == "PENDING_APPROVAL" {
+		return out.PrincipalRoleAssignmentID, domain.ErrAuthzApprovalPending
+	}
 	return out.PrincipalRoleAssignmentID, nil
 }
 
@@ -295,7 +333,7 @@ func (c *AuthzAdminClient) CreateRoleAssignment(ctx context.Context, assignmentI
 // there) is domain.ErrAuthzAssignmentAbsent so the caller can decide whether
 // that is the outcome it wanted.
 func (c *AuthzAdminClient) RevokeRoleAssignment(ctx context.Context, assignmentID string, s Scope) error {
-	err := c.post(ctx, fmt.Sprintf("/v1/admin/role-assignments/%s/revoke", assignmentID), []byte(`{}`), s)
+	err := c.post(ctx, fmt.Sprintf("/v1/admin/role-assignments/%s/revoke", assignmentID), commandBody(s, "ASSIGNMENT_REVOKED", nil), s)
 	if err != nil && strings.Contains(err.Error(), "returned 404") {
 		return fmt.Errorf("%w: %v", domain.ErrAuthzAssignmentAbsent, err)
 	}
@@ -305,7 +343,7 @@ func (c *AuthzAdminClient) RevokeRoleAssignment(ctx context.Context, assignmentI
 // ScheduleRoleAssignmentEnd ends an assignment at a future instant there
 // (an effective-dated revoke). 404 is domain.ErrAuthzAssignmentAbsent.
 func (c *AuthzAdminClient) ScheduleRoleAssignmentEnd(ctx context.Context, assignmentID string, at time.Time, s Scope) error {
-	body, _ := json.Marshal(map[string]time.Time{"effective_to": at.UTC()})
+	body := commandBody(s, "ASSIGNMENT_END_SCHEDULED", map[string]any{"effective_to": at.UTC()})
 	err := c.post(ctx, fmt.Sprintf("/v1/admin/role-assignments/%s/revoke", assignmentID), body, s)
 	if err != nil && strings.Contains(err.Error(), "returned 404") {
 		return fmt.Errorf("%w: %v", domain.ErrAuthzAssignmentAbsent, err)

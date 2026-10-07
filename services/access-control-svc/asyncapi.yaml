@@ -79,8 +79,57 @@ channels:
           - $ref: '#/components/messages/AccessReviewStarted'
           - $ref: '#/components/messages/AccessReviewCompleted'
 
+  # ── consumed (S9-C2 event-triggered reviews; internal/hrevents) ─────────────
+  # This file's convention puts what this service PUBLISHES under `publish`;
+  # the two channels below are the other direction: produced elsewhere and
+  # READ here (consumer group ACS_HR_EVENT_GROUP_ID, default
+  # access-control-svc-hr-reviews), so they sit under `subscribe`.
+  zoiko.employee.events:
+    description: |
+      Produced by employee-master-svc, keyed by employee_id. Consumed for
+      employee.updated (a manager change = mover), employee.status.changed
+      (into TERMINATED / RESIGNED / DEACTIVATED / INACTIVE / ARCHIVED = leaver,
+      "contractor end" for a CONTRACTOR) and employee.terminated. Each opens an
+      EVENT_TRIGGERED review of the LINKED subject only (POST
+      /v1/iam/subject-links); other event types are ignored.
+    subscribe:
+      operationId: readEmployeeEvents
+      message: { $ref: '#/components/messages/HRLifecycleEvent' }
+  zoiko.offboarding.events:
+    description: |
+      Produced by offboarding-severance-svc. Only employee.terminated is read;
+      the same exit already seen from employee-master-svc opens nothing new.
+    subscribe:
+      operationId: readOffboardingEvents
+      message: { $ref: '#/components/messages/HRLifecycleEvent' }
+
 components:
   messages:
+    HRLifecycleEvent:
+      name: employee.*
+      title: An HR lifecycle event (consumed)
+      summary: |
+        The producers' envelope. Only the fields below are read; event_id makes
+        the review idempotent (campaign correlation_id = "hr-" + event_id).
+      payload:
+        type: object
+        required: [event_id, event_type, tenant_id, payload]
+        properties:
+          event_id: { type: string }
+          event_type: { type: string, enum: [employee.updated, employee.status.changed, employee.terminated] }
+          tenant_id: { type: string }
+          legal_entity_id: { type: string }
+          payload:
+            type: object
+            required: [employee_id]
+            properties:
+              employee_id: { type: string }
+              legal_entity_id: { type: string }
+              manager_employee_id: { type: string }
+              status: { type: string }
+              old_status: { type: string }
+              new_status: { type: string }
+              worker_type: { type: string }
     RoleCreated:
       name: role.created
       title: A role definition was created and provisioned

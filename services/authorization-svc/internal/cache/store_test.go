@@ -84,7 +84,7 @@ func (c *countingStore) RecordAccessDecision(_ context.Context, _ domain.RecordA
 func (c *countingStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
 	return &domain.Role{}, true, nil
 }
-func (c *countingStore) SetRoleActive(_ context.Context, _, _ string, _ bool) (*domain.Role, error) {
+func (c *countingStore) SetRoleActive(_ context.Context, _, _ string, _ bool, _ int64) (*domain.Role, error) {
 	return &domain.Role{}, nil
 }
 func (c *countingStore) FindRoleByID(_ context.Context, _ string) (*domain.Role, error) {
@@ -96,7 +96,7 @@ func (c *countingStore) CreatePermissionBundle(_ context.Context, _ domain.Creat
 func (c *countingStore) ListPermissionBundles(_ context.Context, _, _ string) ([]domain.PermissionBundle, error) {
 	return nil, nil
 }
-func (c *countingStore) SetPermissionBundleActive(_ context.Context, _, _ string, _ bool) (*domain.PermissionBundle, error) {
+func (c *countingStore) SetPermissionBundleActive(_ context.Context, _, _ string, _ bool, _ int64) (*domain.PermissionBundle, error) {
 	return &domain.PermissionBundle{}, nil
 }
 func (c *countingStore) CreateRoleAssignment(_ context.Context, _ domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
@@ -139,13 +139,13 @@ func (c *countingStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleP
 func (c *countingStore) ListSoDRules(_ context.Context, _ string) ([]domain.SoDRule, error) {
 	return nil, nil
 }
-func (c *countingStore) SetSoDRuleActive(_ context.Context, _, _ string, _ bool) (*domain.SoDRule, error) {
+func (c *countingStore) SetSoDRuleActive(_ context.Context, _, _ string, _ bool, _ int64) (*domain.SoDRule, error) {
 	return &domain.SoDRule{}, nil
 }
 func (c *countingStore) CreateABACRule(_ context.Context, _ domain.CreateABACRuleParams) (*domain.ABACRule, error) {
 	return &domain.ABACRule{}, nil
 }
-func (c *countingStore) SetABACRuleActive(_ context.Context, _, _ string, _ bool) (*domain.ABACRule, error) {
+func (c *countingStore) SetABACRuleActive(_ context.Context, _, _ string, _ bool, _ int64) (*domain.ABACRule, error) {
 	return &domain.ABACRule{}, nil
 }
 func (c *countingStore) ListABACRules(_ context.Context, _, _ string) ([]domain.ABACRule, error) {
@@ -407,7 +407,7 @@ func TestCache_WritesInvalidate(t *testing.T) {
 		},
 		{
 			name:            "retiring a role re-reads grants AND delegations",
-			write:           func(c *cache.Store) { _, _ = c.SetRoleActive(ctx, "r-1", tenantA, false) },
+			write:           func(c *cache.Store) { _, _ = c.SetRoleActive(ctx, "r-1", tenantA, false, 0) },
 			wantGrantReread: true,
 			wantDelegReread: true,
 		},
@@ -799,3 +799,8 @@ func TestCache_RevokedDelegationIsNotServedFromCache(t *testing.T) {
 	}
 }
 
+
+func (c *countingStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) { return "", nil }
+func (c *countingStore) ProjectEntityStatus(_ context.Context, _ domain.ProjectEntityStatusParams) error {
+	return nil
+}

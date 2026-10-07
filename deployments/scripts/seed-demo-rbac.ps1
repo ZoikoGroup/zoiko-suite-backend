@@ -80,6 +80,21 @@ $PRINCIPAL_ID = "33333333-3333-3333-3333-333333333333"
 $APPROVER_ID  = "66666666-6666-6666-6666-666666666666"
 $ROLE_ID      = "44444444-4444-4444-4444-444444444444"
 
+# The seed's own IAM administrator. It holds IAM_ADMIN_FULL through a role of
+# its own and never holds $ROLE_ID, because authorization-svc refuses a
+# principal changing the permissions of a role they hold (self_grant_not_allowed)
+# -- and both demo principals hold $ROLE_ID, so neither may write its bundles.
+$SEED_ADMIN_ID      = "5eed0000-0000-4000-8000-00000000a001"
+$SEED_ADMIN_ROLE_ID = "5eed0000-0000-4000-8000-00000000a002"
+
+# access-control-svc's own identity (ACS_SERVICE_PRINCIPAL_ID). It EXECUTES the
+# REVOKE an access reviewer decides (Group 1 audit gap S9-B), and opens the
+# EVENT_TRIGGERED reviews HR events trigger (S9-C2), so it holds
+# iam.assignment.revoke and iam.assignment.read and nothing else: it can read
+# and remove access, never grant it.
+$ACS_SERVICE_ID      = "svc-access-control"
+$ACS_SERVICE_ROLE_ID = "5eed0000-0000-4000-8000-00000000a003"
+
 $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
 
 # Platform-scope records (decisions, config, flags, secret policies, policy
@@ -530,11 +545,27 @@ $BUNDLES = @(
             "iam.permission_bundle.manage",
             "iam.assignment.grant",
             "iam.assignment.revoke",
+            # Reading another principal's grants (entity-scope/validate for
+            # someone else) -- the access-control console's audit page.
+            "iam.assignment.read",
             # Security approval of a CRITICAL-risk assignment request in
             # access-control-svc (its migration 000013). The demo approver
             # approves the audit's CRITICAL requests, so it holds this.
             "iam.assignment.approve_privileged",
             "iam.sod_rule.manage",
+            # Authorization Standard Appendix A, as authorization-svc now gates:
+            # the full decision log and its rationale (iam.policy.read), the
+            # GOV-03 cache invalidation command (iam.policy.publish), the SoD
+            # exception register (iam.sod_rule.read) and approving a GOV-04
+            # compensating control (iam.sod_rule.publish).
+            "iam.policy.read",
+            "iam.policy.publish",
+            "iam.sod_rule.read",
+            "iam.sod_rule.publish",
+            # The admin registers' read permissions (§21 "no broad IAM
+            # discovery"): roles and bundles, delegations.
+            "iam.role.read",
+            "iam.delegation.read",
             "iam.abac_rule.manage",
             "iam.delegation.grant",
             "iam.delegation.revoke",
@@ -759,7 +790,11 @@ if ($missing.Count -eq 0) {
     # The approver is bootstrapped as well: it makes the demo principal's own
     # role assignments below, which the demo principal may not make itself.
     if ((Get-Decision -Action "iam.role.manage" -Scope $TENANT_ID).decision_outcome -ne "GRANTED" -or
-        (Get-Decision -Action "iam.assignment.grant" -Scope $TENANT_ID -Principal $APPROVER_ID).decision_outcome -ne "GRANTED") {
+        (Get-Decision -Action "iam.assignment.grant" -Scope $TENANT_ID -Principal $APPROVER_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.permission_bundle.manage" -Scope $TENANT_ID -Principal $SEED_ADMIN_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.assignment.grant" -Scope $PLATFORM_SCOPE -Principal $SEED_ADMIN_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.assignment.revoke" -Scope $TENANT_ID -Principal $ACS_SERVICE_ID).decision_outcome -ne "GRANTED" -or
+        (Get-Decision -Action "iam.assignment.read" -Scope $TENANT_ID -Principal $ACS_SERVICE_ID).decision_outcome -ne "GRANTED") {
         Write-Host "0  bootstrap the IAM admin grant directly (the admin API refuses everyone until one exists)" -NoNewline
         $iamActions = ($BUNDLES | Where-Object { $_.Code -eq "IAM_ADMIN_FULL" }).Actions | ConvertTo-Json -Compress
         $sql = @"
@@ -777,6 +812,32 @@ INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, 
 SELECT '$APPROVER_ID', '$ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
 WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
                   WHERE principal_id = '$APPROVER_ID' AND role_id = '$ROLE_ID' AND legal_entity_id = '$TENANT_ID');
+INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
+VALUES ('$SEED_ADMIN_ROLE_ID', '$TENANT_ID', 'SEED_IAM_ADMIN', 'Seed IAM Administrator', 'LEGAL_ENTITY', true, 'seed-bootstrap')
+ON CONFLICT DO NOTHING;
+INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
+VALUES ('$SEED_ADMIN_ROLE_ID', 'IAM_ADMIN_FULL', '$iamActions'::jsonb, true)
+ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$SEED_ADMIN_ID', '$SEED_ADMIN_ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$SEED_ADMIN_ID' AND role_id = '$SEED_ADMIN_ROLE_ID' AND legal_entity_id = '$TENANT_ID');
+-- Platform scope too: an assignment on the platform-scope entity can only be
+-- made by a holder of iam.assignment.grant AT platform scope.
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$SEED_ADMIN_ID', '$SEED_ADMIN_ROLE_ID', '$PLATFORM_SCOPE', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$SEED_ADMIN_ID' AND role_id = '$SEED_ADMIN_ROLE_ID' AND legal_entity_id = '$PLATFORM_SCOPE');
+INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_by_principal_id)
+VALUES ('$ACS_SERVICE_ROLE_ID', '$TENANT_ID', 'SVC_ACCESS_CONTROL', 'access-control-svc review executor', 'LEGAL_ENTITY', true, 'seed-bootstrap')
+ON CONFLICT DO NOTHING;
+INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions, active_flag)
+VALUES ('$ACS_SERVICE_ROLE_ID', 'REVIEW_REVOKE', '["iam.assignment.revoke", "iam.assignment.read"]'::jsonb, true)
+ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions, active_flag = true;
+INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+SELECT '$ACS_SERVICE_ID', '$ACS_SERVICE_ROLE_ID', '$TENANT_ID', now() - interval '1 minute', 'seed-bootstrap'
+WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
+                  WHERE principal_id = '$ACS_SERVICE_ID' AND role_id = '$ACS_SERVICE_ROLE_ID' AND legal_entity_id = '$TENANT_ID');
 "@
         $sql | docker exec -i $PgContainer psql -U postgres -d authorization_svc -v ON_ERROR_STOP=1 -q | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "IAM bootstrap into authorization_svc failed (container $PgContainer)" }
@@ -812,7 +873,7 @@ WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
     $step = 2
     foreach ($bundle in $BUNDLES) {
         Write-Host "$step  bundle $($bundle.Code) for $($bundle.Service)" -NoNewline
-        $result = Invoke-Authz -Path "/v1/admin/roles/$ROLE_ID/permission-bundles" -Body @{
+        $result = Invoke-Authz -Actor $SEED_ADMIN_ID -Path "/v1/admin/roles/$ROLE_ID/permission-bundles" -Body @{
             bundle_code       = $bundle.Code
             permitted_actions = $bundle.Actions
         }
@@ -858,7 +919,9 @@ WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments
     # is in place.
     Write-Host "$step  assign role to $PRINCIPAL_ID on the platform scope" -NoNewline
     try {
-        $assignment = Invoke-Authz -Actor $APPROVER_ID -Path "/v1/admin/role-assignments" -Body @{
+        # The seed admin, not the approver: an assignment on the platform scope
+        # needs iam.assignment.grant held AT platform scope.
+        $assignment = Invoke-Authz -Actor $SEED_ADMIN_ID -Path "/v1/admin/role-assignments" -Body @{
             principal_id    = $PRINCIPAL_ID
             role_id         = $ROLE_ID
             legal_entity_id = $PLATFORM_SCOPE

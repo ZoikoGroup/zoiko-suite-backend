@@ -127,12 +127,15 @@ type AssignmentRequest struct {
 	DecisionReason         string     `json:"decision_reason,omitempty"`
 	DecidedAt              *time.Time `json:"decided_at,omitempty"`
 	AuthzAssignmentID      string     `json:"authz_assignment_id,omitempty"`
-	RevokedByPrincipalID   string     `json:"revoked_by_principal_id,omitempty"`
-	RevocationReason       string     `json:"revocation_reason,omitempty"`
-	RevokedAt              *time.Time `json:"revoked_at,omitempty"`
-	CorrelationID          string     `json:"correlation_id"`
-	CreatedAt              time.Time  `json:"created_at"`
-	UpdatedAt              time.Time  `json:"updated_at"`
+	// GroupAssignmentID links a member's request to the group assignment
+	// that fanned it out (migration 000014); empty for an individual request.
+	GroupAssignmentID    string     `json:"group_assignment_id,omitempty"`
+	RevokedByPrincipalID string     `json:"revoked_by_principal_id,omitempty"`
+	RevocationReason     string     `json:"revocation_reason,omitempty"`
+	RevokedAt            *time.Time `json:"revoked_at,omitempty"`
+	CorrelationID        string     `json:"correlation_id"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
 type CreateAssignmentRequest struct {
@@ -175,6 +178,9 @@ type AuthzAssignment struct {
 	// Read with include_usage=true, for reviews only.
 	LastGrantedAt   *time.Time `json:"last_granted_at,omitempty"`
 	PrincipalStatus string     `json:"principal_status,omitempty"`
+	// authorization-svc's maker-checker state (its 000025): APPROVED grants;
+	// PENDING_APPROVAL waits for its own checker and grants nothing.
+	ApprovalStatus string `json:"approval_status,omitempty"`
 }
 
 // ── access reviews ──────────────────────────────────────────────────────────
@@ -264,9 +270,12 @@ type CreateCampaignRequest struct {
 	DefaultReviewerPrincipalID string `json:"default_reviewer_principal_id"`
 	// EscalationReviewerPrincipalID reviews the items whose subject is the
 	// default reviewer (no self-attestation). Required only when that happens.
-	EscalationReviewerPrincipalID string    `json:"escalation_reviewer_principal_id,omitempty"`
-	RoleDefinitionIDs             []string  `json:"role_definition_ids,omitempty"`
-	DueAt                         time.Time `json:"due_at"`
+	EscalationReviewerPrincipalID string   `json:"escalation_reviewer_principal_id,omitempty"`
+	RoleDefinitionIDs             []string `json:"role_definition_ids,omitempty"`
+	// SubjectPrincipalID narrows the campaign to one subject's assignments:
+	// an EVENT_TRIGGERED review of a mover or leaver (§24).
+	SubjectPrincipalID string    `json:"subject_principal_id,omitempty"`
+	DueAt              time.Time `json:"due_at"`
 	// DormancyDays is the §24 dormancy window; 0 means DefaultDormancyDays.
 	DormancyDays  int    `json:"dormancy_days,omitempty"`
 	CorrelationID string `json:"correlation_id"`
@@ -305,11 +314,16 @@ var (
 	ErrSelfApproval          = errorString("the requester or the subject of an assignment cannot approve it")
 	ErrRoleRetired           = errorString("a retired role cannot be assigned")
 	ErrAuthzAssignmentAbsent = errorString("the assignment no longer exists in authorization-svc")
-	ErrEntityMismatch        = errorString("legal_entity_id must be the entity the record belongs to")
-	ErrInvalidEffectiveTo    = errorString("effective_to must be after effective_from and in the future")
-	ErrInvalidEffectiveAt    = errorString("effective_at must be in the future; omit it to revoke now")
-	ErrAssignmentWindowOver  = errorString("the requested assignment's effective_to has passed; it can no longer be approved")
-	ErrSecurityApproval      = errorString("a CRITICAL-risk assignment needs a security approver holding " + ActionApprovePrivileged)
+	// ErrAuthzApprovalPending: authorization-svc recorded the assignment but
+	// parked it PENDING_APPROVAL — the provisioning principal is not an
+	// independent approver it recognises for a privileged role there. Nothing
+	// is in force, so this service must not record it as provisioned.
+	ErrAuthzApprovalPending = errorString("authorization-svc holds the assignment pending its own approval; it is not in force")
+	ErrEntityMismatch       = errorString("legal_entity_id must be the entity the record belongs to")
+	ErrInvalidEffectiveTo   = errorString("effective_to must be after effective_from and in the future")
+	ErrInvalidEffectiveAt   = errorString("effective_at must be in the future; omit it to revoke now")
+	ErrAssignmentWindowOver = errorString("the requested assignment's effective_to has passed; it can no longer be approved")
+	ErrSecurityApproval     = errorString("a CRITICAL-risk assignment needs a security approver holding " + ActionApprovePrivileged)
 
 	ErrCampaignNotFound      = errorString("access review campaign not found")
 	ErrReviewItemNotFound    = errorString("access review item not found")
@@ -319,4 +333,146 @@ var (
 	ErrUnresolvedHighRisk    = errorString("high-risk access review items are undecided or escalated; the campaign cannot close")
 	ErrItemAlreadyDecided    = errorString("this access review item is already decided")
 	ErrEscalationReviewerReq = errorString("the default reviewer is the subject of at least one assignment; supply escalation_reviewer_principal_id")
+	ErrAssignmentPending     = errorString("a request for this principal, role and entity is already awaiting approval")
+
+	ErrGroupNotFound           = errorString("group not found")
+	ErrGroupCodeExists         = errorString("a group with that group_code already exists in this tenant")
+	ErrGroupRetired            = errorString("the group is retired")
+	ErrGroupMemberExists       = errorString("the principal is already a member of this group")
+	ErrGroupMemberNotFound     = errorString("the principal is not a member of this group")
+	ErrGroupAssignmentNotFound = errorString("group assignment not found")
+	ErrGroupAssignmentRevoked  = errorString("the group assignment is already revoked")
 )
+
+// ── groups (000014) ──────────────────────────────────────────────────────────
+
+// Group is §2's "administrative collection of subjects". A role assigned to a
+// group is never enforced as a group: it fans out to one governed assignment
+// request per member, each with its own SoD check and risk-tiered approval.
+type Group struct {
+	GroupID              string        `json:"group_id"`
+	TenantID             string        `json:"tenant_id"`
+	LegalEntityID        string        `json:"legal_entity_id"`
+	GroupCode            string        `json:"group_code"`
+	GroupName            string        `json:"group_name"`
+	Status               string        `json:"status"`
+	Source               string        `json:"source"`
+	CreatedByPrincipalID string        `json:"created_by_principal_id"`
+	CorrelationID        string        `json:"correlation_id"`
+	CreatedAt            time.Time     `json:"created_at"`
+	UpdatedAt            time.Time     `json:"updated_at"`
+	Members              []GroupMember `json:"members,omitempty"`
+}
+
+// GroupMember is one live membership. AddedAt distinguishes a re-added member
+// from their earlier membership, so a fan-out for the new membership is a new
+// request rather than a replay of the one revoked when they left.
+type GroupMember struct {
+	PrincipalID        string    `json:"principal_id"`
+	AddedByPrincipalID string    `json:"added_by_principal_id"`
+	AddedAt            time.Time `json:"added_at"`
+}
+
+const (
+	GroupActive  = "ACTIVE"
+	GroupRetired = "RETIRED"
+	GroupManual  = "MANUAL"
+	GroupSCIM    = "SCIM"
+)
+
+type CreateGroupRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	GroupCode     string `json:"group_code"`
+	GroupName     string `json:"group_name"`
+	Source        string `json:"source,omitempty"`
+	CorrelationID string `json:"correlation_id"`
+}
+
+// GroupMemberRequest adds (principal_id) or removes (reason) a member.
+type GroupMemberRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	PrincipalID   string `json:"principal_id,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	CorrelationID string `json:"correlation_id"`
+}
+
+// GroupAssignment is "GROUP + role + scope + effective dates" (§9).
+type GroupAssignment struct {
+	GroupAssignmentID    string     `json:"group_assignment_id"`
+	TenantID             string     `json:"tenant_id"`
+	GroupID              string     `json:"group_id"`
+	RoleDefinitionID     string     `json:"role_definition_id"`
+	LegalEntityID        string     `json:"legal_entity_id"`
+	EffectiveFrom        time.Time  `json:"effective_from"`
+	EffectiveTo          *time.Time `json:"effective_to,omitempty"`
+	Justification        string     `json:"justification"`
+	Status               string     `json:"status"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	RevokedByPrincipalID string     `json:"revoked_by_principal_id,omitempty"`
+	RevocationReason     string     `json:"revocation_reason,omitempty"`
+	RevokedAt            *time.Time `json:"revoked_at,omitempty"`
+	CorrelationID        string     `json:"correlation_id"`
+	CreatedAt            time.Time  `json:"created_at"`
+	// Members is the per-member outcome of a fan-out, on command responses.
+	Members []GroupMemberOutcome `json:"members,omitempty"`
+}
+
+const (
+	GroupAssignmentActive  = "ACTIVE"
+	GroupAssignmentRevoked = "REVOKED"
+)
+
+type CreateGroupAssignmentRequest struct {
+	LegalEntityID    string     `json:"legal_entity_id"`
+	RoleDefinitionID string     `json:"role_definition_id"`
+	EffectiveFrom    time.Time  `json:"effective_from,omitempty"`
+	EffectiveTo      *time.Time `json:"effective_to,omitempty"`
+	Justification    string     `json:"justification"`
+	CorrelationID    string     `json:"correlation_id"`
+}
+
+// GroupMemberOutcome is what a fan-out did for one member: the request it
+// created or touched, or the code it was refused with (an SoD conflict for
+// one member does not block the others).
+type GroupMemberOutcome struct {
+	PrincipalID string `json:"principal_id"`
+	RequestID   string `json:"request_id,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// ── subject links (000015) ───────────────────────────────────────────────────
+
+// SubjectLink is the administered "employee E is principal P" an HR event is
+// resolved through (S9-C2). Never inferred: an unlinked employee's event is
+// skipped.
+type SubjectLink struct {
+	TenantID              string    `json:"tenant_id"`
+	EmployeeID            string    `json:"employee_id"`
+	PrincipalID           string    `json:"principal_id"`
+	LegalEntityID         string    `json:"legal_entity_id"`
+	LastManagerEmployeeID string    `json:"last_manager_employee_id,omitempty"`
+	LastStatus            string    `json:"last_status,omitempty"`
+	LinkedByPrincipalID   string    `json:"linked_by_principal_id"`
+	CorrelationID         string    `json:"correlation_id"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+type LinkSubjectRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	EmployeeID    string `json:"employee_id"`
+	PrincipalID   string `json:"principal_id"`
+	CorrelationID string `json:"correlation_id"`
+}
+
+// ReviewTrigger is one HR event resolved to a subject: what opens an
+// EVENT_TRIGGERED review (§24 "manager change, entity transfer, ...").
+type ReviewTrigger struct {
+	TenantID            string
+	LegalEntityID       string
+	SubjectPrincipalID  string
+	ReviewerPrincipalID string // empty: the configured default reviewer
+	Reason              string
+	CorrelationID       string // derived from the event id: a redelivery replays
+}

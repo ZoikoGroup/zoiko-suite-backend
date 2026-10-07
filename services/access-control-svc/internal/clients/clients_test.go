@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"zoiko.io/access-control-svc/internal/domain"
 )
@@ -129,5 +130,53 @@ func TestAuthzAdmin_403IsARefusalNotAnOutage(t *testing.T) {
 	err = c.CreateRole(context.Background(), "r", "CODE", "Name", "TENANT", s)
 	if err == nil || errors.Is(err, domain.ErrProvisioningForbidden) {
 		t.Fatalf("500 is an outage, got %v", err)
+	}
+}
+
+// §16 fields and the approval reference travel to authorization-svc, and a
+// 202 PENDING_APPROVAL answer is reported, never taken as provisioned.
+func TestAuthzAdmin_CommandFieldsAndPendingAnswer(t *testing.T) {
+	var bodies = map[string]map[string]any{}
+	pending := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		bodies[r.URL.Path] = b
+		if r.URL.Path == "/v1/admin/role-assignments" {
+			status := "APPROVED"
+			if pending {
+				status = "PENDING_APPROVAL"
+				w.WriteHeader(http.StatusAccepted)
+			}
+			_, _ = w.Write([]byte(`{"principal_role_assignment_id":"a-1","approval_status":"` + status + `"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := NewAuthzAdminClient(srv.URL)
+	s := Scope{PrincipalID: "p", TenantID: "t", LegalEntityID: "le", CorrelationID: "c", Purpose: "left the team", ApprovalReference: "req-9"}
+
+	if err := c.SetRoleActive(context.Background(), "r-1", false, s); err != nil {
+		t.Fatal(err)
+	}
+	if b := bodies["/v1/admin/roles/r-1/retire"]; b["reason_code"] != "ROLE_DEFINITION_RETIRED" || b["purpose"] != "left the team" {
+		t.Errorf("retire body = %v", b)
+	}
+	if err := c.RevokeRoleAssignment(context.Background(), "a-1", s); err != nil {
+		t.Fatal(err)
+	}
+	if b := bodies["/v1/admin/role-assignments/a-1/revoke"]; b["reason_code"] != "ASSIGNMENT_REVOKED" {
+		t.Errorf("revoke body = %v", b)
+	}
+	if _, err := c.CreateRoleAssignment(context.Background(), "a-1", "u", "r-1", "le", time.Now(), nil, s); err != nil {
+		t.Fatal(err)
+	}
+	if b := bodies["/v1/admin/role-assignments"]; b["approval_reference"] != "req-9" {
+		t.Errorf("assignment body = %v", b)
+	}
+	pending = true
+	if id, err := c.CreateRoleAssignment(context.Background(), "a-1", "u", "r-1", "le", time.Now(), nil, s); !errors.Is(err, domain.ErrAuthzApprovalPending) || id != "a-1" {
+		t.Errorf("pending answer: want ErrAuthzApprovalPending with the id, got %q %v", id, err)
 	}
 }

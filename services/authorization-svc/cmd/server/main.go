@@ -37,7 +37,9 @@ import (
 	"zoiko.io/authorization-svc/internal/events"
 	"zoiko.io/authorization-svc/internal/handler"
 	"zoiko.io/authorization-svc/internal/health"
+	"zoiko.io/authorization-svc/internal/idempotency"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
+	"zoiko.io/authorization-svc/internal/outbox"
 	"zoiko.io/authorization-svc/internal/mtls"
 	"zoiko.io/authorization-svc/internal/retention"
 	"zoiko.io/authorization-svc/internal/siem"
@@ -171,6 +173,10 @@ func main() {
 	// policy classifies POST /v1/authorize as a material write, which refused
 	// almost every caller of the evaluation endpoint. See handler.MaterialWrite.
 	r.Use(svcenvelope.Middleware(handler.EnvelopePolicy(), svcenvelope.DefaultReporter()))
+	// Idempotency-Key honoured on material writes (migration 000021): a retry
+	// is answered from the first response instead of creating a second grant
+	// or rule. After the envelope, so a refused request claims no key.
+	r.Use(idempotency.Middleware(pgStore, handler.MaterialWrite, log))
 
 	siemClient := siem.New(cfg.SIEMServiceURL, "authorization-svc", log)
 	// Drains the SIEM queue on shutdown. Streaming is fire-and-forget, so
@@ -178,7 +184,26 @@ func main() {
 	// from a request that has long since been answered.
 	defer siemClient.Close()
 	h := handler.New(authzStore, publisher, jurisdictionValidator, siemClient, cfg.PlatformScopeEntityID, cfg.EnforceTenantOnAuthorize, log)
+	// Decision events go through the transactional outbox (migration 000020):
+	// written with the decision, published by the relay below, so a Kafka
+	// outage delays authorization.denied and sod.violation.detected rather than
+	// losing them.
+	h.UseOutbox(events.DecisionEvents)
+	if cfg.CommandContractEnforce {
+		h.SetCommandContract(handler.CommandContractEnforce)
+	} else {
+		log.Warn("AUTHZ_COMMAND_CONTRACT=warn — admin commands without reason_code are admitted and marked; set enforce once callers send it")
+	}
 	handler.RegisterRoutes(r, h)
+
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	go outbox.NewRelay(pool, kafkaWriter, time.Second, 100, log).Run(relayCtx)
+	// Records what has run out: GOV-04 exceptions past expiry
+	// (sod.exception.expired) and privileged assignments whose approval
+	// window passed. Decisions already ignore both from the instant they
+	// expire; this makes the state and the event say so.
+	go pgStore.RunExpirySweeper(relayCtx)
 
 	if cfg.PlatformScopeEntityID == "" {
 		// Not fatal, but worth one loud line at boot: without it every
@@ -366,6 +391,32 @@ func main() {
 		lifecycleConsumer := events.NewLifecycleConsumer(log, authzStore)
 		go lifecycleConsumer.Run(consumerCtx, lifecycleReader)
 		log.Info("lifecycle consumer wired", zap.Strings("topics", cfg.Kafka.LifecycleTopics))
+
+		// Cross-replica cache invalidation. Its own consumer group PER
+		// REPLICA, so every replica sees every message (a broadcast); the
+		// lifecycle consumer's shared group hands each message to one replica
+		// only, which left every other replica serving a revoked grant until
+		// its TTL. Starts at the latest offset: a new replica has nothing
+		// cached to invalidate.
+		host, _ := os.Hostname()
+		invalidationTopics := append(append([]string{}, cfg.Kafka.LifecycleTopics...), cfg.Kafka.Topic)
+		if cfg.Kafka.DelegationTopic != "" {
+			invalidationTopics = append(invalidationTopics, cfg.Kafka.DelegationTopic)
+		}
+		invalidationReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers:                cfg.Kafka.Brokers,
+			GroupID:                cfg.Kafka.LifecycleGroupID + "-invalidate-" + host,
+			GroupTopics:            invalidationTopics,
+			StartOffset:            kafka.LastOffset,
+			MinBytes:               1,
+			MaxBytes:               10e6,
+			MaxWait:                500 * time.Millisecond,
+			ErrorLogger:            kafkaErrorLogger(log, strings.Join(invalidationTopics, ",")),
+			WatchPartitionChanges:  true,
+			PartitionWatchInterval: partitionWatchInterval,
+		})
+		go events.NewCacheInvalidator(log, authzStore).Run(consumerCtx, invalidationReader)
+		log.Info("cache invalidator wired", zap.Strings("topics", invalidationTopics))
 	}
 
 	// ── access_decision_log retention ──────────────────────────────────────

@@ -51,7 +51,7 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	// for the same reason: 000009 creates them, and CREATE OR REPLACE FUNCTION
 	// cannot change a function's return type, so a stale definition from an
 	// earlier schema version fails the migration rather than being replaced.
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS access_reviews, workload_bindings, authority_limits, support_sessions, break_glass_sessions, privileged_sessions, principal_status_projection, abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS sod_exceptions, entity_status_projection, authz_config_history, idempotency_keys, outbox_events, access_reviews, workload_bindings, authority_limits, support_sessions, break_glass_sessions, privileged_sessions, principal_status_projection, abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
 	_, _ = pool.Exec(ctx, "DROP VIEW IF EXISTS access_decision_log_retention_status;")
 	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS detach_access_decision_log_partitions_before(DATE);")
 	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS create_access_decision_log_partition(DATE);")
@@ -112,6 +112,19 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		// source_version and ceiling columns.
 		"000017_add_access_reviews_and_workload_identities.up.sql",
 		"000018_delegation_projection_version_and_limits.up.sql",
+		// 000019 seeds the SoD baseline; 000020-000027 are the 7 Oct
+		// governance pass: outbox, idempotency keys, versions and append-only
+		// history, decision evidence, entity status, maker-checker, IAM event
+		// triggers and SoD exceptions.
+		"000019_seed_sod_baseline.up.sql",
+		"000020_add_outbox.up.sql",
+		"000021_add_idempotency_keys.up.sql",
+		"000022_config_versions_and_history.up.sql",
+		"000023_decision_evidence.up.sql",
+		"000024_entity_status_projection.up.sql",
+		"000025_admin_governance.up.sql",
+		"000026_iam_events.up.sql",
+		"000027_sod_exceptions.up.sql",
 	}
 	// Three migrations have now been missed from this list. Refuse to run
 	// against a schema the list does not fully describe.

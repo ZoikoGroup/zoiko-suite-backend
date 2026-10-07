@@ -64,7 +64,7 @@ func AssignmentGranted(a domain.AssignmentRequest, actorID string) (Outbound, er
 		// expiry sweep's iam.assignment.revoked arrives.
 		p["effective_to"] = *a.EffectiveTo
 	}
-	return Build(TypeAssignmentGranted, a.CorrelationID, a.TenantID, actorID, a.RequestID, p)
+	return Build(TypeAssignmentGranted, a.CorrelationID, a.TenantID, actorID, assignmentKey(a), p)
 }
 
 // AssignmentEnded builds iam.assignment.revoked for an assignment whose
@@ -76,14 +76,28 @@ func AssignmentEnded(a domain.AssignmentRequest, actorID, reason string) (Outbou
 	if a.EffectiveTo != nil {
 		p["effective_to"] = *a.EffectiveTo
 	}
-	return Build(TypeAssignmentRevoked, a.CorrelationID, a.TenantID, actorID, a.RequestID, p)
+	return Build(TypeAssignmentRevoked, a.CorrelationID, a.TenantID, actorID, assignmentKey(a), p)
+}
+
+// assignmentKey is the Kafka key of an assignment's grant and revocation
+// events: authorization-svc's assignment id, the same key a review-driven
+// revocation uses (AssignmentRevokedByReview). Keyed by the request id, a
+// grant and a review's revoke of the same assignment could land on different
+// partitions and reorder, and a late grant re-opened a revoked projection in
+// identity-context-svc (Group 1 audit gap S1-4). The request id is the
+// fallback for a request never provisioned.
+func assignmentKey(a domain.AssignmentRequest) string {
+	if a.AuthzAssignmentID != "" {
+		return a.AuthzAssignmentID
+	}
+	return a.RequestID
 }
 
 // AssignmentRevoked builds iam.assignment.revoked.
 func AssignmentRevoked(a domain.AssignmentRequest, correlationID, actorID, reason string) (Outbound, error) {
 	p := assignmentPayload(a)
 	p["revocation_reason"] = reason
-	return Build(TypeAssignmentRevoked, correlationID, a.TenantID, actorID, a.RequestID, p)
+	return Build(TypeAssignmentRevoked, correlationID, a.TenantID, actorID, assignmentKey(a), p)
 }
 
 // AssignmentRevokedByReview builds iam.assignment.revoked for an assignment a

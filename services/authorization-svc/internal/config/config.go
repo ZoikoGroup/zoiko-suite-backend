@@ -101,6 +101,15 @@ type Config struct {
 	// do not yet forward X-Tenant-Id; once they are all migrated, this should be
 	// set to true.
 	EnforceTenantOnAuthorize bool
+
+	// CommandContractEnforce refuses a privileged or destructive admin
+	// command without purpose / reason_code, and a delegation without an end
+	// date (Governance Control Plane §16; ZS-IAM-001 §11). False is the
+	// migration state: such commands are admitted, marked
+	// X-Command-Contract: violated and logged, and an open-ended delegation
+	// is bounded to the default term. Set AUTHZ_COMMAND_CONTRACT=enforce once
+	// the console and access-control-svc send the fields.
+	CommandContractEnforce bool
 }
 
 type DBConfig struct {
@@ -339,6 +348,7 @@ func Load() (*Config, error) {
 		// do not yet forward X-Tenant-Id; once they are all migrated, this should be
 		// set to true.
 		EnforceTenantOnAuthorize: envBool("AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE", false),
+		CommandContractEnforce:   strings.EqualFold(env("AUTHZ_COMMAND_CONTRACT", "warn"), "enforce"),
 	}, nil
 }
 

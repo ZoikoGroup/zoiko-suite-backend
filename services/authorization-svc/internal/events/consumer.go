@@ -101,12 +101,15 @@ var ConsumedEventTypes = map[string]bool{
 // the fields this consumer acts on are declared, so a producer adding one does
 // not break consumption.
 type inbound struct {
-	EventID       string          `json:"event_id"`
-	EventType     string          `json:"event_type"`
-	TenantID      string          `json:"tenant_id"`
-	LegalEntityID string          `json:"legal_entity_id"`
-	CorrelationID string          `json:"correlation_id"`
-	Payload       json.RawMessage `json:"payload"`
+	EventID       string `json:"event_id"`
+	EventType     string `json:"event_type"`
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	CorrelationID string `json:"correlation_id"`
+	// EffectiveAt orders entity status changes (tenant-entity-registry-svc's
+	// envelope). Absent on producers that do not send it.
+	EffectiveAt *time.Time      `json:"effective_at,omitempty"`
+	Payload     json.RawMessage `json:"payload"`
 }
 
 // delegationPayload is delegated-authority-svc's authority.* payload.
@@ -191,6 +194,17 @@ func (c *Consumer) claim(eventID string) bool {
 	return true
 }
 
+// release forgets eventID, so a message whose apply failed is applied when it
+// is retried rather than skipped as already handled.
+func (c *Consumer) release(eventID string) {
+	if eventID == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.seen, eventID)
+	c.mu.Unlock()
+}
+
 // Run consumes until ctx is cancelled.
 //
 // A broker that is absent or unreachable must NOT stop the service. This is
@@ -224,11 +238,9 @@ func (c *Consumer) Run(ctx context.Context, reader *kafka.Reader) {
 			}
 			continue
 		}
-		if err := c.Handle(ctx, msg.Value); err != nil {
-			// Handle returned an error (only for unrecoverable decode errors).
-			// We still commit to avoid blocking the partition, but log loudly.
-			c.log.Error("delegation event: handle failed — committing offset to avoid stall",
-				zap.Error(err), zap.String("event_id", string(msg.Key)))
+		if !applyUntilDone(ctx, c.log, string(msg.Key), func() error { return c.Handle(ctx, msg.Value) }) {
+			c.log.Info("delegation consumer stopping with an unapplied message — not committed, so it is redelivered")
+			return
 		}
 		if err := reader.CommitMessages(ctx, msg); err != nil {
 			c.log.Error("failed to commit offset", zap.Error(err))
@@ -295,12 +307,21 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 	// Extension used to be dropped, so /v1/authorize ended an extended
 	// delegation at its ORIGINAL end; a resume had no handler at all.
 	case "authority.delegated", "authority.extended", "authority.resumed":
-		return c.applyDelegated(ctx, env, payload)
+		return c.releaseOnError(env.EventID, c.applyDelegated(ctx, env, payload))
 	// A suspended grant confers nothing until resumed — the same as an ended one.
 	case "authority.revoked", "authority.expired", "authority.suspended":
-		return c.applyEnded(ctx, env, payload)
+		return c.releaseOnError(env.EventID, c.applyEnded(ctx, env, payload))
 	}
 	return nil
+}
+
+// releaseOnError releases eventID's claim when the apply failed, so the retry
+// in Run applies it instead of skipping it as already handled.
+func (c *Consumer) releaseOnError(eventID string, err error) error {
+	if err != nil {
+		c.release(eventID)
+	}
+	return err
 }
 
 func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload delegationPayload) error {

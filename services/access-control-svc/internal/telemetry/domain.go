@@ -61,6 +61,11 @@ type Domain struct {
 	// identity-context-svc to end the subject's sessions; authorization-svc
 	// still denies at the instant, so the exposure is session claims only.
 	AssignmentExpiryFailures prometheus.Counter
+
+	// HREvents counts HR lifecycle events by what they did (hrevents
+	// outcomes). A climbing "unlinked" means employees are acting without a
+	// subject link, so their moves and exits open no review.
+	HREvents *prometheus.CounterVec
 }
 
 // Governance operations (GovernanceWrites' operation label).
@@ -76,6 +81,12 @@ const (
 	GovDecideReviewItem    = "decide_review_item"
 	GovReassignReviewItem  = "reassign_review_item"
 	GovCompleteCampaign    = "complete_review_campaign"
+	GovCreateGroup         = "create_group"
+	GovAddGroupMember      = "add_group_member"
+	GovRemoveGroupMember   = "remove_group_member"
+	GovAssignGroup         = "assign_group"
+	GovRevokeGroupAssign   = "revoke_group_assignment"
+	GovLinkSubject         = "link_subject"
 )
 
 // GovernanceOperations is every operation label, pre-created at zero.
@@ -83,6 +94,7 @@ var GovernanceOperations = []string{
 	GovInstantiateTemplate, GovUpgradeTemplate, GovRequestAssignment, GovApproveAssignment,
 	GovRejectAssignment, GovCancelAssignment, GovRevokeAssignment, GovCreateCampaign,
 	GovDecideReviewItem, GovReassignReviewItem, GovCompleteCampaign,
+	GovCreateGroup, GovAddGroupMember, GovRemoveGroupMember, GovAssignGroup, GovRevokeGroupAssign, GovLinkSubject,
 }
 
 // Admin operations added with the governance surface.
@@ -219,12 +231,17 @@ func NewDomainWith(reg prometheus.Registerer, serviceName string) *Domain {
 			Help:        "Assignment expiry sweep passes that failed.",
 			ConstLabels: labels,
 		}),
+		HREvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "access_control_hr_events_total",
+			Help:        "HR lifecycle events consumed, by outcome (review_opened, unlinked, dropped, ...).",
+			ConstLabels: labels,
+		}, []string{"outcome"}),
 	}
 
 	reg.MustRegister(
 		d.RoleWrites, d.BundleWrites, d.AuthZDecisions, d.AuthzAdminCalls,
 		d.OutboxPending, d.OutboxPublished, d.OutboxFailures, d.OutboxOldestAgeSeconds,
-		d.GovernanceWrites, d.AssignmentsExpired, d.AssignmentExpiryFailures,
+		d.GovernanceWrites, d.AssignmentsExpired, d.AssignmentExpiryFailures, d.HREvents,
 	)
 
 	writeOutcomes := []string{

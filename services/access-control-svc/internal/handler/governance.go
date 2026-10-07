@@ -78,6 +78,30 @@ type Gov struct {
 	h     *Handler
 	store GovStore
 	admin AssignmentAdmin
+
+	// servicePrincipalID is this service's own identity in authorization-svc,
+	// holding iam.assignment.revoke. A review REVOKE is the reviewer's DECISION
+	// and this service's EXECUTION of it: a line manager attesting access is
+	// not an IAM administrator, and provisioning as the reviewer left every
+	// such item open behind 403 provisioning_forbidden (audit gap S9-B). The
+	// reviewer, campaign and item travel as the §16 purpose and are recorded
+	// with the revocation there. Empty falls back to the reviewer.
+	servicePrincipalID string
+
+	// groups enables the group-subject routes (groups.go); nil leaves them
+	// unregistered.
+	groups GroupStore
+
+	// links, eventReviewer and eventReviewDue serve S9-C2: the subject-link
+	// routes and the reviews HR events open (subject_links.go).
+	links          SubjectLinkStore
+	eventReviewer  string
+	eventReviewDue time.Duration
+}
+
+// SetServicePrincipal sets the identity review revocations are executed as.
+func (g *Gov) SetServicePrincipal(id string) {
+	g.servicePrincipalID = id
 }
 
 func NewGov(h *Handler, store GovStore, admin AssignmentAdmin) *Gov {
@@ -119,6 +143,12 @@ func RegisterGovernanceRoutes(r chi.Router, g *Gov) {
 	})
 	// §21: "retrieve assigned attestations/reviews" — the caller's own items.
 	r.Get("/v1/iam/access-reviews", g.ListMyReviewItems)
+	if g.groups != nil {
+		registerGroupRoutes(r, g)
+	}
+	if g.links != nil {
+		registerSubjectLinkRoutes(r, g)
+	}
 }
 
 // ── shared helpers ───────────────────────────────────────────────────────────
@@ -148,6 +178,15 @@ func (g *Gov) refuse(w http.ResponseWriter, r *http.Request, op, tenantID, entit
 // fail maps an error from a guard, authorization-svc or the store to the
 // status and code a caller can act on, and records it as a refusal.
 func (g *Gov) fail(w http.ResponseWriter, r *http.Request, op, tenantID, entityID, principalID, correlationID string, err error, payload any) {
+	status, code := classify(err)
+	if status >= 500 {
+		g.h.log.Error("governance command failed", zap.String("operation", op), zap.Error(err))
+	}
+	g.refuse(w, r, op, tenantID, entityID, principalID, correlationID, status, code, err.Error(), payload)
+}
+
+// classify maps an error to the status and code fail answers it with.
+func classify(err error) (int, string) {
 	status, code := http.StatusServiceUnavailable, "store_unavailable"
 	switch {
 	case errors.Is(err, domain.ErrUnknownPermission):
@@ -196,13 +235,25 @@ func (g *Gov) fail(w http.ResponseWriter, r *http.Request, op, tenantID, entityI
 		status, code = http.StatusConflict, "assignment_window_elapsed"
 	case errors.Is(err, domain.ErrSecurityApproval):
 		status, code = http.StatusForbidden, "security_approval_required"
+	case errors.Is(err, domain.ErrAuthzApprovalPending):
+		status, code = http.StatusConflict, "authz_approval_pending"
+	case errors.Is(err, domain.ErrAssignmentPending):
+		status, code = http.StatusConflict, "assignment_pending"
+	case errors.Is(err, domain.ErrGroupNotFound), errors.Is(err, domain.ErrGroupAssignmentNotFound),
+		errors.Is(err, domain.ErrGroupMemberNotFound):
+		status, code = http.StatusNotFound, "not_found"
+	case errors.Is(err, domain.ErrGroupCodeExists):
+		status, code = http.StatusConflict, "group_code_exists"
+	case errors.Is(err, domain.ErrGroupRetired):
+		status, code = http.StatusConflict, "group_retired"
+	case errors.Is(err, domain.ErrGroupMemberExists):
+		status, code = http.StatusConflict, "member_exists"
+	case errors.Is(err, domain.ErrGroupAssignmentRevoked):
+		status, code = http.StatusConflict, "group_assignment_revoked"
 	case strings.Contains(err.Error(), "authorization-svc admin API"):
 		code = "authz_admin_unavailable"
 	}
-	if status >= 500 {
-		g.h.log.Error("governance command failed", zap.String("operation", op), zap.Error(err))
-	}
-	g.refuse(w, r, op, tenantID, entityID, principalID, correlationID, status, code, err.Error(), payload)
+	return status, code
 }
 
 // begin runs the checks every governance command starts with: a principal, a
@@ -660,67 +711,10 @@ func (g *Gov) RequestAssignment(w http.ResponseWriter, r *http.Request) {
 		g.refuse(w, r, op, tenantID, req.LegalEntityID, principalID, req.CorrelationID, http.StatusConflict, "role_retired", string(domain.ErrRoleRetired), req)
 		return
 	}
-	if pending, err := g.store.PendingAssignmentExists(r.Context(), req.TargetPrincipalID, req.RoleDefinitionID, req.LegalEntityID); err != nil {
-		fail(err)
-		return
-	} else if pending {
-		g.refuse(w, r, op, tenantID, req.LegalEntityID, principalID, req.CorrelationID, http.StatusConflict, "assignment_pending",
-			"a request for this principal, role and entity is already awaiting approval", req)
-		return
-	}
-
-	actions, err := g.roleActions(r.Context(), role.RoleDefinitionID)
-	if err != nil {
-		fail(err)
-		return
-	}
-	if len(actions) > 0 {
-		if err := g.h.sod.CheckConflict(r.Context(), domain.SoDCheckRequest{
-			TenantID: tenantID, CallerID: principalID, CorrelationID: req.CorrelationID, CandidateActions: actions,
-			SubjectPrincipalID: req.TargetPrincipalID, LegalEntityID: req.LegalEntityID,
-		}); err != nil {
-			fail(err)
-			return
-		}
-	}
-	risk, drivers, err := g.h.roleRisk(r.Context(), actions)
-	if err != nil {
-		fail(err)
-		return
-	}
-	needsApproval, why := approvalPolicy(principalID, req.TargetPrincipalID, risk, drivers)
-
-	now := time.Now().UTC()
-	effective := req.EffectiveFrom.UTC()
-	if req.EffectiveFrom.IsZero() {
-		effective = now
-	}
-	var end *time.Time
-	if req.EffectiveTo != nil {
-		e := req.EffectiveTo.UTC()
-		end = &e
-	}
-	a := &domain.AssignmentRequest{
-		RequestID: uuid.NewString(), TenantID: tenantID, TargetPrincipalID: req.TargetPrincipalID,
-		RoleDefinitionID: role.RoleDefinitionID, LegalEntityID: req.LegalEntityID, EffectiveFrom: effective, EffectiveTo: end,
-		Justification: req.Justification, RiskTier: risk, ApprovalRequired: needsApproval, ApprovalReason: why,
-		Status: domain.AssignmentPendingApproval, RequestedByPrincipalID: principalID,
-		CorrelationID: req.CorrelationID, CreatedAt: now, UpdatedAt: now,
-	}
-	if !needsApproval {
-		// The request id is the assignment id there, so the two are joined by
-		// construction and a racing duplicate collides instead of doubling.
-		scope := clients.Scope{PrincipalID: principalID, TenantID: tenantID, LegalEntityID: req.LegalEntityID, CorrelationID: req.CorrelationID}
-		id, err := g.admin.CreateRoleAssignment(r.Context(), a.RequestID, a.TargetPrincipalID, a.RoleDefinitionID, assignmentEntity(role, a.LegalEntityID), a.EffectiveFrom, a.EffectiveTo, scope)
-		if err != nil {
-			g.h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateAssignment, adminOutcome(err)).Inc()
-			fail(err)
-			return
-		}
-		g.h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateAssignment, telemetry.AdminOK).Inc()
-		a.Status, a.AuthzAssignmentID = domain.AssignmentProvisioned, id
-	}
-	created, err := g.store.CreateAssignmentRequest(r.Context(), a, principalID)
+	a, created, err := g.submitAssignment(r.Context(), tenantID, principalID, role, assignmentSpec{
+		target: req.TargetPrincipalID, legalEntityID: req.LegalEntityID, justification: req.Justification,
+		correlationID: req.CorrelationID, from: req.EffectiveFrom, to: req.EffectiveTo,
+	})
 	if err != nil {
 		fail(err)
 		return
@@ -736,6 +730,84 @@ func (g *Gov) RequestAssignment(w http.ResponseWriter, r *http.Request) {
 		g.count(op, telemetry.WriteCreated)
 		writeJSON(w, http.StatusAccepted, a)
 	}
+}
+
+// assignmentSpec is one subject's request: from the individual endpoint, or
+// one member's share of a group assignment's fan-out.
+type assignmentSpec struct {
+	target, legalEntityID, justification, correlationID string
+	groupAssignmentID                                   string
+	from                                                time.Time
+	to                                                  *time.Time
+}
+
+// submitAssignment runs the governed request pipeline for one subject: no
+// identical request pending, SoD-clean against what the subject already holds
+// in the entity (principal-aware /v1/sod/validate), risk-tiered approval,
+// provisioning when no independent approver is needed, and the record with
+// its event. A group fan-out runs it once per member, so membership never
+// bypasses any of it (§2 "never bypass policy", A20). created=false is a
+// replay of the correlation id.
+func (g *Gov) submitAssignment(ctx context.Context, tenantID, principalID string, role *domain.RoleDefinition, s assignmentSpec) (*domain.AssignmentRequest, bool, error) {
+	if pending, err := g.store.PendingAssignmentExists(ctx, s.target, role.RoleDefinitionID, s.legalEntityID); err != nil {
+		return nil, false, err
+	} else if pending {
+		return nil, false, domain.ErrAssignmentPending
+	}
+	actions, err := g.roleActions(ctx, role.RoleDefinitionID)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(actions) > 0 {
+		if err := g.h.sod.CheckConflict(ctx, domain.SoDCheckRequest{
+			TenantID: tenantID, CallerID: principalID, CorrelationID: s.correlationID, CandidateActions: actions,
+			SubjectPrincipalID: s.target, LegalEntityID: s.legalEntityID,
+		}); err != nil {
+			return nil, false, err
+		}
+	}
+	risk, drivers, err := g.h.roleRisk(ctx, actions)
+	if err != nil {
+		return nil, false, err
+	}
+	needsApproval, why := approvalPolicy(principalID, s.target, risk, drivers)
+
+	now := time.Now().UTC()
+	effective := s.from.UTC()
+	if s.from.IsZero() {
+		effective = now
+	}
+	var end *time.Time
+	if s.to != nil {
+		e := s.to.UTC()
+		end = &e
+	}
+	a := &domain.AssignmentRequest{
+		RequestID: uuid.NewString(), TenantID: tenantID, TargetPrincipalID: s.target,
+		RoleDefinitionID: role.RoleDefinitionID, LegalEntityID: s.legalEntityID, EffectiveFrom: effective, EffectiveTo: end,
+		Justification: s.justification, RiskTier: risk, ApprovalRequired: needsApproval, ApprovalReason: why,
+		Status: domain.AssignmentPendingApproval, RequestedByPrincipalID: principalID,
+		CorrelationID: s.correlationID, CreatedAt: now, UpdatedAt: now, GroupAssignmentID: s.groupAssignmentID,
+	}
+	if !needsApproval {
+		// The request id is the assignment id there, so the two are joined by
+		// construction and a racing duplicate collides instead of doubling.
+		scope := clients.Scope{PrincipalID: principalID, TenantID: tenantID, LegalEntityID: s.legalEntityID, CorrelationID: s.correlationID,
+			ApprovalReference: a.RequestID, Purpose: s.justification}
+		id, err := g.admin.CreateRoleAssignment(ctx, a.RequestID, a.TargetPrincipalID, a.RoleDefinitionID, assignmentEntity(role, a.LegalEntityID), a.EffectiveFrom, a.EffectiveTo, scope)
+		if err != nil {
+			g.h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateAssignment, adminOutcome(err)).Inc()
+			g.withdrawPending(ctx, err, id, scope)
+			return nil, false, err
+		}
+		g.h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateAssignment, telemetry.AdminOK).Inc()
+		a.Status, a.AuthzAssignmentID = domain.AssignmentProvisioned, id
+	}
+	created, err := g.store.CreateAssignmentRequest(ctx, a, principalID)
+	if err != nil {
+		return nil, false, err
+	}
+	return a, created, nil
 }
 
 // assignmentEntity is the entity sent to authorization-svc: a TENANT-scoped
@@ -836,7 +908,8 @@ func (g *Gov) assignmentCommand(verb string) http.HandlerFunc {
 			fail(domain.ErrEntityMismatch)
 			return
 		}
-		scope := clients.Scope{PrincipalID: principalID, TenantID: tenantID, LegalEntityID: req.LegalEntityID, CorrelationID: req.CorrelationID}
+		scope := clients.Scope{PrincipalID: principalID, TenantID: tenantID, LegalEntityID: req.LegalEntityID, CorrelationID: req.CorrelationID,
+			Purpose: req.Reason, ApprovalReference: a.RequestID}
 
 		switch verb {
 		case "approve", "reject":
@@ -906,6 +979,7 @@ func (g *Gov) assignmentCommand(verb string) http.HandlerFunc {
 			id, err := g.admin.CreateRoleAssignment(r.Context(), a.RequestID, a.TargetPrincipalID, a.RoleDefinitionID, assignmentEntity(role, a.LegalEntityID), a.EffectiveFrom, a.EffectiveTo, scope)
 			if err != nil {
 				g.h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateAssignment, adminOutcome(err)).Inc()
+				g.withdrawPending(r.Context(), err, id, scope)
 				fail(err)
 				return
 			}
@@ -992,6 +1066,20 @@ func (g *Gov) assignmentCommand(verb string) http.HandlerFunc {
 	}
 }
 
+// withdrawPending ends an assignment authorization-svc parked PENDING_APPROVAL
+// (ErrAuthzApprovalPending), so a grant this service did not record as
+// provisioned cannot be approved into force later behind its back. Best
+// effort: the pending row also expires on its own after its window.
+func (g *Gov) withdrawPending(ctx context.Context, err error, assignmentID string, scope clients.Scope) {
+	if !errors.Is(err, domain.ErrAuthzApprovalPending) || assignmentID == "" {
+		return
+	}
+	scope.ReasonCode, scope.Purpose = "PROVISIONING_WITHDRAWN", "authorization-svc did not accept the provisioning principal as the independent approver"
+	if rerr := g.admin.RevokeRoleAssignment(ctx, assignmentID, scope); rerr != nil && !errors.Is(rerr, domain.ErrAuthzAssignmentAbsent) {
+		g.h.log.Warn("could not withdraw an assignment authorization-svc holds pending", zap.String("assignment_id", assignmentID), zap.Error(rerr))
+	}
+}
+
 // ── access review campaigns ─────────────────────────────────────────────────
 
 // CreateCampaign handles POST /v1/access-review-campaigns.
@@ -1044,69 +1132,78 @@ func (g *Gov) CreateCampaign(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	fail := func(err error) {
+	c, created, err := g.buildCampaign(r.Context(), tenantID, principalID, req, false)
+	if err != nil {
 		g.fail(w, r, op, tenantID, req.LegalEntityID, principalID, req.CorrelationID, err, req)
+		return
 	}
+	if created {
+		g.count(op, telemetry.WriteCreated)
+		writeJSON(w, http.StatusCreated, c)
+		return
+	}
+	g.count(op, telemetry.WriteReplayed)
+	writeJSON(w, http.StatusOK, c)
+}
 
-	if prior, err := g.store.FindCampaignByCorrelation(r.Context(), req.CorrelationID); err != nil {
-		fail(err)
-		return
+// buildCampaign snapshots the assignments a campaign covers, builds its items
+// and records it. Shared by POST /v1/access-review-campaigns and the HR-event
+// trigger (hrevents), which opens an EVENT_TRIGGERED review of one subject.
+// callerID is the principal the authorization-svc reads run as. created=false
+// is a replay of the correlation id. skipEmpty records nothing, and returns
+// (nil, false, nil), when no assignment matched: a leaver who held nothing
+// needs no review.
+func (g *Gov) buildCampaign(ctx context.Context, tenantID, callerID string, req domain.CreateCampaignRequest, skipEmpty bool) (*domain.ReviewCampaign, bool, error) {
+	if prior, err := g.store.FindCampaignByCorrelation(ctx, req.CorrelationID); err != nil {
+		return nil, false, err
 	} else if prior != nil {
-		full, err := g.store.GetCampaign(r.Context(), prior.CampaignID)
-		if err != nil {
-			fail(err)
-			return
-		}
-		g.count(op, telemetry.WriteReplayed)
-		writeJSON(w, http.StatusOK, full)
-		return
+		full, err := g.store.GetCampaign(ctx, prior.CampaignID)
+		return full, false, err
 	}
 
 	var roles []domain.RoleDefinition
 	if len(req.RoleDefinitionIDs) > 0 {
 		for _, id := range req.RoleDefinitionIDs {
-			role, err := g.h.store.GetRole(r.Context(), id)
+			role, err := g.h.store.GetRole(ctx, id)
 			if err != nil {
-				fail(err)
-				return
+				return nil, false, err
 			}
 			roles = append(roles, *role)
 		}
 	} else {
-		all, err := g.h.store.ListRoles(r.Context(), domain.ListFilter{})
+		all, err := g.h.store.ListRoles(ctx, domain.ListFilter{})
 		if err != nil {
-			fail(err)
-			return
+			return nil, false, err
 		}
 		roles = all
 	}
 
-	scope := clients.Scope{PrincipalID: principalID, TenantID: tenantID, LegalEntityID: req.LegalEntityID, CorrelationID: req.CorrelationID}
+	scope := clients.Scope{PrincipalID: callerID, TenantID: tenantID, LegalEntityID: req.LegalEntityID, CorrelationID: req.CorrelationID}
 	now := time.Now().UTC()
 	dormantBefore := now.AddDate(0, 0, -req.DormancyDays)
 	var items []domain.ReviewItem
 	for _, role := range roles {
-		actions, err := g.roleActions(r.Context(), role.RoleDefinitionID)
+		actions, err := g.roleActions(ctx, role.RoleDefinitionID)
 		if err != nil {
-			fail(err)
-			return
+			return nil, false, err
 		}
-		risk, _, err := g.h.roleRisk(r.Context(), actions)
+		risk, _, err := g.h.roleRisk(ctx, actions)
 		if err != nil {
-			fail(err)
-			return
+			return nil, false, err
 		}
 		if req.ReviewType == "PRIVILEGED" && domain.RiskRank(risk) < domain.RiskRank(domain.RiskHigh) {
 			continue
 		}
-		assignments, err := g.admin.ListRoleAssignments(r.Context(), role.RoleDefinitionID, scope)
+		assignments, err := g.admin.ListRoleAssignments(ctx, role.RoleDefinitionID, scope)
 		if err != nil {
 			g.h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminListAssignments, adminOutcome(err)).Inc()
-			fail(err)
-			return
+			return nil, false, err
 		}
 		g.h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminListAssignments, telemetry.AdminOK).Inc()
 		for _, as := range assignments {
+			if req.SubjectPrincipalID != "" && as.PrincipalID != req.SubjectPrincipalID {
+				continue
+			}
 			flags := []string{}
 			if role.Status != domain.RoleStatusActive {
 				flags = append(flags, domain.FlagOrphanedRole)
@@ -1114,8 +1211,7 @@ func (g *Gov) CreateCampaign(w http.ResponseWriter, r *http.Request) {
 			reviewer := req.DefaultReviewerPrincipalID
 			if as.PrincipalID == reviewer {
 				if req.EscalationReviewerPrincipalID == "" || req.EscalationReviewerPrincipalID == as.PrincipalID {
-					fail(domain.ErrEscalationReviewerReq)
-					return
+					return nil, false, domain.ErrEscalationReviewerReq
 				}
 				reviewer = req.EscalationReviewerPrincipalID
 				flags = append(flags, domain.FlagSelfReviewReassigned)
@@ -1151,32 +1247,27 @@ func (g *Gov) CreateCampaign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := g.flagToxicCombinations(r.Context(), tenantID, principalID, req.CorrelationID, items); err != nil {
-		fail(err)
-		return
+	if skipEmpty && len(items) == 0 {
+		return nil, false, nil
+	}
+	if err := g.flagToxicCombinations(ctx, tenantID, callerID, req.CorrelationID, items); err != nil {
+		return nil, false, err
 	}
 
 	c := &domain.ReviewCampaign{
 		CampaignID: uuid.NewString(), TenantID: tenantID, CampaignName: req.CampaignName, ReviewType: req.ReviewType,
 		TriggerReason: req.TriggerReason, LegalEntityID: req.LegalEntityID, DefaultReviewerPrincipalID: req.DefaultReviewerPrincipalID,
-		Status: domain.CampaignOpen, DueAt: req.DueAt.UTC(), DormancyDays: req.DormancyDays, CreatedByPrincipalID: principalID,
+		Status: domain.CampaignOpen, DueAt: req.DueAt.UTC(), DormancyDays: req.DormancyDays, CreatedByPrincipalID: callerID,
 		CorrelationID: req.CorrelationID, CreatedAt: now, UpdatedAt: now,
 	}
-	created, err := g.store.CreateCampaign(r.Context(), c, items, principalID)
+	created, err := g.store.CreateCampaign(ctx, c, items, callerID)
 	if err != nil {
-		fail(err)
-		return
+		return nil, false, err
 	}
 	if c.Items == nil {
 		c.Items = []domain.ReviewItem{}
 	}
-	if created {
-		g.count(op, telemetry.WriteCreated)
-		writeJSON(w, http.StatusCreated, c)
-		return
-	}
-	g.count(op, telemetry.WriteReplayed)
-	writeJSON(w, http.StatusOK, c)
+	return c, created, nil
 }
 
 // flagToxicCombinations asks the SoD engine whether a principal's reviewed
@@ -1413,7 +1504,13 @@ func (g *Gov) DecideReviewItem(w http.ResponseWriter, r *http.Request) {
 			fail(domain.ErrCampaignClosed)
 			return
 		}
-		scope := clients.Scope{PrincipalID: principalID, TenantID: tenantID, LegalEntityID: campaign.LegalEntityID, CorrelationID: req.CorrelationID}
+		executor := principalID
+		if g.servicePrincipalID != "" {
+			executor = g.servicePrincipalID
+		}
+		scope := clients.Scope{PrincipalID: executor, TenantID: tenantID, LegalEntityID: campaign.LegalEntityID, CorrelationID: req.CorrelationID,
+			ReasonCode: "ACCESS_REVIEW_REVOKE",
+			Purpose:    "access review " + campaignID + " item " + itemID + " decided REVOKE by " + principalID + ": " + req.Reason}
 		if err := g.admin.RevokeRoleAssignment(r.Context(), it.AuthzAssignmentID, scope); err != nil && !errors.Is(err, domain.ErrAuthzAssignmentAbsent) {
 			g.h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminRevokeAssignment, adminOutcome(err)).Inc()
 			fail(err)

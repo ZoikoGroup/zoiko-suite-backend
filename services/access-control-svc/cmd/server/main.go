@@ -33,6 +33,7 @@ import (
 	"zoiko.io/access-control-svc/internal/expiry"
 	"zoiko.io/access-control-svc/internal/handler"
 	"zoiko.io/access-control-svc/internal/health"
+	"zoiko.io/access-control-svc/internal/hrevents"
 	"zoiko.io/access-control-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/access-control-svc/internal/middleware"
 	"zoiko.io/access-control-svc/internal/mtls"
@@ -386,7 +387,11 @@ func main() {
 
 	h := handler.New(pgStore, authzClient, authzAdminClient, sodClient, protectedCatalogue, permissionTaxonomy, domainMetrics, log)
 	handler.RegisterRoutes(r, h)
-	handler.RegisterGovernanceRoutes(r, handler.NewGov(h, pgStore, authzAdminClient))
+	gov := handler.NewGov(h, pgStore, authzAdminClient)
+	gov.SetServicePrincipal(cfg.ServicePrincipalID)
+	gov.SetGroupStore(pgStore)
+	gov.SetSubjectLinks(pgStore, cfg.EventReviewReviewer, time.Duration(cfg.EventReviewDueDays)*24*time.Hour)
+	handler.RegisterGovernanceRoutes(r, gov)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	//
@@ -420,6 +425,33 @@ func main() {
 	// iam.assignment.revoked, so the sessions holding them end. Stopped with
 	// the relay; see internal/expiry.
 	go expiry.New(pgStore, domainMetrics, log).Run(relayCtx)
+
+	// ── 6d. Event-triggered reviews (S9-C2) ───────────────────────────────────
+	//
+	// HR lifecycle events open an EVENT_TRIGGERED review of the linked
+	// subject; see internal/hrevents. Off until a default reviewer is set: a
+	// review nobody is assigned to is not a control.
+	if cfg.EventReviewReviewer != "" {
+		hrReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers:     cfg.Kafka.Brokers,
+			GroupID:     cfg.HREventGroupID,
+			GroupTopics: cfg.HREventTopics,
+			StartOffset: kafka.FirstOffset,
+			// A nil ErrorLogger hides a consumer that cannot join its group
+			// behind one that looks idle.
+			ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
+				log.Warn(fmt.Sprintf("hr-events reader: "+msg, args...))
+			}),
+		})
+		defer hrReader.Close()
+		hr := hrevents.NewHandler(pgStore, gov, handler.IsTransient, log)
+		go hrevents.Run(relayCtx, hrReader, hr, log, func(outcome string) {
+			domainMetrics.HREvents.WithLabelValues(outcome).Inc()
+		})
+		log.Info("event-triggered reviews on", zap.Strings("topics", cfg.HREventTopics), zap.String("default_reviewer", cfg.EventReviewReviewer))
+	} else {
+		log.Warn("event-triggered reviews off: ACS_EVENT_REVIEW_DEFAULT_REVIEWER is not set")
+	}
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)

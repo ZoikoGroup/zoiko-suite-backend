@@ -318,6 +318,7 @@ type stubAssignAdmin struct {
 	revokeErr   error
 	creates     []assignCall
 	revokes     []string
+	revokeScope []clients.Scope
 	schedules   []scheduleCall
 	scheduleErr error
 	assignments map[string][]domain.AuthzAssignment // by role id
@@ -326,12 +327,15 @@ type stubAssignAdmin struct {
 func (a *stubAssignAdmin) CreateRoleAssignment(_ context.Context, id, principal, role, entity string, _ time.Time, end *time.Time, s clients.Scope) (string, error) {
 	a.creates = append(a.creates, assignCall{id, principal, role, entity, end, s})
 	if a.createErr != nil {
-		return "", a.createErr
+		// authorization-svc returns the id with a PENDING answer, as the
+		// real client does with ErrAuthzApprovalPending.
+		return id, a.createErr
 	}
 	return id, nil
 }
-func (a *stubAssignAdmin) RevokeRoleAssignment(_ context.Context, id string, _ clients.Scope) error {
+func (a *stubAssignAdmin) RevokeRoleAssignment(_ context.Context, id string, s clients.Scope) error {
 	a.revokes = append(a.revokes, id)
+	a.revokeScope = append(a.revokeScope, s)
 	return a.revokeErr
 }
 func (a *stubAssignAdmin) ScheduleRoleAssignmentEnd(_ context.Context, id string, at time.Time, _ clients.Scope) error {
@@ -365,6 +369,9 @@ type govRig struct {
 	asg   *stubAssignAdmin
 	sod   *stubSoD
 	tax   *stubTaxonomy
+	grp   *stubGroupStore
+	gv    *handler.Gov
+	links *stubLinkStore
 }
 
 func newGovRig() *govRig {
@@ -377,6 +384,7 @@ func newGovRig() *govRig {
 		tax:   &stubTaxonomy{risk: map[string]string{"payment.release": domain.RiskCritical}, protected: map[string]bool{"iam.assignment.grant": true}},
 	}
 	g.gov = newStubGovStore(g.base)
+	g.grp = newStubGroupStore(g.gov)
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -387,7 +395,13 @@ func newGovRig() *govRig {
 	h := handler.New(g.base, g.authz, g.admin, g.sod,
 		&stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "iam.assignment.grant"}}, g.tax, metrics, zap.NewNop())
 	handler.RegisterRoutes(r, h)
-	handler.RegisterGovernanceRoutes(r, handler.NewGov(h, g.gov, g.asg))
+	gv := handler.NewGov(h, g.gov, g.asg)
+	gv.SetServicePrincipal("svc-access-control")
+	gv.SetGroupStore(g.grp)
+	g.links = &stubLinkStore{links: map[string]*domain.SubjectLink{}}
+	gv.SetSubjectLinks(g.links, "sec-1", 0)
+	g.gv = gv
+	handler.RegisterGovernanceRoutes(r, gv)
 	g.r = r
 	return g
 }

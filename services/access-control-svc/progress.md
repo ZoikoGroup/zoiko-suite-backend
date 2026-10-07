@@ -407,3 +407,63 @@ scheduled revoke, paged list with usage and subject status). identity-context-sv
 (projects `effective_to`). `seed-demo-rbac.ps1` (the IAM admin bundle holds
 `iam.assignment.approve_privileged`). Migration **000013** is applied to the dev
 `access_control` database, and its down/up round trip has been checked.
+
+## 7 Oct 2026, fourth pass: the remaining gaps closed (S9-B, S9-C1, S9-C2, S9-1, S1-4)
+
+Worked together with authorization-svc's governance pass, whose 7 Oct changes
+(maker-checker, `reason_code` / `purpose`, granting-assignment attribution)
+this service now speaks to. Uncommitted at the time of writing.
+
+### Deploy order
+
+Migrations **000014** (groups) and **000015** (subject links) before this
+build: `assignment_requests` gains `group_assignment_id`, and every assignment
+read selects it. authorization-svc's 000020–000027 go first, as its
+progress.md says.
+
+### What changed
+
+| Gap | Fix |
+|---|---|
+| **S9-C1 group subjects** (the one ⚠️) | `iam_groups` / `iam_group_members` / `iam_group_assignments` (000014, FORCE RLS). `POST /v1/iam/groups`, `…/members`, `…/members/{p}:remove`, `…/assignments`, `/v1/iam/group-assignments/{id}:revoke` and `:sync`. A group assignment is never enforced as a group: it fans out to **one governed request per member** through `submitAssignment`, the pipeline extracted from `RequestAssignment`, so each member gets their own pending check, principal-aware SoD, risk-tiered approval and provisioning (§2 "never bypass policy", A20). Join fans out every ACTIVE group assignment; leave cancels or revokes the member's group-sourced requests before the membership closes; revoke ends every member's request first. Member correlation ids are deterministic per membership, so sync and retries replay instead of doubling. Every command is bound to the group's own entity (`entity_mismatch`). |
+| **S9-C2 event-triggered reviews** | `internal/hrevents` consumes `zoiko.employee.events` (employee-master-svc) and `zoiko.offboarding.events` (offboarding-severance-svc). The audit's "none published" was out of date; the real blocker was that no service maps an employee to a principal. That mapping is now **administered, never inferred**: `POST /v1/iam/subject-links` (000015, ROLE_MANAGE). A manager change (mover) or an exit (TERMINATED / RESIGNED / DEACTIVATED / INACTIVE / ARCHIVED, "contractor end" for a CONTRACTOR) opens an EVENT_TRIGGERED campaign of that subject's assignments only (`subject_principal_id`). It is created by the service identity and reviewed by the new or last manager when they are linked, else by `ACS_EVENT_REVIEW_DEFAULT_REVIEWER`. Idempotent on `"hr-" + event_id`; the second producer's `employee.terminated` opens nothing. Outages are retried before anything is recorded; refusals are final. Unlinked employees are counted (`access_control_hr_events_total{outcome="unlinked"}`). It opens reviews and never revokes. |
+| **S9-B service identity** | A review REVOKE executes as `ACS_SERVICE_PRINCIPAL_ID` (`svc-access-control`, seeded with `iam.assignment.revoke` + `iam.assignment.read` only). The reviewer and reason travel as the §16 purpose, with `reason_code ACCESS_REVIEW_REVOKE`. |
+| **authorization-svc contract** | Every retire / reactivate / revoke / end-date call sends `reason_code` + `purpose`; provisioning sends `approval_reference` = the request id. A grant authorization-svc parks `PENDING_APPROVAL` is withdrawn there and answered `409 authz_approval_pending`, never recorded as provisioned. |
+| **S9-1 DORMANT attribution** | authorization-svc records `matched_grants: ["assignment:<id>", …]` and attributes usage to the granting assignment, so one used role no longer marks the principal's other roles as used. |
+| **S1-4 event keys** | `iam.assignment.granted` / `.revoked` are both keyed by the authorization-svc assignment id (`assignmentKey`), so they land on one partition in order. The identity-context-svc tombstone is that service's change. |
+
+### Score (Authorization Standard §9, the 10 scored rows)
+
+| Row | 7 Oct third pass | Now |
+|---|---|---|
+| Access assignment | ⚠️ (groups only) | ✅ (group subjects, fanned out per member) |
+| Assignment review / attestation | ✅ | ✅ (+ event-triggered, + attributed dormancy) |
+| the other eight | ✅ | ✅ |
+| **Score** | **9/10 (90%, 95% weighted)** | **10/10 (100%, 100%)** |
+
+### Verified
+
+- Unit tests pass in golang:1.25-alpine. New: `groups_test.go` (7),
+  `subject_links_test.go` (4), `authz_contract_test.go` (3),
+  `hrevents/consumer_test.go` (9), `events/assignment_key_test.go`, and the
+  client contract test.
+- The store suite (`-tags=integration`, embedded Postgres 16, NOBYPASSRLS)
+  passes with 000014/000015 applied. 3 new: group isolation and membership
+  history, the group-assignment link, and subject-link observe.
+- Mutants killed: member SoD skipped, group entity binding removed, review
+  subject filter removed, observation recorded before the trigger.
+- openapi.yaml validates with openapi-spec-validator (35 paths). Every emitted
+  error code is in `ServiceErrorCode`; `authz_approval_pending` had been
+  missing. `audit.sh`'s code diff now reads groups.go and subject_links.go.
+  asyncapi.yaml documents the two consumed channels.
+
+### Still open — outside this service
+
+- **Employee links have to be recorded.** Until an employee is linked, their
+  HR events open nothing (by design). The right long-term owner of the
+  mapping is the identity plane (identity-context-svc or a directory/SCIM
+  feed).
+- **SCIM-provisioned groups**: `source = SCIM` is accepted, but there is no
+  SCIM feed yet.
+- identity-context-svc's revocation tombstone (S1-4, its side).
+- S9-D1: the 668 legacy action names are each owning service's to rename.

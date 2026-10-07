@@ -2028,6 +2028,24 @@ membership); event-triggered reviews start only when a caller asks, because no
 consumer of manager-change or contractor-end events exists yet; `DORMANT` counts
 a decision granted through several roles as use of each of them.
 
+## Gap closure, 7 October 2026 (fourth pass): all three closed
+
+| Gap | Closed by |
+|---|---|
+| S9-C1 group subjects | Groups, membership and group assignments (000014). A group assignment fans out to **one governed request per member**, through the same SoD, risk-tiered approval and provisioning as an individual request. A CRITICAL role goes to approval per member; a conflicting member is refused alone. Leave and revoke end the member grants. |
+| S9-C2 event-triggered reviews | The producers did exist (employee-master-svc `employee.updated` / `.status.changed` / `.terminated`; offboarding-severance-svc `employee.terminated`). What was missing was an employee-to-principal mapping, which is now administered (000015, `POST /v1/iam/subject-links`) and never inferred. A manager change or an exit of a linked employee opens an EVENT_TRIGGERED review of that subject only, reviewed by the manager when linked. |
+| S9-1 DORMANT attribution | authorization-svc records the granting assignment in `matched_grants`, and usage is attributed to it alone. |
+| S9-B | Review REVOKE is executed by the service identity `svc-access-control`, with the reviewer recorded in the purpose. |
+
+| | Full match | Weighted |
+|---|---|---|
+| 7 Oct third pass | 9 of 10 (90%) | 95% |
+| **7 Oct fourth pass** | **10 of 10 (100%)** | **100%** |
+
+**Verified:** unit tests pass (23 new). The store suite passes under NOBYPASSRLS with
+000014/000015 (3 new). Four mutants were killed. openapi.yaml validates (35 paths).
+Detail: `services/access-control-svc/progress.md`. Uncommitted.
+
 ---
 
 # Group 1 — overall

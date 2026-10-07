@@ -71,8 +71,8 @@ func TestAuthorityLimit_AmountWithinLimit_Allowed(t *testing.T) {
 	var resp domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected decision ALLOW for amount within limit, got %s", resp.Decision)
+	if resp.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected decision PERMIT for amount within limit, got %s", resp.Decision)
 	}
 }
 
@@ -183,8 +183,8 @@ func TestAuthorityLimit_BoundaryCondition_ExactlyAtLimit(t *testing.T) {
 
 	var resp1 domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w1.Body.Bytes(), &resp1)
-	if resp1.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected ALLOW when amount exactly equals upper limit, got %s", resp1.Decision)
+	if resp1.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected PERMIT when amount exactly equals upper limit, got %s", resp1.Decision)
 	}
 
 	// 2. Exactly at lower limit: 500.00 GBP -> ALLOWED (inclusive lower bound)
@@ -203,8 +203,8 @@ func TestAuthorityLimit_BoundaryCondition_ExactlyAtLimit(t *testing.T) {
 
 	var resp2 domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w2.Body.Bytes(), &resp2)
-	if resp2.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected ALLOW when amount exactly equals lower limit, got %s", resp2.Decision)
+	if resp2.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected PERMIT when amount exactly equals lower limit, got %s", resp2.Decision)
 	}
 }
 
@@ -467,8 +467,8 @@ func TestQuorum_DualApproval_Satisfied_Allowed(t *testing.T) {
 	var resp domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected ALLOW when quorum is satisfied, got %s (basis=%s)", resp.Decision, resp.Basis)
+	if resp.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected PERMIT when quorum is satisfied, got %s (basis=%s)", resp.Decision, resp.Basis)
 	}
 }
 
@@ -746,8 +746,8 @@ func TestScenarioA10_ApprovalFactsUnchanged_Allowed(t *testing.T) {
 	var resp domain.CanonicalDecisionResponse
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 
-	if resp.Decision != domain.CanonicalDecisionAllow {
-		t.Errorf("expected ALLOW when approval facts are unchanged, got %s (basis=%s)", resp.Decision, resp.Basis)
+	if resp.Decision != domain.CanonicalDecisionPermit {
+		t.Errorf("expected PERMIT when approval facts are unchanged, got %s (basis=%s)", resp.Decision, resp.Basis)
 	}
 }
 

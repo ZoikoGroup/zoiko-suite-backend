@@ -73,7 +73,8 @@ var decisionOutcomes = map[string]bool{"GRANTED": true, "DENIED": true}
 func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantScope, ok := h.requireTenant(w, r)
@@ -83,8 +84,30 @@ func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 
+	// Explanation access is restricted (GOV-03 "to prevent policy leakage";
+	// ZS-IAM-001 §25). The whole tenant's log — every denial's basis names
+	// the SoD rule or ABAC condition that fired — needs iam.policy.read.
+	// Without it a caller sees only their own decisions, explained by reason
+	// code, not by internal basis.
+	fullRead, err := h.holdsPermission(r, callerPrincipal, tenantScope, PermissionPolicyRead)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	requestedPrincipal := strings.TrimSpace(q.Get("principal_id"))
+	if !fullRead {
+		if requestedPrincipal != "" && requestedPrincipal != callerPrincipal {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error":   "authorization_denied",
+				"message": PermissionPolicyRead + " is required to read another principal's decisions",
+			})
+			return
+		}
+		requestedPrincipal = callerPrincipal
+	}
+
 	params := domain.ListAccessDecisionsParams{
-		PrincipalID:   strings.TrimSpace(q.Get("principal_id")),
+		PrincipalID:   requestedPrincipal,
 		Outcome:       strings.ToUpper(strings.TrimSpace(q.Get("decision_outcome"))),
 		ActionType:    strings.TrimSpace(q.Get("action_type")),
 		LegalEntityID: strings.TrimSpace(q.Get("legal_entity_id")),
@@ -182,7 +205,43 @@ func (h *Handler) ListAccessDecisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !fullRead {
+		for i := range page.Decisions {
+			redactDecision(&page.Decisions[i])
+		}
+	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+// PermissionPolicyRead is the Authorization Standard Appendix A permission
+// for reading authorization policy and the rationale behind decisions.
+const PermissionPolicyRead = "iam.policy.read"
+
+// redactedBasis replaces an internal decision basis for a reader who may see
+// that a decision was made and why in user terms (reason_codes), but not
+// which rule, role or condition produced it.
+const redactedBasis = "redacted"
+
+// redactDecision strips the policy internals from a decision for a reader
+// without iam.policy.read: the basis (which names SoD rules, ABAC conditions,
+// roles and delegators), the matched grants and the delegation reference.
+// Outcome, decision, reason codes and obligations — the user-actionable part —
+// stay.
+func redactDecision(d *domain.AccessDecisionLog) {
+	d.DecisionBasis = redactedBasis
+	d.MatchedGrants = []string{}
+	d.OnBehalfOf, d.DelegationID = "", ""
+}
+
+// holdsPermission reports whether principalID holds action in the tenant
+// scope, without recording a decision — it gates what a read may show, it
+// authorizes no material act.
+func (h *Handler) holdsPermission(r *http.Request, principalID, tenantID, action string) (bool, error) {
+	actions, _, err := h.store.FindGrantedActions(r.Context(), principalID, tenantID, tenantID)
+	if err != nil {
+		return false, err
+	}
+	return contains(actions, action), nil
 }
 
 // parseTimeParam reads an optional RFC3339 timestamp, writing a 400 and

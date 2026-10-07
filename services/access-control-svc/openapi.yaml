@@ -1108,6 +1108,359 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthenticated' }
 
+  /v1/iam/groups/:
+    get:
+      tags: [groups]
+      summary: Groups in this tenant (§2)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: By group_code.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Group' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [groups]
+      summary: Create a group (§2 "administrative collection of subjects; may be SCIM-provisioned")
+      description: ROLE_MANAGE on legal_entity_id, which becomes the group's administering entity.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateGroupRequest' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '200':
+          description: A replay of this `correlation_id`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/groups/{group_id}:
+    parameters:
+      - { name: group_id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [groups]
+      summary: One group with its live members
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: The group.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/iam/groups/{group_id}/members:
+    parameters:
+      - { name: group_id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [groups]
+      summary: Add a member; fans every ACTIVE group assignment out to them
+      description: |
+        Each ACTIVE group assignment becomes one governed assignment request
+        for the new member, through the individual pipeline (pending check,
+        principal-aware SoD, risk-tiered approval, provisioning). A refusal for
+        one assignment is reported in its outcome and does not undo the join.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GroupMemberRequest' }
+      responses:
+        '201':
+          description: Joined; one outcome per ACTIVE group assignment.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  member: { $ref: '#/components/schemas/GroupMember' }
+                  assignments:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        group_assignment_id: { type: string, format: uuid }
+                        outcome: { $ref: '#/components/schemas/GroupMemberOutcome' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/groups/{group_id}/members/{principal_id}:remove:
+    parameters:
+      - { name: group_id, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: principal_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [groups]
+      summary: Remove a member; ends what membership gave them
+      description: |
+        The member's group-sourced requests are ended first - pending ones
+        cancelled, provisioned ones revoked in authorization-svc and here -
+        and the membership closes only once all of them have. A failure leaves
+        a state the same call can finish. The slash form `/remove` is served too.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GroupMemberRequest' }
+      responses:
+        '200':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  group_id: { type: string, format: uuid }
+                  principal_id: { type: string }
+                  ended: { type: array, items: { $ref: '#/components/schemas/GroupMemberOutcome' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/groups/{group_id}/assignments:
+    parameters:
+      - { name: group_id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [groups]
+      summary: The group's assignments
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: Oldest first.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/GroupAssignment' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [groups]
+      summary: Assign a role to a group (§9 "subject/GROUP + role + scope + effective dates")
+      description: |
+        Never enforced as a group. Fans out to ONE governed assignment request
+        per live member, each with its own SoD check and risk-tiered approval;
+        a protected / CRITICAL role enters the approval path per member (A20),
+        and the requester's own membership needs an independent approver.
+        `members` carries each member's request or refusal.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateGroupAssignmentRequest' }
+      responses:
+        '201':
+          description: Recorded and fanned out.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '200':
+          description: A replay of this `correlation_id`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/group-assignments/{group_assignment_id}:
+    parameters:
+      - { name: group_assignment_id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [groups]
+      summary: One group assignment with the member requests it fanned out to
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: The group assignment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/iam/group-assignments/{group_assignment_id}:revoke:
+    parameters:
+      - { name: group_assignment_id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [groups]
+      summary: Revoke a group assignment; ends every member's request, then closes it
+      description: Requires `reason`. A second revoke is 409 group_assignment_revoked. The slash form `/revoke` is served too.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentDecisionRequest' }
+      responses:
+        '200':
+          description: Revoked; members lists what was ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/group-assignments/{group_assignment_id}:sync:
+    parameters:
+      - { name: group_assignment_id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [groups]
+      summary: Re-run the fan-out for every live member (idempotent)
+      description: Members already served replay; fills in a member a racing join or an outage missed. The slash form `/sync` is served too.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentDecisionRequest' }
+      responses:
+        '200':
+          description: Fanned out.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/subject-links:
+    get:
+      tags: [reviews]
+      summary: Employee-to-principal links HR events are resolved through (§24, S9-C2)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: By employee_id.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SubjectLink' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [reviews]
+      summary: Link an employee to the principal that holds their access
+      description: |
+        HR events (employee.updated, employee.status.changed,
+        employee.terminated) name employees; access is held by principals and
+        nothing on the estate maps one to the other. A linked employee's
+        manager change or exit opens an EVENT_TRIGGERED review of their
+        assignments; an unlinked one's is counted and skipped, never guessed.
+        Re-linking replaces the principal. ROLE_MANAGE on legal_entity_id.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LinkSubjectRequest' }
+      responses:
+        '200':
+          description: Linked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SubjectLink' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+
   /healthz:
     get:
       tags: [operations]
@@ -1492,6 +1845,10 @@ components:
         correlation_id: { type: string }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        group_assignment_id:
+          type: string
+          format: uuid
+          description: Set when the request is one member's share of a group assignment's fan-out.
 
     CreateAssignmentRequest:
       type: object
@@ -1592,6 +1949,7 @@ components:
         default_reviewer_principal_id: { type: string }
         escalation_reviewer_principal_id: { type: string }
         role_definition_ids: { type: array, items: { type: string, format: uuid } }
+        subject_principal_id: { type: string, description: 'Narrows the campaign to one subject (an EVENT_TRIGGERED review of a mover or leaver, §24).' }
         due_at: { type: string, format: date-time }
         dormancy_days: { type: integer, minimum: 1, maximum: 3650, default: 90, description: '§24 dormancy window (400 invalid_dormancy_days outside 1..3650).' }
         correlation_id: { type: string }
@@ -1618,6 +1976,111 @@ components:
       required: [legal_entity_id, correlation_id]
       properties:
         legal_entity_id: { type: string, format: uuid }
+        correlation_id: { type: string }
+
+    Group:
+      type: object
+      properties:
+        group_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string, description: The entity whose ROLE_MANAGE holders administer the group. }
+        group_code: { type: string }
+        group_name: { type: string }
+        status: { type: string, enum: [ACTIVE, RETIRED] }
+        source: { type: string, enum: [MANUAL, SCIM] }
+        created_by_principal_id: { type: string }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        members: { type: array, items: { $ref: '#/components/schemas/GroupMember' } }
+
+    GroupMember:
+      type: object
+      properties:
+        principal_id: { type: string }
+        added_by_principal_id: { type: string }
+        added_at: { type: string, format: date-time }
+
+    CreateGroupRequest:
+      type: object
+      required: [legal_entity_id, group_code, group_name, correlation_id]
+      properties:
+        legal_entity_id: { type: string }
+        group_code: { type: string }
+        group_name: { type: string }
+        source: { type: string, enum: [MANUAL, SCIM], default: MANUAL }
+        correlation_id: { type: string }
+
+    GroupMemberRequest:
+      type: object
+      required: [legal_entity_id, correlation_id]
+      properties:
+        legal_entity_id: { type: string, description: Must be the group's own entity (400 entity_mismatch). }
+        principal_id: { type: string, description: Required to add a member. }
+        reason: { type: string, description: Required to remove a member. }
+        correlation_id: { type: string }
+
+    GroupMemberOutcome:
+      type: object
+      description: What a fan-out did for one member - its request, or the code it was refused with.
+      properties:
+        principal_id: { type: string }
+        request_id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/AssignmentStatus' }
+        error: { $ref: '#/components/schemas/ServiceErrorCode' }
+
+    GroupAssignment:
+      type: object
+      properties:
+        group_assignment_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        group_id: { type: string, format: uuid }
+        role_definition_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        justification: { type: string }
+        status: { type: string, enum: [ACTIVE, REVOKED] }
+        created_by_principal_id: { type: string }
+        revoked_by_principal_id: { type: string }
+        revocation_reason: { type: string }
+        revoked_at: { type: string, format: date-time }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        members: { type: array, items: { $ref: '#/components/schemas/GroupMemberOutcome' } }
+
+    CreateGroupAssignmentRequest:
+      type: object
+      required: [legal_entity_id, role_definition_id, justification, correlation_id]
+      properties:
+        legal_entity_id: { type: string, description: Must be the group's own entity. }
+        role_definition_id: { type: string, format: uuid }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        justification: { type: string }
+        correlation_id: { type: string }
+
+    SubjectLink:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        employee_id: { type: string }
+        principal_id: { type: string }
+        legal_entity_id: { type: string }
+        last_manager_employee_id: { type: string, description: The manager last seen on an HR event. }
+        last_status: { type: string, description: The employment status last seen on an HR event. }
+        linked_by_principal_id: { type: string }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    LinkSubjectRequest:
+      type: object
+      required: [legal_entity_id, employee_id, principal_id, correlation_id]
+      properties:
+        legal_entity_id: { type: string }
+        employee_id: { type: string }
+        principal_id: { type: string }
         correlation_id: { type: string }
 
     ServiceErrorCode:
@@ -1685,6 +2148,13 @@ components:
         - ends_sooner               # a scheduled revoke later than the assignment's existing end
         - assignment_window_elapsed # approving a request whose end date has passed
         - security_approval_required  # a CRITICAL request's approver lacks iam.assignment.approve_privileged
+        - authz_approval_pending    # authorization-svc parked the grant PENDING its own approval; withdrawn there, not provisioned here
+        # Groups (§2, §9).
+        - group_code_exists
+        - group_retired
+        - member_exists             # the principal is already a live member
+        - group_assignment_revoked  # the group assignment is already revoked
+        - invalid_source            # source must be MANUAL or SCIM
         # Access reviews (§24).
         - invalid_review_type
         - missing_trigger_reason
@@ -1795,7 +2265,8 @@ components:
         `not_template_role`, `template_deprecated`, `template_bundle_detached`,
         `role_retired`, `assignment_pending`, `invalid_state`, `already_decided`,
         `campaign_closed`, `unresolved_high_risk`, `assignment_absent`,
-        `ends_sooner`, `assignment_window_elapsed`,
+        `ends_sooner`, `assignment_window_elapsed`, `authz_approval_pending`,
+        `group_code_exists`, `group_retired`, `member_exists`, `group_assignment_revoked`,
         `IDEMPOTENCY_MISMATCH`, `IDEMPOTENCY_IN_FLIGHT`.
       content:
         application/json:

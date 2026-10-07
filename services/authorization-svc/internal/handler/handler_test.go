@@ -37,6 +37,16 @@ type stubStore struct {
 	setActiveErr    error
 	setActiveCalls  int
 	setActiveWanted []bool
+	// gotExpectedVersion is the expected_version SetRoleActive was given.
+	gotExpectedVersion int64
+	// entityStatus is FindEntityStatus's answer ("" = nothing projected).
+	entityStatus    string
+	entityStatusErr error
+	// FindDelegationSource's answer for a delegated grant.
+	delegationSourceDelegator string
+	delegationSourceID        string
+	// FindGrantingAssignments' answer for an RBAC grant.
+	granting []domain.GrantingAssignment
 
 	bundle        *domain.PermissionBundle
 	bundleCreated bool
@@ -52,11 +62,27 @@ type stubStore struct {
 	bundleActiveWant   []bool
 	bundleActiveID     string
 	bundleActiveTenant string
+	// FindPermissionBundleByID's result. Nil synthesizes a bundle on role
+	// "r-1", so reactivation tests that predate the own-role check still reach
+	// SetPermissionBundleActive.
+	findBundle    *domain.PermissionBundle
+	findBundleErr error
 
 	assignment      *domain.PrincipalRoleAssignment
 	assignmentErr   error
 	revokedAssign   *domain.PrincipalRoleAssignment
 	revokeAssignErr error
+	// FindRoleAssignmentByID's result. Nil synthesizes an entity-less
+	// assignment, so revoke tests that predate the platform-scope check still
+	// reach RevokeRoleAssignment.
+	findAssignment    *domain.PrincipalRoleAssignment
+	findAssignmentErr error
+
+	// Maker-checker.
+	gotCreateAssignment domain.CreateRoleAssignmentParams
+	gotDecision         string
+	gotDecider          string
+	decideErr           error
 
 	delegation    *domain.DelegatedAuthority
 	delegationErr error
@@ -227,7 +253,8 @@ func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*d
 func (s *stubStore) FindRoleByID(_ context.Context, _ string) (*domain.Role, error) {
 	return s.role, s.findRoleErr
 }
-func (s *stubStore) SetRoleActive(_ context.Context, _, _ string, active bool) (*domain.Role, error) {
+func (s *stubStore) SetRoleActive(_ context.Context, _, _ string, active bool, expectedVersion int64) (*domain.Role, error) {
+	s.gotExpectedVersion = expectedVersion
 	s.setActiveCalls++
 	s.setActiveWanted = append(s.setActiveWanted, active)
 	return s.setActiveRole, s.setActiveErr
@@ -239,14 +266,45 @@ func (s *stubStore) ListPermissionBundles(_ context.Context, roleID, tenantID st
 	s.bundlesRoleID, s.bundlesTenantID = roleID, tenantID
 	return s.bundles, s.bundlesErr
 }
-func (s *stubStore) SetPermissionBundleActive(_ context.Context, bundleID, tenantID string, active bool) (*domain.PermissionBundle, error) {
+func (s *stubStore) SetPermissionBundleActive(_ context.Context, bundleID, tenantID string, active bool, _ int64) (*domain.PermissionBundle, error) {
 	s.bundleActiveCalls++
 	s.bundleActiveWant = append(s.bundleActiveWant, active)
 	s.bundleActiveID, s.bundleActiveTenant = bundleID, tenantID
 	return s.bundleActive, s.bundleActiveErr
 }
-func (s *stubStore) CreateRoleAssignment(_ context.Context, _ domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
+func (s *stubStore) FindPermissionBundleByID(_ context.Context, bundleID, _ string) (*domain.PermissionBundle, error) {
+	if s.findBundleErr != nil {
+		return nil, s.findBundleErr
+	}
+	if s.findBundle != nil {
+		return s.findBundle, nil
+	}
+	return &domain.PermissionBundle{PermissionBundleID: bundleID, RoleID: "r-1"}, nil
+}
+func (s *stubStore) FindRoleAssignmentByID(_ context.Context, assignmentID, _ string) (*domain.PrincipalRoleAssignment, error) {
+	if s.findAssignmentErr != nil {
+		return nil, s.findAssignmentErr
+	}
+	if s.findAssignment != nil {
+		return s.findAssignment, nil
+	}
+	return &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: assignmentID, RoleID: "r-1"}, nil
+}
+func (s *stubStore) CreateRoleAssignment(_ context.Context, p domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
+	s.gotCreateAssignment = p
+	if s.assignment != nil && p.ApprovalStatus != "" {
+		a := *s.assignment
+		a.ApprovalStatus = p.ApprovalStatus
+		return &a, s.assignmentErr
+	}
 	return s.assignment, s.assignmentErr
+}
+func (s *stubStore) DecideRoleAssignment(_ context.Context, id, _, decision, decider string) (*domain.PrincipalRoleAssignment, error) {
+	s.gotDecision, s.gotDecider = decision, decider
+	if s.decideErr != nil {
+		return nil, s.decideErr
+	}
+	return &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: id, ApprovalStatus: decision}, nil
 }
 func (s *stubStore) RevokeRoleAssignment(_ context.Context, _, _ string) (*domain.PrincipalRoleAssignment, error) {
 	return s.revokedAssign, s.revokeAssignErr
@@ -272,7 +330,7 @@ func (s *stubStore) ListRoleAssignments(_ context.Context, tenantID, principalID
 	return s.listAssignments, nil
 }
 
-func (s *stubStore) SetSoDRuleActive(_ context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error) {
+func (s *stubStore) SetSoDRuleActive(_ context.Context, sodRuleID, tenantID string, active bool, _ int64) (*domain.SoDRule, error) {
 	s.gotSoDActiveID = sodRuleID
 	s.gotSoDActiveTenant = tenantID
 	s.gotSoDActiveValue = active
@@ -316,9 +374,10 @@ func (s *stubStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleParam
 // stubAdminActions are the administration permissions requirePermission
 // checks on the /v1/admin/* routes.
 var stubAdminActions = []string{
-	"iam.abac_rule.manage", "iam.assignment.grant", "iam.assignment.revoke", "iam.break_glass.manage",
+	"iam.abac_rule.manage", "iam.assignment.grant", "iam.assignment.read", "iam.assignment.revoke", "iam.policy.read", "iam.break_glass.manage",
 	"iam.delegation.grant", "iam.delegation.revoke", "iam.pam.manage", "iam.permission_bundle.manage",
 	"iam.role.manage", "iam.sod_rule.manage", "iam.support.manage",
+	"iam.role.read", "iam.delegation.read", "iam.sod_rule.read",
 }
 
 // FindGrantedActions returns the seeded RBAC actions. requirePermission asks
@@ -365,7 +424,7 @@ func (s *stubStore) CreateABACRule(_ context.Context, params domain.CreateABACRu
 	return s.abacRule, s.abacRuleErr
 }
 
-func (s *stubStore) SetABACRuleActive(_ context.Context, _, _ string, active bool) (*domain.ABACRule, error) {
+func (s *stubStore) SetABACRuleActive(_ context.Context, _, _ string, active bool, _ int64) (*domain.ABACRule, error) {
 	s.setABACActiveWant = append(s.setABACActiveWant, active)
 	return s.setABACActiveRule, s.setABACActiveErr
 }
@@ -379,12 +438,22 @@ func (s *stubStore) ListABACRules(_ context.Context, tenantID, actionType string
 	return s.listABACRules, nil
 }
 
+func (s *stubStore) FindGrantingAssignments(_ context.Context, _, _, _, _, _, _ string) ([]domain.GrantingAssignment, error) {
+	return s.granting, nil
+}
+func (s *stubStore) FindDelegationSource(_ context.Context, _, _, _, _, _, _ string) (string, string, error) {
+	return s.delegationSourceDelegator, s.delegationSourceID, nil
+}
+func (s *stubStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) {
+	return s.entityStatus, s.entityStatusErr
+}
 func (s *stubStore) RecordAccessDecision(_ context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
 	s.recordedParams = params
 	if s.decision != nil {
 		return s.decision, s.recordErr
 	}
-	return &domain.AccessDecisionLog{AccessDecisionID: "d-1", DecisionOutcome: "GRANTED", DecisionBasis: "test"}, s.recordErr
+	return &domain.AccessDecisionLog{AccessDecisionID: "d-1", DecisionOutcome: params.Outcome, DecisionBasis: params.Basis,
+		PolicySetVersion: "cfg.42", ExpiresAt: params.ExpiresAt}, s.recordErr
 }
 func (s *stubStore) FindAccessDecisionByID(_ context.Context, _, _ string) (*domain.AccessDecisionLog, error) {
 	return s.findDecision, s.findDecisionErr

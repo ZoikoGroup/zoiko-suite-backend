@@ -386,7 +386,7 @@ const assignmentColumns = `
 	justification, risk_tier, approval_required, approval_reason, status, requested_by_principal_id,
 	COALESCE(decided_by_principal_id, ''), COALESCE(decision_reason, ''), decided_at,
 	COALESCE(authz_assignment_id::text, ''), COALESCE(revoked_by_principal_id, ''), COALESCE(revocation_reason, ''),
-	revoked_at, correlation_id, created_at, updated_at, effective_to
+	revoked_at, correlation_id, created_at, updated_at, effective_to, COALESCE(group_assignment_id::text, '')
 `
 
 func scanAssignment(row pgx.Row, a *domain.AssignmentRequest) error {
@@ -394,7 +394,7 @@ func scanAssignment(row pgx.Row, a *domain.AssignmentRequest) error {
 		&a.Justification, &a.RiskTier, &a.ApprovalRequired, &a.ApprovalReason, &a.Status, &a.RequestedByPrincipalID,
 		&a.DecidedByPrincipalID, &a.DecisionReason, &a.DecidedAt,
 		&a.AuthzAssignmentID, &a.RevokedByPrincipalID, &a.RevocationReason,
-		&a.RevokedAt, &a.CorrelationID, &a.CreatedAt, &a.UpdatedAt, &a.EffectiveTo)
+		&a.RevokedAt, &a.CorrelationID, &a.CreatedAt, &a.UpdatedAt, &a.EffectiveTo, &a.GroupAssignmentID)
 }
 
 func nullable(s string) any {
@@ -459,12 +459,12 @@ func (s *PgStore) CreateAssignmentRequest(ctx context.Context, a *domain.Assignm
 			INSERT INTO assignment_requests (
 				request_id, tenant_id, target_principal_id, role_definition_id, legal_entity_id, effective_from,
 				justification, risk_tier, approval_required, approval_reason, status, requested_by_principal_id,
-				authz_assignment_id, correlation_id, created_at, updated_at, effective_to
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+				authz_assignment_id, correlation_id, created_at, updated_at, effective_to, group_assignment_id
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 			ON CONFLICT (tenant_id, correlation_id) DO NOTHING`,
 			a.RequestID, tenantID, a.TargetPrincipalID, a.RoleDefinitionID, a.LegalEntityID, a.EffectiveFrom,
 			a.Justification, a.RiskTier, a.ApprovalRequired, a.ApprovalReason, a.Status, a.RequestedByPrincipalID,
-			nullable(a.AuthzAssignmentID), a.CorrelationID, a.CreatedAt, a.UpdatedAt, a.EffectiveTo)
+			nullable(a.AuthzAssignmentID), a.CorrelationID, a.CreatedAt, a.UpdatedAt, a.EffectiveTo, nullable(a.GroupAssignmentID))
 		if err != nil {
 			return err
 		}

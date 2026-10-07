@@ -27,6 +27,10 @@ type LifecycleProjector interface {
 	// cache.Store.InvalidateGrantSourcesForTenant for why a consumer is the
 	// right caller for it.
 	InvalidateGrantSourcesForTenant(tenantID string)
+
+	// ProjectEntityStatus records an entity's standing, which /v1/authorize
+	// evaluates as a negative control (SUSPENDED / DISSOLVED deny).
+	ProjectEntityStatus(ctx context.Context, params domain.ProjectEntityStatusParams) error
 }
 
 // LifecycleConsumer consumes the three §8.3 event concepts that were recorded
@@ -237,6 +241,17 @@ func (c *LifecycleConsumer) claim(eventID string) bool {
 	return true
 }
 
+// release forgets eventID, so a message whose apply failed is applied when it
+// is retried rather than skipped as already handled.
+func (c *LifecycleConsumer) release(eventID string) {
+	if eventID == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.seen, eventID)
+	c.mu.Unlock()
+}
+
 // Run consumes until ctx is cancelled.
 //
 // A broker that is absent or unreachable must NOT stop the service, for the
@@ -270,11 +285,9 @@ func (c *LifecycleConsumer) Run(ctx context.Context, reader *kafka.Reader) {
 			}
 			continue
 		}
-		if err := c.Handle(ctx, msg.Value); err != nil {
-			// Handle returned an error (only for critical DB failures).
-			// We still commit to avoid blocking the partition, but log loudly.
-			c.log.Error("lifecycle event: handle failed — committing offset to avoid stall",
-				zap.Error(err), zap.String("event_id", string(msg.Key)))
+		if !applyUntilDone(ctx, c.log, string(msg.Key), func() error { return c.Handle(ctx, msg.Value) }) {
+			c.log.Info("lifecycle consumer stopping with an unapplied message — not committed, so it is redelivered")
+			return
 		}
 		if err := reader.CommitMessages(ctx, msg); err != nil {
 			c.log.Error("failed to commit offset", zap.Error(err))
@@ -315,9 +328,65 @@ func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) error {
 	}
 
 	if isStatus {
-		return c.handlePrincipalStatus(ctx, env)
+		err := c.handlePrincipalStatus(ctx, env)
+		if err != nil {
+			// Released so the retry in Run applies it rather than skipping it.
+			c.release(env.EventID)
+		}
+		return err
+	}
+	if env.EventType == "entity.status.changed" {
+		if err := c.handleEntityStatus(ctx, env); err != nil {
+			c.release(env.EventID)
+			return err
+		}
 	}
 	c.handleInvalidation(env)
+	return nil
+}
+
+// entityStatusPayload is tenant-entity-registry-svc's entity.status.changed.
+type entityStatusPayload struct {
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	NewStatus     string `json:"new_status"`
+}
+
+// handleEntityStatus projects an entity's standing. Until this existed the
+// event only invalidated the cache, so a DISSOLVED entity stayed one anybody
+// holding a grant could act in. A failed write is returned so Run retries it:
+// losing a dissolution would leave the entity operational indefinitely.
+func (c *LifecycleConsumer) handleEntityStatus(ctx context.Context, env inbound) error {
+	var p entityStatusPayload
+	if err := json.Unmarshal(env.Payload, &p); err != nil {
+		c.log.Error("entity status event: undecodable payload — skipped", zap.String("event_id", env.EventID), zap.Error(err))
+		return nil
+	}
+	tenantID := strings.TrimSpace(p.TenantID)
+	if tenantID == "" {
+		tenantID = strings.TrimSpace(env.TenantID)
+	}
+	entityID := strings.TrimSpace(p.LegalEntityID)
+	if entityID == "" {
+		entityID = strings.TrimSpace(env.LegalEntityID)
+	}
+	status := strings.ToUpper(strings.TrimSpace(p.NewStatus))
+	if tenantID == "" || entityID == "" || status == "" {
+		c.log.Error("entity status event: missing tenant, entity or status — skipped", zap.String("event_id", env.EventID))
+		return nil
+	}
+	at := time.Now().UTC()
+	if env.EffectiveAt != nil && !env.EffectiveAt.IsZero() {
+		at = env.EffectiveAt.UTC()
+	}
+	if err := c.store.ProjectEntityStatus(ctx, domain.ProjectEntityStatusParams{
+		LegalEntityID: entityID, TenantID: tenantID, Status: status, StatusChangedAt: at,
+	}); err != nil {
+		c.log.Error("entity status event: projection failed — the entity's standing is unchanged until it is replayed",
+			zap.String("event_id", env.EventID), zap.String("legal_entity_id", entityID), zap.Error(err))
+		return err
+	}
+	c.log.Info("entity status projected", zap.String("legal_entity_id", entityID), zap.String("status", status))
 	return nil
 }
 
