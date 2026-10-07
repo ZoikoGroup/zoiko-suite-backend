@@ -419,7 +419,7 @@ as the table owner (a future regression, manual psql access, etc). Worth doing, 
 | 29 | contract-lifecycle-svc | Not Started |
 | 30 | corporate-actions-svc | Not Started |
 | 31 | corporate-tax-svc | Not Started |
-| 32 | counterparty-management-svc | Not Started |
+| 32 | counterparty-management-svc | Done |
 | 33 | decision-support-svc | Not Started |
 | 34 | employee-master-svc | Not Started |
 | 35 | employment-contracts-svc | Not Started |
