@@ -1,6 +1,6 @@
 # Group 1 — Identity, Scope & Foundation: documentation-compliance audit
 
-**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026, re-audited and six further defects fixed 5 October 2026, in-service gaps closed and full matrix scored 6 October 2026; delegated-authority-svc independently re-audited in two passes and seven defects fixed 6 October 2026; access-control-svc re-audited, two regressions and five gaps fixed 6 October 2026, and its unbuilt §5/§9/§24 scope built the same day)
+**Date:** 23 September 2026 (identity-context-svc re-audited 28 September 2026; tenant-entity-registry-svc re-audited live 29 September 2026; configuration-feature-flag-svc remediated 29 September 2026; secret-vault-integration-svc remediated 29 September 2026; gateway-auth-svc remediated and re-audited 29 September 2026; search-indexer-svc remediated, re-audited live and remediated again 30 September 2026; notification-svc remediated and verified live 30 September 2026, re-audited and six further defects fixed 5 October 2026, in-service gaps closed and full matrix scored 6 October 2026; delegated-authority-svc independently re-audited in two passes and seven defects fixed 6 October 2026; access-control-svc re-audited, two regressions and five gaps fixed 6 October 2026, and its unbuilt §5/§9/§24 scope built the same day; **all nine re-audited 7 October 2026, six findings, not yet fixed: see "Group 1 re-audit, 7 October 2026" at the end; every open gap, grouped by what it waits on, is in "07/10 re-audit gaps" after it**)
 **Scope:** all nine services of Group 1, audited one at a time.
 **Source of truth:** the original `.docx` specifications in `docs/architecture/`, **not** the
 per-service `openapi.yaml` / `asyncapi.yaml` artefacts. This is deliberate: auditing code
@@ -16,13 +16,13 @@ diff the two → report. Anything ambiguous in the documents is flagged **needs 
 
 | # | Service | Port | Spec audited against | Full match | Weighted |
 |---|---|---|---|---|---|
-| 1 | identity-context-svc | 8080 | GOV-01 §4 | **95%** (was 73%) | **97%** (was 82%) |
+| 1 | identity-context-svc | 8080 | GOV-01 §4 | **86%** on 7 Oct re-audit (95% on 28 Sep; was 73%) | **92%** (97% on 28 Sep; was 82%) |
 | 2 | tenant-entity-registry-svc | 8081 | ORG-02 + ORG-03 | **98%** (was 75%) | **99%** (was 80%) |
-| 3 | configuration-feature-flag-svc | 8086 | ZS-SVC-AA-001 (CFG-01…05) | **96%** (was 12%) | **98%** (was 19%) |
+| 3 | configuration-feature-flag-svc | 8086 | ZS-SVC-AA-001 (CFG-01…05) | **94%** on 7 Oct re-audit (96% on 29 Sep; was 12%) | **97%** (98% on 29 Sep; was 19%) |
 | 4 | secret-vault-integration-svc | 8087 | Security Standard §13, §9, §3.1 | **86%** (was 40%) | **93%** (was 52%) |
 | 5 | gateway-auth-svc | 8092 | Security §8 + GOV-01 ingress | **95%** (was 68%; 82% at re-audit) | **98%** (was 80%) |
 | 6 | search-indexer-svc | 8096 | ZS-SVC-AB-001 (ESR-01…05) | **96%** (was 86% recounted; published 90%) | **98%** (was 90%; published 93%) |
-| 7 | notification-svc | 8133 | ZS-SVC-Y-001 (NCD-01…05) | **95%** (was 12%; 81% on 5 Oct re-audit of 43 rows, 95% after fixes; full spec matrix of 110 rows scored 6 Oct: **86%**) | **97%** (was 19%; 98% on 43 rows after fixes; 110-row matrix **92%**) |
+| 7 | notification-svc | 8133 | ZS-SVC-Y-001 (NCD-01…05) | **92%** on 7 Oct re-audit, 34 of 37; 110-row matrix 85% (95% on 30 Sep; was 12%; 81% on 5 Oct re-audit of 43 rows, 95% after fixes; full spec matrix of 110 rows scored 6 Oct: **86%**) | **97%** (was 19%; 98% on 43 rows after fixes; 110-row matrix **92%**) |
 | 8 | delegated-authority-svc | 8136 | ORG-06 (delegation half) | **100%** (23 table rows; was 62% published, 48% recounted; 6 Oct re-audit found 83% in fact, 100% after fixes) | **100%** (was 69%; 57% recounted; 91% on 6 Oct re-audit before fixes) |
 | 9 | access-control-svc | 8137 | Authorization Standard §9 | **90%** (was 20% after the first 6 Oct pass; published 18% on 11; 10% recounted on its 10 rows) | **95%** (was 35%; 23% published; 20% recounted) |
 
@@ -2054,6 +2054,10 @@ one service (95%). Service 9 was the weakest until 6 Oct; its templates, archety
 attestation are now built (90%), and its one partial row waits on authorization-svc's admin API
 (group subjects, grant-time end dates).
 
+> **7 Oct re-audit:** the group total is now **283 of 303 (93.4%; 96.5% weighted)**. Services 1, 3 and
+> 7 each lost rows to self-asserted approvals or evidence gaps; the other six hold. See
+> "Group 1 re-audit, 7 October 2026" at the end of this document.
+
 ## The four findings that cross service boundaries
 
 1. **The governance envelope is unsanitized end to end.** The edge strips 8 `X-Zoiko-*` routing
@@ -2138,3 +2142,283 @@ Ranked by risk across all nine services:
   Resolved: implemented as a non-destructive merge (tenant-entity-registry-svc SPEC_DEVIATIONS.md).
 - ~~What do "hard isolation identifiers" (ORG-02) and "sensitive identifiers" (ORG-03) enumerate to?~~
   Resolved: enumerated in tenant-entity-registry-svc SPEC_DEVIATIONS.md.
+
+---
+
+# Group 1 re-audit, 7 October 2026: all nine services
+
+**Why:** services 1–6 had not been looked at since 28–30 Sep, and three later commits
+(5–6 Oct) changed identity-context-svc and search-indexer-svc after their audits. Each
+service was re-read against the same `.docx` sections as before, with no credit taken from
+earlier passes. Services 8 and 9 were re-audited on 6–7 Oct, so they got a targeted check
+rather than a full re-read.
+
+**How:** for each service:
+1. List the code changes since its last audit.
+2. Re-read its highest-risk rows.
+3. Check it against the three defect shapes this group keeps producing:
+   - approvals the requester asserts;
+   - state changes with no status guard;
+   - consumers that drop work on failure.
+
+Every finding below was reproduced before it was scored. Throwaway tests drove them through
+the real router or against Postgres 16, and the test files were deleted afterwards. **Nothing
+was fixed in this pass.**
+
+**Test evidence:**
+- `go vet` is clean on all nine services.
+- Every test package in all nine services passes: 0 fail and, with a database supplied,
+  0 skip.
+- Store suites ran against a throwaway Postgres 16: identity-context 59, tenant-registry 64,
+  configuration 79, vault 20, search-indexer 27, notification 145, delegated-authority 30
+  (with cmd/server), access-control 33 (embedded Postgres, `-tags=integration`).
+- Six packages that host Application Control blocked on every attempt were run in
+  `golang:1.25-alpine` instead: vault `inboundmtls`; notification `ledger`, `outbox`,
+  `actionlink`; search-indexer `config`; delegated-authority `store`.
+
+**Not run:** any live `audit.sh`, live Traefik request or live Kafka flow. Findings marked
+*code* were read from the source, not driven.
+
+## Scores
+
+| # | Service | Before (last audit) | **7 Oct** | What changed |
+|---|---|---|---|---|
+| 1 | identity-context-svc | 42/44: 95% (97% weighted) | **38/44: 86% (92%)** | 4 rows ✅ → ⚠️ (R-1, R-2, R-3) |
+| 2 | tenant-entity-registry-svc | 47/48: 98% (99%) | **47/48: 98% (99%)** | No change. No code change since its 29 Sep live audit. The approval path was re-read and holds |
+| 3 | configuration-feature-flag-svc | 47/49: 96% (98%) | **46/49: 94% (97%)** | `POST /changes` ✅ → ⚠️ (R-4, R-5) |
+| 4 | secret-vault-integration-svc | 18/21: 86% (93%) | **18/21: 86% (93%)** | No change. Break-glass approval is server-side (approver = verified creator of the exception; retriever ≠ approver). O-1/O-2 are still blocked: mtls-management-svc is unchanged |
+| 5 | gateway-auth-svc | 21/22: 95% (98%) | **21/22: 95% (98%)** | No change. Merges after 29 Sep touched the compose file and GTRM; the edge-contract tests (which read both files) and the GTRM compiler tests pass. No peer mTLS listener yet |
+| 6 | search-indexer-svc | 47/49: 96% (98%) | **47/49: 96% (98%)** | No service-code change. **New defect outside the rows: R-7** |
+| 7 | notification-svc | 35/37: 95% (97%) | **34/37: 92% (96%)** | `POST /recipient-resolution` ✅ → ⚠️ (R-6). On 43 rows: 40/43, 93% (97%). On the 110-row matrix: 93 met, 14 partial, 3 not met, 85% (91%) |
+| 8 | delegated-authority-svc | 23/23: 100% | **23/23: 100%** | No change. The lifecycle has a strict state machine plus `expected_version`, history and an outbox event in the same transaction |
+| 9 | access-control-svc | 9/10: 90% (95%) | **9/10: 90% (95%)** | No change. Review decisions refuse self-attestation and allow only the assigned reviewer |
+| | **Group** | **289/303: 95.4%** (296 weighted, 97.7%) | **283/303: 93.4%** (292.5 weighted, 96.5%) | |
+
+The group's previous weighted figure was published as "≈96%". Recomputed from the
+per-service rows, it was 97.7%. Both columns above use the recomputed basis.
+
+## Findings, ranked by risk
+
+### R-2 · identity-context-svc: the break-glass approver never approves (auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| AttachSupportContext (privileged) | §1: "independently approved"; §2 invariant 8 | `approver_principal_id` is a request-body field. Locally it is checked only for being non-empty and ≠ the grantee (`internal/context/support.go:156-161`) | ⚠️ (was ✅) | **Confirmed at the route.** A caller attaching a grant that names `principal-who-does-not-exist` as approver got **201**, and that name was stored as the approver. The person named is never asked, notified or required to act. Caller = approver passes the local code; the happy-path test `TestAttachSupportRoute_GrantsAndReturnsEvidence` does exactly that. Only the remote SoD call (`maker_is_checker`) stops it, and that call is the permit-all stand-in where `SOD_SERVICE_URL` is unset. tenant-entity-registry-svc's `approval_requests` (a different principal releases the request against its fingerprint) is the pattern to copy |
+
+### R-4 · configuration-feature-flag-svc: one principal can take a C3 change alone (auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| `POST /changes` → approve → activate | §8.1: C2 needs "WFC approval", C3 "segregated approval"; §10.1: "approvals" | Propose, approve and activate all authorize the same `governedAction("config", scope)`. `ApproveChange` (`internal/store/aa001_store.go:1992`) never compares the approver with `created_by_principal_id`. `approved_at` comes from the body (`internal/handler/handler.go:1687-1690`) | ⚠️ (was ✅) | **Confirmed on Postgres 16.** `maker-1` proposed a C3 change, approved it with `approved_at` set to 2020-01-01, and activated it: `PROPOSED → APPROVED → VERIFIED`, no error |
+
+### R-6 · notification-svc: the free-text legal-recipient exception is self-asserted (auth / data integrity)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| `POST /recipient-resolution`, NP-11, INV-15 | §5.2: "free-text endpoint input prohibited unless a **controlled exception** captures authority, verification and reviewer" | `exception_ref`, `verification_ref` and `reviewer_principal_id` are request strings, none of them looked up (`internal/ncd/recipients.go:59-67`). The endpoint is then marked `Verified = true`, `CONTROLLED_INPUT` | ⚠️ (was ✅; matrix rows NP-11 and INV-15 Met → Partial) | **Confirmed by the service's own test** on Postgres 16. `TestNCD02_FreeTextEndpointForRegulatedNeedsControlledException` passes `"EXC-1"`, `"VER-1"` and reviewer `"carol"`, none of which exist, and asserts acceptance. A caller can send a regulated or mandatory notice to any address by typing three strings. The service already has an exceptions register (`ncd_exceptions`) to check the reference against |
+
+### R-3 · identity-context-svc: a failed revocation is lost, not retried (auth)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| NP4 "cache invalidation removes stale privilege promptly"; invariant 10 "consumers assume at-least-once delivery" | at-least-once | `reader.ReadMessage` auto-commits the offset (`internal/events/consumer.go:242`). Each handler then claims the event id in Redis (`SETNX`, `:790`) **before** acting, and returns on a failed eviction without releasing the claim (e.g. `:384-395`) | ⚠️ (was ✅) | **Code.** A Postgres or Redis error during `EvictAllForPrincipal` leaves the offset committed and the event marked seen, so a redelivery is skipped too. The revoked principal keeps its live sessions until they expire. This affects every revocation handler (`authority.*`, `role.updated`, `iam.assignment.revoked`, `entity.updated`). It is the only Group 1 consumer built this way; search-indexer-svc uses `FetchMessage` and commits after the work |
+
+**Related (code, not driven):** `iam.assignment.granted` is keyed by request id, while a
+review-driven `iam.assignment.revoked` is keyed by the authorization-svc assignment id
+(`access-control-svc/internal/events/governance.go:67,93`), so the two can land on different
+partitions. If the revoke arrives first, `EndRoleAssignment` updates 0 rows. The late grant
+then inserts the projection with `effective_to = infinity`, so the next resolve frames the
+revoked role again.
+
+### R-5 · configuration-feature-flag-svc: approval rewrites a finished change's status (data integrity)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| Change lifecycle | §8: governed change path | `ApproveChange`'s `UPDATE config_changes SET status = …` has no status condition | ⚠️ (scored together with R-4) | **Confirmed on Postgres 16.** On a VERIFIED change, a rejection set it back to `PROPOSED` and a re-approval to `APPROVED`, which makes it activatable again |
+
+### R-1 · identity-context-svc: ResolveTenantContext does not require correlation (evidence)
+
+| Item | Documented | Implemented | Status | Notes |
+|---|---|---|---|---|
+| ResolveTenantContext | QUERY: "read-only; scoped; **correlation required**" | `POST /v1/context/resolve` calls no correlation guard. Correlation is read from the body only; the handler copies channel, workload and causation from the envelope but not correlation (`internal/context/handler.go:296-300`) | ⚠️ (was ✅) | **Confirmed at the route.** No correlation → **200**, and the session is stored with `correlation_id = ""`. A correlation sent only as the `X-Correlation-ID` header → **200**, also stored as `""`. The `TenantContextResolutionFailed` events from that path carry the same empty value |
+| Correlation required (queries) | all three queries | enforced on 2 of 3 (GetEffectiveContext, ExplainContextResolution) | ⚠️ (was ✅) | The 28 Sep row read "both read queries"; ResolveTenantContext is the third |
+
+### R-7 · search-indexer-svc: the image can no longer be built (deployability, outside the scored rows)
+
+The 5 Oct merge from main (`a2e27017`) replaced the two-stage `Dockerfile` with
+`COPY services/search-indexer-svc/server` and `…/healthcheck`. Neither file exists, and both are
+ignored by `.gitignore` (`services/*/server`). **Confirmed:** `docker build` from a clean checkout
+fails with `"/services/search-indexer-svc/healthcheck": not found`. The compose file builds the
+service with this Dockerfile, and it is the only Dockerfile in the estate written this way. Anyone
+who drops a binary there gets an image of unknown provenance, which is the stale-image problem
+recorded for the compose stack. The same merge also made `search-client`'s `EnsureIndex` treat
+any error whose text contains "404" as "index missing"; this is minor.
+
+### Also noted (not scored)
+
+- **configuration-feature-flag-svc NP-08 is not met end to end.** Plan eligibility reads
+  `X-Commercial-Plan`, and neither it nor `X-Org-Unit-Id` is stripped or set anywhere at the edge
+  (no match in gateway-auth-svc, compose or GTRM). Any client can assert a plan. The 29 Sep text
+  listed NP-08 as "now also covered"; that holds only once the edge owns the header (cross-service
+  finding 1, still open).
+- **The GTRM `--check` false alarm on Windows.** It reports drift on a Windows checkout because the
+  working copy has CRLF line endings. The index is LF, and a fresh compile matches the committed
+  artefact apart from `generated_at`. CI on Linux is unaffected.
+- **Store suites that skip silently.** Without `TEST_DATABASE_URL`, the store suites of services
+  1, 3, 4 and 6 report PASS with every test skipped (configuration: 68 of 68 skipped). The 29 Sep
+  "not yet deployed" caveat on service 3 still applies to the dev database.
+
+## Cross-service finding 3, updated
+
+Finding 3 says maker-checker must be server-side, not self-asserted. tenant-entity-registry-svc,
+delegated-authority-svc, access-control-svc, secret-vault-integration-svc and notification-svc's
+template, intent and lift approvals all meet it. **Three paths do not:**
+- identity-context-svc break-glass (R-2);
+- configuration change approval (R-4);
+- notification's NP-11 controlled exception (R-6).
+
+All three are privileged. The fix in each case is the same: approval is a separate act by a
+verified principal, recorded against the thing being approved, and never a field in the
+requester's body.
+
+## Where to start
+
+1. **R-2:** make break-glass approval a separate call by the approver, as tenant-entity-registry
+   does.
+2. **R-4 + R-5:** refuse approver = `created_by_principal_id` for C2/C3; take `approved_at` from
+   the server; guard `ApproveChange` on `status = 'PROPOSED'`.
+3. **R-6:** resolve `exception_ref` against `ncd_exceptions` (open, of the right kind, approved
+   by the named reviewer) before marking an endpoint verified.
+4. **R-3:** `FetchMessage` + commit after success, and release the dedupe claim when the side
+   effect fails. Then key both assignment events by the assignment id.
+5. **R-1:** call `requireCorrelation` on resolve, and fall back to the header when the body
+   omits it.
+6. **R-7:** restore the two-stage Dockerfile.
+
+---
+
+# 07/10 re-audit gaps: every gap open on 7 October 2026
+
+This register lists every gap still open in Group 1 after the 7 October re-audit. It brings
+together the six new findings (R-1 … R-7) and every gap the earlier passes left open or
+dependent on another service. **Nothing here is fixed yet.** Each gap is placed under what it
+waits on. When a dependency is finished, take the rows under it, fix them, and re-check them
+the way the "Re-check" column says.
+
+Gap ids are `S<service>-<n>`, so S1 is identity-context-svc and S9 is access-control-svc.
+Where a gap came from the 7 Oct re-audit, its R-number is given too.
+
+**Summary**
+
+| Group | What it waits on | Gaps |
+|---|---|---|
+| A | Nothing. Fixable now inside the service | 17 |
+| B | A service that already exists (connect or change it) | 18 |
+| C | A service or infrastructure that does not exist yet | 17 |
+| D | A decision by the spec or service owners | 14 |
+| | **Total** | **66** |
+
+## A · Fixable now, inside the service (no dependency)
+
+The first seven are the 7 Oct findings, ranked by risk. Fix these first.
+
+| Id | Service | Gap | Spec | Fix | Re-check |
+|---|---|---|---|---|---|
+| S1-1 (R-2) | identity-context-svc | Break-glass approver is a request-body field. It never consents and need not exist; caller = approver passes the local code | GOV-01 §4 AttachSupportContext; §1 "independently approved"; §2 inv. 8 | Make approval a separate call by the approver (tenant-entity-registry `approval_requests` pattern); grant only after it. Refuse caller = approver locally | Attach naming a nonexistent approver → no grant; an approval by the requester → 403 `SOD_CONFLICT`; a real approver's approval → grant |
+| S3-1 (R-4) | configuration-feature-flag-svc | Proposer can approve and activate their own C2/C3 change; `approved_at` is taken from the body | AA-001 §8.1 (C2 WFC approval, C3 segregated approval), §10.1 | Refuse approver = `created_by_principal_id` for C2/C3; set `approved_at` on the server | Store test: maker approves own C3 → refused; backdated `approved_at` ignored |
+| S3-2 (R-5) | configuration-feature-flag-svc | `ApproveChange` has no status guard, so a VERIFIED change goes back to APPROVED or PROPOSED | AA-001 §8 | `WHERE status = 'PROPOSED'`; anything else → 409 | Approve/reject a VERIFIED change → 409, status unchanged |
+| S7-1 (R-6) | notification-svc | NP-11 "controlled exception" is three unchecked strings (`exception_ref`, `verification_ref`, `reviewer_principal_id`); the endpoint is then marked verified | Y-001 §5.2, NP-11, INV-15 | Resolve `exception_ref` against `ncd_exceptions` (open, right kind, approved by the named reviewer, reviewer ≠ caller) | Made-up refs → refused `NCD-007`; a real approved exception → accepted. Rescore NP-11 and INV-15 |
+| S1-2 (R-3) | identity-context-svc | Kafka consumer auto-commits (`ReadMessage`) and claims the event id before acting. A failed session eviction drops the revocation for good | GOV-01 NP4; GOV inv. 10 (at-least-once) | `FetchMessage` + commit after success; release the Redis claim when the side effect fails | Fault-inject `EvictAllForPrincipal` once → the event is redelivered and the sessions end |
+| S1-3 (R-1) | identity-context-svc | `POST /v1/context/resolve` needs no correlation; a header-only correlation is dropped, and sessions are stored with `correlation_id = ""` | GOV-01 §4 "correlation required"; inv. 9 | `requireCorrelation` on resolve; take the header when the body has none | No correlation → 400; header only → stored |
+| S6-1 (R-7) | search-indexer-svc | Dockerfile (5 Oct merge) copies gitignored prebuilt binaries; `docker build` fails from a clean checkout | §9.2-style DoD (buildable, reproducible) | Restore the two-stage build | `docker build -f services/search-indexer-svc/Dockerfile .` succeeds on a clean checkout |
+| S1-4 | identity-context-svc | `iam.assignment.granted` (keyed by request id) and review-driven `iam.assignment.revoked` (keyed by assignment id) can reorder, so a late grant re-opens a revoked projection | GOV-01 NP4 | Key both by the assignment id in access-control-svc. In the projection, never insert over a recorded revocation (tombstone) | Deliver revoke then grant → role not framed |
+| S6-2 | search-client | `EnsureIndex` treats any error containing "404" as "index missing" | — (robustness) | Check the response status, not the error text | Unit test with a non-404 error |
+| S3-3 | configuration-feature-flag-svc | Store suite (68 tests) passes with every test skipped when no DB is set | AA-001 §14 certification | Fail when `REQUIRE_DB_TESTS=1` and no DB (CI sets it) | CI shows the store tests run |
+| S7-2 | notification-svc | NP-34: no post-upload attachment comparison | Y-001 NP-34 | Compare the provider's stored attachment hash with the pinned one once a provider transmits attachments | Matrix row NP-34 → Met |
+| S7-3 | notification-svc | NP-57: the stranded-attempt path has no test | NP-57 | Add the test | Matrix row → Met |
+| S7-4 | notification-svc | INV-29: projections cannot write, true by construction but untested | INV-29 | Add the test | Matrix row → Met |
+| S7-5 | notification-svc | TC-03: no fuzz test | TC-03 | Fuzz the template validator and renderer | Matrix row → Met |
+| S7-6 | notification-svc | TC-18: no DLP check | TC-18 | DLP scan on rendered content | Matrix row → Met |
+| S9-1 | access-control-svc | `DORMANT` counts a decision granted through several roles as use of each | Authz Std §24 | Attribute use to the role that granted the decision (needs the granting role in the decision log, see S9-B) | Two roles, one used → only the used one is not dormant |
+| S5-1 | deployments/gtrm | `gtrm-compiler --check` reports drift on a Windows checkout (CRLF working copy) | — (tooling) | Normalise line endings before comparing, or add `.gitattributes eol=lf` for the artefact | `--check` OK on Windows |
+
+## B · Closable now: connect to, or change, a service that already exists
+
+| Id | Service | Gap | Spec | Depends on (exists) | What closing it takes |
+|---|---|---|---|---|---|
+| S1-B1 | identity-context-svc | Source channel: web vs mobile cannot be known here | GOV-01 §4 server-resolved source channel | **gateway-auth-svc** | Edge stamps `X-Source-Channel` and strips the client's copy |
+| S1-B2 | identity-context-svc | No service grants the six `IDENTITY_*` actions; protected routes answer 403 against a real authorization-svc | GOV-01 §4 authorization | **authorization-svc** | Seed the actions into operator roles by migration |
+| S1-B3 | identity-context-svc | Ingress bindings are never refreshed from the tenant registry; every binding reads `STALE` past the TTL | GOV-01 §4 cache state | **tenant-entity-registry-svc** | Push or poll binding changes (event or scheduled refresh) |
+| S5-B1 | gateway-auth-svc | SEC-INV-05: the gateway's mTLS client is ready, but the peers have no mTLS listener | Security Std §3.1 SEC-INV-05, §9 | **identity-context-svc, tenant-entity-registry-svc** | `:8449` listener with `RequireAndVerifyClientCert` in both, then `*_MTLS_ENABLED=true` |
+| S5-B2 | gateway-auth-svc | Console → service calls bypass ForwardAuth; services trust the `X-*-Id` headers the console server sends | Security §8, SEC-INV-01/04 | **zoiko-suite-frontend-platform** + gateway | Route console server calls through the edge, or sign them; then audit as its own item |
+| S5-B3 | all services | The 8 §4 pass-through fields (`X-Purpose-Context`, `X-Approval-Reference`, `X-Evidence-Refs`, …) are caller assertions; each owning service must validate them | GOV §16 envelope | **each owning service** | Every service that acts on one confirms it (e.g. the approval exists and names this action) |
+| S3-B1 | configuration-feature-flag-svc | Emergency changes are not restricted to designated actors, and need no IAM break-glass session | AA-001 §8.4, §10.1 | **authorization-svc** (+ identity-context break-glass) | Dedicated emergency grant; require a live support/break-glass context on `/emergency-changes` |
+| S3-B2 | configuration-feature-flag-svc | Runtime attestation reads `X-Workload-Id`, which the edge strips; only service-to-service calls can carry it, and nothing sets it from a verified identity | AA-001 §10.1 `/runtime/attest` (workload identity) | **mTLS (mtls-management-svc)** | Take the workload from the client certificate, as secret-vault-integration-svc does |
+| S3-B3 | configuration-feature-flag-svc | `secret://<env>/<path>` references are resolved by nothing | AA-001 §7.2, INV-10 | **secret-vault-integration-svc** | Resolve references through the broker |
+| S3-B4 | configuration-feature-flag-svc | The dev `configuration_feature_flag` DB is at `000003` (code needs `000013`); `audit.sh` (25 routes) was never re-run live | — (deployment) | **migrations runner** | `migrate.py up`, then run `audit.sh` |
+| S4-B1 | secret-vault-integration-svc | The gateway has no client certificate for the gateway → service hop (O-1 forwarder) | Security §9 | **gateway-auth-svc** + mtls-management-svc | Provision it; list it in `MTLS_TRUSTED_FORWARDERS` |
+| S6-B1 | search-indexer-svc | authorization-svc's DB is behind its code (`pra.book_id`), so `/v1/authorize` answers 503; the grant-dependent `audit.sh` sections 7–12 and 16 never ran | AB-001 §11 | **authorization-svc** | Apply its migrations, re-seed, re-run `audit.sh` |
+| S7-B1 (G-1) | notification-svc | Privacy/marketing permission is caller-supplied (one of the 2 partial API rows) | Y-001 §5.3, NP-17, NP-47, INV-30 | **privacy-decision-svc** (PRV-03) + privacy-purpose-registry-svc (PRV-01) | Register purposes, then call `POST /v1/privacy/decisions` in the channel decision |
+| S7-B2 (G-2) | notification-svc | No record declaration; the evidence package waits on a callback (the other partial API row) | Y-001 §8.1, NP-58, TC-15, TC-20 | **document-vault-svc** (DRC-02/03) | Declare the notice package with `POST /v1/records` |
+| S7-B3 (G-3) | notification-svc | Provider, callback, webhook, unsubscribe and DKIM secrets are environment variables | INV-26 | **secret-vault-integration-svc** | Lease them at start-up and on rotation |
+| S7-B4 (G-9) | notification-svc | `TEMPLATE_MANAGE/APPROVE`, `NOTIFICATION_SUPPRESS`, `NOTIFICATION_RESOLVE_OUTCOME` are granted only in the dev seed | — | **authorization-svc** | Grant them by migration (after S6-B1's migration fix) |
+| S7-B5 (G-8, G-7 part) | notification-svc | Console covers only the legacy register; the send form uses the free-text legacy path; regulated-notice acknowledgment is API-only | Y-001 §8.3, §10.1, INV-01 | **zoiko-suite-frontend-platform** | Screens for the plane, a recipient acknowledgment page, and the send form moved to `POST /v1/communications` |
+| S9-B | access-control-svc | A REVOKE review decision provisions as the reviewer, who needs `iam.assignment.revoke`, or the item stays open (`403 provisioning_forbidden`); DORMANT attribution needs the granting role (S9-1) | Authz Std §24 | **authorization-svc** | A service identity this service can revoke as; the granting role recorded in the decision log |
+
+## C · Blocked on a service or infrastructure that does not exist yet
+
+| Id | Service | Gap | Spec | Blocked on | Then |
+|---|---|---|---|---|---|
+| S1-C1 | identity-context-svc | Entitlement context reference never resolved (records `UPSTREAM_NOT_CONFIGURED`) (❌) | GOV-01 §4 server-resolved context | **COM-03 Entitlement** (Commercial spec §4.3) | One `WithEntitlementResolver` call |
+| S3-C1 | configuration-feature-flag-svc | INV-02: plan eligibility needs the commercial entitlement (⚠️) | AA-001 INV-02 | **COM (commercial account service)** + the edge to set `X-Commercial-Plan` | Edge sets it from COM; see S3-D1 |
+| S2-C1 | tenant-entity-registry-svc | Item 28: fiscal-calendar reference is format-checked only (⚠️) | ORG-03 §4.3 | **REF-04 Fiscal Calendar** | Resolve the id against REF-04 |
+| S2-C2 | tenant-entity-registry-svc | §9.2 gate 6: dependents must persist the pinned `object_id`/`object_version` | ORG §9.2 | **each consuming service** | Check each consumer stores them |
+| S2-C3 | tenant-entity-registry-svc | §9.2 gate 7: RPO/RTO must be measured on production | ORG §9.2 | **production database / operations** | Run the restore drill in production |
+| S4-C1 (O-1) | secret-vault-integration-svc | Workload identity not bound to environment/region/audience; inbound cert checks built but off (⚠️) | Security §9 | **mtls-management-svc**: URI SAN `spiffe://zoiko/<env>/<service>` from the issuer's config | Turn on `MTLS_REQUIRED_URI_PREFIX` + `MTLS_MAX_CLIENT_CERT_LIFETIME=24h`, mandatory in production |
+| S4-C2 (O-2) | secret-vault-integration-svc | The mTLS private key is generated by the issuer and sent over the wire (⚠️) | Security §9 | **mtls-management-svc**: CSR signing endpoint | Generate the key in process, send only a CSR |
+| S4-C3 (O-3) | secret-vault-integration-svc | Static material only; no dynamic credentials (⚠️) | Security §13 | **HashiCorp Vault** with a secrets engine + delivery decision (S4-D1) | Per-policy `STATIC`/`DYNAMIC` mode wired to the engine's lease API |
+| S4-C4 | secret-vault-integration-svc | Production refuses to boot until KMS (Transit or Cloud KMS), server/client certificates and shared-secret exceptions exist | Security §13, SEC-INV-07 | **Infrastructure** | Provision; migrate material with `VAULT_MIGRATE_LEGACY_KEY_FILE` |
+| S6-C1 | search-indexer-svc | Semantic search and the §10.1 vector controls are built but answer ESR-019 with no provider (2 ⚠️) | AB-001 §10.1, §11.1 | **An embedding provider** (decision OD-10, S6-D1) | Set `EMBEDDING_PROVIDER_URL`; certify recall |
+| S6-C2 | search-indexer-svc | Rebuilds are bounded by Kafka retention | AB-001 INV-21/22 | **Replay from owning domain services** | Domain replay API for records older than retention |
+| S7-C1 (G-4) | notification-svc | No external-party contacts or authorized cross-tenant relationships; every cross-tenant recipient refused | Y-001 §5.2, NP-12, INV-16, TC-05 | **MDM** (no owner) | Resolve contacts and relationships from MDM |
+| S7-C2 (G-5) | notification-svc | Legal basis and deadlines are caller-supplied | Y-001 §8.1, §8.2 | **PDC** (none) and **WFC** deadline clocks (workflow-svc has WFC-01/02 only) | Take basis from PDC and clocks from WFC |
+| S7-C3 (G-6, G-7 rest) | notification-svc | No service calls notification-svc; the legacy free-text path stays open for old callers. INV-01 not met | INV-01 | **Callers in each domain** (needs per-workflow product decisions) | Move callers to `POST /v1/communications`, then close the legacy path |
+| S7-C4 | notification-svc | NP-01/TC-01: nothing stops another service calling an email provider directly | NP-01, TC-01 | **Estate control** (network policy or secret brokering via S7-B3) | Only notification-svc can reach provider credentials |
+| S9-C1 | access-control-svc | Group subjects: assignments to groups (⚠️, the one partial row) | Authz Std §9 | **A group-membership source** (no service holds groups) | Add group subjects once membership exists |
+| S9-C2 | access-control-svc | Event-triggered reviews start only on request; no consumer of manager-change or contractor-end events | Authz Std §24 | **HR / workforce events** (none published) | Consume them and open reviews automatically |
+
+## D · Waiting on a decision
+
+| Id | Service | Question | Who decides | Affects |
+|---|---|---|---|---|
+| S3-D1 | configuration-feature-flag-svc / gateway | Should `X-Commercial-Plan` and `X-Org-Unit-Id` be edge-set server context (stripped from clients) or caller assertions? Today any client can assert a plan, so NP-08 is not met end to end | Platform / spec owners | S3-C1, INV-02, INV-08, NP-08 |
+| S3-D2 | configuration-feature-flag-svc | OD-03: snapshot and version signing | AA-001 owners | §10.1 "digest/signature" |
+| S4-D1 | secret-vault-integration-svc | Dynamic-credential delivery: Vault Agent sidecar, or broker-returned per-lease credentials | Security owners | S4-C3 |
+| S5-D1 | gateway-auth-svc | Where do the §8 Internet-edge controls (DDoS, WAF, rate limiting, bot/abuse, TLS, request-size limits) live in production? The GCP runbook names no Cloud Armor (6 ❓) | Platform / operations | 6 unscored ❓ rows |
+| S5-D2 | gateway-auth-svc | Should an unreachable CARTA still let requests through (❓)? | Security owners | 1 ❓ row |
+| S5-D3 | gateway-auth-svc | Real client IP for CARTA behind the GCP load balancer (trusted-hop design) | Security / platform | CARTA signal quality |
+| S6-D1 | search-indexer-svc | OD-10: which embedding provider and model | AB-001 owners | S6-C1 |
+| S6-D2 | search-indexer-svc | OD-05: which scopes are R2 (source-hydrated); each needs `SOURCE_SERVICE_URL_<TYPE>` | AB-001 owners | R2 coverage |
+| S6-D3 | search-indexer-svc | RAG contract §10.2: mostly assigned to AIG, not ESR (❓) | AIG / AB-001 owners | 1 ❓ row |
+| S7-D1 (G-15) | notification-svc | Ratify OD-06/13/15 values taken in code: E4 rule, 30-min UNKNOWN deadline, quotas, bulk threshold, reputation thresholds, marketing quiet window | Y-001 owners | Recorded decisions |
+| S7-D2 | notification-svc | NP-33 / OD-05: secure-link audience and authentication model; OD-03/04 SMS and push providers (G-11) | Y-001 owners | NP-33, channels |
+| S7-D3 | notification-svc / estate | Which legal-hold source is authoritative: document-vault-svc or retention-registry-svc (both expose `/v1/legal-holds`)? | Data-governance owners | S7-B2 |
+| S8-D1 | delegated-authority-svc / authorization-svc | Is a 5 s cross-replica revocation window (`AUTHZ_CACHE_TTL_SECONDS`) acceptable? Where does a principal's quantitative (non-monetary) authority limit live? | authorization-svc owners | 2 ❓ |
+| S9-D1 | access-control-svc | The 668 legacy action names do not follow §5 `resource.action`; renaming is each owning service's change | Each service owner | §5 taxonomy |
+
+## Re-check order once dependencies land
+
+1. **Now, no dependency:** group A, starting with S1-1, S3-1/S3-2, S7-1, S1-2, S1-3, S6-1.
+2. **authorization-svc migrated and seeded** → S6-B1, then S1-B2, S7-B4, S9-B, S3-B1. Re-run
+   search-indexer `audit.sh` sections 7–12 and 16 and the notification live check against
+   real grants.
+3. **gateway-auth-svc edge changes** (S1-B1, and S3-D1 once decided) → re-score
+   identity-context source channel and configuration INV-02 / NP-08.
+4. **mTLS listeners + mtls-management-svc URI SAN and CSR** → S5-B1, S4-C1, S4-C2, S3-B2,
+   S4-B1.
+5. **PRV and DRC wired** (S7-B1, S7-B2) → notification's two partial API rows to ✅.
+6. **COM-03, REF-04, MDM, PDC, an embedding provider** as they are built → S1-C1, S3-C1,
+   S2-C1, S7-C1, S7-C2, S6-C1.
+
+After each step, re-score only the rows that step touched. Then update the "Scores" table in
+"Group 1 re-audit, 7 October 2026" and the summary table at the top of this file.
