@@ -1,0 +1,184 @@
+asyncapi: 2.6.0
+
+# fiscal-calendar-svc events (spec REF-04), all on one topic:
+#   zoiko.fiscal-calendar.events
+#
+# WHAT A CONSUMER MUST KNOW
+#
+# 1. EVERY EVENT GOES THROUGH THE TRANSACTIONAL OUTBOX: written in the same
+#    transaction as the state change, delivered afterwards by a relay.
+#    Delivery is AT-LEAST-ONCE; consumers must be idempotent (use event_id, or
+#    object_id + object_version).
+#
+# 2. THE ENVELOPE IS BUILT AT STATE-CHANGE TIME; emitted_at is the recorded_at
+#    of the change and can precede the moment the message reaches the topic.
+#
+# 3. tenant_id IS THE OWNING TENANT. Fiscal calendars are tenant-scoped, so
+#    payload.scope is always TENANT and only that tenant's consumers act on the
+#    event. legal_entity_id is in the event data.
+#
+# 4. MESSAGES ARE KEYED BY object_id: calendar_id for FiscalCalendarCreated and
+#    version_id for the three version events. Events about one object are
+#    ordered on one partition. There is no ordering across objects: a
+#    FiscalCalendarSuperseded and the FiscalCalendarVersionActivated that caused
+#    it have different keys. Correlate them by correlation_id, or by
+#    superseded_by_version_id / previous_version_id.
+#
+# 5. effective_at is the date the change takes effect, as midnight UTC: the
+#    version's effective_from for Created / ChangeProposed / VersionActivated,
+#    and the successor's effective_from for Superseded. recorded_at is when the
+#    service recorded it. object_version is the object's version AFTER the change.
+#
+# 6. CONSUMERS PIN IDS AND VERSIONS. A consumer that materialises periods stores
+#    version_id (and version_no) with them. A superseded version stays readable
+#    forever; its periods are never recomputed under a successor's pattern.
+#
+# 7. NO event carries secrets or personal data; actors are opaque principal ids.
+
+info:
+  title: fiscal-calendar-svc events
+  version: "0.1.0"
+
+servers:
+  local:
+    url: kafka:9094
+    protocol: kafka
+
+channels:
+  zoiko.fiscal-calendar.events:
+    description: Fiscal calendar lifecycle events.
+    subscribe:
+      operationId: onFiscalCalendarEvent
+      message:
+        oneOf:
+          - $ref: '#/components/messages/FiscalCalendarCreated'
+          - $ref: '#/components/messages/FiscalCalendarChangeProposed'
+          - $ref: '#/components/messages/FiscalCalendarVersionActivated'
+          - $ref: '#/components/messages/FiscalCalendarSuperseded'
+
+components:
+  messages:
+    FiscalCalendarCreated:
+      name: FiscalCalendarCreated
+      summary: A calendar and its first DRAFT version were created.
+      description: object_id is the calendar_id; object_version is the calendar's version (1).
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/CommonPayload'
+                  - type: object
+                    properties:
+                      calendar_id: { type: string }
+                      legal_entity_id: { type: string }
+                      code: { type: string }
+                      calendar_scope: { type: string, description: the calendar's opaque book/basis label }
+                      version_id: { type: string }
+                      version_no: { type: integer }
+                      reason: { type: string }
+
+    FiscalCalendarChangeProposed:
+      name: FiscalCalendarChangeProposed
+      summary: A new DRAFT version of an existing calendar was proposed. Nothing is in force yet.
+      description: object_id is the new version_id; object_version is 1.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/CommonPayload'
+                  - type: object
+                    properties:
+                      calendar_id: { type: string }
+                      legal_entity_id: { type: string }
+                      version_no: { type: integer }
+                      reason: { type: string }
+
+    FiscalCalendarVersionActivated:
+      name: FiscalCalendarVersionActivated
+      summary: A version became ACTIVE. This is the event period consumers act on.
+      description: |
+        object_id is the version_id; object_version is the version's version after
+        activation. transition_plan_id is present when an approved plan was
+        required and used. previous_version_id is present when an earlier version
+        was superseded by this activation.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/CommonPayload'
+                  - type: object
+                    properties:
+                      calendar_id: { type: string }
+                      legal_entity_id: { type: string }
+                      calendar_scope: { type: string }
+                      version_no: { type: integer }
+                      effective_from: { type: string, format: date }
+                      effective_to: { type: string, format: date, nullable: true }
+                      previous_version_id: { type: string }
+                      transition_plan_id: { type: string }
+                      reason: { type: string }
+
+    FiscalCalendarSuperseded:
+      name: FiscalCalendarSuperseded
+      summary: A version was superseded by a newly activated one. It stays readable for history.
+      description: |
+        object_id is the superseded version_id. Its effective interval is now closed
+        at effective_to (= the successor's effective_from, exclusive). Periods before
+        effective_to remain governed by this version.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/CommonPayload'
+                  - type: object
+                    properties:
+                      calendar_id: { type: string }
+                      legal_entity_id: { type: string }
+                      version_no: { type: integer }
+                      superseded_by_version_id: { type: string }
+                      effective_to: { type: string, format: date }
+                      reason: { type: string }
+
+  schemas:
+    Envelope:
+      type: object
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, tenant_id, payload]
+      properties:
+        event_id: { type: string, description: "evt-<uuid>; unique per event" }
+        event_type: { type: string, enum: [FiscalCalendarCreated, FiscalCalendarChangeProposed, FiscalCalendarVersionActivated, FiscalCalendarSuperseded] }
+        event_version: { type: string, example: "1.0" }
+        emitted_at: { type: string, format: date-time }
+        schema_version: { type: string, example: "1.0" }
+        source_service: { type: string, enum: [fiscal-calendar-svc] }
+        tenant_id: { type: string }
+        actor_id: { type: string }
+        correlation_id: { type: string }
+        causation_id: { type: string }
+        payload: { type: object }
+
+    CommonPayload:
+      type: object
+      required: [scope, tenant_id, object_type, object_id, object_version, effective_at, recorded_at, actor, correlation_id]
+      properties:
+        scope: { type: string, enum: [TENANT] }
+        tenant_id: { type: string }
+        object_type: { type: string, enum: [fiscal_calendar, fiscal_calendar_version] }
+        object_id: { type: string }
+        object_version: { type: integer }
+        effective_at: { type: string, format: date-time }
+        recorded_at: { type: string, format: date-time }
+        actor: { type: string }
+        correlation_id: { type: string }
+        causation_id: { type: string }

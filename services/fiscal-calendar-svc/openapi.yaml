@@ -1,0 +1,672 @@
+openapi: 3.0.3
+
+# fiscal-calendar-svc (spec REF-04) - the Fiscal Calendar.
+#
+# Owns: FiscalCalendar, FiscalCalendarVersion, CalendarTransitionPlan.
+# Does NOT own: period instances or period close state (REF-05
+# accounting-period-svc), journal posting, tax filing calendars. This service
+# computes what a calendar's periods WOULD be (periods-preview); it never stores
+# or closes a period.
+#
+# THINGS A CLIENT CANNOT GUESS FROM THE PATHS
+#
+#  1. TENANT- AND ENTITY-SCOPED. Every object belongs to one tenant and one legal
+#     entity. Commands need X-Tenant-Id, X-Principal-Id (or X-Workload-Id),
+#     X-Legal-Entity-Id and Idempotency-Key. Queries need X-Tenant-Id. An object
+#     of another tenant is 404 NOT_FOUND, never 403.
+#
+#  2. PATTERNS ARE DATA. A version carries a `pattern` object, validated here:
+#       {"type":"CALENDAR_MONTHS"}
+#       {"type":"WEEK_PATTERN","weeks":[4,4,5,4,4,5,4,4,5,4,4,5],
+#        "week_start":"MONDAY","extra_week_rule":"ADD_TO_LAST"}
+#     plus optional "year_label": START_YEAR (default) | END_YEAR and
+#     "special_periods":[{"key":"ADJ","position":"AFTER_LAST","zero_length":true}].
+#     The fiscal-year start is fiscal_year_start_month/day (day 1-28). `scope` is
+#     an opaque book/basis label chosen by the tenant; the service never
+#     interprets it. No country or jurisdiction value is built in.
+#
+#  3. LIFECYCLE: DRAFT -> APPROVED -> ACTIVE -> SUPERSEDED. A version's pattern,
+#     fiscal-year start and effective_from NEVER change (database trigger).
+#     Corrections are a new version proposed with :propose-change.
+#     effective_to is end-dated exactly once, by supersession.
+#
+#  4. ONE IN-FORCE VERSION PER ENTITY/SCOPE/DATE. Activating a version whose
+#     effective interval [effective_from, effective_to) overlaps an ACTIVE or
+#     SUPERSEDED version of the same (entity, scope) - in any calendar - is
+#     409 INVALID_TRANSITION. The one exception is the calendar's own open-ended
+#     ACTIVE predecessor starting earlier: it is ended where the new version
+#     begins and becomes SUPERSEDED. A different scope (parallel basis) or a
+#     different entity never conflicts.
+#
+#  5. NEVER REWRITE HISTORICAL PERIODS. Activating any version that is not the
+#     first of its calendar makes this service ask REF-05
+#     (GET /v1/calendar-usage). If REF-05 cannot be reached or answers badly
+#     the activation FAILS CLOSED: 503 DEPENDENCY_UNAVAILABLE. If REF-05 reports
+#     posted/closed periods and the new version takes effect on or before the end
+#     of the latest of them, activation needs an APPROVED CalendarTransitionPlan
+#     (to this version, from the version being superseded, declaring
+#     affects_posted_periods=true) - otherwise 409 TRANSITION_PLAN_REQUIRED.
+#
+#  6. SEGREGATION OF DUTIES. The proposer of a version cannot approve it; the
+#     proposer of a plan, and the proposer of the version it leads to, cannot
+#     approve the plan. Violation: 403 SOD_DENIED.
+#
+#  7. ERRORS. Every failure body is {"code": "...", "message": "..."}. Codes are
+#     the shared contract set (CONTEXT_INVALID, VERSION_CONFLICT,
+#     DUPLICATE_CANDIDATE, INVALID_TRANSITION, SOD_DENIED, DEPENDENCY_UNAVAILABLE;
+#     RULE_AMBIGUOUS is raised only if the database ever held overlapping
+#     in-force versions; SOURCE_UNVERIFIED and REFERENCE_RETIRED are part of the
+#     contract but never raised here) plus NOT_FOUND, FORBIDDEN and
+#     TRANSITION_PLAN_REQUIRED (this service's additions).
+#     400 = malformed request / missing mandatory header or field.
+#     422 = well-formed but semantically invalid (CONTEXT_INVALID from the service).
+#
+#  8. COMMANDS need Idempotency-Key, a `reason`, and (on an existing object)
+#     `expected_version` (body field, or X-Expected-Version header). A replay
+#     with the same key and body returns the ORIGINAL result with header
+#     Idempotent-Replay: true and status 200; the same key with a different body
+#     is 422 CONTEXT_INVALID.
+#
+#  9. DATES are YYYY-MM-DD (UTC, no time of day). effective_to is exclusive.
+
+info:
+  title: fiscal-calendar-svc
+  version: "0.1.0"
+  description: REF-04 Fiscal Calendar - entity-specific, effective-dated calendar definitions with controlled transitions and deterministic period preview.
+
+servers:
+  - url: http://localhost:8173
+
+tags:
+  - name: commands
+  - name: queries
+  - name: contract-with-ref-05
+
+paths:
+  /v1/fiscal-calendars:
+    post:
+      tags: [commands]
+      operationId: createFiscalCalendar
+      summary: CreateFiscalCalendar (authz action FISCAL_CALENDAR_PROPOSE)
+      description: Creates the calendar and its first DRAFT version in one step. legal_entity_id must equal X-Legal-Entity-Id.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCalendarRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalendarWithVersion' }
+        '200': { description: Idempotent replay of the original result }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { description: DUPLICATE_CANDIDATE - the code already exists for this entity, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/fiscal-calendars:resolve:
+    get:
+      tags: [queries, contract-with-ref-05]
+      operationId: resolveFiscalCalendar
+      summary: Which calendar version applies to (legal entity, scope, date)
+      description: |
+        Considers ACTIVE and SUPERSEDED versions only. No match is 404 NOT_FOUND:
+        there is no fallback to a nearest, default or latest calendar.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - { name: legal_entity_id, in: query, required: true, schema: { type: string } }
+        - { name: scope, in: query, required: true, schema: { type: string } }
+        - { name: date, in: query, required: true, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: The version in force
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Resolution' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/fiscal-calendars/{id}:
+    get:
+      tags: [queries]
+      operationId: getFiscalCalendar
+      summary: GetFiscalCalendar / GetCalendarAsOf
+      description: |
+        Without as_of: the calendar and the version in force today (UTC), or
+        version null when none is. With as_of=YYYY-MM-DD: the version in force on
+        that date; 404 NOT_FOUND when no version covers it.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/Id'
+        - { name: as_of, in: query, required: false, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: ETag is "<calendar_id>-v<version>"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CalendarView' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/fiscal-calendars/{id}/versions:
+    get:
+      tags: [queries]
+      operationId: listCalendarVersions
+      summary: ListCalendarVersions - every version, historical ones included
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: version_no ascending
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Version' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/fiscal-calendars/{id}/versions:propose-change:
+    post:
+      tags: [commands]
+      operationId: proposeCalendarChange
+      summary: ProposeCalendarChange (authz action FISCAL_CALENDAR_PROPOSE)
+      description: Appends a new DRAFT version. expected_version is the CALENDAR's version. Never edits an existing version.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProposeChangeRequest' }
+      responses:
+        '201':
+          description: The new DRAFT version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Version' }
+        '200': { description: Idempotent replay }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/fiscal-calendar-versions/{id}:
+    get:
+      tags: [queries]
+      operationId: getCalendarVersion
+      summary: One version (ETag "<version_id>-v<version>")
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Version' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/fiscal-calendar-versions/{id}:approve:
+    post:
+      tags: [commands]
+      operationId: approveCalendarVersion
+      summary: ApproveCalendarTransition for a version - DRAFT -> APPROVED (authz action FISCAL_CALENDAR_APPROVE)
+      description: The proposer cannot approve (403 SOD_DENIED). From APPROVED on the definition is immutable.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecisionRequest' }
+      responses:
+        '200':
+          description: The APPROVED version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Version' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/fiscal-calendar-versions/{id}:activate:
+    post:
+      tags: [commands]
+      operationId: activateCalendarVersion
+      summary: ActivateCalendarVersion - APPROVED -> ACTIVE (authz action FISCAL_CALENDAR_ACTIVATE)
+      description: |
+        Guards, in order: lifecycle (INVALID_TRANSITION), effective-interval overlap
+        (INVALID_TRANSITION), and for a version that is not the first of its calendar
+        the REF-05 history check (DEPENDENCY_UNAVAILABLE when unknown;
+        TRANSITION_PLAN_REQUIRED when posted/closed history is touched without an
+        approved plan). Ends the calendar's open-ended ACTIVE predecessor where this
+        version begins (it becomes SUPERSEDED, effective_to set). Emits
+        FiscalCalendarSuperseded (predecessor) then FiscalCalendarVersionActivated.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecisionRequest' }
+      responses:
+        '200':
+          description: The ACTIVE version
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Version' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { description: VERSION_CONFLICT, INVALID_TRANSITION or TRANSITION_PLAN_REQUIRED, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { description: DEPENDENCY_UNAVAILABLE - authorization-svc, REF-05 or the store; fails closed, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /v1/fiscal-calendar-versions/{id}/periods-preview:
+    get:
+      tags: [queries, contract-with-ref-05]
+      operationId: previewPeriods
+      summary: PreviewPeriods - THE CONTRACT WITH REF-05
+      description: |
+        Deterministic: the same (version, fiscal_year) always yields a byte-identical
+        body. Available only for APPROVED, ACTIVE and SUPERSEDED versions; a DRAFT
+        is 409 INVALID_TRANSITION. fiscal_year is 1900-2200 (else 422).
+
+        NORMAL periods are contiguous, non-overlapping and cover the fiscal year
+        exactly; consecutive fiscal years abut. A SPECIAL period is zero-length:
+        start_date = end_date = the last day of the fiscal year, and it follows the
+        normal periods. period_no counts every period in order (a 13th special period
+        has period_no 13). period_key is "FY<year>-P<nn>" for normal periods and
+        "FY<year>-<special key>" for special ones.
+
+        fiscal_year label: START_YEAR (default) = the calendar year of the fiscal
+        year's anchor date; END_YEAR = the calendar year in which it ends (anchor
+        year - 1 unless the anchor is 1 January). WEEK_PATTERN years begin on the
+        first week_start weekday on or after the anchor date and last 52 or 53 weeks;
+        the 53rd week goes to the first or last period per extra_week_rule.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/Id'
+        - { name: fiscal_year, in: query, required: true, schema: { type: integer, minimum: 1900, maximum: 2200 } }
+      responses:
+        '200':
+          description: The periods
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PeriodsPreview' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /v1/fiscal-calendar-versions/{id}/transition-plan:
+    post:
+      tags: [commands]
+      operationId: createTransitionPlan
+      summary: Create a CalendarTransitionPlan (authz action FISCAL_CALENDAR_PROPOSE)
+      description: |
+        {id} is the TO version (DRAFT or APPROVED); expected_version is that
+        version's current version (checked, not bumped). from_version_id must be an
+        earlier ACTIVE or SUPERSEDED version of the same calendar. One live
+        (non-rejected) plan per to-version; a second is 409 DUPLICATE_CANDIDATE.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePlanRequest' }
+      responses:
+        '201':
+          description: The PROPOSED plan
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Plan' }
+        '200': { description: Idempotent replay }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/calendar-transition-plans/{id}:
+    get:
+      tags: [queries]
+      operationId: getTransitionPlan
+      summary: One transition plan
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The plan
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Plan' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/calendar-transition-plans/{id}:approve:
+    post:
+      tags: [commands]
+      operationId: approveTransitionPlan
+      summary: ApproveCalendarTransition for a plan (authz action FISCAL_CALENDAR_APPROVE)
+      description: The plan's proposer and the proposer of its to-version cannot approve (403 SOD_DENIED). Refused if the to-version is already ACTIVE or SUPERSEDED.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecisionRequest' }
+      responses:
+        '200':
+          description: The APPROVED plan
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Plan' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/calendar-transition-plans/{id}:reject:
+    post:
+      tags: [commands]
+      operationId: rejectTransitionPlan
+      summary: Reject a PROPOSED plan (authz action FISCAL_CALENDAR_APPROVE)
+      description: REJECTED is terminal; a new plan may then be created for the same to-version.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecisionRequest' }
+      responses:
+        '200':
+          description: The REJECTED plan
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Plan' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      description: Trusted tenant context (set by the gateway).
+      schema: { type: string }
+    PrincipalId:
+      name: X-Principal-Id
+      in: header
+      required: true
+      description: Calling principal (or X-Workload-Id for a workload).
+      schema: { type: string }
+    LegalEntityId:
+      name: X-Legal-Entity-Id
+      in: header
+      required: true
+      description: Trusted legal-entity context; must match the target object's legal entity.
+      schema: { type: string }
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Error:
+      description: Typed error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [CONTEXT_INVALID, VERSION_CONFLICT, DUPLICATE_CANDIDATE, INVALID_TRANSITION, RULE_AMBIGUOUS,
+                 SOURCE_UNVERIFIED, SOD_DENIED, REFERENCE_RETIRED, DEPENDENCY_UNAVAILABLE, NOT_FOUND, FORBIDDEN,
+                 TRANSITION_PLAN_REQUIRED]
+        message: { type: string }
+
+    Pattern:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [CALENDAR_MONTHS, WEEK_PATTERN] }
+        year_label: { type: string, enum: [START_YEAR, END_YEAR], description: defaults to START_YEAR }
+        weeks:
+          type: array
+          description: WEEK_PATTERN only. Positive integers adding up to 52.
+          items: { type: integer, minimum: 1 }
+        week_start: { type: string, enum: [MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, SUNDAY] }
+        extra_week_rule: { type: string, enum: [ADD_TO_LAST, ADD_TO_FIRST], description: where the 53rd week goes; required for WEEK_PATTERN }
+        special_periods:
+          type: array
+          maxItems: 4
+          items:
+            type: object
+            required: [key, position, zero_length]
+            properties:
+              key: { type: string, pattern: '^[A-Z][A-Z0-9_]{0,15}$', description: unique; may not look like P<number> }
+              position: { type: string, enum: [AFTER_LAST] }
+              zero_length: { type: boolean, enum: [true] }
+
+    Definition:
+      type: object
+      required: [pattern, fiscal_year_start_month, fiscal_year_start_day, effective_from]
+      properties:
+        pattern: { $ref: '#/components/schemas/Pattern' }
+        fiscal_year_start_month: { type: integer, minimum: 1, maximum: 12 }
+        fiscal_year_start_day: { type: integer, minimum: 1, maximum: 28 }
+        effective_from: { type: string, format: date }
+        effective_to: { type: string, format: date, nullable: true, description: exclusive; must be after effective_from }
+
+    CreateCalendarRequest:
+      allOf:
+        - $ref: '#/components/schemas/Definition'
+        - type: object
+          required: [legal_entity_id, code, scope, reason]
+          properties:
+            legal_entity_id: { type: string }
+            code: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$', description: unique per legal entity }
+            scope: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$', description: opaque book/basis label }
+            reason: { type: string }
+
+    ProposeChangeRequest:
+      allOf:
+        - $ref: '#/components/schemas/Definition'
+        - type: object
+          required: [expected_version, reason]
+          properties:
+            expected_version: { type: integer, minimum: 1, description: the CALENDAR's current version }
+            reason: { type: string }
+
+    DecisionRequest:
+      type: object
+      required: [expected_version, reason]
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        reason: { type: string }
+
+    CreatePlanRequest:
+      type: object
+      required: [from_version_id, expected_version, impact_assessment, reason]
+      properties:
+        from_version_id: { type: string, format: uuid }
+        expected_version: { type: integer, minimum: 1, description: the TO version's current version }
+        impact_assessment: { type: object, minProperties: 1 }
+        affects_posted_periods: { type: boolean }
+        mapping:
+          type: object
+          description: old period key -> non-empty array of new period keys. Required non-empty when affects_posted_periods is true.
+          additionalProperties:
+            type: array
+            minItems: 1
+            items: { type: string }
+        reason: { type: string }
+
+    Calendar:
+      type: object
+      properties:
+        calendar_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        code: { type: string }
+        scope: { type: string }
+        status: { type: string, enum: [DRAFT, ACTIVE] }
+        version: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        recorded_at: { type: string, format: date-time }
+
+    Version:
+      type: object
+      properties:
+        version_id: { type: string, format: uuid }
+        calendar_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        scope: { type: string }
+        version_no: { type: integer }
+        pattern: { $ref: '#/components/schemas/Pattern' }
+        fiscal_year_start_month: { type: integer }
+        fiscal_year_start_day: { type: integer }
+        effective_from: { type: string, format: date }
+        effective_to: { type: string, format: date, nullable: true }
+        status: { type: string, enum: [DRAFT, APPROVED, ACTIVE, SUPERSEDED] }
+        proposed_by: { type: string }
+        proposal_reason: { type: string }
+        approved_by: { type: string }
+        approval_reason: { type: string }
+        approved_at: { type: string, format: date-time }
+        activated_by: { type: string }
+        activated_at: { type: string, format: date-time }
+        superseded_by_version_id: { type: string, format: uuid }
+        recorded_at: { type: string, format: date-time }
+        version: { type: integer }
+
+    CalendarWithVersion:
+      type: object
+      properties:
+        calendar: { $ref: '#/components/schemas/Calendar' }
+        version: { $ref: '#/components/schemas/Version' }
+
+    CalendarView:
+      type: object
+      properties:
+        calendar: { $ref: '#/components/schemas/Calendar' }
+        as_of: { type: string, format: date }
+        version: { allOf: [{ $ref: '#/components/schemas/Version' }], nullable: true }
+
+    Plan:
+      type: object
+      properties:
+        plan_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        calendar_id: { type: string, format: uuid }
+        from_version_id: { type: string, format: uuid }
+        to_version_id: { type: string, format: uuid }
+        impact_assessment: { type: object }
+        affects_posted_periods: { type: boolean }
+        mapping: { type: object }
+        status: { type: string, enum: [PROPOSED, APPROVED, REJECTED] }
+        proposed_by: { type: string }
+        reason: { type: string }
+        decided_by: { type: string }
+        decision_reason: { type: string }
+        decided_at: { type: string, format: date-time }
+        version: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    Resolution:
+      type: object
+      properties:
+        calendar_id: { type: string, format: uuid }
+        version_id: { type: string, format: uuid }
+        version_no: { type: integer }
+        legal_entity_id: { type: string }
+        scope: { type: string }
+        date: { type: string, format: date }
+        effective_from: { type: string, format: date }
+        effective_to: { type: string, format: date, nullable: true }
+
+    Period:
+      type: object
+      properties:
+        period_key: { type: string, example: FY2026-P01 }
+        period_no: { type: integer, minimum: 1 }
+        start_date: { type: string, format: date }
+        end_date: { type: string, format: date, description: inclusive }
+        kind: { type: string, enum: [NORMAL, SPECIAL] }
+
+    PeriodsPreview:
+      type: object
+      properties:
+        calendar_id: { type: string, format: uuid }
+        version_id: { type: string, format: uuid }
+        version_no: { type: integer }
+        legal_entity_id: { type: string }
+        fiscal_year: { type: integer }
+        periods:
+          type: array
+          items: { $ref: '#/components/schemas/Period' }

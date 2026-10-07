@@ -72,6 +72,9 @@ services:
       - ../services/procurement-workflow-svc/deployments/migrations:/migrations/procurement-workflow:ro
       - ../services/performance-review-svc/deployments/migrations:/migrations/performance-review:ro
       - ../services/delegated-authority-svc/deployments/migrations:/migrations/delegated-authority:ro
+      - ../services/currency-registry-svc/deployments/migrations:/migrations/currency-registry:ro
+      - ../services/fiscal-calendar-svc/deployments/migrations:/migrations/fiscal-calendar:ro
+      - ../services/accounting-period-svc/deployments/migrations:/migrations/accounting-period:ro
       - ../services/access-control-svc/deployments/migrations:/migrations/access-control:ro
       - ../services/decision-support-svc/deployments/migrations:/migrations/decision-support:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
@@ -2122,6 +2125,130 @@ services:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
       # dead database pool reads as healthy while every read returns 500.
       test: ["CMD", "/healthcheck", "http://localhost:8136/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Currency Registry Service (REF-02). Global reference data: ISO 4217
+  # currencies, versioned minor-unit metadata and the platform support
+  # lifecycle. Owns NO FX rates, functional-currency assignment or amounts.
+  # Reads (validate/get/list) do not call authorization-svc; commands do and
+  # fail closed. Port 8172 was the next unused service port at the time of
+  # writing (8171 was the highest registered).
+  currency-registry-svc:
+    build:
+      context: ../services/currency-registry-svc
+      dockerfile: Dockerfile
+    container_name: currency-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8172:8172"
+    environment:
+      PORT: "8172"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: currency_registry
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.currency-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8172/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Fiscal Calendar Service (REF-04). Calendar definitions and versions as data;
+  # deterministic period preview. Owns NO period state (REF-05) and NO postings.
+  # Activating a non-first calendar version asks accounting-period-svc whether
+  # periods are already closed, and fails closed if it cannot be reached.
+  # Needs authz actions FISCAL_CALENDAR_PROPOSE / _APPROVE / _ACTIVATE seeded.
+  fiscal-calendar-svc:
+    build:
+      context: ../services/fiscal-calendar-svc
+      dockerfile: Dockerfile
+    container_name: fiscal-calendar-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8173:8173"
+    environment:
+      PORT: "8173"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: fiscal_calendar
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.fiscal-calendar.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8173/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Accounting Period Service (REF-05). Authoritative period state and the
+  # posting gate. A missing period is "not allowed", never OPEN. Close and
+  # reopen commands are refused until financial-close-svc serves
+  # /v1/close/workflow-refs/{ref} (not built yet) — fail closed by design.
+  # Needs authz actions PERIOD_STATE_COMMAND / PERIOD_MATERIALIZE seeded.
+  accounting-period-svc:
+    build:
+      context: ../services/accounting-period-svc
+      dockerfile: Dockerfile
+    container_name: accounting-period-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8174:8174"
+    environment:
+      PORT: "8174"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: accounting_period
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.accounting-period.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      FISCAL_CALENDAR_URL: "http://fiscal-calendar-svc:8173"
+      FINANCIAL_CLOSE_URL: "http://financial-close-svc:8104"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8174/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
