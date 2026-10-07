@@ -323,6 +323,12 @@ type Handler struct {
 	// enforceCloseGate makes period close depend on financial-control-svc's
 	// close gate. Off by default; see SetCloseGateEnforced.
 	enforceCloseGate bool
+
+	// REF-05 cutover phase 1 (see period_mirror.go). All nil/empty by default,
+	// which means: no mirroring, and the workflow-ref endpoint refuses everyone.
+	mirror             PeriodMirror
+	workflowRefs       WorkflowRefReader
+	workflowRefCallers map[string]struct{}
 }
 
 // SetCloseGateEnforced turns the financial-control-svc close-gate dependency
@@ -345,6 +351,8 @@ func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, s
 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/control-populations/migration-batch-tieout", h.GetMigrationBatchTieoutPopulation)
+	r.Get("/v1/close/workflow-refs/{ref}", h.GetWorkflowRef)
+	r.Get("/v1/close/workflow-refs/{ref}", h.GetWorkflowRef)
 	r.Route("/v1/close/periods", func(r chi.Router) {
 		r.Post("/", h.CreateFiscalPeriod)
 		r.Get("/", h.ListFiscalPeriods)
@@ -352,6 +360,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}/readiness", h.GetPeriodReadiness)
 		r.Post("/{id}/lock", h.LockPeriod)
 		r.Post("/{id}/reopen", h.ReopenPeriod)
+		r.Post("/{id}:mirror-to-period-service", h.MirrorPeriodToPeriodService)
 	})
 	r.Route("/v1/subledger-control/runs", func(r chi.Router) {
 		r.Post("/", h.RunSubledgerControl)
@@ -737,6 +746,10 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 
 	h.publisher.PublishClosed(r.Context(), correlationID, principalID, *fp, docID)
 
+	// REF-05 phase 1: best-effort mirror. Runs only when PERIOD_SERVICE_MIRROR=on,
+	// is bounded by a short deadline, and can neither fail nor change this response.
+	h.mirrorLock(r.Context(), tenantID, correlationID, principalID, fp, docID, blockingIssues)
+
 	writeJSON(w, http.StatusOK, domain.PeriodLockResponse{
 		FiscalPeriodID:     id,
 		PeriodName:         fp.PeriodName,
@@ -779,7 +792,8 @@ func (h *Handler) ReopenPeriod(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 
@@ -788,6 +802,11 @@ func (h *Handler) ReopenPeriod(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreErr(w, err, "period_not_found")
 		return
 	}
+	// Captured before the store call: the close evidence document being
+	// superseded, and a copy of the period as it was when LOCKED (the mirror
+	// resolves REF-05 by this period start date, which reopen does not change).
+	priorEvidenceDocID := derefString(fp.EvidenceDocumentID)
+	periodBeforeReopen := *fp
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, fp.LegalEntityID, actionPeriodReopen); err != nil {
 		h.writeAuthzErr(w, err)
@@ -831,6 +850,9 @@ func (h *Handler) ReopenPeriod(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.publisher.PublishReopened(r.Context(), correlationID, principalID, *fp, req.Reason)
+
+	// REF-05 phase 1: best-effort mirror (AUTHORIZE_REOPEN). See LockPeriod.
+	h.mirrorReopen(r.Context(), tenantID, correlationID, principalID, periodBeforeReopen, priorEvidenceDocID, req.Reason)
 
 	fp.CloseStatus = "OPEN"
 	fp.CloseLockedAt = nil

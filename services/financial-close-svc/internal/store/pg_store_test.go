@@ -41,7 +41,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
-		close_evidences, fiscal_periods, period_reopen_events,
+		close_workflow_refs, close_evidences, fiscal_periods, period_reopen_events,
 		subledger_control_runs,
 		accrual_recognition_reversals, accrual_recognition_instances, accrual_schedules,
 		prepayment_recognition_instances, prepayment_schedules,

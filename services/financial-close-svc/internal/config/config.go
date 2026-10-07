@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -71,8 +72,36 @@ type Config struct {
 	// startup failure instead.
 	CloseSigningKey string
 
+	// REF-05 cutover, phase 1. financial-close-svc stays authoritative; these
+	// flags only govern (a) the best-effort dual-write mirror into
+	// accounting-period-svc and (b) who may call the workflow-ref provenance
+	// endpoint. Every default is the safe/off state.
+	//
+	// PeriodMirrorEnabled is PERIOD_SERVICE_MIRROR=on. Anything other than
+	// exactly "on" (case-insensitive) is off, so a typo can never switch on an
+	// outbound write path; PeriodMirrorModeInvalid records that it happened.
+	PeriodMirrorEnabled     bool
+	PeriodMirrorModeInvalid bool
+	// AccountingPeriodURL is accounting-period-svc (REF-05).
+	AccountingPeriodURL string
+	// PeriodMirrorReopenWindow is how long a mirrored AUTHORIZE_REOPEN stays
+	// valid in REF-05. Default 24h; capped at MaxPeriodMirrorReopenWindow (REF-05's
+	// REOPEN_MAX_WINDOW default) -- PeriodMirrorReopenWindowAdjusted records a
+	// clamp or an unparseable/non-positive value replaced by the default.
+	PeriodMirrorReopenWindow         time.Duration
+	PeriodMirrorReopenWindowAdjusted bool
+	// WorkflowRefCallers are the X-Workload-Id values allowed to call
+	// GET /v1/close/workflow-refs/{ref}. Default: accounting-period-svc.
+	WorkflowRefCallers []string
+
 	OTELExporterEndpoint string
 }
+
+// MaxPeriodMirrorReopenWindow is accounting-period-svc's REOPEN_MAX_WINDOW default.
+const MaxPeriodMirrorReopenWindow = 72 * time.Hour
+
+// DefaultPeriodMirrorReopenWindow is PERIOD_MIRROR_REOPEN_WINDOW's default.
+const DefaultPeriodMirrorReopenWindow = 24 * time.Hour
 
 // ErrSigningKeyMissing is returned by Load when CLOSE_SIGNING_KEY is unset.
 type ErrSigningKeyMissing struct{}
@@ -121,6 +150,8 @@ func Load() (*Config, error) {
 	}
 
 	gateMode, gateModeInvalid := normalizeCloseGateMode(os.Getenv("FINCTRL_CLOSE_GATE_MODE"))
+	mirrorOn, mirrorInvalid := normalizeMirrorMode(os.Getenv("PERIOD_SERVICE_MIRROR"))
+	reopenWindow, reopenAdjusted := normalizeReopenWindow(os.Getenv("PERIOD_MIRROR_REOPEN_WINDOW"))
 
 	return &Config{
 		Env:  env("ENV", "local"),
@@ -159,6 +190,13 @@ func Load() (*Config, error) {
 		FinancialControlServiceURL: env("FINCTRL_SERVICE_URL", "http://financial-control-svc:8171"),
 		CloseGateMode:              gateMode,
 		CloseGateModeInvalid:       gateModeInvalid,
+
+		PeriodMirrorEnabled:              mirrorOn,
+		PeriodMirrorModeInvalid:          mirrorInvalid,
+		AccountingPeriodURL:              env("ACCOUNTING_PERIOD_URL", "http://accounting-period-svc:8174"),
+		PeriodMirrorReopenWindow:         reopenWindow,
+		PeriodMirrorReopenWindowAdjusted: reopenAdjusted,
+		WorkflowRefCallers:               splitList(env("WORKFLOW_REF_CALLERS", "accounting-period-svc")),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
@@ -175,6 +213,47 @@ func normalizeCloseGateMode(raw string) (mode string, invalid bool) {
 	default:
 		return "enforce", true
 	}
+}
+
+// normalizeMirrorMode maps PERIOD_SERVICE_MIRROR to on/off. Only "on" turns the
+// mirror on; unset/"off" is off; anything else is off AND reported invalid.
+func normalizeMirrorMode(raw string) (on bool, invalid bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "off":
+		return false, false
+	case "on":
+		return true, false
+	default:
+		return false, true
+	}
+}
+
+// normalizeReopenWindow parses PERIOD_MIRROR_REOPEN_WINDOW: unset -> 24h;
+// unparseable or <= 0 -> 24h (adjusted); above REF-05's 72h cap -> 72h (adjusted).
+func normalizeReopenWindow(raw string) (time.Duration, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return DefaultPeriodMirrorReopenWindow, false
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return DefaultPeriodMirrorReopenWindow, true
+	}
+	if d > MaxPeriodMirrorReopenWindow {
+		return MaxPeriodMirrorReopenWindow, true
+	}
+	return d, false
+}
+
+// splitList splits a comma list, trimming blanks and dropping empties.
+func splitList(raw string) []string {
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func env(key, def string) string {
