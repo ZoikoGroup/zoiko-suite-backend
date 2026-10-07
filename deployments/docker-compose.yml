@@ -1587,6 +1587,13 @@ services:
       - "8098:8098"
     environment:
       PORT: "8098"
+      # REF-05 cutover phase 2. off = today's behavior exactly. shadow = also ask
+      # accounting-period-svc by posting date and COMPARE (never changes the
+      # outcome). "enforce" is rejected at startup: that is phase 4 and needs
+      # separate sign-off. Leave off until periods are backfilled, or every
+      # comparison reports not_found.
+      PERIOD_GATE_MODE: "off"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: general_ledger
@@ -2548,6 +2555,14 @@ services:
       - "8104:8104"
     environment:
       PORT: "8104"
+      # REF-05 cutover phase 1. The mirror is best-effort dual-write of lock and
+      # reopen into accounting-period-svc; financial-close-svc stays
+      # authoritative. off = no outbound calls, no workflow refs written. The
+      # provenance endpoint /v1/close/workflow-refs/{ref} is served either way.
+      PERIOD_SERVICE_MIRROR: "off"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
+      WORKFLOW_REF_CALLERS: "accounting-period-svc"
+      PERIOD_MIRROR_REOPEN_WINDOW: "24h"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: financial_close

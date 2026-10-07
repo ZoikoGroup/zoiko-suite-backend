@@ -804,6 +804,132 @@ try {
     }
 }
 
+# -- REF-04 / REF-05 maker-checker roles -------------------------------------------
+#
+# Which action belongs to which service (copied from the `Action*` constants in
+# each service's internal/handler/handler.go -- re-grep them before editing):
+#
+#   currency-registry-svc    CURRENCY_IMPORT, CURRENCY_ACTIVATE, CURRENCY_RESTRICT,
+#                            CURRENCY_RETIRE, CURRENCY_TENANT_ENABLE, CURRENCY_TENANT_DISABLE
+#   fiscal-calendar-svc      FISCAL_CALENDAR_PROPOSE, FISCAL_CALENDAR_APPROVE,
+#                            FISCAL_CALENDAR_ACTIVATE
+#                            (transition-plan creation uses PROPOSE and plan
+#                            approve/reject uses APPROVE -- there is no separate plan action)
+#   accounting-period-svc    PERIOD_STATE_COMMAND, PERIOD_MATERIALIZE
+#
+# These are deliberately NOT appended to $BUNDLES. $BUNDLES all land on
+# CONSOLE_DEMO_OPERATOR, which is assigned to BOTH the demo principal and the
+# SoD approver, so adding them there would hand each of them both sides of
+# every pair below. Instead there are two roles, one per side:
+#
+#   REF05_PERIOD_MAKER    -> $PRINCIPAL_ID  proposes, imports, materialises
+#   REF05_PERIOD_CHECKER  -> $APPROVER_ID   approves, activates, restricts, retires
+#
+# SoD pairs the services enforce on a DIFFERENT PRINCIPAL (so they are only
+# testable if no one principal holds both actions):
+#   FISCAL_CALENDAR_PROPOSE  vs FISCAL_CALENDAR_APPROVE   (proposer may not approve)
+#   CURRENCY_IMPORT          vs CURRENCY_ACTIVATE         (importer may not activate)
+# PERIOD_STATE_COMMAND is ONE action covering soft close and hard close, and
+# accounting-period-svc refuses a hard close by whoever requested the soft
+# close. The action cannot be split, so both roles carry it and the service's own
+# actor check is the control; the demo principals are still distinct.
+#
+# Currency actions authorize against the PLATFORM scope when a request names no
+# legal entity (currency-registry-svc falls back to it), so both roles are also
+# assigned there.
+$REF05_ROLES = @(
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888881"
+        Code       = "REF05_PERIOD_MAKER"
+        Name       = "REF-04/05 Period Maker"
+        Principal  = $PRINCIPAL_ID
+        BundleCode = "REF05_MAKER"
+        Actions    = @(
+            "CURRENCY_IMPORT", "CURRENCY_TENANT_ENABLE", "CURRENCY_TENANT_DISABLE",
+            "FISCAL_CALENDAR_PROPOSE",
+            "PERIOD_MATERIALIZE", "PERIOD_STATE_COMMAND"
+        )
+    },
+    @{
+        RoleId     = "88888888-8888-8888-8888-888888888882"
+        Code       = "REF05_PERIOD_CHECKER"
+        Name       = "REF-04/05 Period Checker"
+        Principal  = $APPROVER_ID
+        BundleCode = "REF05_CHECKER"
+        Actions    = @(
+            "CURRENCY_ACTIVATE", "CURRENCY_RESTRICT", "CURRENCY_RETIRE",
+            "FISCAL_CALENDAR_APPROVE", "FISCAL_CALENDAR_ACTIVATE",
+            "PERIOD_STATE_COMMAND"
+        )
+    }
+)
+$REF05_SOD_PAIRS = @(
+    @("FISCAL_CALENDAR_PROPOSE", "FISCAL_CALENDAR_APPROVE"),
+    @("CURRENCY_IMPORT", "CURRENCY_ACTIVATE")
+)
+
+function Add-Ref05Assignment {
+    param([string] $PrincipalId, [string] $RoleId, [string] $Scope, [string] $Label)
+    Write-Host "assign $RoleId to $PrincipalId on the $Label" -NoNewline
+    try {
+        $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+            principal_id    = $PrincipalId
+            role_id         = $RoleId
+            legal_entity_id = $Scope
+            effective_from  = "2020-01-01T00:00:00Z"
+            assigned_by     = $PRINCIPAL_ID
+        }
+        Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
+    } catch {
+        if ("$_" -match "409|23505|duplicate|already") {
+            Write-Host "  -> already assigned" -ForegroundColor DarkGray
+        } else {
+            throw
+        }
+    }
+}
+
+foreach ($r in $REF05_ROLES) {
+    # Probe as the principal the role is FOR, on both scopes, so a re-run on a
+    # volume that already holds the grant does nothing (bundle posts have no upsert).
+    $roleMissing = @()
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $roleMissing += "$action@$scope" }
+        }
+    }
+    if ($roleMissing.Count -eq 0) {
+        Write-Host "$($r.Code): already granted to $($r.Principal)" -ForegroundColor Green
+        continue
+    }
+    Write-Host "$($r.Code): $($roleMissing.Count) grants missing" -ForegroundColor Yellow
+
+    Write-Host "role $($r.Code)" -NoNewline
+    try {
+        $role = Invoke-Authz -Path "/v1/admin/roles" -Body @{
+            role_id                 = $r.RoleId
+            tenant_id               = $TENANT_ID
+            role_code               = $r.Code
+            role_name               = $r.Name
+            role_scope_type         = "LEGAL_ENTITY"
+            created_by_principal_id = $PRINCIPAL_ID
+        }
+        Write-Host "  -> $($role.status)"
+    } catch {
+        Write-Host "  -> already exists, or could not be created; continuing to the bundle" -ForegroundColor DarkGray
+    }
+    $bundle = Invoke-Authz -Path "/v1/admin/roles/$($r.RoleId)/permission-bundles" -Body @{
+        bundle_code       = $r.BundleCode
+        permitted_actions = $r.Actions
+    }
+    Write-Host "bundle $($r.BundleCode)  -> $($bundle.status) [$($bundle.body.permitted_actions -join ', ')]"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $LEGAL_ENTITY -Label "legal entity"
+    Add-Ref05Assignment -PrincipalId $r.Principal -RoleId $r.RoleId -Scope $PLATFORM_SCOPE -Label "platform scope"
+}
+
 # Confirm through the same path the services use, rather than trusting that a
 # pile of 201s adds up to a working grant.
 Write-Host ""
@@ -855,6 +981,38 @@ foreach ($action in $PLATFORM_SCOPED_ACTIONS) {
     $outcome  = $decision.decision_outcome
     if ($outcome -eq "GRANTED") { $colour = "Green" } else { $colour = "Red"; $failed += "$action (platform scope)" }
     Write-Host ("     {0,-28} {1,-30} -> {2}" -f "platform", $action, $outcome) -ForegroundColor $colour
+}
+
+# REF-04/05: verify each maker/checker role grants what it should, and that no
+# principal holds both sides of an SoD pair (otherwise SoD is untestable and a
+# hand-made grant has crept in).
+Write-Host "Verifying REF-04/05 maker-checker roles:" -ForegroundColor Cyan
+foreach ($r in $REF05_ROLES) {
+    foreach ($action in $r.Actions) {
+        foreach ($scope in @($LEGAL_ENTITY, $PLATFORM_SCOPE)) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $r.Principal; legal_entity_id = $scope; action_type = $action
+            }
+            if ($probe.body.decision_outcome -ne "GRANTED") { $failed += "$action ($($r.Code) on $scope)" }
+        }
+    }
+}
+foreach ($principal in @($PRINCIPAL_ID, $APPROVER_ID)) {
+    foreach ($pair in $REF05_SOD_PAIRS) {
+        $held = @()
+        foreach ($action in $pair) {
+            $probe = Invoke-Authz -Path "/v1/authorize" -Body @{
+                principal_id = $principal; legal_entity_id = $LEGAL_ENTITY; action_type = $action
+            }
+            if ($probe.body.decision_outcome -eq "GRANTED") { $held += $action }
+        }
+        if ($held.Count -eq $pair.Count) {
+            $failed += "$principal holds BOTH sides of an SoD pair ($($pair -join ' / '))"
+            Write-Host "     $principal holds both $($pair -join ' / ')" -ForegroundColor Red
+        } else {
+            Write-Host ("     {0} holds {1} of [{2}]" -f $principal, $held.Count, ($pair -join ' / ')) -ForegroundColor Green
+        }
+    }
 }
 
 if ($failed.Count -gt 0) {
