@@ -19,6 +19,11 @@ import (
 	"zoiko.io/kill-switch-registry-svc/internal/outbox"
 )
 
+const (
+	testTenantID1 = "11111111-1111-1111-1111-111111111111"
+	testTenantID2 = "22222222-2222-2222-2222-222222222222"
+)
+
 // stubStore is a tiny in-memory re-implementation of the real
 // ResolveKillSwitch/ListCurrentStates logic — good enough to exercise the
 // handler's own validation and wiring without a real database.
@@ -229,7 +234,7 @@ func TestEngage_PlatformWideThenResolveBlocksEverything(t *testing.T) {
 	// blocked by the platform-wide switch — that's the whole point of a
 	// nil dimension matching everything.
 	wResolve := httptest.NewRecorder()
-	r.ServeHTTP(wResolve, tenantRequest(http.MethodGet, "/v1/kill-switches/resolve?domain=IMPORT_SYNC&tenant_id=t-1", "t-1"))
+	r.ServeHTTP(wResolve, tenantRequest(http.MethodGet, "/v1/kill-switches/resolve?domain=IMPORT_SYNC&tenant_id="+testTenantID1, testTenantID1))
 	var resolution domain.KillSwitchResolution
 	_ = json.Unmarshal(wResolve.Body.Bytes(), &resolution)
 	if !resolution.Blocked {
@@ -251,7 +256,7 @@ func TestResolve_MostSpecificEngagedSwitchWins(t *testing.T) {
 	// ...then disengage it for one specific tenant only (more specific).
 	r.ServeHTTP(httptest.NewRecorder(), buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
 		Domain:                     "AUTOMATION_ACTION",
-		TenantID:                   "tenant-safe",
+		TenantID:                   testTenantID2,
 		Reason:                     "tenant-safe cleared for automation resumption",
 		ReconciliationProcedureRef: "runbook:tenant-safe",
 		ApprovedByPrincipalID:      "sre-lead-approver-2",
@@ -264,10 +269,10 @@ func TestResolve_MostSpecificEngagedSwitchWins(t *testing.T) {
 	// tenant-safe should resolve to whichever is most specific — since both
 	// are ENGAGE here, the tenant-scoped one (more specific) wins.
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, tenantRequest(http.MethodGet, "/v1/kill-switches/resolve?domain=AUTOMATION_ACTION&tenant_id=tenant-safe", "tenant-safe"))
+	r.ServeHTTP(w, tenantRequest(http.MethodGet, "/v1/kill-switches/resolve?domain=AUTOMATION_ACTION&tenant_id="+testTenantID2, testTenantID2))
 	var resolution domain.KillSwitchResolution
 	_ = json.Unmarshal(w.Body.Bytes(), &resolution)
-	if !resolution.Blocked || resolution.MatchedEvent == nil || resolution.MatchedEvent.TenantID == nil || *resolution.MatchedEvent.TenantID != "tenant-safe" {
+	if !resolution.Blocked || resolution.MatchedEvent == nil || resolution.MatchedEvent.TenantID == nil || *resolution.MatchedEvent.TenantID != testTenantID2 {
 		t.Fatalf("expected the tenant-specific switch to be the matched event, got %+v", resolution)
 	}
 }
@@ -459,5 +464,139 @@ func TestEngage_ApproverAuthzUnavailable_503(t *testing.T) {
 	}))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 Service Unavailable when approver authz check fails, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCheck_RouteAliasWorks(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	// Platform-wide engage
+	r.ServeHTTP(httptest.NewRecorder(), buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+		Reason:                     "platform maintenance",
+		ReconciliationProcedureRef: "runbook:maint",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
+	}))
+
+	// Verify /check returns 200 with Blocked=true
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodGet, "/v1/kill-switches/check?domain=IMPORT_SYNC", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /check, got %d", w.Code)
+	}
+	var res domain.KillSwitchResolution
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to unmarshal resolution: %v", err)
+	}
+	if !res.Blocked {
+		t.Fatalf("expected /check to return Blocked=true, got %+v", res)
+	}
+}
+
+func TestEngage_CrossTenantForbidden403(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	req := buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+		Domain:                     "AUTOMATION_ACTION",
+		TenantID:                   testTenantID2,
+		Reason:                     "cross-tenant attempt",
+		ReconciliationProcedureRef: "runbook:test",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
+	})
+	req.Header.Set("X-Tenant-Id", testTenantID1) // Does not match testTenantID2 in body
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-tenant engage, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEngage_InvalidTenantUUID400(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	req := buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+		Domain:                     "AUTOMATION_ACTION",
+		TenantID:                   "not-a-valid-uuid",
+		Reason:                     "invalid uuid tenant",
+		ReconciliationProcedureRef: "runbook:test",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
+	})
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for non-UUID tenant, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDisengage_CrossTenantForbidden403(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	req := buildRequest(http.MethodPost, "/v1/kill-switches/disengage", domain.DisengageKillSwitchRequest{
+		Domain:                "AUTOMATION_ACTION",
+		TenantID:              testTenantID2,
+		Reason:                "cross-tenant disengage attempt",
+		ApprovedByPrincipalID: "sre-lead-approver-2",
+	})
+	req.Header.Set("X-Tenant-Id", testTenantID1)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-tenant disengage, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDisengage_InvalidTenantUUID400(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	req := buildRequest(http.MethodPost, "/v1/kill-switches/disengage", domain.DisengageKillSwitchRequest{
+		Domain:                "AUTOMATION_ACTION",
+		TenantID:              "bad-uuid-format",
+		Reason:                "bad uuid",
+		ApprovedByPrincipalID: "sre-lead-approver-2",
+	})
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for non-UUID tenant in disengage, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_InvalidTenantUUID400(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	req := buildRequest(http.MethodGet, "/v1/kill-switches/resolve?tenant_id=invalid-uuid", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for invalid tenant_id query param, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEngage_CorrelationIDFallback(t *testing.T) {
+	h, st, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	req := buildRequest(http.MethodPost, "/v1/kill-switches/engage", domain.EngageKillSwitchRequest{
+		Domain:                     "AUTOMATION_ACTION",
+		Reason:                     "test correlation fallback",
+		ReconciliationProcedureRef: "runbook:test-corr",
+		ApprovedByPrincipalID:      "sre-lead-approver-2",
+	})
+	req.Header.Set("X-Correlation-ID", "corr-abc-12345")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d — %s", w.Code, w.Body.String())
+	}
+	if len(st.outboxEvents) == 0 {
+		t.Fatalf("expected outbox event to be recorded")
+	}
+	if st.outboxEvents[0].CorrelationID != "corr-abc-12345" {
+		t.Fatalf("expected outbox CorrelationID 'corr-abc-12345', got %q", st.outboxEvents[0].CorrelationID)
 	}
 }

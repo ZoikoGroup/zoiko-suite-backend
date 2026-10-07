@@ -185,10 +185,9 @@ func (c *WorkflowClient) GetByID(ctx context.Context, workflowInstanceID string)
 // doc named directly: "evidence-manifest-svc currently fetches workflow
 // data directly from workflow-svc by workflow_instance_id and is NOT wired
 // to this cross-workflow query endpoint." This client uses the per-instance
-// endpoint specifically (GET /v1/workflows/{id}/history) — the
-// cross-workflow query (GET /v1/workflows/history) is a distinct,
-// broader discovery surface this service has no request shape for yet,
-// left as a further, separate gap rather than fabricated here.
+// endpoint (GET /v1/workflows/{id}/history, see ListByInstanceID) and the
+// cross-workflow, entity+date-range query (GET /v1/workflows/history, see
+// ListByEntityAndDateRange) — both real endpoints on workflow-history-svc.
 type WorkflowHistoryClient struct {
 	baseURL string
 	http    *http.Client
@@ -243,6 +242,65 @@ func (c *WorkflowHistoryClient) ListByInstanceID(ctx context.Context, workflowIn
 	var raw []json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("aggregator: decode workflow history list: %w", err)
+	}
+
+	out := make([]SourceRecord, 0, len(events))
+	for i, e := range events {
+		out = append(out, SourceRecord{
+			SourceType:     domain.SourceWorkflowHistory,
+			SourceRecordID: e.EventID,
+			RawJSON:        raw[i],
+		})
+	}
+	return out, nil
+}
+
+// ListByEntityAndDateRange calls workflow-history-svc's real
+// GET /v1/workflows/history?legal_entity_id=...&from=...&to=... (the
+// "cross-workflow query endpoint" named in this client's own doc comment),
+// the same "list produces many records" shape as
+// GovernanceDecisionClient.ListByEntityAndDateRange. Both from and to are
+// required by the callee (it 400s on a missing or non-RFC3339 value, and on
+// to <= from), matching the non-pointer signature this method is called
+// with in handler.go — unlike the governance decisions list, whose from/to
+// are genuinely optional there.
+func (c *WorkflowHistoryClient) ListByEntityAndDateRange(ctx context.Context, legalEntityID string, from, to time.Time) ([]SourceRecord, error) {
+	q := url.Values{}
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("from", from.UTC().Format(time.RFC3339))
+	q.Set("to", to.UTC().Format(time.RFC3339))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/workflows/history?"+q.Encode(), nil)
+	if err != nil {
+		return nil, ErrSourceUnavailable
+	}
+	forwardTenant(ctx, req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("workflow-history-svc unreachable — failing closed", zap.Error(err))
+		return nil, ErrSourceUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		c.log.Error("workflow-history-svc unexpected status", zap.Int("status", resp.StatusCode))
+		return nil, ErrSourceUnavailable
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, ErrSourceUnavailable
+	}
+	var events []struct {
+		EventID string `json:"event_id"`
+	}
+	if err := json.Unmarshal(body, &events); err != nil {
+		return nil, fmt.Errorf("aggregator: decode cross-workflow history list: %w", err)
+	}
+
+	// Re-marshal each element individually, same reason as ListByInstanceID.
+	var raw []json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("aggregator: decode cross-workflow history list: %w", err)
 	}
 
 	out := make([]SourceRecord, 0, len(events))

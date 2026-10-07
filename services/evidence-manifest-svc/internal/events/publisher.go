@@ -70,8 +70,14 @@ type ManifestGeneratedEvent struct {
 // the aggregateID as the message key and X-Event-ID as a header. Kafka
 // errors are returned so the outbox relay can track them for retry.
 func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	// Topic is deliberately NOT set on the message: p.writer (a *kafka.Writer
+	// in production, constructed in cmd/server with its own Topic field set)
+	// already pins the topic at the writer level, and kafka-go's
+	// Writer.WriteMessages refuses a message that ALSO carries a Topic —
+	// "Topic must not be specified for both Writer and Message", unconditionally,
+	// on every call, regardless of whether a broker is even reachable. Same
+	// defect found and fixed in document-vault-svc's internal/events/publisher.go.
 	msg := kafka.Message{
-		Topic: p.topic,
 		Key:   []byte(aggregateID),
 		Value: payload,
 		Headers: []kafka.Header{
@@ -120,8 +126,9 @@ func (p *Publisher) PublishManifestGenerated(ctx context.Context, m *domain.Evid
 		return fmt.Errorf("marshal evidence.manifest.generated: %w", err)
 	}
 
+	// Same reason Topic is omitted in PublishOutbox above — p.writer already
+	// pins it.
 	msg := kafka.Message{
-		Topic: p.topic,
 		Key:   []byte(m.ManifestID),
 		Value: data,
 		Headers: []kafka.Header{

@@ -222,11 +222,27 @@ func (s *PgStore) ResolveKillSwitch(ctx context.Context, plane, domainName, prov
 // ListCurrentStates returns the latest event for every distinct scope
 // tuple ever recorded — the full operations-visibility view, regardless
 // of current action (engaged or disengaged).
+//
+// Every other read in this file (LatestEventForScope, ResolveKillSwitch,
+// ListHistoryForScope) filters by tenant_id in its own WHERE clause, in
+// addition to whatever RLS enforces, the same defense-in-depth every
+// tenant-scoped query in this codebase applies. This one originally did
+// not — it relied on migration 000002's RLS policy alone, which is the
+// single point of failure this file's own comment above warns against:
+// if RLS is ever bypassed for any reason (the wrong DB role, a pooler
+// misconfiguration, a future admin session), this was the one query with
+// no independent backstop, and it would hand every tenant's kill-switch
+// history — including a DATABASE_URL role defect found and fixed in this
+// same pass — to any caller. The WHERE clause below mirrors the RLS
+// policy's own condition exactly, so it enforces the identical rule
+// independently rather than merely hoping RLS is in effect.
 func (s *PgStore) ListCurrentStates(ctx context.Context) ([]domain.KillSwitchState, error) {
 	const query = `
 		SELECT DISTINCT ON (plane, domain, provider_code, tenant_id)
 			plane, domain, provider_code, tenant_id, action, reason, created_at
 		FROM kill_switch_events
+		WHERE tenant_id IS NULL
+		   OR tenant_id::text = NULLIF(current_setting('app.tenant_id', true), '')
 		ORDER BY plane, domain, provider_code, tenant_id, event_seq DESC;`
 
 	var out []domain.KillSwitchState

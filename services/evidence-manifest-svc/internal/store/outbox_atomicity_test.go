@@ -2,11 +2,9 @@ package store_test
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -17,20 +15,17 @@ import (
 	"zoiko.io/evidence-manifest-svc/internal/store"
 )
 
-func getTestPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set — skipping real Postgres test")
-	}
-	pool, err := pgxpool.New(context.Background(), dsn)
-	require.NoError(t, err)
-	t.Cleanup(func() { pool.Close() })
-	return pool
-}
-
 func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
-	pool := getTestPool(t)
+	// requireTestDB (defined in pg_store_test.go, same package) drops and
+	// recreates the schema from every migration by glob before returning.
+	// This file used to define its own getTestPool, which only opened a
+	// connection and assumed the schema already existed — on a genuinely
+	// fresh database (a new CI run, a first-time dev setup) with no other
+	// test having happened to run first in the same binary, both tests in
+	// this file failed outright with "relation evidence_manifests does not
+	// exist", never actually verifying the atomicity guarantee they exist
+	// to check.
+	pool := requireTestDB(t)
 	ctx := context.Background()
 
 	tenantID := uuid.New().String()
@@ -108,7 +103,7 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 }
 
 func TestPgStore_FinalizeGenerated_AtomicallyCreatesOutboxEvent_RealDB(t *testing.T) {
-	pool := getTestPool(t)
+	pool := requireTestDB(t)
 	ctx := context.Background()
 
 	tenantID := uuid.New().String()

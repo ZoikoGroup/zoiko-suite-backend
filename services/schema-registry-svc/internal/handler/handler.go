@@ -104,6 +104,34 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx := r.Context()
+
+	// ── Idempotent replay (ZS-ARCH-SVC-001 v2.0 §4, INV-08) ─────────────────
+	//
+	// The envelope middleware already refuses a request with no
+	// Idempotency-Key, but presence alone is not replay protection — until
+	// this check existed, nothing stopped a retried registration (e.g. after
+	// a client-side timeout on a POST that actually succeeded server-side)
+	// from claiming a brand new version number instead of returning the
+	// original one. A genuine replay must return the ORIGINAL outcome
+	// unconditionally, which is why this runs before the body is even
+	// decoded: re-validating compatibility against whatever is latest NOW
+	// would be answering a different question than "what happened the first
+	// time this exact request was sent".
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey != "" {
+		existing, err := h.store.FindByIdempotencyKey(ctx, eventName, idempotencyKey)
+		if err != nil {
+			h.log.Error("idempotency key lookup failed", zap.Error(err), zap.String("event_name", eventName))
+			writeError(w, http.StatusServiceUnavailable, domain.ErrStoreUnavailable.Error())
+			return
+		}
+		if existing != nil {
+			writeJSON(w, http.StatusCreated, existing)
+			return
+		}
+	}
+
 	var req domain.RegisterSchemaRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -137,7 +165,6 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
 	current, err := h.store.LatestVersion(ctx, eventName)
 	if err != nil {
 		h.log.Error("lookup latest version failed", zap.Error(err), zap.String("event_name", eventName))
@@ -184,6 +211,7 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 		OwningService:     req.OwningService,
 		RegisteredBy:      principalID,
 		RegisteredAt:      time.Now().UTC(),
+		IdempotencyKey:    idempotencyKey,
 	}
 
 	// The version is assigned inside the INSERT, guarded by currentVersion.

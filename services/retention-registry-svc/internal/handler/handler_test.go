@@ -14,15 +14,19 @@ import (
 	authzpkg "zoiko.io/retention-registry-svc/internal/authz"
 	"zoiko.io/retention-registry-svc/internal/domain"
 	"zoiko.io/retention-registry-svc/internal/events"
+	svcmiddleware "zoiko.io/retention-registry-svc/internal/middleware"
+	"zoiko.io/retention-registry-svc/internal/outbox"
 )
 
 type stubStore struct {
-	policies []domain.RetentionPolicy
-	holds    []domain.LegalHold
+	policies     []domain.RetentionPolicy
+	holds        []domain.LegalHold
+	outboxEvents []outbox.Event
 }
 
-func (s *stubStore) CreateRetentionPolicy(_ context.Context, p *domain.RetentionPolicy) error {
+func (s *stubStore) CreateRetentionPolicy(_ context.Context, p *domain.RetentionPolicy, outboxEvents ...outbox.Event) error {
 	s.policies = append(s.policies, *p)
+	s.outboxEvents = append(s.outboxEvents, outboxEvents...)
 	return nil
 }
 
@@ -56,8 +60,9 @@ func (s *stubStore) FindApplicableRetentionPolicy(_ context.Context, recordClass
 	return best, nil
 }
 
-func (s *stubStore) CreateLegalHold(_ context.Context, h *domain.LegalHold) error {
+func (s *stubStore) CreateLegalHold(_ context.Context, h *domain.LegalHold, outboxEvents ...outbox.Event) error {
 	s.holds = append(s.holds, *h)
+	s.outboxEvents = append(s.outboxEvents, outboxEvents...)
 	return nil
 }
 
@@ -124,7 +129,7 @@ func (s *stubStore) FindLegalHoldByID(_ context.Context, id, callerTenantID stri
 	return nil, domain.ErrLegalHoldNotFound
 }
 
-func (s *stubStore) ReleaseLegalHold(_ context.Context, id, callerTenantID, releasedBy, releaseApprovedBy string) (*domain.LegalHold, error) {
+func (s *stubStore) ReleaseLegalHold(_ context.Context, id, callerTenantID, releasedBy, releaseApprovedBy string, outboxEvents ...outbox.Event) (*domain.LegalHold, error) {
 	if callerTenantID == "" {
 		return nil, domain.ErrTenantMissing
 	}
@@ -136,6 +141,7 @@ func (s *stubStore) ReleaseLegalHold(_ context.Context, id, callerTenantID, rele
 			s.holds[i].HoldStatus = "RELEASED"
 			s.holds[i].ReleasedByPrincipalID = &releasedBy
 			s.holds[i].ReleaseApprovedByPrincipalID = &releaseApprovedBy
+			s.outboxEvents = append(s.outboxEvents, outboxEvents...)
 			return &s.holds[i], nil
 		}
 	}
@@ -211,6 +217,7 @@ func newTestHandler() (*Handler, *stubStore, *stubPublisher) {
 
 func newTestRouter(h *Handler) *chi.Mux {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	RegisterRoutes(r, h)
 	return r
 }
@@ -287,7 +294,7 @@ func TestCreateRetentionPolicy_ThenResolveFindsIt(t *testing.T) {
 // doc7 §J3 doctrine: a hold blocks regardless of what the retention policy
 // says — the two are independent, and a hold always wins if active.
 func TestLegalHold_BlocksResolveEvenWithAPermissiveRetentionPolicy(t *testing.T) {
-	h, _, pub := newTestHandler()
+	h, st, _ := newTestHandler()
 	r := newTestRouter(h)
 
 	r.ServeHTTP(httptest.NewRecorder(), buildRequest(http.MethodPost, "/v1/retention-policies", domain.CreateRetentionPolicyRequest{
@@ -306,8 +313,14 @@ func TestLegalHold_BlocksResolveEvenWithAPermissiveRetentionPolicy(t *testing.T)
 	if wHold.Code != http.StatusCreated {
 		t.Fatalf("expected 201 creating hold, got %d — %s", wHold.Code, wHold.Body.String())
 	}
-	if pub.calls != 2 { // policy.created + legal_hold.engaged
-		t.Errorf("expected 2 events published, got %d", pub.calls)
+	// policy.created + legal_hold.engaged, delivered via the transactional
+	// outbox (st.outboxEvents) — not via a direct publisher call. A direct
+	// h.publisher.Publish used to also fire here, unconditionally alongside
+	// the outbox insert, so every one of these events was delivered twice
+	// to any real Kafka consumer; removed as part of this pass (see
+	// handler.go's CreateRetentionPolicy/CreateLegalHold/ReleaseLegalHold).
+	if len(st.outboxEvents) != 2 {
+		t.Errorf("expected 2 outbox events, got %d", len(st.outboxEvents))
 	}
 
 	wResolve := httptest.NewRecorder()
@@ -443,5 +456,183 @@ func TestReleaseLegalHold_ApproverAuthzUnavailable_503(t *testing.T) {
 	}))
 	if wRelease.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when approver authz is unavailable, got %d — %s", wRelease.Code, wRelease.Body.String())
+	}
+}
+
+func TestCreateRetentionPolicy_CrossTenantForbidden403(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	req := buildRequestAs(http.MethodPost, "/v1/retention-policies", domain.CreateRetentionPolicyRequest{
+		RecordClass:          "FINANCIAL_LEDGER",
+		LegalRegulatoryBasis: "Tax compliance",
+		EffectiveFrom:        "2026-01-01T00:00:00Z",
+		MinRetentionDays:     365,
+		TenantID:             tenantB, // Header is tenantA
+	}, tenantA)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-tenant policy creation, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateRetentionPolicy_InvalidTenantUUID400(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	req := buildRequestAs(http.MethodPost, "/v1/retention-policies", domain.CreateRetentionPolicyRequest{
+		RecordClass:          "FINANCIAL_LEDGER",
+		LegalRegulatoryBasis: "Tax compliance",
+		EffectiveFrom:        "2026-01-01T00:00:00Z",
+		MinRetentionDays:     365,
+		TenantID:             "not-a-uuid",
+	}, "")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for non-UUID tenant, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateLegalHold_CrossTenantForbidden403(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	req := buildRequestAs(http.MethodPost, "/v1/legal-holds", domain.CreateLegalHoldRequest{
+		ScopeDescription: "cross tenant attempt",
+		Authority:        "SEC",
+		TenantID:         tenantB, // Header is tenantA
+	}, tenantA)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-tenant hold creation, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateLegalHold_InvalidTenantUUID400(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	req := buildRequestAs(http.MethodPost, "/v1/legal-holds", domain.CreateLegalHoldRequest{
+		ScopeDescription: "invalid uuid attempt",
+		Authority:        "SEC",
+		TenantID:         "invalid-uuid",
+	}, "")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for non-UUID tenant, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_InvalidTenantUUID400(t *testing.T) {
+	h, _, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequestAs(http.MethodGet, "/v1/retention/resolve?record_class=FINANCIAL_LEDGER&tenant_id=bad-uuid", nil, ""))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for invalid query tenant_id UUID, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateRetentionPolicy_OutboxEventCreated(t *testing.T) {
+	h, st, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	req := buildRequest(http.MethodPost, "/v1/retention-policies", domain.CreateRetentionPolicyRequest{
+		RecordClass:          "FINANCIAL_LEDGER",
+		LegalRegulatoryBasis: "Tax Code §401",
+		EffectiveFrom:        "2026-01-01T00:00:00Z",
+		MinRetentionDays:     2555,
+		TenantID:             tenantA,
+	})
+	req.Header.Set("X-Correlation-ID", "corr-retention-policy-123")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d — %s", w.Code, w.Body.String())
+	}
+	if len(st.outboxEvents) != 1 {
+		t.Fatalf("expected 1 outbox event, got %d", len(st.outboxEvents))
+	}
+	if st.outboxEvents[0].EventType != "retention_policy.created" {
+		t.Fatalf("expected event type retention_policy.created, got %s", st.outboxEvents[0].EventType)
+	}
+	if st.outboxEvents[0].CorrelationID != "corr-retention-policy-123" {
+		t.Fatalf("expected CorrelationID 'corr-retention-policy-123', got %s", st.outboxEvents[0].CorrelationID)
+	}
+}
+
+func TestCreateLegalHold_OutboxEventCreated(t *testing.T) {
+	h, st, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	req := buildRequest(http.MethodPost, "/v1/legal-holds", domain.CreateLegalHoldRequest{
+		ScopeDescription: "DOJ investigation matter 99",
+		Authority:        "DOJ",
+		TenantID:         tenantA,
+	})
+	req.Header.Set("X-Correlation-ID", "corr-hold-engaged-456")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d — %s", w.Code, w.Body.String())
+	}
+	if len(st.outboxEvents) != 1 {
+		t.Fatalf("expected 1 outbox event, got %d", len(st.outboxEvents))
+	}
+	if st.outboxEvents[0].EventType != "legal_hold.engaged" {
+		t.Fatalf("expected event type legal_hold.engaged, got %s", st.outboxEvents[0].EventType)
+	}
+	if st.outboxEvents[0].CorrelationID != "corr-hold-engaged-456" {
+		t.Fatalf("expected CorrelationID 'corr-hold-engaged-456', got %s", st.outboxEvents[0].CorrelationID)
+	}
+}
+
+func TestReleaseLegalHold_OutboxEventCreated(t *testing.T) {
+	h, st, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	// Create hold first
+	wHold := httptest.NewRecorder()
+	r.ServeHTTP(wHold, buildRequest(http.MethodPost, "/v1/legal-holds", domain.CreateLegalHoldRequest{
+		ScopeDescription: "matter 100",
+		Authority:        "Court",
+		TenantID:         tenantA,
+	}))
+	var hld domain.LegalHold
+	_ = json.Unmarshal(wHold.Body.Bytes(), &hld)
+
+	// Clear outboxEvents from creation
+	st.outboxEvents = nil
+
+	// Release hold
+	reqRelease := buildRequest(http.MethodPost, "/v1/legal-holds/"+hld.LegalHoldID+"/release", domain.ReleaseLegalHoldRequest{
+		ReleaseApprovedByPrincipalID: "independent-legal-counsel-9",
+	})
+	reqRelease.Header.Set("X-Correlation-ID", "corr-hold-released-789")
+
+	wRelease := httptest.NewRecorder()
+	r.ServeHTTP(wRelease, reqRelease)
+	if wRelease.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK releasing hold, got %d — %s", wRelease.Code, wRelease.Body.String())
+	}
+	if len(st.outboxEvents) != 1 {
+		t.Fatalf("expected 1 outbox event, got %d", len(st.outboxEvents))
+	}
+	if st.outboxEvents[0].EventType != "legal_hold.released" {
+		t.Fatalf("expected event type legal_hold.released, got %s", st.outboxEvents[0].EventType)
+	}
+	if st.outboxEvents[0].CorrelationID != "corr-hold-released-789" {
+		t.Fatalf("expected CorrelationID 'corr-hold-released-789', got %s", st.outboxEvents[0].CorrelationID)
 	}
 }

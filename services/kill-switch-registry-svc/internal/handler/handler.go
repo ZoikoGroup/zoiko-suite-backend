@@ -13,6 +13,7 @@ import (
 
 	authzpkg "zoiko.io/kill-switch-registry-svc/internal/authz"
 	"zoiko.io/kill-switch-registry-svc/internal/domain"
+	svcenvelope "zoiko.io/kill-switch-registry-svc/internal/envelope"
 	"zoiko.io/kill-switch-registry-svc/internal/events"
 	svcmiddleware "zoiko.io/kill-switch-registry-svc/internal/middleware"
 	"zoiko.io/kill-switch-registry-svc/internal/outbox"
@@ -76,6 +77,18 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 // of a silently reinterpreted answer about itself.
 func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, declared string) (*string, bool) {
 	verified := svcmiddleware.TenantFromContext(r.Context())
+	if declared != "" {
+		if _, err := uuid.Parse(declared); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+			return nil, false
+		}
+	}
+	if verified != "" {
+		if _, err := uuid.Parse(verified); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+			return nil, false
+		}
+	}
 	if declared != "" && declared != verified {
 		writeError(w, http.StatusForbidden,
 			"tenant_id does not match the verified X-Tenant-Id")
@@ -119,6 +132,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/engage", h.EngageKillSwitch)
 		r.Post("/disengage", h.DisengageKillSwitch)
 		r.Get("/resolve", h.ResolveKillSwitch)
+		r.Get("/check", h.ResolveKillSwitch)
 		r.Get("/", h.ListCurrentStates)
 		r.Get("/history", h.ListHistoryForScope)
 	})
@@ -162,11 +176,32 @@ func (h *Handler) EngageKillSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
+	if verifiedTenant != "" && req.TenantID != "" && req.TenantID != verifiedTenant {
+		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
+		return
+	}
+	if req.TenantID != "" {
+		if _, err := uuid.Parse(req.TenantID); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+			return
+		}
+	}
+
 	if !h.authorize(w, r, principalID, req.TenantID, KillSwitchEngage) {
 		return
 	}
 	if !h.authorizePrincipal(w, r, req.ApprovedByPrincipalID, req.TenantID, KillSwitchEngage, "approver not authorized to approve kill switch engagement") {
 		return
+	}
+
+	correlationID := req.CorrelationID
+	if correlationID == "" {
+		if env, ok := svcenvelope.FromContext(r.Context()); ok && env.CorrelationID != "" {
+			correlationID = env.CorrelationID
+		} else if hdr := r.Header.Get("X-Correlation-ID"); hdr != "" {
+			correlationID = hdr
+		}
 	}
 
 	e := &domain.KillSwitchEvent{
@@ -196,11 +231,11 @@ func (h *Handler) EngageKillSwitch(w http.ResponseWriter, r *http.Request) {
 			EntityID:      e.KillSwitchEventID,
 			TenantID:      req.TenantID,
 			ActorID:       principalID,
-			CorrelationID: req.CorrelationID,
+			CorrelationID: correlationID,
 			OccurredAt:    e.CreatedAt,
 			Payload:       e,
 		},
-		CorrelationID: req.CorrelationID,
+		CorrelationID: correlationID,
 		TenantID:      strPtrOrNil(req.TenantID),
 	}
 
@@ -242,6 +277,18 @@ func (h *Handler) DisengageKillSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
+	if verifiedTenant != "" && req.TenantID != "" && req.TenantID != verifiedTenant {
+		writeError(w, http.StatusForbidden, "tenant_id does not match the verified X-Tenant-Id")
+		return
+	}
+	if req.TenantID != "" {
+		if _, err := uuid.Parse(req.TenantID); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid tenant_id: must be a valid UUID")
+			return
+		}
+	}
+
 	if !h.authorize(w, r, principalID, req.TenantID, KillSwitchDisengage) {
 		return
 	}
@@ -259,6 +306,15 @@ func (h *Handler) DisengageKillSwitch(w http.ResponseWriter, r *http.Request) {
 	if current == nil || current.Action != domain.KillSwitchActionEngage {
 		writeError(w, http.StatusConflict, domain.ErrNotCurrentlyEngaged.Error())
 		return
+	}
+
+	correlationID := req.CorrelationID
+	if correlationID == "" {
+		if env, ok := svcenvelope.FromContext(r.Context()); ok && env.CorrelationID != "" {
+			correlationID = env.CorrelationID
+		} else if hdr := r.Header.Get("X-Correlation-ID"); hdr != "" {
+			correlationID = hdr
+		}
 	}
 
 	e := &domain.KillSwitchEvent{
@@ -287,11 +343,11 @@ func (h *Handler) DisengageKillSwitch(w http.ResponseWriter, r *http.Request) {
 			EntityID:      e.KillSwitchEventID,
 			TenantID:      req.TenantID,
 			ActorID:       principalID,
-			CorrelationID: req.CorrelationID,
+			CorrelationID: correlationID,
 			OccurredAt:    e.CreatedAt,
 			Payload:       e,
 		},
-		CorrelationID: req.CorrelationID,
+		CorrelationID: correlationID,
 		TenantID:      strPtrOrNil(req.TenantID),
 	}
 

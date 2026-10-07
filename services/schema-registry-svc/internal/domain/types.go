@@ -39,6 +39,14 @@ type EventSchema struct {
 
 	RegisteredBy string    `json:"registered_by,omitempty"`
 	RegisteredAt time.Time `json:"registered_at"`
+
+	// IdempotencyKey is the caller-supplied Idempotency-Key (INV-08) this
+	// version was registered under, scoped per event_name. A replayed
+	// registration with the same key against the same event returns this
+	// row again instead of claiming a new version. Omitted from the wire
+	// response (json:"-"): it is the registry's own replay-detection state,
+	// not part of the event contract being described.
+	IdempotencyKey string `json:"-"`
 }
 
 // Compatibility modes. VARCHAR in the database and extensible by data

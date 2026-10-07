@@ -108,7 +108,17 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		Value: data,
 	})
 	if err != nil {
+		// Found unreachable in production — Publish has no live call site
+		// (cmd/server/main.go wires every mutation through the transactional
+		// outbox's PublishOutbox instead, which already returns err
+		// correctly). Fixed anyway: swallowing this error after logging
+		// "event dropped" is exactly the anti-pattern this domain's audit
+		// exists to eliminate elsewhere (see docs/architecture's "Widespread
+		// Lack of Transactional Outbox" finding), and a future caller of
+		// this exported method deserves the same fail-closed guarantee
+		// PublishOutbox already provides.
 		p.logger.Warn("kafka publish failed — event dropped", zap.String("event_type", params.EventType), zap.Error(err))
+		return err
 	}
 	return nil
 }

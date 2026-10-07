@@ -41,8 +41,17 @@ func NewPublisher(log *zap.Logger, topic string, producer MessageWriter) *Publis
 // the aggregateID as the message key and X-Event-ID as a header. Kafka
 // errors are returned so the outbox relay can track them for retry.
 func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	// Topic is deliberately NOT set here. p.producer (a *kafka.Writer in
+	// production, constructed in cmd/server with its own Topic field set)
+	// already pins the topic at the writer level, and kafka-go's
+	// Writer.WriteMessages refuses a message that ALSO carries a Topic —
+	// "Topic must not be specified for both Writer and Message" — it is not
+	// a warning or a merge, every single call fails. That is exactly what
+	// was happening here: every outbox event, forever, logged as a publish
+	// failure and endlessly retried by the relay, with the DB-insert half of
+	// the outbox (see internal/store/pg_store.go) working perfectly and
+	// masking that nothing was ever actually delivered to Kafka.
 	msg := kafka.Message{
-		Topic: p.topic,
 		Key:   []byte(aggregateID),
 		Value: payload,
 		Headers: []kafka.Header{

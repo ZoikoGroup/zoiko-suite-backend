@@ -1376,12 +1376,22 @@ services:
       # This service had no authorization at all — every route was open,
       # including the one that returns the bytes of a RESTRICTED document.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Without this, config.go's own default ("localhost:9092") resolves
+      # inside this container to its own loopback, where nothing listens —
+      # Kafka is a separate container reachable only as "kafka:9094". Every
+      # outbox publish attempt failed with "connection refused" until this
+      # was added; combined with a since-fixed code bug (the Writer and the
+      # Message both carrying a Topic), the transactional outbox had never
+      # actually delivered a single event to Kafka.
+      KAFKA_BROKERS: "kafka:9094"
     volumes:
       - document_vault_storage:/data/documents
     depends_on:
       postgres:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
       document-vault-storage-init:
         condition: service_completed_successfully
@@ -3857,7 +3867,18 @@ services:
       - "8147:8147"
     environment:
       PORT: "8147"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/kill_switch_registry?sslmode=disable"
+      # Migration 000002_add_rls.up.sql FORCEs row-level security specifically
+      # because this is "the one service in the tier where a naive tenant
+      # policy is not an outage or a leak but a SILENT SAFETY BYPASS" (its own
+      # words). FORCE ROW LEVEL SECURITY does not apply to a true superuser —
+      # this was connecting as ${DB_USER:-postgres}, which defaulted to the
+      # postgres superuser (rolsuper=true, rolbypassrls=true) with nothing in
+      # this repo ever overriding it, so every carefully-designed RLS policy
+      # here was unconditionally bypassed. zoiko_app (NOSUPERUSER, NOBYPASSRLS)
+      # already holds the needed grants on kill_switch_events/outbox_events —
+      # same least-privilege role every other RLS-dependent service in this
+      # file uses.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/kill_switch_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.kill-switch-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3892,7 +3913,18 @@ services:
       - "8148:8148"
     environment:
       PORT: "8148"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/retention_registry?sslmode=disable"
+      # Migration 000002_add_rls.up.sql FORCEs row-level security specifically
+      # because, in its own words, this is a case where the naive policy
+      # failure "is IRREVERSIBLE" (a hidden legal hold or retention policy
+      # leads straight to spoliation, not just a leak). FORCE ROW LEVEL
+      # SECURITY does not bind a true superuser — this was connecting as
+      # ${DB_USER:-postgres}, which defaulted to the postgres superuser
+      # (rolsuper=true, rolbypassrls=true) with nothing in this repo ever
+      # overriding it, exactly the defect found and fixed for
+      # kill-switch-registry-svc in this same pass. zoiko_app (NOSUPERUSER,
+      # NOBYPASSRLS) already holds the needed grants on retention_policies,
+      # legal_holds, and outbox_events.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/retention_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.retention-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
