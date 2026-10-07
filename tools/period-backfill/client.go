@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -71,6 +72,11 @@ func (c *apiClient) do(ctx context.Context, a actor, method, url string, body an
 	}
 	req.Header.Set("X-Correlation-ID", c.runID)
 	req.Header.Set("X-Source-System", "period-backfill")
+	// The platform's write envelope (ZS-ARCH-SVC-001 §4) requires a request id and a
+	// source channel on every command; "import" is the permitted channel for bulk
+	// loads. Found by running this tool against the real services.
+	req.Header.Set("X-Request-Id", newRequestID())
+	req.Header.Set("X-Source-Channel", "import")
 	if idemKey != "" {
 		req.Header.Set("Idempotency-Key", idemKey)
 	}
@@ -124,4 +130,16 @@ func idemKey(parts ...string) string {
 func isStatus(err error, code int) bool {
 	ae, ok := err.(*apiError)
 	return ok && ae.Status == code
+}
+
+// newRequestID returns a random RFC 4122 version-4 UUID. Every request gets its
+// own, unlike X-Correlation-ID, which is shared by the whole run.
+func newRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err) // crypto/rand failing is not recoverable
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }

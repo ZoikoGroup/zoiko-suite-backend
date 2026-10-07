@@ -26,10 +26,16 @@ type config struct {
 	PeriodURL       string
 	CloseURL        string
 	CalendarCode    string
-	Scope           string // fiscal-calendar scope AND accounting-period book_scope (REF-05 resolves the calendar by it)
-	Reason          string
-	Apply           bool
-	MirrorClosed    bool
+	Scope           string // fiscal-calendar scope (REF-04 requires a non-empty one)
+	// BookScope is the accounting-period book_scope the periods are materialised
+	// with. Empty (the default) means entity-wide: such a period covers every
+	// request, which is what a caller that presents no book needs (e.g. the GL
+	// shadow gate). It is deliberately NOT the calendar scope: REF-05 only looks a
+	// calendar up by scope when the version is not pinned, and this tool pins it.
+	BookScope    string
+	Reason       string
+	Apply        bool
+	MirrorClosed bool
 }
 
 // ── wire shapes (only the fields this tool reads) ────────────────────────────
@@ -650,7 +656,7 @@ func (r *runner) materialize(ctx context.Context, entity string, cal *calState, 
 		}
 		present := 0
 		for _, p := range ref {
-			if p.FiscalYear == fy && p.BookScope == r.cfg.Scope && p.CalendarVersionID == res.VersionID {
+			if p.FiscalYear == fy && p.BookScope == r.cfg.BookScope && p.CalendarVersionID == res.VersionID {
 				present++
 			}
 		}
@@ -666,9 +672,9 @@ func (r *runner) materialize(ctx context.Context, entity string, cal *calState, 
 		}
 		var out materializeResult
 		_, _, err = r.c.do(ctx, r.maker(entity), "POST", r.cfg.PeriodURL+"/v1/accounting-periods:materialize", map[string]any{
-			"legal_entity_id": entity, "calendar_id": res.CalendarID, "fiscal_year": fy, "book_scope": r.cfg.Scope,
+			"legal_entity_id": entity, "calendar_id": res.CalendarID, "fiscal_year": fy, "book_scope": r.cfg.BookScope,
 			"calendar_version_id": res.VersionID, "reason": r.cfg.Reason,
-		}, idemKey("materialize", r.cfg.Tenant, entity, res.CalendarID, res.VersionID, fmt.Sprint(fy), r.cfg.Scope), &out)
+		}, idemKey("materialize", r.cfg.Tenant, entity, res.CalendarID, res.VersionID, fmt.Sprint(fy), r.cfg.BookScope), &out)
 		if err != nil {
 			row.Action, row.Note = "error", err.Error()
 			er.Errors = append(er.Errors, fmt.Sprintf("materialize FY%d: %v", fy, err))
@@ -697,7 +703,7 @@ func (r *runner) match(er *EntityReport, ref []refPeriod) {
 		}
 		var hits []refPeriod
 		for _, q := range ref {
-			if q.Kind == "NORMAL" && q.BookScope == r.cfg.Scope && q.StartDate == p.Start && q.EndDate == p.End {
+			if q.Kind == "NORMAL" && q.BookScope == r.cfg.BookScope && q.StartDate == p.Start && q.EndDate == p.End {
 				hits = append(hits, q)
 			}
 		}

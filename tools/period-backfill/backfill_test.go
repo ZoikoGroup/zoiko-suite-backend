@@ -47,13 +47,24 @@ type world struct {
 	ref []refPeriod
 
 	// financial-close-svc
+	violations []string
 	mirrorOn   bool
 	mirrorFail bool // answer 200 but report a failed REF-05 step, as the real replay endpoint does
 
 	calls []call
 }
 
+// envelopeViolations lists writes that lacked a header the real services' write
+// envelope requires. The fakes record these instead of silently accepting them,
+// because the first real run of this tool was refused for exactly this reason.
 func (w *world) record(svc string, r *http.Request) {
+	if r.Method != "GET" {
+		for _, h := range []string{"X-Request-Id", "X-Source-Channel", "X-Tenant-Id", "X-Principal-Id", "X-Correlation-ID", "Idempotency-Key"} {
+			if r.Header.Get(h) == "" {
+				w.violations = append(w.violations, svc+" "+r.Method+" "+r.URL.Path+" missing "+h)
+			}
+		}
+	}
 	w.calls = append(w.calls, call{svc, r.Method, r.URL.Path, r.Header.Get("X-Principal-Id"), r.Header.Get("Idempotency-Key")})
 }
 
@@ -613,5 +624,43 @@ func TestMirrorFailedActionIsAnErrorNotAMirror(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the failure reason must reach the report: %+v", rep.Entities[0].Errors)
+	}
+}
+
+// Every write must satisfy the platform write envelope, across the whole apply
+// and mirror path. The real services answered 400 envelope_incomplete without
+// X-Request-Id and X-Source-Channel.
+func TestWritesCarryTheRequiredEnvelopeHeaders(t *testing.T) {
+	w, cfg, stop := newWorld(1, sampleLegacy()...)
+	defer stop()
+	w.mirrorOn = true
+	cfg.Apply = true
+	cfg.MirrorClosed = true
+	run(cfg)
+	if len(w.writes()) == 0 {
+		t.Fatal("test exercised no writes")
+	}
+	if len(w.violations) != 0 {
+		t.Fatalf("writes missing envelope headers: %v", w.violations)
+	}
+}
+
+// A backfilled period must be entity-wide by default. A scoped REF-05 period
+// covers only a request presenting that exact scope, so a caller that presents
+// none (the GL shadow gate) would see PERIOD_NOT_FOUND for every date. Found
+// against the real services, where the old single --scope default (PRIMARY) was
+// used as both the calendar scope and the book_scope.
+func TestMaterializedPeriodsAreEntityWideByDefault(t *testing.T) {
+	w, cfg, stop := newWorld(1, sampleLegacy()...)
+	defer stop()
+	cfg.Apply = true
+	run(cfg)
+	if len(w.ref) == 0 {
+		t.Fatal("nothing was materialised")
+	}
+	for _, p := range w.ref {
+		if p.BookScope != "" {
+			t.Fatalf("period %s materialised with book_scope %q, want entity-wide (empty)", p.PeriodKey, p.BookScope)
+		}
 	}
 }
