@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/counterparty-management-svc/internal/domain"
+	"zoiko.io/counterparty-management-svc/internal/middleware"
 	"zoiko.io/counterparty-management-svc/internal/store"
 )
 
@@ -55,11 +56,9 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// ctx uses context.Background() throughout — middleware.GetTenantID
-// resolves an unset context to "default", which every call in a given
-// test agrees on, so this is a real single-tenant scope, not an
-// unscoped call.
-func ctx() context.Context { return context.Background() }
+// ctx returns a context carrying the "default" tenant scope used by the test fixtures,
+// matching the gateway-verified tenant expected by GetTenantID and crmSetRLS.
+func ctx() context.Context { return middleware.WithTenant(context.Background(), "default") }
 
 func newRelationshipForTest(t *testing.T, s *store.PgStore) *domain.Relationship {
 	t.Helper()
