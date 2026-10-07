@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/counterparty-management-svc/internal/domain"
+	"zoiko.io/counterparty-management-svc/internal/middleware"
 	"zoiko.io/counterparty-management-svc/internal/store"
 )
 
@@ -55,11 +56,22 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// ctx uses context.Background() throughout — middleware.GetTenantID
-// resolves an unset context to "default", which every call in a given
-// test agrees on, so this is a real single-tenant scope, not an
-// unscoped call.
-func ctx() context.Context { return context.Background() }
+// ctx carries a real tenant via middleware.WithTenant, matching the
+// literal "default" every test passes as CreateRelationshipParams.TenantID
+// etc. — the write side and the context-derived read side (GetRelationship
+// and friends call middleware.GetTenantID(ctx)) must agree on the same
+// tenant, the same way production's HTTP middleware ensures they do.
+//
+// This used to be bare context.Background(), relying on
+// middleware.GetTenantID resolving an unset context to the literal
+// "default" as a fallback. That fallback was a real bug — found and fixed
+// in this service's tenant middleware (see internal/middleware/tenant.go)
+// because it meant a request with no X-Tenant-Id header silently pooled
+// into a shared "default" tenant instead of being refused. Once fixed,
+// GetTenantID(context.Background()) correctly returns "" instead, which
+// broke this test's implicit assumption — this helper now establishes a
+// real tenant explicitly instead of depending on the removed fallback.
+func ctx() context.Context { return middleware.WithTenant(context.Background(), "default") }
 
 func newRelationshipForTest(t *testing.T, s *store.PgStore) *domain.Relationship {
 	t.Helper()
