@@ -94,7 +94,7 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 			// to whatever major the library calls "latest," and that patch
 			// build can stop resolving from the remote binary repo with no
 			// code change on our side (this is what broke PR #105's CI).
-			Version(embeddedpostgres.V16).
+			Version(embeddedpostgres.PostgresVersion("16.15.0")).
 			Port(dbPort).
 			Database("workflow_history_consumer_test").
 			Username("postgres").

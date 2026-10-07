@@ -1,0 +1,6 @@
+﻿-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
+
+ALTER TABLE work_authorizations NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE visa_records NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE working_hour_logs NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE compliance_alerts NO FORCE ROW LEVEL SECURITY;

@@ -1,0 +1,4 @@
+﻿-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
+
+ALTER TABLE review_cycles NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE review_records NO FORCE ROW LEVEL SECURITY;

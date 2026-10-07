@@ -97,19 +97,17 @@ func TestServerHealthProbes(t *testing.T) {
 	// ── Start embedded Postgres ───────────────────────────────────────────
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			// Pinned explicitly rather than left on the library default
-			// (V18 as of embedded-postgres v1.34.0): DefaultConfig()
-			// floats to whatever major version the library currently
-			// calls "latest," and that specific patch build
-			// (18.3.0) can stop resolving from the library's remote
-			// binary repository at any time with no code change on our
-			// side — exactly what broke this test on the main-branch CI
-			// run for PR #105 five minutes after the identical commit
-			// passed on dev. V16 is also the version every real service
-			// in this platform actually runs (postgres:16-alpine in
-			// docker-compose.yml), so pinning here is prod-parity, not
-			// just stability.
-			Version(embeddedpostgres.V16).
+			// Pinned to a concrete patch version rather than the V16
+			// constant. In embedded-postgres v1.34.0 the constant resolves
+			// to "16.9.0", which does not exist in the zonkyio binary
+			// repository — causing the download to fail at test startup
+			// with "no version found matching 16.9.0". 16.15.0 is the
+			// latest PG16 binary available in that repo as of 2026-08-28,
+			// and matches the postgres:16-alpine image used by the CI
+			// service container and docker-compose.yml. Update this string
+			// when a newer patch is released; do NOT revert to the V16
+			// constant.
+			Version(embeddedpostgres.PostgresVersion("16.15.0")).
 			Username("testuser").
 			Password("testpass").
 			Database("audit_event_store").
@@ -236,9 +234,10 @@ func TestPgStore_HashChain_RealPostgres(t *testing.T) {
 
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly — see the doc comment on the
-			// other NewDatabase call above for why.
-			Version(embeddedpostgres.V16).
+			// Pinned to a concrete patch version rather than the V16
+			// constant — see the comment above for why the constant is
+			// bypassed. Do NOT revert to embeddedpostgres.PostgresVersion("16.15.0").
+			Version(embeddedpostgres.PostgresVersion("16.15.0")).
 			Username("testuser").
 			Password("testpass").
 			Database("audit_event_store").

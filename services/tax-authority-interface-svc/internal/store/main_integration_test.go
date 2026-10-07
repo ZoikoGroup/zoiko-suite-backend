@@ -31,7 +31,7 @@ func TestMain(m *testing.M) {
 
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			Version(embeddedpostgres.V16).
+			Version(embeddedpostgres.PostgresVersion("16.15.0")).
 			Port(port).
 			Database(dbName).
 			Username("postgres").

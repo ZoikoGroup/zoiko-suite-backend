@@ -55,7 +55,7 @@ func TestMain(m *testing.M) {
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
 			// Version pinned explicitly to a literal patch string, NOT the
-			// library's own embeddedpostgres.V16 alias — see the doc comment
+			// library's own embeddedpostgres.PostgresVersion("16.15.0") alias — see the doc comment
 			// on embeddedpostgres.DefaultConfig() in audit-event-store-svc's
 			// main_integration_test.go for why floating is dangerous (this
 			// is what broke PR #105's CI). V16 itself turned out to be the

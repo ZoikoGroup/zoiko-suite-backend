@@ -34,7 +34,7 @@ func TestMain(m *testing.M) {
 	}
 	pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
 		RuntimePath(runtime).
-		Version(embeddedpostgres.V16).Port(port).Database("intercompany_test").
+		Version(embeddedpostgres.PostgresVersion("16.15.0")).Port(port).Database("intercompany_test").
 		Username("postgres").Password("postgres"))
 	if err := pg.Start(); err != nil {
 		fmt.Printf("failed to start embedded postgres: %v\n", err)

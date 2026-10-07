@@ -50,7 +50,7 @@ func runWithEmbeddedPostgres(m *testing.M) int {
 	_ = l.Close()
 
 	pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
-		Version(embeddedpostgres.V16).Port(port).Database("inv_ctrlpop_test").
+		Version(embeddedpostgres.PostgresVersion("16.15.0")).Port(port).Database("inv_ctrlpop_test").
 		Username("postgres").Password("postgres").
 		RuntimePath(filepath.Join(root, "runtime")))
 	if err := pg.Start(); err != nil {

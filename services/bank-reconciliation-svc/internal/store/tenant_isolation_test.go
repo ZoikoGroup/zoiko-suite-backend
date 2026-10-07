@@ -56,13 +56,17 @@ func TestMain(m *testing.M) {
 	dbPort := uint32(15901 + uint32(os.Getpid()%499))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly — see the doc comment on
-			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
-			// main_integration_test.go for why: the unpinned default floats
-			// to whatever major the library calls "latest," and that patch
-			// build can stop resolving from the remote binary repo with no
-			// code change on our side (this is what broke PR #105's CI).
-			Version(embeddedpostgres.V16).
+			// Pinned to a concrete patch version rather than the V16
+			// constant. In embedded-postgres v1.34.0 the constant resolves
+			// to "16.9.0", which does not exist in the zonkyio binary
+			// repository — causing the download to fail at test startup
+			// with "no version found matching 16.9.0" (the failure that
+			// broke CI job #112822408369). 16.15.0 is the latest PG16
+			// binary available in that repo as of 2026-08-28, and matches
+			// the postgres:16-alpine image used by the CI service container
+			// and docker-compose.yml. Update this string when a newer
+			// patch is available; do NOT revert to the V16 constant.
+			Version(embeddedpostgres.PostgresVersion("16.15.0")).
 			Port(dbPort).
 			Database("bankrec_isolation_test").
 			Username("postgres").
