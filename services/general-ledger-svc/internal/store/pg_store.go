@@ -1298,16 +1298,20 @@ func (s *PgStore) DeactivateAccount(ctx context.Context, tenantID, accountCode s
 const postingExecutionColumns = `
 	execution_id, tenant_id, legal_entity_id, kind, source_event_id, idempotency_key,
 	status, journal_id, calculation_trace::text, failure_reason, correlation_id,
-	created_at, created_by_principal_id, committed_at`
+	created_at, created_by_principal_id, committed_at, request_payload::text`
 
 func scanPostingExecution(row pgx.Row) (*domain.PostingExecution, error) {
 	var e domain.PostingExecution
+	var payload *string
 	if err := row.Scan(
 		&e.ExecutionID, &e.TenantID, &e.LegalEntityID, &e.Kind, &e.SourceEventID, &e.IdempotencyKey,
 		&e.Status, &e.JournalID, &e.CalculationTrace, &e.FailureReason, &e.CorrelationID,
-		&e.CreatedAt, &e.CreatedByPrincipalID, &e.CommittedAt,
+		&e.CreatedAt, &e.CreatedByPrincipalID, &e.CommittedAt, &payload,
 	); err != nil {
 		return nil, err
+	}
+	if payload != nil {
+		e.RequestPayload = []byte(*payload)
 	}
 	return &e, nil
 }
@@ -1324,13 +1328,21 @@ func (s *PgStore) CreatePostingExecution(ctx context.Context, e *domain.PostingE
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// NULL rather than an empty document when nothing was captured, so
+		// "no request to replay" is unambiguous.
+		var payload any
+		if len(e.RequestPayload) > 0 {
+			payload = string(e.RequestPayload)
+		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO posting_executions (
 				execution_id, tenant_id, legal_entity_id, kind, source_event_id, idempotency_key,
-				status, calculation_trace, correlation_id, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
+				status, calculation_trace, correlation_id, created_at, created_by_principal_id,
+				request_payload
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb)
 		`, e.ExecutionID, tenantID, e.LegalEntityID, e.Kind, e.SourceEventID, e.IdempotencyKey,
-			e.Status, e.CalculationTrace, e.CorrelationID, e.CreatedAt, e.CreatedByPrincipalID)
+			e.Status, e.CalculationTrace, e.CorrelationID, e.CreatedAt, e.CreatedByPrincipalID,
+			payload)
 		return mapPgError(err)
 	})
 }
@@ -1377,6 +1389,75 @@ func (s *PgStore) GetPostingExecutionBySource(ctx context.Context, tenantID, sou
 // the journal this execution produced. No fromStatus guard: this is
 // always the one terminal write a given execution makes, called exactly
 // once per successful attempt (initial or reprocessed).
+// ReprocessClaimTimeout is how long a reprocess claim (status VALIDATING)
+// holds before another reprocess may take it over. Far longer than one replay
+// takes; it exists only so a claim abandoned by a crashed process does not
+// strand the execution in VALIDATING for ever.
+const ReprocessClaimTimeout = 15 * time.Minute
+
+// ClaimPostingExecutionForReprocess moves a FAILED or QUARANTINED execution
+// to VALIDATING in one conditional UPDATE, so of two concurrent reprocesses
+// exactly one proceeds — without it both could replay the request and post
+// the same source fact twice. Also takes over a VALIDATING claim older than
+// ReprocessClaimTimeout. Reports false when the execution is in neither state.
+func (s *PgStore) ClaimPostingExecutionForReprocess(ctx context.Context, tenantID, executionID string, now time.Time) (bool, error) {
+	var claimed bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE posting_executions
+			   SET status = 'VALIDATING', reprocess_claimed_at = $3
+			 WHERE tenant_id = $1 AND execution_id = $2
+			   AND (status IN ('FAILED', 'QUARANTINED')
+			        OR (status = 'VALIDATING' AND reprocess_claimed_at IS NOT NULL
+			            AND reprocess_claimed_at < $4))`,
+			tenantID, executionID, now, now.Add(-ReprocessClaimTimeout))
+		claimed = tag.RowsAffected() == 1
+		return mapPgError(err)
+	})
+	return claimed, err
+}
+
+// SetPostingExecutionTrace replaces an execution's calculation trace. A replay
+// re-resolves account mappings (the failure was often a missing one, since
+// fixed), and ExplainPosting must show the resolution that actually posted.
+func (s *PgStore) SetPostingExecutionTrace(ctx context.Context, tenantID, executionID, trace string) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE posting_executions SET calculation_trace = $3::jsonb
+			 WHERE tenant_id = $1 AND execution_id = $2`, tenantID, executionID, trace)
+		return mapPgError(err)
+	})
+}
+
+// FindJournalIDsBySourceEvent lists journals that carry sourceEventID.
+//
+// The double-posting guard for a replay: journal_headers has no uniqueness on
+// source_event_id, so if the failed attempt's journal write did in fact commit
+// (an acknowledgement lost after commit), replaying blindly would post the
+// same fact twice. The replay adopts a single existing journal instead.
+func (s *PgStore) FindJournalIDsBySourceEvent(ctx context.Context, tenantID, sourceEventID string) ([]string, error) {
+	var ids []string
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT journal_id::text FROM journal_headers
+			 WHERE tenant_id = $1 AND source_event_id = $2
+			 ORDER BY created_at`, tenantID, sourceEventID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		return rows.Err()
+	})
+	return ids, err
+}
+
 func (s *PgStore) MarkPostingExecutionCommitted(ctx context.Context, tenantID, executionID, journalID string, committedAt time.Time) error {
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `

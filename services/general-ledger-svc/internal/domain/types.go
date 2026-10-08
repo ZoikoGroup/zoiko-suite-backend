@@ -407,6 +407,12 @@ type PostingExecution struct {
 	CreatedAt            time.Time  `json:"created_at"`
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
 	CommittedAt          *time.Time `json:"committed_at,omitempty"`
+
+	// RequestPayload is the accepted PostAccountingEventRequest, kept so
+	// ReprocessFailedPosting can replay an execution that failed before its
+	// journal was written (migration 000014). Nil for executions recorded
+	// before then. Not part of the API response.
+	RequestPayload []byte `json:"-"`
 }
 
 // PostingEventLineInput is one line of a caller-declared accounting event.

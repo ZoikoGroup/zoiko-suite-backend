@@ -65,6 +65,9 @@ type Store interface {
 	GetPostingExecutionBySource(ctx context.Context, tenantID, sourceEventID string) (*domain.PostingExecution, error)
 	MarkPostingExecutionCommitted(ctx context.Context, tenantID, executionID, journalID string, committedAt time.Time) error
 	MarkPostingExecutionFailed(ctx context.Context, tenantID, executionID, status, reason string) error
+	ClaimPostingExecutionForReprocess(ctx context.Context, tenantID, executionID string, now time.Time) (bool, error)
+	SetPostingExecutionTrace(ctx context.Context, tenantID, executionID, trace string) error
+	FindJournalIDsBySourceEvent(ctx context.Context, tenantID, sourceEventID string) ([]string, error)
 
 	// ACC-03 journal proposal/approval lifecycle — see migration 000010's
 	// doc comment.
@@ -1849,11 +1852,19 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 
 	traceJSON, _ := json.Marshal(trace)
 	sourceEventID := req.SourceEventID
+	// The accepted request, PostingDate default applied, kept so a failure
+	// before the journal is written can be replayed (migration 000014).
+	requestPayload, err := json.Marshal(req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "request_not_recordable", err.Error())
+		return
+	}
 	exec := &domain.PostingExecution{
 		ExecutionID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID, Kind: domain.PostingExecutionKindEvent,
 		SourceEventID: &sourceEventID, Status: domain.PostingExecutionStatusSubmitted,
 		CalculationTrace: string(traceJSON), CorrelationID: req.CorrelationID,
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+		RequestPayload: requestPayload,
 	}
 	if err := h.store.CreatePostingExecution(r.Context(), exec); err != nil {
 		h.log.Error("PostAccountingEvent: failed to record posting execution", zap.Error(err))
@@ -1861,24 +1872,7 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	header := &domain.JournalHeader{
-		JournalID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID,
-		FiscalPeriod: req.FiscalPeriod, Status: domain.JournalStatusPending, Description: req.Description,
-		CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID, SourceEventID: &sourceEventID,
-		JournalType: domain.JournalTypeStandard, TransactionDate: req.DocumentDate,
-		PostingDate: req.PostingDate, CurrencyCode: req.TransactionCurrency,
-		// System-originated: this bypasses ACC-03's human Draft/Submit/
-		// Approve workflow entirely (already gated by actionPostingExecute,
-		// which a deployment grants only to internal service identities —
-		// see that action's own doc comment), landing directly at
-		// POSTING_REQUESTED so commitJournal's own MarkJournalPosted call
-		// has a valid ApprovalStatus to advance from.
-		ApprovalStatus: domain.ApprovalStatusPostingRequested,
-	}
-	lines := make([]domain.JournalLine, len(resolvedLines))
-	for i, l := range resolvedLines {
-		lines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount, Description: l.Description}
-	}
+	header, lines := eventJournal(tenantID, principalID, req, resolvedLines)
 	if _, _, err := h.store.CreateJournal(r.Context(), header, lines); err != nil {
 		h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
@@ -1901,6 +1895,194 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	exec.Status, exec.JournalID, exec.CommittedAt = domain.PostingExecutionStatusCommitted, &header.JournalID, &now
 	writeJSON(w, http.StatusCreated, exec)
+}
+
+// eventJournal builds the journal an accounting event posts as. Shared by
+// PostAccountingEvent and the replay in ReprocessFailedPosting so a replayed
+// event posts exactly the journal the original request would have.
+func eventJournal(tenantID, principalID string, req domain.PostAccountingEventRequest, resolvedLines []domain.CreateJournalLineInput) (*domain.JournalHeader, []domain.JournalLine) {
+	sourceEventID := req.SourceEventID
+	header := &domain.JournalHeader{
+		JournalID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID,
+		FiscalPeriod: req.FiscalPeriod, Status: domain.JournalStatusPending, Description: req.Description,
+		CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID, SourceEventID: &sourceEventID,
+		JournalType: domain.JournalTypeStandard, TransactionDate: req.DocumentDate,
+		PostingDate: req.PostingDate, CurrencyCode: req.TransactionCurrency,
+		// System-originated: this bypasses ACC-03's human Draft/Submit/
+		// Approve workflow entirely (already gated by actionPostingExecute,
+		// which a deployment grants only to internal service identities —
+		// see that action's own doc comment), landing directly at
+		// POSTING_REQUESTED so commitJournal's own MarkJournalPosted call
+		// has a valid ApprovalStatus to advance from.
+		ApprovalStatus: domain.ApprovalStatusPostingRequested,
+	}
+	lines := make([]domain.JournalLine, len(resolvedLines))
+	for i, l := range resolvedLines {
+		lines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount, Description: l.Description}
+	}
+	return header, lines
+}
+
+// replayFailedEvent is ReprocessFailedPosting for an EVENT execution that
+// failed before any journal was written: it replays the captured request.
+//
+// Order matters, and each step exists for a failure mode:
+//
+//  1. Claim (FAILED/QUARANTINED -> VALIDATING) so two concurrent reprocesses
+//     cannot both post the fact.
+//  2. Look for a journal already carrying the source event. journal_headers
+//     does not make source_event_id unique, so if the failed attempt's write
+//     did commit (acknowledgement lost), replaying blindly would post twice.
+//     One such journal is adopted; more than one is refused for a person.
+//  3. Otherwise re-resolve the lines against the CURRENT mappings (the cause
+//     is usually a mapping fixed since), re-check the period and account
+//     restrictions, post, and record the resolution that actually posted.
+//
+// Any failure puts the execution back to FAILED (or QUARANTINED) with the new
+// reason, so it stays visible in the posting backlog and the period close
+// stays blocked until it succeeds.
+func (h *Handler) replayFailedEvent(w http.ResponseWriter, r *http.Request, tenantID, principalID string, exec *domain.PostingExecution) {
+	ctx := r.Context()
+	if exec.Kind != domain.PostingExecutionKindEvent || len(exec.RequestPayload) == 0 || exec.SourceEventID == nil {
+		writeError(w, http.StatusUnprocessableEntity, "no_journal_to_reprocess",
+			"this execution failed before any journal was created and has no captured request to replay "+
+				"(it predates request capture, or is not an accounting-event posting)")
+		return
+	}
+	var req domain.PostAccountingEventRequest
+	if err := json.Unmarshal(exec.RequestPayload, &req); err != nil {
+		h.log.Error("captured posting request does not decode", zap.String("execution_id", exec.ExecutionID), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "captured_request_unreadable", "")
+		return
+	}
+
+	claimed, err := h.store.ClaimPostingExecutionForReprocess(ctx, tenantID, exec.ExecutionID, time.Now().UTC())
+	if err != nil {
+		h.log.Error("reprocess: claim failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if !claimed {
+		writeError(w, http.StatusConflict, "reprocess_in_progress", "another reprocess of this execution is already running")
+		return
+	}
+
+	existing, err := h.store.FindJournalIDsBySourceEvent(ctx, tenantID, *exec.SourceEventID)
+	if err != nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, fmt.Errorf("reprocess: could not check for an existing journal: %w", err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	var journalID string
+	switch len(existing) {
+	case 0:
+		var ok bool
+		if journalID, ok = h.postReplayedEvent(w, r, tenantID, principalID, exec, req); !ok {
+			return
+		}
+	case 1:
+		var ok bool
+		if journalID, ok = h.adoptExistingJournal(w, r, tenantID, principalID, exec, existing[0]); !ok {
+			return
+		}
+	default:
+		cause := fmt.Errorf("%d journals already carry source event %s; refusing to choose between them", len(existing), *exec.SourceEventID)
+		h.failExecution(ctx, tenantID, exec.ExecutionID, cause)
+		writeError(w, http.StatusConflict, "ambiguous_source_journals", cause.Error())
+		return
+	}
+
+	now := time.Now().UTC()
+	if err := h.store.MarkPostingExecutionCommitted(ctx, tenantID, exec.ExecutionID, journalID, now); err != nil {
+		h.log.Error("journal committed on replay but the posting execution could not be marked COMMITTED",
+			zap.String("execution_id", exec.ExecutionID), zap.String("journal_id", journalID), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "execution_not_recorded",
+			"the journal IS finalized ("+journalID+"), but the posting execution could not be marked COMMITTED.")
+		return
+	}
+	exec.Status, exec.JournalID, exec.CommittedAt, exec.FailureReason = domain.PostingExecutionStatusCommitted, &journalID, &now, nil
+	writeJSON(w, http.StatusOK, exec)
+}
+
+// postReplayedEvent posts the captured request afresh. Reports the journal
+// id, or false after writing the response.
+func (h *Handler) postReplayedEvent(w http.ResponseWriter, r *http.Request, tenantID, principalID string, exec *domain.PostingExecution, req domain.PostAccountingEventRequest) (string, bool) {
+	ctx := r.Context()
+	resolvedLines, trace, err := h.resolvePostingLines(ctx, tenantID, req.Lines)
+	if err != nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+		if errors.Is(err, domain.ErrPostingRuleAmbiguous) {
+			writeError(w, http.StatusUnprocessableEntity, "posting_rule_ambiguous", err.Error())
+		} else {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_line", err.Error())
+		}
+		return "", false
+	}
+	if err := h.closeClient.CheckPeriodOpen(ctx, tenantID, req.LegalEntityID, req.FiscalPeriod); err != nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+		h.writePeriodErr(w, err)
+		return "", false
+	}
+	sourceEventID := req.SourceEventID
+	journalReq := domain.CreateJournalRequest{
+		TenantID: tenantID, LegalEntityID: req.LegalEntityID, FiscalPeriod: req.FiscalPeriod,
+		Description: req.Description, Lines: resolvedLines, CorrelationID: req.CorrelationID,
+		SourceEventID: &sourceEventID,
+	}
+	if !h.checkAccountRestrictions(w, r, journalReq, principalID) {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, errors.New("reprocess: refused by account posting restrictions"))
+		return "", false
+	}
+
+	if traceJSON, err := json.Marshal(trace); err == nil {
+		if err := h.store.SetPostingExecutionTrace(ctx, tenantID, exec.ExecutionID, string(traceJSON)); err != nil {
+			h.failExecution(ctx, tenantID, exec.ExecutionID, fmt.Errorf("reprocess: could not record the calculation trace: %w", err))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+			return "", false
+		}
+		exec.CalculationTrace = string(traceJSON)
+	}
+
+	header, lines := eventJournal(tenantID, principalID, req, resolvedLines)
+	if _, _, err := h.store.CreateJournal(ctx, header, lines); err != nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return "", false
+	}
+	if err := h.commitJournal(ctx, header, principalID); err != nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+		h.writePeriodErr(w, err)
+		return "", false
+	}
+	return header.JournalID, true
+}
+
+// adoptExistingJournal finishes a journal the failed attempt did manage to
+// write, instead of posting the source fact a second time.
+func (h *Handler) adoptExistingJournal(w http.ResponseWriter, r *http.Request, tenantID, principalID string, exec *domain.PostingExecution, journalID string) (string, bool) {
+	ctx := r.Context()
+	header, _, err := h.store.GetJournal(ctx, journalID)
+	if err != nil || header == nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, fmt.Errorf("reprocess: could not load existing journal %s", journalID))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return "", false
+	}
+	switch header.Status {
+	case domain.JournalStatusFinalized:
+		return journalID, true
+	case domain.JournalStatusPending:
+		if err := h.commitJournal(ctx, header, principalID); err != nil {
+			h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+			h.writePeriodErr(w, err)
+			return "", false
+		}
+		return journalID, true
+	default:
+		cause := fmt.Errorf("existing journal %s for this source event is %s; a person must decide", journalID, header.Status)
+		h.failExecution(ctx, tenantID, exec.ExecutionID, cause)
+		writeError(w, http.StatusConflict, "existing_journal_not_adoptable", cause.Error())
+		return "", false
+	}
 }
 
 // failExecution marks an execution FAILED (or QUARANTINED for an
@@ -2127,12 +2309,13 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 }
 
 // ReprocessFailedPosting retries a FAILED/QUARANTINED execution.
-// Deliberately scoped to executions that already produced a journal (the
-// original create step succeeded but commit failed, e.g. a transient
-// period-lock race) — an execution that failed before any journal ever
-// existed carries no persisted original request to safely replay, and
-// resubmitting as a brand-new PostAccountingEvent is the honest path
-// rather than fabricating a retry from data this record never kept.
+//
+// With a journal (the create succeeded but the commit failed, e.g. a
+// transient period-lock race) it retries the commit. Without one it replays
+// the request captured when the event was accepted — see replayFailedEvent.
+// Resubmitting the source event is not an alternative: a duplicate source
+// event returns the prior FAILED result (ACC-04), so before request capture
+// such an execution could never be fixed, and it now blocks period close.
 func (h *Handler) ReprocessFailedPosting(w http.ResponseWriter, r *http.Request) {
 	executionID := chi.URLParam(r, "execution_id")
 	principalID, ok := h.requirePrincipal(w, r)
@@ -2156,13 +2339,18 @@ func (h *Handler) ReprocessFailedPosting(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusUnprocessableEntity, "already_committed", domain.ErrPostingAlreadyCommitted.Error())
 		return
 	}
+	// A no-journal execution in VALIDATING is under (or was abandoned by) a
+	// replay; its claim, not this status check, decides whether to proceed.
+	if exec.JournalID == nil && exec.Status == domain.PostingExecutionStatusValidating {
+		h.replayFailedEvent(w, r, tenantID, principalID, exec)
+		return
+	}
 	if exec.Status != domain.PostingExecutionStatusFailed && exec.Status != domain.PostingExecutionStatusQuarantined {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidPostingTransition.Error())
 		return
 	}
 	if exec.JournalID == nil {
-		writeError(w, http.StatusUnprocessableEntity, "no_journal_to_reprocess",
-			"this execution failed before any journal was created; resubmit as a new posting request")
+		h.replayFailedEvent(w, r, tenantID, principalID, exec)
 		return
 	}
 
