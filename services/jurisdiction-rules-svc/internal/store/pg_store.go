@@ -1000,9 +1000,15 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 	return pack, nil
 }
 
-// periodsOverlap checks if two half-open intervals [from1, to1) and [from2, to2) overlap.
+// periodsOverlap checks if two half-open intervals [from1, to1) and [from2, to2)
+// overlap. A nil to is an open end (the rule is still in force) — a pointer
+// here cannot be dereferenced without a nil guard, since effective_to is
+// NULL for rules with no end date.
 func periodsOverlap(from1 time.Time, to1 *time.Time, from2 time.Time, to2 *time.Time) bool {
-	if !to1.IsZero() && to1.Before(from2) || !to2.IsZero() && to2.Before(from1) {
+	if to1 != nil && to1.Before(from2) {
+		return false
+	}
+	if to2 != nil && to2.Before(from1) {
 		return false
 	}
 	return true
