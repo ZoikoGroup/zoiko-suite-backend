@@ -269,7 +269,7 @@ func TestHandleUnsubscribe_ForgedRequestsWriteNothing(t *testing.T) {
 		"bare tenant and email":  {"/v1/notifications/unsubscribe?tenant_id=tenant-abc&email=victim%40example.com", http.StatusBadRequest},
 		"dummy token":            {"/v1/notifications/unsubscribe?token=dummytoken&tenant_id=tenant-abc&email=victim%40example.com", http.StatusForbidden},
 		"tampered token":         {tampered, http.StatusForbidden},
-		"old action-token shape": {"/v1/notifications/unsubscribe?action_token=dGVuYW50LWFiYy5VTlNVQi54Lnk", http.StatusBadRequest},
+		"old action-token shape": {"/v1/notifications/unsubscribe?action_token=dGVuYW50LWFiYy5VTlNVQi54Lnk", http.StatusBadRequest}, // gitleaks:allow — base64 of the deliberately-rejected legacy action-token shape (tenant-abc.UNSUB...), a test fixture, not a live credential
 	}
 	for name, c := range cases {
 		w := oneClick(srv, c.target)

@@ -505,12 +505,16 @@ func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T
 		t.Fatalf("failed to activate global version: %v", err)
 	}
 
-	// Tenant-A-specific override, more specific than global.
+	// Tenant-A-specific override, more specific than global. Effective in
+	// the PAST, not an hour from now: FindApplicableVersions gates on the
+	// version's effective window (effective_from <= now), so a future
+	// version is deliberately not yet applicable and this assertion would
+	// see only the global row.
 	tenantSpecific, _, err := s.CreatePolicyVersion(ctx, domain.CreatePolicyVersionParams{
 		PolicyID:             p.PolicyID,
 		TenantID:             tenantA,
 		RulePayload:          []byte(`{"threshold_amount":9000}`),
-		EffectiveFrom:        time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond),
+		EffectiveFrom:        time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond),
 		CreatedByPrincipalID: "admin-1",
 	})
 	if err != nil {

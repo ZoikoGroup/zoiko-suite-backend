@@ -41,7 +41,7 @@ env PORT=8133 DB_HOST=localhost DB_PORT=5432 DB_NAME=notification \
     SMTP_HOST=localhost SMTP_PORT=1025 SMTP_TLS_MODE=none SMTP_ALLOW_CLEARTEXT=true \
     NCD_CALLBACK_SECRET_SMTP_PRIMARY=live-callback-secret \
     NOTIFICATION_WEBHOOK_SECRETS='{"smtp":["live-webhook-secret-0123456789"]}' \
-    NOTIFICATION_UNSUBSCRIBE_SECRET=live-unsubscribe-secret-0123456789abcdef \
+    NOTIFICATION_UNSUBSCRIBE_SECRET=live-unsubscribe-secret-local-dev-only-runbook \
     NOTIFICATION_PUBLIC_BASE_URL=http://localhost:8133 \
     ./notification-svc.exe
 ```

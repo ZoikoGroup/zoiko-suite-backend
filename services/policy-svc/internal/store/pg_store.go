@@ -99,9 +99,10 @@ type Store interface {
 
 	// FindApplicableVersions returns all ACTIVE versions of the given
 	// policy_type whose scope is compatible with (tenantID,
-	// legalEntityID), most-specific-scope first. See the method's own
+	// legalEntityID) and whose effective window covers now (or asOf when
+	// supplied), most-specific-scope first. See the method's own
 	// doc comment on PgStore for the precedence rule.
-	FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string) ([]*domain.ApplicablePolicyVersion, error)
+	FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string, asOf *time.Time) ([]*domain.ApplicablePolicyVersion, error)
 
 	// EnqueueEvent adds an event to the transactional outbox. The event
 	// will be published asynchronously by a background worker.

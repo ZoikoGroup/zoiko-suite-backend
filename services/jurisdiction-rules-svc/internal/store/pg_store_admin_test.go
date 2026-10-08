@@ -38,23 +38,40 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// migrationFiles is every up migration, in order. Listing them here rather
-// than naming two of them inline means a migration added later is applied by
-// the tests automatically — the alternative has already produced a live
-// incident in this repo, where a migration was never applied and every write
-// failed with a 42P10 that read like a code bug.
+// migrationFiles is every up migration the store suite needs, in order.
+// Listing them here rather than naming two of them inline means a migration
+// added later is applied by the tests automatically — the alternative has
+// already produced a live incident in this repo, where a migration was never
+// applied and every write failed with a 42P10 that read like a code bug.
+//
+// 000005-000006 (outbox, pack registries, pack artifacts) are deliberately
+// not applied: the store suite only exercises jurisdictions,
+// jurisdiction_rules and jurisdiction_rule_drift_events, and those pack
+// tables are neither dropped nor asserted here. 000007/000008 are required —
+// ruleColumnNames (pg_store.go) reads rule_version, supersedes_rule_id and
+// precedence_level, and without them every CreateRule fails with 42703.
+// 000016 must follow 000007: 000007's status-history trigger passes
+// NULL updated_at/updated_by on insert into NOT NULL columns, which makes
+// every rule insert fail until 000016 replaces the function.
 var migrationFiles = []string{
 	"000001_initial_schema.up.sql",
 	"000002_add_audit_columns.up.sql",
 	"000003_add_data_classification.up.sql",
 	"000004_add_rule_code_index.up.sql",
+	"000007_add_bitemporal_replay.up.sql",
+	"000008_add_precedence_metadata.up.sql",
+	"000016_fix_rule_status_history_trigger.up.sql",
 }
 
 // setupTestDB drops and recreates the schema from the migration files.
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS jurisdiction_rule_drift_events, jurisdiction_rules, jurisdictions CASCADE;")
+	// rule_status_history is listed so each test starts with a clean history
+	// — 000007's CREATE TABLE IF NOT EXISTS would otherwise let rows from a
+	// previous test survive (the FK to the dropped jurisdiction_rules is
+	// removed by CASCADE, but the table and its rows are not).
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS rule_status_history, jurisdiction_rule_drift_events, jurisdiction_rules, jurisdictions CASCADE;")
 
 	_, thisFile, _, _ := runtime.Caller(0)
 	migDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "deployments", "migrations")

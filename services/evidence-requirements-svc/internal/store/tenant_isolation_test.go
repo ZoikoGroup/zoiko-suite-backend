@@ -426,7 +426,7 @@ func TestPgStore_TenantIsolation_GetEvaluation(t *testing.T) {
 			EvaluatedForPrincipalID: "p-" + label,
 			CorrelationID:           "corr-eval-" + label,
 		}
-		created, err := testStore.RecordEvaluation(svcmiddleware.WithTenant(ctx, tenantID), e)
+		created, err := testStore.RecordEvaluation(svcmiddleware.WithTenant(ctx, tenantID), e, nil)
 		require.NoError(t, err)
 		require.True(t, created)
 		return tenantID, evalID
@@ -470,14 +470,14 @@ func TestPgStore_RecordEvaluation_IdempotentOnCorrelationID(t *testing.T) {
 	}
 
 	first := mk(domain.OutcomeMissing)
-	created, err := testStore.RecordEvaluation(tctx, first)
+	created, err := testStore.RecordEvaluation(tctx, first, nil)
 	require.NoError(t, err)
 	require.True(t, created)
 
 	// Replay, deliberately with a different outcome: the stored determination
 	// must win. An append-only ledger never gets rewritten.
 	second := mk(domain.OutcomeSatisfied)
-	created, err = testStore.RecordEvaluation(tctx, second)
+	created, err = testStore.RecordEvaluation(tctx, second, nil)
 	require.NoError(t, err)
 	assert.False(t, created)
 	assert.Equal(t, first.EvaluationID, second.EvaluationID)
