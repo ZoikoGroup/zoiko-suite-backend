@@ -214,3 +214,45 @@ func TestWebhookStore_DLQ_Routing_And_RLS(t *testing.T) {
 	assert.Equal(t, webhook.DLQStatusReprocessed, fetchedUpdated.Status)
 	assert.Equal(t, 1, fetchedUpdated.RetryCount)
 }
+
+// seedLedgerAttempt writes one accepted ledger attempt carrying the given message id.
+func seedLedgerAttempt(t *testing.T, s *store.PgStore, tenantID, dedup, providerMsgID string) string {
+	t.Helper()
+	ctx := context.Background()
+	intentID, renderID, attemptID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	_, _, err := s.CreateMessageIntent(ctx, &ledger.MessageIntent{
+		MessageIntentID: intentID, TenantID: tenantID, LegalEntityID: "entity-001", RecipientPrincipalID: "principal-001",
+		RecipientEmail: "customer@example.com", Channel: "EMAIL", CommunicationClass: ledger.ClassT0, TemplateKey: "ZS-T-001",
+		SourceEventType: "test.event", DeduplicationKey: dedup, CorrelationID: "corr-" + dedup,
+		Status: ledger.IntentStatusDispatched, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()})
+	require.NoError(t, err)
+	require.NoError(t, s.RecordMessageRender(ctx, &ledger.MessageRender{RenderID: renderID, MessageIntentID: intentID, TenantID: tenantID,
+		ContentHash: "h", Subject: "s", BodyHTML: "<p>b</p>", BodyText: "b", RenderedAt: time.Now().UTC()}))
+	require.NoError(t, s.RecordDeliveryAttempt(ctx, &ledger.DeliveryAttempt{ProviderAttemptID: attemptID, MessageIntentID: intentID,
+		RenderID: renderID, TenantID: tenantID, SenderStream: ledger.StreamTransactional, FromAddress: "a@zoikosuite.com",
+		ToAddress: "customer@example.com", ProviderName: "ses", ProviderMessageID: &providerMsgID, Status: ledger.AttemptStatusAccepted,
+		AttemptNumber: 1, AttemptedAt: time.Now().UTC()}))
+	return attemptID
+}
+
+// NP-27: a provider message id that two attempts claim (here in two tenants) is
+// ambiguous. The lookup refuses to choose, so a bounce can never be applied to the wrong
+// tenant's recipient.
+func TestWebhookStore_AmbiguousProviderMessageIDIsRefused(t *testing.T) {
+	s := store.New(openTestPool(t))
+	const id = "<shared-id-4242@zoikosuite.com>"
+
+	only := seedLedgerAttempt(t, s, "tenant-amb-a", "dedup-amb-a", id)
+	got, err := s.LookupAttemptByProviderMessageID(context.Background(), id)
+	require.NoError(t, err, "a single claim resolves as before")
+	assert.Equal(t, only, got.ProviderAttemptID)
+
+	seedLedgerAttempt(t, s, "tenant-amb-b", "dedup-amb-b", id)
+	_, err = s.LookupAttemptByProviderMessageID(context.Background(), id)
+	assert.ErrorIs(t, err, webhook.ErrAmbiguousAttempt, "two claims on one id must not resolve to 'the newest'")
+
+	// The attempt's own id is still unambiguous.
+	got, err = s.LookupAttemptByProviderMessageID(context.Background(), only)
+	require.NoError(t, err)
+	assert.Equal(t, only, got.ProviderAttemptID)
+}

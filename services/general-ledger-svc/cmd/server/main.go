@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,11 +25,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/general-ledger-svc/internal/authz"
 	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/config"
@@ -38,7 +42,6 @@ import (
 	"zoiko.io/general-ledger-svc/internal/health"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 	"zoiko.io/general-ledger-svc/internal/mtls"
-	"zoiko.io/general-ledger-svc/internal/outbox"
 	"zoiko.io/general-ledger-svc/internal/store"
 	"zoiko.io/general-ledger-svc/internal/telemetry"
 )
@@ -113,8 +116,14 @@ func main() {
 	}
 	log.Info("db pool connected")
 
+	// The eventing outbox table must exist before the first journal write
+	// tries to enqueue into it; fail here, at deploy time, not on a request.
+	if err := outbox.VerifySchema(pingCtx, pool); err != nil {
+		log.Fatal("eventing outbox schema missing", zap.Error(err))
+	}
+
 	// ── 4. Store, Kafka producer, jurisdiction validator ─────────────────────
-	pgStore := store.New(pool, log)
+	pgStore := store.New(pool, log, store.WithEventRegion(cfg.EventResidencyRegion))
 
 	// Kafka producer — connects lazily on first write, same posture as
 	// identity-context-svc/tenant-entity-registry-svc/policy-svc: not a
@@ -141,11 +150,35 @@ func main() {
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 
-	// ── 4b. Transactional Outbox Relay (ZS-STATE-001 Invariant I-13) ──────────
+	// ── 4b. Transactional outbox relay (ZS-EVENT-001 §6) ─────────────────────
+	// Journal events are written to eventing_outbox in the same transaction
+	// as the journal change; this relay delivers them. kafkaout builds its
+	// own writer because delivery must be acknowledged (RequireAll) — the
+	// writer above is kafka-go's fire-and-forget default and must never back
+	// the outbox, or a "published" event could be one no broker stored.
+	outboxWriter, err := kafkaout.New(kafkaout.Config{
+		Brokers:                cfg.Kafka.Brokers,
+		Topic:                  cfg.Kafka.Topic,
+		AllowAutoTopicCreation: cfg.Env == "local",
+	})
+	if err != nil {
+		log.Fatal("outbox kafka writer", zap.Error(err))
+	}
+	defer func() { _ = outboxWriter.Close() }()
+	relay, err := outbox.NewRelay(pool, outboxWriter, outbox.DefaultConfig(), log)
+	if err != nil {
+		log.Fatal("outbox relay", zap.Error(err))
+	}
 	relayCtx, cancelRelay := context.WithCancel(context.Background())
 	defer cancelRelay()
-	relay := outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, log)
-	go relay.Start(relayCtx)
+	// Buffered send rather than close(): this file imports a package named
+	// close, which shadows the builtin.
+	relayDone := make(chan struct{}, 1)
+	go func() {
+		relay.Run(relayCtx)
+		relayDone <- struct{}{}
+	}()
+	registerOutboxMetrics(relay, log)
 
 	var authzClient *authz.HTTPClient
 	if cfg.AuthzMTLSEnabled {
@@ -231,6 +264,15 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
+	// Stop the relay after the server: requests finishing during Shutdown
+	// may still commit events. Anything not delivered stays in the outbox
+	// for the next process — stopping loses nothing.
+	cancelRelay()
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		log.Warn("outbox relay did not stop before the shutdown deadline")
+	}
 	log.Info("server stopped")
 }
 
@@ -243,4 +285,36 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// registerOutboxMetrics exposes the outbox backlog signals ZS-EVENT-001 §6.1
+// calls first-class. Read at scrape time; each read is three indexed counts.
+// Alert on outbox_oldest_backlog_age_seconds that only grows (relay stopped or
+// broker gone while the service otherwise looks healthy) and on any
+// quarantined event (needs an owner's decision).
+func registerOutboxMetrics(relay *outbox.Relay, log *zap.Logger) {
+	read := func(pick func(outbox.Stats) float64) func() float64 {
+		return func() float64 {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			st, err := relay.ReadStats(ctx)
+			if err != nil {
+				log.Warn("outbox stats unavailable", zap.Error(err))
+				return math.NaN()
+			}
+			return pick(st)
+		}
+	}
+	labels := prometheus.Labels{"service": "general-ledger-svc"}
+	prometheus.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "outbox_backlog_events", Help: "Events committed but not yet published.", ConstLabels: labels,
+		}, read(func(s outbox.Stats) float64 { return float64(s.Backlog) })),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "outbox_quarantined_events", Help: "Events quarantined after exhausting retries or a permanent broker rejection.", ConstLabels: labels,
+		}, read(func(s outbox.Stats) float64 { return float64(s.Quarantined) })),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "outbox_oldest_backlog_age_seconds", Help: "Age of the oldest undelivered event.", ConstLabels: labels,
+		}, read(func(s outbox.Stats) float64 { return s.OldestBacklogAge.Seconds() })),
+	)
 }

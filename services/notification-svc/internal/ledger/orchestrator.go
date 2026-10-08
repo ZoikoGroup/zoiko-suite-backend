@@ -35,6 +35,20 @@ type LedgerStore interface {
 	GetRenderByIntent(ctx context.Context, tenantID, intentID string) (*MessageRender, error)
 }
 
+// CommunicationRegister is the direct path's register (the notifications table
+// and its attempt chain), offered to the ledger pipeline so that ONE communication
+// has ONE identity (ZS-SVC-Y-001 INV-02; plan step 3). When wired, every ledger
+// delivery also leaves a register row, linked to its intent, with the same
+// submission-marker and outcome protocol the direct path uses. Optional: without
+// it the pipeline behaves exactly as before.
+type CommunicationRegister interface {
+	CreateNotification(ctx context.Context, n *domain.Notification) (bool, error)
+	LinkIntentToNotification(ctx context.Context, intentID, notificationID string) error
+	BeginSubmission(ctx context.Context, id, tenantID string, at time.Time) error
+	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, correlationID string, meta domain.AttemptMeta) error
+	MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time, correlationID string, meta domain.AttemptMeta) error
+}
+
 // Deliverer specifies the delivery transport execution boundary.
 type Deliverer interface {
 	Deliver(ctx context.Context, n domain.Notification) domain.DeliveryOutcome
@@ -65,7 +79,15 @@ type Orchestrator struct {
 	deliverer  Deliverer
 	recipient  RecipientResolver
 	metrics    MetricsRecorder
+	register   CommunicationRegister
 	log        *zap.Logger
+}
+
+// WithRegister makes every delivery also a register row linked to its intent
+// (plan step 3). Without it, the pipeline writes only the ledger.
+func (o *Orchestrator) WithRegister(r CommunicationRegister) *Orchestrator {
+	o.register = r
+	return o
 }
 
 // NewOrchestrator constructs the canonical communications orchestrator.
@@ -157,7 +179,9 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 
 	// 3. Resolve recipient email
 	recipientEmail := strings.TrimSpace(req.RecipientEmail)
+	addressSource := domain.AddressSourceRequest
 	if recipientEmail == "" && o.recipient != nil {
+		addressSource = domain.AddressSourceIdentityContext
 		resolved, err := o.recipient.ResolveEmail(ctx, tenantID, callerPrincipalID, req.RecipientPrincipalID)
 		if err != nil {
 			o.log.Warn("failed to resolve recipient email from identity service",
@@ -366,7 +390,29 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 		CreatedAt:            time.Now().UTC(),
 	}
 
+	// Plan step 3: when the register is wired, this delivery is also a register
+	// row linked to the intent. It is created and linked BEFORE the provider is
+	// called, so a failure to record the communication means nothing was sent,
+	// the same posture as the direct path (a failed create is a 503, not a send).
+	var registered *domain.Notification
+	if o.register != nil {
+		reg, err := o.registerCommunication(ctx, tenantID, intent, notificationForDeliverer, addressSource, dedupKey, req.TemplateKey)
+		if err != nil {
+			failMsg := fmt.Sprintf("communication register unavailable; nothing was sent: %v", err)
+			if upErr := o.store.UpdateIntentStatus(ctx, tenantID, intent.MessageIntentID, IntentStatusFailed, &failMsg); upErr != nil {
+				o.log.Error("failed to update intent status to FAILED", zap.String("intent_id", intent.MessageIntentID), zap.Error(upErr))
+			}
+			return nil, fmt.Errorf("register communication: %w", err)
+		}
+		registered = reg
+		notificationForDeliverer.NotificationID = reg.NotificationID
+	}
+
 	outcome := o.deliverer.Deliver(ctx, notificationForDeliverer)
+
+	if registered != nil {
+		o.concludeCommunication(ctx, tenantID, registered, outcome, callerPrincipalID, req.CorrelationID)
+	}
 
 	// 11. Record Delivery Attempt
 	attemptID := uuid.NewString()
@@ -376,10 +422,19 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 		attemptStatus = AttemptStatusFailed
 		attemptFailureReason = &outcome.Reason
 	}
-	var providerMessageID *string
+	// The provider message id is what a callback will quote. The transport's
+	// receipt is a sentence that contains it ("smtp host accepted; message-id=<x>"),
+	// and storing the sentence meant no callback ever matched. A bare token with
+	// no spaces (a transport whose receipt IS the id) is kept as it is.
+	var providerMessageID, providerResponse *string
 	if outcome.ProviderResponse != "" {
 		resp := outcome.ProviderResponse
-		providerMessageID = &resp
+		providerResponse = &resp
+		if id := domain.ExtractProviderMessageID(resp); id != "" {
+			providerMessageID = &id
+		} else if !strings.ContainsAny(resp, " \t") {
+			providerMessageID = &resp
+		}
 	}
 
 	providerName := outcome.ProviderName
@@ -461,7 +516,7 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 		DeduplicationKey: dedupKey,
 		RenderID:         &renderID,
 		AttemptID:        &attemptID,
-		ProviderResponse: providerMessageID,
+		ProviderResponse: providerResponse,
 		FailureReason:    attemptFailureReason,
 	}, nil
 }

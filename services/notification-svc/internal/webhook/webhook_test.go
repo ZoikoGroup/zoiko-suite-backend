@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/ledger"
 	"zoiko.io/notification-svc/internal/webhook"
 )
@@ -27,6 +28,8 @@ type mockWebhookStore struct {
 	suppressions map[string]*ledger.EmailSuppression
 	dlq          map[string]*webhook.DLQItem
 	failNext     error
+	evidence     map[string]*domain.DeliveryEvidence
+	failEvidence error
 }
 
 func newMockWebhookStore() *mockWebhookStore {
@@ -35,6 +38,7 @@ func newMockWebhookStore() *mockWebhookStore {
 		events:       make(map[string]*ledger.DeliveryEvent),
 		suppressions: make(map[string]*ledger.EmailSuppression),
 		dlq:          make(map[string]*webhook.DLQItem),
+		evidence:     make(map[string]*domain.DeliveryEvidence),
 	}
 }
 
@@ -506,7 +510,9 @@ func TestWebhook_HTTPHandler_Routing(t *testing.T) {
 	}
 
 	processor := webhook.NewProcessor(store, zap.NewNop())
-	h := webhook.NewHandler(processor, zap.NewNop())
+	secret := []byte("0123456789abcdef-test-secret")
+	h := webhook.NewHandler(processor, zap.NewNop()).
+		WithVerifier(webhook.NewVerifier(map[string][]string{"smtp": {string(secret)}}, 0))
 
 	r := chi.NewRouter()
 	h.RegisterRoutes(r)
@@ -515,6 +521,7 @@ func TestWebhook_HTTPHandler_Routing(t *testing.T) {
 	payload := `{"event_id":"evt-h-1","event_type":"DELIVERED","recipient_email":"http@example.com","provider_message_id":"<msg-http-001@zoikosuite.com>"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(payload)))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(webhook.SignatureHeader, webhook.Sign(secret, time.Now(), []byte(payload)))
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -525,6 +532,7 @@ func TestWebhook_HTTPHandler_Routing(t *testing.T) {
 
 	// Malformed payload
 	badReq := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(`{not json`)))
+	badReq.Header.Set(webhook.SignatureHeader, webhook.Sign(secret, time.Now(), []byte(`{not json`)))
 	badW := httptest.NewRecorder()
 
 	r.ServeHTTP(badW, badReq)
@@ -578,5 +586,130 @@ func TestWebhook_ProcessRetryableDLQ_Batch(t *testing.T) {
 	}
 	if len(store.events) != 1 {
 		t.Errorf("expected 1 delivery event recorded, got %d", len(store.events))
+	}
+}
+
+// NP-27: when a provider message id matches more than one attempt, the callback is not
+// applied to a guess. It is dead-lettered for a person, and nothing is suppressed.
+func TestWebhook_AmbiguousProviderMessageID_IsNeverApplied(t *testing.T) {
+	store := newMockWebhookStore()
+	store.failNext = webhook.ErrAmbiguousAttempt
+	processor := webhook.NewProcessor(store, zap.NewNop())
+
+	payload := `{
+		"event_id": "evt-ambiguous-001",
+		"event_type": "BOUNCE",
+		"bounce_type": "HARD",
+		"recipient_email": "someone@example.com",
+		"provider_message_id": "<dup-msg@zoikosuite.com>"
+	}`
+	if err := processor.ProcessRawPayload(context.Background(), "smtp", []byte(payload)); err != nil {
+		t.Fatalf("an ambiguous callback is dead-lettered, not an error: %v", err)
+	}
+	if len(store.dlq) != 1 {
+		t.Fatalf("want one DLQ entry, got %d", len(store.dlq))
+	}
+	for _, it := range store.dlq {
+		if it.IsRetryable {
+			t.Error("retrying cannot make an ambiguous id unambiguous; the entry must be terminal")
+		}
+		if !strings.Contains(it.ErrorReason, "ambiguous") {
+			t.Errorf("reason should say ambiguous, got %q", it.ErrorReason)
+		}
+	}
+	if len(store.suppressions) != 0 {
+		t.Errorf("a hard bounce on a guessed attempt must suppress nobody, got %d suppressions", len(store.suppressions))
+	}
+	if len(store.events) != 0 {
+		t.Errorf("no delivery event may be recorded for a guessed attempt, got %d", len(store.events))
+	}
+}
+
+func (m *mockWebhookStore) RecordDeliveryEvidence(_ context.Context, ev *domain.DeliveryEvidence) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failEvidence != nil {
+		return false, m.failEvidence
+	}
+	if m.failNext != nil {
+		err := m.failNext
+		m.failNext = nil
+		return false, err
+	}
+	key := ev.TenantID + ":" + ev.AttemptID + ":" + ev.SourceEventID
+	if _, ok := m.evidence[key]; ok {
+		return false, nil
+	}
+	m.evidence[key] = ev
+	return true, nil
+}
+
+// NCD-04 7.1: a direct send's callback becomes a normalized evidence fact on its attempt.
+func TestWebhook_DirectAttemptCallbackBecomesEvidence(t *testing.T) {
+	store := newMockWebhookStore()
+	store.attempts["<direct-1@zoikosuite.com>"] = &webhook.AttemptLookupResult{ProviderAttemptID: "attempt-direct", TenantID: "tenant-d", RecipientAddress: "bob@example.com"}
+	processor := webhook.NewProcessor(store, zap.NewNop())
+
+	for _, tc := range []struct{ id, payload, fact, strength string }{
+		{"e1", `"event_type":"DELIVERED"`, "MAILBOX_ACCEPTED", "MAILBOX_LEVEL"},
+		{"e2", `"event_type":"BOUNCE","bounce_type":"SOFT"`, "DEFERRED", "MAILBOX_LEVEL"},
+		{"e3", `"event_type":"BOUNCE","bounce_type":"HARD"`, "BOUNCED", "MAILBOX_LEVEL"},
+		{"e4", `"event_type":"COMPLAINT"`, "COMPLAINT", "RECIPIENT_SIGNAL"},
+		{"e5", `"event_type":"DROPPED"`, "REJECTED", "PROVIDER_LEVEL"},
+	} {
+		body := `{"event_id":"` + tc.id + `",` + tc.payload + `,"recipient_email":"bob@example.com","provider_message_id":"<direct-1@zoikosuite.com>","diagnostic_code":"550 5.1.1"}`
+		if err := processor.ProcessRawPayload(context.Background(), "smtp", []byte(body)); err != nil {
+			t.Fatalf("%s: %v", tc.id, err)
+		}
+		got := store.evidence["tenant-d:attempt-direct:"+tc.id]
+		if got == nil || got.Fact != tc.fact || got.Strength != tc.strength {
+			t.Errorf("%s: want %s/%s, got %+v", tc.id, tc.fact, tc.strength, got)
+		}
+	}
+	if len(store.events) != 0 {
+		t.Errorf("a direct attempt has no ledger delivery event, got %d", len(store.events))
+	}
+
+	// The same provider event again adds nothing.
+	_ = processor.ProcessRawPayload(context.Background(), "smtp", []byte(`{"event_id":"e1","event_type":"DELIVERED","recipient_email":"bob@example.com","provider_message_id":"<direct-1@zoikosuite.com>"}`))
+	if len(store.evidence) != 5 {
+		t.Errorf("a replayed callback must not add a fact, have %d", len(store.evidence))
+	}
+}
+
+// A ledger attempt keeps using its own delivery events; no evidence row is written for it.
+func TestWebhook_LedgerAttemptCallbackWritesNoDirectEvidence(t *testing.T) {
+	store := newMockWebhookStore()
+	store.attempts["<led-1@zoikosuite.com>"] = &webhook.AttemptLookupResult{ProviderAttemptID: "attempt-led", MessageIntentID: "intent-led", TenantID: "tenant-l", SenderStream: "TRANSACTIONAL"}
+	processor := webhook.NewProcessor(store, zap.NewNop())
+	body := `{"event_id":"el1","event_type":"DELIVERED","recipient_email":"x@example.com","provider_message_id":"<led-1@zoikosuite.com>"}`
+	if err := processor.ProcessRawPayload(context.Background(), "smtp", []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.events) != 1 || len(store.evidence) != 0 {
+		t.Fatalf("ledger events=%d evidence=%d, want 1 and 0", len(store.events), len(store.evidence))
+	}
+}
+
+// A failure to record evidence is retried through the DLQ, never dropped.
+func TestWebhook_EvidenceWriteFailureIsRetried(t *testing.T) {
+	store := newMockWebhookStore()
+	store.failEvidence = errors.New("evidence store down")
+	store.attempts["<direct-2@zoikosuite.com>"] = &webhook.AttemptLookupResult{ProviderAttemptID: "attempt-d2", TenantID: "tenant-d", RecipientAddress: "c@example.com"}
+	processor := webhook.NewProcessor(store, zap.NewNop())
+	body := `{"event_id":"ef1","event_type":"BOUNCE","bounce_type":"HARD","recipient_email":"c@example.com","provider_message_id":"<direct-2@zoikosuite.com>"}`
+	if err := processor.ProcessRawPayload(context.Background(), "smtp", []byte(body)); err == nil {
+		t.Fatal("a failed evidence write must surface as an error")
+	}
+	if len(store.dlq) != 1 {
+		t.Fatalf("want one retryable DLQ entry, got %d", len(store.dlq))
+	}
+	for _, it := range store.dlq {
+		if !it.IsRetryable {
+			t.Error("the entry must be retryable")
+		}
+	}
+	if len(store.suppressions) != 0 {
+		t.Error("the callback is retried as a whole; nothing is half-applied")
 	}
 }

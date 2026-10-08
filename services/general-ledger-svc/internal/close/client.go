@@ -30,7 +30,10 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 }
 
 type periodStatusResp struct {
-	CloseStatus string `json:"close_status"`
+	CloseStatus     string     `json:"close_status"`
+	PeriodState     string     `json:"period_state"`
+	PostingPolicy   string     `json:"posting_policy"`
+	ReopenExpiresAt *time.Time `json:"reopen_expires_at,omitempty"`
 }
 
 func (c *HTTPClient) CheckPeriodOpen(ctx context.Context, tenantID, legalEntityID, periodName string) error {
@@ -69,8 +72,17 @@ func (c *HTTPClient) CheckPeriodOpen(ctx context.Context, tenantID, legalEntityI
 		return domain.ErrCloseServiceUnavailable
 	}
 
-	if statusResp.CloseStatus == "LOCKED" || statusResp.CloseStatus == "CLOSED" {
-		return domain.ErrPeriodLocked
+	switch statusResp.PostingPolicy {
+	case "OPEN", "REOPENED":
+		return nil
+	case "RESTRICTED":
+		return domain.ErrSoftCloseOverrideRequired
+	case "CLOSE_JOURNALS_ONLY":
+		return domain.ErrPeriodHardClosed
+	case "CLOSED":
+		return domain.ErrPeriodHardClosed
+	default:
+		c.log.Error("unrecognized posting_policy from financial-close-svc — failing closed", zap.String("posting_policy", statusResp.PostingPolicy), zap.String("period_state", statusResp.PeriodState))
+		return domain.ErrPeriodHardClosed
 	}
-	return nil
 }

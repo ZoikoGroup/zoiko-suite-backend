@@ -1,8 +1,8 @@
 # docker-compose.yml — limited, self-contained local stack for general-ledger-svc
 #
 # Runs:
-#   postgres   — PostgreSQL 16. DB: general_ledger. Applies all six migrations
-#                (000001→000006) on first boot.
+#   postgres   — PostgreSQL 16. DB: general_ledger. Applies every
+#                migrations/*.up.sql in lexical order on first boot.
 #   fake       — tiny two-in-one shim: authorization-svc (POST /v1/authorize →
 #                GRANTED on :8089) and financial-close-svc (GET
 #                /v1/close/periods/status → OPEN on :8104). Required because
@@ -42,12 +42,11 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     volumes:
-      - ./migrations/000001_initial_schema.up.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
-      - ./migrations/000002_add_idempotency_index.up.sql:/docker-entrypoint-initdb.d/002_idempotency.sql:ro
-      - ./migrations/000003_add_atomic_linking.up.sql:/docker-entrypoint-initdb.d/003_atomic_linking.sql:ro
-      - ./migrations/000004_force_rls.up.sql:/docker-entrypoint-initdb.d/004_force_rls.sql:ro
-      - ./migrations/000005_policy_empty_tenant_is_null.up.sql:/docker-entrypoint-initdb.d/005_policy_tenant.sql:ro
-      - ./migrations/000006_acc03_journal_inputs.up.sql:/docker-entrypoint-initdb.d/006_acc03.sql:ro
+      # Whole directory + one loop script, not a per-file list: a list here
+      # silently fell behind (it stopped at 000006 while the schema grew to
+      # 000012). See initdb/apply-migrations.sh.
+      - ./migrations:/migrations:ro
+      - ./initdb/apply-migrations.sh:/docker-entrypoint-initdb.d/apply-migrations.sh:ro
       - gl_pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d general_ledger"]
@@ -70,8 +69,9 @@ services:
   # ── general-ledger-svc (resource-limited) ─────────────────────────────────────
   svc:
     build:
-      context: ..
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../..
+      dockerfile: general-ledger-svc/Dockerfile
     container_name: general-ledger-svc
     image: general-ledger-svc:local
     mem_limit: 256m
@@ -92,8 +92,12 @@ services:
       # Fail-closed dependencies answered by the local GRANTED/OPEN shim.
       AUTHZ_SERVICE_URL: "http://fake:8089"
       CLOSE_SERVICE_URL: "http://fake:8104"
-      # No real Kafka for the limited run; publishes are logged no-ops.
+      # No real Kafka for the limited run: journal events stay in
+      # eventing_outbox (outbox_backlog_events grows) and nothing is lost.
       KAFKA_BROKERS: ""
+      # Required, no default (ZS-EVENT-001 §4 residencyregion). "local" marks
+      # events from a developer stack; deployments set their real region code.
+      EVENT_RESIDENCY_REGION: local
     depends_on:
       postgres:
         condition: service_healthy

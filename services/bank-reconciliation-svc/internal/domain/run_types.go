@@ -199,3 +199,33 @@ var (
 	ErrPeriodLocked          = errorString("the accounting period for this run's statement date is closed or locked")
 	ErrCloseServiceUnavailable = errorString("financial-close-svc unavailable")
 )
+
+// PeriodReconciliationStatus answers, for every bank account of one legal
+// entity, whether the account was reconciled within a period — the input
+// period close (ACC-14 "bank recon") needs, which a lookup by run id cannot
+// give it.
+type PeriodReconciliationStatus struct {
+	LegalEntityID string                        `json:"legal_entity_id"`
+	PeriodStart   string                        `json:"period_start"`
+	PeriodEnd     string                        `json:"period_end"`
+	Accounts      []AccountReconciliationStatus `json:"accounts"`
+}
+
+// AccountReconciliationStatus is one bank account's position in the period.
+// LatestCertified is the run that proves it; LatestRun is the most recent run
+// of any status, so a caller can say why the account is not proven ("the 30
+// Oct run is EXCEPTIONS_OPEN") rather than only that it is not.
+type AccountReconciliationStatus struct {
+	BankAccountID   string           `json:"bank_account_id"`
+	LatestCertified *RunStatusDigest `json:"latest_certified,omitempty"`
+	LatestRun       *RunStatusDigest `json:"latest_run,omitempty"`
+}
+
+// RunStatusDigest is the part of a run period close reports and pins.
+type RunStatusDigest struct {
+	RunID                  string     `json:"run_id"`
+	StatementDate          string     `json:"statement_date"`
+	Status                 string     `json:"status"`
+	CertifiedAt            *time.Time `json:"certified_at,omitempty"`
+	CertifiedByPrincipalID *string    `json:"certified_by_principal_id,omitempty"`
+}

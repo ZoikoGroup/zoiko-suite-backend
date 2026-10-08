@@ -223,6 +223,12 @@ type JournalHeader struct {
 	// it corrects. "Corrections create new journals" — never an in-place
 	// edit of a posted one.
 	CorrectionOfJournalID *string `json:"correction_of_journal_id,omitempty"`
+
+	// SoftCloseOverrideReason is the mandatory, non-empty reason provided
+	// when a journal is posted during SOFT_CLOSE (posting_policy RESTRICTED)
+	// with override_soft_close=true. Persisted per ZS-SVC-B-001 ACC-14 §10.1
+	// and emitted in the JournalCreated outbox event for audit traceability.
+	SoftCloseOverrideReason *string `json:"soft_close_override_reason,omitempty"`
 }
 
 // JournalLine is one debit or credit line within a journal. Exactly one of
@@ -407,6 +413,12 @@ type PostingExecution struct {
 	CreatedAt            time.Time  `json:"created_at"`
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
 	CommittedAt          *time.Time `json:"committed_at,omitempty"`
+
+	// RequestPayload is the accepted PostAccountingEventRequest, kept so
+	// ReprocessFailedPosting can replay an execution that failed before its
+	// journal was written (migration 000014). Nil for executions recorded
+	// before then. Not part of the API response.
+	RequestPayload []byte `json:"-"`
 }
 
 // PostingEventLineInput is one line of a caller-declared accounting event.
@@ -441,15 +453,30 @@ type PostAccountingEventRequest struct {
 	TransactionCurrency string `json:"transaction_currency"`
 	DocumentDate        Date   `json:"document_date"`
 	PostingDate         Date   `json:"posting_date"`
+
+	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
+	// CreateJournalRequest — see those field docs for semantics.
+	OverrideSoftClose       bool   `json:"override_soft_close,omitempty"`
+	SoftCloseOverrideReason string `json:"soft_close_override_reason,omitempty"`
 }
 
 type PostApprovedJournalRequest struct {
-	JournalID string `json:"journal_id"`
+	JournalID               string `json:"journal_id"`
+
+	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
+	// CreateJournalRequest — see those field docs for semantics.
+	OverrideSoftClose       bool   `json:"override_soft_close,omitempty"`
+	SoftCloseOverrideReason string `json:"soft_close_override_reason,omitempty"`
 }
 
 type CreateReversalPostingRequest struct {
-	OriginalJournalID string `json:"original_journal_id"`
-	Reason            string `json:"reason"`
+	OriginalJournalID       string `json:"original_journal_id"`
+	Reason                  string `json:"reason"`
+
+	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
+	// CreateJournalRequest — see those field docs for semantics.
+	OverrideSoftClose       bool   `json:"override_soft_close,omitempty"`
+	SoftCloseOverrideReason string `json:"soft_close_override_reason,omitempty"`
 }
 
 // LedgerEntry is ACC-05's own authority: "LedgerEntry and authoritative
@@ -588,11 +615,31 @@ type CreateJournalRequest struct {
 	// account with direct_posting_restricted=true (ACC-01 invariant #7).
 	// False/omitted is the ordinary case and needs no special authority.
 	OverrideControlAccountRestriction bool `json:"override_control_account_restriction,omitempty"`
+
+	// OverrideSoftClose is a caller-declared, never-inferred opt-in to post
+	// during a SOFT_CLOSE period (posting_policy RESTRICTED). Unlike the
+	// control-account override, this one also requires a non-empty
+	// SoftCloseOverrideReason that is persisted on the journal header and
+	// included in outbox events. Both the flag and the reason must be
+	// present, and the caller must hold the GL_SOFT_CLOSE_POSTING_OVERRIDE
+	// authorization action (checked via authorization-svc).
+	OverrideSoftClose bool `json:"override_soft_close,omitempty"`
+
+	// SoftCloseOverrideReason is the mandatory, non-empty reason string
+	// required when OverrideSoftClose is true. Whitespace-only is rejected.
+	// Persisted on the journal header's soft_close_override_reason column and
+	// emitted in the JournalCreated outbox event for audit traceability.
+	SoftCloseOverrideReason string `json:"soft_close_override_reason,omitempty"`
 }
 
 type ReverseJournalRequest struct {
-	Reason        string `json:"reason"`
-	CorrelationID string `json:"correlation_id"`
+	Reason                  string `json:"reason"`
+	CorrelationID           string `json:"correlation_id"`
+
+	// OverrideSoftClose and SoftCloseOverrideReason mirror the fields on
+	// CreateJournalRequest — see those field docs for semantics.
+	OverrideSoftClose       bool   `json:"override_soft_close,omitempty"`
+	SoftCloseOverrideReason string `json:"soft_close_override_reason,omitempty"`
 }
 
 // AmendDraftJournalRequest is ACC-03's AmendDraftJournal command — a full
@@ -687,7 +734,9 @@ var (
 	ErrIdentityMissing = errorString("caller identity missing")
 
 	ErrPeriodLocked            = errorString("accounting period is closed or locked")
-	ErrCloseServiceUnavailable = errorString("financial-close-svc unavailable")
+	ErrSoftCloseOverrideRequired = errorString("soft-close override required: elevated finance role and non-empty reason must be provided")
+	ErrPeriodHardClosed          = errorString("accounting period is hard-closed and cannot be posted to")
+	ErrCloseServiceUnavailable   = errorString("financial-close-svc unavailable")
 
 	// ErrInvalidIdentifier is returned when an id cannot be a UUID at all.
 	// journal_id, tenant_id and legal_entity_id are uuid columns, so Postgres

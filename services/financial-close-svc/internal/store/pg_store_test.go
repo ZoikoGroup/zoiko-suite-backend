@@ -42,7 +42,9 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
 		close_evidences, fiscal_periods, period_reopen_events,
+		period_reopen_requests, period_state_transitions,
 		subledger_control_runs,
+		close_requirements,
 		accrual_recognition_reversals, accrual_recognition_instances, accrual_schedules,
 		prepayment_recognition_instances, prepayment_schedules,
 		allocation_run_result_lines, allocation_runs, allocation_rule_drivers, allocation_rules,
