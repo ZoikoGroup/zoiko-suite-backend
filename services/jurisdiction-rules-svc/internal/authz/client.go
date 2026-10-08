@@ -49,7 +49,7 @@ type AuthorizationClient interface {
 	// Authorize returns nil if the action is permitted.
 	// Returns ErrUnauthorized if denied; ErrAuthZUnavailable if the service
 	// is unreachable or answers in a way that cannot be read as a decision.
-	Authorize(ctx context.Context, principalID, scopeID, resource, action string, envelope *envelope.Envelope) error
+	Authorize(ctx context.Context, principalID, scopeID, resource, action string, envelope *svcenvelope.Envelope) error
 }
 
 // Sentinel errors — mapped to HTTP status codes in handlers.
@@ -72,7 +72,7 @@ func NewStubAuthZClient(log *zap.Logger) *StubAuthZClient {
 	return &StubAuthZClient{log: log}
 }
 
-func (c *StubAuthZClient) Authorize(_ context.Context, principalID, _, resource, action string, _ *envelope.Envelope) error {
+func (c *StubAuthZClient) Authorize(_ context.Context, principalID, _, resource, action string, _ *svcenvelope.Envelope) error {
 	c.log.Debug("authz stub — permitted (wire real AuthZ before production)",
 		zap.String("principal_id", principalID),
 		zap.String("resource", resource),
@@ -171,7 +171,7 @@ func ActionType(resource, action string) string {
 	return strings.ToUpper(resource + "_" + action)
 }
 
-func (c *HTTPAuthZClient) Authorize(ctx context.Context, principalID, scopeID, resource, action string, envelope *envelope.Envelope) error {
+func (c *HTTPAuthZClient) Authorize(ctx context.Context, principalID, scopeID, resource, action string, envelope *svcenvelope.Envelope) error {
 	key := principalID + "|" + scopeID + "|" + resource + "|" + action
 
 	if decision, hit := c.lookupCache(key); hit {
@@ -226,7 +226,7 @@ func (c *HTTPAuthZClient) storeCache(key string, decision error) {
 }
 
 // authorizeLive is the real, uncached call to authorization-svc.
-func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeID, resource, action string, envelope *envelope.Envelope) error {
+func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeID, resource, action string, envelope *svcenvelope.Envelope) error {
 	actionType := ActionType(resource, action)
 
 	reqBody := authorizeRequest{

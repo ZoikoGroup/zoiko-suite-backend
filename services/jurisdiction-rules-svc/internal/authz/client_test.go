@@ -117,7 +117,7 @@ func TestHTTPClient_ForwardsTheEnvelopeHeaders(t *testing.T) {
 	// runs; context.Background() alone (as the other tests use) would not.
 	ctx := context.WithValue(context.Background(), middleware.RequestIDKey, "req-123")
 	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
-	if err := c.Authorize(ctx, "principal-1", "scope-1", "jurisdiction", "create"); err != nil {
+	if err := c.Authorize(ctx, "principal-1", "scope-1", "jurisdiction", "create", nil); err != nil {
 		t.Fatalf("expected permit, got %v", err)
 	}
 

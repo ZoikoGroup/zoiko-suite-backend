@@ -28,7 +28,7 @@ func TestCheckAllowed_ForwardsTenantFromEnvelope(t *testing.T) {
 
 	c := NewHTTPClient(srv.URL, zap.NewNop())
 	ctx := svcenvelope.WithEnvelope(context.Background(), svcenvelope.Envelope{TenantID: "tenant-a"})
-	if err := c.CheckAllowed(ctx, "principal-1", "le-1", "SOME_ACTION", ""); err != nil {
+	if err := c.CheckAllowed(ctx, "principal-1", "le-1", "", "SOME_ACTION", ""); err != nil {
 		t.Fatalf("CheckAllowed: %v", err)
 	}
 	if gotTenant != "tenant-a" {
@@ -44,7 +44,7 @@ func TestCheckAllowed_Denied(t *testing.T) {
 	defer srv.Close()
 
 	c := NewHTTPClient(srv.URL, zap.NewNop())
-	if err := c.CheckAllowed(context.Background(), "principal-1", "le-1", "SOME_ACTION", ""); err != domain.ErrAuthorizationDenied {
+	if err := c.CheckAllowed(context.Background(), "principal-1", "le-1", "", "SOME_ACTION", ""); err != domain.ErrAuthorizationDenied {
 		t.Fatalf("expected ErrAuthorizationDenied, got %v", err)
 	}
 }
