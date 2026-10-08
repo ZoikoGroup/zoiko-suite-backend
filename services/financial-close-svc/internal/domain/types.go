@@ -816,8 +816,11 @@ var (
 	// its posting-backlog population (GL_CONTROL_POPULATION_READ). The close
 	// cannot prove nothing is left unposted, so it does not proceed — and the
 	// caller is told it is a permission, not an outage.
-	ErrCloseRequirementNotFound = errorString("close requirement not found or already removed")
-	ErrPostingBacklogForbidden  = errorString("not permitted to read general-ledger-svc's posting backlog (GL_CONTROL_POPULATION_READ)")
+	ErrTreasuryUnavailable           = errorString("treasury-svc unavailable")
+	ErrBankReconciliationUnavailable = errorString("bank-reconciliation-svc unavailable")
+	ErrUnknownBankAccount            = errorString("bank account is not registered to this legal entity in treasury-svc")
+	ErrCloseRequirementNotFound      = errorString("close requirement not found or already removed")
+	ErrPostingBacklogForbidden       = errorString("not permitted to read general-ledger-svc's posting backlog (GL_CONTROL_POPULATION_READ)")
 
 	// ErrLedgerPageTruncated is returned when the ledger answered with a full
 	// page, so there may be journals this service never saw. A trial balance
@@ -1130,4 +1133,31 @@ type CloseChecklist struct {
 	BaselineSubledgerControls []string           `json:"baseline_subledger_controls"`
 	RequiredSubledgerControls []CloseRequirement `json:"required_subledger_controls"`
 	ExcludedBankAccounts      []CloseRequirement `json:"excluded_bank_accounts"`
+}
+
+// BankAccountRef is a bank account as treasury-svc (BNK-01) reports it — the
+// fields the close needs to decide scope and name an account in a blocker.
+type BankAccountRef struct {
+	BankAccountID       string    `json:"bank_account_id"`
+	LegalEntityID       string    `json:"legal_entity_id"`
+	AccountName         string    `json:"account_name"`
+	MaskedAccountNumber string    `json:"masked_account_number"`
+	AccountStatus       string    `json:"account_status"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
+// BankReconRunDigest mirrors bank-reconciliation-svc's RunStatusDigest.
+type BankReconRunDigest struct {
+	RunID         string `json:"run_id"`
+	StatementDate string `json:"statement_date"`
+	Status        string `json:"status"`
+}
+
+// BankAccountReconStatus mirrors bank-reconciliation-svc's
+// AccountReconciliationStatus: per account, the latest certified run in the
+// period and the latest run of any status.
+type BankAccountReconStatus struct {
+	BankAccountID   string              `json:"bank_account_id"`
+	LatestCertified *BankReconRunDigest `json:"latest_certified,omitempty"`
+	LatestRun       *BankReconRunDigest `json:"latest_run,omitempty"`
 }

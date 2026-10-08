@@ -32,7 +32,12 @@ func (a *actionAuthZ) CheckAllowed(_ context.Context, _, _, action string) error
 func checklistRouter(s *stubStore, authz *actionAuthZ) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
-	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, authz, &stubClients{}, testSigningKey, zap.NewNop()))
+	// Treasury knows le-1's accounts, so exclusions of them are accepted.
+	cl := &stubClients{bankAccounts: []domain.BankAccountRef{
+		{BankAccountID: "acct-1", LegalEntityID: "le-1", AccountStatus: "ACTIVE"},
+		{BankAccountID: "acct-petty", LegalEntityID: "le-1", AccountStatus: "ACTIVE"},
+	}}
+	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, authz, cl, testSigningKey, zap.NewNop()))
 	return r
 }
 
@@ -148,5 +153,30 @@ func TestRemoveCloseRequirement_UsesTheKindsPermission(t *testing.T) {
 		domain.RemoveCloseRequirementRequest{Reason: "account reactivated"}, "controller-1")
 	if rr.Code != http.StatusForbidden || excl.RemovedAt != nil {
 		t.Fatalf("got %d, removed=%v; want 403 and untouched", rr.Code, excl.RemovedAt)
+	}
+}
+
+// An exclusion must name one of the entity's own accounts, as treasury knows
+// them; if treasury cannot say, nothing is waived.
+func TestAddBankExclusion_AccountMustBelongToTheEntity(t *testing.T) {
+	s := newStubStore()
+	r := checklistRouter(s, &actionAuthZ{})
+	unknown := doReq(r, http.MethodPost, "/v1/close/requirements/", domain.CloseRequirementRequest{
+		LegalEntityID: "le-1", Kind: "BANK_ACCOUNT_EXCLUSION", BankAccountID: "acct-of-another-entity", Reason: "dormant"}, "controller-1")
+	if unknown.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("unknown account: got %d %s, want 422", unknown.Code, unknown.Body.String())
+	}
+
+	down := chi.NewRouter()
+	down.Use(middleware.TenantContext())
+	handler.RegisterRoutes(down, handler.New(s, &stubPublisher{}, &actionAuthZ{},
+		&stubClients{bankAccountsErr: domain.ErrTreasuryUnavailable}, testSigningKey, zap.NewNop()))
+	rr := doReq(down, http.MethodPost, "/v1/close/requirements/", domain.CloseRequirementRequest{
+		LegalEntityID: "le-1", Kind: "BANK_ACCOUNT_EXCLUSION", BankAccountID: "acct-1", Reason: "dormant"}, "controller-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("treasury down: got %d, want 503", rr.Code)
+	}
+	if len(s.closeRequirements) != 0 {
+		t.Fatal("an unverified exclusion was stored")
 	}
 }

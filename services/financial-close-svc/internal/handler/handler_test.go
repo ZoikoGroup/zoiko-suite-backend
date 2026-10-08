@@ -1072,12 +1072,20 @@ type stubClients struct {
 	// backlog is general-ledger-svc's posting backlog as the stub reports it;
 	// backlogCutoff records what the handler asked for, so a test can catch
 	// the handler passing the wrong cutoff.
-	backlog       domain.PostingBacklog
-	backlogErr    error
-	backlogCutoff time.Time
-	uploadErr     error
-	trialBalances map[string]float64
-	trialBalErr   error
+	backlog domain.PostingBacklog
+	// Treasury accounts and bank-reconciliation status for the bank gate.
+	// Zero values mean "the entity has no bank accounts".
+	bankAccounts                 []domain.BankAccountRef
+	bankAccountsErr              error
+	bankRecon                    []domain.BankAccountReconStatus
+	bankReconErr                 error
+	bankReconStart, bankReconEnd time.Time
+	bankCalls                    int
+	backlogErr                   error
+	backlogCutoff                time.Time
+	uploadErr                    error
+	trialBalances                map[string]float64
+	trialBalErr                  error
 
 	checkARInvoiceErr  error
 	checkAPInvoiceErr  error
@@ -1145,6 +1153,17 @@ func (c *stubClients) CompileTrialBalance(_ context.Context, _, _, _, _ string) 
 		return c.trialBalances, nil
 	}
 	return map[string]float64{"1000-Cash": 10000.00}, nil
+}
+
+func (c *stubClients) ListBankAccounts(_ context.Context, _, _, _ string) ([]domain.BankAccountRef, error) {
+	c.bankCalls++
+	return c.bankAccounts, c.bankAccountsErr
+}
+
+func (c *stubClients) GetBankReconciliationStatus(_ context.Context, _, _, _ string, start, end time.Time) ([]domain.BankAccountReconStatus, error) {
+	c.bankCalls++
+	c.bankReconStart, c.bankReconEnd = start, end
+	return c.bankRecon, c.bankReconErr
 }
 
 func (c *stubClients) GetPostingBacklog(_ context.Context, _, _, _ string, cutoff time.Time) (domain.PostingBacklog, error) {

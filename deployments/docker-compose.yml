@@ -2461,6 +2461,14 @@ services:
       # control runs to have MATCHED. Default enforce; "off" only while the
       # AR/AP control-account mappings are not configured.
       SUBLEDGER_CONTROL_GATE_MODE: "enforce"
+      # ACC-14 bank recon: every operational bank account (treasury) needs a
+      # certified reconciliation (bank-reconciliation) for a statement dated in
+      # the period, within BANK_RECON_CUTOFF_DAYS of period end. "off" only
+      # where no bank feed exists yet.
+      TREASURY_SERVICE_URL: "http://treasury-svc:8103"
+      BANK_RECONCILIATION_SERVICE_URL: "http://bank-reconciliation-svc:8102"
+      BANK_RECON_GATE_MODE: "enforce"
+      BANK_RECON_CUTOFF_DAYS: "4"
       # The three topics this service's own ACC-18 lineage Kafka consumer
       # subscribes to (asset-management-svc's, inventory-management-svc's
       # and project-accounting-svc's own events topics) — satisfies the

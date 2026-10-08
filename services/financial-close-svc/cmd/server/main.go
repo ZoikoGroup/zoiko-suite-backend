@@ -143,12 +143,21 @@ func main() {
 	}
 
 	clientsWrapper.WithFinancialControlURL(cfg.FinancialControlServiceURL)
+	clientsWrapper.WithBankingURLs(cfg.TreasuryServiceURL, cfg.BankReconciliationServiceURL)
 	if cfg.CloseGateModeInvalid {
 		log.Warn("unrecognised FINCTRL_CLOSE_GATE_MODE; treating as enforce (fail closed)")
 	}
 	log.Info("financial-control close gate", zap.String("mode", cfg.CloseGateMode))
 	if cfg.SubledgerControlGateModeInvalid {
 		log.Warn("unrecognised SUBLEDGER_CONTROL_GATE_MODE; treating as enforce (fail closed)")
+	}
+	if cfg.BankReconGateModeInvalid {
+		log.Warn("unrecognised BANK_RECON_GATE_MODE; treating as enforce (fail closed)")
+	}
+	if cfg.BankReconGateMode == "off" {
+		log.Warn("bank reconciliation close gate is OFF: periods can close without reconciled cash. Use only where no bank feed exists yet.")
+	} else {
+		log.Info("bank reconciliation close gate", zap.String("mode", cfg.BankReconGateMode), zap.Int("cutoff_days", cfg.BankReconCutoffDays))
 	}
 	if cfg.SubledgerControlGateMode == "off" {
 		log.Warn("subledger control close gate is OFF: periods can close without proving AR/AP agree with the GL (ACC-06). Use only until control-account mappings are configured.")
@@ -198,7 +207,8 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, clientsWrapper, clientsWrapper, []byte(cfg.CloseSigningKey), log).SetCloseGateEnforced(cfg.CloseGateMode == "enforce").
-		SetSubledgerControlGateEnforced(cfg.SubledgerControlGateMode == "enforce")
+		SetSubledgerControlGateEnforced(cfg.SubledgerControlGateMode == "enforce").
+		SetBankReconciliationGate(cfg.BankReconGateMode == "enforce", cfg.BankReconCutoffDays)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

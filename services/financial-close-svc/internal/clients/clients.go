@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
@@ -58,6 +59,11 @@ type Clients struct {
 	// financialControlURL is financial-control-svc, set via
 	// WithFinancialControlURL so the New constructors keep their signatures.
 	financialControlURL string
+
+	// treasuryURL and bankReconURL serve the close's bank reconciliation
+	// blocker; set via WithBankingURLs.
+	treasuryURL  string
+	bankReconURL string
 
 	// authzHTTP, when set, is used instead of http for calls to
 	// authorization-svc only — the mTLS pilot's Transport carries this
@@ -1588,4 +1594,96 @@ func (c *Clients) UploadCloseEvidence(ctx context.Context, tenantID, legalEntity
 	}
 
 	return dResp.DocumentID, nil
+}
+
+// WithBankingURLs sets treasury-svc (the entity's bank accounts, BNK-01) and
+// bank-reconciliation-svc (their reconciliation status, BNK-05).
+func (c *Clients) WithBankingURLs(treasuryURL, bankReconURL string) *Clients {
+	c.treasuryURL, c.bankReconURL = treasuryURL, bankReconURL
+	return c
+}
+
+// ListBankAccounts returns the entity's bank accounts from treasury-svc.
+// Any failure is an error, never an empty list: "no accounts" would close a
+// period with no cash reconciliation at all.
+func (c *Clients) ListBankAccounts(ctx context.Context, tenantID, principalID, legalEntityID string) ([]domain.BankAccountRef, error) {
+	if c.treasuryURL == "" || strings.TrimSpace(legalEntityID) == "" {
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	u, err := url.Parse(c.treasuryURL + "/v1/treasury/accounts")
+	if err != nil {
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("treasury-svc unreachable", zap.Error(err))
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		c.log.Error("treasury-svc account list returned non-200", zap.Int("status", resp.StatusCode))
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	var accounts []domain.BankAccountRef
+	if err := json.NewDecoder(resp.Body).Decode(&accounts); err != nil {
+		return nil, fmt.Errorf("%w: decode accounts: %v", domain.ErrTreasuryUnavailable, err)
+	}
+	// Defence in depth: treasury filters by entity, but an account of another
+	// entity must never be counted, or excluded, on this one's behalf.
+	out := accounts[:0]
+	for _, a := range accounts {
+		if a.LegalEntityID == legalEntityID {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+// GetBankReconciliationStatus asks bank-reconciliation-svc for each account's
+// latest certified and latest run with a statement date in [start, end].
+func (c *Clients) GetBankReconciliationStatus(ctx context.Context, tenantID, principalID, legalEntityID string, start, end time.Time) ([]domain.BankAccountReconStatus, error) {
+	if c.bankReconURL == "" {
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	u, err := url.Parse(c.bankReconURL + "/v1/reconciliation-runs/period-status")
+	if err != nil {
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("period_start", start.UTC().Format("2006-01-02"))
+	q.Set("period_end", end.UTC().Format("2006-01-02"))
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("bank-reconciliation-svc unreachable", zap.Error(err))
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		c.log.Error("bank-reconciliation-svc period status returned non-200", zap.Int("status", resp.StatusCode))
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	var out struct {
+		Accounts []domain.BankAccountReconStatus `json:"accounts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("%w: decode period status: %v", domain.ErrBankReconciliationUnavailable, err)
+	}
+	return out.Accounts, nil
 }

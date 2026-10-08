@@ -7,7 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"go.uber.org/zap"
+
 	"zoiko.io/financial-close-svc/internal/domain"
+	"zoiko.io/financial-close-svc/internal/handler"
+	"zoiko.io/financial-close-svc/internal/middleware"
 )
 
 // These tests pin what blocks a period close (ACC-14, ACC-06) using the
@@ -333,4 +338,131 @@ func TestClose_InventoryIntegrityFindingsAreNamed(t *testing.T) {
 	requireBlockedWith(t, code, resp, body,
 		"INVENTORY_QUANTITY: 4 inventory items have a negative quantity on hand",
 		"STOCK_COUNT: 2 stock-count variances are not approved")
+}
+
+// ── Bank reconciliation (ACC-14 "bank recon", BNK-05) ───────────────────────
+
+var (
+	barclays = domain.BankAccountRef{BankAccountID: "acct-barclays", LegalEntityID: "le-1", AccountName: "Barclays operating",
+		MaskedAccountNumber: "****4021", AccountStatus: "ACTIVE", CreatedAt: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)}
+	hsbc = domain.BankAccountRef{BankAccountID: "acct-hsbc", LegalEntityID: "le-1", AccountName: "HSBC payroll",
+		MaskedAccountNumber: "****7788", AccountStatus: "ACTIVE", CreatedAt: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)}
+)
+
+func certified(account, date string) domain.BankAccountReconStatus {
+	d := &domain.BankReconRunDigest{RunID: account + "-" + date, StatementDate: date, Status: "CERTIFIED"}
+	return domain.BankAccountReconStatus{BankAccountID: account, LatestCertified: d, LatestRun: d}
+}
+
+// The worked example: Barclays reconciled for 30 Oct; HSBC's 30 Oct run is
+// stuck with £15,400 of unbooked items, its last certification is 23 Oct.
+// The close must name HSBC, say why, and leave Barclays alone.
+func TestClose_UnreconciledBankAccountBlocks(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	hsbcStatus := certified("acct-hsbc", "2026-10-23")
+	hsbcStatus.LatestRun = &domain.BankReconRunDigest{RunID: "hsbc-30", StatementDate: "2026-10-30", Status: "EXCEPTIONS_OPEN"}
+	cl := &stubClients{
+		bankAccounts: []domain.BankAccountRef{barclays, hsbc},
+		bankRecon:    []domain.BankAccountReconStatus{certified("acct-barclays", "2026-10-30"), hsbcStatus},
+	}
+	code, resp, body := lock(t, s, cl)
+	requireBlockedWith(t, code, resp, body,
+		"bank_reconciliation_stale: latest certified reconciliation for HSBC payroll (****7788) is for the 2026-10-23 statement",
+		"on or after 2026-10-27", "the 2026-10-30 run is EXCEPTIONS_OPEN")
+	for _, issue := range resp.BlockingIssues {
+		if strings.Contains(issue, "Barclays") {
+			t.Fatalf("Barclays is reconciled and must not be reported: %s", issue)
+		}
+	}
+	if !cl.bankReconStart.Equal(octStart) || !cl.bankReconEnd.Equal(octEnd) {
+		t.Fatalf("asked for %v..%v, want the period %v..%v", cl.bankReconStart, cl.bankReconEnd, octStart, octEnd)
+	}
+}
+
+// 31 Oct 2026 is a Saturday: the last statement is Friday 30 Oct, or even
+// Thursday 29th after a bank holiday. Within the 4-day cut-off, it proves the month.
+func TestClose_StatementWithinCutoffProvesTheMonth(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	cl := &stubClients{bankAccounts: []domain.BankAccountRef{barclays}, bankRecon: []domain.BankAccountReconStatus{certified("acct-barclays", "2026-10-27")}}
+	if code, _, body := lock(t, s, cl); code != http.StatusOK {
+		t.Fatalf("a certified 27 Oct reconciliation is within the cut-off: %d %s", code, body)
+	}
+}
+
+func TestClose_CutoffIsConfigurable(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	r := chi.NewRouter()
+	r.Use(middleware.TenantContext())
+	cl := &stubClients{bankAccounts: []domain.BankAccountRef{barclays}, bankRecon: []domain.BankAccountReconStatus{certified("acct-barclays", "2026-10-30")}}
+	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, &stubAuthZ{}, cl, testSigningKey, zap.NewNop()).SetBankReconciliationGate(true, 0))
+	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1")
+	if rr.Code != http.StatusUnprocessableEntity || !strings.Contains(rr.Body.String(), "on or after 2026-10-31") {
+		t.Fatalf("cut-off 0 requires the 31st itself: got %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestClose_AccountWithNoReconciliationBlocks(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	cl := &stubClients{bankAccounts: []domain.BankAccountRef{barclays}}
+	code, resp, body := lock(t, s, cl)
+	requireBlockedWith(t, code, resp, body, "bank_reconciliation_missing: Barclays operating (****4021) has no reconciliation run for 2026-10")
+}
+
+// Scope: only operational accounts that existed by period end, and not those
+// the checklist excludes as immaterial.
+func TestClose_BankAccountScope(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	closed, draft, suspended, opened := barclays, barclays, hsbc, barclays
+	closed.BankAccountID, closed.AccountStatus, closed.AccountName = "acct-closed", "CLOSED", "Closed"
+	draft.BankAccountID, draft.AccountStatus, draft.AccountName = "acct-draft", "DRAFT", "Draft"
+	suspended.BankAccountID, suspended.AccountStatus, suspended.AccountName = "acct-suspended", "SUSPENDED", "Suspended"
+	opened.BankAccountID, opened.AccountName = "acct-november", "Opened in November"
+	opened.CreatedAt = time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	petty := barclays
+	petty.BankAccountID, petty.AccountName = "acct-petty", "Petty cash"
+	s.closeRequirements = append(s.closeRequirements, &domain.CloseRequirement{RequirementID: "ex-1", TenantID: testTenantID,
+		LegalEntityID: "le-1", Kind: domain.CloseRequirementBankAccountExclusion, BankAccountID: "acct-petty", Reason: "float under £200"})
+
+	cl := &stubClients{bankAccounts: []domain.BankAccountRef{closed, draft, suspended, opened, petty}}
+	code, resp, _ := lock(t, s, cl)
+	if code != http.StatusUnprocessableEntity || len(resp.BlockingIssues) != 1 || !strings.Contains(resp.BlockingIssues[0], "Suspended") {
+		t.Fatalf("only the suspended account (it still holds money) is in scope; got %d %v", code, resp.BlockingIssues)
+	}
+}
+
+func TestClose_BankGateFailsClosed(t *testing.T) {
+	for name, cl := range map[string]*stubClients{
+		"treasury down":            {bankAccountsErr: domain.ErrTreasuryUnavailable},
+		"bank reconciliation down": {bankAccounts: []domain.BankAccountRef{barclays}, bankReconErr: domain.ErrBankReconciliationUnavailable},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := octoberStore()
+			bothMatched(s)
+			code, _, body := lock(t, s, cl)
+			if code != http.StatusServiceUnavailable {
+				t.Fatalf("got %d %s, want 503", code, body)
+			}
+			if s.periods["fp-oct"].CloseStatus != "OPEN" {
+				t.Fatal("closed without being able to check cash")
+			}
+		})
+	}
+}
+
+// BANK_RECON_GATE_MODE=off: neither service is asked.
+func TestClose_BankGateOffAsksNobody(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	cl := &stubClients{bankAccountsErr: domain.ErrTreasuryUnavailable}
+	r := chi.NewRouter()
+	r.Use(middleware.TenantContext())
+	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, &stubAuthZ{}, cl, testSigningKey, zap.NewNop()).SetBankReconciliationGate(false, 4))
+	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1"); rr.Code != http.StatusOK || cl.bankCalls != 0 {
+		t.Fatalf("gate off: got %d with %d bank calls", rr.Code, cl.bankCalls)
+	}
 }

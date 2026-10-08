@@ -162,6 +162,8 @@ type Clients interface {
 	// the period it belongs to. Without them a single outstanding invoice
 	// anywhere blocked every period forever.
 	GetPostingBacklog(ctx context.Context, tenantID, principalID, legalEntityID string, cutoff time.Time) (domain.PostingBacklog, error)
+	ListBankAccounts(ctx context.Context, tenantID, principalID, legalEntityID string) ([]domain.BankAccountRef, error)
+	GetBankReconciliationStatus(ctx context.Context, tenantID, principalID, legalEntityID string, start, end time.Time) ([]domain.BankAccountReconStatus, error)
 	// CheckARInvoiceExists/CheckAPInvoiceExists back ACC-17's own closure
 	// of "Open AR included both in history and opening state" — see their
 	// doc comments in internal/clients.
@@ -336,6 +338,12 @@ type Handler struct {
 	// built without an explicit choice must not close on unchecked
 	// subledgers. See SetSubledgerControlGateEnforced.
 	subledgerGateOff bool
+	// bankReconGateOff disables the bank reconciliation blocker; the zero
+	// value enforces, for the same reason as subledgerGateOff.
+	bankReconGateOff bool
+	// bankReconCutoffDays — see config.BankReconCutoffDays. Zero means the
+	// statement must be dated on the period's last day itself.
+	bankReconCutoffDays int
 }
 
 // SetCloseGateEnforced turns the financial-control-svc close-gate dependency
@@ -354,14 +362,27 @@ func (h *Handler) SetSubledgerControlGateEnforced(enforce bool) *Handler {
 	return h
 }
 
+// SetBankReconciliationGate turns the bank reconciliation blocker on (the
+// default) or off and sets the statement cut-off in days before period end.
+func (h *Handler) SetBankReconciliationGate(enforce bool, cutoffDays int) *Handler {
+	h.bankReconGateOff = !enforce
+	h.bankReconCutoffDays = cutoffDays
+	return h
+}
+
+// defaultBankReconCutoffDays matches config's default for a handler built
+// without SetBankReconciliationGate (tests, and any future constructor).
+const defaultBankReconCutoffDays = 4
+
 func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, signingKey []byte, log *zap.Logger) *Handler {
 	return &Handler{
-		store:      store,
-		publisher:  publisher,
-		authz:      authz,
-		clients:    clients,
-		signingKey: signingKey,
-		log:        log,
+		store:               store,
+		publisher:           publisher,
+		authz:               authz,
+		clients:             clients,
+		signingKey:          signingKey,
+		log:                 log,
+		bankReconCutoffDays: defaultBankReconCutoffDays,
 	}
 }
 
@@ -583,6 +604,25 @@ func (h *Handler) AddCloseRequirement(w http.ResponseWriter, r *http.Request) {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, closeRequirementAction(req.Kind)); err != nil {
 		h.writeAuthzErr(w, err)
 		return
+	}
+	if req.Kind == domain.CloseRequirementBankAccountExclusion {
+		accounts, err := h.clients.ListBankAccounts(r.Context(), tenantID, principalID, req.LegalEntityID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "treasury_unavailable",
+				"cannot confirm the bank account belongs to this entity: "+err.Error())
+			return
+		}
+		known := false
+		for _, a := range accounts {
+			known = known || a.BankAccountID == req.BankAccountID
+		}
+		if !known {
+			// An exclusion for an account that is not the entity's would
+			// waive nothing today and silently waive whatever later reuses
+			// the id; refuse it.
+			writeError(w, http.StatusUnprocessableEntity, "unknown_bank_account", string(domain.ErrUnknownBankAccount))
+			return
+		}
 	}
 	cr := &domain.CloseRequirement{
 		RequirementID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID,
@@ -4455,6 +4495,9 @@ func (h *Handler) GetPeriodReadiness(w http.ResponseWriter, r *http.Request) {
 //     projects, stock count), the latest run for the period exists and
 //     MATCHED — e.g. each subledger's total equals its GL control account,
 //     which catches a fact that never reached GL at all;
+//   - bank reconciliation (BNK-05): every operational bank account of the
+//     entity not excluded on its checklist has a certified reconciliation
+//     for a statement dated in the period, within the cut-off of period end;
 //   - financial controls, when that gate is enforced.
 //
 // What does NOT block, deliberately: an invoice or bill that is simply unpaid.
@@ -4489,12 +4532,30 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 		issues = append(issues, issue)
 	}
 
-	if !h.subledgerGateOff {
-		checklist, err := h.store.ListCloseRequirements(ctx, fp.LegalEntityID)
+	var checklist []domain.CloseRequirement
+	if !h.subledgerGateOff || !h.bankReconGateOff {
+		checklist, err = h.store.ListCloseRequirements(ctx, fp.LegalEntityID)
 		if err != nil {
 			h.log.Error("failed to read the close checklist", zap.Error(err))
 			return nil, fmt.Errorf("close checklist: %w", err)
 		}
+	}
+
+	if !h.bankReconGateOff {
+		accounts, err := h.clients.ListBankAccounts(ctx, tenantID, principalID, fp.LegalEntityID)
+		if err != nil {
+			h.log.Error("failed to list bank accounts", zap.Error(err))
+			return nil, fmt.Errorf("treasury-svc: %w", err)
+		}
+		recon, err := h.clients.GetBankReconciliationStatus(ctx, tenantID, principalID, fp.LegalEntityID, fp.PeriodStart, fp.PeriodEnd)
+		if err != nil {
+			h.log.Error("failed to read bank reconciliation status", zap.Error(err))
+			return nil, fmt.Errorf("bank-reconciliation-svc: %w", err)
+		}
+		issues = append(issues, bankReconciliationIssues(accounts, recon, checklist, fp, h.bankReconCutoffDays)...)
+	}
+
+	if !h.subledgerGateOff {
 		runs, err := h.store.ListControlRuns(ctx, fp.LegalEntityID, fp.PeriodName)
 		if err != nil {
 			h.log.Error("failed to read subledger control runs", zap.Error(err))
@@ -4569,6 +4630,72 @@ func postingBacklogIssue(b domain.PostingBacklog) string {
 		}
 	}
 	return msg
+}
+
+// bankReconciliationIssues requires, for every bank account of the entity in
+// scope, a CERTIFIED, non-superseded reconciliation for a statement dated in
+// the period and no more than cutoffDays before its last day.
+//
+// In scope: ACTIVE or SUSPENDED (a suspended account still holds money)
+// accounts that existed by period end, minus those the entity's checklist
+// excludes as immaterial (ZS-CONTROL-001 §22 "material accounts"). DRAFT and
+// PENDING_VERIFICATION accounts are not operational; CLOSED accounts carry no
+// closing date in treasury yet, so they are out.
+//
+// Why the statement must be dated IN the period: bank-reconciliation-svc
+// assigns a run to the period of its statement date (its certification
+// checks that period is open), so a 3 November statement belongs to
+// November. Why the cut-off: without it, a close could pass on a reconciliation
+// a week old while the last statement of the month has not arrived.
+func bankReconciliationIssues(accounts []domain.BankAccountRef, recon []domain.BankAccountReconStatus,
+	checklist []domain.CloseRequirement, fp *domain.FiscalPeriod, cutoffDays int) []string {
+	excluded := map[string]bool{}
+	for _, cr := range checklist {
+		if cr.Kind == domain.CloseRequirementBankAccountExclusion {
+			excluded[cr.BankAccountID] = true
+		}
+	}
+	status := map[string]domain.BankAccountReconStatus{}
+	for _, st := range recon {
+		status[st.BankAccountID] = st
+	}
+	end := fp.PeriodEnd.UTC()
+	lastDay := time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, time.UTC)
+	earliest := lastDay.AddDate(0, 0, -cutoffDays)
+
+	var issues []string
+	for _, a := range accounts {
+		if a.AccountStatus != "ACTIVE" && a.AccountStatus != "SUSPENDED" {
+			continue
+		}
+		if a.CreatedAt.After(lastDay.AddDate(0, 0, 1)) || excluded[a.BankAccountID] {
+			continue
+		}
+		name := a.AccountName
+		if a.MaskedAccountNumber != "" {
+			name += " (" + a.MaskedAccountNumber + ")"
+		}
+		st := status[a.BankAccountID]
+		attempt := ""
+		if st.LatestRun != nil && (st.LatestCertified == nil || st.LatestRun.RunID != st.LatestCertified.RunID) {
+			attempt = fmt.Sprintf("; the %s run is %s", st.LatestRun.StatementDate, st.LatestRun.Status)
+		}
+		if st.LatestCertified == nil {
+			if st.LatestRun == nil {
+				issues = append(issues, fmt.Sprintf("bank_reconciliation_missing: %s has no reconciliation run for %s", name, fp.PeriodName))
+			} else {
+				issues = append(issues, fmt.Sprintf("bank_reconciliation_missing: %s has no certified reconciliation for %s%s", name, fp.PeriodName, attempt))
+			}
+			continue
+		}
+		certified, err := time.Parse("2006-01-02", st.LatestCertified.StatementDate)
+		if err != nil || certified.Before(earliest) {
+			issues = append(issues, fmt.Sprintf(
+				"bank_reconciliation_stale: latest certified reconciliation for %s is for the %s statement; one dated on or after %s (within %d days of period end) is required%s",
+				name, st.LatestCertified.StatementDate, earliest.Format("2006-01-02"), cutoffDays, attempt))
+		}
+	}
+	return issues
 }
 
 // controlKey identifies one required control: the subledger type, and for
