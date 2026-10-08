@@ -1,4 +1,4 @@
-﻿-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
+-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
 
 ALTER TABLE leave_types NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE leave_balances NO FORCE ROW LEVEL SECURITY;

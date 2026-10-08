@@ -1,4 +1,4 @@
-﻿-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
+-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
 
 ALTER TABLE report_definitions NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE report_runs NO FORCE ROW LEVEL SECURITY;

@@ -1,4 +1,4 @@
-﻿-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
+-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
 
 ALTER TABLE payroll_runs NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE pay_slips NO FORCE ROW LEVEL SECURITY;

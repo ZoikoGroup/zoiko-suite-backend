@@ -1,4 +1,4 @@
-﻿-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
+-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
 
 ALTER TABLE benefit_plans NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE benefit_elections NO FORCE ROW LEVEL SECURITY;

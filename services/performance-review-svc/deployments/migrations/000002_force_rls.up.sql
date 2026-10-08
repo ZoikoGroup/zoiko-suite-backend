@@ -1,4 +1,4 @@
-﻿-- Priority 3: Add FORCE ROW LEVEL SECURITY to all tenant-scoped tables.
+-- Priority 3: Add FORCE ROW LEVEL SECURITY to all tenant-scoped tables.
 -- RLS was already ENABLED with policies from migration 000001.
 -- FORCE ensures the policy also applies to the table owner role, providing
 -- defence-in-depth if the table owner ever connects directly (e.g. manual psql).

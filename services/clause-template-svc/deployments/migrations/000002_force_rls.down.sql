@@ -1,4 +1,4 @@
-﻿-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
+-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
 
 ALTER TABLE clauses NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE contract_templates NO FORCE ROW LEVEL SECURITY;

@@ -1,4 +1,4 @@
-﻿-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
+-- Revert FORCE ROW LEVEL SECURITY (leave ENABLE and policies intact).
 
 ALTER TABLE tenants NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE data_residency_policies NO FORCE ROW LEVEL SECURITY;
