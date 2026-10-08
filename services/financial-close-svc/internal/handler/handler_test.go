@@ -1022,16 +1022,15 @@ func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { retu
 type stubClients struct {
 	unpostedCount int
 	unpostedErr   error
-	unsettledAP   int
-	apErr         error
-	unsettledAR   int
-	arErr         error
+	// backlog is general-ledger-svc's posting backlog as the stub reports it;
+	// backlogCutoff records what the handler asked for, so a test can catch
+	// the handler passing the wrong cutoff.
+	backlog       domain.PostingBacklog
+	backlogErr    error
+	backlogCutoff time.Time
 	uploadErr     error
 	trialBalances map[string]float64
 	trialBalErr   error
-
-	apPeriodStart, apPeriodEnd time.Time
-	arPeriodStart, arPeriodEnd time.Time
 
 	checkARInvoiceErr  error
 	checkAPInvoiceErr  error
@@ -1101,16 +1100,9 @@ func (c *stubClients) CompileTrialBalance(_ context.Context, _, _, _, _ string) 
 	return map[string]float64{"1000-Cash": 10000.00}, nil
 }
 
-// The AP/AR counts take the period bounds, and the stub RECORDS them: the
-// defect being guarded against is the handler failing to pass the period
-// through, which a stub that ignored its arguments could not catch.
-func (c *stubClients) GetUnsettledAPInvoicesCount(_ context.Context, _, _ string, periodStart, periodEnd time.Time) (int, error) {
-	c.apPeriodStart, c.apPeriodEnd = periodStart, periodEnd
-	return c.unsettledAP, c.apErr
-}
-func (c *stubClients) GetUnsettledARInvoicesCount(_ context.Context, _, _ string, periodStart, periodEnd time.Time) (int, error) {
-	c.arPeriodStart, c.arPeriodEnd = periodStart, periodEnd
-	return c.unsettledAR, c.arErr
+func (c *stubClients) GetPostingBacklog(_ context.Context, _, _, _ string, cutoff time.Time) (domain.PostingBacklog, error) {
+	c.backlogCutoff = cutoff
+	return c.backlog, c.backlogErr
 }
 
 func (c *stubClients) CheckARInvoiceExists(_ context.Context, _, _, customerID, invoiceNumber string) (bool, error) {
@@ -1265,7 +1257,20 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, cl *stubClien
 	// part of what these tests cover, and a stuffer made every request look
 	// scoped no matter what it sent.
 	r.Use(middleware.TenantContext())
-	h := handler.New(s, pub, authz, cl, testSigningKey, zap.NewNop())
+	// The subledger-agreement gate is switched off here: this router serves
+	// tests about everything else a close does, written before the gate
+	// existed. newGatedRouter builds the handler exactly as production does.
+	h := handler.New(s, pub, authz, cl, testSigningKey, zap.NewNop()).SetSubledgerControlGateEnforced(false)
+	handler.RegisterRoutes(r, h)
+	return r
+}
+
+// newGatedRouter is newRouter with the handler as cmd/server builds it by
+// default: no gate setter called, so the subledger-agreement gate enforces.
+func newGatedRouter(s *stubStore, cl *stubClients) chi.Router {
+	r := chi.NewRouter()
+	r.Use(middleware.TenantContext())
+	h := handler.New(s, &stubPublisher{}, &stubAuthZ{}, cl, testSigningKey, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -1442,38 +1447,6 @@ func TestGetPeriodStatus_LockedPeriod(t *testing.T) {
 }
 
 // ── LockPeriod tests ──────────────────────────────────────────────────────────
-
-func TestLockPeriod_UnsettledAPBlocksClose(t *testing.T) {
-	s := newStubStore()
-	s.periods["fp-open"] = &domain.FiscalPeriod{
-		FiscalPeriodID: "fp-open",
-		TenantID:       "tenant-abc",
-		LegalEntityID:  "le-1",
-		PeriodName:     "2024-Q1",
-		CloseStatus:    "OPEN",
-	}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{unsettledAP: 1})
-	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
-	if rr.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 with unsettled AP invoices outstanding, got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestLockPeriod_UnsettledARBlocksClose(t *testing.T) {
-	s := newStubStore()
-	s.periods["fp-open"] = &domain.FiscalPeriod{
-		FiscalPeriodID: "fp-open",
-		TenantID:       "tenant-abc",
-		LegalEntityID:  "le-1",
-		PeriodName:     "2024-Q1",
-		CloseStatus:    "OPEN",
-	}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{unsettledAR: 1})
-	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
-	if rr.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 with unsettled AR invoices outstanding, got %d: %s", rr.Code, rr.Body.String())
-	}
-}
 
 func TestLockPeriod_GLQueryFails_FailsClosed(t *testing.T) {
 	s := newStubStore()

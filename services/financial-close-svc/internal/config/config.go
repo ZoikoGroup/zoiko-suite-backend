@@ -52,6 +52,16 @@ type Config struct {
 	CloseGateMode        string
 	CloseGateModeInvalid bool
 
+	// SubledgerControlGateMode is "enforce" (the default) or "off". Enforced,
+	// a period closes only when its latest AR and AP subledger-to-GL control
+	// runs MATCHED (ACC-06). "off" is for an environment whose control-account
+	// mappings are not configured yet. Unlike FINCTRL_CLOSE_GATE_MODE this
+	// defaults ON: it needs no external service, and an unchecked subledger is
+	// exactly what a close must not certify. Any value other than "off" is
+	// treated as enforce; SubledgerControlGateModeInvalid records a typo.
+	SubledgerControlGateMode        string
+	SubledgerControlGateModeInvalid bool
+
 	// AssetEventsTopic/InventoryEventsTopic/ProjectEventsTopic are the
 	// three Kafka topics this service's own ACC-18 lineage consumer
 	// subscribes to — asset-management-svc's, inventory-management-svc's
@@ -121,6 +131,7 @@ func Load() (*Config, error) {
 	}
 
 	gateMode, gateModeInvalid := normalizeCloseGateMode(os.Getenv("FINCTRL_CLOSE_GATE_MODE"))
+	subledgerMode, subledgerModeInvalid := normalizeSubledgerControlGateMode(os.Getenv("SUBLEDGER_CONTROL_GATE_MODE"))
 
 	return &Config{
 		Env:  env("ENV", "local"),
@@ -159,7 +170,10 @@ func Load() (*Config, error) {
 		FinancialControlServiceURL: env("FINCTRL_SERVICE_URL", "http://financial-control-svc:8171"),
 		CloseGateMode:              gateMode,
 		CloseGateModeInvalid:       gateModeInvalid,
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+
+		SubledgerControlGateMode:        subledgerMode,
+		SubledgerControlGateModeInvalid: subledgerModeInvalid,
+		OTELExporterEndpoint:            env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 
@@ -172,6 +186,20 @@ func normalizeCloseGateMode(raw string) (mode string, invalid bool) {
 		return "off", false
 	case "enforce":
 		return "enforce", false
+	default:
+		return "enforce", true
+	}
+}
+
+// normalizeSubledgerControlGateMode maps SUBLEDGER_CONTROL_GATE_MODE to
+// "enforce" or "off". Unset/empty/"enforce" is enforce, "off" is off, and
+// anything else is enforce with the second return reporting the typo.
+func normalizeSubledgerControlGateMode(raw string) (mode string, invalid bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "enforce":
+		return "enforce", false
+	case "off":
+		return "off", false
 	default:
 		return "enforce", true
 	}

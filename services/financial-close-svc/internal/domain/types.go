@@ -809,6 +809,11 @@ var (
 	// ErrFinancialControlUnavailable: financial-control-svc could not answer the
 	// close-gate question. Under enforce mode the close fails closed on it.
 	ErrFinancialControlUnavailable = errorString("financial-control-svc unavailable")
+	// ErrPostingBacklogForbidden: general-ledger-svc refused this principal
+	// its posting-backlog population (GL_CONTROL_POPULATION_READ). The close
+	// cannot prove nothing is left unposted, so it does not proceed — and the
+	// caller is told it is a permission, not an outage.
+	ErrPostingBacklogForbidden = errorString("not permitted to read general-ledger-svc's posting backlog (GL_CONTROL_POPULATION_READ)")
 
 	// ErrLedgerPageTruncated is returned when the ledger answered with a full
 	// page, so there may be journals this service never saw. A trial balance
@@ -1042,3 +1047,26 @@ var (
 
 	ErrReconciliationMismatch = errorString("posted journal balances do not match the batch's own crosswalk totals")
 )
+
+// PostingBacklog is general-ledger-svc's posting backlog for one entity as a
+// close sees it: accounting events GL accepted before the cutoff that have not
+// reached COMMITTED (SUBMITTED, VALIDATING, READY, FAILED or QUARANTINED).
+// Each is a business fact whose accounting consequence is not in the ledger.
+type PostingBacklog struct {
+	// Count is the whole backlog, from the population's declared row count —
+	// not the length of Samples.
+	Count int64
+	// TooLarge: GL refused to enumerate the population (over its size limit).
+	// The count is unknown but certainly not zero.
+	TooLarge bool
+	// Samples are the first few items, for a blocker message a person can act
+	// on without opening another system.
+	Samples []PostingBacklogItem
+}
+
+// PostingBacklogItem is one unposted accounting event.
+type PostingBacklogItem struct {
+	Reference     string // the source event id, else the execution id
+	Status        string
+	FailureReason string
+}

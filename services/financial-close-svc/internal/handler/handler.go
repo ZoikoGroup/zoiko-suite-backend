@@ -157,8 +157,7 @@ type Clients interface {
 	// The AP/AR counts take the period bounds: an unsettled invoice only blocks
 	// the period it belongs to. Without them a single outstanding invoice
 	// anywhere blocked every period forever.
-	GetUnsettledAPInvoicesCount(ctx context.Context, tenantID, legalEntityID string, periodStart, periodEnd time.Time) (int, error)
-	GetUnsettledARInvoicesCount(ctx context.Context, tenantID, legalEntityID string, periodStart, periodEnd time.Time) (int, error)
+	GetPostingBacklog(ctx context.Context, tenantID, principalID, legalEntityID string, cutoff time.Time) (domain.PostingBacklog, error)
 	// CheckARInvoiceExists/CheckAPInvoiceExists back ACC-17's own closure
 	// of "Open AR included both in history and opening state" — see their
 	// doc comments in internal/clients.
@@ -323,12 +322,26 @@ type Handler struct {
 	// enforceCloseGate makes period close depend on financial-control-svc's
 	// close gate. Off by default; see SetCloseGateEnforced.
 	enforceCloseGate bool
+	// subledgerGateOff disables the ACC-06 subledger-agreement close
+	// blocker. Named for the exception so the zero value enforces: a handler
+	// built without an explicit choice must not close on unchecked
+	// subledgers. See SetSubledgerControlGateEnforced.
+	subledgerGateOff bool
 }
 
 // SetCloseGateEnforced turns the financial-control-svc close-gate dependency
 // on or off. Off (the zero value) never calls the service and adds no issue.
 func (h *Handler) SetCloseGateEnforced(enforce bool) *Handler {
 	h.enforceCloseGate = enforce
+	return h
+}
+
+// SetSubledgerControlGateEnforced turns the ACC-06 subledger-agreement
+// blocker on (the default) or off. Off exists only for an environment whose
+// AR/AP control-account mappings are not configured yet, where no control run
+// could ever pass; it is reported loudly at startup.
+func (h *Handler) SetSubledgerControlGateEnforced(enforce bool) *Handler {
+	h.subledgerGateOff = !enforce
 	return h
 }
 
@@ -4218,7 +4231,28 @@ func (h *Handler) GetPeriodReadiness(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// checkReadiness runs the three dependency checks for a period.
+// checkReadiness runs the close blockers for a period.
+//
+// WHAT BLOCKS A CLOSE. ACC-14 (ZS-SVC-B-001 §17) lists the close's inputs as
+// "subledger controls; bank recon; tax/payroll/assets/inventory status;
+// unresolved exceptions; approvals; posting backlog", and ACC-06 adds that
+// "unresolved material exceptions block certification/close". Every check
+// below asks whether the books for the period are complete and agree:
+//
+//   - unposted journals: manual journals still in draft for the period;
+//   - posting backlog: accounting events GL accepted before period end but
+//     never committed (catches a subledger fact GL took in and failed on);
+//   - subledger agreement (ACC-06): the latest AR and AP control runs for the
+//     period exist and MATCHED, i.e. each subledger's total equals its GL
+//     control account (catches a fact that never reached GL at all, such as
+//     one rejected at intake);
+//   - financial controls, when that gate is enforced.
+//
+// What does NOT block, deliberately: an invoice or bill that is simply unpaid.
+// The close used to refuse any period with a receivable not yet PAID or a
+// payable not yet PAYMENT_REQUESTED. An open receivable at month end is a
+// correct balance, so that rule stopped ordinary months from closing, while a
+// fact whose accounting never reached the ledger passed straight through.
 //
 // Fails closed: a dependency that cannot be queried returns an error, never an
 // empty issue list. "We could not check" and "there is nothing to report" are
@@ -4237,24 +4271,22 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 			unposted, plural(unposted, "journal is", "journals are")))
 	}
 
-	unsettledAP, err := h.clients.GetUnsettledAPInvoicesCount(ctx, tenantID, fp.LegalEntityID, fp.PeriodStart, fp.PeriodEnd)
+	backlog, err := h.clients.GetPostingBacklog(ctx, tenantID, principalID, fp.LegalEntityID, postingBacklogCutoff(fp))
 	if err != nil {
-		h.log.Error("failed to verify AP invoices", zap.Error(err))
-		return nil, fmt.Errorf("accounts-payable-svc: %w", err)
+		h.log.Error("failed to verify the posting backlog", zap.Error(err))
+		return nil, fmt.Errorf("general-ledger-svc: %w", err)
 	}
-	if unsettledAP > 0 {
-		issues = append(issues, fmt.Sprintf("unsettled_ap_invoices_exist: %d %s due in this period not fully payment requested",
-			unsettledAP, plural(unsettledAP, "invoice is", "invoices are")))
+	if issue := postingBacklogIssue(backlog); issue != "" {
+		issues = append(issues, issue)
 	}
 
-	unsettledAR, err := h.clients.GetUnsettledARInvoicesCount(ctx, tenantID, fp.LegalEntityID, fp.PeriodStart, fp.PeriodEnd)
-	if err != nil {
-		h.log.Error("failed to verify AR invoices", zap.Error(err))
-		return nil, fmt.Errorf("accounts-receivable-svc: %w", err)
-	}
-	if unsettledAR > 0 {
-		issues = append(issues, fmt.Sprintf("unsettled_ar_invoices_exist: %d %s due in this period not PAID",
-			unsettledAR, plural(unsettledAR, "invoice is", "invoices are")))
+	if !h.subledgerGateOff {
+		runs, err := h.store.ListControlRuns(ctx, fp.LegalEntityID, fp.PeriodName)
+		if err != nil {
+			h.log.Error("failed to read subledger control runs", zap.Error(err))
+			return nil, fmt.Errorf("subledger control runs: %w", err)
+		}
+		issues = append(issues, subledgerAgreementIssues(runs, fp.PeriodName)...)
 	}
 
 	if h.enforceCloseGate {
@@ -4272,6 +4304,81 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 	}
 
 	return issues, nil
+}
+
+// postingBacklogCutoff is the start of the day after the period ends: an
+// event GL accepted at any time on the period's last day is in scope.
+//
+// Events are selected by when GL accepted them, not by fiscal period (a
+// posting execution records no period). An October event first submitted in
+// November is therefore outside this check; the subledger-agreement check is
+// what covers it, since the subledger counts it in October regardless.
+func postingBacklogCutoff(fp *domain.FiscalPeriod) time.Time {
+	end := fp.PeriodEnd.UTC()
+	return time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
+}
+
+// postingBacklogIssue renders the backlog as a blocker, naming a few events
+// so whoever closes can act without opening another system. Empty when there
+// is nothing to block on.
+func postingBacklogIssue(b domain.PostingBacklog) string {
+	if b.TooLarge {
+		return "unposted_accounting_events: the posting backlog exceeds general-ledger-svc's population limit; more accounting events are unposted than can be listed"
+	}
+	if b.Count == 0 {
+		return ""
+	}
+	var named []string
+	for _, item := range b.Samples {
+		detail := item.Reference + " (" + item.Status
+		if item.FailureReason != "" {
+			detail += ": " + item.FailureReason
+		}
+		named = append(named, detail+")")
+	}
+	msg := fmt.Sprintf("unposted_accounting_events: %d accounting %s accepted before period end not posted to the ledger",
+		b.Count, plural(int(b.Count), "event", "events"))
+	if len(named) > 0 {
+		msg += ": " + strings.Join(named, "; ")
+		if int64(len(named)) < b.Count {
+			msg += fmt.Sprintf("; and %d more", b.Count-int64(len(named)))
+		}
+	}
+	return msg
+}
+
+// subledgerLedgers are the subledgers whose agreement with the GL a close
+// requires: the two subledger_control_runs supports (migration 000004).
+var subledgerLedgers = []string{"AR", "AP"}
+
+// subledgerAgreementIssues requires, for each subledger, that the LATEST
+// control run for the period exists and MATCHED. Only the latest counts: a
+// run that matched before further postings landed proves nothing about the
+// books as they are now, and an EXCEPTION that was since fixed and re-run is
+// superseded rather than blocking forever.
+func subledgerAgreementIssues(runs []domain.SubledgerControlRun, period string) []string {
+	latest := map[string]domain.SubledgerControlRun{}
+	for _, run := range runs {
+		cur, seen := latest[run.Subledger]
+		if !seen || run.RunAt.After(cur.RunAt) {
+			latest[run.Subledger] = run
+		}
+	}
+	var issues []string
+	for _, ledger := range subledgerLedgers {
+		run, ok := latest[ledger]
+		switch {
+		case !ok:
+			issues = append(issues, fmt.Sprintf(
+				"subledger_control_not_run: no %s subledger-to-GL control run for %s; run one (POST /v1/subledger-control/runs) before closing",
+				ledger, period))
+		case run.Status != "MATCHED":
+			issues = append(issues, fmt.Sprintf(
+				"subledger_control_exception: %s subledger total %.2f does not agree with GL control account %s balance %.2f (difference %.2f; run %s)",
+				ledger, run.SubledgerTotalAmount, run.ControlAccountCode, run.GLControlBalanceAmount, run.DifferenceAmount, run.ControlRunID))
+		}
+	}
+	return issues
 }
 
 // plural picks the singular or plural wording for a count. These strings are
@@ -4310,6 +4417,10 @@ func (h *Handler) signEvidence(hash []byte) string {
 // and always a refusal: a close is never allowed to proceed on an unchecked
 // dependency.
 func (h *Handler) writeReadinessErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, domain.ErrPostingBacklogForbidden) {
+		writeError(w, http.StatusForbidden, "posting_backlog_not_permitted", string(domain.ErrPostingBacklogForbidden)+"; close blocked")
+		return
+	}
 	if errors.Is(err, domain.ErrLedgerPageTruncated) {
 		writeError(w, http.StatusServiceUnavailable, "ledger_page_truncated", string(domain.ErrLedgerPageTruncated))
 		return

@@ -16,7 +16,10 @@ import (
 func gateRouter(s *stubStore, cl *stubClients, enforce bool) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
-	h := handler.New(s, &stubPublisher{}, &stubAuthZ{}, cl, testSigningKey, zap.NewNop()).SetCloseGateEnforced(enforce)
+	// These tests isolate the financial-control gate; the subledger gate has
+	// its own tests (close_readiness_test.go).
+	h := handler.New(s, &stubPublisher{}, &stubAuthZ{}, cl, testSigningKey, zap.NewNop()).
+		SetCloseGateEnforced(enforce).SetSubledgerControlGateEnforced(false)
 	handler.RegisterRoutes(r, h)
 	return r
 }

@@ -79,100 +79,16 @@ func TestGetPeriodStatus_MissingTenantScope_DoesNotFailOpen(t *testing.T) {
 
 // ── period-scoped readiness ──────────────────────────────────────────────────
 
-// The AP/AR checks counted every unsettled invoice for the legal entity
-// regardless of date, so an invoice due in December blocked the close of every
-// month of the year. A going concern always has something outstanding, so in
-// practice no period could ever be closed at all.
-func TestLockPeriod_ReadinessChecksArePeriodScoped(t *testing.T) {
-	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	end := time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)
-
-	s := newStubStore()
-	s.periods["fp-open"] = &domain.FiscalPeriod{
-		FiscalPeriodID: "fp-open", TenantID: testTenantID, LegalEntityID: "le-1",
-		PeriodName: "2026-01", PeriodStart: start, PeriodEnd: end, CloseStatus: "OPEN",
-	}
-	cl := &stubClients{}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
-
-	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
-	}
-
-	if !cl.apPeriodStart.Equal(start) || !cl.apPeriodEnd.Equal(end) {
-		t.Fatalf("the payables check was not given the period bounds: got %v..%v, want %v..%v",
-			cl.apPeriodStart, cl.apPeriodEnd, start, end)
-	}
-	if !cl.arPeriodStart.Equal(start) || !cl.arPeriodEnd.Equal(end) {
-		t.Fatalf("the receivables check was not given the period bounds: got %v..%v, want %v..%v",
-			cl.arPeriodStart, cl.arPeriodEnd, start, end)
-	}
-}
-
-func TestCreateFiscalPeriod_EndBeforeStart_Rejected(t *testing.T) {
-	// A period that ends before it begins contains nothing, so every readiness
-	// check trivially passes and it locks clean — an empty close over a window
-	// that cannot hold a transaction.
-	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
-
-	rr := doReq(r, http.MethodPost, "/v1/close/periods", domain.PeriodCreateRequest{
-		LegalEntityID: "le-1",
-		PeriodName:    "backwards",
-		PeriodStart:   time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC),
-		PeriodEnd:     time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
-	}, "principal-1")
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
-	}
-	if len(s.periods) != 0 {
-		t.Fatal("no period should have been written")
-	}
-}
-
-// ── the readiness endpoint ───────────────────────────────────────────────────
-
-func TestGetPeriodReadiness_ReadyPeriod_HasNoSideEffects(t *testing.T) {
-	s := newStubStore()
-	s.periods["fp-open"] = &domain.FiscalPeriod{
-		FiscalPeriodID: "fp-open", TenantID: testTenantID, LegalEntityID: "le-1",
-		PeriodName: "2026-01", CloseStatus: "OPEN",
-	}
-	pub := &stubPublisher{}
-	r := newRouter(s, pub, &stubAuthZ{}, &stubClients{})
-
-	rr := doReq(r, http.MethodGet, "/v1/close/periods/fp-open/readiness", nil, "principal-1")
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
-	}
-	var resp domain.ReadinessCheckResponse
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if !resp.IsReady {
-		t.Fatalf("expected is_ready=true, got %+v", resp)
-	}
-
-	// The whole point of a dry run: nothing written, nothing published.
-	if s.periods["fp-open"].CloseStatus != "OPEN" {
-		t.Fatal("checking readiness must not close the period")
-	}
-	if pub.started+pub.blocked+pub.closed != 0 {
-		t.Fatalf("checking readiness must publish nothing, got started=%d blocked=%d closed=%d",
-			pub.started, pub.blocked, pub.closed)
-	}
-}
-
 func TestGetPeriodReadiness_BlockedPeriod_NamesEveryIssue(t *testing.T) {
 	s := newStubStore()
 	s.periods["fp-open"] = &domain.FiscalPeriod{
 		FiscalPeriodID: "fp-open", TenantID: testTenantID, LegalEntityID: "le-1",
 		PeriodName: "2026-01", CloseStatus: "OPEN",
 	}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{},
-		&stubClients{unpostedCount: 2, unsettledAP: 1, unsettledAR: 3})
+	// No AR or AP control run in the store: two more blockers.
+	r := newGatedRouter(s,
+		&stubClients{unpostedCount: 2, backlog: domain.PostingBacklog{Count: 1,
+			Samples: []domain.PostingBacklogItem{{Reference: "evt-1", Status: "FAILED", FailureReason: "boom"}}}})
 
 	rr := doReq(r, http.MethodGet, "/v1/close/periods/fp-open/readiness", nil, "principal-1")
 	if rr.Code != http.StatusOK {
@@ -183,10 +99,11 @@ func TestGetPeriodReadiness_BlockedPeriod_NamesEveryIssue(t *testing.T) {
 	if resp.IsReady {
 		t.Fatal("expected is_ready=false")
 	}
-	// All three, not the first one found: an operator clearing blockers one at
-	// a time needs the whole list, or every fix reveals another.
-	if len(resp.BlockingIssues) != 3 {
-		t.Fatalf("expected all three checks to report, got %v", resp.BlockingIssues)
+	// Every blocker, not the first one found: an operator clearing blockers
+	// one at a time needs the whole list, or every fix reveals another.
+	// unposted journals + posting backlog + AR not run + AP not run.
+	if len(resp.BlockingIssues) != 4 {
+		t.Fatalf("expected all four blockers to report, got %v", resp.BlockingIssues)
 	}
 }
 

@@ -147,6 +147,14 @@ func main() {
 		log.Warn("unrecognised FINCTRL_CLOSE_GATE_MODE; treating as enforce (fail closed)")
 	}
 	log.Info("financial-control close gate", zap.String("mode", cfg.CloseGateMode))
+	if cfg.SubledgerControlGateModeInvalid {
+		log.Warn("unrecognised SUBLEDGER_CONTROL_GATE_MODE; treating as enforce (fail closed)")
+	}
+	if cfg.SubledgerControlGateMode == "off" {
+		log.Warn("subledger control close gate is OFF: periods can close without proving AR/AP agree with the GL (ACC-06). Use only until control-account mappings are configured.")
+	} else {
+		log.Info("subledger control close gate", zap.String("mode", cfg.SubledgerControlGateMode))
+	}
 
 	// ── 4b. Lineage Kafka consumer ─────────────────────────────────────────────
 	// Consumes asset-management-svc's, inventory-management-svc's and
@@ -189,7 +197,8 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, clientsWrapper, clientsWrapper, []byte(cfg.CloseSigningKey), log).SetCloseGateEnforced(cfg.CloseGateMode == "enforce")
+	h := handler.New(pgStore, publisher, clientsWrapper, clientsWrapper, []byte(cfg.CloseSigningKey), log).SetCloseGateEnforced(cfg.CloseGateMode == "enforce").
+		SetSubledgerControlGateEnforced(cfg.SubledgerControlGateMode == "enforce")
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
