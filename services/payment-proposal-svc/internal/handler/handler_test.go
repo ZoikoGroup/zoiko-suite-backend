@@ -534,6 +534,50 @@ func TestGetFingerprint(t *testing.T) {
 	}
 }
 
+// TestFreeze_StoresFingerprint_AndFrozenFingerprintStaysIntact: the
+// fingerprint is stored at freeze, equals the live value, and cancelling the
+// proposal makes the live value differ from the frozen one.
+func TestFreeze_StoresFingerprint_AndCancelBreaksIt(t *testing.T) {
+	payables := newStubPayables()
+	payables.add(payableopenitem.SourceSupplierInvoice, "inv-fp", testLegalEntity, "vendor-fp", "OPEN", false, false, 100)
+	sup := newStubSupplier()
+	sup.set(testLegalEntity, "vendor-fp", "ACTIVE", time.Now().UTC(), "")
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, payables, sup, &stubTax{})
+	p := createProposal(t, r)
+	addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceAPInvoice, PayableID: "inv-fp"})
+	recalcAndReview(t, r, p.ProposalID)
+
+	fingerprint := func() (live, frozen string, intact bool) {
+		w := doRequest(r, http.MethodGet, "/ap09/proposals/"+p.ProposalID+"/fingerprint", nil, testTenant)
+		var resp struct {
+			Fingerprint       string `json:"fingerprint"`
+			FrozenFingerprint string `json:"frozen_fingerprint"`
+			Intact            bool   `json:"intact"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		return resp.Fingerprint, resp.FrozenFingerprint, resp.Intact
+	}
+
+	if _, frozen, _ := fingerprint(); frozen != "" {
+		t.Fatalf("expected no frozen fingerprint before freeze, got %q", frozen)
+	}
+	if w := doRequestAs(r, http.MethodPost, "/ap09/proposals/"+p.ProposalID+"/freeze", nil, testTenant, "principal-checker"); w.Code != http.StatusOK {
+		t.Fatalf("freeze: %d %s", w.Code, w.Body.String())
+	}
+	live, frozen, intact := fingerprint()
+	if frozen == "" || live != frozen || !intact {
+		t.Fatalf("expected the stored fingerprint to equal the live one, got live=%q frozen=%q intact=%v", live, frozen, intact)
+	}
+
+	if w := doRequestAs(r, http.MethodPost, "/ap09/proposals/"+p.ProposalID+"/cancel", domain.CancelProposalRequest{Reason: "test"}, testTenant, testPreparer); w.Code != http.StatusOK {
+		t.Fatalf("cancel: %d %s", w.Code, w.Body.String())
+	}
+	live, frozen, intact = fingerprint()
+	if live == frozen || intact {
+		t.Fatalf("expected cancelling to break the fingerprint, got live=%q frozen=%q intact=%v", live, frozen, intact)
+	}
+}
+
 func TestGetProposal_NotFound(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPayables(), newStubSupplier(), &stubTax{})
 	w := doRequest(r, http.MethodGet, "/ap09/proposals/does-not-exist", nil, testTenant)

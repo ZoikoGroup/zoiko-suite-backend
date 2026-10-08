@@ -288,6 +288,32 @@ func (s *PgStore) ApproveAuthorization(ctx context.Context, authorizationID, pol
 	return a, nil
 }
 
+// enqueueEvent writes the authorization's state change to the transactional
+// outbox, in the same transaction as the change itself, so a published event
+// can neither be lost nor describe a change that rolled back. Used for the
+// terminal outcomes that carry no further state: rejected, invalidated,
+// revoked and expired.
+func (s *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, eventType string, a *domain.PaymentAuthorization, actor string) error {
+	corr := middleware.CorrelationIDFromContext(ctx)
+	var corrPtr *string
+	if corr != "" {
+		corrPtr = &corr
+	}
+	outboxEventID := uuid.NewString()
+	env := outbox.NewVariantBEnvelope(outboxEventID, eventType, a.AuthorizationID, a.TenantID, &actor, corrPtr, a)
+	return outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: outboxEventID,
+		AggregateType: "payment_authorization",
+		AggregateID:   a.AuthorizationID,
+		EventType:     eventType,
+		TenantID:      a.TenantID,
+		LegalEntityID: a.LegalEntityID,
+		ActorID:       &actor,
+		CorrelationID: corrPtr,
+		Payload:       env,
+	})
+}
+
 func (s *PgStore) RejectAuthorization(ctx context.Context, authorizationID string, req domain.RejectPaymentRequest, principalID string) (*domain.PaymentAuthorization, error) {
 	var a *domain.PaymentAuthorization
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
@@ -301,7 +327,10 @@ func (s *PgStore) RejectAuthorization(ctx context.Context, authorizationID strin
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationRejected, req.Reason, principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationRejected, req.Reason, principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, domain.EventAuthorizationRejected, a, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -330,7 +359,10 @@ func (s *PgStore) InvalidateAuthorization(ctx context.Context, authorizationID, 
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationInvalidated, reason, "system")
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationInvalidated, reason, "system"); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, domain.EventAuthorizationInvalidated, a, "system")
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -411,7 +443,10 @@ func (s *PgStore) RevokeAuthorization(ctx context.Context, authorizationID strin
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationRevoked, req.Reason, principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationRevoked, req.Reason, principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, domain.EventAuthorizationRevoked, a, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -436,7 +471,10 @@ func (s *PgStore) ExpireAuthorization(ctx context.Context, authorizationID, prin
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationExpired, "", principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationExpired, "", principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, domain.EventAuthorizationExpired, a, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition

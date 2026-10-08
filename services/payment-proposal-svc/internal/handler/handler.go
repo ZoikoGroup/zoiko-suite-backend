@@ -3,13 +3,9 @@ package handler
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
-	"sort"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -653,13 +649,13 @@ func (h *Handler) GetExceptionFlags(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"data": flagged, "count": len(flagged)})
 }
 
-// GetFingerprint computes a real SHA-256 digest over the proposal's own
-// current composition (item IDs and amounts) — the "subject fingerprint"
-// AP-09's own contract names it owns. This is the first fingerprint of this
-// exact kind in this codebase (there is prior art for content-addressed
-// hashing — tax-determination-svc's rule snapshot — but nothing named
-// "subject fingerprint" to follow verbatim, so this is a new, real
-// computation, not a fabricated placeholder).
+// GetFingerprint returns the proposal's subject fingerprint, recomputed
+// live from the stored rows (see domain.ComputeFingerprint for what it
+// covers). For a FROZEN proposal it also returns the fingerprint stored at
+// freeze and whether the live value still matches it. A consumer that
+// recorded the frozen value (AP-10) compares it with "fingerprint": any
+// change to the frozen subject — or cancelling the proposal — makes them
+// differ.
 func (h *Handler) GetFingerprint(w http.ResponseWriter, r *http.Request) {
 	proposalID := chi.URLParam(r, "proposalID")
 	p, ok := h.fetchProposalForAuth(w, r, proposalID)
@@ -672,15 +668,16 @@ func (h *Handler) GetFingerprint(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].ItemID < items[j].ItemID })
-	h256 := sha256.New()
-	fmt.Fprintf(h256, "%s|%s|%.2f|%.2f|%.2f", p.ProposalID, p.Status, p.GrossAmount, p.WithholdingAmount, p.NetAmount)
-	for _, it := range items {
-		fmt.Fprintf(h256, "|%s:%s:%.2f:%.2f", it.PayableSource, it.PayableID, it.GrossAmount, it.NetAmount)
+	live := domain.ComputeFingerprint(p, items, p.Status)
+	resp := map[string]interface{}{
+		"proposal_id": proposalID, "status": p.Status, "fingerprint": live,
+		"fingerprint_version": domain.FingerprintVersion,
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"proposal_id": proposalID, "status": p.Status, "fingerprint": "sha256:" + hex.EncodeToString(h256.Sum(nil)),
-	})
+	if p.FrozenFingerprint != "" {
+		resp["frozen_fingerprint"] = p.FrozenFingerprint
+		resp["intact"] = p.FrozenFingerprint == live
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
