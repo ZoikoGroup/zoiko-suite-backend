@@ -967,10 +967,13 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 
 		winner := cands[0].rule
 
-		// Check for conflicts: same precedence_level and overlapping periods
+		// Check for conflicts: same precedence_level at the SAME depth and
+		// overlapping periods. A candidate from a farther ancestor is an
+		// override, not a conflict — the pack resolves it by nearest
+		// jurisdiction (the sort above already picked the nearest winner).
 		var conflictIDs []string
 		for _, c := range cands[1:] {
-			if c.rule.PrecedenceLevel == winner.PrecedenceLevel {
+			if c.rule.PrecedenceLevel == winner.PrecedenceLevel && c.depth == cands[0].depth {
 				// Check if periods overlap
 				if periodsOverlap(winner.EffectiveFrom, winner.EffectiveTo, c.rule.EffectiveFrom, c.rule.EffectiveTo) {
 					conflictIDs = append(conflictIDs, c.rule.JurisdictionRuleID)
