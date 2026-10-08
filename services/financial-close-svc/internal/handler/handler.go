@@ -4450,10 +4450,11 @@ func (h *Handler) GetPeriodReadiness(w http.ResponseWriter, r *http.Request) {
 //   - unposted journals: manual journals still in draft for the period;
 //   - posting backlog: accounting events GL accepted before period end but
 //     never committed (catches a subledger fact GL took in and failed on);
-//   - subledger agreement (ACC-06): the latest AR and AP control runs for the
-//     period exist and MATCHED, i.e. each subledger's total equals its GL
-//     control account (catches a fact that never reached GL at all, such as
-//     one rejected at intake);
+//   - subledger agreement (ACC-06): for AR, AP and every control the entity's
+//     close checklist adds (assets per book, depreciation, inventory,
+//     projects, stock count), the latest run for the period exists and
+//     MATCHED — e.g. each subledger's total equals its GL control account,
+//     which catches a fact that never reached GL at all;
 //   - financial controls, when that gate is enforced.
 //
 // What does NOT block, deliberately: an invoice or bill that is simply unpaid.
@@ -4489,12 +4490,17 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 	}
 
 	if !h.subledgerGateOff {
+		checklist, err := h.store.ListCloseRequirements(ctx, fp.LegalEntityID)
+		if err != nil {
+			h.log.Error("failed to read the close checklist", zap.Error(err))
+			return nil, fmt.Errorf("close checklist: %w", err)
+		}
 		runs, err := h.store.ListControlRuns(ctx, fp.LegalEntityID, fp.PeriodName)
 		if err != nil {
 			h.log.Error("failed to read subledger control runs", zap.Error(err))
 			return nil, fmt.Errorf("subledger control runs: %w", err)
 		}
-		issues = append(issues, subledgerAgreementIssues(runs, fp.PeriodName)...)
+		issues = append(issues, requiredControlIssues(requiredControls(checklist), runs, fp.PeriodName)...)
 	}
 
 	if h.enforceCloseGate {
@@ -4565,35 +4571,93 @@ func postingBacklogIssue(b domain.PostingBacklog) string {
 	return msg
 }
 
-// subledgerLedgers are the subledgers whose agreement with the GL a close
-// requires: the two subledger_control_runs supports (migration 000004).
-var subledgerLedgers = []string{"AR", "AP"}
+// controlKey identifies one required control: the subledger type, and for
+// ASSETS the book it reconciles (an asset ledger has one net book value per
+// book, and each book is its own control).
+type controlKey struct {
+	Subledger string
+	BookID    string
+}
 
-// subledgerAgreementIssues requires, for each subledger, that the LATEST
-// control run for the period exists and MATCHED. Only the latest counts: a
-// run that matched before further postings landed proves nothing about the
-// books as they are now, and an EXCEPTION that was since fixed and re-run is
-// superseded rather than blocking forever.
-func subledgerAgreementIssues(runs []domain.SubledgerControlRun, period string) []string {
-	latest := map[string]domain.SubledgerControlRun{}
+func (k controlKey) label() string {
+	if k.BookID != "" {
+		return k.Subledger + " (book " + k.BookID + ")"
+	}
+	return k.Subledger
+}
+
+// completenessControls compare counts (covered vs eligible, items found vs
+// expected), not a subledger total against a GL control account.
+var completenessControls = map[string]bool{
+	"DEPRECIATION_COMPLETENESS": true, "INVENTORY_QUANTITY": true, "STOCK_COUNT": true,
+}
+
+// completenessFinding states a failed completeness run in its own terms.
+// RunSubledgerControl stores these as (found, expected): depreciation as
+// (covered, eligible), the inventory checks as (problem count, 0).
+func completenessFinding(run domain.SubledgerControlRun) string {
+	found, expected := run.SubledgerTotalAmount, run.GLControlBalanceAmount
+	switch run.Subledger {
+	case "DEPRECIATION_COMPLETENESS":
+		return fmt.Sprintf("depreciation posted for %.0f of %.0f eligible assets", found, expected)
+	case "INVENTORY_QUANTITY":
+		return fmt.Sprintf("%.0f inventory items have a negative quantity on hand", found)
+	case "STOCK_COUNT":
+		return fmt.Sprintf("%.0f stock-count variances are not approved", found)
+	}
+	return fmt.Sprintf("found %.0f where %.0f were expected", found, expected)
+}
+
+// requiredControls is what an entity's close must prove: the AR/AP baseline
+// (ZS-CONTROL-001 §22, every entity) plus the controls its checklist adds.
+func requiredControls(checklist []domain.CloseRequirement) []controlKey {
+	var out []controlKey
+	for _, ledger := range domain.BaselineSubledgerControls {
+		out = append(out, controlKey{Subledger: ledger})
+	}
+	for _, cr := range checklist {
+		if cr.Kind == domain.CloseRequirementSubledgerControl {
+			out = append(out, controlKey{Subledger: cr.Subledger, BookID: cr.BookID})
+		}
+	}
+	return out
+}
+
+// requiredControlIssues requires, for each required control, that the LATEST
+// run for the period exists and MATCHED. Only the latest counts: a run that
+// matched before further postings landed proves nothing about the books as
+// they are now, and an EXCEPTION that was since fixed and re-run is
+// superseded rather than blocking forever. An ASSETS run counts only for the
+// book it reconciled.
+func requiredControlIssues(required []controlKey, runs []domain.SubledgerControlRun, period string) []string {
+	latest := map[controlKey]domain.SubledgerControlRun{}
 	for _, run := range runs {
-		cur, seen := latest[run.Subledger]
+		key := controlKey{Subledger: run.Subledger, BookID: run.BookID}
+		cur, seen := latest[key]
 		if !seen || run.RunAt.After(cur.RunAt) {
-			latest[run.Subledger] = run
+			latest[key] = run
 		}
 	}
 	var issues []string
-	for _, ledger := range subledgerLedgers {
-		run, ok := latest[ledger]
+	for _, key := range required {
+		run, ok := latest[key]
 		switch {
+		case !ok && completenessControls[key.Subledger]:
+			issues = append(issues, fmt.Sprintf(
+				"subledger_control_not_run: no %s control run for %s; run one (POST /v1/subledger-control/runs) before closing",
+				key.label(), period))
 		case !ok:
 			issues = append(issues, fmt.Sprintf(
 				"subledger_control_not_run: no %s subledger-to-GL control run for %s; run one (POST /v1/subledger-control/runs) before closing",
-				ledger, period))
-		case run.Status != "MATCHED":
+				key.label(), period))
+		case run.Status == "MATCHED":
+		case completenessControls[key.Subledger]:
+			issues = append(issues, fmt.Sprintf("subledger_control_exception: %s: %s (run %s)",
+				key.label(), completenessFinding(run), run.ControlRunID))
+		default:
 			issues = append(issues, fmt.Sprintf(
 				"subledger_control_exception: %s subledger total %.2f does not agree with GL control account %s balance %.2f (difference %.2f; run %s)",
-				ledger, run.SubledgerTotalAmount, run.ControlAccountCode, run.GLControlBalanceAmount, run.DifferenceAmount, run.ControlRunID))
+				key.label(), run.SubledgerTotalAmount, run.ControlAccountCode, run.GLControlBalanceAmount, run.DifferenceAmount, run.ControlRunID))
 		}
 	}
 	return issues

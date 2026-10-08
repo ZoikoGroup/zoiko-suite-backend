@@ -217,3 +217,120 @@ func TestClose_SubledgerGateOffSkipsOnlyTheRuns(t *testing.T) {
 		t.Fatalf("gate off must not disable the posting backlog check, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
+
+// ── The entity's close checklist (ACC-14 checklist items) ───────────────────
+
+func requireControl(s *stubStore, subledger, book string) *domain.CloseRequirement {
+	cr := &domain.CloseRequirement{RequirementID: subledger + "-" + book, TenantID: testTenantID,
+		LegalEntityID: "le-1", Kind: domain.CloseRequirementSubledgerControl, Subledger: subledger, BookID: book}
+	s.closeRequirements = append(s.closeRequirements, cr)
+	return cr
+}
+
+func bookRun(ledger, book, status string, at time.Time, actual, expected float64) domain.SubledgerControlRun {
+	run := controlRun(ledger, status, at, actual, expected)
+	run.BookID = book
+	run.ControlRunID = ledger + "-" + book + "-" + status
+	return run
+}
+
+// The company runs fixed assets and inventory: every control its checklist
+// names must have matched, and then it closes.
+func TestClose_ChecklistControlsAllMatched_Closes(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	requireControl(s, "ASSETS", "STATUTORY")
+	requireControl(s, "INVENTORY_VALUE", "")
+	at := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	s.controlRuns = append(s.controlRuns,
+		bookRun("ASSETS", "STATUTORY", "MATCHED", at, 90000, 90000),
+		bookRun("INVENTORY_VALUE", "", "MATCHED", at, 12000, 12000))
+	if code, _, body := lock(t, s, &stubClients{}); code != http.StatusOK {
+		t.Fatalf("all required controls matched, expected the close: %d %s", code, body)
+	}
+}
+
+// Required controls are blockers whether never run or failed.
+func TestClose_ChecklistControlMissingBlocks(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	requireControl(s, "INVENTORY_VALUE", "")
+	code, resp, body := lock(t, s, &stubClients{})
+	requireBlockedWith(t, code, resp, body, "subledger_control_not_run: no INVENTORY_VALUE subledger-to-GL control run for 2026-10")
+}
+
+// An ASSETS run proves one book. A matched TAX-book run says nothing about
+// the STATUTORY book the checklist requires.
+func TestClose_AssetRunForAnotherBookDoesNotCount(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	requireControl(s, "ASSETS", "STATUTORY")
+	s.controlRuns = append(s.controlRuns,
+		bookRun("ASSETS", "TAX", "MATCHED", time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC), 70000, 70000))
+	code, resp, body := lock(t, s, &stubClients{})
+	requireBlockedWith(t, code, resp, body, "no ASSETS (book STATUTORY) subledger-to-GL control run")
+}
+
+// Completeness controls compare counts; the blocker says so in those terms.
+// October's depreciation was posted for 2 of 5 assets.
+func TestClose_CompletenessControlExceptionBlocks(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	requireControl(s, "DEPRECIATION_COMPLETENESS", "")
+	s.controlRuns = append(s.controlRuns,
+		bookRun("DEPRECIATION_COMPLETENESS", "", "EXCEPTION", time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC), 2, 5))
+	code, resp, body := lock(t, s, &stubClients{})
+	requireBlockedWith(t, code, resp, body, "subledger_control_exception: DEPRECIATION_COMPLETENESS: depreciation posted for 2 of 5 eligible assets")
+}
+
+// A removed checklist item is no longer required; the removal is evidence,
+// not a blocker.
+func TestClose_RemovedChecklistItemIsNotRequired(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	cr := requireControl(s, "STOCK_COUNT", "")
+	at := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+	cr.RemovedAt, cr.RemovedByPrincipalID, cr.RemovalReason = &at, "controller-2", "no stock held since September"
+	if code, _, body := lock(t, s, &stubClients{}); code != http.StatusOK {
+		t.Fatalf("a removed requirement still blocked: %d %s", code, body)
+	}
+}
+
+// A bank-account exclusion is not a subledger control and requires nothing here.
+func TestClose_BankExclusionIsNotASubledgerRequirement(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	s.closeRequirements = append(s.closeRequirements, &domain.CloseRequirement{RequirementID: "x", TenantID: testTenantID,
+		LegalEntityID: "le-1", Kind: domain.CloseRequirementBankAccountExclusion, BankAccountID: "acct-petty", Reason: "petty cash"})
+	if code, _, body := lock(t, s, &stubClients{}); code != http.StatusOK {
+		t.Fatalf("an exclusion must not add a subledger requirement: %d %s", code, body)
+	}
+}
+
+func TestClose_UnreadableChecklistFailsClosed(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	s.listRequirementsErr = domain.ErrStoreUnavailable
+	code, _, body := lock(t, s, &stubClients{})
+	if code != http.StatusServiceUnavailable || !strings.Contains(body, "close checklist") {
+		t.Fatalf("got %d %s; want 503 naming the close checklist", code, body)
+	}
+	if s.periods["fp-oct"].CloseStatus != "OPEN" {
+		t.Fatal("closed without being able to read the checklist")
+	}
+}
+
+func TestClose_InventoryIntegrityFindingsAreNamed(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	requireControl(s, "INVENTORY_QUANTITY", "")
+	requireControl(s, "STOCK_COUNT", "")
+	at := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	s.controlRuns = append(s.controlRuns,
+		bookRun("INVENTORY_QUANTITY", "", "EXCEPTION", at, 4, 0),
+		bookRun("STOCK_COUNT", "", "EXCEPTION", at, 2, 0))
+	code, resp, body := lock(t, s, &stubClients{})
+	requireBlockedWith(t, code, resp, body,
+		"INVENTORY_QUANTITY: 4 inventory items have a negative quantity on hand",
+		"STOCK_COUNT: 2 stock-count variances are not approved")
+}

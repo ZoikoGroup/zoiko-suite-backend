@@ -34,10 +34,11 @@ type stubStore struct {
 	evidence     []domain.CloseEvidence
 	reopenEvents []domain.PeriodReopenEvent
 
-	controlRuns       []domain.SubledgerControlRun
-	closeRequirements []*domain.CloseRequirement
-	createRunErr      error
-	listRunsErr       error
+	controlRuns         []domain.SubledgerControlRun
+	closeRequirements   []*domain.CloseRequirement
+	listRequirementsErr error
+	createRunErr        error
+	listRunsErr         error
 
 	schedules            map[string]*domain.AccrualSchedule
 	createAccrualErr     error
@@ -237,6 +238,9 @@ func (s *stubStore) GetCloseRequirement(_ context.Context, id string) (*domain.C
 }
 
 func (s *stubStore) ListCloseRequirements(_ context.Context, legalEntityID string) ([]domain.CloseRequirement, error) {
+	if s.listRequirementsErr != nil {
+		return nil, s.listRequirementsErr
+	}
 	var out []domain.CloseRequirement
 	for _, cr := range s.closeRequirements {
 		if cr.LegalEntityID == legalEntityID && cr.RemovedAt == nil {
