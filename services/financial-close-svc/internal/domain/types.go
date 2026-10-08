@@ -9,9 +9,12 @@ type FiscalPeriod struct {
 	PeriodName         string     `json:"period_name"`
 	PeriodStart        time.Time  `json:"period_start"`
 	PeriodEnd          time.Time  `json:"period_end"`
-	CloseStatus        string     `json:"close_status"` // OPEN, CLOSED, LOCKED
+	CloseStatus        string     `json:"close_status"` // see period_state.go
 	CloseLockedAt      *time.Time `json:"close_locked_at,omitempty"`
 	EvidenceDocumentID *string    `json:"evidence_document_id,omitempty"`
+	// Set while AUTHORIZED_REOPEN (migration 000018).
+	ReopenedAt      *time.Time `json:"reopened_at,omitempty"`
+	ReopenExpiresAt *time.Time `json:"reopen_expires_at,omitempty"`
 }
 
 // PeriodReopenEvent is a permanent, append-only record that a LOCKED period
@@ -778,6 +781,9 @@ type CloseReliance struct {
 	BankReconciliationCutoffDays int       `json:"bank_reconciliation_cutoff_days"`
 	FinancialControlGate         string    `json:"financial_control_gate"`
 	PostingBacklogCutoff         time.Time `json:"posting_backlog_cutoff"`
+	// ReperformedAfter is set on a reclose: every control run and bank
+	// reconciliation relied on postdates this reopen time.
+	ReperformedAfter *time.Time `json:"reperformed_after,omitempty"`
 	// ChecklistRequirementIDs are the active checklist items when it ran.
 	ChecklistRequirementIDs []string                `json:"checklist_requirement_ids"`
 	SubledgerControls       []RelianceControlRun    `json:"subledger_controls"`
@@ -1204,9 +1210,10 @@ type BankAccountRef struct {
 
 // BankReconRunDigest mirrors bank-reconciliation-svc's RunStatusDigest.
 type BankReconRunDigest struct {
-	RunID         string `json:"run_id"`
-	StatementDate string `json:"statement_date"`
-	Status        string `json:"status"`
+	RunID         string     `json:"run_id"`
+	StatementDate string     `json:"statement_date"`
+	Status        string     `json:"status"`
+	CertifiedAt   *time.Time `json:"certified_at,omitempty"`
 }
 
 // BankAccountReconStatus mirrors bank-reconciliation-svc's

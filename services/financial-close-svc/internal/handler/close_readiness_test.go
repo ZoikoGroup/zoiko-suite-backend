@@ -36,7 +36,7 @@ func octoberStore() *stubStore {
 	s := newStubStore()
 	s.periods["fp-oct"] = &domain.FiscalPeriod{
 		FiscalPeriodID: "fp-oct", TenantID: testTenantID, LegalEntityID: "le-1",
-		PeriodName: "2026-10", PeriodStart: octStart, PeriodEnd: octEnd, CloseStatus: "OPEN",
+		PeriodName: "2026-10", PeriodStart: octStart, PeriodEnd: octEnd, CloseStatus: "CLOSE_REVIEW",
 	}
 	return s
 }
@@ -55,6 +55,14 @@ func controlRun(ledger, status string, at time.Time, subledgerTotal, glBalance f
 // £1,200 is in the AR total AND the GL, which is exactly why it must not block.
 func bothMatched(s *stubStore) {
 	at := time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC)
+	s.controlRuns = append(s.controlRuns,
+		controlRun("AR", "MATCHED", at, 1200, 1200),
+		controlRun("AP", "MATCHED", at, 800, 800))
+}
+
+// bothMatchedAt is bothMatched with an explicit run time, for reclose tests
+// that need evidence dated relative to a reopen.
+func bothMatchedAt(s *stubStore, at time.Time) {
 	s.controlRuns = append(s.controlRuns,
 		controlRun("AR", "MATCHED", at, 1200, 1200),
 		controlRun("AP", "MATCHED", at, 800, 800))
@@ -90,7 +98,7 @@ func TestClose_UnpaidButPostedItemsDoNotBlock(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("a period whose books are complete must close, got %d: %s", code, body)
 	}
-	if !strings.Contains(body, `"LOCKED"`) {
+	if !strings.Contains(body, `"HARD_CLOSED"`) {
 		t.Fatalf("expected the period LOCKED: %s", body)
 	}
 }
@@ -204,7 +212,7 @@ func TestClose_FailsClosedWhenItCannotCheck(t *testing.T) {
 			if code != c.wantCode || !strings.Contains(body, c.wantText) {
 				t.Fatalf("got %d %s; want %d mentioning %q", code, body, c.wantCode, c.wantText)
 			}
-			if s.periods["fp-oct"].CloseStatus != "OPEN" {
+			if s.periods["fp-oct"].CloseStatus != "CLOSE_REVIEW" {
 				t.Fatal("the period was closed although a check could not run")
 			}
 		})
@@ -323,7 +331,7 @@ func TestClose_UnreadableChecklistFailsClosed(t *testing.T) {
 	if code != http.StatusServiceUnavailable || !strings.Contains(body, "close checklist") {
 		t.Fatalf("got %d %s; want 503 naming the close checklist", code, body)
 	}
-	if s.periods["fp-oct"].CloseStatus != "OPEN" {
+	if s.periods["fp-oct"].CloseStatus != "CLOSE_REVIEW" {
 		t.Fatal("closed without being able to read the checklist")
 	}
 }
@@ -354,6 +362,13 @@ var (
 
 func certified(account, date string) domain.BankAccountReconStatus {
 	d := &domain.BankReconRunDigest{RunID: account + "-" + date, StatementDate: date, Status: "CERTIFIED"}
+	return domain.BankAccountReconStatus{BankAccountID: account, LatestCertified: d, LatestRun: d}
+}
+
+// certifiedAt is certified with an explicit certification time, needed for
+// the reperformance (reclose) checks.
+func certifiedAt(account, date string, at time.Time) domain.BankAccountReconStatus {
+	d := &domain.BankReconRunDigest{RunID: account + "-" + date, StatementDate: date, Status: "CERTIFIED", CertifiedAt: &at}
 	return domain.BankAccountReconStatus{BankAccountID: account, LatestCertified: d, LatestRun: d}
 }
 
@@ -450,7 +465,7 @@ func TestClose_BankGateFailsClosed(t *testing.T) {
 			if code != http.StatusServiceUnavailable {
 				t.Fatalf("got %d %s, want 503", code, body)
 			}
-			if s.periods["fp-oct"].CloseStatus != "OPEN" {
+			if s.periods["fp-oct"].CloseStatus != "CLOSE_REVIEW" {
 				t.Fatal("closed without being able to check cash")
 			}
 		})

@@ -111,7 +111,7 @@ func TestGetPeriodReadiness_AlreadyLocked_IsNotReady(t *testing.T) {
 	s := newStubStore()
 	s.periods["fp-locked"] = &domain.FiscalPeriod{
 		FiscalPeriodID: "fp-locked", TenantID: testTenantID, LegalEntityID: "le-1",
-		PeriodName: "2026-01", CloseStatus: "LOCKED",
+		PeriodName: "2026-01", CloseStatus: "HARD_CLOSED",
 	}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
 
@@ -165,7 +165,7 @@ func TestLockPeriod_LedgerPageTruncated_RefusesToClose(t *testing.T) {
 	s := newStubStore()
 	s.periods["fp-open"] = &domain.FiscalPeriod{
 		FiscalPeriodID: "fp-open", TenantID: testTenantID, LegalEntityID: "le-1",
-		PeriodName: "2026-01", CloseStatus: "OPEN",
+		PeriodName: "2026-01", CloseStatus: "CLOSE_REVIEW",
 	}
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{},
@@ -178,7 +178,7 @@ func TestLockPeriod_LedgerPageTruncated_RefusesToClose(t *testing.T) {
 	if !bytes.Contains(rr.Body.Bytes(), []byte("ledger_page_truncated")) {
 		t.Fatalf("the refusal must name its reason, got %s", rr.Body.String())
 	}
-	if s.periods["fp-open"].CloseStatus != "OPEN" {
+	if s.periods["fp-open"].CloseStatus != "CLOSE_REVIEW" {
 		t.Fatal("the period must not be locked over a trial balance that may be incomplete")
 	}
 	if pub.closed != 0 {
@@ -198,7 +198,7 @@ func TestLockPeriod_EvidenceWriteFails_IsReported(t *testing.T) {
 	s.evidenceErr = errors.New("insert failed")
 	s.periods["fp-open"] = &domain.FiscalPeriod{
 		FiscalPeriodID: "fp-open", TenantID: testTenantID, LegalEntityID: "le-1",
-		PeriodName: "2026-01", CloseStatus: "OPEN",
+		PeriodName: "2026-01", CloseStatus: "CLOSE_REVIEW",
 	}
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{}, &stubClients{})
@@ -212,7 +212,7 @@ func TestLockPeriod_EvidenceWriteFails_IsReported(t *testing.T) {
 	}
 	// The period genuinely IS locked, and saying otherwise would be a second
 	// untruth — but nothing may claim the close is evidenced.
-	if s.periods["fp-open"].CloseStatus != "LOCKED" {
+	if s.periods["fp-open"].CloseStatus != "HARD_CLOSED" {
 		t.Fatal("the period was locked before the evidence write; the response must not pretend it was not")
 	}
 	if pub.closed != 0 {
@@ -224,7 +224,7 @@ func TestLockPeriod_EvidenceSignedWithConfiguredKeyNotTheTenantID(t *testing.T) 
 	s := newStubStore()
 	s.periods["fp-open"] = &domain.FiscalPeriod{
 		FiscalPeriodID: "fp-open", TenantID: testTenantID, LegalEntityID: "le-1",
-		PeriodName: "2026-01", CloseStatus: "OPEN",
+		PeriodName: "2026-01", CloseStatus: "CLOSE_REVIEW",
 	}
 	balances := map[string]float64{"1000-Cash": 10000.00, "4000-Rev": -10000.00}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{trialBalances: balances})

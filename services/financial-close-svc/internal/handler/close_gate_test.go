@@ -31,7 +31,7 @@ func gateStore() *stubStore {
 		TenantID:       testTenantID,
 		LegalEntityID:  "le-1",
 		PeriodName:     "2024-Q1",
-		CloseStatus:    "OPEN",
+		CloseStatus:    "CLOSE_REVIEW",
 	}
 	return s
 }
@@ -86,7 +86,7 @@ func TestCloseGate_EnforceUnavailable_503(t *testing.T) {
 	if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), "financial-control-svc") {
 		t.Fatalf("expected 503 fail closed, got %d: %s", rr.Code, rr.Body.String())
 	}
-	if s.periods["fp-open"].CloseStatus != "OPEN" {
+	if s.periods["fp-open"].CloseStatus != "CLOSE_REVIEW" {
 		t.Fatalf("period must stay OPEN")
 	}
 	rr = doReq(r, http.MethodGet, "/v1/close/periods/fp-open/readiness", nil, "principal-1")

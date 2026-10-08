@@ -41,6 +41,16 @@ func checklistRouter(s *stubStore, authz *actionAuthZ) chi.Router {
 	return r
 }
 
+// checklistRouterWithClients is checklistRouter with caller-supplied clients,
+// for tests that need real bank/subledger gate data as well as a specific
+// authz stub.
+func checklistRouterWithClients(s *stubStore, authz *actionAuthZ, cl *stubClients) chi.Router {
+	r := chi.NewRouter()
+	r.Use(middleware.TenantContext())
+	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, authz, cl, testSigningKey, zap.NewNop()))
+	return r
+}
+
 func TestAddCloseRequirement_Validation(t *testing.T) {
 	cases := []struct {
 		name string

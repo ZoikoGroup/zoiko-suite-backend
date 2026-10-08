@@ -21,18 +21,17 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	periods      map[string]*domain.FiscalPeriod
-	createErr    error
-	getErr       error
-	lockErr      error
-	evidenceErr  error
-	reopenErr    error
-	reopenEvtErr error
+	periods     map[string]*domain.FiscalPeriod
+	createErr   error
+	getErr      error
+	lockErr     error
+	evidenceErr error
 
 	// Recorded so a test can assert what was actually signed and stored, rather
 	// than only that the call did not error.
-	evidence     []domain.CloseEvidence
-	reopenEvents []domain.PeriodReopenEvent
+	evidence       []domain.CloseEvidence
+	transitions    []domain.PeriodTransition
+	reopenRequests []*domain.ReopenRequest
 
 	controlRuns         []domain.SubledgerControlRun
 	closeRequirements   []*domain.CloseRequirement
@@ -163,25 +162,6 @@ func (s *stubStore) ListFiscalPeriods(_ context.Context, legalEntityID string) (
 	return out, nil
 }
 
-func (s *stubStore) LockFiscalPeriod(_ context.Context, id string, lockedAt time.Time, evidenceDocID string) error {
-	if s.lockErr != nil {
-		return s.lockErr
-	}
-	fp, ok := s.periods[id]
-	if !ok {
-		return domain.ErrFiscalPeriodNotFound
-	}
-	if fp.CloseStatus != "OPEN" {
-		return domain.ErrPeriodAlreadyLocked
-	}
-	fp.CloseStatus = "LOCKED"
-	t := lockedAt
-	fp.CloseLockedAt = &t
-	doc := evidenceDocID
-	fp.EvidenceDocumentID = &doc
-	return nil
-}
-
 func (s *stubStore) CreateCloseEvidence(_ context.Context, ev *domain.CloseEvidence) error {
 	if s.evidenceErr != nil {
 		return s.evidenceErr
@@ -200,29 +180,133 @@ func (s *stubStore) ListCloseEvidence(_ context.Context, fiscalPeriodID string) 
 	return out, nil
 }
 
-func (s *stubStore) ReopenFiscalPeriod(_ context.Context, id string, reopenedAt time.Time) error {
-	if s.reopenErr != nil {
-		return s.reopenErr
+// ApplyPeriodTransition mirrors the store: refused (with the current period)
+// unless the period is in one of allowedFrom; records the transition.
+func (s *stubStore) ApplyPeriodTransition(_ context.Context, id string, allowedFrom []string, u domain.PeriodUpdate) (*domain.FiscalPeriod, error) {
+	if s.lockErr != nil {
+		return nil, s.lockErr
 	}
 	fp, ok := s.periods[id]
 	if !ok {
+		return nil, domain.ErrFiscalPeriodNotFound
+	}
+	allowed := false
+	for _, from := range allowedFrom {
+		allowed = allowed || fp.CloseStatus == from
+	}
+	if !allowed {
+		cur := *fp
+		return &cur, domain.ErrInvalidPeriodTransition
+	}
+	s.transitions = append(s.transitions, domain.PeriodTransition{FiscalPeriodID: id, FromState: fp.CloseStatus,
+		ToState: u.To, PrincipalID: u.PrincipalID, Reason: u.Reason, ReopenRequestID: u.ReopenRequestID, OccurredAt: u.At})
+	fp.CloseStatus = u.To
+	if u.LockedAt != nil {
+		fp.CloseLockedAt = u.LockedAt
+	}
+	if u.EvidenceDocID != nil {
+		fp.EvidenceDocumentID = u.EvidenceDocID
+	}
+	if u.ReopenedAt != nil {
+		fp.ReopenedAt, fp.ReopenExpiresAt = u.ReopenedAt, u.ReopenExpiresAt
+	}
+	if u.ClearReopen {
+		fp.ReopenedAt, fp.ReopenExpiresAt = nil, nil
+	}
+	out := *fp
+	return &out, nil
+}
+
+func (s *stubStore) CreateReopenRequest(_ context.Context, req *domain.ReopenRequest) error {
+	fp, ok := s.periods[req.FiscalPeriodID]
+	if !ok {
 		return domain.ErrFiscalPeriodNotFound
 	}
-	if fp.CloseStatus != "LOCKED" {
-		return domain.ErrPeriodNotLocked
+	if fp.CloseStatus != domain.PeriodHardClosed && fp.CloseStatus != domain.PeriodReclosed {
+		return domain.ErrInvalidPeriodTransition
 	}
-	fp.CloseStatus = "OPEN"
-	fp.CloseLockedAt = nil
-	fp.EvidenceDocumentID = nil
+	for _, r := range s.reopenRequests {
+		if r.FiscalPeriodID == req.FiscalPeriodID && r.Status == domain.ReopenPending {
+			return domain.ErrReopenRequestPending
+		}
+	}
+	cp := *req
+	s.reopenRequests = append(s.reopenRequests, &cp)
 	return nil
 }
 
-func (s *stubStore) CreateReopenEvent(_ context.Context, ev *domain.PeriodReopenEvent) error {
-	if s.reopenEvtErr != nil {
-		return s.reopenEvtErr
+func (s *stubStore) GetReopenRequest(_ context.Context, id string) (*domain.ReopenRequest, error) {
+	for _, r := range s.reopenRequests {
+		if r.RequestID == id {
+			cp := *r
+			return &cp, nil
+		}
 	}
-	s.reopenEvents = append(s.reopenEvents, *ev)
-	return nil
+	return nil, domain.ErrReopenRequestNotFound
+}
+
+// ApproveReopenRequest mirrors the store, including the table's own rule
+// that nobody decides their own request.
+func (s *stubStore) ApproveReopenRequest(ctx context.Context, id, approver, reason string, at time.Time) (*domain.ReopenRequest, *domain.FiscalPeriod, error) {
+	for _, r := range s.reopenRequests {
+		if r.RequestID != id {
+			continue
+		}
+		if r.Status != domain.ReopenPending {
+			return nil, nil, domain.ErrReopenRequestNotFound
+		}
+		if r.RequestedByPrincipalID == approver {
+			return nil, nil, domain.ErrReopenSelfApproval
+		}
+		if !r.ReopenUntil.After(at) {
+			return nil, nil, domain.ErrReopenWindowInvalid
+		}
+		until, approvedAt := r.ReopenUntil, at
+		fp, err := s.ApplyPeriodTransition(ctx, r.FiscalPeriodID, []string{domain.PeriodHardClosed, domain.PeriodReclosed},
+			domain.PeriodUpdate{To: domain.PeriodAuthorizedReopen, PrincipalID: approver, Reason: r.Reason,
+				ReopenRequestID: r.RequestID, At: at, ReopenedAt: &approvedAt, ReopenExpiresAt: &until})
+		if err != nil {
+			return nil, nil, err
+		}
+		r.Status, r.DecidedByPrincipalID, r.DecidedAt, r.DecisionReason = domain.ReopenApproved, approver, &approvedAt, reason
+		cp := *r
+		return &cp, fp, nil
+	}
+	return nil, nil, domain.ErrReopenRequestNotFound
+}
+
+func (s *stubStore) RejectReopenRequest(_ context.Context, id, decider, reason string, at time.Time) (*domain.ReopenRequest, error) {
+	for _, r := range s.reopenRequests {
+		if r.RequestID != id {
+			continue
+		}
+		if r.Status != domain.ReopenPending {
+			return nil, domain.ErrReopenRequestNotFound
+		}
+		if r.RequestedByPrincipalID == decider {
+			return nil, domain.ErrReopenSelfApproval
+		}
+		decidedAt := at
+		r.Status, r.DecidedByPrincipalID, r.DecidedAt, r.DecisionReason = domain.ReopenRejected, decider, &decidedAt, reason
+		cp := *r
+		return &cp, nil
+	}
+	return nil, domain.ErrReopenRequestNotFound
+}
+
+func (s *stubStore) GetCloseHistory(_ context.Context, periodID string) (*domain.CloseHistory, error) {
+	h := &domain.CloseHistory{FiscalPeriodID: periodID, Transitions: []domain.PeriodTransition{}, ReopenRequests: []domain.ReopenRequest{}}
+	for _, t := range s.transitions {
+		if t.FiscalPeriodID == periodID {
+			h.Transitions = append(h.Transitions, t)
+		}
+	}
+	for _, r := range s.reopenRequests {
+		if r.FiscalPeriodID == periodID {
+			h.ReopenRequests = append(h.ReopenRequests, *r)
+		}
+	}
+	return h, nil
 }
 
 func (s *stubStore) CreateCloseRequirement(_ context.Context, cr *domain.CloseRequirement) (bool, error) {
@@ -1053,6 +1137,11 @@ func (s *stubStore) UpsertLineageProjectionStatus(_ context.Context, legalEntity
 type stubPublisher struct {
 	started, blocked, closed, reopened, controlException int
 	lastControlExceptionRun                              domain.SubledgerControlRun
+	transitionEvents                                     []string
+}
+
+func (p *stubPublisher) PublishPeriodTransition(_ context.Context, eventType, _, _ string, _ domain.FiscalPeriod, _ map[string]any) {
+	p.transitionEvents = append(p.transitionEvents, eventType)
 }
 
 func (p *stubPublisher) PublishCloseStarted(_ context.Context, _, _ string, _ domain.FiscalPeriod) {
@@ -1507,7 +1596,7 @@ func TestGetPeriodStatus_LockedPeriod(t *testing.T) {
 		TenantID:           "tenant-abc",
 		LegalEntityID:      "le-1",
 		PeriodName:         "2024-Q1",
-		CloseStatus:        "LOCKED",
+		CloseStatus:        "HARD_CLOSED",
 		EvidenceDocumentID: &docID,
 	}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
@@ -1517,8 +1606,13 @@ func TestGetPeriodStatus_LockedPeriod(t *testing.T) {
 	}
 	var resp map[string]string
 	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	// close_status keeps its legacy OPEN/LOCKED meaning for old readers;
+	// period_state carries the real state.
 	if resp["close_status"] != "LOCKED" {
-		t.Errorf("expected LOCKED got %q", resp["close_status"])
+		t.Errorf("expected legacy close_status LOCKED got %q", resp["close_status"])
+	}
+	if resp["period_state"] != "HARD_CLOSED" {
+		t.Errorf("expected period_state HARD_CLOSED got %q", resp["period_state"])
 	}
 }
 
@@ -1531,15 +1625,15 @@ func TestLockPeriod_GLQueryFails_FailsClosed(t *testing.T) {
 		TenantID:       "tenant-abc",
 		LegalEntityID:  "le-1",
 		PeriodName:     "2024-Q1",
-		CloseStatus:    "OPEN",
+		CloseStatus:    "CLOSE_REVIEW",
 	}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{unpostedErr: domain.ErrGLServiceUnavailable})
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when general-ledger-svc is unreachable (fail closed), got %d: %s", rr.Code, rr.Body.String())
 	}
-	if s.periods["fp-open"].CloseStatus != "OPEN" {
-		t.Fatalf("period must remain OPEN when a readiness check couldn't be performed, got %s", s.periods["fp-open"].CloseStatus)
+	if s.periods["fp-open"].CloseStatus != "CLOSE_REVIEW" {
+		t.Fatalf("period must remain CLOSE_REVIEW when a readiness check couldn't be performed, got %s", s.periods["fp-open"].CloseStatus)
 	}
 }
 
@@ -1550,15 +1644,15 @@ func TestLockPeriod_TrialBalanceCompileFails_FailsClosed(t *testing.T) {
 		TenantID:       "tenant-abc",
 		LegalEntityID:  "le-1",
 		PeriodName:     "2024-Q1",
-		CloseStatus:    "OPEN",
+		CloseStatus:    "CLOSE_REVIEW",
 	}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{trialBalErr: domain.ErrGLServiceUnavailable})
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when trial balance compilation fails, got %d: %s", rr.Code, rr.Body.String())
 	}
-	if s.periods["fp-open"].CloseStatus != "OPEN" {
-		t.Fatalf("period must remain OPEN when evidence generation failed, got %s", s.periods["fp-open"].CloseStatus)
+	if s.periods["fp-open"].CloseStatus != "CLOSE_REVIEW" {
+		t.Fatalf("period must remain CLOSE_REVIEW when evidence generation failed, got %s", s.periods["fp-open"].CloseStatus)
 	}
 }
 
@@ -1569,15 +1663,15 @@ func TestLockPeriod_EvidenceUploadFails_FailsClosed(t *testing.T) {
 		TenantID:       "tenant-abc",
 		LegalEntityID:  "le-1",
 		PeriodName:     "2024-Q1",
-		CloseStatus:    "OPEN",
+		CloseStatus:    "CLOSE_REVIEW",
 	}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{uploadErr: domain.ErrVaultServiceUnavailable})
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when document-vault-svc upload fails, got %d: %s", rr.Code, rr.Body.String())
 	}
-	if s.periods["fp-open"].CloseStatus != "OPEN" {
-		t.Fatalf("period must remain OPEN when close evidence couldn't be recorded, got %s", s.periods["fp-open"].CloseStatus)
+	if s.periods["fp-open"].CloseStatus != "CLOSE_REVIEW" {
+		t.Fatalf("period must remain CLOSE_REVIEW when close evidence couldn't be recorded, got %s", s.periods["fp-open"].CloseStatus)
 	}
 }
 
@@ -1588,7 +1682,7 @@ func TestLockPeriod_AuthorizationDenied_Returns(t *testing.T) {
 		TenantID:       "tenant-abc",
 		LegalEntityID:  "le-1",
 		PeriodName:     "2024-Q1",
-		CloseStatus:    "OPEN",
+		CloseStatus:    "CLOSE_REVIEW",
 	}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubClients{})
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
@@ -1622,7 +1716,7 @@ func TestLockPeriod_AlreadyLocked(t *testing.T) {
 		TenantID:       "tenant-abc",
 		LegalEntityID:  "le-1",
 		PeriodName:     "2024-Q1",
-		CloseStatus:    "LOCKED",
+		CloseStatus:    "HARD_CLOSED",
 	}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-locked/lock", nil, "principal-1")
@@ -1638,7 +1732,7 @@ func TestLockPeriod_ReadinessBlocked_UnpostedJournals(t *testing.T) {
 		TenantID:       "tenant-abc",
 		LegalEntityID:  "le-1",
 		PeriodName:     "2024-Q1",
-		CloseStatus:    "OPEN",
+		CloseStatus:    "CLOSE_REVIEW",
 	}
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{}, &stubClients{unpostedCount: 3})
@@ -1668,7 +1762,7 @@ func TestLockPeriod_HappyPath(t *testing.T) {
 		PeriodName:     "2024-Q1",
 		PeriodStart:    time.Now().Add(-30 * 24 * time.Hour),
 		PeriodEnd:      time.Now().Add(-1 * time.Hour),
-		CloseStatus:    "OPEN",
+		CloseStatus:    "CLOSE_REVIEW",
 	}
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{}, &stubClients{})
@@ -1680,8 +1774,8 @@ func TestLockPeriod_HappyPath(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.CloseStatus != "LOCKED" {
-		t.Errorf("expected LOCKED got %q", resp.CloseStatus)
+	if resp.CloseStatus != "HARD_CLOSED" {
+		t.Errorf("expected HARD_CLOSED got %q", resp.CloseStatus)
 	}
 	if resp.EvidenceDocumentID == "" {
 		t.Error("evidence_document_id must be set")
@@ -1694,114 +1788,6 @@ func TestLockPeriod_HappyPath(t *testing.T) {
 	}
 	if pub.closed != 1 {
 		t.Errorf("expected 1 Closed event got %d", pub.closed)
-	}
-}
-
-// ── ReopenPeriod Tests (ACC-14 invariant #6) ─────────────────────────────────────
-
-func TestReopenPeriod_HappyPath(t *testing.T) {
-	s := newStubStore()
-	s.periods["fp-locked"] = &domain.FiscalPeriod{
-		FiscalPeriodID:     "fp-locked",
-		TenantID:           "tenant-abc",
-		LegalEntityID:      "le-1",
-		PeriodName:         "2024-Q1",
-		CloseStatus:        "LOCKED",
-		EvidenceDocumentID: strPtr("doc-1"),
-	}
-	pub := &stubPublisher{}
-	r := newRouter(s, pub, &stubAuthZ{}, &stubClients{})
-	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-locked/reopen",
-		domain.ReopenPeriodRequest{Reason: "material misstatement found in AP accrual, correcting entry required"}, "principal-1")
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
-	}
-	var resp domain.FiscalPeriod
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.CloseStatus != "OPEN" {
-		t.Errorf("expected OPEN got %q", resp.CloseStatus)
-	}
-	if resp.EvidenceDocumentID != nil {
-		t.Error("expected evidence_document_id cleared on reopen")
-	}
-	if pub.reopened != 1 {
-		t.Errorf("expected 1 Reopened event got %d", pub.reopened)
-	}
-	if len(s.reopenEvents) != 1 {
-		t.Fatalf("expected 1 permanent reopen event recorded, got %d", len(s.reopenEvents))
-	}
-	if s.reopenEvents[0].Reason == "" || s.reopenEvents[0].ReopenedByPrincipalID != "principal-1" {
-		t.Errorf("expected reopen event to carry the reason and acting principal, got %+v", s.reopenEvents[0])
-	}
-	// The period's OWN prior close evidence in close_evidences must survive —
-	// only the pointer on the period is cleared, never the historical row.
-	// (stubStore doesn't model close_evidences deletion, so this asserts the
-	// handler never attempted to touch it — no evidence-deletion call exists
-	// anywhere in Store, by design.)
-}
-
-func TestReopenPeriod_MissingReason_Returns400(t *testing.T) {
-	s := newStubStore()
-	s.periods["fp-locked"] = &domain.FiscalPeriod{FiscalPeriodID: "fp-locked", TenantID: "tenant-abc", LegalEntityID: "le-1", CloseStatus: "LOCKED"}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
-	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-locked/reopen", domain.ReopenPeriodRequest{Reason: ""}, "principal-1")
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 got %d", rr.Code)
-	}
-	if len(s.reopenEvents) != 0 {
-		t.Error("expected no reopen event recorded when reason is missing")
-	}
-}
-
-// TestReopenPeriod_NotLocked_Returns422 proves an OPEN (or otherwise
-// non-LOCKED) period cannot be "reopened" — this is a LOCKED-only
-// transition, mirroring LockFiscalPeriod's own OPEN-only guard.
-func TestReopenPeriod_NotLocked_Returns422(t *testing.T) {
-	s := newStubStore()
-	s.periods["fp-open"] = &domain.FiscalPeriod{FiscalPeriodID: "fp-open", TenantID: "tenant-abc", LegalEntityID: "le-1", CloseStatus: "OPEN"}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
-	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/reopen", domain.ReopenPeriodRequest{Reason: "test"}, "principal-1")
-	if rr.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-// TestReopenPeriod_UsesDistinctAuthorizationAction proves reopen is
-// gated by its OWN action (actionPeriodReopen), not silently reusing
-// actionCloseInitiate — a principal denied specifically for reopen must be
-// refused even though closing/locking uses a different action entirely.
-func TestReopenPeriod_UsesDistinctAuthorizationAction(t *testing.T) {
-	s := newStubStore()
-	s.periods["fp-locked"] = &domain.FiscalPeriod{FiscalPeriodID: "fp-locked", TenantID: "tenant-abc", LegalEntityID: "le-1", CloseStatus: "LOCKED"}
-	var seenAction string
-	authz := &recordingAuthZ{onCheck: func(_, _, action string) error {
-		seenAction = action
-		return domain.ErrAuthorizationDenied
-	}}
-	h := handler.New(s, &stubPublisher{}, authz, &stubClients{}, testSigningKey, zap.NewNop())
-	rt := chi.NewRouter()
-	rt.Use(middleware.TenantContext())
-	handler.RegisterRoutes(rt, h)
-	rr := doReq(rt, http.MethodPost, "/v1/close/periods/fp-locked/reopen", domain.ReopenPeriodRequest{Reason: "test"}, "principal-1")
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
-	}
-	if seenAction != "PERIOD_REOPEN" {
-		t.Errorf("expected authz checked against PERIOD_REOPEN, got %q", seenAction)
-	}
-}
-
-func TestReopenPeriod_EventNotRecorded_Returns500(t *testing.T) {
-	s := newStubStore()
-	s.periods["fp-locked"] = &domain.FiscalPeriod{FiscalPeriodID: "fp-locked", TenantID: "tenant-abc", LegalEntityID: "le-1", CloseStatus: "LOCKED"}
-	s.reopenEvtErr = domain.ErrStoreUnavailable
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
-	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-locked/reopen", domain.ReopenPeriodRequest{Reason: "test"}, "principal-1")
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

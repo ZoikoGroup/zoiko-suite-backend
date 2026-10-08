@@ -92,6 +92,7 @@ func TestMain(m *testing.M) {
 
 	_, _ = testPool.Exec(ctx, `DROP TABLE IF EXISTS
 		close_evidences, fiscal_periods, period_reopen_events,
+		period_reopen_requests, period_state_transitions,
 		subledger_control_runs,
 		close_requirements,
 		accrual_recognition_reversals, accrual_recognition_instances, accrual_schedules,
@@ -202,15 +203,22 @@ func TestPgStore_TenantIsolation_GetFiscalPeriod(t *testing.T) {
 	assert.Equal(t, b.fiscalPeriodID, gotOwn.FiscalPeriodID)
 }
 
-func TestPgStore_TenantIsolation_LockFiscalPeriod(t *testing.T) {
+func TestPgStore_TenantIsolation_ApplyPeriodTransition(t *testing.T) {
 	a := setupIsolationFixture(t, "A-Lock")
 	b := setupIsolationFixture(t, "B-Lock")
+	lockedAt := time.Now().UTC()
+	docID := uuid.New().String()
 
-	// Tenant B attempts to lock Tenant A's period under tenant B's own context.
+	// Tenant B attempts to hard-close Tenant A's period under tenant B's own
+	// context. RLS scopes the row lookup to tenant_id = B, so A's row is
+	// invisible — the transition fails as "not found", never as a state
+	// conflict, which would leak that the row exists.
 	ctxB := svcmiddleware.WithTenant(context.Background(), b.tenantID)
-	err := testStore.LockFiscalPeriod(ctxB, a.fiscalPeriodID, time.Now().UTC(), uuid.New().String())
-	assert.ErrorIs(t, err, domain.ErrPeriodAlreadyLocked,
-		"ISOLATION FAILURE: tenant B was able to lock tenant A's fiscal period")
+	_, err := testStore.ApplyPeriodTransition(ctxB, a.fiscalPeriodID, []string{domain.PeriodCloseReview},
+		domain.PeriodUpdate{To: domain.PeriodHardClosed, PrincipalID: "intruder", At: lockedAt,
+			LockedAt: &lockedAt, EvidenceDocID: &docID})
+	assert.ErrorIs(t, err, domain.ErrFiscalPeriodNotFound,
+		"ISOLATION FAILURE: tenant B's transition against tenant A's fiscal period returned something other than not-found")
 
 	ctxA := svcmiddleware.WithTenant(context.Background(), a.tenantID)
 	got, err := testStore.GetFiscalPeriod(ctxA, a.fiscalPeriodID)
@@ -219,12 +227,18 @@ func TestPgStore_TenantIsolation_LockFiscalPeriod(t *testing.T) {
 	assert.Equal(t, "OPEN", got.CloseStatus,
 		"ISOLATION FAILURE: tenant A's period status was mutated by tenant B")
 
-	// Sanity: tenant B can still lock its OWN period.
-	err = testStore.LockFiscalPeriod(ctxB, b.fiscalPeriodID, time.Now().UTC(), uuid.New().String())
+	// Sanity: tenant B can still transition its OWN period (from CLOSE_REVIEW,
+	// the state setupIsolationFixture leaves it in only if asked — set it here).
+	_, err = testStore.ApplyPeriodTransition(ctxB, b.fiscalPeriodID, []string{domain.PeriodOpen},
+		domain.PeriodUpdate{To: domain.PeriodCloseReview, PrincipalID: "owner", At: lockedAt})
+	require.NoError(t, err)
+	_, err = testStore.ApplyPeriodTransition(ctxB, b.fiscalPeriodID, []string{domain.PeriodCloseReview},
+		domain.PeriodUpdate{To: domain.PeriodHardClosed, PrincipalID: "owner", At: lockedAt,
+			LockedAt: &lockedAt, EvidenceDocID: &docID})
 	require.NoError(t, err)
 	gotB, err := testStore.GetFiscalPeriod(ctxB, b.fiscalPeriodID)
 	require.NoError(t, err)
-	assert.Equal(t, "LOCKED", gotB.CloseStatus)
+	assert.Equal(t, "HARD_CLOSED", gotB.CloseStatus)
 }
 
 func TestPgStore_TenantIsolation_ListFiscalPeriods(t *testing.T) {

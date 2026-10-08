@@ -31,17 +31,17 @@ type Store interface {
 	GetFiscalPeriod(ctx context.Context, id string) (*domain.FiscalPeriod, error)
 	GetFiscalPeriodByName(ctx context.Context, legalEntityID, name string) (*domain.FiscalPeriod, error)
 	ListFiscalPeriods(ctx context.Context, legalEntityID string) ([]domain.FiscalPeriod, error)
-	LockFiscalPeriod(ctx context.Context, id string, lockedAt time.Time, evidenceDocID string) error
+	// ApplyPeriodTransition moves a period to u.To from one of allowedFrom,
+	// recording the transition atomically; ErrInvalidPeriodTransition (with
+	// the current period) when its state no longer allows it.
+	ApplyPeriodTransition(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate) (*domain.FiscalPeriod, error)
+	CreateReopenRequest(ctx context.Context, req *domain.ReopenRequest) error
+	GetReopenRequest(ctx context.Context, requestID string) (*domain.ReopenRequest, error)
+	ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time) (*domain.ReopenRequest, *domain.FiscalPeriod, error)
+	RejectReopenRequest(ctx context.Context, requestID, deciderID, reason string, at time.Time) (*domain.ReopenRequest, error)
+	GetCloseHistory(ctx context.Context, fiscalPeriodID string) (*domain.CloseHistory, error)
 	CreateCloseEvidence(ctx context.Context, evidence *domain.CloseEvidence) error
 	ListCloseEvidence(ctx context.Context, fiscalPeriodID string) ([]domain.CloseEvidence, error)
-	// ReopenFiscalPeriod transitions id from LOCKED back to OPEN, atomically
-	// and only from LOCKED (mirrors LockFiscalPeriod's OPEN-only guard).
-	// clearedEvidenceDocID is what evidence_document_id is reset to (empty
-	// string — the prior close's own CloseEvidence row is untouched and
-	// stays queryable by fiscal_period_id; only the pointer on the period
-	// itself is cleared, since the next close will produce a new one).
-	ReopenFiscalPeriod(ctx context.Context, id string, reopenedAt time.Time) error
-	CreateReopenEvent(ctx context.Context, event *domain.PeriodReopenEvent) error
 	// CreateControlRun persists one ACC-06 subledger-to-GL reconciliation
 	// result — append-only, see migration 000004's doc comment.
 	CreateControlRun(ctx context.Context, run *domain.SubledgerControlRun) error
@@ -149,6 +149,10 @@ type Publisher interface {
 	PublishCloseBlocked(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod, reasons []string)
 	PublishClosed(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod, evidenceID string)
 	PublishReopened(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod, reason string)
+	// PublishPeriodTransition announces a close state change that has no
+	// dedicated event: period.soft_closed, period.close_review_started,
+	// period.reopen_requested, period.reopen_rejected, period.reclosed.
+	PublishPeriodTransition(ctx context.Context, eventType, correlationID, actorID string, fp domain.FiscalPeriod, details map[string]any)
 	PublishSubledgerControlException(ctx context.Context, correlationID, actorID string, run domain.SubledgerControlRun)
 }
 
@@ -230,6 +234,13 @@ const (
 	// it a separate action lets this be granted to a narrower, more senior
 	// group than ordinary close initiation.
 	actionPeriodReopen = "PERIOD_REOPEN"
+	// actionCloseApprove hard-closes and recloses: the spec's
+	// period.close.approve, distinct from preparing the close
+	// (period.close.manage = PERIOD_CLOSE_INITIATE).
+	actionCloseApprove = "PERIOD_CLOSE_APPROVE"
+	// actionPeriodReopenApprove approves a reopen request someone else made
+	// (period.reopen.approve). PERIOD_REOPEN is period.reopen.request.
+	actionPeriodReopenApprove = "PERIOD_REOPEN_APPROVE"
 
 	// actionSubledgerControlRun is ACC-06's own action, distinct from
 	// actionCloseInitiate — running a control reconciliation is not part of
@@ -388,6 +399,10 @@ func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, s
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Route("/v1/close/reopen-requests", func(r chi.Router) {
+		r.Post("/{request_id}/approve", h.ApproveReopen)
+		r.Post("/{request_id}/reject", h.RejectReopen)
+	})
 	r.Route("/v1/close/requirements", func(r chi.Router) {
 		r.Get("/", h.GetCloseChecklist)
 		r.Post("/", h.AddCloseRequirement)
@@ -400,8 +415,17 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/status", h.GetPeriodStatus)
 		r.Get("/{id}/readiness", h.GetPeriodReadiness)
 		r.Get("/{id}/evidence", h.GetPeriodEvidence)
-		r.Post("/{id}/lock", h.LockPeriod)
-		r.Post("/{id}/reopen", h.ReopenPeriod)
+		r.Post("/{id}/soft-close", h.StartSoftClose)
+		r.Post("/{id}/close-review", h.EnterCloseReview)
+		r.Post("/{id}/hard-close", h.HardClosePeriod)
+		// /lock predates the state machine; it is hard close and, like it,
+		// requires CLOSE_REVIEW.
+		r.Post("/{id}/lock", h.HardClosePeriod)
+		r.Post("/{id}/reclose", h.ReclosePeriod)
+		r.Post("/{id}/reopen-requests", h.RequestReopen)
+		r.Post("/{id}/reopen", h.RetiredReopen)
+		r.Get("/{id}/history", h.GetCloseHistory)
+		r.Get("/{id}/available-actions", h.GetAvailableCloseActions)
 	})
 	r.Route("/v1/subledger-control/runs", func(r chi.Router) {
 		r.Post("/", h.RunSubledgerControl)
@@ -831,9 +855,8 @@ func (h *Handler) GetPeriodStatus(w http.ResponseWriter, r *http.Request) {
 		// that check the whole period lock could be stepped around by omitting
 		// a header — the caller would be told OPEN and the ledger would believe
 		// it.
-		writeJSON(w, http.StatusOK, map[string]string{
-			"period_name":  periodName,
-			"close_status": "OPEN",
+		writeJSON(w, http.StatusOK, domain.PeriodStatusView{
+			PeriodName: periodName, CloseStatus: "OPEN", PeriodState: domain.PeriodOpen, PostingPolicy: domain.PostingOpen,
 		})
 		return
 	}
@@ -842,16 +865,48 @@ func (h *Handler) GetPeriodStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"fiscal_period_id": fp.FiscalPeriodID,
-		"period_name":      fp.PeriodName,
-		"close_status":     fp.CloseStatus,
+	now := time.Now().UTC()
+	writeJSON(w, http.StatusOK, domain.PeriodStatusView{
+		FiscalPeriodID:  fp.FiscalPeriodID,
+		PeriodName:      fp.PeriodName,
+		CloseStatus:     fp.LegacyCloseStatus(now),
+		PeriodState:     fp.CloseStatus,
+		PostingPolicy:   fp.PostingPolicy(now),
+		ReopenExpiresAt: fp.ReopenExpiresAt,
 	})
 }
 
 // ── POST /v1/close/periods/{id}/lock ──────────────────────────────────────────────
 
-func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
+// closeMode is the one difference between a hard close and a reclose.
+type closeMode struct {
+	from, to string
+	// reperform: every control run and bank reconciliation the close relies
+	// on must postdate the reopen (negative path #4, "Reclose without
+	// reperformance") — the evidence of the original close does not count.
+	reperform bool
+}
+
+var (
+	hardCloseMode = closeMode{from: domain.PeriodCloseReview, to: domain.PeriodHardClosed}
+	recloseMode   = closeMode{from: domain.PeriodAuthorizedReopen, to: domain.PeriodReclosed, reperform: true}
+)
+
+// HardClosePeriod — POST /v1/close/periods/{id}/hard-close (and /lock):
+// CLOSE_REVIEW → HARD_CLOSED once every close gate passes, with signed
+// evidence. PERIOD_CLOSE_APPROVE.
+func (h *Handler) HardClosePeriod(w http.ResponseWriter, r *http.Request) {
+	h.closeWithEvidence(w, r, hardCloseMode)
+}
+
+// ReclosePeriod — POST /v1/close/periods/{id}/reclose: AUTHORIZED_REOPEN →
+// RECLOSED, with new evidence built only from controls and reconciliations
+// performed after the reopen. PERIOD_CLOSE_APPROVE.
+func (h *Handler) ReclosePeriod(w http.ResponseWriter, r *http.Request) {
+	h.closeWithEvidence(w, r, recloseMode)
+}
+
+func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode closeMode) {
 	id := chi.URLParam(r, "id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 	if correlationID == "" {
@@ -874,20 +929,30 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.authz.CheckAllowed(r.Context(), principalID, fp.LegalEntityID, actionCloseInitiate); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, fp.LegalEntityID, actionCloseApprove); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	if fp.CloseStatus != "OPEN" {
-		writeError(w, http.StatusUnprocessableEntity, "period_already_locked", string(domain.ErrPeriodAlreadyLocked))
+	if fp.CloseStatus != mode.from {
+		if fp.CloseStatus == mode.to {
+			writeError(w, http.StatusUnprocessableEntity, "period_already_locked", string(domain.ErrPeriodAlreadyLocked))
+			return
+		}
+		writeError(w, http.StatusConflict, "invalid_period_transition",
+			fmt.Sprintf("%s; the period is %s and this command needs %s", domain.ErrInvalidPeriodTransition, fp.CloseStatus, mode.from))
 		return
 	}
 
 	h.publisher.PublishCloseStarted(r.Context(), correlationID, principalID, *fp)
 
+	var notBefore *time.Time
+	if mode.reperform {
+		notBefore = fp.ReopenedAt
+	}
+
 	// Step 1: Run Readiness Checks (FAIL CLOSED on any dependency query error)
-	blockingIssues, reliance, err := h.checkReadiness(r.Context(), tenantID, principalID, fp)
+	blockingIssues, reliance, err := h.checkReadiness(r.Context(), tenantID, principalID, fp, notBefore)
 	if err != nil {
 		h.writeReadinessErr(w, err)
 		return
@@ -941,19 +1006,25 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 
-	// Update DB record lock state
-	if err := h.store.LockFiscalPeriod(r.Context(), id, now, docID); err != nil {
-		if errors.Is(err, domain.ErrPeriodAlreadyLocked) {
+	// Update DB record lock state. The transition re-checks the state under a
+	// row lock, so a concurrent transition between the check above and here
+	// is refused rather than overwritten.
+	lockedAt, evidenceDoc := now, docID
+	if current, err := h.store.ApplyPeriodTransition(r.Context(), id, []string{mode.from}, domain.PeriodUpdate{
+		To: mode.to, PrincipalID: principalID, At: now, LockedAt: &lockedAt, EvidenceDocID: &evidenceDoc,
+		ClearReopen: mode.reperform,
+	}); err != nil {
+		if errors.Is(err, domain.ErrInvalidPeriodTransition) && current != nil && current.CloseStatus != mode.to {
+			// Moved by someone else between the check above and now: refused,
+			// not reported as this command's success.
+			h.writeTransitionErr(w, err, current, mode.from)
+			return
+		}
+		if errors.Is(err, domain.ErrInvalidPeriodTransition) && current != nil {
 			// Replay of a prior request that already succeeded (e.g. a client
-			// timeout on a lock call that actually completed server-side) —
-			// return the current locked state rather than misreporting this
+			// timeout on a close call that actually completed server-side) —
+			// return the current closed state rather than misreporting this
 			// as a store outage.
-			current, getErr := h.store.GetFiscalPeriod(r.Context(), id)
-			if getErr != nil {
-				h.log.Error("failed to fetch already-locked period", zap.Error(getErr))
-				writeError(w, http.StatusServiceUnavailable, "store_unavailable", getErr.Error())
-				return
-			}
 			writeJSON(w, http.StatusOK, domain.PeriodLockResponse{
 				FiscalPeriodID:     current.FiscalPeriodID,
 				PeriodName:         current.PeriodName,
@@ -1009,107 +1080,30 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishClosed(r.Context(), correlationID, principalID, *fp, docID)
+	if mode.reperform {
+		h.publisher.PublishPeriodTransition(r.Context(), "period.reclosed", correlationID, principalID, *fp,
+			map[string]any{"evidence_document_id": docID})
+	} else {
+		h.publisher.PublishClosed(r.Context(), correlationID, principalID, *fp, docID)
+	}
 
 	writeJSON(w, http.StatusOK, domain.PeriodLockResponse{
 		FiscalPeriodID:     id,
 		PeriodName:         fp.PeriodName,
-		CloseStatus:        "LOCKED",
+		CloseStatus:        mode.to,
 		CloseLockedAt:      now,
 		EvidenceDocumentID: docID,
 		VerificationHash:   trialBalanceHash,
 	})
 }
 
-// ── POST /v1/close/periods/{id}/reopen ────────────────────────────────────────────
-//
-// ACC-14 invariant #6: "Hard-closed periods reject ordinary posting; reopen
-// is explicit, scoped, approved and evidenced." Before this handler existed,
-// LOCKED was a terminal state with no code path back — this is that path,
-// built to the same four requirements the invariant names literally:
-//   - explicit: its own POST endpoint, never a side effect of another call
-//   - scoped: only a LOCKED period reopens (ReopenFiscalPeriod's WHERE guard)
-//   - approved: its own authz action (actionPeriodReopen), distinct from and
-//     more sensitive than actionCloseInitiate
-//   - evidenced: a mandatory, non-empty reason recorded in a permanent,
-//     database-enforced append-only period_reopen_events row
-func (h *Handler) ReopenPeriod(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	correlationID := r.Header.Get("X-Correlation-ID")
-	if correlationID == "" {
-		correlationID = uuid.NewString()
-	}
-
-	var req domain.ReopenPeriodRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	if req.Reason == "" {
-		writeError(w, http.StatusBadRequest, "reason_required", string(domain.ErrReopenReasonRequired))
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	if _, ok := h.requireTenant(w, r); !ok {
-		return
-	}
-
-	fp, err := h.store.GetFiscalPeriod(r.Context(), id)
-	if err != nil {
-		h.writeStoreErr(w, err, "period_not_found")
-		return
-	}
-
-	if err := h.authz.CheckAllowed(r.Context(), principalID, fp.LegalEntityID, actionPeriodReopen); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-
-	if fp.CloseStatus != "LOCKED" {
-		writeError(w, http.StatusUnprocessableEntity, "period_not_locked", string(domain.ErrPeriodNotLocked))
-		return
-	}
-
-	now := time.Now().UTC()
-	if err := h.store.ReopenFiscalPeriod(r.Context(), id, now); err != nil {
-		if errors.Is(err, domain.ErrPeriodNotLocked) {
-			writeError(w, http.StatusUnprocessableEntity, "period_not_locked", string(domain.ErrPeriodNotLocked))
-			return
-		}
-		h.log.Error("failed to reopen fiscal period", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-
-	// The state transition already happened — the period IS open again.
-	// Reporting success without the evidence row would mean the one thing
-	// the invariant requires ("evidenced") silently didn't happen, the same
-	// mistake CreateCloseEvidence's own doc comment above already refuses
-	// to make for the close path. Surfaced plainly, not swallowed.
-	event := &domain.PeriodReopenEvent{
-		ReopenEventID:         uuid.NewString(),
-		FiscalPeriodID:        id,
-		Reason:                req.Reason,
-		ReopenedByPrincipalID: principalID,
-		ReopenedAt:            now,
-	}
-	if err := h.store.CreateReopenEvent(r.Context(), event); err != nil {
-		h.log.Error("period reopened but the reopen event could not be recorded",
-			zap.String("period_id", id), zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "reopen_event_not_recorded",
-			string(domain.ErrReopenEventNotRecorded)+" — the period IS open again, but no evidence of why was persisted.")
-		return
-	}
-
-	h.publisher.PublishReopened(r.Context(), correlationID, principalID, *fp, req.Reason)
-
-	fp.CloseStatus = "OPEN"
-	fp.CloseLockedAt = nil
-	fp.EvidenceDocumentID = nil
-	writeJSON(w, http.StatusOK, fp)
+// RetiredReopen — POST /v1/close/periods/{id}/reopen. This used to reopen a
+// locked period in one step, for one person, permanently: the spec's
+// negative path #3, "Reopen without approval". A closed period now reopens
+// by request and independent approval, for a bounded time. 410 so a caller
+// learns where to go rather than retrying.
+func (h *Handler) RetiredReopen(w http.ResponseWriter, r *http.Request) {
+	writeError(w, http.StatusGone, "reopen_requires_approval", string(domain.ErrReopenRetired))
 }
 
 // ── POST /v1/subledger-control/runs ───────────────────────────────────────────────
@@ -1722,7 +1716,9 @@ func (h *Handler) RunAccrualRecognition(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	if fp != nil && fp.CloseStatus == "LOCKED" {
+	// Accrual recognition is a designated close journal: allowed through soft
+	// close and close review, refused once hard closed.
+	if fp != nil && !fp.CloseJournalsAllowed(time.Now().UTC()) {
 		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrRecognitionPeriodLocked))
 		return
 	}
@@ -2190,7 +2186,7 @@ func (h *Handler) RunPrepaymentRecognition(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	if fp != nil && fp.CloseStatus == "LOCKED" {
+	if fp != nil && !fp.CloseJournalsAllowed(time.Now().UTC()) {
 		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrPrepaymentPeriodLocked))
 		return
 	}
@@ -2401,7 +2397,7 @@ func (h *Handler) TerminatePrepayment(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 				return
 			}
-			if fp != nil && fp.CloseStatus == "LOCKED" {
+			if fp != nil && !fp.CloseJournalsAllowed(time.Now().UTC()) {
 				writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrPrepaymentPeriodLocked))
 				return
 			}
@@ -3667,7 +3663,9 @@ func (h *Handler) CommitOpeningPosting(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	if fp != nil && fp.CloseStatus == "LOCKED" {
+	// Opening balances are ordinary postings, not close journals: only into an
+	// open period or a reopen window.
+	if fp != nil && !fp.OrdinaryPostingAllowed(time.Now().UTC()) {
 		writeError(w, http.StatusUnprocessableEntity, "period_locked", string(domain.ErrMigrationPeriodLocked))
 		return
 	}
@@ -4471,7 +4469,7 @@ func (h *Handler) GetPeriodReadiness(w http.ResponseWriter, r *http.Request) {
 
 	// A period that is already locked is not "ready to close" — it is closed.
 	// Answering is_ready:true would invite a lock that then fails 422.
-	if fp.CloseStatus != "OPEN" {
+	if fp.CloseStatus == domain.PeriodHardClosed || fp.CloseStatus == domain.PeriodReclosed {
 		writeJSON(w, http.StatusOK, domain.ReadinessCheckResponse{
 			IsReady:        false,
 			BlockingIssues: []string{"period_already_locked: this period is " + fp.CloseStatus + " and cannot be closed again"},
@@ -4479,7 +4477,11 @@ func (h *Handler) GetPeriodReadiness(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blockingIssues, _, err := h.checkReadiness(r.Context(), tenantID, principalID, fp)
+	var notBefore *time.Time
+	if fp.CloseStatus == domain.PeriodAuthorizedReopen {
+		notBefore = fp.ReopenedAt
+	}
+	blockingIssues, _, err := h.checkReadiness(r.Context(), tenantID, principalID, fp, notBefore)
 	if err != nil {
 		h.writeReadinessErr(w, err)
 		return
@@ -4524,7 +4526,7 @@ func (h *Handler) GetPeriodReadiness(w http.ResponseWriter, r *http.Request) {
 // empty issue list. "We could not check" and "there is nothing to report" are
 // opposite answers, and conflating them would close a period on the strength of
 // a service being down.
-func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID string, fp *domain.FiscalPeriod) ([]string, *domain.CloseReliance, error) {
+func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID string, fp *domain.FiscalPeriod, notBefore *time.Time) ([]string, *domain.CloseReliance, error) {
 	var issues []string
 	reliance := &domain.CloseReliance{
 		SubledgerControlGate:         gateMode(!h.subledgerGateOff),
@@ -4536,6 +4538,7 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 		SubledgerControls:            []domain.RelianceControlRun{},
 		BankReconciliations:          []domain.RelianceBankRecon{},
 		ExcludedBankAccounts:         []domain.RelianceBankExclusion{},
+		ReperformedAfter:             notBefore,
 	}
 
 	unposted, err := h.clients.GetUnpostedJournalsCount(ctx, tenantID, fp.LegalEntityID, fp.PeriodName)
@@ -4580,7 +4583,7 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 			h.log.Error("failed to read bank reconciliation status", zap.Error(err))
 			return nil, nil, fmt.Errorf("bank-reconciliation-svc: %w", err)
 		}
-		bankIssues, proofs, waived := bankReconciliationIssues(accounts, recon, checklist, fp, h.bankReconCutoffDays)
+		bankIssues, proofs, waived := bankReconciliationIssues(accounts, recon, checklist, fp, h.bankReconCutoffDays, notBefore)
 		issues = append(issues, bankIssues...)
 		reliance.BankReconciliations = append(reliance.BankReconciliations, proofs...)
 		reliance.ExcludedBankAccounts = append(reliance.ExcludedBankAccounts, waived...)
@@ -4592,7 +4595,7 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 			h.log.Error("failed to read subledger control runs", zap.Error(err))
 			return nil, nil, fmt.Errorf("subledger control runs: %w", err)
 		}
-		controlIssues, matched := requiredControlIssues(requiredControls(checklist), runs, fp.PeriodName)
+		controlIssues, matched := requiredControlIssues(requiredControls(checklist), runs, fp.PeriodName, notBefore)
 		issues = append(issues, controlIssues...)
 		reliance.SubledgerControls = append(reliance.SubledgerControls, matched...)
 	}
@@ -4681,7 +4684,7 @@ func postingBacklogIssue(b domain.PostingBacklog) string {
 // November. Why the cut-off: without it, a close could pass on a reconciliation
 // a week old while the last statement of the month has not arrived.
 func bankReconciliationIssues(accounts []domain.BankAccountRef, recon []domain.BankAccountReconStatus,
-	checklist []domain.CloseRequirement, fp *domain.FiscalPeriod, cutoffDays int) ([]string, []domain.RelianceBankRecon, []domain.RelianceBankExclusion) {
+	checklist []domain.CloseRequirement, fp *domain.FiscalPeriod, cutoffDays int, notBefore *time.Time) ([]string, []domain.RelianceBankRecon, []domain.RelianceBankExclusion) {
 	excluded := map[string]domain.CloseRequirement{}
 	for _, cr := range checklist {
 		if cr.Kind == domain.CloseRequirementBankAccountExclusion {
@@ -4733,6 +4736,12 @@ func bankReconciliationIssues(accounts []domain.BankAccountRef, recon []domain.B
 			issues = append(issues, fmt.Sprintf(
 				"bank_reconciliation_stale: latest certified reconciliation for %s is for the %s statement; one dated on or after %s (within %d days of period end) is required%s",
 				name, st.LatestCertified.StatementDate, earliest.Format("2006-01-02"), cutoffDays, attempt))
+			continue
+		}
+		if notBefore != nil && (st.LatestCertified.CertifiedAt == nil || !st.LatestCertified.CertifiedAt.After(*notBefore)) {
+			issues = append(issues, fmt.Sprintf(
+				"bank_reconciliation_not_reperformed: the certified reconciliation for %s (%s statement) predates the reopen at %s; re-certify it before reclosing",
+				name, st.LatestCertified.StatementDate, notBefore.UTC().Format(time.RFC3339)))
 			continue
 		}
 		proofs = append(proofs, domain.RelianceBankRecon{
@@ -4849,7 +4858,7 @@ func requiredControls(checklist []domain.CloseRequirement) []controlKey {
 // they are now, and an EXCEPTION that was since fixed and re-run is
 // superseded rather than blocking forever. An ASSETS run counts only for the
 // book it reconciled.
-func requiredControlIssues(required []controlKey, runs []domain.SubledgerControlRun, period string) ([]string, []domain.RelianceControlRun) {
+func requiredControlIssues(required []controlKey, runs []domain.SubledgerControlRun, period string, notBefore *time.Time) ([]string, []domain.RelianceControlRun) {
 	latest := map[controlKey]domain.SubledgerControlRun{}
 	for _, run := range runs {
 		key := controlKey{Subledger: run.Subledger, BookID: run.BookID}
@@ -4871,6 +4880,10 @@ func requiredControlIssues(required []controlKey, runs []domain.SubledgerControl
 			issues = append(issues, fmt.Sprintf(
 				"subledger_control_not_run: no %s subledger-to-GL control run for %s; run one (POST /v1/subledger-control/runs) before closing",
 				key.label(), period))
+		case notBefore != nil && !run.RunAt.After(*notBefore):
+			issues = append(issues, fmt.Sprintf(
+				"subledger_control_not_reperformed: the latest %s control run (%s) predates the reopen at %s; re-run it before reclosing",
+				key.label(), run.ControlRunID, notBefore.UTC().Format(time.RFC3339)))
 		case run.Status == "MATCHED":
 			matched = append(matched, domain.RelianceControlRun{
 				Subledger: key.Subledger, BookID: key.BookID, ControlRunID: run.ControlRunID, RunAt: run.RunAt})
