@@ -14,6 +14,7 @@ import (
 	"zoiko.io/payable-open-item-svc/internal/domain"
 	"zoiko.io/payable-open-item-svc/internal/events"
 	svcmiddleware "zoiko.io/payable-open-item-svc/internal/middleware"
+	"zoiko.io/payable-open-item-svc/internal/paymentstatus"
 	"zoiko.io/payable-open-item-svc/internal/store"
 )
 
@@ -43,11 +44,12 @@ type Handler struct {
 	store store.Store
 	pub   events.Publisher
 	authz AuthzChecker
+	bank  paymentstatus.Client
 	log   *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, log: log}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, bank paymentstatus.Client, log *zap.Logger) *Handler {
+	return &Handler{store: st, pub: pub, authz: az, bank: bank, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -488,8 +490,8 @@ func (h *Handler) ApplyConfirmedPayment(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Amount <= 0 || req.ProviderPaymentRef == "" {
-		writeError(w, http.StatusBadRequest, "a positive amount and provider_payment_ref are required")
+	if req.Amount <= 0 || req.WithholdingAmount < 0 || req.ProviderPaymentRef == "" || req.Bnk07PaymentID == "" {
+		writeError(w, http.StatusBadRequest, "a positive amount, a non-negative withholding_amount, provider_payment_ref and bnk07_payment_id are required")
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -501,6 +503,19 @@ func (h *Handler) ApplyConfirmedPayment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if !h.authorize(w, r, principalID, p.LegalEntityID, PayableSettlementApply) {
+		return
+	}
+
+	// Invariant #19: a payable is settled only from Banking's own
+	// confirmation, never from an initiation response or the caller's word.
+	state, err := h.bank.GetStatus(r.Context(), svcmiddleware.TenantFromContext(r.Context()), req.Bnk07PaymentID)
+	if err != nil {
+		h.log.Error("ApplyConfirmedPayment: payment-status-svc lookup failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, domain.ErrBankingStatusUnavailable.Error())
+		return
+	}
+	if state.Status != "SETTLED" || state.HasOpenConflict || state.LegalEntityID != p.LegalEntityID {
+		writeError(w, http.StatusConflict, domain.ErrPaymentNotSettledAtBank.Error())
 		return
 	}
 

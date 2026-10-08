@@ -42,10 +42,10 @@
 //     GetPaymentEligibility) is the natural next wiring step, mirroring
 //     exactly how AP-11 was wired to BNK-06/BNK-07 in a later turn after
 //     those services were first built.
-//   - ApplyConfirmedPayment has no real caller yet (would come from AP-11/
-//     BNK-07's settlement chain) — it is a caller-attested command for now,
-//     the same "record a real external fact a human observed" doctrine
-//     used throughout this session.
+//   - ApplyConfirmedPayment is called by payment-run-svc (AP-11) once
+//     BNK-07 reports a payment SETTLED, and independently re-checks that
+//     status with payment-status-svc before applying anything. It applies
+//     the net payment and any withheld amount together.
 //   - ApplyRecovery names AP-12 (Supplier Refund/Recovery) as its source —
 //     AP-12 does not exist anywhere in this codebase, so its
 //     RecoveryReference is treated as an opaque caller-supplied reference,
@@ -197,9 +197,17 @@ type ResolveDisputeRequest struct {
 	Resolution string
 }
 
+// ApplyConfirmedPaymentRequest settles a payable from a Banking-confirmed
+// payment (invariant #19: never from an initiation response or a caller's
+// word). Bnk07PaymentID is verified SETTLED with payment-status-svc before
+// anything is applied. Amount is the net paid to the payee;
+// WithholdingAmount is the portion withheld for the tax authority, which
+// also reduces the liability.
 type ApplyConfirmedPaymentRequest struct {
 	Amount             float64
+	WithholdingAmount  float64
 	ProviderPaymentRef string // idempotency reference — e.g. BNK-07's payment_id
+	Bnk07PaymentID     string
 }
 
 type ApplyRecoveryRequest struct {
@@ -222,5 +230,7 @@ const (
 	ErrSettlementAlreadyApplied = sentinel("this settlement reference has already been applied")
 	ErrPayableHeldOrDisputed    = sentinel("payable is held or disputed and cannot be closed")
 	ErrPayableNotFullySettled   = sentinel("payable must be fully settled before it can be closed")
+	ErrPaymentNotSettledAtBank  = sentinel("payment-status-svc does not report this payment SETTLED for this legal entity (or has an open conflict); nothing applied")
+	ErrBankingStatusUnavailable = sentinel("payment-status-svc unavailable")
 	ErrStoreUnavailable         = sentinel("store unavailable")
 )

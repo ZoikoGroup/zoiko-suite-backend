@@ -14,6 +14,8 @@ type Config struct {
 	PaymentAuthorizationServiceURL string
 	PaymentInitiationAdapterURL    string
 	PaymentStatusServiceURL        string
+	PaymentProposalServiceURL      string
+	PayableOpenItemServiceURL      string
 }
 
 func Load() (*Config, error) {
@@ -34,6 +36,8 @@ func Load() (*Config, error) {
 		PaymentAuthorizationServiceURL: getEnvOrDefault("PAYMENT_AUTHORIZATION_SERVICE_URL", "http://payment-authorization-svc:8160"),
 		PaymentInitiationAdapterURL:    getEnvOrDefault("PAYMENT_INITIATION_ADAPTER_URL", "http://payment-initiation-adapter-svc:8162"),
 		PaymentStatusServiceURL:        getEnvOrDefault("PAYMENT_STATUS_SERVICE_URL", "http://payment-status-svc:8163"),
+		PaymentProposalServiceURL:      getEnvOrDefault("PAYMENT_PROPOSAL_SERVICE_URL", "http://payment-proposal-svc:8159"),
+		PayableOpenItemServiceURL:      getEnvOrDefault("PAYABLE_OPEN_ITEM_SERVICE_URL", "http://payable-open-item-svc:8164"),
 	}, nil
 }
 

@@ -21,7 +21,9 @@ import (
 	"zoiko.io/payment-run-svc/internal/handler"
 	"zoiko.io/payment-run-svc/internal/health"
 	"zoiko.io/payment-run-svc/internal/middleware"
+	"zoiko.io/payment-run-svc/internal/payableopenitem"
 	"zoiko.io/payment-run-svc/internal/paymentauthorization"
+	"zoiko.io/payment-run-svc/internal/paymentproposal"
 	"zoiko.io/payment-run-svc/internal/paymentstatus"
 	"zoiko.io/payment-run-svc/internal/provideradapter"
 	"zoiko.io/payment-run-svc/internal/store"
@@ -63,11 +65,13 @@ func main() {
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
-	authClient := paymentauthorization.NewHTTPClient(cfg.PaymentAuthorizationServiceURL, logger)
-	providerClient := provideradapter.NewHTTPClient(cfg.PaymentInitiationAdapterURL, logger)
-	statusClient := paymentstatus.NewHTTPClient(cfg.PaymentStatusServiceURL, logger)
-
-	h := handler.New(pgStore, publisher, authzClient, authClient, providerClient, statusClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, handler.Clients{
+		Authorization: paymentauthorization.NewHTTPClient(cfg.PaymentAuthorizationServiceURL, logger),
+		Proposal:      paymentproposal.NewHTTPClient(cfg.PaymentProposalServiceURL, logger),
+		Payables:      payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, logger),
+		Provider:      provideradapter.NewHTTPClient(cfg.PaymentInitiationAdapterURL, logger),
+		Status:        paymentstatus.NewHTTPClient(cfg.PaymentStatusServiceURL, logger),
+	}, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

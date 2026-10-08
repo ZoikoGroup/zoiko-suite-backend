@@ -4408,6 +4408,9 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.payable-open-item.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # BNK-07: a payment is applied to a payable only once Banking reports
+      # it SETTLED. Not a depends_on (AP-08 fails closed per call instead).
+      PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4720,6 +4723,8 @@ services:
       PAYMENT_AUTHORIZATION_SERVICE_URL: "http://payment-authorization-svc:8160"
       PAYMENT_INITIATION_ADAPTER_URL: "http://payment-initiation-adapter-svc:8162"
       PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
+      PAYMENT_PROPOSAL_SERVICE_URL: "http://payment-proposal-svc:8159"
+      PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4732,6 +4737,10 @@ services:
       payment-initiation-adapter-svc:
         condition: service_healthy
       payment-status-svc:
+        condition: service_healthy
+      payment-proposal-svc:
+        condition: service_healthy
+      payable-open-item-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

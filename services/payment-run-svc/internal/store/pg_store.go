@@ -47,10 +47,19 @@ type Store interface {
 
 	ValidateRun(ctx context.Context, runID, principalID string) (*domain.PaymentRun, error)
 	MarkInstructionConsumed(ctx context.Context, instructionID string) error
-	SetInstructionProviderRefs(ctx context.Context, instructionID, providerAttemptID, bnk07PaymentID string) error
+	SetInstructionAttemptID(ctx context.Context, instructionID, providerAttemptID string) error
+	SetInstructionBnk07PaymentID(ctx context.Context, instructionID, bnk07PaymentID string) error
 	LockRun(ctx context.Context, runID, principalID string) (*domain.PaymentRun, error)
 	MarkRunException(ctx context.Context, runID, reason, principalID string) (*domain.PaymentRun, error)
+	// BindSubmitKey records the run's submit idempotency key the first time
+	// SubmitPaymentRun is called on a LOCKED run, before anything is sent to
+	// Banking. A later call with a different key gets
+	// ErrIdempotencyKeyMismatch.
+	BindSubmitKey(ctx context.Context, runID, idempotencyKey string) (*domain.PaymentRun, error)
 	SubmitRun(ctx context.Context, runID, idempotencyKey, principalID string) (*domain.PaymentRun, error)
+
+	ListUnappliedPayables(ctx context.Context, instructionID string) ([]domain.InstructionPayable, error)
+	MarkPayableApplied(ctx context.Context, instructionID, payableSource, sourceReference string) error
 	CancelRun(ctx context.Context, runID string, req domain.CancelRunRequest, principalID string) (*domain.PaymentRun, error)
 	CloseRun(ctx context.Context, runID string, req domain.CloseRunRequest, principalID string) (*domain.PaymentRun, error)
 
@@ -115,21 +124,35 @@ func scanRun(row pgx.Row) (*domain.PaymentRun, error) {
 }
 
 const instructionColumns = `
-	instruction_id, tenant_id, run_id, authorization_id, authorization_fingerprint, payee_ref, net_amount, currency, status, consumed_at,
+	instruction_id, tenant_id, run_id, authorization_id, authorization_fingerprint, payee_ref, net_amount, currency, status, status_reason, consumed_at,
 	provider_attempt_id, bnk07_payment_id, created_at`
 
 func scanInstruction(row pgx.Row) (*domain.RunInstruction, error) {
 	i := &domain.RunInstruction{}
 	err := row.Scan(&i.InstructionID, &i.TenantID, &i.RunID, &i.AuthorizationID, &i.AuthorizationFingerprint, &i.PayeeRef, &i.NetAmount,
-		&i.Currency, &i.Status, &i.ConsumedAt, &i.ProviderAttemptID, &i.Bnk07PaymentID, &i.CreatedAt)
+		&i.Currency, &i.Status, &i.StatusReason, &i.ConsumedAt, &i.ProviderAttemptID, &i.Bnk07PaymentID, &i.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return i, nil
 }
 
-// CreateRun relies on the migration's unique index to reject an
-// authorization already consumed into another run instruction.
+const instructionPayableColumns = `
+	instruction_id, payable_source, source_reference, gross_amount, withholding_amount, net_amount, payable_applied_at`
+
+func scanInstructionPayable(row pgx.Row) (*domain.InstructionPayable, error) {
+	p := &domain.InstructionPayable{}
+	err := row.Scan(&p.InstructionID, &p.PayableSource, &p.SourceReference, &p.GrossAmount, &p.WithholdingAmount, &p.NetAmount, &p.PayableAppliedAt)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// CreateRun relies on the migration's unique index on
+// (authorization_id, payee_ref) to reject an authorization already used by
+// another run. Each instruction's payables are inserted in the same
+// transaction.
 func (s *PgStore) CreateRun(ctx context.Context, tenantID string, req domain.CreateRunRequest, instructions []domain.RunInstruction, principalID string) (*domain.PaymentRun, []domain.RunInstruction, error) {
 	runID := uuid.New().String()
 	var run *domain.PaymentRun
@@ -150,12 +173,24 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID string, req domain.Cre
 			id := uuid.New().String()
 			created, err := scanInstruction(tx.QueryRow(ctx, `
 				INSERT INTO run_instructions (`+instructionColumns+`)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', NULL, '', '', NOW())
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', '', NULL, '', '', NOW())
 				RETURNING `+instructionColumns,
 				id, run.TenantID, runID, ins.AuthorizationID, ins.AuthorizationFingerprint, ins.PayeeRef, ins.NetAmount, ins.Currency,
 			))
 			if err != nil {
 				return err
+			}
+			for _, p := range ins.Payables {
+				cp, err := scanInstructionPayable(tx.QueryRow(ctx, `
+					INSERT INTO run_instruction_payables (instruction_id, tenant_id, payable_source, source_reference, gross_amount, withholding_amount, net_amount)
+					VALUES ($1, $2, $3, $4, $5, $6, $7)
+					RETURNING `+instructionPayableColumns,
+					id, run.TenantID, p.PayableSource, p.SourceReference, p.GrossAmount, p.WithholdingAmount, p.NetAmount,
+				))
+				if err != nil {
+					return err
+				}
+				created.Payables = append(created.Payables, *cp)
 			}
 			out = append(out, *created)
 		}
@@ -202,15 +237,41 @@ func (s *PgStore) ListInstructions(ctx context.Context, runID string) ([]domain.
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 		for rows.Next() {
 			i, err := scanInstruction(rows)
 			if err != nil {
+				rows.Close()
 				return err
 			}
 			out = append(out, *i)
 		}
-		return rows.Err()
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		byID := make(map[string]int, len(out))
+		for idx := range out {
+			byID[out[idx].InstructionID] = idx
+		}
+		prows, err := tx.Query(ctx, `
+			SELECT `+instructionPayableColumns+` FROM run_instruction_payables
+			WHERE instruction_id IN (SELECT instruction_id FROM run_instructions WHERE run_id = $1)
+			ORDER BY instruction_id, payable_source, source_reference`, runID)
+		if err != nil {
+			return err
+		}
+		defer prows.Close()
+		for prows.Next() {
+			p, err := scanInstructionPayable(prows)
+			if err != nil {
+				return err
+			}
+			if idx, ok := byID[p.InstructionID]; ok {
+				out[idx].Payables = append(out[idx].Payables, *p)
+			}
+		}
+		return prows.Err()
 	})
 	if isInvalidUUID(err) {
 		return nil, nil
@@ -287,34 +348,43 @@ func (s *PgStore) MarkInstructionConsumed(ctx context.Context, instructionID str
 	return nil
 }
 
-// SetInstructionProviderRefs records the real correlation to BNK-06's
-// attempt and BNK-07's execution record, once, right after SubmitPaymentRun
-// actually hands an instruction to Banking. The WHERE clause only matches a
-// row that has never had this set before — 000004's trigger enforces the
-// same invariant at the database level as defense in depth.
-func (s *PgStore) SetInstructionProviderRefs(ctx context.Context, instructionID, providerAttemptID, bnk07PaymentID string) error {
+// setInstructionRefOnce sets a write-once Banking reference column. Setting
+// it again to the same value is a no-op (a resumed submit); a different
+// value is refused — 000004's trigger enforces the same at the database.
+func (s *PgStore) setInstructionRefOnce(ctx context.Context, column, instructionID, value string) error {
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE run_instructions SET provider_attempt_id = $1, bnk07_payment_id = $2
-			WHERE instruction_id = $3 AND provider_attempt_id = ''`,
-			providerAttemptID, bnk07PaymentID, instructionID,
-		)
-		if err != nil {
+		var current string
+		if err := tx.QueryRow(ctx, `SELECT `+column+` FROM run_instructions WHERE instruction_id = $1 FOR UPDATE`, instructionID).Scan(&current); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrInstructionNotFound
+			}
 			return err
 		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrInstructionNotFound
+		if current == value {
+			return nil
 		}
-		return nil
+		if current != "" {
+			return fmt.Errorf("%s already set to a different value for instruction %s", column, instructionID)
+		}
+		_, err := tx.Exec(ctx, `UPDATE run_instructions SET `+column+` = $1 WHERE instruction_id = $2`, value, instructionID)
+		return err
 	})
 	if errors.Is(err, domain.ErrInstructionNotFound) || isInvalidUUID(err) {
 		return domain.ErrInstructionNotFound
 	}
 	if err != nil {
-		s.log.Error("pg SetInstructionProviderRefs failed", zap.Error(err))
+		s.log.Error("pg setInstructionRefOnce failed", zap.String("column", column), zap.Error(err))
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return nil
+}
+
+func (s *PgStore) SetInstructionAttemptID(ctx context.Context, instructionID, providerAttemptID string) error {
+	return s.setInstructionRefOnce(ctx, "provider_attempt_id", instructionID, providerAttemptID)
+}
+
+func (s *PgStore) SetInstructionBnk07PaymentID(ctx context.Context, instructionID, bnk07PaymentID string) error {
+	return s.setInstructionRefOnce(ctx, "bnk07_payment_id", instructionID, bnk07PaymentID)
 }
 
 func (s *PgStore) LockRun(ctx context.Context, runID, principalID string) (*domain.PaymentRun, error) {
@@ -366,6 +436,44 @@ func (s *PgStore) MarkRunException(ctx context.Context, runID, reason, principal
 	}
 	if err != nil {
 		s.log.Error("pg MarkRunException failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return r, nil
+}
+
+func (s *PgStore) BindSubmitKey(ctx context.Context, runID, idempotencyKey string) (*domain.PaymentRun, error) {
+	var r *domain.PaymentRun
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var err error
+		r, err = scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM payment_runs WHERE run_id = $1 FOR UPDATE`, runID))
+		if err != nil {
+			return err
+		}
+		if r.IdempotencyKey != "" {
+			if r.IdempotencyKey != idempotencyKey {
+				return domain.ErrIdempotencyKeyMismatch
+			}
+			return nil
+		}
+		if r.Status != domain.StatusLocked {
+			return domain.ErrInvalidTransition
+		}
+		r, err = scanRun(tx.QueryRow(ctx, `
+			UPDATE payment_runs SET idempotency_key = $2, updated_at = NOW()
+			WHERE run_id = $1
+			RETURNING `+runColumns,
+			runID, idempotencyKey,
+		))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
+		return nil, domain.ErrRunNotFound
+	}
+	if errors.Is(err, domain.ErrIdempotencyKeyMismatch) || errors.Is(err, domain.ErrInvalidTransition) {
+		return nil, err
+	}
+	if err != nil {
+		s.log.Error("pg BindSubmitKey failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return r, nil
@@ -471,24 +579,28 @@ func (s *PgStore) ReconcileInstruction(ctx context.Context, req domain.Reconcile
 			return err
 		}
 
-		_, err := tx.Exec(ctx, `
-			INSERT INTO instruction_reconciliation_events (event_id, tenant_id, instruction_id, provider_event_ref, external_status, recorded_by_principal_id)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			uuid.New().String(), tenantID, req.InstructionID, req.ProviderEventRef, req.ExternalStatus, principalID,
+		// ON CONFLICT DO NOTHING rather than catching the unique violation:
+		// a failed INSERT would abort the transaction and the read-back
+		// below would fail with 25P02.
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO instruction_reconciliation_events (event_id, tenant_id, instruction_id, provider_event_ref, external_status, reason, recorded_by_principal_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (instruction_id, provider_event_ref) DO NOTHING`,
+			uuid.New().String(), tenantID, req.InstructionID, req.ProviderEventRef, req.ExternalStatus, req.Reason, principalID,
 		)
-		if isUniqueViolation(err) {
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
 			applied = false
 			i, err = scanInstruction(tx.QueryRow(ctx, `SELECT `+instructionColumns+` FROM run_instructions WHERE instruction_id = $1`, req.InstructionID))
 			return err
 		}
-		if err != nil {
-			return err
-		}
 
 		i, err = scanInstruction(tx.QueryRow(ctx, `
-			UPDATE run_instructions SET status = $2 WHERE instruction_id = $1
+			UPDATE run_instructions SET status = $2, status_reason = $3 WHERE instruction_id = $1
 			RETURNING `+instructionColumns,
-			req.InstructionID, req.ExternalStatus,
+			req.InstructionID, req.ExternalStatus, req.Reason,
 		))
 		return err
 	})
@@ -508,7 +620,7 @@ func (s *PgStore) UpdateRunAggregateStatus(ctx context.Context, runID string, ne
 		var err error
 		r, err = scanRun(tx.QueryRow(ctx, `
 			UPDATE payment_runs SET status = $2, updated_at = NOW()
-			WHERE run_id = $1 AND status IN ('SUBMITTED', 'ACCEPTED', 'REJECTED', 'PARTIALLY_ACCEPTED')
+			WHERE run_id = $1 AND status IN ('SUBMITTED', 'PENDING_UNKNOWN', 'ACCEPTED', 'REJECTED', 'PARTIALLY_ACCEPTED', 'EXCEPTION')
 			RETURNING `+runColumns,
 			runID, string(newStatus),
 		))
@@ -549,6 +661,54 @@ func (s *PgStore) RetryInstruction(ctx context.Context, instructionID, principal
 	}
 	if err != nil {
 		s.log.Error("pg RetryInstruction failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+// ── AP-08 settlement application ─────────────────────────────────────────────
+
+func (s *PgStore) ListUnappliedPayables(ctx context.Context, instructionID string) ([]domain.InstructionPayable, error) {
+	var out []domain.InstructionPayable
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+instructionPayableColumns+` FROM run_instruction_payables
+			WHERE instruction_id = $1 AND payable_applied_at IS NULL
+			ORDER BY payable_source, source_reference`, instructionID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			p, err := scanInstructionPayable(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *p)
+		}
+		return rows.Err()
+	})
+	if isInvalidUUID(err) {
+		return nil, nil
+	}
+	if err != nil {
+		s.log.Error("pg ListUnappliedPayables failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
+func (s *PgStore) MarkPayableApplied(ctx context.Context, instructionID, payableSource, sourceReference string) error {
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE run_instruction_payables SET payable_applied_at = NOW()
+			WHERE instruction_id = $1 AND payable_source = $2 AND source_reference = $3 AND payable_applied_at IS NULL`,
+			instructionID, payableSource, sourceReference,
+		)
+		return err
+	})
+	if err != nil {
+		s.log.Error("pg MarkPayableApplied failed", zap.Error(err))
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return nil

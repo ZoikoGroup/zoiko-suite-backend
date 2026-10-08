@@ -32,6 +32,7 @@ type Authorization struct {
 	AuthorizationID string  `json:"AuthorizationID"`
 	TenantID        *string `json:"TenantID"`
 	LegalEntityID   string  `json:"LegalEntityID"`
+	ProposalID      string  `json:"ProposalID"`
 	NetAmount       float64 `json:"NetAmount"`
 	Currency        string  `json:"Currency"`
 	Status          string  `json:"Status"`
@@ -42,19 +43,10 @@ type Authorization struct {
 	// rather than BNK-06 trusting a caller-supplied value with nothing
 	// behind it.
 	ProposalFingerprint string `json:"ProposalFingerprint"`
-	// PayeeRef is populated from the first entry of AP-10's own
-	// payee_snapshots, when present — informational/audit only, empty for
-	// an authorization with no AP_INVOICE-sourced items.
-	PayeeRef string `json:"-"`
-}
-
-type payeeSnapshot struct {
-	PayeeRef string `json:"PayeeRef"`
 }
 
 type getAuthResponse struct {
-	Authorization  Authorization   `json:"authorization"`
-	PayeeSnapshots []payeeSnapshot `json:"payee_snapshots"`
+	Authorization Authorization `json:"authorization"`
 }
 
 type validateResponse struct {
@@ -100,9 +92,6 @@ func (c *HTTPClient) GetApprovedAuthorization(ctx context.Context, tenantID, leg
 	a := out.Authorization
 	if a.AuthorizationID == "" || a.LegalEntityID != legalEntityID || (a.TenantID != nil && *a.TenantID != tenantID) || a.Status != "APPROVED" {
 		return nil, domain.ErrAuthorizationNotEligible
-	}
-	if len(out.PayeeSnapshots) > 0 {
-		a.PayeeRef = out.PayeeSnapshots[0].PayeeRef
 	}
 	return &a, nil
 }

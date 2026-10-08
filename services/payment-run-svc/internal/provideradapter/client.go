@@ -1,9 +1,17 @@
 // Package provideradapter is a real HTTP client to
-// payment-initiation-adapter-svc (BNK-06) — the first real caller of
-// BNK-06's PrepareAttempt/SubmitAttempt anywhere in this codebase. Fails
-// closed throughout: any transport error, non-2xx response, or unreadable
-// body is reported to the caller as ErrProviderAdapterUnavailable, never
-// silently treated as success.
+// payment-initiation-adapter-svc (BNK-06).
+//
+// Errors are classified because AP-11 must tell "nothing was sent" apart
+// from "we don't know whether it was sent" (invariant #18):
+//
+//   - ErrBankingPrepareRejected: BNK-06 refused PrepareAttempt with a 4xx.
+//     Nothing reached the bank.
+//   - ErrBankingAttemptConflict: BNK-06 answered 409 to submit/retry — the
+//     attempt moved on (usually an earlier call reached it). Re-read it.
+//   - ErrProviderAdapterUnavailable: transport error, timeout, 5xx or an
+//     unreadable body. For Prepare that is safe to retry (Prepare is
+//     idempotent on IdempotencyKey and sends nothing to the bank); for
+//     Submit/Retry the outcome is UNKNOWN.
 package provideradapter
 
 import (
@@ -18,16 +26,31 @@ import (
 	"zoiko.io/payment-run-svc/internal/domain"
 )
 
+// BNK-06 attempt statuses AP-11 acts on.
+const (
+	AttemptPrepared                 = "PREPARED"
+	AttemptSubmitted                = "SUBMITTED"
+	AttemptPendingUnknown           = "PENDING_UNKNOWN"
+	AttemptRejectedBeforeSubmission = "REJECTED_BEFORE_SUBMISSION"
+	AttemptCancelled                = "CANCELLED"
+	AttemptQuarantined              = "QUARANTINED"
+)
+
 type Client interface {
-	// PrepareAndSubmit calls BNK-06's PrepareAttempt then SubmitAttempt in
-	// sequence, using the same idempotency key for both — a retry of the
-	// whole SubmitPaymentRun call reaches the same PREPARED row rather than
-	// creating a second attempt (BNK-06's own duplicate-idempotency-key
-	// handling returns the existing attempt).
-	PrepareAndSubmit(ctx context.Context, tenantID, principalID string, req PrepareAndSubmitRequest) (*Attempt, error)
+	// Prepare calls BNK-06 PrepareAttempt. A repeat with the same
+	// IdempotencyKey returns the existing attempt (in whatever status it has
+	// reached) rather than creating a second one.
+	Prepare(ctx context.Context, tenantID, principalID string, req PrepareRequest) (*Attempt, error)
+	// Submit calls BNK-06 SubmitAttempt for a PREPARED attempt.
+	Submit(ctx context.Context, tenantID, principalID, attemptID string) (*Attempt, error)
+	// Retry calls BNK-06 RetrySameAttempt for a PENDING_UNKNOWN attempt —
+	// same attempt, same idempotency key, never a new payment.
+	Retry(ctx context.Context, tenantID, principalID, attemptID string) (*Attempt, error)
+	// GetAttempt reads BNK-06's current view of an attempt.
+	GetAttempt(ctx context.Context, tenantID, principalID, attemptID string) (*Attempt, error)
 }
 
-type PrepareAndSubmitRequest struct {
+type PrepareRequest struct {
 	LegalEntityID        string
 	SourceReference      string
 	PayerAccountRef      string
@@ -38,9 +61,8 @@ type PrepareAndSubmitRequest struct {
 	PayerAccountVerified bool
 	IdempotencyKey       string
 	// AuthorizationID/AuthorizationFingerprint/AuthorizationSource carry
-	// AP-10's own real, service-computed fingerprint through to BNK-06 for
-	// independent re-verification there (Wave 11a) — never trusted by
-	// BNK-06 as given.
+	// AP-10's own service-computed fingerprint through to BNK-06 for
+	// independent re-verification there (Wave 11a).
 	AuthorizationID          string
 	AuthorizationFingerprint string
 	AuthorizationSource      string
@@ -56,18 +78,18 @@ type Attempt struct {
 }
 
 type prepareRequestBody struct {
-	LegalEntityID        string    `json:"LegalEntityID"`
-	SourceReference      string    `json:"SourceReference"`
-	PayerAccountRef      string    `json:"PayerAccountRef"`
-	PayeeRef             string    `json:"PayeeRef"`
-	Amount               float64   `json:"Amount"`
-	Currency             string    `json:"Currency"`
-	ExecutionDate        time.Time `json:"ExecutionDate"`
-	PayerAccountVerified bool      `json:"PayerAccountVerified"`
-	IdempotencyKey       string    `json:"IdempotencyKey"`
-	AuthorizationID          string `json:"AuthorizationID"`
-	AuthorizationFingerprint string `json:"AuthorizationFingerprint"`
-	AuthorizationSource      string `json:"AuthorizationSource"`
+	LegalEntityID            string    `json:"LegalEntityID"`
+	SourceReference          string    `json:"SourceReference"`
+	PayerAccountRef          string    `json:"PayerAccountRef"`
+	PayeeRef                 string    `json:"PayeeRef"`
+	Amount                   float64   `json:"Amount"`
+	Currency                 string    `json:"Currency"`
+	ExecutionDate            time.Time `json:"ExecutionDate"`
+	PayerAccountVerified     bool      `json:"PayerAccountVerified"`
+	IdempotencyKey           string    `json:"IdempotencyKey"`
+	AuthorizationID          string    `json:"AuthorizationID"`
+	AuthorizationFingerprint string    `json:"AuthorizationFingerprint"`
+	AuthorizationSource      string    `json:"AuthorizationSource"`
 }
 
 type HTTPClient struct {
@@ -80,7 +102,9 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 	return &HTTPClient{baseURL: baseURL, log: log, http: &http.Client{Timeout: 5 * time.Second}}
 }
 
-func (c *HTTPClient) doJSON(ctx context.Context, method, path, tenantID, principalID string, body interface{}, out interface{}) error {
+// doJSON maps the response to the error classes in the package doc. 4xx
+// other than 409 is reported as rejectErr, which callers pick per call.
+func (c *HTTPClient) doJSON(ctx context.Context, method, path, tenantID, principalID string, body interface{}, out interface{}, rejectErr error) error {
 	var reader *bytes.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -102,13 +126,20 @@ func (c *HTTPClient) doJSON(ctx context.Context, method, path, tenantID, princip
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		c.log.Error("payment-initiation-adapter-svc unreachable — failing closed", zap.Error(err))
+		c.log.Error("payment-initiation-adapter-svc unreachable — outcome unknown to caller", zap.String("path", path), zap.Error(err))
 		return domain.ErrProviderAdapterUnavailable
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		c.log.Error("unexpected response from payment-initiation-adapter-svc — failing closed", zap.Int("status", resp.StatusCode))
+	switch {
+	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
+	case resp.StatusCode == http.StatusConflict:
+		return domain.ErrBankingAttemptConflict
+	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		c.log.Warn("payment-initiation-adapter-svc refused the request", zap.String("path", path), zap.Int("status", resp.StatusCode))
+		return rejectErr
+	default:
+		c.log.Error("unexpected response from payment-initiation-adapter-svc", zap.String("path", path), zap.Int("status", resp.StatusCode))
 		return domain.ErrProviderAdapterUnavailable
 	}
 	if out != nil {
@@ -119,28 +150,40 @@ func (c *HTTPClient) doJSON(ctx context.Context, method, path, tenantID, princip
 	return nil
 }
 
-func (c *HTTPClient) PrepareAndSubmit(ctx context.Context, tenantID, principalID string, req PrepareAndSubmitRequest) (*Attempt, error) {
-	var prepared Attempt
-	if err := c.doJSON(ctx, http.MethodPost, "/bnk06/attempts", tenantID, principalID, prepareRequestBody{
-		LegalEntityID:        req.LegalEntityID,
-		SourceReference:      req.SourceReference,
-		PayerAccountRef:      req.PayerAccountRef,
-		PayeeRef:             req.PayeeRef,
-		Amount:               req.Amount,
-		Currency:             req.Currency,
-		ExecutionDate:        req.ExecutionDate,
-		PayerAccountVerified: req.PayerAccountVerified,
-		IdempotencyKey:       req.IdempotencyKey,
-		AuthorizationID:          req.AuthorizationID,
-		AuthorizationFingerprint: req.AuthorizationFingerprint,
-		AuthorizationSource:      req.AuthorizationSource,
-	}, &prepared); err != nil {
+func (c *HTTPClient) Prepare(ctx context.Context, tenantID, principalID string, req PrepareRequest) (*Attempt, error) {
+	var out Attempt
+	if err := c.doJSON(ctx, http.MethodPost, "/bnk06/attempts", tenantID, principalID, prepareRequestBody(req), &out, domain.ErrBankingPrepareRejected); err != nil {
 		return nil, err
 	}
+	if out.AttemptID == "" {
+		return nil, domain.ErrProviderAdapterUnavailable
+	}
+	return &out, nil
+}
 
-	var submitted Attempt
-	if err := c.doJSON(ctx, http.MethodPost, "/bnk06/attempts/"+prepared.AttemptID+"/submit", tenantID, principalID, nil, &submitted); err != nil {
+func (c *HTTPClient) Submit(ctx context.Context, tenantID, principalID, attemptID string) (*Attempt, error) {
+	var out Attempt
+	// A 4xx other than 409 after the attempt exists is not a definitive
+	// "not sent" answer from the bank's side, so it is reported as
+	// unavailable (outcome unknown) rather than rejected.
+	if err := c.doJSON(ctx, http.MethodPost, "/bnk06/attempts/"+attemptID+"/submit", tenantID, principalID, nil, &out, domain.ErrProviderAdapterUnavailable); err != nil {
 		return nil, err
 	}
-	return &submitted, nil
+	return &out, nil
+}
+
+func (c *HTTPClient) Retry(ctx context.Context, tenantID, principalID, attemptID string) (*Attempt, error) {
+	var out Attempt
+	if err := c.doJSON(ctx, http.MethodPost, "/bnk06/attempts/"+attemptID+"/retry", tenantID, principalID, nil, &out, domain.ErrProviderAdapterUnavailable); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *HTTPClient) GetAttempt(ctx context.Context, tenantID, principalID, attemptID string) (*Attempt, error) {
+	var out Attempt
+	if err := c.doJSON(ctx, http.MethodGet, "/bnk06/attempts/"+attemptID, tenantID, principalID, nil, &out, domain.ErrProviderAdapterUnavailable); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
