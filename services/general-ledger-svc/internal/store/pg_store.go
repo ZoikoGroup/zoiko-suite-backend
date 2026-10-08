@@ -63,7 +63,7 @@ const journalHeaderColumns = `
 	approved_at, approved_by_principal_id,
 	rejected_at, rejected_by_principal_id, rejection_reason,
 	posting_requested_at, posting_requested_by_principal_id,
-	correction_of_journal_id`
+	correction_of_journal_id, soft_close_override_reason`
 
 // scanHeaderTargets returns scan destinations matching journalHeaderColumns,
 // column for column. status and approvalStatus are scanned into plain
@@ -87,7 +87,7 @@ func scanHeaderTargets(h *domain.JournalHeader, status, approvalStatus *string) 
 		&h.ApprovedAt, &h.ApprovedByPrincipalID,
 		&h.RejectedAt, &h.RejectedByPrincipalID, &h.RejectionReason,
 		&h.PostingRequestedAt, &h.PostingRequestedByPrincipalID,
-		&h.CorrectionOfJournalID,
+		&h.CorrectionOfJournalID, &h.SoftCloseOverrideReason,
 	}
 }
 
@@ -267,9 +267,10 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			correlation_id, created_at, validated_at, posted_at, reversed_at,
 			source_event_id, governance_decision_id,
 			journal_type, transaction_date, posting_date, currency_code,
-			book_id, reporting_basis, evidence_refs, approval_status
+			book_id, reporting_basis, evidence_refs, approval_status,
+			soft_close_override_reason
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-		          $19, $20, $21, $22, $23, $24, $25, $26)
+		          $19, $20, $21, $22, $23, $24, $25, $26, $27)
 		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 	`, h.JournalID, tenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
 		h.ReversalOfJournalID, h.Description, h.CreatedByPrincipalID,
@@ -277,7 +278,8 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 		h.CorrelationID, h.CreatedAt, h.ValidatedAt, h.PostedAt, h.ReversedAt,
 		h.SourceEventID, h.GovernanceDecisionID,
 		h.JournalType, h.TransactionDate, h.PostingDate, h.CurrencyCode,
-		h.BookID, h.ReportingBasis, h.EvidenceRefs, string(h.ApprovalStatus))
+		h.BookID, h.ReportingBasis, h.EvidenceRefs, string(h.ApprovalStatus),
+		h.SoftCloseOverrideReason)
 	if err != nil {
 		return nil, false, mapPgError(err)
 	}
@@ -380,13 +382,21 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 			return nil
 		}
 
+		createdData := map[string]any{
+			"journal_id":      h.JournalID,
+			"tenant_id":       h.TenantID,
+			"legal_entity_id": h.LegalEntityID,
+			"fiscal_period":   h.FiscalPeriod,
+		}
+		// Soft-close override is evidence: migration 000015's own doc comment
+		// promises it is "emitted in the JournalCreated outbox event for audit
+		// traceability" — a soft-close exception must be independently
+		// discoverable from the event stream, not only by querying this row.
+		if h.SoftCloseOverrideReason != nil && *h.SoftCloseOverrideReason != "" {
+			createdData["soft_close_override_reason"] = *h.SoftCloseOverrideReason
+		}
 		if err := s.enqueueJournalEvent(ctx, tx, "created", h.TenantID, h.LegalEntityID,
-			h.JournalID, h.CreatedByPrincipalID, h.CorrelationID, map[string]any{
-				"journal_id":      h.JournalID,
-				"tenant_id":       h.TenantID,
-				"legal_entity_id": h.LegalEntityID,
-				"fiscal_period":   h.FiscalPeriod,
-			}); err != nil {
+			h.JournalID, h.CreatedByPrincipalID, h.CorrelationID, createdData); err != nil {
 			return err
 		}
 
