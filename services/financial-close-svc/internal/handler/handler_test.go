@@ -34,9 +34,10 @@ type stubStore struct {
 	evidence     []domain.CloseEvidence
 	reopenEvents []domain.PeriodReopenEvent
 
-	controlRuns  []domain.SubledgerControlRun
-	createRunErr error
-	listRunsErr  error
+	controlRuns       []domain.SubledgerControlRun
+	closeRequirements []*domain.CloseRequirement
+	createRunErr      error
+	listRunsErr       error
 
 	schedules            map[string]*domain.AccrualSchedule
 	createAccrualErr     error
@@ -211,6 +212,48 @@ func (s *stubStore) CreateReopenEvent(_ context.Context, ev *domain.PeriodReopen
 	}
 	s.reopenEvents = append(s.reopenEvents, *ev)
 	return nil
+}
+
+func (s *stubStore) CreateCloseRequirement(_ context.Context, cr *domain.CloseRequirement) (bool, error) {
+	for _, ex := range s.closeRequirements {
+		if ex.RemovedAt == nil && ex.LegalEntityID == cr.LegalEntityID && ex.Kind == cr.Kind &&
+			ex.Subledger == cr.Subledger && ex.BookID == cr.BookID && ex.BankAccountID == cr.BankAccountID {
+			*cr = *ex
+			return false, nil
+		}
+	}
+	copy := *cr
+	s.closeRequirements = append(s.closeRequirements, &copy)
+	return true, nil
+}
+
+func (s *stubStore) GetCloseRequirement(_ context.Context, id string) (*domain.CloseRequirement, error) {
+	for _, cr := range s.closeRequirements {
+		if cr.RequirementID == id {
+			return cr, nil
+		}
+	}
+	return nil, domain.ErrCloseRequirementNotFound
+}
+
+func (s *stubStore) ListCloseRequirements(_ context.Context, legalEntityID string) ([]domain.CloseRequirement, error) {
+	var out []domain.CloseRequirement
+	for _, cr := range s.closeRequirements {
+		if cr.LegalEntityID == legalEntityID && cr.RemovedAt == nil {
+			out = append(out, *cr)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) RemoveCloseRequirement(_ context.Context, id, principalID, reason string, at time.Time) (*domain.CloseRequirement, error) {
+	for _, cr := range s.closeRequirements {
+		if cr.RequirementID == id && cr.RemovedAt == nil {
+			cr.RemovedAt, cr.RemovedByPrincipalID, cr.RemovalReason = &at, principalID, reason
+			return cr, nil
+		}
+	}
+	return nil, domain.ErrCloseRequirementNotFound
 }
 
 func (s *stubStore) CreateControlRun(_ context.Context, run *domain.SubledgerControlRun) error {

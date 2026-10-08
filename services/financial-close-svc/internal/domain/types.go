@@ -816,7 +816,8 @@ var (
 	// its posting-backlog population (GL_CONTROL_POPULATION_READ). The close
 	// cannot prove nothing is left unposted, so it does not proceed — and the
 	// caller is told it is a permission, not an outage.
-	ErrPostingBacklogForbidden = errorString("not permitted to read general-ledger-svc's posting backlog (GL_CONTROL_POPULATION_READ)")
+	ErrCloseRequirementNotFound = errorString("close requirement not found or already removed")
+	ErrPostingBacklogForbidden  = errorString("not permitted to read general-ledger-svc's posting backlog (GL_CONTROL_POPULATION_READ)")
 
 	// ErrLedgerPageTruncated is returned when the ledger answered with a full
 	// page, so there may be journals this service never saw. A trial balance
@@ -1072,4 +1073,61 @@ type PostingBacklogItem struct {
 	Reference     string // the source event id, else the execution id
 	Status        string
 	FailureReason string
+}
+
+// Close requirement kinds (migration 000016).
+const (
+	CloseRequirementSubledgerControl     = "SUBLEDGER_CONTROL"
+	CloseRequirementBankAccountExclusion = "BANK_ACCOUNT_EXCLUSION"
+)
+
+// BaselineSubledgerControls are required at every entity's close and cannot be
+// removed: ZS-CONTROL-001 §22 names AR and AP among the mandatory subledger
+// controls without qualification.
+var BaselineSubledgerControls = []string{"AR", "AP"}
+
+// OptionalSubledgerControls are the subledger controls an entity's close
+// checklist may add (each is a RunSubledgerControl type).
+var OptionalSubledgerControls = []string{"ASSETS", "DEPRECIATION_COMPLETENESS", "INVENTORY_QUANTITY",
+	"INVENTORY_VALUE", "PROJECT_REVENUE", "STOCK_COUNT"}
+
+// CloseRequirement is one item of an entity's close checklist (ACC-14).
+type CloseRequirement struct {
+	RequirementID        string     `json:"requirement_id"`
+	TenantID             string     `json:"tenant_id"`
+	LegalEntityID        string     `json:"legal_entity_id"`
+	Kind                 string     `json:"kind"`
+	Subledger            string     `json:"subledger,omitempty"`
+	BookID               string     `json:"book_id,omitempty"`
+	BankAccountID        string     `json:"bank_account_id,omitempty"`
+	Reason               string     `json:"reason,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	RemovedAt            *time.Time `json:"removed_at,omitempty"`
+	RemovedByPrincipalID string     `json:"removed_by_principal_id,omitempty"`
+	RemovalReason        string     `json:"removal_reason,omitempty"`
+}
+
+// CloseRequirementRequest adds one checklist item.
+type CloseRequirementRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	Kind          string `json:"kind"`
+	Subledger     string `json:"subledger,omitempty"`
+	BookID        string `json:"book_id,omitempty"`
+	BankAccountID string `json:"bank_account_id,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+// RemoveCloseRequirementRequest removes one; the reason is mandatory.
+type RemoveCloseRequirementRequest struct {
+	Reason string `json:"reason"`
+}
+
+// CloseChecklist is an entity's whole close checklist: the fixed baseline
+// plus its active requirements.
+type CloseChecklist struct {
+	LegalEntityID             string             `json:"legal_entity_id"`
+	BaselineSubledgerControls []string           `json:"baseline_subledger_controls"`
+	RequiredSubledgerControls []CloseRequirement `json:"required_subledger_controls"`
+	ExcludedBankAccounts      []CloseRequirement `json:"excluded_bank_accounts"`
 }

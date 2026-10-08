@@ -23,6 +23,10 @@ import (
 )
 
 type Store interface {
+	CreateCloseRequirement(ctx context.Context, cr *domain.CloseRequirement) (created bool, err error)
+	GetCloseRequirement(ctx context.Context, requirementID string) (*domain.CloseRequirement, error)
+	ListCloseRequirements(ctx context.Context, legalEntityID string) ([]domain.CloseRequirement, error)
+	RemoveCloseRequirement(ctx context.Context, requirementID, principalID, reason string, at time.Time) (*domain.CloseRequirement, error)
 	CreateFiscalPeriod(ctx context.Context, fp *domain.FiscalPeriod) (created bool, err error)
 	GetFiscalPeriod(ctx context.Context, id string) (*domain.FiscalPeriod, error)
 	GetFiscalPeriodByName(ctx context.Context, legalEntityID, name string) (*domain.FiscalPeriod, error)
@@ -208,9 +212,14 @@ type Clients interface {
 }
 
 const (
-	actionCloseConfig   = "PERIOD_CLOSE_CONFIG"
-	actionCloseView     = "PERIOD_CLOSE_VIEW"
-	actionCloseInitiate = "PERIOD_CLOSE_INITIATE"
+	actionCloseConfig = "PERIOD_CLOSE_CONFIG"
+	// actionCloseExclusionApprove takes a bank account out of the close's
+	// reconciliation requirement. Separate from PERIOD_CLOSE_CONFIG because
+	// it removes cash from a control rather than adding one: the person who
+	// configures checklists is not automatically trusted to waive them.
+	actionCloseExclusionApprove = "PERIOD_CLOSE_EXCLUSION_APPROVE"
+	actionCloseView             = "PERIOD_CLOSE_VIEW"
+	actionCloseInitiate         = "PERIOD_CLOSE_INITIATE"
 	// actionPeriodReopen is deliberately its own action, not reused from
 	// actionCloseInitiate — ACC-14 invariant #6 requires reopen be
 	// "explicit, scoped, approved," and a locked book being reopened is a
@@ -357,6 +366,11 @@ func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, s
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
+	r.Route("/v1/close/requirements", func(r chi.Router) {
+		r.Get("/", h.GetCloseChecklist)
+		r.Post("/", h.AddCloseRequirement)
+		r.Post("/{id}/remove", h.RemoveCloseRequirement)
+	})
 	r.Get("/v1/control-populations/migration-batch-tieout", h.GetMigrationBatchTieoutPopulation)
 	r.Route("/v1/close/periods", func(r chi.Router) {
 		r.Post("/", h.CreateFiscalPeriod)
@@ -440,6 +454,199 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/verify-path", h.VerifyTracePath)
 		r.Post("/quarantine", h.QuarantineBrokenLineage)
 	})
+}
+
+// ── Close checklist (ACC-14) ───────────────────────────────────────────────────
+
+// closeRequirementAction is the permission a requirement needs: adding a
+// control is configuration, waiving a bank account is an approval.
+func closeRequirementAction(kind string) string {
+	if kind == domain.CloseRequirementBankAccountExclusion {
+		return actionCloseExclusionApprove
+	}
+	return actionCloseConfig
+}
+
+// validateCloseRequirement checks a request's shape before it reaches the
+// database (whose CHECK constraint enforces the same rules), so a caller gets
+// a message naming the problem rather than a constraint name.
+func validateCloseRequirement(req *domain.CloseRequirementRequest) (code, detail string) {
+	req.Subledger = strings.ToUpper(strings.TrimSpace(req.Subledger))
+	req.BookID = strings.TrimSpace(req.BookID)
+	req.BankAccountID = strings.TrimSpace(req.BankAccountID)
+	req.Reason = strings.TrimSpace(req.Reason)
+	if strings.TrimSpace(req.LegalEntityID) == "" {
+		return "missing_fields", "legal_entity_id is required"
+	}
+	switch req.Kind {
+	case domain.CloseRequirementSubledgerControl:
+		if req.BankAccountID != "" {
+			return "invalid_requirement", "bank_account_id does not apply to a SUBLEDGER_CONTROL requirement"
+		}
+		for _, base := range domain.BaselineSubledgerControls {
+			if req.Subledger == base {
+				return "baseline_requirement", req.Subledger + " is required for every entity already and cannot be added or removed"
+			}
+		}
+		known := false
+		for _, opt := range domain.OptionalSubledgerControls {
+			known = known || req.Subledger == opt
+		}
+		if !known {
+			return "invalid_subledger", "subledger must be one of " + strings.Join(domain.OptionalSubledgerControls, ", ")
+		}
+		if req.Subledger == "ASSETS" && req.BookID == "" {
+			return "missing_fields", "book_id is required for an ASSETS requirement: the control reconciles one asset book"
+		}
+		if req.Subledger != "ASSETS" && req.BookID != "" {
+			return "invalid_requirement", "book_id applies only to ASSETS"
+		}
+	case domain.CloseRequirementBankAccountExclusion:
+		if req.Subledger != "" || req.BookID != "" {
+			return "invalid_requirement", "subledger and book_id do not apply to a BANK_ACCOUNT_EXCLUSION"
+		}
+		if req.BankAccountID == "" {
+			return "missing_fields", "bank_account_id is required"
+		}
+		if req.Reason == "" {
+			return "missing_fields", "reason is required: an excluded account is a waived control and must say why it is immaterial"
+		}
+	default:
+		return "invalid_kind", "kind must be SUBLEDGER_CONTROL or BANK_ACCOUNT_EXCLUSION"
+	}
+	return "", ""
+}
+
+// ── GET /v1/close/requirements?legal_entity_id= ─────────────────────────────
+
+func (h *Handler) GetCloseChecklist(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := strings.TrimSpace(r.URL.Query().Get("legal_entity_id"))
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionCloseView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	reqs, err := h.store.ListCloseRequirements(r.Context(), legalEntityID)
+	if err != nil {
+		h.writeStoreErr(w, err, "requirement_not_found")
+		return
+	}
+	writeJSON(w, http.StatusOK, buildCloseChecklist(legalEntityID, reqs))
+}
+
+func buildCloseChecklist(legalEntityID string, reqs []domain.CloseRequirement) domain.CloseChecklist {
+	out := domain.CloseChecklist{
+		LegalEntityID:             legalEntityID,
+		BaselineSubledgerControls: append([]string{}, domain.BaselineSubledgerControls...),
+		RequiredSubledgerControls: []domain.CloseRequirement{},
+		ExcludedBankAccounts:      []domain.CloseRequirement{},
+	}
+	for _, cr := range reqs {
+		if cr.Kind == domain.CloseRequirementBankAccountExclusion {
+			out.ExcludedBankAccounts = append(out.ExcludedBankAccounts, cr)
+		} else {
+			out.RequiredSubledgerControls = append(out.RequiredSubledgerControls, cr)
+		}
+	}
+	return out
+}
+
+// ── POST /v1/close/requirements ─────────────────────────────────────────────
+
+func (h *Handler) AddCloseRequirement(w http.ResponseWriter, r *http.Request) {
+	var req domain.CloseRequirementRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if code, detail := validateCloseRequirement(&req); code != "" {
+		writeError(w, http.StatusBadRequest, code, detail)
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, closeRequirementAction(req.Kind)); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	cr := &domain.CloseRequirement{
+		RequirementID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID,
+		Kind: req.Kind, Subledger: req.Subledger, BookID: req.BookID, BankAccountID: req.BankAccountID,
+		Reason: req.Reason, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	}
+	created, err := h.store.CreateCloseRequirement(r.Context(), cr)
+	if err != nil {
+		h.writeStoreErr(w, err, "requirement_not_found")
+		return
+	}
+	if !created {
+		// Already on the checklist: a replay, answered with the existing item.
+		writeJSON(w, http.StatusOK, cr)
+		return
+	}
+	writeJSON(w, http.StatusCreated, cr)
+}
+
+// ── POST /v1/close/requirements/{id}/remove ─────────────────────────────────
+
+func (h *Handler) RemoveCloseRequirement(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req domain.RemoveCloseRequirementRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "reason is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	existing, err := h.store.GetCloseRequirement(r.Context(), id)
+	if errors.Is(err, domain.ErrCloseRequirementNotFound) {
+		writeError(w, http.StatusNotFound, "requirement_not_found", "")
+		return
+	}
+	if err != nil {
+		h.writeStoreErr(w, err, "requirement_not_found")
+		return
+	}
+	// Same permission as adding it: un-waiving an account restores a control
+	// but is still a change to the waiver, and dropping a required control
+	// weakens the close just as adding one strengthens it.
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, closeRequirementAction(existing.Kind)); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	removed, err := h.store.RemoveCloseRequirement(r.Context(), id, principalID, strings.TrimSpace(req.Reason), time.Now().UTC())
+	if errors.Is(err, domain.ErrCloseRequirementNotFound) {
+		writeError(w, http.StatusConflict, "requirement_already_removed", "")
+		return
+	}
+	if err != nil {
+		h.writeStoreErr(w, err, "requirement_not_found")
+		return
+	}
+	writeJSON(w, http.StatusOK, removed)
 }
 
 // ── POST /v1/close/periods ────────────────────────────────────────────────────────

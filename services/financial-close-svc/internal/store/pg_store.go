@@ -2184,3 +2184,132 @@ func (s *PgStore) UpsertLineageProjectionStatus(ctx context.Context, legalEntity
 		return mapPgError(err)
 	})
 }
+
+// ── Close requirements (ACC-14 checklist, migration 000016) ─────────────────
+
+const closeRequirementColumns = `
+	requirement_id::text, tenant_id, legal_entity_id, kind, COALESCE(subledger, ''),
+	COALESCE(book_id, ''), COALESCE(bank_account_id, ''), reason, created_at,
+	created_by_principal_id, removed_at, COALESCE(removed_by_principal_id, ''),
+	COALESCE(removal_reason, '')`
+
+func scanCloseRequirement(row pgx.Row) (*domain.CloseRequirement, error) {
+	var cr domain.CloseRequirement
+	if err := row.Scan(&cr.RequirementID, &cr.TenantID, &cr.LegalEntityID, &cr.Kind, &cr.Subledger,
+		&cr.BookID, &cr.BankAccountID, &cr.Reason, &cr.CreatedAt, &cr.CreatedByPrincipalID,
+		&cr.RemovedAt, &cr.RemovedByPrincipalID, &cr.RemovalReason); err != nil {
+		return nil, err
+	}
+	return &cr, nil
+}
+
+// CreateCloseRequirement adds a checklist item. Adding one that is already
+// active is a replay: cr is overwritten with the existing row and created is
+// false.
+func (s *PgStore) CreateCloseRequirement(ctx context.Context, cr *domain.CloseRequirement) (created bool, err error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return false, domain.ErrIdentityMissing
+	}
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO close_requirements (
+				requirement_id, tenant_id, legal_entity_id, kind, subledger, book_id,
+				bank_account_id, reason, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8, $9, $10)
+			ON CONFLICT (tenant_id, legal_entity_id, kind, (COALESCE(subledger, '')),
+			             (COALESCE(book_id, '')), (COALESCE(bank_account_id, '')))
+			WHERE removed_at IS NULL DO NOTHING`,
+			cr.RequirementID, tenantID, cr.LegalEntityID, cr.Kind, cr.Subledger, cr.BookID,
+			cr.BankAccountID, cr.Reason, cr.CreatedAt, cr.CreatedByPrincipalID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 1 {
+			created = true
+			return nil
+		}
+		existing, err := scanCloseRequirement(tx.QueryRow(ctx, `SELECT `+closeRequirementColumns+`
+			FROM close_requirements
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND kind = $3
+			  AND COALESCE(subledger, '') = $4 AND COALESCE(book_id, '') = $5
+			  AND COALESCE(bank_account_id, '') = $6 AND removed_at IS NULL`,
+			tenantID, cr.LegalEntityID, cr.Kind, cr.Subledger, cr.BookID, cr.BankAccountID))
+		if err != nil {
+			return err
+		}
+		*cr = *existing
+		return nil
+	})
+	return created, err
+}
+
+// GetCloseRequirement returns one requirement, removed or not.
+func (s *PgStore) GetCloseRequirement(ctx context.Context, requirementID string) (*domain.CloseRequirement, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.CloseRequirement
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		cr, err := scanCloseRequirement(tx.QueryRow(ctx, `SELECT `+closeRequirementColumns+`
+			FROM close_requirements WHERE tenant_id = $1 AND requirement_id::text = $2`, tenantID, requirementID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrCloseRequirementNotFound
+		}
+		out = cr
+		return err
+	})
+	return out, err
+}
+
+// ListCloseRequirements returns an entity's ACTIVE requirements, oldest first.
+func (s *PgStore) ListCloseRequirements(ctx context.Context, legalEntityID string) ([]domain.CloseRequirement, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.CloseRequirement
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT `+closeRequirementColumns+`
+			FROM close_requirements
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND removed_at IS NULL
+			ORDER BY created_at, requirement_id`, tenantID, legalEntityID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			cr, err := scanCloseRequirement(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *cr)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// RemoveCloseRequirement stamps an active requirement removed. Never deletes:
+// the row stays as evidence of what the checklist was and who changed it.
+func (s *PgStore) RemoveCloseRequirement(ctx context.Context, requirementID, principalID, reason string, at time.Time) (*domain.CloseRequirement, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.CloseRequirement
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		cr, err := scanCloseRequirement(tx.QueryRow(ctx, `
+			UPDATE close_requirements
+			   SET removed_at = $3, removed_by_principal_id = $4, removal_reason = $5
+			 WHERE tenant_id = $1 AND requirement_id::text = $2 AND removed_at IS NULL
+			RETURNING `+closeRequirementColumns, tenantID, requirementID, at, principalID, reason))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrCloseRequirementNotFound
+		}
+		out = cr
+		return err
+	})
+	return out, err
+}
