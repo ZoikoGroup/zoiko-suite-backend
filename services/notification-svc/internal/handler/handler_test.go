@@ -8,6 +8,7 @@ import (
 	htmltemplate "html/template"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,16 +18,20 @@ import (
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/quota"
 	"zoiko.io/notification-svc/internal/retry"
 )
 
 // â”€â”€ stubs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 type stubStore struct {
-	byID       map[string]*domain.Notification
-	byCorr     map[string]string // correlation_id -> notification_id
-	lastFilter domain.ListFilter
-	scheduled  []scheduledRetry
+	byID        map[string]*domain.Notification
+	ledgerOwned map[string]bool   // ids produced by the ledger pipeline (not resendable through the direct path)
+	byCorr      map[string]string // correlation_id -> notification_id
+	lastFilter  domain.ListFilter
+	createErr   error // returned by CreateNotification when set (a quota refusal, say)
+	countedCtx  bool  // whether CreateNotification saw a context that asks to be counted
+	scheduled   []scheduledRetry
 
 	templates                map[string]*domain.TemplateDefinition
 	versions                 map[string]*domain.TemplateVersion
@@ -57,7 +62,11 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreateNotification(_ context.Context, n *domain.Notification) (bool, error) {
+func (s *stubStore) CreateNotification(ctx context.Context, n *domain.Notification) (bool, error) {
+	s.countedCtx = quota.Counting(ctx)
+	if s.createErr != nil {
+		return false, s.createErr
+	}
 	// Keyed the way the real store is (migration 000012): on the purpose-scoped
 	// idempotency key when there is one, on the correlation id otherwise.
 	key := "corr:" + n.CorrelationID
@@ -220,6 +229,10 @@ func (s *stubStore) CreateTemplate(_ context.Context, p domain.CreateTemplatePar
 		LegalEntityID: p.LegalEntityID, Name: p.Name, BusinessPurpose: p.BusinessPurpose,
 		OwnerPrincipalID: p.OwnerPrincipalID, Status: "ACTIVE", CreatedAt: time.Now().UTC(),
 	}
+	if p.IntentID != "" {
+		id := p.IntentID
+		d.IntentID = &id
+	}
 	s.templates[d.TemplateID] = d
 	s.emit("template.created")
 	return d, nil
@@ -244,11 +257,20 @@ func (s *stubStore) CreateVersion(_ context.Context, p domain.CreateVersionParam
 	if p.Locale == "" {
 		return nil, domain.ErrTemplateLocaleRequired
 	}
+	var subjectPtr *string
+	if p.Subject != "" {
+		if err := domain.CheckSubjectVariables(p.Subject, p.SubjectVariables, p.VariableSchema); err != nil {
+			return nil, err
+		}
+		subjectPtr = &p.Subject
+	} else if len(p.SubjectVariables) > 0 {
+		return nil, domain.SubjectProblem{Reason: "subject_variables needs a subject"}
+	}
 	s.versionSeq++
 	v := &domain.TemplateVersion{
 		VersionID: fmt.Sprintf("version-%d", s.versionSeq), TemplateID: p.TemplateID,
 		TenantID: "tenant-abc", LegalEntityID: tmpl.LegalEntityID, VersionNumber: s.versionSeq, Locale: p.Locale,
-		Content: p.Content, VariableSchema: p.VariableSchema, Status: domain.TemplateVersionDraft,
+		Content: p.Content, VariableSchema: p.VariableSchema, Subject: subjectPtr, SubjectVariables: append([]string{}, p.SubjectVariables...), Status: domain.TemplateVersionDraft,
 		CreatedByPrincipalID: p.CreatedByPrincipalID, CreatedAt: time.Now().UTC(),
 	}
 	s.versions[v.VersionID] = v
@@ -365,18 +387,38 @@ func (s *stubStore) RenderPreview(_ context.Context, p domain.RenderPreviewParam
 			missing = append(missing, key)
 		}
 	}
+	vars := p.Variables
+	var placeholders []string
 	if len(missing) > 0 {
-		return nil, domain.ErrTemplateVariablesMissing{VersionID: p.VersionID, Missing: missing}
+		if !p.Placeholders {
+			return nil, domain.ErrTemplateVariablesMissing{VersionID: p.VersionID, Missing: missing}
+		}
+		vars = map[string]string{}
+		for k, val := range p.Variables {
+			vars[k] = val
+		}
+		for _, key := range missing {
+			vars[key] = "[" + key + "]"
+		}
+		placeholders = missing
 	}
 	tmpl, err := htmltemplate.New("preview").Parse(v.Content)
 	if err != nil {
 		return nil, domain.ErrTemplateContentInvalid
 	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, p.Variables); err != nil {
+	if err := tmpl.Execute(&buf, vars); err != nil {
 		return nil, err
 	}
-	return &domain.RenderPreviewResult{VersionID: p.VersionID, RenderedContent: buf.String()}, nil
+	res := &domain.RenderPreviewResult{VersionID: p.VersionID, RenderedContent: buf.String(), PlaceholdersUsed: placeholders}
+	if v.Subject != nil {
+		subject, err := domain.RenderSubject(*v.Subject, vars)
+		if err != nil {
+			return nil, err
+		}
+		res.RenderedSubject = subject
+	}
+	return res, nil
 }
 
 func (s *stubStore) CompareVersions(_ context.Context, versionIDA, versionIDB string) (*domain.CompareVersionsResult, error) {
@@ -418,8 +460,6 @@ type stubPublisher struct {
 	sent, failed, outcomeUnknown                                          int
 	templateCreated, templateApproved, templatePublished, templateRetired int
 }
-
-
 
 type stubAuthZ struct {
 	err   error
@@ -1144,7 +1184,11 @@ func TestApproveTemplate_AuthzDenied_Returns403(t *testing.T) {
 
 // ── RenderPreview / CompareVersions / ListLocales tests (BIZ-03 Wave 2) ──────
 
-func TestRenderPreview_MissingVariables_Returns400(t *testing.T) {
+// A preview is for authors checking wording, so a variable they did not supply is
+// shown as a visible marker instead of being refused (audit finding F-09: an author
+// needs no real data). The SEND path still refuses a missing variable; that is
+// covered by TestSendNotification_MissingTemplateVariables.
+func TestRenderPreview_MissingVariables_AreShownAsMarkers(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 	templateID := createTestTemplate(t, r, "owner-1")
 	versionID := createTestVersion(t, r, templateID, "owner-1")
@@ -1152,8 +1196,8 @@ func TestRenderPreview_MissingVariables_Returns400(t *testing.T) {
 	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/preview", map[string]any{
 		"variables": map[string]string{},
 	}, "owner-1")
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "[first_name]") || !strings.Contains(rr.Body.String(), "placeholders_used") {
+		t.Fatalf("expected 200 with a visible marker, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1494,6 +1538,9 @@ func (s *stubStore) BeginResend(_ context.Context, id, _, actor, reason string, 
 	if !ok || (n.Status != domain.StatusSent && n.Status != domain.StatusFailed) {
 		return nil, domain.ErrNotResendable
 	}
+	if s.ledgerOwned[id] {
+		return nil, domain.ErrResendLedgerOwned
+	}
 	n.Status = domain.StatusPending
 	n.ResendCount++
 	n.LastResendReason, n.LastResentAt, n.LastResentByPrincipalID = reason, &at, actor
@@ -1506,4 +1553,19 @@ func (s *stubStore) SetRecipientAddress(_ context.Context, id, _, address, sourc
 		n.RecipientAddress, n.RecipientAddressSource = address, source
 	}
 	return nil
+}
+
+// CancelNotification behaves like the real store: only a queued (PENDING, scheduled) row is
+// withdrawn; anything submitted, claimed or concluded is refused.
+func (s *stubStore) CancelNotification(_ context.Context, id, _, actor, reason string, at time.Time) (*domain.Notification, error) {
+	n, ok := s.byID[id]
+	if !ok {
+		return nil, domain.ErrNotificationNotFound
+	}
+	if n.Status != domain.StatusPending || n.NextAttemptAt == nil {
+		return nil, domain.ErrCancelNotAllowed
+	}
+	n.Status, n.NextAttemptAt, n.SentAt = domain.StatusCancelled, nil, &at
+	n.CancelledBy, n.CancelledAt, n.CancelReason = actor, &at, reason
+	return n, nil
 }

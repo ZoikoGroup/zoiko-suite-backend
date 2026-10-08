@@ -19,6 +19,9 @@ type TemplateDefinition struct {
 	Name                 string     `json:"name"`
 	BusinessPurpose      string     `json:"business_purpose"`
 	OwnerPrincipalID     string     `json:"owner_principal_id"`
+	// IntentID is the communication intent this wording is for; fixed at creation
+	// (migration 000021). Nil for a template bound to no intent.
+	IntentID *string `json:"intent_id,omitempty"`
 	Status               string     `json:"status"` // ACTIVE, RETIRED
 	CreatedAt            time.Time  `json:"created_at"`
 	RetiredAt            *time.Time `json:"retired_at,omitempty"`
@@ -46,6 +49,11 @@ type TemplateVersion struct {
 	Content               string     `json:"content"`
 	ContentHash           string     `json:"content_hash"`
 	VariableSchema        []string   `json:"variable_schema"`
+	// Subject is the reviewed subject text (placeholders only), frozen with the
+	// version; nil on a version that leaves the subject to the caller (legacy).
+	// SubjectVariables are the variables an author declared safe for a subject.
+	Subject               *string    `json:"subject,omitempty"`
+	SubjectVariables      []string   `json:"subject_variables"`
 	BrandingMetadata      *string    `json:"branding_metadata,omitempty"`
 	AccessibilityMetadata *string    `json:"accessibility_metadata,omitempty"`
 	Status                string     `json:"status"`
@@ -66,6 +74,8 @@ type CreateTemplateParams struct {
 	Name             string
 	BusinessPurpose  string
 	OwnerPrincipalID string
+	// IntentID optionally binds the template to a communication intent, for good.
+	IntentID string
 	// CorrelationID is carried onto the template.created event.
 	CorrelationID string
 }
@@ -77,6 +87,8 @@ type CreateVersionParams struct {
 	Locale                string
 	Content               string
 	VariableSchema        []string
+	Subject               string
+	SubjectVariables      []string
 	BrandingMetadata      string
 	AccessibilityMetadata string
 	CreatedByPrincipalID  string
@@ -111,6 +123,10 @@ type RetireTemplateParams struct {
 // like before it is ever published.
 type RenderPreviewParams struct {
 	VersionID string
+	// Placeholders fills a declared variable the caller did not supply with a visible
+	// marker instead of refusing: an author checking wording needs no real data.
+	// Never set on the send path.
+	Placeholders bool
 	Variables map[string]string
 }
 
@@ -118,6 +134,10 @@ type RenderPreviewParams struct {
 type RenderPreviewResult struct {
 	VersionID        string   `json:"version_id"`
 	RenderedContent  string   `json:"rendered_content"`
+	// RenderedSubject is set when the version carries a subject.
+	RenderedSubject  string   `json:"rendered_subject,omitempty"`
+	// PlaceholdersUsed names the variables filled with markers (preview only).
+	PlaceholdersUsed []string `json:"placeholders_used,omitempty"`
 	MissingVariables []string `json:"missing_variables,omitempty"`
 }
 
@@ -170,4 +190,18 @@ type ErrTemplateVariablesMissing struct {
 
 func (e ErrTemplateVariablesMissing) Error() string {
 	return fmt.Sprintf("version %s requires variables: %s", e.VersionID, strings.Join(e.Missing, ", "))
+}
+
+// ErrTemplateVariablesUnexpected backs RenderPreview and the governed-template
+// send: a variable the version's schema does not declare is refused rather than
+// silently ignored (ZS-SVC-Y-001 NP-07). An ignored variable is how a caller
+// believes a value reached the recipient when it did not, and how a variable
+// name starts doing something its template author never reviewed.
+type ErrTemplateVariablesUnexpected struct {
+	VersionID  string
+	Unexpected []string
+}
+
+func (e ErrTemplateVariablesUnexpected) Error() string {
+	return fmt.Sprintf("version %s does not declare variables: %s", e.VersionID, strings.Join(e.Unexpected, ", "))
 }
