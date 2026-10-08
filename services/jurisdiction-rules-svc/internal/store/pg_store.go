@@ -924,19 +924,12 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 	candidates := make(map[string][]ruleCandidate) // key: rule_domain|rule_code
 
 	for rows.Next() {
-		rule, scanErr := scanJurisdictionRule(rows)
-		if scanErr != nil {
-			s.log.Error("pg FindRulePack scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		// Read depth from the last column
+		rule := &domain.JurisdictionRule{}
 		var depth int
 		if err := rows.Scan(append(ruleScanTargets(rule), &depth)...); err != nil {
-			s.log.Error("pg FindRulePack depth scan failed", zap.Error(err))
+			s.log.Error("pg FindRulePack scan failed", zap.Error(err))
 			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		// Re-scan to get the full row including depth
-		// Actually we need to rescan - let me restructure
 		key := rule.RuleDomain + "|" + rule.RuleCode
 		candidates[key] = append(candidates[key], ruleCandidate{rule: rule, depth: depth})
 	}

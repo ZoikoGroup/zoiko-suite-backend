@@ -86,7 +86,7 @@ func (s *PgStore) IssueContract(ctx context.Context, c *domain.EmploymentContrac
 				probation_period_days, notice_period_days, working_hours_per_week, shift_type,
 				created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-				$17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+				$17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, c.ContractID, tenantID, c.LegalEntityID, c.EmployeeID, c.ContractNumber,
 			c.Version, c.ContractType, c.Status, c.Title, c.BaseSalaryAmount, c.Currency,
@@ -335,7 +335,7 @@ func (s *PgStore) AmendContract(ctx context.Context, oldContractID string, newCo
 				probation_period_days, notice_period_days, working_hours_per_week, shift_type,
 				created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-				$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+				$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 		`, newContract.ContractID, tenantID, newContract.LegalEntityID, newContract.EmployeeID, newContract.ContractNumber,
 			newContract.Version, newContract.ContractType, newContract.Status, newContract.Title, newContract.BaseSalaryAmount, newContract.Currency,
 			newContract.PayFrequency, newContract.EffectiveFrom, newContract.EffectiveTo, newContract.DocumentVaultRef,
