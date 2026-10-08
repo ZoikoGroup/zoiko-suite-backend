@@ -749,6 +749,62 @@ type CloseEvidence struct {
 	TrialBalanceHash string    `json:"trial_balance_hash"`
 	Signature        string    `json:"signature"`
 	GeneratedAt      time.Time `json:"generated_at"`
+
+	// RelianceManifest is the exact JSON of the CloseReliance this close
+	// rested on, kept as the signed bytes (migration 000017). RelianceHash is
+	// its sha256 hex; RelianceSignature the HMAC over that hash, with the same
+	// key as Signature. Empty for closes recorded before the migration.
+	RelianceManifest  string `json:"-"`
+	RelianceHash      string `json:"reliance_hash,omitempty"`
+	RelianceSignature string `json:"reliance_signature,omitempty"`
+}
+
+// CloseEvidenceView is a close's evidence as the API returns it: the stored
+// row plus the manifest, decoded for reading, and the exact signed text for
+// verification.
+type CloseEvidenceView struct {
+	CloseEvidence
+	Reliance             *CloseReliance `json:"reliance,omitempty"`
+	RelianceManifestText string         `json:"reliance_manifest,omitempty"`
+}
+
+// CloseReliance is what a period close relied on (ZS-CONTROL-001 §22:
+// "Control run IDs and evidence packages pinned to close instance"). Built
+// by the readiness check, signed and stored when the period locks.
+type CloseReliance struct {
+	// Gate settings in force, so the evidence shows if a gate was off.
+	SubledgerControlGate         string    `json:"subledger_control_gate"`
+	BankReconciliationGate       string    `json:"bank_reconciliation_gate"`
+	BankReconciliationCutoffDays int       `json:"bank_reconciliation_cutoff_days"`
+	FinancialControlGate         string    `json:"financial_control_gate"`
+	PostingBacklogCutoff         time.Time `json:"posting_backlog_cutoff"`
+	// ChecklistRequirementIDs are the active checklist items when it ran.
+	ChecklistRequirementIDs []string                `json:"checklist_requirement_ids"`
+	SubledgerControls       []RelianceControlRun    `json:"subledger_controls"`
+	BankReconciliations     []RelianceBankRecon     `json:"bank_reconciliations"`
+	ExcludedBankAccounts    []RelianceBankExclusion `json:"excluded_bank_accounts"`
+}
+
+// RelianceControlRun is the run that satisfied one required control.
+type RelianceControlRun struct {
+	Subledger    string    `json:"subledger"`
+	BookID       string    `json:"book_id,omitempty"`
+	ControlRunID string    `json:"control_run_id"`
+	RunAt        time.Time `json:"run_at"`
+}
+
+// RelianceBankRecon is the certified reconciliation that proved one account.
+type RelianceBankRecon struct {
+	BankAccountID string `json:"bank_account_id"`
+	RunID         string `json:"run_id"`
+	StatementDate string `json:"statement_date"`
+}
+
+// RelianceBankExclusion is an in-scope account the checklist waived.
+type RelianceBankExclusion struct {
+	BankAccountID string `json:"bank_account_id"`
+	RequirementID string `json:"requirement_id"`
+	Reason        string `json:"reason"`
 }
 
 type PeriodCreateRequest struct {

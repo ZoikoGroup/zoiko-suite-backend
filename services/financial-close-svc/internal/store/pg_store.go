@@ -275,9 +275,11 @@ func (s *PgStore) CreateCloseEvidence(ctx context.Context, evidence *domain.Clos
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO close_evidences (
-				evidence_id, tenant_id, fiscal_period_id, trial_balance_hash, signature, generated_at
-			) VALUES ($1, $2, $3, $4, $5, $6)
-		`, evidence.EvidenceID, tenantID, evidence.FiscalPeriodID, evidence.TrialBalanceHash, evidence.Signature, evidence.GeneratedAt)
+				evidence_id, tenant_id, fiscal_period_id, trial_balance_hash, signature, generated_at,
+				reliance_manifest, reliance_hash, reliance_signature
+			) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''))
+		`, evidence.EvidenceID, tenantID, evidence.FiscalPeriodID, evidence.TrialBalanceHash, evidence.Signature, evidence.GeneratedAt,
+			evidence.RelianceManifest, evidence.RelianceHash, evidence.RelianceSignature)
 		return err
 	})
 }
@@ -2310,6 +2312,39 @@ func (s *PgStore) RemoveCloseRequirement(ctx context.Context, requirementID, pri
 		}
 		out = cr
 		return err
+	})
+	return out, err
+}
+
+// ListCloseEvidence returns every evidence row for a period, oldest first: a
+// period reopened and closed again has one per close, and each stays.
+func (s *PgStore) ListCloseEvidence(ctx context.Context, fiscalPeriodID string) ([]domain.CloseEvidence, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.CloseEvidence
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT evidence_id::text, tenant_id, fiscal_period_id::text, trial_balance_hash, signature,
+			       generated_at, COALESCE(reliance_manifest, ''), COALESCE(reliance_hash, ''),
+			       COALESCE(reliance_signature, '')
+			  FROM close_evidences
+			 WHERE tenant_id = $1 AND fiscal_period_id::text = $2
+			 ORDER BY generated_at, evidence_id`, tenantID, fiscalPeriodID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e domain.CloseEvidence
+			if err := rows.Scan(&e.EvidenceID, &e.TenantID, &e.FiscalPeriodID, &e.TrialBalanceHash, &e.Signature,
+				&e.GeneratedAt, &e.RelianceManifest, &e.RelianceHash, &e.RelianceSignature); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
 	})
 	return out, err
 }

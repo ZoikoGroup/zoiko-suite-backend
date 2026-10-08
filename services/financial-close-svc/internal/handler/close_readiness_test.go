@@ -1,6 +1,9 @@
 package handler_test
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -464,5 +467,100 @@ func TestClose_BankGateOffAsksNobody(t *testing.T) {
 	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, &stubAuthZ{}, cl, testSigningKey, zap.NewNop()).SetBankReconciliationGate(false, 4))
 	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1"); rr.Code != http.StatusOK || cl.bankCalls != 0 {
 		t.Fatalf("gate off: got %d with %d bank calls", rr.Code, cl.bankCalls)
+	}
+}
+
+// ── Evidence: what the close relied on (ZS-CONTROL-001 §22) ─────────────────
+
+// A successful close pins the exact runs that proved it — controls, bank
+// reconciliations, waived accounts, checklist and gate settings — and signs
+// that record so it cannot be altered unnoticed.
+func TestClose_EvidencePinsWhatTheCloseReliedOn(t *testing.T) {
+	s := octoberStore()
+	bothMatched(s)
+	requireControl(s, "ASSETS", "STATUTORY")
+	at := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	assetsRun := bookRun("ASSETS", "STATUTORY", "MATCHED", at, 90000, 90000)
+	s.controlRuns = append(s.controlRuns,
+		// A superseded EXCEPTION earlier: the evidence must name the run that
+		// actually satisfied the control, not merely some run.
+		bookRun("ASSETS", "STATUTORY", "EXCEPTION", at.Add(-time.Hour), 1, 2), assetsRun)
+	petty := barclays
+	petty.BankAccountID, petty.AccountName = "acct-petty", "Petty cash"
+	s.closeRequirements = append(s.closeRequirements, &domain.CloseRequirement{RequirementID: "ex-petty", TenantID: testTenantID,
+		LegalEntityID: "le-1", Kind: domain.CloseRequirementBankAccountExclusion, BankAccountID: "acct-petty", Reason: "float under £200"})
+	cl := &stubClients{bankAccounts: []domain.BankAccountRef{barclays, petty},
+		bankRecon: []domain.BankAccountReconStatus{certified("acct-barclays", "2026-10-30")}}
+
+	if code, _, body := lock(t, s, cl); code != http.StatusOK {
+		t.Fatalf("expected the close: %d %s", code, body)
+	}
+	if len(s.evidence) != 1 {
+		t.Fatalf("evidence rows: %d", len(s.evidence))
+	}
+	ev := s.evidence[0]
+
+	// Signed: hash = sha256(manifest bytes), signature = HMAC(key, hash).
+	sum := sha256.Sum256([]byte(ev.RelianceManifest))
+	if ev.RelianceHash != hex.EncodeToString(sum[:]) {
+		t.Fatal("reliance_hash does not match the stored manifest")
+	}
+	mac := hmac.New(sha256.New, testSigningKey)
+	mac.Write(sum[:])
+	if ev.RelianceSignature != hex.EncodeToString(mac.Sum(nil)) {
+		t.Fatal("reliance_signature does not verify")
+	}
+
+	var rel domain.CloseReliance
+	if err := json.Unmarshal([]byte(ev.RelianceManifest), &rel); err != nil {
+		t.Fatal(err)
+	}
+	if rel.SubledgerControlGate != "enforce" || rel.BankReconciliationGate != "enforce" || rel.BankReconciliationCutoffDays != 4 {
+		t.Fatalf("gate settings not recorded: %+v", rel)
+	}
+	runs := map[string]string{}
+	for _, c := range rel.SubledgerControls {
+		runs[c.Subledger+"@"+c.BookID] = c.ControlRunID
+	}
+	if runs["ASSETS@STATUTORY"] != assetsRun.ControlRunID || runs["AR@"] == "" || runs["AP@"] == "" || len(runs) != 3 {
+		t.Fatalf("control runs pinned %v; want AR, AP and the MATCHED ASSETS@STATUTORY run %s", runs, assetsRun.ControlRunID)
+	}
+	if len(rel.BankReconciliations) != 1 || rel.BankReconciliations[0].RunID != "acct-barclays-2026-10-30" {
+		t.Fatalf("bank reconciliations pinned %+v", rel.BankReconciliations)
+	}
+	if len(rel.ExcludedBankAccounts) != 1 || rel.ExcludedBankAccounts[0].RequirementID != "ex-petty" ||
+		rel.ExcludedBankAccounts[0].Reason != "float under £200" {
+		t.Fatalf("waived accounts pinned %+v", rel.ExcludedBankAccounts)
+	}
+	if len(rel.ChecklistRequirementIDs) != 2 {
+		t.Fatalf("checklist pinned %v; want both active items", rel.ChecklistRequirementIDs)
+	}
+
+	// Readable back through the API, with the exact signed text.
+	rr := doReq(newGatedRouter(s, cl), http.MethodGet, "/v1/close/periods/fp-oct/evidence", nil, "auditor-1")
+	var views []domain.CloseEvidenceView
+	if err := json.Unmarshal(rr.Body.Bytes(), &views); err != nil || rr.Code != http.StatusOK {
+		t.Fatalf("evidence endpoint: %d %s", rr.Code, rr.Body.String())
+	}
+	if len(views) != 1 || views[0].RelianceManifestText != ev.RelianceManifest || views[0].Reliance == nil ||
+		views[0].Reliance.SubledgerControls[0].ControlRunID == "" {
+		t.Fatalf("evidence view %+v", views)
+	}
+}
+
+// A gate switched off is part of the record, not an absence in it.
+func TestClose_EvidenceRecordsAGateThatWasOff(t *testing.T) {
+	s := octoberStore()
+	r := chi.NewRouter()
+	r.Use(middleware.TenantContext())
+	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{}, testSigningKey, zap.NewNop()).
+		SetSubledgerControlGateEnforced(false).SetBankReconciliationGate(false, 4))
+	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1"); rr.Code != http.StatusOK {
+		t.Fatalf("lock: %d %s", rr.Code, rr.Body.String())
+	}
+	var rel domain.CloseReliance
+	_ = json.Unmarshal([]byte(s.evidence[0].RelianceManifest), &rel)
+	if rel.SubledgerControlGate != "off" || rel.BankReconciliationGate != "off" || len(rel.SubledgerControls) != 0 {
+		t.Fatalf("a close with gates off must say so: %+v", rel)
 	}
 }

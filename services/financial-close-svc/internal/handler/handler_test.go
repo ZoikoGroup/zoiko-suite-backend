@@ -190,6 +190,16 @@ func (s *stubStore) CreateCloseEvidence(_ context.Context, ev *domain.CloseEvide
 	return nil
 }
 
+func (s *stubStore) ListCloseEvidence(_ context.Context, fiscalPeriodID string) ([]domain.CloseEvidence, error) {
+	var out []domain.CloseEvidence
+	for _, ev := range s.evidence {
+		if ev.FiscalPeriodID == fiscalPeriodID {
+			out = append(out, ev)
+		}
+	}
+	return out, nil
+}
+
 func (s *stubStore) ReopenFiscalPeriod(_ context.Context, id string, reopenedAt time.Time) error {
 	if s.reopenErr != nil {
 		return s.reopenErr
