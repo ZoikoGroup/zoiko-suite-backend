@@ -37,11 +37,14 @@ type ReopenPeriodRequest struct {
 // migration 000004's doc comment for why the run and its exception
 // outcome are one row, not two separately-lifecycled objects.
 type SubledgerControlRun struct {
-	ControlRunID           string    `json:"control_run_id"`
-	TenantID               string    `json:"tenant_id"`
-	LegalEntityID          string    `json:"legal_entity_id"`
-	FiscalPeriod           string    `json:"fiscal_period"`
-	Subledger              string    `json:"subledger"` // AP | AR
+	ControlRunID  string `json:"control_run_id"`
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
+	Subledger     string `json:"subledger"` // AP | AR | ASSETS | DEPRECIATION_COMPLETENESS | INVENTORY_QUANTITY | INVENTORY_VALUE | PROJECT_REVENUE | STOCK_COUNT
+	// BookID is the asset book an ASSETS run proved (e.g. STATUTORY); empty
+	// for every other subledger. Migration 000015.
+	BookID                 string    `json:"book_id,omitempty"`
 	ControlAccountCode     string    `json:"control_account_code"`
 	SubledgerTotalAmount   float64   `json:"subledger_total_amount"`
 	GLControlBalanceAmount float64   `json:"gl_control_balance_amount"`

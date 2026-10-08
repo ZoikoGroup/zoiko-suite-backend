@@ -1042,6 +1042,7 @@ func (h *Handler) recordAndRespondControlRun(w http.ResponseWriter, r *http.Requ
 		LegalEntityID:          req.LegalEntityID,
 		FiscalPeriod:           req.FiscalPeriod,
 		Subledger:              req.Subledger,
+		BookID:                 assetBook(req),
 		ControlAccountCode:     controlAccountCode,
 		SubledgerTotalAmount:   subledgerTotal,
 		GLControlBalanceAmount: glBalance,
@@ -4304,6 +4305,16 @@ func (h *Handler) checkReadiness(ctx context.Context, tenantID, principalID stri
 	}
 
 	return issues, nil
+}
+
+// assetBook is the book an ASSETS run reconciles; every other subledger has
+// none. A book_id sent with a non-ASSETS run is ignored rather than stored,
+// so the record never claims a book it did not use.
+func assetBook(req domain.RunSubledgerControlRequest) string {
+	if req.Subledger == "ASSETS" {
+		return req.BookID
+	}
+	return ""
 }
 
 // postingBacklogCutoff is the start of the day after the period ends: an

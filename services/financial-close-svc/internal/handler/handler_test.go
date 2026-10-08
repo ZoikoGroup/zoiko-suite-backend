@@ -1842,6 +1842,31 @@ func TestRunSubledgerControl_AssetsMatched_RecordsRun(t *testing.T) {
 	if run.Subledger != "ASSETS" {
 		t.Errorf("expected ASSETS, got %q", run.Subledger)
 	}
+	// The stored evidence must name the book it proved, not just the response.
+	if run.BookID != "GAAP" || len(s.controlRuns) != 1 || s.controlRuns[0].BookID != "GAAP" {
+		t.Errorf("ASSETS run must record its book GAAP: response %q, stored %+v", run.BookID, s.controlRuns)
+	}
+}
+
+// A book sent with a non-ASSETS run was not used, so it is not recorded.
+func TestRunSubledgerControl_NonAssetRunRecordsNoBook(t *testing.T) {
+	s := newStubStore()
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"AR_CONTROL": "1100"},
+		arSubledgerTotal:    1200,
+		trialBalances:       map[string]float64{"1100": 1200},
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "AR",
+		ControlAccountMappingKey: "AR_CONTROL", BookID: "GAAP",
+	}, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(s.controlRuns) != 1 || s.controlRuns[0].BookID != "" {
+		t.Fatalf("an AR run must not claim a book: %+v", s.controlRuns)
+	}
 }
 
 // TestRunSubledgerControl_DepreciationCompletenessMatched_RecordsRun

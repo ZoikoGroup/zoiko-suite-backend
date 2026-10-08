@@ -295,11 +295,11 @@ func (s *PgStore) CreateControlRun(ctx context.Context, run *domain.SubledgerCon
 			INSERT INTO subledger_control_runs (
 				control_run_id, tenant_id, legal_entity_id, fiscal_period, subledger,
 				control_account_code, subledger_total_amount, gl_control_balance_amount,
-				difference_amount, status, run_at, run_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				difference_amount, status, run_at, run_by_principal_id, book_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULLIF($13, ''))
 		`, run.ControlRunID, tenantID, run.LegalEntityID, run.FiscalPeriod, run.Subledger,
 			run.ControlAccountCode, run.SubledgerTotalAmount, run.GLControlBalanceAmount,
-			run.DifferenceAmount, run.Status, run.RunAt, run.RunByPrincipalID)
+			run.DifferenceAmount, run.Status, run.RunAt, run.RunByPrincipalID, run.BookID)
 		return err
 	})
 }
@@ -315,7 +315,7 @@ func (s *PgStore) ListControlRuns(ctx context.Context, legalEntityID, fiscalPeri
 		rows, err := tx.Query(ctx, `
 			SELECT control_run_id, tenant_id, legal_entity_id, fiscal_period, subledger,
 			       control_account_code, subledger_total_amount, gl_control_balance_amount,
-			       difference_amount, status, run_at, run_by_principal_id
+			       difference_amount, status, run_at, run_by_principal_id, COALESCE(book_id, '')
 			FROM subledger_control_runs
 			WHERE tenant_id = $1 AND legal_entity_id = $2 AND fiscal_period = $3
 			ORDER BY run_at DESC
@@ -329,7 +329,7 @@ func (s *PgStore) ListControlRuns(ctx context.Context, legalEntityID, fiscalPeri
 			if err := rows.Scan(
 				&run.ControlRunID, &run.TenantID, &run.LegalEntityID, &run.FiscalPeriod, &run.Subledger,
 				&run.ControlAccountCode, &run.SubledgerTotalAmount, &run.GLControlBalanceAmount,
-				&run.DifferenceAmount, &run.Status, &run.RunAt, &run.RunByPrincipalID,
+				&run.DifferenceAmount, &run.Status, &run.RunAt, &run.RunByPrincipalID, &run.BookID,
 			); err != nil {
 				return err
 			}
