@@ -46,13 +46,44 @@ func TestNCD02_FreeTextEndpointForRegulatedNeedsControlledException(t *testing.T
 	free := &ncd.FreeTextEndpoint{Channel: "EMAIL", Address: "someone@example.com"}
 	_, err := h.svc.ResolveRecipient(h.ctx, h.author, ncd.RecipientInput{IntentID: i.IntentID, RecipientPrincipalID: r, FreeTextEndpoint: free})
 	h.refusal(err, ncd.NCD007EndpointUnverified) // NP-11
-	free.ExceptionRef, free.VerificationRef, free.ReviewerPrincipalID = "EXC-1", "VER-1", "alice"
-	_, err = h.svc.ResolveRecipient(h.ctx, h.author, ncd.RecipientInput{IntentID: i.IntentID, RecipientPrincipalID: r, FreeTextEndpoint: free})
+	resolve := func() (*ncd.RecipientPlan, error) {
+		return h.svc.ResolveRecipient(h.ctx, h.author, ncd.RecipientInput{IntentID: i.IntentID, RecipientPrincipalID: r, FreeTextEndpoint: free})
+	}
+	free.ExceptionRef, free.VerificationRef, free.ReviewerPrincipalID = "EXC-1", "VER-1", h.author.PrincipalID
+	_, err = resolve()
 	h.kind(err, ncd.KindForbidden, "self_review_forbidden")
+	// S7-1 / R-6: made-up references used to be accepted as a verified
+	// endpoint. They are now refused.
 	free.ReviewerPrincipalID = "carol"
-	plan, err := h.svc.ResolveRecipient(h.ctx, h.author, ncd.RecipientInput{IntentID: i.IntentID, RecipientPrincipalID: r, FreeTextEndpoint: free})
+	_, err = resolve()
+	h.refusal(err, ncd.NCD007EndpointUnverified)
+
+	// The real path: requested by the author, approved by a second principal.
+	appr, err := h.svc.RequestEndpointException(h.ctx, h.author, ncd.EndpointExceptionInput{
+		RecipientPrincipalID: r, Address: "Someone@Example.com", VerificationRef: "VER-1", Reason: "court-ordered service address"})
 	h.must(err)
-	if plan.Endpoints[0].Provenance != ncd.ProvenanceControlledInput || !strings.Contains(plan.Endpoints[0].ProvenanceRef, "reviewer:carol") {
+	free.ExceptionRef, free.ReviewerPrincipalID = appr.ApprovalID, h.approver.PrincipalID
+	_, err = resolve()
+	h.refusal(err, ncd.NCD007EndpointUnverified) // still PENDING
+	_, _, err = h.svc.DecideApproval(h.ctx, h.author, appr.ApprovalID, true, "mine")
+	h.kind(err, ncd.KindForbidden, "self_approval_forbidden")
+	_, _, err = h.svc.DecideApproval(h.ctx, h.approver, appr.ApprovalID, true, "verified by phone")
+	h.must(err)
+
+	free.ReviewerPrincipalID = "carol" // named, but not who approved
+	_, err = resolve()
+	h.refusal(err, ncd.NCD007EndpointUnverified)
+	free.ReviewerPrincipalID, free.VerificationRef = h.approver.PrincipalID, "VER-2"
+	_, err = resolve()
+	h.refusal(err, ncd.NCD007EndpointUnverified)
+	free.VerificationRef, free.Address = "VER-1", "other@example.com"
+	_, err = resolve()
+	h.refusal(err, ncd.NCD007EndpointUnverified)
+
+	free.Address = "someone@example.com"
+	plan, err := resolve()
+	h.must(err)
+	if plan.Endpoints[0].Provenance != ncd.ProvenanceControlledInput || !strings.Contains(plan.Endpoints[0].ProvenanceRef, "reviewer:"+h.approver.PrincipalID) {
 		t.Fatalf("controlled exception provenance not recorded: %+v", plan.Endpoints[0])
 	}
 }

@@ -195,6 +195,20 @@ type Store struct {
 	gen       map[string]uint64
 	globalGen map[string]uint64
 
+	// watermark is the data's own "policy_version|assignment_version"
+	// (migration 000028), refreshed by RunWatermark and part of every key.
+	// The generation counters above only see writes through THIS process;
+	// the watermark sees every write, on any replica or straight to the
+	// database, within one refresh (ZS-IAM-001 §19 "assignment version,
+	// policy version" in the key). watermarkMode is set once RunWatermark
+	// starts; from then on a watermark older than watermarkMaxAge bypasses
+	// the cache, so an unreadable watermark costs round-trips, never
+	// freshness.
+	watermarkMode   bool
+	watermark       string
+	watermarkAt     time.Time
+	watermarkMaxAge time.Duration
+
 	hits   uint64
 	misses uint64
 }
@@ -230,6 +244,7 @@ func (s *Store) key(ns, tenantID string, parts ...string) string {
 	s.mu.Lock()
 	g := s.gen[ns+"|"+tenantID]
 	gg := s.globalGen[ns]
+	wm := s.watermark
 	s.mu.Unlock()
 
 	var b strings.Builder
@@ -240,6 +255,8 @@ func (s *Store) key(ns, tenantID string, parts ...string) string {
 	b.WriteString(strconv.FormatUint(g, 10))
 	b.WriteByte('|')
 	b.WriteString(strconv.FormatUint(gg, 10))
+	b.WriteByte('|')
+	b.WriteString(wm)
 	for _, p := range parts {
 		b.WriteByte('|')
 		b.WriteString(p)
@@ -253,6 +270,10 @@ func (s *Store) load(key string) (any, bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.watermarkFreshLocked() {
+		s.misses++
+		return nil, false
+	}
 	e, ok := s.entries[key]
 	if !ok || time.Now().After(e.expiresAt) {
 		s.misses++
@@ -268,10 +289,70 @@ func (s *Store) save(key string, value any) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.watermarkFreshLocked() {
+		return
+	}
 	if len(s.entries) >= maxEntries {
 		s.sweepLocked()
 	}
 	s.entries[key] = entry{value: value, expiresAt: time.Now().Add(s.ttl)}
+}
+
+// watermarkFreshLocked reports whether cached entries may be used. Without a
+// watermark source (tests, AUTHZ_CACHE_TTL_SECONDS with no refresher) the
+// generation counters and the TTL are the only bounds, as before. With one,
+// the cache is used only while the watermark is recent. Caller holds s.mu.
+func (s *Store) watermarkFreshLocked() bool {
+	if !s.watermarkMode {
+		return true
+	}
+	return !s.watermarkAt.IsZero() && time.Since(s.watermarkAt) <= s.watermarkMaxAge
+}
+
+// SetWatermark records a watermark read. Exported for RunWatermark and tests.
+func (s *Store) SetWatermark(policy, assignment int64, at time.Time) {
+	wm := strconv.FormatInt(policy, 10) + "." + strconv.FormatInt(assignment, 10)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.watermarkMode = true
+	if s.watermarkMaxAge <= 0 {
+		s.watermarkMaxAge = 3 * time.Second
+	}
+	s.watermark, s.watermarkAt = wm, at
+}
+
+// RunWatermark refreshes the version watermark every interval until ctx ends.
+// read is the store's VersionWatermark. A failed read is logged and leaves
+// the old watermark ageing out, after which reads bypass the cache.
+func (s *Store) RunWatermark(ctx context.Context, read func(context.Context) (int64, int64, error), every time.Duration) {
+	if every <= 0 {
+		every = time.Second
+	}
+	s.mu.Lock()
+	s.watermarkMode, s.watermarkMaxAge = true, 3*every
+	s.mu.Unlock()
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	failing := false
+	for {
+		p, a, err := read(ctx)
+		switch {
+		case err == nil:
+			s.SetWatermark(p, a, time.Now())
+			if failing {
+				s.log.Info("authorization cache watermark readable again")
+				failing = false
+			}
+		case ctx.Err() == nil && !failing:
+			s.log.Warn("authorization cache watermark unreadable — the cache is bypassed until it is", zap.Error(err))
+			failing = true
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // sweepLocked drops expired entries, and everything if that was not enough.

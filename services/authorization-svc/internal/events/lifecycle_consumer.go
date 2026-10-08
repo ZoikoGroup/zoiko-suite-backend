@@ -60,6 +60,13 @@ type LifecycleProjector interface {
 //	                         — identity-context-svc. The only one of the
 //	                           candidates keyed on principal_id. See below on
 //	                           employee.terminated, which is not usable.
+//	                       employment.changed                zoiko.access-control.events
+//	                         — access-control-svc, since 7 Oct 2026: it holds
+//	                           the ADMINISTERED employee→principal link
+//	                           (its 000015) and publishes a linked employee's
+//	                           exit under the spec's own name, keyed on the
+//	                           principal. Projected as TERMINATED; HR never
+//	                           reinstates (that stays identity-context-svc's).
 //
 //	entity.scope.updated   entity.status.changed,            zoiko.entity.events
 //	                       entity.hierarchy.changed,
@@ -148,6 +155,7 @@ var (
 	// principalStatusEvents is the projecting group.
 	principalStatusEvents = map[string]bool{
 		"principal.status.changed": true,
+		EventEmploymentChanged:     true,
 	}
 
 	// grantGraphEvents is the invalidating group: every event that changes
@@ -205,6 +213,24 @@ func LifecycleConsumedEventTypes() map[string]bool {
 // refuse a STALE event, and nil means "upstream did not say", which that
 // method handles by applying the write. Declaring it now means a producer that
 // starts sending it gets replay protection with no change here.
+// EventEmploymentChanged is Doc 03 §8.3's consumed employment.changed, as
+// access-control-svc publishes it for a linked employee's exit.
+const EventEmploymentChanged = "employment.changed"
+
+// employmentEndedStatuses are the employment states that end a principal's
+// authority. Anything else (ON_LEAVE, SUSPENDED, a rehire's ACTIVE) projects
+// nothing: a temporary absence is not an exit, and reinstatement is the
+// identity plane's decision, not HR's.
+var employmentEndedStatuses = map[string]bool{"TERMINATED": true, "RESIGNED": true, "DEACTIVATED": true, "INACTIVE": true, "ARCHIVED": true}
+
+// employmentChangedPayload is access-control-svc's employment.changed.
+type employmentChangedPayload struct {
+	PrincipalID      string     `json:"principal_id"`
+	TenantID         string     `json:"tenant_id"`
+	EmploymentStatus string     `json:"employment_status"`
+	StatusChangedAt  *time.Time `json:"status_changed_at"`
+}
+
 type principalStatusPayload struct {
 	PrincipalID     string     `json:"principal_id"`
 	TenantID        string     `json:"tenant_id"`
@@ -392,7 +418,23 @@ func (c *LifecycleConsumer) handleEntityStatus(ctx context.Context, env inbound)
 
 func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbound) error {
 	var payload principalStatusPayload
-	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+	source := LifecycleSourceService
+	if env.EventType == EventEmploymentChanged {
+		var e employmentChangedPayload
+		if err := json.Unmarshal(env.Payload, &e); err != nil {
+			c.log.Error("employment.changed: undecodable payload — skipped",
+				zap.String("event_id", env.EventID), zap.Error(err))
+			return nil
+		}
+		if !employmentEndedStatuses[strings.ToUpper(strings.TrimSpace(e.EmploymentStatus))] {
+			c.log.Debug("employment.changed is not an exit — nothing projected",
+				zap.String("event_id", env.EventID), zap.String("employment_status", e.EmploymentStatus))
+			return nil
+		}
+		payload = principalStatusPayload{PrincipalID: e.PrincipalID, TenantID: e.TenantID,
+			NewStatus: "TERMINATED", StatusChangedAt: e.StatusChangedAt}
+		source = "access-control-svc"
+	} else if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		c.log.Error("principal status event: undecodable payload — skipped",
 			zap.String("event_id", env.EventID), zap.Error(err))
 		return nil // Malformed payload, commit and move on
@@ -439,7 +481,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 		PrincipalID:     principalID,
 		TenantID:        tenantID,
 		Status:          status,
-		SourceService:   LifecycleSourceService,
+		SourceService:   source,
 		StatusChangedAt: payload.StatusChangedAt,
 	})
 	if err != nil {

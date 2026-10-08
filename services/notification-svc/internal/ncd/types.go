@@ -896,6 +896,11 @@ const (
 	ApprovalManualEvidence  = "MANUAL_EVIDENCE"
 	ApprovalSuppressionLift = "SUPPRESSION_LIFT"
 	ApprovalBulkSend        = "BULK_SEND"
+	// ApprovalEndpointException is NP-11's controlled exception for a
+	// free-text endpoint on a protected communication: the caller requests
+	// it, a second principal approves it, and only an APPROVED one for the
+	// same recipient, address and verification is honoured (S7-1 / R-6).
+	ApprovalEndpointException = "ENDPOINT_EXCEPTION"
 )
 
 // Exception is an item on the human path.

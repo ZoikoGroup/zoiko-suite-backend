@@ -142,3 +142,15 @@ func TestSubjectLinksObserveReturnsThePriorState(t *testing.T) {
 	require.Equal(t, "user-2", l2.PrincipalID, "re-linking replaces the principal")
 	require.Equal(t, "M-2", l2.LastManagerEmployeeID, "and keeps what was observed")
 }
+
+// 000016: employment.changed is an allowed outbox type, keyed on the principal.
+func TestEmploymentEndedIsEnqueued(t *testing.T) {
+	s := store.New(appPool)
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantGov)
+	l := domain.SubjectLink{TenantID: tenantGov, EmployeeID: "E-x", PrincipalID: "p-leaver-" + uuid.NewString()[:6], LegalEntityID: "le-1"}
+	require.NoError(t, s.RecordEmploymentEnded(ctx, l, "TERMINATED", "ACTIVE", "FULL_TIME", "ev-1"))
+	var n int
+	require.NoError(t, ownerPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM event_outbox WHERE event_type = 'employment.changed' AND aggregate_key = $1`, l.PrincipalID).Scan(&n))
+	require.Equal(t, 1, n)
+}

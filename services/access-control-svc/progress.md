@@ -467,3 +467,10 @@ progress.md says.
   SCIM feed yet.
 - identity-context-svc's revocation tombstone (S1-4, its side).
 - S9-D1: the 668 legacy action names are each owning service's to rename.
+
+### 8 Oct addendum: employment.changed (000016)
+
+A linked employee's exit now also publishes `employment.changed` (Doc 03 §8.3's consumed name), keyed by
+the principal, which authorization-svc projects as `TERMINATED` — the leaver loses access, not just gets
+reviewed. Exits only; never for an unlinked employee, a move or a temporary absence. Migration **000016**
+admits the type in the outbox CHECK; asyncapi.yaml publishes it. Store test + hrevents test.

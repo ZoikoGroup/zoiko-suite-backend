@@ -2671,6 +2671,56 @@ paths:
       requestBody:
         required: false
         content: *id001
+  /v1/recipient-endpoint-exceptions:
+    post:
+      tags:
+      - NCD-02 recipient & channel
+      operationId: post_v1_recipient_endpoint_exceptions
+      summary: Request a controlled free-text endpoint exception (NP-11)
+      description: >-
+        Records a PENDING maker-checker approval (kind ENDPOINT_EXCEPTION) for one
+        recipient, address and verification reference. A second principal approves
+        it at /v1/approvals/{id}/approve. A recipient resolution for a mandatory,
+        regulated or security communication then cites its approval_id as
+        exception_ref, with reviewer_principal_id = the approver; any mismatch, or
+        an exception not APPROVED, is refused NCD-007 (gap S7-1 / R-6).
+      parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/PrincipalId'
+      - $ref: '#/components/parameters/CorrelationId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/SourceChannel'
+      - $ref: '#/components/parameters/LegalEntityId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipient_principal_id, address, verification_ref, reason]
+              properties:
+                recipient_principal_id: {type: string}
+                channel: {type: string, enum: [EMAIL], default: EMAIL}
+                address: {type: string, format: email}
+                verification_ref: {type: string}
+                reason: {type: string}
+      responses:
+        '202':
+          description: Recorded PENDING; honoured only once a second principal approves it.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /v1/suppressions/{id}/lift:
     post:
       tags:

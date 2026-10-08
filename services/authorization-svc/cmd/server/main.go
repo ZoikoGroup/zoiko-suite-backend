@@ -131,6 +131,13 @@ func main() {
 	// see internal/cache's package comment, which is the part worth reading
 	// before changing this line.
 	authzStore := cache.New(pgStore, cfg.CacheTTL, log)
+	// The assignment / policy version watermark in every cache key (000028):
+	// writes on any replica retire cached entries within a second.
+	watermarkCtx, stopWatermark := context.WithCancel(context.Background())
+	defer stopWatermark()
+	if authzStore.Enabled() {
+		go authzStore.RunWatermark(watermarkCtx, pgStore.VersionWatermark, time.Second)
+	}
 	if authzStore.Enabled() {
 		log.Info("authorization read cache enabled", zap.Duration("ttl", cfg.CacheTTL))
 	} else {

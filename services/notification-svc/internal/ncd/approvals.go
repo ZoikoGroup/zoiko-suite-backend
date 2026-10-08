@@ -84,6 +84,8 @@ func (s *Service) DecideApproval(ctx context.Context, a Actor, id string, approv
 			result = sup
 		case ApprovalBulkSend:
 			// Approval only; dispatch presents the audience hash separately.
+		case ApprovalEndpointException:
+			// Approval only; a recipient resolution cites it as exception_ref.
 		}
 		return nil
 	})

@@ -1365,6 +1365,11 @@ is in `services/authorization-svc/progress.md` ("Governance Platform audit closu
 |---|---|---|---|---|---|
 | 28 Sep audit | 29 | 20 | 19 | 42.6% | 57.4% |
 | **7 Oct, after fixes** | **58** | **10** | **0** | **85.3%** | **92.6%** |
+| **8 Oct** | **60** | **8** | **0** | **88.2%** | **94.1%** |
+
+8 Oct: "Cache key includes assignment and policy versions" ✅ (000028 watermark in every key; any replica's
+write retires entries within ~1 s) and "Consume employment.changed" ✅ (access-control-svc publishes it for a
+linked employee's exit through its administered employee→principal link; projected TERMINATED).
 
 All 19 ❌ are closed. The 10 ⚠️ left each wait on something outside the service:
 

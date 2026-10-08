@@ -2195,3 +2195,20 @@ The 10 ⚠️ that remain, each waiting outside this service:
 | Denials are evidentially retrievable | tenantless decisions stay invisible until the callers send a tenant |
 | Consume employment.changed | `principal.status.changed` is consumed; `employee.*` has no employee-to-principal mapping here (access-control-svc now holds an administered one for reviews) |
 | Action names callers use but nothing grants | grants are seeded per service; 000019 seeds only the SoD baseline |
+
+## 8 Oct: the last two in-service rows closed — 60 ✅ / 8 ⚠️ / 0 ❌
+
+| Row | Was | Now | How |
+|---|---|---|---|
+| Cache key includes assignment and policy versions | ⚠️ | ✅ | Migration **000028**: a one-row `authz_versions` watermark, bumped by statement-level SECURITY DEFINER triggers — policy on every `authz_config_history` / `sod_exceptions` write, assignment on assignment, delegation, principal-status and entity-status writes. `cache.RunWatermark` reads it every second and it is part of every key, so a write on ANY replica (or straight to the DB) retires cached entries within ~1 s instead of the TTL. An unreadable watermark bypasses the cache (never serves stale grants). The app role needs SELECT only. |
+| Consume employment.changed | ⚠️ | ✅ | access-control-svc publishes `employment.changed` (the Doc 03 §8.3 name) for a LINKED employee's exit, through its administered employee→principal link. The lifecycle consumer projects it as principal status `TERMINATED` (source `access-control-svc`), so layer 0 denies. Exits only: ON_LEAVE / SUSPENDED / a rehire project nothing — reinstatement stays identity-context-svc's. |
+
+Verified: unit suites; cache watermark tests (3) and employment.changed tests (2); `TestWatermarkIT_PolicyAndAssignmentWritesMoveIt` as the NOBYPASSRLS app role with UPDATE on `authz_versions` revoked (14/14 IT); legacy owner suite 66/66 with 000028 in `setupTestDB`; mutants (exit filter) killed. **Deploy: 000020–000028 before this build.**
+
+| | ✅ | ⚠️ | ❌ | Full | Weighted |
+|---|---|---|---|---|---|
+| 28 Sep audit | 29 | 20 | 19 | 42.6% | 57.4% |
+| 7 Oct | 58 | 10 | 0 | 85.3% | 92.6% |
+| **8 Oct** | **60** | **8** | **0** | **88.2%** | **94.1%** |
+
+The 8 ⚠️ left are all outside this service: the console sending `reason_code` / `purpose` / delegation `reason` (2 rows; then `AUTHZ_COMMAND_CONTRACT=enforce`), the 55 tenantless `/v1/authorize` callers (3 rows; then `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE=true`), the mTLS / workload-identity rollout via mtls-management-svc (2 rows), and per-service grant seeding (1 row).

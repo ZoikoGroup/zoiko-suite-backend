@@ -17,6 +17,12 @@ import (
 type fakeLinks struct {
 	links    map[string]*domain.SubjectLink // by employee id
 	observed int
+	ended    []string // principal:status, per employment.changed
+}
+
+func (f *fakeLinks) RecordEmploymentEnded(_ context.Context, l domain.SubjectLink, status, _, _, _ string) error {
+	f.ended = append(f.ended, l.PrincipalID+":"+status)
+	return nil
 }
 
 func (f *fakeLinks) FindSubjectLink(ctx context.Context, emp string) (*domain.SubjectLink, error) {
@@ -192,5 +198,25 @@ func TestMalformedAndForeignEvents(t *testing.T) {
 	}
 	if out, _ := h.Handle(context.Background(), event(t, "ev-1", "employee.terminated", map[string]any{})); out != hrevents.OutcomeMalformed {
 		t.Errorf("no employee = %s", out)
+	}
+}
+
+// Doc 03 §8.3: a linked exit publishes employment.changed exactly once; a move
+// or a temporary absence publishes nothing.
+func TestExitPublishesEmploymentChanged(t *testing.T) {
+	links, _, h := rig()
+	_, _ = h.Handle(context.Background(), event(t, "ev-1", "employee.updated", map[string]any{"employee_id": "E-1", "manager_employee_id": "E-M2"}))
+	_, _ = h.Handle(context.Background(), event(t, "ev-2", "employee.status.changed", map[string]any{"employee_id": "E-1", "old_status": "ACTIVE", "new_status": "ON_LEAVE"}))
+	if len(links.ended) != 0 {
+		t.Fatalf("a mover / leave published employment.changed: %v", links.ended)
+	}
+	_, _ = h.Handle(context.Background(), event(t, "ev-3", "employee.terminated", map[string]any{"employee_id": "E-1"}))
+	_, _ = h.Handle(context.Background(), event(t, "ev-4", "employee.terminated", map[string]any{"employee_id": "E-1"}))
+	if len(links.ended) != 1 || links.ended[0] != "user-1:TERMINATED" {
+		t.Fatalf("ended = %v; want one employment.changed for user-1", links.ended)
+	}
+	_, _ = h.Handle(context.Background(), event(t, "ev-5", "employee.terminated", map[string]any{"employee_id": "E-404"}))
+	if len(links.ended) != 1 {
+		t.Fatalf("an unlinked employee published employment.changed")
 	}
 }

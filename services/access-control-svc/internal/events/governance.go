@@ -1,6 +1,10 @@
 package events
 
-import "zoiko.io/access-control-svc/internal/domain"
+import (
+	"time"
+
+	"zoiko.io/access-control-svc/internal/domain"
+)
 
 // The canonical IAM domain events (Authorization Standard §23) this service
 // emits for its governance surface. Every name here is also in the outbox's
@@ -12,6 +16,9 @@ const (
 	TypeAssignmentRevoked     = "iam.assignment.revoked"
 	TypeAccessReviewStarted   = "iam.access_review.started"
 	TypeAccessReviewCompleted = "iam.access_review.completed"
+	// TypeEmploymentChanged is Doc 03 §8.3's employment.changed, published
+	// for a LINKED employee's exit (000015 / 000016).
+	TypeEmploymentChanged = "employment.changed"
 )
 
 // RolePublished builds iam.role.published: "role version activated". Emitted
@@ -135,5 +142,23 @@ func AccessReviewCompleted(c domain.ReviewCampaign, correlationID, actorID strin
 		"campaign_name": c.CampaignName,
 		"review_type":   c.ReviewType,
 		"summary":       summary,
+	})
+}
+
+// EmploymentChanged builds employment.changed for a linked employee's exit,
+// keyed by the principal so it orders with that principal's other events.
+// status_changed_at lets authorization-svc refuse a stale replay.
+func EmploymentChanged(l domain.SubjectLink, newStatus, oldStatus, workerType, sourceEventID, correlationID string, at time.Time) (Outbound, error) {
+	return Build(TypeEmploymentChanged, correlationID, l.TenantID, "access-control-svc", l.PrincipalID, map[string]any{
+		"principal_id":      l.PrincipalID,
+		"employee_id":       l.EmployeeID,
+		"tenant_id":         l.TenantID,
+		"legal_entity_id":   l.LegalEntityID,
+		"employment_status": newStatus,
+		"previous_status":   oldStatus,
+		"worker_type":       workerType,
+		"status_changed_at": at.UTC(),
+		"source_event_id":   sourceEventID,
+		"mapping":           "administered subject link",
 	})
 }

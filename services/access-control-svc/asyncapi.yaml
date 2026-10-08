@@ -78,6 +78,7 @@ channels:
           - $ref: '#/components/messages/AssignmentRevoked'
           - $ref: '#/components/messages/AccessReviewStarted'
           - $ref: '#/components/messages/AccessReviewCompleted'
+          - $ref: '#/components/messages/EmploymentChanged'
 
   # ── consumed (S9-C2 event-triggered reviews; internal/hrevents) ─────────────
   # This file's convention puts what this service PUBLISHES under `publish`;
@@ -105,6 +106,28 @@ channels:
 
 components:
   messages:
+    EmploymentChanged:
+      name: employment.changed
+      title: A linked employee left (Doc 03 §8.3)
+      summary: |
+        Published when a LINKED employee exits (employee.terminated, or a
+        status move into TERMINATED / RESIGNED / DEACTIVATED / INACTIVE /
+        ARCHIVED). Keyed by principal_id. authorization-svc projects the
+        principal TERMINATED, so layer 0 denies every action. Never published
+        for an unlinked employee, a move or a temporary absence.
+      payload:
+        type: object
+        required: [principal_id, tenant_id, employment_status]
+        properties:
+          principal_id: { type: string }
+          employee_id: { type: string }
+          tenant_id: { type: string }
+          legal_entity_id: { type: string }
+          employment_status: { type: string }
+          previous_status: { type: string }
+          worker_type: { type: string }
+          status_changed_at: { type: string, format: date-time }
+          source_event_id: { type: string }
     HRLifecycleEvent:
       name: employee.*
       title: An HR lifecycle event (consumed)

@@ -70,6 +70,7 @@ func RegisterNCDRoutes(r chi.Router, h *NCDHandler) {
 		r.Get("/v1/suppressions", h.listSuppressions)
 		r.Post("/v1/suppressions", h.addSuppression)
 		r.Post("/v1/suppressions/{id}/lift", h.liftSuppression)
+		r.Post("/v1/recipient-endpoint-exceptions", h.requestEndpointException)
 		r.Post("/v1/preferences", h.setPreference)
 		r.Get("/v1/preferences/me", h.getPreference)
 		r.Post("/v1/revalidate", h.revalidate)
@@ -592,6 +593,26 @@ func (h *NCDHandler) liftSuppression(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s)
 }
 
+// requestEndpointException records NP-11's controlled exception request. 202:
+// it is honoured only after a second principal approves it.
+func (h *NCDHandler) requestEndpointException(w http.ResponseWriter, r *http.Request) {
+	a, ok := h.actor(w, r)
+	if !ok {
+		return
+	}
+	var in ncd.EndpointExceptionInput
+	if !decodeJSON(w, r, &in) || !h.allow(w, r, a, headerEntity(r), actionSuppressionManage) {
+		return
+	}
+	appr, err := h.svc.RequestEndpointException(r.Context(), a, in)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"approval": appr,
+		"message": "the exception is honoured once a second principal approves it; cite approval_id as exception_ref"})
+}
+
 func (h *NCDHandler) setPreference(w http.ResponseWriter, r *http.Request) {
 	a, ok := h.actor(w, r)
 	if !ok {
@@ -1021,7 +1042,7 @@ func (h *NCDHandler) dispatchBulk(w http.ResponseWriter, r *http.Request) {
 
 func approvalAction(kind string) string {
 	switch kind {
-	case ncd.ApprovalSuppressionLift:
+	case ncd.ApprovalSuppressionLift, ncd.ApprovalEndpointException:
 		return actionSuppressionManage
 	case ncd.ApprovalBulkSend:
 		return actionTemplateApprove

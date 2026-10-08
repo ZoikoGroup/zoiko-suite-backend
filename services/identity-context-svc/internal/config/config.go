@@ -55,6 +55,17 @@ type Config struct {
 	TenantRegistryURL string
 	AccessControlURL  string
 
+	// CommercialAccountURL is COM-03 Entitlement (commercial-account-svc), the
+	// "commercial entitlement read model" §4 names for the entitlement context
+	// reference. Empty leaves it UPSTREAM_NOT_CONFIGURED. ServicePrincipalID is
+	// this service's identity there (platform COMMERCIAL_RESTRICTION_READ).
+	CommercialAccountURL string
+	ServicePrincipalID   string
+
+	// IDPClientChannels maps a verified IdP client id (azp) to its §4 source
+	// channel: IDP_CLIENT_CHANNELS="zoiko-console=web,zoiko-mobile=mobile".
+	IDPClientChannels map[string]string
+
 	// Authorization Service URL for admin mutation authorization checks.
 	// Must be set in production/staging; a placeholder is allowed only in local development.
 	AuthzServiceURL string
@@ -335,6 +346,9 @@ func Load() (*Config, error) {
 		},
 		TenantRegistryURL:    env("TENANT_REGISTRY_URL", "http://tenant-registry-svc"),
 		AccessControlURL:     env("ACCESS_CONTROL_URL", "http://access-control-svc"),
+		CommercialAccountURL: env("COMMERCIAL_ACCOUNT_URL", ""),
+		ServicePrincipalID:   env("IDENTITY_SERVICE_PRINCIPAL_ID", "svc-identity-context"),
+		IDPClientChannels:    envPairs("IDP_CLIENT_CHANNELS"),
 		AuthzServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthzEnv:             env("AUTHZ_ENV", ""), // derived below; never defaulted here
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
@@ -504,4 +518,16 @@ func envBool(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// envPairs parses "a=b,c=d" into a map; blanks and malformed pairs are skipped.
+func envPairs(key string) map[string]string {
+	out := map[string]string{}
+	for _, part := range strings.Split(os.Getenv(key), ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
+			out[strings.TrimSpace(k)] = strings.ToLower(strings.TrimSpace(v))
+		}
+	}
+	return out
 }

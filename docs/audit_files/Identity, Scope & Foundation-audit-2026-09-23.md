@@ -2440,3 +2440,36 @@ The first seven are the 7 Oct findings, ranked by risk. Fix these first.
 
 After each step, re-score only the rows that step touched. Then update the "Scores" table in
 "Group 1 re-audit, 7 October 2026" and the summary table at the top of this file.
+
+
+---
+
+# Gap closure, 8 October 2026: the 7 Oct findings that touch authorization
+
+Fixed in the services that own them, each against the "Re-check" column of the register above, on a
+real Postgres 16 where SQL is involved, with a mutant per control. Uncommitted.
+
+| Gap | Service | Fix | Proof |
+|---|---|---|---|
+| S1-1 (R-2) | identity-context-svc | Attach is a REQUEST (`202 PENDING_APPROVAL`, grants nothing; the caller may not name themselves). The named approver's own `POST /v1/context/support/{id}/approve` (action `IDENTITY_SUPPORT_CONTEXT_APPROVE`) makes it live; requester / grantee → `403 SOD_CONFLICT`, anyone else → `403 AUTHORIZATION_DENIED`; GOV-04 asked again; 1 h approval window; migration 000011 (schema CHECK requester ≠ approver) | Named nonexistent approver → no grant; requester approval → 403 SOD_CONFLICT; real approver → live. Store test on PG |
+| S1-2 (R-3) | identity-context-svc | `FetchMessage` + commit after apply; a failed side effect releases the Redis claim and is retried with backoff (bounded, then logged at ERROR) | Fault-injected eviction: retried, not lost; redelivery still deduplicated |
+| S1-3 (R-1) | identity-context-svc | `/v1/context/resolve` requires correlation; header used when the body has none | No correlation → 400; header-only → stored |
+| S1-4 | identity-context-svc | Revocation tombstones (000010): a grant arriving after its revoke is projected already ended | Revoke-then-grant → not framed; tenant-scoped |
+| S3-1 (R-4) | configuration-feature-flag-svc | C2/C3 proposer cannot approve (`403 change_self_approval`); `approved_at` is server time | Store test on PG |
+| S3-2 (R-5) | configuration-feature-flag-svc | Only PROPOSED/VALIDATED can be decided (guard in code and in the UPDATE); `409 change_not_approvable` | Approve/reject a VERIFIED change → 409, status unchanged, not re-activatable |
+| S7-1 (R-6) | notification-svc | `exception_ref` must be an APPROVED `ENDPOINT_EXCEPTION` approval (000031, requested at `POST /v1/recipient-endpoint-exceptions`, decided by a second principal) for the same recipient, address and verification, decided by the named reviewer | Made-up refs → NCD-007; real approved exception → accepted (231/231 store tests) |
+
+**Found on the way, also fixed:** identity-context-svc could not read an open-ended projected role
+(`effective_to = infinity` → "cannot scan Infinity"), so any principal holding an open-ended governed
+assignment failed to resolve; its openapi.yaml was not valid OpenAPI (duplicate parameter).
+
+| # | Service | 7 Oct | **8 Oct** |
+|---|---|---|---|
+| 1 | identity-context-svc | 38/44: 86% (92%) | **42/44: 95% (98%)** |
+| 3 | configuration-feature-flag-svc | 46/49: 94% (97%) | **47/49: 96% (98%)** |
+| 7 | notification-svc | 34/37: 92% (96%) | **35/37: 95% (97%)** |
+| 9 | access-control-svc | 9/10: 90% (95%) | **10/10: 100%** |
+| | **Group** | 283/303: 93.4% (96.5%) | **290/303: 95.7% (97.7%)** |
+
+Still open from the register's group A: S6-1/S6-2 (search-indexer Dockerfile and `EnsureIndex`), S7-2…S7-6
+(notification test/DLP items), S5-1 (GTRM on Windows) — none of them touch authorization.

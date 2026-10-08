@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/access-control-svc/internal/domain"
+	"zoiko.io/access-control-svc/internal/events"
 )
 
 // Subject links (migration 000015): the administered employee-to-principal
@@ -114,4 +116,19 @@ func (s *PgStore) ObserveSubject(ctx context.Context, employeeID, managerEmploye
 		return nil, err
 	}
 	return &before, nil
+}
+
+// RecordEmploymentEnded enqueues employment.changed for a linked employee's
+// exit (000016), for authorization-svc to project as the principal's status.
+func (s *PgStore) RecordEmploymentEnded(ctx context.Context, l domain.SubjectLink, newStatus, oldStatus, workerType, sourceEventID string) error {
+	tenantID, err := requestTenant(ctx)
+	if err != nil {
+		return err
+	}
+	ev, err := events.EmploymentChanged(l, newStatus, oldStatus, workerType, sourceEventID,
+		requestCorrelation(ctx, "hr-"+sourceEventID), time.Now())
+	if err != nil {
+		return err
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error { return enqueue(ctx, tx, tenantID, ev) })
 }

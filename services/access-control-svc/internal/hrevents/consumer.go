@@ -41,6 +41,9 @@ import (
 type Links interface {
 	FindSubjectLink(ctx context.Context, employeeID string) (*domain.SubjectLink, error)
 	ObserveSubject(ctx context.Context, employeeID, managerEmployeeID, status string) (*domain.SubjectLink, error)
+	// RecordEmploymentEnded publishes employment.changed for a linked exit,
+	// so authorization-svc denies the principal (Doc 03 §8.3).
+	RecordEmploymentEnded(ctx context.Context, l domain.SubjectLink, newStatus, oldStatus, workerType, sourceEventID string) error
 }
 
 // Trigger opens a review (handler.Gov).
@@ -134,6 +137,7 @@ func (h *Handler) Handle(ctx context.Context, value []byte) (string, error) {
 	}
 
 	var reason, reviewerEmployee, observedManager, observedStatus string
+	leaver := false
 	switch env.EventType {
 	case "employee.updated":
 		observedManager, observedStatus = p.ManagerEmployeeID, p.Status
@@ -144,6 +148,7 @@ func (h *Handler) Handle(ctx context.Context, value []byte) (string, error) {
 	case "employee.status.changed":
 		observedStatus = p.NewStatus
 		if leaverStatuses[p.NewStatus] && !leaverStatuses[link.LastStatus] {
+			leaver = true
 			reason = "leaver: status " + p.OldStatus + " -> " + p.NewStatus
 			if strings.EqualFold(p.WorkerType, "CONTRACTOR") {
 				reason = "contractor end: status " + p.OldStatus + " -> " + p.NewStatus
@@ -155,6 +160,7 @@ func (h *Handler) Handle(ctx context.Context, value []byte) (string, error) {
 		// Both producers publish it for the same exit; the second finds the
 		// first's observation and opens nothing.
 		if !leaverStatuses[link.LastStatus] {
+			leaver = true
 			reason = "leaver: employee terminated"
 			reviewerEmployee = link.LastManagerEmployeeID
 		}
@@ -189,6 +195,19 @@ func (h *Handler) Handle(ctx context.Context, value []byte) (string, error) {
 			h.log.Info("event-triggered review opened", zap.String("campaign_id", c.CampaignID), zap.String("subject", link.PrincipalID), zap.String("reason", reason))
 		default:
 			outcome = OutcomeReplayed
+		}
+	}
+	// An exit also ends the principal's authority: employment.changed lets
+	// authorization-svc project the principal as TERMINATED (layer 0 denies).
+	// Published before the observation, like the review, so a retry repeats
+	// it (the projection is an idempotent upsert) rather than losing it.
+	if leaver {
+		prev := p.OldStatus
+		if prev == "" {
+			prev = link.LastStatus
+		}
+		if err := h.links.RecordEmploymentEnded(ctx, *link, observedStatus, prev, p.WorkerType, env.EventID); err != nil {
+			return "", err
 		}
 	}
 	if _, err := h.links.ObserveSubject(ctx, p.EmployeeID, observedManager, observedStatus); err != nil {

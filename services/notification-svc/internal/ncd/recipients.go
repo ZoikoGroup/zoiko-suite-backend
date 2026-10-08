@@ -63,6 +63,13 @@ func (s *Service) resolveEndpoints(ctx context.Context, a Actor, intent Intent, 
 			if f.ReviewerPrincipalID == a.PrincipalID {
 				return nil, evidence, Forbidden("self_review_forbidden", "the reviewer of a controlled endpoint exception cannot be the caller")
 			}
+			// The three fields used to be taken on trust: any strings marked
+			// the endpoint verified (S7-1 / R-6). exception_ref must now be an
+			// APPROVED endpoint-exception approval for this recipient, this
+			// address and this verification, decided by the named reviewer.
+			if err := s.checkEndpointException(ctx, a, in.RecipientPrincipalID, addr.Address, f); err != nil {
+				return nil, evidence, err
+			}
 			ep.Provenance, ep.Verified = ProvenanceControlledInput, true
 			ep.ProvenanceRef = "exception:" + f.ExceptionRef + ";verification:" + f.VerificationRef + ";reviewer:" + f.ReviewerPrincipalID
 		} else {
@@ -694,4 +701,79 @@ func restrictToRendered(intent Intent, renders []RenderedContent) Intent {
 	}
 	intent.AllowedChannels = chs
 	return intent
+}
+
+// ── controlled endpoint exceptions (NP-11) ──────────────────────────────────
+
+// EndpointExceptionInput is POST /v1/recipient-endpoint-exceptions.
+type EndpointExceptionInput struct {
+	RecipientPrincipalID string `json:"recipient_principal_id"`
+	Channel              string `json:"channel"`
+	Address              string `json:"address"`
+	VerificationRef      string `json:"verification_ref"`
+	Reason               string `json:"reason"`
+}
+
+// RequestEndpointException records the request for a controlled free-text
+// endpoint exception (§5.2, NP-11). It grants nothing: a second principal
+// decides it at /v1/approvals/{id}/approve, and its approval_id is then the
+// exception_ref a recipient resolution cites.
+func (s *Service) RequestEndpointException(ctx context.Context, a Actor, in EndpointExceptionInput) (*Approval, error) {
+	if in.RecipientPrincipalID == "" || strings.TrimSpace(in.VerificationRef) == "" || strings.TrimSpace(in.Reason) == "" {
+		return nil, Invalid("missing_fields", "recipient_principal_id, address, verification_ref and reason are required")
+	}
+	if in.Channel == "" {
+		in.Channel = ChannelEmail
+	}
+	if in.Channel != ChannelEmail {
+		return nil, Invalid("unsupported_free_text_channel", "only an EMAIL free-text endpoint is supported")
+	}
+	addr, err := mail.ParseAddress(in.Address)
+	if err != nil {
+		return nil, Invalid("invalid_endpoint", "address is not an email address")
+	}
+	appr := &Approval{ApprovalID: uuid.NewString(), TenantID: a.TenantID, LegalEntityID: "-", Kind: ApprovalEndpointException,
+		TargetID: in.RecipientPrincipalID, Reason: in.Reason, Status: "PENDING", RequestedBy: a.PrincipalID, RequestedAt: s.now(),
+		Payload: map[string]any{"channel": in.Channel, "address": strings.ToLower(addr.Address), "verification_ref": in.VerificationRef}}
+	err = s.store.InTx(ctx, a.TenantID, func(tx Tx) error { return tx.InsertApproval(appr) })
+	if err != nil {
+		return nil, err
+	}
+	return appr, nil
+}
+
+// checkEndpointException resolves a cited exception_ref. Every mismatch is the
+// same NCD-007 refusal: the endpoint is unverified, whichever part failed.
+func (s *Service) checkEndpointException(ctx context.Context, a Actor, recipient, address string, f *FreeTextEndpoint) error {
+	unverified := func(why string) error {
+		return Refused(Refuse(NCD007EndpointUnverified, "the controlled endpoint exception does not hold: "+why+" (NP-11)"))
+	}
+	var appr *Approval
+	err := s.store.InTx(ctx, a.TenantID, func(tx Tx) error {
+		var err error
+		appr, err = tx.GetApproval(f.ExceptionRef, false)
+		return err
+	})
+	if err != nil || appr == nil {
+		return unverified("exception_ref names no recorded exception in this tenant")
+	}
+	addrOf, _ := appr.Payload["address"].(string)
+	verOf, _ := appr.Payload["verification_ref"].(string)
+	switch {
+	case appr.Kind != ApprovalEndpointException:
+		return unverified("exception_ref is not an endpoint exception")
+	case appr.Status != "APPROVED":
+		return unverified("the exception is " + appr.Status + ", not APPROVED")
+	case appr.TargetID != recipient:
+		return unverified("the exception was approved for another recipient")
+	case !strings.EqualFold(addrOf, address):
+		return unverified("the exception was approved for another address")
+	case verOf != f.VerificationRef:
+		return unverified("verification_ref differs from the one approved")
+	case appr.DecidedBy != f.ReviewerPrincipalID:
+		return unverified("reviewer_principal_id is not the principal who approved the exception")
+	case appr.DecidedBy == a.PrincipalID:
+		return unverified("the caller approved this exception")
+	}
+	return nil
 }
