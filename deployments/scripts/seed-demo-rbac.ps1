@@ -95,7 +95,16 @@ $BUNDLES = @(
     @{
         Code    = "PO_FULL"
         Service = "purchase-order-svc"
-        Actions = @("PO_ISSUE", "PO_AMEND", "PO_CLOSE")
+        # PO_ISSUE/PO_AMEND/PO_CLOSE are the original three; the rest gate the
+        # governed lifecycle (AP-03 section 6): create, submit, approve (plus the
+        # high-value tier), hold/release, cancel, the supplier-hold exception, and
+        # the receipt/invoice progress push. Copied from the action* constants in
+        # purchase-order-svc/internal/handler. Maker-checker is NOT decided here:
+        # authorization-svc's own-object SoD refuses a preparer approving their own
+        # order even when they hold PO_APPROVE.
+        Actions = @("PO_ISSUE", "PO_AMEND", "PO_CLOSE",
+                    "PO_CREATE", "PO_SUBMIT", "PO_APPROVE", "PO_APPROVE_HIGHVALUE",
+                    "PO_HOLD", "PO_CANCEL", "PO_SUPPLIER_EXCEPTION", "PO_PROGRESS_RECORD")
     },
     @{
         Code    = "PR_FULL"

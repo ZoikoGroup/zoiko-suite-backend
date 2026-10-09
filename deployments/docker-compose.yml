@@ -1739,6 +1739,10 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-order.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PURCHASE_REQUEST_SERVICE_URL: "http://purchase-request-svc:8100"
+      SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
+      PROCUREMENT_WORKFLOW_SERVICE_URL: "http://procurement-workflow-svc:8134"
+      PO_HIGH_VALUE_THRESHOLD: "${PO_HIGH_VALUE_THRESHOLD:-0}"
+      PO_OVER_TOLERANCE_PERCENT: "${PO_OVER_TOLERANCE_PERCENT:-0}"
     depends_on:
       postgres:
         condition: service_healthy

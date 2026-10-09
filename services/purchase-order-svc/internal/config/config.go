@@ -42,6 +42,22 @@ type Config struct {
 	// trusting the caller's claim (see internal/purchaserequest).
 	PurchaseRequestServiceURL string
 
+	// SupplierProfileServiceURL is supplier-financial-profile-svc (AP-01), asked
+	// whether a supplier may receive NEW purchase orders. Fail-closed.
+	SupplierProfileServiceURL string
+
+	// ProcurementWorkflowServiceURL is procurement-workflow-svc, consulted to verify
+	// an approved procurement case as the approval basis of the legacy direct-issue.
+	ProcurementWorkflowServiceURL string
+
+	// HighValueThreshold: a PO whose total exceeds it needs PO_APPROVE_HIGHVALUE to
+	// approve (0 = disabled).
+	HighValueThreshold float64
+
+	// OverTolerancePercent is how far received/invoiced quantity may exceed the
+	// ordered quantity before a progress push is refused (0 = never exceed).
+	OverTolerancePercent float64
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -93,12 +109,16 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "purchase-order-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.purchase-order.events"),
 		},
-		AuthZServiceURL:           env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		AuthzMTLSEnabled:          env("AUTHZ_MTLS_ENABLED", "false") == "true",
-		AuthzMTLSURL:              env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
-		MTLSManagementServiceURL:  env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
-		PurchaseRequestServiceURL: env("PURCHASE_REQUEST_SERVICE_URL", "http://purchase-request-svc:8100"),
-		OTELExporterEndpoint:      env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		AuthZServiceURL:               env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:              env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:                  env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL:      env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		PurchaseRequestServiceURL:     env("PURCHASE_REQUEST_SERVICE_URL", "http://purchase-request-svc:8100"),
+		SupplierProfileServiceURL:     env("SUPPLIER_PROFILE_SERVICE_URL", "http://supplier-financial-profile-svc:8156"),
+		ProcurementWorkflowServiceURL: env("PROCUREMENT_WORKFLOW_SERVICE_URL", "http://procurement-workflow-svc:8134"),
+		HighValueThreshold:            envFloat("PO_HIGH_VALUE_THRESHOLD", 0),
+		OverTolerancePercent:          envFloat("PO_OVER_TOLERANCE_PERCENT", 0),
+		OTELExporterEndpoint:          env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 
@@ -116,6 +136,18 @@ func envInt(key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
+		return def
+	}
+	return n
+}
+
+func envFloat(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || n < 0 {
 		return def
 	}
 	return n
