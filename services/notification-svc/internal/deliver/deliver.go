@@ -58,11 +58,11 @@ type Provider interface {
 // header, and providers are assembled from strings, so escaping and
 // header-injection defence belong at the transport boundary, not here.
 type Message struct {
-	From          string
-	Headers       map[string]string
-	To            string
-	Subject       string
-	HTMLBody      string
+	From     string
+	Headers  map[string]string
+	To       string
+	Subject  string
+	HTMLBody string
 
 	// CorrelationID travels into the message headers so a delivered mail can
 	// be tied back to the send that produced it without matching on subject.

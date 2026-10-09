@@ -220,3 +220,43 @@ func TestNewPublisher_NilProducer_DoesNotPanic(t *testing.T) {
 		t.Fatalf("dry-run publish returned %v", err)
 	}
 }
+
+// ORG-06 mandatory control: "downstream consumers receive change events with
+// stable object/version identity", and the event envelope names
+// object_version, effective_at and recorded_at for every ORG-06 event.
+//
+// authority.expired used to carry no version. authorization-svc orders a
+// grant's events by version and ignores one older than its projection, so it
+// read the expiry as version 0 and discarded it: every expired grant stayed
+// ACTIVE in the authorization projection, and no expiry ever reached it.
+func TestBuild_EveryEventCarriesVersionAndTimes(t *testing.T) {
+	g := grant()
+	g.Version = 7
+	g.UpdatedAt = time.Now().UTC()
+	revokedAt, suspendedAt := g.UpdatedAt, g.UpdatedAt
+	g.RevokedAt, g.SuspendedAt = &revokedAt, &suspendedAt
+	for _, et := range []string{events.EventDelegated, events.EventResumed, events.EventRevoked,
+		events.EventExpired, events.EventSuspended, events.EventExtended} {
+		_, body, err := events.Build(et, g)
+		if err != nil {
+			t.Fatalf("%s: %v", et, err)
+		}
+		var env struct {
+			Payload map[string]any `json:"payload"`
+		}
+		if err := json.Unmarshal(body, &env); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := env.Payload["version"].(float64); !ok || int64(v) != 7 {
+			t.Errorf("%s: payload version = %v, want 7", et, env.Payload["version"])
+		}
+		if ref, _ := env.Payload["evidence_ref"].(string); ref != "delegation_history/del-1/v7" {
+			t.Errorf("%s: evidence_ref = %q, want the history row of this version", et, ref)
+		}
+		for _, f := range []string{"effective_at", "recorded_at"} {
+			if s, _ := env.Payload[f].(string); s == "" {
+				t.Errorf("%s: payload lacks %s", et, f)
+			}
+		}
+	}
+}

@@ -33,11 +33,11 @@ import (
 	"zoiko.io/evidence-requirements-svc/internal/config"
 	"zoiko.io/evidence-requirements-svc/internal/documentvault"
 	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
-	"zoiko.io/evidence-requirements-svc/internal/events"
 	"zoiko.io/evidence-requirements-svc/internal/handler"
 	"zoiko.io/evidence-requirements-svc/internal/health"
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 	"zoiko.io/evidence-requirements-svc/internal/mtls"
+	"zoiko.io/evidence-requirements-svc/internal/outbox"
 	"zoiko.io/evidence-requirements-svc/internal/store"
 	"zoiko.io/evidence-requirements-svc/internal/telemetry"
 )
@@ -145,8 +145,6 @@ func main() {
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-
 	var authzClient *authz.HTTPClient
 	if cfg.AuthzMTLSEnabled {
 		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "evidence-requirements-svc", platformScopeID)
@@ -159,6 +157,11 @@ func main() {
 		authzClient = authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 	}
 	docsClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, log)
+
+	// ── 4b. Outbox worker ──────────────────────────────────────────────────────
+	outboxWorker := outbox.NewWorker(pool, kafkaWriter, log)
+	outboxWorker.Start(context.Background())
+	defer outboxWorker.Stop()
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -182,7 +185,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, docsClient, log)
+	h := handler.New(pgStore, authzClient, docsClient, log)
 	handler.RegisterRoutes(r, h)
 	handler.RegisterPBCRoutes(r, h, pgStore)
 

@@ -519,6 +519,26 @@ func TestWebhook_HTTPHandler_Routing(t *testing.T) {
 
 	// Valid payload
 	payload := `{"event_id":"evt-h-1","event_type":"DELIVERED","recipient_email":"http@example.com","provider_message_id":"<msg-http-001@zoikosuite.com>"}`
+
+	// INV-27: unsigned and wrongly signed webhooks change nothing.
+	unsigned := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(payload)))
+	uw := httptest.NewRecorder()
+	r.ServeHTTP(uw, unsigned)
+	if uw.Code != http.StatusUnauthorized {
+		t.Fatalf("an unsigned webhook must be refused, got %d", uw.Code)
+	}
+	forged := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(payload)))
+	// Signed with the wrong secret: a well-formed signature that is not ours.
+	forged.Header.Set(webhook.SignatureHeader, webhook.Sign([]byte("not-the-configured-secret-0000"), time.Now(), []byte(payload)))
+	fw := httptest.NewRecorder()
+	r.ServeHTTP(fw, forged)
+	if fw.Code != http.StatusUnauthorized {
+		t.Fatalf("a forged webhook must be refused, got %d", fw.Code)
+	}
+	if len(store.events) != 0 {
+		t.Fatalf("a refused webhook must record nothing, got %d events", len(store.events))
+	}
+
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/webhooks/smtp", bytes.NewReader([]byte(payload)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(webhook.SignatureHeader, webhook.Sign(secret, time.Now(), []byte(payload)))

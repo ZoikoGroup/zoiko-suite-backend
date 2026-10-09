@@ -4,6 +4,8 @@ package middleware
 import (
 	"context"
 	"net/http"
+
+	"zoiko.io/workflow-svc/internal/envelope"
 )
 
 type tenantCtxKey struct{}
@@ -22,11 +24,27 @@ func TenantFromContext(ctx context.Context) string {
 // TenantContext reads the caller's tenant scope from X-Tenant-Id — set by
 // gateway-auth-svc's ForwardAuth verification, same pattern as
 // accounts-payable-svc/tax-rules-svc/document-vault-svc.
+// Also propagates envelope headers to context for cross-service authz calls.
 func TenantContext() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if tenantID := r.Header.Get("X-Tenant-Id"); tenantID != "" {
 				r = r.WithContext(WithTenant(r.Context(), tenantID))
+			}
+			// Propagate envelope headers to context for cross-service authz calls
+			if env, ok := envelope.FromContext(r.Context()); ok {
+				if env.RequestID != "" {
+					r = r.WithContext(context.WithValue(r.Context(), "request_id", env.RequestID))
+				}
+				if env.CorrelationID != "" {
+					r = r.WithContext(context.WithValue(r.Context(), "correlation_id", env.CorrelationID))
+				}
+				if env.SourceChannel != "" {
+					r = r.WithContext(context.WithValue(r.Context(), "source_channel", string(env.SourceChannel)))
+				}
+				if env.IdempotencyKey != "" {
+					r = r.WithContext(context.WithValue(r.Context(), "idempotency_key", env.IdempotencyKey))
+				}
 			}
 			next.ServeHTTP(w, r)
 		})

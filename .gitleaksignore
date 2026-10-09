@@ -1,0 +1,15 @@
+# Gitleaks ignore list — findings tracked and cleaned up separately,
+# per .github/workflows/secret-scan.yml.
+#
+# Both entries are throwaway fixtures introduced by a1293aac (5 Oct audit-fix
+# commit) and are already handled in current HEAD:
+#   - suppression_handler_test.go line 272 is a deliberately-rejected legacy
+#     action-token shape (base64 of tenant-abc.UNSUB...), now marked with a
+#     `// gitleaks:allow` comment.
+#   - README-live-check.md line 44 is a local dev placeholder secret, now
+#     de-fanged to a low-entropy value.
+# The fingerprints below cover the historical patch in the scanned commit
+# range; gitleaks git scans additions, so the fix commits alone cannot
+# clear them.
+a1293aaceb57d44dd7a69bfd2134ac94bcd4d1f2:services/notification-svc/internal/handler/suppression_handler_test.go:generic-api-key:272
+a1293aaceb57d44dd7a69bfd2134ac94bcd4d1f2:services/notification-svc/scripts/README-live-check.md:generic-api-key:44

@@ -23,9 +23,12 @@ func NewClient(baseURL string, httpClient *http.Client) *Client {
 }
 
 type EmployeeResponse struct {
-	EmployeeID    string `json:"employee_id"`
-	LegalEntityID string `json:"legal_entity_id"`
-	Status        string `json:"status"`
+	EmployeeID    string  `json:"employee_id"`
+	LegalEntityID string  `json:"legal_entity_id"`
+	Status        string  `json:"status"`
+	WorkerType    string  `json:"worker_type"`
+	DepartmentID  *string `json:"department_id,omitempty"`
+	JobTitle      *string `json:"job_title,omitempty"`
 }
 
 func (c *Client) ValidateEmployee(ctx context.Context, tenantID, principalID, employeeID string) (*EmployeeResponse, error) {

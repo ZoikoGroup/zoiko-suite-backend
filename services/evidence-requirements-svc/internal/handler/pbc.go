@@ -301,7 +301,7 @@ func (h *pbcHandler) SubmitResponse(w http.ResponseWriter, r *http.Request) {
 			h.writePBCErr(w, err)
 			return
 		}
-		if err := h.docs.VerifyDocument(r.Context(), tenantID, evReq.LegalEntityID, *req.ArtifactDocumentID); err != nil {
+		if err := h.docs.VerifyDocument(r.Context(), tenantID, evReq.LegalEntityID, *req.ArtifactDocumentID, principalID); err != nil {
 			h.writeDocumentErr(w, err)
 			return
 		}

@@ -602,6 +602,6 @@ func TestOriginalRuleLifecycleUnaffectedByProvenanceTriggers(t *testing.T) {
 	assert.Equal(t, "SUPERSEDED", sup.RuleStatus)
 	assert.NotNil(t, sup.EffectiveTo)
 
-	_, err = st.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin")
+	_, _, err = st.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin")
 	require.NoError(t, err)
 }

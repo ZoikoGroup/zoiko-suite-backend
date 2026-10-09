@@ -183,6 +183,19 @@ const (
 	FreshnessStale   Freshness = "STALE"
 )
 
+// Untrusted reports whether the index cannot be treated as a current view of
+// its source. STALE is behind beyond the source's declared bound; UNKNOWN is
+// unmeasured, and "UNKNOWN is never represented as CURRENT" (§2.2). LAGGING is
+// behind but inside the bound, which §2.2 does not treat as unsafe.
+//
+// Untrusted freshness BLOCKS protected content and FLAGS metadata-safe content
+// (§8.3: "protected results may require source hydration or block"). The
+// retrieval class is what decides which, so this method answers only the
+// freshness half of that question.
+func (f Freshness) Untrusted() bool {
+	return f == FreshnessStale || f == FreshnessUnknown || f == ""
+}
+
 // RetrievalOutcome is §2.2's retrieval-authorization dimension. INDETERMINATE
 // fails closed for protected content (INV-07).
 type RetrievalOutcome string
@@ -313,20 +326,93 @@ type SearchFieldDefinition struct {
 // partition rules (§2.1). Immutable after publication — a change is a new
 // version, which is what makes a generation reproducible (§4.3).
 type IndexContract struct {
-	ContractID           string                  `json:"contract_id"`
-	SourceID             string                  `json:"source_id"`
-	ScopeName            string                  `json:"scope_name"`
-	Version              int                     `json:"version"`
-	SchemaDigest         string                  `json:"schema_digest"`
-	State                ContractState           `json:"publication_state"`
-	FreshnessClass       string                  `json:"freshness_class"`
-	RetrievalClass       RetrievalClass          `json:"retrieval_class"`
-	AnalyzerProfile      string                  `json:"analyzer_profile"`
-	AuthzAction          string                  `json:"authz_action"`
-	Fields               []SearchFieldDefinition `json:"fields"`
-	CreatedAt            time.Time               `json:"created_at"`
-	PublishedAt          *time.Time              `json:"published_at,omitempty"`
-	CreatedByPrincipalID string                  `json:"created_by_principal_id"`
+	ContractID      string                  `json:"contract_id"`
+	SourceID        string                  `json:"source_id"`
+	ScopeName       string                  `json:"scope_name"`
+	Version         int                     `json:"version"`
+	SchemaDigest    string                  `json:"schema_digest"`
+	State           ContractState           `json:"publication_state"`
+	FreshnessClass  string                  `json:"freshness_class"`
+	RetrievalClass  RetrievalClass          `json:"retrieval_class"`
+	AnalyzerProfile string                  `json:"analyzer_profile"`
+	AuthzAction     string                  `json:"authz_action"`
+	Fields          []SearchFieldDefinition `json:"fields"`
+	// Embedding pins the semantic half of a scope (§10.1). Nil means the scope
+	// is lexical-only and POST /v1/search/semantic refuses it.
+	Embedding            *EmbeddingSpec `json:"embedding,omitempty"`
+	CreatedAt            time.Time      `json:"created_at"`
+	PublishedAt          *time.Time     `json:"published_at,omitempty"`
+	CreatedByPrincipalID string         `json:"created_by_principal_id"`
+}
+
+// EmbeddingSpec is §10.1's first control: "embedding model/version and
+// preprocessing are pinned in the IndexContract."
+//
+// Pinned means immutable with the contract: a published contract cannot change
+// model, and a new model is a new contract version and therefore a new
+// generation — which is what makes §10.1's "model migration requires parallel
+// rebuild and retrieval-evaluation certification before cutover" enforceable
+// rather than advisory. The provider is not trusted to keep the model stable:
+// every embedding it returns is checked against this pin (NP-35).
+type EmbeddingSpec struct {
+	Model        string `json:"model"`
+	ModelVersion string `json:"model_version"`
+	Dimensions   int    `json:"dimensions"`
+	// SourceFields are the registered contract fields whose projected values
+	// are embedded, in this order. Registered fields only, so a vector can
+	// never encode content the lexical projection was not allowed to hold.
+	SourceFields []string `json:"source_fields"`
+	// Preprocessing names the pinned text-normalisation profile applied before
+	// embedding. Part of the pin because the same model over differently
+	// normalised text is a different embedding space.
+	Preprocessing string `json:"preprocessing"`
+	// Similarity is the engine space type: cosinesimil, l2 or innerproduct.
+	Similarity string `json:"similarity"`
+}
+
+// PinnedModel is the "model@version" stamped on every vector and filtered on
+// by every semantic query.
+func (e *EmbeddingSpec) PinnedModel() string {
+	if e == nil {
+		return ""
+	}
+	return e.Model + "@" + e.ModelVersion
+}
+
+// SamePin reports whether two specs describe the same embedding space. A
+// change to any of these is a model migration (§10.1).
+func (e *EmbeddingSpec) SamePin(o *EmbeddingSpec) bool {
+	if e == nil || o == nil {
+		return e == nil && o == nil
+	}
+	return e.Model == o.Model && e.ModelVersion == o.ModelVersion &&
+		e.Dimensions == o.Dimensions && e.Preprocessing == o.Preprocessing &&
+		e.Similarity == o.Similarity
+}
+
+// RetrievalEvaluation is the certification §10.1 requires before a model
+// migration cuts over: "model migration requires parallel rebuild and
+// retrieval-evaluation certification before cutover."
+//
+// It records a recall measurement of a candidate generation against a gold set
+// the operator supplies. The gold set's queries are not stored — only their
+// digest — for the same reason search evidence stores no query text (INV-17).
+// The threshold is the operator's to state because OD-15 leaves quantitative
+// relevance thresholds open; it is recorded beside the result so a pass can
+// never be read without the bar it cleared.
+type RetrievalEvaluation struct {
+	EvaluationID         string    `json:"evaluation_id"`
+	GenerationID         string    `json:"generation_id"`
+	ScopeName            string    `json:"scope_name"`
+	PinnedModel          string    `json:"pinned_model"`
+	K                    int       `json:"k"`
+	Cases                int       `json:"cases"`
+	MinRecall            float64   `json:"min_recall"`
+	Recall               float64   `json:"recall"`
+	Passed               bool      `json:"passed"`
+	CasesDigest          string    `json:"cases_digest"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }
 
 // IndexGeneration is a concrete searchable index version (§2.1).
@@ -346,7 +432,22 @@ type IndexGeneration struct {
 	RetiredAt            *time.Time `json:"retired_at,omitempty"`
 	CreatedAt            time.Time  `json:"created_at"`
 	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	// BackfillState is the replay of the source topic into this generation
+	// (INV-21): PENDING / RUNNING / COMPLETE / FAILED, or "" for a generation
+	// created before backfill existed. READY requires COMPLETE.
+	BackfillState BackfillState `json:"backfill_state,omitempty"`
+	BackfillNote  string        `json:"backfill_note,omitempty"`
 }
+
+// BackfillState is a generation's source-replay progress.
+type BackfillState string
+
+const (
+	BackfillPending  BackfillState = "PENDING"
+	BackfillRunning  BackfillState = "RUNNING"
+	BackfillComplete BackfillState = "COMPLETE"
+	BackfillFailed   BackfillState = "FAILED"
+)
 
 // IndexCheckpoint is source-to-index progress evidence (§2.1, §5.3).
 type IndexCheckpoint struct {
@@ -408,7 +509,10 @@ type SearchEvidence struct {
 	ReasonCodes     []string     `json:"reason_codes,omitempty"`
 	DurationMS      int64        `json:"duration_ms"`
 	TraceID         string       `json:"trace_id,omitempty"`
-	CreatedAt       time.Time    `json:"created_at"`
+	// EmbeddingModel is the pinned "model@version" that answered a semantic
+	// search (TC-02); empty for lexical.
+	EmbeddingModel string    `json:"embedding_model,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // RetrievalDecision is one candidate's current authorization outcome (§2.1).
@@ -452,4 +556,9 @@ var (
 	ErrReservedField   = errors.New("reserved governance field may not be registered")
 	ErrStaleEpoch      = errors.New("restriction epoch is older than the one already applied")
 	ErrTenantRequired  = errors.New("verified tenant context is required")
+	// ErrSourceGone is a hydration answer, not a failure: the authoritative
+	// record no longer exists (NP-55). The retriever suppresses the hit as
+	// ESR-010 rather than reporting a hydration fault, because nothing is
+	// broken — the record is simply not there to show.
+	ErrSourceGone = errors.New("source record no longer exists")
 )

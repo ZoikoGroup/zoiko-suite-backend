@@ -57,7 +57,7 @@ func publishVersion(t *testing.T, s *store.PgStore, tenant string, v *domain.Int
 }
 
 func TestIntent_StableIdentityKeyShapeUniquenessAndIsolation(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	i := newIntent(t, s, "tenant-int", "payroll.payslip_available")
 	assert.Equal(t, "ACTIVE", i.Status)
 
@@ -77,7 +77,7 @@ func TestIntent_StableIdentityKeyShapeUniquenessAndIsolation(t *testing.T) {
 }
 
 func TestIntentVersion_LifecycleAndMakerChecker(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	ctx := tenantCtx("tenant-int")
 	i := newIntent(t, s, "tenant-int", "hr.review_invitation")
 	v := draftVersion(t, s, "tenant-int", i.IntentID, nil)
@@ -109,7 +109,7 @@ func TestIntentVersion_LifecycleAndMakerChecker(t *testing.T) {
 }
 
 func TestIntentVersion_RefusesAnInvalidContractBeforeStoringIt(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	i := newIntent(t, s, "tenant-int", "billing.invoice_issued")
 	bad := map[string]func(*domain.CreateIntentVersionParams){
 		"unknown purpose class":          func(p *domain.CreateIntentVersionParams) { p.PurposeClass = "Z9" },
@@ -149,7 +149,7 @@ func TestIntentVersion_RefusesAnInvalidContractBeforeStoringIt(t *testing.T) {
 
 // The database refuses what the service would, without the service.
 func TestIntentVersion_DatabaseGuards(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	bg := context.Background()
 	i := newIntent(t, s, "tenant-int-db", "legal.consultation_notice")
@@ -195,7 +195,7 @@ func TestIntentVersion_DatabaseGuards(t *testing.T) {
 
 // NCD-01 4.5 and 9.2: what was in force at time T, as known at time K.
 func TestIntent_EffectiveDatingAndKnowledgeTime(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-int-time"
 	ctx := tenantCtx(tenant)
 	i := newIntent(t, s, tenant, "tax.filing_reminder")
@@ -231,7 +231,7 @@ func TestIntent_EffectiveDatingAndKnowledgeTime(t *testing.T) {
 
 // Publication is never backdated and never reorders history.
 func TestIntent_PublicationCannotBackdateOrReorder(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-int-order"
 	ctx := tenantCtx(tenant)
 	i := newIntent(t, s, tenant, "ops.maintenance_notice")
@@ -257,7 +257,7 @@ func TestIntent_PublicationCannotBackdateOrReorder(t *testing.T) {
 }
 
 func TestIntent_RetirementEndsTheFutureNotTheHistory(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-int-retire"
 	ctx := tenantCtx(tenant)
 	i := newIntent(t, s, tenant, "support.case_update")
@@ -285,7 +285,7 @@ func TestIntent_RetirementEndsTheFutureNotTheHistory(t *testing.T) {
 }
 
 func TestMigration000020_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	// 000025, 000022 and 000021 depend on 000020, so they are rolled back first and re-applied last.
 	for _, f := range []string{"000028_scheduling_cancel_expiry.down.sql", "000027_more_canonical_events.down.sql", "000026_notice_event_sequence.down.sql", "000025_regulated_notices.down.sql", "000022_privacy_binding_and_evidence.down.sql", "000021_intent_binding.down.sql", "000020_communication_intents.down.sql", "000020_communication_intents.up.sql", "000021_intent_binding.up.sql", "000022_privacy_binding_and_evidence.up.sql", "000025_regulated_notices.up.sql", "000026_notice_event_sequence.up.sql", "000027_more_canonical_events.up.sql", "000028_scheduling_cancel_expiry.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)

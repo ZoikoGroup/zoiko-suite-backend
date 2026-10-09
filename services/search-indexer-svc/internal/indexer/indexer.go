@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ import (
 
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/domain"
+	"zoiko.io/search-indexer-svc/internal/embedding"
 	"zoiko.io/search-indexer-svc/internal/events"
 	"zoiko.io/search-indexer-svc/internal/projection"
 	"zoiko.io/search-indexer-svc/internal/store"
@@ -52,21 +54,80 @@ type Indexer struct {
 	// every consumed message takes the read lock — so RWMutex rather than
 	// Mutex.
 	mu sync.RWMutex
-	// bySourceType maps a source_type to its live projector. One projector per
-	// source type, because a source type has exactly one PUBLISHED contract
-	// (index_contracts_one_published_per_scope guarantees it).
+	// bySourceType maps a source_type to its ACTIVE generation's projector,
+	// built from that generation's own contract. One per source type, because
+	// a scope has exactly one ACTIVE generation.
 	bySourceType map[string]*liveScope
+	// candidates are the BUILDING / VALIDATING / READY generations per source
+	// type, written alongside the active one so a rebuild is filled in
+	// parallel and does not fall behind while it is certified.
+	candidates map[string][]*liveScope
+	// backfilling marks generations whose source replay is in progress.
+	backfilling map[string]bool
+	replayer    Replayer
+	baseCtx     context.Context
 	// topics is the union of every registered source's event topic, which is
 	// what the Kafka runner subscribes to. Derived rather than configured, so
 	// registering a source is sufficient to start consuming it.
 	topics map[string]bool
+
+	// lag measures consumer position at the broker for the checkpoint sweep.
+	// Nil means freshness cannot be measured, which records UNKNOWN — never
+	// CURRENT (§2.2).
+	lag LagProbe
+	// embedder produces vectors for semantic scopes. Nil behaves as
+	// embedding.Unconfigured: a semantic scope's documents cannot be indexed.
+	embedder embedding.Embedder
 }
+
+// SourceLag is a consumer group's measured position on one source topic.
+type SourceLag struct {
+	// Partitions is how many partitions the topic has.
+	Partitions int
+	// Backlog is the number of messages published but not yet committed by
+	// this service's consumer group, summed over partitions.
+	Backlog int64
+	// Watermark is the sum of the group's committed offsets — §5.3's "highest
+	// committed source position represented in the index", monotonic as the
+	// consumer advances.
+	Watermark int64
+	// OldestPending is the broker timestamp of the oldest message not yet
+	// consumed. Zero when Backlog is zero.
+	OldestPending time.Time
+}
+
+// Lag is how far behind the index is as of now: the age of the oldest message
+// it has not consumed. Zero when caught up — an idle source with nothing new to
+// index is CURRENT however long ago its last event was, which a lag computed
+// from "time since the last event" would get exactly wrong.
+func (l SourceLag) Lag(now time.Time) time.Duration {
+	if l.Backlog <= 0 || l.OldestPending.IsZero() {
+		return 0
+	}
+	if d := now.Sub(l.OldestPending); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// LagProbe measures a source topic's consumer lag. Satisfied by
+// kafka.LagProbe; an interface so the sweep is testable without a broker.
+type LagProbe interface {
+	TopicLag(ctx context.Context, topic string) (SourceLag, error)
+}
+
+// SetLagProbe wires the broker-side lag measurement into the checkpoint sweep.
+func (ix *Indexer) SetLagProbe(p LagProbe) { ix.lag = p }
+
+// SetEmbedder wires the embedding provider used for semantic scopes.
+func (ix *Indexer) SetEmbedder(e embedding.Embedder) { ix.embedder = e }
 
 // liveScope is one projector bound to the generation it currently writes into.
 type liveScope struct {
 	projector     *projection.Projector
 	generationID  string
 	physicalIndex string
+	backfill      domain.BackfillState
 }
 
 func New(st store.Store, engine searchclient.Engine, pub *events.Publisher, metrics *telemetry.Metrics, log *zap.Logger) *Indexer {
@@ -77,6 +138,8 @@ func New(st store.Store, engine searchclient.Engine, pub *events.Publisher, metr
 		metrics:      metrics,
 		log:          log,
 		bySourceType: map[string]*liveScope{},
+		candidates:   map[string][]*liveScope{},
+		backfilling:  map[string]bool{},
 		topics:       map[string]bool{},
 	}
 }
@@ -84,79 +147,98 @@ func New(st store.Store, engine searchclient.Engine, pub *events.Publisher, metr
 // Reload rebuilds the projector registry from the control plane.
 //
 // Called at startup and after every contract publication or generation
-// activation. A full rebuild rather than an incremental patch: the registry is
-// small (one entry per source type), and an incremental update that missed a
-// case would leave a projector writing into a retired generation — a silent
-// data loss that only shows up as a scope that stopped updating.
+// transition. A full rebuild rather than an incremental patch: the registry is
+// small, and an incremental update that missed a case would leave a projector
+// writing into a retired generation — a silent data loss that only shows up as
+// a scope that stopped updating.
+//
+// EVERY GENERATION IS PROJECTED WITH ITS OWN CONTRACT. This used to project the
+// ACTIVE generation with the scope's PUBLISHED contract, which is correct only
+// until a new version is published: from then on the new contract's fields and
+// embedding spec were written into the old generation's strict mapping, and
+// every event was quarantined (found in the 30 Sep 2026 re-audit). A
+// generation's mapping was built from one contract version, and only that
+// version can write into it.
+//
+// Two sets per source type: the ACTIVE generation, and the CANDIDATES —
+// BUILDING / VALIDATING / READY generations being filled for a cutover. Live
+// events are written into both, so a candidate does not fall behind while it is
+// backfilled and certified (INV-21's "parallel build").
 func (ix *Indexer) Reload(ctx context.Context) error {
 	sources, err := ix.store.ListSources(ctx)
 	if err != nil {
 		return fmt.Errorf("reload: list sources: %w", err)
 	}
+	contracts, err := ix.store.ListContracts(ctx, "")
+	if err != nil {
+		return fmt.Errorf("reload: list contracts: %w", err)
+	}
+	generations, err := ix.store.ListGenerations(ctx, "")
+	if err != nil {
+		return fmt.Errorf("reload: list generations: %w", err)
+	}
 
-	next := map[string]*liveScope{}
+	sourceByID := make(map[string]domain.SearchSource, len(sources))
 	topics := map[string]bool{}
-
 	for _, src := range sources {
+		sourceByID[src.SourceID] = src
 		if src.EventTopic != "" {
 			topics[src.EventTopic] = true
 		}
+	}
+	contractByID := make(map[string]domain.IndexContract, len(contracts))
+	for _, c := range contracts {
+		contractByID[c.ContractID] = c
+	}
 
-		contract, err := ix.publishedContractFor(ctx, src)
-		if err != nil {
-			if errors.Is(err, domain.ErrNotFound) {
-				// Registered but not yet published. Normal during onboarding:
-				// the source exists so its topic is subscribed, and its events
-				// are skipped until a contract says what may be indexed. NOT
-				// an error — refusing to start over it would mean one
-				// half-onboarded domain blocks every other.
-				continue
-			}
-			return err
+	active := map[string]*liveScope{}
+	candidates := map[string][]*liveScope{}
+	for _, g := range generations {
+		switch g.State {
+		case domain.GenerationActive, domain.GenerationBuilding, domain.GenerationValidating, domain.GenerationReady:
+		default:
+			continue
 		}
-
-		gen, err := ix.store.GetActiveGeneration(ctx, contract.ScopeName)
-		if err != nil {
-			if errors.Is(err, domain.ErrNotFound) {
-				ix.log.Info("scope has a published contract but no active generation — not indexing yet",
-					zap.String("scope", contract.ScopeName))
-				continue
-			}
-			return err
+		contract, ok := contractByID[g.ContractID]
+		if !ok {
+			continue
 		}
-
-		proj, err := projection.New(*contract, src)
-		if err != nil {
-			return fmt.Errorf("reload: scope %s: %w", contract.ScopeName, err)
+		src, ok := sourceByID[contract.SourceID]
+		if !ok {
+			continue
 		}
-		next[src.SourceType] = &liveScope{
+		proj, err := projection.New(contract, src)
+		if err != nil {
+			return fmt.Errorf("reload: generation %s: %w", g.GenerationID, err)
+		}
+		ls := &liveScope{
 			projector:     proj,
-			generationID:  gen.GenerationID,
-			physicalIndex: gen.PhysicalIndex,
+			generationID:  g.GenerationID,
+			physicalIndex: g.PhysicalIndex,
+			backfill:      g.BackfillState,
 		}
+		if g.State == domain.GenerationActive {
+			active[src.SourceType] = ls
+		} else {
+			candidates[src.SourceType] = append(candidates[src.SourceType], ls)
+		}
+	}
+	for st := range candidates {
+		sort.Slice(candidates[st], func(i, j int) bool {
+			return candidates[st][i].generationID < candidates[st][j].generationID
+		})
 	}
 
 	ix.mu.Lock()
-	ix.bySourceType = next
+	ix.bySourceType = active
+	ix.candidates = candidates
 	ix.topics = topics
 	ix.mu.Unlock()
 
 	ix.log.Info("projector registry reloaded",
-		zap.Int("live_scopes", len(next)), zap.Int("topics", len(topics)))
+		zap.Int("live_scopes", len(active)), zap.Int("candidate_scopes", len(candidates)),
+		zap.Int("topics", len(topics)))
 	return nil
-}
-
-func (ix *Indexer) publishedContractFor(ctx context.Context, src domain.SearchSource) (*domain.IndexContract, error) {
-	contracts, err := ix.store.ListContracts(ctx, "")
-	if err != nil {
-		return nil, err
-	}
-	for i := range contracts {
-		if contracts[i].SourceID == src.SourceID && contracts[i].State == domain.ContractPublished {
-			return &contracts[i], nil
-		}
-	}
-	return nil, domain.ErrNotFound
 }
 
 // Topics returns the union of registered source topics.
@@ -207,19 +289,32 @@ const (
 )
 
 // Apply projects and writes one event.
+//
+// Into the ACTIVE generation (the primary: its failure fails the event) and
+// into every CANDIDATE generation, each projected with its own contract. A
+// candidate that cannot take the event — its contract cannot project it, or its
+// embedding failed — is logged and skipped rather than failing the live scope:
+// the candidate is then incomplete, and its completeness validation refuses it
+// READY, which is the right place for that to surface.
 func (ix *Indexer) Apply(ctx context.Context, e projection.Event) (Outcome, error) {
 	sourceType := sourceTypeOf(e)
 
 	ix.mu.RLock()
-	live := ix.bySourceType[sourceType]
+	primary := ix.bySourceType[sourceType]
+	candidates := append([]*liveScope(nil), ix.candidates[sourceType]...)
 	ix.mu.RUnlock()
 
-	if live == nil || !live.projector.Handles(e.EventType) {
+	if primary == nil && len(candidates) > 0 {
+		// No generation serving yet (a first build): the first candidate is
+		// the one whose projection the ledger records.
+		primary, candidates = candidates[0], candidates[1:]
+	}
+	if primary == nil || !primary.projector.Handles(e.EventType) {
 		return OutcomeSkipped, nil
 	}
-	scope := live.projector.Scope()
+	scope := primary.projector.Scope()
 
-	result, err := live.projector.Project(e, live.generationID, live.physicalIndex)
+	result, err := primary.projector.Project(e, primary.generationID, primary.physicalIndex)
 	if err != nil {
 		// Every error from Project is a contract violation, by construction:
 		// it validates before it extracts, and the only failures it can return
@@ -232,6 +327,42 @@ func (ix *Indexer) Apply(ctx context.Context, e projection.Event) (Outcome, erro
 			zap.String("event_id", e.EventID),
 			zap.Error(err))
 		return OutcomeQuarantined, err
+	}
+
+	// §10.1: a semantic scope's live document carries a vector from the
+	// pinned model. Embedded BEFORE the ledger write, so a provider failure is
+	// a retry of the whole event rather than a ledger row claiming a projection
+	// the engine never received — the ledger-first window described in the
+	// package comment, widened by a network call, would be refused as stale on
+	// the retry and the document would never be written.
+	if outcome, err := ix.embed(ctx, primary, result); err != nil {
+		ix.metrics.ProjectionsTotal.WithLabelValues(scope, string(outcome)).Inc()
+		ix.log.Error("projection could not be embedded",
+			zap.String("scope", scope), zap.String("event_id", e.EventID),
+			zap.String("outcome", string(outcome)), zap.Error(err))
+		return outcome, err
+	}
+
+	type write struct {
+		target *liveScope
+		doc    searchclient.Projection
+	}
+	writes := []write{{primary, result.Projection}}
+	for _, c := range candidates {
+		if !c.projector.Handles(e.EventType) {
+			continue
+		}
+		r, err := c.projector.Project(e, c.generationID, c.physicalIndex)
+		if err == nil {
+			_, err = ix.embed(ctx, c, r)
+		}
+		if err != nil {
+			ix.log.Warn("candidate generation cannot take this event — it will fail completeness validation",
+				zap.String("scope", scope), zap.String("generation_id", c.generationID),
+				zap.String("event_id", e.EventID), zap.Error(err))
+			continue
+		}
+		writes = append(writes, write{c, r.Projection})
 	}
 
 	// Ledger first. See the package comment for why this order and not the
@@ -251,8 +382,17 @@ func (ix *Indexer) Apply(ctx context.Context, e projection.Event) (Outcome, erro
 		return OutcomeStale, nil
 	}
 
-	if err := ix.engine.IndexProjection(ctx, live.physicalIndex, result.Projection); err != nil {
+	for i, w := range writes {
+		err := ix.engine.IndexProjection(ctx, w.target.physicalIndex, w.doc)
+		if err == nil {
+			continue
+		}
 		ix.metrics.EngineError("index")
+		if i > 0 {
+			ix.log.Error("candidate generation missed a write — it will fail completeness validation",
+				zap.String("scope", scope), zap.String("generation_id", w.target.generationID), zap.Error(err))
+			continue
+		}
 		if errors.Is(err, searchclient.ErrStrictMappingRejected) {
 			// NP-51. The document carried a field the generation's mapping
 			// does not declare, which means the source is emitting outside
@@ -290,6 +430,43 @@ func (ix *Indexer) Apply(ctx context.Context, e projection.Event) (Outcome, erro
 		ix.metrics.IndexLagSeconds.WithLabelValues(scope).Observe(time.Since(e.EmittedAt).Seconds())
 	}
 	ix.metrics.ProjectionsTotal.WithLabelValues(scope, string(OutcomeIndexed)).Inc()
+	return OutcomeIndexed, nil
+}
+
+// embed attaches the pinned-model vector to a semantic scope's live projection.
+//
+// Two failure classes, handled oppositely. A provider that answered with a
+// different model or width is NP-35 — "pinned model/version mismatch blocks
+// indexing" — and is quarantined: redelivering the event will get the same
+// wrong model, and the DLQ copy is what an operator replays once the provider
+// is pinned again. A provider that could not be reached, or no provider at all,
+// is an ordinary transient error: retried, then dead-lettered.
+//
+// A document with no embeddable text gets no vector. It stays a lexical
+// candidate; it is simply never a semantic one, which is the truthful answer
+// for a record that has nothing in its pinned source fields.
+func (ix *Indexer) embed(ctx context.Context, live *liveScope, result *projection.Result) (Outcome, error) {
+	spec := live.projector.Contract().Embedding
+	if spec == nil || result.Projection.Tombstoned {
+		return OutcomeIndexed, nil
+	}
+	text := embedding.DocumentText(*spec, result.Projection.Fields)
+	if text == "" {
+		return OutcomeIndexed, nil
+	}
+	embedder := ix.embedder
+	if embedder == nil {
+		embedder = embedding.Unconfigured{}
+	}
+	vectors, err := embedder.Embed(ctx, *spec, []string{text})
+	if err != nil {
+		if errors.Is(err, embedding.ErrModelMismatch) {
+			return OutcomeQuarantined, fmt.Errorf("%s: %w", domain.ReasonSemanticModelMismatch, err)
+		}
+		return OutcomeError, fmt.Errorf("embed: %w", err)
+	}
+	result.Projection.Embedding = vectors[0]
+	result.Projection.EmbeddingModel = spec.PinnedModel()
 	return OutcomeIndexed, nil
 }
 
@@ -359,6 +536,13 @@ func (ix *Indexer) VerifyRestrictions(ctx context.Context) {
 			if ts, ok := doc["tombstoned"].(bool); ok && ts {
 				invisible = true
 			}
+			// NP-34: "restriction event updates all representations;
+			// verification checks both." A tombstoned lexical document that
+			// still carries its vector is still a nearest-neighbour answer
+			// for the restricted record, so it is NOT invisible.
+			if _, hasVector := doc[searchclient.EmbeddingVectorField]; hasVector {
+				invisible = false
+			}
 		}
 
 		if !invisible {
@@ -401,119 +585,180 @@ func (ix *Indexer) VerifyRestrictions(ctx context.Context) {
 
 // ── §5.3 checkpoint and completeness accounting ──────────────────────────────
 
+// laggingFraction is the share of a source's max_lag_seconds past which a
+// scope is reported LAGGING before it is STALE. §8.3's "alert by freshness
+// class; scope marked LAGGING/STALE" needs an early state that is not yet a
+// block, and half the bound is the point at which an operator still has time
+// to act before protected searches start refusing.
+const laggingFraction = 0.5
+
 // RecordCheckpoints recomputes freshness and population for every live scope.
-//
-// Population is compared BOTH ways — the control-plane ledger and the engine —
-// and a mismatch downgrades freshness rather than being logged and forgotten.
-// That comparison is the point of keeping a ledger at all: NP-17 ("index
-// checkpoint falsely advances past missing events") is only detectable by
-// something that counted independently of the index.
 func (ix *Indexer) RecordCheckpoints(ctx context.Context) {
 	ix.mu.RLock()
-	snapshot := make(map[string]*liveScope, len(ix.bySourceType))
-	for k, v := range ix.bySourceType {
-		snapshot[k] = v
+	snapshot := make([]*liveScope, 0, len(ix.bySourceType))
+	for _, v := range ix.bySourceType {
+		snapshot = append(snapshot, v)
 	}
 	ix.mu.RUnlock()
 
 	for _, live := range snapshot {
-		scope := live.projector.Scope()
-		contract := live.projector.Contract()
-		source := live.projector.Source()
-
-		ledgerLive, ledgerTombstoned, err := ix.store.CountProjections(ctx, scope)
-		if err != nil {
-			ix.log.Error("checkpoint: ledger count failed", zap.String("scope", scope), zap.Error(err))
-			continue
-		}
-		engineLive, err := ix.engine.CountProjections(ctx, live.physicalIndex, nil)
-		if err != nil {
-			ix.metrics.EngineError("count")
-			ix.log.Error("checkpoint: engine count failed", zap.String("scope", scope), zap.Error(err))
-			// Freshness UNKNOWN, not the previous value. §2.2: "UNKNOWN is
-			// never represented as CURRENT."
-			_ = ix.store.UpsertCheckpoint(ctx, domain.IndexCheckpoint{
-				ScopeName: scope, SourcePartition: live.physicalIndex,
-				CommittedAt: time.Now().UTC(), Freshness: domain.FreshnessUnknown,
-				IndexedLive: ledgerLive, IndexedTombstoned: ledgerTombstoned,
-			})
-			if ix.events != nil {
-				_ = ix.events.CheckpointAdvanced(ctx, scope, live.physicalIndex,
-					time.Now().UTC().UnixMilli(), 0, live.generationID, string(domain.FreshnessUnknown))
-			}
-			continue
-		}
-
-		freshness := domain.FreshnessCurrent
-		note := ""
-		if engineLive != ledgerLive {
-			// A gap in either direction. §5.3's "population count: source
-			// eligible count vs indexed live/tombstoned count by
-			// tenant/partition" — this is that check, and it is the one that
-			// catches the window the ledger-first write order leaves open.
-			freshness = domain.FreshnessLagging
-			note = fmt.Sprintf("ledger %d vs engine %d", ledgerLive, engineLive)
-			ix.log.Warn("checkpoint: population mismatch between ledger and index",
-				zap.String("scope", scope),
-				zap.Int64("ledger_live", ledgerLive),
-				zap.Int64("engine_live", engineLive))
-		}
-
-		// §5.3 / NP-60: if the source declares MaxLagSeconds and the latest
-		// committed event is older than that threshold, the index is STALE.
-		// UNKNOWN is not a downgrade of LAGGING — it is a separate path.
-		// STALE supersedes LAGGING: a lagging index that has also exceeded
-		// its staleness threshold is STALE, not LAGGING.
-		var lagMS int64
-		if source.MaxLagSeconds > 0 {
-			// The watermark is in milliseconds since epoch. If the latest
-			// committed event is older than MaxLagSeconds, the index is stale.
-			// We compare the checkpoint's CommittedAt (which is the observed
-			// time of the latest event we've processed) against now.
-			lagMS = time.Since(ix.latestCommittedAt(source.SourceType)).Milliseconds()
-			if lagMS > int64(source.MaxLagSeconds)*1000 {
-				freshness = domain.FreshnessStale
-				note = fmt.Sprintf("lag %dms exceeds max_lag %ds", lagMS, source.MaxLagSeconds)
-				ix.log.Warn("checkpoint: index exceeds staleness threshold",
-					zap.String("scope", scope),
-					zap.Int64("lag_ms", lagMS),
-					zap.Int("max_lag_seconds", source.MaxLagSeconds))
-			}
-		}
-
-		cp := domain.IndexCheckpoint{
-			ScopeName:         scope,
-			SourcePartition:   live.physicalIndex,
-			Watermark:         time.Now().UTC().UnixMilli(),
-			CommittedAt:       time.Now().UTC(),
-			LagMS:             lagMS,
-			Freshness:         freshness,
-			IndexedLive:       ledgerLive,
-			IndexedTombstoned: ledgerTombstoned,
-		}
-		if err := ix.store.UpsertCheckpoint(ctx, cp); err != nil {
-			ix.log.Error("checkpoint write failed", zap.String("scope", scope), zap.Error(err))
-			continue
-		}
-		if ix.events != nil {
-			_ = ix.events.CheckpointAdvanced(ctx, scope, live.physicalIndex,
-				cp.Watermark, cp.LagMS, live.generationID, string(freshness))
-		}
-		_ = contract
-		_ = note
+		ix.recordCheckpoint(ctx, live)
 	}
 }
 
-// latestCommittedAt returns the time of the most recently committed event
-// for a source type, based on the checkpoint watermark.
-// This is a best-effort approximation — the true "latest event time" would
-// require querying the projection ledger for the max indexed_at.
-func (ix *Indexer) latestCommittedAt(sourceType string) time.Time {
-	// For now, use the checkpoint watermark as a proxy. The checkpoint
-	// sweep runs frequently (default 60s), so the watermark is a reasonable
-	// approximation of the latest processed event time.
-	// In the future, this could query the ledger for MAX(indexed_at).
-	return time.Now().UTC()
+// RecordCheckpointForScope measures one scope now, rather than at the next
+// sweep. Called after a generation is activated: a new generation has no
+// checkpoint row, and until it has one its freshness is UNKNOWN, which blocks
+// protected searches — so the first measurement should not wait a full sweep
+// interval.
+func (ix *Indexer) RecordCheckpointForScope(ctx context.Context, scope string) {
+	ix.mu.RLock()
+	var target *liveScope
+	for _, v := range ix.bySourceType {
+		if v.projector.Scope() == scope {
+			target = v
+			break
+		}
+	}
+	ix.mu.RUnlock()
+	if target != nil {
+		ix.recordCheckpoint(ctx, target)
+	}
+}
+
+// recordCheckpoint measures one live scope and writes its checkpoint.
+//
+// Three independent measurements, and freshness is the WORST of them:
+//
+//  1. Source-to-index lag, from the broker (§5.3 "Lag"): the age of the oldest
+//     message this consumer group has not committed. Past the source's
+//     max_lag_seconds the scope is STALE; past half of it, LAGGING.
+//  2. Population, ledger against engine (§5.3 "Population count"): a gap in
+//     either direction is LAGGING — the window the ledger-first write order
+//     leaves open (NP-17).
+//  3. Measurability: if the lag or the engine count cannot be obtained, the
+//     scope is UNKNOWN, not its previous value. §2.2: "UNKNOWN is never
+//     represented as CURRENT."
+func (ix *Indexer) recordCheckpoint(ctx context.Context, live *liveScope) {
+	scope := live.projector.Scope()
+	source := live.projector.Source()
+	now := time.Now().UTC()
+
+	ledgerLive, ledgerTombstoned, err := ix.store.CountProjections(ctx, scope)
+	if err != nil {
+		// No write at all rather than an UNKNOWN row: the database this would
+		// be written to is the thing that just failed. The read side's
+		// observed_at age check turns a checkpoint that stopped being written
+		// into UNKNOWN.
+		ix.log.Error("checkpoint: ledger count failed", zap.String("scope", scope), zap.Error(err))
+		return
+	}
+
+	previous, _ := ix.store.GetCheckpoint(ctx, scope, live.physicalIndex)
+
+	cp := domain.IndexCheckpoint{
+		ScopeName:         scope,
+		SourcePartition:   live.physicalIndex,
+		Watermark:         -1,
+		CommittedAt:       now,
+		Freshness:         domain.FreshnessCurrent,
+		IndexedLive:       ledgerLive,
+		IndexedTombstoned: ledgerTombstoned,
+	}
+	cause := ""
+
+	// 1. Lag, at the broker.
+	if ix.lag == nil {
+		cp.Freshness = domain.FreshnessUnknown
+		cause = "no lag probe configured"
+	} else if source.EventTopic == "" {
+		// Nothing to measure is not "caught up".
+		cp.Freshness = domain.FreshnessUnknown
+		cause = "source has no event topic"
+	} else if measured, err := ix.lag.TopicLag(ctx, source.EventTopic); err != nil {
+		cp.Freshness = domain.FreshnessUnknown
+		cause = "consumer position could not be measured: " + err.Error()
+		ix.log.Error("checkpoint: lag probe failed", zap.String("scope", scope), zap.Error(err))
+	} else if measured.Backlog > 0 && measured.OldestPending.IsZero() {
+		// A backlog whose age cannot be read has an unknown lag, not zero.
+		cp.Watermark = measured.Watermark
+		cp.Freshness = domain.FreshnessUnknown
+		cause = fmt.Sprintf("backlog of %d messages with no readable timestamp", measured.Backlog)
+	} else {
+		cp.Watermark = measured.Watermark
+		cp.LagMS = measured.Lag(now).Milliseconds()
+		if !measured.OldestPending.IsZero() {
+			// committed_at is the source time the index is caught up TO: the
+			// broker timestamp of the oldest message still to be consumed.
+			// Caught up means caught up to now.
+			cp.CommittedAt = measured.OldestPending.UTC()
+		}
+		maxLagMS := int64(source.MaxLagSeconds) * 1000
+		switch {
+		case maxLagMS > 0 && cp.LagMS > maxLagMS:
+			cp.Freshness = domain.FreshnessStale
+			cause = fmt.Sprintf("lag %dms exceeds max_lag_seconds %d", cp.LagMS, source.MaxLagSeconds)
+		case maxLagMS > 0 && float64(cp.LagMS) > laggingFraction*float64(maxLagMS):
+			cp.Freshness = domain.FreshnessLagging
+			cause = fmt.Sprintf("lag %dms is past half of max_lag_seconds %d", cp.LagMS, source.MaxLagSeconds)
+		}
+	}
+
+	// 2/3. Population, ledger against engine.
+	engineLive, err := ix.engine.CountProjections(ctx, live.physicalIndex, nil)
+	switch {
+	case err != nil:
+		ix.metrics.EngineError("count")
+		ix.log.Error("checkpoint: engine count failed", zap.String("scope", scope), zap.Error(err))
+		cp.Freshness = domain.FreshnessUnknown
+		cause = "engine population could not be counted: " + err.Error()
+	case engineLive != ledgerLive && cp.Freshness == domain.FreshnessCurrent:
+		// Downgrades CURRENT only. A STALE or UNKNOWN scope that also has a
+		// population gap is still STALE or UNKNOWN — the worse state wins.
+		cp.Freshness = domain.FreshnessLagging
+		cause = fmt.Sprintf("ledger %d vs engine %d", ledgerLive, engineLive)
+		ix.log.Warn("checkpoint: population mismatch between ledger and index",
+			zap.String("scope", scope),
+			zap.Int64("ledger_live", ledgerLive),
+			zap.Int64("engine_live", engineLive))
+	}
+
+	if err := ix.store.UpsertCheckpoint(ctx, cp); err != nil {
+		ix.log.Error("checkpoint write failed", zap.String("scope", scope), zap.Error(err))
+		return
+	}
+	ix.metrics.ObserveFreshness(scope, string(cp.Freshness), float64(cp.LagMS)/1000)
+	if cp.Freshness != domain.FreshnessCurrent {
+		ix.log.Warn("checkpoint: scope is not CURRENT",
+			zap.String("scope", scope), zap.String("freshness", string(cp.Freshness)),
+			zap.Int64("lag_ms", cp.LagMS), zap.String("cause", cause))
+	}
+
+	if ix.events == nil {
+		return
+	}
+	// esr.index_checkpoint.advanced only when the position actually ADVANCED.
+	// Emitting it every sweep — or, worse, on a sweep that could not measure
+	// anything — tells DQC the index moved when it did not, which is NP-17
+	// ("index checkpoint falsely advances past missing events") delivered as
+	// an event.
+	if cp.Watermark >= 0 && (previous == nil || cp.Watermark > previous.Watermark) {
+		_ = ix.events.CheckpointAdvanced(ctx, scope, live.physicalIndex,
+			cp.Watermark, cp.LagMS, live.generationID, string(cp.Freshness))
+	}
+	// A scope that has just become untrustworthy is announced once, on the
+	// transition, as esr.search.degraded — §11.2 routes that event to
+	// NCD/SRE/operations, which is who §8.3's "alert by freshness class" is
+	// for. Not on every sweep: a standing condition is a gauge, not a stream.
+	if cp.Freshness.Untrusted() && (previous == nil || !previous.Freshness.Untrusted()) {
+		completeness := domain.CompletenessDegraded
+		if cp.Freshness == domain.FreshnessUnknown {
+			completeness = domain.CompletenessUnknown
+		}
+		_ = ix.events.SearchDegraded(ctx, "", scope,
+			"index freshness "+string(cp.Freshness)+": "+cause,
+			string(completeness), []string{live.physicalIndex}, "")
+	}
 }
 
 // RunSweeps starts the two background loops and blocks until ctx is cancelled.
@@ -522,6 +767,11 @@ func (ix *Indexer) RunSweeps(ctx context.Context, verifyEvery, checkpointEvery t
 	defer verify.Stop()
 	checkpoint := time.NewTicker(checkpointEvery)
 	defer checkpoint.Stop()
+
+	// Measure once at start rather than a full interval later. Until a scope
+	// has a checkpoint its freshness is UNKNOWN, which blocks protected
+	// searches — so a restart must not open with a minute of refusals.
+	ix.RecordCheckpoints(ctx)
 
 	for {
 		select {

@@ -161,7 +161,82 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ReasonedError" }
         "503":
-          description: ESR-008 AUTHORIZATION_INDETERMINATE — failing closed
+          description: |
+            The server's state, not the request's — the same request succeeds
+            once it clears:
+            * ESR-008 AUTHORIZATION_INDETERMINATE — failing closed
+            * ESR-012 INDEX_STALE_FOR_SCOPE — the active generation is STALE or
+              UNKNOWN and the scope's contract class is protected (R1+). §8.3:
+              "protected results may require source hydration or block". An R0
+              scope answers instead, flagged (206, `index_freshness`, ESR-012 in
+              `reason_codes`).
+            * ESR-018 RESTRICTION_PROPAGATION_FAILED — more than 500 of this
+              tenant's restrictions in the scope have failed to propagate, or
+              the restriction queue could not be read (NP-59).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+
+  /v1/search/semantic:
+    post:
+      tags: [Search]
+      summary: Semantic or hybrid retrieval over a registered semantic scope
+      description: |
+        §11.1: "semantic/hybrid retrieval for registered scopes; same policy
+        envelope as lexical search; embedding model fixed by scope."
+
+        The same trusted context, Compile ordering, scope-health gate,
+        per-hit re-authorization, hydration and suppression as `/v1/search`.
+        Only candidate selection differs: the k nearest neighbours of a query
+        vector the scope's PINNED model produced, found by a filtered ANN walk
+        that visits only documents inside the caller's mandatory filters
+        (§10.1, NP-33). Similarity is not authorization.
+
+        The query is embedded only after the plan compiled and the scope passed
+        its health gate, so a refused request never reaches the embedding
+        provider. There is no field for a caller-supplied vector.
+
+        One bounded page: no cursor, no facets, no snippets.
+      operationId: searchSemantic
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SemanticSearchRequest" }
+      responses:
+        "200":
+          description: Complete result set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "206":
+          description: PARTIAL, DEGRADED or UNKNOWN — see `completeness_state`
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400":
+          description: ESR-003/004/005/006/015 — the request was refused
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "404":
+          description: |
+            ESR-002 — the scope is not registered for semantic retrieval (its
+            contract pins no embedding model); ESR-011 — no active generation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "409":
+          description: ESR-019 — the request's `model` is not the scope's pinned model
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "503":
+          description: |
+            ESR-008 / ESR-012 / ESR-018 as for `/v1/search`, or ESR-019 — no
+            embedding provider is configured (OD-10), the provider is
+            unreachable, or it answered with a model, version or width other
+            than the pin (NP-35). Never a lexical fallback.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ReasonedError" }
@@ -199,6 +274,11 @@ paths:
               schema: { $ref: "#/components/schemas/SearchResponse" }
         "400":
           description: ESR-016 — too many refs; use an authorized export
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "503":
+          description: ESR-012 / ESR-018 — the same scope-health gate as `/v1/search`
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ReasonedError" }
@@ -380,7 +460,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Source" }
-        "400": { description: Missing event types, or a prohibited ceiling }
+        "400": { description: "Missing event types, or a prohibited ceiling" }
         "403": { description: Principal lacks SEARCH_SOURCE_REGISTER }
         "409": { description: That source_type is already registered }
         "503": { description: Authorization unavailable — failing closed }
@@ -492,7 +572,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Contract" }
-        "409": { description: Illegal transition, or another version is already PUBLISHED }
+        "409": { description: "Illegal transition, or another version is already PUBLISHED" }
 
   /v1/index-generations:
     post:
@@ -546,10 +626,13 @@ paths:
         `PLANNED → BUILDING → VALIDATING → READY → ACTIVE → RETIRED`.
 
         **VALIDATING → READY runs real validation**, not a state write:
+        * the backfill must be COMPLETE (409 `backfill_incomplete` otherwise)
         * cross-tenant contamination — any document with no `tenant_id` fails
           the generation outright (NP-41)
         * completeness against the control-plane ledger, which counted
-          independently of the index (NP-18)
+          independently of the index (NP-18) — including an EMPTY generation
+          over a populated ledger, which used to pass and empty the scope at
+          activation
 
         **→ ACTIVE swaps the alias atomically**, engine first. If the swap
         succeeds and the state write fails, the alias points at a generation
@@ -557,6 +640,18 @@ paths:
         `/readyz`. The other order gives a control plane that claims ACTIVE
         while the alias still serves the old generation: silently wrong, and
         correct-looking from every API.
+
+        **→ READY for a model migration requires certification.** A generation
+        whose contract's embedding pin differs from the serving generation's
+        (a new model, version, width, preprocessing or space, or semantic
+        retrieval introduced on a lexical scope) cannot become READY until its
+        latest retrieval evaluation passed (§10.1). Refused with 409
+        `retrieval_evaluation_required` / `retrieval_evaluation_failed`
+        WITHOUT failing the generation — a missing certification is a
+        precondition to supply, not a defect in the build.
+
+        **→ ACTIVE measures freshness immediately**, so the new generation does
+        not read UNKNOWN (and refuse protected searches) until the next sweep.
 
         Requires `SEARCH_GENERATION_ACTIVATE` rather than
         `SEARCH_GENERATION_CREATE` for ACTIVE and RETIRED — building is
@@ -584,9 +679,84 @@ paths:
               schema: { $ref: "#/components/schemas/Generation" }
         "409":
           description: |
-            Illegal transition; ESR-017 REINDEX_VALIDATION_FAILED; another
-            generation is already ACTIVE; or an attempt to retire the serving
-            generation before its replacement is active.
+            Illegal transition; ESR-017 REINDEX_VALIDATION_FAILED; a model
+            migration without a passing retrieval evaluation (ESR-017,
+            `retrieval_evaluation_required` / `retrieval_evaluation_failed`);
+            another generation is already ACTIVE; or an attempt to retire the
+            serving generation before its replacement is active.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+
+  /v1/index-generations/{generationID}/retrieval-evaluations:
+    post:
+      tags: [Lifecycle]
+      summary: Certify a semantic generation against a gold set (§10.1)
+      description: |
+        "Model migration requires parallel rebuild and retrieval-evaluation
+        certification before cutover." Measures mean recall@k over the cases:
+        every case runs inside the CALLER's verified tenant (a case cannot name
+        a tenant — that made the evaluation a cross-tenant existence oracle),
+        excluding the tenant's FAILED restrictions, among
+        documents embedded by the generation's pinned model, exactly as a real
+        query would. `min_recall` is the operator's to state because OD-15
+        leaves quantitative relevance thresholds open; it is recorded beside
+        the result.
+
+        Numbers only come back. The hits are compared with the expected ids
+        and discarded, so a platform operator learns how well a generation
+        retrieves, never what it retrieved (INV-30). Query text is stored only
+        as `cases_digest` (INV-17). Every run is kept; the LATEST decides the
+        READY gate. A failing run also emits `esr.reindex.failed` with stage
+        `RETRIEVAL_EVALUATION`.
+      operationId: evaluateRetrieval
+      parameters:
+        - { name: generationID, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RetrievalEvaluationRequest" }
+      responses:
+        "201":
+          description: Evaluation recorded (pass or fail)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RetrievalEvaluation" }
+        "400":
+          description: Invalid gold set, k or min_recall
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "403":
+          description: Requires `SEARCH_GENERATION_CREATE` at platform scope
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "409":
+          description: The generation is FAILED/RETIRED, or its contract is not semantic
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "503":
+          description: ESR-019 — the pinned model could not embed the evaluation queries
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+    get:
+      tags: [Lifecycle]
+      summary: The generation's latest retrieval evaluation
+      operationId: getRetrievalEvaluation
+      parameters:
+        - { name: generationID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Latest evaluation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RetrievalEvaluation" }
+        "404":
+          description: Never evaluated
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ReasonedError" }
@@ -600,6 +770,12 @@ paths:
         control-plane ledger, which counted independently of the index — that
         independence is what makes NP-17 ("checkpoint falsely advances past
         missing events") detectable at all.
+
+        `watermark` and `lag_ms` are measured at the BROKER: the consumer
+        group's committed offsets (summed over partitions) and the age of the
+        oldest message it has not consumed. A source caught up is CURRENT
+        however old its last event; past half of `max_lag_seconds` it is
+        LAGGING; past it, STALE; unmeasurable, UNKNOWN.
       operationId: listCheckpoints
       parameters:
         - { name: scope, in: query, schema: { type: string } }
@@ -630,6 +806,14 @@ components:
         Mandatory: `X-Tenant-Id`, `X-Principal-Id` (or `X-Workload-Id`),
         `X-Request-Id`, `X-Correlation-ID`, `X-Source-Channel`,
         `X-Purpose-Context`, and `Idempotency-Key` on POST.
+
+        `Idempotency-Key` is HONOURED on every command (not on the query
+        POSTs `/v1/search`, `/v1/search/semantic`, `/v1/retrieve`): a retry
+        with the same key, principal and body is answered from the first
+        response with `X-Idempotent-Replay: true`; the same key with a
+        different body or principal is 409 `IDEMPOTENCY_MISMATCH`; a retry
+        while the first is still running is 409 `IDEMPOTENCY_IN_FLIGHT`. 5xx
+        responses are not recorded, so they can be retried.
 
         In production Traefik's ForwardAuth sets these from gateway-auth-svc's
         verified identity envelope and strips any inbound copies.
@@ -757,6 +941,17 @@ components:
         reason_codes:
           type: array
           items: { type: string }
+        index_freshness:
+          type: string
+          enum: [CURRENT, LAGGING, STALE, UNKNOWN]
+          description: |
+            The active generation's measured freshness (§4 "return exact
+            source lineage plus freshness status"). A checkpoint older than
+            three sweep intervals reads UNKNOWN: the sweep behind it stopped.
+        index_lag_ms: { type: integer }
+        embedding_model:
+          type: string
+          description: The pinned `model@version` that answered a semantic request.
 
     Result:
       type: object
@@ -793,6 +988,102 @@ components:
             not let index content be trusted as a current display value for
             material records, so a caller has to be able to tell which it got.
 
+    SemanticSearchRequest:
+      type: object
+      required: [scope, query]
+      description: |
+        No tenant, actor, purpose, index name or vector — unknown fields are
+        refused. A caller-supplied vector would let the caller choose what its
+        query is "similar" to without the pinned model being consulted.
+      properties:
+        scope: { type: string }
+        query:
+          type: string
+          maxLength: 2000
+          description: |
+            Natural-language text, NFKC-normalised. In `semantic` mode the
+            lexical operator rules do not apply (a `?` is a question, not a
+            wildcard); in `hybrid` mode they apply to the lexical half.
+        mode: { type: string, enum: [semantic, hybrid], default: semantic }
+        filters:
+          type: object
+          additionalProperties: { type: string }
+        requested_fields: { type: array, items: { type: string } }
+        size: { type: integer, maximum: 100 }
+        k:
+          type: integer
+          maximum: 100
+          description: Nearest neighbours to consider. Defaults to `size`.
+        model:
+          type: string
+          description: |
+            Optional `model@version` the caller expects. A mismatch with the
+            scope's pin is ESR-019 (409) rather than results from an embedding
+            space the caller did not ask for.
+        cursor:
+          type: string
+          description: Refused with ESR-015 — a nearest-neighbour answer is one bounded page.
+
+    EmbeddingSpec:
+      type: object
+      required: [model, model_version, dimensions, source_fields]
+      description: |
+        §10.1: "embedding model/version and preprocessing are pinned in the
+        IndexContract." Immutable with the contract; a new model is a new
+        contract version, a new generation, and a certified migration.
+      properties:
+        model: { type: string }
+        model_version:
+          type: string
+          description: An exact version. `latest` is refused — it is the silent drift NP-35 is about.
+        dimensions: { type: integer, minimum: 1, maximum: 16000 }
+        source_fields:
+          type: array
+          minItems: 1
+          items: { type: string }
+          description: |
+            Registered, non-prohibited TEXT or KEYWORD fields of this contract,
+            embedded in this order from their PROJECTED values (INV-26).
+        preprocessing: { type: string, enum: [nfkc-ws-v1], default: nfkc-ws-v1 }
+        similarity: { type: string, enum: [cosinesimil, l2, innerproduct], default: cosinesimil }
+
+    RetrievalEvaluationRequest:
+      type: object
+      required: [k, min_recall, cases]
+      properties:
+        k: { type: integer, minimum: 1, maximum: 100 }
+        min_recall: { type: number, minimum: 0, exclusiveMinimum: true, maximum: 1 }
+        cases:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            type: object
+            required: [query, expected_source_ids]
+            properties:
+              query: { type: string }
+              expected_source_ids:
+                type: array
+                minItems: 1
+                maxItems: 100
+                items: { type: string }
+
+    RetrievalEvaluation:
+      type: object
+      properties:
+        evaluation_id: { type: string, format: uuid }
+        generation_id: { type: string, format: uuid }
+        scope_name: { type: string }
+        pinned_model: { type: string }
+        k: { type: integer }
+        cases: { type: integer }
+        min_recall: { type: number }
+        recall: { type: number, description: Mean recall@k over the cases. }
+        passed: { type: boolean }
+        cases_digest: { type: string, description: SHA-256 of the gold set; never the queries (INV-17). }
+        created_at: { type: string, format: date-time }
+        created_by_principal_id: { type: string, format: uuid }
+
     RetrieveRequest:
       type: object
       required: [scope, refs]
@@ -810,6 +1101,12 @@ components:
     RestrictionRequest:
       type: object
       required: [scope, source_type, source_id, reason, source_event_id]
+      description: |
+        The projection ledger is stamped tombstoned at the restriction's epoch
+        BEFORE the index is touched, so every later projection of the record —
+        a replay, or a genuinely newer domain update — is refused by the
+        ledger's compare-and-set (NP-11, NP-48). Every serving or candidate
+        generation of the scope is tombstoned.
       properties:
         scope: { type: string }
         source_type: { type: string }
@@ -933,6 +1230,8 @@ components:
           type: array
           minItems: 1
           items: { $ref: "#/components/schemas/FieldDefinition" }
+        embedding:
+          $ref: "#/components/schemas/EmbeddingSpec"
 
     FieldDefinition:
       type: object
@@ -981,6 +1280,8 @@ components:
         fields:
           type: array
           items: { $ref: "#/components/schemas/FieldDefinition" }
+        embedding:
+          $ref: "#/components/schemas/EmbeddingSpec"
         created_at: { type: string, format: date-time }
         published_at: { type: string, format: date-time, nullable: true }
 
@@ -1003,6 +1304,19 @@ components:
           type: string
           description: TC-09 — what was actually checked before activation.
         validation_note: { type: string }
+        backfill_state:
+          type: string
+          enum: [PENDING, RUNNING, COMPLETE, FAILED]
+          description: |
+            Replay of the source topic into this generation (INV-21). A new
+            generation is backfilled from the earliest retained event, with the
+            projection ledger deciding each record's state (a record the ledger
+            holds tombstoned is tombstoned in the rebuild), and receives live
+            events in parallel. READY requires COMPLETE. Empty for generations
+            created before backfill existed.
+        backfill_note:
+          type: string
+          example: replayed=5 written=3 tombstones=1 superseded=1 failed=0
         activated_at: { type: string, format: date-time, nullable: true }
         retired_at: { type: string, format: date-time, nullable: true }
 
@@ -1032,6 +1346,10 @@ components:
         active:
           type: boolean
           description: Whether a generation is currently serving this scope.
+        semantic:
+          type: boolean
+          description: Whether the contract pins an embedding model (POST /v1/search/semantic applies).
+        embedding_model: { type: string }
         fields:
           type: array
           items:

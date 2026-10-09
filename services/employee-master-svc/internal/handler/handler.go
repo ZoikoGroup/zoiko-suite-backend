@@ -43,6 +43,37 @@ const (
 	actionEmployeeUpdateStatus = "EMPLOYEE_UPDATE_STATUS"
 )
 
+var validWorkerTypes = map[string]bool{
+	"FULL_TIME":   true,
+	"PART_TIME":   true,
+	"CONTRACTOR":  true,
+	"INTERN":      true,
+	"PROBATION":   true,
+}
+
+var validEmployeeStatuses = map[string]bool{
+	"ONBOARDING":               true,
+	"ACTIVE":                   true,
+	"INACTIVE":                 true,
+	"PENDING":                  true,
+	"ON_LEAVE":                 true,
+	"TERMINATED":               true,
+	"RESIGNED":                 true,
+	"DEACTIVATED":              true,
+	"SUSPENDED":                true,
+	"LOCKED":                   true,
+	"ARCHIVED":                 true,
+	"PASSWORD_RESET_REQUIRED":  true,
+}
+
+var validGenders = map[string]bool{
+	"MALE":        true,
+	"FEMALE":      true,
+	"NON_BINARY":  true,
+	"OTHER":       true,
+	"UNSPECIFIED": true,
+}
+
 type Handler struct {
 	store     Store
 	publisher Publisher
@@ -83,13 +114,13 @@ func (h *Handler) CreateEmployee(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.WorkerType != "FULL_TIME" && req.WorkerType != "PART_TIME" && req.WorkerType != "CONTRACTOR" {
-		writeError(w, http.StatusBadRequest, "invalid_worker_type", "worker_type must be FULL_TIME, PART_TIME, or CONTRACTOR")
+	if !validWorkerTypes[req.WorkerType] {
+		writeError(w, http.StatusBadRequest, "invalid_worker_type", "worker_type must be FULL_TIME, PART_TIME, CONTRACTOR, INTERN, or PROBATION")
 		return
 	}
 
-	if !validGender(req.Gender) {
-		writeError(w, http.StatusBadRequest, "invalid_gender", genderMessage)
+	if req.Gender != nil && !validGenders[*req.Gender] {
+		writeError(w, http.StatusBadRequest, "invalid_gender", "gender must be MALE, FEMALE, NON_BINARY, OTHER, or UNSPECIFIED")
 		return
 	}
 
@@ -142,13 +173,13 @@ func (h *Handler) CreateEmployee(w http.ResponseWriter, r *http.Request) {
 		JobTitle:          jobTitle,
 		DepartmentID:      req.DepartmentID,
 		ManagerEmployeeID: req.ManagerEmployeeID,
-		WorkerType:        req.WorkerType,
-		Status:            "ACTIVE",
+		WorkerType:        domain.WorkerType(req.WorkerType),
+		Status:            domain.EmployeeStatusActive,
 		HireDate:          req.HireDate,
 		EffectiveFrom:     now,
 
 		DateOfBirth:       req.DateOfBirth,
-		Gender:            req.Gender,
+		Gender:            domain.Gender(""),
 		ProfilePictureURL: req.ProfilePictureURL,
 		PersonalEmail:     req.PersonalEmail,
 		WorkEmail:         req.WorkEmail,
@@ -167,8 +198,15 @@ func (h *Handler) CreateEmployee(w http.ResponseWriter, r *http.Request) {
 		DesignationID:    req.DesignationID,
 		ConfirmationDate: req.ConfirmationDate,
 
+		BasicSalary: req.BasicSalary,
+		CTC:         req.CTC,
+
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+
+	if req.Gender != nil {
+		emp.Gender = domain.Gender(*req.Gender)
 	}
 
 	if err := h.store.CreateEmployee(r.Context(), emp); errors.Is(err, domain.ErrEmailAlreadyExists) {
@@ -317,19 +355,26 @@ func (h *Handler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
 		emp.ManagerEmployeeID = req.ManagerEmployeeID
 	}
 	if req.WorkerType != nil {
-		if *req.WorkerType != "FULL_TIME" && *req.WorkerType != "PART_TIME" && *req.WorkerType != "CONTRACTOR" {
-			writeError(w, http.StatusBadRequest, "invalid_worker_type", "worker_type must be FULL_TIME, PART_TIME, or CONTRACTOR")
+		if !validWorkerTypes[*req.WorkerType] {
+			writeError(w, http.StatusBadRequest, "invalid_worker_type", "worker_type must be FULL_TIME, PART_TIME, CONTRACTOR, INTERN, or PROBATION")
 			return
 		}
-		emp.WorkerType = *req.WorkerType
+		emp.WorkerType = domain.WorkerType(*req.WorkerType)
+	}
+	if req.Status != nil {
+		if !validEmployeeStatuses[*req.Status] {
+			writeError(w, http.StatusBadRequest, "invalid_status", "status must be ONBOARDING, ACTIVE, INACTIVE, PENDING, ON_LEAVE, TERMINATED, RESIGNED, DEACTIVATED, SUSPENDED, LOCKED, ARCHIVED, or PASSWORD_RESET_REQUIRED")
+			return
+		}
+		emp.Status = domain.EmployeeStatus(*req.Status)
 	}
 
 	if req.Gender != nil {
-		if !validGender(req.Gender) {
-			writeError(w, http.StatusBadRequest, "invalid_gender", genderMessage)
+		if !validGenders[*req.Gender] {
+			writeError(w, http.StatusBadRequest, "invalid_gender", "gender must be MALE, FEMALE, NON_BINARY, OTHER, or UNSPECIFIED")
 			return
 		}
-		emp.Gender = req.Gender
+		emp.Gender = domain.Gender(*req.Gender)
 	}
 	if req.DateOfBirth != nil {
 		if !validDate(req.DateOfBirth) {
@@ -387,6 +432,12 @@ func (h *Handler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
 	if req.DesignationID != nil {
 		emp.DesignationID = req.DesignationID
 	}
+	if req.BasicSalary != nil {
+		emp.BasicSalary = req.BasicSalary
+	}
+	if req.CTC != nil {
+		emp.CTC = req.CTC
+	}
 
 	emp.UpdatedAt = time.Now().UTC()
 
@@ -416,13 +467,14 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Status != "ONBOARDING" && req.Status != "ACTIVE" && req.Status != "SUSPENDED" && req.Status != "TERMINATED" {
-		writeError(w, http.StatusBadRequest, "invalid_status", "status must be ONBOARDING, ACTIVE, SUSPENDED, or TERMINATED")
+	if !validEmployeeStatuses[req.Status] {
+		writeError(w, http.StatusBadRequest, "invalid_status", "status must be ONBOARDING, ACTIVE, INACTIVE, PENDING, ON_LEAVE, TERMINATED, RESIGNED, DEACTIVATED, SUSPENDED, LOCKED, ARCHIVED, or PASSWORD_RESET_REQUIRED")
 		return
 	}
 
-	if req.Status == "TERMINATED" && (req.TerminationDate == nil || *req.TerminationDate == "") {
-		writeError(w, http.StatusBadRequest, "missing_fields", "termination_date is required when status is TERMINATED")
+	terminationRequired := req.Status == "TERMINATED" || req.Status == "RESIGNED"
+	if terminationRequired && (req.TerminationDate == nil || *req.TerminationDate == "") {
+		writeError(w, http.StatusBadRequest, "missing_fields", "termination_date is required when status is TERMINATED or RESIGNED")
 		return
 	}
 
@@ -447,63 +499,29 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oldStatus := emp.Status
+	oldStatus := string(emp.Status)
 	if err := h.store.UpdateStatus(r.Context(), id, req.Status, req.TerminationDate); err != nil {
 		h.log.Error("failed to update employee status", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
-	emp.Status = req.Status
+	emp.Status = domain.EmployeeStatus(req.Status)
 	emp.TerminationDate = req.TerminationDate
 	now := time.Now().UTC()
 	emp.UpdatedAt = now
-	if req.Status == "TERMINATED" {
+	if terminationRequired {
 		emp.EffectiveTo = &now
 	}
 
 	correlationID := getCorrelationID(r)
 	h.publisher.PublishStatusChanged(r.Context(), correlationID, principalID, *emp, oldStatus)
 
-	if req.Status == "TERMINATED" {
+	if terminationRequired {
 		h.publisher.PublishEmployeeTerminated(r.Context(), correlationID, principalID, *emp)
 	}
 
 	writeJSON(w, http.StatusOK, emp)
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────────
-
-// allowedGenders mirrors the employees_gender_check constraint in migration
-// 000002. Kept here as well so a bad value is a 400 naming the field rather than
-// a 503 from a constraint violation the caller cannot interpret.
-var allowedGenders = map[string]bool{
-	"MALE":        true,
-	"FEMALE":      true,
-	"NON_BINARY":  true,
-	"OTHER":       true,
-	"UNSPECIFIED": true,
-}
-
-const genderMessage = "gender must be MALE, FEMALE, NON_BINARY, OTHER, or UNSPECIFIED"
-
-// validGender accepts nil — the field is optional to disclose.
-func validGender(g *string) bool {
-	if g == nil {
-		return true
-	}
-	return allowedGenders[*g]
-}
-
-// validDate accepts nil, and otherwise requires a real calendar date in
-// YYYY-MM-DD. Postgres would reject a malformed one anyway, but as a 503 that
-// reads like the store is down rather than a 400 the caller can act on.
-func validDate(d *string) bool {
-	if d == nil {
-		return true
-	}
-	_, err := time.Parse("2006-01-02", *d)
-	return err == nil
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -529,6 +547,17 @@ func getCorrelationID(r *http.Request) string {
 		return uuid.NewString()
 	}
 	return cid
+}
+
+// validDate accepts nil, and otherwise requires a real calendar date in
+// YYYY-MM-DD. Postgres would reject a malformed one anyway, but as a 503 that
+// reads like the store is down rather than a 400 the caller can act on.
+func validDate(d *string) bool {
+	if d == nil {
+		return true
+	}
+	_, err := time.Parse("2006-01-02", *d)
+	return err == nil
 }
 
 func writeError(w http.ResponseWriter, status int, code, msg string) {

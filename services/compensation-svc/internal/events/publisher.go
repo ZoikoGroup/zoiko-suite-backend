@@ -70,26 +70,43 @@ func (p *Publisher) PublishCompensationUpdated(ctx context.Context, correlationI
 		"revision_id":    rev.RevisionID,
 		"tenant_id":      rev.TenantID,
 		"employee_id":    rev.EmployeeID,
+		"structure_id":   rev.StructureID,
 		"pay_type":       rev.PayType,
 		"amount":         rev.Amount,
 		"currency":       rev.Currency,
 		"effective_from": rev.EffectiveFrom,
+		"effective_to":   rev.EffectiveTo,
+		"reason":         rev.Reason,
 		"revised_by":     rev.RevisedBy,
+		"status":         rev.Status,
 		"updated_at":     rev.CreatedAt,
+		// Monolith-aligned fields
+		"previous_amount":   rev.PreviousAmount,
+		"previous_currency": rev.PreviousCurrency,
+		"revision_type":     rev.RevisionType,
+		"approved_by":       rev.ApprovedBy,
+		"approved_at":       rev.ApprovedAt,
 	})
 }
 
 func (p *Publisher) PublishBonusApproved(ctx context.Context, correlationID, legalEntityID, actorID string, b domain.BonusGrant) {
 	p.emit(ctx, "bonus.approved", correlationID, b.TenantID, legalEntityID, actorID, b.GrantID, map[string]any{
-		"grant_id":    b.GrantID,
-		"tenant_id":   b.TenantID,
-		"employee_id": b.EmployeeID,
-		"bonus_type":  b.BonusType,
-		"amount":      b.Amount,
-		"currency":    b.Currency,
-		"grant_date":  b.GrantDate,
-		"approved_by": b.ApprovedBy,
-		"approved_at": time.Now().UTC(),
+		"grant_id":         b.GrantID,
+		"tenant_id":        b.TenantID,
+		"employee_id":      b.EmployeeID,
+		"bonus_type":       b.BonusType,
+		"amount":           b.Amount,
+		"currency":         b.Currency,
+		"grant_date":       b.GrantDate,
+		"approved_by":      b.ApprovedBy,
+		"approved_at":      time.Now().UTC(),
+		// Monolith-aligned fields
+		"paid_at":           b.PaidAt,
+		"payment_reference": b.PaymentReference,
+		"payout_period":     b.PayoutPeriod,
+		"taxable_amount":    b.TaxableAmount,
+		"conditions":        b.Conditions,
+		"notes":             b.Notes,
 	})
 }
 
@@ -98,11 +115,18 @@ func (p *Publisher) PublishEffectiveChanged(ctx context.Context, correlationID, 
 		"revision_id":    rev.RevisionID,
 		"tenant_id":      rev.TenantID,
 		"employee_id":    rev.EmployeeID,
+		"structure_id":   rev.StructureID,
 		"new_amount":     rev.Amount,
 		"currency":       rev.Currency,
 		"effective_from": rev.EffectiveFrom,
 		"effective_to":   rev.EffectiveTo,
 		"changed_at":     time.Now().UTC(),
+		// Monolith-aligned fields
+		"previous_amount":   rev.PreviousAmount,
+		"previous_currency": rev.PreviousCurrency,
+		"revision_type":     rev.RevisionType,
+		"approved_by":       rev.ApprovedBy,
+		"approved_at":       rev.ApprovedAt,
 	})
 }
 

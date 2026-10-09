@@ -57,29 +57,27 @@ func main() {
 	metrics := telemetry.NewMetrics("gateway-auth-svc")
 
 	// mTLS for upstream calls to identity-context-svc (JWKS) and
-	// tenant-entity-registry-svc. Disabled by default — plain HTTP is used
-	// unless the corresponding MTLS_ENABLED env var is set to "true".
+	// tenant-entity-registry-svc. Off unless the peer's *_MTLS_ENABLED is
+	// "true", in which case config.Load has already pointed that peer's URL at
+	// its https:// mTLS listener. One workload identity serves both peers.
 	var jwksHTTPClient, tenantRegistryHTTPClient *http.Client
-	if cfg.IdentityJWKSMTLSEnabled {
-		// The platform scope ID is the same one used by other services for
-		// mTLS provisioning. It is the synthetic platform-scope legal entity
-		// that owns platform-wide reference data.
+	if cfg.IdentityJWKSMTLSEnabled || cfg.TenantRegistryMTLSEnabled {
+		// The synthetic platform-scope legal entity that owns platform-wide
+		// reference data; the same scope other services provision under.
 		const platformScopeID = "00000000-0000-0000-0000-00000000f001"
-		client, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "gateway-auth-svc", platformScopeID)
+		client, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL,
+			"gateway-auth-svc", platformScopeID, cfg.MTLSBootstrapTokenPath)
 		if err != nil {
-			log.Fatal("mtls: failed to provision client identity for JWKS", zap.Error(err))
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
 		}
-		jwksHTTPClient = client
-		log.Info("mTLS enabled for identity-context-svc JWKS calls", zap.String("url", cfg.IdentityJWKSMTLSURL))
-	}
-	if cfg.TenantRegistryMTLSEnabled {
-		const platformScopeID = "00000000-0000-0000-0000-00000000f001"
-		client, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "gateway-auth-svc", platformScopeID)
-		if err != nil {
-			log.Fatal("mtls: failed to provision client identity for tenant registry", zap.Error(err))
+		if cfg.IdentityJWKSMTLSEnabled {
+			jwksHTTPClient = client
+			log.Info("mTLS enabled for identity-context-svc JWKS calls", zap.String("url", cfg.JWKSURL))
 		}
-		tenantRegistryHTTPClient = client
-		log.Info("mTLS enabled for tenant-entity-registry-svc calls", zap.String("url", cfg.TenantRegistryMTLSURL))
+		if cfg.TenantRegistryMTLSEnabled {
+			tenantRegistryHTTPClient = client
+			log.Info("mTLS enabled for tenant-entity-registry-svc calls", zap.String("url", cfg.TenantRegistryURL))
+		}
 	}
 
 	jwksClient := jwks.NewClientWithHTTPClient(cfg.JWKSURL, cfg.JWKSCacheTTL, jwksHTTPClient)

@@ -11,6 +11,7 @@ import (
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/unsubscribe"
 )
 
 type mockLedgerStore struct {
@@ -414,10 +415,10 @@ func TestOrchestrator_SenderStreamAlignment_AndRFC8058(t *testing.T) {
 		TemplateKey:          "ZS-IA-004",
 		CorrelationID:        "corr-crit",
 		Variables: map[string]string{
-			"recipient.first_name":   "Bob",
+			"recipient.first_name":    "Bob",
 			"security.expiry_minutes": "10",
-			"links.action_url":       "https://auth.zoiko.com/sign-in?token=abc",
-			"message.reference":      "REF-CRIT-1",
+			"links.action_url":        "https://auth.zoiko.com/sign-in?token=abc",
+			"message.reference":       "REF-CRIT-1",
 		},
 	}
 
@@ -464,7 +465,29 @@ func TestOrchestrator_SenderStreamAlignment_AndRFC8058(t *testing.T) {
 		t.Fatalf("failed to register marketing template: %v", err)
 	}
 
-	orcMarketing := ledger.NewOrchestrator(store, compiler, ledger.NewKillSwitchManager(zap.NewNop()), deliverer, &mockRecipientResolver{email: "mkt@example.com"}, zap.NewNop())
+	unsubCodec, err := unsubscribe.New([]byte("test-unsubscribe-secret-0123456789abcdef"), "https://notify.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Marketing with no unsubscribe configured is refused before any provider
+	// is called (§11.4, INV-25): it is never sent without a working link.
+	orcNoUnsub := ledger.NewOrchestrator(store, compiler, ledger.NewKillSwitchManager(zap.NewNop()), deliverer, &mockRecipientResolver{email: "mkt@example.com"}, zap.NewNop())
+	callsBefore := deliverer.deliverCalls
+	_, err = orcNoUnsub.IngestEvent(ctx, ledger.EventIngestRequest{
+		EventID: "evt-mkt-nounsub", EventType: "marketing.newsletter_sent", RecipientPrincipalID: "usr-002",
+		LegalEntityID: "entity-001", TemplateKey: "ZS-MKT-001", CorrelationID: "corr-mkt-nounsub",
+		Variables: map[string]string{"recipient.first_name": "Charlie"},
+	}, "caller-001")
+	if !errors.Is(err, ledger.ErrUnsubscribeUnavailable) {
+		t.Fatalf("marketing without unsubscribe: want ErrUnsubscribeUnavailable, got %v", err)
+	}
+	if deliverer.deliverCalls != callsBefore {
+		t.Fatal("marketing without unsubscribe must not reach the provider")
+	}
+
+	orcMarketing := ledger.NewOrchestrator(store, compiler, ledger.NewKillSwitchManager(zap.NewNop()), deliverer, &mockRecipientResolver{email: "mkt@example.com"}, zap.NewNop()).
+		WithUnsubscribe(unsubCodec)
 
 	reqMkt := ledger.EventIngestRequest{
 		EventID:              "evt-mkt-001",
@@ -488,10 +511,17 @@ func TestOrchestrator_SenderStreamAlignment_AndRFC8058(t *testing.T) {
 	if deliverer.lastReceived.From != "ZoikoSuite <hello@news.zoikosuite.com>" {
 		t.Errorf("expected marketing From header, got %s", deliverer.lastReceived.From)
 	}
-	// Verify RFC 8058 headers
-	unsubHeader, hasUnsub := deliverer.lastReceived.Headers["List-Unsubscribe"]
-	if !hasUnsub || !strings.Contains(unsubHeader, "tenant_id="+tenantID) || !strings.Contains(unsubHeader, "mailto:unsubscribe@news.zoikosuite.com") {
-		t.Errorf("missing or invalid List-Unsubscribe header: %s", unsubHeader)
+	// Verify RFC 8058 headers: a sealed token naming this tenant and address,
+	// neither of them in clear, and no mailto nobody reads.
+	unsubHeader := deliverer.lastReceived.Headers["List-Unsubscribe"]
+	const prefix = "<https://notify.example.test/v1/notifications/unsubscribe?token="
+	if !strings.HasPrefix(unsubHeader, prefix) || strings.Contains(unsubHeader, "mkt@example.com") ||
+		strings.Contains(unsubHeader, tenantID) || strings.Contains(unsubHeader, "mailto:") {
+		t.Fatalf("missing or invalid List-Unsubscribe header: %s", unsubHeader)
+	}
+	claims, err := unsubCodec.Open(strings.TrimSuffix(strings.TrimPrefix(unsubHeader, prefix), ">"))
+	if err != nil || claims.TenantID != tenantID || claims.Email != "mkt@example.com" {
+		t.Errorf("unsubscribe token must open to (%s, mkt@example.com), got %+v, %v", tenantID, claims, err)
 	}
 	unsubPost, hasPost := deliverer.lastReceived.Headers["List-Unsubscribe-Post"]
 	if !hasPost || unsubPost != "List-Unsubscribe=One-Click" {

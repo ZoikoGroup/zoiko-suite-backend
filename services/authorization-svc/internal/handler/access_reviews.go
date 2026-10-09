@@ -19,30 +19,15 @@ import (
 func (h *Handler) ListAccessReviews(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	reviewerID := r.Header.Get("X-Principal-Id")
-	if reviewerID == "" {
-		reviewerID = r.URL.Query().Get("principal_id")
-		if reviewerID == "" {
-			reviewerID = r.URL.Query().Get("reviewer_id")
-		}
-	}
-	if reviewerID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "missing_principal",
-			"message": "X-Principal-Id header or principal_id query parameter is required",
-		})
+	// The verified caller only (§21 "retrieve ASSIGNED attestations/reviews";
+	// "no broad IAM discovery"). principal_id / reviewer_id / tenant_id query
+	// fallbacks let anyone read anyone's review queue in any tenant.
+	reviewerID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-
-	tenantScope := r.Header.Get("X-Tenant-Id")
-	if tenantScope == "" {
-		tenantScope = r.URL.Query().Get("tenant_id")
-	}
-	if tenantScope == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "missing_tenant_scope",
-			"message": "X-Tenant-Id header or tenant_id query parameter is required",
-		})
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 
@@ -78,27 +63,14 @@ func (h *Handler) DecideAccessReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reviewerID := r.Header.Get("X-Principal-Id")
-	if reviewerID == "" {
-		reviewerID = r.URL.Query().Get("principal_id")
-	}
-	if reviewerID == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{
-			"error":   "missing_principal",
-			"message": "X-Principal-Id header is required",
-		})
+	// The verified caller only: with the principal_id query fallback anybody
+	// could decide a review AS its assigned reviewer.
+	reviewerID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-
-	tenantScope := r.Header.Get("X-Tenant-Id")
-	if tenantScope == "" {
-		tenantScope = r.URL.Query().Get("tenant_id")
-	}
-	if tenantScope == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "missing_tenant_scope",
-			"message": "X-Tenant-Id header is required",
-		})
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 

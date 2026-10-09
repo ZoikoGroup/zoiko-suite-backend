@@ -8,8 +8,14 @@ openapi: 3.0.3
 # authz checks resolve against it. This service does not shadow that data. It
 # is the front door: creating a role or bundle here makes a synchronous call
 # into authorization-svc's admin API, so a definition recorded here has
-# actually been provisioned for enforcement. Per-principal role ASSIGNMENTS
-# are out of scope and are not reachable on this API at all.
+# actually been provisioned for enforcement.
+#
+# 1.3.0 (6 Oct 2026) adds the governance surface the Authorization Standard
+# asks of the IAM Policy / IAM Governance owner: the §5 permission taxonomy,
+# §9 system role templates (the 21 §9.1 archetypes), §9/§21 governed
+# assignment requests, and §9/§24 access review campaigns. Assignments
+# themselves still live in, and are enforced by, authorization-svc: a request
+# here is provisioned there before it is recorded here.
 #
 # Written from the running service (handler.RegisterRoutes and the store), not
 # from the design note. Where the two disagreed the code won and the note was
@@ -17,7 +23,7 @@ openapi: 3.0.3
 
 info:
   title: access-control-svc
-  version: "1.1.0"
+  version: "1.4.0"
   description: |
     Role catalogues, permission bundles, and the provisioning of both into
     authorization-svc (Doc 03 §9.4).
@@ -50,7 +56,13 @@ info:
 
     ## Idempotency
 
-    `correlation_id` in the body is the idempotency key. Creates are unique on
+    Two keys, both honoured. `Idempotency-Key` (header, required on every
+    write) is bound to the caller and the body: the same key with a different
+    request is `409 IDEMPOTENCY_MISMATCH`, a concurrent duplicate is
+    `409 IDEMPOTENCY_IN_FLIGHT`, and a retry is answered from the first
+    response with `X-Idempotent-Replay: true` (a 201/202 replays as 200).
+
+    `correlation_id` in the body is the domain idempotency key. Creates are unique on
     `(tenant_id, correlation_id)`: a first write answers **201**, a replay
     answers **200** with the original record and writes nothing. A client that
     cannot tell those apart has no use for the key.
@@ -74,6 +86,8 @@ tags:
     description: The role catalogue.
   - name: permission-bundles
     description: The action sets a role definition permits.
+  - name: governance
+    description: Permission taxonomy, role templates, assignment requests, access reviews.
   - name: operations
     description: Health, readiness and metrics.
 
@@ -492,6 +506,961 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '503': { $ref: '#/components/responses/StoreUnavailable' }
 
+  /v1/permission-definitions:
+    get:
+      tags: [governance]
+      summary: The permission taxonomy (Authorization Standard §5, §22)
+      description: |
+        Every action a bundle may grant. A bundle write naming an action not
+        listed here (exact spelling) is `400 unknown_permission`. `TAXONOMY`
+        entries are §5 `resource.action` names; `LEGACY` entries are the
+        SCREAMING_SNAKE names the estate enforced before the registry, kept so
+        no existing role breaks. Entries are added by migration, never by a
+        tenant.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+        - { name: naming, in: query, schema: { type: string, enum: [TAXONOMY, LEGACY] } }
+        - { name: search, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Active registered permissions.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/PermissionDefinition' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/role-templates/:
+    get:
+      tags: [governance]
+      summary: System role templates, including the 21 §9.1 archetypes
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: Every template with its latest published version.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/RoleTemplate' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/role-templates/{template_code}:
+    parameters:
+      - $ref: '#/components/parameters/TemplateCode'
+    get:
+      tags: [governance]
+      summary: One role template
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: The template.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleTemplate' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/role-templates/{template_code}/versions:
+    parameters:
+      - $ref: '#/components/parameters/TemplateCode'
+    get:
+      tags: [governance]
+      summary: Every published version of a template, newest first
+      description: |
+        Versions are append-only (a database trigger refuses UPDATE and DELETE,
+        for every connection including the owner's): a published version never
+        changes under the roles made from it.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: The versions.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/RoleTemplateVersion' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/role-templates/{template_code}/instantiate:
+    parameters:
+      - $ref: '#/components/parameters/TemplateCode'
+    post:
+      tags: [governance]
+      summary: Create a tenant role from a template version
+      description: |
+        The role gets ONE template-managed bundle (`bundle_code` `TEMPLATE`)
+        carrying exactly that version's actions; its actions cannot be edited
+        through the bundle routes (`409 template_managed_bundle`), only by an
+        upgrade. Guards: every action registered, and the set SoD-clean. The
+        protected-action guard does not apply to template actions (§9 reserves
+        protected actions from tenant CUSTOM roles); assigning such a role is
+        CRITICAL risk and needs an independent approver.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstantiateTemplateRequest' }
+      responses:
+        '201':
+          description: Created and provisioned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstantiatedRole' }
+        '200':
+          description: A replay of this `correlation_id`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstantiatedRole' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/role-templates/{template_code}/upgrade:
+    parameters:
+      - $ref: '#/components/parameters/TemplateCode'
+    post:
+      tags: [governance]
+      summary: Move a template-derived role to a newer template version
+      description: |
+        Explicit and evented (§9: "customers cannot mutate canonical template
+        silently"). The new action set is SoD-checked with the role's other
+        active bundles, provisioned, then recorded; `role.updated` ends the
+        sessions holding the old grant and `iam.role.published` records the
+        version activation.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TemplateUpgradeRequest' }
+      responses:
+        '200':
+          description: Upgraded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstantiatedRole' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/access-assignments/:
+    get:
+      tags: [governance]
+      summary: Assignment requests in this tenant
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/AssignmentStatus' } }
+        - { name: target_principal_id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0 } }
+      responses:
+        '200':
+          description: Newest first.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/AssignmentRequest' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [governance]
+      summary: Request an access assignment through the governed workflow (§9, §21)
+      description: |
+        The role must be ACTIVE; no identical request may be pending; the
+        subject plus the role must be SoD-clean against what the subject
+        already holds in the entity. Risk is computed from the role's actions
+        (registry tiers; protected actions are CRITICAL). A STANDARD request
+        that is not a self-request is provisioned into authorization-svc at
+        once (`201`). Anything HIGH or CRITICAL, and any self-request, waits
+        for an independent approver (`202`). authorization-svc's assignment id
+        is the request id.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAssignmentRequest' }
+      responses:
+        '201':
+          description: Provisioned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssignmentRequest' }
+        '202':
+          description: Awaiting an independent approver.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssignmentRequest' }
+        '200':
+          description: A replay of this `correlation_id`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssignmentRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/access-assignments/{request_id}:
+    parameters:
+      - $ref: '#/components/parameters/RequestIdPath'
+    get:
+      tags: [governance]
+      summary: One assignment request
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: The request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssignmentRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/iam/access-assignments/{request_id}:approve:
+    parameters:
+      - $ref: '#/components/parameters/RequestIdPath'
+    post:
+      tags: [governance]
+      summary: Approve and provision a pending request
+      description: |
+        The approver may be neither the requester nor the subject
+        (`403 self_approval`; §10.1 row 6, §10.2 own access elevation). SoD is
+        re-checked, then the assignment is provisioned AS the approver (who
+        therefore needs `iam.assignment.grant` in authorization-svc). Also
+        served as `/{request_id}/approve`.
+
+        Approval authority follows risk (§9): HIGH needs an independent
+        `ROLE_MANAGE` holder; CRITICAL additionally needs
+        `iam.assignment.approve_privileged` (`403 security_approval_required`).
+        A request whose end date has passed cannot be approved
+        (`409 assignment_window_elapsed`).
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentDecisionRequest' }
+      responses:
+        '200':
+          description: PROVISIONED.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssignmentRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/access-assignments/{request_id}:reject:
+    parameters:
+      - $ref: '#/components/parameters/RequestIdPath'
+    post:
+      tags: [governance]
+      summary: Reject a pending request (reason required; not by the requester or subject)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentDecisionRequest' }
+      responses:
+        '200':
+          description: REJECTED.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssignmentRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/iam/access-assignments/{request_id}:cancel:
+    parameters:
+      - $ref: '#/components/parameters/RequestIdPath'
+    post:
+      tags: [governance]
+      summary: Withdraw a pending request (requester only; reason required)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentDecisionRequest' }
+      responses:
+        '200':
+          description: CANCELLED.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssignmentRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/iam/access-assignments/{request_id}:revoke:
+    parameters:
+      - $ref: '#/components/parameters/RequestIdPath'
+    post:
+      tags: [governance]
+      summary: Revoke a provisioned assignment (§21)
+      description: |
+        Revoked in authorization-svc first (as the caller, who needs
+        `iam.assignment.revoke` there), then recorded with
+        `iam.assignment.revoked`, which identity-context-svc acts on by ending
+        every session of the subject. An assignment already gone there is
+        recorded as revoked.
+
+        With `effective_at` in the future the end is SCHEDULED instead (§9
+        "effective-dated removal"): authorization-svc ends the assignment at
+        that instant, the request stays PROVISIONED with `effective_to` set, and
+        the expiry sweep closes it as REVOKED and emits `iam.assignment.revoked`
+        once it passes.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentDecisionRequest' }
+      responses:
+        '200':
+          description: REVOKED.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssignmentRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/access-review-campaigns/:
+    get:
+      tags: [governance]
+      summary: Access review campaigns
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+        - { name: status, in: query, schema: { type: string, enum: [OPEN, COMPLETED] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0 } }
+      responses:
+        '200':
+          description: Newest first (without items).
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ReviewCampaign' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [governance]
+      summary: Start a certification campaign (§9 assignment review, §24)
+      description: |
+        Snapshots the ACTIVE assignments of the covered roles from
+        authorization-svc. Each item carries a risk tier, and flags:
+        `ORPHANED_ROLE` (retired here, still assigned there),
+        `SOD_CONFLICT` (the subject's reviewed roles together conflict; raises
+        the item to at least HIGH), `SELF_REVIEW_REASSIGNED` (the default
+        reviewer is the subject, so `escalation_reviewer_principal_id` reviews
+        it — required in that case). `PRIVILEGED` campaigns cover only
+        HIGH/CRITICAL roles; `EVENT_TRIGGERED` ones name their trigger.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCampaignRequest' }
+      responses:
+        '201':
+          description: Started.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReviewCampaign' }
+        '200':
+          description: A replay of this `correlation_id`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReviewCampaign' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/access-review-campaigns/{campaign_id}:
+    parameters:
+      - $ref: '#/components/parameters/CampaignId'
+    get:
+      tags: [governance]
+      summary: One campaign with its items and outcome summary
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: The campaign.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReviewCampaign' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/access-review-campaigns/{campaign_id}/items/{item_id}/decide:
+    parameters:
+      - $ref: '#/components/parameters/CampaignId'
+      - $ref: '#/components/parameters/ItemId'
+    post:
+      tags: [governance]
+      summary: Decide a review item (KEEP / REVOKE / MODIFY / ESCALATE)
+      description: |
+        Only the item's reviewer, and never its subject (`self_attestation`).
+        The authority is the designation, not ROLE_MANAGE. REVOKE revokes the
+        assignment in authorization-svc as the reviewer before recording; a
+        refusal there leaves the item open. ESCALATE leaves it ESCALATED until
+        reassigned. A reason is always required (§24 evidence).
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DecideItemRequest' }
+      responses:
+        '200':
+          description: Decided.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReviewItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/access-review-campaigns/{campaign_id}/items/{item_id}/reassign:
+    parameters:
+      - $ref: '#/components/parameters/CampaignId'
+      - $ref: '#/components/parameters/ItemId'
+    post:
+      tags: [governance]
+      summary: Hand an undecided or escalated item to another reviewer
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReassignItemRequest' }
+      responses:
+        '200':
+          description: Reassigned (status OPEN).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReviewItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/access-review-campaigns/{campaign_id}/complete:
+    parameters:
+      - $ref: '#/components/parameters/CampaignId'
+    post:
+      tags: [governance]
+      summary: Close a campaign
+      description: |
+        `409 unresolved_high_risk` while any HIGH/CRITICAL item is OPEN or
+        ESCALATED (§24: "unresolved high-risk review cannot silently close").
+        STANDARD items still open become EXPIRED and are counted in the
+        summary and in `iam.access_review.completed`.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompleteCampaignRequest' }
+      responses:
+        '200':
+          description: COMPLETED.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReviewCampaign' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/iam/access-reviews:
+    get:
+      tags: [governance]
+      summary: The review items assigned to the caller (§21)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - { name: status, in: query, schema: { type: string, enum: [OPEN, DECIDED, ESCALATED, EXPIRED] } }
+      responses:
+        '200':
+          description: The caller's items.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ReviewItem' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /v1/iam/groups/:
+    get:
+      tags: [groups]
+      summary: Groups in this tenant (§2)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: By group_code.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Group' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [groups]
+      summary: Create a group (§2 "administrative collection of subjects; may be SCIM-provisioned")
+      description: ROLE_MANAGE on legal_entity_id, which becomes the group's administering entity.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateGroupRequest' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '200':
+          description: A replay of this `correlation_id`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/groups/{group_id}:
+    parameters:
+      - { name: group_id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [groups]
+      summary: One group with its live members
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: The group.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/iam/groups/{group_id}/members:
+    parameters:
+      - { name: group_id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [groups]
+      summary: Add a member; fans every ACTIVE group assignment out to them
+      description: |
+        Each ACTIVE group assignment becomes one governed assignment request
+        for the new member, through the individual pipeline (pending check,
+        principal-aware SoD, risk-tiered approval, provisioning). A refusal for
+        one assignment is reported in its outcome and does not undo the join.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GroupMemberRequest' }
+      responses:
+        '201':
+          description: Joined; one outcome per ACTIVE group assignment.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  member: { $ref: '#/components/schemas/GroupMember' }
+                  assignments:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        group_assignment_id: { type: string, format: uuid }
+                        outcome: { $ref: '#/components/schemas/GroupMemberOutcome' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/groups/{group_id}/members/{principal_id}:remove:
+    parameters:
+      - { name: group_id, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: principal_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [groups]
+      summary: Remove a member; ends what membership gave them
+      description: |
+        The member's group-sourced requests are ended first - pending ones
+        cancelled, provisioned ones revoked in authorization-svc and here -
+        and the membership closes only once all of them have. A failure leaves
+        a state the same call can finish. The slash form `/remove` is served too.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GroupMemberRequest' }
+      responses:
+        '200':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  group_id: { type: string, format: uuid }
+                  principal_id: { type: string }
+                  ended: { type: array, items: { $ref: '#/components/schemas/GroupMemberOutcome' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/groups/{group_id}/assignments:
+    parameters:
+      - { name: group_id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [groups]
+      summary: The group's assignments
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: Oldest first.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/GroupAssignment' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [groups]
+      summary: Assign a role to a group (§9 "subject/GROUP + role + scope + effective dates")
+      description: |
+        Never enforced as a group. Fans out to ONE governed assignment request
+        per live member, each with its own SoD check and risk-tiered approval;
+        a protected / CRITICAL role enters the approval path per member (A20),
+        and the requester's own membership needs an independent approver.
+        `members` carries each member's request or refusal.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateGroupAssignmentRequest' }
+      responses:
+        '201':
+          description: Recorded and fanned out.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '200':
+          description: A replay of this `correlation_id`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/group-assignments/{group_assignment_id}:
+    parameters:
+      - { name: group_assignment_id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [groups]
+      summary: One group assignment with the member requests it fanned out to
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: The group assignment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/iam/group-assignments/{group_assignment_id}:revoke:
+    parameters:
+      - { name: group_assignment_id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [groups]
+      summary: Revoke a group assignment; ends every member's request, then closes it
+      description: Requires `reason`. A second revoke is 409 group_assignment_revoked. The slash form `/revoke` is served too.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentDecisionRequest' }
+      responses:
+        '200':
+          description: Revoked; members lists what was ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/group-assignments/{group_assignment_id}:sync:
+    parameters:
+      - { name: group_assignment_id, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [groups]
+      summary: Re-run the fan-out for every live member (idempotent)
+      description: Members already served replay; fills in a member a racing join or an outage missed. The slash form `/sync` is served too.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentDecisionRequest' }
+      responses:
+        '200':
+          description: Fanned out.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GroupAssignment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/iam/subject-links:
+    get:
+      tags: [reviews]
+      summary: Employee-to-principal links HR events are resolved through (§24, S9-C2)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+      responses:
+        '200':
+          description: By employee_id.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SubjectLink' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [reviews]
+      summary: Link an employee to the principal that holds their access
+      description: |
+        HR events (employee.updated, employee.status.changed,
+        employee.terminated) name employees; access is held by principals and
+        nothing on the estate maps one to the other. A linked employee's
+        manager change or exit opens an EVENT_TRIGGERED review of their
+        assignments; an unlinked one's is counted and skipped, never guessed.
+        Re-linking replaces the principal. ROLE_MANAGE on legal_entity_id.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LinkSubjectRequest' }
+      responses:
+        '200':
+          description: Linked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SubjectLink' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+
   /healthz:
     get:
       tags: [operations]
@@ -623,6 +1592,26 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    TemplateCode:
+      name: template_code
+      in: path
+      required: true
+      schema: { type: string }
+    RequestIdPath:
+      name: request_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CampaignId:
+      name: campaign_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ItemId:
+      name: item_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
 
   schemas:
     RoleStatus:
@@ -668,6 +1657,8 @@ components:
         correlation_id: { type: string }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        template_code: { type: string, description: Set on a role instantiated from a system role template. }
+        template_version: { type: integer }
 
     PermissionBundleDef:
       type: object
@@ -692,6 +1683,10 @@ components:
         correlation_id: { type: string }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        template_code:
+          type: string
+          description: Set on the one template-managed bundle; its actions change only by a template upgrade.
+        template_version: { type: integer }
 
     CreateRoleRequest:
       type: object
@@ -746,6 +1741,348 @@ components:
         active_flag: { type: boolean }
         correlation_id: { type: string }
 
+    PermissionDefinition:
+      type: object
+      required: [action_name, naming, risk_tier, protected]
+      properties:
+        action_name: { type: string, example: payment.release }
+        naming: { type: string, enum: [TAXONOMY, LEGACY] }
+        risk_tier: { $ref: '#/components/schemas/RiskTier' }
+        description: { type: string }
+        protected:
+          type: boolean
+          description: A protected platform-admin action (tenant custom roles may not grant it).
+
+    RiskTier:
+      type: string
+      enum: [STANDARD, HIGH, CRITICAL]
+
+    RoleTemplate:
+      type: object
+      properties:
+        template_code: { type: string, example: TREASURY_RELEASER }
+        template_name: { type: string }
+        default_intent: { type: string, description: The §9.1 intent text. }
+        role_scope_type: { $ref: '#/components/schemas/RoleScopeType' }
+        is_archetype: { type: boolean }
+        status: { type: string, enum: [ACTIVE, DEPRECATED] }
+        latest_version: { type: integer }
+        latest_permitted_actions: { type: array, items: { type: string } }
+
+    RoleTemplateVersion:
+      type: object
+      properties:
+        template_code: { type: string }
+        template_version: { type: integer }
+        permitted_actions: { type: array, items: { type: string } }
+        change_note: { type: string }
+        published_by: { type: string }
+        published_at: { type: string, format: date-time }
+
+    InstantiateTemplateRequest:
+      type: object
+      required: [legal_entity_id, correlation_id]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        role_code: { type: string, description: Defaults to the template code. }
+        role_name: { type: string, description: Defaults to the template name. }
+        template_version: { type: integer, description: Omit (or 0) for the latest. }
+        correlation_id: { type: string }
+
+    TemplateUpgradeRequest:
+      type: object
+      required: [legal_entity_id, role_definition_id, correlation_id]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        role_definition_id: { type: string, format: uuid }
+        template_version: { type: integer, description: Omit (or 0) for the latest. }
+        correlation_id: { type: string }
+
+    InstantiatedRole:
+      type: object
+      properties:
+        role: { $ref: '#/components/schemas/RoleDefinition' }
+        bundle: { $ref: '#/components/schemas/PermissionBundleDef' }
+
+    AssignmentStatus:
+      type: string
+      description: |
+        EXPIRED: the assignment reached an end date set at grant time and the
+        expiry sweep closed it. An end scheduled by a revoke closes as REVOKED.
+      enum: [PENDING_APPROVAL, PROVISIONED, REJECTED, CANCELLED, REVOKED, EXPIRED]
+
+    AssignmentRequest:
+      type: object
+      properties:
+        request_id: { type: string, format: uuid, description: Also authorization-svc's assignment id once provisioned. }
+        tenant_id: { type: string }
+        target_principal_id: { type: string }
+        role_definition_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to:
+          type: string
+          format: date-time
+          description: |
+            The assignment's end: set at grant time, or by an effective-dated
+            revoke (then revoked_by_principal_id and revocation_reason are
+            filled while status is still PROVISIONED). Absent is open-ended.
+            authorization-svc enforces it at the instant; the expiry sweep then
+            closes the request and emits iam.assignment.revoked.
+        justification: { type: string }
+        risk_tier: { $ref: '#/components/schemas/RiskTier' }
+        approval_required: { type: boolean }
+        approval_reason: { type: string }
+        status: { $ref: '#/components/schemas/AssignmentStatus' }
+        requested_by_principal_id: { type: string }
+        decided_by_principal_id: { type: string }
+        decision_reason: { type: string }
+        decided_at: { type: string, format: date-time }
+        authz_assignment_id: { type: string, format: uuid }
+        revoked_by_principal_id: { type: string }
+        revocation_reason: { type: string }
+        revoked_at: { type: string, format: date-time }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        group_assignment_id:
+          type: string
+          format: uuid
+          description: Set when the request is one member's share of a group assignment's fan-out.
+
+    CreateAssignmentRequest:
+      type: object
+      required: [legal_entity_id, target_principal_id, role_definition_id, justification, correlation_id]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        target_principal_id: { type: string }
+        role_definition_id: { type: string, format: uuid }
+        effective_from: { type: string, format: date-time, description: Defaults to now. }
+        effective_to:
+          type: string
+          format: date-time
+          description: 'Optional end date (§9 "effective dates"). Must be after effective_from and in the future (400 invalid_effective_to).'
+        justification: { type: string }
+        correlation_id: { type: string }
+
+    AssignmentDecisionRequest:
+      type: object
+      required: [legal_entity_id, correlation_id]
+      properties:
+        legal_entity_id:
+          type: string
+          format: uuid
+          description: Must be the request's own entity (400 entity_mismatch); ROLE_MANAGE is checked on it.
+        reason: { type: string, description: 'Required to reject, cancel or revoke.' }
+        effective_at:
+          type: string
+          format: date-time
+          description: |
+            Revoke only. A future instant schedules the end (§9 "effective-dated
+            removal") instead of revoking now; it may only bring an existing end
+            earlier (409 ends_sooner). Past: 400 invalid_effective_at.
+        correlation_id: { type: string }
+
+    ReviewItem:
+      type: object
+      properties:
+        item_id: { type: string, format: uuid }
+        campaign_id: { type: string, format: uuid }
+        authz_assignment_id: { type: string, format: uuid }
+        target_principal_id: { type: string }
+        role_definition_id: { type: string, format: uuid }
+        role_code: { type: string }
+        legal_entity_id: { type: string }
+        granted_actions: { type: array, items: { type: string } }
+        risk_tier: { $ref: '#/components/schemas/RiskTier' }
+        flags:
+          type: array
+          description: |
+            ORPHANED_ROLE: the role is retired here but still assigned there.
+            SOD_CONFLICT: the subject's reviewed roles combine to a §10.1
+            conflict in an entity (a tenant-wide role counts in every entity).
+            SELF_REVIEW_REASSIGNED: the default reviewer is the subject.
+            DORMANT: a HIGH/CRITICAL assignment held through the campaign's
+            dormancy window with no GRANTED decision inside it (flagged, never
+            removed). SUBJECT_INACTIVE: the subject is SUSPENDED or DISABLED;
+            raises the item to HIGH.
+          items: { type: string, enum: [ORPHANED_ROLE, SOD_CONFLICT, SELF_REVIEW_REASSIGNED, DORMANT, SUBJECT_INACTIVE] }
+        reviewer_principal_id: { type: string }
+        status: { type: string, enum: [OPEN, DECIDED, ESCALATED, EXPIRED] }
+        decision: { type: string, enum: [KEEP, REVOKE, MODIFY, ESCALATE] }
+        decision_reason: { type: string }
+        decided_by_principal_id: { type: string }
+        decided_at: { type: string, format: date-time }
+        revocation_applied: { type: boolean }
+        last_granted_at: { type: string, format: date-time, description: 'Latest GRANTED decision through this role for the subject, at snapshot. Absent: none on record.' }
+        subject_status: { type: string, description: 'The subject''s status in authorization-svc at snapshot (ACTIVE, SUSPENDED, DISABLED).' }
+
+    ReviewCampaign:
+      type: object
+      properties:
+        campaign_id: { type: string, format: uuid }
+        campaign_name: { type: string }
+        review_type: { type: string, enum: [PERIODIC, EVENT_TRIGGERED, PRIVILEGED] }
+        trigger_reason: { type: string }
+        legal_entity_id: { type: string }
+        default_reviewer_principal_id: { type: string }
+        status: { type: string, enum: [OPEN, COMPLETED] }
+        due_at: { type: string, format: date-time }
+        dormancy_days: { type: integer, description: The dormancy window this campaign applied. }
+        created_by_principal_id: { type: string }
+        completed_by_principal_id: { type: string }
+        completed_at: { type: string, format: date-time }
+        correlation_id: { type: string }
+        items: { type: array, items: { $ref: '#/components/schemas/ReviewItem' } }
+        summary:
+          type: object
+          additionalProperties: { type: integer }
+
+    CreateCampaignRequest:
+      type: object
+      required: [legal_entity_id, campaign_name, review_type, default_reviewer_principal_id, due_at, correlation_id]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        campaign_name: { type: string }
+        review_type: { type: string, enum: [PERIODIC, EVENT_TRIGGERED, PRIVILEGED] }
+        trigger_reason: { type: string, description: Required for EVENT_TRIGGERED. }
+        default_reviewer_principal_id: { type: string }
+        escalation_reviewer_principal_id: { type: string }
+        role_definition_ids: { type: array, items: { type: string, format: uuid } }
+        subject_principal_id: { type: string, description: 'Narrows the campaign to one subject (an EVENT_TRIGGERED review of a mover or leaver, §24).' }
+        due_at: { type: string, format: date-time }
+        dormancy_days: { type: integer, minimum: 1, maximum: 3650, default: 90, description: '§24 dormancy window (400 invalid_dormancy_days outside 1..3650).' }
+        correlation_id: { type: string }
+
+    DecideItemRequest:
+      type: object
+      required: [decision, reason, correlation_id]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        decision: { type: string, enum: [KEEP, REVOKE, MODIFY, ESCALATE] }
+        reason: { type: string }
+        correlation_id: { type: string }
+
+    ReassignItemRequest:
+      type: object
+      required: [legal_entity_id, reviewer_principal_id, correlation_id]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        reviewer_principal_id: { type: string }
+        correlation_id: { type: string }
+
+    CompleteCampaignRequest:
+      type: object
+      required: [legal_entity_id, correlation_id]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        correlation_id: { type: string }
+
+    Group:
+      type: object
+      properties:
+        group_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string, description: The entity whose ROLE_MANAGE holders administer the group. }
+        group_code: { type: string }
+        group_name: { type: string }
+        status: { type: string, enum: [ACTIVE, RETIRED] }
+        source: { type: string, enum: [MANUAL, SCIM] }
+        created_by_principal_id: { type: string }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        members: { type: array, items: { $ref: '#/components/schemas/GroupMember' } }
+
+    GroupMember:
+      type: object
+      properties:
+        principal_id: { type: string }
+        added_by_principal_id: { type: string }
+        added_at: { type: string, format: date-time }
+
+    CreateGroupRequest:
+      type: object
+      required: [legal_entity_id, group_code, group_name, correlation_id]
+      properties:
+        legal_entity_id: { type: string }
+        group_code: { type: string }
+        group_name: { type: string }
+        source: { type: string, enum: [MANUAL, SCIM], default: MANUAL }
+        correlation_id: { type: string }
+
+    GroupMemberRequest:
+      type: object
+      required: [legal_entity_id, correlation_id]
+      properties:
+        legal_entity_id: { type: string, description: Must be the group's own entity (400 entity_mismatch). }
+        principal_id: { type: string, description: Required to add a member. }
+        reason: { type: string, description: Required to remove a member. }
+        correlation_id: { type: string }
+
+    GroupMemberOutcome:
+      type: object
+      description: What a fan-out did for one member - its request, or the code it was refused with.
+      properties:
+        principal_id: { type: string }
+        request_id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/AssignmentStatus' }
+        error: { $ref: '#/components/schemas/ServiceErrorCode' }
+
+    GroupAssignment:
+      type: object
+      properties:
+        group_assignment_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        group_id: { type: string, format: uuid }
+        role_definition_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        justification: { type: string }
+        status: { type: string, enum: [ACTIVE, REVOKED] }
+        created_by_principal_id: { type: string }
+        revoked_by_principal_id: { type: string }
+        revocation_reason: { type: string }
+        revoked_at: { type: string, format: date-time }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        members: { type: array, items: { $ref: '#/components/schemas/GroupMemberOutcome' } }
+
+    CreateGroupAssignmentRequest:
+      type: object
+      required: [legal_entity_id, role_definition_id, justification, correlation_id]
+      properties:
+        legal_entity_id: { type: string, description: Must be the group's own entity. }
+        role_definition_id: { type: string, format: uuid }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        justification: { type: string }
+        correlation_id: { type: string }
+
+    SubjectLink:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        employee_id: { type: string }
+        principal_id: { type: string }
+        legal_entity_id: { type: string }
+        last_manager_employee_id: { type: string, description: The manager last seen on an HR event. }
+        last_status: { type: string, description: The employment status last seen on an HR event. }
+        linked_by_principal_id: { type: string }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    LinkSubjectRequest:
+      type: object
+      required: [legal_entity_id, employee_id, principal_id, correlation_id]
+      properties:
+        legal_entity_id: { type: string }
+        employee_id: { type: string }
+        principal_id: { type: string }
+        correlation_id: { type: string }
+
     ServiceErrorCode:
       type: string
       description: |
@@ -765,12 +2102,15 @@ components:
         - tenant_missing            # no verified tenant
         - authz_unavailable         # the authorize call could not be made; nothing written
         - authz_admin_unavailable   # provisioning could not be made; NOTHING WAS WRITTEN
+        - provisioning_forbidden    # authorization-svc refused THIS CALLER (403): it lacks the iam.* admin grant there; nothing written
         # Conflicts.
         - role_code_exists
         - bundle_code_exists
         # SoD and protected actions (Authorization Standard §9, §10.1).
-        - sod_conflict              # segregation of duties conflict with existing assignments
-        - protected_action          # tenant role/bundle includes platform-admin action(s)
+        - sod_conflict              # the role's whole action set (its other active bundles plus this one) is conflicted; the message names each pair
+        - protected_action          # the bundle includes protected platform-admin action(s), named in the message
+        - sod_unavailable           # no SoD verdict could be read from authorization-svc; fails closed, nothing written
+        - protected_catalogue_unavailable  # the protected-action catalogue is unreadable or empty; fails closed, nothing written
         # Request validation.
         - invalid_json
         - missing_fields
@@ -784,6 +2124,53 @@ components:
         # Resolution and storage.
         - not_found                 # unknown, malformed, or another tenant's id
         - store_unavailable
+        # Permission taxonomy (§5).
+        - unknown_permission        # an action not in the registry (exact spelling), named in the message
+        - taxonomy_unavailable      # the registry could not be read; fails closed
+        - invalid_naming
+        # Role templates (§9).
+        - template_managed_bundle   # the bundle's actions belong to its template; upgrade instead
+        - template_deprecated
+        - template_bundle_detached
+        - not_template_role
+        - template_version_not_newer
+        # Assignment requests (§9, §21).
+        - role_retired
+        - assignment_pending        # an identical request is already awaiting approval
+        - self_approval             # the requester or subject tried to approve/reject
+        - not_requester             # only the requester may cancel
+        - missing_reason
+        - invalid_state             # the request is not in a state that allows this transition
+        - assignment_absent
+        - entity_mismatch           # legal_entity_id is not the request's / campaign's own entity
+        - invalid_effective_to      # end date not after the start, or in the past
+        - invalid_effective_at      # a scheduled revoke in the past
+        - ends_sooner               # a scheduled revoke later than the assignment's existing end
+        - assignment_window_elapsed # approving a request whose end date has passed
+        - security_approval_required  # a CRITICAL request's approver lacks iam.assignment.approve_privileged
+        - authz_approval_pending    # authorization-svc parked the grant PENDING its own approval; withdrawn there, not provisioned here
+        # Groups (§2, §9).
+        - group_code_exists
+        - group_retired
+        - member_exists             # the principal is already a live member
+        - group_assignment_revoked  # the group assignment is already revoked
+        - invalid_source            # source must be MANUAL or SCIM
+        # Access reviews (§24).
+        - invalid_review_type
+        - missing_trigger_reason
+        - invalid_due_at
+        - invalid_decision
+        - self_attestation          # the subject of an item may not review it
+        - not_item_reviewer
+        - already_decided
+        - campaign_closed
+        - unresolved_high_risk      # HIGH/CRITICAL items are open or escalated
+        - escalation_reviewer_required
+        - invalid_dormancy_days
+        # Idempotency-Key (middleware).
+        - IDEMPOTENCY_MISMATCH
+        - IDEMPOTENCY_IN_FLIGHT
+        - invalid_request           # the request body could not be read (replay protection needs it)
 
     ServiceError:
       type: object
@@ -840,8 +2227,20 @@ components:
               - $ref: '#/components/schemas/EnvelopeError'
     Forbidden:
       description: |
-        The caller holds no `ROLE_MANAGE` grant on this legal entity. Entity-
-        scoped, not platform-wide.
+        A refusal. Nothing was written. One of:
+
+        - `forbidden`: the caller holds no `ROLE_MANAGE` grant on this legal
+          entity (entity-scoped, not platform-wide).
+        - `provisioning_forbidden`: authorization-svc refused the caller. Its
+          admin writes require `iam.role.manage` / `iam.permission_bundle.manage`
+          at tenant scope, and this service provisions as the caller.
+        - `sod_conflict` (bundle writes): the role's action set, all its active
+          bundles together, is conflicted. Role creation is never SoD-checked;
+          a role with no actions cannot conflict.
+        - `protected_action` (bundle writes): a protected platform-admin action,
+          including every `iam.*` admin action.
+        - `security_approval_required` (approve): the request is CRITICAL and
+          the approver does not hold `iam.assignment.approve_privileged`.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ServiceError' }
@@ -859,6 +2258,19 @@ components:
           example:
             error_code: not_found
             error_message: role definition not found
+    Conflict:
+      description: |
+        A state conflict. Nothing was written. The code says which:
+        `role_code_exists`, `template_managed_bundle`, `template_version_not_newer`,
+        `not_template_role`, `template_deprecated`, `template_bundle_detached`,
+        `role_retired`, `assignment_pending`, `invalid_state`, `already_decided`,
+        `campaign_closed`, `unresolved_high_risk`, `assignment_absent`,
+        `ends_sooner`, `assignment_window_elapsed`, `authz_approval_pending`,
+        `group_code_exists`, `group_retired`, `member_exists`, `group_assignment_revoked`,
+        `IDEMPOTENCY_MISMATCH`, `IDEMPOTENCY_IN_FLIGHT`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ServiceError' }
     StoreUnavailable:
       description: The catalogue's database could not be reached. Nothing was changed.
       content:
@@ -866,8 +2278,9 @@ components:
           schema: { $ref: '#/components/schemas/ServiceError' }
     ProvisioningUnavailable:
       description: |
-        `authz_admin_unavailable` or `authz_unavailable` — **nothing was
-        written**. On a retirement this means the role is still being enforced;
+        `authz_admin_unavailable`, `authz_unavailable`, `sod_unavailable` or
+        `protected_catalogue_unavailable` — **nothing was written**. The guards
+        fail closed: no verdict is never read as a pass. On a retirement this means the role is still being enforced;
         it is not a transient blip and must not be rendered as one.
       content:
         application/json:

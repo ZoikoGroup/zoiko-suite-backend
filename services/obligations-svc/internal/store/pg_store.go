@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -107,6 +108,14 @@ type Store interface {
 	// obligation. Fails with domain.ErrObligationNotFound if obligation_id
 	// does not exist.
 	ListFilingRequirements(ctx context.Context, obligationID string) ([]*domain.FilingRequirement, error)
+
+	// FindOverdueObligations returns obligations that are OPEN or IN_PROGRESS
+	// and whose due_date has passed. Used by the overdue scheduler.
+	FindOverdueObligations(ctx context.Context) ([]*domain.Obligation, error)
+
+	// TransitionOverdue transitions an obligation to OVERDUE status.
+	// Returns the updated obligation and whether a transition occurred.
+	TransitionOverdue(ctx context.Context, obligationID string) (*domain.Obligation, bool, error)
 
 	// ── Chunk 10: applicability decisions (doc7 §E2) ────────────────────────
 	CreateApplicabilityDecision(ctx context.Context, params domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, error)
@@ -287,7 +296,10 @@ func (s *PgStore) CreateObligation(ctx context.Context, params domain.CreateObli
 	if o.LegalEntityID != params.LegalEntityID ||
 		o.JurisdictionID != params.JurisdictionID ||
 		o.ObligationType != params.ObligationType ||
-		!o.DueDate.Equal(params.DueDate) {
+		!o.DueDate.Equal(params.DueDate) ||
+		o.SeverityLevel != params.SeverityLevel ||
+		o.SourceReference != params.SourceReference ||
+		o.ResponsibleFunction != params.ResponsibleFunction {
 		s.log.Warn("obligation dedup match but attribute mismatch (409 conflict)",
 			zap.String("existing_id", o.ObligationID),
 			zap.String("req_id", params.ObligationID),
@@ -511,6 +523,9 @@ func scanFilingRequirement(row pgx.Row) (*domain.FilingRequirement, error) {
 // policy-svc's CreatePolicyVersion validating its parent policy exists,
 // rather than relying on a bare FK-violation error to surface as a
 // misleading 503.
+//
+// Idempotent on (tenant_id, obligation_id, filing_type, filing_authority, submission_channel).
+// A repeat request with identical attributes returns the existing record.
 func (s *PgStore) CreateFilingRequirement(ctx context.Context, params domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error) {
 	if _, err := s.FindObligationByID(ctx, params.ObligationID); err != nil {
 		return nil, err
@@ -520,15 +535,21 @@ func (s *PgStore) CreateFilingRequirement(ctx context.Context, params domain.Cre
 		params.FilingRequirementID = uuid.New().String()
 	}
 
-	// tenant_id is stored on the row rather than reached through the parent
-	// obligation, so row-level security applies to a bare SELECT here. A
-	// policy that has to join to find its tenant is a policy that does not run.
+	// Dedup key: (tenant_id, obligation_id, filing_type, filing_authority, submission_channel)
 	const query = `
 		INSERT INTO filing_requirements (
 			filing_requirement_id, tenant_id, obligation_id, filing_type, filing_authority,
 			submission_channel, filing_status
 		) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
+		ON CONFLICT (tenant_id, obligation_id, filing_type, filing_authority, submission_channel)
+		DO NOTHING
 		RETURNING ` + filingRequirementColumns + `;`
+
+	const lookupQuery = `
+		SELECT ` + filingRequirementColumns + `
+		FROM filing_requirements
+		WHERE obligation_id = $1 AND tenant_id = $2
+		  AND filing_type = $3 AND filing_authority = $4 AND submission_channel = $5;`
 
 	var f *domain.FilingRequirement
 	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
@@ -537,11 +558,21 @@ func (s *PgStore) CreateFilingRequirement(ctx context.Context, params domain.Cre
 			params.FilingRequirementID, tenantID, params.ObligationID, params.FilingType,
 			params.FilingAuthority, params.SubmissionChannel,
 		))
-		if scanErr != nil {
+		if scanErr == nil {
+			return nil
+		}
+		if !errors.Is(scanErr, pgx.ErrNoRows) {
 			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
 				return domain.ErrInvalidIdentifier
 			}
 			s.log.Error("pg CreateFilingRequirement failed", zap.Error(scanErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+
+		f, scanErr = scanFilingRequirement(tx.QueryRow(ctx, lookupQuery,
+			params.ObligationID, tenantID, params.FilingType, params.FilingAuthority, params.SubmissionChannel))
+		if scanErr != nil {
+			s.log.Error("pg CreateFilingRequirement lookup existing failed", zap.Error(scanErr))
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
 		}
 		return nil
@@ -591,4 +622,56 @@ func (s *PgStore) ListFilingRequirements(ctx context.Context, obligationID strin
 		return nil, err
 	}
 	return results, nil
+}
+
+// FindOverdueObligations returns obligations that are OPEN or IN_PROGRESS
+// and whose due_date has passed. Used by the overdue scheduler.
+func (s *PgStore) FindOverdueObligations(ctx context.Context) ([]*domain.Obligation, error) {
+	tenantID, err := tenantOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	const query = `
+		SELECT ` + obligationColumns + `
+		FROM obligations
+		WHERE tenant_id = $1
+		  AND obligation_status IN ('OPEN', 'IN_PROGRESS')
+		  AND due_date < $2
+		ORDER BY due_date ASC;`
+
+	var results []*domain.Obligation
+	err = s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, tenantID, now)
+		if qErr != nil {
+			s.log.Error("pg FindOverdueObligations failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			o, scanErr := scanObligation(rows)
+			if scanErr != nil {
+				s.log.Error("pg FindOverdueObligations scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, o)
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			s.log.Error("pg FindOverdueObligations rows error", zap.Error(rowsErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, rowsErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// TransitionOverdue transitions an obligation to OVERDUE status.
+// Returns the updated obligation and whether a transition occurred.
+func (s *PgStore) TransitionOverdue(ctx context.Context, obligationID string) (*domain.Obligation, bool, error) {
+	return s.UpdateObligationStatus(ctx, obligationID, "OVERDUE")
 }

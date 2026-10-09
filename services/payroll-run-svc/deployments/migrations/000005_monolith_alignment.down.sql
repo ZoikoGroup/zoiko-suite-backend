@@ -1,0 +1,33 @@
+ALTER TABLE pay_slips
+    DROP COLUMN IF EXISTS basic_salary,
+    DROP COLUMN IF EXISTS hra,
+    DROP COLUMN IF EXISTS special_allowance,
+    DROP COLUMN IF EXISTS conveyance,
+    DROP COLUMN IF EXISTS medical_allowance,
+    DROP COLUMN IF EXISTS lta,
+    DROP COLUMN IF EXISTS pf_employee,
+    DROP COLUMN IF EXISTS pf_employer,
+    DROP COLUMN IF EXISTS esi_employee,
+    DROP COLUMN IF EXISTS esi_employer,
+    DROP COLUMN IF EXISTS pt,
+    DROP COLUMN IF EXISTS tds,
+    DROP COLUMN IF EXISTS other_deductions,
+    DROP COLUMN IF EXISTS arrears,
+    DROP COLUMN IF EXISTS bonus,
+    DROP COLUMN IF EXISTS overtime_pay,
+    DROP COLUMN IF EXISTS leave_encashment,
+    DROP COLUMN IF EXISTS reimbursements,
+    DROP COLUMN IF EXISTS advance_deduction,
+    DROP COLUMN IF EXISTS loan_deduction;
+
+ALTER TABLE payroll_runs
+    DROP COLUMN IF EXISTS total_employer_contributions,
+    DROP COLUMN IF EXISTS total_employee_contributions,
+    DROP COLUMN IF EXISTS total_tds,
+    DROP COLUMN IF EXISTS total_pf,
+    DROP COLUMN IF EXISTS total_esi,
+    DROP COLUMN IF EXISTS total_pt,
+    DROP COLUMN IF EXISTS batch_id,
+    DROP COLUMN IF EXISTS processed_by,
+    DROP COLUMN IF EXISTS approved_by,
+    DROP COLUMN IF EXISTS approved_at;

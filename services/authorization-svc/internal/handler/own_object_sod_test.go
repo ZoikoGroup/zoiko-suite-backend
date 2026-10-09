@@ -74,15 +74,16 @@ func TestAuthorize_DifferentOwner_NotBlocked(t *testing.T) {
 	}
 }
 
-// TestAuthorize_NoResourceOwnerSupplied_SkipsOwnObjectCheck proves the
-// backward-compatible default: a caller that never learned about this
-// field (every caller before this fix) gets exactly today's behavior —
-// no own-object check is attempted at all, not a fail-closed denial.
-func TestAuthorize_NoResourceOwnerSupplied_SkipsOwnObjectCheck(t *testing.T) {
+// TestAuthorize_NoResourceOwnerSupplied_RequiresApproval: an own-object rule
+// applies to the action and the caller did not say who prepared the object.
+// This used to skip the check and GRANT — the audit's "a caller that omits it
+// skips the check". GOV-04: "Unknown participation/history on material action
+// => block or require independent review; never silently assume no conflict."
+func TestAuthorize_NoResourceOwnerSupplied_RequiresApproval(t *testing.T) {
 	store := &stubStore{
 		rbacActions:        []string{"AP_INVOICE_APPROVE"},
 		rbacBasis:          "rbac:role=AP_APPROVER",
-		ownObjectForbidden: true, // would deny IF the check ran
+		ownObjectForbidden: true,
 	}
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
@@ -92,10 +93,28 @@ func TestAuthorize_NoResourceOwnerSupplied_SkipsOwnObjectCheck(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	var got map[string]string
+	var got map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &got)
-	if got["decision_outcome"] != "GRANTED" {
-		t.Fatalf("expected GRANTED with no resource_owner_principal_id supplied, got %s", got["decision_outcome"])
+	if got["decision_outcome"] != "DENIED" || got["decision"] != "REQUIRE_APPROVAL" {
+		t.Fatalf("own-object rule with unknown preparer: want DENIED / REQUIRE_APPROVAL, got %v / %v", got["decision_outcome"], got["decision"])
+	}
+	if got["decision_basis"] != "sod:participation_unknown" {
+		t.Errorf("basis = %v", got["decision_basis"])
+	}
+}
+
+// With no own-object rule for the action, an unknown preparer changes nothing.
+func TestAuthorize_NoResourceOwnerSupplied_NoRule_Granted(t *testing.T) {
+	store := &stubStore{rbacActions: []string{"AP_INVOICE_APPROVE"}, rbacBasis: "rbac:role=AP_APPROVER"}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"AP_INVOICE_APPROVE"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	var got map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got["decision_outcome"] != "GRANTED" || got["decision"] != "PERMIT" {
+		t.Fatalf("no own-object rule: want GRANTED / PERMIT, got %v / %v", got["decision_outcome"], got["decision"])
 	}
 }
 

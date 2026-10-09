@@ -33,6 +33,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 	"zoiko.io/evidence-requirements-svc/internal/handler"
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
 )
@@ -97,7 +98,7 @@ func (s *stubStore) EndDateRequirement(_ context.Context, _, _ string, _ time.Ti
 	return s.endDated, nil
 }
 
-func (s *stubStore) RecordEvaluation(_ context.Context, e *domain.EvidenceEvaluation) (bool, error) {
+func (s *stubStore) RecordEvaluation(_ context.Context, e *domain.EvidenceEvaluation, _ *domain.OutboxEvent) (bool, error) {
 	if s.recordEvalErr != nil {
 		return false, s.recordEvalErr
 	}
@@ -112,10 +113,24 @@ func (s *stubStore) GetEvaluation(_ context.Context, _ string) (*domain.Evidence
 	return s.evaluation, nil
 }
 
+// stubPublisher collects the evaluations whose event reached the outbox.
 type stubPublisher struct{ published []domain.EvidenceEvaluation }
 
-func (p *stubPublisher) PublishEvaluation(_ context.Context, e domain.EvidenceEvaluation) {
-	p.published = append(p.published, e)
+// outboxCapture wraps a Store and records an event into pub whenever the
+// handler hands RecordEvaluation an outbox event and the row was really
+// created — the store writes the event in the same transaction, so a replay
+// (created=false) writes none.
+type outboxCapture struct {
+	handler.Store
+	pub *stubPublisher
+}
+
+func (c outboxCapture) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvaluation, ev *domain.OutboxEvent) (bool, error) {
+	created, err := c.Store.RecordEvaluation(ctx, e, ev)
+	if err == nil && created && ev != nil {
+		c.pub.published = append(c.pub.published, *e)
+	}
+	return created, err
 }
 
 type stubAuthz struct {
@@ -135,17 +150,19 @@ type stubDocs struct {
 	calls int
 }
 
-func (d *stubDocs) VerifyDocument(_ context.Context, _, _, _ string) error {
+func (d *stubDocs) VerifyDocument(_ context.Context, _, _, _, _ string) error {
 	d.calls++
 	return d.err
 }
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
-func newRouter(store handler.Store, pub handler.Publisher, az handler.AuthZClient, docs handler.DocumentVaultClient) http.Handler {
+func newRouter(store handler.Store, pub *stubPublisher, az handler.AuthZClient, docs handler.DocumentVaultClient) http.Handler {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	handler.RegisterRoutes(r, handler.New(store, pub, az, docs, zap.NewNop()))
+	// Envelope middleware in observe mode so tests can pass with partial headers
+	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
+	handler.RegisterRoutes(r, handler.New(outboxCapture{Store: store, pub: pub}, az, docs, zap.NewNop()))
 	return r
 }
 
@@ -160,6 +177,7 @@ func do(t *testing.T, h http.Handler, method, path string, body any, tenant, pri
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", "idem-test-"+t.Name()) // unique per test
 	if tenant != "" {
 		req.Header.Set("X-Tenant-Id", tenant)
 	}
@@ -218,12 +236,9 @@ func TestEvaluate_NoRequirementsDefined(t *testing.T) {
 		"an unconfigured gate must never be indistinguishable from a verified one")
 	assert.Empty(t, got.Unmet)
 
-	// The publisher IS consulted; it is the publisher that decides neither
-	// §8.6 event is true of this outcome and emits nothing to Kafka. That
-	// guarantee is asserted in internal/events/publisher_test.go, which can
-	// see the broker; this stub only sees the call.
-	require.Len(t, pub.published, 1)
-	assert.Equal(t, domain.OutcomeNoRequirementsDefined, pub.published[0].Outcome)
+	// Neither §8.6 event (satisfied / missing) is true of this outcome, so the
+	// handler writes no outbox event: nothing reaches Kafka.
+	assert.Empty(t, pub.published)
 }
 
 func TestEvaluate_Missing_NamesEachUnmetRequirement(t *testing.T) {

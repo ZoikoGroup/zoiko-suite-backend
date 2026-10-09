@@ -26,6 +26,12 @@ const (
 	// service account or API client authenticates as itself).
 	BasisVerifiedPrincipal SourceInputBasis = "VERIFIED_PRINCIPAL"
 
+	// BasisVerifiedClient — derived from the verified IdP token's client
+	// (azp) through the configured IDP_CLIENT_CHANNELS map: the web console's
+	// client is "web", the mobile app's is "mobile". Settles what the principal
+	// type alone cannot (web vs mobile for a human).
+	BasisVerifiedClient SourceInputBasis = "VERIFIED_CLIENT"
+
 	// BasisAssertedConsistent — asserted by the client and checked: it is one
 	// of the values the principal's type can legitimately arrive on. What
 	// cannot be checked here is WHICH of those values is true (web or mobile

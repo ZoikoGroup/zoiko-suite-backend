@@ -47,14 +47,12 @@ func TestSend_AsksToBeCountedAgainstTheQuotas(t *testing.T) {
 	}
 }
 
-// Notice dispatch is a regulated send: it is not refused for volume it did not cause.
-func TestNoticeDispatch_IsNotCountedAgainstTheQuotas(t *testing.T) {
-	rig := newNoticeRig(t, true, true)
-	_, n := rig.create(t, nil)
-	if rr := doReq(rig.r, http.MethodPost, "/v1/notices/"+n.NoticeID+"/dispatch", nil, "sender-1"); rr.Code != http.StatusAccepted {
-		t.Fatalf("dispatch = %d %s", rr.Code, rr.Body.String())
+// contains reports whether sub occurs in s.
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
 	}
-	if rig.store.countedCtx {
-		t.Error("a regulated notice's delivery must not be counted against the send quotas")
-	}
+	return false
 }

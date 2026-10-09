@@ -17,6 +17,7 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
+	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
@@ -37,25 +38,38 @@ type JurisdictionStore interface {
 
 	// CreateJurisdiction inserts a new jurisdiction idempotently.
 	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
+	CreateJurisdictionWithQuerier(ctx context.Context, q store.Querier, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
 
 	// DeactivateJurisdiction sets active_flag=false and updates audit columns.
-	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error)
+	// The bool reports whether anything actually changed (false = already
+	// deactivated; an idempotent replay that must not re-publish).
+	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
+	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
 
 	// FindRuleByID looks up a rule by ID.
 	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
 
 	// CreateRule inserts a new rule idempotently.
 	CreateRule(ctx context.Context, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error)
+	CreateRuleWithQuerier(ctx context.Context, q store.Querier, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error)
 
 	// TransitionRuleStatus atomically updates rule_status if current status is
 	// in allowedPriors. The bool reports whether anything actually changed.
 	TransitionRuleStatus(ctx context.Context, params store.TransitionParams) (*domain.JurisdictionRule, bool, error)
+	TransitionRuleStatusWithQuerier(ctx context.Context, q store.Querier, params store.TransitionParams) (*domain.JurisdictionRule, bool, error)
 
 	// RecordDrift moves legal_drift_state and appends to the drift history.
 	RecordDrift(ctx context.Context, params domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error)
+	RecordDriftWithQuerier(ctx context.Context, q store.Querier, params domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error)
 
 	// FindDriftEvents returns the append-only drift history for a rule.
 	FindDriftEvents(ctx context.Context, ruleID string, limit, offset int) ([]*domain.DriftEvent, error)
+
+	// FindRuleStatusHistory returns the bitemporal status history for a rule.
+	FindRuleStatusHistory(ctx context.Context, ruleID string, limit, offset int) ([]*domain.RuleStatusHistory, error)
+
+	// WithTransaction executes fn within a database transaction.
+	WithTransaction(ctx context.Context, fn func(q store.Querier) error) error
 }
 
 // Handler holds all HTTP handler methods.
@@ -197,6 +211,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rule-pack", h.GetRulePack)
 	r.Get("/v1/rules/{jurisdiction_rule_id}", h.GetRule)
 	r.Get("/v1/rules/{jurisdiction_rule_id}/drift-events", h.GetDriftEvents)
+	r.Get("/v1/rules/{jurisdiction_rule_id}/status-history", h.GetRuleStatusHistory)
 
 	// ── Admin mutations (AuthZ required on every route) ───────────────────────
 	r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
@@ -249,10 +264,8 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 				zap.String("jurisdiction_id", jurisdictionID),
 				zap.String("correlation_id", correlationID),
 			)
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":           "jurisdiction_not_found",
-				"jurisdiction_id": jurisdictionID,
-			})
+			problem.Write(w, problem.New(http.StatusNotFound, "jurisdiction_not_found", "").
+				With("jurisdiction_id", jurisdictionID))
 		default:
 			// Store unavailable — log ERROR, return 503.
 			// Callers (tenant-entity-registry-svc) must fail-closed on 503.
@@ -261,9 +274,7 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 				zap.String("correlation_id", correlationID),
 				zap.Error(err),
 			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-				"error": "store_unavailable",
-			})
+			problem.Write(w, problem.New(http.StatusServiceUnavailable, "store_unavailable", ""))
 		}
 		return
 	}
@@ -312,7 +323,7 @@ func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		problem.Write(w, problem.New(http.StatusServiceUnavailable, "store_unavailable", ""))
 		return
 	}
 
@@ -513,6 +524,38 @@ func (h *Handler) GetDriftEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, history)
 }
 
+// GetRuleStatusHistory handles GET /v1/rules/{jurisdiction_rule_id}/status-history.
+//
+// The bitemporal status log (V-001 §8.1), newest known_from first. Enables
+// "what did the platform know on date X" queries for audit and replay — the
+// mirror image of drift events, but for the rule status timeline itself.
+//
+// Response:
+//
+//	200 → JSON array of RuleStatusHistory objects (may be empty, never null)
+//	400 → malformed limit or offset
+//	404 → jurisdiction_rule_id not found
+//	503 → store unavailable
+func (h *Handler) GetRuleStatusHistory(w http.ResponseWriter, r *http.Request) {
+	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	if !ok {
+		return
+	}
+
+	history, err := h.store.FindRuleStatusHistory(r.Context(), ruleID, limit, offset)
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+	if history == nil {
+		history = []*domain.RuleStatusHistory{}
+	}
+	writeJSON(w, http.StatusOK, history)
+}
+
 // ── Admin mutations ──────────────────────────────────────────────────────────
 
 // CreateJurisdiction handles POST /v1/admin/jurisdictions.
@@ -553,6 +596,21 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		writeMissingField(w, field)
 		return
 	}
+	// These are VARCHAR(n) columns; an over-length value used to die in
+	// Postgres and surface as 503 store_unavailable. Bound them here so the
+	// client learns the field's limit instead of reading an outage.
+	if len(req.JurisdictionCode) > 32 {
+		writeError(w, http.StatusBadRequest, "invalid_jurisdiction_code", "jurisdiction_code must be at most 32 characters")
+		return
+	}
+	if len(req.JurisdictionType) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_jurisdiction_type", "jurisdiction_type must be at most 64 characters")
+		return
+	}
+	if len(req.AuthorityType) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_authority_type", "authority_type must be at most 64 characters")
+		return
+	}
 	if req.EffectiveFrom.IsZero() {
 		writeMissingField(w, "effective_from")
 		return
@@ -562,16 +620,30 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	j, created, err := h.store.CreateJurisdiction(r.Context(), domain.CreateJurisdictionParams{
-		JurisdictionCode:     req.JurisdictionCode,
-		JurisdictionName:     req.JurisdictionName,
-		JurisdictionType:     req.JurisdictionType,
-		ParentJurisdictionID: req.ParentJurisdictionID,
-		AuthorityType:        req.AuthorityType,
-		EffectiveFrom:        req.EffectiveFrom,
-		EffectiveTo:          req.EffectiveTo,
-		ActiveFlag:           true,
-		CreatedByPrincipalID: principalID,
+	var j *domain.Jurisdiction
+	var created bool
+	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		j, created, err = h.store.CreateJurisdictionWithQuerier(r.Context(), q, domain.CreateJurisdictionParams{
+			JurisdictionCode:     req.JurisdictionCode,
+			JurisdictionName:     req.JurisdictionName,
+			JurisdictionType:     req.JurisdictionType,
+			ParentJurisdictionID: req.ParentJurisdictionID,
+			AuthorityType:        req.AuthorityType,
+			EffectiveFrom:        req.EffectiveFrom,
+			EffectiveTo:          req.EffectiveTo,
+			ActiveFlag:           true,
+			CreatedByPrincipalID: principalID,
+		})
+		if err != nil {
+			return err
+		}
+		if created {
+			if err := h.publisher.PublishJurisdictionCreated(r.Context(), *j, correlationID); err != nil {
+				return err
+			}
+		}
+		return h.publisher.FlushPending(r.Context(), q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -580,11 +652,6 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 
 	status := http.StatusOK
 	if created {
-		// Only a real insert emits. An idempotent replay must not make
-		// consumers think a second jurisdiction appeared.
-		h.publish("jurisdiction.created", correlationID, func() error {
-			return h.publisher.PublishJurisdictionCreated(r.Context(), *j, correlationID)
-		})
 		status = http.StatusCreated
 	}
 	h.log.Info("CreateJurisdiction",
@@ -618,15 +685,29 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	j, err := h.store.DeactivateJurisdiction(r.Context(), jurisdictionID, principalID)
+	var j *domain.Jurisdiction
+	var changed bool
+	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		j, changed, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			// Idempotent replay of an already-deactivated jurisdiction: the
+			// trigger skipped the update, no audit columns were rewritten and
+			// no second jurisdiction.deactivated may be emitted.
+			return nil
+		}
+		if err := h.publisher.PublishJurisdictionDeactivated(r.Context(), *j, correlationID); err != nil {
+			return err
+		}
+		return h.publisher.FlushPending(r.Context(), q)
+	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
 	}
-
-	h.publish("jurisdiction.deactivated", correlationID, func() error {
-		return h.publisher.PublishJurisdictionDeactivated(r.Context(), *j, correlationID)
-	})
 
 	h.log.Info("DeactivateJurisdiction",
 		zap.String("jurisdiction_id", jurisdictionID),
@@ -675,6 +756,16 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		writeMissingField(w, field)
 		return
 	}
+	// rule_domain is VARCHAR(64) and rule_code VARCHAR(128). As with the
+	// jurisdiction create, an over-length value must be a 400, not a 503.
+	if len(req.RuleDomain) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_rule_domain", "rule_domain must be at most 64 characters")
+		return
+	}
+	if len(req.RuleCode) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_rule_code", "rule_code must be at most 128 characters")
+		return
+	}
 	if req.EffectiveFrom.IsZero() {
 		writeMissingField(w, "effective_from")
 		return
@@ -702,18 +793,39 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rule, created, err := h.store.CreateRule(r.Context(), domain.CreateRuleParams{
-		JurisdictionID:        jurisdictionID,
-		RuleDomain:            req.RuleDomain,
-		RuleCode:              req.RuleCode,
-		RuleName:              req.RuleName,
-		EffectiveFrom:         req.EffectiveFrom,
-		EffectiveTo:           req.EffectiveTo,
-		RulePayload:           payload,
-		SourceReference:       req.SourceReference,
-		ExternalFeedReference: req.ExternalFeedReference,
-		RuleStatus:            ruleStatus,
-		CreatedByPrincipalID:  principalID,
+	var rule *domain.JurisdictionRule
+	var created bool
+	err = h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		rule, created, err = h.store.CreateRuleWithQuerier(r.Context(), q, domain.CreateRuleParams{
+			JurisdictionID:        jurisdictionID,
+			RuleDomain:            req.RuleDomain,
+			RuleCode:              req.RuleCode,
+			RuleName:              req.RuleName,
+			EffectiveFrom:         req.EffectiveFrom,
+			EffectiveTo:           req.EffectiveTo,
+			RulePayload:           payload,
+			SourceReference:       req.SourceReference,
+			ExternalFeedReference: req.ExternalFeedReference,
+			RuleStatus:            ruleStatus,
+			CreatedByPrincipalID:  principalID,
+		})
+		if err != nil {
+			return err
+		}
+		if created {
+			if err := h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID); err != nil {
+				return err
+			}
+			// A rule created directly in ACTIVE never passes through the
+			// transition endpoint, so activation is announced here instead.
+			if rule.RuleStatus == "ACTIVE" {
+				if err := h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID); err != nil {
+					return err
+				}
+			}
+		}
+		return h.publisher.FlushPending(r.Context(), q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -722,16 +834,6 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 
 	status := http.StatusOK
 	if created {
-		h.publish("jurisdiction.rule.updated", correlationID, func() error {
-			return h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID)
-		})
-		// A rule created directly in ACTIVE never passes through the
-		// transition endpoint, so activation is announced here instead.
-		if rule.RuleStatus == "ACTIVE" {
-			h.publish("jurisdiction.rule.activated", correlationID, func() error {
-				return h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID)
-			})
-		}
 		status = http.StatusCreated
 	}
 	h.log.Info("CreateRule",
@@ -792,30 +894,39 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	rule, transitioned, err := h.store.TransitionRuleStatus(r.Context(), store.TransitionParams{
-		RuleID:        ruleID,
-		NewStatus:     req.NewStatus,
-		AllowedPriors: allowedPriors,
-		EndDate:       endDatingStatuses[req.NewStatus],
-		EffectiveTo:   req.EffectiveTo,
-		ActorID:       principalID,
+	var rule *domain.JurisdictionRule
+	var transitioned bool
+	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		rule, transitioned, err = h.store.TransitionRuleStatusWithQuerier(r.Context(), q, store.TransitionParams{
+			RuleID:        ruleID,
+			NewStatus:     req.NewStatus,
+			AllowedPriors: allowedPriors,
+			EndDate:       endDatingStatuses[req.NewStatus],
+			EffectiveTo:   req.EffectiveTo,
+			ActorID:       principalID,
+		})
+		if err != nil {
+			return err
+		}
+
+		// A replayed transition must not re-emit — a consumer that saw
+		// rule.activated twice would double-apply whatever it does on activation.
+		if transitioned {
+			if err := h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID); err != nil {
+				return err
+			}
+			if req.NewStatus == "ACTIVE" {
+				if err := h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID); err != nil {
+					return err
+				}
+			}
+		}
+		return h.publisher.FlushPending(r.Context(), q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
-	}
-
-	// A replayed transition must not re-emit — a consumer that saw
-	// rule.activated twice would double-apply whatever it does on activation.
-	if transitioned {
-		h.publish("jurisdiction.rule.updated", correlationID, func() error {
-			return h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID)
-		})
-		if req.NewStatus == "ACTIVE" {
-			h.publish("jurisdiction.rule.activated", correlationID, func() error {
-				return h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID)
-			})
-		}
 	}
 
 	h.log.Info("TransitionRuleStatus",
@@ -866,24 +977,34 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rule, event, changed, err := h.store.RecordDrift(r.Context(), domain.RecordDriftParams{
-		JurisdictionRuleID:    ruleID,
-		ToState:               req.DriftState,
-		Reason:                req.Reason,
-		RecordedByPrincipalID: principalID,
-		CorrelationID:         correlationID,
+	var rule *domain.JurisdictionRule
+	var event *domain.DriftEvent
+	var changed bool
+	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		var err error
+		rule, event, changed, err = h.store.RecordDriftWithQuerier(r.Context(), q, domain.RecordDriftParams{
+			JurisdictionRuleID:    ruleID,
+			ToState:               req.DriftState,
+			Reason:                req.Reason,
+			RecordedByPrincipalID: principalID,
+			CorrelationID:         correlationID,
+		})
+		if err != nil {
+			return err
+		}
+
+		// Only a real divergence is news. Returning to CURRENT is a resolution,
+		// carried by the history rather than by a "drift detected" fact.
+		if changed && req.DriftState != "CURRENT" {
+			if err := h.publisher.PublishLegalDriftDetected(r.Context(), *rule, *event, correlationID); err != nil {
+				return err
+			}
+		}
+		return h.publisher.FlushPending(r.Context(), q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
-	}
-
-	// Only a real divergence is news. Returning to CURRENT is a resolution,
-	// carried by the history rather than by a "drift detected" fact.
-	if changed && req.DriftState != "CURRENT" {
-		h.publish("legal.drift.detected", correlationID, func() error {
-			return h.publisher.PublishLegalDriftDetected(r.Context(), *rule, *event, correlationID)
-		})
 	}
 
 	h.log.Info("RecordDrift",
@@ -932,38 +1053,50 @@ func (h *Handler) checkAuthz(r *http.Request, principalID, resource, action stri
 // mutation proceeds without a positive authz decision.
 func (h *Handler) writeAuthzError(w http.ResponseWriter, err error) {
 	if errors.Is(err, authz.ErrUnauthorized) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "unauthorized"})
+		problem.Write(w, problem.New(http.StatusForbidden, "unauthorized", ""))
 		return
 	}
-	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+	problem.Write(w, problem.New(http.StatusServiceUnavailable, "authz_unavailable", ""))
 }
 
 // writeStoreError maps a store error to an HTTP response.
 func (h *Handler) writeStoreError(w http.ResponseWriter, err error, correlationID string) {
+	var status int
+	var code string
 	switch {
+	case errors.Is(err, domain.ErrInputTooLong):
+		// SQLSTATE 22001 — a client sent a value longer than the column holds
+		// (e.g. jurisdiction_code > 32). That is a client error, never a
+		// store outage; the store maps it at the create boundary and this is
+		// the last line of defence for any constrained column the boundary
+		// guards above still miss.
+		status, code = http.StatusBadRequest, "input_too_long"
 	case errors.Is(err, domain.ErrJurisdictionNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "jurisdiction_not_found"})
+		status, code = http.StatusNotFound, "jurisdiction_not_found"
 	case errors.Is(err, domain.ErrParentNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "parent_jurisdiction_not_found"})
+		status, code = http.StatusNotFound, "parent_jurisdiction_not_found"
 	case errors.Is(err, domain.ErrRuleNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "rule_not_found"})
+		status, code = http.StatusNotFound, "rule_not_found"
 	case errors.Is(err, domain.ErrConflict):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "conflict"})
+		status, code = http.StatusConflict, "conflict"
 	case errors.Is(err, domain.ErrOverlappingRule):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "overlapping_rule"})
+		status, code = http.StatusConflict, "overlapping_rule"
 	case errors.Is(err, domain.ErrCyclicHierarchy):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "cyclic_hierarchy"})
+		status, code = http.StatusConflict, "cyclic_hierarchy"
 	case errors.Is(err, domain.ErrInvalidTransition):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+		status, code = http.StatusConflict, "invalid_transition"
 	case errors.Is(err, domain.ErrInvalidEffectivePeriod):
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_effective_period"})
+		status, code = http.StatusBadRequest, "invalid_effective_period"
 	default:
 		h.log.Error("store operation failed",
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		status, code = http.StatusServiceUnavailable, "store_unavailable"
 	}
+	p := problem.New(status, code, "")
+	p.CorrelationID = correlationID
+	problem.Write(w, p)
 }
 
 // publish runs an event emission, logging rather than failing the request if
@@ -1101,18 +1234,13 @@ func validEffectivePeriod(from time.Time, to *time.Time) bool {
 }
 
 func writeMissingField(w http.ResponseWriter, field string) {
-	writeJSON(w, http.StatusBadRequest, map[string]string{
-		"error": "missing_field",
-		"field": field,
-	})
+	p := problem.New(http.StatusBadRequest, "missing_field", "a required field is missing")
+	p.Field("#/"+field, "missing", field+" is required")
+	problem.Write(w, p)
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	body := map[string]string{"error": code}
-	if message != "" {
-		body["message"] = message
-	}
-	writeJSON(w, status, body)
+	problem.Write(w, problem.New(status, code, message))
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.

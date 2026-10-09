@@ -54,6 +54,13 @@ type Projection struct {
 	// else is a contract violation the caller must quarantine before reaching
 	// here; the strict mapping is the second line of defence, not the first.
 	Fields map[string]any
+
+	// Embedding and EmbeddingModel are set only for a semantic scope's live
+	// (non-tombstoned) documents. The vector rides in the same document as
+	// every governance field above, so it can never be a candidate under a
+	// tenant, region or epoch the lexical document would not be (INV-26).
+	Embedding      []float32
+	EmbeddingModel string
 }
 
 // ProjectionDocID is the canonical _id for a projection.
@@ -106,6 +113,14 @@ func (p Projection) document() map[string]any {
 	if p.TombstoneSource != "" {
 		doc["tombstone_source_event"] = p.TombstoneSource
 	}
+	// Never on a tombstone, whatever the caller set. NP-34 — "vector deleted
+	// but lexical doc remains" — has a twin that is worse: lexical content
+	// removed but the vector left behind, still answering nearest-neighbour
+	// queries for a record that was restricted. A tombstone carries no vector.
+	if len(p.Embedding) > 0 && !p.Tombstoned {
+		doc[EmbeddingVectorField] = p.Embedding
+		doc["embedding_model"] = p.EmbeddingModel
+	}
 	return doc
 }
 
@@ -152,6 +167,62 @@ func (c *client) IndexProjection(ctx context.Context, physicalIndex string, p Pr
 		return fmt.Errorf("searchclient: IndexProjection failed: %s", raw)
 	}
 	return nil
+}
+
+// ErrProjectionExists is CreateProjection's answer when the document is
+// already present. Not a failure: the writer that got there first wins.
+var ErrProjectionExists = errors.New("searchclient: projection already exists")
+
+// CreateProjection writes a projection only if no document with its id exists
+// yet (op_type=create).
+//
+// The generation BACKFILL writes with this and the live consumer writes with
+// IndexProjection, and that asymmetry is the whole concurrency story: a live
+// write always wins, and a backfill write — which replays history and may be
+// holding a state the live path has since superseded — can never overwrite
+// one. Without it, a backfill that read the ledger a moment before a live
+// update would write the older state over the newer.
+func (c *client) CreateProjection(ctx context.Context, physicalIndex string, p Projection) error {
+	if p.DocID == "" {
+		return errors.New("searchclient: CreateProjection: DocID must not be empty")
+	}
+	if p.TenantID == "" {
+		return ErrTenantIDRequired
+	}
+	body, err := json.Marshal(p.document())
+	if err != nil {
+		return fmt.Errorf("searchclient: CreateProjection marshal: %w", err)
+	}
+	resp, err := c.os.Document.Create(ctx, opensearchapi.DocumentCreateReq{
+		Index:      physicalIndex,
+		DocumentID: p.DocID,
+		Body:       bytes.NewReader(body),
+		Params:     opensearchapi.DocumentCreateParams{Refresh: "wait_for"},
+	})
+	if err != nil {
+		switch {
+		case isConflict(err.Error()):
+			return ErrProjectionExists
+		case isStrictMappingError(err.Error()):
+			return fmt.Errorf("%w: %s", ErrStrictMappingRejected, err.Error())
+		}
+		return fmt.Errorf("searchclient: CreateProjection request: %w", err)
+	}
+	if raw, isErr := drain(resp.Inspect().Response); isErr {
+		switch {
+		case isConflict(raw):
+			return ErrProjectionExists
+		case isStrictMappingError(raw):
+			return fmt.Errorf("%w: %s", ErrStrictMappingRejected, raw)
+		}
+		return fmt.Errorf("searchclient: CreateProjection failed: %s", raw)
+	}
+	return nil
+}
+
+func isConflict(s string) bool {
+	return strings.Contains(s, "version_conflict_engine_exception") ||
+		strings.Contains(s, "status: [409") || strings.Contains(s, "status: 409")
 }
 
 // isStrictMappingError recognises the refusal a strict mapping produces for an
@@ -267,6 +338,39 @@ func (c *client) CountProjections(ctx context.Context, physicalIndex string, ter
 	}
 	if raw, isErr := drain(resp.Inspect().Response); isErr {
 		return 0, fmt.Errorf("searchclient: CountProjections %s failed: %s", physicalIndex, raw)
+	}
+	return int64(resp.Hits.Total.Value), nil
+}
+
+// CountMissing counts documents in a generation that do NOT carry field at
+// all (bool must_not exists).
+//
+// Separate from CountProjections because an exact-match term with an empty
+// value cannot express "missing": CountProjections skips empty-valued terms,
+// so asking it for tenant_id="" counted EVERY live document — and
+// validateGeneration's cross-tenant contamination check (NP-41) reported every
+// populated generation as untenanted. It never fired only because generations
+// were validated empty until backfill existed.
+func (c *client) CountMissing(ctx context.Context, physicalIndex, field string) (int64, error) {
+	body, err := json.Marshal(map[string]any{
+		"size": 0,
+		"query": map[string]any{"bool": map[string]any{
+			"must_not": []map[string]any{{"exists": map[string]any{"field": field}}},
+		}},
+		"track_total_hits": true,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("searchclient: CountMissing marshal: %w", err)
+	}
+	resp, err := c.os.Search(ctx, &opensearchapi.SearchReq{Indices: []string{physicalIndex}, Body: bytes.NewReader(body)})
+	if err != nil {
+		if isMissing(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("searchclient: CountMissing %s: %w", physicalIndex, err)
+	}
+	if raw, isErr := drain(resp.Inspect().Response); isErr {
+		return 0, fmt.Errorf("searchclient: CountMissing %s failed: %s", physicalIndex, raw)
 	}
 	return int64(resp.Hits.Total.Value), nil
 }

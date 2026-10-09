@@ -61,6 +61,9 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	_, err = pool.Exec(context.Background(), `
 		DROP TABLE IF EXISTS delegation_outbox;
 		DROP TABLE IF EXISTS delegation_grants;
+		DROP TABLE IF EXISTS delegation_history;
+		DROP TABLE IF EXISTS refused_escalations;
+		DROP TABLE IF EXISTS idempotency_keys;
 	`)
 	require.NoError(t, err)
 
@@ -164,9 +167,14 @@ func grant(delegationID, correlationID, entity, delegator, delegate string, from
 		EffectiveTo:          to,
 		Status:               domain.DelegationStatusActive,
 		CreatedByPrincipalID: delegator,
-		CorrelationID:        correlationID,
-		CreatedAt:            now,
-		UpdatedAt:            now,
+		// The delegator granting their own authority: the act is the approval.
+		ApprovedByPrincipalID: &delegator,
+		ApprovedAt:            &now,
+		ApprovalMethod:        ptr(domain.ApprovalDelegatorSelf),
+		Reason:                "test grant",
+		CorrelationID:         correlationID,
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 }
 
@@ -175,6 +183,8 @@ func grant(delegationID, correlationID, entity, delegator, delegate string, from
 // — with the tenant installed on the connection. This is exactly how the relay
 // doesn't run, and asserting on events through the same lens the request path
 // uses is the point.
+func ptr[T any](v T) *T { return &v }
+
 func outboxEvents(t *testing.T, pool *pgxpool.Pool, tenantID, delegationID string) []string {
 	t.Helper()
 	tx, err := pool.Begin(context.Background())
@@ -262,12 +272,16 @@ func TestCreateDelegationIsIdempotentOnCorrelationID(t *testing.T) {
 	_, err := s.CreateDelegation(ctx, d)
 	require.NoError(t, err)
 
-	// A retried submission carries the same idempotency scope — migration
-	// 000008: tenant, correlation, creator, action, entity and effective
-	// window — and may differ in anything outside it (here the delegation id
-	// and the delegate). A replay is not a fresh grant and must neither write
-	// nor overwrite.
-	replay := grant("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbba", "corr-a2", testEntityA, principalSelf, principalThird, from, to)
+	// The same correlation_id naming ANOTHER delegate is not a retry of this
+	// grant. It used to be answered as one: a 200 carrying a delegation to
+	// principalOther, to a caller who had asked for principalThird.
+	other := grant("cccccccc-cccc-cccc-cccc-cccccccccccc", "corr-a2", testEntityA, principalSelf, principalThird, from, to)
+	_, err = s.CreateDelegation(ctx, other)
+	require.ErrorIs(t, err, domain.ErrCorrelationReused)
+
+	// A genuine retry carries the same grant; only its id may differ. A
+	// replay is not a fresh grant and must neither write nor overwrite.
+	replay := grant("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbba", "corr-a2", testEntityA, principalSelf, principalOther, from, to)
 	created, err := s.CreateDelegation(ctx, replay)
 	require.NoError(t, err)
 	require.False(t, created, "a replay must not report a real insert")
@@ -315,7 +329,7 @@ func TestCrossTenantIsolation(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, list, "tenant B's register must not include tenant A's grants")
 
-	_, err = s.RevokeDelegation(ctxB, d.DelegationID, principalOther, 0)
+	_, err = s.Transition(ctxB, d.DelegationID, store.Revoke, domain.TransitionInput{ExpectedVersion: 1, ActorPrincipalID: principalOther, Reason: "test revocation"})
 	require.ErrorIs(t, err, domain.ErrDelegationNotFound,
 		"tenant B must not be able to transition tenant A's grant")
 
@@ -339,7 +353,7 @@ func TestStoreRefusesUnscopedContext(t *testing.T) {
 	_, err = s.ListDelegations(bare, domain.ListDelegationsFilter{})
 	require.ErrorIs(t, err, domain.ErrTenantMissing)
 
-	_, err = s.RevokeDelegation(bare, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa00a4", principalOther, 0)
+	_, err = s.Transition(bare, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa00a4", store.Revoke, domain.TransitionInput{ExpectedVersion: 1, ActorPrincipalID: principalOther, Reason: "test revocation"})
 	require.ErrorIs(t, err, domain.ErrTenantMissing)
 
 	_, err = s.ExpireDue(bare)
@@ -394,7 +408,7 @@ func TestListDelegationsStatusFilterAndUnknownStatus(t *testing.T) {
 	d := grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa00c1", "corr-c1", testEntityA, principalSelf, principalOther, now, now.Add(24*time.Hour))
 	_, err := s.CreateDelegation(ctx, d)
 	require.NoError(t, err)
-	_, err = s.RevokeDelegation(ctx, d.DelegationID, principalOther, 0)
+	_, err = s.Transition(ctx, d.DelegationID, store.Revoke, domain.TransitionInput{ExpectedVersion: 1, ActorPrincipalID: principalOther, Reason: "test revocation"})
 	require.NoError(t, err)
 
 	active, err := s.ListDelegations(ctx, domain.ListDelegationsFilter{Status: string(domain.DelegationStatusActive)})
@@ -460,7 +474,7 @@ func TestRevokeDelegationTransitionsAndEnqueuesRevoked(t *testing.T) {
 	_, err := s.CreateDelegation(ctx, d)
 	require.NoError(t, err)
 
-	revoked, err := s.RevokeDelegation(ctx, d.DelegationID, principalOther, 0)
+	revoked, err := s.Transition(ctx, d.DelegationID, store.Revoke, domain.TransitionInput{ExpectedVersion: 1, ActorPrincipalID: principalOther, Reason: "test revocation"})
 	require.NoError(t, err)
 	require.Equal(t, domain.DelegationStatusRevoked, revoked.Status)
 	require.Equal(t, principalOther, *revoked.RevokedByPrincipalID)
@@ -472,7 +486,7 @@ func TestRevokeDelegationTransitionsAndEnqueuesRevoked(t *testing.T) {
 
 	// A terminal grant cannot be revoked again — the second attempt is a 409,
 	// not a silent no-op and not a fresh state.
-	_, err = s.RevokeDelegation(ctx, d.DelegationID, principalOther, 0)
+	_, err = s.Transition(ctx, d.DelegationID, store.Revoke, domain.TransitionInput{ExpectedVersion: 2, ActorPrincipalID: principalOther, Reason: "test revocation"})
 	require.ErrorIs(t, err, domain.ErrInvalidTransition)
 	require.True(t, errors.Is(err, domain.ErrInvalidTransition))
 

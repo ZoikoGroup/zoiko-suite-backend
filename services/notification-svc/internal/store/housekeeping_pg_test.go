@@ -8,7 +8,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
+	"zoiko.io/notification-svc/internal/housekeeping"
 	"zoiko.io/notification-svc/internal/ledger"
 	"zoiko.io/notification-svc/internal/store"
 )
@@ -196,8 +198,11 @@ func TestHousekeepingStore_StaleIntents_Expiry(t *testing.T) {
 	assert.Equal(t, ledger.IntentStatusPending, intent2.Status)
 }
 
-func TestHousekeepingStore_PurgeCompletedLedgerRecords(t *testing.T) {
-	pool := openTestPool(t)
+// Delivery evidence is never deleted (000023, INV-28). A 90-day purge used to
+// delete concluded intents, and the cascade took their renders, attempts and
+// events with them. The database now refuses the DELETE on every evidence table.
+func TestHousekeepingStore_DeliveryEvidenceIsNeverDeleted(t *testing.T) {
+	pool, admin := openTestPools(t)
 	s := store.New(pool)
 	ctx := context.Background()
 
@@ -254,42 +259,36 @@ func TestHousekeepingStore_PurgeCompletedLedgerRecords(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Intent 2: DISPATCHED 10 days ago (recent, must NOT be purged)
-	recentIntentID := uuid.NewString()
-	_, _, err = s.CreateMessageIntent(ctx, &ledger.MessageIntent{
-		MessageIntentID:      recentIntentID,
-		TenantID:             tenantID,
-		LegalEntityID:        "entity-001",
-		RecipientPrincipalID: "principal-001",
-		RecipientEmail:       "recent@example.com",
-		Channel:              "EMAIL",
-		CommunicationClass:   ledger.ClassT0,
-		TemplateKey:          "ZS-IA-001",
-		SourceEventType:      "test.event",
-		DeduplicationKey:     "dedup-recent-ledger-1",
-		CorrelationID:        "corr-recent-ledger-1",
-		Status:               ledger.IntentStatusDispatched,
-		CreatedAt:            now.Add(-10 * 24 * time.Hour),
-		UpdatedAt:            now.Add(-10 * 24 * time.Hour),
-	})
+	// A worker pass leaves every evidence row in place.
+	w := housekeeping.NewWorker(s, housekeeping.Options{TokenRetention: 30 * 24 * time.Hour, StaleIntentThreshold: 24 * time.Hour}, zap.NewNop())
+	_, err = w.RunOnce(ctx)
 	require.NoError(t, err)
+	got, err := s.GetMessageIntent(ctx, tenantID, oldIntentID)
+	require.NoError(t, err, "a 100-day-old dispatched intent must still be on record")
+	assert.Equal(t, ledger.IntentStatusDispatched, got.Status)
 
-	// Purge with 90-day cutoff
-	cutoff90d := now.Add(-90 * 24 * time.Hour)
-	tenants, err := s.FindTenantsWithCompletedIntents(ctx, cutoff90d, 50)
-	require.NoError(t, err)
-	assert.Contains(t, tenants, tenantID)
+	// Every evidence table carries the guard. (A row trigger only fires on a
+	// row, so the tables this test has no rows in are checked in the catalog.)
+	for _, table := range []string{"message_intents", "message_renders", "delivery_attempts", "delivery_events",
+		"notifications", "notification_delivery_attempts"} {
+		var has bool
+		require.NoError(t, admin.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_trigger
+			WHERE tgrelid = $1::regclass AND tgname = 'trg_reject_evidence_delete' AND tgenabled <> 'D')`, table).Scan(&has))
+		assert.True(t, has, "%s must refuse DELETE", table)
+	}
 
-	purgedCount, err := s.PurgeCompletedLedgerRecordsForTenant(ctx, tenantID, cutoff90d)
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), purgedCount, "Old intent should have been deleted")
-
-	// Verify old intent is gone
-	_, err = s.GetMessageIntent(ctx, tenantID, oldIntentID)
-	assert.Error(t, err)
-
-	// Verify recent intent still exists
-	recentIntent, err := s.GetMessageIntent(ctx, tenantID, recentIntentID)
-	require.NoError(t, err)
-	assert.Equal(t, ledger.IntentStatusDispatched, recentIntent.Status)
+	// And the database refuses a direct DELETE of real rows, cascade included.
+	for _, stmt := range []string{
+		`DELETE FROM message_intents WHERE message_intent_id = '` + oldIntentID + `'`,
+		`DELETE FROM message_renders WHERE render_id = '` + oldRenderID + `'`,
+		`DELETE FROM delivery_attempts WHERE provider_attempt_id = '` + oldAttemptID + `'`,
+	} {
+		_, err := admin.Exec(ctx, stmt)
+		if err == nil {
+			t.Errorf("must be refused: %s", stmt)
+		}
+	}
+	var n int
+	require.NoError(t, admin.QueryRow(ctx, `SELECT count(*) FROM delivery_attempts WHERE provider_attempt_id = $1`, oldAttemptID).Scan(&n))
+	assert.Equal(t, 1, n, "the attempt evidence must survive")
 }

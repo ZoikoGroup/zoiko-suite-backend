@@ -252,7 +252,6 @@ func (d *stubDeliverer) Deliver(_ context.Context, n domain.Notification) domain
 // stubPublisher counts the events the stub store enqueues, by type.
 type stubPublisher struct{ sent, failed, unknown int }
 
-
 type stubResolver struct {
 	email string
 	err   error

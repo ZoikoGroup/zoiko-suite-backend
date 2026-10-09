@@ -29,7 +29,7 @@ func classed(t *testing.T, s *store.PgStore, tenant, corr, class string) *domain
 
 // The class is stated at creation, stored, and read back.
 func TestCommunicationClass_IsStoredAndReadBack(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	n := classed(t, s, "tenant-class", "corr-class-1", "A1")
 	got, err := s.GetNotification(tenantCtx("tenant-class"), n.NotificationID)
 	require.NoError(t, err)
@@ -44,7 +44,7 @@ func TestCommunicationClass_IsStoredAndReadBack(t *testing.T) {
 // The class decides what can block a message, so it cannot be changed afterwards:
 // not by a retry, not by a resend, not by SQL.
 func TestCommunicationClass_IsFrozenAndConstrainedByTheDatabase(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := classed(t, s, "tenant-class", "corr-class-3", "M1")
 	bg := context.Background()
@@ -69,7 +69,7 @@ func TestCommunicationClass_IsFrozenAndConstrainedByTheDatabase(t *testing.T) {
 // path, with the real suppression store. An unsubscribe must not stop a security or
 // transactional notice, and must stop an operational one.
 func TestCommunicationClass_SharedGateWithTheRealSuppressionStore(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-gate"
 	ctx := tenantCtx(tenant)
@@ -121,7 +121,7 @@ func (c *countingDeliverer) Deliver(_ context.Context, _ domain.Notification) do
 
 // The ledger pipeline records the template's class on its register row.
 func TestCommunicationClass_LedgerRegisterRowCarriesTheTemplateClass(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-class-ledger"
 	ctx := tenantCtx(tenant)
 	del := &e2eDeliverer{delivered: true, response: "smtp h accepted; message-id=<class-ledger@example.com>"}
@@ -142,7 +142,7 @@ func TestCommunicationClass_LedgerRegisterRowCarriesTheTemplateClass(t *testing.
 }
 
 func TestMigration000019_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000019_notification_communication_class.down.sql", "000019_notification_communication_class.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)

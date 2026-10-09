@@ -2,52 +2,49 @@ package domain
 
 import "time"
 
-// Component types.
-const (
-	ComponentEarning   = "EARNING"
-	ComponentDeduction = "DEDUCTION"
-)
-
-// Calculation methods for a component within a structure.
-const (
-	MethodFixed         = "FIXED"
-	MethodPercentOfBase = "PERCENT_OF_BASE"
-)
-
 // SalaryComponent is one element of pay — an allowance, or a deduction — that a
 // legal entity can compose into its compensation structures.
 type SalaryComponent struct {
-	ComponentID   string    `json:"component_id"`
-	TenantID      string    `json:"tenant_id"`
-	LegalEntityID string    `json:"legal_entity_id"`
-	Name          string    `json:"name"`
-	Code          string    `json:"code"`
-	ComponentType string    `json:"component_type"` // EARNING, DEDUCTION
-	IsTaxable     bool      `json:"is_taxable"`
-	DefaultAmount *float64  `json:"default_amount,omitempty"`
-	Currency      string    `json:"currency"`
-	Description   *string   `json:"description,omitempty"`
-	Status        string    `json:"status"` // ACTIVE, INACTIVE
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ComponentID   string        `json:"component_id"`
+	TenantID      string        `json:"tenant_id"`
+	LegalEntityID string        `json:"legal_entity_id"`
+	Name          string        `json:"name"`
+	Code          string        `json:"code"`
+	ComponentType ComponentType `json:"component_type"`
+	IsTaxable     bool          `json:"is_taxable"`
+	DefaultAmount *float64      `json:"default_amount,omitempty"`
+	Currency      string        `json:"currency"`
+	Description   *string       `json:"description,omitempty"`
+	Status        string        `json:"status"` // ACTIVE, INACTIVE
+	CreatedAt     time.Time     `json:"created_at"`
+	UpdatedAt     time.Time     `json:"updated_at"`
+	// Monolith-aligned fields
+	StatutoryComponent *bool   `json:"statutory_component,omitempty"`
+	TaxCode            *string `json:"tax_code,omitempty"`
+	PFContributionType *string `json:"pf_contribution_type,omitempty"` // EMPLOYEE, EMPLOYER, BOTH
+	ESICoverage        *bool   `json:"esi_coverage,omitempty"`
+	PTApplicable       *bool   `json:"pt_applicable,omitempty"`
+	IsFlexible         *bool   `json:"is_flexible,omitempty"`
+	MinValue           *float64 `json:"min_value,omitempty"`
+	MaxValue           *float64 `json:"max_value,omitempty"`
 }
 
 // StructureComponent binds a SalaryComponent to a CompensationStructure and
 // says how its amount is derived.
 type StructureComponent struct {
-	StructureComponentID string  `json:"structure_component_id"`
-	TenantID             string  `json:"tenant_id"`
-	StructureID          string  `json:"structure_id"`
-	ComponentID          string  `json:"component_id"`
-	CalculationMethod    string  `json:"calculation_method"` // FIXED, PERCENT_OF_BASE
-	CalculationValue     float64 `json:"calculation_value"`
-	Sequence             int     `json:"sequence"`
+	StructureComponentID string             `json:"structure_component_id"`
+	TenantID             string             `json:"tenant_id"`
+	StructureID          string             `json:"structure_id"`
+	ComponentID          string             `json:"component_id"`
+	CalculationMethod    CalculationMethod  `json:"calculation_method"` // FIXED, PERCENT_OF_BASE
+	CalculationValue     float64            `json:"calculation_value"`
+	Sequence             int                `json:"sequence"`
 
 	// Denormalised from salary_components for the payslip view. Read-only.
-	ComponentName string `json:"component_name,omitempty"`
-	ComponentCode string `json:"component_code,omitempty"`
-	ComponentType string `json:"component_type,omitempty"`
-	IsTaxable     bool   `json:"is_taxable,omitempty"`
+	ComponentName string       `json:"component_name,omitempty"`
+	ComponentCode string       `json:"component_code,omitempty"`
+	ComponentType ComponentType `json:"component_type,omitempty"`
+	IsTaxable     bool         `json:"is_taxable,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -57,11 +54,20 @@ type CreateComponentRequest struct {
 	LegalEntityID string   `json:"legal_entity_id"`
 	Name          string   `json:"name"`
 	Code          string   `json:"code"`
-	ComponentType string   `json:"component_type"`
+	ComponentType ComponentType `json:"component_type"`
 	IsTaxable     *bool    `json:"is_taxable,omitempty"` // pointer: omitted means taxable
 	DefaultAmount *float64 `json:"default_amount,omitempty"`
 	Currency      string   `json:"currency"`
 	Description   *string  `json:"description,omitempty"`
+	// Monolith-aligned fields
+	StatutoryComponent *bool   `json:"statutory_component,omitempty"`
+	TaxCode            *string `json:"tax_code,omitempty"`
+	PFContributionType *string `json:"pf_contribution_type,omitempty"`
+	ESICoverage        *bool   `json:"esi_coverage,omitempty"`
+	PTApplicable       *bool   `json:"pt_applicable,omitempty"`
+	IsFlexible         *bool   `json:"is_flexible,omitempty"`
+	MinValue           *float64 `json:"min_value,omitempty"`
+	MaxValue           *float64 `json:"max_value,omitempty"`
 }
 
 // SetStructureComponentsRequest replaces a structure's whole composition.
@@ -72,25 +78,25 @@ type SetStructureComponentsRequest struct {
 }
 
 type StructureComponentInput struct {
-	ComponentID       string  `json:"component_id"`
-	CalculationMethod string  `json:"calculation_method"`
-	CalculationValue  float64 `json:"calculation_value"`
-	Sequence          int     `json:"sequence"`
+	ComponentID       string             `json:"component_id"`
+	CalculationMethod CalculationMethod  `json:"calculation_method"`
+	CalculationValue  float64            `json:"calculation_value"`
+	Sequence          int                `json:"sequence"`
 }
 
 // ── Breakdown ─────────────────────────────────────────────────────────────────
 
 // BreakdownLine is one resolved component with its computed amount.
 type BreakdownLine struct {
-	ComponentID       string  `json:"component_id"`
-	ComponentCode     string  `json:"component_code"`
-	ComponentName     string  `json:"component_name"`
-	ComponentType     string  `json:"component_type"`
-	IsTaxable         bool    `json:"is_taxable"`
-	CalculationMethod string  `json:"calculation_method"`
-	CalculationValue  float64 `json:"calculation_value"`
-	Amount            float64 `json:"amount"`
-	Sequence          int     `json:"sequence"`
+	ComponentID       string             `json:"component_id"`
+	ComponentCode     string             `json:"component_code"`
+	ComponentName     string             `json:"component_name"`
+	ComponentType     ComponentType      `json:"component_type"`
+	IsTaxable         bool               `json:"is_taxable"`
+	CalculationMethod CalculationMethod  `json:"calculation_method"`
+	CalculationValue  float64            `json:"calculation_value"`
+	Amount            float64            `json:"amount"`
+	Sequence          int                `json:"sequence"`
 }
 
 // CompensationBreakdown is a structure resolved against a base amount.

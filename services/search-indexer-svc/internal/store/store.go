@@ -53,10 +53,11 @@ type Store interface {
 	ListGenerations(ctx context.Context, scopeName string) ([]domain.IndexGeneration, error)
 	GetActiveGeneration(ctx context.Context, scopeName string) (*domain.IndexGeneration, error)
 	TransitionGeneration(ctx context.Context, generationID string, from, to domain.GenerationState, digest, note string) error
+	SetBackfillState(ctx context.Context, generationID string, state domain.BackfillState, note string) error
 
 	UpsertCheckpoint(ctx context.Context, cp domain.IndexCheckpoint) error
 	ListCheckpoints(ctx context.Context, scopeName string) ([]domain.IndexCheckpoint, error)
-	GetLatestCheckpoint(ctx context.Context, scopeName string) (*domain.IndexCheckpoint, error)
+	GetCheckpoint(ctx context.Context, scopeName, partition string) (*domain.IndexCheckpoint, error)
 
 	// ── ESR-02 (tenant-scoped) ───────────────────────────────────────────
 	GetProjectionRecord(ctx context.Context, tenantID, scope, sourceType, sourceID string) (*domain.ProjectionRecord, error)
@@ -67,10 +68,21 @@ type Store interface {
 	MarkTombstoneState(ctx context.Context, tenantID, sourceType, sourceID, sourceEventID string, state domain.PropagationState, reason string) error
 	ListPendingVerification(ctx context.Context, limit int) ([]domain.RestrictionTombstone, error)
 	ListTombstones(ctx context.Context, tenantID, scopeName string, limit int) ([]domain.RestrictionTombstone, error)
+	ListFailedRestrictions(ctx context.Context, tenantID, scopeName string, limit int) ([]string, error)
 
 	// ── ESR-03/04 ────────────────────────────────────────────────────────
 	RecordEvidence(ctx context.Context, e domain.SearchEvidence) error
 	ListEvidence(ctx context.Context, tenantID, scopeName string, limit int) ([]domain.SearchEvidence, error)
+
+	// ── §10.1 model-migration certification ─────────────────────────────
+	CreateRetrievalEvaluation(ctx context.Context, e domain.RetrievalEvaluation) error
+	LatestRetrievalEvaluation(ctx context.Context, generationID string) (*domain.RetrievalEvaluation, error)
+
+	// ── Idempotency-Key replay protection ────────────────────────────────
+	ClaimIdempotencyKey(ctx context.Context, tenantID, endpoint, key, fingerprint string) (*IdempotencyRecord, error)
+	CompleteIdempotencyKey(ctx context.Context, tenantID, endpoint, key string, status int, body []byte) error
+	ReleaseIdempotencyKey(ctx context.Context, tenantID, endpoint, key string) error
+	PurgeIdempotencyKeysBefore(ctx context.Context, cutoff time.Time) (int64, error)
 
 	Ping(ctx context.Context) error
 	Close()
@@ -261,16 +273,20 @@ func (s *PgStore) ListSources(ctx context.Context) ([]domain.SearchSource, error
 // silently omits a searchable field — a search that returns nothing and no
 // error. The all-or-nothing write removes that state entirely.
 func (s *PgStore) CreateContract(ctx context.Context, c domain.IndexContract) error {
+	emb := embeddingColumns(c.Embedding)
 	return s.withPool(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO index_contracts (
 				contract_id, source_id, scope_name, version, schema_digest,
 				publication_state, freshness_class, retrieval_class, analyzer_profile,
-				authz_action, created_by_principal_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+				authz_action, created_by_principal_id,
+				embedding_model, embedding_model_version, embedding_dimensions,
+				embedding_source_fields, embedding_preprocessing, embedding_similarity)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
 			c.ContractID, c.SourceID, c.ScopeName, c.Version, c.SchemaDigest,
 			string(c.State), c.FreshnessClass, string(c.RetrievalClass), c.AnalyzerProfile,
-			c.AuthzAction, c.CreatedByPrincipalID)
+			c.AuthzAction, c.CreatedByPrincipalID,
+			emb.model, emb.version, emb.dimensions, emb.fields, emb.preprocessing, emb.similarity)
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: scope %q version %d already exists", domain.ErrConflict, c.ScopeName, c.Version)
 		}
@@ -298,14 +314,58 @@ func (s *PgStore) CreateContract(ctx context.Context, c domain.IndexContract) er
 
 const contractColumns = `contract_id, source_id, scope_name, version, schema_digest,
 	publication_state, freshness_class, retrieval_class, analyzer_profile, authz_action,
-	created_at, published_at, created_by_principal_id`
+	created_at, published_at, created_by_principal_id,
+	embedding_model, embedding_model_version, embedding_dimensions,
+	embedding_source_fields, embedding_preprocessing, embedding_similarity`
+
+// embeddingCols is the nullable column group behind domain.EmbeddingSpec.
+// All NULL for a lexical contract, all set for a semantic one — the
+// index_contracts_embedding_complete CHECK refuses anything in between.
+type embeddingCols struct {
+	model, version, preprocessing, similarity *string
+	dimensions                                *int
+	fields                                    []string
+}
+
+func embeddingColumns(e *domain.EmbeddingSpec) embeddingCols {
+	if e == nil {
+		return embeddingCols{}
+	}
+	fields := append([]string{}, e.SourceFields...)
+	return embeddingCols{
+		model: &e.Model, version: &e.ModelVersion, preprocessing: &e.Preprocessing,
+		similarity: &e.Similarity, dimensions: &e.Dimensions, fields: fields,
+	}
+}
+
+func (c embeddingCols) spec() *domain.EmbeddingSpec {
+	if c.model == nil {
+		return nil
+	}
+	spec := &domain.EmbeddingSpec{Model: *c.model, SourceFields: c.fields}
+	if c.version != nil {
+		spec.ModelVersion = *c.version
+	}
+	if c.dimensions != nil {
+		spec.Dimensions = *c.dimensions
+	}
+	if c.preprocessing != nil {
+		spec.Preprocessing = *c.preprocessing
+	}
+	if c.similarity != nil {
+		spec.Similarity = *c.similarity
+	}
+	return spec
+}
 
 func scanContract(row pgx.Row) (*domain.IndexContract, error) {
 	var c domain.IndexContract
 	var state, retrieval string
+	var emb embeddingCols
 	err := row.Scan(&c.ContractID, &c.SourceID, &c.ScopeName, &c.Version, &c.SchemaDigest,
 		&state, &c.FreshnessClass, &retrieval, &c.AnalyzerProfile, &c.AuthzAction,
-		&c.CreatedAt, &c.PublishedAt, &c.CreatedByPrincipalID)
+		&c.CreatedAt, &c.PublishedAt, &c.CreatedByPrincipalID,
+		&emb.model, &emb.version, &emb.dimensions, &emb.fields, &emb.preprocessing, &emb.similarity)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
 	}
@@ -314,6 +374,7 @@ func scanContract(row pgx.Row) (*domain.IndexContract, error) {
 	}
 	c.State = domain.ContractState(state)
 	c.RetrievalClass = domain.RetrievalClass(retrieval)
+	c.Embedding = emb.spec()
 	return &c, nil
 }
 
@@ -429,6 +490,21 @@ func (s *PgStore) TransitionContract(ctx context.Context, contractID string, fro
 		publishedAt := "published_at"
 		if to == domain.ContractPublished {
 			publishedAt = "now()"
+			// Publishing a new version SUPERSEDES the previous one, in the
+			// same transaction. Only one version may be PUBLISHED (it is what
+			// new generations are built from), and before this the only way
+			// to publish v2 was to retire v1 first — leaving the scope with no
+			// published contract in between. Retiring the old version does
+			// not stop it serving: a generation is projected and searched with
+			// ITS OWN contract, so v1's generation keeps answering until a v2
+			// generation is certified and activated (§8.1, §10.1).
+			if _, err := tx.Exec(ctx, `
+				UPDATE index_contracts SET publication_state = 'RETIRED'
+				WHERE publication_state = 'PUBLISHED'
+				  AND scope_name = (SELECT scope_name FROM index_contracts WHERE contract_id = $1)
+				  AND contract_id <> $1`, contractID); err != nil {
+				return err
+			}
 		}
 		tag, err := tx.Exec(ctx, `
 			UPDATE index_contracts
@@ -478,14 +554,18 @@ func (s *PgStore) CreateGeneration(ctx context.Context, g domain.IndexGeneration
 
 const generationColumns = `generation_id, contract_id, contract_version, scope_name, physical_index,
 	state, build_from, validation_digest, validation_note, activated_at, retired_at,
-	created_at, created_by_principal_id`
+	created_at, created_by_principal_id, backfill_state, backfill_note`
 
 func scanGeneration(row pgx.Row) (*domain.IndexGeneration, error) {
 	var g domain.IndexGeneration
 	var state string
+	var backfill *string
 	err := row.Scan(&g.GenerationID, &g.ContractID, &g.ContractVersion, &g.ScopeName, &g.PhysicalIndex,
 		&state, &g.BuildFrom, &g.ValidationDigest, &g.ValidationNote, &g.ActivatedAt, &g.RetiredAt,
-		&g.CreatedAt, &g.CreatedByPrincipalID)
+		&g.CreatedAt, &g.CreatedByPrincipalID, &backfill, &g.BackfillNote)
+	if backfill != nil {
+		g.BackfillState = domain.BackfillState(*backfill)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
 	}
@@ -580,6 +660,16 @@ func (s *PgStore) TransitionGeneration(ctx context.Context, generationID string,
 	})
 }
 
+// SetBackfillState records a generation's source-replay progress.
+func (s *PgStore) SetBackfillState(ctx context.Context, generationID string, state domain.BackfillState, note string) error {
+	return s.withPool(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE index_generations SET backfill_state = $1, backfill_note = $2
+			WHERE generation_id = $3`, string(state), note, generationID)
+		return err
+	})
+}
+
 // ── ESR-02: checkpoints ──────────────────────────────────────────────────────
 
 func (s *PgStore) UpsertCheckpoint(ctx context.Context, cp domain.IndexCheckpoint) error {
@@ -640,9 +730,15 @@ func (s *PgStore) ListCheckpoints(ctx context.Context, scopeName string) ([]doma
 	return out, err
 }
 
-// GetLatestCheckpoint returns the most recent checkpoint for a scope.
-// Used by the query planner to enforce ESR-012 (INDEX_STALE_FOR_SCOPE).
-func (s *PgStore) GetLatestCheckpoint(ctx context.Context, scopeName string) (*domain.IndexCheckpoint, error) {
+// GetCheckpoint returns the checkpoint for one scope's one partition, or
+// domain.ErrNotFound when none has been recorded yet.
+//
+// By partition, not "latest for the scope". A scope keeps the row of every
+// generation it has ever served, and after a cutover the retired generation's
+// last row is still there; "the most recently observed row" answers correctly
+// only until the first sweep that fails to write the new one — at which point
+// the retired generation's CURRENT would speak for the live index.
+func (s *PgStore) GetCheckpoint(ctx context.Context, scopeName, partition string) (*domain.IndexCheckpoint, error) {
 	var cp domain.IndexCheckpoint
 	var freshness string
 	err := s.withPool(ctx, func(tx pgx.Tx) error {
@@ -650,11 +746,13 @@ func (s *PgStore) GetLatestCheckpoint(ctx context.Context, scopeName string) (*d
 			SELECT scope_name, source_partition, watermark, committed_at, observed_at,
 			       lag_ms, freshness, indexed_live, indexed_tombstoned
 			FROM index_checkpoints
-			WHERE scope_name = $1
-			ORDER BY observed_at DESC LIMIT 1`, scopeName).Scan(
+			WHERE scope_name = $1 AND source_partition = $2`, scopeName, partition).Scan(
 			&cp.ScopeName, &cp.SourcePartition, &cp.Watermark, &cp.CommittedAt,
 			&cp.ObservedAt, &cp.LagMS, &freshness, &cp.IndexedLive, &cp.IndexedTombstoned)
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -907,6 +1005,42 @@ func (s *PgStore) ListTombstones(ctx context.Context, tenantID, scopeName string
 	return out, err
 }
 
+// ListFailedRestrictions returns the source ids of this tenant's restrictions
+// in a scope whose propagation is FAILED — the restriction queue §8.2 and NP-59
+// say makes a scope unsafe.
+//
+// A FAILED tombstone is one the verifier found STILL DISCOVERABLE (or could not
+// check). Until it verifies, the engine may serve content the domain has
+// withdrawn, so every search in the scope excludes these refs at query time
+// and is reported DEGRADED with ESR-018. limit+1 rows are read so the caller
+// can tell "exactly limit" from "more than limit" — past the limit the
+// exclusion list stops being a safe filter and the scope is blocked instead.
+func (s *PgStore) ListFailedRestrictions(ctx context.Context, tenantID, scopeName string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	out := []string{}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT DISTINCT source_id FROM restriction_tombstones
+			WHERE tenant_id = $1 AND scope_name = $2 AND state = 'FAILED'
+			LIMIT $3`, tenantID, scopeName, limit+1)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			out = append(out, id)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // ── ESR-03/04: evidence ──────────────────────────────────────────────────────
 
 func (s *PgStore) RecordEvidence(ctx context.Context, e domain.SearchEvidence) error {
@@ -930,13 +1064,13 @@ func (s *PgStore) RecordEvidence(ctx context.Context, e domain.SearchEvidence) e
 				on_behalf_of_principal, purpose_context, scope_name, query_digest,
 				mandatory_filters_digest, plan_digest, index_generation, partition_set,
 				complexity_score, result_count, suppressed_count, completeness_state,
-				reason_codes, duration_ms, trace_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+				reason_codes, duration_ms, trace_id, embedding_model)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
 			e.EvidenceID, e.TenantID, e.RequestID, e.CorrelationID, e.ActorID, e.WorkloadID,
 			e.OnBehalfOfID, e.Purpose, e.ScopeName, e.QueryDigest,
 			e.FiltersDigest, e.PlanDigest, e.IndexGeneration, e.PartitionSet,
 			e.ComplexityScore, e.ResultCount, e.SuppressedCount, string(e.Completeness),
-			e.ReasonCodes, e.DurationMS, e.TraceID)
+			e.ReasonCodes, e.DurationMS, e.TraceID, e.EmbeddingModel)
 		return err
 	})
 }
@@ -951,7 +1085,7 @@ func (s *PgStore) ListEvidence(ctx context.Context, tenantID, scopeName string, 
 			on_behalf_of_principal, purpose_context, scope_name, query_digest,
 			mandatory_filters_digest, plan_digest, index_generation, partition_set,
 			complexity_score, result_count, suppressed_count, completeness_state,
-			reason_codes, duration_ms, trace_id, created_at`
+			reason_codes, duration_ms, trace_id, created_at, embedding_model`
 		var rows pgx.Rows
 		var err error
 		if scopeName == "" {
@@ -972,7 +1106,7 @@ func (s *PgStore) ListEvidence(ctx context.Context, tenantID, scopeName string, 
 				&e.ActorID, &e.WorkloadID, &e.OnBehalfOfID, &e.Purpose, &e.ScopeName,
 				&e.QueryDigest, &e.FiltersDigest, &e.PlanDigest, &e.IndexGeneration,
 				&e.PartitionSet, &e.ComplexityScore, &e.ResultCount, &e.SuppressedCount,
-				&completeness, &e.ReasonCodes, &e.DurationMS, &e.TraceID, &e.CreatedAt); err != nil {
+				&completeness, &e.ReasonCodes, &e.DurationMS, &e.TraceID, &e.CreatedAt, &e.EmbeddingModel); err != nil {
 				return err
 			}
 			e.Completeness = domain.Completeness(completeness)

@@ -608,7 +608,10 @@ services:
       # authz stub on purpose, because a deployment with a real GOV-03 and a
       # stubbed GOV-04 would satisfy "authorization enforced" while having no
       # segregation control at all.
-      SOD_SERVICE_URL: "${SOD_SERVICE_URL:-}"
+      # GOV-04 maker-checker answers come from authorization-svc's
+      # /v1/sod/evaluate (it owns the SoD rules). Empty used to mean a
+      # permit-everything stub in development.
+      SOD_SERVICE_URL: "${SOD_SERVICE_URL:-http://authorization-svc:8089}"
 
       # Break-glass bounds. The maximum is the ceiling on how long a support
       # engineer can hold standing inside a customer tenant; raising it is a
@@ -695,6 +698,23 @@ services:
       # unreachable. Writes are never served from a stale context.
       TENANT_CONTEXT_STALE_GRACE_SECONDS: "120"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # SEC-INV-05 mTLS to identity-svc (JWKS) and tenant-svc. The gateway's
+      # client side is ready: set either *_ENABLED to "true" and that peer is
+      # called at its https:// *_MTLS_URL with a 1-day certificate from
+      # mtls-management-svc, renewed at half-life. It stays off because
+      # NEITHER PEER HAS AN mTLS LISTENER YET: enabling it now fails every
+      # JWKS fetch or registry read, which refuses every request in the
+      # estate. Turn each on only after its peer serves :8449 with
+      # RequireAndVerifyClientCert (the pattern is authorization-svc's
+      # internal/mtls).
+      IDENTITY_JWKS_MTLS_ENABLED: "false"
+      IDENTITY_JWKS_MTLS_URL: "https://identity-svc:8449/.well-known/jwks.json"
+      TENANT_REGISTRY_MTLS_ENABLED: "false"
+      TENANT_REGISTRY_MTLS_URL: "https://tenant-entity-registry-svc:8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      - mtls_bootstrap_token:/bootstrap:ro
     depends_on:
       identity-svc:
         condition: service_healthy
@@ -839,7 +859,11 @@ services:
       # provenance class S ("client may request context but cannot override
       # result"). A header the gateway sets and this list omits is dropped
       # silently, so any addition in handler.Verify belongs here too.
-      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale"
+      # X-Workload-Id and X-Support-Context-Id are listed but never set by the
+      # gateway: listing them is how they are stripped, since no client can
+      # assert a workload identity or a support session. Must match
+      # gatewayAuthResponseHeaders in gtrm/compiler/emit.go.
+      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale,X-Workload-Id,X-Support-Context-Id"
       - "traefik.http.routers.jurisdiction.middlewares=gateway-auth,jurisdiction-strip"
 
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
@@ -1208,6 +1232,13 @@ services:
       # through ANOTHER replica can still authorize. 0 disables caching
       # entirely. See internal/cache's package comment before raising it.
       AUTHZ_CACHE_TTL_SECONDS: "5"
+      # Governance Control Plane §16 / ZS-IAM-001 §11 on admin commands:
+      # purpose / reason_code on privileged and destructive commands, a finite
+      # end date on a delegation. "warn" admits a command without them, marks
+      # it X-Command-Contract: violated and bounds an open delegation to 90
+      # days; "enforce" refuses. Stays warn until the console and
+      # access-control-svc send the fields.
+      AUTHZ_COMMAND_CONTRACT: "warn"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # siem-integration-svc lives in docker-compose.phase6.yml — reachable
       # only when that file is up alongside this one. Streaming degrades to
@@ -1507,6 +1538,16 @@ services:
       CHECKPOINT_INTERVAL: "60s"
       MAX_RESULT_WINDOW: "100"
       FACET_MIN_COUNT: "2"
+      # R2/R3 hydration (§7.1): one record COLLECTION per source type; the id
+      # is appended. Hydration forwards the caller's envelope and asks as the
+      # caller, so obligations-svc authorizes the person actually looking. Not
+      # a depends_on: an unreachable source suppresses R2 results with ESR-014,
+      # it does not stop search from starting.
+      SOURCE_SERVICE_URL_OBLIGATION: "http://obligations-svc:8088/v1/obligations"
+      # Semantic scopes (§10.1). Deliberately unset: the provider and model are
+      # OD-10, not yet decided. Until set, semantic contracts cannot build and
+      # POST /v1/search/semantic answers ESR-019.
+      # EMBEDDING_PROVIDER_URL: ""
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -1969,6 +2010,32 @@ services:
       # replica is still working on and the recipient gets it twice. 0 is a
       # true off switch, not "sweep everything now".
       NOTIFICATION_STRANDED_AFTER: "${NOTIFICATION_STRANDED_AFTER:-15m}"
+
+      # Provider callbacks are authenticated (ZS-SVC-Y-001 INV-27). With no
+      # secret configured both routes refuse every request — fail closed —
+      # so the development stack sets its own; a real deployment sets these
+      # from the secret store, never from these defaults.
+      #   NCD plane:     POST /v1/provider-events/smtp-primary
+      #   legacy route:  POST /v1/notifications/webhooks/{provider}
+      NCD_CALLBACK_SECRET_SMTP_PRIMARY: "${NCD_CALLBACK_SECRET_SMTP_PRIMARY:-dev-ncd-callback-secret}"
+      # JSON: provider -> list of secrets (several, so one can be rotated);
+      # each at least 16 bytes. Signed as X-Zoiko-Signature: t=<unix>,v1=<hmac>.
+      NOTIFICATION_WEBHOOK_SECRETS: '${NOTIFICATION_WEBHOOK_SECRETS:-{"smtp":["dev-webhook-secret-0123456789"]}}'
+
+      # One-click unsubscribe (RFC 8058). The link's sealed token is the
+      # receiver's only credential; without a secret the service refuses to
+      # send marketing mail at all rather than send it without a working
+      # link. The base URL is where mail clients POST the unsubscribe — the
+      # gateway route in development. A real deployment sets both from the
+      # secret store and its public hostname.
+      NOTIFICATION_UNSUBSCRIBE_SECRET: "${NOTIFICATION_UNSUBSCRIBE_SECRET:-dev-unsubscribe-secret-0123456789abcdef}"
+      NOTIFICATION_PUBLIC_BASE_URL: "${NOTIFICATION_PUBLIC_BASE_URL:-http://localhost:8133}"
+
+      # DKIM signing and the NP-55 sender-authentication monitor. Unset here:
+      # mailpit needs no signature, and a monitor pointed at a domain with no
+      # published records would (correctly) hold all mail. Set
+      # NOTIFICATION_DKIM_DOMAIN, _SELECTOR and _PRIVATE_KEY together when this
+      # service, not the provider, signs.
     depends_on:
       postgres:
         condition: service_healthy
@@ -2158,6 +2225,14 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.access-control.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # This service's identity in authorization-svc: it executes the REVOKE an
+      # access reviewer decides, holding only iam.assignment.revoke (seeded by
+      # seed-demo-rbac.ps1). The reviewer is recorded as the decider.
+      ACS_SERVICE_PRINCIPAL_ID: "svc-access-control"
+      # S9-C2: HR lifecycle events (employee-master, offboarding) open an
+      # EVENT_TRIGGERED review of the linked subject, reviewed by their manager
+      # when linked, else by this principal. Unset turns the consumer off.
+      ACS_EVENT_REVIEW_DEFAULT_REVIEWER: "5eed0000-0000-4000-8000-00000000a001"
     depends_on:
       postgres:
         condition: service_healthy

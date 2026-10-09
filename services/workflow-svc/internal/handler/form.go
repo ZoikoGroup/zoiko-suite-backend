@@ -58,7 +58,7 @@ func (h *Handler) CreateForm(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_fields"})
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, req.LegalEntityID, actionFormManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, req.LegalEntityID, actionFormManage, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -93,7 +93,7 @@ func (h *Handler) GetForm(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -123,7 +123,7 @@ func (h *Handler) PublishForm(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, existing.LegalEntityID, actionFormApprove); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, existing.LegalEntityID, actionFormApprove, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -163,7 +163,7 @@ func (h *Handler) RetireForm(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, existing.LegalEntityID, actionFormApprove); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, existing.LegalEntityID, actionFormApprove, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -229,7 +229,7 @@ func (h *Handler) SaveDraft(w http.ResponseWriter, r *http.Request) {
 		}
 		legalEntityID = form.LegalEntityID
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, legalEntityID, actionFormSubmit); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, legalEntityID, actionFormSubmit, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -274,7 +274,7 @@ func (h *Handler) SubmitForm(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -317,7 +317,7 @@ func (h *Handler) ValidateSubmission(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -360,7 +360,7 @@ func (h *Handler) GetSubmission(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -403,7 +403,7 @@ func (h *Handler) SupersedeSubmission(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -460,7 +460,7 @@ func (h *Handler) RouteToDomain(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -500,7 +500,7 @@ func (h *Handler) GetSubmissionVersion(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -534,7 +534,7 @@ func (h *Handler) GetValidationResult(w http.ResponseWriter, r *http.Request) {
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}
@@ -564,7 +564,7 @@ func (h *Handler) ListPendingSubmissions(w http.ResponseWriter, r *http.Request)
 		h.writeFormErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead, ""); err != nil {
 		h.writeFormAuthzErr(w, err)
 		return
 	}

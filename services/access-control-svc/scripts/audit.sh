@@ -173,7 +173,13 @@ chk "handler registers 10 routes" "$CODE_ROUTES" "10"
 # branching on the code meets one the contract never mentioned.
 SPEC_CODES=$(Q openapi-error-codes openapi.yaml)
 MISSING=0
-for c in $(grep -oE 'writeError\(w, [^,]+, "[a-z_]+"' internal/handler/handler.go | grep -oE '"[a-z_]+"$' | tr -d '"' | sort -u); do
+# handler.go, governance.go (writeError, g.refuse and the fail() mapping) and
+# the Idempotency-Key middleware.
+EMITTED=$( { grep -ohE 'writeError\(w, [^,]+, "[a-z_]+"' internal/handler/handler.go internal/handler/governance.go internal/handler/groups.go internal/handler/subject_links.go | grep -oE '"[a-z_]+"$';
+  grep -ohE 'http\.Status[A-Za-z]+, "[a-z_]+"' internal/handler/governance.go internal/handler/groups.go internal/handler/subject_links.go | grep -oE '"[a-z_]+"$';
+  grep -ohE 'code = [^,]+, "[a-z_]+"' internal/handler/governance.go | grep -oE '"[a-z_]+"$';
+  grep -ohE 'writeErr\(w, [^,]+, "[A-Za-z_]+"' internal/idempotency/middleware.go | grep -oE '"[A-Za-z_]+"$'; } | tr -d '"' | sort -u)
+for c in $EMITTED; do
   echo "$SPEC_CODES" | grep -qx "$c" || { MISSING=$((MISSING+1)); echo "        undocumented: $c"; }
 done
 chk "every emitted error_code is in openapi" "$MISSING" "0"
@@ -183,7 +189,9 @@ echo "-- 6. Event contract matches asyncapi.yaml -------------------------"
 ASPEC=$(Q asyncapi-events asyncapi.yaml)
 PUB=$(cat internal/events/publisher.go)
 MIG=$(cat deployments/migrations/000004_outbox_and_bundle_code_unique.up.sql)
-for e in role.created role.updated permission.bundle.updated; do
+PUB="$PUB $(cat internal/events/governance.go)"
+MIG="$MIG $(cat deployments/migrations/000010_assignment_requests.up.sql)"
+for e in role.created role.updated permission.bundle.updated iam.role.published iam.assignment.requested          iam.assignment.granted iam.assignment.revoked iam.access_review.started iam.access_review.completed; do
   hasf "asyncapi documents $e" "$ASPEC" "$e"
   hasf "publisher emits $e" "$PUB" "$e"
   # The outbox CHECK constraint is the only list a deployment can actually
@@ -265,7 +273,7 @@ REMOTE=$(authzq "SELECT role_code || '|' || active_flag FROM roles WHERE role_id
 chk "role exists and is active in authorization-svc" "$REMOTE" "$CODE|true"
 BC=$(uuid)
 BUNDLE=$(body -X POST "$B/v1/role-definitions/$ROLE_ID/permission-bundles" $(wh "$TEN" "$ME" "$BC") \
-  -d "{\"legal_entity_id\":\"$ENTITY\",\"bundle_code\":\"AUDIT_BUNDLE\",\"permitted_actions\":[\"AUDIT_ACTION_A\"],\"correlation_id\":\"$BC\"}")
+  -d "{\"legal_entity_id\":\"$ENTITY\",\"bundle_code\":\"AUDIT_BUNDLE\",\"permitted_actions\":[\"supplier_invoice.create\"],\"correlation_id\":\"$BC\"}")
 BUNDLE_ID=$(echo "$BUNDLE" | jfield bundle_id)
 if [ -n "$BUNDLE_ID" ]; then ok "attach bundle 201"; else bad "attach bundle: $BUNDLE"; fi
 chk "bundle exists in authorization-svc" \
@@ -274,9 +282,9 @@ chk "bundle exists in authorization-svc" \
 # creating the second replaced the first's actions there, and detaching either
 # retired the bundle both described.
 chk "duplicate bundle_code is 409" \
-  "$(code -X POST "$B/v1/role-definitions/$ROLE_ID/permission-bundles" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"bundle_code\":\"AUDIT_BUNDLE\",\"permitted_actions\":[\"AUDIT_ACTION_B\"],\"correlation_id\":\"$(uuid)\"}")" "409"
+  "$(code -X POST "$B/v1/role-definitions/$ROLE_ID/permission-bundles" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"bundle_code\":\"AUDIT_BUNDLE\",\"permitted_actions\":[\"supplier_invoice.edit\"],\"correlation_id\":\"$(uuid)\"}")" "409"
 chk "duplicate bundle_code error code" \
-  "$(body -X POST "$B/v1/role-definitions/$ROLE_ID/permission-bundles" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"bundle_code\":\"AUDIT_BUNDLE\",\"permitted_actions\":[\"AUDIT_ACTION_B\"],\"correlation_id\":\"$(uuid)\"}" | ecode)" "bundle_code_exists"
+  "$(body -X POST "$B/v1/role-definitions/$ROLE_ID/permission-bundles" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"bundle_code\":\"AUDIT_BUNDLE\",\"permitted_actions\":[\"supplier_invoice.edit\"],\"correlation_id\":\"$(uuid)\"}" | ecode)" "bundle_code_exists"
 # Retirement propagates BEFORE it is recorded. Retiring here without telling
 # authorization-svc left the role fully live while this register displayed
 # RETIRED — a record that disagrees with the enforcement it describes.
@@ -293,6 +301,293 @@ chk "reactivate 200" \
 chk "reactivation restored active_flag" \
   "$(authzq "SELECT active_flag FROM roles WHERE role_id = '$ROLE_ID'")" "t"
 
+echo
+echo "-- 9b. Pre-provisioning guards, live (6 Oct 2026) -----------------"
+# Until 6 Oct the SoD client sent a body authorization-svc refuses (400, no
+# candidate_actions) and every error became 403 sod_conflict, so NO role or
+# bundle could be created; the protected guard read a route nothing serves and
+# skipped itself. These checks prove both guards decide, and decide correctly.
+#
+# Until 6 Oct the dev database carried no SoD rules (the §10.1 baseline was
+# unseeded) and this section installed a tenant fixture rule. authorization-svc
+# 000019 now seeds the baseline globally, so the checks below run against the
+# real Payment Preparer / Payment Releaser rule, in the §5 names the permission
+# taxonomy (000008) registers.
+chk "the §10.1 baseline is seeded globally in authorization-svc"   "$(authzq "SELECT count(*) FROM sod_rules WHERE tenant_id IS NULL AND active_flag AND sod_rule_id::text LIKE '00000000-0000-0000-0101-%'")" "9"
+authzq "DELETE FROM sod_rules WHERE action_a='AUDIT_SOD_A' AND action_b='AUDIT_SOD_B'" >/dev/null
+GCODE="AUDIT_G_$(date +%s)_$RANDOM"
+GR=$(body -X POST "$B/v1/role-definitions/" $(wh "$TEN" "$ME" "$(uuid)") \
+  -d "{\"legal_entity_id\":\"$ENTITY\",\"role_code\":\"$GCODE\",\"role_name\":\"Guard role\",\"role_scope_type\":\"TENANT\",\"correlation_id\":\"$(uuid)\"}")
+GROLE=$(echo "$GR" | jfield role_definition_id)
+if [ -n "$GROLE" ]; then ok "role create is not SoD-refused"; else bad "role create: $GR"; fi
+gbundle() { # $1 corr, $2 code, $3 actions-json
+  body -X POST "$B/v1/role-definitions/$GROLE/permission-bundles" $(wh "$TEN" "$ME" "$1") \
+    -d "{\"legal_entity_id\":\"$ENTITY\",\"bundle_code\":\"$2\",\"permitted_actions\":$3,\"correlation_id\":\"$1\"}"
+}
+GA=$(uuid); GB=$(uuid); GS=$(uuid); GP=$(uuid); GP2=$(uuid)
+chk "first half of a conflicting pair is accepted" "$(gbundle "$GA" G_A '["payment.prepare"]' | jfield bundle_code)" "G_A"
+GBODY=$(gbundle "$GB" G_B '["payment.release"]')
+chk "the other half, in a SECOND bundle of the same role, is refused" "$(echo "$GBODY" | ecode)" "sod_conflict"
+hasf "the refusal names the pair" "$GBODY" "payment.release conflicts with payment.prepare"
+chk "both halves in one bundle are refused" "$(gbundle "$GS" G_S '["payment.prepare","payment.release"]' | ecode)" "sod_conflict"
+chk "a refused bundle never reaches authorization-svc" \
+  "$(authzq "SELECT count(*) FROM permission_bundles WHERE role_id = '$GROLE'")" "1"
+chk "iam.role.manage is protected" "$(gbundle "$GP" G_P '["supplier_invoice.match","iam.role.manage"]' | ecode)" "protected_action"
+chk "PLATFORM_ADMIN is protected" "$(gbundle "$GP2" G_P2 '["PLATFORM_ADMIN"]' | ecode)" "protected_action"
+chk "refusals are recorded as evidence" \
+  "$(psqlq "SELECT string_agg(refusal_reason, ',' ORDER BY refusal_reason) FROM refused_escalations WHERE correlation_id IN ('$GB','$GS','$GP','$GP2')")" \
+  "protected_action,protected_action,sod_conflict,sod_conflict"
+# A caller holding ROLE_MANAGE but not authorization-svc's iam.role.manage is
+# refused THERE. That 403 used to leave this service as 503
+# authz_admin_unavailable: an outage page for a missing grant.
+RMO=77777777-0000-0000-0000-000000000001; RMP=77777777-0000-0000-0000-0000000000aa
+authzq "INSERT INTO roles (role_id, tenant_id, role_code, role_name, role_scope_type, created_by_principal_id)
+          VALUES ('$RMO','$TEN','AUDIT_ROLE_MANAGE_ONLY','Role manage only','LEGAL_ENTITY','audit') ON CONFLICT DO NOTHING;
+        INSERT INTO permission_bundles (role_id, bundle_code, permitted_actions)
+          SELECT '$RMO','RM_ONLY','[\"ROLE_MANAGE\"]' WHERE NOT EXISTS (SELECT 1 FROM permission_bundles WHERE role_id='$RMO');
+        INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+          SELECT '$RMP','$RMO','$ENTITY', now() - interval '1 minute', 'audit'
+          WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments WHERE principal_id='$RMP')" >/dev/null
+sleep 6 # authorization-svc's grant cache
+GF=$(uuid)
+GFB=$(body -X POST "$B/v1/role-definitions/" $(wh "$TEN" "$RMP" "$GF") \
+  -d "{\"legal_entity_id\":\"$ENTITY\",\"role_code\":\"AUDIT_FORBID_$RANDOM\",\"role_name\":\"x\",\"role_scope_type\":\"TENANT\",\"correlation_id\":\"$GF\"}")
+chk "authorization-svc's refusal is 403 provisioning_forbidden, not an outage" "$(echo "$GFB" | ecode)" "provisioning_forbidden"
+hasf "and keeps authorization-svc's reason" "$GFB" "iam.role.manage is required"
+chk "and is recorded" "$(psqlq "SELECT refusal_reason FROM refused_escalations WHERE correlation_id='$GF'")" "provisioning_forbidden"
+
+echo
+echo "-- 9c. Governance surface, live (6 Oct 2026 gap closure) -----------"
+# The rows the 23 Sep audit recorded as unbuilt: §5 taxonomy, §9 system role
+# templates and the 21 §9.1 archetypes, §9/§21 governed assignment requests,
+# §9/§24 access review attestation, and Idempotency-Key binding. Every check
+# runs against the live service and authorization-svc.
+APPROVER=66666666-6666-6666-6666-666666666666
+RUNID=$(date +%s)_$RANDOM
+
+# §5 taxonomy.
+PDEFS=$(body "$B/v1/permission-definitions" $(rh "$TEN" "$ME" "$(uuid)"))
+# 65 §5 names (000008) plus iam.assignment.approve_privileged (000013), the
+# security-approval authority §9's risk-based approval needs.
+chk "permission taxonomy lists the §5 names" "$(echo "$PDEFS" | python -c "import sys,json;print(sum(1 for d in json.load(sys.stdin) if d['naming']=='TAXONOMY'))" | tr -d '\015')" "66"
+hasf "payment.release is CRITICAL in the taxonomy" "$(body "$B/v1/permission-definitions?search=payment.release" $(rh "$TEN" "$ME" "$(uuid)"))" '"risk_tier":"CRITICAL"'
+TXR=$(gbundle "$(uuid)" G_T '["payment.relase"]')
+chk "a misspelt action is refused (unknown_permission)" "$(echo "$TXR" | ecode)" "unknown_permission"
+hasf "the refusal names the action" "$TXR" "payment.relase"
+chk "a taxonomy refusal never reaches authorization-svc" \
+  "$(authzq "SELECT count(*) FROM permission_bundles WHERE role_id = '$GROLE' AND bundle_code='G_T'")" "0"
+
+# §9 templates.
+TPL=$(body "$B/v1/role-templates/" $(rh "$TEN" "$ME" "$(uuid)"))
+chk "the 21 §9.1 archetypes are seeded" "$(echo "$TPL" | python -c "import sys,json;print(sum(1 for t in json.load(sys.stdin) if t['is_archetype']))" | tr -d '\015')" "21"
+chk "template versions are append-only (even for a superuser)" \
+  "$(psqlq "UPDATE role_template_versions SET change_note='tamper' WHERE template_code='TREASURY_RELEASER'" >/dev/null 2>&1; psqlq "SELECT change_note FROM role_template_versions WHERE template_code='TREASURY_RELEASER' AND template_version=1")" "Initial §9.1 archetype"
+PREP=$(body -X POST "$B/v1/role-templates/TREASURY_PREPARER/instantiate" $(wh "$TEN" "$ME" "$(uuid)") \
+  -d "{\"legal_entity_id\":\"$ENTITY\",\"role_code\":\"AUD_TP_$RUNID\",\"correlation_id\":\"$(uuid)\"}")
+PREP_ROLE=$(echo "$PREP" | python -c "import sys,json;print(json.load(sys.stdin)['role']['role_definition_id'])" 2>/dev/null | tr -d '\015')
+PREP_BUNDLE=$(echo "$PREP" | python -c "import sys,json;print(json.load(sys.stdin)['bundle']['bundle_id'])" 2>/dev/null | tr -d '\015')
+if [ -n "$PREP_ROLE" ]; then ok "TREASURY_PREPARER instantiated"; else bad "instantiate: $PREP"; fi
+chk "the template role is provisioned in authorization-svc" "$(authzq "SELECT role_code FROM roles WHERE role_id='$PREP_ROLE'")" "AUD_TP_$RUNID"
+chk "with exactly the template version's actions" \
+  "$(authzq "SELECT permitted_actions::text FROM permission_bundles WHERE role_id='$PREP_ROLE' AND bundle_code='TEMPLATE'")" '["payment.create", "payment.prepare", "payment.submit"]'
+chk "provenance is recorded" "$(psqlq "SELECT template_code||'/'||template_version FROM role_definitions WHERE role_definition_id='$PREP_ROLE'")" "TREASURY_PREPARER/1"
+chk "a template-managed bundle cannot be edited (409)" \
+  "$(body -X PATCH "$B/v1/role-definitions/$PREP_ROLE/permission-bundles/$PREP_BUNDLE" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"permitted_actions\":[\"payment.release\"],\"correlation_id\":\"$(uuid)\"}" | ecode)" "template_managed_bundle"
+chk "an upgrade to the same version is refused" \
+  "$(body -X POST "$B/v1/role-templates/TREASURY_PREPARER/upgrade" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"role_definition_id\":\"$PREP_ROLE\",\"template_version\":1,\"correlation_id\":\"$(uuid)\"}" | ecode)" "template_version_not_newer"
+REL=$(body -X POST "$B/v1/role-templates/TREASURY_RELEASER/instantiate" $(wh "$TEN" "$ME" "$(uuid)") \
+  -d "{\"legal_entity_id\":\"$ENTITY\",\"role_code\":\"AUD_TR_$RUNID\",\"correlation_id\":\"$(uuid)\"}")
+REL_ROLE=$(echo "$REL" | python -c "import sys,json;print(json.load(sys.stdin)['role']['role_definition_id'])" 2>/dev/null | tr -d '\015')
+if [ -n "$REL_ROLE" ]; then ok "TREASURY_RELEASER instantiated"; else bad "instantiate releaser: $REL"; fi
+chk "iam.role.published was enqueued for the instantiation" \
+  "$(psqlq "SELECT count(*) FROM event_outbox WHERE event_type='iam.role.published' AND aggregate_key='$PREP_ROLE'")" "1"
+
+# §9/§21 assignment requests. Subjects are fresh principals per run.
+T1=$(uuid); T2=$(uuid)
+areq() { # $1 caller $2 target $3 role $4 corr
+  body -X POST "$B/v1/iam/access-assignments/" $(wh "$TEN" "$1" "$4") \
+    -d "{\"legal_entity_id\":\"$ENTITY\",\"target_principal_id\":\"$2\",\"role_definition_id\":\"$3\",\"justification\":\"audit $RUNID\",\"correlation_id\":\"$4\"}"
+}
+A1C=$(uuid)
+A1=$(areq "$ME" "$T1" "$PREP_ROLE" "$A1C")
+A1ID=$(echo "$A1" | jfield request_id)
+chk "a STANDARD request is provisioned on submission" "$(echo "$A1" | jfield status)" "PROVISIONED"
+chk "authorization-svc holds the assignment under the request id" \
+  "$(authzq "SELECT principal_id FROM principal_role_assignments WHERE principal_role_assignment_id='$A1ID' AND effective_to IS NULL")" "$T1"
+chk "iam.assignment.granted was enqueued" "$(psqlq "SELECT count(*) FROM event_outbox WHERE event_type='iam.assignment.granted' AND aggregate_key='$A1ID'")" "1"
+chk "a replay of the request answers 200" "$(code -X POST "$B/v1/iam/access-assignments/" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"target_principal_id\":\"$T1\",\"role_definition_id\":\"$PREP_ROLE\",\"justification\":\"audit $RUNID\",\"correlation_id\":\"$A1C\"}")" "200"
+# The §10.1 baseline against what the subject already HOLDS: T1 now prepares
+# payments, so T1 may not also be given release.
+SODA=$(areq "$ME" "$T1" "$REL_ROLE" "$(uuid)")
+chk "releasing for a principal who prepares is refused (held-based SoD)" "$(echo "$SODA" | ecode)" "sod_conflict"
+hasf "the refusal names the held conflict" "$SODA" "payment.release conflicts with payment."
+A2=$(areq "$ME" "$T2" "$REL_ROLE" "$(uuid)")
+A2ID=$(echo "$A2" | jfield request_id)
+chk "a CRITICAL request waits for approval" "$(echo "$A2" | jfield status)" "PENDING_APPROVAL"
+chk "and is not provisioned yet" "$(authzq "SELECT count(*) FROM principal_role_assignments WHERE principal_role_assignment_id='$A2ID'")" "0"
+adec() { # $1 caller $2 id $3 verb
+  body -X POST "$B/v1/iam/access-assignments/$2:$3" $(wh "$TEN" "$1" "$(uuid)") \
+    -d "{\"legal_entity_id\":\"$ENTITY\",\"reason\":\"audit $RUNID\",\"correlation_id\":\"$(uuid)\"}"
+}
+chk "the requester cannot approve their own request" "$(adec "$ME" "$A2ID" approve | ecode)" "self_approval"
+chk "the subject cannot approve their own access" "$(adec "$T2" "$A2ID" approve | ecode)" "forbidden"
+chk "an independent approver provisions it" "$(adec "$APPROVER" "$A2ID" approve | jfield status)" "PROVISIONED"
+chk "provisioned AS the approver" "$(authzq "SELECT assigned_by FROM principal_role_assignments WHERE principal_role_assignment_id='$A2ID'")" "$APPROVER"
+chk "the database refuses a self-approval row outright" \
+  "$(psqlq "UPDATE assignment_requests SET decided_by_principal_id = target_principal_id WHERE request_id='$A2ID'" >/dev/null 2>&1; psqlq "SELECT decided_by_principal_id FROM assignment_requests WHERE request_id='$A2ID'")" "$APPROVER"
+chk "revoke ends the assignment" "$(adec "$ME" "$A1ID" revoke | jfield status)" "REVOKED"
+chk "in authorization-svc too" "$(authzq "SELECT effective_to IS NOT NULL FROM principal_role_assignments WHERE principal_role_assignment_id='$A1ID'")" "t"
+chk "iam.assignment.revoked names the subject, not the revoker" \
+  "$(psqlq "SELECT payload->'payload'->>'principal_id' FROM event_outbox WHERE event_type='iam.assignment.revoked' AND aggregate_key='$A1ID'")" "$T1"
+
+# §9/§24 access review. The CRITICAL releaser assignment (T2) is reviewed by
+# the approver.
+RC=$(body -X POST "$B/v1/access-review-campaigns/" $(wh "$TEN" "$ME" "$(uuid)") \
+  -d "{\"legal_entity_id\":\"$ENTITY\",\"campaign_name\":\"audit $RUNID\",\"review_type\":\"PRIVILEGED\",\"default_reviewer_principal_id\":\"$APPROVER\",\"role_definition_ids\":[\"$REL_ROLE\"],\"due_at\":\"2030-01-01T00:00:00Z\",\"correlation_id\":\"$(uuid)\"}")
+CID=$(echo "$RC" | jfield campaign_id)
+ITEM=$(echo "$RC" | python -c "import sys,json;print(json.load(sys.stdin)['items'][0]['item_id'])" 2>/dev/null | tr -d '\015')
+chk "the campaign snapshots the live assignment" "$(echo "$RC" | python -c "import sys,json;i=json.load(sys.stdin)['items'];print(len(i), i[0]['target_principal_id'], i[0]['risk_tier'])" 2>/dev/null | tr -d '\015')" "1 $T2 CRITICAL"
+chk "iam.access_review.started was enqueued" "$(psqlq "SELECT count(*) FROM event_outbox WHERE event_type='iam.access_review.started' AND aggregate_key='$CID'")" "1"
+rdec() { # $1 caller $2 decision
+  body -X POST "$B/v1/access-review-campaigns/$CID/items/$ITEM/decide" $(wh "$TEN" "$1" "$(uuid)") \
+    -d "{\"legal_entity_id\":\"$ENTITY\",\"decision\":\"$2\",\"reason\":\"audit $RUNID\",\"correlation_id\":\"$(uuid)\"}"
+}
+chk "the subject cannot attest their own access" "$(rdec "$T2" KEEP | ecode)" "self_attestation"
+chk "only the assigned reviewer decides" "$(rdec "$ME" KEEP | ecode)" "not_item_reviewer"
+chk "an undecided CRITICAL item blocks completion" \
+  "$(body -X POST "$B/v1/access-review-campaigns/$CID/complete" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"correlation_id\":\"$(uuid)\"}" | ecode)" "unresolved_high_risk"
+chk "REVOKE by the reviewer is applied" "$(rdec "$APPROVER" REVOKE | jfield revocation_applied)" "True"
+chk "and revokes the assignment in authorization-svc" "$(authzq "SELECT effective_to IS NOT NULL FROM principal_role_assignments WHERE principal_role_assignment_id='$A2ID'")" "t"
+chk "and closes the request that created it" "$(psqlq "SELECT status FROM assignment_requests WHERE request_id='$A2ID'")" "REVOKED"
+chk "the campaign now completes" \
+  "$(body -X POST "$B/v1/access-review-campaigns/$CID/complete" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"correlation_id\":\"$(uuid)\"}" | jfield status)" "COMPLETED"
+chk "iam.access_review.completed was enqueued" "$(psqlq "SELECT count(*) FROM event_outbox WHERE event_type='iam.access_review.completed' AND aggregate_key='$CID'")" "1"
+chk "my access reviews lists the reviewer's item" \
+  "$(body "$B/v1/iam/access-reviews" $(rh "$TEN" "$APPROVER" "$(uuid)") | python -c "import sys,json;print(any(i['item_id']=='$ITEM' for i in json.load(sys.stdin)))" | tr -d '\015')" "True"
+
+
+echo
+echo "-- 9d. Re-audit fixes, live (7 Oct 2026) ---------------------------"
+# Each check pins one gap the 7 Oct re-audit found in the 6 Oct build:
+# entity binding, approval authority by risk, end dates, effective-dated
+# revocation and its expiry sweep, toxic combinations across a tenant-wide and
+# an entity role, dormancy / inactive-subject flags, and the paged list.
+OTHER_ENTITY=44444444-4444-4444-4444-444444444444
+# The ROLE_MANAGE-only principal also manages OTHER_ENTITY, so the entity
+# binding itself is reached (begin's ROLE_MANAGE check passes on the body's entity).
+authzq "INSERT INTO principal_role_assignments (principal_id, role_id, legal_entity_id, effective_from, assigned_by)
+          SELECT '$RMP','$RMO','$OTHER_ENTITY', now() - interval '1 minute', 'audit'
+          WHERE NOT EXISTS (SELECT 1 FROM principal_role_assignments WHERE principal_id='$RMP' AND legal_entity_id='$OTHER_ENTITY')" >/dev/null
+sleep 6 # authorization-svc's grant cache
+areq_end() { # $1 caller $2 target $3 role $4 corr $5 effective_to
+  body -X POST "$B/v1/iam/access-assignments/" $(wh "$TEN" "$1" "$4") \
+    -d "{\"legal_entity_id\":\"$ENTITY\",\"target_principal_id\":\"$2\",\"role_definition_id\":\"$3\",\"justification\":\"audit $RUNID\",\"effective_to\":\"$5\",\"correlation_id\":\"$4\"}"
+}
+isoin() { python -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=$1)).strftime('%Y-%m-%dT%H:%M:%SZ'))" | tr -d '\015'; }
+
+# F4 approval authority by risk: CRITICAL needs a security approver.
+T3=$(uuid)
+A3=$(areq "$ME" "$T3" "$REL_ROLE" "$(uuid)")
+A3ID=$(echo "$A3" | jfield request_id)
+hasf "a CRITICAL request names the security approver it needs" "$A3" "iam.assignment.approve_privileged"
+chk "a ROLE_MANAGE-only approver is refused for a CRITICAL grant" "$(adec "$RMP" "$A3ID" approve | ecode)" "security_approval_required"
+chk "and nothing is provisioned" "$(authzq "SELECT count(*) FROM principal_role_assignments WHERE principal_role_assignment_id='$A3ID'")" "0"
+chk "the refusal is evidence" "$(psqlq "SELECT count(*) FROM refused_escalations WHERE refusal_reason='security_approval_required' AND principal_id='$RMP'" | awk '{print ($1>0)?"yes":"no"}')" "yes"
+chk "a security approver provisions it" "$(adec "$APPROVER" "$A3ID" approve | jfield status)" "PROVISIONED"
+
+# F1 a command's entity is the record's entity.
+T4=$(uuid)
+A4=$(areq "$ME" "$T4" "$REL_ROLE" "$(uuid)")
+A4ID=$(echo "$A4" | jfield request_id)
+chk "a manager of another entity cannot decide this entity's request" \
+  "$(body -X POST "$B/v1/iam/access-assignments/$A4ID:reject" $(wh "$TEN" "$RMP" "$(uuid)") \
+     -d "{\"legal_entity_id\":\"$OTHER_ENTITY\",\"reason\":\"audit $RUNID\",\"correlation_id\":\"$(uuid)\"}" | ecode)" "entity_mismatch"
+chk "and the request is untouched" "$(psqlq "SELECT status FROM assignment_requests WHERE request_id='$A4ID'")" "PENDING_APPROVAL"
+chk "cleanup: the requester cancels it" "$(body -X POST "$B/v1/iam/access-assignments/$A4ID:cancel" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"reason\":\"audit\",\"correlation_id\":\"$(uuid)\"}" | jfield status)" "CANCELLED"
+
+# F2 / F3 end dates, effective-dated revocation, and the expiry sweep.
+chk "an end date in the past is refused" "$(areq_end "$ME" "$(uuid)" "$PREP_ROLE" "$(uuid)" "2020-01-01T00:00:00Z" | ecode)" "invalid_effective_to"
+T5=$(uuid); T6=$(uuid)
+A5END=$(isoin 20)
+A5=$(areq_end "$ME" "$T5" "$PREP_ROLE" "$(uuid)" "$A5END")
+A5ID=$(echo "$A5" | jfield request_id)
+chk "an assignment with an end date is provisioned" "$(echo "$A5" | jfield status)" "PROVISIONED"
+chk "authorization-svc holds the end date" "$(authzq "SELECT effective_to = '$A5END'::timestamptz FROM principal_role_assignments WHERE principal_role_assignment_id='$A5ID'")" "t"
+hasf "iam.assignment.granted carries effective_to" "$(psqlq "SELECT payload::text FROM event_outbox WHERE event_type='iam.assignment.granted' AND aggregate_key='$A5ID'")" '"effective_to"'
+A6=$(areq "$ME" "$T6" "$PREP_ROLE" "$(uuid)")
+A6ID=$(echo "$A6" | jfield request_id)
+chk "a revoke in the past is refused" "$(body -X POST "$B/v1/iam/access-assignments/$A6ID:revoke" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"reason\":\"audit\",\"effective_at\":\"2020-01-01T00:00:00Z\",\"correlation_id\":\"$(uuid)\"}" | ecode)" "invalid_effective_at"
+A6END=$(isoin 20)
+SCH=$(body -X POST "$B/v1/iam/access-assignments/$A6ID:revoke" $(wh "$TEN" "$ME" "$(uuid)") \
+  -d "{\"legal_entity_id\":\"$ENTITY\",\"reason\":\"moves team\",\"effective_at\":\"$A6END\",\"correlation_id\":\"$(uuid)\"}")
+chk "an effective-dated revoke leaves it PROVISIONED until the instant" "$(echo "$SCH" | jfield status)" "PROVISIONED"
+chk "and schedules the end in authorization-svc" "$(authzq "SELECT effective_to = '$A6END'::timestamptz FROM principal_role_assignments WHERE principal_role_assignment_id='$A6ID'")" "t"
+chk "and announces nothing yet" "$(psqlq "SELECT count(*) FROM event_outbox WHERE event_type='iam.assignment.revoked' AND aggregate_key='$A6ID'")" "0"
+chk "a later schedule cannot extend it" "$(body -X POST "$B/v1/iam/access-assignments/$A6ID:revoke" $(wh "$TEN" "$ME" "$(uuid)") -d "{\"legal_entity_id\":\"$ENTITY\",\"reason\":\"x\",\"effective_at\":\"$(isoin 86400)\",\"correlation_id\":\"$(uuid)\"}" | ecode)" "ends_sooner"
+echo "        waiting 55s: both ends (20s) pass, then the expiry sweep (every 30s) runs"
+sleep 55
+chk "the grant-time end closes as EXPIRED" "$(psqlq "SELECT status FROM assignment_requests WHERE request_id='$A5ID'")" "EXPIRED"
+chk "the scheduled end closes as REVOKED" "$(psqlq "SELECT status FROM assignment_requests WHERE request_id='$A6ID'")" "REVOKED"
+chk "each enqueued iam.assignment.revoked naming the subject" \
+  "$(psqlq "SELECT string_agg(payload->'payload'->>'principal_id', ',' ORDER BY aggregate_key) FROM event_outbox WHERE event_type='iam.assignment.revoked' AND aggregate_key IN ('$A5ID','$A6ID')")" \
+  "$( [ "$A5ID" \< "$A6ID" ] && echo "$T5,$T6" || echo "$T6,$T5")"
+chk "the scheduled one is attributed to who scheduled it" "$(psqlq "SELECT payload->>'actor_id' FROM event_outbox WHERE event_type='iam.assignment.revoked' AND aggregate_key='$A6ID'")" "$ME"
+chk "authorization-svc no longer grants either" "$(authzq "SELECT count(*) FROM principal_role_assignments WHERE principal_role_assignment_id IN ('$A5ID','$A6ID') AND (effective_to IS NULL OR effective_to > now())")" "0"
+hasf "the sweep is counted" "$(curl -s -m 10 "$B/metrics")" "access_control_assignments_expired_total"
+
+# F5 toxic combination across a tenant-wide role and an entity role. T7 holds
+# a tenant-wide role X; is then granted the entity-scoped releaser (clean: X
+# grants nothing conflicting); then X gains payment.prepare (§24 "newly
+# introduced SoD conflicts after role/policy changes"). Grouped by
+# (principal, entity) alone, the two never met.
+XC=$(uuid)
+XR=$(body -X POST "$B/v1/role-definitions/" $(wh "$TEN" "$ME" "$XC") \
+  -d "{\"legal_entity_id\":\"$ENTITY\",\"role_code\":\"AUD_TW_$RUNID\",\"role_name\":\"Tenant-wide\",\"role_scope_type\":\"TENANT\",\"correlation_id\":\"$XC\"}")
+XROLE=$(echo "$XR" | jfield role_definition_id)
+XB1=$(uuid)
+chk "tenant-wide role X gets a harmless bundle" "$(body -X POST "$B/v1/role-definitions/$XROLE/permission-bundles" $(wh "$TEN" "$ME" "$XB1") -d "{\"legal_entity_id\":\"$ENTITY\",\"bundle_code\":\"X1\",\"permitted_actions\":[\"supplier_invoice.create\"],\"correlation_id\":\"$XB1\"}" | jfield bundle_code)" "X1"
+T7=$(uuid)
+A7=$(areq "$ME" "$T7" "$XROLE" "$(uuid)"); A7ID=$(echo "$A7" | jfield request_id)
+chk "X is assigned tenant-wide" "$(authzq "SELECT legal_entity_id IS NULL FROM principal_role_assignments WHERE principal_role_assignment_id='$A7ID'")" "t"
+A8=$(areq "$ME" "$T7" "$REL_ROLE" "$(uuid)"); A8ID=$(echo "$A8" | jfield request_id)
+chk "the entity releaser is granted (nothing conflicting held yet)" "$(adec "$APPROVER" "$A8ID" approve | jfield status)" "PROVISIONED"
+XB2=$(uuid)
+chk "X then gains payment.prepare" "$(body -X POST "$B/v1/role-definitions/$XROLE/permission-bundles" $(wh "$TEN" "$ME" "$XB2") -d "{\"legal_entity_id\":\"$ENTITY\",\"bundle_code\":\"X2\",\"permitted_actions\":[\"payment.prepare\"],\"correlation_id\":\"$XB2\"}" | jfield bundle_code)" "X2"
+# F6 fixtures: T7's releaser grant is backdated past a 1-day window (dormant,
+# never used); T8 holds X and is suspended.
+T8=$(uuid)
+A9=$(areq "$ME" "$T8" "$XROLE" "$(uuid)"); A9ID=$(echo "$A9" | jfield request_id)
+authzq "UPDATE principal_role_assignments SET effective_from = now() - interval '3 days' WHERE principal_role_assignment_id='$A8ID';
+        INSERT INTO principal_status_projection (principal_id, tenant_id, status, source_service)
+          VALUES ('$T8', '$TEN', 'SUSPENDED', 'audit') ON CONFLICT (tenant_id, principal_id) DO UPDATE SET status='SUSPENDED'" >/dev/null
+TC=$(body -X POST "$B/v1/access-review-campaigns/" $(wh "$TEN" "$ME" "$(uuid)") \
+  -d "{\"legal_entity_id\":\"$ENTITY\",\"campaign_name\":\"audit toxic $RUNID\",\"review_type\":\"PERIODIC\",\"default_reviewer_principal_id\":\"$APPROVER\",\"role_definition_ids\":[\"$XROLE\",\"$REL_ROLE\"],\"dormancy_days\":1,\"due_at\":\"2030-01-01T00:00:00Z\",\"correlation_id\":\"$(uuid)\"}")
+flags_of() { echo "$TC" | python -c "import sys,json;print(','.join(sorted(f for i in json.load(sys.stdin)['items'] if i['authz_assignment_id']=='$1' for f in i['flags'])))" 2>/dev/null | tr -d '\015'; }
+chk "the tenant-wide half of the combination is flagged" "$(flags_of "$A7ID")" "SOD_CONFLICT"
+chk "the entity half is flagged (and, unused for the window, DORMANT)" "$(flags_of "$A8ID")" "DORMANT,SOD_CONFLICT"
+chk "a suspended subject's assignment is SUBJECT_INACTIVE" "$(flags_of "$A9ID")" "SUBJECT_INACTIVE"
+chk "and raised to HIGH so the campaign cannot close over it" \
+  "$(echo "$TC" | python -c "import sys,json;print([i['risk_tier']+'/'+i['subject_status'] for i in json.load(sys.stdin)['items'] if i['authz_assignment_id']=='$A9ID'][0])" 2>/dev/null | tr -d '\015')" "HIGH/SUSPENDED"
+chk "the campaign records its dormancy window" "$(echo "$TC" | jfield dormancy_days)" "1"
+TCID=$(echo "$TC" | jfield campaign_id)
+chk "completing through another entity is refused" \
+  "$(body -X POST "$B/v1/access-review-campaigns/$TCID/complete" $(wh "$TEN" "$RMP" "$(uuid)") -d "{\"legal_entity_id\":\"$OTHER_ENTITY\",\"correlation_id\":\"$(uuid)\"}" | ecode)" "entity_mismatch"
+
+# Paged list with usage (authorization-svc).
+PG=$(curl -s -m 10 "$AUTHZ/v1/admin/role-assignments?role_id=$REL_ROLE&include_usage=true&limit=1&offset=0" -H "X-Principal-Id: $ME" -H "X-Tenant-Id: $TEN")
+chk "authorization-svc pages the assignment list" "$(echo "$PG" | python -c "import sys,json;print(len(json.load(sys.stdin)))" 2>/dev/null | tr -d '\015')" "1"
+hasf "and reports the subject's status with each row" "$PG" '"principal_status"'
+authzq "DELETE FROM principal_status_projection WHERE principal_id='$T8' AND source_service='audit'" >/dev/null
+# Idempotency-Key: bound to the request, honoured on retry.
+IK=$(uuid); IC=$(uuid)
+IBODY="{\"legal_entity_id\":\"$ENTITY\",\"role_code\":\"AUD_IK_$RUNID\",\"role_name\":\"Idem\",\"role_scope_type\":\"TENANT\",\"correlation_id\":\"$IC\"}"
+chk "first write with a key creates (201)" "$(code -X POST "$B/v1/role-definitions/" $(wh "$TEN" "$ME" "$IK") -d "$IBODY")" "201"
+IREP=$(curl -s -m 25 -D - -X POST "$B/v1/role-definitions/" $(wh "$TEN" "$ME" "$IK") -d "$IBODY")
+hasf "the same key and body replays as 200" "$IREP" "HTTP/1.1 200"
+hasf "and says it is a replay" "$IREP" "X-Idempotent-Replay: true"
+chk "the same key with a different body is refused" \
+  "$(body -X POST "$B/v1/role-definitions/" $(wh "$TEN" "$ME" "$IK") -d "{\"legal_entity_id\":\"$ENTITY\",\"role_code\":\"AUD_IK2_$RUNID\",\"role_name\":\"Idem\",\"role_scope_type\":\"TENANT\",\"correlation_id\":\"$(uuid)\"}" | ecode)" "IDEMPOTENCY_MISMATCH"
+chk "only one role was created" "$(psqlq "SELECT count(*) FROM role_definitions WHERE role_code LIKE 'AUD_IK%_$RUNID'")" "1"
 echo
 echo "-- 10. Read scoping and malformed ids ------------------------------"
 R=$(uuid)
@@ -345,7 +640,8 @@ hasf "role.created reached Kafka" "$KOUT" "\"role_id\": \"$ROLE_ID\""
 hasf "the Kafka envelope names this service" "$KOUT" '"source_service": "access-control-svc"'
 # authorization-svc consumes these and invalidates its cached grant sources. A
 # stale cache there can serve a grant this register has already withdrawn.
-ALOG=$(docker logs authorization-svc 2>&1 | tail -200)
+# AUTHZ_LOG names a log file when authorization-svc runs outside docker.
+if [ -n "${AUTHZ_LOG:-}" ]; then ALOG=$(tail -400 "$AUTHZ_LOG"); else ALOG=$(docker logs authorization-svc 2>&1 | tail -200); fi
 hasf "authorization-svc consumed a grant-graph event" "$ALOG" "grant-graph event: cached grants invalidated"
 
 echo
@@ -413,6 +709,20 @@ hasf "outbox policy admits the named relay" "$(psqlq "SELECT pg_get_expr(polqual
 chk "status CHECK constraint present" "$(psqlq "SELECT count(*) FROM pg_constraint WHERE conname='role_definitions_status_check'")" "1"
 chk "one bundle_code per role is enforced" "$(psqlq "SELECT count(*) FROM pg_indexes WHERE indexname='idx_permission_bundle_defs_role_code'")" "1"
 chk "no duplicate bundle codes exist" "$(psqlq "SELECT count(*) FROM (SELECT 1 FROM permission_bundle_defs GROUP BY tenant_id, role_definition_id, bundle_code HAVING count(*)>1) x")" "0"
+# 000007: the refusal evidence and the protected catalogue.
+chk "refused_escalations FORCE RLS" "$(psqlq "SELECT relforcerowsecurity FROM pg_class WHERE relname='refused_escalations'")" "t"
+chk "protected_permissions FORCE RLS" "$(psqlq "SELECT relforcerowsecurity FROM pg_class WHERE relname='protected_permissions'")" "t"
+chk "refusals are append-only (no UPDATE/DELETE/ALL policy)" \
+  "$(psqlq "SELECT count(*) FROM pg_policies WHERE tablename='refused_escalations' AND cmd IN ('ALL','UPDATE','DELETE')")" "0"
+chk "the catalogue protects the iam.* admin actions" \
+  "$(psqlq "SELECT count(*) FROM protected_permissions WHERE active_flag AND action_name LIKE 'iam.%'")" "12"
+# 000008-000012: the governance tables.
+for t in permission_definitions role_templates role_template_versions assignment_requests access_review_campaigns access_review_items idempotency_keys; do
+  chk "$t FORCE RLS" "$(psqlq "SELECT relforcerowsecurity FROM pg_class WHERE relname='$t'")" "t"
+done
+chk "template versions carry the immutability trigger" "$(psqlq "SELECT count(*) FROM pg_trigger WHERE tgname='role_template_versions_no_update'")" "1"
+chk "assignment_requests refuses self-decision rows" "$(psqlq "SELECT count(*) FROM pg_constraint WHERE conname='assignment_requests_independent_decision'")" "1"
+chk "review items refuse self-attestation rows" "$(psqlq "SELECT count(*) FROM pg_constraint WHERE conname='access_review_items_no_self_attestation'")" "1"
 # Every up has a down.
 UPS=$(ls "$SVC/deployments/migrations"/*.up.sql | wc -l)
 DOWNS=$(ls "$SVC/deployments/migrations"/*.down.sql | wc -l)

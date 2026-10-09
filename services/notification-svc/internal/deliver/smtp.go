@@ -59,6 +59,9 @@ type SMTPProvider struct {
 	from mail.Address
 
 	timeout time.Duration
+
+	signer MessageSigner
+	gate   SendGate
 }
 
 // SMTPConfig is the settings SMTPProvider needs.
@@ -83,6 +86,24 @@ type SMTPConfig struct {
 	// down somewhere a reviewer can see it. config.Load refuses cleartext in
 	// production regardless of this flag.
 	AllowCleartext bool
+
+	// Signer, when set, DKIM-signs every message (ZS-SVC-Y-001 §11.1).
+	Signer MessageSigner
+	// Gate, when set, is consulted before every send. While it reports the
+	// sending domain's authentication broken, mail is held as a retryable
+	// failure — queued, not dropped, and never sent unsigned or spoofable
+	// (NP-55).
+	Gate SendGate
+}
+
+// MessageSigner signs raw RFC 5322 bytes (internal/senderauth.Signer).
+type MessageSigner interface {
+	Sign(raw []byte) ([]byte, error)
+}
+
+// SendGate reports whether mail may be sent now (internal/senderauth.Monitor).
+type SendGate interface {
+	Healthy() (bool, string)
 }
 
 // NewSMTPProvider validates configuration and returns a provider.
@@ -155,6 +176,8 @@ func NewSMTPProvider(cfg SMTPConfig) (*SMTPProvider, error) {
 		tlsMode:  mode,
 		from:     *addr,
 		timeout:  timeout,
+		signer:   cfg.Signer,
+		gate:     cfg.Gate,
 	}, nil
 }
 
@@ -182,10 +205,27 @@ func (p *SMTPProvider) Send(ctx context.Context, msg Message) (string, error) {
 		}
 	}
 
+	// NP-55: while the sending domain's DKIM/DMARC/SPF no longer authenticate
+	// this mail, hold it before anything reaches the relay. Retryable, so the
+	// message waits for the fix instead of being concluded FAILED.
+	if p.gate != nil {
+		if ok, why := p.gate.Healthy(); !ok {
+			return "", Retryable(fmt.Errorf("email stream suspended: sender authentication is failing (NP-55): %s", why))
+		}
+	}
+
 	messageID := fmt.Sprintf("<%s@%s>", uuid.NewString(), p.messageIDDomain(mailFrom))
 	raw, err := p.buildMessage(msg, *to, messageID)
 	if err != nil {
 		return "", err
+	}
+	if p.signer != nil {
+		// A signing failure is a configuration fault, identical for every
+		// message; sending unsigned instead would be the degraded mode NP-55
+		// forbids.
+		if raw, err = p.signer.Sign(raw); err != nil {
+			return "", fmt.Errorf("dkim signing failed: %w", err)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)

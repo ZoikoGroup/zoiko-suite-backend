@@ -37,7 +37,7 @@ func countEvents(t *testing.T, pool *pgxpool.Pool, aggregate, eventType string) 
 // communication.prepared: a communication announces itself when it is created, pinned to its
 // content, before any delivery is attempted.
 func TestEvents_CommunicationPreparedAtCreation(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := newNotification("tenant-ev27", "entity-1", "recipient-1", "corr-prep")
 	n.RenderedContentHash = "abc123"
@@ -65,7 +65,7 @@ func TestEvents_CommunicationPreparedAtCreation(t *testing.T) {
 
 // communication.blocked: a withheld attempt announces itself with the stable reason code.
 func TestEvents_CommunicationBlockedCarriesTheStableCode(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := seedNotification(t, s, "tenant-ev27-b", "corr-blocked")
 	require.NoError(t, s.ScheduleRetry(tenantCtx("tenant-ev27-b"), n.NotificationID, "tenant-ev27-b", "NCD-012 QUIET_HOUR_DEFERRED: held",
@@ -87,7 +87,7 @@ func TestEvents_CommunicationBlockedCarriesTheStableCode(t *testing.T) {
 
 // delivery.evidence.recorded: each new fact announces itself once.
 func TestEvents_EvidenceRecordedOncePerFact(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := sentDirect(t, s, "tenant-ev27-c", "corr-evrec", "<evrec@example.com>")
 	proc := webhook.NewProcessor(s, zap.NewNop())
@@ -106,7 +106,7 @@ func TestEvents_EvidenceRecordedOncePerFact(t *testing.T) {
 // endpoint.suppressed: announced when a suppression is new or changes, never as the raw
 // address, and not again for an unchanged repeat.
 func TestEvents_EndpointSuppressedIsHashedAndNotRepeated(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-ev27-d"
 	const address = "Someone.Private@Example.com"
@@ -140,7 +140,7 @@ func toString(v any) string {
 // notice.deadline.at_risk: raised once, only while delivery or a response is still missing and
 // the deadline is near.
 func TestEvents_NoticeDeadlineAtRiskIsRaisedOnce(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-ev27-e"
 	ctx := tenantCtx(tenant)
@@ -199,7 +199,7 @@ func near2(t *testing.T, s *store.PgStore, ctx context.Context, id string) *doma
 }
 
 func TestMigration000027_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000027_more_canonical_events.down.sql", "000027_more_canonical_events.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)

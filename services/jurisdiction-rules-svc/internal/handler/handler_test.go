@@ -41,6 +41,7 @@ type stubStore struct {
 
 	deactivatedJurisdiction *domain.Jurisdiction
 	deactivateErr           error
+	deactivateChanged       bool
 	deactivateActorID       string
 
 	ruleByID    *domain.JurisdictionRule
@@ -65,6 +66,9 @@ type stubStore struct {
 	driftEvents    []*domain.DriftEvent
 	driftEventsErr error
 
+	statusHistory    []*domain.RuleStatusHistory
+	statusHistoryErr error
+
 	// paging captures what the handler passed down, so the tests can assert
 	// that a rejected limit/offset never reached the store at all.
 	listParams  store.ListParams
@@ -78,10 +82,10 @@ func (s *stubStore) CreateJurisdiction(_ context.Context, p domain.CreateJurisdi
 	return s.createdJurisdiction, s.jurisdictionWasCreated, s.createJurisdictionErr
 }
 
-func (s *stubStore) DeactivateJurisdiction(_ context.Context, _, actorID string) (*domain.Jurisdiction, error) {
+func (s *stubStore) DeactivateJurisdiction(_ context.Context, _, actorID string) (*domain.Jurisdiction, bool, error) {
 	s.storeCalled = true
 	s.deactivateActorID = actorID
-	return s.deactivatedJurisdiction, s.deactivateErr
+	return s.deactivatedJurisdiction, s.deactivateChanged, s.deactivateErr
 }
 
 func (s *stubStore) FindRuleByID(_ context.Context, _ string) (*domain.JurisdictionRule, error) {
@@ -110,6 +114,11 @@ func (s *stubStore) RecordDrift(_ context.Context, p domain.RecordDriftParams) (
 func (s *stubStore) FindDriftEvents(_ context.Context, _ string, _, _ int) ([]*domain.DriftEvent, error) {
 	s.storeCalled = true
 	return s.driftEvents, s.driftEventsErr
+}
+
+func (s *stubStore) FindRuleStatusHistory(_ context.Context, _ string, _, _ int) ([]*domain.RuleStatusHistory, error) {
+	s.storeCalled = true
+	return s.statusHistory, s.statusHistoryErr
 }
 
 func (s *stubStore) FindByID(_ context.Context, _ string) (*domain.Jurisdiction, error) {
@@ -191,6 +200,39 @@ func (s *stubStore) FindRules(_ context.Context, params store.FindRulesParams) (
 	return filtered[offset:end], nil
 }
 
+// CreateJurisdictionWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) CreateJurisdictionWithQuerier(_ context.Context, _ store.Querier, p domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error) {
+	return s.CreateJurisdiction(context.Background(), p)
+}
+
+// DeactivateJurisdictionWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) DeactivateJurisdictionWithQuerier(_ context.Context, _ store.Querier, _, actorID string) (*domain.Jurisdiction, bool, error) {
+	return s.DeactivateJurisdiction(context.Background(), "", actorID)
+}
+
+// CreateRuleWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) CreateRuleWithQuerier(_ context.Context, _ store.Querier, p domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error) {
+	return s.CreateRule(context.Background(), p)
+}
+
+// TransitionRuleStatusWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) TransitionRuleStatusWithQuerier(_ context.Context, _ store.Querier, p store.TransitionParams) (*domain.JurisdictionRule, bool, error) {
+	return s.TransitionRuleStatus(context.Background(), p)
+}
+
+// RecordDriftWithQuerier implements handler.JurisdictionStore.
+func (s *stubStore) RecordDriftWithQuerier(_ context.Context, _ store.Querier, p domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error) {
+	return s.RecordDrift(context.Background(), p)
+}
+
+// WithTransaction implements handler.JurisdictionStore.
+func (s *stubStore) WithTransaction(ctx context.Context, fn func(store.Querier) error) error {
+	// For testing, we just call the function with a nil querier since stubStore
+	// doesn't actually use transactions. The function should work with our
+	// stub methods which ignore the querier parameter.
+	return fn(nil)
+}
+
 // ── spy publisher ─────────────────────────────────────────────────────────────
 
 // spyPublisher records every event the handler emits so tests can assert both
@@ -224,6 +266,10 @@ func (p *spyPublisher) PublishRuleActivated(context.Context, domain.Jurisdiction
 
 func (p *spyPublisher) PublishLegalDriftDetected(context.Context, domain.JurisdictionRule, domain.DriftEvent, string) error {
 	return p.record("legal.drift.detected")
+}
+
+func (p *spyPublisher) FlushPending(context.Context, store.Querier) error {
+	return p.err
 }
 
 func (p *spyPublisher) has(eventType string) bool {
@@ -335,7 +381,7 @@ func TestGetJurisdiction_404_NotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d — body: %s", rr.Code, rr.Body.String())
 	}
 
-	var body map[string]string
+	var body map[string]any
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
@@ -363,7 +409,7 @@ func TestGetJurisdiction_503_StoreUnavailable(t *testing.T) {
 		t.Fatalf("expected 503 on store unavailability, got %d — body: %s", rr.Code, rr.Body.String())
 	}
 
-	var body map[string]string
+	var body map[string]any
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
@@ -491,7 +537,7 @@ func TestListJurisdictions_503_StoreUnavailable(t *testing.T) {
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
@@ -606,7 +652,7 @@ func TestGetAncestors_404_JurisdictionNotFound(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
@@ -626,7 +672,7 @@ func TestGetAncestors_503_StoreUnavailable(t *testing.T) {
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
@@ -875,6 +921,54 @@ func TestGetDriftEvents_200_EmptyArrayNotNull(t *testing.T) {
 func TestGetDriftEvents_404_RuleNotFound(t *testing.T) {
 	h := newTestRouter(&stubStore{driftEventsErr: domain.ErrRuleNotFound})
 	rr := executeRequest(h, httptest.NewRequest(http.MethodGet, "/v1/rules/nope/drift-events", nil))
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rr.Code)
+	}
+}
+
+// ── GetRuleStatusHistory tests ─────────────────────────────────────────────────
+
+func TestGetRuleStatusHistory_200_History(t *testing.T) {
+	h := newTestRouter(&stubStore{statusHistory: []*domain.RuleStatusHistory{
+		{HistoryID: "h-2", JurisdictionRuleID: "r-1", RuleStatus: "ACTIVE"},
+		{HistoryID: "h-1", JurisdictionRuleID: "r-1", RuleStatus: "DRAFT"},
+	}})
+	rr := executeRequest(h, httptest.NewRequest(http.MethodGet, "/v1/rules/r-1/status-history", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	var got []domain.RuleStatusHistory
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode status history: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(got))
+	}
+	if got[0].HistoryID != "h-2" {
+		t.Errorf("expected newest-first ordering, got %q first", got[0].HistoryID)
+	}
+}
+
+// TestGetRuleStatusHistory_200_EmptyArrayNotNull — a rule that has never
+// changed status has a single initial history row; a store returning nil must
+// still surface as an empty array, not null.
+func TestGetRuleStatusHistory_200_EmptyArrayNotNull(t *testing.T) {
+	h := newTestRouter(&stubStore{statusHistory: nil})
+	rr := executeRequest(h, httptest.NewRequest(http.MethodGet, "/v1/rules/r-1/status-history", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if body := rr.Body.String(); len(body) == 0 || body[0] != '[' {
+		t.Errorf("expected JSON array, got: %s", body)
+	}
+}
+
+func TestGetRuleStatusHistory_404_RuleNotFound(t *testing.T) {
+	h := newTestRouter(&stubStore{statusHistoryErr: domain.ErrRuleNotFound})
+	rr := executeRequest(h, httptest.NewRequest(http.MethodGet, "/v1/rules/nope/status-history", nil))
 
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rr.Code)

@@ -260,6 +260,13 @@ type IdentityContextEnvelope struct {
 	// cannot be satisfied by a zero value.
 	SupportContextID *string `json:"support_context_id,omitempty"`
 
+	// SourceChannel is §4's server-resolved source channel, when this service
+	// could establish it (a verified client mapping, or the principal's own
+	// type). gateway-auth-svc stamps X-Source-Channel from it on every request,
+	// so downstream services read a verified channel instead of the client's
+	// header. Empty when only an assertion was available.
+	SourceChannel string `json:"source_channel,omitempty"`
+
 	// Propagation
 	CorrelationID string `json:"correlation_id"`
 	SchemaVersion string `json:"schema_version"`
@@ -489,6 +496,10 @@ type VerifiedClaims struct {
 	Subject  string
 	TenantID string
 	MFADone  bool
+	// ClientID is the IdP token's azp: the OAuth client the person signed in
+	// through (the web console, the mobile app). Verified with the token, so
+	// the channel derived from it is a fact, not an assertion.
+	ClientID string
 }
 
 // ErrAuthorizationDenied is returned when the caller is not authorized for the requested action.
@@ -496,3 +507,9 @@ var ErrAuthorizationDenied = errors.New("authorization denied")
 
 // ErrAuthorizationServiceUnavailable is returned when authorization-svc cannot be reached.
 var ErrAuthorizationServiceUnavailable = errors.New("authorization service unavailable")
+
+// ErrUnknownPrincipal is returned when a projected role assignment names a
+// principal this service has never seen. principal_role_assignments has a
+// foreign key to principals; such a principal cannot hold a session here, so
+// there is nothing for the projection to serve and the event is skipped.
+var ErrUnknownPrincipal = errors.New("principal not known to identity-context-svc")

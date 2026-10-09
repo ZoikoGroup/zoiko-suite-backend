@@ -744,3 +744,171 @@ groups:
             dependencies here: every write calls authorization-svc and fails
             closed, so a healthy pool alone means 100% of writes answer 503.
             /readyz names which one failed. RUNBOOK section 4.5.
+
+  - name: notification
+    # notification-svc (ZS-SVC-Y-001). Each alert names its section in
+    # services/notification-svc/RUNBOOK.md.
+    #
+    # The failures that matter here are quiet by design. An UNKNOWN attempt is
+    # never resent, a missing callback concludes at PROVIDER_ACCEPTED rather
+    # than failing, and broken sender authentication holds mail as retryable.
+    # Each is the correct behaviour and produces no error, so these alerts read
+    # the plane's own backlog gauges (re-read from the database every 15 s)
+    # rather than HTTP status codes.
+    rules:
+      - alert: NotificationUnknownAttemptsAging
+        expr: >-
+          notification_ncd_unknown_oldest_age_seconds{service="notification-svc"} > 1800
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "notification-svc: an attempt has been UNKNOWN for over 30 minutes"
+          description: >-
+            A message may or may not have reached its provider, and nothing will
+            resend it until someone reconciles it (INV-13). The communication is
+            blocked. RUNBOOK section 4.8.
+
+      - alert: NotificationQueueStalled
+        expr: >-
+          notification_ncd_queued_oldest_age_seconds{service="notification-svc"} > 600
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "notification-svc: a due delivery job has waited over 10 minutes"
+          description: >-
+            Jobs are queued past their run time: a provider outage with an open
+            circuit, a paused stream, or a stopped worker. Jobs are preserved and
+            will expire as exceptions, not silently. RUNBOOK sections 4.1 and 4.4.
+
+      # No gauge carries circuit state, so read the outcomes: a binding whose
+      # submissions all fail is the outage the circuit breaker is reacting to.
+      - alert: NotificationProviderFailing
+        expr: >-
+          sum by (binding) (increase(notification_ncd_attempts_total{service="notification-svc",state="FAILED"}[10m])) >= 5
+          unless
+          sum by (binding) (increase(notification_ncd_attempts_total{service="notification-svc",state=~"ACCEPTED|DELIVERED"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "notification-svc: every submission to {{ $labels.binding }} is failing"
+          description: >-
+            Five or more failures and no success in ten minutes. The circuit has
+            most likely opened. Queued mail is held, not lost. RUNBOOK section 4.1.
+
+      - alert: NotificationCallbacksStopped
+        expr: >-
+          sum by (binding) (increase(notification_ncd_callbacks_total{service="notification-svc",outcome!~"rejected_.*"}[1h])) == 0
+          and
+          sum by (binding) (increase(notification_ncd_callbacks_total{service="notification-svc",outcome!~"rejected_.*"}[24h])) > 0
+          and
+          sum by (binding) (increase(notification_ncd_attempts_total{service="notification-svc",state=~"ACCEPTED|DELIVERED"}[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "notification-svc: provider callbacks from {{ $labels.binding }} have stopped"
+          description: >-
+            Callbacks were arriving and none have in an hour, while mail is still
+            accepted. Deliveries now conclude at PROVIDER_ACCEPTED with no bounce
+            or complaint evidence, so suppressions stop growing. RUNBOOK section 4.2.
+
+      - alert: NotificationCallbacksRejected
+        expr: >-
+          sum by (binding, outcome) (increase(notification_ncd_callbacks_total{service="notification-svc",outcome=~"rejected_.*"}[15m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "notification-svc: callbacks from {{ $labels.binding }} rejected ({{ $labels.outcome }})"
+          description: >-
+            Callbacks are arriving and failing authentication, almost always a
+            secret rotated on one side only. Their evidence is being lost.
+            RUNBOOK section 4.2.
+
+      - alert: NotificationSenderAuthBroken
+        expr: >-
+          notification_sender_auth_healthy{service="notification-svc"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "notification-svc: sender authentication broken, all email held"
+          description: >-
+            DKIM, DMARC or SPF for the sending domain no longer authenticates
+            this service's mail, so every email is held as retryable before the
+            relay (NP-55). Assess spoofing as well as fixing DNS. RUNBOOK section 4.3.
+
+      - alert: NotificationComplaintOrBounceSpike
+        expr: >-
+          notification_ncd_open_exceptions{service="notification-svc",kind="REPUTATION_ALERT"} > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "notification-svc: reputation alert open, a sender stream is paused"
+          description: >-
+            Complaints or hard bounces crossed their threshold and the stream was
+            paused automatically (never CRITICAL). GET /v1/reputation for the
+            tenant shows which. RUNBOOK section 4.5.
+
+      - alert: NotificationMisdeliveryOpen
+        expr: >-
+          notification_ncd_open_exceptions{service="notification-svc",kind="MISDELIVERY_INCIDENT"} > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "notification-svc: a misdelivery incident is open"
+          description: >-
+            A message reached the wrong recipient. Sends to that endpoint are
+            stopped and the evidence is preserved; the security/privacy incident
+            workflow needs an owner. RUNBOOK section 4.6.
+
+      - alert: NotificationNoticesPastDeadline
+        expr: >-
+          notification_ncd_notices_past_deadline{service="notification-svc"} > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "notification-svc: a regulated notice is past its deadline"
+          description: >-
+            A regulated notice reached its deadline without a concluded
+            disposition. An alternate or manual service method may still be
+            required. RUNBOOK section 4.7.
+
+      - alert: NotificationRecordHandoffOverdue
+        expr: >-
+          notification_ncd_record_pending_oldest_age_seconds{service="notification-svc"} > 86400
+        labels:
+          severity: warning
+        annotations:
+          summary: "notification-svc: a notice's DRC record declaration is over a day late"
+          description: >-
+            The notice concluded but its evidence package has not been declared
+            as a record (NP-58). RUNBOOK section 4.7.
+
+      - alert: NotificationExceptionsAging
+        expr: >-
+          notification_ncd_open_exception_oldest_age_seconds{service="notification-svc"} > 14400
+        labels:
+          severity: warning
+        annotations:
+          summary: "notification-svc: an exception has been open for over 4 hours"
+          description: >-
+            The plane's human work queue has an item nobody has picked up.
+            GET /v1/exceptions per tenant lists them. RUNBOOK section 2.
+
+      - alert: NotificationOutboxStalled
+        expr: >-
+          notification_outbox_oldest_age_seconds{service="notification-svc"} > 300
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "notification-svc: events undelivered for over 5 minutes"
+          description: >-
+            Delivery facts are committed but not published, so consumers do not
+            see them. Events are safe in event_outbox. Check the relay and the
+            broker. RUNBOOK section 4.4.

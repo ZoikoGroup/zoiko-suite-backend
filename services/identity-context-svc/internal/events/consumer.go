@@ -32,6 +32,16 @@ type RoleDirectory interface {
 	FindPrincipalIDsByRole(ctx context.Context, roleID, tenantID string, now time.Time) ([]string, error)
 }
 
+// RoleAssignmentProjector maintains the principal_role_assignments projection
+// from access-control-svc's governed assignment events. Optional: a
+// RoleDirectory that also implements it (the PgStore does) is fed; one that
+// does not is left alone. See store.UpsertRoleAssignment for why the
+// projection needs a feed at all.
+type RoleAssignmentProjector interface {
+	UpsertRoleAssignment(ctx context.Context, tenantID string, a domain.PrincipalRoleAssignment) error
+	EndRoleAssignment(ctx context.Context, tenantID, assignmentID string, at time.Time) error
+}
+
 // RiskSignalWriter is the write half of the risk cache. Kept separate from the
 // read interface the resolver holds, so the architectural invariant that
 // Resolve() never writes a signal is expressed in the types.
@@ -65,6 +75,9 @@ const dedupeTTL = 24 * time.Hour
 // broker or a Redis, and leaves room for a different backing store later.
 type Deduper interface {
 	Claim(ctx context.Context, eventID string) (bool, error)
+	// Release gives a claim back after the side effect failed, so the retry
+	// (or a redelivery) acts on the event instead of skipping it as seen.
+	Release(ctx context.Context, eventID string) error
 }
 
 // RedisDeduper claims event ids with SET NX EX.
@@ -83,6 +96,10 @@ func NewRedisDeduper(rdb *redis.Client) *RedisDeduper {
 
 func (d *RedisDeduper) Claim(ctx context.Context, eventID string) (bool, error) {
 	return d.rdb.SetNX(ctx, fmt.Sprintf("event:seen:%s", eventID), 1, d.ttl).Result()
+}
+
+func (d *RedisDeduper) Release(ctx context.Context, eventID string) error {
+	return d.rdb.Del(ctx, fmt.Sprintf("event:seen:%s", eventID)).Err()
 }
 
 // Consumer handles inbound domain events that require identity-context-svc to
@@ -106,6 +123,7 @@ func (d *RedisDeduper) Claim(ctx context.Context, eventID string) (bool, error) 
 // why revocation events changed nothing and the risk cache — whose only writer
 // is HandleRiskSignalUpdate — was permanently empty, pinning every resolved
 // session to STANDARD posture with signal source UNAVAILABLE.
+//
 //	legal.hold.*        → project GOV-10's holds so disposition can be refused
 type Consumer struct {
 	log      *zap.Logger
@@ -228,7 +246,11 @@ func (c *Consumer) Run(ctx context.Context, reader *kafka.Reader) {
 	consecutiveFailures := 0
 
 	for {
-		msg, err := reader.ReadMessage(ctx)
+		// FetchMessage, not ReadMessage: ReadMessage commits the offset before
+		// the handler runs, so a failed side effect was committed past and
+		// never retried (S1-2 / R-3). The offset is committed only once the
+		// event has been applied, or given up on after maxApplyAttempts.
+		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, io.EOF) {
 				c.log.Info("event consumer stopped")
@@ -259,13 +281,52 @@ func (c *Consumer) Run(ctx context.Context, reader *kafka.Reader) {
 		c.log.Debug("event received",
 			zap.Int64("offset", msg.Offset),
 			zap.Int("bytes", len(msg.Value)))
-		c.Handle(ctx, msg.Value)
+		if !c.apply(ctx, msg) {
+			return
+		}
+		if err := reader.CommitMessages(ctx, msg); err != nil && ctx.Err() == nil {
+			// Not fatal: the event is applied, and a redelivery is deduplicated.
+			c.log.Warn("kafka commit failed", zap.Int64("offset", msg.Offset), zap.Error(err))
+		}
+	}
+}
+
+// maxApplyAttempts bounds the retries of one event. With the backoff capped
+// at 30 s this is roughly ten minutes: long enough to ride out a Redis or
+// database restart, short enough that one poisoned event cannot stall every
+// revocation behind it on the partition forever. Giving up is logged at ERROR
+// with the event, so it is never silent.
+const maxApplyAttempts = 25
+
+// apply handles one message, retrying a failed side effect with backoff.
+// Returns false only when ctx ended.
+func (c *Consumer) apply(ctx context.Context, msg kafka.Message) bool {
+	backoff := time.Second
+	for attempt := 1; ; attempt++ {
+		err := c.Handle(ctx, msg.Value)
+		if err == nil {
+			return true
+		}
+		if attempt >= maxApplyAttempts {
+			c.log.Error("event could not be applied after retries — GIVING UP; its revocation or projection did not happen",
+				zap.Int64("offset", msg.Offset), zap.Int("attempts", attempt), zap.Error(err))
+			return true
+		}
+		c.log.Warn("event apply failed — retrying", zap.Int("attempt", attempt), zap.Duration("backoff", backoff), zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
 	}
 }
 
 // Handle decodes one event and dispatches it. Exported so it can be driven
 // directly in tests without a broker.
-func (c *Consumer) Handle(ctx context.Context, raw []byte) {
+func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 	// A leading UTF-8 BOM is not valid JSON and encoding/json rejects it.
 	// Producers on Windows emit one readily — PowerShell adds it to piped
 	// output — and dropping an otherwise well-formed revocation over three
@@ -277,12 +338,12 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 		// Not retryable — the same bytes will fail the same way. Logged and
 		// dropped rather than blocking the partition behind it.
 		c.log.Error("undecodable event — dropped", zap.Error(err))
-		return
+		return nil
 	}
 	if ev.EventID == "" {
 		c.log.Error("event has no event_id — dropped, cannot be deduplicated",
 			zap.String("event_type", ev.EventType))
-		return
+		return nil
 	}
 
 	// ── Self-source guard ────────────────────────────────────────────────────
@@ -304,33 +365,41 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 		c.log.Debug("own event ignored",
 			zap.String("event_type", ev.EventType),
 			zap.String("event_id", ev.EventID))
-		return
+		return nil
 	}
 
 	switch ev.EventType {
-	case "authority.revoked", "authority.expired", "role.updated", "entity.updated":
+	case "authority.revoked", "authority.expired", "authority.suspended", "role.updated", "entity.updated",
+		"iam.assignment.revoked":
 		if c.stale(ev) {
-			return
+			return nil
 		}
 	}
 
 	switch ev.EventType {
-	case "authority.revoked", "authority.expired":
-		c.handleAuthorityEnded(ctx, ev)
+	// A suspended delegation confers nothing until it is resumed (ORG-06
+	// lifecycle), so the delegate's sessions end exactly as on a revocation.
+	// authority.resumed needs nothing: like authority.delegated it ADDS access.
+	case "authority.revoked", "authority.expired", "authority.suspended":
+		return c.handleAuthorityEnded(ctx, ev)
 	case "authority.delegated":
-		c.handleAuthorityDelegated(ctx, ev)
+		return c.handleAuthorityDelegated(ctx, ev)
 	case "role.updated":
-		c.handleRoleUpdated(ctx, ev)
+		return c.handleRoleUpdated(ctx, ev)
+	case "iam.assignment.revoked":
+		return c.handleAssignmentRevoked(ctx, ev)
+	case "iam.assignment.granted":
+		return c.handleAssignmentGranted(ctx, ev)
 	case "entity.updated":
-		c.handleEntityUpdated(ctx, ev)
+		return c.handleEntityUpdated(ctx, ev)
 	case "session.risk.changed", "risk.signal.updated":
-		c.handleRiskSignal(ctx, ev)
+		return c.handleRiskSignal(ctx, ev)
 	case "legal.hold.issued", "LegalHoldIssued":
-		c.handleLegalHoldIssued(ctx, ev)
+		return c.handleLegalHoldIssued(ctx, ev)
 	case "legal.hold.scope_changed", "HoldScopeChanged":
-		c.handleLegalHoldIssued(ctx, ev)
+		return c.handleLegalHoldIssued(ctx, ev)
 	case "legal.hold.released", "LegalHoldReleased":
-		c.handleLegalHoldReleased(ctx, ev)
+		return c.handleLegalHoldReleased(ctx, ev)
 	case "tenant.created":
 		// Acknowledged deliberately. There is no tenant cache to pre-warm —
 		// tenant validity is read live from the registry on every resolve.
@@ -338,6 +407,7 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 	default:
 		c.log.Debug("unhandled event type", zap.String("event_type", ev.EventType))
 	}
+	return nil
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -345,7 +415,7 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 // handleAuthorityEnded revokes every session held by the delegate. This is the
 // hardest case: an active session must stop carrying a delegation that no
 // longer exists, and it must stop now rather than at envelope expiry.
-func (c *Consumer) handleAuthorityEnded(ctx context.Context, ev inbound) {
+func (c *Consumer) handleAuthorityEnded(ctx context.Context, ev inbound) error {
 	var p struct {
 		DelegatePrincipalID string `json:"delegate_principal_id"`
 		PrincipalID         string `json:"principal_id"`
@@ -360,20 +430,20 @@ func (c *Consumer) handleAuthorityEnded(ctx context.Context, ev inbound) {
 	if principalID == "" {
 		c.log.Error("authority event names no delegate — cannot revoke",
 			zap.String("event_id", ev.EventID), zap.String("event_type", ev.EventType))
-		return
+		return nil
 	}
 	if !c.requireTenant(ev) || !c.claim(ctx, ev.EventID) {
-		return
+		return nil
 	}
 
 	n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonDelegationRevoked)
 	if err != nil {
-		c.log.Error("failed to revoke sessions for delegate",
+		c.log.Error("failed to revoke sessions for delegate — will retry",
 			zap.String("principal_id", principalID),
 			zap.String("correlation_id", ev.CorrelationID),
 			zap.Error(err),
 		)
-		return
+		return c.retry(ctx, ev, err)
 	}
 	c.log.Warn("authority ended — sessions revoked",
 		zap.String("event_type", ev.EventType),
@@ -381,6 +451,7 @@ func (c *Consumer) handleAuthorityEnded(ctx context.Context, ev inbound) {
 		zap.Int("sessions_revoked", n),
 		zap.String("correlation_id", ev.CorrelationID),
 	)
+	return nil
 }
 
 // handleAuthorityDelegated records the grant and revokes nothing.
@@ -389,12 +460,13 @@ func (c *Consumer) handleAuthorityEnded(ctx context.Context, ev inbound) {
 // everyone out to hand them a privilege they did not ask for yet, and the next
 // resolve picks the delegation up regardless because delegations are read from
 // the store on every resolution rather than cached.
-func (c *Consumer) handleAuthorityDelegated(ctx context.Context, ev inbound) {
+func (c *Consumer) handleAuthorityDelegated(ctx context.Context, ev inbound) error {
 	if !c.claim(ctx, ev.EventID) {
-		return
+		return nil
 	}
 	c.log.Info("authority.delegated — no revocation required",
 		zap.String("correlation_id", ev.CorrelationID))
+	return nil
 }
 
 // handleRoleUpdated revokes the sessions of every principal holding the role.
@@ -402,7 +474,7 @@ func (c *Consumer) handleAuthorityDelegated(ctx context.Context, ev inbound) {
 // A role's permission bundles are copied into the envelope at resolve time, so
 // changing what a role grants leaves every live envelope asserting the old
 // grant. Revoking forces the next request to re-resolve against current state.
-func (c *Consumer) handleRoleUpdated(ctx context.Context, ev inbound) {
+func (c *Consumer) handleRoleUpdated(ctx context.Context, ev inbound) error {
 	var p struct {
 		RoleID string `json:"role_id"`
 	}
@@ -410,20 +482,23 @@ func (c *Consumer) handleRoleUpdated(ctx context.Context, ev inbound) {
 	if p.RoleID == "" {
 		c.log.Error("role.updated names no role_id — cannot revoke",
 			zap.String("event_id", ev.EventID))
-		return
+		return nil
 	}
 	if !c.requireTenant(ev) || !c.claim(ctx, ev.EventID) {
-		return
+		return nil
 	}
 
 	principals, err := c.roles.FindPrincipalIDsByRole(ctx, p.RoleID, ev.TenantID, time.Now().UTC())
 	if err != nil {
-		c.log.Error("failed to resolve principals for updated role",
+		c.log.Error("failed to resolve principals for updated role — will retry",
 			zap.String("role_id", p.RoleID), zap.Error(err))
-		return
+		return c.retry(ctx, ev, err)
 	}
 
+	// Every holder is attempted; one failure fails the event, and the retry
+	// evicts them all again (an eviction is idempotent).
 	total := 0
+	var firstErr error
 	for _, principalID := range principals {
 		n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
 		if err != nil {
@@ -432,9 +507,15 @@ func (c *Consumer) handleRoleUpdated(ctx context.Context, ev inbound) {
 				zap.String("role_id", p.RoleID),
 				zap.Error(err),
 			)
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		total += n
+	}
+	if firstErr != nil {
+		return c.retry(ctx, ev, firstErr)
 	}
 	c.log.Info("role.updated — sessions revoked",
 		zap.String("role_id", p.RoleID),
@@ -442,10 +523,115 @@ func (c *Consumer) handleRoleUpdated(ctx context.Context, ev inbound) {
 		zap.Int("sessions_revoked", total),
 		zap.String("correlation_id", ev.CorrelationID),
 	)
+	return nil
+}
+
+// handleAssignmentRevoked revokes every session of the principal whose
+// assignment ended (access-control-svc, Authorization Standard §9 / §19).
+//
+// role.updated cannot do this job: it resolves the role's holders NOW, and a
+// principal whose assignment was just revoked is no longer among them, so the
+// one session that most needs ending was the one it could never find. The
+// subject is payload.principal_id; ev.ActorID is the revoker and is never used.
+func (c *Consumer) handleAssignmentRevoked(ctx context.Context, ev inbound) error {
+	var p struct {
+		PrincipalID       string `json:"principal_id"`
+		TargetPrincipalID string `json:"target_principal_id"`
+		RoleID            string `json:"role_id"`
+		AssignmentID      string `json:"assignment_id"`
+	}
+	_ = json.Unmarshal(ev.Payload, &p)
+	principalID := firstNonEmpty(p.PrincipalID, p.TargetPrincipalID)
+	if principalID == "" {
+		c.log.Error("iam.assignment.revoked names no principal — cannot revoke",
+			zap.String("event_id", ev.EventID))
+		return nil
+	}
+	if !c.requireTenant(ev) || !c.claim(ctx, ev.EventID) {
+		return nil
+	}
+	// Close the projection first, so the re-resolve the eviction forces does
+	// not frame the revoked role back into the next envelope.
+	if proj, ok := c.roles.(RoleAssignmentProjector); ok && p.AssignmentID != "" {
+		if err := proj.EndRoleAssignment(ctx, ev.TenantID, p.AssignmentID, c.now()); err != nil {
+			c.log.Error("failed to close projected role assignment — will retry",
+				zap.String("assignment_id", p.AssignmentID), zap.Error(err))
+			return c.retry(ctx, ev, err)
+		}
+	}
+	n, err := c.sessions.EvictAllForPrincipal(ctx, principalID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
+	if err != nil {
+		c.log.Error("failed to revoke sessions after assignment revocation — will retry",
+			zap.String("principal_id", principalID),
+			zap.String("role_id", p.RoleID),
+			zap.String("correlation_id", ev.CorrelationID),
+			zap.Error(err))
+		return c.retry(ctx, ev, err)
+	}
+	c.log.Warn("assignment revoked — sessions revoked",
+		zap.String("principal_id", principalID),
+		zap.String("role_id", p.RoleID),
+		zap.Int("sessions_revoked", n),
+		zap.String("correlation_id", ev.CorrelationID))
+	return nil
+}
+
+// handleAssignmentGranted projects a governed assignment into
+// principal_role_assignments, so the next resolve frames the role and a later
+// role.updated finds this principal among its holders. Revokes nothing: a new
+// assignment only adds access.
+func (c *Consumer) handleAssignmentGranted(ctx context.Context, ev inbound) error {
+	proj, ok := c.roles.(RoleAssignmentProjector)
+	if !ok {
+		return nil
+	}
+	var p struct {
+		AssignmentID  string    `json:"assignment_id"`
+		PrincipalID   string    `json:"principal_id"`
+		RoleID        string    `json:"role_id"`
+		LegalEntityID string    `json:"legal_entity_id"`
+		EffectiveFrom time.Time `json:"effective_from"`
+		// EffectiveTo is the assignment's end date when it was granted with
+		// one. Projected, so a resolve after it stops framing the role even
+		// before the expiry's iam.assignment.revoked arrives.
+		EffectiveTo time.Time `json:"effective_to"`
+	}
+	_ = json.Unmarshal(ev.Payload, &p)
+	if p.AssignmentID == "" || p.PrincipalID == "" || p.RoleID == "" {
+		c.log.Error("iam.assignment.granted is missing assignment_id, principal_id or role_id — not projected",
+			zap.String("event_id", ev.EventID))
+		return nil
+	}
+	if !c.requireTenant(ev) || !c.claim(ctx, ev.EventID) {
+		return nil
+	}
+	a := domain.PrincipalRoleAssignment{
+		AssignmentID: p.AssignmentID, PrincipalID: p.PrincipalID, RoleID: p.RoleID,
+		EffectiveFrom: p.EffectiveFrom, EffectiveTo: p.EffectiveTo, AssignedBy: ev.ActorID,
+	}
+	if a.EffectiveFrom.IsZero() {
+		a.EffectiveFrom = c.now()
+	}
+	if p.LegalEntityID != "" {
+		a.LegalEntityID = &p.LegalEntityID
+	}
+	switch err := proj.UpsertRoleAssignment(ctx, ev.TenantID, a); {
+	case errors.Is(err, domain.ErrUnknownPrincipal):
+		c.log.Info("iam.assignment.granted for a principal with no identity here — nothing to project",
+			zap.String("principal_id", p.PrincipalID))
+	case err != nil:
+		c.log.Error("failed to project role assignment — will retry",
+			zap.String("assignment_id", p.AssignmentID), zap.Error(err))
+		return c.retry(ctx, ev, err)
+	default:
+		c.log.Info("iam.assignment.granted — role assignment projected",
+			zap.String("principal_id", p.PrincipalID), zap.String("role_id", p.RoleID))
+	}
+	return nil
 }
 
 // handleEntityUpdated revokes sessions scoped to the changed legal entity.
-func (c *Consumer) handleEntityUpdated(ctx context.Context, ev inbound) {
+func (c *Consumer) handleEntityUpdated(ctx context.Context, ev inbound) error {
 	var p struct {
 		LegalEntityID string `json:"legal_entity_id"`
 	}
@@ -455,23 +641,24 @@ func (c *Consumer) handleEntityUpdated(ctx context.Context, ev inbound) {
 	if legalEntityID == "" {
 		c.log.Error("entity.updated names no legal_entity_id — cannot revoke",
 			zap.String("event_id", ev.EventID))
-		return
+		return nil
 	}
 	if !c.requireTenant(ev) || !c.claim(ctx, ev.EventID) {
-		return
+		return nil
 	}
 
 	n, err := c.sessions.EvictAllForEntity(ctx, legalEntityID, ev.TenantID, domain.InvalidationReasonAdminRevoke)
 	if err != nil {
-		c.log.Error("failed to revoke sessions for entity",
+		c.log.Error("failed to revoke sessions for entity — will retry",
 			zap.String("legal_entity_id", legalEntityID), zap.Error(err))
-		return
+		return c.retry(ctx, ev, err)
 	}
 	c.log.Info("entity.updated — sessions revoked",
 		zap.String("legal_entity_id", legalEntityID),
 		zap.Int("sessions_revoked", n),
 		zap.String("correlation_id", ev.CorrelationID),
 	)
+	return nil
 }
 
 // handleRiskSignal writes a signal into the cache the resolver reads.
@@ -479,23 +666,23 @@ func (c *Consumer) handleEntityUpdated(ctx context.Context, ev inbound) {
 // This is the ONLY writer. Resolve() reads the cache and never calls out, so
 // without this path every session resolves at STANDARD posture with source
 // UNAVAILABLE and HIGH_RISK/BLOCKED are unreachable.
-func (c *Consumer) handleRiskSignal(ctx context.Context, ev inbound) {
+func (c *Consumer) handleRiskSignal(ctx context.Context, ev inbound) error {
 	var signal domain.RiskSignalCache
 	if err := json.Unmarshal(ev.Payload, &signal); err != nil {
 		c.log.Error("undecodable risk signal payload — dropped",
 			zap.String("event_id", ev.EventID), zap.Error(err))
-		return
+		return nil
 	}
 	if signal.PrincipalID == "" {
 		c.log.Error("risk signal names no principal — dropped",
 			zap.String("event_id", ev.EventID))
-		return
+		return nil
 	}
 	if signal.TenantID == "" {
 		signal.TenantID = ev.TenantID
 	}
 	if !c.claim(ctx, ev.EventID) {
-		return
+		return nil
 	}
 
 	// A signal with no valid_to is not cacheable: UpsertSignal computes its TTL
@@ -510,20 +697,20 @@ func (c *Consumer) handleRiskSignal(ctx context.Context, ev inbound) {
 			zap.String("event_id", ev.EventID),
 			zap.String("principal_id", signal.PrincipalID),
 			zap.String("signal_source", signal.SignalSource))
-		return
+		return nil
 	}
 	if !signal.ValidTo.After(time.Now()) {
 		c.log.Warn("risk signal already expired on arrival — dropped",
 			zap.String("event_id", ev.EventID),
 			zap.String("principal_id", signal.PrincipalID),
 			zap.Time("valid_to", signal.ValidTo))
-		return
+		return nil
 	}
 
 	if err := c.risk.UpsertSignal(ctx, signal); err != nil {
-		c.log.Error("failed to write risk signal",
+		c.log.Error("failed to write risk signal — will retry",
 			zap.String("principal_id", signal.PrincipalID), zap.Error(err))
-		return
+		return c.retry(ctx, ev, err)
 	}
 	c.log.Info("risk signal cached",
 		zap.String("principal_id", signal.PrincipalID),
@@ -531,6 +718,7 @@ func (c *Consumer) handleRiskSignal(ctx context.Context, ev inbound) {
 		zap.String("signal_source", signal.SignalSource),
 		zap.Time("valid_to", signal.ValidTo),
 	)
+	return nil
 }
 
 // ── Legal hold projection (GOV-10 → local read model) ────────────────────────
@@ -541,7 +729,7 @@ func (c *Consumer) handleRiskSignal(ctx context.Context, ev inbound) {
 // not a log: what matters downstream is "is this record held right now", and
 // both events answer that the same way. The distinction lives in GOV-10, which
 // owns the matter.
-func (c *Consumer) handleLegalHoldIssued(ctx context.Context, ev inbound) {
+func (c *Consumer) handleLegalHoldIssued(ctx context.Context, ev inbound) error {
 	var p struct {
 		HoldID      string     `json:"hold_id"`
 		MatterRef   string     `json:"matter_ref"`
@@ -552,12 +740,12 @@ func (c *Consumer) handleLegalHoldIssued(ctx context.Context, ev inbound) {
 	if err := json.Unmarshal(ev.Payload, &p); err != nil {
 		c.log.Error("undecodable legal hold payload — dropped",
 			zap.String("event_id", ev.EventID), zap.Error(err))
-		return
+		return nil
 	}
 	if p.HoldID == "" {
 		c.log.Error("legal hold names no hold_id — dropped",
 			zap.String("event_id", ev.EventID))
-		return
+		return nil
 	}
 
 	tenantID := firstNonEmpty(p.TenantID, ev.TenantID)
@@ -569,10 +757,10 @@ func (c *Consumer) handleLegalHoldIssued(ctx context.Context, ev inbound) {
 		c.log.Error("legal hold names no tenant — CANNOT PROJECT, disposition may proceed",
 			zap.String("event_id", ev.EventID),
 			zap.String("hold_id", p.HoldID))
-		return
+		return nil
 	}
 	if !c.claim(ctx, ev.EventID) {
-		return
+		return nil
 	}
 
 	issuedAt := ev.EmittedAt
@@ -596,9 +784,9 @@ func (c *Consumer) handleLegalHoldIssued(ctx context.Context, ev inbound) {
 	}
 
 	if err := c.holds.UpsertLegalHold(ctx, hold); err != nil {
-		c.log.Error("failed to project legal hold — disposition may proceed on held records",
+		c.log.Error("failed to project legal hold — will retry",
 			zap.String("hold_id", p.HoldID), zap.Error(err))
-		return
+		return c.retry(ctx, ev, err)
 	}
 	c.log.Info("legal hold projected",
 		zap.String("hold_id", p.HoldID),
@@ -606,10 +794,11 @@ func (c *Consumer) handleLegalHoldIssued(ctx context.Context, ev inbound) {
 		zap.String("matter_ref", p.MatterRef),
 		zap.Bool("tenant_wide", hold.PrincipalID == nil),
 	)
+	return nil
 }
 
 // handleLegalHoldReleased marks a hold released so disposition may resume.
-func (c *Consumer) handleLegalHoldReleased(ctx context.Context, ev inbound) {
+func (c *Consumer) handleLegalHoldReleased(ctx context.Context, ev inbound) error {
 	var p struct {
 		HoldID     string     `json:"hold_id"`
 		TenantID   string     `json:"tenant_id"`
@@ -618,21 +807,21 @@ func (c *Consumer) handleLegalHoldReleased(ctx context.Context, ev inbound) {
 	if err := json.Unmarshal(ev.Payload, &p); err != nil {
 		c.log.Error("undecodable legal hold release payload — dropped",
 			zap.String("event_id", ev.EventID), zap.Error(err))
-		return
+		return nil
 	}
 	if p.HoldID == "" {
 		c.log.Error("legal hold release names no hold_id — dropped",
 			zap.String("event_id", ev.EventID))
-		return
+		return nil
 	}
 	tenantID := firstNonEmpty(p.TenantID, ev.TenantID)
 	if tenantID == "" {
 		c.log.Error("legal hold release names no tenant — dropped",
 			zap.String("event_id", ev.EventID), zap.String("hold_id", p.HoldID))
-		return
+		return nil
 	}
 	if !c.claim(ctx, ev.EventID) {
-		return
+		return nil
 	}
 
 	releasedAt := orNow(ev.EmittedAt)
@@ -641,13 +830,14 @@ func (c *Consumer) handleLegalHoldReleased(ctx context.Context, ev inbound) {
 	}
 
 	if err := c.holds.ReleaseLegalHold(ctx, p.HoldID, tenantID, ev.EventID, releasedAt); err != nil {
-		c.log.Error("failed to release projected legal hold",
+		c.log.Error("failed to release projected legal hold — will retry",
 			zap.String("hold_id", p.HoldID), zap.Error(err))
-		return
+		return c.retry(ctx, ev, err)
 	}
 	c.log.Info("legal hold released",
 		zap.String("hold_id", p.HoldID),
 		zap.String("tenant_id", tenantID))
+	return nil
 }
 
 // orNow substitutes the current time for a zero timestamp. Producers should
@@ -679,6 +869,19 @@ func (c *Consumer) claim(ctx context.Context, eventID string) bool {
 		c.log.Debug("duplicate event — skipped", zap.String("event_id", eventID))
 	}
 	return ok
+}
+
+// retry gives the event's claim back and returns a retryable error, so Run
+// applies it again instead of committing past a side effect that did not
+// happen (GOV-01 NP4; invariant 10, at-least-once). The claim used to be kept
+// on failure, which turned a single failed eviction into a lost revocation:
+// the redelivery found the id "seen" and skipped it.
+func (c *Consumer) retry(ctx context.Context, ev inbound, err error) error {
+	if rerr := c.dedupe.Release(ctx, ev.EventID); rerr != nil {
+		c.log.Warn("could not release the event claim; the retry may skip it until the claim expires",
+			zap.String("event_id", ev.EventID), zap.Error(rerr))
+	}
+	return fmt.Errorf("%s %s: %w", ev.EventType, ev.EventID, err)
 }
 
 // requireTenant refuses an event that names no tenant.

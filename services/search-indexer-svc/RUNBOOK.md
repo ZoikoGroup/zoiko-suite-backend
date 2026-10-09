@@ -112,8 +112,21 @@ A `FAILED` tombstone whose reason is *"content is still discoverable after
 propagation"* means **the content is discoverable right now**. Treat as a
 disclosure incident.
 
-**Immediate containment** — §8.2 permits blocking or degrading the affected
-scope rather than continuing known over-disclosure. The safe lever is to
+**Automatic containment (since 30 Sep 2026).** Every search, semantic search
+and retrieve now reads the tenant's `FAILED` tombstones in the scope before it
+runs and excludes those source ids as a mandatory `must_not` — so the record is
+not returned by this service even while the engine still holds it. The answer
+is `206`, `completeness_state: DEGRADED`, with `ESR-018` in `reason_codes`
+(NP-59). Past **500** failed refs for one tenant and scope the exclusion list
+stops being trusted and the scope is refused `503 ESR-018` until they verify.
+If callers report ESR-018, this section is the incident.
+
+The exclusion covers THIS service's responses only. The record is still in the
+engine, so anything reading OpenSearch directly still sees it — fix the
+propagation.
+
+**Manual containment** — §8.2 permits blocking or degrading the affected
+scope rather than continuing known over-disclosure. The heavier lever is to
 retire the serving generation's alias so the scope answers ESR-011 rather than
 returning the record:
 
@@ -147,6 +160,24 @@ PASS; the exception remains explicit and governed."
   event.
 
 ---
+
+## 3a. Rebuilding a scope
+
+`POST /v1/index-generations` builds a new generation from the published
+contract and **backfills it by replaying the source topic** from its earliest
+retained message; live events are written into it in parallel. The ledger is
+the authority for each record: anything it holds tombstoned is tombstoned in
+the rebuild, so an erasure made through `POST /v1/restrictions` — which has no
+event in the topic — survives the rebuild.
+
+READY is refused until `backfill_state` is COMPLETE, and then refused again if
+the generation holds fewer live documents than the ledger (NP-18). **Bounded by
+topic retention**: a record whose only event has aged out cannot be replayed,
+and the generation fails completeness rather than activating with a hole. The
+fix for that is a replay from the owning domain, not relaxing the check.
+
+A restart mid-backfill resumes it (writes are create-only, so repeating one is
+harmless).
 
 ## 3. Index generation corruption or accidental alias switch
 
@@ -220,8 +251,31 @@ means a replayed create cannot resurrect a tombstoned document (NP-11).
 
 ## 5. Source-to-index checkpoint stall or partial partition loss
 
-**Symptom.** `search_indexer_index_lag_seconds` rising; checkpoints reporting
-`LAGGING` or `STALE`; `GET /v1/checkpoints` showing a ledger/engine mismatch.
+**Symptom.** `search_indexer_checkpoint_lag_seconds` rising;
+`search_indexer_scope_freshness{state="STALE"|"UNKNOWN"} == 1`; an
+`esr.search.degraded` event with cause `index freshness ...`; callers getting
+`503 ESR-012 INDEX_STALE_FOR_SCOPE`; `GET /v1/checkpoints` showing a
+ledger/engine mismatch.
+
+**How freshness is decided** (each sweep, per scope, the worst wins):
+
+| State | Condition | Effect on search |
+|---|---|---|
+| `CURRENT` | consumer caught up, ledger = engine | none |
+| `LAGGING` | oldest unconsumed message older than ½ `max_lag_seconds`, or ledger ≠ engine | surfaced in `index_freshness`; not blocked |
+| `STALE` | oldest unconsumed message older than `max_lag_seconds` | R1+ scopes **refused 503 ESR-012**; R0 answers `DEGRADED` with ESR-012, protected docs withheld |
+| `UNKNOWN` | lag or engine count could not be measured, no checkpoint yet, or the checkpoint is older than 3× `CHECKPOINT_INTERVAL` | same as STALE, answers `UNKNOWN` |
+
+Lag is measured at the **broker** — committed offsets vs log end, and the
+timestamp of the oldest unconsumed message — not from the last event's age, so
+an idle source is CURRENT. Before 30 Sep 2026 the sweep compared `time.Now()`
+with itself and could never report STALE.
+
+**ESR-012 clears itself** at the next sweep after the consumer catches up. To
+remeasure immediately, activate is not needed — restart the instance (the sweep
+runs at start) or wait one `CHECKPOINT_INTERVAL`. Do NOT raise
+`max_lag_seconds` to make the refusals stop without a source-owner decision:
+it is the freshness class the source was registered under.
 
 ```bash
 curl -s localhost:8096/v1/checkpoints ... | jq
@@ -269,6 +323,15 @@ for f in services/search-indexer-svc/deployments/migrations/*.up.sql; do
   docker exec -i zoiko-postgres psql -v ON_ERROR_STOP=1 -U postgres -d search_indexer < "$f"
 done
 ```
+
+Every migration is re-runnable (verified by applying 000001–000004 twice to a
+fresh database, 30 Sep 2026), so the loop is safe on a database that already
+has some of them. **An existing database needs `000003` and `000004` applied by
+hand**: embedding columns, `retrieval_evaluations`, `idempotency_keys`, the
+ESR-018 index, generation backfill state, the evidence model column, and the
+reset of pre-upgrade wall-clock watermarks. Without them every search fails on
+the `ListFailedRestrictions` query and every command fails its idempotency
+claim (503 `UPSTREAM_UNAVAILABLE`).
 
 ---
 
@@ -326,6 +389,44 @@ and the control plane needs reconciling afterwards.
 
 **The index is not deleted.** INV-20: removing something from search is not
 record deletion and cannot satisfy a DRC/PRV deletion obligation on its own.
+
+---
+
+## 9. Semantic search (§10.1)
+
+**No provider configured** (the state until OD-10 closes): the log says
+`no embedding provider configured — semantic scopes are unavailable`; a
+semantic contract's `POST /v1/index-generations` answers `409 ESR-019
+embedding_provider_not_configured`; `/v1/search/semantic` answers `503 ESR-019`.
+Lexical search is unaffected. This is correct, not an outage.
+
+**NP-35 — the provider changed model.** Log line `NP-35: embedding provider
+answered with a model other than the scope's pin` on the query side; on the
+index side, projections for that scope are QUARANTINED with ESR-019 and copied
+to `<topic>.dlq`. Do not re-pin the contract to whatever the provider now
+returns — that is the silent drift the pin exists to refuse. Get the provider
+back onto the pinned version, then replay the DLQ. A genuinely new model is a
+migration (below).
+
+**Model migration** — a new contract version with a different embedding pin
+(verified end to end live, 30 Sep 2026):
+
+1. Draft, certify and publish the new contract version. Publishing it RETIRES
+   the previous version in the same transaction; the serving generation keeps
+   serving with its own (old) contract — search and ingestion are unaffected.
+2. `POST /v1/index-generations`. The generation is backfilled from the source
+   topic (`backfill_state` PENDING → RUNNING → COMPLETE) and receives live
+   events in parallel. Move it to `VALIDATING`.
+3. Certify it:
+   `POST /v1/index-generations/{id}/retrieval-evaluations` with
+   `{"k": 10, "min_recall": <agreed>, "cases": [{"tenant_id", "query",
+   "expected_source_ids"}]}`. `min_recall` is the agreed OD-15 bar; the answer
+   is recall numbers only.
+4. `READY` is refused (`409 retrieval_evaluation_required` /
+   `retrieval_evaluation_failed`) until the LATEST evaluation passed under the
+   new pin. A failed run emits `esr.reindex.failed` stage
+   `RETRIEVAL_EVALUATION`; re-run after fixing the build.
+5. `ACTIVE` as usual. Freshness is measured immediately on activation.
 
 ---
 

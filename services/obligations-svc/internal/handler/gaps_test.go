@@ -152,7 +152,7 @@ func TestListObligations_IsPagedAndValidated(t *testing.T) {
 	store := &stubStore{list: []*domain.Obligation{{ObligationID: "o-1"}}}
 	r := newTestRouter(store)
 
-	for _, q := range []string{"?limit=abc", "?limit=0", "?limit=99999", "?offset=-1"} {
+	for _, q := range []string{"?legal_entity_id=le-1&limit=abc", "?legal_entity_id=le-1&limit=0", "?legal_entity_id=le-1&limit=99999", "?legal_entity_id=le-1&offset=-1"} {
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations"+q, nil)))
 		if w.Code != http.StatusBadRequest {
@@ -161,7 +161,7 @@ func TestListObligations_IsPagedAndValidated(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations", nil)))
+	r.ServeHTTP(w, withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations?legal_entity_id=le-1", nil)))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
@@ -187,7 +187,7 @@ func TestStoreTenantMissing_Surfaces401(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations", nil)))
+	r.ServeHTTP(w, withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations?legal_entity_id=le-1", nil)))
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())

@@ -20,12 +20,13 @@ import (
 	"zoiko.io/notification-svc/internal/identity"
 	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
-	"zoiko.io/notification-svc/internal/ncd"
+	"zoiko.io/notification-svc/internal/ncdcode"
 	"zoiko.io/notification-svc/internal/quota"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
 	"zoiko.io/notification-svc/internal/templates"
+	"zoiko.io/notification-svc/internal/unsubscribe"
 	"zoiko.io/notification-svc/internal/webhook"
 )
 
@@ -78,7 +79,6 @@ type Store interface {
 type SuppressionStore interface {
 	AddSuppression(ctx context.Context, supp *ledger.EmailSuppression) error
 	IsEmailSuppressed(ctx context.Context, tenantID, recipientEmail string, stream ledger.SenderStream, commClass ledger.CommunicationClass) (bool, string, error)
-	RemoveSuppression(ctx context.Context, tenantID, recipientEmail, stream string) error
 	ListSuppressions(ctx context.Context, tenantID string, limit, offset int) ([]*ledger.EmailSuppression, error)
 }
 
@@ -171,12 +171,17 @@ type Handler struct {
 	ledgerStore    ledger.LedgerStore
 	webhookHandler *webhook.Handler
 	suppressions   SuppressionStore
-	intents        IntentStore
-	preferences    PreferenceStore
-	evidence       EvidenceStore
-	notices        NoticeStore
+	// unsubscribe opens one-click unsubscribe tokens. Nil means unsubscribe
+	// is not configured, and the receiver refuses every request.
+	unsubscribe *unsubscribe.Codec
+	intents     IntentStore
+	evidence    EvidenceStore
 	// metrics may be nil (tests); every observation is nil-safe.
 	metrics *telemetry.Domain
+
+	// inAppOpened, when set, records the first read of an NCD-routed in-app
+	// notice as OPENED evidence on its communication (ZS-SVC-Y-001 §7.1).
+	inAppOpened InAppOpenedFunc
 
 	// retryPolicy decides whether a first-attempt failure is scheduled for
 	// another try. The same policy the worker uses, so the schedule a send
@@ -201,20 +206,21 @@ type Deps struct {
 	LedgerStore    ledger.LedgerStore
 	WebhookHandler *webhook.Handler
 	Suppressions   SuppressionStore
+	Unsubscribe    *unsubscribe.Codec
+	InAppOpened    InAppOpenedFunc
 	// Intents is the communication intent registry (NCD-01). Optional: without it the
 	// registry routes answer 503 and a template bound to an intent cannot be sent
 	// (fail closed).
 	Intents IntentStore
-	// Preferences is the recipient preference store (NCD-02). Optional: without it the
-	// preference routes answer 503.
-	Preferences PreferenceStore
 	// Evidence reads normalized delivery evidence (NCD-04). Optional: without it the route answers 503.
 	Evidence EvidenceStore
-	// Notices stores regulated notices (NCD-05). Optional: without it, and the intent registry, the routes answer 503.
-	Notices NoticeStore
-	Metrics *telemetry.Domain
-	Log     *zap.Logger
+	Metrics  *telemetry.Domain
+	Log      *zap.Logger
 }
+
+// InAppOpenedFunc records that a recipient opened an NCD in-app notice. The
+// inbox row's id is the NCD attempt id; its source_reference the communication.
+type InAppOpenedFunc func(ctx context.Context, tenantID, principalID, communicationID, attemptID string, at time.Time) error
 
 func New(d Deps) *Handler {
 	return &Handler{
@@ -227,11 +233,11 @@ func New(d Deps) *Handler {
 		ledgerStore:    d.LedgerStore,
 		webhookHandler: d.WebhookHandler,
 		suppressions:   d.Suppressions,
+		unsubscribe:    d.Unsubscribe,
 		intents:        d.Intents,
-		preferences:    d.Preferences,
 		evidence:       d.Evidence,
-		notices:        d.Notices,
 		metrics:        d.Metrics,
+		inAppOpened:    d.InAppOpened,
 		log:            d.Log,
 	}
 }
@@ -259,11 +265,14 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		// Phase 3: Admin suppression management
 		// POST   /v1/notifications/suppression         — add or update a suppression entry
 		// GET    /v1/notifications/suppression         — list active suppressions
-		// DELETE /v1/notifications/suppression/{email} — remove a specific suppression
+		//
+		// There is deliberately no DELETE. A suppression is a durable fact (§7.3,
+		// migration 000022): it is lifted on evidence through POST
+		// /v1/suppressions/{id}/lift, which needs a second principal for a hard
+		// bounce, complaint or operator hold, and the row is kept.
 		r.Route("/suppression", func(r chi.Router) {
 			r.Post("/", h.AddSuppression)
 			r.Get("/", h.ListSuppressions)
-			r.Delete("/{email}", h.RemoveSuppression)
 		})
 
 		// Phase 3: RFC 8058 one-click unsubscribe receiver.
@@ -283,10 +292,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/resolve-delivery-outcome", h.ResolveDeliveryOutcome)
 	})
 
-	registerIntentRoutes(r, h)
-	registerPreferenceRoutes(r, h)
-	registerNoticeRoutes(r, h)
-	r.Post("/v1/channel-decision", h.ChannelDecision)
+	// The NCD control plane (RegisterNCDRoutes) owns /v1/communication-intents,
+	// /v1/preferences, /v1/channel-decision and /v1/regulated-notices. The
+	// parallel registry main carried on those paths was retired in the 7 Oct
+	// merge; a governed template bound to an intent is still enforced on send
+	// (enforceIntent).
 
 	r.Route("/v1/document-templates", func(r chi.Router) {
 		r.Post("/", h.CreateTemplate)
@@ -661,7 +671,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// would name the mail server rather than the missing address.
 	var outcome domain.DeliveryOutcome
 	if resolveErr != nil {
-		outcome.Reason = ncd.Format(ncd.RecipientUnresolved) + ": recipient resolution failed: " + resolveErr.Error()
+		outcome.Reason = ncdcode.Format(ncdcode.RecipientUnresolved) + ": recipient resolution failed: " + resolveErr.Error()
 		outcome.Retryable = !identity.IsSettled(resolveErr)
 	} else {
 		var ok bool
@@ -893,8 +903,9 @@ func (h *Handler) ListNotifications(w http.ResponseWriter, r *http.Request) {
 	filter := domain.ListFilter{
 		LegalEntityID:        r.URL.Query().Get("legal_entity_id"),
 		RecipientPrincipalID: r.URL.Query().Get("recipient_principal_id"),
-		Status:               r.URL.Query().Get("status"),
-		UnreadOnly:           r.URL.Query().Get("unread_only") == "true",
+		// Either vocabulary: the precise §3.3 state or the stored value.
+		Status:     domain.StoredStatusFor(r.URL.Query().Get("status")),
+		UnreadOnly: r.URL.Query().Get("unread_only") == "true",
 	}
 
 	limit, offset, ok := parsePaging(w, r)
@@ -1026,6 +1037,15 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.inAppOpened != nil && notification.ReadAt == nil && notification.SourceEventType == "ncd.communication" {
+		if err := h.inAppOpened(r.Context(), notification.TenantID, principalID, notification.SourceReference,
+			notification.NotificationID, readAt); err != nil {
+			// The read itself is recorded; the evidence write is logged
+			// rather than turning a successful read into an error.
+			h.log.Warn("failed to record NCD in-app OPENED evidence", zap.Error(err))
+		}
+	}
+
 	// Re-read rather than assuming readAt was stored: the store keeps the
 	// FIRST read, so on a repeat call the value written now is discarded and
 	// returning it would report a read time that is not in the database.
@@ -1082,7 +1102,7 @@ func (h *Handler) GetDeliveryStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := deliveryStatusResponse{
-		NotificationID: notification.NotificationID, Status: notification.Status,
+		NotificationID: notification.NotificationID, Status: domain.DeliveryStateOf(*notification),
 		FailureReason: notification.FailureReason, SentAt: notification.SentAt, ResolvedAt: notification.ResolvedAt,
 	}
 	if notification.Status == domain.StatusPendingUnknown {
@@ -1755,9 +1775,9 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 	}
 	// Where the condition is exactly one the standard names, the stable code (section 10.3)
 	// rides beside the service's own. Added, never substituted: existing callers keep working.
-	if stable, ok := ncd.ForAPIError(code); ok {
+	if stable, ok := ncdcode.ForAPIError(code); ok {
 		body["reason_code"] = stable
-		body["reason"] = ncd.Names[stable]
+		body["reason"] = ncdcode.Names[stable]
 	}
 	_ = json.NewEncoder(w).Encode(body)
 }
@@ -1838,6 +1858,8 @@ func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "template_integrity_failure", "template hash integrity check failed")
 		case errors.Is(err, ledger.ErrRecipientEmailUnresolved):
 			writeError(w, http.StatusUnprocessableEntity, "recipient_unresolved", err.Error())
+		case errors.Is(err, ledger.ErrUnsubscribeUnavailable):
+			writeError(w, http.StatusServiceUnavailable, "unsubscribe_unavailable", err.Error())
 		default:
 			h.log.Error("event orchestration failed", zap.String("event_id", req.EventID), zap.Error(err))
 			writeError(w, http.StatusInternalServerError, "orchestration_failed", err.Error())

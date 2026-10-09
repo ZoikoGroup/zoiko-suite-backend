@@ -45,7 +45,7 @@ func (h *Handler) CreateAuditPlan(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -82,7 +82,7 @@ func (h *Handler) GetAuditPlan(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -119,7 +119,7 @@ func (h *Handler) RecordMateriality(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -173,7 +173,7 @@ func (h *Handler) IdentifyRisk(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -227,7 +227,7 @@ func (h *Handler) ListRisks(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanRead, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -258,7 +258,7 @@ func (h *Handler) getRiskForManage(w http.ResponseWriter, r *http.Request, riskI
 		h.writeAuditEngagementErr(w, err)
 		return nil, false
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return nil, false
 	}
@@ -393,7 +393,7 @@ func (h *Handler) ApprovePlan(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanApprove); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditPlanApprove, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}

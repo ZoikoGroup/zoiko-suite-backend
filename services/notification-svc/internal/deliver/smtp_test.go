@@ -2,7 +2,12 @@ package deliver_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"net"
 	"strings"
@@ -10,7 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-msgauth/dkim"
+
 	"zoiko.io/notification-svc/internal/deliver"
+	"zoiko.io/notification-svc/internal/senderauth"
 )
 
 // fakeSMTP is an in-process SMTP server.
@@ -580,5 +588,77 @@ func TestSMTPProvider_Describe_OmitsThePassword(t *testing.T) {
 	}
 	if !strings.Contains(d, "apikey") {
 		t.Errorf("Describe = %q, want the username so the operator can see which credential is in use", d)
+	}
+}
+
+// ── sender authentication (§11.1, NP-55) ─────────────────────────────────────
+
+type brokenAuth struct{}
+
+func (brokenAuth) Healthy() (bool, string) { return false, "no DMARC record at _dmarc.zoiko.test" }
+
+// While the sending domain's authentication is broken, mail is held before it
+// reaches the relay — retryable, so it waits for the fix rather than failing.
+func TestSMTPProvider_HeldWhileSenderAuthenticationIsBroken(t *testing.T) {
+	s := newFakeSMTP(t)
+	host, port := s.addr()
+	p, err := deliver.NewSMTPProvider(deliver.SMTPConfig{Host: host, Port: port, From: "no-reply@zoiko.test",
+		TLSMode: deliver.TLSNone, Timeout: 5 * time.Second, Gate: brokenAuth{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = p.Send(context.Background(), deliver.Message{To: "employee@example.com", Subject: "s", HTMLBody: "<p>b</p>"})
+	var re deliver.RetryableError
+	if !errors.As(err, &re) || !strings.Contains(err.Error(), "NP-55") {
+		t.Fatalf("want a retryable NP-55 hold, got %v", err)
+	}
+	if s.messageCount() != 0 {
+		t.Fatal("nothing may reach the relay while sender authentication is broken")
+	}
+}
+
+// The DKIM signature verifies from the bytes the relay actually received, so
+// it survives SMTP transfer (dot-stuffing, line endings) intact.
+func TestSMTPProvider_SignsWithDKIM(t *testing.T) {
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, _ := x509.MarshalPKCS8PrivateKey(k)
+	signer, err := senderauth.NewSigner("zoiko.test", "s1", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _ := signer.PublicKeyRecord()
+
+	s := newFakeSMTP(t)
+	host, port := s.addr()
+	p, err := deliver.NewSMTPProvider(deliver.SMTPConfig{Host: host, Port: port, From: "no-reply@zoiko.test",
+		TLSMode: deliver.TLSNone, Timeout: 5 * time.Second, Signer: signer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Send(context.Background(), deliver.Message{To: "employee@example.com", Subject: "Offers",
+		HTMLBody: "<p>Hello</p>\n.\n<p>a line that starts with a dot</p>",
+		Headers:  map[string]string{"List-Unsubscribe": "<https://n.example/u?token=t>", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"},
+	}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// The fake relay stores DATA lines as sent; a real relay removes the
+	// transparency dot (RFC 5321 §4.5.2) before the message is verified.
+	got := strings.ReplaceAll(s.lastMessage(t), "\r\n..", "\r\n.")
+	if !strings.HasPrefix(got, "DKIM-Signature:") {
+		t.Fatalf("message is not signed:\n%s", got)
+	}
+	vs, err := dkim.VerifyWithOptions(bytes.NewReader([]byte(got)), &dkim.VerifyOptions{
+		LookupTXT: func(name string) ([]string, error) {
+			if name == "s1._domainkey.zoiko.test" {
+				return []string{"v=DKIM1; k=rsa; p=" + pub}, nil
+			}
+			return nil, errors.New("unexpected lookup " + name)
+		},
+	})
+	if err != nil || len(vs) != 1 || vs[0].Err != nil {
+		t.Fatalf("the signature must verify on the received bytes: %+v %v", vs, err)
 	}
 }

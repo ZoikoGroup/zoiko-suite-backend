@@ -15,6 +15,7 @@ import (
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/domain"
 	"zoiko.io/search-indexer-svc/internal/projection"
+	"zoiko.io/search-indexer-svc/internal/store"
 	"zoiko.io/search-indexer-svc/internal/telemetry"
 )
 
@@ -33,6 +34,12 @@ type fakeStore struct {
 	states    map[string]domain.PropagationState
 	sources   []domain.SearchSource
 	upsertErr error
+
+	checkpoints   []domain.IndexCheckpoint
+	contracts     []domain.IndexContract
+	generations   []domain.IndexGeneration
+	backfill      map[string]domain.BackfillState
+	backfillNotes map[string]string
 }
 
 func newFakeStore() *fakeStore {
@@ -132,7 +139,7 @@ func (f *fakeStore) GetPublishedContract(context.Context, string) (*domain.Index
 	return nil, domain.ErrNotFound
 }
 func (f *fakeStore) ListContracts(context.Context, string) ([]domain.IndexContract, error) {
-	return nil, nil
+	return f.contracts, nil
 }
 func (f *fakeStore) TransitionContract(context.Context, string, domain.ContractState, domain.ContractState) error {
 	return nil
@@ -143,7 +150,7 @@ func (f *fakeStore) GetGeneration(context.Context, string) (*domain.IndexGenerat
 	return nil, domain.ErrNotFound
 }
 func (f *fakeStore) ListGenerations(context.Context, string) ([]domain.IndexGeneration, error) {
-	return nil, nil
+	return f.generations, nil
 }
 func (f *fakeStore) GetActiveGeneration(context.Context, string) (*domain.IndexGeneration, error) {
 	return nil, domain.ErrNotFound
@@ -151,11 +158,45 @@ func (f *fakeStore) GetActiveGeneration(context.Context, string) (*domain.IndexG
 func (f *fakeStore) TransitionGeneration(context.Context, string, domain.GenerationState, domain.GenerationState, string, string) error {
 	return nil
 }
-func (f *fakeStore) UpsertCheckpoint(context.Context, domain.IndexCheckpoint) error { return nil }
+func (f *fakeStore) UpsertCheckpoint(_ context.Context, cp domain.IndexCheckpoint) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkpoints = append(f.checkpoints, cp)
+	return nil
+}
 func (f *fakeStore) ListCheckpoints(context.Context, string) ([]domain.IndexCheckpoint, error) {
 	return nil, nil
 }
-func (f *fakeStore) GetLatestCheckpoint(context.Context, string) (*domain.IndexCheckpoint, error) { return nil, nil }
+func (f *fakeStore) GetCheckpoint(_ context.Context, scope, partition string) (*domain.IndexCheckpoint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.checkpoints) - 1; i >= 0; i-- {
+		if f.checkpoints[i].ScopeName == scope && f.checkpoints[i].SourcePartition == partition {
+			cp := f.checkpoints[i]
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+func (f *fakeStore) ListFailedRestrictions(context.Context, string, string, int) ([]string, error) {
+	return nil, nil
+}
+func (f *fakeStore) CreateRetrievalEvaluation(context.Context, domain.RetrievalEvaluation) error {
+	return nil
+}
+func (f *fakeStore) LatestRetrievalEvaluation(context.Context, string) (*domain.RetrievalEvaluation, error) {
+	return nil, domain.ErrNotFound
+}
+func (f *fakeStore) ClaimIdempotencyKey(context.Context, string, string, string, string) (*store.IdempotencyRecord, error) {
+	return nil, nil
+}
+func (f *fakeStore) CompleteIdempotencyKey(context.Context, string, string, string, int, []byte) error {
+	return nil
+}
+func (f *fakeStore) ReleaseIdempotencyKey(context.Context, string, string, string) error { return nil }
+func (f *fakeStore) PurgeIdempotencyKeysBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
 func (f *fakeStore) CountProjections(context.Context, string) (int64, int64, error) { return 0, 0, nil }
 func (f *fakeStore) ListTombstones(context.Context, string, string, int) ([]domain.RestrictionTombstone, error) {
 	return nil, nil
@@ -165,13 +206,27 @@ func (f *fakeStore) ListEvidence(context.Context, string, string, int) ([]domain
 	return nil, nil
 }
 func (f *fakeStore) Ping(context.Context) error { return nil }
-func (f *fakeStore) Close()                     {}
+func (f *fakeStore) SetBackfillState(_ context.Context, id string, st domain.BackfillState, note string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.backfill == nil {
+		f.backfill = map[string]domain.BackfillState{}
+		f.backfillNotes = map[string]string{}
+	}
+	f.backfill[id] = st
+	f.backfillNotes[id] = note
+	return nil
+}
+func (f *fakeStore) Close() {}
 
 type fakeEngine struct {
 	mu    sync.Mutex
 	docs  map[string]searchclient.Projection
 	err   error
 	calls int
+	// raw overrides GetProjection with an exact stored document, for states
+	// the Projection type cannot produce (a tombstone still holding a vector).
+	raw map[string]map[string]any
 }
 
 func newFakeEngine() *fakeEngine {
@@ -189,9 +244,22 @@ func (f *fakeEngine) IndexProjection(_ context.Context, index string, p searchcl
 	return nil
 }
 
+func (f *fakeEngine) CreateProjection(_ context.Context, index string, p searchclient.Projection) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.docs[index+"/"+p.DocID]; ok {
+		return searchclient.ErrProjectionExists
+	}
+	f.docs[index+"/"+p.DocID] = p
+	return nil
+}
+
 func (f *fakeEngine) GetProjection(_ context.Context, index, docID string) (map[string]any, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if doc, ok := f.raw[index+"/"+docID]; ok {
+		return doc, true, nil
+	}
 	p, ok := f.docs[index+"/"+docID]
 	if !ok {
 		return nil, false, nil
@@ -211,7 +279,8 @@ func (f *fakeEngine) CountProjections(context.Context, string, map[string]string
 	return n, nil
 }
 
-func (f *fakeEngine) EnsureIndex(context.Context, searchclient.IndexName) error { return nil }
+func (f *fakeEngine) CountMissing(context.Context, string, string) (int64, error) { return 0, nil }
+func (f *fakeEngine) EnsureIndex(context.Context, searchclient.IndexName) error   { return nil }
 func (f *fakeEngine) Index(context.Context, searchclient.IndexName, searchclient.Document) error {
 	return nil
 }

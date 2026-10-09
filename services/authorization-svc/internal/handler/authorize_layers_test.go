@@ -112,7 +112,7 @@ func TestAuthorize_PlatformScopeRefusedWhenUnconfigured(t *testing.T) {
 	r := chi.NewRouter()
 	// Empty platform-scope entity id — the default.
 	h := handler.New(store, &stubPublisher{}, &stubValidator{},
-		siem.New("", "authorization-svc", zap.NewNop()), "", zap.NewNop())
+		siem.New("", "authorization-svc", zap.NewNop()), "", false, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 
 	code, got := authorize(t, r,

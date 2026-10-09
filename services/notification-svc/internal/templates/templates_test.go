@@ -270,6 +270,7 @@ func TestCatalogue_IsSortedAndDefensivelyCopied(t *testing.T) {
 		}
 	}
 }
+
 // NP-07: a variable the template does not declare is refused, not ignored.
 func TestRender_UndeclaredVariableIsRefused(t *testing.T) {
 	_, _, err := templates.Render(templates.Approved, map[string]string{

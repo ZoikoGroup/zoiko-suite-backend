@@ -12,11 +12,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/domain"
+	"zoiko.io/policy-svc/internal/envelope"
+	"zoiko.io/policy-svc/internal/store"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 )
 
@@ -24,11 +27,16 @@ import (
 // Allows the handler to be tested without a real database.
 type PolicyStore interface {
 	CreatePolicy(ctx context.Context, params domain.CreatePolicyParams) (*domain.Policy, bool, error)
+	FindPolicyByID(ctx context.Context, policyID string) (*domain.Policy, error)
 	CreatePolicyVersion(ctx context.Context, params domain.CreatePolicyVersionParams) (*domain.PolicyVersion, bool, error)
 	FindPolicyVersionByID(ctx context.Context, policyVersionID string) (*domain.PolicyVersion, error)
 	ActivateVersion(ctx context.Context, policyVersionID, actorID string) (*domain.PolicyVersion, []*domain.PolicyVersion, bool, error)
 	ListVersionHistory(ctx context.Context, policyID string) ([]*domain.PolicyVersion, error)
-	FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string) ([]*domain.ApplicablePolicyVersion, error)
+	FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string, asOf *time.Time) ([]*domain.ApplicablePolicyVersion, error)
+	CheckPolicyTypeOverlap(ctx context.Context, policyType string, policyID, tenantID, legalEntityID *string, effectiveFrom time.Time, effectiveTo *time.Time) (bool, error)
+
+	// EnqueueEvent adds an event to the transactional outbox.
+	EnqueueEvent(ctx context.Context, event store.OutboxEvent) error
 
 	// ── Chunk 10: control tests & attestations ──────────────────────────────
 	CreateControlTestDefinition(ctx context.Context, params domain.CreateControlTestDefinitionParams) (*domain.ControlTestDefinition, bool, error)
@@ -54,7 +62,6 @@ type EventPublisher interface {
 // Handler holds all HTTP handler methods.
 type Handler struct {
 	store       PolicyStore
-	publisher   EventPublisher
 	decisionLog decisionlog.Client
 	authz       authz.Client
 	log         *zap.Logger
@@ -68,10 +75,9 @@ type Handler struct {
 }
 
 // New constructs a Handler.
-func New(store PolicyStore, publisher EventPublisher, decisionLog decisionlog.Client, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
+func New(store PolicyStore, decisionLog decisionlog.Client, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
 	return &Handler{
 		store:                store,
-		publisher:            publisher,
 		decisionLog:          decisionLog,
 		authz:                authzClient,
 		authzPlatformScopeID: authzPlatformScopeID,
@@ -290,15 +296,33 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
-		// Only the first insert is a new fact — a replayed idempotent POST
-		// must not re-emit policy.created. Publish failures are logged,
-		// not surfaced to the caller: the write already succeeded and
-		// event delivery is a stubbed, non-blocking concern.
-		if pubErr := h.publisher.PublishPolicyCreated(r.Context(), *p, correlationID); pubErr != nil {
-			h.log.Error("CreatePolicy: failed to publish policy.created",
+		// Enqueue policy.created event to transactional outbox
+		env := envelope.MustFromContext(r.Context())
+		payload := map[string]any{
+			"policy_id":               p.PolicyID,
+			"policy_code":             p.PolicyCode,
+			"policy_name":             p.PolicyName,
+			"policy_type":             p.PolicyType,
+			"created_by_principal_id": p.CreatedByPrincipalID,
+			"created_at":              p.CreatedAt,
+		}
+		payloadBytes, _ := json.Marshal(payload)
+		if err := h.store.EnqueueEvent(r.Context(), store.OutboxEvent{
+			EventType:      "policy.created",
+			EventVersion:   "1.0",
+			SchemaVersion:  "1.0",
+			SourceService:  "policy-svc",
+			TenantID:       nil,
+			LegalEntityID:  nil,
+			ActorID:        p.CreatedByPrincipalID,
+			CorrelationID:  correlationID,
+			IdempotencyKey: env.IdempotencyKey,
+			Payload:        payloadBytes,
+		}); err != nil {
+			h.log.Error("CreatePolicy: failed to enqueue policy.created",
 				zap.String("policy_id", p.PolicyID),
 				zap.String("correlation_id", correlationID),
-				zap.Error(pubErr),
+				zap.Error(err),
 			)
 		}
 	}
@@ -357,14 +381,43 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate UUID format for path parameter
+	if _, err := uuid.Parse(policyID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_policy_id",
+			"message": "policy_id must be a valid UUID",
+		})
+		return
+	}
+
 	var req createPolicyVersionRequest
 	if !decodeJSON(w, r, &req) {
 		return
+	}
+
+	// Validate X-Legal-Entity-Id header matches body (if body has legal_entity_id)
+	if env, ok := envelope.FromContext(r.Context()); ok && req.LegalEntityID != nil && *req.LegalEntityID != "" {
+		if env.LegalEntityID != *req.LegalEntityID {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "legal_entity_mismatch",
+				"message": "X-Legal-Entity-Id header does not match body legal_entity_id",
+			})
+			return
+		}
 	}
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "missing_field",
 			"field": missing,
+		})
+		return
+	}
+
+	// Validate effective_to > effective_from (V-001 §10.1 step 4)
+	if req.EffectiveTo != nil && !req.EffectiveTo.After(req.EffectiveFrom) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_temporal_range",
+			"message": "effective_to must be after effective_from",
 		})
 		return
 	}
@@ -394,21 +447,62 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authorized in the scope the version will apply to, so a principal
-	// granted POLICY_VERSION_CREATE for one legal entity cannot publish a
-	// version binding another.
-	// Global versions (tenant_id == nil) require a distinct platform-wide grant.
-	createAction := authz.ActionPolicyVersionCreate
-	if req.TenantID == nil {
-		createAction = authz.ActionPolicyVersionCreateGlobal
-	}
-	if !h.authorize(w, r, principalID, createAction, req.LegalEntityID) {
-		return
-	}
+// Authorized in the scope the version will apply to, so a principal
+// granted POLICY_VERSION_CREATE for one legal entity cannot publish a
+// version binding another.
+// Global versions (tenant_id == nil) require a distinct platform-wide grant.
+createAction := authz.ActionPolicyVersionCreate
+if req.TenantID == nil {
+	createAction = authz.ActionPolicyVersionCreateGlobal
+}
+if !h.authorize(w, r, principalID, createAction, req.LegalEntityID) {
+	return
+}
 
-	// req.TenantID is either nil (GLOBAL, deliberately) or equal to the verified
-	// tenant — refuseForeignTenant has already rejected anything else.
-	params := domain.CreatePolicyVersionParams{
+// Fetch parent policy to get its type for overlap check
+parentPolicy, err := h.store.FindPolicyByID(r.Context(), policyID)
+if err != nil {
+	switch {
+	case errors.Is(err, domain.ErrPolicyNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":     "policy_not_found",
+			"policy_id": policyID,
+		})
+	default:
+		h.log.Error("CreatePolicyVersion: parent policy lookup failed",
+			zap.String("policy_id", policyID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	}
+	return
+}
+
+// Check for overlapping policies of the same type at the same specificity
+// (GOV-05 negative path #2, V-001 PDC-I-08)
+overlaps, err := h.store.CheckPolicyTypeOverlap(r.Context(), parentPolicy.PolicyType, &policyID, req.TenantID, req.LegalEntityID, req.EffectiveFrom, req.EffectiveTo)
+if err != nil {
+	h.log.Error("CreatePolicyVersion: overlap check failed",
+		zap.String("policy_id", policyID),
+		zap.String("correlation_id", correlationID),
+		zap.Error(err),
+	)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	return
+}
+if overlaps {
+	writeJSON(w, http.StatusConflict, map[string]string{
+		"error":       "policy_overlap",
+		"message":     "an active policy of the same type already exists with overlapping scope and temporal range",
+		"policy_type": parentPolicy.PolicyType,
+	})
+	return
+}
+
+// req.TenantID is either nil (GLOBAL, deliberately) or equal to the verified
+// tenant — refuseForeignTenant has already rejected anything else.
+params := domain.CreatePolicyVersionParams{
 		PolicyVersionID:      req.PolicyVersionID,
 		PolicyID:             policyID,
 		TenantID:             req.TenantID,
@@ -446,11 +540,35 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
-		if pubErr := h.publisher.PublishPolicyUpdated(r.Context(), *v, correlationID); pubErr != nil {
-			h.log.Error("CreatePolicyVersion: failed to publish policy.updated",
+		// Enqueue policy.updated event to transactional outbox
+		env := envelope.MustFromContext(r.Context())
+		payload := map[string]any{
+			"policy_version_id":       v.PolicyVersionID,
+			"policy_id":               v.PolicyID,
+			"tenant_id":               v.TenantID,
+			"legal_entity_id":         v.LegalEntityID,
+			"effective_from":          v.EffectiveFrom,
+			"effective_to":            v.EffectiveTo,
+			"version_status":          v.VersionStatus,
+			"created_by_principal_id": v.CreatedByPrincipalID,
+		}
+		payloadBytes, _ := json.Marshal(payload)
+		if err := h.store.EnqueueEvent(r.Context(), store.OutboxEvent{
+			EventType:      "policy.updated",
+			EventVersion:   "1.0",
+			SchemaVersion:  "1.0",
+			SourceService:  "policy-svc",
+			TenantID:       v.TenantID,
+			LegalEntityID:  v.LegalEntityID,
+			ActorID:        v.CreatedByPrincipalID,
+			CorrelationID:  correlationID,
+			IdempotencyKey: env.IdempotencyKey,
+			Payload:        payloadBytes,
+		}); err != nil {
+			h.log.Error("CreatePolicyVersion: failed to enqueue policy.updated",
 				zap.String("policy_version_id", v.PolicyVersionID),
 				zap.String("correlation_id", correlationID),
-				zap.Error(pubErr),
+				zap.Error(err),
 			)
 		}
 	}
@@ -485,7 +603,7 @@ type activateVersionRequest struct {
 // Response:
 //
 //	200 → activated (or already active — idempotent no-op)
-//	400 → missing activated_by_principal_id
+//	400 → invalid policy_id or version_id format, or empty request body
 //	404 → policy_id/version_id not found, or version_id does not belong to policy_id
 //	409 → version is not in DRAFT (or already ACTIVE) — illegal transition
 //	503 → store unavailable
@@ -499,10 +617,28 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate UUID format for path parameters to return 400 instead of 503
+	if _, err := uuid.Parse(policyID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_policy_id",
+			"message": "policy_id must be a valid UUID",
+		})
+		return
+	}
+	if _, err := uuid.Parse(versionID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_version_id",
+			"message": "version_id must be a valid UUID",
+		})
+		return
+	}
+
 	var req activateVersionRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	// Body is optional: the acting principal comes from X-Principal-Id header.
+	// decodeJSON accepts empty body ({} or empty) and returns true.
 
 	// Validate the version belongs to the policy in the path before mutating
 	// anything — an activate call must never succeed against the wrong
@@ -534,18 +670,71 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authorized against the scope the version actually binds, read from the
-	// stored record rather than the request — activation is the moment a
-	// policy starts governing real spend, so it is checked after the version
-	// is resolved and before anything is written.
-	// Global versions (tenant_id == nil) require a distinct platform-wide grant.
-	activateAction := authz.ActionPolicyVersionActivate
-	if existing.TenantID == nil {
-		activateAction = authz.ActionPolicyVersionActivateGlobal
-	}
-	if !h.authorize(w, r, principalID, activateAction, existing.LegalEntityID) {
+	// Maker-checker: the principal activating a version must be different
+	// from the principal who created it. A creator activating their own
+	// version defeats the separation-of-duties requirement (GOV-07, ZS-DATA-GOV-001).
+	if existing.CreatedByPrincipalID == principalID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "maker_checker_violation",
+			"message": "the principal who created this version cannot activate it",
+		})
 		return
 	}
+
+// Authorized against the scope the version actually binds, read from the
+// stored record rather than the request — activation is the moment a
+// policy starts governing real spend, so it is checked after the version
+// is resolved and before anything is written.
+// Global versions (tenant_id == nil) require a distinct platform-wide grant.
+activateAction := authz.ActionPolicyVersionActivate
+if existing.TenantID == nil {
+	activateAction = authz.ActionPolicyVersionActivateGlobal
+}
+if !h.authorize(w, r, principalID, activateAction, existing.LegalEntityID) {
+	return
+}
+
+// Fetch parent policy to get its type for overlap check at activation time
+// (race condition: another policy of same type could have been activated since creation)
+parentPolicy, err := h.store.FindPolicyByID(r.Context(), existing.PolicyID)
+if err != nil {
+	switch {
+	case errors.Is(err, domain.ErrPolicyNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":     "policy_not_found",
+			"policy_id": existing.PolicyID,
+		})
+	default:
+		h.log.Error("ActivateVersion: parent policy lookup failed",
+			zap.String("policy_id", existing.PolicyID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	}
+	return
+}
+
+// Check for overlapping policies of the same type at the same specificity
+// (GOV-05 negative path #2, V-001 PDC-I-08)
+overlaps, err := h.store.CheckPolicyTypeOverlap(r.Context(), parentPolicy.PolicyType, &existing.PolicyID, existing.TenantID, existing.LegalEntityID, existing.EffectiveFrom, existing.EffectiveTo)
+if err != nil {
+	h.log.Error("ActivateVersion: overlap check failed",
+		zap.String("policy_version_id", versionID),
+		zap.String("correlation_id", correlationID),
+		zap.Error(err),
+	)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	return
+}
+if overlaps {
+	writeJSON(w, http.StatusConflict, map[string]string{
+		"error":       "policy_overlap",
+		"message":     "an active policy of the same type already exists with overlapping scope and temporal range",
+		"policy_type": parentPolicy.PolicyType,
+	})
+	return
+}
 
 	activated, superseded, transitioned, err := h.store.ActivateVersion(r.Context(), versionID, principalID)
 	if err != nil {
@@ -575,19 +764,62 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 	// (transitioned=false, the version was already ACTIVE) must not
 	// re-emit policy.version.activated or policy.rule.retired.
 	if transitioned {
-		if pubErr := h.publisher.PublishVersionActivated(r.Context(), *activated, correlationID); pubErr != nil {
-			h.log.Error("ActivateVersion: failed to publish policy.version.activated",
+		env := envelope.MustFromContext(r.Context())
+
+		// Enqueue policy.version.activated
+		payload := map[string]any{
+			"policy_version_id":         activated.PolicyVersionID,
+			"policy_id":                 activated.PolicyID,
+			"tenant_id":                 activated.TenantID,
+			"legal_entity_id":           activated.LegalEntityID,
+			"effective_from":            activated.EffectiveFrom,
+			"activated_by_principal_id": activated.ActivatedByPrincipalID,
+			"activated_at":              activated.ActivatedAt,
+		}
+		payloadBytes, _ := json.Marshal(payload)
+		if err := h.store.EnqueueEvent(r.Context(), store.OutboxEvent{
+			EventType:      "policy.version.activated",
+			EventVersion:   "1.0",
+			SchemaVersion:  "1.0",
+			SourceService:  "policy-svc",
+			TenantID:       activated.TenantID,
+			LegalEntityID:  activated.LegalEntityID,
+			ActorID:        deref(activated.ActivatedByPrincipalID),
+			CorrelationID:  correlationID,
+			IdempotencyKey: env.IdempotencyKey,
+			Payload:        payloadBytes,
+		}); err != nil {
+			h.log.Error("ActivateVersion: failed to enqueue policy.version.activated",
 				zap.String("policy_version_id", activated.PolicyVersionID),
 				zap.String("correlation_id", correlationID),
-				zap.Error(pubErr),
+				zap.Error(err),
 			)
 		}
+
+		// Enqueue policy.rule.retired for each superseded version
 		for _, s := range superseded {
-			if pubErr := h.publisher.PublishRuleRetired(r.Context(), *s, correlationID); pubErr != nil {
-				h.log.Error("ActivateVersion: failed to publish policy.rule.retired",
+			payload := map[string]any{
+				"policy_version_id": s.PolicyVersionID,
+				"policy_id":         s.PolicyID,
+				"version_status":    s.VersionStatus,
+			}
+			payloadBytes, _ := json.Marshal(payload)
+			if err := h.store.EnqueueEvent(r.Context(), store.OutboxEvent{
+				EventType:      "policy.rule.retired",
+				EventVersion:   "1.0",
+				SchemaVersion:  "1.0",
+				SourceService:  "policy-svc",
+				TenantID:       s.TenantID,
+				LegalEntityID:  s.LegalEntityID,
+				ActorID:        "",
+				CorrelationID:  correlationID,
+				IdempotencyKey: env.IdempotencyKey,
+				Payload:        payloadBytes,
+			}); err != nil {
+				h.log.Error("ActivateVersion: failed to enqueue policy.rule.retired",
 					zap.String("policy_version_id", s.PolicyVersionID),
 					zap.String("correlation_id", correlationID),
-					zap.Error(pubErr),
+					zap.Error(err),
 				)
 			}
 		}
@@ -618,6 +850,7 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 // Response:
 //
 //	200 → JSON array of PolicyVersion objects (may be empty)
+//	400 → invalid policy_id format
 //	404 → policy_id not found
 //	503 → store unavailable
 func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
@@ -625,6 +858,15 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	// Validate UUID format for path parameter
+	if _, err := uuid.Parse(policyID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_policy_id",
+			"message": "policy_id must be a valid UUID",
+		})
 		return
 	}
 
@@ -667,11 +909,21 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 // Response:
 //
 //	200 → the PolicyVersion
+//	400 → invalid version_id format
 //	404 → version_id not found
 //	503 → store unavailable
 func (h *Handler) GetPolicyVersionByID(w http.ResponseWriter, r *http.Request) {
 	versionID := chi.URLParam(r, "version_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	// Validate UUID format for path parameter
+	if _, err := uuid.Parse(versionID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_version_id",
+			"message": "version_id must be a valid UUID",
+		})
+		return
+	}
 
 	// The store scopes this lookup to the tenant in context — but with an empty
 	// tenant it fell back to an UNSCOPED lookup, so a request with no
@@ -713,15 +965,19 @@ func (h *Handler) GetPolicyVersionByID(w http.ResponseWriter, r *http.Request) {
 //	policy_type=X          required — e.g. APPROVAL_THRESHOLD
 //	tenant_id=Y             optional — omit for global-only scope
 //	legal_entity_id=Z       optional
+//	as_of=TIMESTAMP         optional — RFC3339 timestamp to query the
+//	                          policy set as it existed at that time.
+//	                          If omitted, returns currently active versions.
 //
-// Returns every currently-ACTIVE version of policy_type whose scope is
-// compatible with the given tenant_id/legal_entity_id, most-specific
-// scope first (see PgStore.FindApplicableVersions).
+// Returns every ACTIVE version of policy_type whose scope is compatible
+// with the given tenant_id/legal_entity_id, most-specific scope first
+// (see PgStore.FindApplicableVersions). If as_of is provided, returns
+// versions that were effective at that timestamp instead of currently.
 //
 // Response:
 //
 //	200 → JSON array of ApplicablePolicyVersion (may be empty)
-//	400 → missing policy_type
+//	400 → missing policy_type, or invalid as_of timestamp
 //	503 → store unavailable
 func (h *Handler) ListApplicablePolicyVersions(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -734,6 +990,19 @@ func (h *Handler) ListApplicablePolicyVersions(w http.ResponseWriter, r *http.Re
 			"field": "policy_type",
 		})
 		return
+	}
+
+	var asOf *time.Time
+	if v := q.Get("as_of"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_as_of",
+				"message": "as_of must be a valid RFC3339 timestamp",
+			})
+			return
+		}
+		asOf = &t
 	}
 
 	verifiedTenant, ok := h.requireTenant(w, r)
@@ -756,7 +1025,7 @@ func (h *Handler) ListApplicablePolicyVersions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	results, err := h.store.FindApplicableVersions(r.Context(), policyType, tenantID, legalEntityID)
+	results, err := h.store.FindApplicableVersions(r.Context(), policyType, tenantID, legalEntityID, asOf)
 	if err != nil {
 		h.log.Error("ListApplicablePolicyVersions: store unavailable",
 			zap.String("policy_type", policyType),
@@ -778,30 +1047,17 @@ func (h *Handler) ListApplicablePolicyVersions(w http.ResponseWriter, r *http.Re
 
 // evaluateRequest is the wire shape for POST /v1/policies/evaluate.
 //
-// EvaluatedByPrincipalID is required — not part of the original spec's
-// evaluate contract, but required by governance-decision-log-svc's
-// POST /v1/decisions (actor_id is a required field there), which Evaluate
-// now calls to record every evaluation as evidence (see internal/decisionlog).
-// Without an actor, the evidence obligation this endpoint must satisfy
-// ("preserve evaluation basis for governed decisions", §8.1) cannot be met.
-//
-// DecisionID is also required, as of the idempotency-hardening pass that
-// followed §19 — it is the caller-supplied idempotency key that makes
-// evidence recording safely repeatable end to end. Making it optional
-// (as it was immediately after §19) meant a client-side retry of Evaluate
-// with no supplied ID would record a duplicate decision every time —
-// documented as an accepted limitation then, closed for real now that
-// doctrine's idempotency requirement applies to the evidence write too,
-// not just Evaluate's own returned result. governance-decision-log-svc is
-// itself idempotent on decision_id, so this closes the gap completely
-// rather than shifting it.
+// DecisionID is required — it is the caller-supplied idempotency key that
+// makes evidence recording safely repeatable end to end. governance-decision-log-svc
+// is itself idempotent on decision_id, so a repeated call never records a
+// duplicate decision.
 type evaluateRequest struct {
-	PolicyType             string          `json:"policy_type"`
-	TenantID               *string         `json:"tenant_id,omitempty"`
-	LegalEntityID          *string         `json:"legal_entity_id,omitempty"`
-	ActionContext          json.RawMessage `json:"action_context,omitempty"`
-	EvaluatedByPrincipalID string          `json:"evaluated_by_principal_id"`
-	DecisionID             string          `json:"decision_id"`
+	PolicyType     string          `json:"policy_type"`
+	TenantID       *string         `json:"tenant_id,omitempty"`
+	LegalEntityID  *string         `json:"legal_entity_id,omitempty"`
+	ActionContext  json.RawMessage `json:"action_context,omitempty"`
+	DecisionID     string          `json:"decision_id"`
+	AsOf           *time.Time      `json:"as_of,omitempty"`
 }
 
 // evaluateResponse is the wire shape returned by a successful evaluation.
@@ -812,6 +1068,7 @@ type evaluateResponse struct {
 	Result          string `json:"result"`
 	PolicyVersionID string `json:"policy_version_id"`
 	RuleBasis       string `json:"rule_basis"`
+	EvidenceID      string `json:"evidence_id,omitempty"`
 }
 
 // Evaluate handles POST /v1/policies/evaluate — the "evaluate policy
@@ -828,10 +1085,17 @@ type evaluateResponse struct {
 // governance-decision-log-svc is itself idempotent on decision_id, so a
 // repeated call never records a duplicate decision.
 //
+// The acting principal comes from the gateway-verified X-Principal-Id
+// header, not from the request body — the body value was previously
+// recorded as actor_id and forwarded to the decision log, which meant
+// the ledger's author was whatever the caller typed. Now the authenticated
+// principal is used, preventing attribution forgery.
+//
 // Response:
 //
 //	200 → {"result": "APPROVAL_REQUIRED"|"WITHIN_THRESHOLD", "policy_version_id": "...", "rule_basis": "..."}
-//	400 → missing policy_type/evaluated_by_principal_id/decision_id, or (for APPROVAL_THRESHOLD) missing/invalid action_context.amount
+//	400 → missing policy_type/decision_id, or (for APPROVAL_THRESHOLD) missing/invalid action_context.amount
+//	401 → missing X-Principal-Id
 //	404 → no applicable ACTIVE policy for that type+scope — the caller
 //	      decides fail-open/fail-closed, this service does not guess
 //	501 → policy_type has no evaluation logic implemented yet
@@ -850,18 +1114,17 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if req.EvaluatedByPrincipalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "evaluated_by_principal_id",
-		})
-		return
-	}
 	if req.DecisionID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "missing_field",
 			"field": "decision_id",
 		})
+		return
+	}
+
+	// The acting principal comes from the gateway-verified header.
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 
@@ -877,7 +1140,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	matches, err := h.store.FindApplicableVersions(r.Context(), req.PolicyType, req.TenantID, req.LegalEntityID)
+	matches, err := h.store.FindApplicableVersions(r.Context(), req.PolicyType, req.TenantID, req.LegalEntityID, req.AsOf)
 	if err != nil {
 		h.log.Error("Evaluate: store unavailable",
 			zap.String("policy_type", req.PolicyType),
@@ -897,11 +1160,45 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	applicable := matches[0] // most specific scope match — see FindApplicableVersions ordering
+
+	// Check for conflicting policies at the same specificity tier.
+	// If multiple distinct policies have ACTIVE versions at the same
+	// specificity, return 409 CONFLICTED instead of silently picking one.
+	applicable := matches[0]
+	for _, m := range matches[1:] {
+		// Compare specificity: same tenant_id + legal_entity_id combination
+		sameSpecificity := (applicable.TenantID == nil && m.TenantID == nil) ||
+			(applicable.TenantID != nil && m.TenantID != nil && *applicable.TenantID == *m.TenantID)
+		if applicable.LegalEntityID != nil && m.LegalEntityID != nil {
+			sameSpecificity = sameSpecificity && (*applicable.LegalEntityID == *m.LegalEntityID)
+		} else if applicable.LegalEntityID == nil && m.LegalEntityID == nil {
+			sameSpecificity = sameSpecificity && true
+		} else {
+			sameSpecificity = false
+		}
+
+		if sameSpecificity && applicable.PolicyID != m.PolicyID {
+			h.log.Warn("Evaluate: conflicting policies at same specificity",
+				zap.String("policy_type", req.PolicyType),
+				zap.String("policy_id_1", applicable.PolicyID),
+				zap.String("policy_version_id_1", applicable.PolicyVersionID),
+				zap.String("policy_id_2", m.PolicyID),
+				zap.String("policy_version_id_2", m.PolicyVersionID),
+				zap.String("correlation_id", correlationID),
+			)
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":             "conflicting_policies",
+				"policy_type":       req.PolicyType,
+				"message":           "multiple distinct policies active at the same specificity",
+				"policy_version_id": applicable.PolicyVersionID,
+			})
+			return
+		}
+	}
 
 	switch req.PolicyType {
 	case "APPROVAL_THRESHOLD":
-		h.evaluateApprovalThreshold(w, r, req, applicable, correlationID)
+		h.evaluateApprovalThreshold(w, r, req, applicable, correlationID, principalID)
 	default:
 		// No evaluation logic exists for this type, so nothing to record.
 		writeJSON(w, http.StatusNotImplemented, map[string]string{
@@ -954,7 +1251,7 @@ func decodeExactAmount(raw json.RawMessage, field string) (*big.Rat, bool, error
 // Fixing that is an estate-wide type migration, out of scope here — this
 // fix guarantees only that THIS comparison introduces no additional
 // binary-floating-point error of its own.
-func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Request, req evaluateRequest, applicable *domain.ApplicablePolicyVersion, correlationID string) {
+func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Request, req evaluateRequest, applicable *domain.ApplicablePolicyVersion, correlationID string, actorID string) {
 	thresholdAmount, present, err := decodeExactAmount(applicable.RulePayload, "threshold_amount")
 	if err != nil || !present {
 		h.log.Error("evaluateApprovalThreshold: policy version has invalid/missing threshold_amount",
@@ -982,15 +1279,21 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 	ruleBasis := fmt.Sprintf("%s:%s", applicable.PolicyCode, applicable.PolicyVersionID)
 
 	if err := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
-		DecisionID:        req.DecisionID,
-		TenantID:          req.TenantID,
-		LegalEntityID:     req.LegalEntityID,
-		ActorID:           req.EvaluatedByPrincipalID,
-		ActionType:        req.PolicyType,
-		Outcome:           canonicalOutcome(result),
-		RuleBasis:         ruleBasis,
-		EvaluationContext: req.ActionContext,
-		CorrelationID:     correlationID,
+		DecisionID:            req.DecisionID,
+		TenantID:              req.TenantID,
+		LegalEntityID:         req.LegalEntityID,
+		ActorID:               actorID,
+		ActionType:            req.PolicyType,
+		Outcome:               canonicalOutcome(result),
+		RuleBasis:             ruleBasis,
+		EvaluationContext:     req.ActionContext,
+		CorrelationID:         correlationID,
+		PolicyVersionID:       &applicable.PolicyVersionID,
+		ActionSubjectType:     nil, // Could be derived from action_context if needed
+		ActionSubjectID:       nil,
+		WorkflowInstanceID:    nil,
+		CausationID:           nil,
+		DecidedAt:             nil, // Will default to server time
 	}); err != nil {
 		// Best-effort: the evaluation result is still correct and still
 		// returned to the caller. Evaluate's own availability must not
@@ -1007,6 +1310,7 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 		Result:          result,
 		PolicyVersionID: applicable.PolicyVersionID,
 		RuleBasis:       ruleBasis,
+		EvidenceID:      req.DecisionID,
 	})
 }
 
@@ -1074,4 +1378,12 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// deref returns the string value of a *string or empty string if nil.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

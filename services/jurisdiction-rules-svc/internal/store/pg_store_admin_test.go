@@ -3,12 +3,15 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
+	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -16,6 +19,55 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
+
+// TestMain boots an embedded PostgreSQL once for the whole suite when
+// EMBEDDED_PG_STORE_TESTS=1 and no TEST_DATABASE_URL is set, so the real
+// migrations (including the 000009 deactivation/append-only triggers) can be
+// exercised without a server. A live DB env is used as-is when present.
+func TestMain(m *testing.M) {
+	if os.Getenv("TEST_DATABASE_URL") == "" && os.Getenv("EMBEDDED_PG_STORE_TESTS") == "1" {
+		if err := startEmbeddedPostgres(); err != nil {
+			fmt.Fprintf(os.Stderr, "embedded postgres: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	code := m.Run()
+	stopEmbeddedPostgres()
+	os.Exit(code)
+}
+
+var (
+	pgOnce     sync.Once
+	pgStartErr error
+	pgStopFn   func() error
+)
+
+func startEmbeddedPostgres() error {
+	pgOnce.Do(func() {
+		port := uint32(17301 + uint32(os.Getpid()%499))
+		pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
+			Version(embeddedpostgres.V16).
+			Port(port).
+			Database("jur_store_test").
+			Username("postgres").
+			Password("postgres"))
+		if err := pg.Start(); err != nil {
+			pgStartErr = err
+			return
+		}
+		pgStopFn = pg.Stop
+		os.Setenv("TEST_DATABASE_URL", fmt.Sprintf(
+			"host=localhost port=%d dbname=jur_store_test user=postgres password=postgres sslmode=disable", port))
+	})
+	return pgStartErr
+}
+
+func stopEmbeddedPostgres() {
+	if pgStopFn != nil {
+		_ = pgStopFn()
+		pgStopFn = nil
+	}
+}
 
 func getTestPool(t *testing.T) *pgxpool.Pool {
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -38,23 +90,47 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// migrationFiles is every up migration, in order. Listing them here rather
-// than naming two of them inline means a migration added later is applied by
-// the tests automatically — the alternative has already produced a live
-// incident in this repo, where a migration was never applied and every write
-// failed with a 42P10 that read like a code bug.
+// migrationFiles is every up migration the store suite needs, in order.
+// Listing them here rather than naming two of them inline means a migration
+// added later is applied by the tests automatically — the alternative has
+// already produced a live incident in this repo, where a migration was never
+// applied and every write failed with a 42P10 that read like a code bug.
+//
+// 000005-000006 (outbox, pack registries, pack artifacts) are deliberately
+// not applied: the store suite only exercises jurisdictions,
+// jurisdiction_rules and jurisdiction_rule_drift_events, and those pack
+// tables are neither dropped nor asserted here. 000007/000008 are required —
+// ruleColumnNames (pg_store.go) reads rule_version, supersedes_rule_id and
+// precedence_level, and without them every CreateRule fails with 42703.
+// 000009 must be applied because DeactivateJurisdiction's idempotency relies
+// on trg_prevent_duplicate_deactivation (a second UPDATE is a no-op), and the
+// drift append-only assertions rely on trg_enforce_drift_append_only.
+// 000017 adds the rule_status_history DELETE guard asserted below plus the
+// runtime-role privilege revokes.
+// 000016 must follow 000007: 000007's status-history trigger passes
+// NULL updated_at/updated_by on insert into NOT NULL columns, which makes
+// every rule insert fail until 000016 replaces the function.
 var migrationFiles = []string{
 	"000001_initial_schema.up.sql",
 	"000002_add_audit_columns.up.sql",
 	"000003_add_data_classification.up.sql",
 	"000004_add_rule_code_index.up.sql",
+	"000007_add_bitemporal_replay.up.sql",
+	"000008_add_precedence_metadata.up.sql",
+	"000009_enforce_drift_append_only.up.sql",
+	"000016_fix_rule_status_history_trigger.up.sql",
+	"000017_append_only_rbac.up.sql",
 }
 
 // setupTestDB drops and recreates the schema from the migration files.
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS jurisdiction_rule_drift_events, jurisdiction_rules, jurisdictions CASCADE;")
+	// rule_status_history is listed so each test starts with a clean history
+	// — 000007's CREATE TABLE IF NOT EXISTS would otherwise let rows from a
+	// previous test survive (the FK to the dropped jurisdiction_rules is
+	// removed by CASCADE, but the table and its rows are not).
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS rule_status_history, jurisdiction_rule_drift_events, jurisdiction_rules, jurisdictions CASCADE;")
 
 	_, thisFile, _, _ := runtime.Caller(0)
 	migDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "deployments", "migrations")
@@ -196,9 +272,12 @@ func TestPgStore_DeactivateJurisdiction(t *testing.T) {
 
 	j := mustCreateJurisdiction(t, s, ctx, "GB", nil)
 
-	deactivated, err := s.DeactivateJurisdiction(ctx, j.JurisdictionID, "actor-deactivate")
+	deactivated, changed, err := s.DeactivateJurisdiction(ctx, j.JurisdictionID, "actor-deactivate")
 	if err != nil {
 		t.Fatalf("unexpected error on deactivate: %v", err)
+	}
+	if !changed {
+		t.Error("first deactivate must report changed=true")
 	}
 	if deactivated.ActiveFlag {
 		t.Errorf("expected ActiveFlag=false after deactivation")
@@ -213,6 +292,22 @@ func TestPgStore_DeactivateJurisdiction(t *testing.T) {
 		t.Errorf("expected UpdatedByPrincipalID=actor-deactivate, got %v", deactivated.UpdatedByPrincipalID)
 	}
 
+	// A second deactivate is an idempotent replay: changed=false, the audit
+	// columns are not rewritten and no re-announcement may be made.
+	again, changedAgain, err := s.DeactivateJurisdiction(ctx, j.JurisdictionID, "actor-again")
+	if err != nil {
+		t.Fatalf("unexpected error on replay deactivate: %v", err)
+	}
+	if changedAgain {
+		t.Error("a replay deactivate must report changed=false")
+	}
+	if again.UpdatedByPrincipalID == nil || *again.UpdatedByPrincipalID != "actor-deactivate" {
+		t.Errorf("replay must not rewrite updated_by; got %v", again.UpdatedByPrincipalID)
+	}
+	if again.EffectiveTo == nil || deactivated.EffectiveTo == nil || !again.EffectiveTo.Equal(*deactivated.EffectiveTo) {
+		t.Errorf("replay must not move effective_to; got %v, want %v", again.EffectiveTo, deactivated.EffectiveTo)
+	}
+
 	// The active-only validation contract must now reject it.
 	if _, err := s.FindByID(ctx, j.JurisdictionID); !errors.Is(err, domain.ErrJurisdictionNotFound) {
 		t.Errorf("expected FindByID to 404 a deactivated jurisdiction, got %v", err)
@@ -223,7 +318,7 @@ func TestPgStore_DeactivateJurisdiction(t *testing.T) {
 	}
 
 	// Non-existent deactivation
-	_, err = s.DeactivateJurisdiction(ctx, uuid.New().String(), "actor-1")
+	_, _, err = s.DeactivateJurisdiction(ctx, uuid.New().String(), "actor-1")
 	if !errors.Is(err, domain.ErrJurisdictionNotFound) {
 		t.Errorf("expected ErrJurisdictionNotFound for unknown UUID, got: %v", err)
 	}
@@ -248,7 +343,7 @@ func TestPgStore_MalformedUUIDIsNotFoundNotOutage(t *testing.T) {
 	if _, err := s.FindAncestors(ctx, "not-a-uuid"); !errors.Is(err, domain.ErrJurisdictionNotFound) {
 		t.Errorf("FindAncestors: expected ErrJurisdictionNotFound, got %v", err)
 	}
-	if _, err := s.DeactivateJurisdiction(ctx, "not-a-uuid", "actor"); !errors.Is(err, domain.ErrJurisdictionNotFound) {
+	if _, _, err := s.DeactivateJurisdiction(ctx, "not-a-uuid", "actor"); !errors.Is(err, domain.ErrJurisdictionNotFound) {
 		t.Errorf("DeactivateJurisdiction: expected ErrJurisdictionNotFound, got %v", err)
 	}
 }
@@ -793,8 +888,10 @@ func TestPgStore_FindRulePack_ResolvesInheritance(t *testing.T) {
 	country := mustCreateJurisdiction(t, s, ctx, "US", nil)
 	state := mustCreateJurisdiction(t, s, ctx, "US-CA", &country.JurisdictionID)
 
+	// Rules are effective from 2024; the jurisdictions (helper) are effective
+	// since now-365d, so any `at` at or after now lies inside every window.
 	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	at := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+	at := time.Now().UTC()
 
 	newRule := func(jID, domainName, code, name, status string, effFrom time.Time) {
 		t.Helper()
@@ -877,7 +974,7 @@ func TestPgStore_FindRulePack_InactiveJurisdictionFailsClosed(t *testing.T) {
 	s, _, ctx := newTestStore(t)
 	j := mustCreateJurisdiction(t, s, ctx, "GB", nil)
 
-	if _, err := s.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin-1"); err != nil {
+	if _, _, err := s.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin-1"); err != nil {
 		t.Fatalf("failed to deactivate: %v", err)
 	}
 
@@ -886,6 +983,288 @@ func TestPgStore_FindRulePack_InactiveJurisdictionFailsClosed(t *testing.T) {
 	}
 	if _, err := s.FindRulePack(ctx, uuid.New().String(), "", time.Now().UTC()); !errors.Is(err, domain.ErrJurisdictionNotFound) {
 		t.Fatalf("expected ErrJurisdictionNotFound for an unknown jurisdiction, got %v", err)
+	}
+}
+
+// TestPgStore_FindRulePack_HistoricalReplayAfterDeactivation — a pack is a
+// runtime artifact, but "historical actions must always be explainable against
+// the rule set active at the time of execution" (03-microservices.md §8.2). A
+// deactivated jurisdiction therefore fails closed only for `at` outside its
+// effective window; an `at` from before its retirement still replays the pack.
+func TestPgStore_FindRulePack_HistoricalReplayAfterDeactivation(t *testing.T) {
+	s, _, ctx := newTestStore(t)
+	j := mustCreateJurisdiction(t, s, ctx, "GB", nil)
+
+	before := time.Now().UTC().Add(-time.Hour)
+	r, _, err := s.CreateRule(ctx, domain.CreateRuleParams{
+		JurisdictionRuleID:   uuid.New().String(),
+		JurisdictionID:       j.JurisdictionID,
+		RuleDomain:           "TAX",
+		RuleCode:             "GB_VAT",
+		RuleName:             "VAT",
+		EffectiveFrom:        before.Add(-time.Hour),
+		RulePayload:          []byte(`{"filing_frequency": "QUARTERLY"}`),
+		RuleStatus:           "ACTIVE",
+		CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create rule: %v", err)
+	}
+
+	pre, err := s.FindRulePack(ctx, j.JurisdictionID, "", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("expected a live pack before deactivation, got %v", err)
+	}
+	if len(pre.Rules) != 1 {
+		t.Fatalf("expected 1 rule before deactivation, got %d", len(pre.Rules))
+	}
+
+	if _, _, err := s.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin-1"); err != nil {
+		t.Fatalf("failed to deactivate: %v", err)
+	}
+
+	if _, err := s.FindRulePack(ctx, j.JurisdictionID, "", time.Now().UTC().Add(time.Minute)); !errors.Is(err, domain.ErrJurisdictionNotFound) {
+		t.Fatalf("expected ErrJurisdictionNotFound for `at` after the end of the window, got %v", err)
+	}
+	hist, err := s.FindRulePack(ctx, j.JurisdictionID, "", before)
+	if err != nil {
+		t.Fatalf("a historical pack after deactivation must still answer, got %v", err)
+	}
+	if len(hist.Rules) != 1 || hist.Rules[0].JurisdictionRuleID != r.JurisdictionRuleID {
+		t.Errorf("historical pack got %d rules; want the single rule that was in force", len(hist.Rules))
+	}
+}
+
+// TestPgStore_FindRulePack_AncestorRulesEndWithTheirJurisdiction — an inherited
+// rule is only resolvable while the ancestor that owns it is itself effective,
+// even when the rule row carries no end date. A retired ancestor must stop
+// contributing to a later pack while still contributing to an earlier one.
+func TestPgStore_FindRulePack_AncestorRulesEndWithTheirJurisdiction(t *testing.T) {
+	s, _, ctx := newTestStore(t)
+	country := mustCreateJurisdiction(t, s, ctx, "CA", nil)
+	state := mustCreateJurisdiction(t, s, ctx, "CA-ON", &country.JurisdictionID)
+
+	before := time.Now().UTC().Add(-time.Hour)
+	countryRule, _, err := s.CreateRule(ctx, domain.CreateRuleParams{
+		JurisdictionRuleID:   uuid.New().String(),
+		JurisdictionID:       country.JurisdictionID,
+		RuleDomain:           "TAX",
+		RuleCode:             "CA_FEDERAL",
+		RuleName:             "Federal",
+		EffectiveFrom:        before.Add(-2 * time.Hour),
+		RulePayload:          []byte(`{"applies": true}`),
+		RuleStatus:           "ACTIVE",
+		CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create country rule: %v", err)
+	}
+	if _, _, err := s.CreateRule(ctx, domain.CreateRuleParams{
+		JurisdictionID:       state.JurisdictionID,
+		RuleDomain:           "TAX",
+		RuleCode:             "ON_PAYROLL",
+		RuleName:             "Payroll",
+		EffectiveFrom:        before.Add(-time.Hour),
+		RulePayload:          []byte(`{"applies": true}`),
+		RuleStatus:           "ACTIVE",
+		CreatedByPrincipalID: "admin-1",
+	}); err != nil {
+		t.Fatalf("failed to create state rule: %v", err)
+	}
+
+	inherited, err := s.FindRulePack(ctx, state.JurisdictionID, "", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("unexpected error on live pack: %v", err)
+	}
+	if len(inherited.Rules) != 2 {
+		t.Fatalf("expected 2 inherited rules while both are active, got %d", len(inherited.Rules))
+	}
+
+	if _, _, err := s.DeactivateJurisdiction(ctx, country.JurisdictionID, "admin-1"); err != nil {
+		t.Fatalf("failed to deactivate country: %v", err)
+	}
+
+	onlyState, err := s.FindRulePack(ctx, state.JurisdictionID, "", time.Now().UTC().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("unexpected error on the state pack after the country retired: %v", err)
+	}
+	for _, rule := range onlyState.Rules {
+		if rule.JurisdictionRuleID == countryRule.JurisdictionRuleID {
+			t.Fatal("a retired country's open-ended rule must not resolve into a later state pack")
+		}
+	}
+	if len(onlyState.Rules) != 1 {
+		t.Fatalf("expected only the state rule to survive, got %d", len(onlyState.Rules))
+	}
+
+	historic, err := s.FindRulePack(ctx, state.JurisdictionID, "", before)
+	if err != nil {
+		t.Fatalf("a historical state pack must still include the country rule, got %v", err)
+	}
+	var found bool
+	for _, rule := range historic.Rules {
+		found = found || rule.JurisdictionRuleID == countryRule.JurisdictionRuleID
+	}
+	if !found {
+		t.Error("historical state pack must retain the retired country's rule")
+	}
+}
+
+// TestPgStore_AppendOnlyEnforced — drift history and rule status history are
+// append-only (000009 + 000017). Direct UPDATE/DELETE on either table must be
+// denied in the database, not merely discouraged by the store API.
+func TestPgStore_AppendOnlyEnforced(t *testing.T) {
+	s, pool, ctx := newTestStore(t)
+	j := mustCreateJurisdiction(t, s, ctx, "NL", nil)
+
+	r, _, err := s.CreateRule(ctx, domain.CreateRuleParams{
+		JurisdictionRuleID:   uuid.New().String(),
+		JurisdictionID:       j.JurisdictionID,
+		RuleDomain:           "TAX",
+		RuleCode:             "NL_VAT",
+		RuleName:             "VAT",
+		EffectiveFrom:        time.Now().UTC().Add(-time.Hour),
+		RulePayload:          []byte(`{"filing_frequency": "MONTHLY"}`),
+		RuleStatus:           "DRAFT",
+		CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create rule: %v", err)
+	}
+	if _, _, err := s.TransitionRuleStatus(ctx, store.TransitionParams{
+		RuleID:        r.JurisdictionRuleID,
+		NewStatus:     "ACTIVE",
+		AllowedPriors: []string{"DRAFT"},
+		ActorID:       "actor-1",
+	}); err != nil {
+		t.Fatalf("failed to transition DRAFT -> ACTIVE: %v", err)
+	}
+	if _, event, _, err := s.RecordDrift(ctx, domain.RecordDriftParams{
+		JurisdictionRuleID:    r.JurisdictionRuleID,
+		ToState:               "DRIFTED",
+		RecordedByPrincipalID: "admin-1",
+	}); err != nil || event == nil {
+		t.Fatalf("failed to record drift: %v", err)
+	}
+
+	assertAppendOnly := func(table, column string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, "UPDATE "+table+" SET "+column+" = "+column+" WHERE jurisdiction_rule_id = $1", r.JurisdictionRuleID); err == nil {
+			t.Errorf("%s: an UPDATE must be denied (append-only)", table)
+		}
+		if _, err := pool.Exec(ctx, "DELETE FROM "+table+" WHERE jurisdiction_rule_id = $1", r.JurisdictionRuleID); err == nil {
+			t.Errorf("%s: a DELETE must be denied (append-only)", table)
+		}
+	}
+
+	// rule_status_history: UPDATE is legitimate (the record_rule_status_change
+	// trigger writes known_to on close-out), so only DELETE is asserted there.
+	if _, err := pool.Exec(ctx, "DELETE FROM rule_status_history WHERE jurisdiction_rule_id = $1", r.JurisdictionRuleID); err == nil {
+		t.Error("rule_status_history: a DELETE must be denied (append-only)")
+	}
+	assertAppendOnly("jurisdiction_rule_drift_events", "reason")
+}
+
+// TestPgStore_FindRulePack_StatusHistoryGovernsHistoricalPacks — the pack's
+// status test is bitemporal: it is the status KNOWN at `at` that decides, not
+// the rule's current status. These two rules share the same "today" (one still
+// ACTIVE, one RETIRED at runtime) but differ in what the platform knew earlier.
+//
+// The known timeline is seeded directly because a runtime DRAFT→ACTIVE or
+// ACTIVE→RETIRED transition collapses into the same timestamp as creation —
+// the only way to pin a historical `at` deterministically is to write the
+// rows the trigger would have written.
+func TestPgStore_FindRulePack_StatusHistoryGovernsHistoricalPacks(t *testing.T) {
+	s, pool, ctx := newTestStore(t)
+	now := time.Now().UTC()
+	from := now.Add(-6 * time.Hour)
+
+	newRule := func(jID, code, status string) *domain.JurisdictionRule {
+		t.Helper()
+		r, _, err := s.CreateRule(ctx, domain.CreateRuleParams{
+			JurisdictionRuleID:   uuid.New().String(),
+			JurisdictionID:       jID,
+			RuleDomain:           "TAX",
+			RuleCode:             code,
+			RuleName:             code,
+			EffectiveFrom:        from,
+			RulePayload:          []byte(`{"rate":"0.2"}`),
+			RuleStatus:           status,
+			CreatedByPrincipalID: "admin-1",
+		})
+		if err != nil {
+			t.Fatalf("failed to create rule %s: %v", code, err)
+		}
+		return r
+	}
+
+	seedHistory := func(ruleID, status string, knownFrom, knownTo time.Time) {
+		t.Helper()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO rule_status_history
+			 (jurisdiction_rule_id, rule_status, effective_from, known_from, known_to,
+			  changed_by_principal_id, schema_version)
+			 VALUES ($1, $2, $3, $4, $5, 'admin-1', '1.0')`,
+			ruleID, status, from, knownFrom, knownTo); err != nil {
+			t.Fatalf("failed to seed history row for %s: %v", ruleID, err)
+		}
+	}
+
+	find := func(jID string, at time.Time) []*domain.JurisdictionRule {
+		t.Helper()
+		pack, err := s.FindRulePack(ctx, jID, "", at)
+		if err != nil {
+			t.Fatalf("FindRulePack at %s: %v", at, err)
+		}
+		return pack.Rules
+	}
+	has := func(rules []*domain.JurisdictionRule, id string) bool {
+		for _, rule := range rules {
+			if rule.JurisdictionRuleID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	// draftNow — currently ACTIVE, but the platform knew it as DRAFT until
+	// now-1h. At now-2h it must NOT govern (audit: "a rule activated after its
+	// effective_from appears effective for dates when it was still DRAFT").
+	j := mustCreateJurisdiction(t, s, ctx, "JP", nil)
+	draftNow := newRule(j.JurisdictionID, "JP_CTT", "ACTIVE")
+	seedHistory(draftNow.JurisdictionRuleID, "DRAFT", now.Add(-3*time.Hour), now.Add(-time.Hour))
+
+	for _, rule := range find(j.JurisdictionID, now.Add(-2*time.Hour)) {
+		if rule.JurisdictionRuleID == draftNow.JurisdictionRuleID {
+			t.Fatal("a rule the platform knew as DRAFT at `at` must not govern the historical pack")
+		}
+	}
+	if !has(find(j.JurisdictionID, now), draftNow.JurisdictionRuleID) {
+		t.Error("the same rule must govern today, where the ACTIVE row is in force")
+	}
+
+	// retiredNow — retired at runtime (current status RETIRED), but ACTIVE
+	// until now-1h in the history. It must STILL govern a pack for now-2h
+	// (audit: "a RETIRED rule vanishes from historical packs, even for dates
+	// when it governed").
+	j2 := mustCreateJurisdiction(t, s, ctx, "IE", nil)
+	retiredNow := newRule(j2.JurisdictionID, "IE_VAT", "ACTIVE")
+	seedHistory(retiredNow.JurisdictionRuleID, "ACTIVE", now.Add(-3*time.Hour), now.Add(-time.Hour))
+	if _, _, err := s.TransitionRuleStatus(ctx, store.TransitionParams{
+		RuleID:        retiredNow.JurisdictionRuleID,
+		NewStatus:     "RETIRED",
+		AllowedPriors: []string{"ACTIVE"},
+		EndDate:       true,
+		ActorID:       "admin-1",
+	}); err != nil {
+		t.Fatalf("failed to retire rule: %v", err)
+	}
+
+	if !has(find(j2.JurisdictionID, now.Add(-2*time.Hour)), retiredNow.JurisdictionRuleID) {
+		t.Error("a since-RETIRED rule must remain in historical packs for the dates it governed")
+	}
+	if has(find(j2.JurisdictionID, now.Add(30*time.Second)), retiredNow.JurisdictionRuleID) {
+		t.Error("a RETIRED rule must not govern a later pack")
 	}
 }
 

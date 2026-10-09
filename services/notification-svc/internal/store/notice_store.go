@@ -25,7 +25,7 @@ const noticeColumns = `notice_id::text, tenant_id, legal_entity_id, lineage_id::
 	to_char(effective_date, 'YYYY-MM-DD'), ack_requirement, deadline_at, status,
 	notification_id::text, superseded_by_notice_id::text, created_by_principal_id, created_at`
 
-func scanNotice(s scannable, n *domain.Notice) error {
+func scanRegulatedNotice(s scannable, n *domain.Notice) error {
 	return s.Scan(&n.NoticeID, &n.TenantID, &n.LegalEntityID, &n.LineageID, &n.VersionNumber,
 		&n.SupersedesNoticeID, &n.CorrectionReason, &n.IntentVersionID, &n.RecipientPrincipalID,
 		&n.RecipientCapacity, &n.Channel, &n.Locale, &n.Subject, &n.Body, &n.ContentHash, &n.PolicyRef,
@@ -39,7 +39,7 @@ func getNoticeTx(ctx context.Context, tx pgx.Tx, tenantID, noticeID string, forU
 		q += ` FOR UPDATE`
 	}
 	var n domain.Notice
-	if err := scanNotice(tx.QueryRow(ctx, q, noticeID, tenantID), &n); err != nil {
+	if err := scanRegulatedNotice(tx.QueryRow(ctx, q, noticeID, tenantID), &n); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrNoticeNotFound
 		}
@@ -111,7 +111,7 @@ func (s *PgStore) CreateNotice(ctx context.Context, p domain.CreateNoticeParams)
 		if prior != nil {
 			supersedes, reason = &prior.NoticeID, &p.CorrectionReason
 		}
-		if err := scanNotice(tx.QueryRow(ctx, `
+		if err := scanRegulatedNotice(tx.QueryRow(ctx, `
 			INSERT INTO regulated_notices (tenant_id, legal_entity_id, lineage_id, version_number, supersedes_notice_id, correction_reason,
 				intent_version_id, recipient_principal_id, locale, subject, body, content_hash, policy_ref, effective_date,
 				ack_requirement, deadline_at, created_by_principal_id)

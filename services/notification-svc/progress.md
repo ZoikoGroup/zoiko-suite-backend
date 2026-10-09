@@ -1,6 +1,123 @@
 # notification-svc — Progress
 
-## Status: complete and working, with no callers (2026-09-08)
+## Status: 6 Oct 2026 — in-service audit gaps closed, full spec matrix scored
+
+The five gaps the 5 Oct audit left inside this service are closed. Detail, the
+before/after scores and the list of gaps that wait on other services are in
+`docs/audit_files/Identity, Scope & Foundation-audit-2026-09-23.md`, section 7/9,
+"Follow-up, 6 October 2026".
+
+- **G-12** Migration `000024`: `ncd_exceptions` gets a platform-read policy, so
+  open exceptions reach the backlog gauges (`notification_ncd_open_exceptions{kind}`,
+  `..._open_exception_oldest_age_seconds`). Negative control recorded; live
+  gauges matched the database exactly. Applied to the dev DB with `migrate.py`.
+- **G-14** The legacy store suite runs as `zoiko_app_test NOSUPERUSER NOBYPASSRLS`.
+  That alone proved nothing: every legacy query also filters on `tenant_id`, so
+  with the tenant policies opened to everyone the suite still passed.
+  `TestLegacyTables_RLSIsolatesTenantsAsTheAppRole` reads all 13 legacy tenant
+  tables (found from the catalog) directly, and fails under that control.
+- **G-13** `RUNBOOK.md` (the ten §13.2 runbooks) and twelve alerts in
+  `deployments/prometheus-rules.yml` (promtool: valid). New gauge
+  `notification_sender_auth_healthy`, registered only where DKIM is configured.
+- **G-10** `CERTIFICATION_MATRIX.md`: all 110 NP/INV/TC rows scored. 95 met,
+  12 partial, 3 not met: 86% (92% weighted). 95% on the 100 rows this service
+  can close alone. Five tests added for rows that were correct but unproven
+  (NP-10, NP-39, NP-56 with a negative control, NP-60, INV-06).
+- **G-16** 9 files reformatted. The rest of `gofmt -l`'s Windows list is CRLF
+  in the working copy only.
+
+414 tests pass across 19 packages, 0 fail, 0 skip (store 132). Live check 69/69.
+
+**Correction:** PRV and DRC exist (privacy-decision-svc, document-vault-svc).
+This service does not call them yet. That, not a missing service, is why gaps
+G-1 and G-2 remain open.
+
+---
+
+## Status: 5 Oct 2026 re-audit — six defects fixed and proven live
+
+The 30 Sep audit scored 37 API and table rows. The re-audit also read the spec's NP and INV
+matrices and the legacy code beside the plane. The NCD plane held up. The legacy surface did not.
+All six defects are fixed. Store suite 128 pass, 1 skip (the legacy outbox RLS test refuses to run as superuser), 0 fail
+against Postgres 16, NCD tests as the
+`NOSUPERUSER NOBYPASSRLS` role. `scripts/ncd_live_check.py` 69/69 on three consecutive runs,
+including a real marketing round-trip through Mailpit.
+
+| # | Defect (as found) | Fix |
+|---|---|---|
+| 1 | `POST /v1/notifications/unsubscribe` was envelope-exempt and never verified its token. An anonymous `{tenant_id, email}` wrote an UNSUBSCRIBE. The legacy upsert (`ON CONFLICT DO UPDATE reason`) then rewrote a recorded HARD_BOUNCE as UNSUBSCRIBE, which the gate scopes to marketing, so transactional and security mail resumed to a dead address. **Proven live.** | `internal/unsubscribe`: AES-256-GCM token over (tenant, address), keyed by `NOTIFICATION_UNSUBSCRIBE_SECRET`. The receiver believes only the token: forged gets 403, absent gets 400, unconfigured gets 503. The upsert never weakens a reason (rank UNSUBSCRIBE < COMPLAINT < HARD_BOUNCE < ADMIN_SUPPRESSED). Negative control recorded. |
+| 2 | `DELETE /v1/notifications/suppression/{email}` hard-deleted a suppression: one principal, no evidence. | Route and store method removed. Migration `000022` adds lift columns with the canonical CHECKs (evidence, plus a second principal for bounce/complaint/hold), refuses DELETE by trigger, and makes the uniqueness active-rows-only so a lifted row stays as history. `POST /v1/suppressions/{id}/lift` now reaches legacy rows. |
+| 3 | The housekeeping worker deleted concluded `message_intents` older than 90 days. The FK cascade took renders, attempts and delivery events with them, with no legal-hold check (§8.4, §9.2, INV-28). | Purge step, option, stat and store methods removed. Migration `000023` makes all six evidence tables refuse DELETE. Retention is DRC's. Negative control recorded. |
+| 4 | Marketing mail from the plane carried no unsubscribe link. The legacy header hard-coded `notify.zoiko.com` with the raw address in the URL, plus a `mailto:` nobody reads. | Both paths add the sealed RFC 8058 header, with its base from `NOTIFICATION_PUBLIC_BASE_URL`. Marketing that cannot carry a working link is refused before the provider (NCD-011 / `ErrUnsubscribeUnavailable`), never sent without one (INV-25). |
+| 5 | The plane exported no metrics. No §13.1 dimension was observable. | `telemetry.NCD` through an `ncd.Metrics` port. Counters only where nothing can roll back: submits (state, latency) and callbacks (`rejected_<code>`, applied, duplicate…). Backlog gauges re-read from the DB every 15 s under platform scope: UNKNOWN count and age, queue depth and age, notices past deadline, pending DRC declarations. Label allow-list test (§13.3). The RLS negative control showed zeros. |
+| 6 | No DKIM, and no reaction to broken sender authentication (§11.1, NP-55). | `internal/senderauth`: DKIM relaxed/relaxed signing (go-msgauth), covering List-Unsubscribe(-Post) per RFC 8058 §4. A monitor checks the selector key, DMARC and SPF. A definite break holds email as retryable before the relay. Resolver timeouts change nothing. Enabled by `NOTIFICATION_DKIM_DOMAIN/_SELECTOR/_PRIVATE_KEY`. **Proven live**: email went to RETRY_SCHEDULED with the NP-55 reason and Mailpit was unchanged. |
+
+The live check also changed. It raced the worker (it read the attempt while still SUBMITTING;
+53/57 on one run), its README and stand-ins were never committed, and it covered none of the
+above. It now waits for a concluded attempt and adds 12 checks. `scripts/README-live-check.md`
+and `scripts/live_check_stubs.py` make it reproducible.
+
+**Deploy notes.** Apply `000022` and `000023`. Set `NOTIFICATION_UNSUBSCRIBE_SECRET` (32+ bytes)
+and `NOTIFICATION_PUBLIC_BASE_URL` from the secret store, otherwise marketing email is refused.
+Set the DKIM trio only where this service, not the provider, signs.
+
+**Still open (not defects in this service):** nothing in the estate calls notification-svc
+(INV-01 adoption). The console uses only the 6 legacy routes, with no NCD screens and no
+acknowledgment UI. PRV and DRC do not exist. `ncd_exceptions` has no platform-read policy, so
+open exceptions are not in the backlog gauges. 62 pre-existing files are not gofmt-clean (CI
+does not check).
+
+---
+
+## Earlier status: ZS-SVC-Y-001 control plane implemented and verified live (2026-09-30)
+
+The five canonical NCD services now live in this one service (`internal/ncd`, migrations
+`000015`–`000021`), the way configuration-feature-flag-svc implemented AA-001. Group 1 audit 7/9
+went from 12% to **95%** (35 of 37 rows; the two partials wait on PRV and DRC, which do not exist).
+The full scoring, row by row, is in `docs/audit_files/Identity, Scope & Foundation-audit-2026-09-23.md`.
+
+**Re-prove it:** `python scripts/ncd_live_check.py` against a running service (57 checks; header of
+the script says what it needs), and the store suite with `TEST_DATABASE_URL` pointing at
+`notification_test` — it resets the schema, applies every migration and connects as the
+unprivileged `zoiko_ncd_app` role, because a superuser bypasses RLS and would hide exactly the
+defects RLS exists to catch. Regenerate the contract with `python scripts/gen_openapi.py`.
+
+**Shape.** `internal/ncd` is pure policy over two ports: `Store.InTx` hands out a tenant-scoped
+`Tx` whose `Enqueue` is the only way to emit an event (so no fact is announced outside the
+transaction that records it), and `Transport` submits through a certified binding (SMTP router,
+or the in-app register). Handlers in `internal/handler/ncd_handler.go` fetch, authorize against the
+stored object's legal entity, then act. The worker (`Service.Run`) moves jobs, turns stranded
+SUBMITTING attempts into UNKNOWN, raises UNKNOWN past its deadline as an exception, runs notice
+clocks and evaluates reputation; dispatch kicks it.
+
+**The rules that are database rules, not conventions:** template and intent content immutable
+(triggers); the §6.2 attempt graph (trigger); no new attempt of a communication while one is
+UNKNOWN (trigger — INV-13 cannot be forgotten by any code path); evidence, plans, decisions and
+acknowledgments append-only; suppressions never deleted, governed lifts need a second principal
+(CHECK); SoD on intent activation and template approval (CHECK).
+
+**Defects found on the way, all fixed:** the legacy send path consulted no suppression list at all
+(`GatedDeliverer` now gates handler, resend and retry worker); the legacy provider webhook was
+unauthenticated (HMAC now); the live `notification` DB was on the pre-merge migration lineage
+(empty — rebuilt to 000021); `Idempotency-Key` was demanded and never read (middleware now); the dev
+RBAC seed granted none of the four other actions this service authorizes; `openapi.yaml` and the
+audit script were lost in the merge; and, in the new code, callback dedupe keyed without the tenant.
+
+**§3.3 on the legacy register.** `status` in every API response is now the precise proposition
+(`PROVIDER_ACCEPTED`, `DELIVERED_TO_INBOX`, `DELIVERY_UNKNOWN`, `RETRY_SCHEDULED`, …); the column is
+unchanged and returned as `stored_status`; `?status=` accepts both vocabularies; the console and its
+e2e mock follow.
+
+**Still open:** the legacy `POST /v1/notifications` and `/events/ingest` paths remain for existing
+callers and name no intent — gated and §3.3-correct, but INV-01 holds only once callers move to
+`POST /v1/communications`. Provider callbacks for SMTP need a real adapter posting to
+`/v1/provider-events/smtp-primary` with `NCD_CALLBACK_SECRET_SMTP_PRIMARY`; the legacy webhook needs
+`NOTIFICATION_WEBHOOK_SECRET[_<PROVIDER>]` or it refuses everything (by design). `docker-compose.yml`
+sets development defaults for both; a real deployment must set them from the secret store.
+
+---
+
+## Earlier status: complete and working, with no callers (2026-09-08)
 
 Six routes, all wired to the Next.js console. Templates, retry with
 exponential backoff and jitter, the stranded-delivery sweep added this pass,

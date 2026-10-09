@@ -52,8 +52,22 @@ func (f *fakeSupportStore) InsertSupportContextWithEvent(_ context.Context, sc d
 	}
 	cp := sc
 	f.contexts[sc.SupportContextID] = &cp
-	f.events = append(f.events, rec)
+	if rec.EventID != "" {
+		f.events = append(f.events, rec)
+	}
 	return nil
+}
+
+// Mirrors the store: only a pending, unrevoked request naming this approver.
+func (f *fakeSupportStore) ApproveSupportContextWithEvent(_ context.Context, id, tenantID, approver string, grantedAt, expiresAt time.Time, rec outbox.Record) (bool, error) {
+	sc, ok := f.contexts[id]
+	if !ok || sc.TenantID != tenantID || sc.ApproverPrincipalID != approver ||
+		sc.ApprovalStatus != domain.SupportPendingApproval || sc.RevokedAt != nil {
+		return false, nil
+	}
+	sc.ApprovalStatus, sc.ApprovedAt, sc.GrantedAt, sc.ExpiresAt = domain.SupportApproved, &grantedAt, grantedAt, expiresAt
+	f.events = append(f.events, rec)
+	return true, nil
 }
 
 func (f *fakeSupportStore) FindSupportContext(_ context.Context, id, tenantID string) (*domain.SupportContext, error) {
@@ -175,6 +189,21 @@ type noopSink struct{}
 
 func (noopSink) Emit(_ context.Context, _ outbox.Record) error { return nil }
 
+// requesterID makes support requests in these tests. It is never the
+// approver: the request names "support-lead-9", who approves it themselves.
+const requesterID = "support-requester-3"
+
+// attachApproved is the full two-party flow: a request, then the named
+// approver's own approval. The tests below used to attach with the caller set
+// to the approver, which is exactly the hole S1-1 / R-2 recorded.
+func attachApproved(svc *identityctx.SupportService, req domain.AttachSupportContextRequest) (*domain.SupportContext, error) {
+	sc, err := svc.Attach(context.Background(), req, requesterID)
+	if err != nil {
+		return nil, err
+	}
+	return svc.Approve(context.Background(), sc.SupportContextID, req.TenantID, req.ApproverPrincipalID, "corr-approve")
+}
+
 func validAttachRequest() domain.AttachSupportContextRequest {
 	return domain.AttachSupportContextRequest{
 		TenantID:            "tenant-a",
@@ -192,7 +221,7 @@ func validAttachRequest() domain.AttachSupportContextRequest {
 
 func TestAttachSupportContext_GrantsScopedToOneTenant(t *testing.T) {
 	f := newSupportFixture()
-	sc, err := f.build().Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(f.build(), validAttachRequest())
 
 	require.NoError(t, err)
 	assert.Equal(t, "tenant-a", sc.TenantID)
@@ -206,7 +235,7 @@ func TestAttachSupportContext_NarrowedGrantCoversOnlyItsSubject(t *testing.T) {
 	subject := "principal-77"
 	req.SubjectPrincipalID = &subject
 
-	sc, err := f.build().Attach(context.Background(), req, "support-lead-9")
+	sc, err := attachApproved(f.build(), req)
 	require.NoError(t, err)
 
 	assert.True(t, sc.Covers("principal-77"))
@@ -221,7 +250,7 @@ func TestSupportContext_ExpiresAutomatically(t *testing.T) {
 	req := validAttachRequest()
 	req.TTLSeconds = 60
 
-	sc, err := f.build().Attach(context.Background(), req, "support-lead-9")
+	sc, err := attachApproved(f.build(), req)
 	require.NoError(t, err)
 
 	// Live at grant time...
@@ -241,7 +270,7 @@ func TestVerifySupportContext_ReportsExpiryDistinctlyFromAbsence(t *testing.T) {
 	req := validAttachRequest()
 	req.TTLSeconds = 60
 
-	sc, err := svc.Attach(context.Background(), req, "support-lead-9")
+	sc, err := attachApproved(svc, req)
 	require.NoError(t, err)
 
 	// Force it past its window.
@@ -262,7 +291,7 @@ func TestAttachSupportContext_RefusesWindowBeyondMaximum(t *testing.T) {
 	req := validAttachRequest()
 	req.TTLSeconds = int((30 * 24 * time.Hour).Seconds())
 
-	_, err := f.build().Attach(context.Background(), req, "support-lead-9")
+	_, err := attachApproved(f.build(), req)
 
 	// REFUSED, not clamped. Clamping would issue a grant with a window nobody
 	// requested and nobody reviewed, and the requester would believe they held
@@ -273,7 +302,7 @@ func TestAttachSupportContext_RefusesWindowBeyondMaximum(t *testing.T) {
 func TestVerifySupportContext_RevokedGrantIsUnusableImmediately(t *testing.T) {
 	f := newSupportFixture()
 	svc := f.build()
-	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(svc, validAttachRequest())
 	require.NoError(t, err)
 
 	require.NoError(t, svc.Revoke(context.Background(), sc.SupportContextID, "tenant-a", "incident closed", "support-lead-9", "corr-2"))
@@ -300,7 +329,7 @@ func TestAttachSupportContext_RequiresAnApprover(t *testing.T) {
 	req := validAttachRequest()
 	req.ApproverPrincipalID = ""
 
-	_, err := f.build().Attach(context.Background(), req, "support-lead-9")
+	_, err := attachApproved(f.build(), req)
 	require.Error(t, err, "there is no single-party form of this command")
 }
 
@@ -310,7 +339,7 @@ func TestAttachSupportContext_RefusedOnSoDConflict(t *testing.T) {
 	f := newSupportFixture()
 	f.sod = conflictingSoD{}
 
-	_, err := f.build().Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	_, err := attachApproved(f.build(), validAttachRequest())
 
 	require.ErrorIs(t, err, sod.ErrConflict)
 	assert.Empty(t, f.store.contexts, "a conflicting grant must not be written")
@@ -326,7 +355,7 @@ func TestAttachSupportContext_FailsClosedWhenSoDUnavailable(t *testing.T) {
 	f := newSupportFixture()
 	f.sod = unavailableSoD{}
 
-	_, err := f.build().Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	_, err := attachApproved(f.build(), validAttachRequest())
 
 	require.ErrorIs(t, err, sod.ErrUnavailable)
 	assert.Empty(t, f.store.contexts)
@@ -343,16 +372,20 @@ func TestAttachSupportContext_AsksSoDAboutTheRightPair(t *testing.T) {
 	checker := &clearSoD{}
 	f.sod = checker
 
-	_, err := f.build().Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	_, err := attachApproved(f.build(), validAttachRequest())
 	require.NoError(t, err)
 
-	require.Len(t, checker.calls, 1)
-	call := checker.calls[0]
-	assert.Equal(t, "support-lead-9", call.MakerPrincipalID)
-	assert.Equal(t, "support-lead-9", call.CheckerPrincipalID)
-	assert.Equal(t, "support-eng-1", call.SubjectPrincipalID)
-	assert.Equal(t, identityctx.ActionAttachSupportContext, call.ActionType)
-	assert.Equal(t, "tenant-a", call.TenantID)
+	// Asked at the request, and again at the approval with the approver who
+	// actually acted. The maker is the requester, never the approver: the
+	// old single call passed the caller as both.
+	require.Len(t, checker.calls, 2)
+	for _, call := range checker.calls {
+		assert.Equal(t, requesterID, call.MakerPrincipalID)
+		assert.Equal(t, "support-lead-9", call.CheckerPrincipalID)
+		assert.Equal(t, "support-eng-1", call.SubjectPrincipalID)
+		assert.Equal(t, identityctx.ActionAttachSupportContext, call.ActionType)
+		assert.Equal(t, "tenant-a", call.TenantID)
+	}
 }
 
 // ── "fully evidenced" ────────────────────────────────────────────────────────
@@ -362,7 +395,7 @@ func TestAttachSupportContext_RequiresAUsableJustification(t *testing.T) {
 	req := validAttachRequest()
 	req.Justification = "asdf"
 
-	_, err := f.build().Attach(context.Background(), req, "support-lead-9")
+	_, err := attachApproved(f.build(), req)
 
 	// A justification nobody can act on is not evidence, it is a checkbox.
 	require.Error(t, err)
@@ -374,7 +407,7 @@ func TestAttachSupportContext_RequiresARecognisedReason(t *testing.T) {
 	req := validAttachRequest()
 	req.ReasonCode = "BECAUSE_I_SAID_SO"
 
-	_, err := f.build().Attach(context.Background(), req, "support-lead-9")
+	_, err := attachApproved(f.build(), req)
 	require.Error(t, err, "a reason nobody can group a report by is not a reason")
 }
 
@@ -383,13 +416,13 @@ func TestAttachSupportContext_RequiresATicketReference(t *testing.T) {
 	req := validAttachRequest()
 	req.TicketRef = "   "
 
-	_, err := f.build().Attach(context.Background(), req, "support-lead-9")
+	_, err := attachApproved(f.build(), req)
 	require.Error(t, err)
 }
 
 func TestAttachSupportContext_EmitsItsEventAtomically(t *testing.T) {
 	f := newSupportFixture()
-	sc, err := f.build().Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(f.build(), validAttachRequest())
 	require.NoError(t, err)
 
 	// A privileged elevation the security team was never told about is the
@@ -410,7 +443,7 @@ func TestAttachSupportContext_EmitsItsEventAtomically(t *testing.T) {
 func TestReconcile_ReportsExpiredGrantsThatWereNeverReviewed(t *testing.T) {
 	f := newSupportFixture()
 	svc := f.build()
-	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(svc, validAttachRequest())
 	require.NoError(t, err)
 
 	f.store.contexts[sc.SupportContextID].ExpiresAt = time.Now().UTC().Add(-time.Hour)
@@ -427,7 +460,7 @@ func TestReconcile_ReportsExpiredGrantsThatWereNeverReviewed(t *testing.T) {
 func TestReconcile_DoesNotAutoApprove(t *testing.T) {
 	f := newSupportFixture()
 	svc := f.build()
-	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(svc, validAttachRequest())
 	require.NoError(t, err)
 	f.store.contexts[sc.SupportContextID].ExpiresAt = time.Now().UTC().Add(-time.Hour)
 
@@ -452,7 +485,7 @@ func TestReconcile_DoesNotAutoApprove(t *testing.T) {
 func TestVerifySupportContext_ForeignTenantIsNotFound(t *testing.T) {
 	f := newSupportFixture()
 	svc := f.build()
-	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(svc, validAttachRequest())
 	require.NoError(t, err)
 
 	_, err = svc.Verify(context.Background(), sc.SupportContextID, "tenant-b", "support-eng-1", "")
@@ -462,7 +495,7 @@ func TestVerifySupportContext_ForeignTenantIsNotFound(t *testing.T) {
 func TestVerifySupportContext_AnotherEngineersGrantIsNotFound(t *testing.T) {
 	f := newSupportFixture()
 	svc := f.build()
-	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(svc, validAttachRequest())
 	require.NoError(t, err)
 
 	// Holding the id of somebody else's grant must not be enough to use it.
@@ -473,7 +506,7 @@ func TestVerifySupportContext_AnotherEngineersGrantIsNotFound(t *testing.T) {
 func TestRevokeSupportContext_IsIdempotent(t *testing.T) {
 	f := newSupportFixture()
 	svc := f.build()
-	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(svc, validAttachRequest())
 	require.NoError(t, err)
 
 	require.NoError(t, svc.Revoke(context.Background(), sc.SupportContextID, "tenant-a", "done", "lead", "c1"))
@@ -494,7 +527,7 @@ func TestAttachSupportContext_DefaultTTLAppliesWhenNoneRequested(t *testing.T) {
 	req := validAttachRequest()
 	req.TTLSeconds = 0
 
-	sc, err := f.build().Attach(context.Background(), req, "support-lead-9")
+	sc, err := attachApproved(f.build(), req)
 	require.NoError(t, err)
 
 	window := sc.ExpiresAt.Sub(sc.GrantedAt)
@@ -508,7 +541,7 @@ func TestSupportJustificationIsTrimmedNotPadded(t *testing.T) {
 	req.Justification = "   " + strings.Repeat("x", 5) + "   "
 
 	// Whitespace must not be able to satisfy the minimum length.
-	_, err := f.build().Attach(context.Background(), req, "support-lead-9")
+	_, err := attachApproved(f.build(), req)
 	require.Error(t, err)
 }
 
@@ -521,7 +554,7 @@ func TestSupportJustificationIsTrimmedNotPadded(t *testing.T) {
 func TestMarkReviewed_EmitsExactlyOneReviewedEvent(t *testing.T) {
 	f := newSupportFixture()
 	svc := f.build()
-	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(svc, validAttachRequest())
 	require.NoError(t, err)
 	before := len(f.store.events)
 
@@ -550,7 +583,7 @@ func TestMarkReviewed_EmitsExactlyOneReviewedEvent(t *testing.T) {
 func TestMarkReviewed_RepeatIsANoOpWithNoSecondEvent(t *testing.T) {
 	f := newSupportFixture()
 	svc := f.build()
-	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(svc, validAttachRequest())
 	require.NoError(t, err)
 
 	require.NoError(t, svc.MarkReviewed(context.Background(), sc.SupportContextID, "tenant-a", "security-lead-3", "c1"))
@@ -564,7 +597,7 @@ func TestMarkReviewed_RepeatIsANoOpWithNoSecondEvent(t *testing.T) {
 func TestMarkReviewed_UnknownOrForeignGrantIsNotFound(t *testing.T) {
 	f := newSupportFixture()
 	svc := f.build()
-	sc, err := svc.Attach(context.Background(), validAttachRequest(), "support-lead-9")
+	sc, err := attachApproved(svc, validAttachRequest())
 	require.NoError(t, err)
 
 	assert.ErrorIs(t, svc.MarkReviewed(context.Background(), "no-such-grant", "tenant-a", "r", "c"), domain.ErrSupportContextNotFound)

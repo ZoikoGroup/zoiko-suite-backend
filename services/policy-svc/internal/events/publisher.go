@@ -3,6 +3,7 @@ package events
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -14,29 +15,36 @@ import (
 	"zoiko.io/policy-svc/internal/domain"
 )
 
-// envelope is this platform's event contract (Doc 03 §19): every published
-// event must carry event name, event version, timestamp, tenant ID, legal
-// entity ID, jurisdiction context, actor ID, correlation ID, source
-// service, and payload schema version. domain.Policy is a global
-// definition with no tenant/legal-entity scope at all — genuinely
-// correct to omit both, not an oversight. domain.PolicyVersion is
-// independently-nullable-scoped (nil TenantID/LegalEntityID means
-// global/tenant-wide, per ScopeType) — nil is correctly omitted rather
+// Envelope is this platform's event contract (Doc 03 §19, Event Catalogue §4):
+// every published event must carry event name, event version, timestamp,
+// tenant ID, legal entity ID, jurisdiction context, actor ID, correlation
+// ID, source service, payload schema version, classification, payload hash,
+// aggregate version, causation ID, and residency region.
+// domain.Policy is a global definition with no tenant/legal-entity scope at
+// all — genuinely correct to omit both, not an oversight.
+// domain.PolicyVersion is independently-nullable-scoped (nil TenantID/LegalEntityID
+// means global/tenant-wide, per ScopeType) — nil is correctly omitted rather
 // than fabricated. policy.rule.retired carries no actor: it fires as a
 // system side effect of activating a newer version in the same scope,
 // not a principal-driven transition.
-type envelope struct {
-	EventID       string          `json:"event_id"`
-	EventType     string          `json:"event_type"`
-	EventVersion  string          `json:"event_version"`
-	EmittedAt     time.Time       `json:"emitted_at"`
-	SchemaVersion string          `json:"schema_version"`
-	SourceService string          `json:"source_service"`
-	TenantID      string          `json:"tenant_id,omitempty"`
-	LegalEntityID string          `json:"legal_entity_id,omitempty"`
-	ActorID       string          `json:"actor_id,omitempty"`
-	CorrelationID string          `json:"correlation_id"`
-	Payload       json.RawMessage `json:"payload"`
+type Envelope struct {
+	EventID            string          `json:"event_id"`
+	EventType          string          `json:"event_type"`
+	EventVersion       string          `json:"event_version"`
+	EmittedAt          time.Time       `json:"emitted_at"`
+	SchemaVersion      string          `json:"schema_version"`
+	SourceService      string          `json:"source_service"`
+	TenantID           string          `json:"tenant_id,omitempty"`
+	LegalEntityID      string          `json:"legal_entity_id,omitempty"`
+	ActorID            string          `json:"actor_id,omitempty"`
+	CorrelationID      string          `json:"correlation_id"`
+	CausationID        string          `json:"causation_id,omitempty"`
+	Classification     string          `json:"classification,omitempty"`
+	PayloadHash        string          `json:"payload_hash,omitempty"`
+	AggregateVersion   string          `json:"aggregate_version,omitempty"`
+	ResidencyRegion    string          `json:"residency_region,omitempty"`
+	PublishedAt        time.Time       `json:"published_at"`
+	Payload            json.RawMessage `json:"payload"`
 }
 
 // MessageWriter is the one method Publisher needs from *kafka.Writer.
@@ -139,20 +147,31 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID
 	if err != nil {
 		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
 	}
-	env := envelope{
+
+	// Compute payload hash for integrity verification
+	payloadHash := fmt.Sprintf("sha256-%x", sha256.Sum256(raw))
+
+	now := time.Now().UTC()
+	env := Envelope{
 		// A fresh UUID per publish, not a deterministic string — see
 		// docs/architecture/known-gaps.md's event_id collision writeup.
-		EventID:       "evt-" + uuid.New().String(),
-		EventType:     eventType,
-		EventVersion:  "1.0",
-		EmittedAt:     time.Now().UTC(),
-		SchemaVersion: "1.0",
-		SourceService: "policy-svc",
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		ActorID:       actorID,
-		CorrelationID: correlationID,
-		Payload:       json.RawMessage(raw),
+		EventID:          "evt-" + uuid.New().String(),
+		EventType:        eventType,
+		EventVersion:     "1.0",
+		EmittedAt:        now,
+		SchemaVersion:    "1.0",
+		SourceService:    "policy-svc",
+		TenantID:         tenantID,
+		LegalEntityID:    legalEntityID,
+		ActorID:          actorID,
+		CorrelationID:    correlationID,
+		CausationID:      correlationID, // Use correlation as causation by default
+		Classification:   "governance",
+		PayloadHash:      payloadHash,
+		AggregateVersion: "1",
+		ResidencyRegion:  "", // Could be derived from tenant context if needed
+		PublishedAt:      now,
+		Payload:          json.RawMessage(raw),
 	}
 	data, err := json.Marshal(env)
 	if err != nil {

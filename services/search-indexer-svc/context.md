@@ -264,9 +264,9 @@ close. None is a stub pretending to work.
 
 | Not built | Open decision | Why the boundary is still enforced |
 |---|---|---|
-| Semantic / vector search | OD-10, OD-11 | Wave 7. The projection and restriction model already carries the lineage vectors need, so it is an additional index family rather than a redesign. |
+| Semantic provider | OD-10, OD-11 | Semantic search is BUILT (30 Sep 2026) but no provider is configured. Semantic contracts cannot build and `/v1/search/semantic` answers ESR-019 until one is. |
 | Bulk export delivery | OD-13 | `/v1/search-exports` authorizes, records the population and transfers nothing. The route exists so INV-29's boundary is enforced rather than implied; inventing a size limit would be making OD-13's decision. |
-| R2 source hydration | OD-05 | No scope is registered R2. A scope configured R2 with no hydrator answers ESR-014 — a loud refusal — rather than silently downgrading to index content, which would be a freshness lie nothing downstream could detect. |
+| R2 scope classification | OD-05 | The hydrator is wired (obligation) and hydrates as the caller. Which scopes are R2 is OD-05's; a source type with no configured collection suppresses its R2 results with ESR-014. |
 | Numeric SLOs | OD-03, OD-04 | The metrics that would be alerted on exist and are correctly separated; the thresholds are a capacity decision. |
 | Region-pinned clusters | OD-01, OD-02 | Residency is enforced logically via the `residency_region` mandatory filter. Physical pinning for RESTRICTED-tier data remains the GTRM follow-up `search-client`'s README flags. |
 

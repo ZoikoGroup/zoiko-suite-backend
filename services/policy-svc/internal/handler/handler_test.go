@@ -16,6 +16,7 @@ import (
 	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/domain"
 	"zoiko.io/policy-svc/internal/handler"
+	"zoiko.io/policy-svc/internal/store"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 )
 
@@ -91,8 +92,20 @@ func (s *stubStore) ListVersionHistory(_ context.Context, _ string) ([]*domain.P
 	return s.history, s.historyErr
 }
 
-func (s *stubStore) FindApplicableVersions(_ context.Context, _ string, _, _ *string) ([]*domain.ApplicablePolicyVersion, error) {
+func (s *stubStore) FindApplicableVersions(_ context.Context, _ string, _, _ *string, _ *time.Time) ([]*domain.ApplicablePolicyVersion, error) {
 	return s.applicable, s.applicableErr
+}
+
+func (s *stubStore) FindPolicyByID(_ context.Context, _ string) (*domain.Policy, error) {
+	return s.policy, s.policyErr
+}
+
+func (s *stubStore) CheckPolicyTypeOverlap(_ context.Context, _ string, _, _, _ *string, _ time.Time, _ *time.Time) (bool, error) {
+	return false, nil
+}
+
+func (s *stubStore) EnqueueEvent(_ context.Context, _ store.OutboxEvent) error {
+	return nil
 }
 
 // ── Chunk 10: control tests & attestations ──────────────────────────────────
@@ -222,15 +235,15 @@ func (d *stubDecisionLog) RecordDecision(_ context.Context, params decisionlog.R
 }
 
 func newTestRouter(s *stubStore) chi.Router {
-	return newTestRouterFull(s, &stubPublisher{}, &stubDecisionLog{})
+	return newTestRouterFull(s, &stubDecisionLog{})
 }
 
-func newTestRouterWithPublisher(s *stubStore, p *stubPublisher) chi.Router {
-	return newTestRouterFull(s, p, &stubDecisionLog{})
+func newTestRouterWithDecisionLog(s *stubStore, d *stubDecisionLog) chi.Router {
+	return newTestRouterFull(s, d)
 }
 
-func newTestRouterFull(s *stubStore, p *stubPublisher, d *stubDecisionLog) chi.Router {
-	return newTestRouterWithAuthz(s, p, d, &stubAuthz{})
+func newTestRouterFull(s *stubStore, d *stubDecisionLog) chi.Router {
+	return newTestRouterWithAuthz(s, d, &stubAuthz{})
 }
 
 // newTestRouterWithAuthz is the same wiring with an explicit authz client —
@@ -240,10 +253,10 @@ func newTestRouterFull(s *stubStore, p *stubPublisher, d *stubDecisionLog) chi.R
 // under test saw an empty tenant scope — and the store's lookup, which widens
 // itself to every tenant when the scope is empty, was exercised in exactly the
 // configuration the tests were meant to rule out.
-func newTestRouterWithAuthz(s *stubStore, p *stubPublisher, d *stubDecisionLog, az *stubAuthz) chi.Router {
+func newTestRouterWithAuthz(s *stubStore, d *stubDecisionLog, az *stubAuthz) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, p, d, az, testAuthzScopeID, zap.NewNop())
+	h := handler.New(s, d, az, testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -253,7 +266,7 @@ func newTestRouterWithAuthz(s *stubStore, p *stubPublisher, d *stubDecisionLog, 
 // handler.RegisterRoutes.
 func newControlTestRouter(s *stubStore, az *stubAuthz) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, &stubPublisher{}, &stubDecisionLog{}, az, testAuthzScopeID, zap.NewNop())
+	h := handler.New(s, &stubDecisionLog{}, az, testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	handler.RegisterControlTestRoutes(r, h)
 	return r
@@ -321,8 +334,8 @@ func TestCreatePolicy_Created(t *testing.T) {
 		},
 		policyCreated: true,
 	}
-	pub := &stubPublisher{}
-	r := newTestRouterWithPublisher(store, pub)
+	dlog := &stubDecisionLog{}
+	r := newTestRouterWithDecisionLog(store, dlog)
 
 	body := `{"policy_code":"APPROVAL_5K","policy_name":"5K Approval Threshold","policy_type":"APPROVAL_THRESHOLD","created_by_principal_id":"admin-1"}`
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body)))
@@ -331,9 +344,6 @@ func TestCreatePolicy_Created(t *testing.T) {
 
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
-	}
-	if pub.createdCalls != 1 {
-		t.Errorf("expected policy.created published once, got %d", pub.createdCalls)
 	}
 	var got domain.Policy
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
@@ -346,11 +356,11 @@ func TestCreatePolicy_Created(t *testing.T) {
 
 func TestCreatePolicy_IdempotentReplay(t *testing.T) {
 	store := &stubStore{
-		policy:        &domain.Policy{PolicyID: "p-1", PolicyCode: "APPROVAL_5K"},
+		policy:        &domain.Policy{PolicyID: "11111111-1111-1111-1111-111111111111", PolicyCode: "APPROVAL_5K"},
 		policyCreated: false,
 	}
-	pub := &stubPublisher{}
-	r := newTestRouterWithPublisher(store, pub)
+	dlog := &stubDecisionLog{}
+	r := newTestRouterWithDecisionLog(store, dlog)
 
 	body := `{"policy_code":"APPROVAL_5K","policy_name":"5K Approval Threshold","policy_type":"APPROVAL_THRESHOLD","created_by_principal_id":"admin-1"}`
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body)))
@@ -359,9 +369,6 @@ func TestCreatePolicy_IdempotentReplay(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 on idempotent replay, got %d", w.Code)
-	}
-	if pub.createdCalls != 0 {
-		t.Errorf("expected policy.created NOT published on idempotent replay, got %d calls", pub.createdCalls)
 	}
 }
 
@@ -409,10 +416,19 @@ func TestCreatePolicy_StoreUnavailable(t *testing.T) {
 // ── CreatePolicyVersion ──────────────────────────────────────────────────────
 
 func TestCreatePolicyVersion_Created(t *testing.T) {
+	policyID := "11111111-1111-1111-1111-111111111111"
+	versionID := "22222222-2222-2222-2222-222222222222"
 	store := &stubStore{
+		policy: &domain.Policy{
+			PolicyID:             policyID,
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
 		version: &domain.PolicyVersion{
-			PolicyVersionID: "pv-1",
-			PolicyID:        "p-1",
+			PolicyVersionID: versionID,
+			PolicyID:        policyID,
 			VersionStatus:   "DRAFT",
 			RulePayload:     []byte(`{"threshold_amount":5000}`),
 		},
@@ -420,8 +436,8 @@ func TestCreatePolicyVersion_Created(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"rule_payload":{"threshold_amount":5000},"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body)))
+	body := `{"rule_payload":{"threshold_amount":5000},"effective_from":"2026-01-01T00:00:00Z"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/"+policyID+"/versions", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -433,8 +449,8 @@ func TestCreatePolicyVersion_Created(t *testing.T) {
 func TestCreatePolicyVersion_MissingEffectiveFrom(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	body := `{"created_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body)))
+	body := ``
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/11111111-1111-1111-1111-111111111111/versions", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -444,11 +460,11 @@ func TestCreatePolicyVersion_MissingEffectiveFrom(t *testing.T) {
 }
 
 func TestCreatePolicyVersion_PolicyNotFound(t *testing.T) {
-	store := &stubStore{versionErr: domain.ErrPolicyNotFound}
+	store := &stubStore{policyErr: domain.ErrPolicyNotFound}
 	r := newTestRouter(store)
 
-	body := `{"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/missing/versions", bytes.NewBufferString(body)))
+	body := `{"effective_from":"2026-01-01T00:00:00Z"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/33333333-3333-3333-3333-333333333333/versions", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -460,17 +476,26 @@ func TestCreatePolicyVersion_PolicyNotFound(t *testing.T) {
 // ── ActivateVersion ──────────────────────────────────────────────────────────
 
 func TestActivateVersion_Success(t *testing.T) {
+	policyID := "11111111-1111-1111-1111-111111111111"
+	versionID := "22222222-2222-2222-2222-222222222222"
 	store := &stubStore{
-		findVersion:  &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT"},
-		activated:    &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "ACTIVE"},
-		superseded:   []*domain.PolicyVersion{{PolicyVersionID: "pv-0", PolicyID: "p-1", VersionStatus: "SUPERSEDED"}},
+		policy: &domain.Policy{
+			PolicyID:             policyID,
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
+		findVersion:  &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "DRAFT"},
+		activated:    &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "ACTIVE"},
+		superseded:   []*domain.PolicyVersion{{PolicyVersionID: "33333333-3333-3333-3333-333333333333", PolicyID: policyID, VersionStatus: "SUPERSEDED"}},
 		transitioned: true,
 	}
-	pub := &stubPublisher{}
-	r := newTestRouterWithPublisher(store, pub)
+	dlog := &stubDecisionLog{}
+	r := newTestRouterWithDecisionLog(store, dlog)
 
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/"+policyID+"/versions/"+versionID+"/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -484,24 +509,19 @@ func TestActivateVersion_Success(t *testing.T) {
 	if got.VersionStatus != "ACTIVE" {
 		t.Errorf("expected status ACTIVE, got %s", got.VersionStatus)
 	}
-	if pub.activatedCalls != 1 {
-		t.Errorf("expected policy.version.activated published once, got %d", pub.activatedCalls)
-	}
-	if pub.retiredCalls != 1 {
-		t.Errorf("expected policy.rule.retired published once (for the superseded version), got %d", pub.retiredCalls)
-	}
 }
 
 // ── GetPolicyVersionByID ─────────────────────────────────────────────────────
 
 func TestGetPolicyVersionByID_Found(t *testing.T) {
+	versionID := "22222222-2222-2222-2222-222222222222"
 	store := &stubStore{
-		findVersion: &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "SUPERSEDED"},
+		findVersion: &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: "11111111-1111-1111-1111-111111111111", VersionStatus: "SUPERSEDED"},
 	}
 	r := newTestRouter(store)
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, scoped(httptest.NewRequest(http.MethodGet, "/v1/policy-versions/pv-1", nil)))
+	r.ServeHTTP(w, scoped(httptest.NewRequest(http.MethodGet, "/v1/policy-versions/"+versionID, nil)))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -522,32 +542,37 @@ func TestGetPolicyVersionByID_NotFound(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, scoped(httptest.NewRequest(http.MethodGet, "/v1/policy-versions/does-not-exist", nil)))
+	r.ServeHTTP(w, scoped(httptest.NewRequest(http.MethodGet, "/v1/policy-versions/44444444-4444-4444-4444-444444444444", nil)))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
 func TestActivateVersion_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
+	policyID := "11111111-1111-1111-1111-111111111111"
+	versionID := "22222222-2222-2222-2222-222222222222"
 	store := &stubStore{
-		findVersion:  &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "ACTIVE"},
-		activated:    &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "ACTIVE"},
+		policy: &domain.Policy{
+			PolicyID:             policyID,
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
+		findVersion:  &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "ACTIVE"},
+		activated:    &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "ACTIVE"},
 		transitioned: false, // store signals this was a no-op, not a real transition
 	}
-	pub := &stubPublisher{}
-	r := newTestRouterWithPublisher(store, pub)
+	dlog := &stubDecisionLog{}
+	r := newTestRouterWithDecisionLog(store, dlog)
 
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/"+policyID+"/versions/"+versionID+"/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if pub.activatedCalls != 0 || pub.retiredCalls != 0 {
-		t.Errorf("expected no events published on idempotent no-op, got activated=%d retired=%d",
-			pub.activatedCalls, pub.retiredCalls)
 	}
 }
 
@@ -557,16 +582,25 @@ func TestActivateVersion_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 // the audit trail records about them, so the actor is read from the
 // gateway-verified header and an empty body is perfectly valid.
 func TestActivateVersion_ActorComesFromHeaderNotBody(t *testing.T) {
+	policyID := "11111111-1111-1111-1111-111111111111"
+	versionID := "22222222-2222-2222-2222-222222222222"
 	store := &stubStore{
-		findVersion:  &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT"},
-		activated:    &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "ACTIVE"},
+		policy: &domain.Policy{
+			PolicyID:             policyID,
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
+		findVersion:  &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "DRAFT"},
+		activated:    &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "ACTIVE"},
 		transitioned: true,
 	}
 	r := newTestRouter(store)
 
 	// Body names someone else entirely; the header is what must be recorded.
 	body := `{"activated_by_principal_id":"someone-else"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/"+policyID+"/versions/"+versionID+"/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -588,18 +622,23 @@ var mutatingRoutes = []struct {
 	body string
 }{
 	{"create policy", "/v1/policies", `{"policy_code":"C","policy_name":"N","policy_type":"APPROVAL_THRESHOLD"}`},
-	{"create version", "/v1/policies/p-1/versions", `{"effective_from":"2025-01-01T00:00:00Z","rule_payload":{"threshold_amount":100}}`},
-	{"activate version", "/v1/policies/p-1/versions/pv-1/activate", `{}`},
+	{"create version", "/v1/policies/11111111-1111-1111-1111-111111111111/versions", `{"effective_from":"2025-01-01T00:00:00Z","rule_payload":{"threshold_amount":100}}`},
+	{"activate version", "/v1/policies/11111111-1111-1111-1111-111111111111/versions/22222222-2222-2222-2222-222222222222/activate", `{}`},
 }
 
 func okStore() *stubStore {
 	return &stubStore{
-		policy:         &domain.Policy{PolicyID: "p-1", PolicyCode: "C"},
+		policy: &domain.Policy{
+			PolicyID:             "11111111-1111-1111-1111-111111111111",
+			PolicyCode:           "C",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
 		policyCreated:  true,
-		version:        &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT"},
+		version:        &domain.PolicyVersion{PolicyVersionID: "22222222-2222-2222-2222-222222222222", PolicyID: "11111111-1111-1111-1111-111111111111", VersionStatus: "DRAFT"},
 		versionCreated: true,
-		findVersion:    &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT"},
-		activated:      &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "ACTIVE"},
+		findVersion:    &domain.PolicyVersion{PolicyVersionID: "22222222-2222-2222-2222-222222222222", PolicyID: "11111111-1111-1111-1111-111111111111", VersionStatus: "DRAFT"},
+		activated:      &domain.PolicyVersion{PolicyVersionID: "22222222-2222-2222-2222-222222222222", PolicyID: "11111111-1111-1111-1111-111111111111", VersionStatus: "ACTIVE"},
 		transitioned:   true,
 	}
 }
@@ -629,7 +668,7 @@ func TestMutatingRoutes_403_Denied(t *testing.T) {
 		t.Run(route.name, func(t *testing.T) {
 			store := okStore()
 			az := &stubAuthz{err: domain.ErrAuthorizationDenied}
-			r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
+			r := newTestRouterWithAuthz(store, &stubDecisionLog{}, az)
 
 			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
 			w := httptest.NewRecorder()
@@ -658,7 +697,7 @@ func TestMutatingRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 		t.Run(route.name, func(t *testing.T) {
 			store := okStore()
 			az := &stubAuthz{err: domain.ErrAuthorizationServiceUnavailable}
-			r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
+			r := newTestRouterWithAuthz(store, &stubDecisionLog{}, az)
 
 			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
 			w := httptest.NewRecorder()
@@ -682,12 +721,12 @@ func TestActivateVersion_AuthorizedAgainstStoredScope(t *testing.T) {
 	store := okStore()
 	// Version has a legal entity but no tenant_id (global scope), so it requires the global action.
 	store.findVersion = &domain.PolicyVersion{
-		PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT", LegalEntityID: &entity, TenantID: nil,
+		PolicyVersionID: "22222222-2222-2222-2222-222222222222", PolicyID: "11111111-1111-1111-1111-111111111111", VersionStatus: "DRAFT", LegalEntityID: &entity, TenantID: nil,
 	}
 	az := &stubAuthz{}
-	r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
+	r := newTestRouterWithAuthz(store, &stubDecisionLog{}, az)
 
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(`{}`)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/11111111-1111-1111-1111-111111111111/versions/22222222-2222-2222-2222-222222222222/activate", bytes.NewBufferString(`{}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -707,7 +746,7 @@ func TestActivateVersion_AuthorizedAgainstStoredScope(t *testing.T) {
 // legal entity, and authorization-svc rejects an empty legal_entity_id.
 func TestCreatePolicy_UsesPlatformScopeWhenUnscoped(t *testing.T) {
 	az := &stubAuthz{}
-	r := newTestRouterWithAuthz(okStore(), &stubPublisher{}, &stubDecisionLog{}, az)
+	r := newTestRouterWithAuthz(okStore(), &stubDecisionLog{}, az)
 
 	body := `{"policy_code":"C","policy_name":"N","policy_type":"APPROVAL_THRESHOLD"}`
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body)))
@@ -728,7 +767,7 @@ func TestCreatePolicy_UsesPlatformScopeWhenUnscoped(t *testing.T) {
 func TestEvaluate_NotGated(t *testing.T) {
 	az := &stubAuthz{err: domain.ErrAuthorizationDenied}
 	store := &stubStore{applicable: []*domain.ApplicablePolicyVersion{}}
-	r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
+	r := newTestRouterWithAuthz(store, &stubDecisionLog{}, az)
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_amount":100,"evaluated_by_principal_id":"caller-1"}`
 	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
@@ -746,12 +785,12 @@ func TestEvaluate_NotGated(t *testing.T) {
 func TestActivateVersion_PolicyIDMismatch(t *testing.T) {
 	// version_id resolves, but belongs to a different policy_id than the path.
 	store := &stubStore{
-		findVersion: &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-OTHER", VersionStatus: "DRAFT"},
+		findVersion: &domain.PolicyVersion{PolicyVersionID: "22222222-2222-2222-2222-222222222222", PolicyID: "33333333-3333-3333-3333-333333333333", VersionStatus: "DRAFT"},
 	}
 	r := newTestRouter(store)
 
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/11111111-1111-1111-1111-111111111111/versions/22222222-2222-2222-2222-222222222222/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -762,13 +801,20 @@ func TestActivateVersion_PolicyIDMismatch(t *testing.T) {
 
 func TestActivateVersion_InvalidTransition(t *testing.T) {
 	store := &stubStore{
-		findVersion: &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "RETIRED"},
+		policy: &domain.Policy{
+			PolicyID:             "11111111-1111-1111-1111-111111111111",
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
+		findVersion: &domain.PolicyVersion{PolicyVersionID: "22222222-2222-2222-2222-222222222222", PolicyID: "11111111-1111-1111-1111-111111111111", VersionStatus: "RETIRED"},
 		activateErr: domain.ErrInvalidTransition,
 	}
 	r := newTestRouter(store)
 
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/11111111-1111-1111-1111-111111111111/versions/22222222-2222-2222-2222-222222222222/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -783,7 +829,7 @@ func TestListVersionHistory_EmptyReturnsArray(t *testing.T) {
 	store := &stubStore{history: nil}
 	r := newTestRouter(store)
 
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil))
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/11111111-1111-1111-1111-111111111111/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -799,7 +845,7 @@ func TestListVersionHistory_NotFound(t *testing.T) {
 	store := &stubStore{historyErr: domain.ErrPolicyNotFound}
 	r := newTestRouter(store)
 
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/missing/versions", nil))
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/44444444-4444-4444-4444-444444444444/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -812,13 +858,13 @@ func TestListVersionHistory_NewestFirst(t *testing.T) {
 	now := time.Now().UTC()
 	store := &stubStore{
 		history: []*domain.PolicyVersion{
-			{PolicyVersionID: "pv-2", EffectiveFrom: now, VersionStatus: "ACTIVE"},
-			{PolicyVersionID: "pv-1", EffectiveFrom: now.Add(-time.Hour), VersionStatus: "SUPERSEDED"},
+			{PolicyVersionID: "22222222-2222-2222-2222-222222222222", EffectiveFrom: now, VersionStatus: "ACTIVE"},
+			{PolicyVersionID: "11111111-1111-1111-1111-111111111111", EffectiveFrom: now.Add(-time.Hour), VersionStatus: "SUPERSEDED"},
 		},
 	}
 	r := newTestRouter(store)
 
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil))
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/11111111-1111-1111-1111-111111111111/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -826,7 +872,7 @@ func TestListVersionHistory_NewestFirst(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatalf("failed to unmarshal response: %v", err)
 	}
-	if len(got) != 2 || got[0].PolicyVersionID != "pv-2" {
+	if len(got) != 2 || got[0].PolicyVersionID != "22222222-2222-2222-2222-222222222222" {
 		t.Fatalf("expected pv-2 first (newest), got %+v", got)
 	}
 }
@@ -915,11 +961,11 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 		},
 	}
 	decisionLog := &stubDecisionLog{}
-	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
+	r := newTestRouterFull(store, decisionLog)
 
 	tenantID := testTenant
-	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"` + testTenant + `","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"` + testTenant + `","action_context":{"amount":7500},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -948,8 +994,8 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 	if decisionLog.calls != 1 {
 		t.Fatalf("expected RecordDecision called once, got %d", decisionLog.calls)
 	}
-	if decisionLog.last.ActorID != "admin-1" {
-		t.Errorf("expected ActorID admin-1, got %s", decisionLog.last.ActorID)
+	if decisionLog.last.ActorID != testPrincipal {
+		t.Errorf("expected ActorID %s, got %s", testPrincipal, decisionLog.last.ActorID)
 	}
 	// Recorded outcome must be in the decision log's vocabulary
 	// (GRANTED/DENIED/ESCALATED), not this service's own result vocabulary.
@@ -970,24 +1016,11 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 	}
 }
 
-func TestEvaluate_MissingEvaluatedByPrincipalID(t *testing.T) {
-	r := newTestRouter(&stubStore{})
-
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", w.Code)
-	}
-}
-
 func TestEvaluate_MissingDecisionID(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000}}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1009,10 +1042,10 @@ func TestEvaluate_DecisionLogFailure_StillReturns200(t *testing.T) {
 		},
 	}
 	decisionLog := &stubDecisionLog{err: fmt.Errorf("governance-decision-log-svc unreachable")}
-	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
+	r := newTestRouterFull(store, decisionLog)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1040,8 +1073,8 @@ func TestEvaluate_WithinThreshold(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1074,8 +1107,8 @@ func TestEvaluate_AmountEqualsThreshold_IsWithinThreshold(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":5000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":5000},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1116,8 +1149,8 @@ func TestEvaluate_LargeAmount_PrecisionNotLost(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":10000000000000001},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":10000000000000001},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1150,10 +1183,10 @@ func TestEvaluate_WithinThreshold_RecordsGrantedOutcome(t *testing.T) {
 		},
 	}
 	decisionLog := &stubDecisionLog{}
-	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
+	r := newTestRouterFull(store, decisionLog)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1185,7 +1218,7 @@ func TestEvaluate_MissingPolicyType(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
 	body := `{"action_context":{"amount":1000}}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1207,8 +1240,8 @@ func TestEvaluate_MissingActionContextAmount(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1219,10 +1252,10 @@ func TestEvaluate_MissingActionContextAmount(t *testing.T) {
 
 func TestEvaluate_NoApplicablePolicy(t *testing.T) {
 	decisionLog := &stubDecisionLog{}
-	r := newTestRouterFull(&stubStore{applicable: nil}, &stubPublisher{}, decisionLog)
+	r := newTestRouterFull(&stubStore{applicable: nil}, decisionLog)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1241,10 +1274,10 @@ func TestEvaluate_PolicyTypeNotImplemented(t *testing.T) {
 		},
 	}
 	decisionLog := &stubDecisionLog{}
-	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
+	r := newTestRouterFull(store, decisionLog)
 
-	body := `{"policy_type":"SPEND_CONTROL","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"SPEND_CONTROL","action_context":{"amount":1000},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1263,9 +1296,9 @@ func TestEvaluate_PolicyTypeNotImplemented(t *testing.T) {
 // UNSCOPED, so a request that simply omitted X-Tenant-Id read any tenant's
 // policy version by id.
 func TestGetPolicyVersionByID_NoTenantScope_Refused(t *testing.T) {
-	r := newTestRouter(&stubStore{findVersion: &domain.PolicyVersion{PolicyVersionID: "pv-1"}})
+	r := newTestRouter(&stubStore{findVersion: &domain.PolicyVersion{PolicyVersionID: "22222222-2222-2222-2222-222222222222"}})
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policy-versions/pv-1", nil))
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policy-versions/22222222-2222-2222-2222-222222222222", nil))
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", w.Code, w.Body.String())
 	}
@@ -1298,10 +1331,10 @@ func TestListApplicablePolicyVersions_ForeignTenantQueryParam_Refused(t *testing
 // A policy version decides what the platform enforces, so publishing one into
 // another tenant is the most consequential write this service has.
 func TestCreatePolicyVersion_ForeignTenantBody_Refused(t *testing.T) {
-	store := &stubStore{policy: &domain.Policy{PolicyID: "p-1"}}
+	store := &stubStore{policy: &domain.Policy{PolicyID: "11111111-1111-1111-1111-111111111111"}}
 	r := newTestRouter(store)
 	body := `{"tenant_id":"` + otherTenant + `","rule_payload":{"threshold_amount":5000},"effective_from":"2026-01-01T00:00:00Z"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/11111111-1111-1111-1111-111111111111/versions", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
@@ -1313,10 +1346,10 @@ func TestCreatePolicyVersion_ForeignTenantBody_Refused(t *testing.T) {
 // scope — and it used to be the way to reach global scope while authorizing only
 // against an entity the caller already held.
 func TestCreatePolicyVersion_GlobalScopeWithLegalEntity_Refused(t *testing.T) {
-	store := &stubStore{policy: &domain.Policy{PolicyID: "p-1"}}
+	store := &stubStore{policy: &domain.Policy{PolicyID: "11111111-1111-1111-1111-111111111111"}}
 	r := newTestRouter(store)
 	body := `{"legal_entity_id":"33333333-3333-3333-3333-333333333333","rule_payload":{"threshold_amount":5000},"effective_from":"2026-01-01T00:00:00Z"}`
-	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body)))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/11111111-1111-1111-1111-111111111111/versions", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -1326,8 +1359,8 @@ func TestCreatePolicyVersion_GlobalScopeWithLegalEntity_Refused(t *testing.T) {
 
 func TestEvaluate_ForeignTenantBody_Refused(t *testing.T) {
 	r := newTestRouter(&stubStore{})
-	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"` + otherTenant + `","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"` + otherTenant + `","action_context":{"amount":7500},"decision_id":"dec-1"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {

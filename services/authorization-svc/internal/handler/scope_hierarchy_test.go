@@ -90,7 +90,7 @@ func (s *scopeTrackingStore) CreateDelegatedAuthority(_ context.Context, params 
 
 func newScopeRouter(s *scopeTrackingStore) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, &stubPublisher{}, &stubValidator{}, siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", zap.NewNop())
+	h := handler.New(s, &stubPublisher{}, &stubValidator{}, siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", false, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }

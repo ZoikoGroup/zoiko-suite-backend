@@ -22,6 +22,7 @@ const fullColumns = `
 	date_of_birth::text, gender, profile_picture_url, personal_email, work_email,
 	current_address, permanent_address, city, state, country, postal_code,
 	company, business_unit, division, team, designation_id, confirmation_date::text,
+	basic_salary, ctc,
 	created_at, updated_at`
 
 // listColumns is the directory projection. It deliberately omits date of birth,
@@ -104,6 +105,7 @@ func scanFull(row pgx.Row, emp *domain.Employee) error {
 		&emp.DateOfBirth, &emp.Gender, &emp.ProfilePictureURL, &emp.PersonalEmail, &emp.WorkEmail,
 		&emp.CurrentAddress, &emp.PermanentAddress, &emp.City, &emp.State, &emp.Country, &emp.PostalCode,
 		&emp.Company, &emp.BusinessUnit, &emp.Division, &emp.Team, &emp.DesignationID, &emp.ConfirmationDate,
+		&emp.BasicSalary, &emp.CTC,
 		&emp.CreatedAt, &emp.UpdatedAt,
 	)
 }
@@ -134,10 +136,11 @@ func (s *PgStore) CreateEmployee(ctx context.Context, emp *domain.Employee) erro
 				date_of_birth, gender, profile_picture_url, personal_email, work_email,
 				current_address, permanent_address, city, state, country, postal_code,
 				company, business_unit, division, team, designation_id, confirmation_date,
+				basic_salary, ctc,
 				created_at, updated_at
 			) VALUES (
 				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-				$19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36
+				$19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38
 			)
 		`, emp.EmployeeID, tenantID, emp.LegalEntityID, emp.EmployeeNumber, emp.FirstName, emp.LastName,
 			emp.Email, emp.Phone, emp.JobTitle, emp.DepartmentID, emp.ManagerEmployeeID, emp.WorkerType,
@@ -145,6 +148,7 @@ func (s *PgStore) CreateEmployee(ctx context.Context, emp *domain.Employee) erro
 			emp.DateOfBirth, emp.Gender, emp.ProfilePictureURL, emp.PersonalEmail, emp.WorkEmail,
 			emp.CurrentAddress, emp.PermanentAddress, emp.City, emp.State, emp.Country, emp.PostalCode,
 			emp.Company, emp.BusinessUnit, emp.Division, emp.Team, emp.DesignationID, emp.ConfirmationDate,
+			emp.BasicSalary, emp.CTC,
 			emp.CreatedAt, emp.UpdatedAt)
 		return err
 	})
@@ -266,8 +270,10 @@ func (s *PgStore) UpdateEmployee(ctx context.Context, emp *domain.Employee) erro
 			    current_address = $13, permanent_address = $14, city = $15,
 			    state = $16, country = $17, postal_code = $18,
 			    company = $19, business_unit = $20, division = $21, team = $22,
-			    designation_id = $23, confirmation_date = $24, updated_at = $25
-			WHERE employee_id = $26 AND tenant_id = $27
+			    designation_id = $23, confirmation_date = $24,
+			    basic_salary = $25, ctc = $26,
+			    updated_at = $27
+			WHERE employee_id = $28 AND tenant_id = $29
 		`, emp.FirstName, emp.LastName, emp.Phone, emp.JobTitle,
 			emp.DepartmentID, emp.ManagerEmployeeID, emp.WorkerType,
 			emp.DateOfBirth, emp.Gender, emp.ProfilePictureURL,
@@ -275,7 +281,9 @@ func (s *PgStore) UpdateEmployee(ctx context.Context, emp *domain.Employee) erro
 			emp.CurrentAddress, emp.PermanentAddress, emp.City,
 			emp.State, emp.Country, emp.PostalCode,
 			emp.Company, emp.BusinessUnit, emp.Division, emp.Team,
-			emp.DesignationID, emp.ConfirmationDate, emp.UpdatedAt,
+			emp.DesignationID, emp.ConfirmationDate,
+			emp.BasicSalary, emp.CTC,
+			emp.UpdatedAt,
 			emp.EmployeeID, tenantID)
 		if err != nil {
 			return err

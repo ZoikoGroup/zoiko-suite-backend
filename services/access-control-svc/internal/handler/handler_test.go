@@ -39,6 +39,9 @@ type stubStore struct {
 	// modelling the fire-and-forget path the outbox replaced, and would keep
 	// passing if that path ever came back.
 	events *stubPublisher
+
+	// refusals is what RecordRefusedEscalation was handed.
+	refusals []domain.RefusedEscalation
 }
 
 func newStubStore() *stubStore {
@@ -150,8 +153,17 @@ func (s *stubStore) CreateBundle(_ context.Context, b *domain.PermissionBundleDe
 	return true, nil
 }
 
+// ListBundles reads the live rows, as the real store does. It used to return
+// bundlesByRole, a copy taken at create time that UpdateBundle never touched,
+// so a test reading a role's bundles after an edit saw the pre-edit state.
 func (s *stubStore) ListBundles(_ context.Context, roleDefinitionID string) ([]domain.PermissionBundleDef, error) {
-	return s.bundlesByRole[roleDefinitionID], nil
+	var out []domain.PermissionBundleDef
+	for _, b := range s.bundlesByID {
+		if b.RoleDefinitionID == roleDefinitionID {
+			out = append(out, *b)
+		}
+	}
+	return out, nil
 }
 
 func (s *stubStore) GetBundle(_ context.Context, roleDefinitionID, bundleID string) (*domain.PermissionBundleDef, error) {
@@ -196,6 +208,7 @@ func (s *stubStore) ListAllBundles(_ context.Context, filter domain.BundleListFi
 }
 
 func (s *stubStore) RecordRefusedEscalation(_ context.Context, r *domain.RefusedEscalation) error {
+	s.refusals = append(s.refusals, *r)
 	return nil
 }
 
@@ -261,9 +274,22 @@ func (a *stubAuthzAdmin) SetPermissionBundleActive(_ context.Context, roleID, bu
 	return a.setBundleActiveErr
 }
 
-type stubSoD struct{ err error }
+// stubSoD records every request. decide, when set, answers per request (so a
+// test can make a conflict depend on the candidate set); otherwise err is
+// returned.
+type stubSoD struct {
+	err    error
+	decide func(domain.SoDCheckRequest) error
+	reqs   []domain.SoDCheckRequest
+}
 
-func (s *stubSoD) CheckConflict(_ context.Context, _ domain.SoDCheckRequest) error { return s.err }
+func (s *stubSoD) CheckConflict(_ context.Context, req domain.SoDCheckRequest) error {
+	s.reqs = append(s.reqs, req)
+	if s.decide != nil {
+		return s.decide(req)
+	}
+	return s.err
+}
 
 type stubProtectedActions struct {
 	actions []string
@@ -272,6 +298,39 @@ type stubProtectedActions struct {
 
 func (s *stubProtectedActions) ListActive(_ context.Context) ([]string, error) {
 	return s.actions, s.err
+}
+
+// stubTaxonomy registers every action unless it is named in unknown, with the
+// risk tier in risk (default STANDARD). The role/bundle tests predate the
+// registry and use free action names; the registry's own behaviour is tested
+// in governance_test.go.
+type stubTaxonomy struct {
+	unknown   map[string]bool
+	risk      map[string]string
+	protected map[string]bool
+	err       error
+}
+
+func (s *stubTaxonomy) Lookup(_ context.Context, actions []string) (map[string]domain.PermissionDefinition, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	out := map[string]domain.PermissionDefinition{}
+	for _, a := range actions {
+		if s.unknown[a] {
+			continue
+		}
+		tier := s.risk[a]
+		if tier == "" {
+			tier = domain.RiskStandard
+		}
+		out[a] = domain.PermissionDefinition{ActionName: a, Naming: "LEGACY", RiskTier: tier, Protected: s.protected[a]}
+	}
+	return out, nil
+}
+
+func (s *stubTaxonomy) List(_ context.Context, _, _ string) ([]domain.PermissionDefinition, error) {
+	return nil, s.err
 }
 
 // ── router factory ─────────────────────────────────────────────────────────────
@@ -299,7 +358,7 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, admin *stubAu
 		})
 	})
 	metrics := telemetry.NewDomainWith(telemetry.NewRegistry(), "access-control-svc")
-	h := handler.New(s, authz, admin, sod, prot, metrics, zap.NewNop())
+	h := handler.New(s, authz, admin, sod, prot, &stubTaxonomy{}, metrics, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -1127,6 +1186,6 @@ func newRouterWithAuthz(s *stubStore, authz *recordingAuthZ) chi.Router {
 		})
 	})
 	metrics := telemetry.NewDomainWith(telemetry.NewRegistry(), "access-control-svc")
-	handler.RegisterRoutes(r, handler.New(s, authz, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}}, metrics, zap.NewNop()))
+	handler.RegisterRoutes(r, handler.New(s, authz, &stubAuthzAdmin{}, &stubSoD{}, &stubProtectedActions{actions: []string{"PLATFORM_ADMIN", "TENANT_ADMIN", "ROLE_MANAGE", "USER_PROVISION", "ENTITY_MANAGE", "AUDIT_READ", "SECURITY_POLICY_MANAGE", "BILLING_ADMIN"}}, &stubTaxonomy{}, metrics, zap.NewNop()))
 	return r
 }

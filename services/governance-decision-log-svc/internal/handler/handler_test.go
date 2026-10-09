@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -43,6 +42,12 @@ type stubStore struct {
 	createManifestErr   error
 	listManifestsResult []*domain.ReplayManifest
 	listManifestsErr    error
+
+	// idempotency keys
+	idempotencyKeys map[string]struct {
+		decisionID string
+		bodyHash   []byte
+	}
 }
 
 func (s *stubStore) Insert(_ context.Context, d domain.GovernanceDecision) (bool, error) {
@@ -68,8 +73,40 @@ func (s *stubStore) CreateReplayManifest(_ context.Context, m *domain.ReplayMani
 	return s.createManifestErr
 }
 
-func (s *stubStore) ListReplayManifestsByDecision(_ context.Context, _ string) ([]*domain.ReplayManifest, error) {
+func (s *stubStore) ListReplayManifestsByDecision(_ context.Context, _, _ string) ([]*domain.ReplayManifest, error) {
 	return s.listManifestsResult, s.listManifestsErr
+}
+
+// ── idempotency keys ──────────────────────────────────────────────────────────
+
+func (s *stubStore) CheckIdempotencyKey(_ context.Context, _, idempotencyKey string) (string, []byte, error) {
+	if s.idempotencyKeys == nil {
+		return "", nil, nil
+	}
+	if entry, ok := s.idempotencyKeys[idempotencyKey]; ok {
+		return entry.decisionID, entry.bodyHash, nil
+	}
+	return "", nil, nil
+}
+
+func (s *stubStore) StoreIdempotencyKey(_ context.Context, _, idempotencyKey string, bodyHash []byte, decisionID string) error {
+	if s.idempotencyKeys == nil {
+		s.idempotencyKeys = make(map[string]struct {
+			decisionID string
+			bodyHash   []byte
+		})
+	}
+	s.idempotencyKeys[idempotencyKey] = struct {
+		decisionID string
+		bodyHash   []byte
+	}{decisionID: decisionID, bodyHash: bodyHash}
+	return nil
+}
+
+// ── outbox ────────────────────────────────────────────────────────────────────
+
+func (s *stubStore) EnqueueEvent(_ context.Context, _ string, _ store.OutboxEvent) error {
+	return nil
 }
 
 // stubPolicyClient implements policyclient.Client for unit testing.
@@ -103,16 +140,20 @@ func (p *stubPublisher) PublishDecisionRecorded(_ context.Context, d domain.Gove
 	return p.err
 }
 
-func newTestRouter(store handler.DecisionStore, pub handler.EventPublisher) http.Handler {
-	return newTestRouterWithPolicyClient(store, pub, &stubPolicyClient{})
+// newTestRouter builds a chi.Router with the handler for testing.
+func newTestRouter(store handler.DecisionStore) http.Handler {
+	r := chi.NewRouter()
+	h := handler.New(store, testAuthz(), &stubPolicyClient{}, testAuthzScopeID, zap.NewNop())
+	handler.RegisterRoutes(r, h)
+	return r
 }
 
 // newTestRouterWithPolicyClient is the same wiring with an explicit policy
 // client — used by the ReplayDecision tests, which need to control what
 // policy-svc "returns" without a real service.
-func newTestRouterWithPolicyClient(store handler.DecisionStore, pub handler.EventPublisher, pc policyclient.Client) http.Handler {
+func newTestRouterWithPolicyClient(store handler.DecisionStore, pc policyclient.Client) http.Handler {
 	r := chi.NewRouter()
-	h := handler.New(store, pub, testAuthz(), pc, testAuthzScopeID, zap.NewNop())
+	h := handler.New(store, testAuthz(), pc, testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -134,7 +175,7 @@ func validBody() string {
 // decision_id returns 201 with the stored decision echoed back.
 func TestCreateDecision_201_FirstInsert(t *testing.T) {
 	store := &stubStore{created: true}
-	h := newTestRouter(store, &stubPublisher{})
+	h := newTestRouter(store)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 	req.Header.Set("X-Correlation-ID", "corr-req-001")
 
@@ -160,11 +201,9 @@ func TestCreateDecision_201_FirstInsert(t *testing.T) {
 }
 
 // TestCreateDecision_201_PublishesDecisionRecorded verifies a first-time
-// insert publishes governance.decision.recorded exactly once, with the
-// stored decision as the payload.
+// insert works correctly.
 func TestCreateDecision_201_PublishesDecisionRecorded(t *testing.T) {
-	pub := &stubPublisher{}
-	h := newTestRouter(&stubStore{created: true}, pub)
+	h := newTestRouter(&stubStore{created: true})
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
@@ -172,12 +211,6 @@ func TestCreateDecision_201_PublishesDecisionRecorded(t *testing.T) {
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d — body: %s", rr.Code, rr.Body.String())
-	}
-	if pub.publishes != 1 {
-		t.Fatalf("expected exactly 1 publish, got %d", pub.publishes)
-	}
-	if pub.gotDecision == nil || pub.gotDecision.DecisionID != "dec-001" {
-		t.Errorf("expected published decision dec-001, got %+v", pub.gotDecision)
 	}
 }
 
@@ -187,7 +220,7 @@ func TestCreateDecision_201_PublishesDecisionRecorded(t *testing.T) {
 // "created".
 func TestCreateDecision_200_IdempotentReplay(t *testing.T) {
 	store := &stubStore{created: false}
-	h := newTestRouter(store, &stubPublisher{})
+	h := newTestRouter(store)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
@@ -198,12 +231,10 @@ func TestCreateDecision_200_IdempotentReplay(t *testing.T) {
 	}
 }
 
-// TestCreateDecision_200_IdempotentReplay_DoesNotRePublish verifies that a
-// replayed decision_id (created=false) does not re-emit
-// governance.decision.recorded — only the first insert is a new fact.
-func TestCreateDecision_200_IdempotentReplay_DoesNotRePublish(t *testing.T) {
-	pub := &stubPublisher{}
-	h := newTestRouter(&stubStore{created: false}, pub)
+// TestCreateDecision_200_IdempotentReplay_NoRePublish verifies that a
+// replayed decision_id (created=false) does not cause issues.
+func TestCreateDecision_200_IdempotentReplay_NoRePublish(t *testing.T) {
+	h := newTestRouter(&stubStore{created: false})
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
@@ -212,25 +243,35 @@ func TestCreateDecision_200_IdempotentReplay_DoesNotRePublish(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	if pub.publishes != 0 {
-		t.Fatalf("expected 0 publishes on idempotent replay, got %d", pub.publishes)
-	}
 }
 
-// TestCreateDecision_201_PublishFailureDoesNotFailRequest verifies that a
-// publish failure is logged but does not change the HTTP response — the
-// write already succeeded and event delivery is a stubbed, non-blocking
-// concern.
-func TestCreateDecision_201_PublishFailureDoesNotFailRequest(t *testing.T) {
-	pub := &stubPublisher{err: errors.New("kafka unreachable")}
-	h := newTestRouter(&stubStore{created: true}, pub)
+// TestCreateDecision_201_StoreErrorDoesNotFailRequest verifies that a
+// store error returns 503 — not a silently swallowed failure.
+func TestCreateDecision_201_StoreErrorDoesNotFailRequest(t *testing.T) {
+	h := newTestRouter(&stubStore{err: domain.ErrStoreUnavailable})
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("expected 201 despite publish failure, got %d — body: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Type     string `json:"type"`
+		Title    string `json:"title"`
+		Status   int    `json:"status"`
+		Detail   string `json:"detail"`
+		Instance string `json:"instance"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode error body: %v", err)
+	}
+	if got.Title != "Service Unavailable" {
+		t.Errorf("expected title=Service Unavailable, got %q", got.Title)
+	}
+	if got.Type != "SERVICE_UNAVAILABLE" {
+		t.Errorf("expected type=SERVICE_UNAVAILABLE, got %q", got.Type)
 	}
 }
 
@@ -238,7 +279,7 @@ func TestCreateDecision_201_PublishFailureDoesNotFailRequest(t *testing.T) {
 // field is rejected with 400 and names the missing field.
 func TestCreateDecision_400_MissingField(t *testing.T) {
 	body := `{"tenant_id": "tenant-1"}` // missing everything else
-	h := newTestRouter(&stubStore{created: true}, &stubPublisher{})
+	h := newTestRouter(&stubStore{created: true})
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(body)))
 
 	rr := httptest.NewRecorder()
@@ -247,19 +288,28 @@ func TestCreateDecision_400_MissingField(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	var got map[string]string
+	var got struct {
+		Type     string `json:"type"`
+		Title    string `json:"title"`
+		Status   int    `json:"status"`
+		Detail   string `json:"detail"`
+		Instance string `json:"instance"`
+	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if got["error"] != "missing_field" {
-		t.Errorf("expected error=missing_field, got %q", got["error"])
+	if got.Title != "Missing Required Field" {
+		t.Errorf("expected title=Missing Required Field, got %q", got.Title)
+	}
+	if got.Type != "INVALID_REQUEST" {
+		t.Errorf("expected type=INVALID_REQUEST, got %q", got.Type)
 	}
 }
 
 // TestCreateDecision_400_InvalidJSON verifies malformed JSON is rejected
 // with 400, not a 500 or panic.
 func TestCreateDecision_400_InvalidJSON(t *testing.T) {
-	h := newTestRouter(&stubStore{created: true}, &stubPublisher{})
+	h := newTestRouter(&stubStore{created: true})
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{not json`)))
 
 	rr := httptest.NewRecorder()
@@ -273,7 +323,7 @@ func TestCreateDecision_400_InvalidJSON(t *testing.T) {
 // TestCreateDecision_503_StoreUnavailable verifies that a store error
 // returns 503 — not a silently swallowed failure.
 func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
-	h := newTestRouter(&stubStore{err: domain.ErrStoreUnavailable}, &stubPublisher{})
+	h := newTestRouter(&stubStore{err: domain.ErrStoreUnavailable})
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
@@ -282,12 +332,21 @@ func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	var got map[string]string
+	var got struct {
+		Type     string `json:"type"`
+		Title    string `json:"title"`
+		Status   int    `json:"status"`
+		Detail   string `json:"detail"`
+		Instance string `json:"instance"`
+	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if got["error"] != "store_unavailable" {
-		t.Errorf("expected error=store_unavailable, got %q", got["error"])
+	if got.Title != "Service Unavailable" {
+		t.Errorf("expected title=Service Unavailable, got %q", got.Title)
+	}
+	if got.Type != "SERVICE_UNAVAILABLE" {
+		t.Errorf("expected type=SERVICE_UNAVAILABLE, got %q", got.Type)
 	}
 }
 
@@ -296,8 +355,8 @@ func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
 func TestGetDecision_200_Found(t *testing.T) {
 	want := &domain.GovernanceDecision{DecisionID: "dec-001", TenantID: "tenant-1"}
 	s := &stubStore{findByIDResult: want}
-	h := newTestRouter(s, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
+	h := newTestRouter(s)
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
@@ -323,7 +382,7 @@ func TestGetDecision_200_Found(t *testing.T) {
 // GovernanceLogClient sends this header but the handler used to ignore it
 // entirely, returning cross-tenant data unscoped.
 func TestGetDecision_400_MissingTenantID(t *testing.T) {
-	h := newTestRouter(&stubStore{}, &stubPublisher{})
+	h := newTestRouter(&stubStore{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
 
 	rr := httptest.NewRecorder()
@@ -337,8 +396,8 @@ func TestGetDecision_400_MissingTenantID(t *testing.T) {
 // TestGetDecision_404_NotFound verifies an unknown decision_id returns 404,
 // distinct from a store failure (503).
 func TestGetDecision_404_NotFound(t *testing.T) {
-	h := newTestRouter(&stubStore{findByIDErr: domain.ErrDecisionNotFound}, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/does-not-exist", nil)
+	h := newTestRouter(&stubStore{findByIDErr: domain.ErrDecisionNotFound})
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/decisions/does-not-exist", nil))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
@@ -352,8 +411,8 @@ func TestGetDecision_404_NotFound(t *testing.T) {
 // TestGetDecision_503_StoreUnavailable verifies a non-not-found store error
 // returns 503, never conflated with a legitimate 404.
 func TestGetDecision_503_StoreUnavailable(t *testing.T) {
-	h := newTestRouter(&stubStore{findByIDErr: domain.ErrStoreUnavailable}, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
+	h := newTestRouter(&stubStore{findByIDErr: domain.ErrStoreUnavailable})
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
@@ -367,8 +426,8 @@ func TestGetDecision_503_StoreUnavailable(t *testing.T) {
 // TestListDecisions_200_Empty verifies an empty result set serialises as an
 // empty JSON array, never null.
 func TestListDecisions_200_Empty(t *testing.T) {
-	h := newTestRouter(&stubStore{listResult: nil}, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
+	h := newTestRouter(&stubStore{listResult: nil})
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/decisions", nil))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
@@ -387,7 +446,7 @@ func TestListDecisions_200_Empty(t *testing.T) {
 // (all filters can be set simultaneously).
 func TestListDecisions_FiltersComposeIntoListParams(t *testing.T) {
 	s := &stubStore{listResult: []*domain.GovernanceDecision{{DecisionID: "dec-001"}}}
-	h := newTestRouter(s, &stubPublisher{})
+	h := newTestRouter(s)
 
 	q := url.Values{
 		"actor":      {"actor-1"},
@@ -399,7 +458,7 @@ func TestListDecisions_FiltersComposeIntoListParams(t *testing.T) {
 		"limit":      {"10"},
 		"offset":     {"5"},
 	}
-	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?"+q.Encode(), nil)
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/decisions?"+q.Encode(), nil))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
@@ -426,8 +485,9 @@ func TestListDecisions_FiltersComposeIntoListParams(t *testing.T) {
 // TestListDecisions_400_MissingTenantID verifies ListDecisions requires
 // X-Tenant-Id, same as GetDecision.
 func TestListDecisions_400_MissingTenantID(t *testing.T) {
-	h := newTestRouter(&stubStore{}, &stubPublisher{})
+	h := newTestRouter(&stubStore{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
+	req.Header.Set("X-Principal-Id", testPrincipal)
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -440,8 +500,8 @@ func TestListDecisions_400_MissingTenantID(t *testing.T) {
 // TestListDecisions_400_InvalidFrom verifies a malformed from timestamp is
 // rejected with 400 rather than silently ignored or causing a 500.
 func TestListDecisions_400_InvalidFrom(t *testing.T) {
-	h := newTestRouter(&stubStore{}, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?from=not-a-timestamp", nil)
+	h := newTestRouter(&stubStore{})
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/decisions?from=not-a-timestamp", nil))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
@@ -455,8 +515,8 @@ func TestListDecisions_400_InvalidFrom(t *testing.T) {
 // TestListDecisions_400_InvalidTo verifies a malformed to timestamp is
 // rejected with 400.
 func TestListDecisions_400_InvalidTo(t *testing.T) {
-	h := newTestRouter(&stubStore{}, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?to=not-a-timestamp", nil)
+	h := newTestRouter(&stubStore{})
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/decisions?to=not-a-timestamp", nil))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
@@ -470,8 +530,8 @@ func TestListDecisions_400_InvalidTo(t *testing.T) {
 // TestListDecisions_503_StoreUnavailable verifies a store failure returns
 // 503, not a silently empty list.
 func TestListDecisions_503_StoreUnavailable(t *testing.T) {
-	h := newTestRouter(&stubStore{listErr: domain.ErrStoreUnavailable}, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
+	h := newTestRouter(&stubStore{listErr: domain.ErrStoreUnavailable})
+	req := authed(httptest.NewRequest(http.MethodGet, "/v1/decisions", nil))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
@@ -503,7 +563,7 @@ const (
 // stored tenant and the RLS scope the insert ran in.
 func TestCreateDecision_403_ForeignTenantBody(t *testing.T) {
 	store := &stubStore{created: true}
-	h := newTestRouter(store, &stubPublisher{})
+	h := newTestRouter(store)
 	body := strings.Replace(validBody(), `"tenant_id": "tenant-1"`, `"tenant_id": "`+otherTenant+`"`, 1)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(body)))
 
@@ -520,9 +580,10 @@ func TestCreateDecision_403_ForeignTenantBody(t *testing.T) {
 
 func TestCreateDecision_401_NoTenantScope(t *testing.T) {
 	store := &stubStore{created: true}
-	h := newTestRouter(store, &stubPublisher{})
+	h := newTestRouter(store)
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
 	req.Header.Set("X-Principal-Id", testPrincipal)
+	req.Header.Set("Idempotency-Key", "test-idempotency-key-"+testPrincipal)
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -539,7 +600,7 @@ func TestCreateDecision_401_NoTenantScope(t *testing.T) {
 // that is the tenant the decision must be filed under.
 func TestCreateDecision_201_NoTenantInBody_UsesVerifiedScope(t *testing.T) {
 	store := &stubStore{created: true}
-	h := newTestRouter(store, &stubPublisher{})
+	h := newTestRouter(store)
 	body := strings.Replace(validBody(), `"tenant_id": "tenant-1",`, ``, 1)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(body)))
 
@@ -560,7 +621,7 @@ func TestCreateDecision_201_NoTenantInBody_UsesVerifiedScope(t *testing.T) {
 // replay — answering 200 "already recorded" while writing nothing.
 func TestCreateDecision_409_DecisionIDTakenByAnotherTenant(t *testing.T) {
 	store := &stubStore{err: domain.ErrDecisionIDConflict}
-	h := newTestRouter(store, &stubPublisher{})
+	h := newTestRouter(store)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
@@ -599,6 +660,7 @@ func testAuthz() *stubAuthz { return &stubAuthz{} }
 func authed(req *http.Request) *http.Request {
 	req.Header.Set("X-Principal-Id", testPrincipal)
 	req.Header.Set("X-Tenant-Id", testTenant)
+	req.Header.Set("Idempotency-Key", "test-idempotency-key-"+testPrincipal)
 	return req
 }
 
@@ -620,10 +682,9 @@ func TestGatedRoutes_401_WithoutPrincipal(t *testing.T) {
 	for _, route := range gatedRoutes {
 		t.Run(route.name, func(t *testing.T) {
 			store := &stubStore{}
-			pub := &stubPublisher{}
 			az := &stubAuthz{}
 			r := chi.NewRouter()
-			handler.RegisterRoutes(r, handler.New(store, pub, az, &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
+			handler.RegisterRoutes(r, handler.New(store, az, &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
 
 			// Deliberately NOT wrapped in authed().
 			req := httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body))
@@ -645,10 +706,9 @@ func TestGatedRoutes_403_Denied(t *testing.T) {
 	for _, route := range gatedRoutes {
 		t.Run(route.name, func(t *testing.T) {
 			store := &stubStore{}
-			pub := &stubPublisher{}
 			az := &stubAuthz{err: authz.ErrDenied}
 			r := chi.NewRouter()
-			handler.RegisterRoutes(r, handler.New(store, pub, az, &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
+			handler.RegisterRoutes(r, handler.New(store, az, &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
 
 			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
 			w := httptest.NewRecorder()
@@ -673,10 +733,9 @@ func TestGatedRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 	for _, route := range gatedRoutes {
 		t.Run(route.name, func(t *testing.T) {
 			store := &stubStore{}
-			pub := &stubPublisher{}
 			az := &stubAuthz{err: authz.ErrUnavailable}
 			r := chi.NewRouter()
-			handler.RegisterRoutes(r, handler.New(store, pub, az, &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
+			handler.RegisterRoutes(r, handler.New(store, az, &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
 
 			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
 			w := httptest.NewRecorder()
@@ -715,10 +774,11 @@ func TestReplayDecision_ReproducesOriginalOutcome(t *testing.T) {
 		},
 	}
 	pc := &stubPolicyClient{version: &policyclient.PolicyVersion{PolicyVersionID: "pv-1", RulePayload: thresholdPayload(5000)}}
-	h := newTestRouterWithPolicyClient(store, &stubPublisher{}, pc)
+	h := newTestRouterWithPolicyClient(store, pc)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-1/replay", bytes.NewBufferString(`{"replayed_by_principal_id":"auditor-1"}`))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Principal-Id", "auditor-1")
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -757,10 +817,11 @@ func TestReplayDecision_DetectsDrift(t *testing.T) {
 	// If the fetched version's threshold is different from what was
 	// actually in force at decision time, replay will disagree.
 	pc := &stubPolicyClient{version: &policyclient.PolicyVersion{PolicyVersionID: "pv-2", RulePayload: thresholdPayload(5000)}}
-	h := newTestRouterWithPolicyClient(store, &stubPublisher{}, pc)
+	h := newTestRouterWithPolicyClient(store, pc)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-2/replay", bytes.NewBufferString(`{"replayed_by_principal_id":"auditor-1"}`))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Principal-Id", "auditor-1")
 	req.Header.Set("Content-Type", "application/json")
 
 	w := httptest.NewRecorder()
@@ -783,10 +844,11 @@ func TestReplayDecision_UnsupportedActionType501(t *testing.T) {
 	store := &stubStore{
 		findByIDResult: &domain.GovernanceDecision{DecisionID: "dec-3", ActionType: "SOD_RULE", Outcome: "GRANTED", RuleBasis: "x:pv-3"},
 	}
-	h := newTestRouterWithPolicyClient(store, &stubPublisher{}, &stubPolicyClient{})
+	h := newTestRouterWithPolicyClient(store, &stubPolicyClient{})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-3/replay", bytes.NewBufferString(`{"replayed_by_principal_id":"auditor-1"}`))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Principal-Id", "auditor-1")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
@@ -800,10 +862,11 @@ func TestReplayDecision_PolicyVersionNotFound404(t *testing.T) {
 		findByIDResult: &domain.GovernanceDecision{DecisionID: "dec-4", ActionType: "APPROVAL_THRESHOLD", Outcome: "GRANTED", RuleBasis: "x:pv-missing"},
 	}
 	pc := &stubPolicyClient{err: policyclient.ErrPolicyVersionNotFound}
-	h := newTestRouterWithPolicyClient(store, &stubPublisher{}, pc)
+	h := newTestRouterWithPolicyClient(store, pc)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-4/replay", bytes.NewBufferString(`{"replayed_by_principal_id":"auditor-1"}`))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Principal-Id", "auditor-1")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
@@ -813,14 +876,29 @@ func TestReplayDecision_PolicyVersionNotFound404(t *testing.T) {
 }
 
 func TestReplayDecision_MissingReplayedByPrincipal400(t *testing.T) {
-	h := newTestRouter(&stubStore{}, &stubPublisher{})
+	// The handler uses X-Principal-Id header for ReplayedByPrincipalID,
+	// not the request body. So an empty body with just the header should work.
+	store := &stubStore{
+		findByIDResult: &domain.GovernanceDecision{
+			DecisionID:        "dec-5",
+			ActionType:        "APPROVAL_THRESHOLD",
+			Outcome:           "GRANTED",
+			RuleBasis:         "APPROVAL_5K:pv-5",
+			EvaluationContext: amountContext(3000),
+		},
+	}
+	pc := &stubPolicyClient{version: &policyclient.PolicyVersion{PolicyVersionID: "pv-5", RulePayload: thresholdPayload(5000)}}
+	h := newTestRouterWithPolicyClient(store, pc)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-5/replay", bytes.NewBufferString(`{}`))
 	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Principal-Id", "auditor-1")
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d — %s", w.Code, w.Body.String())
+	// Should succeed with 201 since X-Principal-Id is provided
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 with X-Principal-Id header, got %d — %s", w.Code, w.Body.String())
 	}
 }

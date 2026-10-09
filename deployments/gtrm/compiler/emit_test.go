@@ -1,6 +1,8 @@
 package main
 
 import (
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -16,13 +18,13 @@ func TestEmit_NoFallback_SingleLoadBalancer(t *testing.T) {
 		t.Fatalf("expected single LB to eu-pool, got: %+v", svc.LoadBalancer)
 	}
 
-	// Router points at the service, uses strip + auth + ctx middlewares, host rule set.
+	// Router points at the service, uses strip + ctx + auth middlewares, host rule set.
 	r := cfg.HTTP.Routers["gtrm-acme"]
 	if r.Rule != "Host(`acme.zoikosuite.dev.internal`)" {
 		t.Fatalf("unexpected router rule: %s", r.Rule)
 	}
-	if len(r.Middlewares) != 3 || r.Middlewares[0] != edgeStripMW || r.Middlewares[1] != authMW {
-		t.Fatalf("expected [edge-strip, gateway-auth, ctx] middlewares, got: %v", r.Middlewares)
+	if len(r.Middlewares) != 3 || r.Middlewares[0] != edgeStripMW || r.Middlewares[1] != "gtrm-ctx-acme" || r.Middlewares[2] != authMW {
+		t.Fatalf("expected [edge-strip, ctx, gateway-auth] middlewares, got: %v", r.Middlewares)
 	}
 }
 
@@ -144,6 +146,90 @@ func TestEmit_EdgeStrip_RemovesUntrustedHeaders(t *testing.T) {
 		if !present || v != "" {
 			t.Fatalf("header %s must be stripped (set to empty), got present=%v value=%q", h, present, v)
 		}
+	}
+}
+
+// The edge splits the envelope: identity-class headers never survive from the
+// client, while §4 caller assertions reach the owning service, which validates
+// them. Named literally rather than read from the lists under test, so a
+// change to either list cannot pass by changing both.
+func TestEmit_EnvelopeSanitation_SplitPolicy(t *testing.T) {
+	cfg := Emit(validMap(validTenant()), testCatalog())
+	strip := cfg.HTTP.Middlewares[edgeStripMW].Headers.CustomRequestHeaders
+	fa := cfg.HTTP.Middlewares[authMW].ForwardAuth
+	overwritten := map[string]bool{}
+	for _, h := range fa.AuthResponseHeaders {
+		overwritten[h] = true
+	}
+
+	// Every header gateway-auth-svc sets must be overwritten by ForwardAuth,
+	// or a client-supplied copy reaches the backend as if verified.
+	for _, h := range []string{
+		"X-Principal-Id", "X-Tenant-Id", "X-Legal-Entity-Id", "X-Correlation-Id",
+		"X-Jurisdiction-Context", "X-Timezone", "X-Residency-Policy-Id", "X-Tenant-Context-Stale",
+	} {
+		if !overwritten[h] {
+			t.Errorf("%s is set by gateway-auth but not in authResponseHeaders — client copy passes through", h)
+		}
+	}
+	for _, h := range []string{"X-Workload-Id", "X-Support-Context-Id"} {
+		if _, ok := strip[h]; !ok || !overwritten[h] {
+			t.Errorf("%s must be stripped at the edge and by ForwardAuth", h)
+		}
+	}
+	for _, h := range []string{
+		"X-Purpose-Context", "X-Approval-Reference", "X-Evidence-Refs", "X-Causation-Id",
+		"X-Workflow-Instance-Id", "X-Book-Id", "X-Source-Channel", "X-Expected-Version",
+	} {
+		if _, ok := strip[h]; ok || overwritten[h] {
+			t.Errorf("%s is a §4 caller assertion and must reach the owning service", h)
+		}
+	}
+}
+
+// Production ingress is this compiled config (GCP runbook Step 13), so it is
+// where "every route is authenticated" has to hold. Checked against the real
+// routing map, not a fixture: every router that reaches a tenant pool must run
+// exactly [edge-strip, its own ctx, gateway-auth]. Order is the point: ctx
+// must set X-Zoiko-Resolved-Tenant-Id before ForwardAuth, or /verify never
+// sees it and the token/hostname tenant check (test O) is dead. The only
+// router exempt is the catch-all, which terminates at the safe backend.
+func TestEmit_RealMap_EveryDataBearingRouterIsForwardAuthed(t *testing.T) {
+	m, err := loadRoutingMap("../routing-map.yaml")
+	if err != nil {
+		t.Fatalf("load routing map: %v", err)
+	}
+	cat, err := loadRegions("../regions.yaml")
+	if err != nil {
+		t.Fatalf("load regions: %v", err)
+	}
+	if errs := Validate(m, cat, false); len(errs) > 0 {
+		t.Fatalf("routing map invalid: %v", errs)
+	}
+	cfg := Emit(m, cat)
+	if len(cfg.HTTP.Routers) < 2 {
+		t.Fatalf("expected tenant routers plus the catch-all, got %v", cfg.routerNames())
+	}
+	for name, r := range cfg.HTTP.Routers {
+		if name == safeRouter {
+			if r.Service != safeService {
+				t.Errorf("catch-all must terminate at %s, got %s", safeService, r.Service)
+			}
+			continue
+		}
+		ctx := "gtrm-ctx-" + strings.TrimPrefix(name, "gtrm-")
+		want := []string{edgeStripMW, ctx, authMW}
+		if !slices.Equal(r.Middlewares, want) {
+			t.Errorf("router %s reaches %s with %v, want %v", name, r.Service, r.Middlewares, want)
+		}
+		if cfg.HTTP.Middlewares[ctx].Headers.CustomRequestHeaders["X-Zoiko-Resolved-Tenant-Id"] == "" {
+			t.Errorf("%s must set X-Zoiko-Resolved-Tenant-Id for /verify to compare", ctx)
+		}
+	}
+	// With trustForwardHeader on, a client's X-Forwarded-Method reaches
+	// /verify through any trusted proxy, and a POST can present as a GET.
+	if cfg.HTTP.Middlewares[authMW].ForwardAuth.TrustForwardHeader {
+		t.Error("gateway-auth ForwardAuth must not trust inbound X-Forwarded-* headers")
 	}
 }
 

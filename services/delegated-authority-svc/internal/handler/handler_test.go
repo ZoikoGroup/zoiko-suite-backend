@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"zoiko.io/delegated-authority-svc/internal/events"
 	"zoiko.io/delegated-authority-svc/internal/handler"
 	"zoiko.io/delegated-authority-svc/internal/middleware"
+	"zoiko.io/delegated-authority-svc/internal/store"
 )
 
 // ── stubs ─────────────────────────────────────────────────────────────────────
@@ -30,7 +32,8 @@ type stubStore struct {
 	byID          map[string]*domain.DelegationGrant
 	byCorrelation map[string]*domain.DelegationGrant
 
-	events []string
+	events   []string
+	refusals []string
 }
 
 func newStubStore() *stubStore {
@@ -52,10 +55,13 @@ func (s *stubStore) CreateDelegation(_ context.Context, d *domain.DelegationGran
 		*d = *existing
 		return false, nil
 	}
+	d.Version = 1
 	cp := *d
 	s.byID[d.DelegationID] = &cp
 	s.byCorrelation[d.CorrelationID] = &cp
-	s.events = append(s.events, events.EventDelegated)
+	if d.Status == domain.DelegationStatusActive {
+		s.events = append(s.events, events.EventDelegated)
+	}
 	return true, nil
 }
 
@@ -124,52 +130,78 @@ func (s *stubStore) ListDelegations(_ context.Context, f domain.ListDelegationsF
 	return out, nil
 }
 
-// RevokeDelegation with expected_version for optimistic locking
-func (s *stubStore) RevokeDelegation(_ context.Context, delegationID, revokedByPrincipalID string, expectedVersion int64) (*domain.DelegationGrant, error) {
+// Transition mirrors the real store's rules: version required and current,
+// legal from the current state, no re-entry to ACTIVE once the window ended.
+func (s *stubStore) Transition(_ context.Context, delegationID string, kind store.TransitionKind, in domain.TransitionInput) (*domain.DelegationGrant, error) {
 	d, ok := s.byID[delegationID]
 	if !ok {
 		return nil, domain.ErrDelegationNotFound
 	}
-	if d.Status != domain.DelegationStatusActive {
-		return nil, domain.ErrInvalidTransition
-	}
-	if expectedVersion > 0 && d.Version != expectedVersion {
-		return nil, domain.ErrVersionMismatch
+	if in.ExpectedVersion <= 0 {
+		return nil, domain.ErrVersionRequired
 	}
 	now := time.Now().UTC()
-	d.Status = domain.DelegationStatusRevoked
-	d.RevokedByPrincipalID = &revokedByPrincipalID
-	d.RevokedAt = &now
+	from := map[store.TransitionKind][]domain.DelegationStatus{
+		store.Activate: {domain.DelegationStatusProposed},
+		store.Suspend:  {domain.DelegationStatusActive},
+		store.Resume:   {domain.DelegationStatusSuspended},
+		store.Revoke:   {domain.DelegationStatusProposed, domain.DelegationStatusActive, domain.DelegationStatusSuspended},
+		store.Extend:   {domain.DelegationStatusActive},
+	}[kind]
+	legal := false
+	for _, st := range from {
+		legal = legal || d.Status == st
+	}
+	if !legal {
+		if kind == store.Extend {
+			return nil, domain.ErrCannotExtend
+		}
+		return nil, domain.ErrInvalidTransition
+	}
+	if d.Version != in.ExpectedVersion {
+		return nil, domain.ErrVersionMismatch
+	}
+	if (kind == store.Activate || kind == store.Resume || kind == store.Extend) && !d.EffectiveTo.After(now) {
+		return nil, domain.ErrLapsed
+	}
+	actor := in.ActorPrincipalID
+	reason := in.Reason
+	switch kind {
+	case store.Activate:
+		method := in.ApprovalMethod
+		d.Status, d.ApprovedByPrincipalID, d.ApprovedAt, d.ApprovalMethod = domain.DelegationStatusActive, &actor, &now, &method
+		s.events = append(s.events, events.EventDelegated)
+	case store.Suspend:
+		d.Status, d.SuspendedByPrincipalID, d.SuspendedAt, d.SuspensionReason = domain.DelegationStatusSuspended, &actor, &now, &reason
+		s.events = append(s.events, events.EventSuspended)
+	case store.Resume:
+		d.Status = domain.DelegationStatusActive
+		s.events = append(s.events, events.EventResumed)
+	case store.Revoke:
+		d.Status, d.RevokedByPrincipalID, d.RevokedAt, d.RevocationReason = domain.DelegationStatusRevoked, &actor, &now, &reason
+		s.events = append(s.events, events.EventRevoked)
+	case store.Extend:
+		d.EffectiveTo = in.NewEffectiveTo
+		s.events = append(s.events, events.EventExtended)
+	}
 	d.UpdatedAt = now
 	d.Version++
 	cp := *d
-	s.events = append(s.events, events.EventRevoked)
 	return &cp, nil
 }
 
-func (s *stubStore) ExtendDelegation(_ context.Context, delegationID, extendedByPrincipalID string, newEffectiveTo time.Time, expectedVersion int64) (*domain.DelegationGrant, error) {
-	d, ok := s.byID[delegationID]
-	if !ok {
-		return nil, domain.ErrDelegationNotFound
+func (s *stubStore) ListEffectiveAsOf(_ context.Context, f domain.ListDelegationsFilter, asOf time.Time) ([]domain.DelegationGrant, error) {
+	var out []domain.DelegationGrant
+	for _, d := range s.byID {
+		if d.Status == domain.DelegationStatusActive && !d.EffectiveFrom.After(asOf) && d.EffectiveTo.After(asOf) {
+			out = append(out, *d)
+		}
 	}
-	if d.Status != domain.DelegationStatusActive {
-		return nil, domain.ErrCannotExtend
-	}
-	if !newEffectiveTo.After(d.EffectiveTo) {
-		return nil, domain.ErrCannotExtend
-	}
-	if expectedVersion > 0 && d.Version != expectedVersion {
-		return nil, domain.ErrVersionMismatch
-	}
-	d.EffectiveTo = newEffectiveTo
-	d.UpdatedAt = time.Now().UTC()
-	d.Version++
-	cp := *d
-	s.events = append(s.events, events.EventDelegated)
-	return &cp, nil
+	return out, nil
 }
 
 func (s *stubStore) RecordRefusedEscalation(_ context.Context, r *domain.RefusedEscalation) error {
+	s.refusals = append(s.refusals, r.RefusalReason)
 	return nil
 }
 
@@ -177,14 +209,17 @@ func (s *stubStore) ExplainDelegationChain(_ context.Context, _, _, _, _, _ stri
 	return nil, nil
 }
 
-func (s *stubStore) CheckOverlap(_ context.Context, _, _, delegatePrincipalID, actionType string, effectiveFrom, effectiveTo time.Time, correlationID string) error {
+func (s *stubStore) CheckOverlap(_ context.Context, _, _, delegatePrincipalID, actionType string, effectiveFrom, effectiveTo time.Time, correlationID, delegationID string) error {
 	for _, d := range s.byID {
+		if d.DelegationID == delegationID {
+			continue
+		}
 		if d.Status == domain.DelegationStatusActive &&
 			d.DelegatePrincipalID == delegatePrincipalID &&
 			d.ActionType == actionType &&
 			d.EffectiveFrom.Before(effectiveTo) &&
 			d.EffectiveTo.After(effectiveFrom) &&
-			d.CorrelationID != correlationID {
+			(correlationID == "" || d.CorrelationID != correlationID) {
 			return domain.ErrOverlapConflict
 		}
 	}
@@ -196,6 +231,30 @@ func (s *stubStore) CheckOverlap(_ context.Context, _, _, delegatePrincipalID, a
 // from the caller's own authz check (which always succeeds here).
 type stubAuthZ struct {
 	delegatorDenied string // principal_id that should be denied
+	// delegatedOnly holds every action only by delegation to them.
+	delegatedOnly string
+	// limitDenied makes every CheckAllowedAtLimit answer DENIED: the
+	// delegator's own authority limit is below the delegated ceiling.
+	limitDenied bool
+	limitAsked  []string
+}
+
+func (a *stubAuthZ) CheckAllowedAtLimit(_ context.Context, principalID, _, _, amount, currency string) error {
+	a.limitAsked = append(a.limitAsked, principalID+"@"+amount+" "+currency)
+	if a.limitDenied {
+		return domain.ErrAuthorizationDenied
+	}
+	return nil
+}
+
+func (a *stubAuthZ) CheckHeldInOwnRight(ctx context.Context, principalID, entity, action string) error {
+	if err := a.CheckAllowed(ctx, principalID, entity, action); err != nil {
+		return err
+	}
+	if a.delegatedOnly != "" && principalID == a.delegatedOnly {
+		return domain.ErrDelegatorAuthorityDelegated
+	}
+	return nil
 }
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, principalID, _, _ string) error {
@@ -240,6 +299,11 @@ func newRouter(s *stubStore, authz *stubAuthZ, sod handler.SoDClient) chi.Router
 	// nil metrics: the handler's count* helpers tolerate it, and registering a
 	// real Domain here would panic on the second test binary to call
 	// prometheus.MustRegister with the same collector names.
+	if sod == nil {
+		// The handler fails closed without an SoD engine; tests that are not
+		// about SoD get one that permits everything.
+		sod = newStubSoD()
+	}
 	h := handler.New(s, authz, sod, zap.NewNop(), nil)
 	handler.RegisterRoutes(r, h)
 	return r
@@ -269,6 +333,7 @@ func delegationBody(delegator, correlationID string, from, to time.Time) map[str
 		"effective_from":         from,
 		"effective_to":           to,
 		"correlation_id":         correlationID,
+		"reason":                 "cover during leave",
 	}
 }
 
@@ -299,10 +364,11 @@ func TestCreateDelegation_DelegatorLacksAuthority(t *testing.T) {
 	}
 }
 
+// A delegator delegating their own authority: the act is the approval.
 func TestCreateDelegation_HappyPath(t *testing.T) {
 	store := newStubStore()
 	r := newRouter(store, &stubAuthZ{}, nil)
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "delegator-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -313,6 +379,28 @@ func TestCreateDelegation_HappyPath(t *testing.T) {
 	}
 	if n := store.countEvents(events.EventDelegated); n != 1 {
 		t.Errorf("expected 1 authority.delegated event, got %d", n)
+	}
+	if d.ApprovalMethod == nil || *d.ApprovalMethod != domain.ApprovalDelegatorSelf {
+		t.Errorf("approval must be recorded as the delegator's own, got %v", d.ApprovalMethod)
+	}
+}
+
+// On someone else's behalf the grant is only PROPOSED: it confers nothing and
+// tells nobody downstream until it is approved.
+func TestCreateDelegation_OnBehalfIsProposed(t *testing.T) {
+	store := newStubStore()
+	r := newRouter(store, &stubAuthZ{}, nil)
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var d domain.DelegationGrant
+	_ = json.NewDecoder(rr.Body).Decode(&d)
+	if d.Status != domain.DelegationStatusProposed || d.ApprovedByPrincipalID != nil {
+		t.Errorf("expected an unapproved PROPOSED grant, got %q approved_by=%v", d.Status, d.ApprovedByPrincipalID)
+	}
+	if n := store.countEvents(events.EventDelegated); n != 0 {
+		t.Errorf("a proposal must not publish authority.delegated, got %d", n)
 	}
 }
 
@@ -335,8 +423,10 @@ func TestCreateDelegation_IdempotentReplay(t *testing.T) {
 
 // ── revoke tests ─────────────────────────────────────────────────────────────
 
+// createActiveDelegation has the delegator delegate their own authority,
+// which is the one path that is ACTIVE at once.
 func createActiveDelegation(t *testing.T, r chi.Router) domain.DelegationGrant {
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "caller-1")
+	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), time.Now(), time.Now().Add(24*time.Hour)), "delegator-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("delegation setup failed: %d %s", rr.Code, rr.Body.String())
 	}
@@ -345,12 +435,34 @@ func createActiveDelegation(t *testing.T, r chi.Router) domain.DelegationGrant {
 	return d
 }
 
+// seedLapsed puts an ACTIVE grant whose window has already ended straight into
+// the store — the API no longer accepts one, but a grant made in-window and
+// never read since is exactly this.
+func seedLapsed(s *stubStore, delegator string) domain.DelegationGrant {
+	past := time.Now().Add(-48 * time.Hour)
+	d := domain.DelegationGrant{DelegationID: uuid.NewString(), TenantID: "tenant-abc", LegalEntityID: "le-us",
+		DelegatorPrincipalID: delegator, DelegatePrincipalID: "delegate-1", ActionType: "PO_ISSUE",
+		EffectiveFrom: past, EffectiveTo: past.Add(time.Hour), Status: domain.DelegationStatusActive,
+		CreatedByPrincipalID: delegator, CorrelationID: uuid.NewString(), CreatedAt: past, UpdatedAt: past, Version: 1}
+	cp := d
+	s.byID[d.DelegationID] = &cp
+	s.byCorrelation[d.CorrelationID] = &cp
+	return d
+}
+
+// revokeReq revokes with the version the caller read and a reason, as every
+// protected change now must.
+func revokeReq(r chi.Router, id string, version int64, caller string) *httptest.ResponseRecorder {
+	return doReq(r, http.MethodPost, fmt.Sprintf("/v1/delegations/%s/revoke?expected_version=%d", id, version),
+		map[string]any{"reason": "no longer needed"}, caller)
+}
+
 func TestRevokeDelegation_HappyPath(t *testing.T) {
 	store := newStubStore()
 	r := newRouter(store, &stubAuthZ{}, nil)
 	d := createActiveDelegation(t, r)
 
-	rr := doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", nil, "admin-1")
+	rr := revokeReq(r, d.DelegationID, d.Version, "admin-1")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -358,6 +470,9 @@ func TestRevokeDelegation_HappyPath(t *testing.T) {
 	_ = json.NewDecoder(rr.Body).Decode(&updated)
 	if updated.Status != domain.DelegationStatusRevoked {
 		t.Errorf("expected REVOKED got %q", updated.Status)
+	}
+	if updated.RevocationReason == nil || *updated.RevocationReason != "no longer needed" {
+		t.Errorf("the revocation reason is evidence and must be recorded, got %v", updated.RevocationReason)
 	}
 	if n := store.countEvents(events.EventRevoked); n != 1 {
 		t.Errorf("expected 1 authority.revoked event, got %d", n)
@@ -367,9 +482,9 @@ func TestRevokeDelegation_HappyPath(t *testing.T) {
 func TestRevokeDelegation_AlreadyRevoked(t *testing.T) {
 	r := newRouter(newStubStore(), &stubAuthZ{}, nil)
 	d := createActiveDelegation(t, r)
-	_ = doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", nil, "admin-1")
+	_ = revokeReq(r, d.DelegationID, d.Version, "admin-1")
 
-	rr := doReq(r, http.MethodPost, "/v1/delegations/"+d.DelegationID+"/revoke", nil, "admin-1")
+	rr := revokeReq(r, d.DelegationID, d.Version+1, "admin-1")
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("expected 409 got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -380,13 +495,7 @@ func TestRevokeDelegation_AlreadyRevoked(t *testing.T) {
 func TestListDelegations_LazilyExpiresDueGrants(t *testing.T) {
 	store := newStubStore()
 	r := newRouter(store, &stubAuthZ{}, nil)
-	past := time.Now().Add(-48 * time.Hour)
-	rr := doReq(r, http.MethodPost, "/v1/delegations/", delegationBody("delegator-1", uuid.NewString(), past, past.Add(1*time.Hour)), "caller-1")
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("delegation setup failed: %d %s", rr.Code, rr.Body.String())
-	}
-	var d domain.DelegationGrant
-	_ = json.NewDecoder(rr.Body).Decode(&d)
+	d := seedLapsed(store, "caller-1")
 
 	listRR := doReq(r, http.MethodGet, "/v1/delegations/", nil, "caller-1")
 	if listRR.Code != http.StatusOK {

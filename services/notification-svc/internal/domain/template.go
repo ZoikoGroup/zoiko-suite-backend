@@ -13,15 +13,15 @@ import (
 // version maturing independently, so the state machine lives on the
 // version — see migration 000005's own comment for why.
 type TemplateDefinition struct {
-	TemplateID           string     `json:"template_id"`
-	TenantID             string     `json:"tenant_id"`
-	LegalEntityID        string     `json:"legal_entity_id"`
-	Name                 string     `json:"name"`
-	BusinessPurpose      string     `json:"business_purpose"`
-	OwnerPrincipalID     string     `json:"owner_principal_id"`
+	TemplateID       string `json:"template_id"`
+	TenantID         string `json:"tenant_id"`
+	LegalEntityID    string `json:"legal_entity_id"`
+	Name             string `json:"name"`
+	BusinessPurpose  string `json:"business_purpose"`
+	OwnerPrincipalID string `json:"owner_principal_id"`
 	// IntentID is the communication intent this wording is for; fixed at creation
 	// (migration 000021). Nil for a template bound to no intent.
-	IntentID *string `json:"intent_id,omitempty"`
+	IntentID             *string    `json:"intent_id,omitempty"`
 	Status               string     `json:"status"` // ACTIVE, RETIRED
 	CreatedAt            time.Time  `json:"created_at"`
 	RetiredAt            *time.Time `json:"retired_at,omitempty"`
@@ -40,15 +40,15 @@ const (
 )
 
 type TemplateVersion struct {
-	VersionID             string     `json:"version_id"`
-	TemplateID            string     `json:"template_id"`
-	TenantID              string     `json:"tenant_id"`
-	LegalEntityID         string     `json:"legal_entity_id"`
-	VersionNumber         int        `json:"version_number"`
-	Locale                string     `json:"locale"`
-	Content               string     `json:"content"`
-	ContentHash           string     `json:"content_hash"`
-	VariableSchema        []string   `json:"variable_schema"`
+	VersionID      string   `json:"version_id"`
+	TemplateID     string   `json:"template_id"`
+	TenantID       string   `json:"tenant_id"`
+	LegalEntityID  string   `json:"legal_entity_id"`
+	VersionNumber  int      `json:"version_number"`
+	Locale         string   `json:"locale"`
+	Content        string   `json:"content"`
+	ContentHash    string   `json:"content_hash"`
+	VariableSchema []string `json:"variable_schema"`
 	// Subject is the reviewed subject text (placeholders only), frozen with the
 	// version; nil on a version that leaves the subject to the caller (legacy).
 	// SubjectVariables are the variables an author declared safe for a subject.
@@ -127,15 +127,15 @@ type RenderPreviewParams struct {
 	// marker instead of refusing: an author checking wording needs no real data.
 	// Never set on the send path.
 	Placeholders bool
-	Variables map[string]string
+	Variables    map[string]string
 }
 
 // RenderPreviewResult is RenderPreview's output.
 type RenderPreviewResult struct {
-	VersionID        string   `json:"version_id"`
-	RenderedContent  string   `json:"rendered_content"`
+	VersionID       string `json:"version_id"`
+	RenderedContent string `json:"rendered_content"`
 	// RenderedSubject is set when the version carries a subject.
-	RenderedSubject  string   `json:"rendered_subject,omitempty"`
+	RenderedSubject string `json:"rendered_subject,omitempty"`
 	// PlaceholdersUsed names the variables filled with markers (preview only).
 	PlaceholdersUsed []string `json:"placeholders_used,omitempty"`
 	MissingVariables []string `json:"missing_variables,omitempty"`

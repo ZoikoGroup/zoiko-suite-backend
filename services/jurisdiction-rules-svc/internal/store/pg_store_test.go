@@ -2,8 +2,11 @@ package store_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
@@ -125,7 +128,7 @@ func TestPgStore_FindRules_SurvivesDeactivation(t *testing.T) {
 		t.Fatalf("failed to create rule: %v", err)
 	}
 
-	if _, err := s.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin-1"); err != nil {
+	if _, _, err := s.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin-1"); err != nil {
 		t.Fatalf("failed to deactivate: %v", err)
 	}
 
@@ -175,7 +178,7 @@ func TestPgStore_List_Pagination(t *testing.T) {
 	}
 
 	// active=true must exclude a deactivated jurisdiction.
-	if _, err := s.DeactivateJurisdiction(ctx, page1[0].JurisdictionID, "admin-1"); err != nil {
+	if _, _, err := s.DeactivateJurisdiction(ctx, page1[0].JurisdictionID, "admin-1"); err != nil {
 		t.Fatalf("failed to deactivate: %v", err)
 	}
 	activeOnly, err := s.List(ctx, store.ListParams{ActiveOnly: true})
@@ -184,5 +187,33 @@ func TestPgStore_List_Pagination(t *testing.T) {
 	}
 	if len(activeOnly) != 4 {
 		t.Errorf("expected 4 active jurisdictions after deactivating one, got %d", len(activeOnly))
+	}
+}
+
+// TestStore_IsInputTooLong classifies SQLSTATE 22001 (string data too long)
+// without needing a database — the classification the handler's writeStoreError
+// net uses to turn an over-length create into 400 instead of 503.
+func TestStore_IsInputTooLong(t *testing.T) {
+	f := func(code string) error {
+		return &pgconn.PgError{Code: code, Message: "boom"}
+	}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"22001 direct", f("22001"), true},
+		{"22001 wrapped so errors.As can reach it", fmt.Errorf("create failed: %w", f("22001")), true},
+		{"23503 foreign key is not a length problem", f("23503"), false},
+		{"22P02 bad uuid is not a length problem", f("22P02"), false},
+		{"plain error carries no sqlstate", fmt.Errorf("network is down"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := store.IsInputTooLong(tc.err); got != tc.want {
+				t.Errorf("IsInputTooLong(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }

@@ -20,7 +20,6 @@
 package query
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -34,7 +33,6 @@ import (
 
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/domain"
-	"zoiko.io/search-indexer-svc/internal/store"
 )
 
 // Request is the §6.1 canonical request envelope, minus the parts that come
@@ -122,9 +120,32 @@ type Plan struct {
 	// ReturnableFields is the allowlist the retrieval layer filters _source
 	// through a second time.
 	ReturnableFields map[string]bool
+	// SourcePaths maps each returnable field to its path in the SOURCE
+	// object. A hydrated R2 result is the source's own representation, keyed
+	// by source paths rather than by the contract's field names, so it has to
+	// be projected through the contract again — reading it by field name found
+	// nothing whenever the two differed, and an R2 result came back empty.
+	SourcePaths map[string]string
 
 	// Page is the cursor page number this plan serves, for the window check.
 	Page int
+
+	// Freshness is the scope's measured index freshness for this request, set
+	// by the handler from the active generation's checkpoint before execution.
+	// The retriever suppresses protected hits under untrusted freshness (§8.3).
+	Freshness domain.Freshness
+	// LagMS is the measured source-to-index lag behind Freshness.
+	LagMS int64
+	// RestrictionExclusions counts this tenant's FAILED restrictions in the
+	// scope, whose refs the handler added to MandatoryMustNot (NP-59). Non-zero
+	// makes the answer DEGRADED with ESR-018: the results are safe, the
+	// restriction lane behind them is not healthy.
+	RestrictionExclusions int
+
+	// Semantic plans carry their pinned model so evidence and the response can
+	// say which embedding space answered (§10.1, TC-02).
+	Semantic    bool
+	PinnedModel string
 }
 
 // Limits bounds what a plan may ask for.
@@ -155,15 +176,19 @@ func DefaultLimits() Limits {
 }
 
 // Planner compiles requests against published contracts.
+//
+// Pure: no store, no network. Operational state that decides whether a plan
+// may RUN — index freshness, restriction-propagation health — is the handler's
+// to consult (handler.scopeHealth), because it changes minute to minute and a
+// plan is a function of the request and the contract.
 type Planner struct {
-	limits  Limits
-	store   store.Store
+	limits Limits
 	// cursorKey signs and verifies pagination tokens.
 	cursorKey []byte
 }
 
-func NewPlanner(limits Limits, store store.Store, cursorKey []byte) *Planner {
-	return &Planner{limits: limits, store: store, cursorKey: cursorKey}
+func NewPlanner(limits Limits, cursorKey []byte) *Planner {
+	return &Planner{limits: limits, cursorKey: cursorKey}
 }
 
 // Compile turns a request plus trusted context plus a published contract into
@@ -173,7 +198,7 @@ func NewPlanner(limits Limits, store store.Store, cursorKey []byte) *Planner {
 // identity, then purpose, then scope, then partitions, then filters, then
 // budget. A request that fails an earlier check never reaches a later one, so
 // a caller cannot learn from a complexity refusal that a scope exists.
-func (p *Planner) Compile(ctx context.Context, req Request, tc Context, contract *domain.IndexContract, generation *domain.IndexGeneration) (*Plan, error) {
+func (p *Planner) Compile(req Request, tc Context, contract *domain.IndexContract, generation *domain.IndexGeneration) (*Plan, error) {
 	// 1. Trusted actor/tenant.
 	if tc.TenantID == "" {
 		return nil, refuse(domain.ReasonTenantContextMissing,
@@ -207,26 +232,6 @@ func (p *Planner) Compile(ctx context.Context, req Request, tc Context, contract
 	if generation == nil {
 		return nil, refuse(domain.ReasonGenerationNotActive,
 			"scope %q has no active index generation", req.Scope)
-	}
-
-	// 3b. Freshness check (ESR-012). A scope whose latest checkpoint reports
-	// STALE must not be queried — the index cannot be trusted as a current
-	// view of the source. §5.3: "STALE is never represented as CURRENT".
-	// UNKNOWN is also a refusal: an unmeasured index is not a safe index.
-	if p.store != nil {
-		cp, err := p.store.GetLatestCheckpoint(ctx, contract.ScopeName)
-		if err == nil && cp != nil {
-			switch cp.Freshness {
-			case domain.FreshnessStale:
-				return nil, refuse(domain.ReasonIndexStaleForScope,
-					"scope %q has stale index (checkpoint freshness=STALE, lag=%dms, watermark=%d)",
-					contract.ScopeName, cp.LagMS, cp.Watermark)
-			case domain.FreshnessUnknown:
-				return nil, refuse(domain.ReasonIndexStaleForScope,
-					"scope %q has unmeasured index (checkpoint freshness=UNKNOWN)",
-					contract.ScopeName)
-			}
-		}
 	}
 
 	fields := indexFields(contract)
@@ -341,6 +346,7 @@ func (p *Planner) Compile(ctx context.Context, req Request, tc Context, contract
 		PartitionSet:     []string{generation.PhysicalIndex},
 		SnippetFields:    snippetFields,
 		ReturnableFields: returnable,
+		SourcePaths:      sourcePaths(fields, returnable),
 	}
 
 	plan.QueryDigest = digest(text)
@@ -634,6 +640,20 @@ func indexFields(c *domain.IndexContract) map[string]domain.SearchFieldDefinitio
 			continue
 		}
 		out[f.FieldID] = f
+	}
+	return out
+}
+
+func sourcePaths(fields map[string]domain.SearchFieldDefinition, returnable map[string]bool) map[string]string {
+	out := make(map[string]string, len(returnable))
+	for name := range returnable {
+		if f, ok := fields[name]; ok {
+			path := f.SourcePath
+			if path == "" {
+				path = name
+			}
+			out[name] = path
+		}
 	}
 	return out
 }

@@ -135,10 +135,19 @@ func (c *HTTPClient) CheckConflict(ctx context.Context, req Request) (*Decision,
 		return nil, fmt.Errorf("%w: build request: %v", ErrUnavailable, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// authorization-svc answers GOV-04 here (5 Oct 2026) and validates the
+	// canonical §4 envelope: without a principal it refuses with 401, which
+	// this client would read as "unavailable" and fail closed on every call.
+	// The maker is the principal asking.
 	httpReq.Header.Set("X-Tenant-Id", req.TenantID)
-	if req.CorrelationID != "" {
-		httpReq.Header.Set("X-Correlation-ID", req.CorrelationID)
+	httpReq.Header.Set("X-Principal-Id", req.MakerPrincipalID)
+	httpReq.Header.Set("X-Source-Channel", "system")
+	requestID := req.CorrelationID
+	if requestID == "" {
+		requestID = "sod-" + req.ActionType + "-" + fmt.Sprint(time.Now().UnixNano())
 	}
+	httpReq.Header.Set("X-Request-Id", requestID)
+	httpReq.Header.Set("X-Correlation-ID", requestID)
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {

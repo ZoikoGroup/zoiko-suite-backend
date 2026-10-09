@@ -7,10 +7,12 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -96,11 +98,20 @@ type Store interface {
 	// call actually performed a transition (false = idempotent no-op).
 	ActivateVersion(ctx context.Context, policyVersionID, actorID string) (*domain.PolicyVersion, []*domain.PolicyVersion, bool, error)
 
-	// FindApplicableVersions returns all ACTIVE versions of the given
-	// policy_type whose scope is compatible with (tenantID,
-	// legalEntityID), most-specific-scope first. See the method's own
-	// doc comment on PgStore for the precedence rule.
-	FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string) ([]*domain.ApplicablePolicyVersion, error)
+// FindApplicableVersions returns all ACTIVE versions of the given
+// policy_type whose scope is compatible with (tenantID,
+// legalEntityID) and whose effective window covers now (or asOf when
+// supplied), most-specific-scope first. See the method's own
+// doc comment on PgStore for the precedence rule.
+FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string, asOf *time.Time) ([]*domain.ApplicablePolicyVersion, error)
+
+// CheckPolicyTypeOverlap checks if there is an ACTIVE version of the same
+// policy_type (different policy_id) with overlapping scope and temporal range.
+CheckPolicyTypeOverlap(ctx context.Context, policyType string, policyID, tenantID, legalEntityID *string, effectiveFrom time.Time, effectiveTo *time.Time) (bool, error)
+
+	// EnqueueEvent adds an event to the transactional outbox. The event
+	// will be published asynchronously by a background worker.
+	EnqueueEvent(ctx context.Context, event OutboxEvent) error
 
 	// ── Chunk 10: control tests & attestations (doc7 §E3, §E6, §I3) ─────────
 	CreateControlTestDefinition(ctx context.Context, params domain.CreateControlTestDefinitionParams) (*domain.ControlTestDefinition, bool, error)
@@ -234,6 +245,11 @@ const policyVersionColumns = `
 	effective_from,
 	effective_to,
 	version_status,
+	version_number,
+	source,
+	rationale,
+	artifact_digest,
+	known_from,
 	activated_by_principal_id,
 	activated_at,
 	created_at,
@@ -251,6 +267,11 @@ func scanPolicyVersion(row pgx.Row) (*domain.PolicyVersion, error) {
 		&v.EffectiveFrom,
 		&v.EffectiveTo,
 		&v.VersionStatus,
+		&v.VersionNumber,
+		&v.Source,
+		&v.Rationale,
+		&v.ArtifactDigest,
+		&v.KnownFrom,
 		&v.ActivatedByPrincipalID,
 		&v.ActivatedAt,
 		&v.CreatedAt,
@@ -330,16 +351,30 @@ func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreateP
 
 	scopeType := domain.DeriveScopeType(params.TenantID, params.LegalEntityID)
 
+	// Default values for new required columns
+	versionNumber := 1
+	source := "internal"
+	rationale := ""
+	artifactDigest := ""
+	if len(params.RulePayload) > 0 {
+		artifactDigest = fmt.Sprintf("sha256-%x", sha256.Sum256(params.RulePayload))
+	} else {
+		artifactDigest = "sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // SHA256 of empty
+	}
+	knownFrom := time.Now().UTC()
+
 	const query = `
 		INSERT INTO policy_versions (
 			policy_version_id, policy_id, tenant_id, legal_entity_id, rule_payload,
-			effective_from, effective_to, version_status, created_by_principal_id, scope_type
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DRAFT', $8, $9)
+			effective_from, effective_to, version_status, version_number, source, rationale,
+			artifact_digest, known_from, created_by_principal_id, scope_type
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DRAFT', $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (
 			policy_id,
 			COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID),
 			COALESCE(legal_entity_id, '` + nilScopeUUID + `'::UUID),
-			effective_from
+			effective_from,
+			COALESCE(version_number, 0)
 		)
 		DO NOTHING
 		RETURNING ` + policyVersionColumns + `;`
@@ -350,14 +385,16 @@ func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreateP
 		WHERE policy_id = $1
 		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($2::uuid, '` + nilScopeUUID + `'::UUID)
 		  AND COALESCE(legal_entity_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
-		  AND effective_from = $4;`
+		  AND effective_from = $4
+		  AND COALESCE(version_number, 0) = COALESCE($5, 0);`
 
 	var result *domain.PolicyVersion
 	var created bool
 	err := s.withRLS(ctx, derefOrEmpty(params.TenantID), func(tx pgx.Tx) error {
 		v, err := scanPolicyVersion(tx.QueryRow(ctx, query,
 			params.PolicyVersionID, params.PolicyID, params.TenantID, params.LegalEntityID, params.RulePayload,
-			params.EffectiveFrom, params.EffectiveTo, params.CreatedByPrincipalID, scopeType,
+			params.EffectiveFrom, params.EffectiveTo, versionNumber, source, rationale, artifactDigest, knownFrom,
+			params.CreatedByPrincipalID, scopeType,
 		))
 		if err == nil {
 			result, created = v, true
@@ -593,6 +630,12 @@ func (s *PgStore) ActivateVersion(ctx context.Context, policyVersionID, actorID 
 // set on the version but NOT matching the request's is excluded outright
 // (never leaks across tenants/entities).
 //
+// Additionally, only versions that are currently effective are returned:
+// the current time must be >= effective_from AND (effective_to IS NULL OR
+// current time < effective_to). This gates applicability by the version's
+// effective window.
+// If asOf is provided, the check uses that timestamp instead of NOW().
+//
 // Results are ordered most-specific-scope first: an exact
 // (tenant_id, legal_entity_id) match sorts before a tenant-only match,
 // which sorts before a global (both NULL) match. GET /v1/policies
@@ -600,19 +643,18 @@ func (s *PgStore) ActivateVersion(ctx context.Context, policyVersionID, actorID 
 // 03-microservices.md §8.1); Evaluate takes the first entry as "the"
 // applicable version for that type+scope. If more than one *distinct
 // policy* of the same policy_type is active at the same specificity
-// tier, the tie-break is effective_from DESC — a known v1 simplification
-// (see PROGRESS.md); v1 assumes at most one Policy per policy_type is
-// the realistic case.
-func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string) ([]*domain.ApplicablePolicyVersion, error) {
+// tier, the handler returns 409 CONFLICTED (see handler.go Evaluate).
+func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string, asOf *time.Time) ([]*domain.ApplicablePolicyVersion, error) {
 	// Column list is policyVersionColumns qualified with the pv. alias, plus
 	// p.policy_code last. Keep it in that order and complete: this query cannot
 	// use the shared const because of the join, and omitting
 	// activated_by_principal_id/activated_at here once made GET /v1/policies
 	// report every ACTIVE version as never activated.
-	const query = `
+const query = `
 		SELECT
 			pv.policy_version_id, pv.policy_id, pv.tenant_id, pv.legal_entity_id,
 			pv.rule_payload, pv.effective_from, pv.effective_to, pv.version_status,
+			pv.version_number, pv.source, pv.rationale, pv.artifact_digest, pv.known_from,
 			pv.activated_by_principal_id, pv.activated_at,
 			pv.created_at, pv.created_by_principal_id, p.policy_code
 		FROM policy_versions pv
@@ -621,14 +663,15 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string,
 		  AND pv.version_status = 'ACTIVE'
 		  AND (pv.tenant_id IS NULL OR pv.tenant_id = $2::uuid)
 		  AND (pv.legal_entity_id IS NULL OR pv.legal_entity_id = $3::uuid)
+		  AND pv.effective_from <= COALESCE($4, NOW())
+		  AND (pv.effective_to IS NULL OR pv.effective_to > COALESCE($4, NOW()))
 		ORDER BY
 			(CASE WHEN pv.tenant_id IS NOT NULL THEN 1 ELSE 0 END
-			 + CASE WHEN pv.legal_entity_id IS NOT NULL THEN 1 ELSE 0 END) DESC,
-			pv.effective_from DESC;`
+			 + CASE WHEN pv.legal_entity_id IS NOT NULL THEN 1 ELSE 0 END) DESC;`
 
 	var results []*domain.ApplicablePolicyVersion
 	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, query, policyType, tenantID, legalEntityID)
+		rows, err := tx.Query(ctx, query, policyType, tenantID, legalEntityID, asOf)
 		if err != nil {
 			return err
 		}
@@ -639,6 +682,7 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string,
 			if scanErr := rows.Scan(
 				&v.PolicyVersionID, &v.PolicyID, &v.TenantID, &v.LegalEntityID,
 				&v.RulePayload, &v.EffectiveFrom, &v.EffectiveTo, &v.VersionStatus,
+				&v.VersionNumber, &v.Source, &v.Rationale, &v.ArtifactDigest, &v.KnownFrom,
 				&v.ActivatedByPrincipalID, &v.ActivatedAt,
 				&v.CreatedAt, &v.CreatedByPrincipalID, &v.PolicyCode,
 			); scanErr != nil {
@@ -649,9 +693,79 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string,
 		}
 		return rows.Err()
 	})
+if err != nil {
+	s.log.Error("pg FindApplicableVersions failed", zap.String("policy_type", policyType), zap.Error(err))
+	return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+}
+return results, nil
+}
+
+// CheckPolicyTypeOverlap checks if there is an ACTIVE version of the same
+// policy_type (different policy_id) with overlapping scope and temporal range.
+// This prevents conflicting policies of the same type at the same specificity
+// (GOV-05 negative path #2, V-001 PDC-I-08).
+func (s *PgStore) CheckPolicyTypeOverlap(ctx context.Context, policyType string, policyID, tenantID, legalEntityID *string, effectiveFrom time.Time, effectiveTo *time.Time) (bool, error) {
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM policy_versions pv
+			JOIN policies p ON p.policy_id = pv.policy_id
+			WHERE p.policy_type = $1
+			  AND pv.policy_id != $2
+			  AND pv.version_status = 'ACTIVE'
+			  AND (pv.tenant_id IS NULL OR pv.tenant_id = $3::uuid)
+			  AND (pv.legal_entity_id IS NULL OR pv.legal_entity_id = $4::uuid)
+			  AND pv.effective_from <= COALESCE($5, $6)
+			  AND (pv.effective_to IS NULL OR pv.effective_to > $6)
+		);`
+
+	var exists bool
+	err := s.pool.QueryRow(ctx, query, policyType, policyID, tenantID, legalEntityID, effectiveTo, effectiveFrom).Scan(&exists)
 	if err != nil {
-		s.log.Error("pg FindApplicableVersions failed", zap.String("policy_type", policyType), zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return false, fmt.Errorf("check policy type overlap: %w", err)
 	}
-	return results, nil
+	return exists, nil
+}
+
+// ── outbox ────────────────────────────────────────────────────────────────
+
+// OutboxEvent represents an event to be published via the transactional outbox.
+type OutboxEvent struct {
+	EventType      string
+	EventVersion   string
+	SchemaVersion  string
+	SourceService  string
+	TenantID       *string
+	LegalEntityID  *string
+	ActorID        string
+	CorrelationID  string
+	IdempotencyKey string
+	Payload        []byte
+}
+
+// EnqueueEvent adds an event to the transactional outbox in the same
+// transaction as the business write.
+func (s *PgStore) EnqueueEvent(ctx context.Context, event OutboxEvent) error {
+	tenantID := derefOrEmpty(event.TenantID)
+
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO outbox (
+				event_type, event_version, schema_version, source_service,
+				tenant_id, legal_entity_id, actor_id, correlation_id, idempotency_key, payload
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`,
+			event.EventType,
+			event.EventVersion,
+			event.SchemaVersion,
+			event.SourceService,
+			event.TenantID,
+			event.LegalEntityID,
+			event.ActorID,
+			event.CorrelationID,
+			event.IdempotencyKey,
+			event.Payload,
+		)
+		return err
+	})
 }

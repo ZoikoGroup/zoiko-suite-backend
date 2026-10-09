@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"zoiko.io/notification-svc/internal/ledger"
 	"zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/retry"
+	"zoiko.io/notification-svc/internal/unsubscribe"
 )
 
 // ── stubSuppressionStore ──────────────────────────────────────────────────────
@@ -27,7 +29,6 @@ import (
 type stubSuppressionStore struct {
 	suppressions []*ledger.EmailSuppression
 	addCalls     int
-	removeCalls  int
 }
 
 func (s *stubSuppressionStore) AddSuppression(_ context.Context, supp *ledger.EmailSuppression) error {
@@ -55,18 +56,6 @@ func (s *stubSuppressionStore) IsEmailSuppressed(_ context.Context, tenantID, re
 	return false, "", nil
 }
 
-func (s *stubSuppressionStore) RemoveSuppression(_ context.Context, tenantID, recipientEmail, stream string) error {
-	s.removeCalls++
-	out := s.suppressions[:0]
-	for _, supp := range s.suppressions {
-		if !(supp.TenantID == tenantID && supp.RecipientEmail == recipientEmail && supp.SourceStream == stream) {
-			out = append(out, supp)
-		}
-	}
-	s.suppressions = out
-	return nil
-}
-
 func (s *stubSuppressionStore) ListSuppressions(_ context.Context, tenantID string, limit, _ int) ([]*ledger.EmailSuppression, error) {
 	var out []*ledger.EmailSuppression
 	for _, supp := range s.suppressions {
@@ -82,9 +71,19 @@ func (s *stubSuppressionStore) ListSuppressions(_ context.Context, tenantID stri
 
 // ── test helpers ──────────────────────────────────────────────────────────────
 
+// testUnsubscribe is the codec the handler under test opens tokens with.
+var testUnsubscribe = func() *unsubscribe.Codec {
+	c, err := unsubscribe.New([]byte("test-unsubscribe-secret-0123456789abcdef"), "https://notify.example.test")
+	if err != nil {
+		panic(err)
+	}
+	return c
+}()
+
 func newSuppressionHandler(t *testing.T, ss *stubSuppressionStore) http.Handler {
 	t.Helper()
 	h := handler.New(handler.Deps{
+		Unsubscribe:  testUnsubscribe,
 		Store:        &stubStore{byID: make(map[string]*domain.Notification), templates: make(map[string]*domain.TemplateDefinition), versions: make(map[string]*domain.TemplateVersion)},
 		AuthZ:        &stubAuthZ{},
 		Deliverer:    &stubDeliverer{delivered: true},
@@ -205,104 +204,120 @@ func TestListSuppressions_EmptyList(t *testing.T) {
 
 // ── DELETE /v1/notifications/suppression/{email} ─────────────────────────────
 
-func TestRemoveSuppression_OK(t *testing.T) {
+// There is no DELETE: a suppression is lifted on evidence through the governed
+// NCD lift and never removed (§7.3, migration 000022).
+func TestRemoveSuppression_RouteIsGone(t *testing.T) {
 	ss := &stubSuppressionStore{suppressions: []*ledger.EmailSuppression{
 		{TenantID: "tenant-abc", RecipientEmail: "alice@example.com", Reason: ledger.SuppressionReasonHardBounce, SourceStream: "ALL"},
 	}}
 	srv := newSuppressionHandler(t, ss)
 
-	email := url.QueryEscape("alice@example.com")
-	req := httptest.NewRequest(http.MethodDelete, "/v1/notifications/suppression/"+email, nil)
+	req := httptest.NewRequest(http.MethodDelete, "/v1/notifications/suppression/"+url.QueryEscape("alice@example.com"), nil)
 	req.Header.Set("X-Principal-Id", "principal-1")
 	req.Header.Set("X-Tenant-Id", "tenant-abc")
 	w := httptest.NewRecorder()
-
 	srv.ServeHTTP(w, req)
 
-	require.Equal(t, http.StatusNoContent, w.Code)
-	assert.Equal(t, 1, ss.removeCalls)
+	assert.Contains(t, []int{http.StatusNotFound, http.StatusMethodNotAllowed}, w.Code)
+	assert.Len(t, ss.suppressions, 1, "the suppression must survive")
 }
 
 // ── POST /v1/notifications/unsubscribe ───────────────────────────────────────
 
-func TestHandleUnsubscribe_FormBody(t *testing.T) {
+func unsubscribeURL(t *testing.T, tenantID, email string) string {
+	t.Helper()
+	h, err := testUnsubscribe.Headers(tenantID, email)
+	require.NoError(t, err)
+	u := strings.TrimSuffix(strings.TrimPrefix(h["List-Unsubscribe"], "<https://notify.example.test"), ">")
+	return u
+}
+
+// oneClick posts the RFC 8058 body to target, as a mail client does.
+func oneClick(srv http.Handler, target string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader("List-Unsubscribe=One-Click"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	return w
+}
+
+func TestHandleUnsubscribe_ValidTokenRecordsUnsubscribe(t *testing.T) {
 	ss := &stubSuppressionStore{}
 	srv := newSuppressionHandler(t, ss)
 
-	// Simulate a mail client's RFC 8058 one-click POST
-	formData := url.Values{}
-	formData.Set("List-Unsubscribe", "One-Click")
-	formData.Set("action_token", "dummytoken")
-	req := httptest.NewRequest(http.MethodPost,
-		"/v1/notifications/unsubscribe?tenant_id=tenant-abc&email=alice%40example.com",
-		bytes.NewBufferString(formData.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	// No auth headers — RFC 8058 request from mail client
-	w := httptest.NewRecorder()
+	w := oneClick(srv, unsubscribeURL(t, "tenant-abc", "Bob.Smith+promo@Example.COM"))
 
-	srv.ServeHTTP(w, req)
-
-	// Must return 200 per RFC 8058 even if token is dummy
-	assert.Equal(t, http.StatusOK, w.Code)
-	// Suppression must be recorded
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	require.Len(t, ss.suppressions, 1)
-	assert.Equal(t, "alice@example.com", ss.suppressions[0].RecipientEmail)
-	assert.Equal(t, ledger.SuppressionReasonUnsubscribe, ss.suppressions[0].Reason)
 	assert.Equal(t, "tenant-abc", ss.suppressions[0].TenantID)
-}
-
-func TestHandleUnsubscribe_NoTenantOrEmail(t *testing.T) {
-	ss := &stubSuppressionStore{}
-	srv := newSuppressionHandler(t, ss)
-
-	// Missing tenant_id and email — fail-closed returns 400 Bad Request
-	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/unsubscribe", nil)
-	w := httptest.NewRecorder()
-
-	srv.ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Empty(t, ss.suppressions)
-}
-
-func TestHandleUnsubscribe_EmailNormalization(t *testing.T) {
-	ss := &stubSuppressionStore{}
-	srv := newSuppressionHandler(t, ss)
-
-	formData := url.Values{}
-	formData.Set("List-Unsubscribe", "One-Click")
-	req := httptest.NewRequest(http.MethodPost,
-		"/v1/notifications/unsubscribe?tenant_id=tenant-abc&email=Bob.Smith%2Bpromo%40Example.COM",
-		bytes.NewBufferString(formData.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w := httptest.NewRecorder()
-
-	srv.ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	require.Len(t, ss.suppressions, 1)
 	assert.Equal(t, "bob.smith+promo@example.com", ss.suppressions[0].RecipientEmail)
+	assert.Equal(t, ledger.SuppressionReasonUnsubscribe, ss.suppressions[0].Reason)
+}
+
+// The forgery that used to work: tenant and address named in the request,
+// with no token or a made-up one. Nothing is written.
+func TestHandleUnsubscribe_ForgedRequestsWriteNothing(t *testing.T) {
+	ss := &stubSuppressionStore{}
+	srv := newSuppressionHandler(t, ss)
+
+	valid := unsubscribeURL(t, "tenant-abc", "alice@example.com")
+	tampered := valid[:len(valid)-2] + "AA"
+	cases := map[string]struct {
+		target string
+		want   int
+	}{
+		"bare tenant and email":  {"/v1/notifications/unsubscribe?tenant_id=tenant-abc&email=victim%40example.com", http.StatusBadRequest},
+		"dummy token":            {"/v1/notifications/unsubscribe?token=dummytoken&tenant_id=tenant-abc&email=victim%40example.com", http.StatusForbidden},
+		"tampered token":         {tampered, http.StatusForbidden},
+		"old action-token shape": {"/v1/notifications/unsubscribe?action_token=dGVuYW50LWFiYy5VTlNVQi54Lnk", http.StatusBadRequest}, // gitleaks:allow — base64 of the deliberately-rejected legacy action-token shape (tenant-abc.UNSUB...), a test fixture, not a live credential
+	}
+	for name, c := range cases {
+		w := oneClick(srv, c.target)
+		assert.Equal(t, c.want, w.Code, name)
+	}
+	assert.Empty(t, ss.suppressions, "a refused unsubscribe must write nothing")
+}
+
+// A valid token for one address cannot be redirected at another by adding
+// parameters: only the token is believed.
+func TestHandleUnsubscribe_ParametersCannotOverrideToken(t *testing.T) {
+	ss := &stubSuppressionStore{}
+	srv := newSuppressionHandler(t, ss)
+
+	w := oneClick(srv, unsubscribeURL(t, "tenant-abc", "alice@example.com")+"&tenant_id=tenant-evil&email=victim%40example.com")
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, ss.suppressions, 1)
+	assert.Equal(t, "tenant-abc", ss.suppressions[0].TenantID)
+	assert.Equal(t, "alice@example.com", ss.suppressions[0].RecipientEmail)
+}
+
+func TestHandleUnsubscribe_NotConfiguredRefusesEverything(t *testing.T) {
+	ss := &stubSuppressionStore{}
+	h := handler.New(handler.Deps{
+		Store:        &stubStore{byID: make(map[string]*domain.Notification), templates: make(map[string]*domain.TemplateDefinition), versions: make(map[string]*domain.TemplateVersion)},
+		AuthZ:        &stubAuthZ{},
+		Deliverer:    &stubDeliverer{delivered: true},
+		RetryPolicy:  retry.DefaultPolicy,
+		Suppressions: ss,
+		Log:          zap.NewNop(),
+	})
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	w := oneClick(r, unsubscribeURL(t, "tenant-abc", "alice@example.com"))
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Empty(t, ss.suppressions)
 }
 
 func TestHandleUnsubscribe_Idempotent(t *testing.T) {
 	ss := &stubSuppressionStore{}
 	srv := newSuppressionHandler(t, ss)
+	target := unsubscribeURL(t, "tenant-abc", "carol@example.com")
 
-	sendUnsubscribe := func() {
-		formData := url.Values{}
-		formData.Set("List-Unsubscribe", "One-Click")
-		req := httptest.NewRequest(http.MethodPost,
-			"/v1/notifications/unsubscribe?tenant_id=tenant-abc&email=carol%40example.com",
-			bytes.NewBufferString(formData.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		srv.ServeHTTP(httptest.NewRecorder(), req)
+	for i := 0; i < 3; i++ {
+		require.Equal(t, http.StatusOK, oneClick(srv, target).Code)
 	}
-
-	sendUnsubscribe()
-	sendUnsubscribe()
-	sendUnsubscribe()
-
-	// Should be idempotent — AddSuppression uses ON CONFLICT DO UPDATE
-	assert.Equal(t, 3, ss.addCalls) // called each time
-	assert.Len(t, ss.suppressions, 1) // stored only once
+	assert.Equal(t, 3, ss.addCalls)
+	assert.Len(t, ss.suppressions, 1)
 }

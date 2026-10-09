@@ -856,6 +856,8 @@ var governedCodeStatus = map[string]int{
 	"version_immutable":          http.StatusConflict,
 	"snapshot_rollback_rejected": http.StatusConflict,
 	"change_approval_required":   http.StatusConflict,
+	"change_not_approvable":      http.StatusConflict,
+	"change_self_approval":       http.StatusForbidden,
 	"drift_detected":             http.StatusConflict,
 	"consumer_incompatible":      http.StatusConflict,
 	"flag_key_retired":           http.StatusConflict,
@@ -1684,10 +1686,9 @@ func (h *Handler) ApproveChange(w http.ResponseWriter, r *http.Request) {
 	if req.Approved != nil {
 		approved = *req.Approved
 	}
+	// Server time, always. approved_at from the body let a caller date an
+	// approval to whenever it liked (S3-1 / R-4); a body value is ignored.
 	approvedAt := time.Now().UTC()
-	if !req.ApprovedAt.IsZero() {
-		approvedAt = req.ApprovedAt
-	}
 
 	action, ok := h.authorizeTarget(w, r, principalID, tenantScope, "change", changeID)
 	if !ok {

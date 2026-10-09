@@ -104,13 +104,40 @@ func postJSONWithApprovalAs(t *testing.T, h http.Handler, path string, body any,
 	return executeRequest(h, req)
 }
 
-func decodeError(t *testing.T, rr *httptest.ResponseRecorder) map[string]string {
+func decodeError(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
-	var body map[string]string
+	// Every error response goes through the RFC 9457 contract: a
+	// problem+json content type plus the legacy `error` alias of `code`.
+	if ct := rr.Header().Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("expected Content-Type application/problem+json, got %q", ct)
+	}
+	var body map[string]any
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
+	if body["error"] != body["code"] {
+		t.Errorf("expected legacy error alias to equal code, got error=%v code=%v", body["error"], body["code"])
+	}
 	return body
+}
+
+// requireMissingField asserts the RFC 9457 errors[] shape of a
+// missing_field response: exactly one entry located at the offending field
+// by JSON Pointer, with the stable machine code.
+func requireMissingField(t *testing.T, rr *httptest.ResponseRecorder, field string) {
+	t.Helper()
+	body := decodeError(t, rr)
+	if body["error"] != "missing_field" {
+		t.Fatalf("expected error=missing_field, got %v", body)
+	}
+	errs, ok := body["errors"].([]any)
+	if !ok || len(errs) != 1 {
+		t.Fatalf("expected exactly one field error, got %v", body["errors"])
+	}
+	e, ok := errs[0].(map[string]any)
+	if !ok || e["pointer"] != "#/"+field || e["code"] != "missing" {
+		t.Fatalf("expected errors[0] pointer=#/%s code=missing, got %v", field, e)
+	}
 }
 
 // validJurisdictionBody is a complete, valid create request. Tests that
@@ -350,6 +377,56 @@ func TestCreateJurisdiction_404_ParentNotFound(t *testing.T) {
 	}
 }
 
+// TestCreateJurisdiction_400_OverLengthFields — jurisdiction_code/type and
+// authority_type are VARCHAR(n) columns; an over-length value used to die in
+// Postgres and surface as 503 store_unavailable. The handler must reject it
+// as 400 before the store is ever reached.
+func TestCreateJurisdiction_400_OverLengthFields(t *testing.T) {
+	cases := []struct {
+		name, field, value, code string
+	}{
+		{"jurisdiction_code", "jurisdiction_code", strings.Repeat("x", 33), "invalid_jurisdiction_code"},
+		{"jurisdiction_type", "jurisdiction_type", strings.Repeat("x", 65), "invalid_jurisdiction_type"},
+		{"authority_type", "authority_type", strings.Repeat("x", 65), "invalid_authority_type"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &stubStore{}
+			body := validJurisdictionBody()
+			body[tc.field] = tc.value
+
+			rr := postJSON(t, newTestRouterWithAuthz(st, permitAll()), "/v1/admin/jurisdictions", body)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for over-length %s, got %d — body: %s", tc.field, rr.Code, rr.Body.String())
+			}
+			if got := decodeError(t, rr)["error"]; got != tc.code {
+				t.Errorf("expected error=%s, got %q", tc.code, got)
+			}
+			if st.storeCalled {
+				t.Error("an over-length create reached the store")
+			}
+		})
+	}
+}
+
+// TestCreateJurisdiction_400_InputTooLongNet — the last line of defence. Any
+// over-length field the boundary guards still miss (a VARCHAR column this
+// codebase did not bound) must come back as 400 input_too_long, never as 503
+// store_unavailable. The store maps SQLSTATE 22001 onto ErrInputTooLong.
+func TestCreateJurisdiction_400_InputTooLongNet(t *testing.T) {
+	st := &stubStore{createJurisdictionErr: domain.ErrInputTooLong}
+
+	rr := postJSON(t, newTestRouterWithAuthz(st, permitAll()), "/v1/admin/jurisdictions", validJurisdictionBody())
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a 22001 store failure, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if got := decodeError(t, rr)["error"]; got != "input_too_long" {
+		t.Errorf("expected error=input_too_long, got %q", got)
+	}
+}
+
 func TestCreateJurisdiction_400_MalformedBody(t *testing.T) {
 	st := &stubStore{}
 	h := newTestRouterWithAuthz(st, permitAll())
@@ -378,10 +455,7 @@ func TestCreateJurisdiction_400_MissingRequiredFields(t *testing.T) {
 			if rr.Code != http.StatusBadRequest {
 				t.Fatalf("expected 400 with %s omitted, got %d — body: %s", field, rr.Code, rr.Body.String())
 			}
-			got := decodeError(t, rr)
-			if got["error"] != "missing_field" || got["field"] != field {
-				t.Errorf("expected missing_field/%s, got %v", field, got)
-			}
+			requireMissingField(t, rr, field)
 			if st.storeCalled {
 				t.Error("an invalid create reached the store")
 			}
@@ -399,9 +473,7 @@ func TestCreateJurisdiction_400_MissingEffectiveFrom(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	if got := decodeError(t, rr)["field"]; got != "effective_from" {
-		t.Errorf("expected field=effective_from, got %q", got)
-	}
+	requireMissingField(t, rr, "effective_from")
 }
 
 // TestCreateJurisdiction_400_InvertedEffectivePeriod — a period that ends
@@ -447,7 +519,10 @@ func TestCreateJurisdiction_400_UnknownField(t *testing.T) {
 // ── DeactivateJurisdiction ───────────────────────────────────────────────────
 
 func TestDeactivateJurisdiction_200_OK(t *testing.T) {
-	st := &stubStore{deactivatedJurisdiction: &domain.Jurisdiction{JurisdictionID: "j-1", ActiveFlag: false}}
+	st := &stubStore{
+		deactivatedJurisdiction: &domain.Jurisdiction{JurisdictionID: "j-1", ActiveFlag: false},
+		deactivateChanged:       true,
+	}
 	h, pub := newTestRouterWithPublisher(st, permitAll())
 
 	rr := postJSON(t, h, "/v1/admin/jurisdictions/j-1/deactivate", nil)
@@ -460,6 +535,27 @@ func TestDeactivateJurisdiction_200_OK(t *testing.T) {
 	}
 	if !pub.has("jurisdiction.deactivated") {
 		t.Errorf("expected jurisdiction.deactivated to be published, got %v", pub.emitted)
+	}
+}
+
+// TestDeactivateJurisdiction_200_IdempotentReplay does not re-publish: the
+// trg_prevent_duplicate_deactivation trigger skips the UPDATE on a second
+// deactivate, the store reports changed=false, and no consumer may see a
+// second jurisdiction.deactivated (03-microservices.md §3.7).
+func TestDeactivateJurisdiction_200_IdempotentReplayDoesNotPublish(t *testing.T) {
+	st := &stubStore{
+		deactivatedJurisdiction: &domain.Jurisdiction{JurisdictionID: "j-1", ActiveFlag: false},
+		deactivateChanged:       false,
+	}
+	h, pub := newTestRouterWithPublisher(st, permitAll())
+
+	rr := postJSON(t, h, "/v1/admin/jurisdictions/j-1/deactivate", nil)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for replay, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(pub.emitted) != 0 {
+		t.Errorf("an idempotent replay must not publish, got %v", pub.emitted)
 	}
 }
 
@@ -567,6 +663,37 @@ func TestCreateRule_400_MissingRequiredFields(t *testing.T) {
 			}
 			if st.storeCalled {
 				t.Error("an invalid create reached the store")
+			}
+		})
+	}
+}
+
+// TestCreateRule_400_OverLengthFields — rule_domain is VARCHAR(64) and
+// rule_code VARCHAR(128); an over-length value used to surface as 503
+// store_unavailable. It must be a 400, rejected before the store is reached.
+func TestCreateRule_400_OverLengthFields(t *testing.T) {
+	cases := []struct {
+		name, field, value, code string
+	}{
+		{"rule_domain", "rule_domain", strings.Repeat("x", 65), "invalid_rule_domain"},
+		{"rule_code", "rule_code", strings.Repeat("x", 129), "invalid_rule_code"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &stubStore{}
+			body := validRuleBody()
+			body[tc.field] = tc.value
+
+			rr := postJSON(t, newTestRouterWithAuthz(st, permitAll()), "/v1/admin/jurisdictions/j-1/rules", body)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for over-length %s, got %d — body: %s", tc.field, rr.Code, rr.Body.String())
+			}
+			if got := decodeError(t, rr)["error"]; got != tc.code {
+				t.Errorf("expected error=%s, got %q", tc.code, got)
+			}
+			if st.storeCalled {
+				t.Error("an over-length create reached the store")
 			}
 		})
 	}
@@ -927,21 +1054,23 @@ func TestRecordDrift_404_RuleNotFound(t *testing.T) {
 	}
 }
 
-// TestRecordDrift_PublishFailureDoesNotFailRequest — the state change is
-// already committed; refusing the response would tell the caller nothing
-// happened when something did.
+// TestRecordDrift_PublishFailureDoesNotFailRequest — with the outbox pattern,
+// the event is written to the outbox within the same transaction as the state
+// change. The actual Kafka publish happens asynchronously in the background
+// worker, so the request always succeeds (the state change is already committed).
 func TestRecordDrift_PublishFailureDoesNotFailRequest(t *testing.T) {
 	st := &stubStore{
 		driftRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", LegalDriftState: "DRIFTED"},
 		driftEvent:   &domain.DriftEvent{DriftEventID: "d-1"},
 		driftChanged: true,
 	}
-	h, pub := newTestRouterWithPublisher(st, permitAll())
-	pub.err = context.DeadlineExceeded
+	h, _ := newTestRouterWithPublisher(st, permitAll())
 
 	rr := postJSON(t, h, "/v1/admin/rules/r-1/drift", map[string]any{"drift_state": "DRIFTED"})
 
+	// The request should succeed because the event is written to the outbox
+	// within the transaction. Kafka publish happens asynchronously.
 	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 despite a broker failure, got %d", rr.Code)
+		t.Fatalf("expected 200 with outbox pattern, got %d", rr.Code)
 	}
 }

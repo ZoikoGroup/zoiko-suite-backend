@@ -43,7 +43,7 @@ func (h *Handler) OpenReview(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -109,7 +109,7 @@ func (h *Handler) AssignReviewer(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -151,7 +151,7 @@ func (h *Handler) RaiseReviewNote(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -239,7 +239,7 @@ func (h *Handler) SignOff(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewSignOff); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewSignOff, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -303,7 +303,7 @@ func (h *Handler) StartQualityReview(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -357,7 +357,7 @@ func (h *Handler) EvaluateReleaseGates(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionReviewRead, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}

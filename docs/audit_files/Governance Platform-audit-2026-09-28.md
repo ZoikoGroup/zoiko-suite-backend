@@ -1351,6 +1351,40 @@ in the group.
    `POST /internal/authorization/decisions`, while the code uses `/v1/authorize`. Is either
    binding (group C4)?
 
+## Gap closure, 7 October 2026
+
+Every in-service gap was fixed against the documents (Doc 03 §8.3, GOV-03 / 04 / 12,
+ZS-IAM-001). The ❓ items were decided from those documents: this service is the GOV-04
+SoD authority (exceptions with compensating controls, never self-approved, always
+expiring); it holds maker-checker for privileged assignments (GOV-12, §9, A20); and
+access-control-svc authors the role catalogue, which this service enforces. The detail
+is in `services/authorization-svc/progress.md` ("Governance Platform audit closure") and
+`ADMIN-API.md`. Uncommitted; migrations 000020–000027 must be applied before the build.
+
+| | ✅ | ⚠️ | ❌ | Full | Weighted |
+|---|---|---|---|---|---|
+| 28 Sep audit | 29 | 20 | 19 | 42.6% | 57.4% |
+| **7 Oct, after fixes** | **58** | **10** | **0** | **85.3%** | **92.6%** |
+| **8 Oct** | **60** | **8** | **0** | **88.2%** | **94.1%** |
+
+8 Oct: "Cache key includes assignment and policy versions" ✅ (000028 watermark in every key; any replica's
+write retires entries within ~1 s) and "Consume employment.changed" ✅ (access-control-svc publishes it for a
+linked employee's exit through its administered employee→principal link; projected TERMINATED).
+
+All 19 ❌ are closed. The 10 ⚠️ left each wait on something outside the service:
+
+- the console sending `reason` (then `AUTHZ_COMMAND_CONTRACT=enforce`), which covers 2 rows;
+- the ~86 tenantless `/v1/authorize` callers sending `X-Tenant-Id`, which covers 3 rows;
+- the mTLS / gateway identity rollout, which covers 2 rows;
+- an employee-to-principal mapping (`employment.changed`);
+- per-service grant seeding;
+- a version component in the cache key (invalidation already broadcasts).
+
+The integration suites found one regression in this pass, and it is fixed:
+`GET /v1/access-decisions` answered 503 once the evidence columns were added. Both
+store suites now pass on a fully migrated database (13/13 as the app role, 66/66 as the
+owner).
+
 ---
 
 # 6/7 — workflow-svc (:8090) vs Doc 03 §8.4, GOV-06 and R-001 WFC-02 / WFC-03
@@ -1819,4 +1853,159 @@ the service has no consumer of its own.
 5. Which **document statuses** count as valid evidence? No spec section defines this.
 6. Is evaluate a **"material write"**? The envelope treats it as one and demands
    Idempotency-Key and a legal-entity header, while the code comments call it a precondition
-   query. The answer decides whether to override `MaterialWrite` or fix the callers (C5).
+   `query. The answer decides whether to override \`MaterialWrite\` or fix the callers (C5).`
+
+---
+
+## Gap-closure notes (jurisdiction-rules-svc)
+
+**Record #282 (over-length input returns 503 instead of 400, L283) — RESOLVED (V2).**
+Boundary guards added in CreateJurisdiction/CreateRule (`handler.go`) reject over-length
+`jurisdiction_code` (≤32), `jurisdiction_type`/`authority_type` (≤64), `rule_domain` (≤64)
+and `rule_code` (≤128) with field-specific 400 codes; the store maps SQLSTATE 22001 onto
+`domain.ErrInputTooLong` at the create boundary (`pg_store.go`, mirroring the 22P02 pattern),
+and `writeStoreError` answers 400 `input_too_long` as the last line of defence. Verified:
+`go test ./internal/handler/...` (over-length table tests + 22001-net test, asserting the
+store is never reached) and `go test ./internal/store/... TestStore_IsInputTooLong`. The full
+suite is green apart from the known OS "Application Control policy" transient on
+`internal/resolver` (untouched by this change).
+
+**Record #296 (error contract, L295) — RESOLVED (V4).** RFC 9457 problem+json via
+`internal/problem` (single choke point `problem.Write`), `type` from GCP §16 classes, legacy
+`error` alias kept for one minor cycle, envelope `writeViolation` converted, openapi `Error`
+schema and 12 `application/problem+json` response blocks updated. Verified by problem unit
+tests, envelope middleware tests, and handler decode tests asserting problem+json + code.
+
+**Record #302 (deactivate not idempotent, jurisdiction section row) — RESOLVED.**
+`DeactivateJurisdiction`/`DeactivateJurisdictionWithQuerier` now return
+`(*domain.Jurisdiction, bool, error)`, where the bool is `changed`. The first deactivate
+reports `changed=true`; a replay is a no-op because migration 000009's
+`trg_prevent_duplicate_deactivation` trigger skips the UPDATE (no row returned), the store
+falls back to `FindByIDAny` with `changed=false`, and the handler skips both the outbox
+`jurisdiction.deactivated` publish and any audit-column rewrite (`handler.go`). Verified at
+the handler level (stub no-republish test) and at the DB with the real schema (embedded
+Postgres, all migrations incl. 000009): a second deactivate preserves `updated_by` and
+`effective_to`. The store-suite `migrationFiles` now includes 000009 so the listing mirrors
+the prod schema, and the suite gained an opt-in `EMBEDDED_PG_STORE_TESTS` embedded-Postgres
+`TestMain` mirroring registryit. Fractions: `go vet ./internal/...` clean; full suite green
+apart from the known OS "Application Control policy" transient on `internal/resolver`.
+
+**Record #303 (rule pack 404 at any effective_at once inactive, jurisdiction section
+row / §8.2 historical replay) — RESOLVED.** `FindRulePack` now keys its fail-closed guard
+off the requested `at`, not the clock: a since-deactivated jurisdiction still serves the
+pack that was in force for any `at` inside its effective window, and 404s only for `at`
+at/after its `effective_to` (or before `effective_from`). The pack query now also windows
+every rule by its owning jurisdiction's effective period, so a retired ancestor's
+open-ended rules stop resolving into later packs without vanishing from historical ones.
+The store-suite `migrationFiles` already covers the schema these depend on. Verified
+against embedded Postgres (all migrations): `TestPgStore_FindRulePack_HistoricalReplayAfterDeactivation`,
+`TestPgStore_FindRulePack_AncestorRulesEndWithTheirJurisdiction`, plus the existing
+`ResolvesInheritance` (its `at` moved inside the helper-created jurisdiction windows) and
+`InactiveJurisdictionFailsClosed` (still 404 for `at=now`).
+
+**Record #304 (outbox: no publish-failure metric, jurisdiction section row / §3.8
+"alertable failure states") — RESOLVED (G3).** `telemetry.Metrics` gained
+`outbox_publish_failures_total{event_type}` (CounterVec) and `outbox_pending_events`
+(Gauge); the OutboxWorker now takes the metrics object, increments the counter on every
+producer write failure and sets the gauge to the last-read outbox depth each batch —
+so a stalled worker or silent event loss is alertable instead of existing only as a log
+line. `NewOutboxWorker` gained the `metrics` argument; the single caller (main.go) passes
+the constructed `telemetry.Metrics`. Verified: `TestOutboxMetricsReport` (telemetry)
+asserts both series on the default /metrics registry, and events/handler suites stay green.
+
+**Record #305 (drift/status history append-only at the privilege layer, G5) — RESOLVED.**
+New migration `000017_append_only_rbac` adds a DELETE-blocking trigger on
+`rule_status_history` (DELETE is always illegitimate there; UPDATE stays legal because
+`record_rule_status_change` writes `known_to` on close-out) and, where the
+`app_jurisdiction_rules` role exists, revokes UPDATE/DELETE on
+`jurisdiction_rule_drift_events` and DELETE on `rule_status_history`, mirroring 000009's
+guarded pattern. Verified against embedded Postgres with the real migration set:
+`TestPgStore_AppendOnlyEnforced` proves direct UPDATE/DELETE on the tables is denied in
+the database, and the full store suite plus a full-migration boot (registryit TestMain)
+pass. NOTE (out of scope — shared infra): `deployments/scripts/create-app-roles.sh` still
+grants blanket UPDATE/DELETE ON ALL TABLES to `app_jurisdiction_rules` on every run, so
+the privilege revokes are best-effort protection that a later script run re-grants; the
+DB triggers remain the load-bearing enforcement. A platform owner should tighten that
+script when a cross-service infra change is next made.
+
+**Record #306 (jurisdiction-rules-svc publishes host port 8082 in shared compose, G6) — NOTED, no change made.**
+`deployments/docker-compose.yml` maps `"8082:8082"` for `jurisdiction-svc`. Internal consumers
+(tenant-entity-registry-svc etc.) call `http://jurisdiction-svc:8082` over the compose network, so the
+host bind serves local debugging only and removing it changes nothing for in-stack callers. Applied
+or dropped only by a platform owner — per the standing constraint this shared infra file is not
+edited here. Proposed minimal fix for when that window opens: delete the `ports:` entry (or bind the
+loopback only, `127.0.0.1:8082:8082`). Traefik routing is by container DNS and is unaffected either
+way.
+
+**Record #307 (openapi: envelope 400/401 + 413 on transition/drift, G7) — RESOLVED.**
+`openapi.yaml`: the `BadRequest` response now documents `envelope_incomplete` (HTTP 400 — a
+write-strict obligation header `X-Request-Id`/`X-Source-Channel`/`Idempotency-Key` is missing), the
+`MissingPrincipal` response now documents `envelope_incomplete` with HTTP 401 (envelope omits
+`X-Tenant-Id`/`X-Principal-Id`), and the transition + drift endpoints gained the existing
+`BodyTooLarge` (`413` `request_body_too_large`, 256 KiB) response — matching
+`internal/handler/handler.go:1142` and the envelope middleware's `StatusFor` (401 only for the
+tenant/principal fields, 400 otherwise). Verified: `openapi.yaml` still parses.
+
+**Record #308 (stale platform docs vs jurisdiction-rules-svc, G8) — RESOLVED.**
+`backend-completion-tracker.md` row 96: the "21 GET / 5 POST" audit figure is replaced with the
+current routed surface (registry + resolver wires mounted in main.go) — 44 GET / 57 POST / 6 PUT
+tallied across handler.go, registry.go, compile/cert/ops/calendar/tax/rollout/submission/records/
+payroll/resolve. Every write route funnels through the shared `admin`/`checkAuthz` helpers that
+delegate to a real `Authorize`; GETs are open reference/query data by design. Row 66: the "no
+compliance calendar" gap is **Done** — `regulatory_calendars`/`regulatory_calendar_versions`/
+`calendar_version_sources`/`pack_version_calendars` (migration 000010), `jurisdiction.calendar.changed`
+declared in `internal/events` and emitted by `PublishCalendarVersion` (`internal/handler/calendar.go`),
+asserted by `calendar_integration_test.go`. `known-gaps.md`: "jurisdiction-rules-svc owns no compliance
+calendar" section flips Open → Resolved; "seed-demo-rbac.ps1 does not grant the JURISDICTION_*
+actions" is closed (the script now grants `JURISDICTION_FULL`, `JURISDICTION_RESOLVER_CALLER` and
+`JURISDICTION_PACK_REGISTRY_FULL`). `03-microservices.md` §8.2 already listed all four published
+events and needed no change. Two stale notes remain in SHARED infra (out of scope, flagged):
+seed-demo-rbac.ps1's comment "gates all five of its admin routes" understates the now ~57 POST + 6
+PUT surface; and `FiscalCalendar` (tracker row 70) is a platform Doc 04 data-model item distinct from
+this service's own calendar tables.
+
+**Record #309 (minimal Postman collection, G10) — RESOLVED.**
+New `postman/postman/ZoikoSuite_JurisdictionRules.postman_collection.json` (Postman v2.1.0, same
+location/conventions as the Phase 5/6/7 collections): health, the 7 open reads, and the 5 base admin
+writes (create jurisdiction, create rule, transition, drift, deactivate) carrying the write-strict
+envelope headers, plus variables and 201 → `jurisdictionId`/`ruleId` capture scripts. NOTE while
+writing it: `/v1/validate-action` is documented in `openapi.yaml` but has NO handler and is not
+registered anywhere in the service — it remains a decision-required spec item, and the collection
+deliberately omits it. The route-surface tally in #308 also surfaced that a full openapi↔routes
+parity check is not yet done; recommend it for the next pass over this service.
+**Record #310 (re-audit gap pass, R1) - RESOLVED (with noted decision-required items).**
+A fresh doc-first parity pass over jurisdiction-rules-svc closed four gaps:
+
+1. GET /v1/rules/{jurisdiction_rule_id}/status-history - documented in openapi.yaml but not
+   registered. Now wired end-to-end: GetRuleStatusHistory handler (mirrors GetDriftEvents),
+   route in RegisterRoutes, stub plus 3 unit tests; the store method and interface already
+   existed and are now reachable over HTTP.
+2. POST /v1/admin/calendars/{calendar_code}/versions - registered in code (calendar.go:36) but
+   the openapi entry sat at the wrong path /v1/calendars/{calendar_code}/versions, which is the
+   public list AND the draft is an admin write. Moved to its true admin path; GET list untouched.
+3. Write-strict envelope headers - the envelope middleware mandates X-Request-Id, X-Tenant-Id,
+   X-Source-Channel on every operation and Idempotency-Key on every write (INV-08), yet openapi
+   declared them required:false and referenced them nowhere. All 64 write operations now carry
+   the four reusable components/parameters refs; inline (required:false) Idempotency-Key params
+   that would duplicate the ref were removed; the four component definitions are required:true
+   with accurate descriptions. YAML re-parses; per-operation parameter-name uniqueness held.
+4. FindRulePack bitemporal status - the pack filtered on the rule's CURRENT status, so a
+   since-RETIRED rule vanished from every earlier pack and a rule activated after its
+   effective_from answered for dates on which the platform knew it DRAFT (audit L325). The query
+   now derives each rule's status at the requested point-in-time from rule_status_history
+   (falling back to the stored status when history does not cover it, preserving pre-000007
+   behaviour and the historical-replay-after-deactivation semantics). A new store test seeds the
+   history timeline deterministically and proves both directions; all prior pack tests pass
+   unchanged.
+
+Verification: go build + vet clean; full store suite vs embedded Postgres passes including the
+new test; handler and resolver suites pass (run via go test -c binaries because of the host
+Application Control policy); domain/envelope/events pass; registryit full-migration boot OK.
+
+Remaining, unchanged from #307/#309 and still decision-required rather than gaps:
+/v1/validate-action (openapi + microservices 8.2 spec with no handler); the :resolve
+entity/jurisdiction applicability mapping and the consumed events (entity.created,
+entity.jurisdiction.changed, external regulatory feed changes) are cross-service boundaries
+outside this service's mount; precedence-conflict semantics and maker-checker stay product
+negotiations. Route parity is now clean modulo validate-action and the three infra mounts
+(/healthz, /readyz, /metrics), all deliberately outside the API contract.

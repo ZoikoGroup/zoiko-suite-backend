@@ -45,13 +45,18 @@ type Client interface {
 // ActionApplicabilityDecide is separate for the same reason and is the strongest
 // of the four in practice: an applicability decision is the record of WHETHER a
 // statutory obligation binds an entity at all, and everything downstream —
-// filings, evidence, aging — is derived from it. "May raise an obligation" and
-// "may decide it does not apply" are emphatically not the same authority.
+// filings, evidence, aging — is all derived from it. "May raise an obligation"
+// and "may decide it does not apply" are emphatically not the same authority.
+//
+// Read actions for object-level authorization on GET endpoints.
 const (
 	ActionObligationCreate       = "OBLIGATION_CREATE"
 	ActionObligationStatusUpdate = "OBLIGATION_STATUS_UPDATE"
 	ActionFilingRequirementAdd   = "FILING_REQUIREMENT_CREATE"
 	ActionApplicabilityDecide    = "APPLICABILITY_DECISION_RECORD"
+	ActionObligationRead         = "OBLIGATION_READ"
+	ActionFilingRequirementRead  = "FILING_REQUIREMENT_READ"
+	ActionApplicabilityRead      = "APPLICABILITY_DECISION_READ"
 )
 
 type HTTPClient struct {
