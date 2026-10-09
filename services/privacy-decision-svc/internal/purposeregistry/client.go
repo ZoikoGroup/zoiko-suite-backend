@@ -45,10 +45,17 @@ func NewClient(baseURL string) *Client {
 // activityID, or nil if it doesn't resolve to one at all (not found, or
 // exists but never activated) — GET /privacy/processing-activities/{id}
 // in PRV-01 already only ever resolves ACTIVE/SUSPENDED/RETIRED.
-func (c *Client) ResolveActivity(ctx context.Context, activityID string) (*ActivityVersion, error) {
+// tenantID is forwarded via X-Tenant-Id — PRV-01's own RLS scopes this
+// read by tenant, and an activity genuinely owned by the caller's tenant
+// resolves to nothing without it (see retentionregistry.Client.Resolve's
+// doc comment for the same convention).
+func (c *Client) ResolveActivity(ctx context.Context, tenantID, activityID string) (*ActivityVersion, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/processing-activities/"+activityID, nil)
 	if err != nil {
 		return nil, err
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -71,11 +78,15 @@ func (c *Client) ResolveActivity(ctx context.Context, activityID string) (*Activ
 }
 
 // ResolvePurpose mirrors ResolveActivity for GET /privacy/purposes/{id},
-// which only ever resolves a PUBLISHED version.
-func (c *Client) ResolvePurpose(ctx context.Context, purposeID string) (*PurposeVersion, error) {
+// which only ever resolves a PUBLISHED version. tenantID is forwarded the
+// same way — see ResolveActivity's doc comment.
+func (c *Client) ResolvePurpose(ctx context.Context, tenantID, purposeID string) (*PurposeVersion, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/purposes/"+purposeID, nil)
 	if err != nil {
 		return nil, err
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

@@ -54,7 +54,7 @@ func newStubPurposeRegistry() *stubPurposeRegistry {
 	return &stubPurposeRegistry{activities: map[string]*purposeregistry.ActivityVersion{}}
 }
 
-func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, activityID string) (*purposeregistry.ActivityVersion, error) {
+func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, _, activityID string) (*purposeregistry.ActivityVersion, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -209,6 +209,67 @@ func TestEvaluateTransfer_Authorized_NoAssessmentRequired(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &d)
 	if d.Result != domain.ResultAuthorized {
 		t.Fatalf("expected AUTHORIZED, got %s (reasons=%v)", d.Result, d.ReasonCodes)
+	}
+}
+
+// TestEvaluateTransfer_AuthorizationDenied proves EvaluateTransfer is now
+// gated the same way every other mutating handler in this service already
+// is: a principal lacking PRIVACY_TRANSFER_DECISION_EVALUATE is rejected
+// with 403 before any decision is recorded or published, closing the gap
+// where any non-empty X-Principal-Id could previously evaluate transfers.
+func TestEvaluateTransfer_AuthorizationDenied(t *testing.T) {
+	st := newStubStore()
+	setupRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, setupRouter)
+	mech := createValidMechanism(t, setupRouter)
+
+	pub := &stubPublisher{}
+	deniedRouter := newTestRouter(st, pub, &stubAuthz{deny: true}, newStubPurposeRegistry())
+	w := doRequest(deniedRouter, http.MethodPost, "/privacy/transfer-decisions", domain.EvaluateTransferRequest{
+		RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID,
+	}, testTenant)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(st.decisions) != 0 {
+		t.Fatalf("expected no decision recorded on denial, found %d", len(st.decisions))
+	}
+	if pub.calls != 0 {
+		t.Fatalf("expected no event published on denial, got %d publish calls", pub.calls)
+	}
+}
+
+// TestEvaluateTransfer_AuthorizationDenied_NoIdempotencyRecordCreated proves
+// a denied request cannot back-door a decision into existence via the
+// idempotency store either: the same Idempotency-Key, retried by an
+// authorized principal, must still evaluate for real rather than replaying
+// a cached response the denied call never got to create.
+func TestEvaluateTransfer_AuthorizationDenied_NoIdempotencyRecordCreated(t *testing.T) {
+	st := newStubStore()
+	setupRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	rel := createRelationship(t, setupRouter)
+	mech := createValidMechanism(t, setupRouter)
+
+	const key = "evaluate-denied-then-retry"
+	deniedRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{deny: true}, newStubPurposeRegistry())
+	denied := doRequestWithHeaders(deniedRouter, http.MethodPost, "/privacy/transfer-decisions",
+		domain.EvaluateTransferRequest{RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID},
+		map[string]string{"X-Tenant-Id": testTenant, "Idempotency-Key": key})
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", denied.Code, denied.Body.String())
+	}
+
+	allowedRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, newStubPurposeRegistry())
+	allowed := doRequestWithHeaders(allowedRouter, http.MethodPost, "/privacy/transfer-decisions",
+		domain.EvaluateTransferRequest{RelationshipID: rel.RelationshipID, TransferMechanismID: mech.MechanismID},
+		map[string]string{"X-Tenant-Id": testTenant, "Idempotency-Key": key})
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("expected the same key to succeed once actually authorized, got %d: %s", allowed.Code, allowed.Body.String())
+	}
+	var d domain.TransferDecision
+	_ = json.Unmarshal(allowed.Body.Bytes(), &d)
+	if d.Result != domain.ResultAuthorized {
+		t.Fatalf("expected AUTHORIZED, got %s", d.Result)
 	}
 }
 

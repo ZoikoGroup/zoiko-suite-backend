@@ -31,11 +31,13 @@ func TestTenantScopedRoutes_RefuseMissingTenant(t *testing.T) {
 		{"create automation policy", http.MethodPost, "/v1/automation-policies", domain.CreateAutomationPolicyRequest{
 			Role: "FINANCE_AGENT", Tool: "LEDGER_POST", ActionType: "POST_JOURNAL",
 		}},
+		{"list automation policies", http.MethodGet, "/v1/automation-policies", nil},
 		{"resolve automation policy", http.MethodGet,
 			"/v1/automation-policies/resolve?role=FINANCE_AGENT&tool=LEDGER_POST&action_type=POST_JOURNAL", nil},
 		{"propose automation action", http.MethodPost, "/v1/automation-actions", domain.ProposeAutomationActionRequest{
 			ActionType: "POST_JOURNAL", Role: "FINANCE_AGENT", Tool: "LEDGER_POST", IdempotencyKey: "idem-1",
 		}},
+		{"list automation actions", http.MethodGet, "/v1/automation-actions", nil},
 		{"get automation action", http.MethodGet, "/v1/automation-actions/some-id", nil},
 		{"decide automation action", http.MethodPost, "/v1/automation-actions/some-id/decision",
 			domain.ApproveAutomationActionRequest{Decision: "APPROVED"}},
@@ -69,6 +71,12 @@ func TestPlatformScopedRoutes_WorkWithoutTenant(t *testing.T) {
 		t.Fatalf("platform route must not require X-Tenant-Id, got %d — %s", w.Code, w.Body.String())
 	}
 
+	wRiskList := httptest.NewRecorder()
+	r.ServeHTTP(wRiskList, buildRequestAs(http.MethodGet, "/v1/action-risk-classifications", nil, ""))
+	if wRiskList.Code != http.StatusOK {
+		t.Fatalf("platform list route must not require X-Tenant-Id, got %d — %s", wRiskList.Code, wRiskList.Body.String())
+	}
+
 	wProv := httptest.NewRecorder()
 	r.ServeHTTP(wProv, buildRequestAs(http.MethodPost, "/v1/model-providers",
 		domain.RegisterModelProviderRequest{
@@ -76,6 +84,18 @@ func TestPlatformScopedRoutes_WorkWithoutTenant(t *testing.T) {
 		}, ""))
 	if wProv.Code != http.StatusOK && wProv.Code != http.StatusCreated {
 		t.Fatalf("platform route must not require X-Tenant-Id, got %d — %s", wProv.Code, wProv.Body.String())
+	}
+
+	wProvList := httptest.NewRecorder()
+	r.ServeHTTP(wProvList, buildRequestAs(http.MethodGet, "/v1/model-providers", nil, ""))
+	if wProvList.Code != http.StatusOK {
+		t.Fatalf("platform list route must not require X-Tenant-Id, got %d — %s", wProvList.Code, wProvList.Body.String())
+	}
+
+	wApprList := httptest.NewRecorder()
+	r.ServeHTTP(wApprList, buildRequestAs(http.MethodGet, "/v1/policy-change-approvals", nil, ""))
+	if wApprList.Code != http.StatusOK {
+		t.Fatalf("platform list route must not require X-Tenant-Id, got %d — %s", wApprList.Code, wApprList.Body.String())
 	}
 }
 

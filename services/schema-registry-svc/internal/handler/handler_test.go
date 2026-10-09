@@ -40,6 +40,15 @@ type stubStore struct {
 	// the write guard are the same version.
 	insertedExpectedVersion int
 
+	// byIdempotencyKey stands in for rows a prior registration already wrote
+	// under a given (event_name, idempotency_key) — a test populates this to
+	// simulate a replay. findByIdempotencyKeyCalled records whether the
+	// handler checked at all, and findErr lets a test force the lookup itself
+	// to fail (the store is unavailable).
+	byIdempotencyKey           *domain.EventSchema
+	findErr                    error
+	findByIdempotencyKeyCalled bool
+
 	// gotLimit/gotOffset record the paging bounds the handler applied, so a
 	// test can prove the reads are bounded rather than assuming it.
 	gotLimit, gotOffset int
@@ -70,6 +79,10 @@ func (s *stubStore) Insert(_ context.Context, sch *domain.EventSchema, expectedV
 	stored := *sch
 	stored.Version = expectedVersion + 1
 	return &stored, nil
+}
+func (s *stubStore) FindByIdempotencyKey(_ context.Context, _, _ string) (*domain.EventSchema, error) {
+	s.findByIdempotencyKeyCalled = true
+	return s.byIdempotencyKey, s.findErr
 }
 
 // ── stub authz client ──────────────────────────────────────────────────────
@@ -462,4 +475,90 @@ func TestRegisterVersion_GenuineStoreFailureIsStill503(t *testing.T) {
 	r.ServeHTTP(rec, req)
 
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
+// ── Idempotent replay (INV-08) ───────────────────────────────────────────────
+//
+// §4 requires Idempotency-Key on every material write and states its purpose
+// plainly: duplicate/replay protection. The envelope middleware (wired in
+// cmd/server/main.go, not exercised by these handler-only tests) already
+// refuses a request with no key; these tests cover what the handler itself
+// must do once a key is present — a retried registration must return the
+// ORIGINAL outcome, not claim a new version.
+
+func TestRegisterVersion_IdempotentReplay_ReturnsOriginalWithoutInserting(t *testing.T) {
+	original := &domain.EventSchema{
+		EventName:      "replayed.probe",
+		Version:        1,
+		JSONSchema:     json.RawMessage(`{"properties":{},"required":[]}`),
+		IdempotencyKey: "retry-key-001",
+	}
+	s := &stubStore{byIdempotencyKey: original}
+	r := newRouter(s)
+
+	body := `{"json_schema":{"properties":{"anything":{"type":"string"}}}}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/replayed.probe/versions", bytes.NewBufferString(body)))
+	req.Header.Set("Idempotency-Key", "retry-key-001")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code,
+		"a replay returns the same success status as the original registration")
+	var got domain.EventSchema
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, 1, got.Version, "the replay must return the ORIGINAL version, not a new one")
+	assert.True(t, s.findByIdempotencyKeyCalled)
+	assert.Nil(t, s.insertedArg, "a genuine replay must not reach Insert at all")
+}
+
+func TestRegisterVersion_NewIdempotencyKey_InsertsNormally(t *testing.T) {
+	s := &stubStore{latest: nil, byIdempotencyKey: nil}
+	r := newRouter(s)
+
+	body := `{"json_schema":{"properties":{"a":{"type":"string"}}}}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/fresh.probe/versions", bytes.NewBufferString(body)))
+	req.Header.Set("Idempotency-Key", "first-attempt-001")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.NotNil(t, s.insertedArg)
+	assert.Equal(t, "first-attempt-001", s.insertedArg.IdempotencyKey,
+		"the key must be persisted so a later replay can be detected")
+}
+
+func TestRegisterVersion_IdempotencyLookupFails_Returns503FailClosed(t *testing.T) {
+	s := &stubStore{findErr: errors.New("connection refused")}
+	r := newRouter(s)
+
+	body := `{"json_schema":{"properties":{}}}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/broken.probe/versions", bytes.NewBufferString(body)))
+	req.Header.Set("Idempotency-Key", "some-key")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code,
+		"a failed idempotency lookup must fail closed, not silently proceed to insert")
+	assert.Nil(t, s.insertedArg)
+}
+
+func TestRegisterVersion_NoIdempotencyKey_SkipsReplayCheck(t *testing.T) {
+	// Handler-level tests construct the router without the envelope
+	// middleware that normally refuses this request before it arrives here
+	// (see cmd/server/main.go). This proves the handler itself degrades
+	// safely — it still registers normally — rather than panicking or
+	// silently always treating an empty key as a match.
+	s := &stubStore{latest: nil}
+	r := newRouter(s)
+
+	body := `{"json_schema":{"properties":{"a":{"type":"string"}}}}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/nokey.probe/versions", bytes.NewBufferString(body)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	assert.False(t, s.findByIdempotencyKeyCalled,
+		"no key means nothing to look up — the check must not run")
+	require.NotNil(t, s.insertedArg)
+	assert.Empty(t, s.insertedArg.IdempotencyKey)
 }

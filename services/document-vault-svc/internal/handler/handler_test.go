@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -39,6 +40,7 @@ type stubStore struct {
 	linkSeq           int
 	classificationSeq int
 	createErr         error
+	addVersionErr     error
 	findErr           error
 	recordErr         error
 }
@@ -78,6 +80,9 @@ func (s *stubStore) CreateDocument(_ context.Context, doc *domain.Document, v *d
 }
 
 func (s *stubStore) AddVersion(_ context.Context, documentID string, v *domain.DocumentVersion, _ string) (*domain.Document, error) {
+	if s.addVersionErr != nil {
+		return nil, s.addVersionErr
+	}
 	doc, ok := s.docs[documentID]
 	if !ok {
 		return nil, domain.ErrDocumentNotFound
@@ -712,6 +717,27 @@ func TestCreateDocument_ResidencyServiceUnavailable_FailsClosed503(t *testing.T)
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }
 
+func TestCreateDocument_StoreFailure_CompensatesAndDeletesBlob(t *testing.T) {
+	dir := t.TempDir()
+	st, err := storage.NewLocalFileBackend(dir, "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f")
+	require.NoError(t, err)
+
+	s := newStubStore()
+	s.createErr = errors.New("database connection pool exhausted")
+
+	r := newRouter(s, &stubResidency{}, st)
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "unpersisted blob content")))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+
+	// Compensation check: no orphan .enc files left in storage dir
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "storage blob must be deleted/compensated when database write fails")
+}
+
 // ── Scan gate (BIZ-01 Wave 4) ────────────────────────────────────────────────
 
 func TestCreateDocument_Quarantined_Returns422_NeverPersists(t *testing.T) {
@@ -843,6 +869,46 @@ func TestAddVersion_DocumentNotFound_Returns404(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestAddVersion_StoreFailure_CompensatesAndDeletesBlob(t *testing.T) {
+	dir := t.TempDir()
+	st, err := storage.NewLocalFileBackend(dir, "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f")
+	require.NoError(t, err)
+
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+
+	// Step 1: Create a document successfully
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "version 1 content")))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusCreated, rec.Code)
+
+	var doc domain.Document
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &doc))
+
+	// Verify exactly 1 blob on disk for version 1
+	entriesBefore, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entriesBefore, 1)
+
+	// Step 2: Add version with store failure
+	s.addVersionErr = errors.New("database disk full")
+	body, _ := json.Marshal(domain.CreateDocumentVersionRequest{
+		ContentType:   "text/plain",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte("version 2 candidate failed")),
+	})
+	reqV2 := httptest.NewRequest(http.MethodPost, "/v1/documents/"+doc.DocumentID+"/versions", bytes.NewReader(body))
+	recV2 := httptest.NewRecorder()
+	r.ServeHTTP(recV2, reqV2)
+	require.Equal(t, http.StatusServiceUnavailable, recV2.Code)
+
+	// Compensation check: candidate blob must be deleted, leaving only version 1's blob
+	entriesAfter, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Len(t, entriesAfter, 1, "failed version blob must be compensated; original version blob must remain")
+	assert.Equal(t, entriesBefore[0].Name(), entriesAfter[0].Name(), "original blob must remain untouched")
 }
 
 func strPtr(s string) *string { return &s }

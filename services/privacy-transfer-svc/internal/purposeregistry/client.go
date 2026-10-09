@@ -33,11 +33,16 @@ func NewClient(baseURL string) *Client {
 
 // ResolveActivity mirrors privacy-decision-svc's client — GET
 // /privacy/processing-activities/{id} only ever resolves ACTIVE/
-// SUSPENDED/RETIRED.
-func (c *Client) ResolveActivity(ctx context.Context, activityID string) (*ActivityVersion, error) {
+// SUSPENDED/RETIRED. tenantID is forwarded via X-Tenant-Id — PRV-01's own
+// RLS scopes this read by tenant (see retentionregistry-style clients
+// elsewhere in this domain for the same convention).
+func (c *Client) ResolveActivity(ctx context.Context, tenantID, activityID string) (*ActivityVersion, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/processing-activities/"+activityID, nil)
 	if err != nil {
 		return nil, err
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

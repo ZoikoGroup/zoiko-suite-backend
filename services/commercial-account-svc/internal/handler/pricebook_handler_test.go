@@ -411,3 +411,18 @@ func TestPriceBookHandler_SellableOffersValidateFilters(t *testing.T) {
 		t.Fatalf("valid filters: HTTP %d calls=%v", w.Code, st.calls)
 	}
 }
+
+func TestPriceVersionAction_SelfApproval_Blocked(t *testing.T) {
+	v := sampleVersion()
+	v.CreatedByPrincipalID = "alice" // Same as caller principal in serve()
+	st := &pbStub{version: v}
+	w := serve(t, newPBRouter(st, &actionAuthz{}), req{
+		method:  http.MethodPost,
+		path:    "/v1/commercial/price-versions/" + v.PriceVersionID + ":approve",
+		headers: cmdHeaders(nil),
+	})
+	if w.Code != http.StatusForbidden || problemCode(t, w) != CodeSoDViolation {
+		t.Fatalf("creator self-approval expected 403 Forbidden with %s, got HTTP %d (%s)", CodeSoDViolation, w.Code, w.Body.String())
+	}
+}
+
