@@ -133,7 +133,7 @@ func main() {
 	relay := outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, log)
 	go relay.Start(relayCtx)
 
-	ledgerClient := ledger.NewHTTPClient(cfg.LedgerServiceURL)
+	ledgerClient := ledger.NewHTTPClient(cfg.LedgerServiceURL, log)
 	entityClient := entity.NewHTTPClient(cfg.TenantRegistryURL)
 
 	var authzClient *authz.HTTPClient

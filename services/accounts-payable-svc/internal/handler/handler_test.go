@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/accounts-payable-svc/internal/domain"
@@ -113,6 +114,16 @@ func (s *stubStore) TransitionInvoice(_ context.Context, _, invoiceID string, fr
 	return nil
 }
 
+// SetApprovalJournalID stores the GL journal ID on the invoice (test stub).
+func (s *stubStore) SetApprovalJournalID(_ context.Context, _, invoiceID, journalID string) error {
+	inv, ok := s.invoices[invoiceID]
+	if !ok {
+		return nil
+	}
+	inv.ApprovalJournalID = &journalID
+	return nil
+}
+
 type stubPublisher struct {
 	received, validated, approved, paymentRequested int
 }
@@ -163,23 +174,41 @@ func (p *stubPayables) CreatePayableFromApprovedSource(_ context.Context, _, _ s
 	return &payableopenitem.PayableOpenItem{PayableID: "payable-" + req.SourceReference, Status: "OPEN"}, nil
 }
 
+// stubLedger stands in for general-ledger-svc when a test cares about the
+// handler's branching rather than the client's HTTP behaviour.
+type stubLedger struct {
+	err       error
+	journalID string
+	postErr   error
+}
+
+func (l *stubLedger) PostInvoiceApprovedAccountingEvent(_ context.Context, _, _ string, _ *domain.VendorInvoice) (string, error) {
+	if l.postErr != nil {
+		return "", l.postErr
+	}
+	if l.journalID == "" {
+		l.journalID = "journal-" + uuid.New().String()
+	}
+	return l.journalID, nil
+}
+
 // newRouter mounts TenantContext, which the real server mounts in
 // cmd/server/main.go. It used to be omitted, so every handler under test saw an
 // empty tenant scope and fell back to the query parameter or the body — the very
 // behaviour these tests are supposed to be checking. A handler harness must
 // mount the middleware the handler depends on.
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ) chi.Router {
-	return newRouterWith(s, p, a, &stubPO{}, &stubPayables{})
+	return newRouterWith(s, p, a, &stubPO{}, &stubPayables{}, &stubLedger{})
 }
 
 // newRouterWith is newRouter with both downstream stubs made explicit. Most
 // tests never set purchase_order_id and never reach Verify, and most never
 // post an open item either, so they should not each have to name stubs they
 // do not use — hence the two thin wrappers below.
-func newRouterWith(s *stubStore, p *stubPublisher, a *stubAuthZ, po *stubPO, payables *stubPayables) chi.Router {
+func newRouterWith(s *stubStore, p *stubPublisher, a *stubAuthZ, po *stubPO, payables *stubPayables, ledger *stubLedger) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, p, a, po, payables, zap.NewNop())
+	h := handler.New(s, p, a, po, payables, ledger, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -583,6 +612,41 @@ func TestApproveInvoice_CreatesRealAP08Payable(t *testing.T) {
 	}
 }
 
+// TestApproveInvoice_LedgerPostingFails_Returns503AndLeavesNoJournalLink is
+// the literal enforcement of handler.go's own comment at the
+// PostInvoiceApprovedAccountingEvent call site: "an approved invoice that
+// cannot be booked leaves the books without the liability ... Do not leave
+// an unbooked approved invoice in the system." Before this test, stubLedger's
+// postErr field existed but nothing ever set it.
+//
+// Unlike AP-08 (best-effort, see TestApproveInvoice_AP08Unavailable_ApprovalStillStands
+// below), GL posting is deliberately fail-strict: AP-08 creates a downstream
+// convenience record that can be retried independently, while a missing GL
+// journal means the books themselves don't match reality.
+func TestApproveInvoice_LedgerPostingFails_Returns503AndLeavesNoJournalLink(t *testing.T) {
+	s := newStubStore()
+	s.invoices["i1"] = &domain.VendorInvoice{
+		InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, VendorID: "vendor-1",
+		Amount: 500, CurrencyCode: "USD", DueDate: time.Now().UTC().Add(30 * 24 * time.Hour),
+		Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-creator",
+	}
+
+	r := newRouterWith(s, &stubPublisher{}, &stubAuthZ{}, &stubPO{}, &stubPayables{},
+		&stubLedger{postErr: errors.New("gl unavailable")})
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/approve", nil, "principal-1")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when GL posting fails, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.invoices["i1"].ApprovalJournalID != nil {
+		t.Fatalf("invoice i1 has ApprovalJournalID set despite GL posting having failed: %q",
+			*s.invoices["i1"].ApprovalJournalID)
+	}
+	// The transition to APPROVED already happened (ApproveInvoice re-fetches
+	// before posting to GL — see handler.go), so the status itself cannot be
+	// rolled back without a distributed transaction. What matters is that no
+	// journal link is ever recorded for a journal that doesn't exist.
+}
+
 // TestApproveInvoice_AP08Unavailable_ApprovalStillStands verifies the AP-08
 // call is genuinely best-effort — mirroring expense-claim-svc's own
 // doctrine — and never undoes an approval that already succeeded.
@@ -898,12 +962,12 @@ func TestCreateInvoice_PurchaseOrderVerified_RecordsVendorProfile(t *testing.T) 
 
 // newRouterWithPO keys an invoice against a purchase order (AP-05).
 func newRouterWithPO(s *stubStore, p *stubPublisher, a *stubAuthZ, po *stubPO) chi.Router {
-	return newRouterWith(s, p, a, po, &stubPayables{})
+	return newRouterWith(s, p, a, po, &stubPayables{}, &stubLedger{})
 }
 
 // newRouterWithPay exercises the AP-08 open-item posting path.
 func newRouterWithPay(s *stubStore, p *stubPublisher, a *stubAuthZ, payables *stubPayables) chi.Router {
-	return newRouterWith(s, p, a, &stubPO{}, payables)
+	return newRouterWith(s, p, a, &stubPO{}, payables, &stubLedger{})
 }
 
 // TestNoSynchronousHandlerPublishing verifies that HTTP handlers do not publish
