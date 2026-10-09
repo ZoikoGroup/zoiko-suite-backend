@@ -4358,6 +4358,15 @@ services:
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PURCHASE_ORDER_SERVICE_URL: "http://purchase-order-svc:8129"
       GENERAL_LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      # Service identities for the two background workers. Deliberately no
+      # default: while one is empty its worker stays off and the work waits
+      # PENDING (visible, nothing lost) rather than acting under an invented id.
+      #   ACCOUNTING_PRINCIPAL_ID  must hold GL_POSTING_EXECUTE (GRNI postings).
+      #   PO_PROGRESS_PRINCIPAL_ID must hold PO_PROGRESS_RECORD (received-quantity
+      #                            deltas to purchase-order-svc).
+      ACCOUNTING_PRINCIPAL_ID: "${GOODS_RECEIPT_ACCOUNTING_PRINCIPAL_ID:-}"
+      PO_PROGRESS_PRINCIPAL_ID: "${GOODS_RECEIPT_PO_PROGRESS_PRINCIPAL_ID:-}"
+      OVER_RECEIPT_TOLERANCE_PCT: "${OVER_RECEIPT_TOLERANCE_PCT:-0}"
     depends_on:
       postgres:
         condition: service_healthy

@@ -107,6 +107,18 @@ $BUNDLES = @(
                     "PO_HOLD", "PO_CANCEL", "PO_SUPPLIER_EXCEPTION", "PO_PROGRESS_RECORD")
     },
     @{
+        # goods-service-receipt-svc (AP-04): the spec's receipt.read/create/confirm/
+        # reverse and service.accept, plus the "approved exception" a confirmer
+        # needs to pass PO tolerance. Copied from the constants in
+        # goods-service-receipt-svc/internal/handler. As with the PO bundle,
+        # authorization-svc's own-object SoD still stops a receiver certifying
+        # their own receipt where independent acceptance is required.
+        Code    = "GOODS_RECEIPT_FULL"
+        Service = "goods-service-receipt-svc"
+        Actions = @("GOODS_SERVICE_RECEIPT_READ", "GOODS_SERVICE_RECEIPT_CREATE", "GOODS_SERVICE_RECEIPT_CONFIRM",
+                    "GOODS_SERVICE_RECEIPT_REVERSE", "SERVICE_ACCEPT", "GOODS_SERVICE_RECEIPT_TOLERANCE_OVERRIDE")
+    },
+    @{
         Code    = "PR_FULL"
         Service = "purchase-request-svc"
         Actions = @("PR_REQUEST_CREATE", "PR_REQUEST_APPROVE", "PR_REQUEST_REJECT")
