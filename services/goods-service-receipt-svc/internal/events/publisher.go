@@ -11,12 +11,15 @@ import (
 )
 
 type Event struct {
-	EventID       string      `json:"event_id"`
-	EventType     string      `json:"event_type"`
-	EventVersion  string      `json:"event_version"`
-	SchemaVersion string      `json:"schema_version"`
-	SourceService string      `json:"source_service"`
-	EntityID      string      `json:"entity_id"`
+	EventID       string `json:"event_id"`
+	EventType     string `json:"event_type"`
+	EventVersion  string `json:"event_version"`
+	SchemaVersion string `json:"schema_version"`
+	SourceService string `json:"source_service"`
+	EntityID      string `json:"entity_id"`
+	LegalEntityID string `json:"legal_entity_id,omitempty"`
+	// SourceVersion is the version of the source object the event describes.
+	SourceVersion int         `json:"source_version,omitempty"`
 	TenantID      string      `json:"tenant_id,omitempty"`
 	ActorID       string      `json:"actor_id,omitempty"`
 	CorrelationID string      `json:"correlation_id,omitempty"`
@@ -86,5 +89,33 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 	if err != nil {
 		p.logger.Warn("kafka publish failed — event dropped", zap.String("event_type", params.EventType), zap.Error(err))
 	}
+	return nil
+}
+
+// PublishOutbox publishes an event from the transactional outbox relay (the
+// payload is the Event envelope marshalled at transaction time), preserving the
+// stable outboxEventID as the X-Event-ID Kafka header across all retries. Unlike
+// Publish it returns the broker error so the relay keeps the row and retries.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	msg := kafka.Message{
+		Key:   []byte(aggregateID),
+		Value: payload,
+		Headers: []kafka.Header{
+			{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+		},
+	}
+	if err := p.writer.WriteMessages(ctx, msg); err != nil {
+		p.logger.Warn("outbox kafka write failed",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.Error(err),
+		)
+		return err
+	}
+	p.logger.Info("outbox event published",
+		zap.String("outbox_event_id", outboxEventID),
+		zap.String("aggregate_id", aggregateID),
+		zap.String("topic", p.topic),
+	)
 	return nil
 }
