@@ -166,6 +166,21 @@ type requestFixture struct {
 	requestID string
 }
 
+// transition drives the store's single transition primitive (Apply) as the given tenant.
+func transition(tenantID, requestID string, to domain.RequestStatus, actor, reason string) error {
+	return transitionFrom(tenantID, requestID, domain.RequestStatusPending, to, actor, reason)
+}
+
+func transitionFrom(tenantID, requestID string, from, to domain.RequestStatus, actor, reason string) error {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	_, err := testStore.Apply(ctx, store.Transition{
+		TenantID: tenantID, RequestID: requestID,
+		From: []domain.RequestStatus{from}, To: to, Action: string(to),
+		Meta: store.Meta{Actor: actor, CorrelationID: "isolation-" + requestID, Reason: reason},
+	})
+	return err
+}
+
 func setupIsolationFixture(t *testing.T, tenantLabel string) requestFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -189,6 +204,9 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) requestFixture {
 		CorrelationID:          "corr-" + tenantLabel + "-" + f.requestID,
 	})
 	require.NoError(t, err)
+	// CreateRequest always records a DRAFT; submit it so the isolation tests attack a
+	// request that is actually awaiting approval.
+	require.NoError(t, transitionFrom(f.tenantID, f.requestID, domain.RequestStatusDraft, domain.RequestStatusPending, "test-"+tenantLabel, ""))
 
 	return f
 }
@@ -273,8 +291,9 @@ func TestPgStore_TenantIsolation_TransitionRequest_Approve(t *testing.T) {
 	// tenantID as the scope argument — exactly what a handler bug would look
 	// like if TenantID were taken from the request body instead of the
 	// caller's real context.
-	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusApproved, "attacker", time.Now().UTC(), nil)
-	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
+	err := transition(b.tenantID, a.requestID, domain.RequestStatusApproved, "attacker", "")
+	// Another tenant's row is invisible to this tenant: not found, never a transition.
+	assert.ErrorIs(t, err, domain.ErrRequestNotFound,
 		"ISOLATION FAILURE: tenant B was able to approve tenant A's request")
 
 	// Verify tenant A's request is still PENDING.
@@ -286,7 +305,7 @@ func TestPgStore_TenantIsolation_TransitionRequest_Approve(t *testing.T) {
 		"ISOLATION FAILURE: tenant A's request status was mutated by tenant B")
 
 	// Sanity: tenant B can still approve its OWN request.
-	err = testStore.TransitionRequest(context.Background(), b.tenantID, b.requestID, domain.RequestStatusApproved, "b-admin", time.Now().UTC(), nil)
+	err = transition(b.tenantID, b.requestID, domain.RequestStatusApproved, "b-admin", "")
 	require.NoError(t, err)
 	ctxB := svcmiddleware.WithTenant(context.Background(), b.tenantID)
 	gotB, err := testStore.GetRequest(ctxB, b.requestID)
@@ -299,8 +318,8 @@ func TestPgStore_TenantIsolation_TransitionRequest_Reject(t *testing.T) {
 	b := setupIsolationFixture(t, "B-Reject")
 
 	reason := "attacker-supplied reason"
-	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusRejected, "attacker", time.Now().UTC(), &reason)
-	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
+	err := transition(b.tenantID, a.requestID, domain.RequestStatusRejected, "attacker", reason)
+	assert.ErrorIs(t, err, domain.ErrRequestNotFound,
 		"ISOLATION FAILURE: tenant B was able to reject tenant A's request")
 
 	ctxA := svcmiddleware.WithTenant(context.Background(), a.tenantID)
