@@ -103,8 +103,6 @@ func scanTargets(inv *domain.VendorInvoice, status *string) []any {
 		&inv.ApprovedAt,
 		&inv.PaymentRequestedAt,
 
-		&inv.ApprovalJournalID,
-
 		&inv.InvoiceDate,
 		&inv.SupplyDate,
 		&inv.NetAmount,
@@ -113,6 +111,8 @@ func scanTargets(inv *domain.VendorInvoice, status *string) []any {
 		&inv.GoodsReceiptRef,
 		&inv.POVendorProfileID,
 		&inv.InvoiceDocumentID,
+
+		&inv.ApprovalJournalID,
 	}
 }
 
