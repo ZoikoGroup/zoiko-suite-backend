@@ -4670,6 +4670,12 @@ services:
       SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
       PAYEE_IDENTITY_SERVICE_URL: "http://payee-banking-identity-svc:8166"
       POLICY_SERVICE_URL: "http://policy-svc:8085"
+      # AP-10 controls: how long an unused authorization stays valid, how often
+      # overdue ones are expired, and how many distinct signers a high-value
+      # payment needs.
+      AUTHORIZATION_TTL: "24h"
+      EXPIRY_SWEEP_INTERVAL: "1m"
+      HIGH_VALUE_REQUIRED_SIGNATURES: "2"
     depends_on:
       postgres:
         condition: service_healthy

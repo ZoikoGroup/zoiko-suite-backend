@@ -56,21 +56,43 @@
 //     ORG-10 is new), DestinationID stays empty and no re-check is made
 //     for that payee — an honest absence, not a fabricated pass.
 //
-// Two honest gaps, not fabricated:
+// Controls added on top of that (ZS-SVC-D-001 AP-10):
 //
-//   - AP-10's own command list has no automatic trigger for
-//     ExpirePaymentAuthorization — there is no background scheduler
-//     anywhere in this codebase (the same class of gap already documented
-//     for AP-04's GRNI retry and AP-01's high-risk-change flow). Expiry is
-//     exposed as a real command an operator or a future scheduled job can
-//     call, never invented as an automatic timer this service doesn't
-//     actually run.
-//   - ConsumePaymentAuthorization has no real caller yet: AP-11 ("Payment
-//     Run"), the service that would actually execute a payment and
-//     consume its authorization, does not exist in this codebase. This
-//     service still implements Consume fully and honestly (including
-//     negative-path #4's replay protection) so it is ready the moment
-//     AP-11 exists, rather than leaving it half-built.
+//   - Signer quorum. A payment policy-svc flags APPROVAL_REQUIRED needs
+//     HIGH_VALUE_REQUIRED_SIGNATURES (default 2) DISTINCT signers, each
+//     holding PAYMENT_AUTHORIZE_HIGHVALUE and none of them the proposal's
+//     preparer. Each signature is an append-only row under a unique
+//     (authorization, signer) index, so the same person can never count
+//     twice; the authorization becomes APPROVED, and PaymentAuthorized is
+//     published, only when the count is reached. The required count can be
+//     raised but never lowered.
+//   - Expiry. expires_at is set at request time (AUTHORIZATION_TTL, default
+//     24h). Approve and Consume refuse an overdue authorization on their
+//     own, and a sweeper (internal/expiry) expires overdue ones and
+//     publishes PaymentAuthorizationExpired. Rows that predate expiry keep a
+//     NULL expires_at and are never auto-expired.
+//   - Payee-bank changer. Whoever proposed, verified or approved a payee's
+//     active ORG-10 banking destination cannot request or sign a payment to
+//     it (SOD_CONFLICT); the check fails closed if ORG-10 cannot be asked.
+//   - Idempotency-Key is required on request, approve and consume; a replay
+//     returns the stored response (Idempotent-Replay: true), the same key on
+//     a different request is IDEMPOTENCY_KEY_REUSED. expected_version is
+//     honoured on approve/reject/revoke when supplied (STALE_VERSION); it is
+//     not required here because the subject fingerprint and the live
+//     re-validation already bind exactly what is being approved.
+//   - Every terminal outcome (rejected, invalidated, revoked, expired,
+//     consumed) and the final approval go through the transactional outbox.
+//     Intermediate signatures are local evidence only.
+//   - Errors carry a stable "code" next to the human "error" text.
+//
+// Remaining gaps, stated plainly:
+//
+//   - No step-up / session-assurance evidence is collected for signers (the
+//     spec lists it as optional input); there is no break-glass path.
+//   - A payee ORG-10 has no destination for is still allowed through
+//     unpinned (see above), so the bank-changer rule cannot apply to it.
+//   - The AP-01 supplier profile's own "last payee-related change by"
+//     principal is not yet consulted; only ORG-10's record is.
 package domain
 
 import "time"
@@ -132,8 +154,44 @@ type PaymentAuthorization struct {
 
 	InvalidatedReason string
 
+	// Version is bumped by the database on every update; a caller can pass it
+	// back as expected_version to refuse acting on a stale view.
+	Version int
+	// RequiredSignatures is how many distinct signers must approve (set from
+	// the policy result at the first signature); SignatureCount how many have.
+	RequiredSignatures int
+	SignatureCount     int
+	// ExpiresAt is when an unused authorization stops being valid; nil for
+	// rows created before expiry existed.
+	ExpiresAt *time.Time
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// Signature is one signer's approval of an authorization.
+type Signature struct {
+	SignatureID       string
+	TenantID          *string
+	AuthorizationID   string
+	SignerPrincipalID string
+	PolicyResult      string
+	PolicyVersionID   string
+	SignedAt          time.Time
+}
+
+// ExpiredRef identifies an authorization past its expires_at, for the sweeper.
+type ExpiredRef struct {
+	AuthorizationID string
+	TenantID        string
+}
+
+// IdempotencyRecord is the stored state of an Idempotency-Key.
+type IdempotencyRecord struct {
+	RequestHash string
+	Completed   bool
+	StatusCode  int
+	Body        []byte
 }
 
 // PayeeSnapshot is AP-10's own authoritative copy of the payee identity
@@ -175,6 +233,9 @@ const (
 	EventAuthorizationConsumed    = "PAYMENT_AUTHORIZATION_CONSUMED"
 	EventAuthorizationRevoked     = "PAYMENT_AUTHORIZATION_REVOKED"
 	EventAuthorizationExpired     = "PAYMENT_AUTHORIZATION_EXPIRED"
+	// EventAuthorizationSigned is local evidence of one signature toward a
+	// quorum; it is not published (PaymentAuthorized is, once the quorum is met).
+	EventAuthorizationSigned = "PAYMENT_AUTHORIZATION_SIGNED"
 )
 
 // ── request DTOs ────────────────────────────────────────────────────────────
@@ -183,12 +244,19 @@ type RequestAuthorizationRequest struct {
 	ProposalID string
 }
 
+// ApproveRequest is the optional body of ApprovePayment.
+type ApproveRequest struct {
+	ExpectedVersion *int `json:"expected_version,omitempty"`
+}
+
 type RejectPaymentRequest struct {
-	Reason string
+	Reason          string
+	ExpectedVersion *int `json:"expected_version,omitempty"`
 }
 
 type RevokeAuthorizationRequest struct {
-	Reason string
+	Reason          string
+	ExpectedVersion *int `json:"expected_version,omitempty"`
 }
 
 // ── sentinel errors ─────────────────────────────────────────────────────────
@@ -211,4 +279,8 @@ const (
 	ErrNoActiveDestination                = sentinel("payee-banking-identity-svc has no active destination on file for this payee")
 	ErrPolicyServiceUnavailable           = sentinel("policy-svc unavailable")
 	ErrStoreUnavailable                   = sentinel("store unavailable")
+	ErrAlreadySigned                      = sentinel("this principal has already signed this authorization")
+	ErrStaleVersion                       = sentinel("the authorization changed since the version the caller acted on")
+	ErrAuthorizationExpired               = sentinel("the authorization has expired")
+	ErrBankDetailChangerConflict          = sentinel("a principal who proposed, verified or approved this payee's banking destination cannot authorize a payment to it")
 )

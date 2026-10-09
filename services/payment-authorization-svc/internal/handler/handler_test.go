@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -174,6 +175,8 @@ var _ policy.Client = (*stubPolicy)(nil)
 
 // ── test harness ─────────────────────────────────────────────────────────────
 
+var idemCounter int
+
 const testTenant = "tenant-ap10-1"
 const testLegalEntity = "le-ap10-1"
 const testPreparer = "principal-preparer"
@@ -199,6 +202,12 @@ func doRequestAs(r http.Handler, method, path string, body interface{}, tenantID
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Principal-Id", principalID)
+	// Every command carries a fresh Idempotency-Key (required on request,
+	// approve and consume); tests of replay set their own via doRequestKeyed.
+	if method == http.MethodPost {
+		idemCounter++
+		req.Header.Set("Idempotency-Key", fmt.Sprintf("test-key-%d", idemCounter))
+	}
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
 	}
@@ -315,9 +324,11 @@ func TestApprovePayment_ApprovalRequired_UsesHighValueAction(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, az, prop, sup, &stubPolicy{result: "APPROVAL_REQUIRED"})
 	a := requestAuthorization(t, r, "prop-6")
 
+	// A high-value payment needs two distinct signers: the first signature is
+	// recorded (202), the authorization stays PENDING.
 	w := doRequestAs(r, http.MethodPost, "/ap10/authorizations/"+a.AuthorizationID+"/approve", nil, testTenant, "principal-checker")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 for the first of two signatures, got %d: %s", w.Code, w.Body.String())
 	}
 	if az.lastAction != handler.PaymentAuthorizeHighValue {
 		t.Fatalf("expected APPROVAL_REQUIRED to check %s, got %s", handler.PaymentAuthorizeHighValue, az.lastAction)
@@ -616,4 +627,20 @@ func TestNoSynchronousHandlerPublishing(t *testing.T) {
 	if pub.calls != 0 {
 		t.Fatalf("expected 0 synchronous publisher calls from handler, got %d", pub.calls)
 	}
+}
+
+// setChangedBy records who proposed/verified/approved the destination
+// (ORG-10's own maker/verifier/approver record) for the bank-changer SoD rule.
+func (p *stubPayee) setChangedBy(legalEntityID, payeeRef, role, principalID string) {
+	key := legalEntityID + "|" + payeeRef
+	d := p.destinations[key]
+	switch role {
+	case "proposer":
+		d.ProposedByPrincipalID = principalID
+	case "verifier":
+		d.VerifiedByPrincipalID = principalID
+	case "approver":
+		d.ApprovedByPrincipalID = principalID
+	}
+	p.destinations[key] = d
 }
