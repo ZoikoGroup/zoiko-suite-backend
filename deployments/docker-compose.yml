@@ -4725,6 +4725,12 @@ services:
       PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
       PAYMENT_PROPOSAL_SERVICE_URL: "http://payment-proposal-svc:8159"
       PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
+      # ACC-04 settlement postings. The principal must hold GL_POSTING_EXECUTE in
+      # authorization-svc (an internal service identity, never a human role).
+      # Deliberately no default: while it is empty the dispatcher stays off and
+      # posting requests wait PENDING rather than posting under an invented id.
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      ACCOUNTING_PRINCIPAL_ID: "${PAYMENT_RUN_ACCOUNTING_PRINCIPAL_ID:-}"
     depends_on:
       postgres:
         condition: service_healthy

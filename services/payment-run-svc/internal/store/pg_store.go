@@ -68,15 +68,19 @@ type Store interface {
 	RetryInstruction(ctx context.Context, instructionID, principalID string) error
 
 	ListEvents(ctx context.Context, runID string) ([]domain.RunEvent, error)
+
+	ListAccountingRequests(ctx context.Context, runID string) ([]AccountingRequest, error)
+	RequeueAccountingRequests(ctx context.Context, runID string) (int64, error)
 }
 
 type PgStore struct {
-	pool *pgxpool.Pool
-	log  *zap.Logger
+	accounting AccountingConfig
+	pool       *pgxpool.Pool
+	log        *zap.Logger
 }
 
 func NewPgStore(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
-	return &PgStore{pool: pool, log: log}
+	return &PgStore{pool: pool, log: log, accounting: DefaultAccountingConfig()}
 }
 
 func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
@@ -194,7 +198,7 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID string, req domain.Cre
 			}
 			out = append(out, *created)
 		}
-		return s.recordEvent(ctx, tx, run.TenantID, runID, domain.EventRunCreated, "", principalID)
+		return s.recordAndEnqueue(ctx, tx, run, domain.EventRunCreated, "", principalID)
 	})
 	if isUniqueViolation(err) {
 		return nil, nil, domain.ErrAuthorizationNotEligible
@@ -315,7 +319,7 @@ func (s *PgStore) ValidateRun(ctx context.Context, runID, principalID string) (*
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, r.TenantID, runID, domain.EventRunValidated, "", principalID)
+		return s.recordAndEnqueue(ctx, tx, r, domain.EventRunValidated, "", principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -400,7 +404,7 @@ func (s *PgStore) LockRun(ctx context.Context, runID, principalID string) (*doma
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, r.TenantID, runID, domain.EventRunLocked, "", principalID)
+		return s.recordAndEnqueue(ctx, tx, r, domain.EventRunLocked, "", principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -429,7 +433,7 @@ func (s *PgStore) MarkRunException(ctx context.Context, runID, reason, principal
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, r.TenantID, runID, domain.EventRunExceptionRaised, reason, principalID)
+		return s.recordAndEnqueue(ctx, tx, r, domain.EventRunExceptionRaised, reason, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -497,7 +501,7 @@ func (s *PgStore) SubmitRun(ctx context.Context, runID, idempotencyKey, principa
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, r.TenantID, runID, domain.EventRunSubmitted, "", principalID)
+		return s.recordAndEnqueue(ctx, tx, r, domain.EventRunSubmitted, "", principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -522,7 +526,7 @@ func (s *PgStore) CancelRun(ctx context.Context, runID string, req domain.Cancel
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, r.TenantID, runID, domain.EventRunCancelled, req.Reason, principalID)
+		return s.recordAndEnqueue(ctx, tx, r, domain.EventRunCancelled, req.Reason, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -547,7 +551,7 @@ func (s *PgStore) CloseRun(ctx context.Context, runID string, req domain.CloseRu
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, r.TenantID, runID, domain.EventRunCompleted, req.Note, principalID)
+		return s.recordAndEnqueue(ctx, tx, r, domain.EventRunCompleted, req.Note, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -602,7 +606,12 @@ func (s *PgStore) ReconcileInstruction(ctx context.Context, req domain.Reconcile
 			RETURNING `+instructionColumns,
 			req.InstructionID, req.ExternalStatus, req.Reason,
 		))
-		return err
+		if err != nil {
+			return err
+		}
+		// The instruction's event and, for SETTLED, its accounting posting
+		// request commit with the status change itself.
+		return s.afterInstructionStatus(ctx, tx, i, req.Reason, principalID)
 	})
 	if errors.Is(err, domain.ErrInstructionNotFound) {
 		return nil, false, domain.ErrInstructionNotFound

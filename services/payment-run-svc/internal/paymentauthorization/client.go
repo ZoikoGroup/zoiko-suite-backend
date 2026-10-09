@@ -129,6 +129,10 @@ func (c *HTTPClient) ConsumeAuthorization(ctx context.Context, tenantID, princip
 	}
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Principal-Id", principalID)
+	// AP-10 requires an Idempotency-Key on consume. Deterministic per
+	// (authorization, operator), so a retry after a lost response replays the
+	// stored result instead of reporting the authorization as already consumed.
+	req.Header.Set("Idempotency-Key", "consume:"+authorizationID+":"+principalID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

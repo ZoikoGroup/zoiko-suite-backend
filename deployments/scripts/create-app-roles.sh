@@ -92,6 +92,7 @@ delegated_authority:app_delegated_authority
 document_vault:app_document_vault
 obligations:app_obligations
 authorization_svc:app_authorization
+payment_run:app_payment_run
 "
 
 created=0

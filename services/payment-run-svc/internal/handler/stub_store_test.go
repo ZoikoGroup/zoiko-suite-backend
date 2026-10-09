@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"zoiko.io/payment-run-svc/internal/domain"
+	"zoiko.io/payment-run-svc/internal/store"
 )
 
 // stubStore is a real, working in-memory implementation of store.Store —
@@ -18,6 +19,7 @@ type stubStore struct {
 	consumedAuth      map[string]string          // authorization_id -> instruction_id, once ever consumed
 	reconciledEvents  map[string]map[string]bool // instruction_id -> provider_event_ref -> applied
 	events            map[string][]domain.RunEvent
+	accounting        map[string][]*store.AccountingRequest // run_id -> posting requests
 }
 
 func newStubStore() *stubStore {
@@ -28,6 +30,7 @@ func newStubStore() *stubStore {
 		consumedAuth:      map[string]string{},
 		reconciledEvents:  map[string]map[string]bool{},
 		events:            map[string][]domain.RunEvent{},
+		accounting:        map[string][]*store.AccountingRequest{},
 	}
 }
 
@@ -283,7 +286,43 @@ func (s *stubStore) ReconcileInstruction(_ context.Context, req domain.Reconcile
 	i.Status = req.ExternalStatus
 	i.StatusReason = req.Reason
 	i.ProviderEventRef = req.ProviderEventRef
+	// A bank-confirmed settlement records one posting request, keyed by the
+	// instruction, in the same step (as PgStore does in the same transaction).
+	if req.ExternalStatus == domain.InstructionSettled {
+		src := "ap11:settle:" + i.InstructionID
+		seen := false
+		for _, q := range s.accounting[i.RunID] {
+			seen = seen || q.SourceEventID == src
+		}
+		if !seen {
+			s.accounting[i.RunID] = append(s.accounting[i.RunID], &store.AccountingRequest{
+				RequestID: uuid.New().String(), InstructionID: i.InstructionID, SourceEventID: src, Status: "PENDING",
+			})
+		}
+	}
 	return i, true, nil
+}
+
+func (s *stubStore) ListAccountingRequests(_ context.Context, runID string) ([]store.AccountingRequest, error) {
+	var out []store.AccountingRequest
+	for _, q := range s.accounting[runID] {
+		out = append(out, *q)
+	}
+	return out, nil
+}
+
+func (s *stubStore) RequeueAccountingRequests(_ context.Context, runID string) (int64, error) {
+	if _, ok := s.runs[runID]; !ok {
+		return 0, domain.ErrRunNotFound
+	}
+	var n int64
+	for _, q := range s.accounting[runID] {
+		if q.Status == "FAILED" || q.Status == "QUARANTINED" {
+			q.Status, q.Attempts = "PENDING", 0
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (s *stubStore) UpdateRunAggregateStatus(_ context.Context, runID string, newStatus domain.RunStatus, principalID string) (*domain.PaymentRun, error) {

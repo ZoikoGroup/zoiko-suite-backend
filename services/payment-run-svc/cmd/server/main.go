@@ -15,12 +15,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/payment-run-svc/internal/accounting"
 	"zoiko.io/payment-run-svc/internal/authz"
 	"zoiko.io/payment-run-svc/internal/config"
 	"zoiko.io/payment-run-svc/internal/events"
 	"zoiko.io/payment-run-svc/internal/handler"
 	"zoiko.io/payment-run-svc/internal/health"
 	"zoiko.io/payment-run-svc/internal/middleware"
+	"zoiko.io/payment-run-svc/internal/outbox"
 	"zoiko.io/payment-run-svc/internal/payableopenitem"
 	"zoiko.io/payment-run-svc/internal/paymentauthorization"
 	"zoiko.io/payment-run-svc/internal/paymentproposal"
@@ -61,11 +63,28 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	pgStore := store.NewPgStore(pool, logger)
+	pgStore := store.NewPgStore(pool, logger).WithAccounting(store.AccountingConfig{
+		PayableControlKey: cfg.PayableControlKey, PaymentClearingKey: cfg.PaymentClearingKey,
+		WithholdingPayableKey: cfg.WithholdingPayableKey,
+	})
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+
+	// Background workers: the transactional-outbox relay (ZS-STATE-001 I-13)
+	// and the ACC-04 settlement-posting dispatcher. Both stop on shutdown.
+	workerCtx, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, logger).Start(workerCtx)
+		if cfg.AccountingPrincipalID == "" {
+			logger.Warn("ACCOUNTING_PRINCIPAL_ID is not set: settlement posting dispatcher not started; posting requests stay PENDING")
+		} else {
+			go accounting.New(pgStore, cfg.LedgerServiceURL, cfg.AccountingPrincipalID, 5*time.Second, 20, logger).Start(workerCtx)
+		}
+	}
+
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
-	h := handler.New(pgStore, publisher, authzClient, handler.Clients{
+	h := handler.New(pgStore, authzClient, handler.Clients{
 		Authorization: paymentauthorization.NewHTTPClient(cfg.PaymentAuthorizationServiceURL, logger),
 		Proposal:      paymentproposal.NewHTTPClient(cfg.PaymentProposalServiceURL, logger),
 		Payables:      payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, logger),
@@ -106,6 +125,7 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down payment-run-svc gracefully...")
+	stopWorkers()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

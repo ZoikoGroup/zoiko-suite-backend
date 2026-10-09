@@ -15,7 +15,6 @@ import (
 
 	authzpkg "zoiko.io/payment-run-svc/internal/authz"
 	"zoiko.io/payment-run-svc/internal/domain"
-	"zoiko.io/payment-run-svc/internal/events"
 	"zoiko.io/payment-run-svc/internal/handler"
 	"zoiko.io/payment-run-svc/internal/middleware"
 	"zoiko.io/payment-run-svc/internal/payableopenitem"
@@ -23,6 +22,7 @@ import (
 	"zoiko.io/payment-run-svc/internal/paymentproposal"
 	"zoiko.io/payment-run-svc/internal/paymentstatus"
 	"zoiko.io/payment-run-svc/internal/provideradapter"
+	"zoiko.io/payment-run-svc/internal/store"
 )
 
 const testTenant = "tenant-ap11-1"
@@ -31,17 +31,6 @@ const testAccount = "bank-acct-1"
 const testMethod = "ACH"
 
 var testValueDate = time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC)
-
-// ── stub publisher ───────────────────────────────────────────────────────────
-
-type stubPublisher struct{ calls int }
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	p.calls++
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 // ── stub authz ───────────────────────────────────────────────────────────────
 
@@ -243,6 +232,7 @@ var _ payableopenitem.Client = (*stubPayables)(nil)
 
 type env struct {
 	store     *stubStore
+	authz     *stubAuthz
 	auth      *stubAuth
 	proposals *stubProposals
 	provider  *stubProvider
@@ -254,6 +244,7 @@ type env struct {
 func newEnv() *env {
 	e := &env{
 		store: newStubStore(),
+		authz: &stubAuthz{},
 		auth: &stubAuth{auths: map[string]paymentauthorization.Authorization{}, validity: map[string]bool{},
 			consumeFails: map[string]bool{}, consumeCalls: map[string]int{}},
 		proposals: &stubProposals{props: map[string]*paymentproposal.Proposal{}},
@@ -261,7 +252,7 @@ func newEnv() *env {
 		status:    newStubStatus(),
 		payables:  &stubPayables{},
 	}
-	h := handler.New(e.store, &stubPublisher{}, &stubAuthz{}, handler.Clients{
+	h := handler.New(e.store, e.authz, handler.Clients{
 		Authorization: e.auth, Proposal: e.proposals, Payables: e.payables, Provider: e.provider, Status: e.status,
 	}, zap.NewNop())
 	r := chi.NewRouter()
@@ -842,6 +833,95 @@ func TestPoll_Settled_AP08Down_RetriedOnNextPoll(t *testing.T) {
 	}
 	if len(e.payables.applied) != 1 {
 		t.Fatalf("expected exactly one AP-08 application, got %d", len(e.payables.applied))
+	}
+}
+
+// settledRun drives a single-payee run to a bank-confirmed SETTLED instruction.
+func (e *env) settledRun(t *testing.T, authID string) (*domain.PaymentRun, domain.RunInstruction) {
+	t.Helper()
+	e.add(authID, 100)
+	run := e.lockedRun(t, authID)
+	e.submit(run.RunID, "idem-"+authID)
+	ins := e.instructions(t, run.RunID)[0]
+	e.status.statuses[ins.Bnk07PaymentID] = "SETTLED"
+	e.poll(t, ins.InstructionID)
+	return run, ins
+}
+
+func (e *env) accountingStatus(t *testing.T, runID string) map[string]interface{} {
+	t.Helper()
+	w := doRequest(e.router, http.MethodGet, "/ap11/runs/"+runID+"/accounting-status", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("accounting-status: %d %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	return resp
+}
+
+// A bank-confirmed settlement records exactly one ACC-04 posting request, and
+// polling again never records a second.
+func TestAccountingStatus_SettlementRecordsOnePostingRequest(t *testing.T) {
+	e := newEnv()
+	run, ins := e.settledRun(t, "auth-acc-1")
+	e.poll(t, ins.InstructionID)
+
+	resp := e.accountingStatus(t, run.RunID)
+	postings, _ := resp["postings"].([]interface{})
+	if len(postings) != 1 {
+		t.Fatalf("expected exactly one posting request, got %v", resp["postings"])
+	}
+	p := postings[0].(map[string]interface{})
+	if p["status"] != "PENDING" || p["source_event_id"] != "ap11:settle:"+ins.InstructionID {
+		t.Fatalf("unexpected posting request %v", p)
+	}
+	if resp["posting_counts"].(map[string]interface{})["PENDING"].(float64) != 1 {
+		t.Fatalf("expected posting_counts PENDING=1, got %v", resp["posting_counts"])
+	}
+}
+
+func TestRequeueAccounting_RequeuesOnlyFailedAndQuarantined(t *testing.T) {
+	e := newEnv()
+	run, _ := e.settledRun(t, "auth-acc-2")
+	reqs := e.store.accounting[run.RunID]
+	reqs[0].Status = "QUARANTINED"
+	posted := &store.AccountingRequest{RequestID: "posted-1", SourceEventID: "ap11:settle:other", Status: "POSTED"}
+	e.store.accounting[run.RunID] = append(reqs, posted)
+
+	w := doRequest(e.router, http.MethodPost, "/ap11/runs/"+run.RunID+"/accounting/requeue", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("requeue: %d %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["requeued"].(float64) != 1 {
+		t.Fatalf("expected 1 requeued, got %v", resp)
+	}
+	if reqs[0].Status != "PENDING" || posted.Status != "POSTED" {
+		t.Fatalf("requeue must reset QUARANTINED and never touch POSTED: %s / %s", reqs[0].Status, posted.Status)
+	}
+}
+
+func TestRequeueAccounting_RequiresAuthorization(t *testing.T) {
+	e := newEnv()
+	run, _ := e.settledRun(t, "auth-acc-3")
+	e.store.accounting[run.RunID][0].Status = "FAILED"
+	e.authz.deny = true
+
+	w := doRequest(e.router, http.MethodPost, "/ap11/runs/"+run.RunID+"/accounting/requeue", nil, testTenant)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when not authorized, got %d", w.Code)
+	}
+	if e.store.accounting[run.RunID][0].Status != "FAILED" {
+		t.Fatal("a refused requeue must not change the request")
+	}
+}
+
+func TestRequeueAccounting_UnknownRun_404(t *testing.T) {
+	e := newEnv()
+	w := doRequest(e.router, http.MethodPost, "/ap11/runs/does-not-exist/accounting/requeue", nil, testTenant)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
 

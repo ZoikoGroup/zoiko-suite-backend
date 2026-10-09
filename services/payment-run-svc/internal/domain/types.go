@@ -208,6 +208,25 @@ const (
 	EventInstructionRetried  = "PAYMENT_INSTRUCTION_RETRIED"
 )
 
+// InstructionEventType is the domain event published when an instruction
+// takes status s.
+func InstructionEventType(s InstructionStatus) string {
+	switch s {
+	case InstructionPending:
+		return EventInstructionPending
+	case InstructionPendingUnknown:
+		return EventInstructionUnknown
+	case InstructionAccepted:
+		return EventInstructionAccepted
+	case InstructionRejected:
+		return EventInstructionRejected
+	case InstructionSettled:
+		return EventInstructionSettled
+	default:
+		return EventRunExceptionRaised
+	}
+}
+
 // ── request DTOs ────────────────────────────────────────────────────────────
 
 type CreateRunRequest struct {

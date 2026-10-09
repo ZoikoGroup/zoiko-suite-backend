@@ -16,7 +16,6 @@ import (
 
 	authzpkg "zoiko.io/payment-run-svc/internal/authz"
 	"zoiko.io/payment-run-svc/internal/domain"
-	"zoiko.io/payment-run-svc/internal/events"
 	svcmiddleware "zoiko.io/payment-run-svc/internal/middleware"
 	"zoiko.io/payment-run-svc/internal/payableopenitem"
 	"zoiko.io/payment-run-svc/internal/paymentauthorization"
@@ -55,7 +54,6 @@ type Clients struct {
 
 type Handler struct {
 	store     store.Store
-	pub       events.Publisher
 	authz     AuthzChecker
 	auth      paymentauthorization.Client
 	proposals paymentproposal.Client
@@ -65,9 +63,9 @@ type Handler struct {
 	log       *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, c Clients, log *zap.Logger) *Handler {
+func New(st store.Store, az AuthzChecker, c Clients, log *zap.Logger) *Handler {
 	return &Handler{
-		store: st, pub: pub, authz: az, auth: c.Authorization, proposals: c.Proposal,
+		store: st, authz: az, auth: c.Authorization, proposals: c.Proposal,
 		payables: c.Payables, provider: c.Provider, status: c.Status, log: log,
 	}
 }
@@ -85,6 +83,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{runID}/external-status", h.GetExternalStatus)
 		r.Get("/{runID}/exceptions", h.GetRunExceptions)
 		r.Get("/{runID}/accounting-status", h.GetAccountingStatus)
+		r.Post("/{runID}/accounting/requeue", h.RequeueAccounting)
 		r.Get("/{runID}/available-actions", h.GetAvailableActions)
 		r.Get("/{runID}/history", h.GetRunHistory)
 	})
@@ -296,10 +295,6 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRunCreated, EntityID: run.RunID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: run,
-	})
 	writeJSON(w, http.StatusCreated, map[string]interface{}{"run": run, "instructions": createdInstructions})
 }
 
@@ -465,10 +460,6 @@ func (h *Handler) LockPaymentRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRunLocked, EntityID: updated.RunID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -481,19 +472,15 @@ func (h *Handler) setInstructionStatus(ctx context.Context, principalID, correla
 	if ins.Status == status {
 		return nil
 	}
-	updated, applied, err := h.store.ReconcileInstruction(ctx, domain.ReconcileInstructionRequest{
+	// The store publishes the instruction event (and, for SETTLED, records the
+	// accounting posting request) in the same transaction as the status change.
+	updated, _, err := h.store.ReconcileInstruction(ctx, domain.ReconcileInstructionRequest{
 		InstructionID: ins.InstructionID, ExternalStatus: status, ProviderEventRef: ref, Reason: reason,
 	}, principalID)
 	if err != nil {
 		return err
 	}
 	*ins = *updated
-	if applied {
-		_ = h.pub.Publish(ctx, events.PublishParams{
-			EventType: instructionEventType(status), EntityID: ins.InstructionID, ActorID: principalID,
-			CorrelationID: correlationID, Payload: updated,
-		})
-	}
 	return nil
 }
 
@@ -703,12 +690,6 @@ func (h *Handler) SubmitPaymentRun(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "store unavailable")
 			return
 		}
-		if err == nil {
-			_ = h.pub.Publish(r.Context(), events.PublishParams{
-				EventType: domain.EventRunSubmitted, EntityID: run.RunID, ActorID: principalID,
-				CorrelationID: correlationID, Payload: run,
-			})
-		}
 	}
 	run = h.refreshRunStatus(r.Context(), runID, principalID)
 
@@ -760,10 +741,6 @@ func (h *Handler) CancelUnsubmittedRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRunCancelled, EntityID: updated.RunID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -801,10 +778,6 @@ func (h *Handler) ClosePaymentRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRunCompleted, EntityID: updated.RunID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -869,10 +842,6 @@ func (h *Handler) ReconcilePaymentRunStatus(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusOK, map[string]interface{}{"instruction": updated, "applied": false, "note": domain.ErrProviderEventAlreadyApplied.Error()})
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRunExceptionRaised, EntityID: instructionID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	h.refreshRunStatus(r.Context(), ins.RunID, principalID)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"instruction": updated, "applied": true})
 }
@@ -1015,23 +984,6 @@ func (h *Handler) PollInstructionStatus(w http.ResponseWriter, r *http.Request) 
 	}
 	h.refreshRunStatus(r.Context(), ins.RunID, principalID)
 	writeJSON(w, http.StatusOK, resp)
-}
-
-func instructionEventType(s domain.InstructionStatus) string {
-	switch s {
-	case domain.InstructionPending:
-		return domain.EventInstructionPending
-	case domain.InstructionPendingUnknown:
-		return domain.EventInstructionUnknown
-	case domain.InstructionAccepted:
-		return domain.EventInstructionAccepted
-	case domain.InstructionRejected:
-		return domain.EventInstructionRejected
-	case domain.InstructionSettled:
-		return domain.EventInstructionSettled
-	default:
-		return domain.EventRunExceptionRaised
-	}
 }
 
 // recomputeRunStatus derives the run's aggregate status from its
@@ -1212,9 +1164,9 @@ func (h *Handler) GetRunExceptions(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetAccountingStatus is a read-only projection of this service's own
-// state: what has settled at the bank and how much of it AP-08 has
-// recorded. Payment-clearing accounting events to the Accounting Kernel are
-// not emitted by this service yet.
+// state: what has settled at the bank, how much of it AP-08 has recorded, and
+// where each settlement's ACC-04 posting request stands (PENDING, POSTED,
+// FAILED, QUARANTINED). AP-11 never writes the ledger itself.
 func (h *Handler) GetAccountingStatus(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runID")
 	run, ok := h.fetchRunForAuth(w, r, runID)
@@ -1226,6 +1178,21 @@ func (h *Handler) GetAccountingStatus(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("GetAccountingStatus: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
+	}
+	requests, err := h.store.ListAccountingRequests(r.Context(), runID)
+	if err != nil {
+		h.log.Error("GetAccountingStatus: accounting requests unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
+	postings := make([]map[string]interface{}, 0, len(requests))
+	counts := map[string]int{}
+	for _, q := range requests {
+		counts[q.Status]++
+		postings = append(postings, map[string]interface{}{
+			"instruction_id": q.InstructionID, "source_event_id": q.SourceEventID, "status": q.Status,
+			"attempts": q.Attempts, "last_error": q.LastError, "posting_execution_id": q.PostingExecutionID,
+		})
 	}
 	var settledCents int64
 	var payablesApplied, payablesPending int
@@ -1245,7 +1212,38 @@ func (h *Handler) GetAccountingStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"run_id": runID, "run_status": run.Status, "settled_total": float64(settledCents) / 100, "currency": run.Currency,
 		"payables_settled_in_ap": payablesApplied, "payables_pending_settlement": payablesPending,
+		"postings": postings, "posting_counts": counts,
 	})
+}
+
+// RequeueAccounting puts the run's FAILED/QUARANTINED posting requests back to
+// PENDING once an operator has fixed the cause (for example a missing ACC-02
+// mapping). A POSTED request is never touched. Requeueing re-submits the same
+// source_event_id, which the ledger treats idempotently.
+func (h *Handler) RequeueAccounting(w http.ResponseWriter, r *http.Request) {
+	runID := chi.URLParam(r, "runID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	run, ok := h.fetchRunForAuth(w, r, runID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, run.LegalEntityID, PaymentRunExceptionResolve) {
+		return
+	}
+	n, err := h.store.RequeueAccountingRequests(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRunNotFound) {
+			writeError(w, http.StatusNotFound, "payment run not found")
+			return
+		}
+		h.log.Error("RequeueAccounting: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"run_id": runID, "requeued": n})
 }
 
 func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
