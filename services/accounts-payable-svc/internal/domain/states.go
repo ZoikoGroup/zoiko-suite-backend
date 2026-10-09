@@ -287,7 +287,7 @@ func (v *VendorInvoice) ApprovalBlocker() *ApprovalBlocker {
 		return &ApprovalBlocker{CodePayeeVersionMismatch, "payee_mismatch_unresolved", "invoice bank details differ from the ORG-10 active destination; resolve the payee mismatch first"}
 	case v.TaxState != TaxVerified:
 		return &ApprovalBlocker{CodeTaxUnavailable, "tax_not_verified", "TAX/withholding provenance is not verified"}
-	case v.DocumentType == DocInvoice && v.MatchRequired && !v.MatchCleared:
+	case v.RequiresMatch() && !v.MatchCleared:
 		return &ApprovalBlocker{CodeMatchException, "match_not_cleared", "a MATCHED/WITHIN_TOLERANCE (or approved-variance) match run is required before approval"}
 	}
 	return nil

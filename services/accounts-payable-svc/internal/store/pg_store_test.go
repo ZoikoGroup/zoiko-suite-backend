@@ -51,6 +51,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
+	// AP-06 tables reference vendor_invoices; drop them first so the migration re-creates them cleanly.
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS invoice_match_exceptions, invoice_match_lines, invoice_match_runs, match_policy_versions CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS vendor_invoices CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox_events CASCADE;`)
 

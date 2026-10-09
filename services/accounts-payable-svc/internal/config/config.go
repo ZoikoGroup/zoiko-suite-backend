@@ -44,6 +44,10 @@ type Config struct {
 	// is supplied — but when it is, the check fails closed.
 	PurchaseOrderServiceURL string
 
+	// GoodsReceiptServiceURL is AP-04 (received-to-date), the third leg of a
+	// three-way match. Missing receipt evidence yields an INCOMPLETE match.
+	GoodsReceiptServiceURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -112,6 +116,7 @@ func Load() (*Config, error) {
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		PurchaseOrderServiceURL:  env("PURCHASE_ORDER_URL", "http://purchase-order-svc:8129"),
+		GoodsReceiptServiceURL:   env("GOODS_RECEIPT_URL", "http://goods-service-receipt-svc:8157"),
 	}
 
 	if err := cfg.validate(); err != nil {

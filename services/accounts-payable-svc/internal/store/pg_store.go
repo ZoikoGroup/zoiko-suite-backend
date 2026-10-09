@@ -237,6 +237,10 @@ func mapPgError(err error) error {
 		}
 		return err
 	case "23000":
+		// The AP-06 match gate is a state-machine refusal, not an immutability one.
+		if strings.Contains(pgErr.Message, "AP-06 match") {
+			return fmt.Errorf("%w: %s", domain.ErrInvalidTransition, pgErr.Message)
+		}
 		// Raised by the immutability triggers.
 		return fmt.Errorf("%w: %s", domain.ErrInvoiceImmutable, pgErr.Message)
 	default:

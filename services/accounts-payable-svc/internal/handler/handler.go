@@ -82,6 +82,7 @@ type Handler struct {
 	authz          AuthZClient
 	purchaseOrders PurchaseOrderVerifier
 	payables       payableopenitem.Client
+	match          *MatchDeps // AP-06; nil until WithMatching
 	log            *zap.Logger
 }
 
@@ -131,7 +132,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{invoice_id}/validate", h.ValidateInvoice)
 		r.Post("/{invoice_id}/approve", h.ApproveInvoice)
 		r.Post("/{invoice_id}/request-payment", h.RequestPayment)
+		h.registerInvoiceMatchRoutes(r)
 	})
+	h.registerMatchRoutes(r)
 }
 
 // ── POST /v1/invoices ────────────────────────────────────────────────────────

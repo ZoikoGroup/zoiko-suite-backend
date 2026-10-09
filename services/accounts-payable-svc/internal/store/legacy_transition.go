@@ -114,6 +114,8 @@ func (s *PgStore) TransitionInvoice(ctx context.Context, tenantID, invoiceID str
 				return nil, err
 			}
 			inv.ValidatedByPrincipalID, inv.ValidatedAt = &actor, &now
+			// Whether this document must carry a cleared AP-06 match is decided here.
+			inv.MatchRequired = inv.RequiresMatch()
 			// Validation is the point at which this service says the document is
 			// real and complete, so the source representation freezes here.
 			if inv.SourceAcceptedAt == nil {
@@ -128,7 +130,7 @@ func (s *PgStore) TransitionInvoice(ctx context.Context, tenantID, invoiceID str
 			// attempted on this path.
 			switch {
 			case inv.HoldState != domain.HoldNone, inv.DuplicateState == domain.DuplicateSuspected,
-				inv.MatchRequired && !inv.MatchCleared:
+				inv.RequiresMatch() && !inv.MatchCleared:
 				return nil, domain.ErrInvalidTransition
 			}
 			if inv.ApprovalState == domain.ApprovalNone {

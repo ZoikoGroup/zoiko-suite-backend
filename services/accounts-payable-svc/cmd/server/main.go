@@ -40,6 +40,7 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/outbox"
 	"zoiko.io/accounts-payable-svc/internal/payableopenitem"
 	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
+	"zoiko.io/accounts-payable-svc/internal/receipts"
 	"zoiko.io/accounts-payable-svc/internal/store"
 	"zoiko.io/accounts-payable-svc/internal/telemetry"
 )
@@ -211,6 +212,9 @@ func main() {
 	payablesClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, log)
 
 	h := handler.New(pgStore, publisher, authzClient, poClient, payablesClient, log)
+	// AP-06 Invoice Matching runs inside this service: PO (AP-03) and receipt (AP-04)
+	// evidence in, an immutable match run and the invoice's match dimension out.
+	h.WithMatching(handler.MatchDeps{Store: pgStore, PO: poClient, Receipts: receipts.NewHTTPClient(cfg.GoodsReceiptServiceURL)})
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
