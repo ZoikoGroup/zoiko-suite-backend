@@ -461,3 +461,135 @@ func TestAIG02_RejectedRelease_IsTerminal(t *testing.T) {
 		t.Fatalf("advance a rejected release: %v", err)
 	}
 }
+
+// ── Collection reads (ListUseCases / ListModelReleases) ─────────────────────
+//
+// Added to close the gap where the console had no way to browse existing
+// AIG-01/AIG-02 records: a prior pass's frontend code called GET
+// /v1/ai/use-cases and GET /v1/ai/model-releases, but no such route — and
+// no such store method — existed, so both calls returned a live 405. These
+// tests exercise the real Postgres queries behind the new routes, as the
+// NOSUPERUSER NOBYPASSRLS app role, the same way every other test in this
+// file does — not the handler-level in-memory stub.
+
+func TestAIG01_ListUseCases_EmptyForFreshTenant(t *testing.T) {
+	admin := openAdminPool(t)
+	s := store.NewPgStore(appRolePool(t, admin))
+	tenant := uuid.NewString()
+
+	list, err := s.ListUseCases(ctxWithTenant(tenant))
+	if err != nil {
+		t.Fatalf("list use cases: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("expected 0 use cases for a fresh tenant, got %d", len(list))
+	}
+}
+
+func TestAIG01_ListUseCases_ReturnsOwnRecordsOrderedNewestFirst(t *testing.T) {
+	admin := openAdminPool(t)
+	s := store.NewPgStore(appRolePool(t, admin))
+	tenant := uuid.NewString()
+	ctx := ctxWithTenant(tenant)
+
+	first, err := s.CreateUseCase(ctx, baseCreateUseCaseRequest("A1"), tenant, "creator-carl", "")
+	if err != nil {
+		t.Fatalf("create first use case: %v", err)
+	}
+	second, err := s.CreateUseCase(ctx, baseCreateUseCaseRequest("A1"), tenant, "creator-carl", "")
+	if err != nil {
+		t.Fatalf("create second use case: %v", err)
+	}
+
+	list, err := s.ListUseCases(ctx)
+	if err != nil {
+		t.Fatalf("list use cases: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 use cases, got %d", len(list))
+	}
+	// ORDER BY created_at DESC: the most recently created row comes first.
+	if list[0].UseCaseID != second.UseCaseID || list[1].UseCaseID != first.UseCaseID {
+		t.Fatalf("expected newest-first ordering [%s, %s], got [%s, %s]",
+			second.UseCaseID, first.UseCaseID, list[0].UseCaseID, list[1].UseCaseID)
+	}
+}
+
+// TestAIG01_ListUseCases_TenantIsolation is the RLS claim for the new
+// collection route specifically — a cross-tenant GetUseCase already proves
+// RLS blocks a targeted read (TestAIG01_TenantIsolation above); this proves
+// the untargeted collection read is equally isolated, not just that a
+// WHERE clause happens to filter correctly without RLS backing it up.
+func TestAIG01_ListUseCases_TenantIsolation(t *testing.T) {
+	admin := openAdminPool(t)
+	s := store.NewPgStore(appRolePool(t, admin))
+	tenantA := uuid.NewString()
+	tenantB := uuid.NewString()
+
+	if _, err := s.CreateUseCase(ctxWithTenant(tenantA), baseCreateUseCaseRequest("A1"), tenantA, "creator-carl", ""); err != nil {
+		t.Fatalf("create use case for tenant A: %v", err)
+	}
+
+	listB, err := s.ListUseCases(ctxWithTenant(tenantB))
+	if err != nil {
+		t.Fatalf("list use cases as tenant B: %v", err)
+	}
+	if len(listB) != 0 {
+		t.Fatalf("ISOLATION FAILURE: tenant B's list returned %d of tenant A's use cases", len(listB))
+	}
+
+	listA, err := s.ListUseCases(ctxWithTenant(tenantA))
+	if err != nil {
+		t.Fatalf("list use cases as tenant A: %v", err)
+	}
+	if len(listA) != 1 {
+		t.Fatalf("expected tenant A to see its own 1 use case, got %d", len(listA))
+	}
+}
+
+func TestAIG02_ListModelReleases_EmptyWhenNoneRegisteredYet(t *testing.T) {
+	// No fixture-isolation lever exists for this platform-wide table (no
+	// tenant_id to scope by, same as ListModelProviders) — this only runs
+	// meaningfully as a smoke check that the query itself returns an empty
+	// slice rather than erroring, not an exhaustive isolation claim.
+	admin := openAdminPool(t)
+	s := store.NewPgStore(appRolePool(t, admin))
+
+	list, err := s.ListModelReleases(context.Background())
+	if err != nil {
+		t.Fatalf("list model releases: %v", err)
+	}
+	if list == nil {
+		t.Fatalf("expected a non-nil (possibly empty) slice")
+	}
+}
+
+func TestAIG02_ListModelReleases_ReturnsRegisteredRelease(t *testing.T) {
+	admin := openAdminPool(t)
+	s := store.NewPgStore(appRolePool(t, admin))
+	ctx := context.Background()
+
+	req := baseRegisterReleaseRequest()
+	req.ProviderModelID = "claude-list-test-" + uuid.NewString()
+	m, err := s.RegisterModelRelease(ctx, req, "operator-dave")
+	if err != nil {
+		t.Fatalf("register release: %v", err)
+	}
+
+	list, err := s.ListModelReleases(ctx)
+	if err != nil {
+		t.Fatalf("list model releases: %v", err)
+	}
+	found := false
+	for _, r := range list {
+		if r.ModelReleaseID == m.ModelReleaseID {
+			found = true
+			if r.ProviderModelID != req.ProviderModelID {
+				t.Fatalf("expected provider_model_id %q, got %q", req.ProviderModelID, r.ProviderModelID)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected the just-registered release %s in the list of %d", m.ModelReleaseID, len(list))
+	}
+}

@@ -9,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	svcenvelope "zoiko.io/retention-registry-svc/internal/envelope"
+	svcmiddleware "zoiko.io/retention-registry-svc/internal/middleware"
 )
 
 var ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
@@ -135,6 +138,36 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := "req-" + time.Now().Format("20060102150405.000000")
+	authzSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		} else if tenantID := svcmiddleware.TenantFromContext(ctx); tenantID != "" {
+			req.Header.Set("X-Tenant-Id", tenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	} else if tenantID := svcmiddleware.TenantFromContext(ctx); tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return ErrAuthzServiceUnavailable

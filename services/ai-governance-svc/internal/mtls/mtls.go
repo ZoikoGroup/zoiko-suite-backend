@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type provisionRequest struct {
@@ -46,6 +48,15 @@ type provisionResult struct {
 // populates (see deployments/docker-compose.yml), never minted or verified
 // by this service. An empty bootstrapToken sends no header at all, which
 // falls through to mtls-management-svc's normal principal/authorize path.
+//
+// THE CANONICAL INPUT CONTRACT APPLIES TO THIS CALL TOO. mtls-management-svc
+// enforces the estate envelope on every route; a request carrying only
+// Content-Type and a tenant header is refused 401 envelope_incomplete
+// before the bootstrap-token branch is ever reached, which reads like a
+// rejected credential even though the token is never looked at (see
+// authorization-svc/internal/mtls's identical fix for the same bug).
+// actor_subject_id is X-Workload-Id, not X-Principal-Id — this is a service
+// provisioning its own certificate during startup, with no human subject.
 func NewClientHTTPClient(ctx context.Context, mtlsServiceURL, serviceName, platformScopeID, bootstrapToken string) (*http.Client, error) {
 	reqBody, err := json.Marshal(provisionRequest{
 		LegalEntityID: platformScopeID,
@@ -62,7 +73,18 @@ func NewClientHTTPClient(ctx context.Context, mtlsServiceURL, serviceName, platf
 		return nil, fmt.Errorf("build provision request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-ID", platformScopeID)
+	req.Header.Set("X-Tenant-Id", platformScopeID)
+	req.Header.Set("X-Legal-Entity-Id", platformScopeID)
+	req.Header.Set("X-Workload-Id", serviceName)
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Correlation-ID", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("X-Purpose-Context", "service_identity_provisioning")
+	// Issuing a certificate is a material state change, so the contract wants
+	// an idempotency key. A fresh one per attempt is correct here: a retry
+	// after a failed provision must be allowed to mint a new leaf, not replay
+	// the answer to a call whose result never arrived.
+	req.Header.Set("Idempotency-Key", uuid.NewString())
 	if bootstrapToken != "" {
 		req.Header.Set("X-Mtls-Bootstrap-Token", bootstrapToken)
 	}

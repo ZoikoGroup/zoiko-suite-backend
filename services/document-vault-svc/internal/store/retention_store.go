@@ -383,12 +383,14 @@ func (s *PgStore) ApproveForDisposition(ctx context.Context, p domain.ApproveFor
 
 const legalHoldColumns = `
 	hold_id, tenant_id, matter_ref, authority_ref, hold_reason_code, status, issued_by_principal_id, issued_at,
-	activated_by_principal_id, activated_at, release_reason, released_by_principal_id, released_at
+	activated_by_principal_id, activated_at, release_reason, released_by_principal_id,
+	release_approved_by_principal_id, released_at
 `
 
 func scanLegalHold(row pgx.Row, h *domain.LegalHold) error {
 	return row.Scan(&h.HoldID, &h.TenantID, &h.MatterRef, &h.AuthorityRef, &h.HoldReasonCode, &h.Status, &h.IssuedByPrincipalID, &h.IssuedAt,
-		&h.ActivatedByPrincipalID, &h.ActivatedAt, &h.ReleaseReason, &h.ReleasedByPrincipalID, &h.ReleasedAt)
+		&h.ActivatedByPrincipalID, &h.ActivatedAt, &h.ReleaseReason, &h.ReleasedByPrincipalID,
+		&h.ReleaseApprovedByPrincipalID, &h.ReleasedAt)
 }
 
 const legalHoldTargetColumns = `hold_target_id, tenant_id, hold_id, record_id, applied_at, released_at, created_at`
@@ -543,7 +545,11 @@ func (s *PgStore) AddLegalHoldTarget(ctx context.Context, p domain.AddLegalHoldT
 }
 
 // ReleaseLegalHold moves ACTIVE -> RELEASED and releases every
-// still-applied target in the same transaction.
+// still-applied target in the same transaction. Enforces ZS-SVC-S-001
+// §5.5's maker-checker gate: the approver must differ from the
+// principal executing the release (migration 000011's own CHECK
+// constraint is the backstop; this is the friendlier pre-check — same
+// shape as ApproveRetentionRuleVersion's self-approval guard above).
 func (s *PgStore) ReleaseLegalHold(ctx context.Context, p domain.ReleaseLegalHoldParams) (*domain.LegalHold, error) {
 	var out domain.LegalHold
 	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
@@ -554,6 +560,9 @@ func (s *PgStore) ReleaseLegalHold(ctx context.Context, p domain.ReleaseLegalHol
 		if h.Status != domain.LegalHoldActive {
 			return domain.ErrLegalHoldNotActive
 		}
+		if p.ReleasedByPrincipalID == p.ReleaseApprovedByPrincipalID {
+			return domain.ErrLegalHoldSelfRelease
+		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE legal_hold_targets SET released_at = now()
 			WHERE hold_id = $1 AND tenant_id::text = $2 AND applied_at IS NOT NULL AND released_at IS NULL`,
@@ -561,9 +570,10 @@ func (s *PgStore) ReleaseLegalHold(ctx context.Context, p domain.ReleaseLegalHol
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
 		}
 		row := tx.QueryRow(ctx, `
-			UPDATE legal_holds SET status = 'RELEASED', release_reason = $2, released_by_principal_id = $3, released_at = now()
+			UPDATE legal_holds SET status = 'RELEASED', release_reason = $2, released_by_principal_id = $3,
+				release_approved_by_principal_id = $4, released_at = now()
 			WHERE hold_id = $1 RETURNING `+legalHoldColumns,
-			p.HoldID, p.ReleaseReason, p.ReleasedByPrincipalID,
+			p.HoldID, p.ReleaseReason, p.ReleasedByPrincipalID, p.ReleaseApprovedByPrincipalID,
 		)
 		return scanLegalHold(row, &out)
 	})

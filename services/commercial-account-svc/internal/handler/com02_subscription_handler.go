@@ -79,30 +79,37 @@ func (h *SubscriptionHandler) WithClock(now func() time.Time) *SubscriptionHandl
 	return h
 }
 
+// RegisterSubscriptionV2Routes registers each route as a fully-qualified
+// literal path (the same convention used by RegisterEntitlementRoutes,
+// RegisterUsageRoutes, RegisterBillingRoutes, RegisterPaymentRoutes,
+// RegisterCreditRoutes, RegisterDunningRoutes, and RegisterDisputeRoutes)
+// rather than a blanket r.Route("/v1/commercial", ...) mount. chi's Mount()
+// panics if two handlers are mounted at the exact same path, and
+// RegisterPriceBookRoutes already owns that mount — this must not create a
+// second one. Every resolved path below is byte-for-byte identical to the
+// previous nested-Route form.
 func RegisterSubscriptionV2Routes(r chi.Router, h *SubscriptionHandler) {
-	r.Route("/v1/commercial", func(r chi.Router) {
-		r.Put("/accounts/{id}/market", h.SetAccountMarket)
-		r.Post("/subscriptions:start", h.StartSubscription)
-		r.Post("/subscriptions/{id}", h.SubscriptionAction)
-		r.Get("/subscriptions/{id}", h.GetSubscription)
-		r.Get("/subscriptions/{id}/effective-version", h.GetEffectiveVersion)
-		r.Get("/subscriptions/{id}/history", h.GetChangeHistory)
-		r.Get("/subscriptions/{id}/renewal-state", h.GetRenewalState)
-		r.Get("/subscriptions/{id}/changes", h.GetChanges)
+	r.Put("/v1/commercial/accounts/{id}/market", h.SetAccountMarket)
+	r.Post("/v1/commercial/subscriptions:start", h.StartSubscription)
+	r.Post("/v1/commercial/subscriptions/{id}", h.SubscriptionAction)
+	r.Get("/v1/commercial/subscriptions/{id}", h.GetSubscription)
+	r.Get("/v1/commercial/subscriptions/{id}/effective-version", h.GetEffectiveVersion)
+	r.Get("/v1/commercial/subscriptions/{id}/history", h.GetChangeHistory)
+	r.Get("/v1/commercial/subscriptions/{id}/renewal-state", h.GetRenewalState)
+	r.Get("/v1/commercial/subscriptions/{id}/changes", h.GetChanges)
 
-		r.Post("/plan-transition-rules", h.CreateTransitionRule)
-		r.Get("/plan-transition-rules", h.ListTransitionRules)
-		r.Post("/plan-transition-rules/{id}", h.TransitionRuleAction)
+	r.Post("/v1/commercial/plan-transition-rules", h.CreateTransitionRule)
+	r.Get("/v1/commercial/plan-transition-rules", h.ListTransitionRules)
+	r.Post("/v1/commercial/plan-transition-rules/{id}", h.TransitionRuleAction)
 
-		r.Post("/subscriptions/{id}/discounts", h.ProposeDiscount)
-		r.Get("/subscriptions/{id}/discounts", h.ListDiscounts)
-		r.Post("/subscriptions/{id}/discounts/{discountID}", h.DiscountAction)
-		r.Get("/subscriptions/{id}/migration-offers", h.ListMigrationOffersFor)
+	r.Post("/v1/commercial/subscriptions/{id}/discounts", h.ProposeDiscount)
+	r.Get("/v1/commercial/subscriptions/{id}/discounts", h.ListDiscounts)
+	r.Post("/v1/commercial/subscriptions/{id}/discounts/{discountID}", h.DiscountAction)
+	r.Get("/v1/commercial/subscriptions/{id}/migration-offers", h.ListMigrationOffersFor)
 
-		r.Post("/migration-offers", h.CreateMigrationOffer)
-		r.Get("/migration-offers/{id}", h.GetMigrationOffer)
-		r.Post("/migration-offers/{id}", h.MigrationOfferAction)
-	})
+	r.Post("/v1/commercial/migration-offers", h.CreateMigrationOffer)
+	r.Get("/v1/commercial/migration-offers/{id}", h.GetMigrationOffer)
+	r.Post("/v1/commercial/migration-offers/{id}", h.MigrationOfferAction)
 }
 
 // ── Scope ────────────────────────────────────────────────────────────────────

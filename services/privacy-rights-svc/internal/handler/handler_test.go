@@ -277,6 +277,51 @@ func TestAttachWFCProcessRef(t *testing.T) {
 	}
 }
 
+// TestAttachWFCProcessRef_OnClosedRequest_Conflict and its two siblings
+// below prove the three "process" mutations (WFC ref, identity
+// verification, discovery manifest) consistently reject a CLOSED request
+// with 409/PRV-020, the same immutability-conflict code CloseRequest
+// itself already uses for a double-close — rather than falling through to
+// a generic 503/PRV-019 as if the backing store were merely unavailable.
+func TestAttachWFCProcessRef_OnClosedRequest_Conflict(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	req := createRequest(t, r)
+	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
+		domain.CloseRequestRequest{Outcome: domain.OutcomeWithdrawn}, testTenant)
+
+	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/wfc-process-ref",
+		domain.AttachWFCProcessRefRequest{WFCProcessRef: "wf-instance-123"}, testTenant)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 attaching WFC ref to a CLOSED request, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRecordIdentityVerification_OnClosedRequest_Conflict(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	req := createRequest(t, r)
+	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
+		domain.CloseRequestRequest{Outcome: domain.OutcomeWithdrawn}, testTenant)
+
+	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/identity-verification",
+		domain.RecordIdentityVerificationRequest{Verified: true, Method: "GOVT_ID_MATCH"}, testTenant)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 recording identity verification on a CLOSED request, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAttachDiscoveryManifest_OnClosedRequest_Conflict(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	req := createRequest(t, r)
+	doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/close",
+		domain.CloseRequestRequest{Outcome: domain.OutcomeWithdrawn}, testTenant)
+
+	w := doRequest(r, http.MethodPost, "/privacy/rights-requests/"+req.RequestID+"/discovery-manifests",
+		domain.AttachDiscoveryManifestRequest{Domain: "accounts-receivable-svc", ContentHash: "sha256:abc", CandidateCount: 3}, testTenant)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 attaching a discovery manifest to a CLOSED request, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestListRequestsBySubject(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
 	createRequest(t, r)

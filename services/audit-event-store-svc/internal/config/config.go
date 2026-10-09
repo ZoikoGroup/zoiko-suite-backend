@@ -24,6 +24,12 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// AuthzServiceURL is authorization-svc's base URL, used by the HTTP
+	// handlers to gate /v1/events, /v1/events/verify, and /v1/archives/*
+	// behind a real RBAC decision instead of trusting caller-supplied
+	// X-Tenant-Id/X-Principal-Id headers outright.
+	AuthzServiceURL string
 }
 
 // DBConfig carries the PostgreSQL connection parameters.
@@ -90,6 +96,7 @@ func Load() (*Config, error) {
 			),
 		},
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		AuthzServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 	}, nil
 }
 

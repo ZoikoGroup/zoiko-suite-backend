@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -99,16 +100,27 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		OccurredAt:    time.Now().UTC(),
 		Payload:       params.Payload,
 	}
+	return p.PublishEvent(ctx, evt)
+}
+
+// PublishEvent writes an already-persisted event without changing its event ID.
+// The outbox relay uses this so broker retries are recognizable redeliveries.
+func (p *KafkaPublisher) PublishEvent(ctx context.Context, evt Event) error {
+	if evt.EventID == "" {
+		return fmt.Errorf("event_id is required")
+	}
 	data, err := json.Marshal(evt)
 	if err != nil {
 		return err
 	}
 	err = p.writer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(params.EntityID),
+		Key:   []byte(evt.EntityID),
 		Value: data,
 	})
 	if err != nil {
-		p.logger.Warn("kafka publish failed — event dropped", zap.String("event_type", params.EventType), zap.Error(err))
+		p.logger.Error("kafka publish failed; event remains in transactional outbox",
+			zap.String("event_id", evt.EventID), zap.String("event_type", evt.EventType), zap.Error(err))
+		return fmt.Errorf("publish event %s: %w", evt.EventID, err)
 	}
 	return nil
 }
