@@ -100,6 +100,10 @@ type authorizeRequest struct {
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
+
+	// ResourceOwnerPrincipalID drives authorization-svc's dynamic own-object
+	// segregation-of-duties check: a principal may not act on an object they own.
+	ResourceOwnerPrincipalID string `json:"resource_owner_principal_id,omitempty"`
 }
 
 type authorizeResponse struct {
@@ -107,13 +111,19 @@ type authorizeResponse struct {
 }
 
 func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	return c.CheckAllowedOwnObject(ctx, principalID, legalEntityID, actionType, "")
+}
+
+// CheckAllowedOwnObject is CheckAllowed plus the owner of the object acted on, so
+// authorization-svc can enforce own-object segregation of duties dynamically.
+func (c *HTTPClient) CheckAllowedOwnObject(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType + "|" + resourceOwnerPrincipalID
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType, resourceOwnerPrincipalID)
 
 	// Cache the decision itself (GRANTED or DENIED), never an unavailable
 	// outcome — see the doc comment on decisionCacheTTL.
@@ -163,8 +173,8 @@ func (c *HTTPClient) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
-func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType})
+func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) error {
+	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType, ResourceOwnerPrincipalID: resourceOwnerPrincipalID})
 	if err != nil {
 		return fmt.Errorf("marshal authorize request: %w", err)
 	}

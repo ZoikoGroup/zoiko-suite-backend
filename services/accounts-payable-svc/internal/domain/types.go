@@ -32,6 +32,8 @@ const (
 	InvoiceStatusValidated        InvoiceStatus = "VALIDATED"
 	InvoiceStatusApproved         InvoiceStatus = "APPROVED"
 	InvoiceStatusPaymentRequested InvoiceStatus = "PAYMENT_REQUESTED"
+	InvoiceStatusRejected         InvoiceStatus = "REJECTED"
+	InvoiceStatusQuarantined      InvoiceStatus = "QUARANTINED"
 )
 
 // ValidInvoiceStatus reports whether s is a status this service can ever have
@@ -39,7 +41,8 @@ const (
 // list, so a typo was indistinguishable from a tenant with no payables.
 func ValidInvoiceStatus(s string) bool {
 	switch InvoiceStatus(s) {
-	case InvoiceStatusReceived, InvoiceStatusValidated, InvoiceStatusApproved, InvoiceStatusPaymentRequested:
+	case InvoiceStatusReceived, InvoiceStatusValidated, InvoiceStatusApproved, InvoiceStatusPaymentRequested,
+		InvoiceStatusRejected, InvoiceStatusQuarantined:
 		return true
 	default:
 		return false
@@ -127,6 +130,68 @@ type VendorInvoice struct {
 	ValidatedAt                   *time.Time `json:"validated_at,omitempty"`
 	ApprovedAt                    *time.Time `json:"approved_at,omitempty"`
 	PaymentRequestedAt            *time.Time `json:"payment_requested_at,omitempty"`
+
+	// ── AP-05 state dimensions and evidence (migration 000008) ──────────────
+
+	// Version is incremented by every command; expected_version guards it.
+	Version      int    `json:"version"`
+	DocumentType string `json:"document_type"`
+
+	IntakeState     IntakeState     `json:"intake_state"`
+	MatchState      MatchState      `json:"match_state"`
+	ApprovalState   ApprovalState   `json:"approval_state"`
+	AccountingState AccountingState `json:"accounting_state"`
+	SettlementState SettlementState `json:"settlement_state"`
+	HoldState       HoldState       `json:"hold_state"`
+	HoldReason      *string         `json:"hold_reason,omitempty"`
+
+	// Immutable source representation: sha256 of the canonical submitted payload,
+	// optional attachment hash and the channel it arrived on. Once
+	// SourceAcceptedAt is set none of it can change (DB trigger).
+	SourceHash       string     `json:"source_hash"`
+	AttachmentHash   *string    `json:"attachment_hash,omitempty"`
+	SourceChannel    string     `json:"source_channel"`
+	SourceAcceptedAt *time.Time `json:"source_accepted_at,omitempty"`
+
+	InvoiceNumberNormalized string         `json:"invoice_number_normalized"`
+	DuplicateState          DuplicateState `json:"duplicate_state"`
+	QuarantineReason        *string        `json:"quarantine_reason,omitempty"`
+
+	SubmittedByPrincipalID *string    `json:"submitted_by_principal_id,omitempty"`
+	SubmittedAt            *time.Time `json:"submitted_at,omitempty"`
+	RejectedByPrincipalID  *string    `json:"rejected_by_principal_id,omitempty"`
+	RejectedAt             *time.Time `json:"rejected_at,omitempty"`
+	RejectReason           *string    `json:"reject_reason,omitempty"`
+
+	// TAX / withholding provenance. AP never calculates tax: these are the
+	// verified references into tax-determination-svc and what they said.
+	TaxState                    TaxState         `json:"tax_state"`
+	TaxProvenance               []TaxProvenance  `json:"tax_provenance,omitempty"`
+	TaxResultHash               *string          `json:"tax_result_hash,omitempty"`
+	TaxVerifiedAt               *time.Time       `json:"tax_verified_at,omitempty"`
+	WithholdingRef              *string          `json:"withholding_ref,omitempty"`
+	WithholdingDeterminationID  *string          `json:"withholding_determination_id,omitempty"`
+	WithholdingProvenance       *TaxProvenance   `json:"withholding_provenance,omitempty"`
+
+	// ExtractedBankDetails is what the supplier's document said, stored as
+	// EVIDENCE ONLY. It is never a payment destination: ORG-10 is the only
+	// authority, and AP-08 payable creation carries no bank data at all.
+	ExtractedBankDetails *BankDetails `json:"extracted_bank_details,omitempty"`
+	PayeeState           PayeeState   `json:"payee_state"`
+	PayeeCheck           *PayeeCheck  `json:"payee_check,omitempty"`
+
+	SupplierProfileID      *string `json:"supplier_profile_id,omitempty"`
+	SupplierProfileVersion *int    `json:"supplier_profile_version,omitempty"`
+	PORevision             *int    `json:"po_revision,omitempty"`
+
+	// MatchRequired is decided at validation (a PO-backed invoice must match);
+	// MatchCleared and MatchRunID are written only by the AP-06 module.
+	MatchRequired bool    `json:"match_required"`
+	MatchCleared  bool    `json:"match_cleared"`
+	MatchRunID    *string `json:"match_run_id,omitempty"`
+
+	PayableID         *string `json:"payable_id,omitempty"`
+	AccountingEventID *string `json:"accounting_event_id,omitempty"`
 }
 
 // VendorInvoiceLine is one line of a supplier invoice — AP-05's "lines" and

@@ -63,7 +63,7 @@ func newStubStore() *stubStore {
 	return &stubStore{invoices: map[string]*domain.VendorInvoice{}, byCorrelation: map[string]string{}}
 }
 
-func (s *stubStore) CreateInvoice(_ context.Context, inv *domain.VendorInvoice) (bool, error) {
+func (s *stubStore) CreateInvoice(_ context.Context, inv *domain.VendorInvoice, _ *domain.Mutation) (bool, error) {
 	if s.createErr != nil {
 		return false, s.createErr
 	}

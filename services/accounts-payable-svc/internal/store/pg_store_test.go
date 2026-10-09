@@ -145,6 +145,8 @@ func newTestInvoice(tenantID string) *domain.VendorInvoice {
 		CurrencyCode:         "USD",
 		DueDate:              time.Now().Add(30 * 24 * time.Hour),
 		Status:               domain.InvoiceStatusReceived,
+		InvoiceDate:          domain.CalendarDate{Time: time.Now().UTC().Truncate(24 * time.Hour)},
+		SupplyDate:           domain.CalendarDate{Time: time.Now().UTC().Truncate(24 * time.Hour)},
 		CreatedByPrincipalID: "test-admin",
 		CorrelationID:        "corr-" + uuid.New().String(),
 	}
@@ -166,7 +168,7 @@ func TestPgStore_CreateInvoice_DuplicateInvoiceNumber_IsDistinguishable(t *testi
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	first := newTestInvoice(tenantID)
-	if _, err := s.CreateInvoice(ctx, first); err != nil {
+	if _, err := s.CreateInvoice(ctx, first, nil); err != nil {
 		t.Fatalf("first CreateInvoice failed: %v", err)
 	}
 
@@ -176,7 +178,7 @@ func TestPgStore_CreateInvoice_DuplicateInvoiceNumber_IsDistinguishable(t *testi
 	second.VendorID = first.VendorID
 	second.InvoiceNumber = first.InvoiceNumber
 
-	_, err := s.CreateInvoice(ctx, second)
+	_, err := s.CreateInvoice(ctx, second, nil)
 	if err == nil {
 		t.Fatal("expected a duplicate (vendor, invoice_number) to be refused")
 	}
@@ -195,7 +197,7 @@ func TestPgStore_CreateInvoice_SameNumberDifferentVendor_Allowed(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	first := newTestInvoice(tenantID)
-	if _, err := s.CreateInvoice(ctx, first); err != nil {
+	if _, err := s.CreateInvoice(ctx, first, nil); err != nil {
 		t.Fatalf("first CreateInvoice failed: %v", err)
 	}
 
@@ -203,7 +205,7 @@ func TestPgStore_CreateInvoice_SameNumberDifferentVendor_Allowed(t *testing.T) {
 	second.VendorID = "a-different-vendor"
 	second.InvoiceNumber = first.InvoiceNumber
 
-	created, err := s.CreateInvoice(ctx, second)
+	created, err := s.CreateInvoice(ctx, second, nil)
 	if err != nil {
 		t.Fatalf("a different vendor must be allowed to reuse a number: %v", err)
 	}
@@ -259,7 +261,7 @@ func TestPgStore_ReadShape_EveryColumnIsPopulated(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	if _, err := s.CreateInvoice(ctx, inv); err != nil {
+	if _, err := s.CreateInvoice(ctx, inv, nil); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 	// Walk the whole lifecycle so the three actor and three timestamp columns are
@@ -322,7 +324,7 @@ func TestPgStore_CreateInvoice_And_GetInvoice(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	if _, err := s.CreateInvoice(ctx, inv); err != nil {
+	if _, err := s.CreateInvoice(ctx, inv, nil); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 
@@ -351,7 +353,7 @@ func TestPgStore_CreateInvoice_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 
 	inv1 := newTestInvoice(tenantID)
 	inv1.CorrelationID = "corr-retry-1"
-	created1, err := s.CreateInvoice(ctx, inv1)
+	created1, err := s.CreateInvoice(ctx, inv1, nil)
 	if err != nil {
 		t.Fatalf("first CreateInvoice failed: %v", err)
 	}
@@ -363,7 +365,7 @@ func TestPgStore_CreateInvoice_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 	// client would generate) but the SAME correlation_id.
 	inv2 := newTestInvoice(tenantID)
 	inv2.CorrelationID = "corr-retry-1"
-	created2, err := s.CreateInvoice(ctx, inv2)
+	created2, err := s.CreateInvoice(ctx, inv2, nil)
 	if err != nil {
 		t.Fatalf("retried CreateInvoice failed: %v", err)
 	}
@@ -394,7 +396,7 @@ func TestPgStore_TransitionInvoice_WrongFromStatus_Rejected(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	if _, err := s.CreateInvoice(ctx, inv); err != nil {
+	if _, err := s.CreateInvoice(ctx, inv, nil); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 
@@ -422,7 +424,7 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	ctxB := svcmiddleware.WithTenant(context.Background(), tenantB)
 
 	invA := newTestInvoice(tenantA)
-	if _, err := s.CreateInvoice(ctxA, invA); err != nil {
+	if _, err := s.CreateInvoice(ctxA, invA, nil); err != nil {
 		t.Fatalf("CreateInvoice (tenant A) failed: %v", err)
 	}
 
@@ -466,7 +468,7 @@ func TestPgStore_ListInvoices_TenantScoped(t *testing.T) {
 	ctxA := svcmiddleware.WithTenant(context.Background(), tenantA)
 
 	invA := newTestInvoice(tenantA)
-	if _, err := s.CreateInvoice(ctxA, invA); err != nil {
+	if _, err := s.CreateInvoice(ctxA, invA, nil); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 
@@ -495,7 +497,7 @@ func TestPgStore_CreateInvoice_OutboxAtomicity(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	created, err := s.CreateInvoice(ctx, inv)
+	created, err := s.CreateInvoice(ctx, inv, nil)
 	if err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
@@ -533,14 +535,14 @@ func TestPgStore_CreateInvoice_IdempotentReplay_NoOutboxDuplicate(t *testing.T) 
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	created1, err := s.CreateInvoice(ctx, inv)
+	created1, err := s.CreateInvoice(ctx, inv, nil)
 	if err != nil || !created1 {
 		t.Fatalf("first CreateInvoice failed: %v", err)
 	}
 
 	replayInv := *inv
 	replayInv.InvoiceID = uuid.New().String()
-	created2, err := s.CreateInvoice(ctx, &replayInv)
+	created2, err := s.CreateInvoice(ctx, &replayInv, nil)
 	if err != nil {
 		t.Fatalf("retried CreateInvoice failed: %v", err)
 	}
@@ -565,7 +567,7 @@ func TestPgStore_TransitionInvoice_OutboxAtomicity(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	if _, err := s.CreateInvoice(ctx, inv); err != nil {
+	if _, err := s.CreateInvoice(ctx, inv, nil); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 

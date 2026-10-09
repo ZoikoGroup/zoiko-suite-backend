@@ -1,31 +1,43 @@
-// Package purchaseorder validates AP-05's "PO refs" input against
-// purchase-order-svc.
+// Package purchaseorder is accounts-payable-svc's client for purchase-order-svc
+// (AP-03).
 //
-// §9.F lists PO and receipt references among a supplier invoice's required
-// inputs, and names "duplicate detection; supplier verification" among what the
-// service must resolve rather than accept. A purchase order is the commitment an
-// invoice is claimed against: recording an invoice against a PO that does not
-// exist, belongs to another entity, or has been closed is how an unauthorised
-// spend enters the payables ledger looking authorised.
+// Three jobs, all fail-closed:
 //
-// This is not AP-06 Invoice Matching, which does not exist. It validates the
-// reference; it does not compare quantities or prices.
+//   - Verify: at invoice capture/validation, the referenced PO must exist, belong
+//     to the same legal entity and be ISSUED (contract #2: receipts and invoices
+//     are allowed only while po_status == "ISSUED").
+//   - GetOrder / OpenQuantity: the frozen PO revision, lines and open quantities
+//     AP-06 matches against (contract #2: GET /v1/purchase-orders/{id} adds
+//     "revision" and "lines"; GET .../open-quantity).
+//   - ReportProgress: AP-05/06 push invoiced quantities back to AP-03
+//     (POST /v1/purchase-orders/{id}/lines/{line_id}/progress, idempotent on
+//     source_ref + kind).
 package purchaseorder
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
+	"net/url"
 	"strings"
-	"time"
 
 	"zoiko.io/accounts-payable-svc/internal/domain"
+	"zoiko.io/accounts-payable-svc/internal/svcclient"
 )
 
-// PurchaseOrder is the subset of purchase-order-svc's response this package
-// reads. Declared narrowly so an unrelated change to that service's shape
-// cannot break decoding here.
+// Line is one PO line (contract #2).
+type Line struct {
+	LineID      string  `json:"line_id"`
+	LineNumber  int     `json:"line_number"`
+	ItemRef     string  `json:"item_ref"`
+	Description string  `json:"description"`
+	Quantity    float64 `json:"quantity"`
+	UnitPrice   float64 `json:"unit_price"`
+	UOM         string  `json:"uom"`
+	LineAmount  float64 `json:"line_amount"`
+}
+
 type PurchaseOrder struct {
 	PurchaseOrderID string  `json:"purchase_order_id"`
 	TenantID        string  `json:"tenant_id"`
@@ -34,93 +46,131 @@ type PurchaseOrder struct {
 	POStatus        string  `json:"po_status"`
 	TotalAmount     float64 `json:"total_amount"`
 	CurrencyCode    string  `json:"currency_code"`
+
+	// Revision and Lines are contract #2 additions. HasRevision/HasLines record
+	// whether the response actually carried them, so a PO service that has not
+	// shipped them yet yields INCOMPLETE matches instead of an empty "match".
+	Revision    int    `json:"revision"`
+	Lines       []Line `json:"lines"`
+	HasRevision bool   `json:"-"`
+	HasLines    bool   `json:"-"`
 }
 
-// Client reads purchase orders from purchase-order-svc.
+// LineProgress is one line of the open-quantity read.
+type LineProgress struct {
+	LineID              string  `json:"line_id"`
+	OrderedQuantity     float64 `json:"ordered_quantity"`
+	ReceivedQuantity    float64 `json:"received_quantity"`
+	InvoicedQuantity    float64 `json:"invoiced_quantity"`
+	OpenReceiptQuantity float64 `json:"open_receipt_quantity"`
+	OpenInvoiceQuantity float64 `json:"open_invoice_quantity"`
+}
+
+// ProgressReport is the body of POST .../lines/{line_id}/progress.
+type ProgressReport struct {
+	Kind      string  `json:"kind"` // INVOICED
+	Quantity  float64 `json:"quantity"`
+	Amount    float64 `json:"amount"`
+	SourceRef string  `json:"source_ref"`
+	DeltaSign int     `json:"delta_sign"` // 1 | -1
+}
+
+// Reader is what the matching module depends on.
+type Reader interface {
+	GetOrder(ctx context.Context, caller svcclient.Caller, purchaseOrderID string) (*PurchaseOrder, error)
+	OpenQuantity(ctx context.Context, caller svcclient.Caller, purchaseOrderID string) ([]LineProgress, error)
+	ReportProgress(ctx context.Context, caller svcclient.Caller, purchaseOrderID, lineID string, r ProgressReport) error
+}
+
 type Client struct {
-	baseURL string
-	http    *http.Client
+	c *svcclient.Client
 }
 
-// NewClient builds a Client. The timeout is short because this sits in front of
-// invoice intake: a slow purchase-order service must surface as a fast
-// fail-closed refusal rather than as latency on every invoice keyed.
-func NewClient(baseURL string) *Client {
-	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: 5 * time.Second},
-	}
-}
+func NewClient(baseURL string) *Client { return &Client{c: svcclient.New(baseURL)} }
 
-// Verify checks that the referenced purchase order exists, belongs to
-// legalEntityID, and is still open to invoicing.
-//
-// Returns the PO so the caller can record its supplier for later comparison.
-// An empty purchaseOrderID passes and returns nil: §9.F treats the PO reference
-// as one of a pair with the receipt reference, and an invoice with neither is a
-// non-PO invoice, which is ordinary.
+// Verify validates AP-05's PO reference. It returns ErrPurchaseOrderUnknown,
+// ErrPurchaseOrderClosed, ErrPurchaseOrderNotIssued or (wrapping)
+// ErrPurchaseOrderUnverifiable.
 func (c *Client) Verify(ctx context.Context, tenantID, legalEntityID, correlationID, purchaseOrderID string) (*PurchaseOrder, error) {
 	if purchaseOrderID == "" {
 		return nil, nil
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		fmt.Sprintf("%s/v1/purchase-orders/%s", c.baseURL, purchaseOrderID), nil)
+	po, err := c.GetOrder(ctx, svcclient.Caller{TenantID: tenantID, CorrelationID: correlationID}, purchaseOrderID)
 	if err != nil {
+		if errors.Is(err, domain.ErrPurchaseOrderUnknown) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %v", domain.ErrPurchaseOrderUnverifiable, err)
 	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Source-Channel", "system")
-	req.Header.Set("Accept", "application/json")
-	if correlationID != "" {
-		req.Header.Set("X-Correlation-ID", correlationID)
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrPurchaseOrderUnverifiable, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	switch {
-	case resp.StatusCode == http.StatusNotFound:
-		return nil, domain.ErrPurchaseOrderUnknown
-	case resp.StatusCode == http.StatusOK:
-		// fall through
-	default:
-		return nil, fmt.Errorf("%w: purchase-order-svc returned %d", domain.ErrPurchaseOrderUnverifiable, resp.StatusCode)
-	}
-
-	var po PurchaseOrder
-	if err := json.NewDecoder(resp.Body).Decode(&po); err != nil {
-		return nil, fmt.Errorf("%w: malformed purchase order response: %v", domain.ErrPurchaseOrderUnverifiable, err)
-	}
-
-	// A PO belonging to another legal entity reads the same as one that does
-	// not exist. Distinguishing them would confirm to a caller that a PO it has
-	// no relationship with is real.
 	if po.LegalEntityID != "" && legalEntityID != "" && po.LegalEntityID != legalEntityID {
 		return nil, domain.ErrPurchaseOrderUnknown
 	}
-
-	if closedStatus(po.POStatus) {
+	status := strings.ToUpper(strings.TrimSpace(po.POStatus))
+	switch {
+	case closedStatus(status):
 		return nil, domain.ErrPurchaseOrderClosed
+	case status != "ISSUED":
+		return nil, domain.ErrPurchaseOrderNotIssued
 	}
+	return po, nil
+}
+
+// GetOrder fetches the PO as AP-03 currently states it. A 404 is
+// ErrPurchaseOrderUnknown; any other failure is svcclient.ErrUnavailable.
+func (c *Client) GetOrder(ctx context.Context, caller svcclient.Caller, purchaseOrderID string) (*PurchaseOrder, error) {
+	status, body, err := c.c.Do(ctx, caller, "GET", "/v1/purchase-orders/"+url.PathEscape(purchaseOrderID), nil)
+	if err != nil {
+		return nil, svcclient.ErrUnavailable
+	}
+	switch status {
+	case 200:
+	case 404:
+		return nil, domain.ErrPurchaseOrderUnknown
+	default:
+		return nil, svcclient.ErrUnavailable
+	}
+	var po PurchaseOrder
+	if err := json.Unmarshal(body, &po); err != nil {
+		return nil, svcclient.ErrUnavailable
+	}
+	var probe map[string]json.RawMessage
+	_ = json.Unmarshal(body, &probe)
+	_, po.HasRevision = probe["revision"]
+	_, po.HasLines = probe["lines"]
 	return &po, nil
 }
 
-// closedStatus reports whether a PO status means "no longer accepting
-// invoices".
-//
-// Deny-listed rather than allow-listed, deliberately and unlike the tenant
-// lifecycle check in the envelope resolver. There the risk of admitting an
-// unconsidered state was the whole point; here the opposite risk dominates: a
-// status purchase-order-svc adds later would, under an allow-list, silently
-// start refusing every invoice against every PO in that state. Refusing to pay
-// suppliers is the worse failure, and an unknown status is visible in the data
-// rather than swallowed.
+// OpenQuantity reads AP-03's per-line ordered/received/invoiced quantities.
+func (c *Client) OpenQuantity(ctx context.Context, caller svcclient.Caller, purchaseOrderID string) ([]LineProgress, error) {
+	status, body, err := c.c.Do(ctx, caller, "GET", "/v1/purchase-orders/"+url.PathEscape(purchaseOrderID)+"/open-quantity", nil)
+	if err != nil || status != 200 {
+		return nil, svcclient.ErrUnavailable
+	}
+	var out struct {
+		Lines []LineProgress `json:"lines"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, svcclient.ErrUnavailable
+	}
+	return out.Lines, nil
+}
+
+// ReportProgress pushes invoiced quantity to AP-03. Idempotent on
+// source_ref + kind at the receiving side.
+func (c *Client) ReportProgress(ctx context.Context, caller svcclient.Caller, purchaseOrderID, lineID string, r ProgressReport) error {
+	path := "/v1/purchase-orders/" + url.PathEscape(purchaseOrderID) + "/lines/" + url.PathEscape(lineID) + "/progress"
+	status, _, err := c.c.Do(ctx, caller, "POST", path, r)
+	if err != nil {
+		return svcclient.ErrUnavailable
+	}
+	if status == 200 || status == 201 || status == 202 || status == 204 {
+		return nil
+	}
+	return svcclient.ErrUnavailable
+}
+
 func closedStatus(s string) bool {
-	switch strings.ToUpper(strings.TrimSpace(s)) {
+	switch s {
 	case "CLOSED", "CANCELLED", "CANCELED", "VOIDED", "SUPERSEDED":
 		return true
 	default:
