@@ -1,22 +1,18 @@
-// Package ledger provides a read-only client against general-ledger-svc, used to
-// verify that the books actually account for a receivable before this service
-// records payment against it.
+// Package ledger provides a client against general-ledger-svc:
 //
-// WHAT THIS REPLACED, AND WHY IT MATTERED. The check used to live inline in the
-// handler and did two things wrong. It listed the tenant's ENTIRE finalized
-// register and scanned it client-side for a journal whose correlation_id matched
-// the invoice — an unbounded read that grows with the ledger. And having found
-// one, it accepted it. It never looked at the amount. So a journal for £1
-// discharged a £24,500 receivable, and any principal who could post a journal
-// could mark any invoice paid by posting a trivial one against it. The gate
-// existed, and measured nothing.
+//  1. Read-only Verify — confirms the books account for a receivable before
+//     payment is recorded (existing).
+//  2. Write PostInvoiceIssuedAccountingEvent — posts the issuance accounting
+//     event through GL's system-originated path (POST /v1/postings/events),
+//     using the invoice ID as source_event_id for idempotency (new).
 //
-// The tenant scope travels in X-Tenant-Id — the gateway-auth-svc convention every
-// service here trusts — and the journal id travels as a path segment, path-escaped,
-// never interpolated into a query string.
+// The tenant scope travels in X-Tenant-Id — the gateway-auth-svc convention
+// every service here trusts — and the journal id travels as a path segment,
+// path-escaped, never interpolated into a query string.
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +22,10 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"go.uber.org/zap"
+
+	"zoiko.io/accounts-receivable-svc/internal/domain"
 )
 
 var (
@@ -98,17 +98,20 @@ func ToCents(v float64) int64 { return toCents(v) }
 // Client is the narrow interface the handler depends on.
 type Client interface {
 	Verify(ctx context.Context, tenantID, legalEntityID, invoiceID string, amount float64) error
+	PostInvoiceIssuedAccountingEvent(ctx context.Context, tenantID, principalID string, inv *domain.CustomerInvoice) (journalID string, err error)
 }
 
 type HTTPClient struct {
 	baseURL string
 	http    *http.Client
+	log     *zap.Logger
 }
 
-func NewHTTPClient(baseURL string) *HTTPClient {
+func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 	return &HTTPClient{
 		baseURL: baseURL,
 		http:    &http.Client{Timeout: 3 * time.Second, Transport: newRetryTransport()},
+		log:     log,
 	}
 }
 
@@ -240,4 +243,116 @@ func (c *HTTPClient) getJournal(ctx context.Context, tenantID, journalID string)
 		return nil, fmt.Errorf("%w: decode journal: %v", ErrUnavailable, err)
 	}
 	return &j, nil
+}
+
+// ── Write: PostInvoiceIssuedAccountingEvent ──────────────────────────────────
+//
+// Posts the AR invoice issuance accounting event through general-ledger-svc's
+// system-originated posting path (POST /v1/postings/events).
+//
+// The invoice's InvoiceID is used as source_event_id, making a retried call
+// idempotent against GL's own UNIQUE(tenant_id, source_event_id) constraint.
+//
+// Lines posted (using account mappings registered in GL via ACC-02):
+//   - Debit: AR_RECEIVABLE_STANDARD for inv.Amount (gross)
+//   - Credit: AR_REVENUE_STANDARD for inv.NetAmount
+//   - Credit: AR_TAX_OUTPUT for inv.TaxAmount (only if TaxAmount > 0)
+//
+// The sum of debits equals sum of credits (Amount == NetAmount + TaxAmount),
+// which is already enforced by the invoice's Balances() check.
+//
+// FiscalPeriod is derived from inv.InvoiceDate as "YYYY-MM".
+// DocumentDate and PostingDate are both set to inv.InvoiceDate as "YYYY-MM-DD".
+// TransactionCurrency is inv.CurrencyCode.
+
+type postingEventLine struct {
+	MappingKey   string  `json:"mapping_key"`
+	DebitAmount  float64 `json:"debit_amount,omitempty"`
+	CreditAmount float64 `json:"credit_amount,omitempty"`
+}
+
+type postAccountingEventRequest struct {
+	LegalEntityID       string             `json:"legal_entity_id"`
+	FiscalPeriod        string             `json:"fiscal_period"`
+	Description         string             `json:"description"`
+	SourceEventID       string             `json:"source_event_id"`
+	CorrelationID       string             `json:"correlation_id"`
+	TransactionCurrency string             `json:"transaction_currency"`
+	DocumentDate        string             `json:"document_date"`
+	PostingDate         string             `json:"posting_date"`
+	Lines               []postingEventLine `json:"lines"`
+}
+
+type postingExecutionResponse struct {
+	JournalID *string `json:"journal_id"`
+	Status    string  `json:"status"`
+}
+
+// PostInvoiceIssuedAccountingEvent posts the issuance accounting event for an
+// AR invoice. Returns the created journal ID on success.
+//
+// On non-2xx response from GL, returns an error — caller MUST fail the invoice
+// creation (see handler.CreateInvoice). GL's source_event_id uniqueness makes
+// retry safe even though the invoice row already exists.
+func (c *HTTPClient) PostInvoiceIssuedAccountingEvent(ctx context.Context, tenantID, principalID string, inv *domain.CustomerInvoice) (journalID string, err error) {
+	fiscalPeriod := inv.InvoiceDate.Time.Format("2006-01")
+	documentDate := inv.InvoiceDate.Time.Format("2006-01-02")
+	postingDate := inv.InvoiceDate.Time.Format("2006-01-02")
+
+	description := fmt.Sprintf("AR invoice %s issued", inv.InvoiceNumber)
+
+	lines := []postingEventLine{
+		{MappingKey: "AR_RECEIVABLE_STANDARD", DebitAmount: inv.Amount},
+		{MappingKey: "AR_REVENUE_STANDARD", CreditAmount: inv.NetAmount},
+	}
+	if inv.TaxAmount > 0 {
+		lines = append(lines, postingEventLine{MappingKey: "AR_TAX_OUTPUT", CreditAmount: inv.TaxAmount})
+	}
+
+	body := postAccountingEventRequest{
+		LegalEntityID:       inv.LegalEntityID,
+		FiscalPeriod:        fiscalPeriod,
+		Description:         description,
+		SourceEventID:       inv.InvoiceID,
+		CorrelationID:       inv.CorrelationID,
+		TransactionCurrency: inv.CurrencyCode,
+		DocumentDate:        documentDate,
+		PostingDate:         postingDate,
+		Lines:               lines,
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/postings/events", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to post AR invoice issuance accounting event", zap.Error(err))
+		return "", ErrUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		c.log.Error("GL returned error posting AR issuance event", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+		return "", ErrUnavailable
+	}
+
+	var execResp postingExecutionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&execResp); err != nil {
+		return "", err
+	}
+	if execResp.JournalID == nil {
+		return "", ErrUnavailable
+	}
+	return *execResp.JournalID, nil
 }

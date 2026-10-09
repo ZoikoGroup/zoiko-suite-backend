@@ -127,6 +127,12 @@ type VendorInvoice struct {
 	ValidatedAt                   *time.Time `json:"validated_at,omitempty"`
 	ApprovedAt                    *time.Time `json:"approved_at,omitempty"`
 	PaymentRequestedAt            *time.Time `json:"payment_requested_at,omitempty"`
+
+	// ApprovalJournalID is the journal ID returned by general-ledger-svc when
+	// the invoice approval accounting event was posted (via ACC-14 / GL posting).
+	// Nullable: pre-existing invoices and invoices created before this migration
+	// will not have this populated.
+	ApprovalJournalID *string `json:"approval_journal_id,omitempty"`
 }
 
 // VendorInvoiceLine is one line of a supplier invoice — AP-05's "lines" and

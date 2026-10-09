@@ -37,6 +37,9 @@ type Store interface {
 	// ControlPopulation serves the control-population contract (open-invoices).
 	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
 	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string, paymentDate *domain.CalendarDate, paymentReference *string) (*domain.CustomerInvoice, error)
+	// SetIssuanceJournalID records the GL journal ID returned when the invoice
+	// issuance accounting event was posted (ACC-14).
+	SetIssuanceJournalID(ctx context.Context, tenantID, invoiceID, journalID string) error
 }
 
 // Publisher is the event publisher contract.
@@ -53,9 +56,11 @@ type AuthZClient interface {
 }
 
 // LedgerClient verifies that the books account for an invoice before payment is
-// recorded against it. See internal/ledger.
+// recorded against it, AND posts issuance accounting events to GL (ACC-14).
+// See internal/ledger.
 type LedgerClient interface {
 	Verify(ctx context.Context, tenantID, legalEntityID, invoiceID string, amount float64) error
+	PostInvoiceIssuedAccountingEvent(ctx context.Context, tenantID, principalID string, inv *domain.CustomerInvoice) (journalID string, err error)
 }
 
 // EntityClient reconciles a caller-supplied legal entity with the caller's
@@ -268,6 +273,30 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		// the original invoice, do not re-publish the issued event.
 		writeJSON(w, http.StatusOK, inv)
 		return
+	}
+
+	// Post the issuance accounting event to general-ledger-svc.
+	// This MUST succeed — an invoice that cannot be booked is unpayable
+	// (ReceivePayment hard-requires a FINALIZED journal for the amount).
+	// SourceEventID = inv.InvoiceID makes retry safe against GL's
+	// UNIQUE(tenant_id, source_event_id) constraint.
+	journalID, err := h.ledger.PostInvoiceIssuedAccountingEvent(r.Context(), tenantID, principalID, inv)
+	if err != nil {
+		h.log.Error("CreateInvoice: failed to post accounting event — invoice exists but is not yet booked",
+			zap.String("invoice_id", inv.InvoiceID), zap.Error(err))
+		// Fail the request so the caller knows to retry. Do not leave an
+		// unpayable invoice in the system.
+		writeError(w, http.StatusServiceUnavailable, "ledger_posting_failed",
+			"invoice created but accounting event could not be posted; retry the request")
+		return
+	}
+
+	// Store the journal ID on the invoice for audit traceability.
+	inv.IssuanceJournalID = &journalID
+	if err := h.store.SetIssuanceJournalID(r.Context(), tenantID, inv.InvoiceID, journalID); err != nil {
+		h.log.Error("CreateInvoice: invoice posted but failed to store journal ID",
+			zap.String("invoice_id", inv.InvoiceID), zap.String("journal_id", journalID), zap.Error(err))
+		// The journal exists in GL; this is an audit-only failure. Log and continue.
 	}
 
 	writeJSON(w, http.StatusCreated, inv)
