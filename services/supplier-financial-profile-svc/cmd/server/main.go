@@ -21,6 +21,8 @@ import (
 	"zoiko.io/supplier-financial-profile-svc/internal/handler"
 	"zoiko.io/supplier-financial-profile-svc/internal/health"
 	"zoiko.io/supplier-financial-profile-svc/internal/middleware"
+	"zoiko.io/supplier-financial-profile-svc/internal/outbox"
+	"zoiko.io/supplier-financial-profile-svc/internal/payee"
 	"zoiko.io/supplier-financial-profile-svc/internal/store"
 )
 
@@ -61,7 +63,16 @@ func main() {
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	// Domain events are written to outbox_events inside each command transaction;
+	// the relay publishes them to Kafka (at-least-once).
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	if pool != nil {
+		relay := outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger)
+		go relay.Start(relayCtx)
+	}
+
+	h := handler.New(pgStore, authzClient, payee.NewHTTPClient(cfg.PayeeIdentityServiceURL, logger), logger)
+	h.AllowServiceReads = cfg.AllowServiceReads
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -96,6 +107,7 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down supplier-financial-profile-svc gracefully...")
+	relayCancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
