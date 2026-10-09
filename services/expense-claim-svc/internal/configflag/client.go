@@ -33,7 +33,10 @@ import (
 
 var ErrServiceUnavailable = errors.New("configuration-feature-flag-svc unavailable")
 
-const receiptThresholdKey = "RECEIPT_REQUIRED_THRESHOLD"
+const (
+	receiptThresholdKey = "RECEIPT_REQUIRED_THRESHOLD"
+	termsDaysKey        = "EXPENSE_REIMBURSEMENT_TERMS_DAYS"
+)
 
 type Client interface {
 	// ResolveReceiptThreshold looks up RECEIPT_REQUIRED_THRESHOLD for
@@ -42,6 +45,12 @@ type Client interface {
 	// either scope — a legitimate, non-error outcome. found=false with a
 	// non-nil err means the registry could not be consulted at all.
 	ResolveReceiptThreshold(ctx context.Context, environment, tenantID string) (threshold float64, found bool, err error)
+
+	// ResolveReimbursementTermsDays looks up EXPENSE_REIMBURSEMENT_TERMS_DAYS —
+	// the payment term, in days after approval, of the payable an approved claim
+	// creates — with the same tenant-then-global resolution and the same
+	// found/err semantics as ResolveReceiptThreshold.
+	ResolveReimbursementTermsDays(ctx context.Context, environment, tenantID string) (days float64, found bool, err error)
 }
 
 type HTTPClient struct {
@@ -54,13 +63,22 @@ func NewHTTPClient(baseURL string) *HTTPClient {
 }
 
 func (c *HTTPClient) ResolveReceiptThreshold(ctx context.Context, environment, tenantID string) (float64, bool, error) {
-	if threshold, found, err := c.get(ctx, environment, tenantID, true); found || err != nil {
-		return threshold, found, err
+	return c.resolve(ctx, receiptThresholdKey, environment, tenantID)
+}
+
+func (c *HTTPClient) ResolveReimbursementTermsDays(ctx context.Context, environment, tenantID string) (float64, bool, error) {
+	return c.resolve(ctx, termsDaysKey, environment, tenantID)
+}
+
+// resolve tries the tenant-scoped row, then the global default.
+func (c *HTTPClient) resolve(ctx context.Context, key, environment, tenantID string) (float64, bool, error) {
+	if v, found, err := c.get(ctx, key, environment, tenantID, true); found || err != nil {
+		return v, found, err
 	}
 	// No tenant-scoped override — try the global default (nil tenant_id
 	// in the query). The caller's own tenant is still the verified
 	// X-Tenant-Id on this request; only the query scope changes.
-	return c.get(ctx, environment, tenantID, false)
+	return c.get(ctx, key, environment, tenantID, false)
 }
 
 // get performs one lookup. tenantID is always the caller's own verified
@@ -69,7 +87,7 @@ func (c *HTTPClient) ResolveReceiptThreshold(ctx context.Context, environment, t
 // all, even a request asking about the global default. scoped controls
 // only whether the query itself asks about tenantID's row (true) or the
 // global row (false, omits ?tenant_id=).
-func (c *HTTPClient) get(ctx context.Context, environment, tenantID string, scoped bool) (float64, bool, error) {
+func (c *HTTPClient) get(ctx context.Context, key, environment, tenantID string, scoped bool) (float64, bool, error) {
 	q := url.Values{}
 	q.Set("environment", environment)
 	if scoped {
@@ -77,7 +95,7 @@ func (c *HTTPClient) get(ctx context.Context, environment, tenantID string, scop
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		c.baseURL+"/v1/config/"+receiptThresholdKey+"?"+q.Encode(), nil)
+		c.baseURL+"/v1/config/"+key+"?"+q.Encode(), nil)
 	if err != nil {
 		return 0, false, err
 	}
