@@ -1,8 +1,9 @@
 package domain
 
 import (
-	"fmt"
 	"encoding/json"
+	"fmt"
+	"math"
 	"time"
 )
 
@@ -286,7 +287,10 @@ func BuildAccountingPosting(inv *VendorInvoice, correlationID string, keys Posti
 		SourceEventID: inv.InvoiceID, CorrelationID: correlationID,
 		TransactionCurrency: inv.CurrencyCode, DocumentDate: inv.InvoiceDate.Time.UTC().Format("2006-01-02"),
 	}
-	p.Lines = append(p.Lines, line(keys.Expense, inv.NetAmount, "net", debitSide))
+	// Net is derived as gross minus tax so the posting always balances, including for a
+	// pre-contract invoice that carries only a gross amount.
+	net := math.Round((inv.Amount-inv.TaxAmount)*100) / 100
+	p.Lines = append(p.Lines, line(keys.Expense, net, "net", debitSide))
 	if inv.TaxAmount > 0 {
 		p.Lines = append(p.Lines, line(keys.TaxInput, inv.TaxAmount, "tax", debitSide))
 	}

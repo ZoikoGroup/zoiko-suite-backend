@@ -47,7 +47,7 @@ func finalizedJournal(t *testing.T, ctx context.Context, s *store.PgStore, tenan
 
 func TestPgStore_ACC05_FinalizingJournal_AppendsLedgerEntries_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -75,7 +75,7 @@ func TestPgStore_ACC05_FinalizingJournal_AppendsLedgerEntries_RealDB(t *testing.
 // nothing this service's own code path could have prevented — must fail.
 func TestPgStore_ACC05_LedgerEntries_RejectsUpdateAndDelete_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -105,7 +105,7 @@ func TestPgStore_ACC05_LedgerEntries_RejectsUpdateAndDelete_RealDB(t *testing.T)
 
 func TestPgStore_ACC05_DuplicateFinalize_AppendsOnce_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -132,7 +132,7 @@ func TestPgStore_ACC05_DuplicateFinalize_AppendsOnce_RealDB(t *testing.T) {
 
 func TestPgStore_ACC05_RebuildDerivedBalanceProjection_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)

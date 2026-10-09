@@ -71,6 +71,10 @@ spec:
           value: "general-ledger-svc"
         - name: KAFKA_EVENTS_TOPIC
           value: "zoiko.general-ledger.events"
+        # Required, no default: the residencyregion every journal event
+        # carries (ZS-EVENT-001 §4). Set to the cluster's real region code.
+        - name: EVENT_RESIDENCY_REGION
+          value: "local"
         # In-cluster DNS name for authorization-svc.
         # Config default is "http://authorization-svc:8089" which is the compose
         # short name and would NXDOMAIN inside K8s — override explicitly here.

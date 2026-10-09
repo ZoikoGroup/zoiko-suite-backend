@@ -60,7 +60,7 @@ var mutableColumns = []string{
 	"extracted_bank_details", "payee_state", "payee_check",
 	"supplier_profile_id", "supplier_profile_version", "po_revision",
 	"match_required", "match_cleared", "match_run_id",
-	"payable_id", "accounting_event_id",
+	"payable_id", "accounting_event_id", "approval_journal_id",
 }
 
 // invoiceColumns is the single source of truth for the read shape. Every SELECT
@@ -99,7 +99,7 @@ func scanRefs(inv *domain.VendorInvoice, r *raw) []any {
 		&r.bank, &r.payee, &r.payeeCheck,
 		&inv.SupplierProfileID, &inv.SupplierProfileVersion, &inv.PORevision,
 		&inv.MatchRequired, &inv.MatchCleared, &inv.MatchRunID,
-		&inv.PayableID, &inv.AccountingEventID,
+		&inv.PayableID, &inv.AccountingEventID, &inv.ApprovalJournalID,
 		// version
 		&inv.Version,
 	}
@@ -179,7 +179,7 @@ func mutableValues(inv *domain.VendorInvoice) []any {
 		jsonOrNil(inv.ExtractedBankDetails, inv.ExtractedBankDetails == nil), string(inv.PayeeState), jsonOrNil(inv.PayeeCheck, inv.PayeeCheck == nil),
 		inv.SupplierProfileID, inv.SupplierProfileVersion, inv.PORevision,
 		inv.MatchRequired, inv.MatchCleared, inv.MatchRunID,
-		inv.PayableID, inv.AccountingEventID,
+		inv.PayableID, inv.AccountingEventID, inv.ApprovalJournalID,
 	}
 }
 
@@ -251,6 +251,7 @@ func mapPgError(err error) error {
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+	keys domain.PostingMappingKeys
 }
 
 func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
@@ -715,4 +716,15 @@ func firstNonEmpty(v ...string) string {
 		}
 	}
 	return ""
+}
+
+// SetApprovalJournalID records the GL journal ID returned when the invoice
+// approval accounting event was posted (ACC-14).
+func (s *PgStore) SetApprovalJournalID(ctx context.Context, tenantID, invoiceID, journalID string) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE vendor_invoices SET approval_journal_id = $1 WHERE invoice_id = $2 AND tenant_id = $3`,
+			journalID, invoiceID, tenantID)
+		return err
+	})
 }

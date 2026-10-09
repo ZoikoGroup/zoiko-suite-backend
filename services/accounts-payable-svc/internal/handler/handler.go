@@ -500,6 +500,7 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
+
 	// vendor.invoice.approved is written to the outbox inside TransitionInvoice
 	// (ZS-STATE-001), so it is not published here as well.
 	//

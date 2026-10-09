@@ -113,6 +113,16 @@ func (s *stubStore) TransitionInvoice(_ context.Context, _, invoiceID string, fr
 	return nil
 }
 
+// SetApprovalJournalID stores the GL journal ID on the invoice (test stub).
+func (s *stubStore) SetApprovalJournalID(_ context.Context, _, invoiceID, journalID string) error {
+	inv, ok := s.invoices[invoiceID]
+	if !ok {
+		return nil
+	}
+	inv.ApprovalJournalID = &journalID
+	return nil
+}
+
 type stubPublisher struct {
 	received, validated, approved, paymentRequested int
 }

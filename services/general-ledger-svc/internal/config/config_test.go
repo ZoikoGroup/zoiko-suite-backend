@@ -9,6 +9,7 @@ import (
 )
 
 func TestLoad_PeriodGateDefaults(t *testing.T) {
+	t.Setenv("EVENT_RESIDENCY_REGION", "uk") // required since the shared eventing outbox (main)
 	t.Setenv("PERIOD_GATE_MODE", "")
 	t.Setenv("PERIOD_GATE_SHADOW_TIMEOUT", "")
 	t.Setenv("ACCOUNTING_PERIOD_URL", "")
@@ -23,6 +24,7 @@ func TestLoad_PeriodGateDefaults(t *testing.T) {
 }
 
 func TestLoad_ShadowAndOffAccepted(t *testing.T) {
+	t.Setenv("EVENT_RESIDENCY_REGION", "uk") // required since the shared eventing outbox (main)
 	for _, m := range []string{"off", "shadow", " Shadow ", "OFF"} {
 		t.Setenv("PERIOD_GATE_MODE", m)
 		c, err := config.Load()
@@ -36,6 +38,7 @@ func TestLoad_ShadowAndOffAccepted(t *testing.T) {
 }
 
 func TestLoad_EnforceAndGarbageRejectedAtStartup(t *testing.T) {
+	t.Setenv("EVENT_RESIDENCY_REGION", "uk") // required since the shared eventing outbox (main)
 	for _, m := range []string{"enforce", "ENFORCE", "on", "true", "shadow,enforce", "garbage"} {
 		t.Setenv("PERIOD_GATE_MODE", m)
 		c, err := config.Load()
@@ -49,6 +52,7 @@ func TestLoad_EnforceAndGarbageRejectedAtStartup(t *testing.T) {
 }
 
 func TestLoad_BadShadowTimeoutRejected(t *testing.T) {
+	t.Setenv("EVENT_RESIDENCY_REGION", "uk") // required since the shared eventing outbox (main)
 	for _, v := range []string{"abc", "0", "-5ms", "300"} {
 		t.Setenv("PERIOD_GATE_MODE", "shadow")
 		t.Setenv("PERIOD_GATE_SHADOW_TIMEOUT", v)

@@ -1578,8 +1578,9 @@ services:
   # enforces tenant isolation, same posture as tenant-entity-registry-svc.
   general-ledger-svc:
     build:
-      context: ../services/general-ledger-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: general-ledger-svc/Dockerfile
     container_name: general-ledger-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1602,6 +1603,8 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.general-ledger.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
@@ -2600,6 +2603,18 @@ services:
       # FINCTRL_CLOSE_GATE_MODE=enforce; off until mandatory controls are configured.
       FINCTRL_SERVICE_URL: "http://financial-control-svc:8171"
       FINCTRL_CLOSE_GATE_MODE: "off"
+      # ACC-06: close requires the period's latest AR and AP subledger-to-GL
+      # control runs to have MATCHED. Default enforce; "off" only while the
+      # AR/AP control-account mappings are not configured.
+      SUBLEDGER_CONTROL_GATE_MODE: "enforce"
+      # ACC-14 bank recon: every operational bank account (treasury) needs a
+      # certified reconciliation (bank-reconciliation) for a statement dated in
+      # the period, within BANK_RECON_CUTOFF_DAYS of period end. "off" only
+      # where no bank feed exists yet.
+      TREASURY_SERVICE_URL: "http://treasury-svc:8103"
+      BANK_RECONCILIATION_SERVICE_URL: "http://bank-reconciliation-svc:8102"
+      BANK_RECON_GATE_MODE: "enforce"
+      BANK_RECON_CUTOFF_DAYS: "4"
       # The three topics this service's own ACC-18 lineage Kafka consumer
       # subscribes to (asset-management-svc's, inventory-management-svc's
       # and project-accounting-svc's own events topics) — satisfies the

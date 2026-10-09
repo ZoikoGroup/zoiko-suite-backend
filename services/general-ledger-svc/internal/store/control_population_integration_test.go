@@ -27,7 +27,7 @@ func newCPFixture(t *testing.T) *cpFixture {
 	pool := openTestPool(t)
 	tenant := uuid.New().String()
 	return &cpFixture{
-		s:      store.New(pool, zap.NewNop()),
+		s:      store.New(pool, zap.NewNop(), store.WithEventRegion("uk")),
 		tenant: tenant,
 		entity: uuid.New().String(),
 		ctx:    svcmiddleware.WithTenant(context.Background(), tenant),

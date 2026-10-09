@@ -187,7 +187,7 @@ func (h *Handler) MirrorPeriodToPeriodService(w http.ResponseWriter, r *http.Req
 	}
 
 	// The readiness snapshot of a replay is computed now, as of the replay.
-	issues, err := h.checkReadiness(r.Context(), tenantID, principalID, fp)
+	issues, _, err := h.checkReadiness(r.Context(), tenantID, principalID, fp, nil)
 	if err != nil {
 		h.log.Error("mirror replay: readiness could not be computed", zap.String("period_id", id), zap.Error(err))
 		resp.Actions = append(resp.Actions, h.mirror.Fail(domain.WorkflowCmdSoftClose, periodmirror.ReasonReadinessUnavail))

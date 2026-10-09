@@ -278,7 +278,7 @@ func (s *PgStore) FinishPayableRequest(ctx context.Context, requestID, status, p
 	_, err := s.pool.Exec(ctx, `
 		UPDATE payable_creation_requests SET status = $2, payable_id = COALESCE(NULLIF($3, ''), payable_id), last_error = NULLIF($4, ''),
 			next_attempt_at = $5, locked_until = NULL,
-			completed_at = CASE WHEN $2 IN ('CREATED','BLOCKED','DEAD') THEN now() ELSE NULL END
+			completed_at = CASE WHEN $2::text IN ('CREATED','BLOCKED','DEAD') THEN now() ELSE NULL END
 		WHERE request_id::text = $1`, requestID, status, payableID, lastError, retryAt)
 	return err
 }
@@ -332,9 +332,9 @@ func (s *PgStore) ClaimPostingRequests(ctx context.Context, limit int, lease tim
 
 func (s *PgStore) FinishPostingRequest(ctx context.Context, requestID, status, executionID, lastError string, retryAt time.Time) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE accounting_posting_requests SET status = $2, posting_execution_id = COALESCE(NULLIF($3, ''), posting_execution_id),
+		UPDATE accounting_posting_requests SET status = $2::varchar, posting_execution_id = COALESCE(NULLIF($3, ''), posting_execution_id),
 			last_error = NULLIF($4, ''), next_attempt_at = $5, locked_until = NULL, updated_at = now(),
-			completed_at = CASE WHEN $2 IN ('POSTED','FAILED','QUARANTINED') THEN now() ELSE NULL END
+			completed_at = CASE WHEN $2::text IN ('POSTED','FAILED','QUARANTINED') THEN now() ELSE NULL END
 		WHERE request_id::text = $1`, requestID, status, executionID, lastError, retryAt)
 	return err
 }

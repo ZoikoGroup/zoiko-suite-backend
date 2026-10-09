@@ -23,8 +23,11 @@ import (
 // ── stubs ────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	lines         map[string]*domain.StatementLine
-	byCorrelation map[string]string
+	periodStatus     []domain.AccountReconciliationStatus
+	periodStatusErr  error
+	periodStatusArgs []string
+	lines            map[string]*domain.StatementLine
+	byCorrelation    map[string]string
 
 	createErr      error
 	getErr         error
@@ -285,6 +288,10 @@ func (s *stubStore) StartRun(_ context.Context, _ string, req domain.StartRunReq
 	}
 	return &domain.ReconciliationRun{RunID: "run-1", TenantID: req.TenantID, LegalEntityID: req.LegalEntityID,
 		BankAccountID: req.BankAccountID, StatementDate: req.StatementDate, Status: domain.RunStatusDraft}, true, nil
+}
+func (s *stubStore) PeriodReconciliationStatus(_ context.Context, tenantID, entity, start, end string) ([]domain.AccountReconciliationStatus, error) {
+	s.periodStatusArgs = []string{tenantID, entity, start, end}
+	return s.periodStatus, s.periodStatusErr
 }
 func (s *stubStore) GetRun(_ context.Context, _, _ string) (*domain.ReconciliationRun, error) {
 	if s.getRunErr != nil {

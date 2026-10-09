@@ -148,6 +148,11 @@ func (s *PgStore) TransitionInvoice(ctx context.Context, tenantID, invoiceID str
 			}
 			inv.ApprovedByPrincipalID, inv.ApprovedAt = &actor, &now
 			mut.Command = "ApproveSupplierInvoice"
+			// The accounting obligation commits WITH the approval: one durable ACC-04 request
+			// per invoice (idempotent on source_event_id = invoice id), delivered by the
+			// accounting dispatcher with retry and quarantine.
+			posting := domain.BuildAccountingPosting(inv, mut.CorrelationID, s.postingKeys())
+			mut.AccountingPosting = &posting
 			mut.Events = []domain.OutboxEvent{{EventType: "vendor.invoice.approved", Payload: map[string]any{"invoice_id": inv.InvoiceID}}}
 
 		case domain.InvoiceStatusPaymentRequested:
@@ -166,4 +171,25 @@ func (s *PgStore) TransitionInvoice(ctx context.Context, tenantID, invoiceID str
 		return mut, nil
 	})
 	return err
+}
+
+// WithPostingMappingKeys sets the ACC-02 mapping keys approvals post against. Left
+// unset, domain.DefaultPostingMappingKeys applies.
+func (s *PgStore) WithPostingMappingKeys(k domain.PostingMappingKeys) *PgStore {
+	s.keys = k
+	return s
+}
+
+func (s *PgStore) postingKeys() domain.PostingMappingKeys {
+	d := domain.DefaultPostingMappingKeys()
+	if s.keys.Expense != "" {
+		d.Expense = s.keys.Expense
+	}
+	if s.keys.TaxInput != "" {
+		d.TaxInput = s.keys.TaxInput
+	}
+	if s.keys.PayableControl != "" {
+		d.PayableControl = s.keys.PayableControl
+	}
+	return d
 }

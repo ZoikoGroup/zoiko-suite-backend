@@ -792,3 +792,84 @@ func (s *PgStore) ListUnmatchedLinesInPopulation(ctx context.Context, tenantID, 
 	}
 	return lines, nil
 }
+
+// PeriodReconciliationStatus returns, per bank account of the entity with any
+// run whose statement date falls in [periodStart, periodEnd]:
+//
+//   - the latest CERTIFIED, non-superseded run in the period (latest by
+//     statement date, then by certification time) — the proof;
+//   - the latest run of any status other than SUPERSEDED — the explanation
+//     when there is no proof, or the proof is older than the latest attempt.
+//
+// Accounts with no run in the period are absent; the caller knows the
+// entity's accounts (treasury) and reports those as unreconciled.
+func (s *PgStore) PeriodReconciliationStatus(ctx context.Context, tenantID, legalEntityID, periodStart, periodEnd string) ([]domain.AccountReconciliationStatus, error) {
+	byAccount := map[string]*domain.AccountReconciliationStatus{}
+	var order []string
+	get := func(id string) *domain.AccountReconciliationStatus {
+		if a, ok := byAccount[id]; ok {
+			return a
+		}
+		a := &domain.AccountReconciliationStatus{BankAccountID: id}
+		byAccount[id] = a
+		order = append(order, id)
+		return a
+	}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		for _, q := range []struct {
+			certified bool
+			sql       string
+		}{
+			{true, `
+				SELECT DISTINCT ON (bank_account_id)
+				       bank_account_id::text, run_id::text, statement_date::text, status,
+				       certified_at, certified_by_principal_id
+				  FROM reconciliation_runs
+				 WHERE tenant_id = $1 AND legal_entity_id = $2
+				   AND statement_date BETWEEN $3::date AND $4::date
+				   AND status = 'CERTIFIED' AND superseded_by_run_id IS NULL
+				 ORDER BY bank_account_id, statement_date DESC, certified_at DESC NULLS LAST, run_id`},
+			{false, `
+				SELECT DISTINCT ON (bank_account_id)
+				       bank_account_id::text, run_id::text, statement_date::text, status,
+				       certified_at, certified_by_principal_id
+				  FROM reconciliation_runs
+				 WHERE tenant_id = $1 AND legal_entity_id = $2
+				   AND statement_date BETWEEN $3::date AND $4::date
+				   AND status <> 'SUPERSEDED'
+				 ORDER BY bank_account_id, statement_date DESC, created_at DESC, run_id`},
+		} {
+			rows, err := tx.Query(ctx, q.sql, tenantID, legalEntityID, periodStart, periodEnd)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var account string
+				var d domain.RunStatusDigest
+				if err := rows.Scan(&account, &d.RunID, &d.StatementDate, &d.Status, &d.CertifiedAt, &d.CertifiedByPrincipalID); err != nil {
+					rows.Close()
+					return err
+				}
+				digest := d
+				if q.certified {
+					get(account).LatestCertified = &digest
+				} else {
+					get(account).LatestRun = &digest
+				}
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	out := make([]domain.AccountReconciliationStatus, 0, len(order))
+	for _, id := range order {
+		out = append(out, *byAccount[id])
+	}
+	return out, nil
+}

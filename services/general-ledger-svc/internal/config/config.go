@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -16,6 +17,13 @@ type Config struct {
 	DB DBConfig
 
 	Kafka KafkaConfig
+
+	// EventResidencyRegion is the residencyregion every event this service
+	// emits carries (ZS-EVENT-001 §4: required, "authoritative regional
+	// data-bearing context"). Deliberately NO default: a wrong region silently
+	// stamped on every financial event is worse than refusing to start.
+	// EVENT_RESIDENCY_REGION, a lower-case code such as "uk" or "eu-west".
+	EventResidencyRegion string
 
 	// AuthZServiceURL is the base URL of authorization-svc. Every mutating
 	// journal action (create/validate/post/reverse) is checked against it
@@ -92,8 +100,13 @@ func Load() (*Config, error) {
 		}
 		timeout = d
 	}
+	region := os.Getenv("EVENT_RESIDENCY_REGION")
+	if region == "" {
+		return nil, errors.New("EVENT_RESIDENCY_REGION is required (e.g. uk, eu-west): every emitted event must carry its residency region")
+	}
 	return &Config{
-		Env: env("ENV", "local"),
+		EventResidencyRegion: region,
+		Env:                  env("ENV", "local"),
 		// 8098: 8080-8097 are already taken by every other service built so
 		// far (search-indexer-svc claimed 8096, workflow-history-svc claimed
 		// 8097 on a sibling in-flight branch) — see services/README.md.

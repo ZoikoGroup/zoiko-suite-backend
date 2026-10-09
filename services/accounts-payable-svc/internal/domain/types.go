@@ -192,6 +192,10 @@ type VendorInvoice struct {
 
 	PayableID         *string `json:"payable_id,omitempty"`
 	AccountingEventID *string `json:"accounting_event_id,omitempty"`
+
+	// ApprovalJournalID is the general-ledger journal the approval posting produced
+	// (ACC-14 audit link). Nil until the posting queue reports POSTED.
+	ApprovalJournalID *string `json:"approval_journal_id,omitempty"`
 }
 
 // VendorInvoiceLine is one line of a supplier invoice — AP-05's "lines" and

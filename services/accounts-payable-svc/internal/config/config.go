@@ -47,6 +47,17 @@ type Config struct {
 	// GoodsReceiptServiceURL is AP-04 (received-to-date), the third leg of a
 	// three-way match. Missing receipt evidence yields an INCOMPLETE match.
 	GoodsReceiptServiceURL string
+	// LedgerServiceURL is general-ledger-svc, where the accounting dispatcher posts
+	// approvals (ACC-04 POST /v1/postings/events, idempotent on the invoice id).
+	LedgerServiceURL string
+
+	// AccountingPrincipalID is the service identity granted GL_POSTING_EXECUTE. When
+	// empty each posting is made as the principal who approved the invoice.
+	AccountingPrincipalID string
+
+	// ACC-02 mapping keys approvals post against. They must be configured in the
+	// general ledger; nothing here invents an account.
+	PostingKeyExpense, PostingKeyTaxInput, PostingKeyPayableControl string
 
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
@@ -117,6 +128,11 @@ func Load() (*Config, error) {
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		PurchaseOrderServiceURL:  env("PURCHASE_ORDER_URL", "http://purchase-order-svc:8129"),
 		GoodsReceiptServiceURL:   env("GOODS_RECEIPT_URL", "http://goods-service-receipt-svc:8157"),
+		LedgerServiceURL:         env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		AccountingPrincipalID:    env("ACCOUNTING_PRINCIPAL_ID", ""),
+		PostingKeyExpense:        env("AP_POSTING_KEY_EXPENSE", "AP_EXPENSE"),
+		PostingKeyTaxInput:       env("AP_POSTING_KEY_TAX_INPUT", "AP_TAX_INPUT"),
+		PostingKeyPayableControl: env("AP_POSTING_KEY_PAYABLE_CONTROL", "AP_PAYABLE_CONTROL"),
 	}
 
 	if err := cfg.validate(); err != nil {

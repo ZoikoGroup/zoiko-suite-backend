@@ -52,6 +52,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	// AP-06 tables reference vendor_invoices; drop them first so the migration re-creates them cleanly.
+	// The queues are cross-tenant and not FK-bound after the CASCADE drop, so rows would leak between tests.
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS accounting_posting_requests, payable_creation_requests CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS invoice_match_exceptions, invoice_match_lines, invoice_match_runs, match_policy_versions CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS vendor_invoices CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox_events CASCADE;`)
@@ -610,5 +612,78 @@ func TestPgStore_TransitionInvoice_OutboxAtomicity(t *testing.T) {
 	}
 	if paymentCount != 1 {
 		t.Fatalf("expected 1 payment.requested outbox event, got %d", paymentCount)
+	}
+}
+
+// TestPgStore_SetApprovalJournalID_RoundTripsThroughGetInvoice proves the
+// ACC-04 audit link actually persists against a real column, not a stub map.
+// Before this test, SetApprovalJournalID had zero coverage anywhere in this
+// service — the handler's ApproveInvoice calls it right after posting the
+// invoice's accounting event to general-ledger-svc.
+func TestPgStore_SetApprovalJournalID_RoundTripsThroughGetInvoice(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	inv := newTestInvoice(tenantID)
+	if _, err := s.CreateInvoice(ctx, inv, nil); err != nil {
+		t.Fatalf("CreateInvoice failed: %v", err)
+	}
+
+	got, err := s.GetInvoice(ctx, inv.InvoiceID)
+	if err != nil {
+		t.Fatalf("GetInvoice failed: %v", err)
+	}
+	if got.ApprovalJournalID != nil {
+		t.Fatalf("expected a freshly created invoice to have no approval_journal_id yet, got %q", *got.ApprovalJournalID)
+	}
+
+	const journalID = "j-integration-1"
+	if err := s.SetApprovalJournalID(ctx, tenantID, inv.InvoiceID, journalID); err != nil {
+		t.Fatalf("SetApprovalJournalID failed: %v", err)
+	}
+
+	got, err = s.GetInvoice(ctx, inv.InvoiceID)
+	if err != nil {
+		t.Fatalf("GetInvoice after SetApprovalJournalID failed: %v", err)
+	}
+	if got.ApprovalJournalID == nil {
+		t.Fatal("approval_journal_id did not survive a reload from Postgres — it is nil")
+	}
+	if *got.ApprovalJournalID != journalID {
+		t.Fatalf("approval_journal_id = %q, want %q", *got.ApprovalJournalID, journalID)
+	}
+}
+
+// TestPgStore_SetApprovalJournalID_WrongTenant_IsNoop proves the tenant
+// predicate in SetApprovalJournalID's UPDATE actually scopes the write — a
+// caller holding another tenant's invoice_id must not be able to stamp a
+// journal link onto a row it doesn't own.
+func TestPgStore_SetApprovalJournalID_WrongTenant_IsNoop(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	ownerTenant := uuid.New().String()
+	otherTenant := uuid.New().String()
+	ctxOwner := svcmiddleware.WithTenant(context.Background(), ownerTenant)
+
+	inv := newTestInvoice(ownerTenant)
+	if _, err := s.CreateInvoice(ctxOwner, inv, nil); err != nil {
+		t.Fatalf("CreateInvoice failed: %v", err)
+	}
+
+	if err := s.SetApprovalJournalID(context.Background(), otherTenant, inv.InvoiceID, "j-intruder"); err != nil {
+		t.Fatalf("SetApprovalJournalID under the wrong tenant returned an error instead of a silent no-op: %v", err)
+	}
+
+	got, err := s.GetInvoice(ctxOwner, inv.InvoiceID)
+	if err != nil {
+		t.Fatalf("GetInvoice failed: %v", err)
+	}
+	if got.ApprovalJournalID != nil {
+		t.Fatalf("ISOLATION FAILURE: SetApprovalJournalID under tenant %q stamped a journal onto tenant %q's invoice: %q",
+			otherTenant, ownerTenant, *got.ApprovalJournalID)
 	}
 }
