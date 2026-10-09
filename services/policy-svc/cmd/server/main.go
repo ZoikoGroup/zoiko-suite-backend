@@ -26,14 +26,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/config"
+	"zoiko.io/policy-svc/internal/consumer"
 	"zoiko.io/policy-svc/internal/decisionlog"
 	svcenvelope "zoiko.io/policy-svc/internal/envelope"
 	"zoiko.io/policy-svc/internal/handler"
 	"zoiko.io/policy-svc/internal/health"
+	"zoiko.io/policy-svc/internal/outbox"
 	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 	"zoiko.io/policy-svc/internal/store"
 	"zoiko.io/policy-svc/internal/telemetry"
@@ -104,10 +107,37 @@ func main() {
 	}
 	log.Info("db pool connected")
 
+	// ── 3b. Kafka producer & outbox worker ────────────────────────────────────
+	kafkaWriter := &kafka.Writer{
+		Addr:         kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:        cfg.Kafka.Topic,
+		Balancer:     &kafka.LeastBytes{},
+		BatchSize:    100,
+		BatchTimeout: 10 * time.Millisecond,
+		RequiredAcks: kafka.RequireAll,
+		Async:        false,
+	}
+	defer func() {
+		if err := kafkaWriter.Close(); err != nil {
+			log.Error("kafka writer close failed", zap.Error(err))
+		}
+	}()
+
+	outboxWorker := outbox.NewWorker(pool, kafkaWriter, cfg.Kafka.Topic, log)
+	outboxWorker.Start(context.Background())
+	defer outboxWorker.Stop()
+
 	// ── 4. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
 
-	decisionLogClient := decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL)
+	// ── 4b. Kafka consumer for external events ────────────────────────────────
+	consumerCfg := consumer.DefaultConsumerConfig(cfg.Kafka.Brokers, cfg.Kafka.GroupID)
+	consumerHandler := consumer.NewHandler(pgStore, log)
+	consumer := consumer.NewConsumer(consumerCfg, consumerHandler, log)
+	consumer.Start(context.Background())
+	defer consumer.Stop()
+
+	decisionLogClient := decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL, cfg.AuthZPlatformScopeID)
 
 	// AuthZ client. Refuses to start in production/staging against a
 	// placeholder URL — no service may silently fall back to permit-all.
@@ -148,6 +178,9 @@ func main() {
 			return true
 		}
 	}
+	// LegalEntityID is not universally required: global policy creation (POST /v1/policies)
+	// has no legal entity, and version creation validates the header against the body.
+	envelopePolicy.LegalEntityID = svcenvelope.NotRequired
 	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, decisionLogClient, authzClient, cfg.AuthZPlatformScopeID, log)

@@ -77,6 +77,14 @@ type Metrics struct {
 	// ReadinessUp is the source for the ReadinessProbeFailing alert rule.
 	// 1 if the last /readyz check returned 200, 0 otherwise.
 	ReadinessUp prometheus.Gauge
+	// OutboxPublishFailuresTotal counts outbox events whose producer write
+	// failed (audit X3: "no metric exists to alert on it"). A rising value
+	// means events committed to the local DB are being lost to the broker.
+	OutboxPublishFailuresTotal *prometheus.CounterVec
+	// OutboxPendingEvents is the most recent outbox depth — the lag between
+	// what is committed and what has reached the broker. Source for an
+	// alert on a stalled OutboxWorker.
+	OutboxPendingEvents prometheus.Gauge
 }
 
 // NewMetrics constructs and registers this service's Prometheus
@@ -100,8 +108,18 @@ func NewMetrics(serviceName string) *Metrics {
 			Help:        "1 if the last /readyz check succeeded, 0 otherwise.",
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
+		OutboxPublishFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "outbox_publish_failures_total",
+			Help:        "Total outbox publishes that failed to reach the broker.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}, []string{"event_type"}),
+		OutboxPendingEvents: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "outbox_pending_events",
+			Help:        "Depth of the outbox: events committed but not yet published.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}),
 	}
-	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp)
+	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp, m.OutboxPublishFailuresTotal, m.OutboxPendingEvents)
 	return m
 }
 

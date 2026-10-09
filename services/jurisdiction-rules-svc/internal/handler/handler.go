@@ -17,6 +17,7 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
+	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 	"zoiko.io/jurisdiction-rules-svc/internal/resolver"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
@@ -40,8 +41,10 @@ type JurisdictionStore interface {
 	CreateJurisdictionWithQuerier(ctx context.Context, q store.Querier, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
 
 	// DeactivateJurisdiction sets active_flag=false and updates audit columns.
-	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error)
-	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, error)
+	// The bool reports whether anything actually changed (false = already
+	// deactivated; an idempotent replay that must not re-publish).
+	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
+	DeactivateJurisdictionWithQuerier(ctx context.Context, q store.Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
 
 	// FindRuleByID looks up a rule by ID.
 	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
@@ -208,6 +211,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rule-pack", h.GetRulePack)
 	r.Get("/v1/rules/{jurisdiction_rule_id}", h.GetRule)
 	r.Get("/v1/rules/{jurisdiction_rule_id}/drift-events", h.GetDriftEvents)
+	r.Get("/v1/rules/{jurisdiction_rule_id}/status-history", h.GetRuleStatusHistory)
 
 	// ── Admin mutations (AuthZ required on every route) ───────────────────────
 	r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
@@ -260,10 +264,8 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 				zap.String("jurisdiction_id", jurisdictionID),
 				zap.String("correlation_id", correlationID),
 			)
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":           "jurisdiction_not_found",
-				"jurisdiction_id": jurisdictionID,
-			})
+			problem.Write(w, problem.New(http.StatusNotFound, "jurisdiction_not_found", "").
+				With("jurisdiction_id", jurisdictionID))
 		default:
 			// Store unavailable — log ERROR, return 503.
 			// Callers (tenant-entity-registry-svc) must fail-closed on 503.
@@ -272,9 +274,7 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 				zap.String("correlation_id", correlationID),
 				zap.Error(err),
 			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-				"error": "store_unavailable",
-			})
+			problem.Write(w, problem.New(http.StatusServiceUnavailable, "store_unavailable", ""))
 		}
 		return
 	}
@@ -323,7 +323,7 @@ func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		problem.Write(w, problem.New(http.StatusServiceUnavailable, "store_unavailable", ""))
 		return
 	}
 
@@ -524,6 +524,38 @@ func (h *Handler) GetDriftEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, history)
 }
 
+// GetRuleStatusHistory handles GET /v1/rules/{jurisdiction_rule_id}/status-history.
+//
+// The bitemporal status log (V-001 §8.1), newest known_from first. Enables
+// "what did the platform know on date X" queries for audit and replay — the
+// mirror image of drift events, but for the rule status timeline itself.
+//
+// Response:
+//
+//	200 → JSON array of RuleStatusHistory objects (may be empty, never null)
+//	400 → malformed limit or offset
+//	404 → jurisdiction_rule_id not found
+//	503 → store unavailable
+func (h *Handler) GetRuleStatusHistory(w http.ResponseWriter, r *http.Request) {
+	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	if !ok {
+		return
+	}
+
+	history, err := h.store.FindRuleStatusHistory(r.Context(), ruleID, limit, offset)
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+	if history == nil {
+		history = []*domain.RuleStatusHistory{}
+	}
+	writeJSON(w, http.StatusOK, history)
+}
+
 // ── Admin mutations ──────────────────────────────────────────────────────────
 
 // CreateJurisdiction handles POST /v1/admin/jurisdictions.
@@ -562,6 +594,21 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		requiredField{"authority_type", req.AuthorityType},
 	); field != "" {
 		writeMissingField(w, field)
+		return
+	}
+	// These are VARCHAR(n) columns; an over-length value used to die in
+	// Postgres and surface as 503 store_unavailable. Bound them here so the
+	// client learns the field's limit instead of reading an outage.
+	if len(req.JurisdictionCode) > 32 {
+		writeError(w, http.StatusBadRequest, "invalid_jurisdiction_code", "jurisdiction_code must be at most 32 characters")
+		return
+	}
+	if len(req.JurisdictionType) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_jurisdiction_type", "jurisdiction_type must be at most 64 characters")
+		return
+	}
+	if len(req.AuthorityType) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_authority_type", "authority_type must be at most 64 characters")
 		return
 	}
 	if req.EffectiveFrom.IsZero() {
@@ -639,11 +686,18 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 	}
 
 	var j *domain.Jurisdiction
+	var changed bool
 	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
 		var err error
-		j, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID)
+		j, changed, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID)
 		if err != nil {
 			return err
+		}
+		if !changed {
+			// Idempotent replay of an already-deactivated jurisdiction: the
+			// trigger skipped the update, no audit columns were rewritten and
+			// no second jurisdiction.deactivated may be emitted.
+			return nil
 		}
 		if err := h.publisher.PublishJurisdictionDeactivated(r.Context(), *j, correlationID); err != nil {
 			return err
@@ -700,6 +754,16 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		requiredField{"rule_name", req.RuleName},
 	); field != "" {
 		writeMissingField(w, field)
+		return
+	}
+	// rule_domain is VARCHAR(64) and rule_code VARCHAR(128). As with the
+	// jurisdiction create, an over-length value must be a 400, not a 503.
+	if len(req.RuleDomain) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_rule_domain", "rule_domain must be at most 64 characters")
+		return
+	}
+	if len(req.RuleCode) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_rule_code", "rule_code must be at most 128 characters")
 		return
 	}
 	if req.EffectiveFrom.IsZero() {
@@ -989,38 +1053,50 @@ func (h *Handler) checkAuthz(r *http.Request, principalID, resource, action stri
 // mutation proceeds without a positive authz decision.
 func (h *Handler) writeAuthzError(w http.ResponseWriter, err error) {
 	if errors.Is(err, authz.ErrUnauthorized) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "unauthorized"})
+		problem.Write(w, problem.New(http.StatusForbidden, "unauthorized", ""))
 		return
 	}
-	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+	problem.Write(w, problem.New(http.StatusServiceUnavailable, "authz_unavailable", ""))
 }
 
 // writeStoreError maps a store error to an HTTP response.
 func (h *Handler) writeStoreError(w http.ResponseWriter, err error, correlationID string) {
+	var status int
+	var code string
 	switch {
+	case errors.Is(err, domain.ErrInputTooLong):
+		// SQLSTATE 22001 — a client sent a value longer than the column holds
+		// (e.g. jurisdiction_code > 32). That is a client error, never a
+		// store outage; the store maps it at the create boundary and this is
+		// the last line of defence for any constrained column the boundary
+		// guards above still miss.
+		status, code = http.StatusBadRequest, "input_too_long"
 	case errors.Is(err, domain.ErrJurisdictionNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "jurisdiction_not_found"})
+		status, code = http.StatusNotFound, "jurisdiction_not_found"
 	case errors.Is(err, domain.ErrParentNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "parent_jurisdiction_not_found"})
+		status, code = http.StatusNotFound, "parent_jurisdiction_not_found"
 	case errors.Is(err, domain.ErrRuleNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "rule_not_found"})
+		status, code = http.StatusNotFound, "rule_not_found"
 	case errors.Is(err, domain.ErrConflict):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "conflict"})
+		status, code = http.StatusConflict, "conflict"
 	case errors.Is(err, domain.ErrOverlappingRule):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "overlapping_rule"})
+		status, code = http.StatusConflict, "overlapping_rule"
 	case errors.Is(err, domain.ErrCyclicHierarchy):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "cyclic_hierarchy"})
+		status, code = http.StatusConflict, "cyclic_hierarchy"
 	case errors.Is(err, domain.ErrInvalidTransition):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+		status, code = http.StatusConflict, "invalid_transition"
 	case errors.Is(err, domain.ErrInvalidEffectivePeriod):
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_effective_period"})
+		status, code = http.StatusBadRequest, "invalid_effective_period"
 	default:
 		h.log.Error("store operation failed",
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		status, code = http.StatusServiceUnavailable, "store_unavailable"
 	}
+	p := problem.New(status, code, "")
+	p.CorrelationID = correlationID
+	problem.Write(w, p)
 }
 
 // publish runs an event emission, logging rather than failing the request if
@@ -1158,18 +1234,13 @@ func validEffectivePeriod(from time.Time, to *time.Time) bool {
 }
 
 func writeMissingField(w http.ResponseWriter, field string) {
-	writeJSON(w, http.StatusBadRequest, map[string]string{
-		"error": "missing_field",
-		"field": field,
-	})
+	p := problem.New(http.StatusBadRequest, "missing_field", "a required field is missing")
+	p.Field("#/"+field, "missing", field+" is required")
+	problem.Write(w, p)
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	body := map[string]string{"error": code}
-	if message != "" {
-		body["message"] = message
-	}
-	writeJSON(w, status, body)
+	problem.Write(w, problem.New(status, code, message))
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.

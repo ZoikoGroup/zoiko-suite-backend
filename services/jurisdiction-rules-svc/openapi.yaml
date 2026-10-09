@@ -309,6 +309,10 @@ paths:
       operationId: createJurisdiction
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/PrincipalID'
         - $ref: '#/components/parameters/CorrelationID'
       requestBody:
@@ -334,7 +338,7 @@ paths:
           description: |
             `parent_jurisdiction_not_found` — the supplied parent does not exist.
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Error' }
         "409":
           description: |
@@ -342,7 +346,7 @@ paths:
             attributes. `cyclic_hierarchy` — the parent assignment would make the
             jurisdiction its own ancestor.
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Error' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
@@ -358,6 +362,10 @@ paths:
       operationId: deactivateJurisdiction
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/JurisdictionID'
         - $ref: '#/components/parameters/PrincipalID'
         - $ref: '#/components/parameters/CorrelationID'
@@ -389,6 +397,10 @@ paths:
       operationId: createRule
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/JurisdictionID'
         - $ref: '#/components/parameters/PrincipalID'
         - $ref: '#/components/parameters/CorrelationID'
@@ -417,7 +429,7 @@ paths:
           description: |
             `jurisdiction_not_found` — the jurisdiction is unknown or has been deactivated.
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Error' }
         "409":
           description: |
@@ -425,7 +437,7 @@ paths:
             name. `overlapping_rule` — the effective period overlaps another live rule
             with the same `rule_code`.
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Error' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
@@ -448,6 +460,10 @@ paths:
       operationId: transitionRuleStatus
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/RuleID'
         - $ref: '#/components/parameters/PrincipalID'
         - $ref: '#/components/parameters/CorrelationID'
@@ -474,8 +490,9 @@ paths:
             `overlapping_rule` — activating this rule would overlap another live rule
             with the same `rule_code`.
           content:
-            application/json:
+            application/problem+json:
               schema: { $ref: '#/components/schemas/Error' }
+        "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
   /v1/admin/rules/{jurisdiction_rule_id}/drift:
@@ -495,6 +512,10 @@ paths:
       operationId: recordDrift
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/RuleID'
         - $ref: '#/components/parameters/PrincipalID'
         - $ref: '#/components/parameters/CorrelationID'
@@ -513,6 +534,7 @@ paths:
         "401": { $ref: '#/components/responses/MissingPrincipal' }
         "403": { $ref: '#/components/responses/Forbidden' }
         "404": { $ref: '#/components/responses/NotFound' }
+        "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
   # ── Validate Action ────────────────────────────────────────────────────────────
@@ -531,6 +553,10 @@ paths:
       operationId: validateAction
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/CorrelationID'
       requestBody:
         required: true
@@ -559,7 +585,7 @@ paths:
   # Mounted only when the registry store is wired (it is, in main.go). Every
   # privileged command below is a separate authorization action so authoring,
   # independent review/approval and submission can sit with different roles.
-  # Error bodies are {"error": "<code>", "message": "..."}.
+  # Error bodies are RFC 9457 application/problem+json (see components/schemas/Error).
 
   /v1/regimes:
     get: { tags: [Registry], summary: List regulatory regimes, operationId: listRegimes, responses: { "200": { description: Regimes. } } }
@@ -635,7 +661,7 @@ paths:
       description: "Action REGULATORY_REGIME_CREATE. Body: regime_code, regime_name, description?."
       operationId: createRegime
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
       responses:
         "200": { description: Already existed. }
         "201": { description: Created. }
@@ -655,7 +681,7 @@ paths:
         immutable (database trigger); only review and supersede links can be added.
       operationId: createSource
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { $ref: '#/components/parameters/CorrelationID' }]
       responses:
         "200": { description: Identical capture already recorded. }
         "201": { description: Captured. }
@@ -671,7 +697,7 @@ paths:
       description: "Action REGULATORY_SOURCE_REVIEW. The reviewer must not be the author (403 segregation_of_duties); a second different reviewer is 409."
       operationId: reviewSource
       security: [{ principalHeader: [] }]
-      parameters: [{ name: source_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: source_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Reviewed (or the same reviewer replaying). }, "403": { $ref: '#/components/responses/Forbidden' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Already reviewed by someone else. } }
   /v1/admin/sources/{source_id}/supersede:
     post:
@@ -680,7 +706,7 @@ paths:
       description: "Action REGULATORY_SOURCE_SUPERSEDE. Body: replacement_source_id."
       operationId: supersedeSource
       security: [{ principalHeader: [] }]
-      parameters: [{ name: source_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: source_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Superseded. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Already superseded by another source. } }
   /v1/admin/interpretations:
     post:
@@ -689,7 +715,7 @@ paths:
       description: "Action INTERPRETATION_RECORD_CREATE. Body: jurisdiction_id, regime_id?, subject, decision, rationale, source_ids[]."
       operationId: createInterpretation
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "201": { description: Recorded as PENDING. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { $ref: '#/components/responses/Forbidden' } }
   /v1/admin/interpretations/{interpretation_id}/approve:
     post:
@@ -702,7 +728,7 @@ paths:
         immutable. AI-proposed content cannot become authoritative without this step (JUR-NEG-18).
       operationId: approveInterpretation
       security: [{ principalHeader: [] }]
-      parameters: [{ name: interpretation_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: interpretation_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Approved (or the same approver replaying). }, "403": { $ref: '#/components/responses/Forbidden' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: 'Source not ready, or already approved by someone else.' } }
   /v1/admin/packs:
     post:
@@ -711,7 +737,7 @@ paths:
       description: "Action JURISDICTION_PACK_CREATE. Body: pack_ref (jur.gb.tax.core), pack_name, owner, support_owner?."
       operationId: createPack
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Already existed. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Same ref, different attributes.' } }
   /v1/admin/packs/{pack_ref}/versions:
     post:
@@ -729,7 +755,7 @@ paths:
         (JUR-NEG-20). Signing, artifact digest and certification arrive in later waves.
       operationId: createPackVersion
       security: [{ principalHeader: [] }]
-      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Identical version already drafted. }, "201": { description: Drafted. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Version collision or not newer. } }
   /v1/admin/packs/{pack_ref}/versions/{version}/submit-review:
     post:
@@ -739,6 +765,10 @@ paths:
       operationId: submitPackVersion
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
@@ -755,7 +785,7 @@ paths:
         A rule past DRAFT is immutable (409 not_draft).
       operationId: setRuleProvenance
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/RuleID' }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/RuleID' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Provenance replaced. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: 'Rule not DRAFT, or interpretation not approved.' } }
 
   # ── ZS-JUR-001 Wave 1: compiler, signing, verification, trusted keys ───────
@@ -778,6 +808,10 @@ paths:
       operationId: compilePackVersion
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
@@ -800,6 +834,10 @@ paths:
       operationId: signPackVersion
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
@@ -826,6 +864,10 @@ paths:
       operationId: verifyPackArtifact
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
@@ -839,7 +881,7 @@ paths:
       description: "Action PACK_SIGNING_KEY_REGISTER. Body: key_ref, public_key (base64 32-byte Ed25519), algorithm? (ED25519). A key_ref names one key forever (different key = 409). Private keys are never accepted or stored."
       operationId: registerSigningKey
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Already registered. }, "201": { description: Registered. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: key_ref held by a different key. } }
   /v1/admin/pack-signing-keys/{key_ref}/retire:
     post:
@@ -848,7 +890,7 @@ paths:
       description: "Action PACK_SIGNING_KEY_RETIRE. Body: reason (required)."
       operationId: retireSigningKey
       security: [{ principalHeader: [] }]
-      parameters: [{ name: key_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: key_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Retired (or already). }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Illegal status move. } }
   /v1/admin/pack-signing-keys/{key_ref}/revoke:
     post:
@@ -857,7 +899,7 @@ paths:
       description: "Action PACK_SIGNING_KEY_REVOKE. Body: reason (required). Status only moves forward; never deleted."
       operationId: revokeSigningKey
       security: [{ principalHeader: [] }]
-      parameters: [{ name: key_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: key_ref, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Revoked (or already). }, "404": { $ref: '#/components/responses/NotFound' } }
 
   # ── ZS-JUR-001 Wave 3: test harness, reviews, certification ─────────────────
@@ -874,6 +916,10 @@ paths:
       operationId: submitTestBundle
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
@@ -901,6 +947,10 @@ paths:
       operationId: runTests
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
@@ -927,6 +977,10 @@ paths:
       operationId: addReview
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
@@ -956,6 +1010,10 @@ paths:
       operationId: certifyPackVersion
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - { name: pack_ref, in: path, required: true, schema: { type: string } }
         - { name: version, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/PrincipalID' }
@@ -1004,8 +1062,11 @@ paths:
       operationId: resolveRule
       security: [{ principalHeader: [] }]
       parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
         - { $ref: '#/components/parameters/PrincipalID' }
-        - { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }
       responses:
         "200": { description: RESOLVED or NO_RULE. }
         "400": { $ref: '#/components/responses/BadRequest' }
@@ -1043,7 +1104,7 @@ paths:
         make it immediate. The cache is per process: with several replicas, invalidate each.
       operationId: invalidateResolverCache
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Invalidated; cache counters in the body. }, "403": { $ref: '#/components/responses/Forbidden' } }
 
   # ── ZS-JUR-001 Wave 7: release, rings, rollback, hotfix, source-change intake, metrics ──
@@ -1051,11 +1112,11 @@ paths:
   # 409 {"error":"operation_blocked","reasons":[...]} listing ALL unmet gates at once.
 
   /v1/admin/deployment-regions:
-    post: { tags: [Admin, Rollout], summary: Register a deployment region (append-only), description: "Action DEPLOYMENT_REGION_CREATE. Body: region_code (lowercase), description?.", operationId: createRegion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' } } }
+    post: { tags: [Admin, Rollout], summary: Register a deployment region (append-only), description: "Action DEPLOYMENT_REGION_CREATE. Body: region_code (lowercase), description?.", operationId: createRegion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' } } }
   /v1/deployment-regions:
     get: { tags: [Rollout], summary: List regions, operationId: listRegions, responses: { "200": { description: Regions. } } }
   /v1/admin/deployment-rings:
-    post: { tags: [Admin, Rollout], summary: Define a rollout ring (append-only), description: "Action DEPLOYMENT_RING_CREATE. Body: ring_code, ordinal (>=1, unique), min_soak_seconds (time a version must have been active in THIS ring before the next), description?. Same code with different values is 409.", operationId: createRing, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "409": { description: Conflicting definition. } } }
+    post: { tags: [Admin, Rollout], summary: Define a rollout ring (append-only), description: "Action DEPLOYMENT_RING_CREATE. Body: ring_code, ordinal (>=1, unique), min_soak_seconds (time a version must have been active in THIS ring before the next), description?. Same code with different values is 409.", operationId: createRing, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "409": { description: Conflicting definition. } } }
   /v1/deployment-rings:
     get: { tags: [Rollout], summary: List rings in rollout order, operationId: listRings, responses: { "200": { description: Rings. } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/publish:
@@ -1069,7 +1130,7 @@ paths:
         through these commands (database-enforced). Publishing again is a no-op.
       operationId: publishPackVersion
       security: [{ principalHeader: [] }]
-      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Released (changed=true) or already released. }, "409": { description: 'Not CERTIFIED, or operation_blocked.' } }
   /v1/admin/packs/{pack_ref}/versions/{version}/withdraw:
     post:
@@ -1079,12 +1140,12 @@ paths:
       description: "Action JURISDICTION_PACK_VERSION_WITHDRAW. Body: reason AND evidence_ref are required. Refused while another RELEASED version depends on it. Rolls its ACTIVE deployments back with the reason."
       operationId: withdrawPackVersion
       security: [{ principalHeader: [] }]
-      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Withdrawn (or already). }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'In use by a released dependent, or wrong state.' } }
   /v1/admin/packs/{pack_ref}/versions/{version}/block:
-    post: { tags: [Admin, Packs], summary: Emergency stop (RELEASED to EMERGENCY_BLOCKED), description: "Action JURISDICTION_PACK_VERSION_BLOCK. Body: reason (required). The resolver stops using it within its cache TTL.", operationId: blockPackVersion, security: [{ principalHeader: [] }], parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Blocked. }, "409": { description: Not RELEASED. } } }
+    post: { tags: [Admin, Packs], summary: Emergency stop (RELEASED to EMERGENCY_BLOCKED), description: "Action JURISDICTION_PACK_VERSION_BLOCK. Body: reason (required). The resolver stops using it within its cache TTL.", operationId: blockPackVersion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Blocked. }, "409": { description: Not RELEASED. } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/unblock:
-    post: { tags: [Admin, Packs], summary: Return a blocked version to RELEASED after incident review, description: "Action JURISDICTION_PACK_VERSION_UNBLOCK. Body: reason (required). Re-verifies the version first.", operationId: unblockPackVersion, security: [{ principalHeader: [] }], parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Released again. }, "409": { description: 'Not blocked, or unverified.' } } }
+    post: { tags: [Admin, Packs], summary: Return a blocked version to RELEASED after incident review, description: "Action JURISDICTION_PACK_VERSION_UNBLOCK. Body: reason (required). Re-verifies the version first.", operationId: unblockPackVersion, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Released again. }, "409": { description: 'Not blocked, or unverified.' } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/deploy:
     post:
       tags: [Admin, Packs]
@@ -1099,7 +1160,7 @@ paths:
         reconciliation health: there is no such signal in this service.
       operationId: deployPackVersion
       security: [{ principalHeader: [] }]
-      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Already active there. }, "201": { description: Deployed. }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: operation_blocked or not RELEASED. } }
   /v1/admin/packs/{pack_ref}/versions/{version}/rollback:
     post:
@@ -1113,7 +1174,7 @@ paths:
         no reconciliation was performed.
       operationId: rollbackDeployment
       security: [{ principalHeader: [] }]
-      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Rolled back and restored. }, "404": { description: No active deployment of that version there. }, "409": { description: operation_blocked. } }
   /v1/packs/{pack_ref}/versions/{version}/deployments:
     get: { tags: [Rollout], summary: Deployment history of a version, operationId: listDeployments, parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }], responses: { "200": { description: Deployments. } } }
@@ -1128,12 +1189,12 @@ paths:
         approving reviewers regardless of PACK_CERT_MIN_REVIEWS. Starts the retrospective clock (HOTFIX_RETRO_SLA_HOURS).
       operationId: declareHotfix
       security: [{ principalHeader: [] }]
-      parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Identical declaration already exists. }, "201": { description: Declared. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Different declaration exists, wrong state, or invalid rollback target.' } }
   /v1/packs/{pack_ref}/versions/{version}/hotfix:
     get: { tags: [Packs], summary: The hotfix record of a version, operationId: getHotfix, parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The hotfix. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/admin/packs/{pack_ref}/versions/{version}/hotfix/retrospective:
-    post: { tags: [Admin, Packs], summary: Record the mandatory post-incident retrospective (once), description: "Action JURISDICTION_PACK_VERSION_COMPLETE_RETROSPECTIVE. Body: note (required). Overdue retrospectives appear in /v1/ops/metrics.", operationId: completeRetrospective, security: [{ principalHeader: [] }], parameters: [{ name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Completed (or already). }, "404": { $ref: '#/components/responses/NotFound' } } }
+    post: { tags: [Admin, Packs], summary: Record the mandatory post-incident retrospective (once), description: "Action JURISDICTION_PACK_VERSION_COMPLETE_RETROSPECTIVE. Body: note (required). Overdue retrospectives appear in /v1/ops/metrics.", operationId: completeRetrospective, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: pack_ref, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Completed (or already). }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/admin/source-change-notices:
     post:
       tags: [Admin, SourceChange]
@@ -1145,16 +1206,16 @@ paths:
         edits, activates or publishes a rule.
       operationId: createNotice
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "201": { description: Recorded OPEN. }, "400": { $ref: '#/components/responses/BadRequest' } }
   /v1/source-change-notices:
     get: { tags: [SourceChange], summary: List notices (filter status=open|under_review|closed), operationId: listNotices, responses: { "200": { description: Notices. } } }
   /v1/source-change-notices/{notice_id}:
     get: { tags: [SourceChange], summary: Get a notice, operationId: getNotice, parameters: [{ name: notice_id, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The notice. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/admin/source-change-notices/{notice_id}/review:
-    post: { tags: [Admin, SourceChange], summary: Take the notice for independent review, description: "Action SOURCE_CHANGE_NOTICE_REVIEW. The reviewer must differ from the author (403 segregation_of_duties).", operationId: startNoticeReview, security: [{ principalHeader: [] }], parameters: [{ name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Under review. }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Already reviewed by someone else. } } }
+    post: { tags: [Admin, SourceChange], summary: Take the notice for independent review, description: "Action SOURCE_CHANGE_NOTICE_REVIEW. The reviewer must differ from the author (403 segregation_of_duties).", operationId: startNoticeReview, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Under review. }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Already reviewed by someone else. } } }
   /v1/admin/source-change-notices/{notice_id}/close:
-    post: { tags: [Admin, SourceChange], summary: Close with a conclusion, description: "Action SOURCE_CHANGE_NOTICE_CLOSE. Only the assigned reviewer may close. Body: outcome (NO_CHANGE|INTERPRETATION_RECORDED|RULE_CHANGE_PLANNED|CAPABILITY_BLOCKED), note, linked_interpretation_id (required, and must be APPROVED, for INTERPRETATION_RECORDED). Changes no rule or pack.", operationId: closeNotice, security: [{ principalHeader: [] }], parameters: [{ name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Closed (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Different conclusion already recorded. } } }
+    post: { tags: [Admin, SourceChange], summary: Close with a conclusion, description: "Action SOURCE_CHANGE_NOTICE_CLOSE. Only the assigned reviewer may close. Body: outcome (NO_CHANGE|INTERPRETATION_RECORDED|RULE_CHANGE_PLANNED|CAPABILITY_BLOCKED), note, linked_interpretation_id (required, and must be APPROVED, for INTERPRETATION_RECORDED). Changes no rule or pack.", operationId: closeNotice, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: notice_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Closed (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: Different conclusion already recorded. } } }
   /v1/ops/metrics:
     get:
       tags: [Ops]
@@ -1177,13 +1238,14 @@ paths:
   # runtime only inside signed, certified, released packs (manifest fields calendar_modules and obligation_modules).
 
   /v1/admin/calendars:
-    post: { tags: [Admin, Calendar], summary: Register an authority calendar, description: "Action REGULATORY_CALENDAR_CREATE. Body: calendar_code (lowercase), jurisdiction_id, authority, description?. Same code with different jurisdiction or authority is 409.", operationId: createCalendar, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Conflicting definition. } } }
+    post: { tags: [Admin, Calendar], summary: Register an authority calendar, description: "Action REGULATORY_CALENDAR_CREATE. Body: calendar_code (lowercase), jurisdiction_id, authority, description?. Same code with different jurisdiction or authority is 409.", operationId: createCalendar, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Already exists. }, "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Conflicting definition. } } }
   /v1/calendars:
     get: { tags: [Calendar], summary: List calendars, operationId: listCalendars, responses: { "200": { description: Calendars. } } }
   /v1/calendars/{calendar_code}:
     get: { tags: [Calendar], summary: Get a calendar, operationId: getCalendar, parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The calendar. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/calendars/{calendar_code}/versions:
     get: { tags: [Calendar], summary: List versions with holidays and sources, operationId: listCalendarVersions, parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }], responses: { "200": { description: Versions. } } }
+  /v1/admin/calendars/{calendar_code}/versions:
     post:
       tags: [Admin, Calendar]
       summary: Draft the next calendar version
@@ -1193,12 +1255,12 @@ paths:
         holidays [{date, name}]. The version number is assigned by the server.
       operationId: createCalendarVersion
       security: [{ principalHeader: [] }]
-      parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "201": { description: Drafted. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' } }
   /v1/calendars/{calendar_code}/versions/{version}:
     get: { tags: [Calendar], summary: One calendar version, operationId: getCalendarVersion, parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }], responses: { "200": { description: The version. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/admin/calendars/{calendar_code}/versions/{version}/sources:
-    put: { tags: [Admin, Calendar], summary: Replace the official sources of a DRAFT version, description: "Action REGULATORY_CALENDAR_VERSION_SET_SOURCES. Body: source_ids[]. 409 not_draft once published.", operationId: setCalendarVersionSources, security: [{ principalHeader: [] }], parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Sources set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Not DRAFT. } } }
+    put: { tags: [Admin, Calendar], summary: Replace the official sources of a DRAFT version, description: "Action REGULATORY_CALENDAR_VERSION_SET_SOURCES. Body: source_ids[]. 409 not_draft once published.", operationId: setCalendarVersionSources, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Sources set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: Not DRAFT. } } }
   /v1/admin/calendars/{calendar_code}/versions/{version}/publish:
     post:
       tags: [Admin, Calendar]
@@ -1209,7 +1271,7 @@ paths:
         Emits jurisdiction.calendar.changed. An amended holiday list is a NEW version, never an edit (JUR-NEG-13).
       operationId: publishCalendarVersion
       security: [{ principalHeader: [] }]
-      parameters: [{ name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: calendar_code, in: path, required: true, schema: { type: string } }, { name: version, in: path, required: true, schema: { type: integer } }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready. } }
   /v1/admin/obligation-rules:
     post:
@@ -1226,16 +1288,16 @@ paths:
         plus a granted extension, then the business-day adjustment, then the authority-local cutoff.
       operationId: createObligationRule
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "201": { description: Drafted. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' } }
   /v1/obligation-rules:
     get: { tags: [Obligations], summary: 'List obligation rules (filters jurisdiction_id, obligation_code)', operationId: listObligationRules, responses: { "200": { description: Rules. } } }
   /v1/obligation-rules/{obligation_rule_id}:
     get: { tags: [Obligations], summary: Get an obligation rule, operationId: getObligationRule, parameters: [{ name: obligation_rule_id, in: path, required: true, schema: { type: string } }], responses: { "200": { description: The rule. }, "404": { $ref: '#/components/responses/NotFound' } } }
   /v1/admin/obligation-rules/{obligation_rule_id}/provenance:
-    put: { tags: [Admin, Obligations], summary: 'Set regime, interpretation and sources of a DRAFT rule', description: "Action OBLIGATION_RULE_SET_PROVENANCE. Body: regime_id, interpretation_id (must be APPROVED, in the rule's jurisdiction or an ancestor), source_ids[]. Full replacement.", operationId: setObligationProvenance, security: [{ principalHeader: [] }], parameters: [{ name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Not DRAFT, or interpretation not approved.' } } }
+    put: { tags: [Admin, Obligations], summary: 'Set regime, interpretation and sources of a DRAFT rule', description: "Action OBLIGATION_RULE_SET_PROVENANCE. Body: regime_id, interpretation_id (must be APPROVED, in the rule's jurisdiction or an ancestor), source_ids[]. Full replacement.", operationId: setObligationProvenance, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Set. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'Not DRAFT, or interpretation not approved.' } } }
   /v1/admin/obligation-rules/{obligation_rule_id}/publish:
-    post: { tags: [Admin, Obligations], summary: Publish (freeze) an obligation rule, description: "Action OBLIGATION_RULE_PUBLISH. Publisher must differ from the author (403). Needs regime, an APPROVED interpretation, reviewed non-superseded sources, and an existing calendar when one is named.", operationId: publishObligationRule, security: [{ principalHeader: [] }], parameters: [{ name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready or interpretation_not_approved. } } }
+    post: { tags: [Admin, Obligations], summary: Publish (freeze) an obligation rule, description: "Action OBLIGATION_RULE_PUBLISH. Publisher must differ from the author (403). Needs regime, an APPROVED interpretation, reviewed non-superseded sources, and an existing calendar when one is named.", operationId: publishObligationRule, security: [{ principalHeader: [] }], parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { name: obligation_rule_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/PrincipalID' }], responses: { "200": { description: Published (or already). }, "403": { $ref: '#/components/responses/Forbidden' }, "409": { description: source_not_ready or interpretation_not_approved. } } }
   /v1/obligation-calculations:calculate:
     post:
       tags: [Resolver]
@@ -1256,7 +1318,7 @@ paths:
         or EXTENSION_NOT_PERMITTED (not legally supported, over the cap, or not evidenced); 503 pack_unverified.
       operationId: calculateObligation
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: 'Calculated, or no obligation rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: 'AMBIGUOUS, NO_CALENDAR or idempotency_conflict.' }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
 
   # ── ZS-JUR-001 Wave 4 (tax half): rule parameters and regulatory calculation ──
@@ -1278,7 +1340,7 @@ paths:
         409 not_draft once the rule leaves DRAFT; the database also refuses any change then.
       operationId: setRuleParameters
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/RuleID' }, { $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/RuleID' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Set (or cleared). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { $ref: '#/components/responses/NotFound' }, "409": { description: Not DRAFT. } }
   /v1/rules/{jurisdiction_rule_id}/parameters:
     get: { tags: [Rules], summary: A rule's typed calculation parameters (null when none), operationId: getRuleParameters, parameters: [{ $ref: '#/components/parameters/RuleID' }], responses: { "200": { description: The parameters. }, "404": { $ref: '#/components/responses/NotFound' } } }
@@ -1306,7 +1368,7 @@ paths:
         (JUR-T022), and a NEGATIVE case in which an unsupported amount is refused (JUR-T023).
       operationId: executeCalculation
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: 'Calculated, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
 
   /v1/payroll-statutory-parameters:resolve:
@@ -1325,7 +1387,7 @@ paths:
         HTTP: 200 PARAMETERS_RESOLVED or NO_RULE; 409 AMBIGUOUS or idempotency_conflict; 422 UNSUPPORTED_JURISDICTION; 503 pack_unverified.
       operationId: resolvePayrollParameters
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: 'Parameter set, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: UNSUPPORTED_JURISDICTION. }, "503": { description: pack_unverified. } }
 
   /v1/retention-rules:resolve:
@@ -1345,7 +1407,7 @@ paths:
         TRIGGER_MISMATCH or NO_PARAMETERS; 503 pack_unverified.
       operationId: resolveRetention
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: 'Retention determined, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
 
   /v1/accounting-mappings:resolve:
@@ -1362,7 +1424,7 @@ paths:
         or NO_PARAMETERS; 503 pack_unverified.
       operationId: resolveAccountingMapping
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: 'Mapping resolved, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
 
   /v1/submission-profiles:resolve:
@@ -1382,7 +1444,7 @@ paths:
         DEPENDENCY_EXPIRED or NO_PARAMETERS; 503 pack_unverified.
       operationId: resolveSubmissionProfile
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: 'Profile resolved, or no rule applies.' }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
 
   /v1/regulatory-submissions:
@@ -1401,7 +1463,7 @@ paths:
         HTTP: 201 registered, 200 idempotent repeat; 409 AMBIGUOUS or idempotency_conflict; 422 refusal; 503 pack_unverified.
       operationId: registerSubmission
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 128 } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Idempotent repeat. }, "201": { description: Registered. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: AMBIGUOUS or idempotency_conflict. }, "422": { description: Explicit refusal. }, "503": { description: pack_unverified. } }
 
   /v1/regulatory-submissions/{submission_id}:
@@ -1429,7 +1491,7 @@ paths:
         with replayed true (JUR-NEG-10). Every report is append-only evidence.
       operationId: recordSubmissionEvent
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: submission_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: submission_id, in: path, required: true, schema: { type: string, format: uuid } }]
       responses: { "200": { description: Report stored (see applied and disposition). }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: submission_not_found. } }
 
   /v1/admin/rollouts:
@@ -1442,7 +1504,7 @@ paths:
         Naming a family here does NOT mean certified rules exist for it (s32).
       operationId: createRollout
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "201": { description: Created. }, "400": { $ref: '#/components/responses/BadRequest' }, "409": { description: One rollout per family_ref. } }
     get:
       tags: [Rollout]
@@ -1460,7 +1522,7 @@ paths:
       description: Action JURISDICTION_ROLLOUT_SEED. States intent only; a PLANNED entry is not support.
       operationId: seedRolloutPortfolio
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }]
       responses: { "200": { description: Counts of created and already present entries. } }
 
   /v1/admin/rollouts/{rollout_id}:
@@ -1480,7 +1542,7 @@ paths:
       description: Action JURISDICTION_ROLLOUT_SET_OWNER. A principal who already attested to or approved the rollout cannot become its owner. Not allowed once LAUNCHED or RETIRED.
       operationId: setRolloutOwner
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
       responses: { "200": { description: Updated. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties. }, "404": { description: rollout_not_found. } }
 
   /v1/admin/rollouts/{rollout_id}/packs:
@@ -1490,7 +1552,7 @@ paths:
       description: Action JURISDICTION_ROLLOUT_LINK_PACKS. Body pack_refs (1 to 50).
       operationId: linkRolloutPacks
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
       responses: { "200": { description: Linked pack refs. }, "404": { description: rollout_not_found or pack_not_found. } }
 
   /v1/admin/rollouts/{rollout_id}/attestations:
@@ -1502,7 +1564,7 @@ paths:
         rollout owner. Append-only: the latest answer for an item is current, so an item can be withdrawn by recording met false.
       operationId: attestRollout
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
       responses: { "201": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties. }, "404": { description: rollout_not_found. } }
 
   /v1/admin/rollouts/{rollout_id}/expert-approvals:
@@ -1512,7 +1574,7 @@ paths:
       description: 'Action JURISDICTION_ROLLOUT_EXPERT_APPROVE. Body: qualification, scope, decision (APPROVE or REJECT), notes?. The expert cannot be the rollout owner. An expert''s latest decision counts.'
       operationId: expertApproveRollout
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
       responses: { "201": { description: Recorded. }, "400": { $ref: '#/components/responses/BadRequest' }, "403": { description: segregation_of_duties. }, "404": { description: rollout_not_found. } }
 
   /v1/admin/rollouts/{rollout_id}/transition:
@@ -1525,7 +1587,7 @@ paths:
         RELEASED version, and a launcher who is neither the owner nor an expert on the rollout. A refused move returns 409 with EVERY blocker. The database enforces the same gates.
       operationId: transitionRollout
       security: [{ principalHeader: [] }]
-      parameters: [{ $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      parameters: [{ $ref: '#/components/parameters/RequestID' }, { $ref: '#/components/parameters/TenantID' }, { $ref: '#/components/parameters/SourceChannel' }, { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/PrincipalID' }, { name: rollout_id, in: path, required: true, schema: { type: string, format: uuid } }]
       responses: { "200": { description: Moved. }, "400": { $ref: '#/components/responses/BadRequest' }, "404": { description: rollout_not_found. }, "409": { description: 'rollout_blocked, with blockers.' } }
 
   /v1/rollout-checklists:
@@ -1638,18 +1700,19 @@ components:
     TenantID:
       name: X-Tenant-Id
       in: header
-      required: false
+      required: true
       description: |
-        The tenant context from the verified identity envelope. Set by the gateway's
-        ForwardAuth middleware. Required for tenant-scoped operations.
+        The tenant context from the verified identity envelope. Mandatory on every
+        request — INV-01 ("every authenticated operation resolves exactly one tenant
+        context before data access"). Set by the gateway's ForwardAuth middleware.
       schema: { type: string }
 
     RequestID:
       name: X-Request-Id
       in: header
-      required: false
+      required: true
       description: |
-        Unique request identifier from the gateway. Used for tracing and idempotency.
+        Unique request identifier. Mandatory on every request — request tracing.
       schema: { type: string }
 
     WorkloadID:
@@ -1663,9 +1726,10 @@ components:
     SourceChannel:
       name: X-Source-Channel
       in: header
-      required: false
+      required: true
       description: |
-        Originating channel: api, batch, webhook, cli. Used for attribution.
+        Originating channel. Mandatory on every request; unrecognised values are
+        refused (400) rather than silently accepted.
       schema:
         type: string
         enum: [api, batch, webhook, cli]
@@ -1673,10 +1737,12 @@ components:
     IdempotencyKey:
       name: Idempotency-Key
       in: header
-      required: false
+      required: true
       description: |
-        Client-generated idempotency key for safe retries on mutations.
-      schema: { type: string }
+        Client-generated idempotency key for safe retries on material state changes
+        (INV-08). Mandatory on every write; outside the envelope a missing key is a
+        400 `envelope_incomplete`, a conflict on replay is a 409.
+      schema: { type: string, maxLength: 128 }
 
     EffectiveAt:
       name: effective_at
@@ -1712,22 +1778,27 @@ components:
         Malformed or incomplete request. Codes include `missing_field`,
         `invalid_request_body`, `invalid_effective_at`, `invalid_effective_period`,
         `invalid_limit`, `invalid_offset`, `invalid_rule_status`,
-        `invalid_rule_payload`, `invalid_status`, `invalid_drift_state`.
+        `invalid_rule_payload`, `invalid_status`, `invalid_drift_state`, and
+        `envelope_incomplete` — a write-strict obligation header (`X-Request-Id`,
+        `X-Source-Channel`, `Idempotency-Key`) is missing or unusable.
         An unknown JSON field is rejected rather than ignored.
       content:
-        application/json:
+        application/problem+json:
           schema: { $ref: '#/components/schemas/Error' }
 
     MissingPrincipal:
-      description: '`missing_principal` — no caller identity on the request.'
+      description: |
+        `missing_principal` — no caller identity on the request, or
+        `envelope_incomplete` with HTTP 401 — the request envelope omitted
+        `X-Tenant-Id` or `X-Principal-Id` (a write-strict obligation).
       content:
-        application/json:
+        application/problem+json:
           schema: { $ref: '#/components/schemas/Error' }
 
     Forbidden:
       description: '`unauthorized` — the Authorization Service denied the action.'
       content:
-        application/json:
+        application/problem+json:
           schema: { $ref: '#/components/schemas/Error' }
 
     NotFound:
@@ -1735,13 +1806,13 @@ components:
         `jurisdiction_not_found` / `rule_not_found`. Also returned for a malformed id,
         which cannot name an existing row.
       content:
-        application/json:
+        application/problem+json:
           schema: { $ref: '#/components/schemas/Error' }
 
     BodyTooLarge:
       description: '`request_body_too_large` — the body exceeds 256 KiB.'
       content:
-        application/json:
+        application/problem+json:
           schema: { $ref: '#/components/schemas/Error' }
 
     StoreUnavailable:
@@ -1749,7 +1820,7 @@ components:
         `store_unavailable` — the service cannot answer. This is NOT "no". Callers
         validating a `jurisdiction_id` must reject the write fail-closed.
       content:
-        application/json:
+        application/problem+json:
           schema: { $ref: '#/components/schemas/Error' }
 
     AuthzOrStoreUnavailable:
@@ -1758,22 +1829,27 @@ components:
         mutation was refused. `store_unavailable` — the database could not be reached.
         Both fail closed: nothing was written.
       content:
-        application/json:
+        application/problem+json:
           schema: { $ref: '#/components/schemas/Error' }
 
   schemas:
 
     Error:
       type: object
-      required: [type, title, status, detail, instance]
+      required: [type, title, status, code]
       description: |
-        RFC 9457 Problem Details format. Clients can switch on `type` or `title`.
-        The `extension` fields provide machine-readable codes.
+        RFC 9457 Problem Details (API standard §12) plus the Zoiko extensions:
+        `code` is the stable machine-readable code clients branch on, and `error`
+        is a deprecated alias of `code` retained for one migration cycle.
+        `type` names the stable error class (Governance Control Plane §16) where
+        one applies. Additional extension fields — `field`, `jurisdiction_id`,
+        `reasons`, `report`, `failures`, `service` — appear inline as relevant.
+        Emitted as `application/problem+json`.
       properties:
         type:
           type: string
           format: uri
-          description: URI identifying the problem type.
+          description: URI naming the problem type (GCP §16 class when one applies).
         title:
           type: string
           description: Short, human-readable summary of the problem type.
@@ -1787,10 +1863,39 @@ components:
         instance:
           type: string
           format: uri
-          description: URI reference identifying the specific occurrence.
+          description: URI reference identifying the specific occurrence, when known.
         code:
           type: string
           description: Stable machine-readable code for client logic (e.g., "missing_field").
+        error:
+          type: string
+          description: Deprecated alias of `code`; clients should branch on `code`.
+        request_id:
+          type: string
+          description: Request identifier for support/evidence (API standard §12).
+        correlation_id:
+          type: string
+          description: Cross-service business correlation, when known.
+        retryable:
+          type: boolean
+          description: |
+            Advisory only; a retry still respects idempotency and Retry-After.
+            Marked true only for transient 429/503/504 conditions.
+        errors:
+          type: array
+          description: Field/item validation details.
+          items:
+            type: object
+            properties:
+              pointer:
+                type: string
+                description: JSON Pointer-style location of the field (e.g. "#/rule_code").
+              code:
+                type: string
+                description: Stable machine code for the violation (e.g. "missing").
+              detail:
+                type: string
+                description: Human-readable explanation of the violation.
         field:
           type: string
           description: The offending field, when code is "missing_field".

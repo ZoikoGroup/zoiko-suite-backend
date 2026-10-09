@@ -94,10 +94,7 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
 		return id, true
 	}
-	writeJSON(w, http.StatusUnauthorized, map[string]string{
-		"error":   "missing_principal",
-		"message": "X-Principal-Id is required to append to the governance ledger",
-	})
+	WriteProblem(w, http.StatusUnauthorized, "Missing Principal", "X-Principal-Id is required to append to the governance ledger", r.URL.Path, "UNAUTHORIZED")
 	return "", false
 }
 
@@ -112,11 +109,11 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	case err == nil:
 		return true
 	case errors.Is(err, authz.ErrDenied):
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+		WriteProblem(w, http.StatusForbidden, "Authorization Denied", "Principal not authorized for this action", r.URL.Path, "AUTHORIZATION_DENIED")
 	default:
 		h.log.Error("authorization check failed — refusing the write",
 			zap.String("principal_id", principalID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+		WriteProblem(w, http.StatusServiceUnavailable, "Authorization Service Unavailable", "Authorization service unavailable", r.URL.Path, "AUTHZ_UNAVAILABLE")
 	}
 	return false
 }
@@ -208,8 +205,12 @@ func (req createDecisionRequest) missingField() string {
 //
 //	201 → decision recorded for the first time
 //	200 → decision_id already existed; no-op, not an error
-//	400 → missing required field
-//	503 → store unavailable
+//	400 → missing required field, invalid JSON, invalid decided_at
+//	401 → missing X-Principal-Id
+//	403 → tenant scope mismatch, authorization denied
+//	409 → decision_id conflict, idempotency mismatch
+//	413 → request body too large
+//	503 → store unavailable, authorization service unavailable
 func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -221,10 +222,7 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	// Read the raw body for idempotency key validation
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if idempotencyKey == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_idempotency_key",
-			"message": "Idempotency-Key is required for material state changes",
-		})
+		WriteProblem(w, http.StatusBadRequest, "Idempotency Key Required", "Idempotency-Key is required for material state changes", r.URL.Path, "IDEMPOTENCY_KEY_REQUIRED")
 		return
 	}
 
@@ -232,30 +230,24 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.log.Error("CreateDecision: failed to read request body", zap.Error(err))
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_body"})
+		WriteProblem(w, http.StatusBadRequest, "Invalid Request Body", "Failed to read request body", r.URL.Path, "INVALID_REQUEST")
 		return
 	}
 
 	// Re-parse the JSON from the raw body
 	var req createDecisionRequest
 	if err := json.Unmarshal(rawBody, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		WriteProblem(w, http.StatusBadRequest, "Invalid JSON", err.Error(), r.URL.Path, "INVALID_REQUEST")
 		return
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if tenantID == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{
-			"error":   "tenant_scope_missing",
-			"message": domain.ErrTenantScopeMissing.Error(),
-		})
+		WriteProblem(w, http.StatusUnauthorized, "Tenant Scope Missing", domain.ErrTenantScopeMissing.Error(), r.URL.Path, "TENANT_SCOPE_MISSING")
 		return
 	}
 	if req.TenantID != "" && req.TenantID != tenantID {
-		writeJSON(w, http.StatusForbidden, map[string]string{
-			"error":   "tenant_scope_mismatch",
-			"message": domain.ErrTenantScopeMismatch.Error(),
-		})
+		WriteProblem(w, http.StatusForbidden, "Tenant Scope Mismatch", domain.ErrTenantScopeMismatch.Error(), r.URL.Path, "TENANT_SCOPE_MISMATCH")
 		return
 	}
 
@@ -264,25 +256,21 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	existingDecisionID, existingHash, err := h.store.CheckIdempotencyKey(r.Context(), tenantID, idempotencyKey)
 	if err != nil {
 		h.log.Error("CreateDecision: idempotency check failed", zap.String("idempotency_key", idempotencyKey), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		WriteProblem(w, http.StatusServiceUnavailable, "Service Unavailable", "Store unavailable", r.URL.Path, "SERVICE_UNAVAILABLE")
 		return
 	}
 
 	if existingDecisionID != "" {
 		// Key exists - verify body hash matches
 		if !bytes.Equal(existingHash, bodyHash[:]) {
-			writeJSON(w, http.StatusConflict, map[string]string{
-				"error":          "idempotency_mismatch",
-				"idempotency_key": idempotencyKey,
-				"message":        "Idempotency-Key reused with different request body",
-			})
+			WriteProblem(w, http.StatusConflict, "Idempotency Mismatch", "Idempotency-Key reused with different request body", r.URL.Path, "IDEMPOTENCY_MISMATCH")
 			return
 		}
 		// Same body - idempotent replay, return existing decision
 		existingDecision, err := h.store.FindByID(r.Context(), tenantID, existingDecisionID)
 		if err != nil {
 			h.log.Error("CreateDecision: failed to fetch existing decision", zap.String("decision_id", existingDecisionID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			WriteProblem(w, http.StatusServiceUnavailable, "Service Unavailable", "Store unavailable", r.URL.Path, "SERVICE_UNAVAILABLE")
 			return
 		}
 		writeJSON(w, http.StatusOK, existingDecision)
@@ -290,10 +278,7 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if missing := req.missingField(); missing != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": missing,
-		})
+		WriteProblem(w, http.StatusBadRequest, "Missing Required Field", "Field '"+missing+"' is required", r.URL.Path, "INVALID_REQUEST")
 		return
 	}
 
@@ -309,17 +294,11 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	// Validate decided_at bounds (not in future beyond clock skew, not before retention floor)
 	now := time.Now().UTC()
 	if decidedAt.After(now.Add(24 * time.Hour)) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_decided_at",
-			"message": "decided_at cannot be more than 24 hours in the future",
-		})
+		WriteProblem(w, http.StatusBadRequest, "Invalid Decision Time", "decided_at cannot be more than 24 hours in the future", r.URL.Path, "INVALID_REQUEST")
 		return
 	}
 	if decidedAt.Before(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_decided_at",
-			"message": "decided_at cannot be before 2020-01-01",
-		})
+		WriteProblem(w, http.StatusBadRequest, "Invalid Decision Time", "decided_at cannot be before 2020-01-01", r.URL.Path, "INVALID_REQUEST")
 		return
 	}
 
@@ -343,11 +322,7 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 
 	created, err := h.store.Insert(r.Context(), d)
 	if errors.Is(err, domain.ErrDecisionIDConflict) {
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"error":       "decision_id_conflict",
-			"decision_id": d.DecisionID,
-			"message":     "decision_id is already in use",
-		})
+		WriteProblem(w, http.StatusConflict, "Decision ID Conflict", "decision_id is already in use", r.URL.Path, "DECISION_ID_CONFLICT")
 		return
 	}
 	if err != nil {
@@ -356,7 +331,7 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		WriteProblem(w, http.StatusServiceUnavailable, "Service Unavailable", "Store unavailable", r.URL.Path, "SERVICE_UNAVAILABLE")
 		return
 	}
 
@@ -427,13 +402,13 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 //	401 → missing X-Principal-Id
 //	403 → not authorized to read decisions
 //	404 → no decision with this decision_id for this tenant
-//	503 → store unavailable
+//	503 → store unavailable, authorization service unavailable
 func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
 	decisionID := chi.URLParam(r, "decision_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if tenantID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_tenant_id"})
+		WriteProblem(w, http.StatusBadRequest, "Tenant Scope Missing", "X-Tenant-Id is required", r.URL.Path, "TENANT_SCOPE_MISSING")
 		return
 	}
 
@@ -450,17 +425,14 @@ func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrDecisionNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":       "decision_not_found",
-				"decision_id": decisionID,
-			})
+			WriteProblem(w, http.StatusNotFound, "Decision Not Found", "No decision with this decision_id for this tenant", r.URL.Path, "NOT_FOUND")
 		default:
 			h.log.Error("GetDecision: store unavailable",
 				zap.String("decision_id", decisionID),
 				zap.String("correlation_id", correlationID),
 				zap.Error(err),
 			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			WriteProblem(w, http.StatusServiceUnavailable, "Service Unavailable", "Store unavailable", r.URL.Path, "SERVICE_UNAVAILABLE")
 		}
 		return
 	}
@@ -498,7 +470,7 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if tenantID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_tenant_id"})
+		WriteProblem(w, http.StatusBadRequest, "Tenant Scope Missing", "X-Tenant-Id is required", r.URL.Path, "TENANT_SCOPE_MISSING")
 		return
 	}
 
@@ -515,11 +487,11 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 	decision, err := h.store.FindByID(r.Context(), tenantID, decisionID)
 	if err != nil {
 		if errors.Is(err, domain.ErrDecisionNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "decision_not_found", "decision_id": decisionID})
+			WriteProblem(w, http.StatusNotFound, "Decision Not Found", "No decision with this decision_id for this tenant", r.URL.Path, "NOT_FOUND")
 			return
 		}
 		h.log.Error("ReplayDecision: fetch decision failed", zap.String("decision_id", decisionID), zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		WriteProblem(w, http.StatusServiceUnavailable, "Service Unavailable", "Store unavailable", r.URL.Path, "SERVICE_UNAVAILABLE")
 		return
 	}
 
@@ -528,19 +500,13 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if decision.ActionType != "APPROVAL_THRESHOLD" {
-		writeJSON(w, http.StatusNotImplemented, map[string]string{
-			"error":       "replay_not_implemented",
-			"action_type": decision.ActionType,
-		})
+		WriteProblem(w, http.StatusNotImplemented, "Replay Not Implemented", "Replay not implemented for action type: "+decision.ActionType, r.URL.Path, "NOT_IMPLEMENTED")
 		return
 	}
 
 	_, policyVersionID, ok := policyclient.ParseRuleBasis(decision.RuleBasis)
 	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":      "unparseable_rule_basis",
-			"rule_basis": decision.RuleBasis,
-		})
+		WriteProblem(w, http.StatusBadRequest, "Unparseable Rule Basis", "Decision's rule_basis is not parseable: "+decision.RuleBasis, r.URL.Path, "INVALID_REQUEST")
 		return
 	}
 
@@ -549,20 +515,17 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 	version, err := h.policyClient.GetPolicyVersion(r.Context(), tenantID, policyVersionID)
 	if err != nil {
 		if errors.Is(err, policyclient.ErrPolicyVersionNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":             "policy_version_not_found",
-				"policy_version_id": policyVersionID,
-			})
+			WriteProblem(w, http.StatusNotFound, "Policy Version Not Found", "Policy version no longer resolvable: "+policyVersionID, r.URL.Path, "NOT_FOUND")
 			return
 		}
 		h.log.Error("ReplayDecision: policy-svc unavailable", zap.String("decision_id", decisionID), zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "policy_service_unavailable"})
+		WriteProblem(w, http.StatusServiceUnavailable, "Service Unavailable", "Policy service unavailable", r.URL.Path, "SERVICE_UNAVAILABLE")
 		return
 	}
 
 	replayedOutcome, err := replayApprovalThreshold(version.RulePayload, decision.EvaluationContext)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_replay_input", "message": err.Error()})
+		WriteProblem(w, http.StatusBadRequest, "Invalid Replay Input", err.Error(), r.URL.Path, "INVALID_REQUEST")
 		return
 	}
 
@@ -579,7 +542,7 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.store.CreateReplayManifest(r.Context(), manifest); err != nil {
 		h.log.Error("ReplayDecision: failed to record manifest", zap.String("decision_id", decisionID), zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		WriteProblem(w, http.StatusServiceUnavailable, "Service Unavailable", "Store unavailable", r.URL.Path, "SERVICE_UNAVAILABLE")
 		return
 	}
 
@@ -631,12 +594,12 @@ func replayApprovalThreshold(rulePayload, evaluationContext json.RawMessage) (st
 //	400 → missing X-Tenant-Id
 //	401 → missing X-Principal-Id
 //	403 → not authorized to read decisions
-//	503 → store unavailable
+//	503 → store unavailable, authorization service unavailable
 func (h *Handler) ListReplayManifests(w http.ResponseWriter, r *http.Request) {
 	decisionID := chi.URLParam(r, "decision_id")
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if tenantID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_tenant_id"})
+		WriteProblem(w, http.StatusBadRequest, "Tenant Scope Missing", "X-Tenant-Id is required", r.URL.Path, "TENANT_SCOPE_MISSING")
 		return
 	}
 
@@ -651,7 +614,7 @@ func (h *Handler) ListReplayManifests(w http.ResponseWriter, r *http.Request) {
 
 	results, err := h.store.ListReplayManifestsByDecision(r.Context(), tenantID, decisionID)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		WriteProblem(w, http.StatusServiceUnavailable, "Service Unavailable", "Store unavailable", r.URL.Path, "SERVICE_UNAVAILABLE")
 		return
 	}
 	if results == nil {
@@ -679,15 +642,15 @@ func (h *Handler) ListReplayManifests(w http.ResponseWriter, r *http.Request) {
 // Response:
 //
 //	200 → JSON array of decisions (may be empty), newest first
-//	400 → missing X-Tenant-Id, invalid from/to timestamp
+//	400 → missing X-Tenant-Id, invalid from/to timestamp, invalid limit/offset
 //	401 → missing X-Principal-Id
 //	403 → not authorized to read decisions
-//	503 → store unavailable
+//	503 → store unavailable, authorization service unavailable
 func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if tenantID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_tenant_id"})
+		WriteProblem(w, http.StatusBadRequest, "Tenant Scope Missing", "X-Tenant-Id is required", r.URL.Path, "TENANT_SCOPE_MISSING")
 		return
 	}
 
@@ -712,10 +675,7 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error":   "invalid_from",
-				"message": "from must be a valid RFC3339 timestamp",
-			})
+			WriteProblem(w, http.StatusBadRequest, "Invalid Timestamp", "from must be a valid RFC3339 timestamp", r.URL.Path, "INVALID_REQUEST")
 			return
 		}
 		params.From = t
@@ -723,10 +683,7 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("to"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error":   "invalid_to",
-				"message": "to must be a valid RFC3339 timestamp",
-			})
+			WriteProblem(w, http.StatusBadRequest, "Invalid Timestamp", "to must be a valid RFC3339 timestamp", r.URL.Path, "INVALID_REQUEST")
 			return
 		}
 		params.To = t
@@ -739,10 +696,7 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("offset"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			if n < 0 {
-				writeJSON(w, http.StatusBadRequest, map[string]string{
-					"error":   "invalid_offset",
-					"message": "offset must be a non-negative integer",
-				})
+				WriteProblem(w, http.StatusBadRequest, "Invalid Offset", "offset must be a non-negative integer", r.URL.Path, "INVALID_REQUEST")
 				return
 			}
 			params.Offset = n
@@ -755,7 +709,7 @@ func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		WriteProblem(w, http.StatusServiceUnavailable, "Service Unavailable", "Store unavailable", r.URL.Path, "SERVICE_UNAVAILABLE")
 		return
 	}
 
@@ -814,10 +768,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+			WriteProblem(w, http.StatusRequestEntityTooLarge, "Payload Too Large", "Request body exceeds maximum allowed size", r.URL.Path, "PAYLOAD_TOO_LARGE")
 			return false
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		WriteProblem(w, http.StatusBadRequest, "Invalid JSON", err.Error(), r.URL.Path, "INVALID_REQUEST")
 		return false
 	}
 	return true

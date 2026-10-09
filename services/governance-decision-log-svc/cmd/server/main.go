@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/governance-decision-log-svc/internal/authz"
@@ -35,6 +36,7 @@ import (
 	"zoiko.io/governance-decision-log-svc/internal/handler"
 	"zoiko.io/governance-decision-log-svc/internal/health"
 	"zoiko.io/governance-decision-log-svc/internal/mtls"
+	"zoiko.io/governance-decision-log-svc/internal/outbox"
 	"zoiko.io/governance-decision-log-svc/internal/policyclient"
 	"zoiko.io/governance-decision-log-svc/internal/store"
 	"zoiko.io/governance-decision-log-svc/internal/telemetry"
@@ -108,12 +110,30 @@ func main() {
 	}
 	log.Info("db pool connected")
 
-	// ── 4. Store ──────────────────────────────────────────────────────────────
+	// ── 4b. Kafka producer & outbox worker ──────────────────────────────────────
+	kafkaWriter := &kafka.Writer{
+		Addr:         kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:        cfg.Kafka.Topic,
+		Balancer:     &kafka.LeastBytes{},
+		BatchSize:    100,
+		BatchTimeout: 10 * time.Millisecond,
+		RequiredAcks: kafka.RequireAll,
+		Async:        false,
+	}
+	defer func() {
+		if err := kafkaWriter.Close(); err != nil {
+			log.Error("kafka writer close failed", zap.Error(err))
+		}
+	}()
+
+	outboxWorker := outbox.NewWorker(pool, kafkaWriter, cfg.Kafka.Topic, log)
+	outboxWorker.Start(context.Background())
+	defer outboxWorker.Stop()
+
+	// ── 5. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
 
-	// ── 5. Event publisher removed - using transactional outbox instead ────────────
-	// Events are written to the outbox table in the same transaction as the
-	// business write, then published asynchronously by a background worker.
+	// Event publishing uses transactional outbox (see 4b above)
 
 	// AuthZ client. Refuses to start in production/staging against a
 	// placeholder URL — no service may silently fall back to permit-all.

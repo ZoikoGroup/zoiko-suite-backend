@@ -257,12 +257,21 @@ func TestCreateDecision_201_StoreErrorDoesNotFailRequest(t *testing.T) {
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	var got map[string]string
+	var got struct {
+		Type     string `json:"type"`
+		Title    string `json:"title"`
+		Status   int    `json:"status"`
+		Detail   string `json:"detail"`
+		Instance string `json:"instance"`
+	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if got["error"] != "store_unavailable" {
-		t.Errorf("expected error=store_unavailable, got %q", got["error"])
+	if got.Title != "Service Unavailable" {
+		t.Errorf("expected title=Service Unavailable, got %q", got.Title)
+	}
+	if got.Type != "SERVICE_UNAVAILABLE" {
+		t.Errorf("expected type=SERVICE_UNAVAILABLE, got %q", got.Type)
 	}
 }
 
@@ -279,12 +288,21 @@ func TestCreateDecision_400_MissingField(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	var got map[string]string
+	var got struct {
+		Type     string `json:"type"`
+		Title    string `json:"title"`
+		Status   int    `json:"status"`
+		Detail   string `json:"detail"`
+		Instance string `json:"instance"`
+	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if got["error"] != "missing_field" {
-		t.Errorf("expected error=missing_field, got %q", got["error"])
+	if got.Title != "Missing Required Field" {
+		t.Errorf("expected title=Missing Required Field, got %q", got.Title)
+	}
+	if got.Type != "INVALID_REQUEST" {
+		t.Errorf("expected type=INVALID_REQUEST, got %q", got.Type)
 	}
 }
 
@@ -314,12 +332,21 @@ func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
 	}
-	var got map[string]string
+	var got struct {
+		Type     string `json:"type"`
+		Title    string `json:"title"`
+		Status   int    `json:"status"`
+		Detail   string `json:"detail"`
+		Instance string `json:"instance"`
+	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("failed to decode error body: %v", err)
 	}
-	if got["error"] != "store_unavailable" {
-		t.Errorf("expected error=store_unavailable, got %q", got["error"])
+	if got.Title != "Service Unavailable" {
+		t.Errorf("expected title=Service Unavailable, got %q", got.Title)
+	}
+	if got.Type != "SERVICE_UNAVAILABLE" {
+		t.Errorf("expected type=SERVICE_UNAVAILABLE, got %q", got.Type)
 	}
 }
 

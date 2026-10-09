@@ -170,14 +170,14 @@ func ActionType(resource, action string) string {
 	return strings.ToUpper(resource + "_" + action)
 }
 
-func (c *HTTPAuthZClient) Authorize(ctx context.Context, principalID, scopeID, resource, action string, envelope *envelope.Envelope) error {
+func (c *HTTPAuthZClient) Authorize(ctx context.Context, principalID, scopeID, resource, action string, env *envelope.Envelope) error {
 	key := principalID + "|" + scopeID + "|" + resource + "|" + action
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.authorizeLive(ctx, principalID, scopeID, resource, action, envelope)
+	err := c.authorizeLive(ctx, principalID, scopeID, resource, action, env)
 
 	if err == nil || errors.Is(err, ErrUnauthorized) {
 		c.storeCache(key, err)
@@ -225,7 +225,7 @@ func (c *HTTPAuthZClient) storeCache(key string, decision error) {
 }
 
 // authorizeLive is the real, uncached call to authorization-svc.
-func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeID, resource, action string, envelope *envelope.Envelope) error {
+func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeID, resource, action string, env *envelope.Envelope) error {
 	actionType := ActionType(resource, action)
 
 	reqBody := authorizeRequest{
@@ -234,12 +234,12 @@ func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeI
 		ActionType:    actionType,
 	}
 
-	if envelope != nil {
-		reqBody.TenantID = envelope.TenantID
-		reqBody.RequestID = envelope.RequestID
-		reqBody.CorrelationID = envelope.CorrelationID
-		reqBody.SourceChannel = string(envelope.SourceChannel)
-		reqBody.IdempotencyKey = envelope.IdempotencyKey
+	if env != nil {
+		reqBody.TenantID = env.TenantID
+		reqBody.RequestID = env.RequestID
+		reqBody.CorrelationID = env.CorrelationID
+		reqBody.SourceChannel = string(env.SourceChannel)
+		reqBody.IdempotencyKey = env.IdempotencyKey
 	}
 
 	body, err := json.Marshal(reqBody)
@@ -252,6 +252,26 @@ func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeI
 		return ErrAuthZUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Forward the canonical request context as headers so authorization-svc's
+	// middleware and decision log attribute the outbound call to the same
+	// tenant/principal/correlation/request/channel the caller used (audit X6
+	// attribution). The acting principal always names the caller; the rest are
+	// only set when the envelope supplies them.
+	req.Header.Set(envelope.HeaderActorSubjectID, principalID)
+	if env != nil {
+		if env.TenantID != "" {
+			req.Header.Set(envelope.HeaderTenantID, env.TenantID)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set(envelope.HeaderCorrelationID, env.CorrelationID)
+		}
+		if env.RequestID != "" {
+			req.Header.Set(envelope.HeaderRequestID, env.RequestID)
+		}
+		if env.SourceChannel != "" {
+			req.Header.Set(envelope.HeaderSourceChannel, string(env.SourceChannel))
+		}
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {

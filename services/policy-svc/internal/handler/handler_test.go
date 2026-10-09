@@ -96,6 +96,14 @@ func (s *stubStore) FindApplicableVersions(_ context.Context, _ string, _, _ *st
 	return s.applicable, s.applicableErr
 }
 
+func (s *stubStore) FindPolicyByID(_ context.Context, _ string) (*domain.Policy, error) {
+	return s.policy, s.policyErr
+}
+
+func (s *stubStore) CheckPolicyTypeOverlap(_ context.Context, _ string, _, _, _ *string, _ time.Time, _ *time.Time) (bool, error) {
+	return false, nil
+}
+
 func (s *stubStore) EnqueueEvent(_ context.Context, _ store.OutboxEvent) error {
 	return nil
 }
@@ -411,6 +419,13 @@ func TestCreatePolicyVersion_Created(t *testing.T) {
 	policyID := "11111111-1111-1111-1111-111111111111"
 	versionID := "22222222-2222-2222-2222-222222222222"
 	store := &stubStore{
+		policy: &domain.Policy{
+			PolicyID:             policyID,
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
 		version: &domain.PolicyVersion{
 			PolicyVersionID: versionID,
 			PolicyID:        policyID,
@@ -445,7 +460,7 @@ func TestCreatePolicyVersion_MissingEffectiveFrom(t *testing.T) {
 }
 
 func TestCreatePolicyVersion_PolicyNotFound(t *testing.T) {
-	store := &stubStore{versionErr: domain.ErrPolicyNotFound}
+	store := &stubStore{policyErr: domain.ErrPolicyNotFound}
 	r := newTestRouter(store)
 
 	body := `{"effective_from":"2026-01-01T00:00:00Z"}`
@@ -464,6 +479,13 @@ func TestActivateVersion_Success(t *testing.T) {
 	policyID := "11111111-1111-1111-1111-111111111111"
 	versionID := "22222222-2222-2222-2222-222222222222"
 	store := &stubStore{
+		policy: &domain.Policy{
+			PolicyID:             policyID,
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
 		findVersion:  &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "DRAFT"},
 		activated:    &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "ACTIVE"},
 		superseded:   []*domain.PolicyVersion{{PolicyVersionID: "33333333-3333-3333-3333-333333333333", PolicyID: policyID, VersionStatus: "SUPERSEDED"}},
@@ -530,6 +552,13 @@ func TestActivateVersion_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	policyID := "11111111-1111-1111-1111-111111111111"
 	versionID := "22222222-2222-2222-2222-222222222222"
 	store := &stubStore{
+		policy: &domain.Policy{
+			PolicyID:             policyID,
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
 		findVersion:  &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "ACTIVE"},
 		activated:    &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "ACTIVE"},
 		transitioned: false, // store signals this was a no-op, not a real transition
@@ -556,6 +585,13 @@ func TestActivateVersion_ActorComesFromHeaderNotBody(t *testing.T) {
 	policyID := "11111111-1111-1111-1111-111111111111"
 	versionID := "22222222-2222-2222-2222-222222222222"
 	store := &stubStore{
+		policy: &domain.Policy{
+			PolicyID:             policyID,
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
 		findVersion:  &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "DRAFT"},
 		activated:    &domain.PolicyVersion{PolicyVersionID: versionID, PolicyID: policyID, VersionStatus: "ACTIVE"},
 		transitioned: true,
@@ -592,7 +628,12 @@ var mutatingRoutes = []struct {
 
 func okStore() *stubStore {
 	return &stubStore{
-		policy:         &domain.Policy{PolicyID: "11111111-1111-1111-1111-111111111111", PolicyCode: "C"},
+		policy: &domain.Policy{
+			PolicyID:             "11111111-1111-1111-1111-111111111111",
+			PolicyCode:           "C",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
 		policyCreated:  true,
 		version:        &domain.PolicyVersion{PolicyVersionID: "22222222-2222-2222-2222-222222222222", PolicyID: "11111111-1111-1111-1111-111111111111", VersionStatus: "DRAFT"},
 		versionCreated: true,
@@ -760,6 +801,13 @@ func TestActivateVersion_PolicyIDMismatch(t *testing.T) {
 
 func TestActivateVersion_InvalidTransition(t *testing.T) {
 	store := &stubStore{
+		policy: &domain.Policy{
+			PolicyID:             "11111111-1111-1111-1111-111111111111",
+			PolicyCode:           "APPROVAL_5K",
+			PolicyName:           "5K Approval Threshold",
+			PolicyType:           "APPROVAL_THRESHOLD",
+			CreatedByPrincipalID: "admin-1",
+		},
 		findVersion: &domain.PolicyVersion{PolicyVersionID: "22222222-2222-2222-2222-222222222222", PolicyID: "11111111-1111-1111-1111-111111111111", VersionStatus: "RETIRED"},
 		activateErr: domain.ErrInvalidTransition,
 	}

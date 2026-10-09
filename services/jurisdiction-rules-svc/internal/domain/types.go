@@ -276,6 +276,12 @@ var ErrConflict = errorString("conflict: record already exists with differing at
 // rule that exists but is unreachable.
 var ErrInvalidEffectivePeriod = errorString("effective_to must be after effective_from")
 
+// ErrInputTooLong is returned when a client-supplied value exceeds its
+// column's length (Postgres SQLSTATE 22001). The store maps it at the create
+// boundary, like 22P02, so over-length input reads as a 400 client error
+// rather than a 503 store outage.
+var ErrInputTooLong = errorString("input exceeds the maximum allowed length")
+
 // ErrStoreUnavailable is returned when the database cannot be reached.
 // Callers must fail-closed — treat as unavailable, not as "not found".
 var ErrStoreUnavailable = errorString("jurisdiction rules store unavailable")

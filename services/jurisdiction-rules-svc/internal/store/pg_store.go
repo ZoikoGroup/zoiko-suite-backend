@@ -106,7 +106,9 @@ type Store interface {
 	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
 
 	// DeactivateJurisdiction sets active_flag=false and end-dates the record.
-	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error)
+	// The bool reports whether the row actually changed (false on an
+	// idempotent replay of an already-deactivated jurisdiction).
+	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
 
 	// FindRuleByID looks up a rule by ID.
 	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
@@ -238,6 +240,24 @@ func isExclusionViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23P01"
 }
+
+// isStringDataRightTruncation reports whether err is SQLSTATE 22001 (string
+// data too long for the column). It is what a non-UUID, over-length code in
+// the body produces when a handler does not bound its own text fields — e.g.
+// jurisdiction_code VARCHAR(32). Without this every over-length create died
+// in the pgx driver and surfaced as 503 store_unavailable: a client mistake
+// reading as a platform outage, exactly the class of error 22P02 already
+// maps to 404. The client's input is the problem, so handlers reject it and
+// the WriteError net below keeps any missed path a 400 too.
+func isStringDataRightTruncation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "22001"
+}
+
+// IsInputTooLong reports whether err (or anything it wraps) is a Postgres
+// string-data-too-long error. Exported so the handler layer can classify
+// store failures without importing the pgx driver itself.
+func IsInputTooLong(err error) bool { return isStringDataRightTruncation(err) }
 
 // notFoundOr maps a scan error onto notFound for both "no rows" and
 // "the id could never match a row", and to ErrStoreUnavailable otherwise.
@@ -698,6 +718,12 @@ func (s *PgStore) CreateJurisdictionWithQuerier(ctx context.Context, q Querier, 
 	if isForeignKeyViolation(err) {
 		return nil, false, domain.ErrParentNotFound
 	}
+	if isStringDataRightTruncation(err) {
+		// An over-length code/type is the client's mistake, not an outage
+		// (SQLSTATE 22001). Handlers bound these fields too; this is the net
+		// for any constrained column they miss.
+		return nil, false, domain.ErrInputTooLong
+	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		s.log.Error("pg CreateJurisdiction failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -737,12 +763,16 @@ func (s *PgStore) CreateJurisdictionWithQuerier(ctx context.Context, q Querier, 
 // deactivated jurisdiction still had an open-ended effective period and kept
 // satisfying every effective_to-based query in this service and in callers
 // that read the record directly.
-func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error) {
+func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error) {
 	return s.DeactivateJurisdictionWithQuerier(ctx, s.pool, jurisdictionID, actorID)
 }
 
 // DeactivateJurisdictionWithQuerier is the same as DeactivateJurisdiction but uses the provided querier (transaction).
-func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, error) {
+// The bool is true when the jurisdiction transitioned active → deactivated, and
+// false when it was already deactivated (the trg_prevent_duplicate_deactivation
+// trigger skips the UPDATE, so no row is returned): an idempotent replay that a
+// caller must not re-announce.
+func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error) {
 	query := `
 		UPDATE jurisdictions
 		SET active_flag             = FALSE,
@@ -755,16 +785,20 @@ func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Queri
 	j, err := scanJurisdiction(q.QueryRow(ctx, query, jurisdictionID, actorID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Trigger may have skipped the update because already deactivated.
-			// Fetch the existing jurisdiction.
-			return s.FindByIDAny(ctx, jurisdictionID)
+			// Trigger skipped the update because already deactivated.
+			// Fetch the existing jurisdiction; nothing changed.
+			existing, findErr := s.FindByIDAny(ctx, jurisdictionID)
+			if findErr != nil {
+				return nil, false, findErr
+			}
+			return existing, false, nil
 		}
 		if !isInvalidTextRepresentation(err) {
 			s.log.Error("pg DeactivateJurisdiction failed", zap.String("id", jurisdictionID), zap.Error(err))
 		}
-		return nil, notFoundOr(err, domain.ErrJurisdictionNotFound)
+		return nil, false, notFoundOr(err, domain.ErrJurisdictionNotFound)
 	}
-	return j, nil
+	return j, true, nil
 }
 
 // ── rules: reads ─────────────────────────────────────────────────────────────
@@ -848,7 +882,11 @@ func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*dom
 
 // FindRulePack resolves the runtime rule pack for a jurisdiction at a point in
 // time — the "resolve jurisdiction set" + "fetch runtime rule pack" inbound
-// APIs of 03-microservices.md §8.2.
+// APIs of 03-microservices.md §8.2. It fails closed (ErrJurisdictionNotFound)
+// when the requested `at` falls outside the jurisdiction's own effectiveness
+// window, and windows every rule by its owning jurisdiction's effective period,
+// so a since-deactivated jurisdiction (or retired ancestor) still replays the
+// pack that was in force at a historical `at`.
 //
 // Callers previously had to fetch the ancestor chain and then issue one
 // /rules request per generation, and merge the results themselves — which
@@ -864,15 +902,23 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 		return nil, err
 	}
 
-	// The pack is a runtime artifact — an inactive or expired jurisdiction
-	// has no runtime rules. Fail closed rather than serve a stale pack.
-	self := chain[0]
-	if !self.ActiveFlag || (self.EffectiveTo != nil && !self.EffectiveTo.After(time.Now().UTC())) {
-		return nil, domain.ErrJurisdictionNotFound
-	}
-
 	if at.IsZero() {
 		at = time.Now().UTC()
+	}
+
+	// The pack is a runtime artifact. A jurisdiction with an end date only has
+	// runtime rules for `at` inside its own effectiveness window: demanding a
+	// pack for a moment after deactivation fails closed (404) rather than
+	// serving a stale pack. The check is keyed off `at`, not the clock, so a
+	// historical query against a since-deactivated jurisdiction still answers —
+	// "historical actions must always be explainable against the rule set
+	// active at the time of execution" (03-microservices.md §8.2).
+	self := chain[0]
+	if !self.EffectiveFrom.IsZero() && at.Before(self.EffectiveFrom) {
+		return nil, domain.ErrJurisdictionNotFound
+	}
+	if self.EffectiveTo != nil && !at.Before(*self.EffectiveTo) {
+		return nil, domain.ErrJurisdictionNotFound
 	}
 
 	resolvedFrom := make([]string, 0, len(chain))
@@ -898,10 +944,35 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 		SELECT %s, c.depth
 		FROM   jurisdiction_rules r
 		JOIN   chain c ON c.jurisdiction_id = r.jurisdiction_id
+		JOIN   jurisdictions jj ON jj.jurisdiction_id = c.jurisdiction_id
 		WHERE  ($3 = '' OR r.rule_domain = $3)
-		  AND  r.rule_status NOT IN ('DRAFT', 'RETIRED')
+		  -- Status is bitemporal: a rule is in a historical pack when the status
+		  -- KNOWN to the platform at the queried point-in-time was live, not when
+		  -- its CURRENT status is live. The latter would drop a since-RETIRED
+		  -- rule from every earlier pack and make a since-activated rule answer
+		  -- for dates on which it was still DRAFT. Where the history does not
+		  -- cover the point-in-time -- rules created before 000007, or a query
+		  -- before the rule was created -- the stored status governs.
+		  AND  (
+		      ( NOT EXISTS (
+		            SELECT 1 FROM rule_status_history h
+		            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+		              AND  h.known_from <= $4
+		              AND  (h.known_to IS NULL OR h.known_to > $4)
+		        )
+		        AND  r.rule_status NOT IN ('DRAFT', 'RETIRED') )
+		      OR EXISTS (
+		            SELECT 1 FROM rule_status_history h
+		            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+		              AND  h.known_from <= $4
+		              AND  (h.known_to IS NULL OR h.known_to > $4)
+		              AND  h.rule_status NOT IN ('DRAFT', 'RETIRED')
+		        )
+		  )
 		  AND  r.effective_from <= $4
 		  AND  (r.effective_to IS NULL OR r.effective_to > $4)
+		  AND  (jj.effective_from IS NULL OR jj.effective_from <= $4)
+		  AND  (jj.effective_to IS NULL OR jj.effective_to > $4)
 		ORDER BY r.rule_domain ASC, r.rule_code ASC, r.precedence_level ASC, c.depth ASC, r.effective_from DESC`,
 		ruleColumnsR,
 	)
@@ -1091,6 +1162,9 @@ func (s *PgStore) CreateRuleWithQuerier(ctx context.Context, q Querier, params d
 	}
 	if isExclusionViolation(err) {
 		return nil, false, domain.ErrOverlappingRule
+	}
+	if isStringDataRightTruncation(err) {
+		return nil, false, domain.ErrInputTooLong
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		s.log.Error("pg CreateRule failed", zap.Error(err))

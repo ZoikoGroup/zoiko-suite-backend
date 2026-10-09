@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
+	"zoiko.io/jurisdiction-rules-svc/internal/telemetry"
 )
 
 const (
@@ -326,18 +327,20 @@ type OutboxWorker struct {
 	store     *store.PgStore
 	producer  *kafka.Writer
 	topic     string
+	metrics   *telemetry.Metrics
 	interval  time.Duration
 	batchSize int
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 }
 
-func NewOutboxWorker(log *zap.Logger, store *store.PgStore, producer *kafka.Writer, topic string) *OutboxWorker {
+func NewOutboxWorker(log *zap.Logger, store *store.PgStore, producer *kafka.Writer, topic string, metrics *telemetry.Metrics) *OutboxWorker {
 	return &OutboxWorker{
 		log:       log,
 		store:     store,
 		producer:  producer,
 		topic:     topic,
+		metrics:   metrics,
 		interval:  5 * time.Second,
 		batchSize: 100,
 		stopCh:    make(chan struct{}),
@@ -380,6 +383,9 @@ func (w *OutboxWorker) processBatch() {
 		w.log.Error("outbox: failed to fetch pending events", zap.Error(err))
 		return
 	}
+	if w.metrics != nil {
+		w.metrics.OutboxPendingEvents.Set(float64(len(events)))
+	}
 	if len(events) == 0 {
 		return
 	}
@@ -402,6 +408,9 @@ func (w *OutboxWorker) processBatch() {
 				zap.String("event_type", e.EventType),
 				zap.Error(err),
 			)
+			if w.metrics != nil {
+				w.metrics.OutboxPublishFailuresTotal.WithLabelValues(e.EventType).Inc()
+			}
 			if markErr := w.store.MarkOutboxEventFailed(ctx, e.OutboxID, err.Error()); markErr != nil {
 				w.log.Error("outbox: failed to mark event failed", zap.Error(markErr))
 			}

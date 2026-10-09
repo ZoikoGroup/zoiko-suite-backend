@@ -418,14 +418,16 @@ func (s *PgStore) CreateReplayManifest(ctx context.Context, m *domain.ReplayMani
 }
 
 func (s *PgStore) ListReplayManifestsByDecision(ctx context.Context, tenantID, decisionID string) ([]*domain.ReplayManifest, error) {
+	// Explicit tenant_id filter for defense-in-depth alongside RLS
+	// (mirrors FindByID pattern for governance_decisions)
 	const q = `SELECT ` + replayManifestColumns + `
 FROM replay_manifests
-WHERE decision_id = $1
+WHERE decision_id = $1 AND tenant_id = $2
 ORDER BY replayed_at DESC`
 
 	var out []*domain.ReplayManifest
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, queryErr := tx.Query(ctx, q, decisionID)
+		rows, queryErr := tx.Query(ctx, q, decisionID, tenantID)
 		if queryErr != nil {
 			return queryErr
 		}

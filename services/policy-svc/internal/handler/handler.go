@@ -27,11 +27,13 @@ import (
 // Allows the handler to be tested without a real database.
 type PolicyStore interface {
 	CreatePolicy(ctx context.Context, params domain.CreatePolicyParams) (*domain.Policy, bool, error)
+	FindPolicyByID(ctx context.Context, policyID string) (*domain.Policy, error)
 	CreatePolicyVersion(ctx context.Context, params domain.CreatePolicyVersionParams) (*domain.PolicyVersion, bool, error)
 	FindPolicyVersionByID(ctx context.Context, policyVersionID string) (*domain.PolicyVersion, error)
 	ActivateVersion(ctx context.Context, policyVersionID, actorID string) (*domain.PolicyVersion, []*domain.PolicyVersion, bool, error)
 	ListVersionHistory(ctx context.Context, policyID string) ([]*domain.PolicyVersion, error)
 	FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string, asOf *time.Time) ([]*domain.ApplicablePolicyVersion, error)
+	CheckPolicyTypeOverlap(ctx context.Context, policyType string, policyID, tenantID, legalEntityID *string, effectiveFrom time.Time, effectiveTo *time.Time) (bool, error)
 
 	// EnqueueEvent adds an event to the transactional outbox.
 	EnqueueEvent(ctx context.Context, event store.OutboxEvent) error
@@ -392,10 +394,30 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+
+	// Validate X-Legal-Entity-Id header matches body (if body has legal_entity_id)
+	if env, ok := envelope.FromContext(r.Context()); ok && req.LegalEntityID != nil && *req.LegalEntityID != "" {
+		if env.LegalEntityID != *req.LegalEntityID {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "legal_entity_mismatch",
+				"message": "X-Legal-Entity-Id header does not match body legal_entity_id",
+			})
+			return
+		}
+	}
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "missing_field",
 			"field": missing,
+		})
+		return
+	}
+
+	// Validate effective_to > effective_from (V-001 §10.1 step 4)
+	if req.EffectiveTo != nil && !req.EffectiveTo.After(req.EffectiveFrom) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_temporal_range",
+			"message": "effective_to must be after effective_from",
 		})
 		return
 	}
@@ -425,21 +447,62 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authorized in the scope the version will apply to, so a principal
-	// granted POLICY_VERSION_CREATE for one legal entity cannot publish a
-	// version binding another.
-	// Global versions (tenant_id == nil) require a distinct platform-wide grant.
-	createAction := authz.ActionPolicyVersionCreate
-	if req.TenantID == nil {
-		createAction = authz.ActionPolicyVersionCreateGlobal
-	}
-	if !h.authorize(w, r, principalID, createAction, req.LegalEntityID) {
-		return
-	}
+// Authorized in the scope the version will apply to, so a principal
+// granted POLICY_VERSION_CREATE for one legal entity cannot publish a
+// version binding another.
+// Global versions (tenant_id == nil) require a distinct platform-wide grant.
+createAction := authz.ActionPolicyVersionCreate
+if req.TenantID == nil {
+	createAction = authz.ActionPolicyVersionCreateGlobal
+}
+if !h.authorize(w, r, principalID, createAction, req.LegalEntityID) {
+	return
+}
 
-	// req.TenantID is either nil (GLOBAL, deliberately) or equal to the verified
-	// tenant — refuseForeignTenant has already rejected anything else.
-	params := domain.CreatePolicyVersionParams{
+// Fetch parent policy to get its type for overlap check
+parentPolicy, err := h.store.FindPolicyByID(r.Context(), policyID)
+if err != nil {
+	switch {
+	case errors.Is(err, domain.ErrPolicyNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":     "policy_not_found",
+			"policy_id": policyID,
+		})
+	default:
+		h.log.Error("CreatePolicyVersion: parent policy lookup failed",
+			zap.String("policy_id", policyID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	}
+	return
+}
+
+// Check for overlapping policies of the same type at the same specificity
+// (GOV-05 negative path #2, V-001 PDC-I-08)
+overlaps, err := h.store.CheckPolicyTypeOverlap(r.Context(), parentPolicy.PolicyType, &policyID, req.TenantID, req.LegalEntityID, req.EffectiveFrom, req.EffectiveTo)
+if err != nil {
+	h.log.Error("CreatePolicyVersion: overlap check failed",
+		zap.String("policy_id", policyID),
+		zap.String("correlation_id", correlationID),
+		zap.Error(err),
+	)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	return
+}
+if overlaps {
+	writeJSON(w, http.StatusConflict, map[string]string{
+		"error":       "policy_overlap",
+		"message":     "an active policy of the same type already exists with overlapping scope and temporal range",
+		"policy_type": parentPolicy.PolicyType,
+	})
+	return
+}
+
+// req.TenantID is either nil (GLOBAL, deliberately) or equal to the verified
+// tenant — refuseForeignTenant has already rejected anything else.
+params := domain.CreatePolicyVersionParams{
 		PolicyVersionID:      req.PolicyVersionID,
 		PolicyID:             policyID,
 		TenantID:             req.TenantID,
@@ -574,14 +637,8 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	// Empty body check (decodeJSON returns false on empty body)
-	if r.Body != nil && r.ContentLength == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "empty_body",
-			"message": "request body is required",
-		})
-		return
-	}
+	// Body is optional: the acting principal comes from X-Principal-Id header.
+	// decodeJSON accepts empty body ({} or empty) and returns true.
 
 	// Validate the version belongs to the policy in the path before mutating
 	// anything — an activate call must never succeed against the wrong
@@ -624,18 +681,60 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authorized against the scope the version actually binds, read from the
-	// stored record rather than the request — activation is the moment a
-	// policy starts governing real spend, so it is checked after the version
-	// is resolved and before anything is written.
-	// Global versions (tenant_id == nil) require a distinct platform-wide grant.
-	activateAction := authz.ActionPolicyVersionActivate
-	if existing.TenantID == nil {
-		activateAction = authz.ActionPolicyVersionActivateGlobal
+// Authorized against the scope the version actually binds, read from the
+// stored record rather than the request — activation is the moment a
+// policy starts governing real spend, so it is checked after the version
+// is resolved and before anything is written.
+// Global versions (tenant_id == nil) require a distinct platform-wide grant.
+activateAction := authz.ActionPolicyVersionActivate
+if existing.TenantID == nil {
+	activateAction = authz.ActionPolicyVersionActivateGlobal
+}
+if !h.authorize(w, r, principalID, activateAction, existing.LegalEntityID) {
+	return
+}
+
+// Fetch parent policy to get its type for overlap check at activation time
+// (race condition: another policy of same type could have been activated since creation)
+parentPolicy, err := h.store.FindPolicyByID(r.Context(), existing.PolicyID)
+if err != nil {
+	switch {
+	case errors.Is(err, domain.ErrPolicyNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":     "policy_not_found",
+			"policy_id": existing.PolicyID,
+		})
+	default:
+		h.log.Error("ActivateVersion: parent policy lookup failed",
+			zap.String("policy_id", existing.PolicyID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 	}
-	if !h.authorize(w, r, principalID, activateAction, existing.LegalEntityID) {
-		return
-	}
+	return
+}
+
+// Check for overlapping policies of the same type at the same specificity
+// (GOV-05 negative path #2, V-001 PDC-I-08)
+overlaps, err := h.store.CheckPolicyTypeOverlap(r.Context(), parentPolicy.PolicyType, &existing.PolicyID, existing.TenantID, existing.LegalEntityID, existing.EffectiveFrom, existing.EffectiveTo)
+if err != nil {
+	h.log.Error("ActivateVersion: overlap check failed",
+		zap.String("policy_version_id", versionID),
+		zap.String("correlation_id", correlationID),
+		zap.Error(err),
+	)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	return
+}
+if overlaps {
+	writeJSON(w, http.StatusConflict, map[string]string{
+		"error":       "policy_overlap",
+		"message":     "an active policy of the same type already exists with overlapping scope and temporal range",
+		"policy_type": parentPolicy.PolicyType,
+	})
+	return
+}
 
 	activated, superseded, transitioned, err := h.store.ActivateVersion(r.Context(), versionID, principalID)
 	if err != nil {
@@ -969,6 +1068,7 @@ type evaluateResponse struct {
 	Result          string `json:"result"`
 	PolicyVersionID string `json:"policy_version_id"`
 	RuleBasis       string `json:"rule_basis"`
+	EvidenceID      string `json:"evidence_id,omitempty"`
 }
 
 // Evaluate handles POST /v1/policies/evaluate — the "evaluate policy
@@ -1179,15 +1279,21 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 	ruleBasis := fmt.Sprintf("%s:%s", applicable.PolicyCode, applicable.PolicyVersionID)
 
 	if err := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
-		DecisionID:        req.DecisionID,
-		TenantID:          req.TenantID,
-		LegalEntityID:     req.LegalEntityID,
-		ActorID:           actorID,
-		ActionType:        req.PolicyType,
-		Outcome:           canonicalOutcome(result),
-		RuleBasis:         ruleBasis,
-		EvaluationContext: req.ActionContext,
-		CorrelationID:     correlationID,
+		DecisionID:            req.DecisionID,
+		TenantID:              req.TenantID,
+		LegalEntityID:         req.LegalEntityID,
+		ActorID:               actorID,
+		ActionType:            req.PolicyType,
+		Outcome:               canonicalOutcome(result),
+		RuleBasis:             ruleBasis,
+		EvaluationContext:     req.ActionContext,
+		CorrelationID:         correlationID,
+		PolicyVersionID:       &applicable.PolicyVersionID,
+		ActionSubjectType:     nil, // Could be derived from action_context if needed
+		ActionSubjectID:       nil,
+		WorkflowInstanceID:    nil,
+		CausationID:           nil,
+		DecidedAt:             nil, // Will default to server time
 	}); err != nil {
 		// Best-effort: the evaluation result is still correct and still
 		// returned to the caller. Evaluate's own availability must not
@@ -1204,6 +1310,7 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 		Result:          result,
 		PolicyVersionID: applicable.PolicyVersionID,
 		RuleBasis:       ruleBasis,
+		EvidenceID:      req.DecisionID,
 	})
 }
 

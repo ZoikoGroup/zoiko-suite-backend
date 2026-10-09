@@ -137,7 +137,7 @@ func main() {
 	// Start outbox worker for reliable event publishing
 	var outboxWorker *events.OutboxWorker
 	if writer != nil {
-		outboxWorker = events.NewOutboxWorker(log, pgStore, writer, cfg.Kafka.Topic)
+		outboxWorker = events.NewOutboxWorker(log, pgStore, writer, cfg.Kafka.Topic, metrics)
 		outboxWorker.Start()
 		defer outboxWorker.Stop()
 	}
