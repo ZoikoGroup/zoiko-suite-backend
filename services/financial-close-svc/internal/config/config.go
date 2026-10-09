@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -51,6 +52,31 @@ type Config struct {
 	// silently disable a control; CloseGateModeInvalid records that it happened.
 	CloseGateMode        string
 	CloseGateModeInvalid bool
+
+	// SubledgerControlGateMode is "enforce" (the default) or "off". Enforced,
+	// a period closes only when its latest AR and AP subledger-to-GL control
+	// runs MATCHED (ACC-06). "off" is for an environment whose control-account
+	// mappings are not configured yet. Unlike FINCTRL_CLOSE_GATE_MODE this
+	// defaults ON: it needs no external service, and an unchecked subledger is
+	// exactly what a close must not certify. Any value other than "off" is
+	// treated as enforce; SubledgerControlGateModeInvalid records a typo.
+	SubledgerControlGateMode        string
+	SubledgerControlGateModeInvalid bool
+
+	// Bank reconciliation close gate (ACC-14 "bank recon"; ZS-CONTROL-001
+	// §22). TreasuryServiceURL lists the entity's bank accounts;
+	// BankReconciliationServiceURL says which are reconciled.
+	TreasuryServiceURL           string
+	BankReconciliationServiceURL string
+	// BankReconGateMode is "enforce" (default) or "off" — off only where no
+	// bank feed exists yet. Any other value enforces and sets the Invalid flag.
+	BankReconGateMode        string
+	BankReconGateModeInvalid bool
+	// BankReconCutoffDays: the certified reconciliation that proves a period
+	// must be for a statement dated no more than this many days before period
+	// end (BNK-05 "bank cut-off"). Covers a weekend month end; stops a close
+	// passing on a week-old reconciliation while the last statement is late.
+	BankReconCutoffDays int
 
 	// AssetEventsTopic/InventoryEventsTopic/ProjectEventsTopic are the
 	// three Kafka topics this service's own ACC-18 lineage consumer
@@ -121,6 +147,18 @@ func Load() (*Config, error) {
 	}
 
 	gateMode, gateModeInvalid := normalizeCloseGateMode(os.Getenv("FINCTRL_CLOSE_GATE_MODE"))
+	subledgerMode, subledgerModeInvalid := normalizeSubledgerControlGateMode(os.Getenv("SUBLEDGER_CONTROL_GATE_MODE"))
+	bankReconMode, bankReconModeInvalid := normalizeSubledgerControlGateMode(os.Getenv("BANK_RECON_GATE_MODE"))
+	cutoffDays := 4
+	if raw := strings.TrimSpace(os.Getenv("BANK_RECON_CUTOFF_DAYS")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 || n > 31 {
+			// Not silently defaulted: this decides what counts as a
+			// reconciled month, and a typo must not change that unnoticed.
+			return nil, fmt.Errorf("BANK_RECON_CUTOFF_DAYS must be a whole number of days between 0 and 31, got %q", raw)
+		}
+		cutoffDays = n
+	}
 
 	return &Config{
 		Env:  env("ENV", "local"),
@@ -159,7 +197,16 @@ func Load() (*Config, error) {
 		FinancialControlServiceURL: env("FINCTRL_SERVICE_URL", "http://financial-control-svc:8171"),
 		CloseGateMode:              gateMode,
 		CloseGateModeInvalid:       gateModeInvalid,
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+
+		SubledgerControlGateMode:        subledgerMode,
+		SubledgerControlGateModeInvalid: subledgerModeInvalid,
+
+		TreasuryServiceURL:           env("TREASURY_SERVICE_URL", "http://treasury-svc:8103"),
+		BankReconciliationServiceURL: env("BANK_RECONCILIATION_SERVICE_URL", "http://bank-reconciliation-svc:8102"),
+		BankReconGateMode:            bankReconMode,
+		BankReconGateModeInvalid:     bankReconModeInvalid,
+		BankReconCutoffDays:          cutoffDays,
+		OTELExporterEndpoint:         env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 
@@ -172,6 +219,20 @@ func normalizeCloseGateMode(raw string) (mode string, invalid bool) {
 		return "off", false
 	case "enforce":
 		return "enforce", false
+	default:
+		return "enforce", true
+	}
+}
+
+// normalizeSubledgerControlGateMode maps SUBLEDGER_CONTROL_GATE_MODE to
+// "enforce" or "off". Unset/empty/"enforce" is enforce, "off" is off, and
+// anything else is enforce with the second return reporting the typo.
+func normalizeSubledgerControlGateMode(raw string) (mode string, invalid bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "enforce":
+		return "enforce", false
+	case "off":
+		return "off", false
 	default:
 		return "enforce", true
 	}
