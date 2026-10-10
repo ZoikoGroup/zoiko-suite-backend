@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -53,6 +54,13 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// EventResidencyRegion is the residencyregion every event this service
+	// enqueues to the transactional outbox carries (ZS-EVENT-001 §4,
+	// required). Set via EVENT_RESIDENCY_REGION, a lower-case code such as
+	// "uk" or "eu-west" — same requirement as general-ledger-svc and
+	// commercial-account-svc.
+	EventResidencyRegion string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -91,6 +99,10 @@ type KafkaConfig struct {
 
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
+	region := os.Getenv("EVENT_RESIDENCY_REGION")
+	if region == "" {
+		return nil, errors.New("EVENT_RESIDENCY_REGION is required (e.g. uk, eu-west): every emitted event must carry its residency region")
+	}
 	return &Config{
 		Env: env("ENV", "local"),
 		// 8102: 8080-8099 are already taken by every other service built so
@@ -119,6 +131,7 @@ func Load() (*Config, error) {
 		BankingConnectorURL:      env("BANKING_CONNECTOR_URL", "http://banking-connector-svc:8145"),
 		CloseServiceURL:          env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		EventResidencyRegion:     region,
 	}, nil
 }
 

@@ -22,7 +22,7 @@ import (
 
 // Store is the persistence contract the handler depends on.
 type Store interface {
-	CreateStatementLine(ctx context.Context, l *domain.StatementLine) (created bool, err error)
+	CreateStatementLine(ctx context.Context, l *domain.StatementLine, actorID string) (created bool, err error)
 	GetStatementLine(ctx context.Context, statementLineID string) (*domain.StatementLine, error)
 	ListStatementLines(ctx context.Context, filter domain.ListStatementLinesFilter) ([]domain.StatementLine, error)
 	MatchStatementLine(ctx context.Context, tenantID, statementLineID, journalID, actorPrincipalID string) error
@@ -67,21 +67,6 @@ type Store interface {
 }
 
 // Publisher is the event-publishing contract the handler depends on.
-type Publisher interface {
-	PublishStatementIngested(ctx context.Context, l domain.StatementLine, actorID string)
-	PublishReconciliationMatched(ctx context.Context, l domain.StatementLine)
-	PublishReconciliationExceptionRaised(ctx context.Context, l domain.StatementLine)
-	PublishReconciliationCompleted(ctx context.Context, correlationID, tenantID, actorID, bankAccountID, statementDate string)
-	// Run lifecycle events.
-	PublishReconciliationStarted(ctx context.Context, run domain.ReconciliationRun)
-	PublishReconciliationReperformed(ctx context.Context, newRun domain.ReconciliationRun, priorRunID string)
-	PublishReconciliationSuperseded(ctx context.Context, priorRun domain.ReconciliationRun, newRunID string)
-	PublishReconciliationCertified(ctx context.Context, run domain.ReconciliationRun, cert domain.ReconciliationCertificate)
-	// Evidence conflict events.
-	PublishEvidenceConflictRaised(ctx context.Context, conflict domain.EvidenceConflict)
-	PublishEvidenceConflictResolved(ctx context.Context, conflict domain.EvidenceConflict)
-}
-
 // AuthZClient is the authorization contract the handler depends on.
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
@@ -105,7 +90,6 @@ const maxBodyBytes = 64 << 10
 
 type Handler struct {
 	store       Store
-	publisher   Publisher
 	authz       AuthZClient
 	ledger      ledger.Client
 	banking     banking.Client
@@ -113,8 +97,8 @@ type Handler struct {
 	log         *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, ledgerClient ledger.Client, bankingClient banking.Client, closeClient close.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, ledger: ledgerClient, banking: bankingClient, closeClient: closeClient, log: log}
+func New(store Store, authz AuthZClient, ledgerClient ledger.Client, bankingClient banking.Client, closeClient close.Client, log *zap.Logger) *Handler {
+	return &Handler{store: store, authz: authz, ledger: ledgerClient, banking: bankingClient, closeClient: closeClient, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -223,19 +207,18 @@ func (h *Handler) CreateStatementLine(w http.ResponseWriter, r *http.Request) {
 		GLCashAccountCode: &cashAccount,
 		CorrelationID:     req.CorrelationID,
 	}
-	created, err := h.store.CreateStatementLine(r.Context(), l)
+	created, err := h.store.CreateStatementLine(r.Context(), l, principalID)
 	if err != nil {
 		h.writeStoreErr(w, "CreateStatementLine", err)
 		return
 	}
 	if !created {
 		// Replay of a prior request with the same correlation_id — return
-		// the original line, do not re-publish the ingested event.
+		// the original line, do not re-enqueue the ingested event.
 		writeJSON(w, http.StatusOK, l)
 		return
 	}
 
-	h.publisher.PublishStatementIngested(r.Context(), *l, principalID)
 	writeJSON(w, http.StatusCreated, l)
 }
 
@@ -380,7 +363,6 @@ func (h *Handler) MatchStatementLine(w http.ResponseWriter, r *http.Request) {
 	}
 
 	l.MatchedByPrincipalID = &principalID
-	h.publisher.PublishReconciliationMatched(r.Context(), *l)
 	writeJSON(w, http.StatusOK, l)
 }
 
@@ -510,7 +492,6 @@ func (h *Handler) FlagException(w http.ResponseWriter, r *http.Request) {
 	l.Status = domain.StatementLineStatusException
 	l.ExceptionReason = &req.Reason
 	l.FlaggedByPrincipalID = &principalID
-	h.publisher.PublishReconciliationExceptionRaised(r.Context(), *l)
 	writeJSON(w, http.StatusOK, l)
 }
 
@@ -568,7 +549,6 @@ func (h *Handler) UnmatchWithReason(w http.ResponseWriter, r *http.Request) {
 	l.Status = domain.StatementLineStatusException
 	l.ExceptionReason = &req.Reason
 	l.FlaggedByPrincipalID = &principalID
-	h.publisher.PublishReconciliationExceptionRaised(r.Context(), *l)
 	writeJSON(w, http.StatusOK, l)
 }
 
@@ -649,16 +629,13 @@ func (h *Handler) CompleteStatement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cert, created, err := h.store.CertifyStatement(r.Context(), tenantID, legalEntityID, bankAccountID, statementDate,
+	cert, _, err := h.store.CertifyStatement(r.Context(), tenantID, legalEntityID, bankAccountID, statementDate,
 		principalID, r.Header.Get("X-Correlation-ID"), matchedCount)
 	if err != nil {
 		h.writeStoreErr(w, "CompleteStatement", err)
 		return
 	}
 
-	if created {
-		h.publisher.PublishReconciliationCompleted(r.Context(), r.Header.Get("X-Correlation-ID"), tenantID, principalID, bankAccountID, statementDate)
-	}
 	writeJSON(w, http.StatusOK, cert)
 }
 

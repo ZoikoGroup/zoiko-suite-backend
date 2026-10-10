@@ -26,15 +26,73 @@ import (
 
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
 	svcmiddleware "zoiko.io/bank-reconciliation-svc/internal/middleware"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 )
 
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+
+	// eventRegion is the residencyregion stamped on every reconciliation
+	// event. Empty means no region was configured, and every event-emitting
+	// write then fails (envelope.New refuses it) rather than emitting an
+	// event with a guessed region.
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
-	return &PgStore{pool: pool, log: log}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (config EVENT_RESIDENCY_REGION).
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// enqueueReconciliationEvent writes one BNK-05 lifecycle event to the
+// transactional outbox inside tx, the transaction that made the change it
+// reports (ZS-EVENT-001 S:6). Replaces internal/events.Publisher's direct,
+// post-commit Kafka write for this fact.
+//
+// fact is the past-tense lifecycle fact (e.g. "matched", "run.certified").
+// The canonical type is com.zoikosuite.banking.reconciliation.<fact>; the
+// pre-standard "reconciliation.<fact>" is kept as the legacy event_type so
+// nothing filtering on the old name breaks.
+func (s *PgStore) enqueueReconciliationEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.banking.reconciliation." + fact,
+		LegacyType:      legacyType,
+		Service:         "bank-reconciliation-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "reconciliation",
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		// Bank reconciliation facts are financial records of a tenant's
+		// books.
+		Classification: envelope.Confidential,
+		Data:           data,
+	})
+	if err != nil {
+		return fmt.Errorf("build reconciliation.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue reconciliation.%s event: %w", fact, err)
+	}
+	return nil
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
@@ -126,7 +184,7 @@ func scanLine(row interface{ Scan(...any) error }, l *domain.StatementLine) erro
 // not stop the mismatch — so a caller could set the header to its own tenant
 // and the body to somebody else's and land a row in a register it has no
 // rights to. One value, used everywhere, is the fix.
-func (s *PgStore) CreateStatementLine(ctx context.Context, l *domain.StatementLine) (created bool, err error) {
+func (s *PgStore) CreateStatementLine(ctx context.Context, l *domain.StatementLine, actorID string) (created bool, err error) {
 	tenantID := tenantFromCtxOrFallback(ctx, l.TenantID)
 	l.TenantID = tenantID
 
@@ -162,7 +220,14 @@ func (s *PgStore) CreateStatementLine(ctx context.Context, l *domain.StatementLi
 		}
 		l.CreatedAt = now
 		created = true
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "ingested", "statement.ingested",
+			tenantID, l.LegalEntityID, l.StatementLineID, actorID, l.CorrelationID, map[string]any{
+				"statement_line_id": l.StatementLineID,
+				"tenant_id":         tenantID,
+				"legal_entity_id":   l.LegalEntityID,
+				"bank_account_id":   l.BankAccountID,
+				"amount":            l.Amount,
+			})
 	})
 	return created, mapPgError(err)
 }
@@ -256,50 +321,52 @@ func (s *PgStore) ListStatementLines(ctx context.Context, filter domain.ListStat
 // by the caller (internal/handler) before this is invoked; this method only
 // persists the outcome.
 func (s *PgStore) MatchStatementLine(ctx context.Context, tenantID, statementLineID, journalID, actorPrincipalID string) error {
-	var affected int64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var legalEntityID, correlationID string
+		err := tx.QueryRow(ctx, `
 			UPDATE statement_lines
 			SET status = 'MATCHED', matched_journal_id = $1, matched_by_principal_id = $2, matched_at = $3
 			WHERE statement_line_id = $4 AND status IN ('UNMATCHED', 'EXCEPTION') AND tenant_id = $5
-		`, journalID, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+			RETURNING legal_entity_id, correlation_id
+		`, journalID, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID).Scan(&legalEntityID, &correlationID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidTransition
+		}
 		if err != nil {
 			return err
 		}
-		affected = tag.RowsAffected()
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "matched", "reconciliation.matched",
+			tenantID, legalEntityID, statementLineID, actorPrincipalID, correlationID, map[string]any{
+				"statement_line_id":  statementLineID,
+				"matched_journal_id": journalID,
+			})
 	})
-	if err != nil {
-		return mapPgError(err)
-	}
-	if affected == 0 {
-		return domain.ErrInvalidTransition
-	}
-	return nil
+	return mapPgError(err)
 }
 
 // FlagException transitions a line from UNMATCHED to EXCEPTION, atomically.
 func (s *PgStore) FlagException(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error {
-	var affected int64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var legalEntityID, correlationID string
+		err := tx.QueryRow(ctx, `
 			UPDATE statement_lines
 			SET status = 'EXCEPTION', exception_reason = $1, flagged_by_principal_id = $2, flagged_at = $3
 			WHERE statement_line_id = $4 AND status = 'UNMATCHED' AND tenant_id = $5
-		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+			RETURNING legal_entity_id, correlation_id
+		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID).Scan(&legalEntityID, &correlationID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidTransition
+		}
 		if err != nil {
 			return err
 		}
-		affected = tag.RowsAffected()
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "exception.raised", "reconciliation.exception.raised",
+			tenantID, legalEntityID, statementLineID, actorPrincipalID, correlationID, map[string]any{
+				"statement_line_id": statementLineID,
+				"reason":            reason,
+			})
 	})
-	if err != nil {
-		return mapPgError(err)
-	}
-	if affected == 0 {
-		return domain.ErrInvalidTransition
-	}
-	return nil
+	return mapPgError(err)
 }
 
 // UnmatchWithReason reverts a MATCHED line back to EXCEPTION with a
@@ -319,26 +386,27 @@ func (s *PgStore) FlagException(ctx context.Context, tenantID, statementLineID, 
 // method re-checks, so unmatching a line from an already-certified run's
 // population will not update or invalidate that certificate.
 func (s *PgStore) UnmatchWithReason(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error {
-	var affected int64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var legalEntityID, correlationID string
+		err := tx.QueryRow(ctx, `
 			UPDATE statement_lines
 			SET status = 'EXCEPTION', exception_reason = $1, flagged_by_principal_id = $2, flagged_at = $3
 			WHERE statement_line_id = $4 AND status = 'MATCHED' AND tenant_id = $5
-		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+			RETURNING legal_entity_id, correlation_id
+		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID).Scan(&legalEntityID, &correlationID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidTransition
+		}
 		if err != nil {
 			return err
 		}
-		affected = tag.RowsAffected()
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "exception.raised", "reconciliation.exception.raised",
+			tenantID, legalEntityID, statementLineID, actorPrincipalID, correlationID, map[string]any{
+				"statement_line_id": statementLineID,
+				"reason":            reason,
+			})
 	})
-	if err != nil {
-		return mapPgError(err)
-	}
-	if affected == 0 {
-		return domain.ErrInvalidTransition
-	}
-	return nil
+	return mapPgError(err)
 }
 
 // CountUnmatched returns how many lines are still UNMATCHED for the given
@@ -490,7 +558,11 @@ func (s *PgStore) ConfirmMatch(ctx context.Context, tenantID, statementLineID, c
 		l.MatchedTransactionID = matchedTxnID
 		l.MatchedByPrincipalID = &confirmingPrincipalID
 		l.MatchedAt = &now
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "matched", "reconciliation.matched",
+			tenantID, l.LegalEntityID, statementLineID, confirmingPrincipalID, l.CorrelationID, map[string]any{
+				"statement_line_id":  statementLineID,
+				"matched_journal_id": journalID,
+			})
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -509,25 +581,29 @@ func (s *PgStore) ConfirmMatch(ctx context.Context, tenantID, statementLineID, c
 // EXCEPTION, with the rejection reason recorded in exception_reason so
 // it becomes a normal queue item again.
 func (s *PgStore) RejectProposedMatch(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error {
-	var affected int64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var legalEntityID, correlationID string
+		err := tx.QueryRow(ctx, `
 			UPDATE statement_lines
 			SET status = 'EXCEPTION', exception_reason = $1, flagged_by_principal_id = $2, flagged_at = $3,
 				proposed_journal_id = NULL, proposed_transaction_id = NULL, proposed_by_principal_id = NULL, proposed_at = NULL
 			WHERE statement_line_id = $4 AND status = 'PENDING_CONFIRMATION' AND tenant_id = $5
-		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+			RETURNING legal_entity_id, correlation_id
+		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID).Scan(&legalEntityID, &correlationID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidTransition
+		}
 		if err != nil {
 			return err
 		}
-		affected = tag.RowsAffected()
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "exception.raised", "reconciliation.exception.raised",
+			tenantID, legalEntityID, statementLineID, actorPrincipalID, correlationID, map[string]any{
+				"statement_line_id": statementLineID,
+				"reason":            reason,
+			})
 	})
 	if err != nil {
 		return mapPgError(err)
-	}
-	if affected == 0 {
-		return domain.ErrInvalidTransition
 	}
 	return nil
 }
@@ -555,7 +631,12 @@ func (s *PgStore) CertifyStatement(ctx context.Context, tenantID, legalEntityID,
 		if err == nil {
 			c.StatementDate = stmtDate.Format("2006-01-02")
 			created = true
-			return nil
+			return s.enqueueReconciliationEvent(ctx, tx, "completed", "reconciliation.completed",
+				tenantID, legalEntityID, bankAccountID, certifiedByPrincipalID, correlationID, map[string]any{
+					"tenant_id":       tenantID,
+					"bank_account_id": bankAccountID,
+					"statement_date":  statementDate,
+				})
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -579,24 +660,28 @@ func (s *PgStore) CertifyStatement(ctx context.Context, tenantID, legalEntityID,
 }
 
 func (s *PgStore) MatchStatementLineWithCanonical(ctx context.Context, tenantID, statementLineID, transactionID, actorPrincipalID string) error {
-	var affected int64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var legalEntityID, correlationID string
+		err := tx.QueryRow(ctx, `
 			UPDATE statement_lines
 			SET status = 'MATCHED', matched_transaction_id = $1, matched_by_principal_id = $2, matched_at = $3
 			WHERE statement_line_id = $4 AND status IN ('UNMATCHED', 'EXCEPTION') AND tenant_id = $5
-		`, transactionID, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+			RETURNING legal_entity_id, correlation_id
+		`, transactionID, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID).Scan(&legalEntityID, &correlationID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrInvalidTransition
+		}
 		if err != nil {
 			return err
 		}
-		affected = tag.RowsAffected()
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "matched", "reconciliation.matched",
+			tenantID, legalEntityID, statementLineID, actorPrincipalID, correlationID, map[string]any{
+				"statement_line_id":      statementLineID,
+				"matched_transaction_id": transactionID,
+			})
 	})
 	if err != nil {
 		return mapPgError(err)
-	}
-	if affected == 0 {
-		return domain.ErrInvalidTransition
 	}
 	return nil
 }
