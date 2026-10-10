@@ -33,6 +33,11 @@ type Event struct {
 	Payload       interface{} `json:"payload"`
 }
 
+const (
+	EventTypeKillSwitchEngaged    = "kill_switch.engaged"
+	EventTypeKillSwitchDisengaged = "kill_switch.disengaged"
+)
+
 // PublishParams carries the envelope-level fields a call site supplies,
 // alongside the payload-level business object.
 type PublishParams struct {
@@ -103,7 +108,65 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		Value: data,
 	})
 	if err != nil {
+		// Found unreachable in production — Publish has no live call site
+		// (cmd/server/main.go wires every mutation through the transactional
+		// outbox's PublishOutbox instead, which already returns err
+		// correctly). Fixed anyway: swallowing this error after logging
+		// "event dropped" is exactly the anti-pattern this domain's audit
+		// exists to eliminate elsewhere (see docs/architecture's "Widespread
+		// Lack of Transactional Outbox" finding), and a future caller of
+		// this exported method deserves the same fail-closed guarantee
+		// PublishOutbox already provides.
 		p.logger.Warn("kafka publish failed — event dropped", zap.String("event_type", params.EventType), zap.Error(err))
+		return err
 	}
 	return nil
 }
+
+// PublishOutbox delivers a message from the outbox relay worker to Kafka.
+// It returns a non-nil error on failure so the relay can track retry attempts.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	headers := []kafka.Header{
+		{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+	}
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(aggregateID),
+		Value:   payload,
+		Headers: headers,
+	})
+	if err != nil {
+		p.logger.Warn("kafka outbox publish failed",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.Error(err),
+		)
+		return err
+	}
+	return nil
+}
+
+// LogOnlyPublisher is used in development/test environments where Kafka is not configured.
+type LogOnlyPublisher struct {
+	Logger *zap.Logger
+}
+
+func (l *LogOnlyPublisher) Publish(_ context.Context, params PublishParams) error {
+	if l.Logger != nil {
+		l.Logger.Info("log-only publisher received event",
+			zap.String("event_type", params.EventType),
+			zap.String("entity_id", params.EntityID),
+		)
+	}
+	return nil
+}
+
+func (l *LogOnlyPublisher) PublishOutbox(_ context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	if l.Logger != nil {
+		l.Logger.Info("log-only publisher received outbox event",
+			zap.String("outbox_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+		)
+	}
+	return nil
+}
+

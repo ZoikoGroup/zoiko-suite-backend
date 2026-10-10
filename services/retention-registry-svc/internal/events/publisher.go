@@ -111,3 +111,25 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 	}
 	return nil
 }
+
+// PublishOutbox delivers a message from the outbox relay worker to Kafka.
+// It returns a non-nil error on failure so the relay can track retry attempts.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	headers := []kafka.Header{
+		{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+	}
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(aggregateID),
+		Value:   payload,
+		Headers: headers,
+	})
+	if err != nil {
+		p.logger.Warn("kafka outbox publish failed",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.Error(err),
+		)
+		return err
+	}
+	return nil
+}

@@ -168,12 +168,84 @@ func (c *Consumer) Handle(ctx context.Context, eventID string, raw []byte) error
 	case "audit.engagement.created", "audit.engagement.acceptance_submitted", "audit.engagement.accepted", "audit.engagement.rejected", "audit.engagement.activated", "audit.engagement.withdrawn":
 		return c.handleAuditEngagement(ctx, eventID, env)
 	default:
-		c.log.Warn("unknown event_type — skipped",
-			zap.String("event_id", eventID),
-			zap.String("event_type", env.EventType),
-		)
-		return nil
+		return c.handleGenericDomainEvent(ctx, eventID, env)
 	}
+}
+
+// handleGenericDomainEvent stores any platform domain event published with the canonical
+// envelope, ensuring the event is appended to the tamper-evident hash chain.
+func (c *Consumer) handleGenericDomainEvent(ctx context.Context, eventID string, env envelope) error {
+	tenantID := env.TenantID
+	legalEntityID := env.LegalEntityID
+	principalID := env.ActorID
+	correlationID := env.CorrelationID
+	causationID := env.CausationID
+
+	// If envelope lacks scope fields, inspect payload JSON for fallback context
+	if len(env.Payload) > 0 && (tenantID == "" || legalEntityID == "" || principalID == "" || correlationID == "") {
+		var pScope struct {
+			TenantID      string `json:"tenant_id"`
+			LegalEntityID string `json:"legal_entity_id"`
+			PrincipalID   string `json:"principal_id"`
+			ActorID       string `json:"actor_id"`
+			CorrelationID string `json:"correlation_id"`
+			CausationID   string `json:"causation_id"`
+		}
+		if err := json.Unmarshal(env.Payload, &pScope); err == nil {
+			if tenantID == "" {
+				tenantID = pScope.TenantID
+			}
+			if legalEntityID == "" {
+				legalEntityID = pScope.LegalEntityID
+			}
+			if principalID == "" {
+				if pScope.PrincipalID != "" {
+					principalID = pScope.PrincipalID
+				} else {
+					principalID = pScope.ActorID
+				}
+			}
+			if correlationID == "" {
+				correlationID = pScope.CorrelationID
+			}
+			if causationID == "" {
+				causationID = pScope.CausationID
+			}
+		}
+	}
+
+	// Satisfy database NOT NULL constraints fail-safe
+	if tenantID == "" {
+		tenantID = "platform"
+	}
+	if legalEntityID == "" {
+		legalEntityID = tenantID
+	}
+
+	evt := &store.AuditEvent{
+		EventID:       eventID,
+		EventType:     env.EventType,
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		PrincipalID:   principalID,
+		SourceService: env.SourceService,
+		SchemaVersion: env.SchemaVersion,
+		Payload:       env.Payload,
+		CorrelationID: correlationID,
+		CausationID:   causationID,
+	}
+
+	if err := c.store.Store(ctx, evt); err != nil {
+		return fmt.Errorf("handleGenericDomainEvent: store: %w", err)
+	}
+
+	c.log.Info("domain event stored",
+		zap.String("event_id", eventID),
+		zap.String("event_type", env.EventType),
+		zap.String("tenant_id", tenantID),
+		zap.String("source_service", env.SourceService),
+	)
+	return nil
 }
 
 // handleAuditEngagement stores AUD-01 lifecycle facts. The consumer has no

@@ -515,9 +515,17 @@ func (h *retentionHandler) ListLegalHoldTargets(w http.ResponseWriter, r *http.R
 }
 
 type releaseLegalHoldRequest struct {
-	ReleaseReason string `json:"release_reason"`
+	ReleaseReason                string `json:"release_reason"`
+	ReleaseApprovedByPrincipalID string `json:"release_approved_by_principal_id"`
 }
 
+// ReleaseLegalHold enforces ZS-SVC-S-001 §5.5's "release_approved_by:
+// Separate release authority; self-release restrictions apply" — the
+// principal executing the release must name a distinct approver, who
+// is independently checked against authorization-svc for the same
+// action, mirroring kill-switch-registry-svc's EngageKillSwitch/
+// DisengageKillSwitch two-man rule (require the field, reject
+// self-approval, authorize the approver separately from the caller).
 func (h *retentionHandler) ReleaseLegalHold(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -534,11 +542,23 @@ func (h *retentionHandler) ReleaseLegalHold(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "missing_field", "release_reason")
 		return
 	}
+	if req.ReleaseApprovedByPrincipalID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "release_approved_by_principal_id")
+		return
+	}
+	if principalID == req.ReleaseApprovedByPrincipalID {
+		writeError(w, http.StatusForbidden, "self_release_forbidden", domain.ErrLegalHoldSelfRelease.Error())
+		return
+	}
 	if !h.authorize(w, r, principalID, "", actionLegalHoldManage) {
+		return
+	}
+	if !h.authorize(w, r, req.ReleaseApprovedByPrincipalID, "", actionLegalHoldManage) {
 		return
 	}
 	hold, err := h.store.ReleaseLegalHold(r.Context(), domain.ReleaseLegalHoldParams{
 		HoldID: chi.URLParam(r, "hold_id"), ReleaseReason: req.ReleaseReason, ReleasedByPrincipalID: principalID,
+		ReleaseApprovedByPrincipalID: req.ReleaseApprovedByPrincipalID,
 	})
 	if err != nil {
 		h.handleRetentionStoreError(w, err)
@@ -556,6 +576,8 @@ func (h *retentionHandler) handleRetentionStoreError(w http.ResponseWriter, err 
 		errors.Is(err, domain.ErrInvalidTriggerType), errors.Is(err, domain.ErrInvalidDispositionAction),
 		errors.Is(err, domain.ErrNoRecordIDsForHold):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+	case errors.Is(err, domain.ErrLegalHoldSelfRelease):
+		writeError(w, http.StatusForbidden, "self_release_forbidden", err.Error())
 	case errors.Is(err, domain.ErrRetentionRuleNotDraft), errors.Is(err, domain.ErrRetentionRuleNotApproved),
 		errors.Is(err, domain.ErrRetentionRuleSelfApproval), errors.Is(err, domain.ErrRetentionRuleNotActive),
 		errors.Is(err, domain.ErrRetentionRuleMismatch), errors.Is(err, domain.ErrRecordAlreadyBound),

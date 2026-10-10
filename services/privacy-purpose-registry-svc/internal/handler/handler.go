@@ -716,6 +716,24 @@ func (h *Handler) runStructuralValidation(ctx context.Context, v *domain.Process
 				Code: "PRV-001", Field: "purpose_ids",
 				Message: "purpose " + pid + " is not a registered, published purpose",
 			})
+			continue
+		}
+		// Gate 4 (§8.2): "Approved lawful-basis ... references from PDC."
+		// This service has no established PDC integration contract (no
+		// client/adapter exists anywhere in this codebase), so "approved" is
+		// enforced structurally — the published purpose version must itself
+		// carry at least one lawful-basis reference — rather than by calling
+		// PDC for a live approval decision, which would require inventing an
+		// external contract. The special-category/other-condition reference
+		// half of gate 4 is not enforced: no such field exists anywhere in
+		// this service's schema yet, and adding one was judged out of scope
+		// for a validation fix (see audit notes).
+		pv, err := h.store.ResolvePurposeAsOf(ctx, pid, time.Now())
+		if err != nil || pv == nil || len(pv.LawfulBasisRefs) == 0 {
+			findings = append(findings, domain.ValidationFinding{
+				Code: "PRV-005", Field: "purpose_ids",
+				Message: "purpose " + pid + " has no approved lawful-basis reference",
+			})
 		}
 	}
 
@@ -740,6 +758,19 @@ func (h *Handler) runStructuralValidation(ctx context.Context, v *domain.Process
 	if len(v.RetentionRuleRefs) == 0 {
 		findings = append(findings, domain.ValidationFinding{
 			Code: "PRV-014", Field: "retention_rule_refs", Message: "at least one retention rule reference is required",
+		})
+	}
+
+	// Gate 6 (continued): "... and transfer/processor dependencies
+	// identified" (§8.2). This schema has no explicit cross-border/recipient
+	// flag, so multiple jurisdictions on one version is the only
+	// structurally determinable signal that a transfer dependency applies —
+	// a conservative, documented reading, not an invented one. A
+	// single-jurisdiction activity is not required to populate this.
+	if len(v.Jurisdictions) > 1 && len(v.TransferRefs) == 0 {
+		findings = append(findings, domain.ValidationFinding{
+			Code: "PRV-015", Field: "transfer_refs",
+			Message: "transfer dependencies must be identified when processing spans multiple jurisdictions",
 		})
 	}
 

@@ -271,3 +271,109 @@ func TestPgStore_Insert_ConcurrentRegistrationsProduceNoDuplicates(t *testing.T)
 	require.NoError(t, err)
 	assert.Len(t, versions, 1, "concurrent registrations must not produce duplicate versions")
 }
+
+// ── Idempotency key (INV-08) ─────────────────────────────────────────────────
+
+func TestPgStore_FindByIdempotencyKey_NoneRegistered_ReturnsNil(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	got, err := s.FindByIdempotencyKey(ctx, "unregistered.probe", "some-key")
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+func TestPgStore_Insert_PersistsIdempotencyKey_AndFindByIdempotencyKeyReturnsIt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	stored, err := s.Insert(ctx, &domain.EventSchema{
+		EventName:         "idempotent.probe",
+		JSONSchema:        json.RawMessage(`{"properties":{},"required":[]}`),
+		CompatibilityMode: domain.CompatibilityBackward,
+		IdempotencyKey:    "key-abc",
+	}, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stored.Version)
+
+	found, err := s.FindByIdempotencyKey(ctx, "idempotent.probe", "key-abc")
+	require.NoError(t, err)
+	require.NotNil(t, found)
+	assert.Equal(t, 1, found.Version)
+	assert.Equal(t, "key-abc", found.IdempotencyKey)
+}
+
+// TestPgStore_Insert_SameIdempotencyKeyDifferentEvent_BothSucceed proves the
+// unique index is scoped to (event_name, idempotency_key), not the key alone
+// — a caller-generated key only has to be unique within the registration it
+// protects, the same way correlation_id is scoped to tenant_id elsewhere on
+// this platform.
+func TestPgStore_Insert_SameIdempotencyKeyDifferentEvent_BothSucceed(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	_, err := s.Insert(ctx, &domain.EventSchema{
+		EventName:         "event.one",
+		JSONSchema:        json.RawMessage(`{"properties":{},"required":[]}`),
+		CompatibilityMode: domain.CompatibilityBackward,
+		IdempotencyKey:    "shared-key",
+	}, 0)
+	require.NoError(t, err)
+
+	_, err = s.Insert(ctx, &domain.EventSchema{
+		EventName:         "event.two",
+		JSONSchema:        json.RawMessage(`{"properties":{},"required":[]}`),
+		CompatibilityMode: domain.CompatibilityBackward,
+		IdempotencyKey:    "shared-key",
+	}, 0)
+	require.NoError(t, err, "the same key under a different event name must not collide")
+}
+
+// TestPgStore_Insert_ConcurrentReplaySameKey_OneWriterInsertsTheRestGetTheSameRow
+// is the idempotency analogue of TestPgStore_Insert_ConcurrentRegistrationsProduceNoDuplicates:
+// several callers race to register under the SAME (event_name, idempotency_key)
+// pair — the handler's own FindByIdempotencyKey pre-check cannot close this
+// window by itself, so the store must resolve the race itself when it reaches
+// Insert, and every loser must get the SAME row back, not an error.
+func TestPgStore_Insert_ConcurrentReplaySameKey_OneWriterInsertsTheRestGetTheSameRow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const writers = 8
+	type result struct {
+		schema *domain.EventSchema
+		err    error
+	}
+	results := make(chan result, writers)
+	for i := 0; i < writers; i++ {
+		go func() {
+			stored, err := s.Insert(ctx, &domain.EventSchema{
+				EventName:         "replayrace.probe",
+				JSONSchema:        json.RawMessage(`{"properties":{},"required":[]}`),
+				CompatibilityMode: domain.CompatibilityBackward,
+				IdempotencyKey:    "race-key",
+			}, 0)
+			results <- result{stored, err}
+		}()
+	}
+
+	versionsSeen := map[int]int{}
+	for i := 0; i < writers; i++ {
+		r := <-results
+		require.NoError(t, r.err,
+			"every concurrent replay under the same idempotency key must succeed — "+
+				"either by inserting or by resolving to the row that won")
+		require.NotNil(t, r.schema)
+		versionsSeen[r.schema.Version]++
+	}
+
+	assert.Len(t, versionsSeen, 1, "every writer must agree on exactly one version")
+	for version, count := range versionsSeen {
+		assert.Equal(t, 1, version, "the shared key must resolve to the single version that was actually inserted")
+		assert.Equal(t, writers, count)
+	}
+
+	versions, err := s.Versions(ctx, "replayrace.probe", 100, 0)
+	require.NoError(t, err)
+	assert.Len(t, versions, 1, "a replayed key must never produce a second version")
+}

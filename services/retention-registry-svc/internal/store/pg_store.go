@@ -8,24 +8,26 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/retention-registry-svc/internal/domain"
 	svcmiddleware "zoiko.io/retention-registry-svc/internal/middleware"
+	"zoiko.io/retention-registry-svc/internal/outbox"
 )
 
 type Store interface {
-	CreateRetentionPolicy(ctx context.Context, p *domain.RetentionPolicy) error
+	CreateRetentionPolicy(ctx context.Context, p *domain.RetentionPolicy, outboxEvents ...outbox.Event) error
 	FindApplicableRetentionPolicy(ctx context.Context, recordClass string, jurisdictionCode, tenantID *string) (*domain.RetentionPolicy, error)
 	ListRetentionPolicies(ctx context.Context, f domain.RetentionPolicyFilter) ([]domain.RetentionPolicy, error)
 
-	CreateLegalHold(ctx context.Context, h *domain.LegalHold) error
+	CreateLegalHold(ctx context.Context, h *domain.LegalHold, outboxEvents ...outbox.Event) error
 	ListLegalHolds(ctx context.Context, f domain.LegalHoldFilter) ([]domain.LegalHold, error)
 	// FindLegalHoldByID takes the caller's verified tenant, not only an id —
 	// see the implementation for what reading a hold discloses.
 	FindLegalHoldByID(ctx context.Context, id, callerTenantID string) (*domain.LegalHold, error)
-	ReleaseLegalHold(ctx context.Context, id, callerTenantID, releasedBy, releaseApprovedBy string) (*domain.LegalHold, error)
+	ReleaseLegalHold(ctx context.Context, id, callerTenantID, releasedBy, releaseApprovedBy string, outboxEvents ...outbox.Event) (*domain.LegalHold, error)
 	FindActiveHoldForScope(ctx context.Context, recordClass, tenantID, entityRef *string) (*domain.LegalHold, error)
 
 	Resolve(ctx context.Context, recordClass string, jurisdictionCode, tenantID, entityRef *string) (*domain.RetentionResolution, error)
@@ -93,7 +95,7 @@ func scanPolicy(row pgx.Row) (*domain.RetentionPolicy, error) {
 	return p, err
 }
 
-func (s *PgStore) CreateRetentionPolicy(ctx context.Context, p *domain.RetentionPolicy) error {
+func (s *PgStore) CreateRetentionPolicy(ctx context.Context, p *domain.RetentionPolicy, outboxEvents ...outbox.Event) error {
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO retention_policies (
@@ -105,7 +107,15 @@ func (s *PgStore) CreateRetentionPolicy(ctx context.Context, p *domain.Retention
 			p.MinRetentionDays, p.MaxRetentionDays, p.LegalRegulatoryBasis,
 			p.SourceRightsBasis, p.PrivacyBasis, p.EffectiveFrom, p.CreatedByPrincipalID,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		for _, oEvt := range outboxEvents {
+			if err := outbox.Insert(ctx, tx, oEvt); err != nil {
+				return fmt.Errorf("insert outbox event: %w", err)
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("insert retention policy: %w", err)
@@ -170,7 +180,7 @@ func scanHold(row pgx.Row) (*domain.LegalHold, error) {
 	return h, nil
 }
 
-func (s *PgStore) CreateLegalHold(ctx context.Context, h *domain.LegalHold) error {
+func (s *PgStore) CreateLegalHold(ctx context.Context, h *domain.LegalHold, outboxEvents ...outbox.Event) error {
 	custodians := h.CustodiansObjects
 	if custodians == nil {
 		custodians = []string{}
@@ -193,7 +203,15 @@ func (s *PgStore) CreateLegalHold(ctx context.Context, h *domain.LegalHold) erro
 		`, h.LegalHoldID, h.ScopeDescription, custodiansJSON, h.Authority,
 			h.RecordClass, h.TenantID, h.EntityRef, h.CreatedByPrincipalID,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		for _, oEvt := range outboxEvents {
+			if err := outbox.Insert(ctx, tx, oEvt); err != nil {
+				return fmt.Errorf("insert outbox event: %w", err)
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("insert legal hold: %w", err)
@@ -227,6 +245,9 @@ func (s *PgStore) CreateLegalHold(ctx context.Context, h *domain.LegalHold) erro
 func (s *PgStore) FindLegalHoldByID(ctx context.Context, id, callerTenantID string) (*domain.LegalHold, error) {
 	if callerTenantID == "" {
 		return nil, domain.ErrTenantMissing
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, domain.ErrLegalHoldNotFound
 	}
 
 	const query = `
@@ -275,21 +296,40 @@ func (s *PgStore) ListRetentionPolicies(ctx context.Context, f domain.RetentionP
 		ORDER BY effective_from DESC, created_at DESC
 		LIMIT $4 OFFSET $5;`
 
-	rows, err := s.pool.Query(ctx, query, f.CallerTenantID, f.RecordClass, f.PolicyStatus, limit, offset)
+	// Runs through withTenant, same as every other method in this file, so
+	// app.tenant_id is actually set for this query. This used to run on the
+	// bare pool directly: the explicit WHERE clause above was already the
+	// real, correct tenant filter (the handler's own doctrine — see this
+	// file's comments elsewhere), but once RLS is genuinely enforced (see
+	// deployments/docker-compose.yml's DATABASE_URL fix this pass) RLS's own
+	// policy ALSO applies to every query against this table, and its
+	// condition reads app.tenant_id, not this query's $1 parameter. With
+	// app.tenant_id never set, RLS's own (tenant_id IS NULL OR tenant_id =
+	// current_setting(...)) evaluated false for every tenant-scoped row,
+	// silently hiding all of them behind the already-correct WHERE clause —
+	// not a leak, the opposite: every tenant's register appeared empty.
+	var out []domain.RetentionPolicy
+	err = s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, queryErr := tx.Query(ctx, query, f.CallerTenantID, f.RecordClass, f.PolicyStatus, limit, offset)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+
+		out = make([]domain.RetentionPolicy, 0)
+		for rows.Next() {
+			p, scanErr := scanPolicy(rows)
+			if scanErr != nil {
+				return fmt.Errorf("scan retention policy: %w", scanErr)
+			}
+			out = append(out, *p)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list retention policies: %w", err)
 	}
-	defer rows.Close()
-
-	out := make([]domain.RetentionPolicy, 0)
-	for rows.Next() {
-		p, err := scanPolicy(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan retention policy: %w", err)
-		}
-		out = append(out, *p)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ListLegalHolds is the other half of the register.
@@ -315,21 +355,30 @@ func (s *PgStore) ListLegalHolds(ctx context.Context, f domain.LegalHoldFilter) 
 		ORDER BY (hold_status = 'ACTIVE') DESC, started_at DESC
 		LIMIT $4 OFFSET $5;`
 
-	rows, err := s.pool.Query(ctx, query, f.CallerTenantID, f.HoldStatus, f.RecordClass, limit, offset)
+	// See ListRetentionPolicies's comment: must run through withTenant so
+	// app.tenant_id is set before RLS evaluates its own policy on this query.
+	var out []domain.LegalHold
+	err = s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, queryErr := tx.Query(ctx, query, f.CallerTenantID, f.HoldStatus, f.RecordClass, limit, offset)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+
+		out = make([]domain.LegalHold, 0)
+		for rows.Next() {
+			h, scanErr := scanHold(rows)
+			if scanErr != nil {
+				return fmt.Errorf("scan legal hold: %w", scanErr)
+			}
+			out = append(out, *h)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list legal holds: %w", err)
 	}
-	defer rows.Close()
-
-	out := make([]domain.LegalHold, 0)
-	for rows.Next() {
-		h, err := scanHold(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan legal hold: %w", err)
-		}
-		out = append(out, *h)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // pageBounds applies the estate's usual register limits. An out-of-range value
@@ -358,9 +407,12 @@ func pageBounds(limit, offset int) (int, int, error) {
 // the query that acts on the row should not be able to disagree about which
 // tenant's row is being written. Releasing a hold unblocks deletion of records
 // something ordered frozen, so this is a poor place to rely on one gate.
-func (s *PgStore) ReleaseLegalHold(ctx context.Context, id, callerTenantID, releasedBy, releaseApprovedBy string) (*domain.LegalHold, error) {
+func (s *PgStore) ReleaseLegalHold(ctx context.Context, id, callerTenantID, releasedBy, releaseApprovedBy string, outboxEvents ...outbox.Event) (*domain.LegalHold, error) {
 	if callerTenantID == "" {
 		return nil, domain.ErrTenantMissing
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, domain.ErrLegalHoldNotFound
 	}
 
 	const query = `
@@ -376,7 +428,15 @@ func (s *PgStore) ReleaseLegalHold(ctx context.Context, id, callerTenantID, rele
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var scanErr error
 		h, scanErr = scanHold(tx.QueryRow(ctx, query, releasedBy, releaseApprovedBy, id, callerTenantID))
-		return scanErr
+		if scanErr != nil {
+			return scanErr
+		}
+		for _, oEvt := range outboxEvents {
+			if err := outbox.Insert(ctx, tx, oEvt); err != nil {
+				return fmt.Errorf("insert outbox event: %w", err)
+			}
+		}
+		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		if _, findErr := s.FindLegalHoldByID(ctx, id, callerTenantID); findErr != nil {

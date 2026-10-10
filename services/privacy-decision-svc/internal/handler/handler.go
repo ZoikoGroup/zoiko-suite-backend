@@ -28,12 +28,12 @@ import (
 // PurposeChecker, ConsentChecker, HoldChecker and TransferChecker are the narrow
 // interfaces the handler depends on.
 type PurposeChecker interface {
-	ResolveActivity(ctx context.Context, activityID string) (*purposeregistry.ActivityVersion, error)
-	ResolvePurpose(ctx context.Context, purposeID string) (*purposeregistry.PurposeVersion, error)
+	ResolveActivity(ctx context.Context, tenantID, activityID string) (*purposeregistry.ActivityVersion, error)
+	ResolvePurpose(ctx context.Context, tenantID, purposeID string) (*purposeregistry.PurposeVersion, error)
 }
 
 type ConsentChecker interface {
-	ResolveStatus(ctx context.Context, subjectRef, purposeID string) (*consentregistry.ConsentResolution, error)
+	ResolveStatus(ctx context.Context, tenantID, subjectRef, purposeID string) (*consentregistry.ConsentResolution, error)
 }
 
 type HoldChecker interface {
@@ -281,7 +281,7 @@ func (h *Handler) evaluate(
 	decision *domain.PrivacyDecision,
 ) (domain.DecisionResult, []string, []domain.DecisionConstraint) {
 	// Step 1: Resolve the processing activity — must be ACTIVE (§13 step 1, §32 PRV-002).
-	activity, err := h.purposes.ResolveActivity(ctx, req.ProcessingActivityID)
+	activity, err := h.purposes.ResolveActivity(ctx, tenantID, req.ProcessingActivityID)
 	if err != nil {
 		h.log.Error("evaluate: purpose registry unavailable (activity)", zap.Error(err))
 		return domain.ResultIndeterminate, []string{domain.PRV019PrivacyContextIndeterminate}, nil
@@ -304,7 +304,7 @@ func (h *Handler) evaluate(
 	}
 
 	// Resolve the purpose itself — must be PUBLISHED (§13 step 1, §32 PRV-001).
-	purpose, err := h.purposes.ResolvePurpose(ctx, req.PurposeID)
+	purpose, err := h.purposes.ResolvePurpose(ctx, tenantID, req.PurposeID)
 	if err != nil {
 		h.log.Error("evaluate: purpose registry unavailable (purpose)", zap.Error(err))
 		return domain.ResultIndeterminate, []string{domain.PRV019PrivacyContextIndeterminate}, nil
@@ -341,7 +341,7 @@ func (h *Handler) evaluate(
 	// Step 4: Consent evaluation (§12.1 + PRV-C04 + Activity Dependency).
 	consentRequired := (req.ConsentCheck != nil && req.ConsentCheck.Required) || activity.NoticeConsentDependency == "REQUIRED"
 	if consentRequired {
-		resolution, err := h.consents.ResolveStatus(ctx, req.SubjectRef, req.PurposeID)
+		resolution, err := h.consents.ResolveStatus(ctx, tenantID, req.SubjectRef, req.PurposeID)
 		if err != nil {
 			h.log.Error("evaluate: consent registry unavailable", zap.Error(err))
 			return domain.ResultIndeterminate, []string{domain.PRV019PrivacyContextIndeterminate}, nil

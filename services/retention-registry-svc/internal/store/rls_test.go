@@ -56,7 +56,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS legal_holds, retention_policies CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS legal_holds, retention_policies, outbox_events CASCADE;`)
 
 	// Every migration in filename order, never one hardcoded name.
 	_, thisFile, _, _ := runtime.Caller(0)
@@ -413,5 +413,65 @@ func TestRLS_WithCheckRefusesForeignTenantWrite(t *testing.T) {
 		uuid.NewString(), tenantA)
 	if err == nil {
 		t.Fatal("WITH CHECK must refuse a legal hold attributed to another tenant")
+	}
+}
+
+// TestRLS_ListLegalHolds_ScopesCorrectly is the regression test for a
+// defect found this pass: ListLegalHolds ran on the bare pool, never
+// calling withTenant, so app.tenant_id was never set for this specific
+// query. Its own WHERE clause (tenant_id IS NULL OR tenant_id = $1) was
+// always correct, so this stayed invisible as long as RLS was bypassed by
+// a superuser connection — once DATABASE_URL was corrected to the
+// NOSUPERUSER zoiko_app role (this same pass), RLS's OWN policy started
+// applying too, and its condition reads app.tenant_id — which this query
+// never set. The two conditions intersected to nothing for any
+// tenant-scoped row: every tenant's legal-hold register appeared empty.
+func TestRLS_ListLegalHolds_ScopesCorrectly(t *testing.T) {
+	admin := openAdminPool(t)
+	s := store.NewPgStore(appRolePool(t, admin))
+
+	addHold(t, s, tenantA, "FINANCIAL_LEDGER", strp(tenantA))
+	addHold(t, s, tenantB, "FINANCIAL_LEDGER", strp(tenantB))
+	addHold(t, s, "", "FINANCIAL_LEDGER", nil) // platform-wide
+
+	holdsA, err := s.ListLegalHolds(ctxFor(tenantA), domain.LegalHoldFilter{CallerTenantID: tenantA, Limit: 100})
+	if err != nil {
+		t.Fatalf("list legal holds as tenant A: %v", err)
+	}
+	if len(holdsA) != 2 {
+		t.Fatalf("expected tenant A to see its own hold plus the platform-wide one (2 rows), got %d — "+
+			"if this is 0, app.tenant_id is not being set for this query and RLS is silently hiding everything",
+			len(holdsA))
+	}
+	for _, h := range holdsA {
+		if h.TenantID != nil && *h.TenantID == tenantB {
+			t.Fatalf("tenant A must not see tenant B's legal hold, got %+v", h)
+		}
+	}
+}
+
+// TestRLS_ListRetentionPolicies_ScopesCorrectly is the same regression
+// test for ListRetentionPolicies, which had the identical defect.
+func TestRLS_ListRetentionPolicies_ScopesCorrectly(t *testing.T) {
+	admin := openAdminPool(t)
+	s := store.NewPgStore(appRolePool(t, admin))
+
+	addPolicy(t, s, tenantA, "FINANCIAL_LEDGER", strp(tenantA), 30)
+	addPolicy(t, s, tenantB, "FINANCIAL_LEDGER", strp(tenantB), 60)
+	addPolicy(t, s, "", "FINANCIAL_LEDGER", nil, 90) // platform-wide
+
+	policiesA, err := s.ListRetentionPolicies(ctxFor(tenantA), domain.RetentionPolicyFilter{CallerTenantID: tenantA, Limit: 100})
+	if err != nil {
+		t.Fatalf("list retention policies as tenant A: %v", err)
+	}
+	if len(policiesA) != 2 {
+		t.Fatalf("expected tenant A to see its own policy plus the platform-wide one (2 rows), got %d — "+
+			"if this is 0, app.tenant_id is not being set for this query and RLS is silently hiding everything",
+			len(policiesA))
+	}
+	for _, p := range policiesA {
+		if p.TenantID != nil && *p.TenantID == tenantB {
+			t.Fatalf("tenant A must not see tenant B's retention policy, got %+v", p)
+		}
 	}
 }

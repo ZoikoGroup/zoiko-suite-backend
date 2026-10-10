@@ -90,3 +90,67 @@ func TestPut_DifferentKeys_ProduceDifferentChecksumsForDifferentContent(t *testi
 
 	assert.NotEqual(t, c1, c2)
 }
+
+func TestDelete_RemovesFile(t *testing.T) {
+	dir := t.TempDir()
+	b, err := storage.NewLocalFileBackend(dir, testKeyHex)
+	require.NoError(t, err)
+
+	content := []byte("temporary blob to be deleted")
+	checksum, err := b.Put(context.Background(), "blob-to-delete", content)
+	require.NoError(t, err)
+
+	// Verify file is readable
+	got, err := b.Get(context.Background(), "blob-to-delete", checksum)
+	require.NoError(t, err)
+	assert.Equal(t, content, got)
+
+	// Verify file exists on disk
+	filePath := filepath.Join(dir, "blob-to-delete.enc")
+	_, err = os.Stat(filePath)
+	require.NoError(t, err)
+
+	// Delete
+	err = b.Delete(context.Background(), "blob-to-delete")
+	require.NoError(t, err)
+
+	// Verify file is no longer on disk
+	_, err = os.Stat(filePath)
+	assert.True(t, os.IsNotExist(err))
+
+	// Get should return ErrObjectNotFound
+	_, err = b.Get(context.Background(), "blob-to-delete", checksum)
+	assert.ErrorIs(t, err, storage.ErrObjectNotFound)
+}
+
+func TestDelete_NonExistentKey_Idempotent(t *testing.T) {
+	b, err := storage.NewLocalFileBackend(t.TempDir(), testKeyHex)
+	require.NoError(t, err)
+
+	// Deleting a non-existent key should succeed silently (idempotent)
+	err = b.Delete(context.Background(), "never-existed")
+	assert.NoError(t, err)
+}
+
+func TestDelete_ExistingBlobSafety(t *testing.T) {
+	b, err := storage.NewLocalFileBackend(t.TempDir(), testKeyHex)
+	require.NoError(t, err)
+
+	content1 := []byte("important document version 1")
+	content2 := []byte("failed candidate version 2")
+
+	sum1, err := b.Put(context.Background(), "key-keep", content1)
+	require.NoError(t, err)
+
+	_, err = b.Put(context.Background(), "key-delete", content2)
+	require.NoError(t, err)
+
+	// Delete key-delete
+	err = b.Delete(context.Background(), "key-delete")
+	require.NoError(t, err)
+
+	// key-keep must remain completely intact and readable
+	got1, err := b.Get(context.Background(), "key-keep", sum1)
+	require.NoError(t, err)
+	assert.Equal(t, content1, got1)
+}
