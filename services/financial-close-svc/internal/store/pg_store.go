@@ -10,6 +10,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
 )
@@ -33,11 +36,26 @@ func mapPgError(err error) error {
 }
 
 type PgStore struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	log         *zap.Logger
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (config EVENT_RESIDENCY_REGION).
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // withRLS runs a query block under the specified tenant RLS context.
@@ -61,6 +79,45 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+// enqueuePeriodEvent writes one period lifecycle event to the transactional
+// outbox inside tx, the transaction that made the change it reports.
+//
+// fact is the past-tense lifecycle fact, kebab-case (closed, reopened,
+// soft-closed, close-review-started, reopen-requested, reopen-rejected,
+// subledger-control-exception) — envelope.New rejects an underscore in the
+// canonical type. legacyType is the pre-standard event_type existing
+// consumers filter on (ZS-EVENT-001 §6.1 requires producers to "remain
+// backward compatible with active consumers during contract migration");
+// without it, every consumer reading this service's legacy event_type field
+// silently sees the new canonical string instead the moment this method
+// replaced the old Publisher's direct Kafka write.
+// The canonical type is com.zoikosuite.accounting.period.<fact> (ZS-EVENT-001 §5.1).
+func (s *PgStore) enqueuePeriodEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, periodID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.period." + fact,
+		LegacyType:      legacyType,
+		Service:         "financial-close-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "fiscal-period",
+		AggregateID:     periodID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build period.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue period.%s event: %w", fact, err)
 	}
 	return nil
 }
@@ -203,26 +260,28 @@ const fiscalPeriodColumns = `fiscal_period_id, tenant_id, legal_entity_id, perio
 // commands racing the same period serialise: the second sees the state the
 // first left and is refused if its transition no longer applies — rather
 // than both "succeeding" against the state they each read earlier.
-func (s *PgStore) ApplyPeriodTransition(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate) (*domain.FiscalPeriod, error) {
+//
+// If fact is non-empty, a period lifecycle event is enqueued to the
+// transactional outbox in the same transaction (e.g. "soft_closed",
+// "close_review_started", "reopened", "reclosed").
+func (s *PgStore) ApplyPeriodTransition(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID string) (*domain.FiscalPeriod, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, domain.ErrIdentityMissing
 	}
 	var out *domain.FiscalPeriod
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		fp, err := applyPeriodTransition(ctx, tx, tenantID, id, allowedFrom, u)
+		fp, err := s.applyPeriodTransition(ctx, tx, tenantID, id, allowedFrom, u, fact, legacyType, correlationID, actorID)
 		out = fp
 		return err
 	})
 	if err != nil {
-		// On ErrInvalidPeriodTransition out is the period as it actually is,
-		// so the caller can say which state refused the command.
 		return out, mapPgError(err)
 	}
 	return out, nil
 }
 
-func applyPeriodTransition(ctx context.Context, tx pgx.Tx, tenantID, id string, allowedFrom []string, u domain.PeriodUpdate) (*domain.FiscalPeriod, error) {
+func (s *PgStore) applyPeriodTransition(ctx context.Context, tx pgx.Tx, tenantID, id string, allowedFrom []string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID string) (*domain.FiscalPeriod, error) {
 	var fp domain.FiscalPeriod
 	err := tx.QueryRow(ctx, `SELECT `+fiscalPeriodColumns+`
 		FROM fiscal_periods WHERE fiscal_period_id = $1 AND tenant_id = $2 FOR UPDATE`, id, tenantID).Scan(
@@ -275,6 +334,21 @@ func applyPeriodTransition(ctx context.Context, tx pgx.Tx, tenantID, id string, 
 		uuid.NewString(), tenantID, id, from, u.To, u.PrincipalID, u.Reason, requestID, u.At); err != nil {
 		return nil, err
 	}
+	// Enqueue period lifecycle event if requested.
+	if fact != "" {
+		if err := s.enqueuePeriodEvent(ctx, tx, fact, legacyType, tenantID, fp.LegalEntityID, id, actorID, correlationID, map[string]any{
+			"tenant_id":        tenantID,
+			"legal_entity_id":  fp.LegalEntityID,
+			"fiscal_period_id": id,
+			"period_name":      fp.PeriodName,
+			"from_state":       from,
+			"to_state":         u.To,
+			"reason":           u.Reason,
+			"timestamp":        time.Now().UTC(),
+		}); err != nil {
+			return nil, err
+		}
+	}
 	return &fp, nil
 }
 
@@ -297,7 +371,7 @@ func (s *PgStore) CreateReopenEvent(ctx context.Context, event *domain.PeriodReo
 	})
 }
 
-func (s *PgStore) CreateCloseEvidence(ctx context.Context, evidence *domain.CloseEvidence) error {
+func (s *PgStore) CreateCloseEvidence(ctx context.Context, evidence *domain.CloseEvidence, correlationID, actorID string, periodName, legalEntityID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
@@ -311,13 +385,29 @@ func (s *PgStore) CreateCloseEvidence(ctx context.Context, evidence *domain.Clos
 			) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''))
 		`, evidence.EvidenceID, tenantID, evidence.FiscalPeriodID, evidence.TrialBalanceHash, evidence.Signature, evidence.GeneratedAt,
 			evidence.RelianceManifest, evidence.RelianceHash, evidence.RelianceSignature)
-		return err
+		if err != nil {
+			return err
+		}
+		// Enqueue period.closed event with evidence details.
+		if err := s.enqueuePeriodEvent(ctx, tx, "closed", "period.closed", tenantID, legalEntityID, evidence.FiscalPeriodID, actorID, correlationID, map[string]any{
+			"tenant_id":            tenantID,
+			"legal_entity_id":      legalEntityID,
+			"fiscal_period_id":     evidence.FiscalPeriodID,
+			"period_name":          periodName,
+			"evidence_document_id": evidence.EvidenceID,
+			"trial_balance_hash":   evidence.TrialBalanceHash,
+			"timestamp":            time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+		return nil
 	})
 }
 
 // CreateControlRun persists one ACC-06 subledger-to-GL reconciliation
 // result — append-only, see migration 000004's doc comment.
-func (s *PgStore) CreateControlRun(ctx context.Context, run *domain.SubledgerControlRun) error {
+// If the run's status is EXCEPTION, enqueues a period.subledger_control_exception event.
+func (s *PgStore) CreateControlRun(ctx context.Context, run *domain.SubledgerControlRun, correlationID, actorID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
@@ -333,7 +423,27 @@ func (s *PgStore) CreateControlRun(ctx context.Context, run *domain.SubledgerCon
 		`, run.ControlRunID, tenantID, run.LegalEntityID, run.FiscalPeriod, run.Subledger,
 			run.ControlAccountCode, run.SubledgerTotalAmount, run.GLControlBalanceAmount,
 			run.DifferenceAmount, run.Status, run.RunAt, run.RunByPrincipalID, run.BookID)
-		return err
+		if err != nil {
+			return err
+		}
+		// Enqueue subledger control exception event if status is EXCEPTION.
+		if run.Status == "EXCEPTION" {
+			if err := s.enqueuePeriodEvent(ctx, tx, "subledger-control-exception", "subledger.control.exception", tenantID, run.LegalEntityID, run.ControlRunID, actorID, correlationID, map[string]any{
+				"control_run_id":             run.ControlRunID,
+				"tenant_id":                  run.TenantID,
+				"legal_entity_id":            run.LegalEntityID,
+				"fiscal_period":              run.FiscalPeriod,
+				"subledger":                  run.Subledger,
+				"control_account_code":       run.ControlAccountCode,
+				"subledger_total_amount":     run.SubledgerTotalAmount,
+				"gl_control_balance_amount":  run.GLControlBalanceAmount,
+				"difference_amount":          run.DifferenceAmount,
+				"timestamp":                  time.Now().UTC(),
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -2397,16 +2507,16 @@ func scanReopenRequest(row pgx.Row) (*domain.ReopenRequest, error) {
 
 // CreateReopenRequest records a request to reopen a closed period. The
 // period must be HARD_CLOSED or RECLOSED; at most one request per period may
-// be pending.
-func (s *PgStore) CreateReopenRequest(ctx context.Context, req *domain.ReopenRequest) error {
+// be pending. Enqueues a period.reopen_requested event to the outbox.
+func (s *PgStore) CreateReopenRequest(ctx context.Context, req *domain.ReopenRequest, correlationID, actorID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var status string
-		err := tx.QueryRow(ctx, `SELECT close_status FROM fiscal_periods
-			WHERE fiscal_period_id = $1 AND tenant_id = $2 FOR UPDATE`, req.FiscalPeriodID, tenantID).Scan(&status)
+		var status, legalEntityID string
+		err := tx.QueryRow(ctx, `SELECT close_status, legal_entity_id FROM fiscal_periods
+			WHERE fiscal_period_id = $1 AND tenant_id = $2 FOR UPDATE`, req.FiscalPeriodID, tenantID).Scan(&status, &legalEntityID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrFiscalPeriodNotFound
 		}
@@ -2425,7 +2535,22 @@ func (s *PgStore) CreateReopenRequest(ctx context.Context, req *domain.ReopenReq
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return domain.ErrReopenRequestPending
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		// Enqueue period.reopen_requested event.
+		if err := s.enqueuePeriodEvent(ctx, tx, "reopen-requested", "period.reopen_requested", tenantID, legalEntityID, req.FiscalPeriodID, actorID, correlationID, map[string]any{
+			"tenant_id":        tenantID,
+			"legal_entity_id":  legalEntityID,
+			"fiscal_period_id": req.FiscalPeriodID,
+			"request_id":       req.RequestID,
+			"reason":           req.Reason,
+			"reopen_until":     req.ReopenUntil,
+			"timestamp":        time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+		return nil
 	})
 	return mapPgError(err)
 }
@@ -2448,14 +2573,13 @@ func (s *PgStore) GetReopenRequest(ctx context.Context, requestID string) (*doma
 	})
 	return out, err
 }
-
 // ApproveReopenRequest decides a pending request APPROVED and reopens its
 // period until the requested time, atomically: the request is never approved
 // without the period reopening, nor the period reopened without an approved
 // request. The approver must differ from the requester (also a CHECK in the
 // table). The window runs from approval, so a request approved late still
-// ends when it said it would.
-func (s *PgStore) ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time) (*domain.ReopenRequest, *domain.FiscalPeriod, error) {
+// ends when it said it would. Enqueues a period.reopened event to the outbox.
+func (s *PgStore) ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, *domain.FiscalPeriod, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, nil, domain.ErrIdentityMissing
@@ -2482,14 +2606,15 @@ func (s *PgStore) ApproveReopenRequest(ctx context.Context, requestID, approverI
 		}
 		until := r.ReopenUntil
 		approvedAt := at
-		fp, err = applyPeriodTransition(ctx, tx, tenantID, r.FiscalPeriodID,
+		fp, err = s.applyPeriodTransition(ctx, tx, tenantID, r.FiscalPeriodID,
 			[]string{domain.PeriodHardClosed, domain.PeriodReclosed}, domain.PeriodUpdate{
 				To: domain.PeriodAuthorizedReopen, PrincipalID: approverID, Reason: r.Reason,
 				ReopenRequestID: r.RequestID, At: at, ReopenedAt: &approvedAt, ReopenExpiresAt: &until,
-			})
+			}, "reopened", "period.reopened", correlationID, actorID)
 		if err != nil {
 			return err
 		}
+
 		if _, err := tx.Exec(ctx, `
 			UPDATE period_reopen_requests
 			   SET status = 'APPROVED', decided_by_principal_id = $3, decided_at = $4, decision_reason = $5
@@ -2508,7 +2633,8 @@ func (s *PgStore) ApproveReopenRequest(ctx context.Context, requestID, approverI
 
 // RejectReopenRequest decides a pending request REJECTED; the period is
 // untouched. The decider must not be the requester, as for approval.
-func (s *PgStore) RejectReopenRequest(ctx context.Context, requestID, deciderID, reason string, at time.Time) (*domain.ReopenRequest, error) {
+// Enqueues a period.reopen_rejected event to the outbox.
+func (s *PgStore) RejectReopenRequest(ctx context.Context, requestID, deciderID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, domain.ErrIdentityMissing
@@ -2529,6 +2655,12 @@ func (s *PgStore) RejectReopenRequest(ctx context.Context, requestID, deciderID,
 		if r.RequestedByPrincipalID == deciderID {
 			return domain.ErrReopenSelfApproval
 		}
+		// Fetch legal_entity_id from fiscal period for the event.
+		var legalEntityID string
+		if err := tx.QueryRow(ctx, `SELECT legal_entity_id FROM fiscal_periods
+			WHERE fiscal_period_id = $1 AND tenant_id = $2`, r.FiscalPeriodID, tenantID).Scan(&legalEntityID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE period_reopen_requests
 			   SET status = 'REJECTED', decided_by_principal_id = $3, decided_at = $4, decision_reason = $5
@@ -2538,6 +2670,17 @@ func (s *PgStore) RejectReopenRequest(ctx context.Context, requestID, deciderID,
 		decidedAt := at
 		r.Status, r.DecidedByPrincipalID, r.DecidedAt, r.DecisionReason = domain.ReopenRejected, deciderID, &decidedAt, reason
 		out = r
+		// Enqueue period.reopen_rejected event.
+		if err := s.enqueuePeriodEvent(ctx, tx, "reopen-rejected", "period.reopen_rejected", tenantID, legalEntityID, r.FiscalPeriodID, actorID, correlationID, map[string]any{
+			"tenant_id":        tenantID,
+			"legal_entity_id":  legalEntityID,
+			"fiscal_period_id": r.FiscalPeriodID,
+			"request_id":       requestID,
+			"reason":           reason,
+			"timestamp":        time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {

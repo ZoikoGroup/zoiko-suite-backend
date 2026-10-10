@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -20,7 +21,7 @@ import (
 // INVENTORY_VALUE, PROJECT_REVENUE and STOCK_COUNT.
 func TestCreateControlRun_StoresEverySubledgerType(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	entity := "le-" + uuid.NewString()[:8]
@@ -35,7 +36,7 @@ func TestCreateControlRun_StoresEverySubledgerType(t *testing.T) {
 		if ledger == "ASSETS" {
 			run.BookID = "STATUTORY"
 		}
-		if err := s.CreateControlRun(ctx, run); err != nil {
+		if err := s.CreateControlRun(ctx, run, "corr-1", "actor-1"); err != nil {
 			t.Fatalf("%s: could not be stored: %v", ledger, err)
 		}
 	}
@@ -62,7 +63,7 @@ func TestCreateControlRun_StoresEverySubledgerType(t *testing.T) {
 // without the book, the evidence cannot say what was proven.
 func TestCreateControlRun_AssetsRunRequiresItsBook(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -70,7 +71,7 @@ func TestCreateControlRun_AssetsRunRequiresItsBook(t *testing.T) {
 		ControlRunID: uuid.NewString(), TenantID: tenantID, LegalEntityID: "le-1",
 		FiscalPeriod: "2026-10", Subledger: "ASSETS", ControlAccountCode: "1500",
 		Status: "MATCHED", RunAt: time.Now().UTC(), RunByPrincipalID: "controller-1",
-	})
+	}, "corr-1", "actor-1")
 	if err == nil {
 		t.Fatal("an ASSETS run without a book was stored")
 	}
@@ -80,7 +81,7 @@ func TestCreateControlRun_AssetsRunRequiresItsBook(t *testing.T) {
 // the database rather than create a run no close requirement will ever match.
 func TestCreateControlRun_UnknownSubledgerIsRejected(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -88,7 +89,7 @@ func TestCreateControlRun_UnknownSubledgerIsRejected(t *testing.T) {
 		ControlRunID: uuid.NewString(), TenantID: tenantID, LegalEntityID: "le-1",
 		FiscalPeriod: "2026-10", Subledger: "INVENTORY_VALEU", ControlAccountCode: "1500",
 		Status: "MATCHED", RunAt: time.Now().UTC(), RunByPrincipalID: "controller-1",
-	})
+	}, "corr-1", "actor-1")
 	if err == nil || !strings.Contains(err.Error(), "subledger") {
 		t.Fatalf("unknown subledger type: err = %v, want a check-constraint violation", err)
 	}

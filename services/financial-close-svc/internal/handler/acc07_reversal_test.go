@@ -30,7 +30,7 @@ func recognizeOnePeriod(t *testing.T, r chi.Router, id, fiscalPeriod string) dom
 func TestReverseAccrualRecognition_MissingReason_Returns400(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	id := createApprovedAccrual(t, s, r, 900.00, 3, "2026-01")
 	recognizeOnePeriod(t, r, id, "2026-01")
 
@@ -43,7 +43,7 @@ func TestReverseAccrualRecognition_MissingReason_Returns400(t *testing.T) {
 func TestReverseAccrualRecognition_UnrecognizedPeriod_Returns404(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	id := createApprovedAccrual(t, s, r, 900.00, 3, "2026-01")
 	// Never called /recognize for 2026-01.
 
@@ -59,7 +59,7 @@ func TestReverseAccrualRecognition_UnrecognizedPeriod_Returns404(t *testing.T) {
 func TestReverseAccrualRecognition_HappyPath_CallsRealGLReversal(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{reversingJournalID: "reversing-journal-1"}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	id := createApprovedAccrual(t, s, r, 900.00, 3, "2026-01")
 	inst := recognizeOnePeriod(t, r, id, "2026-01")
 
@@ -89,7 +89,7 @@ func TestReverseAccrualRecognition_HappyPath_CallsRealGLReversal(t *testing.T) {
 func TestReverseAccrualRecognition_Replay_IsIdempotentNoDuplicateReversal(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{reversingJournalID: "reversing-journal-1"}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	id := createApprovedAccrual(t, s, r, 900.00, 3, "2026-01")
 	recognizeOnePeriod(t, r, id, "2026-01")
 
@@ -121,11 +121,11 @@ func TestReverseAccrualRecognition_AuthorizationDenied_NeverCallsGL(t *testing.T
 	// Build the schedule and recognize a period through an ALLOWING
 	// router, sharing the same store — the denial under test is specific
 	// to the reverse call itself, not to every prior setup step.
-	setupRouter := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	setupRouter := newRouter(s, &stubAuthZ{}, cl)
 	id := createApprovedAccrual(t, s, setupRouter, 900.00, 3, "2026-01")
 	recognizeOnePeriod(t, setupRouter, id, "2026-01")
 
-	denyingRouter := newRouter(s, &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, cl)
+	denyingRouter := newRouter(s, &stubAuthZ{err: domain.ErrAuthorizationDenied}, cl)
 	rr := doReq(denyingRouter, http.MethodPost, "/v1/accruals/"+id+"/recognitions/2026-01/reverse", map[string]string{"reason": "x"}, "reverser-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d: %s", rr.Code, rr.Body.String())

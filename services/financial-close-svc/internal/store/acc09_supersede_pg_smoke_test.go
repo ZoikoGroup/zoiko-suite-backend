@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -44,7 +45,7 @@ func approvedAllocationRule(t *testing.T, ctx context.Context, s *store.PgStore,
 
 func TestPgStore_ACC09_SupersedeAllocationRule_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -92,7 +93,7 @@ func TestPgStore_ACC09_SupersedeAllocationRule_RealDB(t *testing.T) {
 // already SUPERSEDED) is refused.
 func TestPgStore_ACC09_SupersedeAllocationRule_NoCurrentVersion_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -125,7 +126,7 @@ func TestPgStore_ACC09_SupersedeAllocationRule_NoCurrentVersion_Refused(t *testi
 // the same rule_id with effective_to still NULL is rejected outright.
 func TestPgStore_ACC09_CurrentVersionUniqueConstraint_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)

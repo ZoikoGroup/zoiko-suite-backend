@@ -97,6 +97,11 @@ type Config struct {
 	// startup failure instead.
 	CloseSigningKey string
 
+	// EventResidencyRegion is the residency region (e.g. "eu-west", "uk")
+	// stamped on every outbox event for data-residency compliance (ZS-EVENT-001 §4).
+	// Required at startup; no default.
+	EventResidencyRegion string
+
 	OTELExporterEndpoint string
 }
 
@@ -206,6 +211,7 @@ func Load() (*Config, error) {
 		BankReconGateMode:            bankReconMode,
 		BankReconGateModeInvalid:     bankReconModeInvalid,
 		BankReconCutoffDays:          cutoffDays,
+		EventResidencyRegion:         env("EVENT_RESIDENCY_REGION", ""),
 		OTELExporterEndpoint:         env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }

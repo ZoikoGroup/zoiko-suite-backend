@@ -22,7 +22,7 @@ func supersedeReq() domain.SupersedeAllocationRuleRequest {
 func TestSupersedeAllocationRule_MissingFields_Returns400(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	rr := doReq(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", map[string]any{}, "preparer-1")
@@ -34,7 +34,7 @@ func TestSupersedeAllocationRule_MissingFields_Returns400(t *testing.T) {
 func TestSupersedeAllocationRule_NoCurrentRule_Returns404(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 
 	rr := doReq(r, http.MethodPost, "/v1/allocation-rules/nonexistent/supersede", supersedeReq(), "preparer-1")
 	if rr.Code != http.StatusNotFound {
@@ -45,7 +45,7 @@ func TestSupersedeAllocationRule_NoCurrentRule_Returns404(t *testing.T) {
 func TestSupersedeAllocationRule_StillDraft_Refused(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 
 	// Create but never approve — the rule's current version is DRAFT.
 	if cl.accountStatuses == nil {
@@ -65,7 +65,7 @@ func TestSupersedeAllocationRule_StillDraft_Refused(t *testing.T) {
 func TestSupersedeAllocationRule_ApprovedRule_CreatesNewDraftVersion(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	rr := doReq(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", supersedeReq(), "preparer-1")
@@ -102,7 +102,7 @@ func TestSupersedeAllocationRule_TwiceInARow_SecondRefusedAsAlreadySuperseded(t 
 	// never a window where two versions are simultaneously current.
 	s := newStubStore()
 	cl := &stubClients{}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	ruleID := createApprovedAllocationRule(t, s, cl, r, evenDrivers())
 
 	first := doReq(r, http.MethodPost, "/v1/allocation-rules/"+ruleID+"/supersede", supersedeReq(), "preparer-1")

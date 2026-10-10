@@ -70,7 +70,7 @@ func bothMatchedAt(s *stubStore, at time.Time) {
 
 func lock(t *testing.T, s *stubStore, cl *stubClients) (int, domain.ReadinessCheckResponse, string) {
 	t.Helper()
-	rr := doReq(newGatedRouter(s, cl), http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1")
+	rr := doReq(newGatedRouter(s, &stubAuthZ{}, cl), http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1")
 	var resp domain.ReadinessCheckResponse
 	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
 	return rr.Code, resp, rr.Body.String()
@@ -222,13 +222,13 @@ func TestClose_FailsClosedWhenItCannotCheck(t *testing.T) {
 // SUBLEDGER_CONTROL_GATE_MODE=off: no runs required, everything else still is.
 func TestClose_SubledgerGateOffSkipsOnlyTheRuns(t *testing.T) {
 	s := octoberStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1"); rr.Code != http.StatusOK {
 		t.Fatalf("gate off: a period with no control runs should close, got %d: %s", rr.Code, rr.Body.String())
 	}
 
 	s2 := octoberStore()
-	r2 := newRouter(s2, &stubPublisher{}, &stubAuthZ{}, &stubClients{backlog: domain.PostingBacklog{Count: 2}})
+	r2 := newRouter(s2, &stubAuthZ{}, &stubClients{backlog: domain.PostingBacklog{Count: 2}})
 	if rr := doReq(r2, http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1"); rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("gate off must not disable the posting backlog check, got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -415,7 +415,7 @@ func TestClose_CutoffIsConfigurable(t *testing.T) {
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	cl := &stubClients{bankAccounts: []domain.BankAccountRef{barclays}, bankRecon: []domain.BankAccountReconStatus{certified("acct-barclays", "2026-10-30")}}
-	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, &stubAuthZ{}, cl, testSigningKey, zap.NewNop()).SetBankReconciliationGate(true, 0))
+	handler.RegisterRoutes(r, handler.New(s, &stubAuthZ{}, cl, testSigningKey, zap.NewNop()).SetBankReconciliationGate(true, 0))
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1")
 	if rr.Code != http.StatusUnprocessableEntity || !strings.Contains(rr.Body.String(), "on or after 2026-10-31") {
 		t.Fatalf("cut-off 0 requires the 31st itself: got %d %s", rr.Code, rr.Body.String())
@@ -479,7 +479,7 @@ func TestClose_BankGateOffAsksNobody(t *testing.T) {
 	cl := &stubClients{bankAccountsErr: domain.ErrTreasuryUnavailable}
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
-	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, &stubAuthZ{}, cl, testSigningKey, zap.NewNop()).SetBankReconciliationGate(false, 4))
+	handler.RegisterRoutes(r, handler.New(s, &stubAuthZ{}, cl, testSigningKey, zap.NewNop()).SetBankReconciliationGate(false, 4))
 	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1"); rr.Code != http.StatusOK || cl.bankCalls != 0 {
 		t.Fatalf("gate off: got %d with %d bank calls", rr.Code, cl.bankCalls)
 	}
@@ -552,7 +552,7 @@ func TestClose_EvidencePinsWhatTheCloseReliedOn(t *testing.T) {
 	}
 
 	// Readable back through the API, with the exact signed text.
-	rr := doReq(newGatedRouter(s, cl), http.MethodGet, "/v1/close/periods/fp-oct/evidence", nil, "auditor-1")
+	rr := doReq(newGatedRouter(s, &stubAuthZ{}, cl), http.MethodGet, "/v1/close/periods/fp-oct/evidence", nil, "auditor-1")
 	var views []domain.CloseEvidenceView
 	if err := json.Unmarshal(rr.Body.Bytes(), &views); err != nil || rr.Code != http.StatusOK {
 		t.Fatalf("evidence endpoint: %d %s", rr.Code, rr.Body.String())
@@ -568,7 +568,7 @@ func TestClose_EvidenceRecordsAGateThatWasOff(t *testing.T) {
 	s := octoberStore()
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
-	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{}, testSigningKey, zap.NewNop()).
+	handler.RegisterRoutes(r, handler.New(s, &stubAuthZ{}, &stubClients{}, testSigningKey, zap.NewNop()).
 		SetSubledgerControlGateEnforced(false).SetBankReconciliationGate(false, 4))
 	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-oct/lock", nil, "controller-1"); rr.Code != http.StatusOK {
 		t.Fatalf("lock: %d %s", rr.Code, rr.Body.String())

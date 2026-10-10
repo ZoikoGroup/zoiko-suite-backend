@@ -27,7 +27,7 @@ import (
 
 func TestPgStore_LineageConsumer_RedeliveryIsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	log, err := zap.NewDevelopment()
 	if err != nil {
 		t.Fatalf("zap.NewDevelopment: %v", err)
