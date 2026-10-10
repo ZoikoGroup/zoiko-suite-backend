@@ -654,10 +654,25 @@ function Invoke-Authz {
         [Parameter(Mandatory)] $Body
     )
     $json = $Body | ConvertTo-Json -Compress -Depth 5
+    # authorization-svc's envelope middleware now rejects every request missing
+    # this header set (tenant authority, an identified actor, request tracing,
+    # a source channel, and a replay-protection key) with 401
+    # envelope_incomplete -- this script predates that middleware. The legal
+    # entity mirrors the body's own scope when the call carries one (Get-Decision
+    # probes different scopes per call), falling back to the demo legal entity
+    # for admin calls that scope themselves some other way.
+    $legalEntityHeader = if ($Body.legal_entity_id) { $Body.legal_entity_id } else { $LEGAL_ENTITY }
+    $headers = @{
+        "X-Tenant-Id"       = $TENANT_ID
+        "X-Principal-Id"    = $PRINCIPAL_ID
+        "X-Legal-Entity-Id" = $legalEntityHeader
+        "X-Request-Id"      = [guid]::NewGuid().ToString()
+        "X-Source-Channel"  = "system"
+        "Idempotency-Key"   = [guid]::NewGuid().ToString()
+    }
     try {
-        $response = Invoke-WebRequest -Uri "$AUTHZ$Path" -Method POST -Body $json `
-            -ContentType "application/json" -Headers (New-AuthzEnvelope -Path $Path) `
-            -UseBasicParsing -TimeoutSec 10
+        $response = Invoke-WebRequest -Uri "$AUTHZ$Path" -Method POST -Body $json -Headers $headers `
+            -ContentType "application/json" -UseBasicParsing -TimeoutSec 10
         return @{ status = [int] $response.StatusCode; body = $response.Content | ConvertFrom-Json }
     } catch {
         $status = if ($_.Exception.Response) { [int] $_.Exception.Response.StatusCode.value__ } else { 0 }
