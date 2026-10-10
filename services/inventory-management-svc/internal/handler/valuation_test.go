@@ -391,6 +391,122 @@ func TestEmitInventoryAccountingEvent_DifferentApprover_PostsJournal(t *testing.
 	}
 }
 
+// ── Inbound GRNI reclass (AP-03 linked receipts) ─────────────────────────────
+
+func receiveWithAPReceipt(t *testing.T, r chi.Router, itemID, locID, idemKey, apReceiptID string, qty float64) domain.InventoryMovement {
+	t.Helper()
+	req := domain.CreateInventoryMovementRequest{
+		ItemID: itemID, DestinationLocationID: locID, Quantity: qty, UOM: "EACH",
+		SourceReference: "AP-RCPT", SourceIdempotencyKey: idemKey, FiscalPeriod: "2026-09", APReceiptID: apReceiptID,
+	}
+	rr := doReq(r, http.MethodPost, "/v1/movements/receive", req, "preparer-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("receive failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var m domain.InventoryMovement
+	_ = json.NewDecoder(rr.Body).Decode(&m)
+	if v := doReq(r, http.MethodPost, "/v1/movements/"+m.MovementID+"/validate", nil, "preparer-1"); v.Code != http.StatusOK {
+		t.Fatalf("validate failed: %d %s", v.Code, v.Body.String())
+	}
+	if c := doReq(r, http.MethodPost, "/v1/movements/"+m.MovementID+"/commit", nil, "preparer-1"); c.Code != http.StatusOK {
+		t.Fatalf("commit failed: %d %s", c.Code, c.Body.String())
+	}
+	return m
+}
+
+func newRun(t *testing.T, r chi.Router) string {
+	t.Helper()
+	runReq := domain.CreateValuationRunRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-09", InventoryAccountCode: "INV-ASSET", COGSAccountCode: "COGS"}
+	rr := doReq(r, http.MethodPost, "/v1/valuation/runs/", runReq, "preparer-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create run failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	return resp["run_id"].(string)
+}
+
+func TestEmitInventoryAccountingEvent_APLinkedInbound_PostsGRNIReclass(t *testing.T) {
+	s := newStubStore()
+	ledger := &stubLedger{}
+	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	itemID, locID := valuationFixture(t, s, r)
+
+	linked := receiveWithAPReceipt(t, r, itemID, locID, "idem-grni-1", "rcpt-100", 10)
+	if rr := valueMovement(t, r, linked.MovementID, f(3.0)); rr.StatusCode != http.StatusCreated {
+		t.Fatalf("value receipt failed: %d", rr.StatusCode)
+	}
+	runID := newRun(t, r)
+
+	emit := doReq(r, http.MethodPost, "/v1/valuation/runs/"+runID+"/emit", nil, "approver-2")
+	if emit.Code != http.StatusOK {
+		t.Fatalf("expected 200 (inbound-only linked run is postable), got %d: %s", emit.Code, emit.Body.String())
+	}
+	if len(ledger.lastLines) != 2 {
+		t.Fatalf("expected exactly the 2 reclass lines, got %+v", ledger.lastLines)
+	}
+	dr, cr := ledger.lastLines[0], ledger.lastLines[1]
+	if dr.AccountCode != "INV-ASSET" || dr.DebitAmount != 30 || dr.MappingKey != "" {
+		t.Fatalf("expected Dr INV-ASSET 30 by account code, got %+v", dr)
+	}
+	if cr.MappingKey != "AP_GRNI_EXPENSE" || cr.CreditAmount != 30 || cr.AccountCode != "" {
+		t.Fatalf("expected Cr AP_GRNI_EXPENSE 30 by mapping key only, got %+v", cr)
+	}
+}
+
+// An inbound receipt with no AP link must NOT be posted: INV cannot know the
+// cost was already expensed, so posting would double-count it.
+func TestEmitInventoryAccountingEvent_UnlinkedInboundOnly_NotPosted(t *testing.T) {
+	s := newStubStore()
+	ledger := &stubLedger{}
+	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	itemID, locID := valuationFixture(t, s, r)
+
+	unlinked := createAndCommitReceipt(t, r, itemID, locID, "idem-grni-2", 10)
+	if rr := valueMovement(t, r, unlinked.MovementID, f(3.0)); rr.StatusCode != http.StatusCreated {
+		t.Fatalf("value receipt failed: %d", rr.StatusCode)
+	}
+	runID := newRun(t, r)
+
+	emit := doReq(r, http.MethodPost, "/v1/valuation/runs/"+runID+"/emit", nil, "approver-2")
+	if emit.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 no_valuation_to_emit, got %d: %s", emit.Code, emit.Body.String())
+	}
+	if ledger.postCalls != 0 {
+		t.Fatalf("expected no journal post for unlinked inbound, got %d", ledger.postCalls)
+	}
+}
+
+func TestCreateMovement_APReceiptOnNonReceipt_Returns422(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, locID := valuationFixture(t, s, r)
+	req := domain.CreateInventoryMovementRequest{
+		ItemID: itemID, SourceLocationID: locID, Quantity: 1, UOM: "EACH",
+		SourceReference: "SO-1", SourceIdempotencyKey: "idem-grni-3", FiscalPeriod: "2026-09", APReceiptID: "rcpt-1",
+	}
+	if rr := doReq(r, http.MethodPost, "/v1/movements/issue", req, "preparer-1"); rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreateMovement_RelinkToDifferentAPReceipt_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, locID := valuationFixture(t, s, r)
+	req := domain.CreateInventoryMovementRequest{
+		ItemID: itemID, DestinationLocationID: locID, Quantity: 1, UOM: "EACH",
+		SourceReference: "AP-RCPT", SourceIdempotencyKey: "idem-grni-4", FiscalPeriod: "2026-09", APReceiptID: "rcpt-A",
+	}
+	if rr := doReq(r, http.MethodPost, "/v1/movements/receive", req, "preparer-1"); rr.Code != http.StatusCreated {
+		t.Fatalf("first create failed: %d %s", rr.Code, rr.Body.String())
+	}
+	req.APReceiptID = "rcpt-B" // same idempotency key, different AP receipt
+	if rr := doReq(r, http.MethodPost, "/v1/movements/receive", req, "preparer-1"); rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on conflicting re-link, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 // ── RecordInventoryWriteDown / ReverseWriteDown ──────────────────────────────
 
 func TestRecordInventoryWriteDown_MissingEvidence_Returns422(t *testing.T) {

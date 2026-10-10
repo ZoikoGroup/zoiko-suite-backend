@@ -19,6 +19,11 @@ func (h *Handler) SetTrackingPolicy(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if req.NegativeStockPolicy != "" &&
+		req.NegativeStockPolicy != domain.NegativeStockProhibited && req.NegativeStockPolicy != domain.NegativeStockAllowed {
+		writeError(w, http.StatusBadRequest, "invalid_negative_stock_policy", domain.ErrInvalidNegativeStockPolicy.Error())
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -39,6 +44,7 @@ func (h *Handler) SetTrackingPolicy(w http.ResponseWriter, r *http.Request) {
 	p := &domain.TrackingPolicy{
 		PolicyVersionID: uuid.NewString(), ItemID: id,
 		RequiresLotTracking: req.RequiresLotTracking, RequiresSerialTracking: req.RequiresSerialTracking, RequiresExpiryTracking: req.RequiresExpiryTracking,
+		NegativeStockPolicy: req.NegativeStockPolicy,
 		EffectiveFrom: now, CreatedAt: now, CreatedByPrincipalID: principalID,
 	}
 	if err := h.store.SetTrackingPolicy(r.Context(), p, now); err != nil {

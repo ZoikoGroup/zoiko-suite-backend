@@ -386,6 +386,29 @@ func TestCertifyStockCount_BeforeAdjustmentsGenerated_Refused(t *testing.T) {
 	}
 }
 
+// §9 "Stock count": a count must not certify while a line still carries an
+// observed variance that was never approved/adjusted.
+func TestCertifyStockCount_UnapprovedVarianceLeftBehind_Refused(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	countID, _, _ := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", domain.RecordBlindCountRequest{ObservedQuantity: 18}, "counter-1")
+	// Simulate another line having driven the count to ADJUSTMENTS_GENERATED
+	// while this one was never approved.
+	s.stockCounts[countID].Status = domain.StockCountStatusAdjustmentsGenerated
+
+	rr := doReq(r, http.MethodPost, "/v1/stock-counts/"+countID+"/certify", nil, "certifier-1")
+	if rr.Code != http.StatusUnprocessableEntity || !strings.Contains(rr.Body.String(), "unresolved_variance") {
+		t.Fatalf("expected 422 unresolved_variance, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if s.stockCounts[countID].Status == domain.StockCountStatusCertified {
+		t.Fatalf("count must not be CERTIFIED with an unresolved variance")
+	}
+}
+
 func TestCancelStockCount_MissingReason_Returns400(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})

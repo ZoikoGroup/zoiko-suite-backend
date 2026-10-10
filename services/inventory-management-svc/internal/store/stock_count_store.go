@@ -380,6 +380,20 @@ func (s *PgStore) CertifyStockCount(ctx context.Context, countID, principalID st
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// Same transaction as the status UPDATE below, so a line cannot be
+		// observed, left unapproved, and certified past in between.
+		var unresolved int
+		if err := tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM inventory_stock_count_lines
+			WHERE count_id = $1 AND tenant_id = $2
+			  AND observed_quantity IS NOT NULL AND observed_quantity != system_quantity
+			  AND status != $3
+		`, countID, tenantID, domain.CountLineStatusAdjustmentGenerated).Scan(&unresolved); err != nil {
+			return err
+		}
+		if unresolved > 0 {
+			return domain.ErrUnresolvedCountVariance
+		}
 		tag, err := tx.Exec(ctx, `
 			UPDATE inventory_stock_counts SET status = $1, certified_at = $2, certified_by_principal_id = $3
 			WHERE count_id = $4 AND status = $5 AND tenant_id = $6
