@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -45,7 +46,7 @@ func recognizedAccrualInstance(t *testing.T, ctx context.Context, s *store.PgSto
 
 func TestPgStore_ACC07_CreateRecognitionReversal_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -79,7 +80,7 @@ func TestPgStore_ACC07_CreateRecognitionReversal_RealDB(t *testing.T) {
 // resolve to the ORIGINAL reversal, never a second row.
 func TestPgStore_ACC07_DuplicateReversal_ReturnsExisting_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -118,7 +119,7 @@ func TestPgStore_ACC07_DuplicateReversal_ReturnsExisting_RealDB(t *testing.T) {
 // proves the append-only trigger at the database level.
 func TestPgStore_ACC07_RecognitionReversals_RejectsUpdateAndDelete_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)

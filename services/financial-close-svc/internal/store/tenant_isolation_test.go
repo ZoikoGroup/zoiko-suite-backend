@@ -28,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -101,7 +102,8 @@ func TestMain(m *testing.M) {
 		fx_revaluation_items, fx_revaluation_runs,
 		migration_crosswalk_entries, migration_batches,
 		financial_snapshots,
-		lineage_edges, lineage_projection_status, lineage_trace_verifications, lineage_quarantined_gaps
+		lineage_edges, lineage_projection_status, lineage_trace_verifications, lineage_quarantined_gaps,
+		eventing_outbox
 		CASCADE;`)
 
 	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
@@ -143,7 +145,7 @@ func TestMain(m *testing.M) {
 		}
 	}
 
-	testStore = store.New(testPool)
+	testStore = store.New(testPool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	code := m.Run()
 
@@ -216,7 +218,7 @@ func TestPgStore_TenantIsolation_ApplyPeriodTransition(t *testing.T) {
 	ctxB := svcmiddleware.WithTenant(context.Background(), b.tenantID)
 	_, err := testStore.ApplyPeriodTransition(ctxB, a.fiscalPeriodID, []string{domain.PeriodCloseReview},
 		domain.PeriodUpdate{To: domain.PeriodHardClosed, PrincipalID: "intruder", At: lockedAt,
-			LockedAt: &lockedAt, EvidenceDocID: &docID})
+			LockedAt: &lockedAt, EvidenceDocID: &docID}, "", "", "corr-isolation-probe", "intruder")
 	assert.ErrorIs(t, err, domain.ErrFiscalPeriodNotFound,
 		"ISOLATION FAILURE: tenant B's transition against tenant A's fiscal period returned something other than not-found")
 
@@ -230,11 +232,11 @@ func TestPgStore_TenantIsolation_ApplyPeriodTransition(t *testing.T) {
 	// Sanity: tenant B can still transition its OWN period (from CLOSE_REVIEW,
 	// the state setupIsolationFixture leaves it in only if asked — set it here).
 	_, err = testStore.ApplyPeriodTransition(ctxB, b.fiscalPeriodID, []string{domain.PeriodOpen},
-		domain.PeriodUpdate{To: domain.PeriodCloseReview, PrincipalID: "owner", At: lockedAt})
+		domain.PeriodUpdate{To: domain.PeriodCloseReview, PrincipalID: "owner", At: lockedAt}, "", "", "corr-isolation-owner-1", "owner")
 	require.NoError(t, err)
 	_, err = testStore.ApplyPeriodTransition(ctxB, b.fiscalPeriodID, []string{domain.PeriodCloseReview},
 		domain.PeriodUpdate{To: domain.PeriodHardClosed, PrincipalID: "owner", At: lockedAt,
-			LockedAt: &lockedAt, EvidenceDocID: &docID})
+			LockedAt: &lockedAt, EvidenceDocID: &docID}, "", "", "corr-isolation-owner-2", "owner")
 	require.NoError(t, err)
 	gotB, err := testStore.GetFiscalPeriod(ctxB, b.fiscalPeriodID)
 	require.NoError(t, err)

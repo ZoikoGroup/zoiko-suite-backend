@@ -22,17 +22,17 @@ import (
 // SOFT_CLOSE. Ordinary posting stops; close journals continue.
 // PERIOD_CLOSE_INITIATE.
 func (h *Handler) StartSoftClose(w http.ResponseWriter, r *http.Request) {
-	h.simpleTransition(w, r, domain.PeriodOpen, domain.PeriodSoftClose, "period.soft_closed")
+	h.simpleTransition(w, r, domain.PeriodOpen, domain.PeriodSoftClose, "soft-closed", "period.soft_closed")
 }
 
 // EnterCloseReview — POST /v1/close/periods/{id}/close-review: SOFT_CLOSE →
 // CLOSE_REVIEW. Only designated close journals from here; next is hard
 // close. PERIOD_CLOSE_INITIATE.
 func (h *Handler) EnterCloseReview(w http.ResponseWriter, r *http.Request) {
-	h.simpleTransition(w, r, domain.PeriodSoftClose, domain.PeriodCloseReview, "period.close_review_started")
+	h.simpleTransition(w, r, domain.PeriodSoftClose, domain.PeriodCloseReview, "close-review-started", "period.close_review_started")
 }
 
-func (h *Handler) simpleTransition(w http.ResponseWriter, r *http.Request, from, to, eventType string) {
+func (h *Handler) simpleTransition(w http.ResponseWriter, r *http.Request, from, to, fact, legacyType string) {
 	id := chi.URLParam(r, "id")
 	var req domain.PeriodTransitionRequest
 	if r.ContentLength != 0 && !decodeJSON(w, r, &req) {
@@ -54,14 +54,14 @@ func (h *Handler) simpleTransition(w http.ResponseWriter, r *http.Request, from,
 		h.writeAuthzErr(w, err)
 		return
 	}
+	correlationID := correlationIDOf(r)
 	updated, err := h.store.ApplyPeriodTransition(r.Context(), id, []string{from}, domain.PeriodUpdate{
 		To: to, PrincipalID: principalID, Reason: strings.TrimSpace(req.Reason), At: time.Now().UTC(),
-	})
+	}, fact, legacyType, correlationID, principalID)
 	if err != nil {
 		h.writeTransitionErr(w, err, updated, from)
 		return
 	}
-	h.publisher.PublishPeriodTransition(r.Context(), eventType, correlationIDOf(r), principalID, *updated, nil)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -105,7 +105,8 @@ func (h *Handler) RequestReopen(w http.ResponseWriter, r *http.Request) {
 		RequestID: uuid.NewString(), TenantID: tenantID, FiscalPeriodID: id, RequestedByPrincipalID: principalID,
 		Reason: req.Reason, ReopenUntil: req.ReopenUntil.UTC(), Status: domain.ReopenPending, CreatedAt: now,
 	}
-	if err := h.store.CreateReopenRequest(r.Context(), rr); err != nil {
+	correlationID := correlationIDOf(r)
+	if err := h.store.CreateReopenRequest(r.Context(), rr, correlationID, principalID); err != nil {
 		switch {
 		case errors.Is(err, domain.ErrReopenRequestPending):
 			writeError(w, http.StatusConflict, "reopen_request_pending", string(domain.ErrReopenRequestPending))
@@ -117,8 +118,6 @@ func (h *Handler) RequestReopen(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	h.publisher.PublishPeriodTransition(r.Context(), "period.reopen_requested", correlationIDOf(r), principalID, *fp,
-		map[string]any{"request_id": rr.RequestID, "reason": rr.Reason, "reopen_until": rr.ReopenUntil})
 	writeJSON(w, http.StatusCreated, rr)
 }
 
@@ -179,23 +178,21 @@ func (h *Handler) decideReopen(w http.ResponseWriter, r *http.Request, approve b
 	}
 
 	now := time.Now().UTC()
+	correlationID := correlationIDOf(r)
 	if !approve {
-		decided, err := h.store.RejectReopenRequest(r.Context(), requestID, principalID, req.Reason, now)
+		decided, err := h.store.RejectReopenRequest(r.Context(), requestID, principalID, req.Reason, now, correlationID, principalID)
 		if err != nil {
 			h.writeReopenDecisionErr(w, err)
 			return
 		}
-		h.publisher.PublishPeriodTransition(r.Context(), "period.reopen_rejected", correlationIDOf(r), principalID, *fp,
-			map[string]any{"request_id": requestID, "reason": req.Reason})
 		writeJSON(w, http.StatusOK, decided)
 		return
 	}
-	decided, reopened, err := h.store.ApproveReopenRequest(r.Context(), requestID, principalID, req.Reason, now)
+	decided, reopened, err := h.store.ApproveReopenRequest(r.Context(), requestID, principalID, req.Reason, now, correlationID, principalID)
 	if err != nil {
 		h.writeReopenDecisionErr(w, err)
 		return
 	}
-	h.publisher.PublishReopened(r.Context(), correlationIDOf(r), principalID, *reopened, decided.Reason)
 	writeJSON(w, http.StatusOK, map[string]any{"reopen_request": decided, "period": reopened})
 }
 

@@ -34,7 +34,7 @@ func TestPeriodStateMachine_FullHappyPath(t *testing.T) {
 	s := newStubStore()
 	newOpenPeriod(s, "fp-1")
 	cl := closeClients()
-	r := newGatedRouter(s, cl)
+	r := newGatedRouter(s, &stubAuthZ{}, cl)
 
 	// OPEN -> SOFT_CLOSE
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/soft-close", nil, "accountant-1")
@@ -82,7 +82,7 @@ func TestPeriodStateMachine_FullHappyPath(t *testing.T) {
 func TestPeriodStateMachine_OutOfOrderTransitionsRefused(t *testing.T) {
 	s := newStubStore()
 	newOpenPeriod(s, "fp-1")
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 
 	// Cannot enter close-review before soft-close.
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/close-review", nil, "accountant-1")
@@ -104,7 +104,7 @@ func TestLegacyLockEndpoint_IsHardClose(t *testing.T) {
 	s := newStubStore()
 	newOpenPeriod(s, "fp-1")
 	s.periods["fp-1"].CloseStatus = domain.PeriodCloseReview
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/lock", nil, "controller-1")
 	if rr.Code != http.StatusOK || s.periods["fp-1"].CloseStatus != domain.PeriodHardClosed {
 		t.Fatalf("legacy lock: %d %s", rr.Code, rr.Body.String())
@@ -117,7 +117,7 @@ func TestRetiredReopen_Returns410(t *testing.T) {
 	s := newStubStore()
 	newOpenPeriod(s, "fp-1")
 	s.periods["fp-1"].CloseStatus = domain.PeriodHardClosed
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reopen", domain.ReopenPeriodRequest{Reason: "x"}, "accountant-1")
 	if rr.Code != http.StatusGone {
 		t.Fatalf("got %d, want 410", rr.Code)
@@ -137,7 +137,7 @@ func hardClosedPeriod(s *stubStore, id string) {
 func TestReopenRequest_RequiresReasonAndBoundedWindow(t *testing.T) {
 	s := newStubStore()
 	hardClosedPeriod(s, "fp-1")
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 
 	cases := []struct {
 		name string
@@ -161,7 +161,7 @@ func TestReopenRequest_RequiresReasonAndBoundedWindow(t *testing.T) {
 func TestReopenRequest_OnlyFromClosedStates(t *testing.T) {
 	s := newStubStore()
 	newOpenPeriod(s, "fp-1") // still OPEN
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reopen-requests",
 		domain.RequestReopenRequest{Reason: "x", ReopenUntil: time.Now().Add(24 * time.Hour)}, "accountant-1")
 	if rr.Code != http.StatusConflict {
@@ -172,7 +172,7 @@ func TestReopenRequest_OnlyFromClosedStates(t *testing.T) {
 func TestReopenRequest_OnlyOnePending(t *testing.T) {
 	s := newStubStore()
 	hardClosedPeriod(s, "fp-1")
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 	first := domain.RequestReopenRequest{Reason: "first", ReopenUntil: time.Now().Add(24 * time.Hour)}
 	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reopen-requests", first, "accountant-1"); rr.Code != http.StatusCreated {
 		t.Fatalf("first request: %d", rr.Code)
@@ -188,7 +188,7 @@ func TestReopenRequest_OnlyOnePending(t *testing.T) {
 func TestApproveReopen_RequesterCannotApproveOwnRequest(t *testing.T) {
 	s := newStubStore()
 	hardClosedPeriod(s, "fp-1")
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reopen-requests",
 		domain.RequestReopenRequest{Reason: "x", ReopenUntil: time.Now().Add(24 * time.Hour)}, "accountant-1")
 	var req domain.ReopenRequest
@@ -211,7 +211,7 @@ func TestApproveReopen_RequesterCannotApproveOwnRequest(t *testing.T) {
 func TestRejectReopen_RequiresReasonAndLeavesPeriodClosed(t *testing.T) {
 	s := newStubStore()
 	hardClosedPeriod(s, "fp-1")
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reopen-requests",
 		domain.RequestReopenRequest{Reason: "x", ReopenUntil: time.Now().Add(24 * time.Hour)}, "accountant-1")
 	var req domain.ReopenRequest
@@ -238,7 +238,7 @@ func TestRejectReopen_RequiresReasonAndLeavesPeriodClosed(t *testing.T) {
 func TestApproveReopen_AlreadyDecidedIsRefused(t *testing.T) {
 	s := newStubStore()
 	hardClosedPeriod(s, "fp-1")
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reopen-requests",
 		domain.RequestReopenRequest{Reason: "x", ReopenUntil: time.Now().Add(24 * time.Hour)}, "accountant-1")
 	var req domain.ReopenRequest
@@ -324,7 +324,7 @@ func TestReclose_StaleControlRunBlocks(t *testing.T) {
 	bothMatchedAt(s, reopenAt.Add(-time.Hour)) // before the reopen
 	cl := closeClients()
 	cl.bankRecon = []domain.BankAccountReconStatus{certifiedAt("acct-barclays", "2026-10-30", reopenAt.Add(-time.Hour))}
-	r := newGatedRouter(s, cl)
+	r := newGatedRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reclose", nil, "controller-1")
 	if rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("stale evidence must block reclose, got %d: %s", rr.Code, rr.Body.String())
@@ -346,7 +346,7 @@ func TestReclose_ReperformedEvidenceCloses(t *testing.T) {
 	bothMatchedAt(s, after)
 	cl := closeClients()
 	cl.bankRecon = []domain.BankAccountReconStatus{certifiedAt("acct-barclays", "2026-10-30", after)}
-	r := newGatedRouter(s, cl)
+	r := newGatedRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-1/reclose", nil, "controller-1")
 	if rr.Code != http.StatusOK || s.periods["fp-1"].CloseStatus != domain.PeriodReclosed {
 		t.Fatalf("reclose with fresh evidence: %d %s", rr.Code, rr.Body.String())
@@ -361,7 +361,7 @@ func TestReclose_ReperformedEvidenceCloses(t *testing.T) {
 func TestCloseHistory_RecordsEveryTransition(t *testing.T) {
 	s := newStubStore()
 	newOpenPeriod(s, "fp-1")
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 	doReq(r, http.MethodPost, "/v1/close/periods/fp-1/soft-close", nil, "accountant-1")
 	doReq(r, http.MethodPost, "/v1/close/periods/fp-1/close-review", nil, "accountant-1")
 	doReq(r, http.MethodPost, "/v1/close/periods/fp-1/hard-close", nil, "controller-1")
@@ -385,7 +385,7 @@ func TestCloseHistory_RecordsEveryTransition(t *testing.T) {
 func TestAvailableCloseActions_MatchesState(t *testing.T) {
 	s := newStubStore()
 	newOpenPeriod(s, "fp-1")
-	r := newGatedRouter(s, closeClients())
+	r := newGatedRouter(s, &stubAuthZ{}, closeClients())
 	rr := doReq(r, http.MethodGet, "/v1/close/periods/fp-1/available-actions", nil, "accountant-1")
 	var actions domain.AvailableCloseActions
 	_ = json.Unmarshal(rr.Body.Bytes(), &actions)

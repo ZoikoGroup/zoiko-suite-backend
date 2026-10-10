@@ -13,7 +13,6 @@ import (
 	"zoiko.io/migration-integrity-svc/internal/authz"
 	"zoiko.io/migration-integrity-svc/internal/domain"
 	svcenvelope "zoiko.io/migration-integrity-svc/internal/envelope"
-	"zoiko.io/migration-integrity-svc/internal/events"
 	"zoiko.io/migration-integrity-svc/internal/health"
 	"zoiko.io/migration-integrity-svc/internal/middleware"
 	"zoiko.io/migration-integrity-svc/internal/store"
@@ -28,14 +27,13 @@ const (
 )
 
 type Handler struct {
-	store     store.Store
-	publisher *events.Publisher
-	authz     *authz.Client
-	logger    *zap.Logger
+	store  store.Store
+	authz  *authz.Client
+	logger *zap.Logger
 }
 
-func NewHandler(s store.Store, p *events.Publisher, a *authz.Client, l *zap.Logger) *Handler {
-	return &Handler{store: s, publisher: p, authz: a, logger: l}
+func NewHandler(s store.Store, a *authz.Client, l *zap.Logger) *Handler {
+	return &Handler{store: s, authz: a, logger: l}
 }
 
 func NewRouter(h *Handler) http.Handler {
@@ -123,33 +121,10 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 		CompletedAt:         &now,
 	}
 
-	if err := h.store.CreateJob(r.Context(), tenantID, job, checks, entries); err != nil {
+	if err := h.store.CreateJob(r.Context(), tenantID, job, checks, entries, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.logger.Error("failed to save migration job", zap.Error(err))
 		h.errJSON(w, http.StatusInternalServerError, "failed to persist migration validation results")
 		return
-	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "migration.integrity_validated", SubjectID: job.ID, TenantID: tenantID,
-		LegalEntityID: job.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload: map[string]interface{}{
-			"job_id":          job.ID,
-			"integrity_score": score,
-			"status":          string(status),
-		},
-	})
-
-	if invalidCount > 0 {
-		_ = h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "migration.integrity_violations_detected", SubjectID: job.ID, TenantID: tenantID,
-			LegalEntityID: job.LegalEntityID, ActorID: principalID,
-			CorrelationID: r.Header.Get("X-Correlation-ID"),
-			Payload: map[string]interface{}{
-				"job_id":        job.ID,
-				"invalid_count": invalidCount,
-			},
-		})
 	}
 
 	h.okJSON(w, http.StatusCreated, job)
@@ -207,17 +182,12 @@ func (h *Handler) RemediateEntry(w http.ResponseWriter, r *http.Request) {
 	var req domain.RemediateRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	entry, err := h.store.RemediateEntry(r.Context(), tenantID, jobID, entryID, req.Notes)
+	entry, err := h.store.RemediateEntry(r.Context(), tenantID, jobID, entryID, req.Notes, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		h.errJSON(w, http.StatusNotFound, err.Error())
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "migration.audit_entry_remediated", SubjectID: entryID, TenantID: tenantID,
-		LegalEntityID: job.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: entry,
-	})
 	h.okJSON(w, http.StatusOK, entry)
 }
 
@@ -240,17 +210,11 @@ func (h *Handler) ArchiveJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.ArchiveJob(r.Context(), tenantID, id); err != nil {
+	if err := h.store.ArchiveJob(r.Context(), tenantID, id, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.errJSON(w, http.StatusNotFound, "migration job not found")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "migration.job_archived", SubjectID: id, TenantID: tenantID,
-		LegalEntityID: job.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload:       map[string]string{"job_id": id},
-	})
 	h.okJSON(w, http.StatusOK, map[string]string{"message": "migration job archived", "id": id})
 }
 

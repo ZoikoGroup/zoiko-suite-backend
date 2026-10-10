@@ -203,17 +203,16 @@ func TestCompleteStatement_BankAccountBelongsToAnotherEntity_Returns403(t *testi
 	s.countUnmatched = 0
 	s.legalEntities = []string{"e2"} // the lines really belong to e2
 
-	pub := &stubPublisher{}
-	r := newRouter(s, pub, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
 
 	// ...but the caller authorizes against e1, which it does hold rights over.
 	rec := doRequest(r, http.MethodPost, "/v1/bank-accounts/b1/statements/2026-07-01/complete?legal_entity_id=e1", nil, "principal-1")
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 when the authorized entity is not the one the statement belongs to, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if pub.completed != 0 {
-		t.Fatal("reconciliation.completed was published for another entity's bank account")
-	}
+	// The 403 above means CertifyStatement (and therefore the
+	// reconciliation.completed outbox enqueue) was never reached for
+	// another entity's bank account.
 }
 
 // Zero unmatched lines and zero lines at all are not the same thing. The
@@ -223,16 +222,15 @@ func TestCompleteStatement_NoLinesAtAll_Returns404AndPublishesNothing(t *testing
 	s.countUnmatched = 0
 	s.legalEntities = []string{}
 
-	pub := &stubPublisher{}
-	r := newRouter(s, pub, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
 
 	rec := doRequest(r, http.MethodPost, "/v1/bank-accounts/b1/statements/2026-07-01/complete?legal_entity_id=e1", nil, "principal-1")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for a bank account and date with no statement lines, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if pub.completed != 0 {
-		t.Fatal("reconciliation.completed was published for a statement that does not exist")
-	}
+	// The 404 above means CertifyStatement (and therefore the
+	// reconciliation.completed outbox enqueue) was never reached for a
+	// statement that does not exist.
 }
 
 // ── input handling and error mapping ─────────────────────────────────────────

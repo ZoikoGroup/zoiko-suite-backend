@@ -12,7 +12,7 @@ import (
 // ── GetLineageAsOf ────────────────────────────────────────────────────────────
 
 func TestGetLineageAsOf_MissingAsOf_Returns400(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
 	rr := doReq(r, http.MethodGet, "/v1/lineage/journals/journal-1/source/as-of", nil, "preparer-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -27,7 +27,7 @@ func TestGetLineageAsOf_ExcludesEdgesRecordedAfterWatermark(t *testing.T) {
 		{FromType: "allocation_run", FromID: "run-1", ToType: "journal", ToID: "journal-1", RecordedAt: early},
 		{FromType: "allocation_run", FromID: "run-2", ToType: "journal", ToID: "journal-1", RecordedAt: late},
 	}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	asOf := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
 	rr := doReq(r, http.MethodGet, "/v1/lineage/journals/journal-1/source/as-of?as_of="+asOf, nil, "preparer-1")
@@ -44,7 +44,7 @@ func TestGetLineageAsOf_ExcludesEdgesRecordedAfterWatermark(t *testing.T) {
 // ── VerifyTracePath ──────────────────────────────────────────────────────────
 
 func TestVerifyTracePath_MissingFields_Returns400(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
 	rr := doReq(r, http.MethodPost, "/v1/lineage/verify-path", map[string]string{}, "preparer-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
@@ -56,7 +56,7 @@ func TestVerifyTracePath_EdgeExists_ReturnsVerifiedTrueAndPersists(t *testing.T)
 	s.lineageEdges = []domain.LineageEdge{
 		{FromType: "allocation_run", FromID: "run-1", ToType: "journal", ToID: "journal-1"},
 	}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	req := domain.VerifyTracePathRequest{LegalEntityID: "le-1", FromType: "allocation_run", FromID: "run-1", ToID: "journal-1"}
 	rr := doReq(r, http.MethodPost, "/v1/lineage/verify-path", req, "auditor-1")
@@ -75,7 +75,7 @@ func TestVerifyTracePath_EdgeExists_ReturnsVerifiedTrueAndPersists(t *testing.T)
 
 func TestVerifyTracePath_EdgeMissing_ReturnsVerifiedFalse(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	req := domain.VerifyTracePathRequest{LegalEntityID: "le-1", FromType: "allocation_run", FromID: "run-1", ToID: "journal-1"}
 	rr := doReq(r, http.MethodPost, "/v1/lineage/verify-path", req, "auditor-1")
@@ -95,7 +95,7 @@ func TestVerifyTracePath_EdgeMissing_ReturnsVerifiedFalse(t *testing.T) {
 // ── QuarantineBrokenLineage ──────────────────────────────────────────────────
 
 func TestQuarantineBrokenLineage_MissingReason_Returns400(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
 	req := domain.QuarantineBrokenLineageRequest{LegalEntityID: "le-1", FromType: "allocation_run", FromID: "run-1", ToID: "journal-1"}
 	rr := doReq(r, http.MethodPost, "/v1/lineage/quarantine", req, "preparer-1")
 	if rr.Code != http.StatusBadRequest {
@@ -112,7 +112,7 @@ func TestQuarantineBrokenLineage_RemovesGapFromCompletenessReport(t *testing.T) 
 	s.postedJournalRefs = []domain.PostedJournalRef{
 		{FromType: "allocation_run", FromID: "run-1", JournalID: "journal-1"},
 	}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 
 	// Before quarantine: a real gap.
 	before := doReq(r, http.MethodGet, "/v1/lineage/verify?legal_entity_id=le-1", nil, "preparer-1")

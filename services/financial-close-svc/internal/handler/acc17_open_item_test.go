@@ -15,7 +15,7 @@ func TestValidateOpeningBalances_AROpenItemAlreadyExistsInHistory_QuarantinesBat
 		accountStatuses:    map[string]string{"1000-Cash": "ACTIVE", "1200-AR": "ACTIVE"},
 		existingARInvoices: map[string]bool{"cust-1|INV-100": true}, // already a real invoice in AR's own history
 	}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
@@ -45,7 +45,7 @@ func TestValidateOpeningBalances_APOpenItemAlreadyExistsInHistory_QuarantinesBat
 		accountStatuses:    map[string]string{"1000-Cash": "ACTIVE", "2100-AP": "ACTIVE"},
 		existingAPInvoices: map[string]bool{"vendor-1|BILL-200": true},
 	}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
@@ -71,7 +71,7 @@ func TestValidateOpeningBalances_AROpenItemNotInHistory_ValidationSucceeds(t *te
 		accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "1200-AR": "ACTIVE"},
 		// existingARInvoices left empty — nothing exists in AR's history yet.
 	}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,
@@ -94,7 +94,7 @@ func TestValidateOpeningBalances_AROpenItemNotInHistory_ValidationSucceeds(t *te
 func TestValidateOpeningBalances_OpenItemMissingPartyID_QuarantinesBatch(t *testing.T) {
 	s := newStubStore()
 	cl := &stubClients{accountStatuses: map[string]string{"1000-Cash": "ACTIVE", "1200-AR": "ACTIVE"}}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	req := domain.CreateMigrationBatchRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-01", SourceSystemName: "LegacyERP", SourceExtractHash: "sha256:x",
 		ExpectedRowCount: 2, ExpectedTotalDebits: 500, ExpectedTotalCredits: 500,

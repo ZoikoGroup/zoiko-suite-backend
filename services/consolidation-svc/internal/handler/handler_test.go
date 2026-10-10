@@ -26,9 +26,17 @@ type stubStore struct {
 	contributions map[string][]domain.BalanceContribution
 	contribErr    error
 
-	adjustments  map[string]*domain.ConsolidationAdjustment
-	groupHasRun  map[string]bool
-	hasSnapshot  map[string]bool
+	adjustments map[string]*domain.ConsolidationAdjustment
+	groupHasRun map[string]bool
+	hasSnapshot map[string]bool
+
+	// What the handler handed the store for the run's events; the enqueue
+	// itself happens inside PgStore and is proven in outbox_events_test.go.
+	createRunActor      string
+	completedStatus     string
+	completedActor      string
+	completedSnapshots  int
+	completedExceptions []string
 }
 
 func newStubStore() *stubStore {
@@ -42,8 +50,9 @@ func newStubStore() *stubStore {
 	}
 }
 
-func (s *stubStore) CreateRun(_ context.Context, run *domain.ConsolidationRun) error {
+func (s *stubStore) CreateRun(_ context.Context, run *domain.ConsolidationRun, actorID, _ string) error {
 	s.runs[run.ConsolidationRunID] = run
+	s.createRunActor = actorID
 	return nil
 }
 
@@ -66,11 +75,13 @@ func (s *stubStore) ListRuns(_ context.Context, groupLegalEntityID string) ([]do
 	return out, nil
 }
 
-func (s *stubStore) CompleteRun(_ context.Context, id, status string, exceptionCount int, completedAt time.Time) error {
+func (s *stubStore) CompleteRun(_ context.Context, id, status string, exceptionCount int, completedAt time.Time, actorID, _ string, snapshotCount int, exceptions []string) error {
 	run, ok := s.runs[id]
 	if !ok {
 		return domain.ErrRunNotFound
 	}
+	s.completedStatus, s.completedActor = status, actorID
+	s.completedSnapshots, s.completedExceptions = snapshotCount, exceptions
 	run.Status = status
 	run.ExceptionCount = exceptionCount
 	t := completedAt
@@ -185,20 +196,6 @@ func (s *stubStore) ReverseAdjustment(_ context.Context, id, principalID, reason
 // depends on.
 var _ handler.Store = (*stubStore)(nil)
 
-type stubPublisher struct {
-	started, completed, exceptions int
-}
-
-func (p *stubPublisher) PublishRunStarted(_ context.Context, _, _ string, _ domain.ConsolidationRun) {
-	p.started++
-}
-func (p *stubPublisher) PublishCompleted(_ context.Context, _, _ string, _ domain.ConsolidationRun, _ int) {
-	p.completed++
-}
-func (p *stubPublisher) PublishExceptionDetected(_ context.Context, _, _ string, _ domain.ConsolidationRun, _ []string) {
-	p.exceptions++
-}
-
 type stubAuthZ struct{ err error }
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
@@ -217,9 +214,9 @@ type stubClients struct {
 	journalLines    map[string][]clients.JournalLine
 	journalLinesErr map[string]error
 
-	postJournalID  string
-	postErr        error
-	reverseErr     error
+	postJournalID           string
+	postErr                 error
+	reverseErr              error
 	lastPostedLegalEntityID string
 }
 
@@ -267,7 +264,7 @@ func (c *stubClients) ReverseConsolidationAdjustmentJournal(_ context.Context, _
 
 // ── router factory ─────────────────────────────────────────────────────────────
 
-func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, cl *stubClients) chi.Router {
+func newRouter(s *stubStore, authz *stubAuthZ, cl *stubClients) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -275,7 +272,7 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, cl *stubClien
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, cl, zap.NewNop())
+	h := handler.New(s, authz, cl, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -298,7 +295,7 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 // ── StartRun Tests ────────────────────────────────────────────────────────────
 
 func TestStartRun_MissingPrincipal(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
 		"group_legal_entity_id":  "le-group",
 		"child_legal_entity_ids": []string{"le-us", "le-uk"},
@@ -311,7 +308,7 @@ func TestStartRun_MissingPrincipal(t *testing.T) {
 }
 
 func TestStartRun_AuthzDenied(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubClients{})
+	r := newRouter(newStubStore(), &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubClients{})
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
 		"group_legal_entity_id":  "le-group",
 		"child_legal_entity_ids": []string{"le-us", "le-uk"},
@@ -324,7 +321,7 @@ func TestStartRun_AuthzDenied(t *testing.T) {
 }
 
 func TestStartRun_MissingFields(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
 		"group_legal_entity_id": "le-group",
 	}, "principal-1")
@@ -335,14 +332,13 @@ func TestStartRun_MissingFields(t *testing.T) {
 
 func TestStartRun_HappyPath(t *testing.T) {
 	s := newStubStore()
-	pub := &stubPublisher{}
 	cl := &stubClients{
 		glBalances: map[string]map[string]float64{
 			"le-us": {"1000-Cash": 5000.0, "2000-AP": -2000.0},
 			"le-uk": {"1000-Cash": 3000.0, "2000-AP": -1000.0},
 		},
 	}
-	r := newRouter(s, pub, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
 		"group_legal_entity_id":  "le-group",
 		"child_legal_entity_ids": []string{"le-us", "le-uk"},
@@ -365,11 +361,13 @@ func TestStartRun_HappyPath(t *testing.T) {
 	if len(resp.Snapshots) != 2 {
 		t.Fatalf("expected 2 balance snapshots, got %d", len(resp.Snapshots))
 	}
-	if pub.started != 1 {
-		t.Errorf("expected 1 started event got %d", pub.started)
+	// started/completed enqueue: TestPgStore_CreateRun_EnqueuesStartedEvent and
+	// TestPgStore_CompleteRun_EnqueuesCompletedEvent (outbox_events_test.go).
+	if s.createRunActor != "principal-1" || s.completedActor != "principal-1" {
+		t.Errorf("expected the caller's principal handed to the store as event actor, got create=%q complete=%q", s.createRunActor, s.completedActor)
 	}
-	if pub.completed != 1 {
-		t.Errorf("expected 1 completed event got %d", pub.completed)
+	if s.completedStatus != "COMPLETED" || s.completedSnapshots != 2 {
+		t.Errorf("expected CompleteRun(COMPLETED, 2 snapshots), got (%q, %d)", s.completedStatus, s.completedSnapshots)
 	}
 }
 
@@ -381,7 +379,6 @@ func TestStartRun_HappyPath(t *testing.T) {
 // external cash balances.
 func TestStartRun_EliminatesMatchedIntercompanyEntry(t *testing.T) {
 	s := newStubStore()
-	pub := &stubPublisher{}
 	tgtJournal := "journal-uk-1"
 	cl := &stubClients{
 		glBalances: map[string]map[string]float64{
@@ -404,7 +401,7 @@ func TestStartRun_EliminatesMatchedIntercompanyEntry(t *testing.T) {
 			"journal-uk-1": {{AccountCode: "2500-IC-Payable", DebitAmount: 0, CreditAmount: 500.0}},
 		},
 	}
-	r := newRouter(s, pub, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
 		"group_legal_entity_id":  "le-group",
 		"child_legal_entity_ids": []string{"le-us", "le-uk"},
@@ -450,7 +447,6 @@ func TestStartRun_EliminatesMatchedIntercompanyEntry(t *testing.T) {
 // while quietly having skipped elimination.
 func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) {
 	s := newStubStore()
-	pub := &stubPublisher{}
 	tgtJournal := "journal-uk-1"
 	cl := &stubClients{
 		glBalances: map[string]map[string]float64{
@@ -470,7 +466,7 @@ func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) 
 			"journal-us-1": domain.ErrGLServiceUnavailable,
 		},
 	}
-	r := newRouter(s, pub, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
 		"group_legal_entity_id":  "le-group",
 		"child_legal_entity_ids": []string{"le-us", "le-uk"},
@@ -488,8 +484,9 @@ func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) 
 	if resp.ExceptionCount != 1 {
 		t.Fatalf("expected 1 visible elimination exception, got %d", resp.ExceptionCount)
 	}
-	if pub.exceptions != 1 {
-		t.Errorf("expected PublishExceptionDetected to fire once, got %d calls", pub.exceptions)
+	// exception.detected enqueue: TestPgStore_CompleteRun_WithExceptions_EnqueuesExceptionDetectedEvent.
+	if len(s.completedExceptions) != 1 {
+		t.Errorf("expected the 1 elimination exception handed to CompleteRun, got %v", s.completedExceptions)
 	}
 }
 
@@ -499,14 +496,13 @@ func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) 
 // not just summed in memory and discarded.
 func TestStartRun_RecordsEntityToGroupProvenance(t *testing.T) {
 	s := newStubStore()
-	pub := &stubPublisher{}
 	cl := &stubClients{
 		glBalances: map[string]map[string]float64{
 			"le-us": {"1000-Cash": 5000.0},
 			"le-uk": {"1000-Cash": 3000.0},
 		},
 	}
-	r := newRouter(s, pub, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
 		"group_legal_entity_id":  "le-group",
 		"child_legal_entity_ids": []string{"le-us", "le-uk"},
@@ -550,7 +546,7 @@ func TestStartRun_ContributionRecordingFails_RunFailsVisibly(t *testing.T) {
 	s := newStubStore()
 	s.contribErr = domain.ErrStoreUnavailable
 	cl := &stubClients{glBalances: map[string]map[string]float64{"le-us": {"1000-Cash": 5000.0}}}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	r := newRouter(s, &stubAuthZ{}, cl)
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
 		"group_legal_entity_id":  "le-group",
 		"child_legal_entity_ids": []string{"le-us"},
@@ -565,7 +561,7 @@ func TestStartRun_ContributionRecordingFails_RunFailsVisibly(t *testing.T) {
 // ── ListRuns & Snapshots Tests ────────────────────────────────────────────────
 
 func TestGetRun_NotFound(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
 	rr := doReq(r, http.MethodGet, "/v1/consolidation/runs/nonexistent-id", nil, "principal-1")
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 got %d", rr.Code)

@@ -74,7 +74,7 @@ func popRouter(tenant string, f *popFake, az *countingAuthZ) chi.Router {
 			next.ServeHTTP(w, req)
 		})
 	})
-	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, az, &stubClients{}, zap.NewNop()))
+	handler.RegisterRoutes(r, handler.New(s, az, &stubClients{}, zap.NewNop()))
 	return r
 }
 
