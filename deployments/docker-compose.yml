@@ -2677,8 +2677,9 @@ services:
 
   consolidation-svc:
     build:
-      context: ../services/consolidation-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: consolidation-svc/Dockerfile
     container_name: consolidation-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -2694,6 +2695,8 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.consolidation.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       INTERCOMPANY_SERVICE_URL: "http://intercompany-accounting-svc:8105"
