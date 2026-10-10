@@ -428,10 +428,8 @@ func (h *Handler) RefreshFXExposure(w http.ResponseWriter, r *http.Request) {
 // HasStaleComponent already flags a stale rate — same already-computed
 // trigger mapping as BNK-08's publishCashPositionCalculated.
 func (h *Handler) publishFXExposureCalculated(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot) {
-	h.publisher.PublishFXExposureCalculated(ctx, correlationID, actorID, snap)
-	if snap.HasStaleComponent {
-		h.publisher.PublishFXExposureBecameStale(ctx, correlationID, actorID, snap)
-	}
+	// Events are now enqueued in the store layer (CreateFXExposureSnapshot)
+	// via the transactional outbox pattern.
 }
 
 // PublishFXExposureSnapshot handles
@@ -459,7 +457,6 @@ func (h *Handler) PublishFXExposureSnapshot(w http.ResponseWriter, r *http.Reque
 		h.writeFXExposureErr(w, err)
 		return
 	}
-	h.publisher.PublishFXExposurePublished(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
