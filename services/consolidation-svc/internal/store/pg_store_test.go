@@ -50,6 +50,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000002_add_balance_contributions.up.sql",
 		"000003_add_consolidation_adjustments.up.sql",
 		"000004_add_eventing_outbox.up.sql",
+		"000005_eventing_outbox_relay_policy.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
