@@ -15,16 +15,21 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/expense-claim-svc/internal/accountingdispatch"
 	"zoiko.io/expense-claim-svc/internal/authz"
 	"zoiko.io/expense-claim-svc/internal/config"
 	"zoiko.io/expense-claim-svc/internal/configflag"
 	"zoiko.io/expense-claim-svc/internal/documentvault"
+	"zoiko.io/expense-claim-svc/internal/domain"
 	"zoiko.io/expense-claim-svc/internal/employeemaster"
 	"zoiko.io/expense-claim-svc/internal/events"
 	"zoiko.io/expense-claim-svc/internal/handler"
 	"zoiko.io/expense-claim-svc/internal/health"
 	"zoiko.io/expense-claim-svc/internal/middleware"
+	"zoiko.io/expense-claim-svc/internal/outbox"
 	"zoiko.io/expense-claim-svc/internal/payableopenitem"
+	"zoiko.io/expense-claim-svc/internal/payablerelay"
+	"zoiko.io/expense-claim-svc/internal/payeeidentity"
 	"zoiko.io/expense-claim-svc/internal/policy"
 	"zoiko.io/expense-claim-svc/internal/store"
 	"zoiko.io/expense-claim-svc/internal/tax"
@@ -71,12 +76,41 @@ func main() {
 	taxClient := tax.NewHTTPClient(cfg.TaxDeterminationServiceURL, logger)
 	policyClient := policy.NewHTTPClient(cfg.PolicyServiceURL, logger)
 	payableClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, logger)
+	payeeClient := payeeidentity.NewHTTPClient(cfg.PayeeIdentityServiceURL, logger)
 	configFlagsClient := configflag.NewHTTPClient(cfg.ConfigFeatureFlagServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, employeeClient, docsClient, taxClient, policyClient, payableClient, configFlagsClient, handler.Config{
-		ReceiptRequiredThreshold: cfg.ReceiptRequiredThreshold,
-		Environment:              cfg.Environment,
-	}, logger)
+	// Background workers, all stopped on shutdown: the transactional-outbox relay
+	// (ZS-STATE-001 I-13), the reliable AP-08 payable hand-off (which also closes
+	// settled claims), and the ACC-04 posting dispatcher.
+	workerCtx, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
+	relay := payablerelay.New(pgStore, employeeClient, payeeClient, payableClient, logger)
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, logger).Start(workerCtx)
+		go relay.Start(workerCtx)
+		if cfg.AccountingPrincipalID == "" {
+			logger.Warn("ACCOUNTING_PRINCIPAL_ID is not set: ACC-04 posting dispatcher not started; posting requests stay PENDING")
+		} else {
+			go accountingdispatch.New(pgStore, accountingdispatch.NewHTTPClient(cfg.GeneralLedgerServiceURL),
+				cfg.AccountingPrincipalID, logger).Start(workerCtx)
+		}
+	}
+
+	h := handler.New(handler.Deps{
+		Store: pgStore, Authz: authzClient, Employee: employeeClient, Docs: docsClient, Tax: taxClient,
+		Policy: policyClient, Payable: payableClient, ConfigFlags: configFlagsClient, Relay: relay,
+		Config: handler.Config{
+			ReceiptRequiredThreshold:   cfg.ReceiptRequiredThreshold,
+			Environment:                cfg.Environment,
+			ReimbursementTermsDays:     cfg.ReimbursementTermsDays,
+			PolicyControlledCategories: cfg.PolicyControlledCategories,
+			Posting: domain.PostingConfig{
+				ExpenseKey: cfg.PostingExpenseKey, PayableKey: cfg.PostingPayableKey,
+				TaxRecoverableKey: cfg.PostingTaxRecoverableKey, FiscalPeriodLayout: cfg.FiscalPeriodLayout,
+			},
+		},
+		Log: logger,
+	})
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -111,6 +145,7 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down expense-claim-svc gracefully...")
+	stopWorkers()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

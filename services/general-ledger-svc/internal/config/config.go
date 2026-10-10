@@ -2,9 +2,11 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for general-ledger-svc.
@@ -47,6 +49,15 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// PeriodGateMode is the REF-05 posting-gate mode: "off" (default) or
+	// "shadow" (consult + compare only; never changes any outcome). "enforce"
+	// is NOT implemented in this phase and is rejected at startup.
+	PeriodGateMode string
+	// AccountingPeriodURL is accounting-period-svc (REF-05).
+	AccountingPeriodURL string
+	// PeriodGateShadowTimeout bounds each shadow resolve call.
+	PeriodGateShadowTimeout time.Duration
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -77,6 +88,18 @@ type KafkaConfig struct {
 
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
+	mode, err := ParsePeriodGateMode(os.Getenv("PERIOD_GATE_MODE"))
+	if err != nil {
+		return nil, err
+	}
+	timeout := 300 * time.Millisecond
+	if v := strings.TrimSpace(os.Getenv("PERIOD_GATE_SHADOW_TIMEOUT")); v != "" {
+		d, perr := time.ParseDuration(v)
+		if perr != nil || d <= 0 {
+			return nil, fmt.Errorf("PERIOD_GATE_SHADOW_TIMEOUT %q must be a positive duration such as 300ms", v)
+		}
+		timeout = d
+	}
 	region := os.Getenv("EVENT_RESIDENCY_REGION")
 	if region == "" {
 		return nil, errors.New("EVENT_RESIDENCY_REGION is required (e.g. uk, eu-west): every emitted event must carry its residency region")
@@ -107,6 +130,9 @@ func Load() (*Config, error) {
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		CloseServiceURL:          env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		PeriodGateMode:           mode,
+		AccountingPeriodURL:      env("ACCOUNTING_PERIOD_URL", "http://accounting-period-svc:8174"),
+		PeriodGateShadowTimeout:  timeout,
 	}, nil
 }
 
@@ -127,4 +153,21 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// ParsePeriodGateMode validates PERIOD_GATE_MODE. Only "off" (also when unset)
+// and "shadow" are accepted; "enforce" gets a specific error because it is the
+// obvious next value and silently accepting it would make operators believe
+// the gate is enforcing when it is not.
+func ParsePeriodGateMode(raw string) (string, error) {
+	switch m := strings.ToLower(strings.TrimSpace(raw)); m {
+	case "", "off":
+		return "off", nil
+	case "shadow":
+		return "shadow", nil
+	case "enforce":
+		return "", fmt.Errorf("PERIOD_GATE_MODE=enforce is not implemented in this phase: enforcement is phase 4 and requires separate sign-off; allowed values are off or shadow")
+	default:
+		return "", fmt.Errorf("invalid PERIOD_GATE_MODE %q: allowed values are off or shadow (enforce is not implemented in this phase)", raw)
+	}
 }

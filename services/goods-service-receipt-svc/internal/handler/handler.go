@@ -6,33 +6,54 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/goods-service-receipt-svc/internal/authz"
 	"zoiko.io/goods-service-receipt-svc/internal/domain"
-	"zoiko.io/goods-service-receipt-svc/internal/events"
-	"zoiko.io/goods-service-receipt-svc/internal/ledger"
 	svcmiddleware "zoiko.io/goods-service-receipt-svc/internal/middleware"
 	"zoiko.io/goods-service-receipt-svc/internal/purchaseorder"
 	"zoiko.io/goods-service-receipt-svc/internal/store"
 )
 
 // Action constants — AP-04's own contract's "Authorization / permissions"
-// line ("receipt.read/create/confirm/reverse; service.accept"), adapted to
-// this platform's SCREAMING_SNAKE_CASE convention (see
-// master-register-findings-2026-08-27.md §2.5). RejectReceipt and
-// AmendReceiptDraft/AttachReceiptEvidence are not separately named in the
-// spec's permission list — Reject reuses the Confirm action (both are the
-// decision on a pending receipt) and the draft-stage mutations reuse the
-// Create action.
+// line ("receipt.read/create/confirm/reverse; service.accept"), adapted to this
+// platform's SCREAMING_SNAKE_CASE convention. RejectReceipt reuses the Confirm
+// action (both are the decision on a pending receipt); the draft-stage
+// mutations and evidence reuse Create. ToleranceOverride is the spec's "approved
+// exception": a receipt confirmer cannot exceed PO tolerance without it.
 const (
-	ReceiptRead    = "GOODS_SERVICE_RECEIPT_READ"
-	ReceiptCreate  = "GOODS_SERVICE_RECEIPT_CREATE"
-	ReceiptConfirm = "GOODS_SERVICE_RECEIPT_CONFIRM"
-	ReceiptReverse = "GOODS_SERVICE_RECEIPT_REVERSE"
-	ServiceAccept  = "SERVICE_ACCEPT"
+	ReceiptRead       = "GOODS_SERVICE_RECEIPT_READ"
+	ReceiptCreate     = "GOODS_SERVICE_RECEIPT_CREATE"
+	ReceiptConfirm    = "GOODS_SERVICE_RECEIPT_CONFIRM"
+	ReceiptReverse    = "GOODS_SERVICE_RECEIPT_REVERSE"
+	ServiceAccept     = "SERVICE_ACCEPT"
+	ToleranceOverride = "GOODS_SERVICE_RECEIPT_TOLERANCE_OVERRIDE"
+)
+
+// Stable machine-readable error codes (spec section 16).
+const (
+	codeValidation   = "VALIDATION_FAILED"
+	codeForbidden    = "FORBIDDEN"
+	codeNotFound     = "RECEIPT_NOT_FOUND"
+	codeInvalidTrans = "INVALID_TRANSITION"
+	codeStale        = "STALE_VERSION"
+	codeVersionReq   = "EXPECTED_VERSION_REQUIRED"
+	codeTolerance    = "OVER_RECEIPT_TOLERANCE"
+	codeOverReversal = "OVER_REVERSAL"
+	codePONotOpen    = "PO_NOT_OPEN"
+	codePONotFound   = "PO_NOT_FOUND"
+	codePOMismatch   = "PO_MISMATCH"
+	codePOLine       = "PO_LINE_INVALID"
+	codeCurrency     = "CURRENCY_MISMATCH"
+	codeDependency   = "DEPENDENCY_UNAVAILABLE"
+	codeStore        = "STORE_UNAVAILABLE"
+	codeIdentity     = "IDENTITY_MISSING"
+	codeTenant       = "TENANT_SCOPE_INVALID"
 )
 
 // AuthzChecker is the real dependency on authorization-svc, including its
@@ -42,25 +63,25 @@ type AuthzChecker interface {
 	CheckAllowedOwnObject(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) error
 }
 
-// Config is the subset of internal/config the handler needs.
+// Config is the policy the handler applies.
 type Config struct {
-	GRNIDebitAccountCode    string
-	GRNICreditAccountCode   string
+	// OverReceiptTolerancePct is how far a receipt may exceed the open quantity
+	// (or PO total) without an approved exception, as a PERCENTAGE of the ordered
+	// quantity (5 = 5%) — the same unit as purchase-order-svc's
+	// PO_OVER_TOLERANCE_PERCENT.
 	OverReceiptTolerancePct float64
 }
 
 type Handler struct {
-	store  store.Store
-	pub    events.Publisher
-	authz  AuthzChecker
-	po     purchaseorder.Client
-	ledger ledger.Client
-	cfg    Config
-	log    *zap.Logger
+	store store.Store
+	authz AuthzChecker
+	po    purchaseorder.Client
+	cfg   Config
+	log   *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, po purchaseorder.Client, gl ledger.Client, cfg Config, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, po: po, ledger: gl, cfg: cfg, log: log}
+func New(st store.Store, az AuthzChecker, po purchaseorder.Client, cfg Config, log *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, po: po, cfg: cfg, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -76,11 +97,19 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{receiptID}/evidence", h.ListReceiptEvidence)
 		r.Get("/{receiptID}/available-actions", h.GetAvailableActions)
 		r.Get("/{receiptID}/accounting-status", h.GetReceiptAccountingStatus)
+		r.Post("/{receiptID}/accounting/requeue", h.RequeueAccounting)
 	})
 	r.Route("/ap04/purchase-orders/{purchaseOrderID}", func(r chi.Router) {
 		r.Get("/receipts", h.ListReceiptsForPO)
 		r.Get("/received-to-date", h.GetReceivedToDate)
 	})
+}
+
+// ── responses ────────────────────────────────────────────────────────────────
+
+type errorBody struct {
+	Error string `json:"error"`
+	Code  string `json:"code"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -89,14 +118,53 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+// writeError keeps the existing `error` message and adds the stable code.
+func writeError(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, errorBody{Error: msg, Code: code})
+}
+
+const maxBody = 1 << 20
+
+func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, codeValidation, "invalid request body")
+		return false
+	}
+	return true
+}
+
+// decodeOptional accepts an empty body (commands whose body is optional).
+func decodeOptional(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	err := json.NewDecoder(r.Body).Decode(dst)
+	if err != nil && err.Error() != "EOF" {
+		writeError(w, http.StatusBadRequest, codeValidation, "invalid request body")
+		return false
+	}
+	return true
+}
+
+func isUUID(s string) bool {
+	_, err := uuid.Parse(s)
+	return err == nil
+}
+
+// ── identity, tenant, authorization ──────────────────────────────────────────
+
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	t := svcmiddleware.TenantFromContext(r.Context())
+	if t == "" {
+		writeError(w, http.StatusUnauthorized, codeTenant, domain.ErrTenantScopeMissing.Error())
+		return "", false
+	}
+	return t, true
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
-		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		writeError(w, http.StatusUnauthorized, codeIdentity, "X-Principal-Id header is required")
 		return "", false
 	}
 	return principalID, true
@@ -111,63 +179,195 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 
 func (h *Handler) handleAuthzErr(w http.ResponseWriter, err error) bool {
 	if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
-		writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		writeError(w, http.StatusForbidden, codeForbidden, "not authorized to perform this action")
 		return false
 	}
 	h.log.Error("authorization check failed", zap.Error(err))
-	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+	writeError(w, http.StatusServiceUnavailable, codeDependency, "authorization service unavailable")
 	return false
 }
 
-func (h *Handler) fetchReceiptForAuth(w http.ResponseWriter, r *http.Request, receiptID string) (*domain.GoodsServiceReceipt, bool) {
+// authorizeRead authorizes a read in scope (a legal entity, or the tenant when
+// none is known yet). A request with no principal is served ONLY when it
+// declares itself an internal service call (X-Source-Channel: system — for
+// example accounts-payable-svc's matching reading the received-to-date basis);
+// it is still tenant-scoped.
+func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request, scope string) bool {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		if strings.EqualFold(r.Header.Get("X-Source-Channel"), "system") {
+			return true
+		}
+		writeError(w, http.StatusUnauthorized, codeIdentity, "X-Principal-Id header is required")
+		return false
+	}
+	return h.authorize(w, r, principalID, scope, ReceiptRead)
+}
+
+// expectedVersion reads expected_version from the body, falling back to the
+// X-Expected-Version envelope header. required=true makes absence a 400.
+func expectedVersion(w http.ResponseWriter, r *http.Request, body *int, required bool) (*int, bool) {
+	v := body
+	if v == nil {
+		if hv := strings.TrimSpace(r.Header.Get("X-Expected-Version")); hv != "" {
+			n, err := strconv.Atoi(hv)
+			if err != nil || n < 1 {
+				writeError(w, http.StatusBadRequest, codeValidation, "X-Expected-Version must be a positive integer")
+				return nil, false
+			}
+			v = &n
+		}
+	}
+	if v == nil && required {
+		writeError(w, http.StatusBadRequest, codeVersionReq, "expected_version is required for this transition; read it from the receipt's version")
+		return nil, false
+	}
+	if v != nil && *v < 1 {
+		writeError(w, http.StatusBadRequest, codeValidation, "expected_version must be a positive integer")
+		return nil, false
+	}
+	return v, true
+}
+
+func (h *Handler) command(r *http.Request, principalID string, ev *int) domain.Command {
+	return domain.Command{PrincipalID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), ExpectedVersion: ev}
+}
+
+func (h *Handler) fetchReceipt(w http.ResponseWriter, r *http.Request, receiptID string) (*domain.GoodsServiceReceipt, bool) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return nil, false
+	}
 	rcpt, err := h.store.FindReceipt(r.Context(), receiptID)
 	if err != nil {
-		if errors.Is(err, domain.ErrReceiptNotFound) {
-			writeError(w, http.StatusNotFound, "goods/service receipt not found")
-			return nil, false
-		}
-		h.log.Error("fetchReceiptForAuth: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.writeStoreErr(w, "FindReceipt", err)
 		return nil, false
 	}
 	return rcpt, true
 }
 
+// writeStoreErr maps store failures onto the response; commands add their own
+// cases first.
+func (h *Handler) writeStoreErr(w http.ResponseWriter, op string, err error) {
+	switch {
+	case errors.Is(err, domain.ErrReceiptNotFound):
+		writeError(w, http.StatusNotFound, codeNotFound, "goods/service receipt not found")
+	case errors.Is(err, domain.ErrTenantScopeMissing):
+		writeError(w, http.StatusUnauthorized, codeTenant, domain.ErrTenantScopeMissing.Error())
+	case errors.Is(err, domain.ErrStaleVersion):
+		writeError(w, http.StatusConflict, codeStale, "receipt version does not match expected_version")
+	default:
+		h.log.Error(op+": store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, codeStore, "store unavailable")
+	}
+}
+
 func (h *Handler) writePurchaseOrderErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrPurchaseOrderNotFound):
-		writeError(w, http.StatusBadRequest, "purchase order not found")
+		writeError(w, http.StatusBadRequest, codePONotFound, "purchase order not found")
 	case errors.Is(err, domain.ErrPurchaseOrderMismatch):
-		writeError(w, http.StatusForbidden, "purchase order does not belong to the caller's tenant/legal entity")
+		writeError(w, http.StatusForbidden, codePOMismatch, "purchase order does not belong to the caller's tenant/legal entity")
 	case errors.Is(err, domain.ErrPurchaseOrderNotOpen):
-		writeError(w, http.StatusConflict, "purchase order is closed")
+		// Receipt against a draft, held, cancelled or closed PO is refused.
+		writeError(w, http.StatusConflict, codePONotOpen, "purchase order is closed")
 	default:
 		h.log.Error("purchase-order-svc lookup failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "purchase-order-svc unavailable")
+		writeError(w, http.StatusServiceUnavailable, codeDependency, "purchase-order-svc unavailable")
 	}
+}
+
+// ── purchase-order checks shared by create and confirm ───────────────────────
+
+// poContext is what the handler learns from AP-03 about the order a receipt is
+// against.
+type poContext struct {
+	order *purchaseorder.Summary
+	line  *purchaseorder.Line
+	open  float64 // AP-03's open_receipt_quantity for the line
+}
+
+// loadPO verifies the PO is real, the caller's and ISSUED, the currency agrees,
+// and (for a line receipt) the line belongs to it. It writes the response and
+// returns false on any refusal; every failure path is closed.
+func (h *Handler) loadPO(w http.ResponseWriter, r *http.Request, tenantID, legalEntityID, poID, currency string, lineID *string) (*poContext, bool) {
+	order, err := h.po.GetOpenOrder(r.Context(), tenantID, legalEntityID, poID)
+	if err != nil {
+		h.writePurchaseOrderErr(w, err)
+		return nil, false
+	}
+	if order.CurrencyCode != "" && currency != "" && !strings.EqualFold(order.CurrencyCode, currency) {
+		writeError(w, http.StatusUnprocessableEntity, codeCurrency, domain.ErrCurrencyMismatch.Error())
+		return nil, false
+	}
+	pc := &poContext{order: order}
+	if lineID == nil || *lineID == "" {
+		return pc, true
+	}
+	line, ok := order.Line(*lineID)
+	if !ok {
+		writeError(w, http.StatusUnprocessableEntity, codePOLine, domain.ErrPurchaseOrderLineInvalid.Error())
+		return nil, false
+	}
+	pc.line = &line
+	open, err := h.po.GetOpenQuantity(r.Context(), tenantID, legalEntityID, poID)
+	if err != nil {
+		h.writePurchaseOrderErr(w, err)
+		return nil, false
+	}
+	found := false
+	for _, l := range open {
+		if strings.EqualFold(l.LineID, line.LineID) {
+			pc.open, found = l.OpenReceiptQuantity, true
+		}
+	}
+	if !found {
+		// AP-03 reports no open quantity for a line it listed: cannot verify.
+		writeError(w, http.StatusServiceUnavailable, codeDependency, "purchase-order-svc did not report the line's open quantity")
+		return nil, false
+	}
+	return pc, true
+}
+
+func (h *Handler) limits(pc *poContext) domain.ConfirmLimits {
+	l := domain.ConfirmLimits{POTotalAmount: pc.order.TotalAmount, TolerancePct: h.cfg.OverReceiptTolerancePct}
+	if pc.line != nil {
+		l.LineOrderedQuantity, l.LineOpenReceiptQuantity = pc.line.Quantity, pc.open
+	}
+	return l
 }
 
 // ── receipts ─────────────────────────────────────────────────────────────────
 
 func (h *Handler) CreateReceipt(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateReceiptRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decode(w, r, &req) {
 		return
 	}
-	if req.LegalEntityID == "" || req.PurchaseOrderID == "" {
-		writeError(w, http.StatusBadRequest, "legal_entity_id and purchase_order_id are required")
+	switch {
+	case req.LegalEntityID == "" || req.PurchaseOrderID == "":
+		writeError(w, http.StatusBadRequest, codeValidation, "legal_entity_id and purchase_order_id are required")
 		return
-	}
-	if !domain.ValidReceiptType(req.ReceiptType) {
-		writeError(w, http.StatusBadRequest, "receipt_type must be GOODS or SERVICE")
+	case !isUUID(req.LegalEntityID) || !isUUID(req.PurchaseOrderID) || (req.POLineID != "" && !isUUID(req.POLineID)):
+		writeError(w, http.StatusBadRequest, codeValidation, "legal_entity_id, purchase_order_id and po_line_id must be UUIDs")
 		return
-	}
-	if req.Amount <= 0 || req.Quantity <= 0 {
-		writeError(w, http.StatusBadRequest, "amount and quantity must be positive")
+	case !domain.ValidReceiptType(req.ReceiptType):
+		writeError(w, http.StatusBadRequest, codeValidation, "receipt_type must be GOODS or SERVICE")
+		return
+	case req.Amount <= 0 || req.Quantity <= 0:
+		writeError(w, http.StatusBadRequest, codeValidation, "amount and quantity must be positive")
+		return
+	case req.CurrencyCode == "":
+		writeError(w, http.StatusBadRequest, codeValidation, "currency_code is required")
+		return
+	case req.ReceiptDate.IsZero():
+		writeError(w, http.StatusBadRequest, codeValidation, "receipt_date is required")
 		return
 	}
 
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -175,46 +375,72 @@ func (h *Handler) CreateReceipt(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, req.LegalEntityID, ReceiptCreate) {
 		return
 	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-
-	// Negative-path scenario #2's create-time half: a receipt can never be
-	// opened against a PO that isn't real, isn't the caller's, or is
-	// already closed.
-	if _, err := h.po.GetOpenOrder(r.Context(), verifiedTenant, req.LegalEntityID, req.PurchaseOrderID); err != nil {
-		h.writePurchaseOrderErr(w, err)
+	if req.ToleranceExceptionRef != "" && !h.authorize(w, r, principalID, req.LegalEntityID, ToleranceOverride) {
 		return
 	}
 
-	rcpt, err := h.store.CreateReceipt(r.Context(), verifiedTenant, req, principalID)
+	// Negative path 2's create-time half: a receipt can never be opened against a
+	// PO that isn't real, isn't the caller's, or isn't ISSUED.
+	var lineID *string
+	if req.POLineID != "" {
+		lineID = &req.POLineID
+	}
+	pc, ok := h.loadPO(w, r, tenantID, req.LegalEntityID, req.PurchaseOrderID, req.CurrencyCode, lineID)
+	if !ok {
+		return
+	}
+
+	// Advisory over-receipt check (the authoritative one runs at confirmation,
+	// under a lock). Refusing early saves the caller a doomed draft.
+	if pc.line != nil && req.ToleranceExceptionRef == "" {
+		pending, err := h.store.PendingLineQuantity(r.Context(), *lineID)
+		if err != nil {
+			h.writeStoreErr(w, "CreateReceipt", err)
+			return
+		}
+		lim := h.limits(pc)
+		if req.Quantity > (lim.LineOpenReceiptQuantity-pending)+lim.LineOrderedQuantity*lim.TolerancePct/100+0.0001 {
+			writeError(w, http.StatusConflict, codeTolerance, domain.ErrOverReceiptTolerance.Error())
+			return
+		}
+	}
+
+	rcpt, err := h.store.CreateReceipt(r.Context(), tenantID, req, h.command(r, principalID, nil))
 	if err != nil {
-		h.log.Error("CreateReceipt: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.writeStoreErr(w, "CreateReceipt", err)
 		return
 	}
-
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventReceiptCreated, EntityID: rcpt.ReceiptID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rcpt,
-	})
 	writeJSON(w, http.StatusCreated, rcpt)
 }
 
 func (h *Handler) GetReceipt(w http.ResponseWriter, r *http.Request) {
-	receiptID := chi.URLParam(r, "receiptID")
-	rcpt, ok := h.fetchReceiptForAuth(w, r, receiptID)
-	if !ok {
+	rcpt, ok := h.fetchReceipt(w, r, chi.URLParam(r, "receiptID"))
+	if !ok || !h.authorizeRead(w, r, rcpt.LegalEntityID) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rcpt)
 }
 
+// scopeForPO is the authorization scope for a PO-level read: the legal entity of
+// a receipt already on file against the PO, else the tenant.
+func (h *Handler) scopeForPO(receipts []domain.GoodsServiceReceipt, tenantID string) string {
+	if len(receipts) > 0 {
+		return receipts[0].LegalEntityID
+	}
+	return tenantID
+}
+
 func (h *Handler) ListReceiptsForPO(w http.ResponseWriter, r *http.Request) {
-	purchaseOrderID := chi.URLParam(r, "purchaseOrderID")
-	receipts, err := h.store.ListReceiptsForPO(r.Context(), purchaseOrderID)
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	receipts, err := h.store.ListReceiptsForPO(r.Context(), chi.URLParam(r, "purchaseOrderID"))
 	if err != nil {
-		h.log.Error("ListReceiptsForPO: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.writeStoreErr(w, "ListReceiptsForPO", err)
+		return
+	}
+	if !h.authorizeRead(w, r, h.scopeForPO(receipts, tenantID)) {
 		return
 	}
 	if receipts == nil {
@@ -226,57 +452,69 @@ func (h *Handler) ListReceiptsForPO(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) AmendReceiptDraft(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "receiptID")
 	var req domain.AmendReceiptDraftRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decode(w, r, &req) {
 		return
 	}
-
+	if (req.Quantity != nil && *req.Quantity <= 0) || (req.Amount != nil && *req.Amount <= 0) {
+		writeError(w, http.StatusBadRequest, codeValidation, "amount and quantity must be positive")
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	existing, ok := h.fetchReceiptForAuth(w, r, receiptID)
+	existing, ok := h.fetchReceipt(w, r, receiptID)
+	if !ok || !h.authorize(w, r, principalID, existing.LegalEntityID, ReceiptCreate) {
+		return
+	}
+	ev, ok := expectedVersion(w, r, req.ExpectedVersion, false)
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, existing.LegalEntityID, ReceiptCreate) {
-		return
-	}
-
-	rcpt, err := h.store.AmendReceiptDraft(r.Context(), receiptID, req, principalID)
+	rcpt, err := h.store.AmendReceiptDraft(r.Context(), receiptID, req, h.command(r, principalID, ev))
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidTransition) {
-			writeError(w, http.StatusConflict, "receipt is not in the required DRAFT state")
+			writeError(w, http.StatusConflict, codeInvalidTrans, "receipt is not in the required DRAFT state")
 			return
 		}
-		h.log.Error("AmendReceiptDraft: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.writeStoreErr(w, "AmendReceiptDraft", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, rcpt)
 }
 
-// ConfirmReceipt handles POST .../confirm. Enforces, for real: negative-path
-// #1 (over-tolerance without an approved exception, checked against a live
-// SumNetConfirmedAmountForPO aggregate — see internal/domain's package doc
-// for why this is amount- rather than line-level), negative-path #2's
-// confirm-time half (a live re-check that the PO is still open — it may
-// have closed between CreateReceipt and now), and the SoD line ("receiver
-// cannot self-certify sensitive services where policy requires independent
-// acceptance") via authorization-svc's own-object layer. GRNI posting is
-// attempted afterwards, best-effort — see postGRNI.
+// ConfirmReceipt handles POST .../confirm. Enforces: negative path 1 (over
+// tolerance without an approved exception — re-checked authoritatively inside the
+// confirmation transaction), negative path 2's confirm-time half (a live
+// re-check that the PO is still ISSUED — it may have been cancelled or closed
+// since the draft), the "approved exception" rule (an exception reference needs
+// the tolerance-override permission), and the SoD line (a receiver cannot
+// self-certify where independent acceptance is required) via authorization-svc's
+// own-object layer. GRNI posting is queued in the same transaction.
 func (h *Handler) ConfirmReceipt(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "receiptID")
+	var req domain.ConfirmReceiptRequest
+	if !decodeOptional(w, r, &req) {
+		return
+	}
+	if req.POLineID != "" && !isUUID(req.POLineID) {
+		writeError(w, http.StatusBadRequest, codeValidation, "po_line_id must be a UUID")
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	existing, ok := h.fetchReceiptForAuth(w, r, receiptID)
+	existing, ok := h.fetchReceipt(w, r, receiptID)
 	if !ok {
 		return
 	}
 	if !domain.CanConfirm(existing.Status) {
-		writeError(w, http.StatusConflict, "receipt is not in a confirmable state")
+		writeError(w, http.StatusConflict, codeInvalidTrans, "receipt is not in a confirmable state")
 		return
 	}
 
@@ -288,191 +526,154 @@ func (h *Handler) ConfirmReceipt(w http.ResponseWriter, r *http.Request) {
 	} else if !h.authorize(w, r, principalID, existing.LegalEntityID, ReceiptConfirm) {
 		return
 	}
-
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-
-	po, err := h.po.GetOpenOrder(r.Context(), verifiedTenant, existing.LegalEntityID, existing.PurchaseOrderID)
-	if err != nil {
-		h.writePurchaseOrderErr(w, err)
+	exception := firstNonEmpty(req.ToleranceExceptionRef, existing.ToleranceExceptionRef)
+	if exception != "" && !h.authorize(w, r, principalID, existing.LegalEntityID, ToleranceOverride) {
+		return
+	}
+	ev, ok := expectedVersion(w, r, req.ExpectedVersion, true)
+	if !ok {
+		return
+	}
+	if ev != nil && existing.Version != *ev {
+		writeError(w, http.StatusConflict, codeStale, "receipt version does not match expected_version")
 		return
 	}
 
-	// Negative-path scenario #1: block an over-tolerance receipt unless an
-	// approved exception was recorded at CreateReceipt time.
-	if existing.ToleranceExceptionRef == "" {
-		netToDate, err := h.store.SumNetConfirmedAmountForPO(r.Context(), existing.PurchaseOrderID)
-		if err != nil {
-			h.log.Error("ConfirmReceipt: tolerance check failed", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
-			return
-		}
-		ceiling := po.TotalAmount * (1 + h.cfg.OverReceiptTolerancePct)
-		if netToDate+existing.Amount > ceiling+0.0001 {
-			writeError(w, http.StatusConflict, "receipt amount exceeds purchase order tolerance without an approved exception")
-			return
-		}
+	lineID := existing.POLineID
+	if req.POLineID != "" {
+		lineID = &req.POLineID
 	}
-
-	rcpt, err := h.store.ConfirmReceipt(r.Context(), receiptID, principalID)
-	if err != nil {
-		if errors.Is(err, domain.ErrInvalidTransition) {
-			writeError(w, http.StatusConflict, "receipt is not in a confirmable state")
-			return
-		}
-		h.log.Error("ConfirmReceipt: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+	pc, ok := h.loadPO(w, r, tenantID, existing.LegalEntityID, existing.PurchaseOrderID, existing.CurrencyCode, lineID)
+	if !ok {
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventReceiptConfirmed, EntityID: rcpt.ReceiptID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rcpt,
-	})
-
-	acctEvent := h.postGRNI(r.Context(), verifiedTenant, rcpt, principalID)
-	writeJSON(w, http.StatusOK, map[string]interface{}{"receipt": rcpt, "accounting_event": acctEvent})
-}
-
-// postGRNI is deliberately best-effort — see internal/ledger's package doc
-// and internal/domain's package doc. Any failure is recorded as an
-// EXCEPTION accounting event and returned to the caller for visibility;
-// it never undoes the receipt confirmation that already succeeded.
-func (h *Handler) postGRNI(ctx context.Context, tenantID string, rcpt *domain.GoodsServiceReceipt, principalID string) *domain.ReceiptAccountingEvent {
-	journalID, err := h.ledger.PostGRNI(ctx, ledger.PostGRNIParams{
-		TenantID: tenantID, LegalEntityID: rcpt.LegalEntityID, CorrelationID: rcpt.ReceiptID,
-		PrincipalID: principalID, Amount: rcpt.Amount,
-		DebitAccountCode: h.cfg.GRNIDebitAccountCode, CreditAccountCode: h.cfg.GRNICreditAccountCode,
-		Description: "GRNI accrual for goods/service receipt " + rcpt.ReceiptID,
-	})
-	var event *domain.ReceiptAccountingEvent
+	rev := pc.order.Revision
+	res, err := h.store.ConfirmReceipt(r.Context(), receiptID, domain.ConfirmInput{
+		POLineID: strPtr(req.POLineID), PORevision: &rev, ToleranceExceptionRef: req.ToleranceExceptionRef, Limits: h.limits(pc),
+	}, h.command(r, principalID, ev))
 	if err != nil {
-		h.log.Warn("GRNI posting failed — recording EXCEPTION accounting event, receipt confirmation stands", zap.Error(err))
-		event, err = h.store.RecordAccountingEvent(ctx, rcpt.ReceiptID, domain.AccountingException, nil, err.Error())
-	} else {
-		jid := journalID
-		event, err = h.store.RecordAccountingEvent(ctx, rcpt.ReceiptID, domain.AccountingPosted, &jid, "")
+		switch {
+		case errors.Is(err, domain.ErrInvalidTransition):
+			writeError(w, http.StatusConflict, codeInvalidTrans, "receipt is not in a confirmable state")
+		case errors.Is(err, domain.ErrOverReceiptTolerance):
+			writeError(w, http.StatusConflict, codeTolerance, "receipt amount exceeds purchase order tolerance without an approved exception")
+		case errors.Is(err, domain.ErrPurchaseOrderLineInvalid):
+			writeError(w, http.StatusUnprocessableEntity, codePOLine, domain.ErrPurchaseOrderLineInvalid.Error())
+		default:
+			h.writeStoreErr(w, "ConfirmReceipt", err)
+		}
+		return
 	}
-	if err != nil {
-		h.log.Error("failed to record accounting event", zap.Error(err))
-		return nil
-	}
-	return event
+	writeJSON(w, http.StatusOK, map[string]interface{}{"receipt": res.Receipt, "accounting_event": res.Accounting})
 }
 
 func (h *Handler) RejectReceipt(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "receiptID")
 	var req domain.RejectReceiptRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decode(w, r, &req) {
 		return
 	}
 	if req.Reason == "" {
-		writeError(w, http.StatusBadRequest, "reason is required")
+		writeError(w, http.StatusBadRequest, codeValidation, "reason is required")
 		return
 	}
-
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	existing, ok := h.fetchReceiptForAuth(w, r, receiptID)
+	existing, ok := h.fetchReceipt(w, r, receiptID)
+	if !ok || !h.authorize(w, r, principalID, existing.LegalEntityID, ReceiptConfirm) {
+		return
+	}
+	ev, ok := expectedVersion(w, r, req.ExpectedVersion, false)
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, existing.LegalEntityID, ReceiptConfirm) {
-		return
-	}
-
-	rcpt, err := h.store.RejectReceipt(r.Context(), receiptID, req, principalID)
+	rcpt, err := h.store.RejectReceipt(r.Context(), receiptID, req, h.command(r, principalID, ev))
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidTransition) {
-			writeError(w, http.StatusConflict, "receipt is not in a rejectable state")
+			writeError(w, http.StatusConflict, codeInvalidTrans, "receipt is not in a rejectable state")
 			return
 		}
-		h.log.Error("RejectReceipt: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.writeStoreErr(w, "RejectReceipt", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, rcpt)
 }
 
 // ReverseReceipt handles POST .../reverse — the platform's only sanctioned
-// correction mechanism for a confirmed receipt, directly enforcing
-// negative-path scenario #3 ("confirmed receipt deleted to fix mismatch"
-// must be blocked; the immutability trigger blocks DELETE unconditionally,
-// and this is the real correction path instead).
+// correction mechanism for a confirmed receipt, directly enforcing negative path
+// 3 ("confirmed receipt deleted to fix mismatch" must be blocked; the
+// immutability trigger blocks DELETE and edits unconditionally, and this linked
+// reversal is the real correction path).
 func (h *Handler) ReverseReceipt(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "receiptID")
 	var req domain.ReverseReceiptRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decode(w, r, &req) {
 		return
 	}
 	if req.ReversedAmount <= 0 || req.Reason == "" {
-		writeError(w, http.StatusBadRequest, "reversed_amount (positive) and reason are required")
+		writeError(w, http.StatusBadRequest, codeValidation, "reversed_amount (positive) and reason are required")
 		return
 	}
-
+	if req.ReversedQuantity != nil && *req.ReversedQuantity < 0 {
+		writeError(w, http.StatusBadRequest, codeValidation, "reversed_quantity must not be negative")
+		return
+	}
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	existing, ok := h.fetchReceiptForAuth(w, r, receiptID)
+	existing, ok := h.fetchReceipt(w, r, receiptID)
+	if !ok || !h.authorize(w, r, principalID, existing.LegalEntityID, ReceiptReverse) {
+		return
+	}
+	ev, ok := expectedVersion(w, r, req.ExpectedVersion, false)
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, existing.LegalEntityID, ReceiptReverse) {
-		return
-	}
-
-	rcpt, err := h.store.ReverseReceipt(r.Context(), receiptID, req, principalID)
+	rcpt, reversal, err := h.store.ReverseReceipt(r.Context(), receiptID, req, h.command(r, principalID, ev))
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrOverReversal):
-			writeError(w, http.StatusConflict, "reversal amount exceeds remaining unreversed receipt amount")
+			writeError(w, http.StatusConflict, codeOverReversal, "reversal amount exceeds remaining unreversed receipt amount")
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeError(w, http.StatusConflict, "receipt is not in a reversible state")
+			writeError(w, http.StatusConflict, codeInvalidTrans, "receipt is not in a reversible state")
 		default:
-			h.log.Error("ReverseReceipt: store unavailable", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
+			h.writeStoreErr(w, "ReverseReceipt", err)
 		}
 		return
 	}
-
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventReceiptReversed, EntityID: rcpt.ReceiptID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rcpt,
-	})
-	writeJSON(w, http.StatusOK, rcpt)
+	writeJSON(w, http.StatusOK, struct {
+		*domain.GoodsServiceReceipt
+		Reversal *domain.ReceiptReversal `json:"reversal"`
+	}{rcpt, reversal})
 }
 
-// RecordServiceAcceptance handles POST .../service-acceptance. When the
-// receipt is flagged RequiresIndependentAcceptance, the accepting principal
-// is checked against authorization-svc's own-object SoD layer with the
-// original receiver as resource_owner_principal_id — the direct
-// enforcement of AP-04's SoD line ("receiver/acceptor cannot self-certify
-// sensitive services where policy requires independent acceptance").
+// RecordServiceAcceptance handles POST .../service-acceptance. When the receipt
+// requires independent acceptance, the accepting principal is checked against
+// authorization-svc's own-object SoD layer with the original receiver as owner —
+// the direct enforcement of AP-04's SoD line ("receiver/acceptor cannot
+// self-certify sensitive services where policy requires independent acceptance").
 func (h *Handler) RecordServiceAcceptance(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "receiptID")
 	var req domain.RecordServiceAcceptanceRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decodeOptional(w, r, &req) {
 		return
 	}
-
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	existing, ok := h.fetchReceiptForAuth(w, r, receiptID)
+	existing, ok := h.fetchReceipt(w, r, receiptID)
 	if !ok {
 		return
 	}
 	if existing.ReceiptType != domain.ReceiptTypeService {
-		writeError(w, http.StatusBadRequest, "service acceptance only applies to SERVICE receipts")
+		writeError(w, http.StatusBadRequest, codeValidation, "service acceptance only applies to SERVICE receipts")
 		return
 	}
-
 	if existing.RequiresIndependentAcceptance {
 		if err := h.authz.CheckAllowedOwnObject(r.Context(), principalID, existing.LegalEntityID, ServiceAccept, existing.ReceiverPrincipalID); err != nil {
 			h.handleAuthzErr(w, err)
@@ -481,22 +682,19 @@ func (h *Handler) RecordServiceAcceptance(w http.ResponseWriter, r *http.Request
 	} else if !h.authorize(w, r, principalID, existing.LegalEntityID, ServiceAccept) {
 		return
 	}
-
-	rcpt, err := h.store.RecordServiceAcceptance(r.Context(), receiptID, req, principalID)
-	if err != nil {
-		if errors.Is(err, domain.ErrInvalidTransition) {
-			writeError(w, http.StatusConflict, "receipt is not in the required DRAFT state")
-			return
-		}
-		h.log.Error("RecordServiceAcceptance: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+	ev, ok := expectedVersion(w, r, req.ExpectedVersion, false)
+	if !ok {
 		return
 	}
-
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventServiceAcceptanceRecorded, EntityID: rcpt.ReceiptID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rcpt,
-	})
+	rcpt, err := h.store.RecordServiceAcceptance(r.Context(), receiptID, req, h.command(r, principalID, ev))
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidTransition) {
+			writeError(w, http.StatusConflict, codeInvalidTrans, "receipt is not in the required DRAFT state")
+			return
+		}
+		h.writeStoreErr(w, "RecordServiceAcceptance", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, rcpt)
 }
 
@@ -505,35 +703,24 @@ func (h *Handler) RecordServiceAcceptance(w http.ResponseWriter, r *http.Request
 func (h *Handler) AttachReceiptEvidence(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "receiptID")
 	var req domain.AttachReceiptEvidenceRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decode(w, r, &req) {
 		return
 	}
 	if req.EvidenceRef == "" {
-		writeError(w, http.StatusBadRequest, "evidence_ref is required")
+		writeError(w, http.StatusBadRequest, codeValidation, "evidence_ref is required")
 		return
 	}
-
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	existing, ok := h.fetchReceiptForAuth(w, r, receiptID)
-	if !ok {
+	existing, ok := h.fetchReceipt(w, r, receiptID)
+	if !ok || !h.authorize(w, r, principalID, existing.LegalEntityID, ReceiptCreate) {
 		return
 	}
-	if !h.authorize(w, r, principalID, existing.LegalEntityID, ReceiptCreate) {
-		return
-	}
-
 	e, err := h.store.AttachReceiptEvidence(r.Context(), receiptID, req, principalID)
 	if err != nil {
-		if errors.Is(err, domain.ErrReceiptNotFound) {
-			writeError(w, http.StatusNotFound, "goods/service receipt not found")
-			return
-		}
-		h.log.Error("AttachReceiptEvidence: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.writeStoreErr(w, "AttachReceiptEvidence", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, e)
@@ -541,10 +728,13 @@ func (h *Handler) AttachReceiptEvidence(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) ListReceiptEvidence(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "receiptID")
+	existing, ok := h.fetchReceipt(w, r, receiptID)
+	if !ok || !h.authorizeRead(w, r, existing.LegalEntityID) {
+		return
+	}
 	evidence, err := h.store.ListReceiptEvidence(r.Context(), receiptID)
 	if err != nil {
-		h.log.Error("ListReceiptEvidence: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.writeStoreErr(w, "ListReceiptEvidence", err)
 		return
 	}
 	if evidence == nil {
@@ -555,17 +745,22 @@ func (h *Handler) ListReceiptEvidence(w http.ResponseWriter, r *http.Request) {
 
 // ── queries ──────────────────────────────────────────────────────────────────
 
+// GetAvailableActions lists what the CALLER may do next, given the state and
+// segregation of duties (Confirm is hidden from a receiver who must not
+// self-certify).
 func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "receiptID")
-	rcpt, ok := h.fetchReceiptForAuth(w, r, receiptID)
-	if !ok {
+	rcpt, ok := h.fetchReceipt(w, r, receiptID)
+	if !ok || !h.authorizeRead(w, r, rcpt.LegalEntityID) {
 		return
 	}
-	var actions []string
+	caller := r.Header.Get("X-Principal-Id")
+	actions := []string{}
 	if domain.CanAmendDraft(rcpt.Status) {
 		actions = append(actions, "AmendReceiptDraft")
 	}
-	if domain.CanConfirm(rcpt.Status) {
+	selfCertify := rcpt.RequiresIndependentAcceptance && caller != "" && caller == rcpt.ReceiverPrincipalID
+	if domain.CanConfirm(rcpt.Status) && !selfCertify {
 		actions = append(actions, "ConfirmReceipt")
 	}
 	if domain.CanReject(rcpt.Status) {
@@ -574,24 +769,29 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 	if domain.CanReverse(rcpt.Status) {
 		actions = append(actions, "ReverseReceipt")
 	}
-	if rcpt.Status == domain.StatusDraft && rcpt.ReceiptType == domain.ReceiptTypeService {
+	if rcpt.Status == domain.StatusDraft && rcpt.ReceiptType == domain.ReceiptTypeService && !selfCertify {
 		actions = append(actions, "RecordServiceAcceptance")
 	}
-	if actions == nil {
-		actions = []string{}
+	if rcpt.Status != domain.StatusRejected {
+		actions = append(actions, "AttachReceiptEvidence")
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"receipt_id": receiptID, "status": rcpt.Status, "available_actions": actions})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"receipt_id": receiptID, "status": rcpt.Status, "version": rcpt.Version, "available_actions": actions,
+	})
 }
 
+// GetReceiptAccountingStatus reports the true state of the receipt's GRNI
+// posting request(s): PENDING, POSTED, FAILED or QUARANTINED, with attempts and
+// the last error. An accounting failure is visible here, never silent.
 func (h *Handler) GetReceiptAccountingStatus(w http.ResponseWriter, r *http.Request) {
 	receiptID := chi.URLParam(r, "receiptID")
-	if _, ok := h.fetchReceiptForAuth(w, r, receiptID); !ok {
+	rcpt, ok := h.fetchReceipt(w, r, receiptID)
+	if !ok || !h.authorizeRead(w, r, rcpt.LegalEntityID) {
 		return
 	}
 	event, err := h.store.GetLatestAccountingEvent(r.Context(), receiptID)
 	if err != nil {
-		h.log.Error("GetReceiptAccountingStatus: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.writeStoreErr(w, "GetReceiptAccountingStatus", err)
 		return
 	}
 	if event == nil {
@@ -601,36 +801,83 @@ func (h *Handler) GetReceiptAccountingStatus(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, event)
 }
 
-// GetReceivedToDate reports the real aggregate net-confirmed-amount against
-// purchaseOrderID alongside the PO's own total_amount from purchase-order-
-// svc — the amount-level equivalent of "PO open quantity/amount" (see
-// internal/domain's package doc for why line/quantity isn't available).
+// RequeueAccounting puts the receipt's FAILED/QUARANTINED posting requests back
+// to PENDING once an operator fixed the cause. A POSTED request is never
+// touched; a requeue re-submits the same source_event_id, which the ledger
+// treats idempotently.
+func (h *Handler) RequeueAccounting(w http.ResponseWriter, r *http.Request) {
+	receiptID := chi.URLParam(r, "receiptID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	rcpt, ok := h.fetchReceipt(w, r, receiptID)
+	if !ok || !h.authorize(w, r, principalID, rcpt.LegalEntityID, ReceiptConfirm) {
+		return
+	}
+	n, err := h.store.RequeueAccounting(r.Context(), receiptID)
+	if err != nil {
+		h.writeStoreErr(w, "RequeueAccounting", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"receipt_id": receiptID, "requeued": n})
+}
+
+// GetReceivedToDate reports the net confirmed receipt of a PO — per line
+// (quantity and amount, less reversals) and in total — alongside the PO's own
+// total from purchase-order-svc. It is the receipt basis AP-06 matching reads.
 func (h *Handler) GetReceivedToDate(w http.ResponseWriter, r *http.Request) {
 	purchaseOrderID := chi.URLParam(r, "purchaseOrderID")
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
-	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-
+	receipts, err := h.store.ListReceiptsForPO(r.Context(), purchaseOrderID)
+	if err != nil {
+		h.writeStoreErr(w, "GetReceivedToDate", err)
+		return
+	}
+	if !h.authorizeRead(w, r, h.scopeForPO(receipts, tenantID)) {
+		return
+	}
 	netToDate, err := h.store.SumNetConfirmedAmountForPO(r.Context(), purchaseOrderID)
 	if err != nil {
-		h.log.Error("GetReceivedToDate: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		h.writeStoreErr(w, "GetReceivedToDate", err)
 		return
 	}
-
-	resp := map[string]interface{}{"purchase_order_id": purchaseOrderID, "net_confirmed_amount": netToDate}
-	// The PO's own total_amount/status is best-effort enrichment, not an
-	// authorization gate (this service's own receipts are already
-	// tenant-scoped by RLS) — it needs a legal_entity_id to check against,
-	// which this read-only query doesn't otherwise have, so it's borrowed
-	// from any receipt already on file against this PO. No receipts yet
-	// means no enrichment, not an error.
-	if receipts, err := h.store.ListReceiptsForPO(r.Context(), purchaseOrderID); err == nil && len(receipts) > 0 {
-		if po, err := h.po.GetOrder(r.Context(), verifiedTenant, receipts[0].LegalEntityID, purchaseOrderID); err == nil {
+	lines, err := h.store.ReceivedToDate(r.Context(), purchaseOrderID)
+	if err != nil {
+		h.writeStoreErr(w, "GetReceivedToDate", err)
+		return
+	}
+	if lines == nil {
+		lines = []domain.LineReceived{}
+	}
+	resp := map[string]interface{}{"purchase_order_id": purchaseOrderID, "net_confirmed_amount": netToDate, "lines": lines}
+	// The PO's own total/status is best-effort enrichment, not a gate; it needs a
+	// legal entity, borrowed from a receipt already on file. No receipts means no
+	// enrichment, not an error.
+	if len(receipts) > 0 {
+		if po, err := h.po.GetOrder(r.Context(), tenantID, receipts[0].LegalEntityID, purchaseOrderID); err == nil {
 			resp["po_total_amount"] = po.TotalAmount
 			resp["po_status"] = po.Status
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func strPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

@@ -1,11 +1,10 @@
 // Package policy calls the real policy-svc for an APPROVAL_THRESHOLD
-// evaluation of a claim's total amount — the only policy type policy-svc
-// currently has real evaluation logic for. A 404 ("no_applicable_policy")
-// means no threshold policy has been configured yet; this is treated as
-// WITHIN_THRESHOLD, per policy-svc's own documented stance that an
-// unconfigured policy is a setup gap for the caller to interpret, not a
-// security signal it will guess about — see internal/domain's package doc
-// for the full reasoning.
+// evaluation of a claim's total amount. A 404 ("no_applicable_policy")
+// is reported as domain.ErrNoApplicablePolicy and an unreachable/erroring
+// service as domain.ErrPolicyServiceUnavailable; neither is turned into a
+// permissive result here. The handler fails closed for controlled
+// categories and is the only place that may let an unassessed claim
+// through (see internal/handler).
 package policy
 
 import (
@@ -74,7 +73,9 @@ func (c *HTTPClient) EvaluateApprovalThreshold(ctx context.Context, principalID,
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return string(domain.PolicyWithinThreshold), "", nil
+		// "no_applicable_policy": the caller decides whether that is fatal
+		// (controlled categories); this client never invents WITHIN_THRESHOLD.
+		return "", "", domain.ErrNoApplicablePolicy
 	}
 	if resp.StatusCode != http.StatusOK {
 		c.log.Error("unexpected response from policy-svc — failing closed", zap.Int("status", resp.StatusCode))

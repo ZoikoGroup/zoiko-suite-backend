@@ -218,7 +218,12 @@ func TestPgStore_AssetEvent_RejectsEconomicMutationOnceApplied(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	a := activeAssetInStore(t, ctx, s, tenantID, "le-1")
 
+	if err := s.CreateDepreciationSchedule(ctx, newTestSchedule(tenantID, a)); err != nil {
+		t.Fatalf("CreateDepreciationSchedule: %v", err)
+	}
 	e := newTestAssetEvent(tenantID, a, domain.AssetEventTypeAddition)
+	book := "book-1"
+	e.BookID = &book
 	amount := 100.0
 	e.Amount = &amount
 	if err := s.CreateAssetEvent(ctx, e); err != nil {

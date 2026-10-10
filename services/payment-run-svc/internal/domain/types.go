@@ -5,80 +5,39 @@
 // initiation/status, while preserving idempotency, external UNKNOWN states
 // and payment-clearing/accounting lineage."
 //
-// THE CENTRAL, HONEST GAP OF THIS SERVICE — read before anything else.
-// A direct search of this entire codebase (services/*, every banking-
-// adjacent service: banking-connector-svc, bank-reconciliation-svc,
-// treasury-svc) found no real endpoint anywhere that initiates an outbound
-// payment to an external bank/provider, and no real webhook/callback
-// receiver for a provider's status response. treasury-svc's own
-// /v1/treasury/transfers "InitiateTransfer" only inserts a row and moves
-// balances between two of its own internal ledger rows — it never calls
-// out to anything external. This is not a field-level gap like AP-01's
-// PayeeReference or AP-09's PayingBankAccountRef; it is the literal,
-// stated purpose of AP-11 itself. Confirmed directly with the user before
-// building this service at all, rather than silently fabricating a fake
-// bank integration to look complete.
+// How a run flows (ZS-SVC-D-001 §14, invariants #16–#19):
 //
-// UPDATE — this gap is now half-closed by wiring to BNK-06/BNK-07 (the two
-// real Banking services this package doc originally said didn't exist yet
-// as real callers of AP-11). What changed, command by command:
+//   - CreateRun reads each AP-10 authorization and its frozen AP-09
+//     proposal, and creates ONE INSTRUCTION PER PAYEE with that payee's own
+//     net total and the payables it settles. The proposal must be the exact
+//     subject AP-10 approved (FROZEN, same fingerprint, same net total), and
+//     the run may not change any authorized field (paying account,
+//     currency, method, value date). Cross-tenant/cross-entity
+//     authorizations are refused (negative-path #4).
+//   - LockPaymentRun live-validates, then consumes each distinct
+//     authorization exactly once; a consumption failure moves the run to
+//     EXCEPTION before anything is sent.
+//   - SubmitPaymentRun binds the run's idempotency key, then hands each
+//     instruction to Banking: BNK-06 PrepareAttempt (attempt id persisted
+//     BEFORE submit), SubmitAttempt, then BNK-07 RecordPaymentStatus. A
+//     timeout or lost response makes the instruction PENDING_UNKNOWN —
+//     never failed, never re-initiated (invariant #18, negative-paths
+//     #32/#33). A replay with the same key resumes without re-sending
+//     (negative-path #1).
+//   - PollInstructionStatus is the only path to ACCEPTED/REJECTED/SETTLED:
+//     it reads BNK-06/BNK-07's own records, idempotently per real-world
+//     status (negative-path #2). A SETTLED instruction then settles its
+//     AP-08 payables (net + withholding), retried on later polls until
+//     AP-08 accepts them. Nothing is settled from an initiation response
+//     (negative-path #3, invariant #19).
+//   - RetrySafeInstruction re-sends a PENDING_UNKNOWN instruction through
+//     BNK-06 RetrySameAttempt — same attempt, same key.
+//   - ReconcilePaymentRunStatus (manual) can only flag EXCEPTION with a
+//     reason and evidence reference.
 //
-//   - SubmitPaymentRun now calls BNK-06's PrepareAttempt+SubmitAttempt for
-//     every instruction (internal/provideradapter client), and records the
-//     resulting canonical execution record with BNK-07's RecordPaymentStatus
-//     (internal/paymentstatus client) before ever transitioning the run
-//     itself from LOCKED to SUBMITTED — mirroring LockPaymentRun's own
-//     "do the real work first, only then transition; any failure raises
-//     EXCEPTION instead of a silent partial state" discipline. This is a
-//     REAL handoff to Banking now, not a no-op.
-//   - What is still honestly not real: BNK-06's own Provider Adapter behind
-//     that call is a documented stub (see payment-initiation-adapter-svc's
-//     own package doc) — no actual bank/PSP network call exists anywhere in
-//     this codebase. Wiring AP-11 to BNK-06/BNK-07 moves the one remaining
-//     honest gap down to exactly that boundary, and no further.
-//   - PollInstructionStatus (new) queries BNK-07's real canonical
-//     GetPaymentStatus for the instruction's own bnk07_payment_id and
-//     reconciles the run from that real answer — this is what
-//     ReconcilePaymentRunStatus used to have to fake with a caller-attested
-//     ExternalStatus. ReconcilePaymentRunStatus itself is kept as a
-//     deliberate, separate manual-override path (an operator recording a
-//     real external fact some other way BNK-07 didn't capture) rather than
-//     removed — the same "record a real external fact a human observed"
-//     doctrine used throughout this session. Negative-path scenario #2
-//     ("provider callback forged/replayed") is enforced identically either
-//     way: a repeat call with the same ProviderEventRef against the same
-//     instruction is idempotent (a genuine database uniqueness constraint),
-//     never double-applied.
-//   - PayerAccountVerified is asserted true when calling BNK-06 — AP-09/
-//     AP-10 already treat the paying bank account reference as opaque (no
-//     real account-status source exists anywhere in this codebase, exactly
-//     as BNK-06's own package doc says), so this is the same caller-
-//     attestation gate BNK-06 itself defines, not a new fabrication.
-//
-// What IS real, not fabricated:
-//
-//   - This is the FIRST real caller of payment-authorization-svc (AP-10)'s
-//     ConsumePaymentAuthorization — a gap AP-10 itself documented two
-//     services ago ("no real caller yet"). LockPaymentRun calls AP-10's
-//     real ValidateAuthorization (live re-check) then ConsumeAuthorization
-//     for every instruction in the run, atomically enough that a
-//     mid-sequence failure moves the whole run to EXCEPTION rather than
-//     silently leaving some authorizations consumed and others not.
-//   - Negative-path scenario #4 ("cross-tenant payable included in run") is
-//     enforced for real: every authorization named in CreatePaymentRun is
-//     fetched live from AP-10 and its LegalEntityID/TenantID must match the
-//     run's own, or the whole create is rejected.
-//   - Negative-path scenario #1 ("payment run replayed after timeout") is
-//     enforced by a real database uniqueness constraint on the run's own
-//     idempotency key, captured once at first SubmitPaymentRun and rejected
-//     if a later call names a different one.
-//   - Negative-path scenario #3 ("run marks payment settled from initiation
-//     response") is enforced structurally, not by a runtime check that
-//     could be forgotten: SubmitPaymentRun's own method signature has no
-//     path to any status beyond SUBMITTED. Only a later,
-//     separate ReconcilePaymentRunStatus call can ever move a run to
-//     ACCEPTED/REJECTED/PARTIALLY_ACCEPTED/SETTLED — matching the spec's
-//     own words, "status reflects BNK authority, not inference."
+// Remaining boundary: BNK-06's own Provider Adapter is a documented stub
+// (see payment-initiation-adapter-svc), so no real bank/PSP call happens
+// yet; AP-11 does not yet emit payment-clearing accounting events.
 //
 // One more scope note: this service's own SoD line ("run operator cannot
 // alter authorized fields; unauthorized re-initiation prohibited") is a
@@ -99,6 +58,7 @@ const (
 	StatusValidated         RunStatus = "VALIDATED"
 	StatusLocked            RunStatus = "LOCKED"
 	StatusSubmitted         RunStatus = "SUBMITTED"
+	StatusPendingUnknown    RunStatus = "PENDING_UNKNOWN"
 	StatusAccepted          RunStatus = "ACCEPTED"
 	StatusRejected          RunStatus = "REJECTED"
 	StatusPartiallyAccepted RunStatus = "PARTIALLY_ACCEPTED"
@@ -112,10 +72,23 @@ func CanValidate(s RunStatus) bool { return s == StatusDraft }
 func CanLock(s RunStatus) bool     { return s == StatusValidated }
 func CanSubmit(s RunStatus) bool   { return s == StatusLocked }
 func CanCancel(s RunStatus) bool   { return s == StatusDraft || s == StatusValidated }
-func CanReconcile(s RunStatus) bool {
-	return s == StatusSubmitted || s == StatusAccepted || s == StatusPartiallyAccepted
+
+// CanResumeSubmit covers a SubmitPaymentRun replay with the same
+// idempotency key: instructions not yet handed to Banking are handed off,
+// already-handed-off ones are skipped.
+func CanResumeSubmit(s RunStatus) bool {
+	return s == StatusLocked || s == StatusSubmitted || s == StatusPendingUnknown
 }
-func CanRetry(s RunStatus) bool { return s == StatusSubmitted }
+
+// CanReconcile includes EXCEPTION: one instruction failing must not strand
+// the run's other instructions, which may already be at the bank.
+func CanReconcile(s RunStatus) bool {
+	return s == StatusSubmitted || s == StatusPendingUnknown || s == StatusAccepted ||
+		s == StatusPartiallyAccepted || s == StatusException
+}
+func CanRetry(s RunStatus) bool {
+	return s == StatusSubmitted || s == StatusPendingUnknown || s == StatusException
+}
 func CanClose(s RunStatus) bool {
 	return s == StatusSettled || s == StatusRejected || s == StatusPartiallyAccepted || s == StatusException
 }
@@ -123,11 +96,17 @@ func CanClose(s RunStatus) bool {
 type InstructionStatus string
 
 const (
-	InstructionPending   InstructionStatus = "PENDING"
-	InstructionAccepted  InstructionStatus = "ACCEPTED"
-	InstructionRejected  InstructionStatus = "REJECTED"
-	InstructionSettled   InstructionStatus = "SETTLED"
-	InstructionException InstructionStatus = "EXCEPTION"
+	InstructionPending InstructionStatus = "PENDING"
+	// InstructionPendingUnknown: Banking was called but gave no
+	// authoritative answer (timeout, lost response, BNK-06 PENDING_UNKNOWN).
+	// The payment may or may not be at the bank. It is never treated as
+	// failed and never re-initiated; it is resolved only by polling BNK-06/
+	// BNK-07 or by RetrySafeInstruction re-using the same BNK-06 attempt.
+	InstructionPendingUnknown InstructionStatus = "PENDING_UNKNOWN"
+	InstructionAccepted       InstructionStatus = "ACCEPTED"
+	InstructionRejected       InstructionStatus = "REJECTED"
+	InstructionSettled        InstructionStatus = "SETTLED"
+	InstructionException      InstructionStatus = "EXCEPTION"
 )
 
 type PaymentRun struct {
@@ -170,17 +149,37 @@ type RunInstruction struct {
 	Currency                 string
 
 	Status           InstructionStatus
+	StatusReason     string
 	ConsumedAt       *time.Time
 	ProviderEventRef string
 
-	// ProviderAttemptID correlates to BNK-06's PaymentInitiationAttempt;
-	// Bnk07PaymentID correlates to BNK-07's PaymentExecutionState. Both are
-	// set exactly once, at first real submission to Banking (SubmitPaymentRun),
-	// and are immutable afterward — enforced by a database trigger.
+	// ProviderAttemptID correlates to BNK-06's PaymentInitiationAttempt and
+	// is recorded right after PrepareAttempt, before anything is sent, so a
+	// lost submit response can always be traced to its attempt.
+	// Bnk07PaymentID correlates to BNK-07's PaymentExecutionState and is
+	// recorded once BNK-06 reports the attempt SUBMITTED. Each is set once
+	// and immutable afterward — enforced by a database trigger.
 	ProviderAttemptID string
 	Bnk07PaymentID    string
 
+	// Payables are the AP-08 payables this instruction settles, frozen from
+	// the authorized AP-09 proposal items at CreateRun.
+	Payables []InstructionPayable `json:",omitempty"`
+
 	CreatedAt time.Time
+}
+
+// InstructionPayable is one authorized AP-09 proposal item an instruction
+// pays. SourceReference is the AP-08 payable's source reference (invoice or
+// claim id), which is what AP-09 records as its PayableID.
+type InstructionPayable struct {
+	InstructionID     string
+	PayableSource     string // AP_INVOICE | EXPENSE_CLAIM
+	SourceReference   string
+	GrossAmount       float64
+	WithholdingAmount float64
+	NetAmount         float64
+	PayableAppliedAt  *time.Time
 }
 
 type RunEvent struct {
@@ -199,6 +198,7 @@ const (
 	EventRunLocked           = "PAYMENT_RUN_LOCKED"
 	EventRunSubmitted        = "PAYMENT_RUN_SUBMITTED"
 	EventInstructionPending  = "PAYMENT_INSTRUCTION_PENDING"
+	EventInstructionUnknown  = "PAYMENT_INSTRUCTION_PENDING_UNKNOWN"
 	EventInstructionAccepted = "PAYMENT_INSTRUCTION_ACCEPTED"
 	EventInstructionRejected = "PAYMENT_INSTRUCTION_REJECTED"
 	EventInstructionSettled  = "PAYMENT_INSTRUCTION_SETTLED"
@@ -207,6 +207,25 @@ const (
 	EventRunCancelled        = "PAYMENT_RUN_CANCELLED"
 	EventInstructionRetried  = "PAYMENT_INSTRUCTION_RETRIED"
 )
+
+// InstructionEventType is the domain event published when an instruction
+// takes status s.
+func InstructionEventType(s InstructionStatus) string {
+	switch s {
+	case InstructionPending:
+		return EventInstructionPending
+	case InstructionPendingUnknown:
+		return EventInstructionUnknown
+	case InstructionAccepted:
+		return EventInstructionAccepted
+	case InstructionRejected:
+		return EventInstructionRejected
+	case InstructionSettled:
+		return EventInstructionSettled
+	default:
+		return EventRunExceptionRaised
+	}
+}
 
 // ── request DTOs ────────────────────────────────────────────────────────────
 
@@ -223,10 +242,14 @@ type SubmitRunRequest struct {
 	IdempotencyKey string
 }
 
+// ReconcileInstructionRequest records one status change on an instruction.
+// From the manual ReconcilePaymentRunStatus endpoint only EXCEPTION is
+// accepted (with a Reason); every other status comes from Banking.
 type ReconcileInstructionRequest struct {
 	InstructionID    string
-	ExternalStatus   InstructionStatus // ACCEPTED, REJECTED, SETTLED, or EXCEPTION
+	ExternalStatus   InstructionStatus
 	ProviderEventRef string
+	Reason           string
 }
 
 type CancelRunRequest struct {
@@ -259,4 +282,18 @@ const (
 	ErrProviderAdapterUnavailable      = sentinel("payment-initiation-adapter-svc unavailable")
 	ErrPaymentStatusUnavailable        = sentinel("payment-status-svc unavailable")
 	ErrInstructionNotSubmitted         = sentinel("instruction was never submitted to Banking; nothing to poll")
+	ErrInstructionNotRetryable         = sentinel("only a PENDING_UNKNOWN instruction with a Banking attempt can be retried")
+	ErrManualStatusNotAllowed          = sentinel("manual reconciliation may only flag EXCEPTION; ACCEPTED/REJECTED/SETTLED come only from Banking")
+	ErrReasonRequired                  = sentinel("reason is required")
+	ErrProposalServiceUnavailable      = sentinel("payment-proposal-svc unavailable")
+	ErrAuthorizedSubjectMismatch       = sentinel("authorized proposal does not match the authorization (status, fingerprint, currency or net total)")
+	ErrPayableServiceUnavailable       = sentinel("payable-open-item-svc unavailable")
+	// ErrBankingPrepareRejected is BNK-06 refusing PrepareAttempt with a 4xx
+	// (fingerprint mismatch, payer account not eligible, bad request).
+	// Nothing was sent to the bank.
+	ErrBankingPrepareRejected = sentinel("payment-initiation-adapter-svc refused to prepare the attempt")
+	// ErrBankingAttemptConflict is BNK-06 answering 409 to a submit/retry:
+	// the attempt is not in the state the call expected, typically because
+	// an earlier call reached it. The caller must re-read the attempt.
+	ErrBankingAttemptConflict = sentinel("payment-initiation-adapter-svc attempt is not in the expected state")
 )

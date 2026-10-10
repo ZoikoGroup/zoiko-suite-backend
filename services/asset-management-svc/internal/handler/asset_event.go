@@ -134,6 +134,9 @@ func (h *Handler) createAssetEvent(w http.ResponseWriter, r *http.Request, req d
 	if req.CorrectionOfEventID != "" {
 		e.CorrectionOfEventID = &req.CorrectionOfEventID
 	}
+	if req.BookID != "" {
+		e.BookID = &req.BookID
+	}
 
 	if err := h.store.CreateAssetEvent(r.Context(), e); err != nil {
 		h.log.Error("failed to create asset event", zap.Error(err))
@@ -352,6 +355,13 @@ func (h *Handler) ValidateAssetEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "valuation_evidence_required", domain.ErrValuationEvidenceRequired.Error())
 		return
 	}
+	// IMPAIRMENT/REVALUATION/ADDITION are book-specific (spec invariant 2):
+	// without a book_id there is no schedule to re-base at apply time.
+	if (e.EventType == domain.AssetEventTypeImpairment || e.EventType == domain.AssetEventTypeRevaluation || e.EventType == domain.AssetEventTypeAddition) &&
+		(e.BookID == nil || *e.BookID == "") {
+		writeError(w, http.StatusUnprocessableEntity, "book_required", domain.ErrBookRequiredForBookEvent.Error())
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, e.LegalEntityID, actionAssetEventCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -439,6 +449,14 @@ func (h *Handler) ApplyAssetEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		h.log.Error("ApplyAssetEvent: period check failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "period_check_unavailable", err.Error())
+		return
+	}
+
+	// Refuse store-side ineligibility (no schedule for the book, run in flight,
+	// impairment >= carrying, asset not disposable...) BEFORE posting: a journal
+	// posted ahead of a failed apply would be left behind with the event APPROVED.
+	if err := h.store.PreflightApplyAssetEvent(r.Context(), id, time.Now().UTC()); err != nil {
+		h.writeAssetEventErr(w, err)
 		return
 	}
 
@@ -570,6 +588,13 @@ func (h *Handler) writeAssetEventErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "asset_event_not_found", "")
 	case errors.Is(err, domain.ErrInvalidAssetEventTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
+	case errors.Is(err, domain.ErrDepreciationRunInFlight):
+		writeError(w, http.StatusConflict, "depreciation_run_in_flight", err.Error())
+	case errors.Is(err, domain.ErrNoActiveScheduleForBook), errors.Is(err, domain.ErrBookRequiredForBookEvent),
+		errors.Is(err, domain.ErrRebaseAmountInvalid), errors.Is(err, domain.ErrImpairmentExceedsCarrying),
+		errors.Is(err, domain.ErrScheduleFullyDepreciated), errors.Is(err, domain.ErrReversalWouldZeroCarrying),
+		errors.Is(err, domain.ErrReversalOutOfOrder):
+		writeError(w, http.StatusUnprocessableEntity, "book_rebase_refused", err.Error())
 	case errors.Is(err, domain.ErrAssetNotEligibleForDisposal):
 		writeError(w, http.StatusUnprocessableEntity, "asset_not_eligible_for_disposal", err.Error())
 	default:

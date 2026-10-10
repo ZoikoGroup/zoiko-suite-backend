@@ -33,6 +33,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS idempotency_keys CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS authorization_signatures CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox_events CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS authorization_events CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS authorization_payee_snapshots CASCADE;`)

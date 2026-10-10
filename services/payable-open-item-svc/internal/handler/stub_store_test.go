@@ -137,7 +137,9 @@ func (s *stubStore) ApplySupplierCredit(_ context.Context, payableID string, req
 }
 
 func (s *stubStore) ApplyConfirmedPayment(_ context.Context, payableID string, req domain.ApplyConfirmedPaymentRequest, principalID string) (*domain.PayableOpenItem, bool, error) {
-	return s.applyDelta(payableID, "PAYMENT", -req.Amount, req.ProviderPaymentRef, "", principalID, false)
+	// Mirrors PgStore: net payment and withholding applied together under
+	// the payment reference.
+	return s.applyDelta(payableID, "PAYMENT", -(req.Amount + req.WithholdingAmount), req.ProviderPaymentRef, "", principalID, false)
 }
 
 func (s *stubStore) ApplyRecovery(_ context.Context, payableID string, req domain.ApplyRecoveryRequest, principalID string) (*domain.PayableOpenItem, error) {

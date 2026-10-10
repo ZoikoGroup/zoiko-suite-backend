@@ -657,6 +657,8 @@ func (h *Handler) writeRecognitionErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
 	case errors.Is(err, domain.ErrApprovedEstimateRequired):
 		writeError(w, http.StatusUnprocessableEntity, "approved_estimate_required", err.Error())
+	case errors.Is(err, domain.ErrMilestonesExceedContractValue):
+		writeError(w, http.StatusUnprocessableEntity, "milestones_exceed_contract_value", err.Error())
 	case errors.Is(err, domain.ErrContractValueRequired):
 		writeError(w, http.StatusUnprocessableEntity, "contract_value_required", err.Error())
 	default:

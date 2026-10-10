@@ -27,3 +27,19 @@ func TenantContext() func(http.Handler) http.Handler {
 		})
 	}
 }
+
+// RequireTenant refuses a request that carries no tenant. Every row this
+// service writes is tenant-scoped (row-level security has no NULL-tenant
+// escape hatch), so a tenant-less request can neither read nor write
+// anything and is rejected up front with a stable code.
+func RequireTenant(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if TenantFromContext(r.Context()) == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"X-Tenant-Id header is required","code":"VALIDATION_FAILED"}` + "\n"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

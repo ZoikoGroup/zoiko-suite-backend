@@ -1,0 +1,420 @@
+openapi: 3.0.3
+
+# accounting-period-svc (spec REF-05) - Accounting Period.
+#
+# Owns: AccountingPeriod, AccountingPeriodState, PeriodStateHistory.
+# Does NOT own: the fiscal-calendar definition (REF-04), close checklist /
+# workflow evidence (ACC-14), postings.
+#
+# THINGS A CLIENT CANNOT GUESS FROM THE PATHS
+#
+#  1. THE POSTING GATE IS GET /v1/accounting-periods:resolve. It reads the
+#     primary (strongly consistent), always answers Cache-Control: no-store, and
+#     NEVER defaults. No period for the entity/date/scope is 404 PERIOD_NOT_FOUND
+#     with posting_allowed=false - not OPEN. Several periods with different
+#     outcomes is 409 RULE_AMBIGUOUS. Every failure body of this endpoint also
+#     carries posting_allowed=false, so no error can be read as permission.
+#     Callers must treat ANY non-200 as "do not post".
+#
+#  2. posting_allowed is the verdict; posting_mode explains it:
+#       OPEN               ALLOWED     / allowed
+#       SOFT_CLOSED        RESTRICTED  / allowed only when the caller presents
+#                                        soft_close_exception=true (asserted by the
+#                                        caller, not verified here)
+#       HARD_CLOSED        BLOCKED
+#       REOPEN_AUTHORIZED  RESTRICTED  / allowed only inside the authorised
+#                                        book/module scope AND before expires_at,
+#                                        judged at READ time against the service clock
+#       RECLOSED           BLOCKED
+#
+#  3. STATE MACHINE (nothing else is legal; anything else is 409 INVALID_TRANSITION):
+#       OPEN -request-soft-close-> SOFT_CLOSED -hard-close-> HARD_CLOSED
+#       HARD_CLOSED -authorize-reopen-> REOPEN_AUTHORIZED -reclose-> RECLOSED
+#       RECLOSED -authorize-reopen-> REOPEN_AUTHORIZED   (a later reopen)
+#     There is no SOFT_CLOSED -> OPEN.
+#
+#  4. EVERY STATE COMMAND needs Idempotency-Key, `reason`, `expected_version`,
+#     and ACC-14 evidence: `acc14_workflow_ref` AND `control_snapshot_ref`.
+#     Missing refs -> 422 CONTEXT_INVALID. Refs that ACC-14 does not confirm (not
+#     APPROVED, or approved for another period/command/snapshot) -> 422
+#     SOURCE_UNVERIFIED. ACC-14 unreachable -> 503 DEPENDENCY_UNAVAILABLE. All
+#     three reject the command and record a PeriodCommandRejected control event.
+#     The caller must also hold authorization-svc action PERIOD_STATE_COMMAND
+#     (403 FORBIDDEN otherwise). hard-close and authorize-reopen additionally
+#     need a different actor than the one who requested the soft close
+#     (403 SOD_DENIED, also a control event).
+#     !! The ACC-14 verification endpoint (financial-close-svc
+#     !! GET /v1/close/workflow-refs/{ref}) does not exist yet; until the
+#     !! cutover step builds it, every state command is rejected (fail closed).
+#
+#  5. authorize-reopen is time-bound and scoped: `reopen_scope` and `expires_at`
+#     are REQUIRED; expires_at must be in the future and no later than now +
+#     REOPEN_MAX_WINDOW (default 72h); the scope may only narrow the period's.
+#
+#  6. Period boundaries are copied from a fiscal-calendar version at
+#     materialisation and never change (database trigger). A different calendar
+#     version produces SEPARATE periods. Re-materialising never duplicates and
+#     reports boundary_drift instead of moving anything.
+#
+#  7. ERRORS. Every failure body is {"code": "...", "message": "..."}. Codes: the
+#     shared contract set (CONTEXT_INVALID, VERSION_CONFLICT, DUPLICATE_CANDIDATE,
+#     INVALID_TRANSITION, RULE_AMBIGUOUS, SOURCE_UNVERIFIED, SOD_DENIED,
+#     REFERENCE_RETIRED, DEPENDENCY_UNAVAILABLE) plus NOT_FOUND, FORBIDDEN and
+#     PERIOD_NOT_FOUND. 400 = malformed request / missing mandatory header or
+#     field; 422 = well-formed but semantically invalid (CONTEXT_INVALID raised by
+#     the service, SOURCE_UNVERIFIED).
+#
+#  8. Replays: the same Idempotency-Key and body returns the ORIGINAL result with
+#     header Idempotent-Replay: true; the same key with a different body is 422.
+
+info:
+  title: accounting-period-svc
+  version: "0.1.0"
+  description: REF-05 Accounting Period - period instances, authoritative period state and the posting gate.
+
+servers:
+  - url: http://localhost:8174
+
+tags:
+  - name: commands
+  - name: queries
+  - name: gate
+
+paths:
+  /v1/accounting-periods:materialize:
+    post:
+      tags: [commands]
+      operationId: materializePeriods
+      summary: MaterializePeriods (authz action PERIOD_MATERIALIZE)
+      description: |
+        Creates the OPEN periods of one fiscal year of one fiscal-calendar version
+        for one legal entity and book scope, from REF-04 periods-preview. If
+        calendar_version_id is omitted it is resolved through REF-04 at
+        resolve_date (default YYYY-01-01 of fiscal_year); the resolved
+        calendar_id must equal calendar_id. Idempotent per (entity, calendar
+        version, fiscal year, book scope). 201 when at least one period was
+        created, 200 otherwise (including replays). At most 60 periods; one
+        PeriodOpened event per created period.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [legal_entity_id, calendar_id, fiscal_year, reason]
+              additionalProperties: false
+              properties:
+                legal_entity_id: {type: string}
+                calendar_id: {type: string}
+                fiscal_year: {type: integer, minimum: 1900, maximum: 2200}
+                book_scope: {type: string, description: "Opaque; empty = entity-wide."}
+                calendar_version_id: {type: string}
+                resolve_date: {type: string, format: date}
+                reason: {type: string}
+      responses:
+        '200': {description: Nothing created (already materialised) or replay., content: {application/json: {schema: {$ref: '#/components/schemas/MaterializeResult'}}}}
+        '201': {description: Periods created., content: {application/json: {schema: {$ref: '#/components/schemas/MaterializeResult'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+
+  /v1/accounting-periods/{idCommand}:
+    post:
+      tags: [commands]
+      operationId: periodCommand
+      summary: "{id}:request-soft-close | :hard-close | :authorize-reopen | :reclose (authz action PERIOD_STATE_COMMAND)"
+      description: |
+        The path segment is `{period_id}:{command}`. Commands: request-soft-close
+        (RequestSoftClose), hard-close (SetHardClosed), authorize-reopen
+        (AuthorizeReopen), reclose (ReclosePeriod). See the header comment for the
+        evidence, SoD and window rules.
+      parameters:
+        - name: idCommand
+          in: path
+          required: true
+          schema: {type: string, example: "018f2c1e-0000-7000-8000-000000000001:hard-close"}
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_version, reason, acc14_workflow_ref, control_snapshot_ref]
+              additionalProperties: false
+              properties:
+                expected_version: {type: integer, minimum: 1}
+                reason: {type: string}
+                acc14_workflow_ref: {type: string}
+                control_snapshot_ref: {type: string}
+                reopen_scope:
+                  type: object
+                  description: Required for authorize-reopen.
+                  properties:
+                    book_scope: {type: string}
+                    module_scope: {type: string}
+                expires_at: {type: string, format: date-time, description: Required for authorize-reopen; future and bounded.}
+      responses:
+        '200': {description: The updated period., headers: {ETag: {schema: {type: string}}}, content: {application/json: {schema: {$ref: '#/components/schemas/Period'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '403': {description: FORBIDDEN (authorization-svc) or SOD_DENIED., content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {description: VERSION_CONFLICT or INVALID_TRANSITION., content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {description: CONTEXT_INVALID (incl. missing ACC-14 refs) or SOURCE_UNVERIFIED., content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {$ref: '#/components/responses/Error'}
+
+  /v1/accounting-periods:resolve:
+    get:
+      tags: [gate]
+      operationId: resolvePeriodByDate
+      summary: ResolvePeriodByDate - the POSTING GATE
+      description: |
+        Strongly consistent (primary read), Cache-Control: no-store. 404
+        PERIOD_NOT_FOUND when no period covers the entity/date/scope; 409
+        RULE_AMBIGUOUS when several cover it with different outcomes. When several
+        cover it with the SAME outcome the most specific scope wins (then NORMAL
+        before SPECIAL, then lowest period_id). Narrow with kind=NORMAL|SPECIAL
+        when a special period overlaps a normal one. Boundaries are inclusive.
+        Periods whose book_scope/module_scope is empty cover every request; a
+        scoped period covers only a request presenting that exact scope.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - {name: legal_entity_id, in: query, required: true, schema: {type: string}}
+        - {name: date, in: query, required: true, schema: {type: string, format: date}}
+        - {name: book_scope, in: query, schema: {type: string}}
+        - {name: module_scope, in: query, schema: {type: string}}
+        - {name: purpose, in: query, schema: {type: string, enum: [post, read], default: post}}
+        - {name: kind, in: query, schema: {type: string, enum: [NORMAL, SPECIAL]}}
+        - {name: soft_close_exception, in: query, schema: {type: boolean}, description: "Caller asserts it holds the soft-close exception (only relevant to SOFT_CLOSED)."}
+      responses:
+        '200': {description: The governing period and the verdict., headers: {Cache-Control: {schema: {type: string, example: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/Resolution'}}}}
+        '401': {$ref: '#/components/responses/GateError'}
+        '404': {description: PERIOD_NOT_FOUND - not allowed., content: {application/json: {schema: {$ref: '#/components/schemas/GateError'}}}}
+        '409': {description: RULE_AMBIGUOUS - not allowed., content: {application/json: {schema: {$ref: '#/components/schemas/GateError'}}}}
+        '422': {$ref: '#/components/responses/GateError'}
+        '503': {$ref: '#/components/responses/GateError'}
+
+  /v1/accounting-periods:status-by-key:
+    get:
+      tags: [gate]
+      operationId: statusByKey
+      summary: Compatibility read for the legacy close-status contract
+      description: |
+        Shaped like financial-close-svc GET /v1/close/periods/status. period_name
+        is accepted as an alias of period_key. Mapping: OPEN and REOPEN_AUTHORIZED
+        (inside its window) -> OPEN; SOFT_CLOSED, RECLOSED and an expired reopen ->
+        CLOSED; HARD_CLOSED -> LOCKED. Several periods with the key (different book
+        scopes / calendar versions) -> the MOST RESTRICTIVE status. An unknown
+        period is 404 PERIOD_NOT_FOUND, never OPEN.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - {name: legal_entity_id, in: query, required: true, schema: {type: string}}
+        - {name: period_key, in: query, schema: {type: string}}
+        - {name: period_name, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: Legacy-shaped status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  period_key: {type: string}
+                  close_status: {type: string, enum: [OPEN, CLOSED, LOCKED]}
+        '404': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+
+  /v1/accounting-periods:
+    get:
+      tags: [queries]
+      operationId: listPeriods
+      summary: ListOpenPeriods (state=OPEN) and general listing
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - {name: legal_entity_id, in: query, required: true, schema: {type: string}}
+        - {name: state, in: query, schema: {$ref: '#/components/schemas/State'}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+      responses:
+        '200':
+          description: Periods ordered by start_date.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/Period'}}
+                  limit: {type: integer}
+                  offset: {type: integer}
+        '422': {$ref: '#/components/responses/Error'}
+
+  /v1/accounting-periods/{id}:
+    get:
+      tags: [queries]
+      operationId: getPeriod
+      summary: GetPeriod
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200': {description: The period., headers: {ETag: {schema: {type: string}}}, content: {application/json: {schema: {$ref: '#/components/schemas/Period'}}}}
+        '404': {$ref: '#/components/responses/Error'}
+
+  /v1/accounting-periods/{id}/state-history:
+    get:
+      tags: [queries]
+      operationId: getPeriodStateHistory
+      summary: GetPeriodStateHistory (append-only)
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: History, oldest first; the first entry is the MATERIALIZE entry.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/HistoryEntry'}}
+        '404': {$ref: '#/components/responses/Error'}
+
+  /v1/calendar-usage:
+    get:
+      tags: [queries]
+      operationId: calendarUsage
+      summary: Has this calendar (version) been used? (called by fiscal-calendar-svc)
+      description: |
+        latest_period_end is the latest end_date among materialised periods of the
+        calendar (optionally one version), or null. has_posted_or_closed_periods is
+        true when any of those periods is in a state other than OPEN. This service
+        cannot see postings, so "posted" is approximated by "not OPEN" (an OPEN
+        period may already hold postings).
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - {name: calendar_id, in: query, required: true, schema: {type: string}}
+        - {name: calendar_version_id, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: Usage.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [latest_period_end, has_posted_or_closed_periods]
+                properties:
+                  latest_period_end: {type: string, format: date, nullable: true}
+                  has_posted_or_closed_periods: {type: boolean}
+        '422': {$ref: '#/components/responses/Error'}
+
+components:
+  parameters:
+    IdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string}}
+    TenantId: {name: X-Tenant-Id, in: header, required: true, schema: {type: string}}
+    PrincipalId: {name: X-Principal-Id, in: header, required: true, schema: {type: string}, description: "Or X-Workload-Id for service callers."}
+
+  responses:
+    Error:
+      description: Typed error.
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    GateError:
+      description: Typed error; posting_allowed is always false.
+      content: {application/json: {schema: {$ref: '#/components/schemas/GateError'}}}
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [CONTEXT_INVALID, VERSION_CONFLICT, DUPLICATE_CANDIDATE, INVALID_TRANSITION, RULE_AMBIGUOUS, SOURCE_UNVERIFIED, SOD_DENIED, REFERENCE_RETIRED, DEPENDENCY_UNAVAILABLE, NOT_FOUND, FORBIDDEN, PERIOD_NOT_FOUND]
+        message: {type: string}
+    GateError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          required: [posting_allowed]
+          properties:
+            posting_allowed: {type: boolean, enum: [false]}
+    State:
+      type: string
+      enum: [OPEN, SOFT_CLOSED, HARD_CLOSED, REOPEN_AUTHORIZED, RECLOSED]
+    Resolution:
+      type: object
+      required: [period_id, period_key, state, posting_allowed, posting_mode, reason, version, state_version]
+      properties:
+        period_id: {type: string, format: uuid}
+        period_key: {type: string}
+        state: {$ref: '#/components/schemas/State'}
+        posting_allowed: {type: boolean}
+        posting_mode: {type: string, enum: [ALLOWED, RESTRICTED, BLOCKED]}
+        reason: {type: string, enum: [PERIOD_OPEN, SOFT_CLOSED_EXCEPTION_PRESENTED, SOFT_CLOSED_RESTRICTED, PERIOD_HARD_CLOSED, PERIOD_RECLOSED, REOPEN_AUTHORIZED_IN_SCOPE_AND_WINDOW, REOPEN_WINDOW_EXPIRED, OUTSIDE_REOPEN_SCOPE, UNKNOWN_STATE]}
+        version: {type: integer, description: "Period row version (the value to pass as expected_version)."}
+        state_version: {type: integer, description: "Version at which the current state was entered; equals version today because only state changes bump the version."}
+    Period:
+      type: object
+      properties:
+        period_id: {type: string, format: uuid}
+        tenant_id: {type: string}
+        legal_entity_id: {type: string}
+        calendar_id: {type: string}
+        calendar_version_id: {type: string}
+        book_scope: {type: string}
+        module_scope: {type: string}
+        period_key: {type: string, example: FY2026-P03}
+        fiscal_year: {type: integer}
+        period_no: {type: integer}
+        start_date: {type: string, format: date}
+        end_date: {type: string, format: date}
+        kind: {type: string, enum: [NORMAL, SPECIAL]}
+        state: {$ref: '#/components/schemas/State'}
+        version: {type: integer}
+        reopen_authorization:
+          type: object
+          properties:
+            book_scope: {type: string}
+            module_scope: {type: string}
+            expires_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    HistoryEntry:
+      type: object
+      properties:
+        history_id: {type: string, format: uuid}
+        period_id: {type: string, format: uuid}
+        from_state: {type: string}
+        to_state: {$ref: '#/components/schemas/State'}
+        command: {type: string, enum: [MATERIALIZE, SOFT_CLOSE, HARD_CLOSE, AUTHORIZE_REOPEN, RECLOSE]}
+        acc14_workflow_ref: {type: string}
+        control_snapshot_ref: {type: string}
+        requested_by: {type: string}
+        reason: {type: string}
+        recorded_at: {type: string, format: date-time}
+        expected_version: {type: integer}
+        resulting_version: {type: integer}
+        decision_fingerprint: {type: string}
+        reopen_authorization: {type: object}
+        correlation_id: {type: string}
+    MaterializeResult:
+      type: object
+      properties:
+        calendar_id: {type: string}
+        calendar_version_id: {type: string}
+        fiscal_year: {type: integer}
+        book_scope: {type: string}
+        created: {type: integer}
+        existing: {type: integer}
+        boundary_drift:
+          type: array
+          items: {type: string}
+          description: period_keys whose existing boundaries differ from the calendar's current preview. Never applied.
+        periods: {type: array, items: {$ref: '#/components/schemas/Period'}}

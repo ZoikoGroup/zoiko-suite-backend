@@ -37,8 +37,11 @@ import (
 	"zoiko.io/purchase-order-svc/internal/health"
 	svcmiddleware "zoiko.io/purchase-order-svc/internal/middleware"
 	"zoiko.io/purchase-order-svc/internal/mtls"
+	"zoiko.io/purchase-order-svc/internal/outbox"
+	"zoiko.io/purchase-order-svc/internal/procurementcase"
 	"zoiko.io/purchase-order-svc/internal/purchaserequest"
 	"zoiko.io/purchase-order-svc/internal/store"
+	"zoiko.io/purchase-order-svc/internal/supplier"
 	"zoiko.io/purchase-order-svc/internal/telemetry"
 )
 
@@ -111,7 +114,7 @@ func main() {
 	log.Info("db pool connected")
 
 	// ── 4. Store, Kafka producer, authz + purchase-request clients ───────────
-	pgStore := store.New(pool, log)
+	pgStore := store.New(pool, log).WithOverTolerancePercent(cfg.OverTolerancePercent)
 
 	// Kafka producer — connects lazily on first write, same posture as
 	// identity-context-svc/tenant-entity-registry-svc/policy-svc: not a
@@ -160,6 +163,30 @@ func main() {
 	}
 
 	prClient := purchaserequest.NewHTTPClient(cfg.PurchaseRequestServiceURL, log)
+	supplierClient := supplier.NewHTTPClient(cfg.SupplierProfileServiceURL, log)
+	caseClient := procurementcase.NewHTTPClient(cfg.ProcurementWorkflowServiceURL, log)
+
+	// Transactional outbox: events are written in the same transaction as the
+	// state change and relayed to Kafka here, with retry. The relay reads across
+	// tenants, so it relies on the runtime role bypassing RLS (as the other
+	// services' relays do).
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, log).Start(relayCtx)
+	go func() {
+		t := time.NewTicker(6 * time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-relayCtx.Done():
+				return
+			case <-t.C:
+				if _, err := pgStore.PurgeIdempotency(relayCtx, 7*24*time.Hour); err != nil {
+					log.Warn("idempotency purge failed", zap.Error(err))
+				}
+			}
+		}
+	}()
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -183,7 +210,10 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, prClient, log)
+	h := handler.New(pgStore, authzClient, prClient, log).
+		WithSupplierClient(supplierClient).
+		WithProcurementCases(caseClient).
+		WithOptions(handler.Options{HighValueThreshold: cfg.HighValueThreshold})
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

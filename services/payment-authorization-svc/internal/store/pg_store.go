@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -45,7 +46,25 @@ type Store interface {
 	FindAuthorization(ctx context.Context, authorizationID string) (*domain.PaymentAuthorization, error)
 	ListPayeeSnapshots(ctx context.Context, authorizationID string) ([]domain.PayeeSnapshot, error)
 
-	ApproveAuthorization(ctx context.Context, authorizationID, policyResult, policyVersionID, principalID string) (*domain.PaymentAuthorization, error)
+	// ApproveAuthorization records principalID's signature. The authorization
+	// becomes APPROVED only when the number of distinct signatures reaches
+	// the required count (the larger of what it already required and
+	// requiredSignatures); until then it stays PENDING with the signature
+	// recorded. Errors: ErrInvalidTransition (not PENDING), ErrStaleVersion,
+	// ErrAuthorizationExpired, ErrAlreadySigned.
+	ApproveAuthorization(ctx context.Context, authorizationID, policyResult, policyVersionID, principalID string, requiredSignatures int, expectedVersion *int) (*domain.PaymentAuthorization, error)
+	ListSignatures(ctx context.Context, authorizationID string) ([]domain.Signature, error)
+	// ListExpiredCandidates returns authorizations past expires_at across all
+	// tenants, for the expiry sweeper. It relies on the same RLS-exempt
+	// runtime role as the outbox relay.
+	ListExpiredCandidates(ctx context.Context, limit int) ([]domain.ExpiredRef, error)
+
+	// Idempotency (spec §16 idempotency_key). BeginIdempotent claims the key
+	// (created=true) or returns what is already stored for it.
+	BeginIdempotent(ctx context.Context, scope, key, requestHash string) (rec *domain.IdempotencyRecord, created bool, err error)
+	CompleteIdempotent(ctx context.Context, scope, key string, statusCode int, body []byte) error
+	ReleaseIdempotent(ctx context.Context, scope, key string) error
+	PurgeIdempotency(ctx context.Context, olderThan time.Duration) (int64, error)
 	RejectAuthorization(ctx context.Context, authorizationID string, req domain.RejectPaymentRequest, principalID string) (*domain.PaymentAuthorization, error)
 	InvalidateAuthorization(ctx context.Context, authorizationID, reason string) (*domain.PaymentAuthorization, error)
 	ConsumeAuthorization(ctx context.Context, authorizationID, principalID string) (*domain.PaymentAuthorization, error)
@@ -103,7 +122,8 @@ const authColumns = `
 	status, policy_assessment_result, policy_version_id, requested_by_principal_id,
 	approved_by_principal_id, approved_at, rejected_reason,
 	revoked_by_principal_id, revoked_reason, revoked_at, expired_at,
-	consumed_by_principal_id, consumed_at, invalidated_reason, created_at, updated_at`
+	consumed_by_principal_id, consumed_at, invalidated_reason, created_at, updated_at,
+	version, required_signatures, signature_count, expires_at`
 
 func scanAuth(row pgx.Row) (*domain.PaymentAuthorization, error) {
 	a := &domain.PaymentAuthorization{}
@@ -111,7 +131,8 @@ func scanAuth(row pgx.Row) (*domain.PaymentAuthorization, error) {
 		&a.NetAmount, &a.Currency, &a.Status, &nullString{&a.PolicyAssessmentResult}, &nullString{&a.PolicyVersionID},
 		&a.RequestedByPrincipalID, &a.ApprovedByPrincipalID, &a.ApprovedAt, &nullString{&a.RejectedReason},
 		&a.RevokedByPrincipalID, &nullString{&a.RevokedReason}, &a.RevokedAt, &a.ExpiredAt,
-		&a.ConsumedByPrincipalID, &a.ConsumedAt, &nullString{&a.InvalidatedReason}, &a.CreatedAt, &a.UpdatedAt)
+		&a.ConsumedByPrincipalID, &a.ConsumedAt, &nullString{&a.InvalidatedReason}, &a.CreatedAt, &a.UpdatedAt,
+		&a.Version, &a.RequiredSignatures, &a.SignatureCount, &a.ExpiresAt)
 	if err != nil {
 		return nil, err
 	}
@@ -129,10 +150,11 @@ func (s *PgStore) RequestAuthorization(ctx context.Context, tenantID string, aut
 		var err error
 		out, err = scanAuth(tx.QueryRow(ctx, `
 			INSERT INTO payment_authorizations (`+authColumns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', '', '', $8, NULL, NULL, '', NULL, '', NULL, NULL, NULL, NULL, '', NOW(), NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', '', '', $8, NULL, NULL, '', NULL, '', NULL, NULL, NULL, NULL, '', NOW(), NOW(),
+				1, 1, 0, $9)
 			RETURNING `+authColumns,
 			id, strPtrOrNil(tenantID), auth.LegalEntityID, auth.ProposalID, auth.ProposalFingerprint,
-			auth.NetAmount, auth.Currency, auth.RequestedByPrincipalID,
+			auth.NetAmount, auth.Currency, auth.RequestedByPrincipalID, auth.ExpiresAt,
 		))
 		if err != nil {
 			return err
@@ -234,58 +256,237 @@ func (s *PgStore) ListPayeeSnapshots(ctx context.Context, authorizationID string
 
 // ── lifecycle ────────────────────────────────────────────────────────────────
 
-func (s *PgStore) ApproveAuthorization(ctx context.Context, authorizationID, policyResult, policyVersionID, principalID string) (*domain.PaymentAuthorization, error) {
+// ApproveAuthorization records one signer's signature under a row lock and
+// moves the authorization to APPROVED only when enough distinct signers have
+// signed. The unique (authorization_id, signer) index makes a second
+// signature by the same principal impossible; the required count never goes
+// down once raised.
+func (s *PgStore) ApproveAuthorization(ctx context.Context, authorizationID, policyResult, policyVersionID, principalID string, requiredSignatures int, expectedVersion *int) (*domain.PaymentAuthorization, error) {
 	var a *domain.PaymentAuthorization
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
+		current, err := scanAuth(tx.QueryRow(ctx, `SELECT `+authColumns+` FROM payment_authorizations WHERE authorization_id = $1 FOR UPDATE`, authorizationID))
+		if err != nil {
+			return err
+		}
+		if current.Status != domain.StatusPending {
+			return domain.ErrInvalidTransition
+		}
+		if expectedVersion != nil && current.Version != *expectedVersion {
+			return domain.ErrStaleVersion
+		}
+		if current.ExpiresAt != nil && !current.ExpiresAt.After(time.Now()) {
+			return domain.ErrAuthorizationExpired
+		}
+
+		// ON CONFLICT DO NOTHING (not a caught unique violation): a failed
+		// INSERT would abort this transaction.
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO authorization_signatures (signature_id, tenant_id, authorization_id, signer_principal_id, policy_result, policy_version_id)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (authorization_id, signer_principal_id) DO NOTHING`,
+			uuid.New().String(), current.TenantID, authorizationID, principalID, policyResult, policyVersionID,
+		)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrAlreadySigned
+		}
+
+		required := current.RequiredSignatures
+		if requiredSignatures > required {
+			required = requiredSignatures
+		}
+		count := current.SignatureCount + 1
+
+		if count < required {
+			a, err = scanAuth(tx.QueryRow(ctx, `
+				UPDATE payment_authorizations SET signature_count = $2, required_signatures = $3,
+					policy_assessment_result = $4, policy_version_id = $5, updated_at = NOW()
+				WHERE authorization_id = $1 AND status = 'PENDING'
+				RETURNING `+authColumns,
+				authorizationID, count, required, policyResult, policyVersionID,
+			))
+			if err != nil {
+				return err
+			}
+			return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationSigned,
+				fmt.Sprintf("signature %d of %d", count, required), principalID)
+		}
+
 		a, err = scanAuth(tx.QueryRow(ctx, `
-			UPDATE payment_authorizations SET status = 'APPROVED', policy_assessment_result = $2, policy_version_id = $3,
-				approved_by_principal_id = $4, approved_at = NOW(), updated_at = NOW()
+			UPDATE payment_authorizations SET status = 'APPROVED', signature_count = $2, required_signatures = $3,
+				policy_assessment_result = $4, policy_version_id = $5,
+				approved_by_principal_id = $6, approved_at = NOW(), updated_at = NOW()
 			WHERE authorization_id = $1 AND status = 'PENDING'
 			RETURNING `+authColumns,
-			authorizationID, policyResult, policyVersionID, principalID,
+			authorizationID, count, required, policyResult, policyVersionID, principalID,
 		))
 		if err != nil {
 			return err
 		}
-		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventPaymentAuthorized, "", principalID); err != nil {
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventPaymentAuthorized, fmt.Sprintf("%d of %d signatures", count, required), principalID); err != nil {
 			return err
 		}
-		corr := middleware.CorrelationIDFromContext(ctx)
-		var corrPtr *string
-		if corr != "" {
-			corrPtr = &corr
-		}
-		outboxEventID := uuid.NewString()
-		env := outbox.NewVariantBEnvelope(
-			outboxEventID,
-			domain.EventPaymentAuthorized,
-			a.AuthorizationID,
-			a.TenantID,
-			&principalID,
-			corrPtr,
-			a,
-		)
-		return outbox.Insert(ctx, tx, outbox.Event{
-			OutboxEventID: outboxEventID,
-			AggregateType: "payment_authorization",
-			AggregateID:   a.AuthorizationID,
-			EventType:     domain.EventPaymentAuthorized,
-			TenantID:      a.TenantID,
-			LegalEntityID: a.LegalEntityID,
-			ActorID:       &principalID,
-			CorrelationID: corrPtr,
-			Payload:       env,
-		})
+		return s.enqueueEvent(ctx, tx, domain.EventPaymentAuthorized, a, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
+	}
+	for _, known := range []error{domain.ErrInvalidTransition, domain.ErrStaleVersion, domain.ErrAuthorizationExpired, domain.ErrAlreadySigned} {
+		if errors.Is(err, known) {
+			return nil, err
+		}
 	}
 	if err != nil {
 		s.log.Error("pg ApproveAuthorization failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return a, nil
+}
+
+func (s *PgStore) ListSignatures(ctx context.Context, authorizationID string) ([]domain.Signature, error) {
+	var out []domain.Signature
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT signature_id, tenant_id, authorization_id, signer_principal_id, policy_result, policy_version_id, signed_at
+			FROM authorization_signatures WHERE authorization_id = $1 ORDER BY signed_at ASC`, authorizationID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var sg domain.Signature
+			if err := rows.Scan(&sg.SignatureID, &sg.TenantID, &sg.AuthorizationID, &sg.SignerPrincipalID, &sg.PolicyResult, &sg.PolicyVersionID, &sg.SignedAt); err != nil {
+				return err
+			}
+			out = append(out, sg)
+		}
+		return rows.Err()
+	})
+	if isInvalidUUID(err) {
+		return nil, nil
+	}
+	if err != nil {
+		s.log.Error("pg ListSignatures failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
+// ListExpiredCandidates reads across tenants (no app.tenant_id), exactly as
+// the outbox relay does; it depends on the runtime role bypassing RLS.
+func (s *PgStore) ListExpiredCandidates(ctx context.Context, limit int) ([]domain.ExpiredRef, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT authorization_id::text, COALESCE(tenant_id::text, '')
+		FROM payment_authorizations
+		WHERE status IN ('PENDING', 'APPROVED') AND expires_at IS NOT NULL AND expires_at < NOW()
+		ORDER BY expires_at ASC LIMIT $1`, limit)
+	if err != nil {
+		s.log.Error("pg ListExpiredCandidates failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+	var out []domain.ExpiredRef
+	for rows.Next() {
+		var r domain.ExpiredRef
+		if err := rows.Scan(&r.AuthorizationID, &r.TenantID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ── idempotency ──────────────────────────────────────────────────────────────
+
+// BeginIdempotent claims (tenant, scope, key). An earlier claim that never
+// completed (a crash mid-command) is taken over after a minute so a retry is
+// not locked out forever; a completed one is returned for replay.
+func (s *PgStore) BeginIdempotent(ctx context.Context, scope, key, requestHash string) (*domain.IdempotencyRecord, bool, error) {
+	tenantKey := middleware.TenantFromContext(ctx)
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO idempotency_keys (tenant_key, scope, idem_key, request_hash)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (tenant_key, scope, idem_key) DO UPDATE
+			SET request_hash = EXCLUDED.request_hash, created_at = NOW()
+			WHERE idempotency_keys.status_code IS NULL AND idempotency_keys.created_at < NOW() - INTERVAL '60 seconds'`,
+		tenantKey, scope, key, requestHash)
+	if err != nil {
+		s.log.Error("pg BeginIdempotent failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil, true, nil
+	}
+	var rec domain.IdempotencyRecord
+	var status *int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT request_hash, status_code, response_body FROM idempotency_keys
+		WHERE tenant_key = $1 AND scope = $2 AND idem_key = $3`, tenantKey, scope, key,
+	).Scan(&rec.RequestHash, &status, &rec.Body); err != nil {
+		s.log.Error("pg BeginIdempotent read failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if status != nil {
+		rec.Completed, rec.StatusCode = true, *status
+	}
+	return &rec, false, nil
+}
+
+func (s *PgStore) CompleteIdempotent(ctx context.Context, scope, key string, statusCode int, body []byte) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE idempotency_keys SET status_code = $4, response_body = $5, completed_at = NOW()
+		WHERE tenant_key = $1 AND scope = $2 AND idem_key = $3 AND status_code IS NULL`,
+		middleware.TenantFromContext(ctx), scope, key, statusCode, body)
+	if err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+func (s *PgStore) ReleaseIdempotent(ctx context.Context, scope, key string) error {
+	_, err := s.pool.Exec(ctx, `
+		DELETE FROM idempotency_keys WHERE tenant_key = $1 AND scope = $2 AND idem_key = $3 AND status_code IS NULL`,
+		middleware.TenantFromContext(ctx), scope, key)
+	if err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+func (s *PgStore) PurgeIdempotency(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM idempotency_keys WHERE created_at < NOW() - make_interval(secs => $1)`, olderThan.Seconds())
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// enqueueEvent writes the authorization's state change to the transactional
+// outbox, in the same transaction as the change itself, so a published event
+// can neither be lost nor describe a change that rolled back. Used for the
+// terminal outcomes that carry no further state: rejected, invalidated,
+// revoked and expired.
+func (s *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, eventType string, a *domain.PaymentAuthorization, actor string) error {
+	corr := middleware.CorrelationIDFromContext(ctx)
+	var corrPtr *string
+	if corr != "" {
+		corrPtr = &corr
+	}
+	outboxEventID := uuid.NewString()
+	env := outbox.NewVariantBEnvelope(outboxEventID, eventType, a.AuthorizationID, a.TenantID, &actor, corrPtr, a)
+	return outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: outboxEventID,
+		AggregateType: "payment_authorization",
+		AggregateID:   a.AuthorizationID,
+		EventType:     eventType,
+		TenantID:      a.TenantID,
+		LegalEntityID: a.LegalEntityID,
+		ActorID:       &actor,
+		CorrelationID: corrPtr,
+		Payload:       env,
+	})
 }
 
 func (s *PgStore) RejectAuthorization(ctx context.Context, authorizationID string, req domain.RejectPaymentRequest, principalID string) (*domain.PaymentAuthorization, error) {
@@ -301,7 +502,10 @@ func (s *PgStore) RejectAuthorization(ctx context.Context, authorizationID strin
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationRejected, req.Reason, principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationRejected, req.Reason, principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, domain.EventAuthorizationRejected, a, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -330,7 +534,10 @@ func (s *PgStore) InvalidateAuthorization(ctx context.Context, authorizationID, 
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationInvalidated, reason, "system")
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationInvalidated, reason, "system"); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, domain.EventAuthorizationInvalidated, a, "system")
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -411,7 +618,10 @@ func (s *PgStore) RevokeAuthorization(ctx context.Context, authorizationID strin
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationRevoked, req.Reason, principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationRevoked, req.Reason, principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, domain.EventAuthorizationRevoked, a, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -436,7 +646,10 @@ func (s *PgStore) ExpireAuthorization(ctx context.Context, authorizationID, prin
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationExpired, "", principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, authorizationID, domain.EventAuthorizationExpired, "", principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, domain.EventAuthorizationExpired, a, principalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition

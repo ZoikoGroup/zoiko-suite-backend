@@ -42,6 +42,8 @@ type stubStore struct {
 	valuationRuns     map[string]*domain.ValuationRun
 	writeDowns        map[string]*domain.WriteDown
 	layerConsumptions []*domain.LayerConsumption
+	receiptLinks      map[string]string // movement_id -> ap_receipt_id
+	landedCosts       map[string]*domain.LandedCostAllocation
 
 	stockCounts         map[string]*domain.StockCount
 	stockCountLocations map[string][]string // count_id -> location_ids
@@ -438,6 +440,32 @@ func (s *stubStore) GetValuationRun(_ context.Context, runID string) (*domain.Va
 	return &cp, nil
 }
 
+func (s *stubStore) LinkMovementReceipt(_ context.Context, movementID, apReceiptID, _ string, _ time.Time) error {
+	if s.receiptLinks == nil {
+		s.receiptLinks = map[string]string{}
+	}
+	if existing, ok := s.receiptLinks[movementID]; ok && existing != apReceiptID {
+		return domain.ErrReceiptLinkConflict
+	}
+	s.receiptLinks[movementID] = apReceiptID
+	return nil
+}
+
+func (s *stubStore) GetRunInboundValue(_ context.Context, runID string) (domain.RunInboundValue, error) {
+	var out domain.RunInboundValue
+	for _, e := range s.valuationEntries {
+		if e.RunID == nil || *e.RunID != runID || e.EntryType != domain.ValuationEntryTypeInbound {
+			continue
+		}
+		if _, linked := s.receiptLinks[e.MovementID]; linked {
+			out.ReceiptLinked += e.Value
+		} else {
+			out.Unlinked += e.Value
+		}
+	}
+	return out, nil
+}
+
 func (s *stubStore) MarkValuationRunEmitted(_ context.Context, runID, principalID, journalID string, at time.Time) error {
 	r, ok := s.valuationRuns[runID]
 	if !ok || r.Status != domain.ValuationRunStatusPopulationFrozen {
@@ -644,6 +672,12 @@ func (s *stubStore) CertifyStockCount(_ context.Context, countID, principalID st
 	sc, ok := s.stockCounts[countID]
 	if !ok || sc.Status != domain.StockCountStatusAdjustmentsGenerated {
 		return domain.ErrInvalidCountTransition
+	}
+	for _, l := range s.countLines {
+		if l.CountID == countID && l.ObservedQuantity != nil && *l.ObservedQuantity != l.SystemQuantity &&
+			l.Status != domain.CountLineStatusAdjustmentGenerated {
+			return domain.ErrUnresolvedCountVariance
+		}
 	}
 	sc.Status, sc.CertifiedAt, sc.CertifiedByPrincipalID = domain.StockCountStatusCertified, &at, &principalID
 	return nil
@@ -891,6 +925,13 @@ func (s *stubStore) LinkCatalogItem(_ context.Context, itemID, catalogItemID str
 
 func (s *stubStore) SetTrackingPolicy(_ context.Context, p *domain.TrackingPolicy, _ time.Time) error {
 	cp := *p
+	if cp.NegativeStockPolicy == "" {
+		if prior, ok := s.trackingPolicies[p.ItemID]; ok && prior.NegativeStockPolicy != "" {
+			cp.NegativeStockPolicy = prior.NegativeStockPolicy
+		} else {
+			cp.NegativeStockPolicy = domain.NegativeStockProhibited
+		}
+	}
 	s.trackingPolicies[p.ItemID] = &cp
 	return nil
 }
@@ -1000,6 +1041,9 @@ func serialKey(itemID string, serial *string) string {
 
 func (s *stubStore) checkNegativeStock(m *domain.InventoryMovement) error {
 	if m.SourceLocationID == nil {
+		return nil
+	}
+	if tp, ok := s.trackingPolicies[m.ItemID]; ok && tp.NegativeStockPolicy == domain.NegativeStockAllowed {
 		return nil
 	}
 	var onHand float64
@@ -1341,10 +1385,12 @@ type stubLedger struct {
 	postCalls     int
 	reverseErr    error
 	reverseCalls  int
+	lastLines     []clients.LedgerLine
 }
 
-func (l *stubLedger) PostInventoryAccountingEvent(_ context.Context, _, _, _, _, _, sourceEventID, _ string, _ []clients.LedgerLine) (string, error) {
+func (l *stubLedger) PostInventoryAccountingEvent(_ context.Context, _, _, _, _, _, sourceEventID, _ string, lines []clients.LedgerLine) (string, error) {
 	l.postCalls++
+	l.lastLines = lines
 	if l.postErr != nil {
 		return "", l.postErr
 	}

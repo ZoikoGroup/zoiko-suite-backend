@@ -12,6 +12,7 @@
 package store
 
 import (
+	"math"
 	"context"
 	"errors"
 	"fmt"
@@ -40,7 +41,7 @@ func uuidNewString() string {
 // imprecise. Same helper this platform already uses in
 // financial-close-svc/asset-management-svc.
 func roundCents(v float64) float64 {
-	return float64(int64(v*100+0.5)) / 100
+	return math.Round(v*100) / 100 // half away from zero; the old int64(v*100+0.5) truncated toward zero and lost a cent on negatives
 }
 
 type PgStore struct {
@@ -255,14 +256,14 @@ func (s *PgStore) LinkCatalogItem(ctx context.Context, itemID, catalogItemID str
 
 const trackingPolicyColumns = `
 	policy_version_id, policy_id, version, item_id,
-	requires_lot_tracking, requires_serial_tracking, requires_expiry_tracking,
+	requires_lot_tracking, requires_serial_tracking, requires_expiry_tracking, negative_stock_policy,
 	effective_from, effective_to, created_at, created_by_principal_id`
 
 func scanTrackingPolicy(row pgx.Row) (*domain.TrackingPolicy, error) {
 	var p domain.TrackingPolicy
 	if err := row.Scan(
 		&p.PolicyVersionID, &p.PolicyID, &p.Version, &p.ItemID,
-		&p.RequiresLotTracking, &p.RequiresSerialTracking, &p.RequiresExpiryTracking,
+		&p.RequiresLotTracking, &p.RequiresSerialTracking, &p.RequiresExpiryTracking, &p.NegativeStockPolicy,
 		&p.EffectiveFrom, &p.EffectiveTo, &p.CreatedAt, &p.CreatedByPrincipalID,
 	); err != nil {
 		return nil, err
@@ -280,12 +281,12 @@ func (s *PgStore) SetTrackingPolicy(ctx context.Context, p *domain.TrackingPolic
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var currentVersion int
-		var policyID string
+		var policyID, priorNegativeStock string
 		err := tx.QueryRow(ctx, `
 			UPDATE inventory_tracking_policies SET effective_to = $1
 			WHERE tenant_id = $2 AND item_id = $3 AND effective_to IS NULL
-			RETURNING policy_id, version
-		`, at, tenantID, p.ItemID).Scan(&policyID, &currentVersion)
+			RETURNING policy_id, version, negative_stock_policy
+		`, at, tenantID, p.ItemID).Scan(&policyID, &currentVersion, &priorNegativeStock)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
@@ -296,14 +297,22 @@ func (s *PgStore) SetTrackingPolicy(ctx context.Context, p *domain.TrackingPolic
 			p.PolicyID = uuidNewString()
 			p.Version = 1
 		}
+		// Omitted -> carry the prior version's value forward, else the safe
+		// default. A new version must never silently flip the policy.
+		if p.NegativeStockPolicy == "" {
+			p.NegativeStockPolicy = priorNegativeStock
+		}
+		if p.NegativeStockPolicy == "" {
+			p.NegativeStockPolicy = domain.NegativeStockProhibited
+		}
 		_, err = tx.Exec(ctx, `
 			INSERT INTO inventory_tracking_policies (
 				policy_version_id, policy_id, version, tenant_id, item_id,
-				requires_lot_tracking, requires_serial_tracking, requires_expiry_tracking,
+				requires_lot_tracking, requires_serial_tracking, requires_expiry_tracking, negative_stock_policy,
 				effective_from, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		`, p.PolicyVersionID, p.PolicyID, p.Version, tenantID, p.ItemID,
-			p.RequiresLotTracking, p.RequiresSerialTracking, p.RequiresExpiryTracking,
+			p.RequiresLotTracking, p.RequiresSerialTracking, p.RequiresExpiryTracking, p.NegativeStockPolicy,
 			p.EffectiveFrom, p.CreatedAt, p.CreatedByPrincipalID)
 		return err
 	})

@@ -17,6 +17,7 @@ import (
 	"zoiko.io/payable-open-item-svc/internal/events"
 	"zoiko.io/payable-open-item-svc/internal/handler"
 	"zoiko.io/payable-open-item-svc/internal/middleware"
+	"zoiko.io/payable-open-item-svc/internal/paymentstatus"
 )
 
 // ── stub publisher ───────────────────────────────────────────────────────────
@@ -41,14 +42,37 @@ func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
 	return nil
 }
 
+// ── stub BNK-07 ─────────────────────────────────────────────────────────────
+
+// stubBank reports every payment SETTLED for testLegalEntity unless a test
+// overrides it.
+type stubBank struct {
+	states map[string]paymentstatus.PaymentState
+	fail   bool
+}
+
+func (b *stubBank) GetStatus(_ context.Context, _, paymentID string) (*paymentstatus.PaymentState, error) {
+	if b.fail {
+		return nil, paymentstatus.ErrUnavailable
+	}
+	if s, ok := b.states[paymentID]; ok {
+		return &s, nil
+	}
+	return &paymentstatus.PaymentState{PaymentID: paymentID, LegalEntityID: testLegalEntity, Status: "SETTLED"}, nil
+}
+
 // ── test harness ─────────────────────────────────────────────────────────────
 
 const testTenant = "tenant-ap08-1"
 const testLegalEntity = "le-ap08-1"
 
 func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz) chi.Router {
+	return newTestRouterWithBank(st, pub, az, &stubBank{states: map[string]paymentstatus.PaymentState{}})
+}
+
+func newTestRouterWithBank(st *stubStore, pub *stubPublisher, az *stubAuthz, bank *stubBank) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, logger)
+	h := handler.New(st, pub, az, bank, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -128,7 +152,7 @@ func TestApplyConfirmedPayment_PartialThenFull(t *testing.T) {
 	p := createPayable(t, r, "claim-3", 100)
 
 	w := doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment",
-		domain.ApplyConfirmedPaymentRequest{Amount: 60, ProviderPaymentRef: "pay-evt-1"}, testTenant)
+		domain.ApplyConfirmedPaymentRequest{Amount: 60, ProviderPaymentRef: "pay-evt-1", Bnk07PaymentID: "pay-evt-1"}, testTenant)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -141,7 +165,7 @@ func TestApplyConfirmedPayment_PartialThenFull(t *testing.T) {
 	}
 
 	w = doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment",
-		domain.ApplyConfirmedPaymentRequest{Amount: 40, ProviderPaymentRef: "pay-evt-2"}, testTenant)
+		domain.ApplyConfirmedPaymentRequest{Amount: 40, ProviderPaymentRef: "pay-evt-2", Bnk07PaymentID: "pay-evt-2"}, testTenant)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -160,7 +184,7 @@ func TestApplyConfirmedPayment_ReplayedRef_Idempotent(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
 	p := createPayable(t, r, "claim-4", 100)
 
-	req := domain.ApplyConfirmedPaymentRequest{Amount: 100, ProviderPaymentRef: "pay-evt-dup"}
+	req := domain.ApplyConfirmedPaymentRequest{Amount: 100, ProviderPaymentRef: "pay-evt-dup", Bnk07PaymentID: "pay-evt-dup"}
 	doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment", req, testTenant)
 
 	w := doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment", req, testTenant)
@@ -183,9 +207,78 @@ func TestApplyConfirmedPayment_ExceedsResidual_Blocked(t *testing.T) {
 	p := createPayable(t, r, "claim-5", 100)
 
 	w := doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment",
-		domain.ApplyConfirmedPaymentRequest{Amount: 150, ProviderPaymentRef: "pay-evt-over"}, testTenant)
+		domain.ApplyConfirmedPaymentRequest{Amount: 150, ProviderPaymentRef: "pay-evt-over", Bnk07PaymentID: "pay-evt-over"}, testTenant)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 residual would go negative, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestApplyConfirmedPayment_NotSettledAtBank_Refused is negative-path #35:
+// no payable is settled unless BNK-07 itself reports the payment SETTLED
+// for this legal entity with no open conflict.
+func TestApplyConfirmedPayment_NotSettledAtBank_Refused(t *testing.T) {
+	cases := map[string]paymentstatus.PaymentState{
+		"only submitted":     {LegalEntityID: testLegalEntity, Status: "SUBMITTED"},
+		"other legal entity": {LegalEntityID: "le-other", Status: "SETTLED"},
+		"open conflict":      {LegalEntityID: testLegalEntity, Status: "SETTLED", HasOpenConflict: true},
+		"unknown to banking": {},
+	}
+	for name, state := range cases {
+		t.Run(name, func(t *testing.T) {
+			st := newStubStore()
+			bank := &stubBank{states: map[string]paymentstatus.PaymentState{"pay-x": state}}
+			r := newTestRouterWithBank(st, &stubPublisher{}, &stubAuthz{}, bank)
+			p := createPayable(t, r, "claim-bank-"+name, 100)
+
+			w := doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment",
+				domain.ApplyConfirmedPaymentRequest{Amount: 100, ProviderPaymentRef: "pay-x", Bnk07PaymentID: "pay-x"}, testTenant)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+			}
+			if st.payables[p.PayableID].ResidualAmount != 100 {
+				t.Fatalf("expected nothing applied, residual %.2f", st.payables[p.PayableID].ResidualAmount)
+			}
+		})
+	}
+}
+
+func TestApplyConfirmedPayment_BankingUnavailable_FailsClosed(t *testing.T) {
+	r := newTestRouterWithBank(newStubStore(), &stubPublisher{}, &stubAuthz{}, &stubBank{fail: true})
+	p := createPayable(t, r, "claim-bank-down", 100)
+	w := doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment",
+		domain.ApplyConfirmedPaymentRequest{Amount: 100, ProviderPaymentRef: "pay-y", Bnk07PaymentID: "pay-y"}, testTenant)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestApplyConfirmedPayment_MissingBankingReference_Rejected(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	p := createPayable(t, r, "claim-no-ref", 100)
+	w := doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment",
+		domain.ApplyConfirmedPaymentRequest{Amount: 100, ProviderPaymentRef: "pay-z"}, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without bnk07_payment_id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestApplyConfirmedPayment_NetPlusWithholding_FullySettles: paying 90 net
+// with 10 withheld extinguishes a 100 liability.
+func TestApplyConfirmedPayment_NetPlusWithholding_FullySettles(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	p := createPayable(t, r, "inv-wht", 100)
+
+	w := doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment",
+		domain.ApplyConfirmedPaymentRequest{Amount: 90, WithholdingAmount: 10, ProviderPaymentRef: "pay-wht", Bnk07PaymentID: "pay-wht"}, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Payable domain.PayableOpenItem `json:"payable"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Payable.Status != domain.StatusSettled || resp.Payable.ResidualAmount != 0 {
+		t.Fatalf("expected SETTLED residual 0, got %s / %.2f", resp.Payable.Status, resp.Payable.ResidualAmount)
 	}
 }
 
@@ -249,7 +342,7 @@ func TestClosePayable_RequiresFullySettledAndNotHeldOrDisputed(t *testing.T) {
 	}
 
 	doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment",
-		domain.ApplyConfirmedPaymentRequest{Amount: 100, ProviderPaymentRef: "pay-close-1"}, testTenant)
+		domain.ApplyConfirmedPaymentRequest{Amount: 100, ProviderPaymentRef: "pay-close-1", Bnk07PaymentID: "pay-close-1"}, testTenant)
 
 	w = doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/close", nil, testTenant)
 	if w.Code != http.StatusOK {
@@ -261,7 +354,7 @@ func TestClosePayable_HeldBlocksClose(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
 	p := createPayable(t, r, "claim-11", 100)
 	doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/apply-confirmed-payment",
-		domain.ApplyConfirmedPaymentRequest{Amount: 100, ProviderPaymentRef: "pay-close-2"}, testTenant)
+		domain.ApplyConfirmedPaymentRequest{Amount: 100, ProviderPaymentRef: "pay-close-2", Bnk07PaymentID: "pay-close-2"}, testTenant)
 	doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/hold", domain.PlaceHoldRequest{Reason: "audit hold"}, testTenant)
 
 	w := doRequest(r, http.MethodPost, "/ap08/payables/"+p.PayableID+"/close", nil, testTenant)

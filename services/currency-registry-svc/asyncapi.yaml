@@ -1,0 +1,182 @@
+asyncapi: 2.6.0
+
+# currency-registry-svc events (spec REF-02), all on one topic:
+#   zoiko.currency-registry.events
+#
+# WHAT A CONSUMER MUST KNOW
+#
+# 1. EVERY EVENT GOES THROUGH THE TRANSACTIONAL OUTBOX: written in the same
+#    transaction as the state change, delivered afterwards by a relay.
+#    Delivery is AT-LEAST-ONCE; consumers must be idempotent (use event_id, or
+#    object_id + object_version).
+#
+# 2. THE ENVELOPE IS BUILT AT STATE-CHANGE TIME; emitted_at is the recorded_at
+#    of the change and can precede the moment the message reaches the topic.
+#
+# 3. tenant_id IS THE ACTOR'S TENANT CONTEXT, NOT AN OWNER. Currencies are
+#    global reference data. For payload.scope = GLOBAL, tenant_id names the
+#    tenant context the initiating actor operated in (the platform stewards'
+#    tenant); every consumer in every tenant must treat the fact as applying to
+#    all tenants. For payload.scope = TENANT (tenant overlay changes),
+#    tenant_id is the tenant whose overlay changed and ONLY that tenant's
+#    consumers should act on it.
+#
+# 4. MESSAGES ARE KEYED BY object_id (currency_id; import_id for
+#    CurrencyImportQuarantined), so events about one currency are ordered on one
+#    partition. No ordering across currencies.
+#
+# 5. object_version is the currency's version after the change (for overlay
+#    events, the overlay row's version, with object_id still the currency_id).
+#    Consumers that persist "the currency version I applied" use these values
+#    and the minor-unit valid_from from the :validate response.
+#
+# 6. NO event carries secrets or personal data; actors are opaque principal ids.
+
+info:
+  title: currency-registry-svc events
+  version: "0.1.0"
+
+servers:
+  local:
+    url: kafka:9094
+    protocol: kafka
+
+channels:
+  zoiko.currency-registry.events:
+    description: Currency registry lifecycle and reference-data events.
+    subscribe:
+      operationId: onCurrencyRegistryEvent
+      message:
+        oneOf:
+          - $ref: '#/components/messages/CurrencyUpdated'
+          - $ref: '#/components/messages/CurrencySupportChanged'
+          - $ref: '#/components/messages/CurrencyRetired'
+          - $ref: '#/components/messages/CurrencyImportQuarantined'
+
+components:
+  messages:
+    CurrencyUpdated:
+      name: CurrencyUpdated
+      summary: A currency was introduced or its name/flag/minor unit changed by an applied import.
+      description: |
+        change_kind: CREATED | MINOR_UNIT_CHANGED | ATTRIBUTES_CHANGED |
+        MINOR_UNIT_AND_ATTRIBUTES_CHANGED. A minor-unit change appends a new
+        minor-unit version effective at effective_at; earlier versions (and the
+        precision of historical amounts) are unchanged.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/CommonPayload'
+                  - type: object
+                    properties:
+                      alpha_code: { type: string }
+                      numeric_code: { type: string }
+                      change_kind: { type: string }
+                      status: { type: string }
+                      minor_unit: { type: integer }
+                      previous_minor_unit: { type: integer }
+                      import_id: { type: string }
+                      source_name: { type: string }
+                      source_version: { type: string }
+
+    CurrencySupportChanged:
+      name: CurrencySupportChanged
+      summary: Platform support status changed (activate/restrict) - or a tenant overlay was enabled/disabled.
+      description: |
+        scope GLOBAL: previous_status/new_status of the currency.
+        scope TENANT: `enabled` is the tenant overlay's new state.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/CommonPayload'
+                  - type: object
+                    properties:
+                      alpha_code: { type: string }
+                      numeric_code: { type: string }
+                      previous_status: { type: string }
+                      new_status: { type: string }
+                      enabled: { type: boolean }
+                      currency_version: { type: integer }
+                      reason: { type: string }
+                      approver: { type: string }
+
+    CurrencyRetired:
+      name: CurrencyRetired
+      summary: A currency was retired (terminal). It remains readable for history; new postings must be refused.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/CommonPayload'
+                  - type: object
+                    properties:
+                      alpha_code: { type: string }
+                      numeric_code: { type: string }
+                      previous_status: { type: string }
+                      new_status: { type: string }
+                      reason: { type: string }
+                      approver: { type: string }
+
+    CurrencyImportQuarantined:
+      name: CurrencyImportQuarantined
+      summary: An import failed validation; the whole import was quarantined and nothing was applied.
+      description: object_id is the import_id; object_version is always 1.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/CommonPayload'
+                  - type: object
+                    properties:
+                      source_name: { type: string }
+                      source_version: { type: string }
+                      manifest_hash: { type: string }
+                      row_count: { type: integer }
+                      error_count: { type: integer }
+                      quarantine_reason: { type: string }
+
+  schemas:
+    Envelope:
+      type: object
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, tenant_id, payload]
+      properties:
+        event_id: { type: string, description: "evt-<uuid>; unique per event" }
+        event_type: { type: string, enum: [CurrencyUpdated, CurrencySupportChanged, CurrencyRetired, CurrencyImportQuarantined] }
+        event_version: { type: string, example: "1.0" }
+        emitted_at: { type: string, format: date-time }
+        schema_version: { type: string, example: "1.0" }
+        source_service: { type: string, enum: [currency-registry-svc] }
+        tenant_id: { type: string, description: "actor's tenant context - see note 3" }
+        actor_id: { type: string }
+        correlation_id: { type: string }
+        causation_id: { type: string }
+        payload: { type: object }
+
+    CommonPayload:
+      type: object
+      required: [scope, tenant_id, object_type, object_id, object_version, effective_at, recorded_at, actor, correlation_id]
+      properties:
+        scope: { type: string, enum: [GLOBAL, TENANT] }
+        tenant_id: { type: string }
+        object_type: { type: string, enum: [currency, currency_import, tenant_currency_support] }
+        object_id: { type: string }
+        object_version: { type: integer }
+        effective_at: { type: string, format: date-time }
+        recorded_at: { type: string, format: date-time }
+        actor: { type: string }
+        correlation_id: { type: string }
+        causation_id: { type: string }

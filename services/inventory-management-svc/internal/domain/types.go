@@ -75,12 +75,21 @@ type TrackingPolicy struct {
 	RequiresSerialTracking bool `json:"requires_serial_tracking"`
 	RequiresExpiryTracking bool `json:"requires_expiry_tracking"`
 
+	// NegativeStockPolicy is PROHIBITED (default) or ALLOWED — spec
+	// invariant 11, "Negative inventory behavior is explicit policy."
+	NegativeStockPolicy string `json:"negative_stock_policy"`
+
 	EffectiveFrom time.Time  `json:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
 
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }
+
+const (
+	NegativeStockProhibited = "PROHIBITED"
+	NegativeStockAllowed    = "ALLOWED"
+)
 
 // ValuationPolicy is INV-01's own "valuation-policy reference" —
 // versioned, effective-dated, and — per SetValuationPolicyFutureEffective's
@@ -125,6 +134,9 @@ type SetTrackingPolicyRequest struct {
 	RequiresLotTracking    bool `json:"requires_lot_tracking"`
 	RequiresSerialTracking bool `json:"requires_serial_tracking"`
 	RequiresExpiryTracking bool `json:"requires_expiry_tracking"`
+	// NegativeStockPolicy is optional: empty carries forward the current
+	// version's value (PROHIBITED if the item has no prior policy).
+	NegativeStockPolicy string `json:"negative_stock_policy,omitempty"`
 }
 
 type SetValuationPolicyRequest struct {
@@ -395,6 +407,17 @@ type CreateInventoryMovementRequest struct {
 	BusinessDate          *time.Time `json:"business_date,omitempty"`
 	FiscalPeriod          string     `json:"fiscal_period"`
 	Reason                string     `json:"reason,omitempty"`
+	// APReceiptID links a RECEIPT to the AP-03 goods/service receipt it
+	// came from, so INV-04 can reclass the cost AP already accrued to
+	// expense (see migration 000008). RECEIPT only.
+	APReceiptID string `json:"ap_receipt_id,omitempty"`
+}
+
+// RunInboundValue splits a valuation run's INBOUND value by whether the
+// movement is linked to an AP-03 receipt.
+type RunInboundValue struct {
+	ReceiptLinked float64
+	Unlinked      float64
 }
 
 type ReverseMovementRequest struct {
@@ -459,6 +482,16 @@ var (
 	// "Negative stock allowed despite policy prohibition" — no
 	// per-item/location override exists in this v1, refused universally.
 	ErrNegativeStockNotAllowed = errorString("this movement would take on-hand quantity below zero")
+
+	ErrInvalidNegativeStockPolicy = errorString("negative_stock_policy must be PROHIBITED or ALLOWED")
+
+	ErrLandedCostNotFound         = errorString("landed cost allocation not found")
+	ErrNoCostLayerForMovement     = errorString("this movement has no cost layer — only a valued RECEIPT can take landed cost")
+	ErrLandedCostNotApplicable    = errorString("landed cost cannot be allocated to an item valued at STANDARD_COST (it is a variance, not a layer cost)")
+	ErrLandedCostKeyConflict      = errorString("this idempotency key was already used for a different landed cost allocation")
+
+	ErrReceiptLinkConflict       = errorString("this movement is already linked to a different AP receipt")
+	ErrAPReceiptOnlyForReceipt   = errorString("ap_receipt_id is only valid on a RECEIPT movement")
 
 	ErrPeriodCheckUnavailable = errorString("financial-close-svc unavailable")
 	ErrPeriodLocked           = errorString("cannot commit a movement into a LOCKED fiscal period")
@@ -598,6 +631,50 @@ type RecordWriteDownRequest struct {
 
 type ReverseWriteDownRequest struct {
 	Reason string `json:"reason"`
+}
+
+const (
+	LandedCostStatusPendingPosting        = "PENDING_POSTING"
+	LandedCostStatusAccountingEventEmitted = "ACCOUNTING_EVENT_EMITTED"
+)
+
+// LandedCostAllocation is INV-04's AllocateLandedCost record — see migration
+// 000009. InventoryShare raises the layer's remaining units' cost;
+// COGSShare trues up cost of the units already consumed.
+type LandedCostAllocation struct {
+	AllocationID                  string     `json:"allocation_id"`
+	LegalEntityID                 string     `json:"legal_entity_id"`
+	ItemID                        string     `json:"item_id"`
+	LocationID                    string     `json:"location_id"`
+	MovementID                    string     `json:"movement_id"`
+	LayerID                       string     `json:"layer_id"`
+	IdempotencyKey                string     `json:"idempotency_key"`
+	Amount                        float64    `json:"amount"`
+	InventoryShare                float64    `json:"inventory_share"`
+	COGSShare                     float64    `json:"cogs_share"`
+	RemainingQuantityAtAllocation float64    `json:"remaining_quantity_at_allocation"`
+	UnitUplift                    float64    `json:"unit_uplift"`
+	ValuationEvidenceRef          string     `json:"valuation_evidence_ref"`
+	FiscalPeriod                  string     `json:"fiscal_period"`
+	InventoryAccountCode          string     `json:"inventory_account_code"`
+	COGSAccountCode               string     `json:"cogs_account_code"`
+	OffsetAccountCode             string     `json:"offset_account_code"`
+	Status                        string     `json:"status"`
+	JournalID                     *string    `json:"journal_id,omitempty"`
+	CreatedAt                     time.Time  `json:"created_at"`
+	CreatedByPrincipalID          string     `json:"created_by_principal_id"`
+	EmittedAt                     *time.Time `json:"emitted_at,omitempty"`
+}
+
+type AllocateLandedCostRequest struct {
+	MovementID           string  `json:"movement_id"`
+	IdempotencyKey       string  `json:"idempotency_key"`
+	Amount               float64 `json:"amount"`
+	ValuationEvidenceRef string  `json:"valuation_evidence_ref"`
+	FiscalPeriod         string  `json:"fiscal_period"` // the CURRENT open period the correction posts in
+	InventoryAccountCode string  `json:"inventory_account_code"`
+	COGSAccountCode      string  `json:"cogs_account_code"`
+	OffsetAccountCode    string  `json:"offset_account_code"` // credited with the full amount (e.g. freight payable/accrual)
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────
@@ -762,6 +839,12 @@ var (
 	ErrLineNotYetCounted = errorString("this line has not been counted yet")
 
 	ErrNoVarianceApprovedLines = errorString("no variance-approved lines were found to generate adjustments for")
+
+	// ErrUnresolvedCountVariance blocks CertifyStockCount while any line
+	// still carries an observed variance that has not been turned into an
+	// adjustment movement — spec §9 "Stock count": "Unapproved variance
+	// cannot be hidden or directly cleared."
+	ErrUnresolvedCountVariance = errorString("stock count has lines with an observed variance that has not been approved and adjusted; it cannot be certified")
 )
 
 // ── BIZ-07 Product & Service Catalog ────────────────────────────────────────
@@ -927,3 +1010,78 @@ var (
 
 	ErrInvalidMappingType = errorString("mapping_type must be one of TAX, ACCOUNTING, PRODUCT")
 )
+
+// ── INV-04 RecalculateValuation / RebuildCostLayersControlled (migration 000010) ──
+
+var (
+	// ErrRebuildReasonRequired — a rebuild is a controlled correction; the
+	// reason is part of the audit row.
+	ErrRebuildReasonRequired = errorString("reason is required for a controlled cost-layer rebuild")
+	// ErrLayerOverConsumed — consumption evidence exceeds the layer's
+	// original quantity, so the expected remaining would be negative. That is
+	// corrupt evidence, not drift: it is never auto-fixed.
+	ErrLayerOverConsumed = errorString("a cost layer's consumption evidence exceeds its original quantity; this cannot be rebuilt automatically")
+)
+
+// LayerRecalcRow is one cost layer's recorded state against the state
+// recomputed purely from immutable evidence (original quantity, layer
+// consumptions, the INBOUND valuation entry, landed-cost allocations).
+type LayerRecalcRow struct {
+	LayerID            string  `json:"layer_id"`
+	SourceMovementID   string  `json:"source_movement_id"`
+	OriginalQuantity   float64 `json:"original_quantity"`
+	RemainingQuantity  float64 `json:"remaining_quantity"`
+	ExpectedRemaining  float64 `json:"expected_remaining_quantity"`
+	UnitCost           float64 `json:"unit_cost"`
+	ExpectedUnitCost   float64 `json:"expected_unit_cost"`
+	QuantityDrift      bool    `json:"quantity_drift"`
+	CostDrift          bool    `json:"cost_drift"`
+	OverConsumed       bool    `json:"over_consumed"`
+}
+
+// ValuationRecalculation is the read-only RecalculateValuation result.
+type ValuationRecalculation struct {
+	ItemID        string           `json:"item_id"`
+	LocationID    string           `json:"location_id"`
+	Layers        []LayerRecalcRow `json:"layers"`
+	RecordedValue float64          `json:"recorded_value"`
+	ExpectedValue float64          `json:"expected_value"`
+	DriftDetected bool             `json:"drift_detected"`
+}
+
+type RecalculateValuationRequest struct {
+	ItemID     string `json:"item_id"`
+	LocationID string `json:"location_id"`
+}
+
+type RebuildCostLayersRequest struct {
+	ItemID     string `json:"item_id"`
+	LocationID string `json:"location_id"`
+	Reason     string `json:"reason"`
+}
+
+// LayerRebuild is one append-only audit row of inventory_layer_rebuilds.
+type LayerRebuild struct {
+	RebuildID            string    `json:"rebuild_id"`
+	LayerID              string    `json:"layer_id"`
+	OldRemaining         float64   `json:"old_remaining"`
+	NewRemaining         float64   `json:"new_remaining"`
+	Reason               string    `json:"reason"`
+	RebuiltByPrincipalID string    `json:"rebuilt_by_principal_id"`
+	CreatedAt            time.Time `json:"created_at"`
+}
+
+// CostLayerRebuildResult is the RebuildCostLayersControlled result. Value
+// before/after is reported so a reconciliation owner can see any effect on
+// inventory value; nothing is posted to the GL by this command.
+type CostLayerRebuildResult struct {
+	ItemID              string         `json:"item_id"`
+	LocationID          string         `json:"location_id"`
+	Rebuilt             int            `json:"rebuilt"`
+	Rebuilds            []LayerRebuild `json:"rebuilds"`
+	ValueBefore         float64        `json:"value_before"`
+	ValueAfter          float64        `json:"value_after"`
+	CostDriftLayerIDs   []string       `json:"cost_drift_layer_ids"`
+	CostDriftNotFixed   bool           `json:"cost_drift_not_fixed"`
+	GLNotPosted         bool           `json:"gl_not_posted"`
+}

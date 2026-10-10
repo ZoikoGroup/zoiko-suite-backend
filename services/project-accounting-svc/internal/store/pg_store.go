@@ -12,6 +12,7 @@
 package store
 
 import (
+	"math"
 	"context"
 	"errors"
 	"fmt"
@@ -40,7 +41,7 @@ func uuidNewString() string {
 // imprecise. Same helper this platform already uses in
 // financial-close-svc/asset-management-svc/inventory-management-svc.
 func roundCents(v float64) float64 {
-	return float64(int64(v*100+0.5)) / 100
+	return math.Round(v*100) / 100 // half away from zero; the old int64(v*100+0.5) truncated toward zero and lost a cent on negatives
 }
 
 type PgStore struct {

@@ -37,6 +37,11 @@ func (c *stubCloseForPolicy) CheckPeriodOpen(_ context.Context, _, _, _ string) 
 	}
 }
 
+// CheckPeriodOpenAt returns exactly what CheckPeriodOpen does, like the real client.
+func (c *stubCloseForPolicy) CheckPeriodOpenAt(ctx context.Context, tenantID string, ref close.PeriodRef) error {
+	return c.CheckPeriodOpen(ctx, tenantID, ref.LegalEntityID, ref.PeriodName)
+}
+
 var _ close.Client = (*stubCloseForPolicy)(nil)
 
 // selectiveAuthZ allows all actions except one specific action to test authz denial

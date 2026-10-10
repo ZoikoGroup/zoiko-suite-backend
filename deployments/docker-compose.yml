@@ -72,6 +72,9 @@ services:
       - ../services/procurement-workflow-svc/deployments/migrations:/migrations/procurement-workflow:ro
       - ../services/performance-review-svc/deployments/migrations:/migrations/performance-review:ro
       - ../services/delegated-authority-svc/deployments/migrations:/migrations/delegated-authority:ro
+      - ../services/currency-registry-svc/deployments/migrations:/migrations/currency-registry:ro
+      - ../services/fiscal-calendar-svc/deployments/migrations:/migrations/fiscal-calendar:ro
+      - ../services/accounting-period-svc/deployments/migrations:/migrations/accounting-period:ro
       - ../services/access-control-svc/deployments/migrations:/migrations/access-control:ro
       - ../services/decision-support-svc/deployments/migrations:/migrations/decision-support:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
@@ -1603,6 +1606,13 @@ services:
       - "8098:8098"
     environment:
       PORT: "8098"
+      # REF-05 cutover phase 2. off = today's behavior exactly. shadow = also ask
+      # accounting-period-svc by posting date and COMPARE (never changes the
+      # outcome). "enforce" is rejected at startup: that is phase 4 and needs
+      # separate sign-off. Leave off until periods are backfilled, or every
+      # comparison reports not_found.
+      PERIOD_GATE_MODE: "off"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: general_ledger
@@ -1750,6 +1760,10 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-order.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PURCHASE_REQUEST_SERVICE_URL: "http://purchase-request-svc:8100"
+      SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
+      PROCUREMENT_WORKFLOW_SERVICE_URL: "http://procurement-workflow-svc:8134"
+      PO_HIGH_VALUE_THRESHOLD: "${PO_HIGH_VALUE_THRESHOLD:-0}"
+      PO_OVER_TOLERANCE_PERCENT: "${PO_OVER_TOLERANCE_PERCENT:-0}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2149,6 +2163,130 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # Currency Registry Service (REF-02). Global reference data: ISO 4217
+  # currencies, versioned minor-unit metadata and the platform support
+  # lifecycle. Owns NO FX rates, functional-currency assignment or amounts.
+  # Reads (validate/get/list) do not call authorization-svc; commands do and
+  # fail closed. Port 8172 was the next unused service port at the time of
+  # writing (8171 was the highest registered).
+  currency-registry-svc:
+    build:
+      context: ../services/currency-registry-svc
+      dockerfile: Dockerfile
+    container_name: currency-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8172:8172"
+    environment:
+      PORT: "8172"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: currency_registry
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.currency-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8172/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Fiscal Calendar Service (REF-04). Calendar definitions and versions as data;
+  # deterministic period preview. Owns NO period state (REF-05) and NO postings.
+  # Activating a non-first calendar version asks accounting-period-svc whether
+  # periods are already closed, and fails closed if it cannot be reached.
+  # Needs authz actions FISCAL_CALENDAR_PROPOSE / _APPROVE / _ACTIVATE seeded.
+  fiscal-calendar-svc:
+    build:
+      context: ../services/fiscal-calendar-svc
+      dockerfile: Dockerfile
+    container_name: fiscal-calendar-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8173:8173"
+    environment:
+      PORT: "8173"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: fiscal_calendar
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.fiscal-calendar.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8173/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Accounting Period Service (REF-05). Authoritative period state and the
+  # posting gate. A missing period is "not allowed", never OPEN. Close and
+  # reopen commands are refused until financial-close-svc serves
+  # /v1/close/workflow-refs/{ref} (not built yet) — fail closed by design.
+  # Needs authz actions PERIOD_STATE_COMMAND / PERIOD_MATERIALIZE seeded.
+  accounting-period-svc:
+    build:
+      context: ../services/accounting-period-svc
+      dockerfile: Dockerfile
+    container_name: accounting-period-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8174:8174"
+    environment:
+      PORT: "8174"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: accounting_period
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.accounting-period.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      FISCAL_CALENDAR_URL: "http://fiscal-calendar-svc:8173"
+      FINANCIAL_CLOSE_URL: "http://financial-close-svc:8104"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8174/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   # Access Control Service — 03-microservices.md §9.4. Owns role/permission-
   # bundle DEFINITIONS (the catalogue); previously unbuilt. Scope decision:
   # authorization-svc keeps owning live RBAC role/assignment data — this
@@ -2442,6 +2580,14 @@ services:
       - "8104:8104"
     environment:
       PORT: "8104"
+      # REF-05 cutover phase 1. The mirror is best-effort dual-write of lock and
+      # reopen into accounting-period-svc; financial-close-svc stays
+      # authoritative. off = no outbound calls, no workflow refs written. The
+      # provenance endpoint /v1/close/workflow-refs/{ref} is served either way.
+      PERIOD_SERVICE_MIRROR: "off"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
+      WORKFLOW_REF_CALLERS: "accounting-period-svc"
+      PERIOD_MIRROR_REOPEN_WINDOW: "24h"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: financial_close
@@ -4314,6 +4460,15 @@ services:
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PURCHASE_ORDER_SERVICE_URL: "http://purchase-order-svc:8129"
       GENERAL_LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      # Service identities for the two background workers. Deliberately no
+      # default: while one is empty its worker stays off and the work waits
+      # PENDING (visible, nothing lost) rather than acting under an invented id.
+      #   ACCOUNTING_PRINCIPAL_ID  must hold GL_POSTING_EXECUTE (GRNI postings).
+      #   PO_PROGRESS_PRINCIPAL_ID must hold PO_PROGRESS_RECORD (received-quantity
+      #                            deltas to purchase-order-svc).
+      ACCOUNTING_PRINCIPAL_ID: "${GOODS_RECEIPT_ACCOUNTING_PRINCIPAL_ID:-}"
+      PO_PROGRESS_PRINCIPAL_ID: "${GOODS_RECEIPT_PO_PROGRESS_PRINCIPAL_ID:-}"
+      OVER_RECEIPT_TOLERANCE_PCT: "${OVER_RECEIPT_TOLERANCE_PCT:-0}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4368,6 +4523,9 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.payable-open-item.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # BNK-07: a payment is applied to a payable only once Banking reports
+      # it SETTLED. Not a depends_on (AP-08 fails closed per call instead).
+      PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4614,6 +4772,12 @@ services:
       SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
       PAYEE_IDENTITY_SERVICE_URL: "http://payee-banking-identity-svc:8166"
       POLICY_SERVICE_URL: "http://policy-svc:8085"
+      # AP-10 controls: how long an unused authorization stays valid, how often
+      # overdue ones are expired, and how many distinct signers a high-value
+      # payment needs.
+      AUTHORIZATION_TTL: "24h"
+      EXPIRY_SWEEP_INTERVAL: "1m"
+      HIGH_VALUE_REQUIRED_SIGNATURES: "2"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4680,6 +4844,14 @@ services:
       PAYMENT_AUTHORIZATION_SERVICE_URL: "http://payment-authorization-svc:8160"
       PAYMENT_INITIATION_ADAPTER_URL: "http://payment-initiation-adapter-svc:8162"
       PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
+      PAYMENT_PROPOSAL_SERVICE_URL: "http://payment-proposal-svc:8159"
+      PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
+      # ACC-04 settlement postings. The principal must hold GL_POSTING_EXECUTE in
+      # authorization-svc (an internal service identity, never a human role).
+      # Deliberately no default: while it is empty the dispatcher stays off and
+      # posting requests wait PENDING rather than posting under an invented id.
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      ACCOUNTING_PRINCIPAL_ID: "${PAYMENT_RUN_ACCOUNTING_PRINCIPAL_ID:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4692,6 +4864,10 @@ services:
       payment-initiation-adapter-svc:
         condition: service_healthy
       payment-status-svc:
+        condition: service_healthy
+      payment-proposal-svc:
+        condition: service_healthy
+      payable-open-item-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

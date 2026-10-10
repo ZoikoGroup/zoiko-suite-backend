@@ -432,6 +432,7 @@ type AssetEvent struct {
 	CreditAccountCode        *string   `json:"credit_account_code,omitempty"`
 	JournalID                *string   `json:"journal_id,omitempty"`
 	CorrectionOfEventID      *string   `json:"correction_of_event_id,omitempty"`
+	BookID                   *string   `json:"book_id,omitempty"` // IMPAIRMENT/REVALUATION/ADDITION: the book whose schedule is re-based
 
 	CreatedAt               time.Time  `json:"created_at"`
 	CreatedByPrincipalID    string     `json:"created_by_principal_id"`
@@ -468,6 +469,7 @@ type CreateAssetEventRequest struct {
 	DebitAccountCode         string     `json:"debit_account_code,omitempty"`
 	CreditAccountCode        string     `json:"credit_account_code,omitempty"`
 	CorrectionOfEventID      string     `json:"correction_of_event_id,omitempty"`
+	BookID                   string     `json:"book_id,omitempty"`
 }
 
 type ReverseAssetEventRequest struct {
@@ -513,4 +515,17 @@ var (
 	ErrComponentRequiredForReplacement = errorString("component_id is required for a COMPONENT_REPLACEMENT event")
 
 	ErrProceedsRequiredForDisposal = errorString("proceeds_amount is required for a DISPOSAL event")
+
+	// Book re-base (IMPAIRMENT/REVALUATION/ADDITION) errors — see
+	// internal/store/asset_event_rebase.go.
+	ErrBookRequiredForBookEvent = errorString("book_id is required for IMPAIRMENT, REVALUATION and ADDITION events (book-specific values)")
+	ErrNoActiveScheduleForBook  = errorString("asset has no current ACTIVE depreciation schedule for this book — nothing to re-base")
+	ErrRebaseAmountInvalid      = errorString("event amount is missing or not valid for this event type")
+	ErrImpairmentExceedsCarrying = errorString("impairment amount must be less than the current carrying amount")
+	ErrScheduleFullyDepreciated = errorString("schedule has no remaining useful life — cannot re-base")
+	ErrReversalWouldZeroCarrying = errorString("reversal would take the carrying amount to zero or below")
+	ErrReversalOutOfOrder       = errorString("a later re-base exists on this schedule — reverse the later event first")
+	// ErrDepreciationRunInFlight: policy/life/residual changes after
+	// approval invalidate the run — we block instead of silently diverging.
+	ErrDepreciationRunInFlight = errorString("a depreciation run (POPULATION_FROZEN/VALIDATED/APPROVED) includes this schedule — emit or supersede it before re-basing")
 )

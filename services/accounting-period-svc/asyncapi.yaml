@@ -1,0 +1,194 @@
+asyncapi: 2.6.0
+
+# accounting-period-svc events (spec REF-05), all on one topic:
+#   zoiko.accounting-period.events
+#
+# WHAT A CONSUMER MUST KNOW
+#
+# 1. EVERY EVENT GOES THROUGH THE TRANSACTIONAL OUTBOX: written in the same
+#    transaction as the state change, delivered afterwards by a relay.
+#    Delivery is AT-LEAST-ONCE; consumers must be idempotent (use event_id, or
+#    object_id + object_version).
+#
+# 2. EVENTS ARE FACTS, NOT THE GATE. A consumer may use them to invalidate or
+#    refresh views, but must not derive posting permission from them: the gate is
+#    GET /v1/accounting-periods:resolve, which reads the primary. In particular a
+#    REOPEN_AUTHORIZED window EXPIRES WITHOUT ANY EVENT (it is judged at read
+#    time), so an event stream alone can never tell you a reopen has ended.
+#
+# 3. tenant_id IS THE TENANT THAT OWNS THE PERIOD. MESSAGES ARE KEYED BY
+#    object_id (period_id), so events about one period are ordered on one
+#    partition. No ordering across periods.
+#
+# 4. object_version is the period's version after the change; effective_at and
+#    recorded_at are the instant of the change. acc14_workflow_ref is present on
+#    every state event and on PeriodCommandRejected when the caller supplied one.
+#
+# 5. PeriodOpened: ONE EVENT PER PERIOD (a materialisation is capped at 60
+#    periods, so a single transaction always carries them all).
+#
+# 6. PeriodCommandRejected is the SECURITY/CONTROL event (spec negative paths 30
+#    and 31): a close/reopen command was refused for missing or unverified ACC-14
+#    evidence, ACC-14 being unreachable, or segregation of duties. It is recorded
+#    in its own transaction after the refusal. It is only emitted for an existing
+#    period (object_id must be a period_id) and only for evidence/SoD refusals,
+#    not for version conflicts or illegal transitions. Recording is best effort:
+#    if that second transaction fails the command is still refused, and an error
+#    is logged.
+#
+# 7. NO event carries secrets or personal data; actors are opaque principal ids.
+
+info:
+  title: accounting-period-svc events
+  version: "0.1.0"
+
+servers:
+  local:
+    url: kafka:9094
+    protocol: kafka
+
+channels:
+  zoiko.accounting-period.events:
+    description: Accounting period lifecycle events.
+    subscribe:
+      operationId: onAccountingPeriodEvent
+      message:
+        oneOf:
+          - $ref: '#/components/messages/PeriodOpened'
+          - $ref: '#/components/messages/PeriodSoftClosed'
+          - $ref: '#/components/messages/PeriodHardClosed'
+          - $ref: '#/components/messages/PeriodReopened'
+          - $ref: '#/components/messages/PeriodReclosed'
+          - $ref: '#/components/messages/PeriodCommandRejected'
+
+components:
+  messages:
+    PeriodOpened:
+      name: PeriodOpened
+      summary: A period was materialised (state OPEN) from a fiscal-calendar version.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload: {$ref: '#/components/schemas/PeriodPayload'}
+    PeriodSoftClosed:
+      name: PeriodSoftClosed
+      summary: OPEN -> SOFT_CLOSED (RequestSoftClose).
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload: {$ref: '#/components/schemas/PeriodTransitionPayload'}
+    PeriodHardClosed:
+      name: PeriodHardClosed
+      summary: SOFT_CLOSED -> HARD_CLOSED (SetHardClosed). Posting is blocked.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload: {$ref: '#/components/schemas/PeriodTransitionPayload'}
+    PeriodReopened:
+      name: PeriodReopened
+      summary: HARD_CLOSED or RECLOSED -> REOPEN_AUTHORIZED (AuthorizeReopen), time-bound and scoped.
+      description: Carries reopen_book_scope, reopen_module_scope and reopen_expires_at. The window ends at expires_at WITHOUT a further event.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload: {$ref: '#/components/schemas/PeriodTransitionPayload'}
+    PeriodReclosed:
+      name: PeriodReclosed
+      summary: REOPEN_AUTHORIZED -> RECLOSED (ReclosePeriod); a new certified close state.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload: {$ref: '#/components/schemas/PeriodTransitionPayload'}
+    PeriodCommandRejected:
+      name: PeriodCommandRejected
+      summary: Security/control event - a state command was refused for evidence or SoD reasons.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              payload:
+                allOf:
+                  - $ref: '#/components/schemas/BasePayload'
+                  - type: object
+                    properties:
+                      command: {type: string, enum: [SOFT_CLOSE, HARD_CLOSE, AUTHORIZE_REOPEN, RECLOSE]}
+                      rejection_code: {type: string, enum: [CONTEXT_INVALID, SOURCE_UNVERIFIED, DEPENDENCY_UNAVAILABLE, SOD_DENIED]}
+                      rejection_message: {type: string}
+                      period_key: {type: string}
+                      legal_entity_id: {type: string}
+                      state: {type: string}
+                      control_snapshot_ref: {type: string}
+                      reason: {type: string}
+
+  schemas:
+    Envelope:
+      type: object
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, tenant_id, payload]
+      properties:
+        event_id: {type: string}
+        event_type: {type: string}
+        event_version: {type: string, example: "1.0"}
+        emitted_at: {type: string, format: date-time}
+        schema_version: {type: string}
+        source_service: {type: string, enum: [accounting-period-svc]}
+        tenant_id: {type: string}
+        actor_id: {type: string}
+        correlation_id: {type: string}
+        causation_id: {type: string}
+        payload: {type: object}
+    BasePayload:
+      type: object
+      required: [scope, tenant_id, object_type, object_id, object_version, effective_at, recorded_at, actor]
+      properties:
+        scope: {type: string, enum: [TENANT]}
+        tenant_id: {type: string}
+        object_type: {type: string, enum: [accounting_period]}
+        object_id: {type: string, format: uuid, description: period_id}
+        object_version: {type: integer}
+        effective_at: {type: string, format: date-time}
+        recorded_at: {type: string, format: date-time}
+        actor: {type: string}
+        correlation_id: {type: string}
+        causation_id: {type: string}
+        acc14_workflow_ref: {type: string}
+    PeriodPayload:
+      allOf:
+        - $ref: '#/components/schemas/BasePayload'
+        - type: object
+          properties:
+            legal_entity_id: {type: string}
+            calendar_id: {type: string}
+            calendar_version_id: {type: string}
+            book_scope: {type: string}
+            module_scope: {type: string}
+            period_key: {type: string}
+            fiscal_year: {type: integer}
+            period_no: {type: integer}
+            start_date: {type: string, format: date}
+            end_date: {type: string, format: date}
+            kind: {type: string, enum: [NORMAL, SPECIAL]}
+            state: {type: string}
+    PeriodTransitionPayload:
+      allOf:
+        - $ref: '#/components/schemas/PeriodPayload'
+        - type: object
+          properties:
+            command: {type: string}
+            from_state: {type: string}
+            to_state: {type: string}
+            control_snapshot_ref: {type: string}
+            reason: {type: string}
+            reopen_book_scope: {type: string}
+            reopen_module_scope: {type: string}
+            reopen_expires_at: {type: string, format: date-time}

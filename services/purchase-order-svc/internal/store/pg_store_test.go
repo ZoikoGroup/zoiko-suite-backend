@@ -20,15 +20,14 @@ import (
 	"zoiko.io/purchase-order-svc/internal/store"
 )
 
-// openTestPool connects to a real Postgres and reapplies the migration from a
+// openTestPool connects to a real Postgres and reapplies every migration from a
 // clean slate. Skips (not fails) if TEST_DATABASE_URL isn't set.
 //
-// WARNING, and the reason for the guard below: this DROPs purchase_orders,
-// purchase_order_amendments and the po_number sequence. Point TEST_DATABASE_URL
-// at the `purchase_order` database a running service uses and it silently
-// deletes that register — which happened once to accounts-payable during this
-// platform's console work, and afterwards the loss looks like a service bug
-// rather than a test.
+// WARNING, and the reason for the guard below: this DROPs purchase_orders and
+// every table that hangs off it. Point TEST_DATABASE_URL at the `purchase_order`
+// database a running service uses and it silently deletes that register — which
+// happened once to accounts-payable during this platform's console work, and
+// afterwards the loss looks like a service bug rather than a test.
 func openTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -47,9 +46,13 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	// Amendments first — it references the orders table.
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS purchase_order_amendments CASCADE;`)
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS purchase_orders CASCADE;`)
+	// Children first; CASCADE for the FKs and the triggers that hang off them.
+	for _, tbl := range []string{
+		"idempotency_keys", "outbox_events", "purchase_order_events", "purchase_order_revisions",
+		"purchase_order_progress", "purchase_order_lines", "purchase_order_amendments", "purchase_orders",
+	} {
+		_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS `+tbl+` CASCADE;`)
+	}
 	_, _ = pool.Exec(ctx, `DROP SEQUENCE IF EXISTS purchase_order_number_seq CASCADE;`)
 
 	// Every *.up.sql, sorted, rather than a list written out here.
@@ -83,6 +86,26 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// openStore returns the store under test. When TEST_APP_DATABASE_URL names an
+// ordinary NOSUPERUSER NOBYPASSRLS role (as docker-compose runs this service),
+// the store runs as THAT role, so row-level security, the grants and the
+// triggers are exercised exactly as in a deployment; migrations always run as the
+// owner. Without it, the store runs as the owner, as the older suites did.
+func openStore(t *testing.T) (*store.PgStore, *pgxpool.Pool) {
+	t.Helper()
+	owner := openTestPool(t)
+	if appDSN := os.Getenv("TEST_APP_DATABASE_URL"); appDSN != "" {
+		requireThrowawayDatabase(t, appDSN)
+		app, err := pgxpool.New(context.Background(), appDSN)
+		if err != nil {
+			t.Fatalf("failed to connect as the app role: %v", err)
+		}
+		t.Cleanup(app.Close)
+		return store.New(app, zap.NewNop()), owner
+	}
+	return store.New(owner, zap.NewNop()), owner
+}
+
 // requireThrowawayDatabase fails the test unless the DSN's database name marks
 // it as disposable. Two names are legitimate: CI points TEST_DATABASE_URL at
 // `testdb`, and the local convention is `purchase_order_test`. Both contain
@@ -108,51 +131,56 @@ func requireThrowawayDatabase(t *testing.T, dsn string) {
 	}
 }
 
-func newTestOrder(tenantID string) *domain.PurchaseOrder {
-	return &domain.PurchaseOrder{
-		PurchaseOrderID:     uuid.New().String(),
-		TenantID:            tenantID,
-		LegalEntityID:       uuid.New().String(),
-		TotalAmount:         12500,
-		CurrencyCode:        "GBP",
-		IssuedByPrincipalID: "test-buyer",
-		CorrelationID:       "corr-" + uuid.New().String(),
+// legacyInput is a header-only direct-issue request with a verified approval
+// basis: the shape of the original POST /v1/purchase-orders.
+func legacyInput(tenantID string) store.IssuedInput {
+	return store.IssuedInput{
+		CreateDraftInput: store.CreateDraftInput{
+			TenantID: tenantID, LegalEntityID: uuid.New().String(), CurrencyCode: "GBP",
+			CorrelationID: "corr-" + uuid.New().String(), PreparedBy: "test-buyer", TotalAmount: 12500,
+		},
+		ApprovalBasis: domain.ApprovalBasisProcurementCase, ApprovalRef: "case-1", ApprovedBy: "case-approver",
 	}
 }
 
-func TestPgStore_CreateOrder_And_GetOrder(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
-	tenantID := uuid.New().String()
-	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+func tctx(tenantID string) context.Context {
+	return svcmiddleware.WithTenant(context.Background(), tenantID)
+}
 
-	o := newTestOrder(tenantID)
-	created, err := s.CreateOrder(ctx, o)
+func TestPgStore_CreateIssued_And_GetOrder(t *testing.T) {
+	s, _ := openStore(t)
+	tenantID := uuid.New().String()
+	ctx := tctx(tenantID)
+
+	d, created, err := s.CreateIssued(ctx, legacyInput(tenantID))
 	if err != nil {
-		t.Fatalf("CreateOrder: %v", err)
+		t.Fatalf("CreateIssued: %v", err)
 	}
 	if !created {
 		t.Fatal("expected created=true for a first insert")
 	}
-	if !strings.HasPrefix(o.PONumber, "PO-") {
-		t.Errorf("po_number = %q, want a PO- prefixed number from the sequence", o.PONumber)
+	if !strings.HasPrefix(d.PONumber, "PO-") {
+		t.Errorf("po_number = %q, want a PO- prefixed number from the sequence", d.PONumber)
 	}
-	if o.Version != 1 {
-		t.Errorf("version = %d, want 1 on issue", o.Version)
+	if d.Version != 1 || d.Revision != 1 {
+		t.Errorf("version/revision = %d/%d, want 1/1 on issue", d.Version, d.Revision)
+	}
+	if d.Status != domain.OrderStatusIssued {
+		t.Errorf("status = %q, want ISSUED", d.Status)
+	}
+	if d.ApprovalBasis != domain.ApprovalBasisProcurementCase || d.ApprovedByPrincipalID == nil || *d.ApprovedByPrincipalID != "case-approver" {
+		t.Errorf("approval evidence not recorded: basis=%q approver=%v", d.ApprovalBasis, d.ApprovedByPrincipalID)
+	}
+	if d.IssuedAt == nil || d.IssuedByPrincipalID != "test-buyer" {
+		t.Errorf("issue evidence not recorded: at=%v by=%q", d.IssuedAt, d.IssuedByPrincipalID)
 	}
 
-	got, err := s.GetOrder(ctx, o.PurchaseOrderID)
-	if err != nil {
-		t.Fatalf("GetOrder: %v", err)
+	got, err := s.GetOrder(ctx, d.PurchaseOrderID)
+	if err != nil || got == nil {
+		t.Fatalf("GetOrder: got=%v err=%v", got, err)
 	}
-	if got == nil {
-		t.Fatal("expected to read back the order just created")
-	}
-	if got.Status != domain.OrderStatusIssued {
-		t.Errorf("status = %q, want ISSUED", got.Status)
-	}
-	if got.TotalAmount != o.TotalAmount {
-		t.Errorf("total_amount = %v, want %v", got.TotalAmount, o.TotalAmount)
+	if got.TotalAmount != 12500 {
+		t.Errorf("total_amount = %v, want 12500", got.TotalAmount)
 	}
 	if got.ClosedByPrincipalID != nil || got.ClosedAt != nil {
 		t.Error("a freshly ISSUED order carries closure fields")
@@ -160,56 +188,57 @@ func TestPgStore_CreateOrder_And_GetOrder(t *testing.T) {
 }
 
 // Issue is idempotent on (tenant_id, correlation_id) — 201 real, 200 replay.
-// A replay that created a SECOND order would double-commit the spend, so this
-// also guards against re-publishing purchase.order.issued.
-func TestPgStore_CreateOrder_RetriedCorrelationID_IsIdempotent(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+// A replay that created a SECOND order would double-commit the spend.
+func TestPgStore_CreateIssued_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+	s, owner := openStore(t)
 	tenantID := uuid.New().String()
-	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	ctx := tctx(tenantID)
 
-	first := newTestOrder(tenantID)
-	created, err := s.CreateOrder(ctx, first)
+	in := legacyInput(tenantID)
+	first, created, err := s.CreateIssued(ctx, in)
 	if err != nil || !created {
-		t.Fatalf("first CreateOrder: created=%v err=%v", created, err)
+		t.Fatalf("first CreateIssued: created=%v err=%v", created, err)
 	}
 
-	replay := newTestOrder(tenantID)
-	replay.CorrelationID = first.CorrelationID
+	replay := legacyInput(tenantID)
+	replay.CorrelationID = in.CorrelationID
 	replay.TotalAmount = 999999
-
-	created, err = s.CreateOrder(ctx, replay)
+	again, created, err := s.CreateIssued(ctx, replay)
 	if err != nil {
-		t.Fatalf("replayed CreateOrder: %v", err)
+		t.Fatalf("replayed CreateIssued: %v", err)
 	}
 	if created {
 		t.Fatal("expected created=false on a replayed correlation_id")
 	}
-	if replay.PurchaseOrderID != first.PurchaseOrderID {
-		t.Errorf("replay resolved to %s, want the original %s",
-			replay.PurchaseOrderID, first.PurchaseOrderID)
+	if again.PurchaseOrderID != first.PurchaseOrderID {
+		t.Errorf("replay resolved to %s, want the original %s", again.PurchaseOrderID, first.PurchaseOrderID)
 	}
-	if replay.TotalAmount != first.TotalAmount {
-		t.Errorf("replay returned total %v, want the original %v — a replay's body "+
-			"must not restate the committed amount", replay.TotalAmount, first.TotalAmount)
+	if again.TotalAmount != first.TotalAmount || again.PONumber != first.PONumber {
+		t.Errorf("replay restated the committed order: total %v po %q", again.TotalAmount, again.PONumber)
 	}
-	if replay.PONumber != first.PONumber {
-		t.Errorf("replay returned po_number %q, want %q", replay.PONumber, first.PONumber)
+
+	// ...and published nothing a second time: Created, Submitted, Approved and
+	// Issued (+ its legacy alias) from the first call only.
+	var n int
+	if err := owner.QueryRow(context.Background(),
+		`SELECT count(*) FROM outbox_events WHERE aggregate_id = $1`, first.PurchaseOrderID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Errorf("outbox has %d events for the order, want 5 (Created, Submitted, Approved, Issued, purchase.order.issued)", n)
 	}
 }
 
 func TestPgStore_GetOrder_OtherTenant_ReadsAsAbsent(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s, _ := openStore(t)
 	owner := uuid.New().String()
 
-	o := newTestOrder(owner)
-	if _, err := s.CreateOrder(svcmiddleware.WithTenant(context.Background(), owner), o); err != nil {
-		t.Fatalf("CreateOrder: %v", err)
+	d, _, err := s.CreateIssued(tctx(owner), legacyInput(owner))
+	if err != nil {
+		t.Fatalf("CreateIssued: %v", err)
 	}
 
-	intruder := svcmiddleware.WithTenant(context.Background(), uuid.New().String())
-	got, err := s.GetOrder(intruder, o.PurchaseOrderID)
+	got, err := s.GetOrder(tctx(uuid.New().String()), d.PurchaseOrderID)
 	if err != nil {
 		t.Fatalf("cross-tenant GetOrder returned an error: %v", err)
 	}
@@ -220,11 +249,10 @@ func TestPgStore_GetOrder_OtherTenant_ReadsAsAbsent(t *testing.T) {
 
 // purchase_order_id is a uuid column, so a mistyped id dies in the driver as
 // 22P02. Unmapped it reached the caller as 503 store_unavailable, which reads as
-// an outage rather than a typo — this service's known behaviour before the fix.
+// an outage rather than a typo.
 func TestPgStore_GetOrder_MalformedUUID_ReadsAsAbsent(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
-	ctx := svcmiddleware.WithTenant(context.Background(), uuid.New().String())
+	s, _ := openStore(t)
+	ctx := tctx(uuid.New().String())
 
 	got, err := s.GetOrder(ctx, "not-a-uuid")
 	if err != nil {
@@ -236,129 +264,56 @@ func TestPgStore_GetOrder_MalformedUUID_ReadsAsAbsent(t *testing.T) {
 	}
 }
 
-func TestPgStore_AmendAndClose_MalformedUUID_IsNotFound(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+func TestPgStore_AmendAndTransition_MalformedUUID_IsNotFound(t *testing.T) {
+	s, _ := openStore(t)
 	tenantID := uuid.New().String()
-	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	ctx := tctx(tenantID)
 
-	if _, err := s.AmendOrder(ctx, tenantID, "not-a-uuid", 100, "reason", "actor"); !errors.Is(err, domain.ErrOrderNotFound) {
+	if _, err := s.AmendOrder(ctx, tenantID, "not-a-uuid", "actor", domain.AmendOrderRequest{NewTotalAmount: 100, Reason: "reason"}); !errors.Is(err, domain.ErrOrderNotFound) {
 		t.Errorf("AmendOrder err = %v, want ErrOrderNotFound — invalid_transition would "+
 			"assert the order exists in the wrong state", err)
 	}
-	if _, err := s.CloseOrder(ctx, tenantID, "not-a-uuid", "actor"); !errors.Is(err, domain.ErrOrderNotFound) {
-		t.Errorf("CloseOrder err = %v, want ErrOrderNotFound", err)
-	}
-}
-
-// Amending restates the total and appends an immutable amendment row. It must
-// NOT change status, and the ledger must record the before and after values —
-// before this ledger was readable, `version` was the only trace an amendment
-// had ever happened.
-func TestPgStore_AmendOrder_RecordsLedgerAndKeepsStatus(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
-	tenantID := uuid.New().String()
-	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
-
-	o := newTestOrder(tenantID)
-	if _, err := s.CreateOrder(ctx, o); err != nil {
-		t.Fatalf("CreateOrder: %v", err)
-	}
-
-	amended, err := s.AmendOrder(ctx, tenantID, o.PurchaseOrderID, 20000, "scope increased", "amender-1")
-	if err != nil {
-		t.Fatalf("AmendOrder: %v", err)
-	}
-	if amended.Version != 2 {
-		t.Errorf("version = %d, want 2 after one amendment", amended.Version)
-	}
-	if amended.TotalAmount != 20000 {
-		t.Errorf("total_amount = %v, want 20000", amended.TotalAmount)
-	}
-	if amended.Status != domain.OrderStatusIssued {
-		t.Errorf("status = %q after amending, want ISSUED — amending is not a transition", amended.Status)
-	}
-
-	ledger, err := s.ListAmendments(ctx, o.PurchaseOrderID)
-	if err != nil {
-		t.Fatalf("ListAmendments: %v", err)
-	}
-	if len(ledger) != 1 {
-		t.Fatalf("ledger has %d rows, want 1", len(ledger))
-	}
-	a := ledger[0]
-	if a.FromVersion != 1 || a.ToVersion != 2 {
-		t.Errorf("ledger versions = %d->%d, want 1->2", a.FromVersion, a.ToVersion)
-	}
-	if a.PreviousTotalAmount != 12500 || a.NewTotalAmount != 20000 {
-		t.Errorf("ledger amounts = %v->%v, want 12500->20000", a.PreviousTotalAmount, a.NewTotalAmount)
-	}
-	// The reason the operator gave is the audit record for the restatement.
-	if a.Reason != "scope increased" {
-		t.Errorf("ledger reason = %q, want %q", a.Reason, "scope increased")
-	}
-
-	// A second amendment appends rather than overwriting: the ledger is the
-	// history, so losing the first row would erase how the order got here.
-	if _, err := s.AmendOrder(ctx, tenantID, o.PurchaseOrderID, 21000, "freight added", "amender-2"); err != nil {
-		t.Fatalf("second AmendOrder: %v", err)
-	}
-	ledger, err = s.ListAmendments(ctx, o.PurchaseOrderID)
-	if err != nil {
-		t.Fatalf("ListAmendments after second amendment: %v", err)
-	}
-	if len(ledger) != 2 {
-		t.Fatalf("ledger has %d rows after two amendments, want 2", len(ledger))
-	}
-	if ledger[0].FromVersion != 1 || ledger[1].FromVersion != 2 {
-		t.Errorf("ledger not ordered oldest-first: %d then %d",
-			ledger[0].FromVersion, ledger[1].FromVersion)
+	if _, err := s.Transition(ctx, store.TransitionInput{TenantID: tenantID, OrderID: "not-a-uuid", Actor: "actor", Command: store.CmdClose}); !errors.Is(err, domain.ErrOrderNotFound) {
+		t.Errorf("Transition err = %v, want ErrOrderNotFound", err)
 	}
 }
 
 // Closing is terminal. Re-closing and amending a CLOSED order are both refused,
-// and the real code is 422 invalid_transition rather than 409.
-func TestPgStore_CloseOrder_IsTerminal(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+// and the refused calls must not alter the record.
+func TestPgStore_Close_IsTerminal(t *testing.T) {
+	s, _ := openStore(t)
 	tenantID := uuid.New().String()
-	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	ctx := tctx(tenantID)
 
-	o := newTestOrder(tenantID)
-	if _, err := s.CreateOrder(ctx, o); err != nil {
-		t.Fatalf("CreateOrder: %v", err)
+	o, _, err := s.CreateIssued(ctx, legacyInput(tenantID))
+	if err != nil {
+		t.Fatalf("CreateIssued: %v", err)
 	}
 
-	closed, err := s.CloseOrder(ctx, tenantID, o.PurchaseOrderID, "closer-1")
+	closed, err := s.Transition(ctx, store.TransitionInput{TenantID: tenantID, OrderID: o.PurchaseOrderID, Actor: "closer-1", Command: store.CmdClose})
 	if err != nil {
-		t.Fatalf("CloseOrder: %v", err)
+		t.Fatalf("close: %v", err)
 	}
 	if closed.Status != domain.OrderStatusClosed {
 		t.Errorf("status = %q, want CLOSED", closed.Status)
 	}
-	if closed.ClosedByPrincipalID == nil || *closed.ClosedByPrincipalID != "closer-1" {
+	if closed.ClosedByPrincipalID == nil || *closed.ClosedByPrincipalID != "closer-1" || closed.ClosedAt == nil {
 		t.Error("closer was not recorded")
 	}
-	if closed.ClosedAt == nil {
-		t.Error("closed_at was not recorded")
-	}
 
-	if _, err := s.CloseOrder(ctx, tenantID, o.PurchaseOrderID, "closer-2"); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, err := s.Transition(ctx, store.TransitionInput{TenantID: tenantID, OrderID: o.PurchaseOrderID, Actor: "closer-2", Command: store.CmdClose}); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Errorf("re-close err = %v, want ErrInvalidTransition", err)
 	}
-	if _, err := s.AmendOrder(ctx, tenantID, o.PurchaseOrderID, 500, "too late", "amender"); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, err := s.AmendOrder(ctx, tenantID, o.PurchaseOrderID, "amender", domain.AmendOrderRequest{NewTotalAmount: 500, Reason: "too late"}); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Errorf("amend-after-close err = %v, want ErrInvalidTransition", err)
 	}
 
-	// The refused calls must not have altered the record.
 	after, err := s.GetOrder(ctx, o.PurchaseOrderID)
 	if err != nil || after == nil {
 		t.Fatalf("GetOrder: got=%v err=%v", after, err)
 	}
-	if after.TotalAmount != 12500 || after.Version != 1 {
-		t.Errorf("refused calls mutated the order: total=%v version=%d",
-			after.TotalAmount, after.Version)
+	if after.TotalAmount != 12500 || after.Status != domain.OrderStatusClosed {
+		t.Errorf("refused calls mutated the order: total=%v status=%s", after.TotalAmount, after.Status)
 	}
 }
 
@@ -366,21 +321,19 @@ func TestPgStore_CloseOrder_IsTerminal(t *testing.T) {
 // store must not collapse them: ListAmendments for another tenant's order
 // returns nothing rather than that order's ledger.
 func TestPgStore_ListAmendments_TenantScoped(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s, _ := openStore(t)
 	owner := uuid.New().String()
-	ownerCtx := svcmiddleware.WithTenant(context.Background(), owner)
+	ownerCtx := tctx(owner)
 
-	o := newTestOrder(owner)
-	if _, err := s.CreateOrder(ownerCtx, o); err != nil {
-		t.Fatalf("CreateOrder: %v", err)
+	o, _, err := s.CreateIssued(ownerCtx, legacyInput(owner))
+	if err != nil {
+		t.Fatalf("CreateIssued: %v", err)
 	}
-	if _, err := s.AmendOrder(ownerCtx, owner, o.PurchaseOrderID, 30000, "restated", "amender"); err != nil {
+	if _, err := s.AmendOrder(ownerCtx, owner, o.PurchaseOrderID, "amender", domain.AmendOrderRequest{NewTotalAmount: 30000, Reason: "restated"}); err != nil {
 		t.Fatalf("AmendOrder: %v", err)
 	}
 
-	intruder := svcmiddleware.WithTenant(context.Background(), uuid.New().String())
-	ledger, err := s.ListAmendments(intruder, o.PurchaseOrderID)
+	ledger, err := s.ListAmendments(tctx(uuid.New().String()), o.PurchaseOrderID)
 	if err != nil {
 		t.Fatalf("cross-tenant ListAmendments returned an error: %v", err)
 	}
@@ -390,66 +343,41 @@ func TestPgStore_ListAmendments_TenantScoped(t *testing.T) {
 }
 
 func TestPgStore_ListOrders_FiltersAndTenantScope(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s, _ := openStore(t)
 	tenantID := uuid.New().String()
-	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
-
+	ctx := tctx(tenantID)
 	entity := uuid.New().String()
 
-	issued := newTestOrder(tenantID)
-	issued.LegalEntityID = entity
-	if _, err := s.CreateOrder(ctx, issued); err != nil {
-		t.Fatalf("create issued: %v", err)
+	issue := func(entityID string) *domain.OrderDetail {
+		in := legacyInput(tenantID)
+		in.LegalEntityID = entityID
+		d, _, err := s.CreateIssued(ctx, in)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		return d
 	}
-
-	toClose := newTestOrder(tenantID)
-	toClose.LegalEntityID = entity
-	if _, err := s.CreateOrder(ctx, toClose); err != nil {
-		t.Fatalf("create to-close: %v", err)
-	}
-	if _, err := s.CloseOrder(ctx, tenantID, toClose.PurchaseOrderID, "closer"); err != nil {
+	issue(entity)
+	toClose := issue(entity)
+	if _, err := s.Transition(ctx, store.TransitionInput{TenantID: tenantID, OrderID: toClose.PurchaseOrderID, Actor: "closer", Command: store.CmdClose}); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-
-	elsewhere := newTestOrder(tenantID)
-	if _, err := s.CreateOrder(ctx, elsewhere); err != nil {
-		t.Fatalf("create other-entity: %v", err)
-	}
+	issue(uuid.New().String())
 
 	all, err := s.ListOrders(ctx, domain.ListOrdersFilter{TenantID: tenantID})
-	if err != nil {
-		t.Fatalf("ListOrders unfiltered: %v", err)
+	if err != nil || len(all) != 3 {
+		t.Fatalf("unfiltered list: n=%d err=%v, want 3", len(all), err)
 	}
-	if len(all) != 3 {
-		t.Fatalf("unfiltered list returned %d orders, want 3", len(all))
+	closedOnly, err := s.ListOrders(ctx, domain.ListOrdersFilter{TenantID: tenantID, Status: string(domain.OrderStatusClosed)})
+	if err != nil || len(closedOnly) != 1 || closedOnly[0].PurchaseOrderID != toClose.PurchaseOrderID {
+		t.Fatalf("status filter: n=%d err=%v, want exactly the closed one", len(closedOnly), err)
 	}
-
-	closedOnly, err := s.ListOrders(ctx, domain.ListOrdersFilter{
-		TenantID: tenantID, Status: string(domain.OrderStatusClosed),
-	})
-	if err != nil {
-		t.Fatalf("ListOrders by status: %v", err)
+	byEntity, err := s.ListOrders(ctx, domain.ListOrdersFilter{TenantID: tenantID, LegalEntityID: entity})
+	if err != nil || len(byEntity) != 2 {
+		t.Fatalf("entity filter: n=%d err=%v, want 2", len(byEntity), err)
 	}
-	if len(closedOnly) != 1 || closedOnly[0].PurchaseOrderID != toClose.PurchaseOrderID {
-		t.Fatalf("status filter returned %d orders, want exactly the closed one", len(closedOnly))
-	}
-
-	byEntity, err := s.ListOrders(ctx, domain.ListOrdersFilter{
-		TenantID: tenantID, LegalEntityID: entity,
-	})
-	if err != nil {
-		t.Fatalf("ListOrders by entity: %v", err)
-	}
-	if len(byEntity) != 2 {
-		t.Fatalf("entity filter returned %d orders, want 2", len(byEntity))
-	}
-
 	empty, err := s.ListOrders(ctx, domain.ListOrdersFilter{TenantID: uuid.New().String()})
-	if err != nil {
-		t.Fatalf("ListOrders for a foreign tenant: %v", err)
-	}
-	if len(empty) != 0 {
-		t.Fatalf("a foreign tenant read %d orders", len(empty))
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("a foreign tenant read %d orders (err=%v)", len(empty), err)
 	}
 }

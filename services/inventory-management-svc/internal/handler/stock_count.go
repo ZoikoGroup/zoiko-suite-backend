@@ -664,6 +664,8 @@ func (h *Handler) writeStockCountErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "count_line_not_found", "")
 	case errors.Is(err, domain.ErrInvalidCountTransition), errors.Is(err, domain.ErrInvalidCountLineTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
+	case errors.Is(err, domain.ErrUnresolvedCountVariance):
+		writeError(w, http.StatusUnprocessableEntity, "unresolved_variance", err.Error())
 	default:
 		h.log.Error("stock count store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())

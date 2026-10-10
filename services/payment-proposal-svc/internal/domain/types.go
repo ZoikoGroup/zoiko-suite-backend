@@ -156,6 +156,10 @@ type PaymentProposal struct {
 
 	FrozenByPrincipalID *string
 	FrozenAt            *time.Time
+	// FrozenFingerprint is the subject fingerprint computed at freeze
+	// (see ComputeFingerprint). Empty for proposals frozen before it was
+	// stored.
+	FrozenFingerprint string
 
 	CreatedByPrincipalID string
 	CreatedAt            time.Time

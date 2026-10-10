@@ -236,6 +236,33 @@ func (h *Handler) now() time.Time {
 	return time.Now()
 }
 
+// periodRefOf is the shadow-gate reference for a stored journal header.
+// SHADOW DATE for sites 2 (PostJournal), 4 (commitJournal), 6 (PostApprovedJournal)
+// and 8 (ReprocessFailedPosting): header.PostingDate, the date the entry takes
+// effect in the ledger (ACC-03), as loaded from the store. A legacy row with a
+// NULL posting_date yields the zero Date and the shadow skips (no_date).
+func periodRefOf(header *domain.JournalHeader) close.PeriodRef {
+	return close.PeriodRef{
+		LegalEntityID: header.LegalEntityID,
+		PeriodName:    header.FiscalPeriod,
+		PostingDate:   header.PostingDate,
+		JournalID:     header.JournalID,
+	}
+}
+
+// reversalPostingDate is the posting date ReverseJournal gives the reversing
+// journal: today (UTC), or the original document date if that is in the future.
+func (h *Handler) reversalPostingDate(header *domain.JournalHeader) domain.Date {
+	d := domain.Date{Time: h.now().UTC().Truncate(24 * time.Hour)}
+	if d.Before(header.TransactionDate.Time) {
+		// Only reachable for a journal whose document is dated in the future.
+		// Posting before the document exists would trip the same invariant
+		// CreateJournal refuses, so the reversal follows the document instead.
+		d = header.TransactionDate
+	}
+	return d
+}
+
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/journals", func(r chi.Router) {
 		r.Post("/", h.CreateJournal)
@@ -339,7 +366,12 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Enforce Period Lock Check with soft-close override support
-	if err := h.closeClient.CheckPeriodOpen(r.Context(), req.TenantID, req.LegalEntityID, req.FiscalPeriod); err != nil {
+	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), req.TenantID, close.PeriodRef{
+		LegalEntityID: req.LegalEntityID, PeriodName: req.FiscalPeriod,
+		// SHADOW DATE (site 1, CreateJournal): the request's own posting_date,
+		// validated non-zero by requiredJournalFieldMissing above.
+		PostingDate: req.PostingDate,
+	}); err != nil {
 		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
 			if !h.checkSoftCloseOverride(w, r, req.OverrideSoftClose, req.SoftCloseOverrideReason, principalID, req.LegalEntityID) {
 				return
@@ -1023,7 +1055,7 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 	if header.SoftCloseOverrideReason != nil {
 		softCloseOverrideReason = *header.SoftCloseOverrideReason
 	}
-	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, periodRefOf(header)); err != nil {
 		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
 			if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
 				return
@@ -1108,7 +1140,13 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Enforce Period Lock Check with soft-close override support
-	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+	// SHADOW DATE (site 3, ReverseJournal): the date the reversal journal will
+	// actually carry (see reversalPostingDate), computed once and reused below.
+	reversalPostingDate := h.reversalPostingDate(header)
+	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, close.PeriodRef{
+		LegalEntityID: header.LegalEntityID, PeriodName: header.FiscalPeriod,
+		PostingDate: reversalPostingDate, JournalID: header.JournalID,
+	}); err != nil {
 		h.writePeriodErr(w, err)
 		return
 	}
@@ -1123,13 +1161,6 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	// posting_date — the reversal reaches the ledger today, not on the day the
 	// entry it reverses did. transaction_date stays the original's, because the
 	// underlying document has not changed.
-	reversalPostingDate := domain.Date{Time: h.now().UTC().Truncate(24 * time.Hour)}
-	if reversalPostingDate.Before(header.TransactionDate.Time) {
-		// Only reachable for a journal whose document is dated in the future.
-		// Posting before the document exists would trip the same invariant
-		// CreateJournal refuses, so the reversal follows the document instead.
-		reversalPostingDate = header.TransactionDate
-	}
 
 	reversingHeader := &domain.JournalHeader{
 		JournalID:              uuid.NewString(),
@@ -1797,7 +1828,7 @@ func (h *Handler) commitJournal(ctx context.Context, header *domain.JournalHeade
 		return err
 	}
 	// Re-check period with soft-close override from journal header if present
-	if err := h.closeClient.CheckPeriodOpen(ctx, header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+	if err := h.closeClient.CheckPeriodOpenAt(ctx, header.TenantID, periodRefOf(header)); err != nil {
 		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && header.SoftCloseOverrideReason != nil && *header.SoftCloseOverrideReason != "" {
 			// Override was declared at journal creation — honor it
 		} else {
@@ -1897,7 +1928,13 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 		OverrideSoftClose:       req.OverrideSoftClose,
 		SoftCloseOverrideReason: req.SoftCloseOverrideReason,
 	}
-	if err := h.closeClient.CheckPeriodOpen(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod); err != nil {
+	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), tenantID, close.PeriodRef{
+		LegalEntityID: req.LegalEntityID, PeriodName: req.FiscalPeriod,
+		// SHADOW DATE (site 5, PostAccountingEvent): req.PostingDate, which the
+		// handler has already defaulted to document_date when omitted and
+		// validated non-zero. No journal id exists yet.
+		PostingDate: req.PostingDate,
+	}); err != nil {
 		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
 			if !h.checkSoftCloseOverride(w, r, req.OverrideSoftClose, req.SoftCloseOverrideReason, principalID, req.LegalEntityID) {
 				return
@@ -2294,7 +2331,7 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, periodRefOf(header)); err != nil {
 		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
 			if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
 				return
@@ -2375,7 +2412,13 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+	if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, close.PeriodRef{
+		LegalEntityID: header.LegalEntityID, PeriodName: header.FiscalPeriod, JournalID: req.OriginalJournalID,
+		// SHADOW DATE (site 7, CreateReversalPosting): NO date. The reversing
+		// header built below never sets PostingDate (it is zero), and the
+		// original's date is not the date the reversal lands on. Not guessed:
+		// the shadow records shadow_skipped{reason="no_date"}.
+	}); err != nil {
 		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
 			if !h.checkSoftCloseOverride(w, r, req.OverrideSoftClose, req.SoftCloseOverrideReason, principalID, header.LegalEntityID) {
 				return
@@ -2504,7 +2547,7 @@ func (h *Handler) ReprocessFailedPosting(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	} else if header.Status == domain.JournalStatusValidated {
-		if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+		if err := h.closeClient.CheckPeriodOpenAt(r.Context(), header.TenantID, periodRefOf(header)); err != nil {
 			h.failExecution(r.Context(), tenantID, executionID, err)
 			h.writePeriodErr(w, err)
 			return

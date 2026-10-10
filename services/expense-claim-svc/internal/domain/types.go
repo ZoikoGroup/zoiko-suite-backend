@@ -5,102 +5,126 @@
 // reimbursement/payable basis, without allowing self-approval or direct
 // bank execution.
 //
-// Real integrations, verified against each peer's actual code before this
-// service was written, not assumed:
+// State model (spec §10): Draft → Submitted → PendingApproval →
+// Approved/Rejected/Returned → Reimbursable → Closed, plus Cancelled. The
+// transition table below is the single source of truth; the same table is
+// enforced in Postgres by a trigger (migration 000004), so a handler bug
+// cannot skip a state.
 //
-//   - Claimant identity: employee-master-svc's real GET /v1/employees/{id}
-//     verifies the claimant exists and is ACTIVE (not ONBOARDING/SUSPENDED/
-//     TERMINATED) at CreateExpenseClaim time.
-//   - Receipt evidence: document-vault-svc's real GET /v1/documents/{id}
-//     verifies a receipt reference genuinely exists, belongs to the
-//     caller's tenant/legal entity, and isn't PURGE_PENDING. Negative-path
-//     scenario #2 ("same receipt used on two claims") is enforced by a
-//     genuine partial UNIQUE index on receipt_document_id — a database
-//     invariant, not an application check a race could defeat.
-//   - Tax: tax-determination-svc's real POST /v1/tax-determinations is
-//     called, per line, whenever a line declares ClaimTaxRecovery — this is
-//     the literal enforcement of negative-path scenario #4 ("tax reclaim
-//     inferred without TAX result" must be blocked): TaxableAmount and
-//     CalculatedTaxAmount are NEVER set by this service except from that
-//     real call's own response, keyed by the returned DeterminationID, and
-//     a failed call blocks SubmitExpenseClaim outright rather than leaving
-//     a claim with an invented tax figure.
-//   - Policy: policy-svc's real POST /v1/policies/evaluate is called at
-//     Submit with policy_type=APPROVAL_THRESHOLD (the only policy type it
-//     has real evaluation logic for) against the claim's total amount. A
-//     404 "no_applicable_policy" (no threshold policy configured yet) is
-//     treated as WITHIN_THRESHOLD — policy-svc's own doc comment says
-//     explicitly "this service does not guess fail-open/fail-closed... the
-//     caller decides", and an unconfigured threshold is a setup gap, not a
-//     security signal, so this service defaults permissive rather than
-//     fabricating a threshold. This is a judgment call, documented here
-//     rather than hidden.
-//   - AP-08 "Payables": accounts-payable-svc exists but its entire model is
-//     vendor-invoice-shaped (vendor_id, CreateInvoice/ApproveInvoice) with
-//     no claimant/reimbursement concept anywhere in it, so routing an
-//     approved claim through it as a fabricated "vendor invoice" was never
-//     going to happen. UPDATE: payable-open-item-svc (a real AP-08) now
-//     exists specifically to close this gap — ApproveExpenseClaim calls its
-//     real CreatePayableFromApprovedSource (internal/payableopenitem
-//     client) instead of emitting an unconsumed event. The call is
-//     deliberately best-effort, mirroring goods-service-receipt-svc's own
-//     GRNI-posting doctrine: a failure emits
-//     EXPENSE_CLAIM_PAYABLE_CREATE_FAILED for visibility but never undoes
-//     the approval that already succeeded — the claimant should not be
-//     penalized for a downstream service being unavailable at this instant.
-//     PayeeRef falls back to the claimant's own principal ID when no
-//     PaymentPreferenceRef was recorded; DueDate is "now" since nothing in
-//     this domain gives a reimbursement a negotiated payment term.
+//   - SUBMITTED: the claim's evidence is frozen into an immutable,
+//     hash-addressed submission snapshot (expense_claim_submissions) and
+//     tax determinations are recorded; policy assessment is pending.
+//     SubmitExpenseClaim on a SUBMITTED claim resumes routing.
+//   - PENDING_APPROVAL: policy assessed, awaiting a decision.
+//   - RETURNED: the approver sent it back. The prior submission snapshot is
+//     preserved untouched; correction voids/adds lines (lines are never
+//     edited or deleted) and the resubmission writes snapshot version N+1.
+//   - APPROVED: the approval is final, the payee has not yet been resolved
+//     and the AP-08 payable has not yet been created. A durable
+//     payable_requests row was written in the same transaction.
+//   - REIMBURSABLE: AP-08 holds a payable for this claim (created
+//     idempotently by the payable relay with source_reference = claim id).
+//   - CLOSED: AP-08 reports the payable SETTLED (observed by the relay, or
+//     asserted via CloseExpenseClaim — which still verifies against AP-08).
 //
-// Two scope decisions of this service's own design, not gaps in a peer:
+// Real integrations (verified against each peer's code, not assumed):
 //
-//   - The spec's state model names both "Submitted" and "PendingApproval"
-//     as distinct states but the command list has only one command
-//     (SubmitExpenseClaim) to reach either — there is no second command
-//     to move Submitted -> PendingApproval. This service collapses them
-//     into one PENDING_APPROVAL status reached directly by
-//     SubmitExpenseClaim, the same kind of honest consolidation as AP-01's
-//     added Activate command for an analogous gap in its own state model.
-//   - "Approved -> Reimbursable -> Closed" per the spec, but Closed would
-//     require a real payables consumer to report the reimbursement
-//     actually settled — since none exists (see AP-08 above), this service
-//     only ever reaches REIMBURSABLE, never CLOSED. Also not in the spec's
-//     command list: an explicit CANCELLED terminal state is added for the
-//     CancelExpenseClaim command the spec's own commands list does name
-//     but the state model diagram omits.
+//   - Claimant identity: employee-master-svc GET /v1/employees/{id}
+//     (ACTIVE) at create time and again before any payable is requested.
+//   - Receipt evidence: document-vault-svc; a partial UNIQUE index on
+//     receipt_document_id (excluding voided lines) is the database
+//     invariant for "same receipt on two claims".
+//   - Tax: tax-determination-svc, per line claiming recovery. A reclaim
+//     figure only ever comes from that response; approval re-verifies that
+//     every recovery line carries a determination id (TAX_UNAVAILABLE).
+//   - Policy: policy-svc APPROVAL_THRESHOLD. "No applicable policy" (404)
+//     and service failure FAIL CLOSED for controlled categories
+//     (POLICY_CONTROLLED_CATEGORIES, default every category); only a claim
+//     made entirely of non-controlled categories may proceed unassessed.
+//   - Payee: the reimbursement payee must be an ACTIVE controlled
+//     destination in payee-banking-identity-svc (ORG-10) for the claim's
+//     payment_preference_ref (or the claimant's own party reference when
+//     none was given). With none, the claim is NOT payable: payable_state
+//     is BLOCKED with a stable reason and the relay keeps re-checking. The
+//     claimant principal id is never silently used as a payee.
+//   - AP-08: payable-open-item-svc CreatePayableFromApprovedSource, due
+//     date from reimbursement terms (REIMBURSEMENT_TERMS_DAYS, overridable
+//     per tenant via configuration-feature-flag-svc), never "now".
+//
+// Events are written to a transactional outbox (spec names such as
+// ExpenseClaimSubmitted, plus the pre-existing EXPENSE_CLAIM_* strings as
+// aliases). Approval also emits an accounting.event.requested fact shaped
+// like services/_contract/accounting.AccountingEvent — this service never
+// writes the ledger.
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type ClaimStatus string
 
 const (
 	StatusDraft           ClaimStatus = "DRAFT"
+	StatusSubmitted       ClaimStatus = "SUBMITTED"
 	StatusPendingApproval ClaimStatus = "PENDING_APPROVAL"
 	StatusApproved        ClaimStatus = "APPROVED"
 	StatusRejected        ClaimStatus = "REJECTED"
 	StatusReturned        ClaimStatus = "RETURNED"
 	StatusReimbursable    ClaimStatus = "REIMBURSABLE"
+	StatusClosed          ClaimStatus = "CLOSED"
 	StatusCancelled       ClaimStatus = "CANCELLED"
 )
 
-var submittableFrom = map[ClaimStatus]bool{StatusDraft: true, StatusReturned: true}
+// AllStatuses lists every status, for table-driven parity tests.
+var AllStatuses = []ClaimStatus{
+	StatusDraft, StatusSubmitted, StatusPendingApproval, StatusApproved, StatusRejected,
+	StatusReturned, StatusReimbursable, StatusClosed, StatusCancelled,
+}
 
-// CanSubmit reports whether a claim in status s may be submitted.
-func CanSubmit(s ClaimStatus) bool { return submittableFrom[s] }
+// transitions is the claim state machine. Never mutated at runtime.
+var transitions = map[ClaimStatus][]ClaimStatus{
+	StatusDraft:           {StatusSubmitted, StatusCancelled},
+	StatusSubmitted:       {StatusPendingApproval, StatusCancelled},
+	StatusPendingApproval: {StatusApproved, StatusRejected, StatusReturned, StatusCancelled},
+	StatusReturned:        {StatusSubmitted, StatusCancelled},
+	StatusApproved:        {StatusReimbursable},
+	StatusReimbursable:    {StatusClosed},
+}
+
+// CanTransition reports whether from → to is a legal state change.
+func CanTransition(from, to ClaimStatus) bool {
+	for _, t := range transitions[from] {
+		if t == to {
+			return true
+		}
+	}
+	return false
+}
+
+// IsTerminal reports whether no further state change is possible.
+func IsTerminal(s ClaimStatus) bool { return len(transitions[s]) == 0 }
+
+// CanSubmit reports whether SubmitExpenseClaim applies: a fresh/returned
+// claim is submitted, a SUBMITTED claim has its routing resumed.
+func CanSubmit(s ClaimStatus) bool {
+	return s == StatusDraft || s == StatusReturned || s == StatusSubmitted
+}
 
 // CanDecide reports whether a claim in status s may be approved, rejected,
 // returned for correction, or have a policy exception recorded against it.
 func CanDecide(s ClaimStatus) bool { return s == StatusPendingApproval }
 
-var cancellableFrom = map[ClaimStatus]bool{StatusDraft: true, StatusPendingApproval: true, StatusReturned: true}
-
 // CanCancel reports whether a claim in status s may be cancelled.
-func CanCancel(s ClaimStatus) bool { return cancellableFrom[s] }
+func CanCancel(s ClaimStatus) bool { return CanTransition(s, StatusCancelled) }
 
 // CanAddLine reports whether a claim in status s may still accept new/
-// amended expense lines.
+// voided expense lines.
 func CanAddLine(s ClaimStatus) bool { return s == StatusDraft || s == StatusReturned }
+
+// CanClose reports whether a claim may be closed (once reimbursable).
+func CanClose(s ClaimStatus) bool { return s == StatusReimbursable }
 
 // PolicyAssessmentResult mirrors policy-svc's own APPROVAL_THRESHOLD
 // evaluate() result values exactly.
@@ -110,6 +134,25 @@ const (
 	PolicyWithinThreshold  PolicyAssessmentResult = "WITHIN_THRESHOLD"
 	PolicyApprovalRequired PolicyAssessmentResult = "APPROVAL_REQUIRED"
 	PolicyNotAssessed      PolicyAssessmentResult = "NOT_ASSESSED"
+)
+
+// PayableState is the AP-08 hand-off state of an approved claim.
+type PayableState string
+
+const (
+	PayableNone    PayableState = "NONE"
+	PayablePending PayableState = "PENDING"
+	// PayableBlocked: the claim is approved but NOT payable (see
+	// PayableBlockedReason); the relay keeps re-checking.
+	PayableBlocked PayableState = "BLOCKED"
+	PayableCreated PayableState = "CREATED"
+)
+
+// Stable reasons a payable hand-off is blocked.
+const (
+	BlockedNoControlledPayee  = "NO_CONTROLLED_PAYEE"
+	BlockedClaimantNotActive  = "CLAIMANT_NOT_ACTIVE"
+	BlockedPayeeLegalEntityMM = "PAYEE_LEGAL_ENTITY_MISMATCH"
 )
 
 type ExpenseClaim struct {
@@ -123,6 +166,8 @@ type ExpenseClaim struct {
 	PaymentPreferenceRef string
 
 	Status                 ClaimStatus
+	Version                int
+	SubmittedVersion       int
 	RejectionReason        string
 	ReturnReason           string
 	HasPolicyException     bool
@@ -132,6 +177,14 @@ type ExpenseClaim struct {
 
 	ApprovedByPrincipalID *string
 	ApprovedAt            *time.Time
+
+	PayableState         PayableState
+	PayableID            string
+	PayableBlockedReason string
+	PayeeDestinationID   string
+
+	ClosedAt    *time.Time
+	CloseReason string
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -157,7 +210,22 @@ type ExpenseLine struct {
 	TaxableAmount       float64
 	CalculatedTaxAmount float64
 
+	VoidedAt   *time.Time
+	VoidReason string
+
 	CreatedAt time.Time
+}
+
+// ActiveLines drops voided lines — the lines that count for totals,
+// receipts, tax and snapshots.
+func ActiveLines(lines []ExpenseLine) []ExpenseLine {
+	out := make([]ExpenseLine, 0, len(lines))
+	for _, l := range lines {
+		if l.VoidedAt == nil {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // ExpenseClaimEvent is an append-only audit trail entry — GetClaimHistory's
@@ -172,17 +240,86 @@ type ExpenseClaimEvent struct {
 	CreatedAt        time.Time
 }
 
+// ExpenseClaimSubmission is one immutable, hash-addressed submission
+// version of a claim.
+type ExpenseClaimSubmission struct {
+	SubmissionID string
+	ClaimID      string
+	VersionNo    int
+	Snapshot     json.RawMessage
+	SnapshotHash string
+	SubmittedBy  string
+	SubmittedAt  time.Time
+}
+
+// PayableRequest is the durable AP-08 hand-off record written in the
+// approval transaction.
+type PayableRequest struct {
+	RequestID            string
+	TenantID             string
+	LegalEntityID        string
+	ClaimID              string
+	ClaimantPrincipalID  string
+	PaymentPreferenceRef string
+	RequestedBy          string
+	CorrelationID        string
+	Amount               float64
+	Currency             string
+	DueDate              time.Time
+	State                PayableState
+	BlockedReason        string
+	Attempts             int
+}
+
+// History event types (stored in expense_claim_events). Each is also
+// emitted through the outbox under a spec name (see OutboxTypes).
 const (
 	EventClaimCreated             = "EXPENSE_CLAIM_CREATED"
 	EventClaimSubmitted           = "EXPENSE_CLAIM_SUBMITTED"
+	EventClaimRouted              = "EXPENSE_CLAIM_PENDING_APPROVAL"
 	EventClaimApproved            = "EXPENSE_CLAIM_APPROVED"
 	EventClaimRejected            = "EXPENSE_CLAIM_REJECTED"
 	EventClaimReturned            = "EXPENSE_CLAIM_RETURNED"
 	EventClaimCancelled           = "EXPENSE_CLAIM_CANCELLED"
+	EventClaimClosed              = "EXPENSE_CLAIM_CLOSED"
+	EventLineVoided               = "EXPENSE_CLAIM_LINE_VOIDED"
 	EventPolicyExceptionRecorded  = "EXPENSE_CLAIM_POLICY_EXCEPTION_RECORDED"
+	EventClaimPayableRequested    = "EXPENSE_CLAIM_PAYABLE_REQUESTED"
+	EventClaimPayableBlocked      = "EXPENSE_CLAIM_PAYABLE_BLOCKED"
 	EventClaimPayableCreated      = "EXPENSE_CLAIM_PAYABLE_CREATED"
 	EventClaimPayableCreateFailed = "EXPENSE_CLAIM_PAYABLE_CREATE_FAILED"
+
+	// EventAccountingRequested carries an accounting-contract payload; the
+	// Accounting Kernel is the only consumer allowed to post it.
+	EventAccountingRequested = "accounting.event.requested"
 )
+
+var outboxTypes = map[string]string{
+	EventClaimCreated:             "ExpenseClaimCreated",
+	EventClaimSubmitted:           "ExpenseClaimSubmitted",
+	EventClaimRouted:              "ExpenseClaimPendingApproval",
+	EventClaimApproved:            "ExpenseClaimApproved",
+	EventClaimRejected:            "ExpenseClaimRejected",
+	EventClaimReturned:            "ExpenseClaimReturned",
+	EventClaimCancelled:           "ExpenseClaimCancelled",
+	EventClaimClosed:              "ExpenseClaimClosed",
+	EventLineVoided:               "ExpenseClaimLineVoided",
+	EventPolicyExceptionRecorded:  "ExpenseClaimPolicyExceptionApproved",
+	EventClaimPayableRequested:    "ExpenseClaimPayableRequested",
+	EventClaimPayableBlocked:      "ExpenseClaimPayableBlocked",
+	EventClaimPayableCreated:      "ExpenseClaimPayableCreated",
+	EventClaimPayableCreateFailed: "ExpenseClaimPayableCreateFailed",
+}
+
+// OutboxTypes returns every event type a history event is published as: the
+// spec name first, then the pre-existing EXPENSE_CLAIM_* alias. The
+// accounting event has a single name.
+func OutboxTypes(historyType string) []string {
+	if spec, ok := outboxTypes[historyType]; ok {
+		return []string{spec, historyType}
+	}
+	return []string{historyType}
+}
 
 // ── request DTOs ────────────────────────────────────────────────────────────
 
@@ -208,20 +345,67 @@ type AddExpenseLineRequest struct {
 	TaxCategory       string
 }
 
-type RejectClaimRequest struct {
-	Reason string
+// DecisionRequest is the body shared by the commands that carry a reason and
+// an optimistic version.
+type DecisionRequest struct {
+	Reason          string `json:"reason"`
+	ExpectedVersion *int   `json:"expected_version"`
 }
 
-type ReturnClaimRequest struct {
-	Reason string
+type RejectClaimRequest = DecisionRequest
+type ReturnClaimRequest = DecisionRequest
+type CancelClaimRequest = DecisionRequest
+type RecordPolicyExceptionRequest = DecisionRequest
+type CloseClaimRequest = DecisionRequest
+
+// VersionedRequest is the body of commands that carry only expected_version.
+type VersionedRequest struct {
+	ExpectedVersion *int `json:"expected_version"`
 }
 
-type CancelClaimRequest struct {
-	Reason string
+type VoidLineRequest struct {
+	Reason string `json:"reason"`
 }
 
-type RecordPolicyExceptionRequest struct {
-	Reason string
+// ── idempotency ─────────────────────────────────────────────────────────────
+
+// IdemKey identifies one idempotent command invocation.
+type IdemKey struct {
+	Key         string
+	Operation   string
+	RequestHash string
+}
+
+// IdemRecord is a stored command result.
+type IdemRecord struct {
+	Operation   string
+	RequestHash string
+	StatusCode  int
+	Body        []byte
+}
+
+// CommandParams is the common input of the state-changing store commands.
+type CommandParams struct {
+	ClaimID         string
+	PrincipalID     string
+	CorrelationID   string
+	Reason          string
+	ExpectedVersion *int
+	Idem            *IdemKey
+}
+
+type RoutingParams struct {
+	CommandParams
+	PolicyResult    PolicyAssessmentResult
+	PolicyVersionID string
+}
+
+type ApproveParams struct {
+	CommandParams
+	// Posting holds the ACC-02 mapping keys for the accounting request.
+	Posting PostingConfig
+	// DueDate is the reimbursement due date derived from payment terms.
+	DueDate time.Time
 }
 
 // ── sentinel errors ─────────────────────────────────────────────────────────
@@ -233,7 +417,10 @@ func (s sentinel) Error() string { return string(s) }
 const (
 	ErrClaimNotFound              = sentinel("expense claim not found")
 	ErrInvalidTransition          = sentinel("invalid expense claim state transition")
+	ErrStaleVersion               = sentinel("expense claim version changed; reload and retry")
 	ErrLineNotFound               = sentinel("expense line not found")
+	ErrNoLines                    = sentinel("a claim needs at least one active expense line")
+	ErrCurrencyMismatch           = sentinel("expense line currency differs from the claim currency; no implicit conversion")
 	ErrClaimantNotEligible        = sentinel("claimant does not exist or is not an active employee")
 	ErrClaimantServiceUnavailable = sentinel("employee-master-svc unavailable")
 	ErrDuplicateReceipt           = sentinel("receipt document is already attached to another expense line")
@@ -244,6 +431,20 @@ const (
 	ErrMissingRequiredReceipt     = sentinel("one or more expense lines exceed the receipt-required threshold without an attached, verified receipt")
 	ErrTaxDeterminationFailed     = sentinel("tax-determination-svc call failed for a line claiming tax recovery")
 	ErrPolicyServiceUnavailable   = sentinel("policy-svc unavailable")
+	ErrNoApplicablePolicy         = sentinel("policy-svc has no applicable approval-threshold policy")
 	ErrPayableServiceUnavailable  = sentinel("payable-open-item-svc unavailable")
+	ErrNoControlledPayee          = sentinel("no active controlled reimbursement payee in payee-banking-identity-svc")
+	ErrPayeeServiceUnavailable    = sentinel("payee-banking-identity-svc unavailable")
+	ErrIdempotencyConflict        = sentinel("idempotency key already used by a concurrent request")
 	ErrStoreUnavailable           = sentinel("store unavailable")
 )
+
+// SettlementCandidate is a REIMBURSABLE claim whose AP-08 payable the relay
+// polls for settlement.
+type SettlementCandidate struct {
+	TenantID      string
+	ClaimID       string
+	LegalEntityID string
+	PayableID     string
+	PrincipalID   string
+}
