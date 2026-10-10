@@ -2,36 +2,95 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/migration-integrity-svc/internal/domain"
 )
 
 // ─── Interface ────────────────────────────────────────────────────────────────
 
+// The three write methods enqueue their evidence events into the
+// transactional outbox inside the same transaction as the state change, so an
+// event exists if and only if the change it reports committed.
 type Store interface {
-	CreateJob(ctx context.Context, tenantID string, job *domain.MigrationJob, checks []domain.IntegrityCheck, entries []domain.AuditEntry) error
+	CreateJob(ctx context.Context, tenantID string, job *domain.MigrationJob, checks []domain.IntegrityCheck, entries []domain.AuditEntry, actorID, correlationID string) error
 	GetJobByID(ctx context.Context, tenantID, id string) (*domain.MigrationJob, error)
 	ListJobs(ctx context.Context, tenantID, legalEntityID, status string) ([]domain.MigrationJob, error)
-	ArchiveJob(ctx context.Context, tenantID, id string) error
-	RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes string) (*domain.AuditEntry, error)
+	ArchiveJob(ctx context.Context, tenantID, id, actorID, correlationID string) error
+	RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes, actorID, correlationID string) (*domain.AuditEntry, error)
 }
 
 // ─── PgStore ──────────────────────────────────────────────────────────────────
 
+const (
+	aggregateJob        = "migration-job"
+	aggregateAuditEntry = "migration-audit-entry"
+)
+
 type PgStore struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	log         *zap.Logger
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (config EVENT_RESIDENCY_REGION).
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
 }
 
-func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.MigrationJob, checks []domain.IntegrityCheck, entries []domain.AuditEntry) error {
+func NewPgStore(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// enqueueMigrationEvent writes one migration evidence event to the
+// transactional outbox inside tx. typeSegment and fact build the canonical
+// com.zoikosuite.migration.<typeSegment>.<fact> (kebab-case only: envelope.New
+// rejects underscores). legacyType is the exact pre-standard event_type
+// consumers filter on; it is evidence-relevant and must never be derived.
+func (s *PgStore) enqueueMigrationEvent(ctx context.Context, tx pgx.Tx, typeSegment, fact, legacyType, aggregateType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.migration." + typeSegment + "." + fact,
+		LegacyType:      legacyType,
+		Service:         "migration-integrity-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   aggregateType,
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", legacyType, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue %s event: %w", legacyType, err)
+	}
+	return nil
+}
+
+func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.MigrationJob, checks []domain.IntegrityCheck, entries []domain.AuditEntry, actorID, correlationID string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -90,6 +149,24 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Mi
 		)
 		if err != nil {
 			return fmt.Errorf("insert audit_entry: %w", err)
+		}
+	}
+
+	if err := s.enqueueMigrationEvent(ctx, tx, "job", "integrity-validated", "migration.integrity_validated", aggregateJob,
+		tenantID, job.LegalEntityID, job.ID, actorID, correlationID, map[string]interface{}{
+			"job_id":          job.ID,
+			"integrity_score": job.IntegrityScore,
+			"status":          string(job.Status),
+		}); err != nil {
+		return err
+	}
+	if job.InvalidRecordsCount > 0 {
+		if err := s.enqueueMigrationEvent(ctx, tx, "job", "integrity-violations-detected", "migration.integrity_violations_detected", aggregateJob,
+			tenantID, job.LegalEntityID, job.ID, actorID, correlationID, map[string]interface{}{
+				"job_id":        job.ID,
+				"invalid_count": job.InvalidRecordsCount,
+			}); err != nil {
+			return err
 		}
 	}
 
@@ -222,7 +299,9 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, status 
 	return jobs, nil
 }
 
-func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
+// ArchiveJob archives a job. Archiving an already-archived job still succeeds
+// but emits nothing: a second job_archived would be a false evidence record.
+func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id, actorID, correlationID string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -231,17 +310,31 @@ func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
 		return err
 	}
-	cmd, err := tx.Exec(ctx, "UPDATE migration_jobs SET status='ARCHIVED', updated_at=$1 WHERE id=$2", time.Now(), id)
+	var legalEntityID, prevStatus string
+	err = tx.QueryRow(ctx, `
+		UPDATE migration_jobs j SET status = 'ARCHIVED', updated_at = $1
+		FROM (SELECT id, status FROM migration_jobs WHERE id = $2 AND tenant_id = $3 FOR UPDATE) prev
+		WHERE j.id = prev.id
+		RETURNING j.legal_entity_id, prev.status`, time.Now(), id, tenantID).Scan(&legalEntityID, &prevStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("migration job not found")
+	}
 	if err != nil {
 		return err
 	}
-	if cmd.RowsAffected() == 0 {
-		return fmt.Errorf("migration job not found")
+	if prevStatus != string(domain.JobStatusArchived) {
+		if err := s.enqueueMigrationEvent(ctx, tx, "job", "archived", "migration.job_archived", aggregateJob,
+			tenantID, legalEntityID, id, actorID, correlationID, map[string]string{"job_id": id}); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }
 
-func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes string) (*domain.AuditEntry, error) {
+// RemediateEntry marks an audit entry remediated. Re-remediating an entry still
+// succeeds but emits nothing: a second audit_entry_remediated would be a false
+// evidence record. The event's aggregate is the entry, as the old subject_id was.
+func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes, actorID, correlationID string) (*domain.AuditEntry, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -254,13 +347,24 @@ func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, 
 
 	var e domain.AuditEntry
 	var fieldName, srcVal, tgtVal *string
+	var wasRemediated bool
+	var legalEntityID string
 	err = tx.QueryRow(ctx, `
-		UPDATE migration_audit_entries
+		UPDATE migration_audit_entries e
 		SET is_remediated = true
-		WHERE id = $1 AND job_id = $2
-		RETURNING id, tenant_id, job_id, record_ref, field_name, source_value, target_value, violation_type, is_remediated, created_at`,
-		entryID, jobID).Scan(
+		FROM (
+			SELECT a.id, a.is_remediated, j.legal_entity_id
+			FROM migration_audit_entries a
+			JOIN migration_jobs j ON j.id = a.job_id
+			WHERE a.id = $1 AND a.job_id = $2 AND a.tenant_id = $3
+			FOR UPDATE OF a
+		) prev
+		WHERE e.id = prev.id
+		RETURNING e.id, e.tenant_id, e.job_id, e.record_ref, e.field_name, e.source_value, e.target_value,
+		          e.violation_type, e.is_remediated, e.created_at, prev.is_remediated, prev.legal_entity_id`,
+		entryID, jobID, tenantID).Scan(
 		&e.ID, &e.TenantID, &e.JobID, &e.RecordRef, &fieldName, &srcVal, &tgtVal, &e.ViolationType, &e.IsRemediated, &e.CreatedAt,
+		&wasRemediated, &legalEntityID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("audit entry not found: %w", err)
@@ -275,6 +379,13 @@ func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, 
 		e.TargetValue = *tgtVal
 	}
 
+	if !wasRemediated {
+		if err := s.enqueueMigrationEvent(ctx, tx, "audit-entry", "remediated", "migration.audit_entry_remediated", aggregateAuditEntry,
+			tenantID, legalEntityID, entryID, actorID, correlationID, &e); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -282,6 +393,9 @@ func (s *PgStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, 
 }
 
 // ─── MemoryStore ──────────────────────────────────────────────────────────────
+
+// MemoryStore is a handler-test double only. It has no outbox, so it must never
+// back the running service: evidence and its events would both be lost.
 
 type MemoryStore struct {
 	mu   sync.RWMutex
@@ -292,7 +406,7 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{jobs: make(map[string]*domain.MigrationJob)}
 }
 
-func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domain.MigrationJob, checks []domain.IntegrityCheck, entries []domain.AuditEntry) error {
+func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domain.MigrationJob, checks []domain.IntegrityCheck, entries []domain.AuditEntry, _, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
@@ -346,7 +460,7 @@ func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sta
 	return result, nil
 }
 
-func (m *MemoryStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
+func (m *MemoryStore) ArchiveJob(ctx context.Context, tenantID, id, _, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[id]
@@ -358,7 +472,7 @@ func (m *MemoryStore) ArchiveJob(ctx context.Context, tenantID, id string) error
 	return nil
 }
 
-func (m *MemoryStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes string) (*domain.AuditEntry, error) {
+func (m *MemoryStore) RemediateEntry(ctx context.Context, tenantID, jobID, entryID, notes, _, _ string) (*domain.AuditEntry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[jobID]

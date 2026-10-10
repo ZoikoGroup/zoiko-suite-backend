@@ -244,6 +244,8 @@ services:
       DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/migration_integrity?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.migration-integrity.events
+      # Required, no default (ZS-EVENT-001 §4 residencyregion).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
     depends_on:
       postgres:
