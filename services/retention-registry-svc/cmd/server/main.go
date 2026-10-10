@@ -23,6 +23,7 @@ import (
 	"zoiko.io/retention-registry-svc/internal/health"
 	"zoiko.io/retention-registry-svc/internal/middleware"
 	"zoiko.io/retention-registry-svc/internal/mtls"
+	"zoiko.io/retention-registry-svc/internal/outbox"
 	"zoiko.io/retention-registry-svc/internal/store"
 	"zoiko.io/retention-registry-svc/internal/telemetry"
 )
@@ -66,6 +67,16 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+
+	var relayCancel context.CancelFunc
+	if pool != nil {
+		relay := outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, logger)
+		var relayCtx context.Context
+		relayCtx, relayCancel = context.WithCancel(context.Background())
+		go relay.Start(relayCtx)
+		logger.Info("started outbox relay worker")
+	}
+
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
 		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "retention-registry-svc", platformScopeID)
@@ -120,6 +131,10 @@ func main() {
 	logger.Info("shutting down retention-registry-svc gracefully...")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
+
+	if relayCancel != nil {
+		relayCancel()
+	}
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))

@@ -1,12 +1,15 @@
-// Package outbox implements the Transactional Outbox pattern for general-ledger-svc
-// per ZS-STATE-001 Invariant I-13.
+// Package outbox implements the Transactional Outbox pattern for
+// evidence-manifest-svc per ZS-STATE-001 Invariant I-13.
 //
-// An event is written to outbox_events inside the SAME database transaction as the
-// authoritative journal mutation, guaranteeing state mutations and event publication
-// are atomic.
+// An event is written to outbox_events inside the SAME database transaction
+// as the authoritative manifest state finalization, guaranteeing state mutations and
+// event publication are atomic.
 //
-// A background Relay polls unpublished rows using FOR UPDATE SKIP LOCKED
-// to provide multi-replica concurrency safety and at-least-once delivery to Kafka.
+// A background Relay then polls unpublished rows using FOR UPDATE SKIP
+// LOCKED to provide multi-replica concurrency safety and at-least-once
+// delivery to Kafka. Mirrors document-vault-svc/accounts-payable-svc/
+// general-ledger-svc/payment-authorization-svc/workflow-svc's own outbox
+// packages exactly.
 package outbox
 
 import (
@@ -21,10 +24,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// MaxPublishAttempts defines the maximum number of publish attempts before an event
-// is considered dead-lettered and excluded from active polling cycles.
-const MaxPublishAttempts = 10
-
 // Event is one row to be written to outbox_events inside a domain transaction.
 type Event struct {
 	OutboxEventID string
@@ -37,43 +36,6 @@ type Event struct {
 	CorrelationID string
 	Headers       map[string]string
 	Payload       any
-}
-
-// VariantAEnvelope preserves the existing general-ledger-svc Kafka event contract.
-// Notice: There is intentionally NO event_id in the JSON body (Variant A contract).
-// Event ID is conveyed via the X-Event-ID Kafka header.
-type VariantAEnvelope struct {
-	EventType     string          `json:"event_type"`
-	EventVersion  string          `json:"event_version"`
-	EmittedAt     time.Time       `json:"emitted_at"`
-	SchemaVersion string          `json:"schema_version"`
-	SourceService string          `json:"source_service"`
-	CorrelationID string          `json:"correlation_id"`
-	TenantID      string          `json:"tenant_id,omitempty"`
-	LegalEntityID string          `json:"legal_entity_id,omitempty"`
-	ActorID       string          `json:"actor_id,omitempty"`
-	Jurisdiction  string          `json:"jurisdiction,omitempty"`
-	Payload       json.RawMessage `json:"payload"`
-}
-
-// NewVariantAEnvelope constructs a Variant A envelope matching the general-ledger-svc platform contract.
-func NewVariantAEnvelope(eventType, correlationID, tenantID, legalEntityID, actorID string, payload any) (VariantAEnvelope, error) {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return VariantAEnvelope{}, fmt.Errorf("marshal inner event payload: %w", err)
-	}
-	return VariantAEnvelope{
-		EventType:     eventType,
-		EventVersion:  "1.0",
-		EmittedAt:     time.Now().UTC(),
-		SchemaVersion: "1.0",
-		SourceService: "general-ledger-svc",
-		CorrelationID: correlationID,
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		ActorID:       actorID,
-		Payload:       raw,
-	}, nil
 }
 
 // StoredEvent represents an unpublished event row fetched for relaying.
@@ -205,12 +167,11 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 		       payload, publish_attempts
 		FROM outbox_events
 		WHERE published_at IS NULL
-		  AND publish_attempts < $2
 		ORDER BY created_at ASC
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED
 	`
-	rows, err := tx.Query(ctx, pollSQL, r.batchSize, MaxPublishAttempts)
+	rows, err := tx.Query(ctx, pollSQL, r.batchSize)
 	if err != nil {
 		r.log.Error("outbox relay: poll failed", zap.Error(err))
 		return
@@ -244,28 +205,16 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 
 	for _, e := range pending {
 		if pubErr := r.publisher.PublishOutbox(ctx, e.OutboxEventID, e.AggregateID, e.Payload); pubErr != nil {
-			newAttempts := e.Attempts + 1
 			_, _ = tx.Exec(ctx, `
 				UPDATE outbox_events
 				SET publish_attempts = publish_attempts + 1, last_error = $2
 				WHERE outbox_event_id = $1
 			`, e.OutboxEventID, pubErr.Error())
-			if newAttempts >= MaxPublishAttempts {
-				r.log.Error("outbox relay: event reached dead-letter ceiling, moving to dead-letter",
-					zap.String("outbox_event_id", e.OutboxEventID),
-					zap.String("event_type", e.EventType),
-					zap.Int("publish_attempts", newAttempts),
-					zap.Int("max_publish_attempts", MaxPublishAttempts),
-					zap.Error(pubErr),
-				)
-			} else {
-				r.log.Warn("outbox relay: publish failed, will retry",
-					zap.String("outbox_event_id", e.OutboxEventID),
-					zap.String("event_type", e.EventType),
-					zap.Int("publish_attempts", newAttempts),
-					zap.Error(pubErr),
-				)
-			}
+			r.log.Warn("outbox relay: publish failed, will retry",
+				zap.String("outbox_event_id", e.OutboxEventID),
+				zap.String("event_type", e.EventType),
+				zap.Error(pubErr),
+			)
 		} else {
 			_, _ = tx.Exec(ctx, `
 				UPDATE outbox_events

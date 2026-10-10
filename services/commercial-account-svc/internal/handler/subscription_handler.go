@@ -36,6 +36,23 @@ func retiredCatalogWrite(w http.ResponseWriter, r *http.Request) {
 		Detail: "catalog and plan writes moved to the COM-01 price book: POST /v1/commercial/products and /v1/commercial/price-versions"})
 }
 
+// resolveAccountOrg resolves the owning commercial account for commercialAccountID
+// and returns its authoritative OrganizationID (tracker row 84a). If the account is
+// not found or outside the verified tenant's RLS scope, it writes a 404 error
+// response and returns false.
+func (h *Handler) resolveAccountOrg(w http.ResponseWriter, r *http.Request, commercialAccountID string) (string, bool) {
+	acct, err := h.store.GetCommercialAccount(r.Context(), commercialAccountID)
+	if err != nil {
+		if errors.Is(err, domain.ErrCommercialAccountNotFound) {
+			writeError(w, http.StatusNotFound, "commercial account not found")
+			return "", false
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch commercial account")
+		return "", false
+	}
+	return acct.OrganizationID, true
+}
+
 func RegisterSubscriptionRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/price-catalogs", func(r chi.Router) {
 		r.Post("/", retiredCatalogWrite)
@@ -114,7 +131,11 @@ func (h *Handler) CreateSubscription(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, req.CommercialAccountID, SubscriptionCreate) {
+	orgID, ok := h.resolveAccountOrg(w, r, req.CommercialAccountID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, orgID, SubscriptionCreate) {
 		return
 	}
 
@@ -212,7 +233,11 @@ func (h *Handler) CreateEvaluationProgram(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, sub.CommercialAccountID, EvaluationProgramCreate) {
+	orgID, ok := h.resolveAccountOrg(w, r, sub.CommercialAccountID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, orgID, EvaluationProgramCreate) {
 		return
 	}
 
@@ -270,7 +295,11 @@ func (h *Handler) CreateOverlay(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, req.CommercialAccountID, OverlayCreate) {
+	orgID, ok := h.resolveAccountOrg(w, r, req.CommercialAccountID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, orgID, OverlayCreate) {
 		return
 	}
 
@@ -365,7 +394,11 @@ func (h *Handler) PreviewSubscriptionChange(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, sub.CommercialAccountID, SubscriptionChangePreview) {
+	orgID, ok := h.resolveAccountOrg(w, r, sub.CommercialAccountID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, orgID, SubscriptionChangePreview) {
 		return
 	}
 
@@ -418,7 +451,11 @@ func (h *Handler) ConfirmSubscriptionChange(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, sub.CommercialAccountID, SubscriptionChangeConfirm) {
+	orgID, ok := h.resolveAccountOrg(w, r, sub.CommercialAccountID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, orgID, SubscriptionChangeConfirm) {
 		return
 	}
 
@@ -490,7 +527,11 @@ func (h *Handler) SetSubscriptionStatus(w http.ResponseWriter, r *http.Request) 
 	if !ok2 {
 		return
 	}
-	if !h.authorize(w, r, principalID, sub.CommercialAccountID, SubscriptionStatusSet) {
+	orgID, ok := h.resolveAccountOrg(w, r, sub.CommercialAccountID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, orgID, SubscriptionStatusSet) {
 		return
 	}
 
@@ -554,7 +595,11 @@ func (h *Handler) TransferBillingSource(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if !h.authorize(w, r, principalID, req.CommercialAccountID, BillingSourceTransferSet) {
+	orgID, ok := h.resolveAccountOrg(w, r, req.CommercialAccountID)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, orgID, BillingSourceTransferSet) {
 		return
 	}
 

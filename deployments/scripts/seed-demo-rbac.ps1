@@ -552,6 +552,28 @@ $BUNDLES = @(
             "SEARCH_GENERATION_CREATE", "SEARCH_GENERATION_ACTIVATE",
             "SEARCH_RESTRICTION_APPLY", "SEARCH_EXPORT"
         )
+    },
+    @{
+        # commercial-account-svc's COM-01 price book checks every write
+        # against AUTHZ_PLATFORM_SCOPE_ID, not a legal entity -- same
+        # posture as governance-decision-log-svc etc. above. Propose,
+        # approve and publish are separate actions (COM-CTRL-004 maker-
+        # checker: the handler itself refuses an approve/publish from the
+        # same principal who proposed, regardless of what this bundle
+        # grants -- RBAC only answers "is this principal allowed to call
+        # this action at all", never "are these two principals distinct").
+        Code    = "COMMERCIAL_PRICE_BOOK_FULL"
+        Service = "commercial-account-svc"
+        Actions = @(
+            "COMMERCIAL_PRICE_BOOK_PROPOSE", "COMMERCIAL_PRICE_BOOK_APPROVE",
+            "COMMERCIAL_PRICE_BOOK_PUBLISH", "COMMERCIAL_PRICE_BOOK_RETIRE",
+            "COMMERCIAL_PRICE_BOOK_READ",
+            # Currency registration is a prerequisite seller-authority action
+            # for creating any price version at all (pricebook_handler.go's
+            # PutCurrency route) -- same platform scope as the price-book
+            # actions above.
+            "COMMERCIAL_CURRENCY_MANAGE"
+        )
     }
 )
 
@@ -580,7 +602,12 @@ $PLATFORM_SCOPED_ACTION_CODES = @(
     # scope. A grant made only on the legal entity would be invisible to every
     # one of its checks -- silently, and fail-closed, so it would read as
     # "no_grant" rather than as a scope mismatch.
-    "SEARCH_FULL")
+    "SEARCH_FULL",
+    # commercial-account-svc's COM-01 price book (propose/approve/publish/
+    # retire/read) checks every write against platformScopeID -- see
+    # handler.go's platformScopeID constant and pricebook_handler.go's
+    # h.authz.CheckAllowed(ctx, principal, platformScopeID, action) call.
+    "COMMERCIAL_PRICE_BOOK_FULL")
 $PLATFORM_SCOPED_ACTIONS = $BUNDLES |
     Where-Object { $PLATFORM_SCOPED_ACTION_CODES -contains $_.Code } |
     ForEach-Object { $_.Actions }
@@ -807,6 +834,29 @@ try {
         principal_id    = $APPROVER_ID
         role_id         = $ROLE_ID
         legal_entity_id = $LEGAL_ENTITY
+        effective_from  = "2020-01-01T00:00:00Z"
+        assigned_by     = $PRINCIPAL_ID
+    }
+    Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
+} catch {
+    if ("$_" -match "409|23505|duplicate|already") {
+        Write-Host "  -> already assigned" -ForegroundColor DarkGray
+    } else {
+        throw
+    }
+}
+
+# $APPROVER_ID also needs the platform scope: commercial-account-svc's COM-01
+# price book (and every other PLATFORM_SCOPED_ACTION_CODES bundle) checks
+# against platformScopeID, not the legal entity. Without this, a genuine SoD
+# approve/publish test (a second principal distinct from the proposer) has no
+# principal to use for any platform-scoped action.
+Write-Host "assign role to $APPROVER_ID on the platform scope (SoD approver)" -NoNewline
+try {
+    $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+        principal_id    = $APPROVER_ID
+        role_id         = $ROLE_ID
+        legal_entity_id = $PLATFORM_SCOPE
         effective_from  = "2020-01-01T00:00:00Z"
         assigned_by     = $PRINCIPAL_ID
     }

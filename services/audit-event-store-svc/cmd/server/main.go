@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
+	"zoiko.io/audit-event-store-svc/internal/authz"
 	"zoiko.io/audit-event-store-svc/internal/config"
 	"zoiko.io/audit-event-store-svc/internal/consumer"
 	svcenvelope "zoiko.io/audit-event-store-svc/internal/envelope"
@@ -141,7 +143,14 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	router.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	policy := svcenvelope.ServicePolicy()
+	policy.MaterialWrite = func(r *http.Request) bool {
+		if r.Method == http.MethodPost && (r.URL.Path == "/v1/events/verify" || strings.HasSuffix(r.URL.Path, "/verify")) {
+			return false
+		}
+		return r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+	}
+	router.Use(svcenvelope.Middleware(policy, svcenvelope.DefaultReporter()))
 
 	// Health probes — no auth, no tenant context required.
 	healthH := health.New(pool, log)
@@ -151,7 +160,8 @@ func main() {
 
 	// AUD-10 archive/verify API — this service's first business HTTP
 	// endpoint set (see internal/handler's own package doc).
-	archiveHandler := handler.New(pgStore, log)
+	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	archiveHandler := handler.New(pgStore, authzClient, log)
 	handler.RegisterRoutes(router, archiveHandler)
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────

@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -78,11 +79,9 @@ func NewKafkaPublisherWithWriter(writer MessageWriter, topic string, logger *zap
 	return &KafkaPublisher{writer: writer, topic: topic, logger: logger}
 }
 
-func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
-	evt := Event{
-		// A fresh UUID per publish, not a deterministic string — see
-		// docs/architecture/known-gaps.md's event_id collision writeup.
-		EventID:       "evt-" + uuid.New().String(),
+func NewEvent(params PublishParams) Event {
+	return Event{
+		EventID:       "evt-" + uuid.NewString(),
 		EventType:     params.EventType,
 		EventVersion:  "1.0",
 		SchemaVersion: "1.0",
@@ -94,16 +93,48 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 		OccurredAt:    time.Now().UTC(),
 		Payload:       params.Payload,
 	}
+}
+
+func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
+	evt := NewEvent(params)
 	data, err := json.Marshal(evt)
 	if err != nil {
 		return err
 	}
-	err = p.writer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(params.EntityID),
-		Value: data,
+	return p.PublishOutbox(ctx, params.EntityID, data)
+}
+
+// PublishOutbox sends the already-serialized event so retries preserve its
+// original event ID, timestamp, and payload. Consumers use the envelope event
+// ID for deduplication, so the Kafka header must match the envelope.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, entityID string, payload []byte) error {
+	if !json.Valid(payload) {
+		return fmt.Errorf("publish outbox event: invalid JSON payload")
+	}
+	var event struct {
+		EventID string `json:"event_id"`
+	}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return fmt.Errorf("publish outbox event: decode event ID: %w", err)
+	}
+	if event.EventID == "" {
+		return fmt.Errorf("publish outbox event: event_id is required")
+	}
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(entityID),
+		Value:   payload,
+		Headers: []kafka.Header{{Key: "X-Event-ID", Value: []byte(event.EventID)}},
 	})
 	if err != nil {
-		p.logger.Warn("kafka publish failed — event dropped", zap.String("event_type", params.EventType), zap.Error(err))
+		p.logger.Warn("kafka outbox publish failed", zap.String("entity_id", entityID), zap.Error(err))
+		return fmt.Errorf("publish outbox event for %s: %w", entityID, err)
+	}
+	return nil
+}
+
+func (p *KafkaPublisher) Close() error {
+	if closer, ok := p.writer.(interface{ Close() error }); ok {
+		return closer.Close()
 	}
 	return nil
 }

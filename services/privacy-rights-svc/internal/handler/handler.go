@@ -295,6 +295,10 @@ func (h *Handler) RecordIdentityVerification(w http.ResponseWriter, r *http.Requ
 	if !h.authorize(w, r, principalID, tenantID, PrivacyRightsRequestProcess) {
 		return
 	}
+	if existing.Status == domain.StatusClosed {
+		writeError(w, http.StatusConflict, domain.PRV020ImmutableEvidenceConflict)
+		return
+	}
 
 	// Check idempotency (§18.1)
 	_, handled, idemKey, reqHash := h.checkIdempotency(w, r, tenantID, principalID, bodyBytes)
@@ -358,6 +362,10 @@ func (h *Handler) AttachDiscoveryManifest(w http.ResponseWriter, r *http.Request
 		tenantID = *existing.TenantID
 	}
 	if !h.authorize(w, r, principalID, tenantID, PrivacyRightsRequestProcess) {
+		return
+	}
+	if existing.Status == domain.StatusClosed {
+		writeError(w, http.StatusConflict, domain.PRV020ImmutableEvidenceConflict)
 		return
 	}
 
@@ -438,6 +446,10 @@ func (h *Handler) AttachWFCProcessRef(w http.ResponseWriter, r *http.Request) {
 		tenantID = *existing.TenantID
 	}
 	if !h.authorize(w, r, principalID, tenantID, PrivacyRightsRequestProcess) {
+		return
+	}
+	if existing.Status == domain.StatusClosed {
+		writeError(w, http.StatusConflict, domain.PRV020ImmutableEvidenceConflict)
 		return
 	}
 

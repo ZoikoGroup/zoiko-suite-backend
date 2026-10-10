@@ -27,6 +27,9 @@ type Store interface {
 	ListInvoices(ctx context.Context, filter domain.ListInvoicesFilter) ([]domain.VendorInvoice, error)
 	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string) error
 	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
+	// SetApprovalJournalID records the GL journal ID returned when the invoice
+	// approval accounting event was posted (ACC-14).
+	SetApprovalJournalID(ctx context.Context, tenantID, invoiceID, journalID string) error
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -40,6 +43,11 @@ type Publisher interface {
 // AuthZClient is the authorization contract the handler depends on.
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+// LedgerClient posts approval accounting events to GL (ACC-14).
+type LedgerClient interface {
+	PostInvoiceApprovedAccountingEvent(ctx context.Context, tenantID, principalID string, inv *domain.VendorInvoice) (journalID string, err error)
 }
 
 // Action types checked against authorization-svc. A single, platform-wide
@@ -81,11 +89,12 @@ type Handler struct {
 	authz          AuthZClient
 	purchaseOrders PurchaseOrderVerifier
 	payables       payableopenitem.Client
+	ledger         LedgerClient
 	log            *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, po PurchaseOrderVerifier, payables payableopenitem.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, purchaseOrders: po, payables: payables, log: log}
+func New(store Store, publisher Publisher, authz AuthZClient, po PurchaseOrderVerifier, payables payableopenitem.Client, ledger LedgerClient, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, authz: authz, purchaseOrders: po, payables: payables, ledger: ledger, log: log}
 }
 
 // linesFromRequest maps the wire lines onto domain lines. Line numbers are
@@ -496,6 +505,31 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
+
+	// Post the approval accounting event to general-ledger-svc.
+	// This MUST succeed — an approved invoice that cannot be booked leaves
+	// the books without the liability.
+	// SourceEventID = inv.InvoiceID makes retry safe against GL's
+	// UNIQUE(tenant_id, source_event_id) constraint.
+	journalID, err := h.ledger.PostInvoiceApprovedAccountingEvent(r.Context(), inv.TenantID, principalID, inv)
+	if err != nil {
+		h.log.Error("ApproveInvoice: failed to post accounting event — invoice approved but not yet booked",
+			zap.String("invoice_id", inv.InvoiceID), zap.Error(err))
+		// Fail the request so the caller knows to retry. Do not leave an
+		// unbooked approved invoice in the system.
+		writeError(w, http.StatusServiceUnavailable, "ledger_posting_failed",
+			"invoice approved but accounting event could not be posted; retry the request")
+		return
+	}
+
+	// Store the journal ID on the invoice for audit traceability.
+	inv.ApprovalJournalID = &journalID
+	if err := h.store.SetApprovalJournalID(r.Context(), inv.TenantID, inv.InvoiceID, journalID); err != nil {
+		h.log.Error("ApproveInvoice: invoice posted but failed to store journal ID",
+			zap.String("invoice_id", inv.InvoiceID), zap.String("journal_id", journalID), zap.Error(err))
+		// The journal exists in GL; this is an audit-only failure. Log and continue.
+	}
+
 	// vendor.invoice.approved is written to the outbox inside TransitionInvoice
 	// (ZS-STATE-001), so it is not published here as well.
 	//

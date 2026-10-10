@@ -16,6 +16,7 @@ import (
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/handler"
+	"zoiko.io/general-ledger-svc/internal/store"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 )
 
@@ -69,6 +70,7 @@ type stubStore struct {
 
 	postingExecutions map[string]*domain.PostingExecution // by execution_id
 	bySourceEvent     map[string]string                   // "tenant|source_event_id" -> execution_id
+	claimedAt         map[string]time.Time                // execution_id -> reprocess claim time
 	createExecErr     error
 	markCommittedErr  error
 	markFailedErr     error
@@ -85,6 +87,7 @@ func newStubStore() *stubStore {
 		currentMappings:   map[string]*domain.AccountMapping{},
 		postingExecutions: map[string]*domain.PostingExecution{},
 		bySourceEvent:     map[string]string{},
+		claimedAt:         map[string]time.Time{},
 	}
 }
 
@@ -376,6 +379,40 @@ func (s *stubStore) MarkPostingExecutionFailed(_ context.Context, tenantID, exec
 	}
 	e.Status, e.FailureReason = status, &reason
 	return nil
+}
+
+// ClaimPostingExecutionForReprocess mirrors the store's conditional UPDATE:
+// only FAILED/QUARANTINED (or a VALIDATING claim older than the timeout)
+// can be claimed.
+func (s *stubStore) ClaimPostingExecutionForReprocess(_ context.Context, _, executionID string, now time.Time) (bool, error) {
+	e, ok := s.postingExecutions[executionID]
+	if !ok {
+		return false, nil
+	}
+	stale := e.Status == domain.PostingExecutionStatusValidating && s.claimedAt[executionID].Before(now.Add(-store.ReprocessClaimTimeout))
+	if e.Status != domain.PostingExecutionStatusFailed && e.Status != domain.PostingExecutionStatusQuarantined && !stale {
+		return false, nil
+	}
+	e.Status = domain.PostingExecutionStatusValidating
+	s.claimedAt[executionID] = now
+	return true, nil
+}
+
+func (s *stubStore) SetPostingExecutionTrace(_ context.Context, _, executionID, trace string) error {
+	if e, ok := s.postingExecutions[executionID]; ok {
+		e.CalculationTrace = trace
+	}
+	return nil
+}
+
+func (s *stubStore) FindJournalIDsBySourceEvent(_ context.Context, tenantID, sourceEventID string) ([]string, error) {
+	var ids []string
+	for id, h := range s.journals {
+		if h.TenantID == tenantID && h.SourceEventID != nil && *h.SourceEventID == sourceEventID {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }
 
 func (s *stubStore) SubmitJournalForApproval(_ context.Context, _, journalID, principalID string) error {

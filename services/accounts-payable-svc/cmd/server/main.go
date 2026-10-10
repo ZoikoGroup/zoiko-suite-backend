@@ -40,6 +40,7 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/outbox"
 	"zoiko.io/accounts-payable-svc/internal/payableopenitem"
 	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
+	"zoiko.io/accounts-payable-svc/internal/ledger"
 	"zoiko.io/accounts-payable-svc/internal/store"
 	"zoiko.io/accounts-payable-svc/internal/telemetry"
 )
@@ -210,7 +211,10 @@ func main() {
 	// AP-08's open-item posting.
 	payablesClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, log)
 
-	h := handler.New(pgStore, publisher, authzClient, poClient, payablesClient, log)
+	// GL ledger client for posting approval accounting events (ACC-14).
+	ledgerClient := ledger.NewHTTPClient(cfg.LedgerServiceURL, log)
+
+	h := handler.New(pgStore, publisher, authzClient, poClient, payablesClient, ledgerClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

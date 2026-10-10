@@ -65,6 +65,9 @@ type Store interface {
 	GetPostingExecutionBySource(ctx context.Context, tenantID, sourceEventID string) (*domain.PostingExecution, error)
 	MarkPostingExecutionCommitted(ctx context.Context, tenantID, executionID, journalID string, committedAt time.Time) error
 	MarkPostingExecutionFailed(ctx context.Context, tenantID, executionID, status, reason string) error
+	ClaimPostingExecutionForReprocess(ctx context.Context, tenantID, executionID string, now time.Time) (bool, error)
+	SetPostingExecutionTrace(ctx context.Context, tenantID, executionID, trace string) error
+	FindJournalIDsBySourceEvent(ctx context.Context, tenantID, sourceEventID string) ([]string, error)
 
 	// ACC-03 journal proposal/approval lifecycle — see migration 000010's
 	// doc comment.
@@ -137,6 +140,12 @@ const (
 	// deliberately a distinct, more sensitive action than actionCreateJournal
 	// itself, so it can be granted to a narrower group.
 	actionOverridePostingRestriction = "COA_CONTROL_ACCOUNT_POSTING_OVERRIDE"
+
+	// actionOverrideSoftClose gates the soft-close override (ZS-SVC-B-001
+	// ACC-14 §10.1) — elevated finance role + mandatory reason + evidence.
+	// Distinct from actionOverridePostingRestriction so it can be granted to
+	// a different (typically narrower) group.
+	actionOverrideSoftClose = "GL_SOFT_CLOSE_POSTING_OVERRIDE"
 
 	// ACC-02 Account Mapping actions.
 	actionSetAccountMapping  = "COA_MAPPING_SET"
@@ -329,14 +338,17 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enforce Period Lock Check
+	// Enforce Period Lock Check with soft-close override support
 	if err := h.closeClient.CheckPeriodOpen(r.Context(), req.TenantID, req.LegalEntityID, req.FiscalPeriod); err != nil {
-		if errors.Is(err, domain.ErrPeriodLocked) {
-			writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
+		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
+			if !h.checkSoftCloseOverride(w, r, req.OverrideSoftClose, req.SoftCloseOverrideReason, principalID, req.LegalEntityID) {
+				return
+			}
+			// Override allowed — fall through to create the journal
 		} else {
-			writeError(w, http.StatusServiceUnavailable, "close_check_failed", err.Error())
+			h.writePeriodErr(w, err)
+			return
 		}
-		return
 	}
 
 	// ACC-01 invariant #7: "Control accounts cannot be bypassed by ordinary
@@ -376,13 +388,14 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		SourceEventID:        req.SourceEventID,
 		GovernanceDecisionID: req.GovernanceDecisionID,
 
-		JournalType:     req.JournalType,
-		TransactionDate: req.TransactionDate,
-		PostingDate:     req.PostingDate,
-		CurrencyCode:    req.CurrencyCode,
-		BookID:          bookID,
-		ReportingBasis:  reportingBasis,
-		EvidenceRefs:    mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
+		JournalType:              req.JournalType,
+		TransactionDate:          req.TransactionDate,
+		PostingDate:              req.PostingDate,
+		CurrencyCode:             req.CurrencyCode,
+		BookID:                   bookID,
+		ReportingBasis:           reportingBasis,
+		EvidenceRefs:             mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
+		SoftCloseOverrideReason:  &req.SoftCloseOverrideReason,
 
 		// ACC-03: every ordinary journal a human creates starts as a
 		// proposal nobody has acted on yet — explicit here rather than
@@ -472,6 +485,32 @@ func (h *Handler) checkAccountRestrictions(w http.ResponseWriter, r *http.Reques
 				return false
 			}
 		}
+	}
+	return true
+}
+
+// checkSoftCloseOverride enforces the soft-close posting restriction
+// (ZS-SVC-B-001 ACC-14 §10.1, ZS global accounting kernel §10.1/§10.2).
+// When a period is in SOFT_CLOSE (posting_policy RESTRICTED), ordinary
+// posting is refused unless the caller explicitly declares an override,
+// holds the GL_SOFT_CLOSE_POSTING_OVERRIDE authorization action, AND
+// provides a non-empty reason string that is persisted on the journal
+// header and emitted in outbox events. Unlike the control-account
+// override, the reason is mandatory here per the kernel standard.
+func (h *Handler) checkSoftCloseOverride(w http.ResponseWriter, r *http.Request, overrideFlag bool, reason string, principalID, legalEntityID string) bool {
+	if !overrideFlag {
+		writeError(w, http.StatusPreconditionFailed, "soft_close_override_required",
+			domain.ErrSoftCloseOverrideRequired.Error())
+		return false
+	}
+	if reason == "" || len(strings.TrimSpace(reason)) == 0 {
+		writeError(w, http.StatusBadRequest, "soft_close_override_reason_required",
+			"soft_close_override_reason is required and must be non-empty when override_soft_close is true")
+		return false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionOverrideSoftClose); err != nil {
+		h.writeAuthzErr(w, err)
+		return false
 	}
 	return true
 }
@@ -978,14 +1017,22 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enforce Period Lock Check
+	// Soft-close override: if the journal was created with a soft-close override
+	// reason, allow it through SOFT_CLOSE without requiring a new override at post time.
+	softCloseOverrideReason := ""
+	if header.SoftCloseOverrideReason != nil {
+		softCloseOverrideReason = *header.SoftCloseOverrideReason
+	}
 	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
-		if errors.Is(err, domain.ErrPeriodLocked) {
-			writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
+		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
+			if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
+				return
+			}
+			// Override allowed — fall through
 		} else {
-			writeError(w, http.StatusServiceUnavailable, "close_check_failed", err.Error())
+			h.writePeriodErr(w, err)
+			return
 		}
-		return
 	}
 
 	if err := h.store.TransitionJournal(r.Context(), header.TenantID, journalID,
@@ -1060,13 +1107,9 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enforce Period Lock Check
+	// Enforce Period Lock Check with soft-close override support
 	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
-		if errors.Is(err, domain.ErrPeriodLocked) {
-			writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
-		} else {
-			writeError(w, http.StatusServiceUnavailable, "close_check_failed", err.Error())
-		}
+		h.writePeriodErr(w, err)
 		return
 	}
 
@@ -1089,16 +1132,17 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reversingHeader := &domain.JournalHeader{
-		JournalID:            uuid.NewString(),
-		TenantID:             header.TenantID,
-		LegalEntityID:        header.LegalEntityID,
-		FiscalPeriod:         header.FiscalPeriod,
-		Status:               domain.JournalStatusFinalized,
-		ReversalOfJournalID:  &reversalID,
-		Description:          "Reversal of " + journalID + ": " + req.Reason,
-		CreatedByPrincipalID: principalID,
-		PostedByPrincipalID:  &principalID,
-		CorrelationID:        req.CorrelationID,
+		JournalID:              uuid.NewString(),
+		TenantID:               header.TenantID,
+		LegalEntityID:          header.LegalEntityID,
+		FiscalPeriod:           header.FiscalPeriod,
+		Status:                 domain.JournalStatusFinalized,
+		ReversalOfJournalID:    &reversalID,
+		Description:            "Reversal of " + journalID + ": " + req.Reason,
+		CreatedByPrincipalID:   principalID,
+		PostedByPrincipalID:    &principalID,
+		CorrelationID:          req.CorrelationID,
+		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 
 		JournalType:     domain.JournalTypeReversal,
 		TransactionDate: header.TransactionDate,
@@ -1737,6 +1781,9 @@ func (h *Handler) resolvePostingLines(ctx context.Context, tenantID string, line
 // the FINALIZED transition, the spec's own negative path, "Closed period
 // race during commit": a period locked AFTER this journal was created but
 // BEFORE it is actually posted must still block the commit.
+// If the journal was created with a soft-close override reason, it is
+// honored for this re-check as well (mirroring the control-account override
+// pattern where the override is declared at creation and honored at posting).
 func (h *Handler) commitJournal(ctx context.Context, header *domain.JournalHeader, principalID string) error {
 	debitTotal, creditTotal, err := h.store.SumLines(ctx, header.TenantID, header.JournalID)
 	if err != nil {
@@ -1749,8 +1796,13 @@ func (h *Handler) commitJournal(ctx context.Context, header *domain.JournalHeade
 		domain.JournalStatusPending, domain.JournalStatusValidated, principalID); err != nil {
 		return err
 	}
+	// Re-check period with soft-close override from journal header if present
 	if err := h.closeClient.CheckPeriodOpen(ctx, header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
-		return err
+		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && header.SoftCloseOverrideReason != nil && *header.SoftCloseOverrideReason != "" {
+			// Override was declared at journal creation — honor it
+		} else {
+			return err
+		}
 	}
 	if err := h.store.TransitionJournal(ctx, header.TenantID, header.JournalID,
 		domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID); err != nil {
@@ -1835,13 +1887,26 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	journalReq := domain.CreateJournalRequest{
-		TenantID: tenantID, LegalEntityID: req.LegalEntityID, FiscalPeriod: req.FiscalPeriod,
-		Description: req.Description, Lines: resolvedLines, CorrelationID: req.CorrelationID,
-		SourceEventID: &req.SourceEventID,
+		TenantID:                tenantID,
+		LegalEntityID:           req.LegalEntityID,
+		FiscalPeriod:            req.FiscalPeriod,
+		Description:             req.Description,
+		Lines:                   resolvedLines,
+		CorrelationID:           req.CorrelationID,
+		SourceEventID:           &req.SourceEventID,
+		OverrideSoftClose:       req.OverrideSoftClose,
+		SoftCloseOverrideReason: req.SoftCloseOverrideReason,
 	}
 	if err := h.closeClient.CheckPeriodOpen(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod); err != nil {
-		h.writePeriodErr(w, err)
-		return
+		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
+			if !h.checkSoftCloseOverride(w, r, req.OverrideSoftClose, req.SoftCloseOverrideReason, principalID, req.LegalEntityID) {
+				return
+			}
+			// Override allowed — fall through
+		} else {
+			h.writePeriodErr(w, err)
+			return
+		}
 	}
 	if !h.checkAccountRestrictions(w, r, journalReq, principalID) {
 		return
@@ -1849,11 +1914,19 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 
 	traceJSON, _ := json.Marshal(trace)
 	sourceEventID := req.SourceEventID
+	// The accepted request, PostingDate default applied, kept so a failure
+	// before the journal is written can be replayed (migration 000014).
+	requestPayload, err := json.Marshal(req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "request_not_recordable", err.Error())
+		return
+	}
 	exec := &domain.PostingExecution{
 		ExecutionID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID, Kind: domain.PostingExecutionKindEvent,
 		SourceEventID: &sourceEventID, Status: domain.PostingExecutionStatusSubmitted,
 		CalculationTrace: string(traceJSON), CorrelationID: req.CorrelationID,
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+		RequestPayload: requestPayload,
 	}
 	if err := h.store.CreatePostingExecution(r.Context(), exec); err != nil {
 		h.log.Error("PostAccountingEvent: failed to record posting execution", zap.Error(err))
@@ -1861,24 +1934,7 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	header := &domain.JournalHeader{
-		JournalID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID,
-		FiscalPeriod: req.FiscalPeriod, Status: domain.JournalStatusPending, Description: req.Description,
-		CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID, SourceEventID: &sourceEventID,
-		JournalType: domain.JournalTypeStandard, TransactionDate: req.DocumentDate,
-		PostingDate: req.PostingDate, CurrencyCode: req.TransactionCurrency,
-		// System-originated: this bypasses ACC-03's human Draft/Submit/
-		// Approve workflow entirely (already gated by actionPostingExecute,
-		// which a deployment grants only to internal service identities —
-		// see that action's own doc comment), landing directly at
-		// POSTING_REQUESTED so commitJournal's own MarkJournalPosted call
-		// has a valid ApprovalStatus to advance from.
-		ApprovalStatus: domain.ApprovalStatusPostingRequested,
-	}
-	lines := make([]domain.JournalLine, len(resolvedLines))
-	for i, l := range resolvedLines {
-		lines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount, Description: l.Description}
-	}
+	header, lines := eventJournal(tenantID, principalID, req, resolvedLines)
 	if _, _, err := h.store.CreateJournal(r.Context(), header, lines); err != nil {
 		h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
@@ -1903,6 +1959,235 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, exec)
 }
 
+// eventJournal builds the journal an accounting event posts as. Shared by
+// PostAccountingEvent and the replay in ReprocessFailedPosting so a replayed
+// event posts exactly the journal the original request would have.
+func eventJournal(tenantID, principalID string, req domain.PostAccountingEventRequest, resolvedLines []domain.CreateJournalLineInput) (*domain.JournalHeader, []domain.JournalLine) {
+	sourceEventID := req.SourceEventID
+	header := &domain.JournalHeader{
+		JournalID:                uuid.NewString(),
+		TenantID:                 tenantID,
+		LegalEntityID:            req.LegalEntityID,
+		FiscalPeriod:             req.FiscalPeriod,
+		Status:                   domain.JournalStatusPending,
+		Description:              req.Description,
+		CreatedByPrincipalID:     principalID,
+		CorrelationID:            req.CorrelationID,
+		SourceEventID:            &sourceEventID,
+		JournalType:              domain.JournalTypeStandard,
+		TransactionDate:          req.DocumentDate,
+		PostingDate:              req.PostingDate,
+		CurrencyCode:             req.TransactionCurrency,
+		SoftCloseOverrideReason:  &req.SoftCloseOverrideReason,
+		// System-originated: this bypasses ACC-03's human Draft/Submit/
+		// Approve workflow entirely (already gated by actionPostingExecute,
+		// which a deployment grants only to internal service identities —
+		// see that action's own doc comment), landing directly at
+		// POSTING_REQUESTED so commitJournal's own MarkJournalPosted call
+		// has a valid ApprovalStatus to advance from.
+		ApprovalStatus: domain.ApprovalStatusPostingRequested,
+	}
+	lines := make([]domain.JournalLine, len(resolvedLines))
+	for i, l := range resolvedLines {
+		lines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount, Description: l.Description}
+	}
+	return header, lines
+}
+
+// replayFailedEvent is ReprocessFailedPosting for an EVENT execution that
+// failed before any journal was written: it replays the captured request.
+//
+// Order matters, and each step exists for a failure mode:
+//
+//  1. Claim (FAILED/QUARANTINED -> VALIDATING) so two concurrent reprocesses
+//     cannot both post the fact.
+//  2. Look for a journal already carrying the source event. journal_headers
+//     does not make source_event_id unique, so if the failed attempt's write
+//     did commit (acknowledgement lost), replaying blindly would post twice.
+//     One such journal is adopted; more than one is refused for a person.
+//  3. Otherwise re-resolve the lines against the CURRENT mappings (the cause
+//     is usually a mapping fixed since), re-check the period and account
+//     restrictions, post, and record the resolution that actually posted.
+//
+// Any failure puts the execution back to FAILED (or QUARANTINED) with the new
+// reason, so it stays visible in the posting backlog and the period close
+// stays blocked until it succeeds.
+func (h *Handler) replayFailedEvent(w http.ResponseWriter, r *http.Request, tenantID, principalID string, exec *domain.PostingExecution) {
+	ctx := r.Context()
+	if exec.Kind != domain.PostingExecutionKindEvent || len(exec.RequestPayload) == 0 || exec.SourceEventID == nil {
+		writeError(w, http.StatusUnprocessableEntity, "no_journal_to_reprocess",
+			"this execution failed before any journal was created and has no captured request to replay "+
+				"(it predates request capture, or is not an accounting-event posting)")
+		return
+	}
+	var req domain.PostAccountingEventRequest
+	if err := json.Unmarshal(exec.RequestPayload, &req); err != nil {
+		h.log.Error("captured posting request does not decode", zap.String("execution_id", exec.ExecutionID), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "captured_request_unreadable", "")
+		return
+	}
+
+	claimed, err := h.store.ClaimPostingExecutionForReprocess(ctx, tenantID, exec.ExecutionID, time.Now().UTC())
+	if err != nil {
+		h.log.Error("reprocess: claim failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if !claimed {
+		writeError(w, http.StatusConflict, "reprocess_in_progress", "another reprocess of this execution is already running")
+		return
+	}
+
+	existing, err := h.store.FindJournalIDsBySourceEvent(ctx, tenantID, *exec.SourceEventID)
+	if err != nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, fmt.Errorf("reprocess: could not check for an existing journal: %w", err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	var journalID string
+	switch len(existing) {
+	case 0:
+		var ok bool
+		if journalID, ok = h.postReplayedEvent(w, r, tenantID, principalID, exec, req); !ok {
+			return
+		}
+	case 1:
+		var ok bool
+		if journalID, ok = h.adoptExistingJournal(w, r, tenantID, principalID, exec, existing[0]); !ok {
+			return
+		}
+	default:
+		cause := fmt.Errorf("%d journals already carry source event %s; refusing to choose between them", len(existing), *exec.SourceEventID)
+		h.failExecution(ctx, tenantID, exec.ExecutionID, cause)
+		writeError(w, http.StatusConflict, "ambiguous_source_journals", cause.Error())
+		return
+	}
+
+	now := time.Now().UTC()
+	if err := h.store.MarkPostingExecutionCommitted(ctx, tenantID, exec.ExecutionID, journalID, now); err != nil {
+		h.log.Error("journal committed on replay but the posting execution could not be marked COMMITTED",
+			zap.String("execution_id", exec.ExecutionID), zap.String("journal_id", journalID), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "execution_not_recorded",
+			"the journal IS finalized ("+journalID+"), but the posting execution could not be marked COMMITTED.")
+		return
+	}
+	exec.Status, exec.JournalID, exec.CommittedAt, exec.FailureReason = domain.PostingExecutionStatusCommitted, &journalID, &now, nil
+	writeJSON(w, http.StatusOK, exec)
+}
+
+// postReplayedEvent posts the captured request afresh. Reports the journal
+// id, or false after writing the response.
+func (h *Handler) postReplayedEvent(w http.ResponseWriter, r *http.Request, tenantID, principalID string, exec *domain.PostingExecution, req domain.PostAccountingEventRequest) (string, bool) {
+	ctx := r.Context()
+	resolvedLines, trace, err := h.resolvePostingLines(ctx, tenantID, req.Lines)
+	if err != nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+		if errors.Is(err, domain.ErrPostingRuleAmbiguous) {
+			writeError(w, http.StatusUnprocessableEntity, "posting_rule_ambiguous", err.Error())
+		} else {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_line", err.Error())
+		}
+		return "", false
+	}
+	if err := h.closeClient.CheckPeriodOpen(ctx, tenantID, req.LegalEntityID, req.FiscalPeriod); err != nil {
+		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
+			if !h.checkSoftCloseOverride(w, r, req.OverrideSoftClose, req.SoftCloseOverrideReason, principalID, req.LegalEntityID) {
+				h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+				return "", false
+			}
+			// Override allowed — fall through
+		} else {
+			h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+			h.writePeriodErr(w, err)
+			return "", false
+		}
+	}
+	sourceEventID := req.SourceEventID
+	journalReq := domain.CreateJournalRequest{
+		TenantID:                tenantID,
+		LegalEntityID:           req.LegalEntityID,
+		FiscalPeriod:            req.FiscalPeriod,
+		Description:             req.Description,
+		Lines:                   resolvedLines,
+		CorrelationID:           req.CorrelationID,
+		SourceEventID:           &sourceEventID,
+		OverrideSoftClose:       req.OverrideSoftClose,
+		SoftCloseOverrideReason: req.SoftCloseOverrideReason,
+	}
+	if !h.checkAccountRestrictions(w, r, journalReq, principalID) {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, errors.New("reprocess: refused by account posting restrictions"))
+		return "", false
+	}
+
+	if traceJSON, err := json.Marshal(trace); err == nil {
+		if err := h.store.SetPostingExecutionTrace(ctx, tenantID, exec.ExecutionID, string(traceJSON)); err != nil {
+			h.failExecution(ctx, tenantID, exec.ExecutionID, fmt.Errorf("reprocess: could not record the calculation trace: %w", err))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+			return "", false
+		}
+		exec.CalculationTrace = string(traceJSON)
+	}
+
+	header, lines := eventJournal(tenantID, principalID, req, resolvedLines)
+	if _, _, err := h.store.CreateJournal(ctx, header, lines); err != nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return "", false
+	}
+	if err := h.commitJournal(ctx, header, principalID); err != nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+		h.writePeriodErr(w, err)
+		return "", false
+	}
+	return header.JournalID, true
+}
+
+// adoptExistingJournal finishes a journal the failed attempt did manage to
+// write, instead of posting the source fact a second time.
+func (h *Handler) adoptExistingJournal(w http.ResponseWriter, r *http.Request, tenantID, principalID string, exec *domain.PostingExecution, journalID string) (string, bool) {
+	ctx := r.Context()
+	header, _, err := h.store.GetJournal(ctx, journalID)
+	if err != nil || header == nil {
+		h.failExecution(ctx, tenantID, exec.ExecutionID, fmt.Errorf("reprocess: could not load existing journal %s", journalID))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return "", false
+	}
+	switch header.Status {
+	case domain.JournalStatusFinalized:
+		return journalID, true
+	case domain.JournalStatusPending:
+		// Soft-close override: if the journal was created with a soft-close override
+		// reason, allow it through SOFT_CLOSE without requiring a new override at commit time.
+		softCloseOverrideReason := ""
+		if header.SoftCloseOverrideReason != nil {
+			softCloseOverrideReason = *header.SoftCloseOverrideReason
+		}
+		if err := h.closeClient.CheckPeriodOpen(ctx, header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+			if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
+				if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
+					return "", false
+				}
+				// Override allowed — fall through to commit
+			} else {
+				h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+				h.writePeriodErr(w, err)
+				return "", false
+			}
+		}
+		if err := h.commitJournal(ctx, header, principalID); err != nil {
+			h.failExecution(ctx, tenantID, exec.ExecutionID, err)
+			h.writePeriodErr(w, err)
+			return "", false
+		}
+		return journalID, true
+	default:
+		cause := fmt.Errorf("existing journal %s for this source event is %s; a person must decide", journalID, header.Status)
+		h.failExecution(ctx, tenantID, exec.ExecutionID, cause)
+		writeError(w, http.StatusConflict, "existing_journal_not_adoptable", cause.Error())
+		return "", false
+	}
+}
+
 // failExecution marks an execution FAILED (or QUARANTINED for an
 // ambiguous/unbalanced posting rule, which needs a human to resolve
 // rather than a simple retry) with the underlying error as its permanent,
@@ -1919,7 +2204,11 @@ func (h *Handler) failExecution(ctx context.Context, tenantID, executionID strin
 }
 
 func (h *Handler) writePeriodErr(w http.ResponseWriter, err error) {
-	if errors.Is(err, domain.ErrPeriodLocked) {
+	if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
+		writeError(w, http.StatusPreconditionFailed, "soft_close_override_required", err.Error())
+		return
+	}
+	if errors.Is(err, domain.ErrPeriodHardClosed) || errors.Is(err, domain.ErrPeriodLocked) {
 		writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
 		return
 	}
@@ -1985,6 +2274,15 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Soft-close override: if the journal was created with a soft-close override
+	// reason, allow it through SOFT_CLOSE without requiring a new override at post time.
+	// This mirrors the control-account override pattern where the override is
+	// declared at journal creation and honored at posting.
+	softCloseOverrideReason := ""
+	if header.SoftCloseOverrideReason != nil {
+		softCloseOverrideReason = *header.SoftCloseOverrideReason
+	}
+
 	exec := &domain.PostingExecution{
 		ExecutionID: uuid.NewString(), TenantID: tenantID, LegalEntityID: header.LegalEntityID, Kind: domain.PostingExecutionKindApprovedJournal,
 		Status: domain.PostingExecutionStatusSubmitted, CalculationTrace: "{}", CorrelationID: header.CorrelationID,
@@ -1997,9 +2295,16 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
-		h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
-		h.writePeriodErr(w, err)
-		return
+		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) && softCloseOverrideReason != "" {
+			if !h.checkSoftCloseOverride(w, r, true, softCloseOverrideReason, principalID, header.LegalEntityID) {
+				return
+			}
+			// Override allowed — fall through
+		} else {
+			h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
+			h.writePeriodErr(w, err)
+			return
+		}
 	}
 	if err := h.store.TransitionJournal(r.Context(), header.TenantID, req.JournalID,
 		domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID); err != nil {
@@ -2069,9 +2374,17 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusUnprocessableEntity, "only_finalized_reversible", domain.ErrOnlyFinalizedReversible.Error())
 		return
 	}
+
 	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
-		h.writePeriodErr(w, err)
-		return
+		if errors.Is(err, domain.ErrSoftCloseOverrideRequired) {
+			if !h.checkSoftCloseOverride(w, r, req.OverrideSoftClose, req.SoftCloseOverrideReason, principalID, header.LegalEntityID) {
+				return
+			}
+			// Override allowed — fall through
+		} else {
+			h.writePeriodErr(w, err)
+			return
+		}
 	}
 
 	correlationID := "posting-reversal:" + req.OriginalJournalID
@@ -2088,10 +2401,17 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 
 	reversalID := req.OriginalJournalID
 	reversingHeader := &domain.JournalHeader{
-		JournalID: uuid.NewString(), TenantID: header.TenantID, LegalEntityID: header.LegalEntityID,
-		FiscalPeriod: header.FiscalPeriod, Status: domain.JournalStatusFinalized, ReversalOfJournalID: &reversalID,
-		Description: "Reversal of " + req.OriginalJournalID + ": " + req.Reason, CreatedByPrincipalID: principalID,
-		PostedByPrincipalID: &principalID, CorrelationID: correlationID,
+		JournalID:               uuid.NewString(),
+		TenantID:                header.TenantID,
+		LegalEntityID:           header.LegalEntityID,
+		FiscalPeriod:            header.FiscalPeriod,
+		Status:                  domain.JournalStatusFinalized,
+		ReversalOfJournalID:     &reversalID,
+		Description:             "Reversal of " + req.OriginalJournalID + ": " + req.Reason,
+		CreatedByPrincipalID:    principalID,
+		PostedByPrincipalID:     &principalID,
+		CorrelationID:           correlationID,
+		SoftCloseOverrideReason: &req.SoftCloseOverrideReason,
 	}
 	_, originalLines, err := h.store.GetJournal(r.Context(), req.OriginalJournalID)
 	if err != nil {
@@ -2127,12 +2447,13 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 }
 
 // ReprocessFailedPosting retries a FAILED/QUARANTINED execution.
-// Deliberately scoped to executions that already produced a journal (the
-// original create step succeeded but commit failed, e.g. a transient
-// period-lock race) — an execution that failed before any journal ever
-// existed carries no persisted original request to safely replay, and
-// resubmitting as a brand-new PostAccountingEvent is the honest path
-// rather than fabricating a retry from data this record never kept.
+//
+// With a journal (the create succeeded but the commit failed, e.g. a
+// transient period-lock race) it retries the commit. Without one it replays
+// the request captured when the event was accepted — see replayFailedEvent.
+// Resubmitting the source event is not an alternative: a duplicate source
+// event returns the prior FAILED result (ACC-04), so before request capture
+// such an execution could never be fixed, and it now blocks period close.
 func (h *Handler) ReprocessFailedPosting(w http.ResponseWriter, r *http.Request) {
 	executionID := chi.URLParam(r, "execution_id")
 	principalID, ok := h.requirePrincipal(w, r)
@@ -2156,13 +2477,18 @@ func (h *Handler) ReprocessFailedPosting(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusUnprocessableEntity, "already_committed", domain.ErrPostingAlreadyCommitted.Error())
 		return
 	}
+	// A no-journal execution in VALIDATING is under (or was abandoned by) a
+	// replay; its claim, not this status check, decides whether to proceed.
+	if exec.JournalID == nil && exec.Status == domain.PostingExecutionStatusValidating {
+		h.replayFailedEvent(w, r, tenantID, principalID, exec)
+		return
+	}
 	if exec.Status != domain.PostingExecutionStatusFailed && exec.Status != domain.PostingExecutionStatusQuarantined {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidPostingTransition.Error())
 		return
 	}
 	if exec.JournalID == nil {
-		writeError(w, http.StatusUnprocessableEntity, "no_journal_to_reprocess",
-			"this execution failed before any journal was created; resubmit as a new posting request")
+		h.replayFailedEvent(w, r, tenantID, principalID, exec)
 		return
 	}
 

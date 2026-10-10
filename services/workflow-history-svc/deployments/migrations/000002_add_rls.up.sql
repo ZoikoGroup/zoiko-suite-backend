@@ -10,6 +10,8 @@
 -- gap tracked in docs/architecture/known-gaps.md.
 
 ALTER TABLE workflow_history_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workflow_history_events FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_isolation_policy ON workflow_history_events FOR ALL
     USING (tenant_id = current_setting('app.tenant_id', true) OR current_setting('app.bypass_rls', true) = 'on');
+

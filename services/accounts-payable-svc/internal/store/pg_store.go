@@ -71,6 +71,9 @@ var invoiceColumns = []string{
 	"goods_receipt_ref",
 	"po_vendor_profile_id",
 	"invoice_document_id",
+
+	// ACC-14: GL journal link from invoice approval posting.
+	"approval_journal_id",
 }
 
 var invoiceSelectList = strings.Join(invoiceColumns, ", ")
@@ -108,6 +111,8 @@ func scanTargets(inv *domain.VendorInvoice, status *string) []any {
 		&inv.GoodsReceiptRef,
 		&inv.POVendorProfileID,
 		&inv.InvoiceDocumentID,
+
+		&inv.ApprovalJournalID,
 	}
 }
 
@@ -580,4 +585,15 @@ func transitionColumns(to domain.InvoiceStatus) (actorColumn, timeColumn string)
 	default:
 		return "approved_by_principal_id", "approved_at"
 	}
+}
+
+// SetApprovalJournalID records the GL journal ID returned when the invoice
+// approval accounting event was posted (ACC-14).
+func (s *PgStore) SetApprovalJournalID(ctx context.Context, tenantID, invoiceID, journalID string) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE vendor_invoices SET approval_journal_id = $1 WHERE invoice_id = $2 AND tenant_id = $3`,
+			journalID, invoiceID, tenantID)
+		return err
+	})
 }

@@ -187,6 +187,10 @@ func (h *Handler) GetCommercialAccount(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireTenant(w, r, ""); !ok {
 		return
 	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	acct, err := h.store.GetCommercialAccount(r.Context(), id)
 	if err != nil {
@@ -264,6 +268,10 @@ func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireTenant(w, r, ""); !ok {
 		return
 	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	m, err := h.store.GetMembership(r.Context(), id)
 	if err != nil {
@@ -280,7 +288,8 @@ func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
-// ListMemberships lists the verified tenant's own memberships.
+// ListMemberships lists the verified tenant's own memberships, authorized by
+// MEMBERSHIP_READ (tracker row 84b).
 //
 // The {organizationID} path segment is kept for URL compatibility but is
 // no longer what drives the query: it must AGREE with the verified

@@ -349,6 +349,12 @@ func (h *BillingHandler) InvoiceCandidateAction(w http.ResponseWriter, r *http.R
 		return
 	}
 	if action == "approve" {
+		if existing, err := h.store.GetInvoiceCandidate(r.Context(), id); err == nil && existing != nil {
+			if principal == existing.CreatedByPrincipalID {
+				h.fail(w, r, domain.ErrInvoiceCandidateSelfApproval)
+				return
+			}
+		}
 		c, err := h.store.ApproveInvoiceCandidate(r.Context(), id, principal, h.now(), cmd.claim)
 		if err != nil {
 			if HandleIdempotentReplay(w, r, err, func(resourceID string) (any, error) {

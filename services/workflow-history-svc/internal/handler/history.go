@@ -14,11 +14,10 @@
 //	  Cross-workflow query for all transitions within a time window for a
 //	  specific tenant and legal entity.
 //
-//	  v1 Known Gap: evidence-manifest-svc currently fetches workflow data
-//	  directly from workflow-svc by workflow_instance_id and is NOT wired to
-//	  this cross-workflow query endpoint. Wiring that cross-reference is a
-//	  documented v1 scope constraint — see docs/architecture/known-gaps.md.
-//	  The endpoint is fully functional; no upstream caller uses it in v1.
+//	  evidence-manifest-svc's aggregator (internal/aggregator/clients.go,
+//	  WorkflowHistoryClient.ListByEntityAndDateRange) calls this endpoint
+//	  directly for its workflow-history time-window source — wired as of
+//	  the Evidence, Audit & Utility domain's evidence-manifest-svc pass.
 package handler
 
 import (
