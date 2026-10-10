@@ -69,7 +69,30 @@ func (s *PgStore) CreateCashPositionSnapshot(ctx context.Context, p domain.Calcu
 			calc.FXRateVersion, breakdown,
 			calc.HasStaleComponent, p.ActorPrincipalID, p.CorrelationID,
 		)
-		return scanCashPosition(row, &snap)
+		if err := scanCashPosition(row, &snap); err != nil {
+			return err
+		}
+		// Enqueue cash_position.calculated event
+		if err := s.enqueueCashPositionEvent(ctx, tx, "calculated", "cash_position.calculated", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+			"snapshot_id":        snap.SnapshotID,
+			"tenant_id":          snap.TenantID,
+			"legal_entity_id":    snap.LegalEntityID,
+			"reporting_currency": snap.ReportingCurrency,
+			"status":             snap.Status,
+			"has_stale_component": snap.HasStaleComponent,
+		}); err != nil {
+			return err
+		}
+		// Enqueue cash_position.became_stale event if HasStaleComponent is true
+		if snap.HasStaleComponent {
+			return s.enqueueCashPositionEvent(ctx, tx, "became_stale", "cash_position.became_stale", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+				"snapshot_id":        snap.SnapshotID,
+				"tenant_id":          snap.TenantID,
+				"legal_entity_id":    snap.LegalEntityID,
+				"reporting_currency": snap.ReportingCurrency,
+			})
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -192,7 +215,17 @@ func (s *PgStore) PublishCashPositionSnapshot(ctx context.Context, p domain.Publ
 			WHERE snapshot_id=$1 AND tenant_id=$2 AND status='CALCULATED'
 			RETURNING `+cashPositionColumns,
 			p.SnapshotID, p.TenantID, p.ActorPrincipalID)
-		return scanCashPosition(row, &snap)
+		if err := scanCashPosition(row, &snap); err != nil {
+			return err
+		}
+		// Enqueue cash_position.published event
+		return s.enqueueCashPositionEvent(ctx, tx, "published", "cash_position.published", p.TenantID, snap.LegalEntityID, p.SnapshotID, p.ActorPrincipalID, "", map[string]any{
+			"snapshot_id":        snap.SnapshotID,
+			"tenant_id":          snap.TenantID,
+			"legal_entity_id":    snap.LegalEntityID,
+			"reporting_currency": snap.ReportingCurrency,
+			"status":             snap.Status,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrInvalidCashPositionTransition
