@@ -19,6 +19,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/accounts-receivable-svc/internal/ar01"
 	"zoiko.io/accounts-receivable-svc/internal/authz"
 	"zoiko.io/accounts-receivable-svc/internal/config"
 	"zoiko.io/accounts-receivable-svc/internal/entity"
@@ -26,6 +27,7 @@ import (
 	"zoiko.io/accounts-receivable-svc/internal/events"
 	"zoiko.io/accounts-receivable-svc/internal/handler"
 	"zoiko.io/accounts-receivable-svc/internal/health"
+	"zoiko.io/accounts-receivable-svc/internal/kit"
 	"zoiko.io/accounts-receivable-svc/internal/ledger"
 	svcmiddleware "zoiko.io/accounts-receivable-svc/internal/middleware"
 	"zoiko.io/accounts-receivable-svc/internal/mtls"
@@ -168,6 +170,12 @@ func main() {
 
 	h := handler.New(pgStore, publisher, authzClient, ledgerClient, entityClient, log)
 	handler.RegisterRoutes(r, h)
+
+	// AR-01 Customer Financial Profile (ZS-SVC-C-001). getCreditStatus needs
+	// AR-07 open items for exposure; until that module is wired it reports
+	// exposure_available:false rather than guessing.
+	kitDeps := kit.Deps{DB: kit.NewDB(pool), Log: log, Authz: authzClient, Entities: entityClient}
+	ar01.New(kitDeps, ar01.NewCounterpartyDirectory(cfg.CounterpartyMgmtURL), nil).Register(r)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

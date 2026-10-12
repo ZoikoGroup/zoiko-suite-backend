@@ -168,6 +168,20 @@ $BUNDLES = @(
         Actions = @("AR_INVOICE_ISSUE", "AR_INVOICE_SEND", "AR_MARK_OVERDUE", "AR_PAYMENT_RECEIVE")
     },
     @{
+        # AR-01 Customer Financial Profile (ZS-SVC-C-001). Maintaining a profile
+        # and approving an out-of-policy credit-limit increase are separate roles
+        # on purpose: the service refuses self-approval (SEGREGATION_OF_DUTIES), and
+        # a role holding both would let one person staff both sides in a demo.
+        Code    = "AR01_PROFILE_MANAGER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR01_PROFILE_MANAGE", "AR01_CREDIT_LIMIT_MANAGE", "AR01_CREDIT_HOLD_MANAGE")
+    },
+    @{
+        Code    = "AR01_CREDIT_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR01_CREDIT_LIMIT_APPROVE")
+    },
+    @{
         # bank-reconciliation-svc gates ingest, match, exception and statement
         # completion separately. Its two READ routes are not authorized at all
         # -- they are scoped by the verified X-Tenant-Id instead, the same
