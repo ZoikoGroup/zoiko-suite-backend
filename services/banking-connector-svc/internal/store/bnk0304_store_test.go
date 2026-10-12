@@ -28,7 +28,7 @@ func seedConnection(t *testing.T, ctx context.Context, s *store.PgStore, tenantI
 func TestBNK03_IngestStatement_IdempotentOnContentHash(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk03-a")
 	connID := seedConnection(t, ctx, s, "tenant-bnk03-a")
@@ -42,12 +42,12 @@ func TestBNK03_IngestStatement_IdempotentOnContentHash(t *testing.T) {
 		},
 	}
 
-	first, err := s.IngestStatement(ctx, "tenant-bnk03-a", req, "auditor-1")
+	first, err := s.IngestStatement(ctx, "tenant-bnk03-a", req, "auditor-1", "")
 	if err != nil || !first.Created || len(first.Lines) != 2 {
 		t.Fatalf("first ingest: created=%v lines=%d err=%v", first.Created, len(first.Lines), err)
 	}
 
-	second, err := s.IngestStatement(ctx, "tenant-bnk03-a", req, "auditor-1")
+	second, err := s.IngestStatement(ctx, "tenant-bnk03-a", req, "auditor-1", "")
 	if err != nil {
 		t.Fatalf("retried ingest: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestBNK03_IngestStatement_IdempotentOnContentHash(t *testing.T) {
 func TestBNK03_StatementLifecycle_CAS_Transitions(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk03-b")
 	connID := seedConnection(t, ctx, s, "tenant-bnk03-b")
@@ -77,7 +77,7 @@ func TestBNK03_StatementLifecycle_CAS_Transitions(t *testing.T) {
 		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(), ContentHash: "hash-lifecycle",
 		OpeningBalance: 0, ClosingBalance: 10,
 		Lines: []domain.StatementLineIn{{PostedDate: time.Now(), Amount: 10, Currency: "USD"}},
-	}, "auditor-1")
+	}, "auditor-1", "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestBNK03_StatementLifecycle_CAS_Transitions(t *testing.T) {
 func TestBNK03_ValidateStatement_MatchingBalance_ValidatesCleanly(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk03-balance-ok")
 	connID := seedConnection(t, ctx, s, "tenant-bnk03-balance-ok")
@@ -142,7 +142,7 @@ func TestBNK03_ValidateStatement_MatchingBalance_ValidatesCleanly(t *testing.T) 
 			{PostedDate: time.Now(), Amount: 100.50, Currency: "USD", Description: "deposit"},
 			{PostedDate: time.Now(), Amount: -20.00, Currency: "USD", Description: "fee"},
 		},
-	}, "auditor-1")
+	}, "auditor-1", "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestBNK03_ValidateStatement_MatchingBalance_ValidatesCleanly(t *testing.T) 
 func TestBNK03_ValidateStatement_BrokenBalance_AutoQuarantines(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk03-balance-bad")
 	connID := seedConnection(t, ctx, s, "tenant-bnk03-balance-bad")
@@ -178,7 +178,7 @@ func TestBNK03_ValidateStatement_BrokenBalance_AutoQuarantines(t *testing.T) {
 		Lines: []domain.StatementLineIn{
 			{PostedDate: time.Now(), Amount: 100.50, Currency: "USD", Description: "deposit"},
 		},
-	}, "auditor-1")
+	}, "auditor-1", "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -210,14 +210,14 @@ func TestBNK03_ValidateStatement_BrokenBalance_AutoQuarantines(t *testing.T) {
 func TestBNK03_StatementLines_AreAppendOnly(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk03-c")
 	connID := seedConnection(t, ctx, s, "tenant-bnk03-c")
 	result, err := s.IngestStatement(ctx, "tenant-bnk03-c", domain.IngestStatementLinesRequest{
 		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(), ContentHash: "hash-lines",
 		Lines: []domain.StatementLineIn{{PostedDate: time.Now(), Amount: 5, Currency: "USD", Description: "orig"}},
-	}, "auditor-1")
+	}, "auditor-1", "")
 	if err != nil || len(result.Lines) != 1 {
 		t.Fatalf("ingest: lines=%d err=%v", len(result.Lines), err)
 	}
@@ -238,7 +238,7 @@ func TestBNK03_StatementLines_AreAppendOnly(t *testing.T) {
 func TestBNK04_NormalizeTransaction_ActiveLineUniqueness(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk04-a")
 	connID := seedConnection(t, ctx, s, "tenant-bnk04-a")
@@ -251,7 +251,7 @@ func TestBNK04_NormalizeTransaction_ActiveLineUniqueness(t *testing.T) {
 	result, err := s.IngestStatement(ctx, "tenant-bnk04-a", domain.IngestStatementLinesRequest{
 		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(), ContentHash: "hash-normalize",
 		Lines: []domain.StatementLineIn{{PostedDate: time.Now(), Amount: 250, Currency: "USD", Description: "wire in", BankCode: "WIRE-IN-CODE"}},
-	}, "auditor-1")
+	}, "auditor-1", "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestBNK04_NormalizeTransaction_ActiveLineUniqueness(t *testing.T) {
 func TestBNK04_CanonicalTransaction_SupersededIsImmutable(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk04-b")
 	connID := seedConnection(t, ctx, s, "tenant-bnk04-b")
@@ -325,7 +325,7 @@ func TestBNK04_CanonicalTransaction_SupersededIsImmutable(t *testing.T) {
 	result, err := s.IngestStatement(ctx, "tenant-bnk04-b", domain.IngestStatementLinesRequest{
 		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(), ContentHash: "hash-immutable",
 		Lines: []domain.StatementLineIn{{PostedDate: time.Now(), Amount: 75, Currency: "USD", BankCode: "MISC-CODE"}},
-	}, "auditor-1")
+	}, "auditor-1", "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -374,14 +374,14 @@ func TestBNK04_CanonicalTransaction_SupersededIsImmutable(t *testing.T) {
 func TestBNK04_ApproveMappingException_RejectsSelfApproval(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk04-c")
 	connID := seedConnection(t, ctx, s, "tenant-bnk04-c")
 	result, err := s.IngestStatement(ctx, "tenant-bnk04-c", domain.IngestStatementLinesRequest{
 		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(), ContentHash: "hash-exception",
 		Lines: []domain.StatementLineIn{{PostedDate: time.Now(), Amount: 42, Currency: "USD", Description: "unknown code"}},
-	}, "auditor-1")
+	}, "auditor-1", "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestBNK04_ApproveMappingException_RejectsSelfApproval(t *testing.T) {
 func TestBNK04_NormalizeTransaction_KnownCode_NormalizesAutomatically(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk04-map-known")
 	connID := seedConnection(t, ctx, s, "tenant-bnk04-map-known")
@@ -443,7 +443,7 @@ func TestBNK04_NormalizeTransaction_KnownCode_NormalizesAutomatically(t *testing
 	result, err := s.IngestStatement(ctx, "tenant-bnk04-map-known", domain.IngestStatementLinesRequest{
 		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(), ContentHash: "hash-map-known",
 		Lines: []domain.StatementLineIn{{PostedDate: time.Now(), Amount: 500, Currency: "USD", Description: "payroll", BankCode: "ACH-CREDIT"}},
-	}, "auditor-1")
+	}, "auditor-1", "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestBNK04_NormalizeTransaction_KnownCode_NormalizesAutomatically(t *testing
 func TestBNK04_NormalizeTransaction_UnknownCode_AutoQuarantines(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk04-map-unknown")
 	connID := seedConnection(t, ctx, s, "tenant-bnk04-map-unknown")
@@ -480,7 +480,7 @@ func TestBNK04_NormalizeTransaction_UnknownCode_AutoQuarantines(t *testing.T) {
 	result, err := s.IngestStatement(ctx, "tenant-bnk04-map-unknown", domain.IngestStatementLinesRequest{
 		ConnectionID: connID, StatementFormat: domain.FormatBAI2, StatementDate: time.Now(), ContentHash: "hash-map-unknown",
 		Lines: []domain.StatementLineIn{{PostedDate: time.Now(), Amount: 999, Currency: "USD", Description: "mystery", BankCode: "XYZ-UNKNOWN"}},
-	}, "auditor-1")
+	}, "auditor-1", "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -519,7 +519,7 @@ func TestBNK04_NormalizeTransaction_UnknownCode_AutoQuarantines(t *testing.T) {
 func TestBNK04_CreateTransactionMapping_RejectsDuplicateBankCode(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk04-map-dup")
 

@@ -11,6 +11,14 @@ type Config struct {
 	KafkaEventsTopic string
 	AuthzServiceURL  string
 
+	// EventResidencyRegion is the authoritative regional data-bearing
+	// context (ZS-EVENT-001 §4, envelope.Spec.ResidencyRegion) stamped on
+	// every event this service emits through the transactional outbox. No
+	// safe default exists; left empty here, envelope.New refuses to build
+	// an event without it, same posture as financial-close-svc/
+	// bank-reconciliation-svc's EVENT_RESIDENCY_REGION.
+	EventResidencyRegion string
+
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
 	// Disabled by default — AuthzServiceURL (plain HTTP) keeps being used
@@ -31,6 +39,8 @@ func Load() *Config {
 		KafkaBrokers:     getEnv("KAFKA_BROKERS", "localhost:9092"),
 		KafkaEventsTopic: getEnv("KAFKA_EVENTS_TOPIC", "zoiko.banking.connector.events"),
 		AuthzServiceURL:  getEnv("AUTHZ_SERVICE_URL", "http://localhost:8081"),
+
+		EventResidencyRegion: getEnv("EVENT_RESIDENCY_REGION", ""),
 
 		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

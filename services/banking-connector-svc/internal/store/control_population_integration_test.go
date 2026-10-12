@@ -85,7 +85,7 @@ func newCPFixture(t *testing.T) cpFixture {
 	appPool := appRolePool(t, admin)
 	seedTenant(t, admin, cpT1, "a-")
 	seedTenant(t, admin, cpT2, "b-")
-	return cpFixture{admin: admin, s: store.NewPgStore(appPool)}
+	return cpFixture{admin: admin, s: store.NewPgStore(appPool, store.WithEventRegion("uk"))}
 }
 
 func (f cpFixture) get(t *testing.T, tenant string, q domain.ControlPopulationQuery) *domain.ControlPopulationPage {
