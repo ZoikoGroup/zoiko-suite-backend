@@ -82,7 +82,10 @@ SET version_number = n.vn
 FROM numbered n
 WHERE pv.policy_version_id = n.policy_version_id;
 
--- Populate artifact_digest for existing versions
+-- Populate artifact_digest for existing versions. sha256() takes bytea only
+-- (there is no sha256(text)), so the payload text is encoded first. This hashes
+-- Postgres's normalised jsonb text, not the original request bytes the store
+-- hashes on insert, so a backfilled digest identifies the stored payload only.
 UPDATE policy_versions
-SET artifact_digest = 'sha256-' || encode(sha256(rule_payload::text), 'hex')
+SET artifact_digest = 'sha256-' || encode(sha256(convert_to(rule_payload::text, 'UTF8')), 'hex')
 WHERE artifact_digest IS NULL;

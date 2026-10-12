@@ -405,7 +405,7 @@ func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreateP
 		}
 
 		// Conflict occurred on the dedup key. Lookup existing record.
-		existing, err := scanPolicyVersion(tx.QueryRow(ctx, lookupQuery, params.PolicyID, params.TenantID, params.LegalEntityID, params.EffectiveFrom))
+		existing, err := scanPolicyVersion(tx.QueryRow(ctx, lookupQuery, params.PolicyID, params.TenantID, params.LegalEntityID, params.EffectiveFrom, versionNumber))
 		if err != nil {
 			return err
 		}
