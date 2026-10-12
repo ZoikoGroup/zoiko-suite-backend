@@ -15,10 +15,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/payment-initiation-adapter-svc/internal/authz"
 	"zoiko.io/payment-initiation-adapter-svc/internal/clients"
 	"zoiko.io/payment-initiation-adapter-svc/internal/config"
-	"zoiko.io/payment-initiation-adapter-svc/internal/events"
 	"zoiko.io/payment-initiation-adapter-svc/internal/handler"
 	"zoiko.io/payment-initiation-adapter-svc/internal/health"
 	"zoiko.io/payment-initiation-adapter-svc/internal/middleware"
@@ -58,9 +59,11 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	pgStore := store.NewPgStore(pool, logger)
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+	if err := outbox.VerifySchema(ctx, pool); err != nil {
+		logger.Fatal("eventing outbox schema verification failed", zap.Error(err))
+	}
+
+	pgStore := store.NewPgStore(pool, logger, store.WithEventRegion(cfg.EventResidencyRegion))
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	// StubProviderAdapter — NOT a real bank connection. See
 	// internal/provideradapter's package doc.
@@ -68,7 +71,18 @@ func main() {
 	treasuryClient := clients.NewTreasuryHTTPClient(cfg.TreasuryServiceURL)
 	authorizationClient := clients.NewAuthorizationHTTPClient(cfg.AuthorizationServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, provider, treasuryClient, authorizationClient, logger)
+	h := handler.New(pgStore, authzClient, provider, treasuryClient, authorizationClient, logger)
+
+	brokers := strings.Split(cfg.KafkaBrokers, ",")
+	writer, err := kafkaout.New(kafkaout.Config{Brokers: brokers, Topic: cfg.KafkaEventsTopic})
+	if err != nil {
+		logger.Fatal("failed to create kafka writer", zap.Error(err))
+	}
+	relay, err := outbox.NewRelay(pool, writer, outbox.DefaultConfig(), logger)
+	if err != nil {
+		logger.Fatal("failed to create outbox relay", zap.Error(err))
+	}
+	go relay.Run(ctx)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
