@@ -172,9 +172,18 @@ func (h *Handler) CreateCommercialAccount(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusCreated, acct)
 }
 
-// GetCommercialAccount reads one account, scoped to the verified tenant and
-// authorized by COMMERCIAL_ACCOUNT_READ (tracker row 84b).
+// GetCommercialAccount reads one account, scoped to the verified tenant.
+//
+// Authz is now gated on COMMERCIAL_ACCOUNT_READ. The account is fetched
+// first (store is tenant-scoped so a foreign tenant's account is already
+// indistinguishable from 404), then the check is made against the account's
+// OWN organization_id — never against a caller-supplied scope — to avoid
+// the namespace-mismatch risk documented in tracker row 84a.
 func (h *Handler) GetCommercialAccount(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	if _, ok := h.requireTenant(w, r, ""); !ok {
 		return
 	}
@@ -246,9 +255,16 @@ func (h *Handler) CreateMembership(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, m)
 }
 
-// GetMembership reads one membership, scoped to the verified tenant and
-// authorized by MEMBERSHIP_READ (tracker row 84b).
+// GetMembership reads one membership, scoped to the verified tenant.
+//
+// Authz is now gated on MEMBERSHIP_READ. The membership is fetched first
+// (store is tenant-scoped so a foreign tenant's membership is 404), then
+// the check is made against the membership's OWN organization_id.
 func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	if _, ok := h.requireTenant(w, r, ""); !ok {
 		return
 	}
@@ -275,16 +291,18 @@ func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
 // ListMemberships lists the verified tenant's own memberships, authorized by
 // MEMBERSHIP_READ (tracker row 84b).
 //
-// The {organizationID} path segment is kept in the route for URL
-// compatibility but is no longer what the query filters on: it must now
-// AGREE with the verified X-Tenant-Id, and the roster is read from the
-// context tenant either way.
+// The {organizationID} path segment is kept for URL compatibility but is
+// no longer what drives the query: it must AGREE with the verified
+// X-Tenant-Id, and the store always filters by the context tenant.
+// MEMBERSHIP_READ authorization is checked against the verified tenant ID
+// (the organization scope), not the path parameter — eliminates the
+// any-caller-can-enumerate-any-org gap.
 func (h *Handler) ListMemberships(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := h.requireTenant(w, r, chi.URLParam(r, "organizationID"))
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-	principalID, ok := h.requirePrincipal(w, r)
+	tenantID, ok := h.requireTenant(w, r, chi.URLParam(r, "organizationID"))
 	if !ok {
 		return
 	}

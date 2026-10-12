@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
@@ -94,6 +95,42 @@ func TestHTTPClient_Granted(t *testing.T) {
 	}
 	if gotBody["action_type"] != "JURISDICTION_RULE_TRANSITION" {
 		t.Errorf("action_type = %q, want JURISDICTION_RULE_TRANSITION", gotBody["action_type"])
+	}
+}
+
+// TestHTTPClient_ForwardsTheEnvelopeHeaders is the regression test for the
+// defect this client just replaced: authorizeLive sent NO envelope headers
+// at all, so authorization-svc's canonical-envelope middleware answered 401
+// envelope_incomplete on every single admin write, and this client folded
+// that into the indistinguishable ErrAuthZUnavailable — a missing header
+// read as authorization-svc being down.
+func TestHTTPClient_ForwardsTheEnvelopeHeaders(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED"}`))
+	}))
+	defer srv.Close()
+
+	// A real inbound request carries a chi request id by the time this client
+	// runs; context.Background() alone (as the other tests use) would not.
+	ctx := context.WithValue(context.Background(), middleware.RequestIDKey, "req-123")
+	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
+	if err := c.Authorize(ctx, "principal-1", "scope-1", "jurisdiction", "create", nil); err != nil {
+		t.Fatalf("expected permit, got %v", err)
+	}
+
+	for _, header := range []string{"X-Request-Id", "X-Source-Channel", "Idempotency-Key", "X-Legal-Entity-Id", "X-Principal-Id"} {
+		if got.Get(header) == "" {
+			t.Errorf("request is missing %s — authorization-svc will answer 401 envelope_incomplete", header)
+		}
+	}
+	if got.Get("X-Legal-Entity-Id") != "scope-1" {
+		t.Errorf("X-Legal-Entity-Id sent as %q, want %q", got.Get("X-Legal-Entity-Id"), "scope-1")
+	}
+	if got.Get("X-Principal-Id") != "principal-1" {
+		t.Errorf("X-Principal-Id sent as %q, want %q", got.Get("X-Principal-Id"), "principal-1")
 	}
 }
 
