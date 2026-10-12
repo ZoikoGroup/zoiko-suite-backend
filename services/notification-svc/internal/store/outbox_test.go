@@ -30,7 +30,6 @@ import (
 // that now exists in between: a row in event_outbox, committed by the same
 // transaction as the status transition.
 
-
 // The core property: concluding a delivery and recording the event that
 // announces it are ONE transaction.
 func TestOutbox_ConcludingADeliveryEnqueuesItsEvent(t *testing.T) {
@@ -63,7 +62,6 @@ func TestOutbox_ConcludingADeliveryEnqueuesItsEvent(t *testing.T) {
 		t.Error("a freshly enqueued event must be unpublished")
 	}
 }
-
 
 // A conclusion that does not happen must not emit an event. Two replicas can
 // race on the same notification, and the loser affects zero rows — if it

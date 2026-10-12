@@ -16,6 +16,20 @@ type Config struct {
 
 	AuthZServiceURL string
 
+	// ServicePrincipalID is this service's identity in authorization-svc, used
+	// to EXECUTE a review's REVOKE decision (it holds iam.assignment.revoke);
+	// the reviewer is recorded as the decider. Empty executes as the reviewer.
+	ServicePrincipalID string
+
+	// HR lifecycle events (S9-C2): the topics the event-triggered review
+	// consumer reads, its consumer group, the default reviewer of an event
+	// review, and how long such a review stays open. An empty reviewer
+	// leaves the consumer off.
+	HREventTopics       []string
+	HREventGroupID      string
+	EventReviewReviewer string
+	EventReviewDueDays  int
+
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
 	// Disabled by default — AuthZServiceURL (plain HTTP) keeps being used
@@ -72,6 +86,11 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.access-control.events"),
 		},
 		AuthZServiceURL: env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		ServicePrincipalID: env("ACS_SERVICE_PRINCIPAL_ID", "svc-access-control"),
+		HREventTopics:       strings.Split(env("ACS_HR_EVENT_TOPICS", "zoiko.employee.events,zoiko.offboarding.events"), ","),
+		HREventGroupID:      env("ACS_HR_EVENT_GROUP_ID", "access-control-svc-hr-reviews"),
+		EventReviewReviewer: env("ACS_EVENT_REVIEW_DEFAULT_REVIEWER", ""),
+		EventReviewDueDays:  envInt("ACS_EVENT_REVIEW_DUE_DAYS", 7),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

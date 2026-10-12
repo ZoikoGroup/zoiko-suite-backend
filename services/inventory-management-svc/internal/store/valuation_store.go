@@ -417,7 +417,10 @@ func (s *PgStore) GetInventoryValueAsOf(ctx context.Context, itemID, locationID 
 	var value float64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT COALESCE(SUM(l.unit_cost * (l.original_quantity - COALESCE(consumed.qty, 0))), 0)
+			SELECT COALESCE(SUM((l.unit_cost - COALESCE((
+					SELECT SUM(a.unit_uplift) FROM inventory_landed_cost_allocations a
+					WHERE a.tenant_id = $1 AND a.layer_id = l.layer_id AND a.created_at > $4
+				), 0)) * (l.original_quantity - COALESCE(consumed.qty, 0))), 0)
 			FROM inventory_cost_layers l
 			LEFT JOIN (
 				SELECT layer_id, SUM(quantity_consumed) AS qty

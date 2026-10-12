@@ -58,6 +58,9 @@ type Runner struct {
 	log       *zap.Logger
 	dlqWriter *kafka.Writer
 
+	// topicExists is asked before a reader is created. Overridable in tests.
+	topicExists func(ctx context.Context, topic string) (bool, error)
+
 	mu      sync.Mutex
 	readers map[string]*kafka.Reader
 	cancels map[string]context.CancelFunc
@@ -78,6 +81,19 @@ func NewRunner(brokers []string, groupID string, ix *indexer.Indexer, metrics *t
 		},
 		readers: map[string]*kafka.Reader{},
 		cancels: map[string]context.CancelFunc{},
+		topicExists: func(ctx context.Context, topic string) (bool, error) {
+			client := &kafka.Client{Addr: kafka.TCP(brokers...), Timeout: 5 * time.Second}
+			md, err := client.Metadata(ctx, &kafka.MetadataRequest{Topics: []string{topic}})
+			if err != nil {
+				return false, err
+			}
+			for _, t := range md.Topics {
+				if t.Name == topic {
+					return t.Error == nil && len(t.Partitions) > 0, nil
+				}
+			}
+			return false, nil
+		},
 	}
 }
 
@@ -121,6 +137,20 @@ func (r *Runner) Subscribe(ctx context.Context, topics []string) {
 
 	for topic := range want {
 		if _, running := r.readers[topic]; running {
+			continue
+		}
+		// A group reader that joins before its topic exists gets no
+		// partitions and, in kafka-go v0.4.47, never recovers — the
+		// partition watch did not pick the topic up once it was created, and
+		// the scope indexed nothing until a restart (found live, 30 Sep
+		// 2026). So a reader is only created for a topic that exists; a
+		// missing one is retried on the next Subscribe, which main calls
+		// every 30s. The producer owns its topic — this service does not
+		// create it.
+		exists, err := r.topicExists(ctx, topic)
+		if err != nil || !exists {
+			r.log.Warn("kafka: topic not available yet — not subscribing; will retry",
+				zap.String("topic", topic), zap.Error(err))
 			continue
 		}
 		reader := kafka.NewReader(kafka.ReaderConfig{
@@ -226,8 +256,14 @@ func (r *Runner) run(ctx context.Context, topic string, reader *kafka.Reader) {
 				// producer emitted, which is otherwise gone once the retention
 				// window passes.
 				if dlqErr := r.publishToDLQ(ctx, msg, handleErr); dlqErr != nil {
-					log.Warn("quarantined message could not be copied to the DLQ",
+					// NOT committed. The DLQ copy is the only place this
+					// event survives once it is committed — committing
+					// without it lost the first quarantined message on every
+					// topic whose DLQ did not exist yet (found live 30 Sep
+					// 2026), which is the message an NP-35 recovery replays.
+					log.Error("quarantined message could not be copied to the DLQ — not committing; a restart will retry",
 						zap.String("event_id", eventID), zap.Error(dlqErr))
+					continue
 				}
 			}
 		}
@@ -276,12 +312,27 @@ func (r *Runner) publishToDLQ(ctx context.Context, msg kafka.Message, cause erro
 	// subscribed topic's DLQ, and kafka-go rejects a Message that names a
 	// topic when the Writer already has one — so the Writer deliberately has
 	// none.
-	return r.dlqWriter.WriteMessages(ctx, kafka.Message{
+	dlq := kafka.Message{
 		Topic:   msg.Topic + ".dlq",
 		Key:     msg.Key,
 		Value:   msg.Value,
 		Headers: headers,
-	})
+	}
+	// Retried: the first write to a DLQ topic that does not exist yet answers
+	// UnknownTopicOrPartition while the broker auto-creates it, and succeeds
+	// a moment later.
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = r.dlqWriter.WriteMessages(ctx, dlq); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
+		}
+	}
+	return err
 }
 
 // extractEventID prefers the X-Event-ID header and falls back to the message

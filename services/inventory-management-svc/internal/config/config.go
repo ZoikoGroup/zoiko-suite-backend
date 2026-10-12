@@ -23,6 +23,10 @@ type Config struct {
 	// posts through its ACC-04 system-originated posting path
 	// (POST /v1/postings/events), never a bespoke ledger write.
 	LedgerServiceURL string
+	// GRNIReclassMappingKey is the ACC-02 mapping key AP-03 debits when it
+	// accrues a receipt (its GRNI_DEBIT_MAPPING_KEY); INV-04 credits it
+	// when it reclasses that cost into inventory. Must match AP-03.
+	GRNIReclassMappingKey string
 
 	// AuthzMTLSEnabled turns on the mTLS pilot for calls to authorization-svc.
 	// OFF by default — when false, nothing about the existing authz call
@@ -85,6 +89,8 @@ func Load() (*Config, error) {
 		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		CloseServiceURL:  env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
 		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+
+		GRNIReclassMappingKey: env("GRNI_RECLASS_MAPPING_KEY", "AP_GRNI_EXPENSE"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

@@ -28,6 +28,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -415,7 +416,7 @@ func TestPgStore_ProjectDelegation_IsIdempotentOnRedelivery(t *testing.T) {
 	}
 
 	// An upstream revocation ends it.
-	if _, err := s.RevokeProjectedDelegation(ctx, params.SourceService, params.SourceDelegationID, tenantID); err != nil {
+	if _, err := s.RevokeProjectedDelegation(ctx, params.SourceService, params.SourceDelegationID, tenantID, 0); err != nil {
 		t.Fatalf("revoke projected delegation: %v", err)
 	}
 	actions, _, err = s.FindDelegatedActions(ctx, "assistant-1", legalEntityID, tenantID)
@@ -452,7 +453,7 @@ func TestPgStore_RevokeProjectedDelegation_LeavesLocalRowsAlone(t *testing.T) {
 	}
 
 	// An upstream event naming the LOCAL row's id must find nothing.
-	if _, err := s.RevokeProjectedDelegation(ctx, "delegated-authority-svc", local.DelegatedAuthorityID, tenantID); err == nil {
+	if _, err := s.RevokeProjectedDelegation(ctx, "delegated-authority-svc", local.DelegatedAuthorityID, tenantID, 0); err == nil {
 		t.Fatal("an upstream revocation matched a locally-authored delegation")
 	}
 
@@ -462,5 +463,62 @@ func TestPgStore_RevokeProjectedDelegation_LeavesLocalRowsAlone(t *testing.T) {
 	}
 	if still.RevocationStatus != "ACTIVE" {
 		t.Fatalf("local delegation is %s — an upstream event revoked a delegation it does not own", still.RevocationStatus)
+	}
+}
+
+// TestPgStore_ProjectDelegation_VersionGuardAndCeiling: a replayed older
+// event cannot undo a later one, and the delegation's ceiling is stored and
+// returned for the decision layer.
+func TestPgStore_ProjectDelegation_VersionGuardAndCeiling(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+	const tenantID = "00000000-0000-0000-0000-0000000000a1"
+	legalEntityID := "00000000-0000-0000-0000-0000000000e1"
+	setupRoleWithGrant(t, s, tenantID, "boss-1", legalEntityID, "FINANCE_LEAD", []string{"PAYMENT_APPROVE"})
+
+	cents, cur := int64(50000), "USD"
+	params := domain.ProjectDelegationParams{
+		SourceService: "delegated-authority-svc", SourceDelegationID: "upstream-v", TenantID: tenantID,
+		DelegatorPrincipalID: "boss-1", DelegatePrincipalID: "assistant-1", LegalEntityID: &legalEntityID,
+		DelegatedActions: []string{"PAYMENT_APPROVE"}, EffectiveFrom: time.Now().Add(-time.Hour),
+		SourceVersion: 2, LimitMinor: &cents, LimitCurrency: &cur,
+	}
+	if _, err := s.ProjectDelegation(ctx, params); err != nil {
+		t.Fatalf("project v2: %v", err)
+	}
+	ceilings, err := s.FindDelegationCeilings(ctx, "assistant-1", legalEntityID, tenantID, "PAYMENT_APPROVE")
+	if err != nil || len(ceilings) != 1 || ceilings[0].LimitMinor == nil || *ceilings[0].LimitMinor != 50000 {
+		t.Fatalf("ceiling not stored/returned: %+v %v", ceilings, err)
+	}
+	if other, _ := s.FindDelegationCeilings(ctx, "assistant-1", legalEntityID, tenantID, "PAYMENT_INITIATE"); len(other) != 0 {
+		t.Errorf("a delegation of PAYMENT_APPROVE must not cap another action: %+v", other)
+	}
+
+	// v3: suspended.
+	if _, err := s.RevokeProjectedDelegation(ctx, params.SourceService, params.SourceDelegationID, tenantID, 3); err != nil {
+		t.Fatalf("end v3: %v", err)
+	}
+	// A replayed v2 authority.delegated must not bring it back.
+	if _, err := s.ProjectDelegation(ctx, params); !errors.Is(err, domain.ErrStaleProjection) {
+		t.Fatalf("replayed older event: want ErrStaleProjection, got %v", err)
+	}
+	if actions, _, _ := s.FindDelegatedActions(ctx, "assistant-1", legalEntityID, tenantID); len(actions) != 0 {
+		t.Fatalf("a stale replay re-activated a suspended delegation: %v", actions)
+	}
+	// v4: resumed.
+	params.SourceVersion = 4
+	if _, err := s.ProjectDelegation(ctx, params); err != nil {
+		t.Fatalf("resume v4: %v", err)
+	}
+	// A replayed v3 suspension must not end it again.
+	if _, err := s.RevokeProjectedDelegation(ctx, params.SourceService, params.SourceDelegationID, tenantID, 3); !errors.Is(err, domain.ErrDelegatedAuthorityNotFound) {
+		t.Fatalf("replayed older end: want it refused, got %v", err)
+	}
+	if actions, _, _ := s.FindDelegatedActions(ctx, "assistant-1", legalEntityID, tenantID); len(actions) != 1 {
+		t.Fatalf("a stale replayed suspension ended a resumed delegation: %v", actions)
 	}
 }

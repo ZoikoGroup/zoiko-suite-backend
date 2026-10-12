@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -335,5 +336,109 @@ func TestCA_LoadOrCreate_PersistsAcrossRestarts(t *testing.T) {
 
 	if string(first.CertificatePEM()) != string(second.CertificatePEM()) {
 		t.Fatal("reloading the CA from the same directory must return the same root certificate")
+	}
+}
+
+// failingPolicyStore wraps a real MemoryStore but forces CreatePolicy to
+// fail, so CreatePolicy's handler can be proven to report the failure
+// instead of discarding it.
+type failingPolicyStore struct {
+	*store.MemoryStore
+}
+
+func (failingPolicyStore) CreatePolicy(context.Context, string, *domain.CommunicationPolicy) error {
+	return errors.New("simulated persistence failure")
+}
+
+// TestCreatePolicy_StoreFailure_Returns500NotFalse201 is the regression test
+// for a defect found in this pass: CreatePolicy discarded
+// h.store.CreatePolicy's error (`_ = h.store.CreatePolicy(...)`) and always
+// answered 201, even if the policy was never actually persisted. Today's
+// MemoryStore.CreatePolicy can never itself fail, so this held no visible
+// consequence yet — but a caller depending on `requires_mtls: true` actually
+// being stored would have had no way to learn it silently was not, and the
+// discarded-error shape was inconsistent with every other write in this
+// file (CreateCert's caller, for example, already checked its error).
+func TestCreatePolicy_StoreFailure_Returns500NotFalse201(t *testing.T) {
+	c, err := internalca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create test CA: %v", err)
+	}
+	router := handler.NewRouter(handler.New(
+		failingPolicyStore{store.NewMemoryStore()}, c,
+		siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), "",
+	))
+
+	body, _ := json.Marshal(domain.CreatePolicyRequest{PolicyName: "ledger-to-treasury", SourceService: "ledger-svc", TargetService: "treasury-svc", Action: domain.PolicyAllow, RequiresMtls: true})
+	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/policies", bytes.NewBuffer(body))
+	withEnvelope(req)
+	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != 500 {
+		t.Fatalf("a failed CreatePolicy write must not be reported as 201, got %d: %s", w.Code, w.Body)
+	}
+}
+
+// failingListStore wraps a real MemoryStore but forces ListCerts and
+// ListPolicies to fail. Found in the same pass as failingPolicyStore above:
+// ListCerts and ListPolicies both did `x, _ := h.store.List...(...)`,
+// discarding the error and returning a false empty 200 — indistinguishable
+// from "this tenant genuinely has nothing" — on a real store failure.
+type failingListStore struct {
+	*store.MemoryStore
+}
+
+func (failingListStore) ListCerts(context.Context, string, string, string) ([]domain.MtlsCertificate, error) {
+	return nil, errors.New("simulated persistence failure")
+}
+
+func (failingListStore) ListPolicies(context.Context, string) ([]domain.CommunicationPolicy, error) {
+	return nil, errors.New("simulated persistence failure")
+}
+
+func TestListCerts_StoreFailure_Returns500NotFalseEmpty200(t *testing.T) {
+	c, err := internalca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create test CA: %v", err)
+	}
+	router := handler.NewRouter(handler.New(
+		failingListStore{store.NewMemoryStore()}, c,
+		siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), "",
+	))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates?legal_entity_id=LE-1", nil)
+	withEnvelope(req)
+	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != 500 {
+		t.Fatalf("a failed ListCerts read must not be reported as an empty 200, got %d: %s", w.Code, w.Body)
+	}
+}
+
+func TestListPolicies_StoreFailure_Returns500NotFalseEmpty200(t *testing.T) {
+	c, err := internalca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create test CA: %v", err)
+	}
+	router := handler.NewRouter(handler.New(
+		failingListStore{store.NewMemoryStore()}, c,
+		siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), "",
+	))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/policies", nil)
+	withEnvelope(req)
+	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != 500 {
+		t.Fatalf("a failed ListPolicies read must not be reported as an empty 200, got %d: %s", w.Code, w.Body)
 	}
 }

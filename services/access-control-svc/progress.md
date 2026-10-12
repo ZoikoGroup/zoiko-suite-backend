@@ -7,7 +7,7 @@ decision caches). There is no dedicated `ZS-SVC-*` specification document for
 this service — §9.4 is one line, and most of what this register has to get
 right follows from that line plus the estate-wide invariants.
 
-Last updated: 2026-09-22.
+Last updated: 2026-10-06 (re-audit, then gap closure; see the two 6 Oct sections at the end).
 
 ---
 
@@ -27,8 +27,9 @@ here makes a real synchronous call into authorization-svc's admin API, so the
 definition is actually provisioned for enforcement. authorization-svc remains
 the enforcement source of truth; this adds an authz-checked, idempotent,
 correlation-tracked, event-publishing front door in front of what is otherwise
-an unguarded admin API. **Per-principal role assignments are explicitly out of
-scope** and are not reachable on this API at all.
+an unguarded admin API. *(Superseded 6 Oct 2026: per-principal assignments
+are now requested, approved, revoked and reviewed here through a governed
+workflow, and still held and enforced by authorization-svc. See the end.)*
 
 ---
 
@@ -299,12 +300,177 @@ role withdraws access from everyone holding it, a maker-checker step is worth
 considering — it is a product decision, not a defect, and it is not smuggled in
 here.
 
-### Refusals this service makes before calling authorization-svc leave no evidence row
+### ~~Refusals this service makes before calling authorization-svc leave no evidence row~~
 
-A 409, a malformed request or a missing field is counted in Prometheus and
-logged, but there is no durable per-refusal row in this service's own tables.
-authorization-svc records its own decisions, so anything that reached it is
-evidenced; anything refused earlier exists only in metrics and logs. Doc 04's
-"denials are as important as grants" arguably wants more. Same shape as the gap
-recorded against delegated-authority-svc, and left consistent with it rather
-than solved differently in one place.
+Closed by migration 000006 (`refused_escalations`) and completed on 6 Oct: early
+refusals (invalid_json, missing_fields) are now actually written (they were
+refused by RLS), UPDATE_ROLE and DETACH_BUNDLE refusals are recorded, and the
+table is append-only under FORCE RLS (000007).
+
+---
+
+## 6 Oct 2026 re-audit: two regressions and five gaps, all fixed
+
+Live `scripts/audit.sh` before the fixes: **111 / 137**. After: **153 / 153**
+(16 new checks: §9b guards, §15 000007 posture). Unit tests 65 (was 53), store
+tests 21 (was 16).
+
+| # | Finding | Fix |
+|---|---|---|
+| R1 | **Regression (28 Sep):** the SoD client sent `{role_code, bundle_code, permitted_actions, …}` to `/v1/sod/validate`, which takes `candidate_actions` and answers 400 without it. Every error became `403 sod_conflict`, so **no role or bundle could be created**. | Client speaks the real contract and reads `conflict_free` strictly. |
+| R2 | **Regression (30 Sep, cross-service):** authorization-svc began gating its admin API on `iam.*` at tenant scope. Its 403 was reported here as `503 authz_admin_unavailable`, and the dev seed could no longer bootstrap. | 403 → `403 provisioning_forbidden` with authorization-svc's reason; the seed bootstraps the iam grants and has the approver make assignments (no self-grant). |
+| 3 | SoD failed **open**: a 200 `conflict_free:false` would have counted as a pass. | Strict verdict; no verdict → `503 sod_unavailable`. |
+| 4 | SoD checked only the bundle being written, never the role's other bundles; reactivation skipped it; role creation made a meaningless call. | Candidate set = role's other active bundles + this one; reactivation checked; role-create call removed. |
+| 5 | Protected-action guard **never fired**: it fetched a route nothing serves, and an empty list meant "skip". The seeded table was unused, and lacked the `iam.*` actions. | Reads `protected_permissions` (fail closed, also on empty); 000007 adds 11 `iam.*` actions; case- and space-insensitive match; names the action. |
+| 6 | `refused_escalations` ENABLE-only RLS, FOR ALL policy (a tenant could rewrite its refusals), and early refusals lost to RLS. | 000007: FORCE, SELECT + INSERT policies only, revoke UPDATE/DELETE; store fills the request tenant. |
+| 7 | UPDATE_ROLE and DETACH_BUNDLE refusals left no evidence row. | Recorded. |
+
+**Still open, outside this service:** authorization-svc's dev database has
+**no SoD rules** (the §10.1 baseline is unseeded), so `sod_conflict` can only
+fire on rules someone adds; the audit installs a tenant-scoped test rule.
+
+---
+
+## 6 Oct 2026, second pass: the unbuilt §5 / §9 / §24 scope built
+
+Score on the audit's 10 §9 rows: **2 → 9 of 10** (35% → 95% weighted). Live
+`audit.sh` **229 / 229** (was 153); `live_session_revocation_check.sh` 10 / 10.
+The full write-up, with the five decisions this took, is in
+`docs/audit_files/Identity, Scope & Foundation-audit-2026-09-23.md` (9/9,
+"Gap closure, 6 October 2026 (second pass)").
+
+| Area | What exists now |
+|---|---|
+| §5 taxonomy | `permission_definitions` (000008); every bundle action must be registered; `GET /v1/permission-definitions` |
+| §9 templates, §9.1 archetypes | `role_templates` + append-only versions (000009), 21 archetypes; instantiate / upgrade; template bundles immutable through the bundle routes |
+| §9 / §21 assignment requests | `POST /v1/iam/access-assignments` + `:approve`, `:reject`, `:cancel`, `:revoke` (000010); risk-based approval, independence, held-based SoD |
+| §9 / §24 attestation | `/v1/access-review-campaigns` (000011): snapshot, orphan + toxic-combination flags, decisions, high-risk completion gate; `GET /v1/iam/access-reviews` |
+| §19 revocation | `iam.assignment.granted` / `.revoked` feed identity-context-svc's role-holder projection (which had no feed, so `role.updated` ended no session); proven live |
+| §10.1 baseline | authorization-svc 000019 (global rules) |
+| Idempotency-Key | Honoured (000012 + `internal/idempotency`) |
+
+**Still open:** group subjects and grant-time end dates on assignments
+(authorization-svc's admin API has neither); automatic event-triggered reviews
+and dormancy detection; the 668 legacy action names are not §5-shaped; a
+reviewer revoking via a review decision needs `iam.assignment.revoke` in
+authorization-svc.
+
+---
+
+## 7 Oct 2026 re-audit (third pass): the 6 Oct "9 of 10" re-scored, eight gaps closed
+
+The code was read again against §9, §21, §22, §23 and §24, with no credit
+taken from earlier passes. The 6 Oct score of **9 of 10 (90%, 95% weighted)**
+did not survive: four rows had defects or missing clauses, giving **6 of 10
+(60%, 80% weighted)** before today's fixes. After them: **9 of 10 (90%, 95%
+weighted)**, and this time each claim is backed by a live check in `audit.sh`
+§9d.
+
+| # | Finding | Row | Fix |
+|---|---|---|---|
+| D1 | approve / reject / cancel / revoke and campaign reassign / complete checked `ROLE_MANAGE` on the **body's** `legal_entity_id`, never the record's own. A manager of entity B could reject or cancel entity A's requests, or close A's review campaign, by naming B. | Assignment request; review | The body's entity must equal the request's / campaign's (`400 entity_mismatch`, recorded). |
+| D2 | Review snapshots read authorization-svc's assignment list, which stops at **500 rows** with no indication. A campaign over a role with more holders reviewed only part of them, and left the rest unremovable through review. | Review | authorization-svc: paged `limit`/`offset`; the client reads every page. |
+| D3 | Toxic combinations were grouped by (principal, entity). A **tenant-wide** assignment has no entity, so a tenant-wide Payment Preparer and an entity Payment Releaser were never compared. | Review (§24) | Tenant-wide items join every entity group of the principal. Live: both halves flagged. |
+| D4 | No end date at grant time (§9 / §22 "effective dates"). | Access assignment | `effective_to` on the request, provisioned into authorization-svc (new optional field there), in `iam.assignment.granted`, projected by identity-context-svc. |
+| D5 | No effective-dated revocation (§9 "immediate **or effective-dated** removal"). | Revocation | `:revoke` with `effective_at` schedules the end there and here; it can only bring an end earlier (`409 ends_sooner`). |
+| D6 | Nothing ever announced an assignment ending by date, so identity-context-svc never ended the sessions holding it. | Revocation | Expiry sweep (`internal/expiry`, every 30s) closes due rows (EXPIRED, or REVOKED when scheduled) and enqueues `iam.assignment.revoked` in the same transaction. Cross-tenant scan through a SELECT-only named policy (000013). |
+| D7 | Approval authority did not depend on risk. Any independent `ROLE_MANAGE` holder approved CRITICAL grants. §9 asks for manager / data-owner / **security** approval "depending on risk". | Assignment request | CRITICAL also needs `iam.assignment.approve_privileged` (new, protected; `SECURITY_ACCESS_APPROVER` template). Otherwise `403 security_approval_required`. |
+| D8 | Reviews detected no stale or unowned assignments (§24 "Dormancy", "Orphan detection"). | Review | `DORMANT` flag: HIGH/CRITICAL, held through the window, with no GRANTED decision on record (window per campaign, default 90 days). `SUBJECT_INACTIVE` flag: the subject is suspended or disabled; raised to HIGH. Evidence is stored on the item. |
+
+| Row | 6 Oct claim | 7 Oct before fixes | After |
+|---|---|---|---|
+| System role template | ✅ | ✅ | ✅ |
+| Tenant custom role / protected | ✅ | ✅ | ✅ |
+| Access assignment | ⚠️ | ⚠️ (no end date, no groups) | ⚠️ (groups only) |
+| Assignment request | ✅ | ⚠️ (D1, D7) | ✅ |
+| Assignment review / attestation | ✅ | ⚠️ (D1, D2, D3, D8) | ✅ |
+| Revocation invalidates cache / session | ✅ | ⚠️ (D5, D6) | ✅ |
+| §9.1 archetypes | ✅ | ✅ | ✅ |
+| §5 taxonomy | ✅ | ✅ | ✅ |
+| §10.1 consulted | ✅ | ✅ | ✅ |
+| §20 evidence | ✅ | ✅ | ✅ |
+| **Score** | 9/10 (90%, 95%) | **6/10 (60%, 80%)** | **9/10 (90%, 95%)** |
+
+**Still open:**
+
+- **Group subjects** on assignments. No service in the estate holds groups or
+  group membership. §22 assigns them to "Identity/IAM". This is the one ⚠️.
+- **Event-triggered reviews start only when a caller asks.** A caller starts
+  them and names the trigger. Nothing yet consumes manager-change or
+  contractor-end events to start one automatically.
+- `DORMANT` reads authorization-svc's decision log through the role code in
+  `decision_basis`. A decision granted through several roles counts as use of
+  each of them.
+
+Changed outside this service: authorization-svc (`effective_to` on create,
+scheduled revoke, paged list with usage and subject status). identity-context-svc
+(projects `effective_to`). `seed-demo-rbac.ps1` (the IAM admin bundle holds
+`iam.assignment.approve_privileged`). Migration **000013** is applied to the dev
+`access_control` database, and its down/up round trip has been checked.
+
+## 7 Oct 2026, fourth pass: the remaining gaps closed (S9-B, S9-C1, S9-C2, S9-1, S1-4)
+
+Worked together with authorization-svc's governance pass, whose 7 Oct changes
+(maker-checker, `reason_code` / `purpose`, granting-assignment attribution)
+this service now speaks to. Uncommitted at the time of writing.
+
+### Deploy order
+
+Migrations **000014** (groups) and **000015** (subject links) before this
+build: `assignment_requests` gains `group_assignment_id`, and every assignment
+read selects it. authorization-svc's 000020–000027 go first, as its
+progress.md says.
+
+### What changed
+
+| Gap | Fix |
+|---|---|
+| **S9-C1 group subjects** (the one ⚠️) | `iam_groups` / `iam_group_members` / `iam_group_assignments` (000014, FORCE RLS). `POST /v1/iam/groups`, `…/members`, `…/members/{p}:remove`, `…/assignments`, `/v1/iam/group-assignments/{id}:revoke` and `:sync`. A group assignment is never enforced as a group: it fans out to **one governed request per member** through `submitAssignment`, the pipeline extracted from `RequestAssignment`, so each member gets their own pending check, principal-aware SoD, risk-tiered approval and provisioning (§2 "never bypass policy", A20). Join fans out every ACTIVE group assignment; leave cancels or revokes the member's group-sourced requests before the membership closes; revoke ends every member's request first. Member correlation ids are deterministic per membership, so sync and retries replay instead of doubling. Every command is bound to the group's own entity (`entity_mismatch`). |
+| **S9-C2 event-triggered reviews** | `internal/hrevents` consumes `zoiko.employee.events` (employee-master-svc) and `zoiko.offboarding.events` (offboarding-severance-svc). The audit's "none published" was out of date; the real blocker was that no service maps an employee to a principal. That mapping is now **administered, never inferred**: `POST /v1/iam/subject-links` (000015, ROLE_MANAGE). A manager change (mover) or an exit (TERMINATED / RESIGNED / DEACTIVATED / INACTIVE / ARCHIVED, "contractor end" for a CONTRACTOR) opens an EVENT_TRIGGERED campaign of that subject's assignments only (`subject_principal_id`). It is created by the service identity and reviewed by the new or last manager when they are linked, else by `ACS_EVENT_REVIEW_DEFAULT_REVIEWER`. Idempotent on `"hr-" + event_id`; the second producer's `employee.terminated` opens nothing. Outages are retried before anything is recorded; refusals are final. Unlinked employees are counted (`access_control_hr_events_total{outcome="unlinked"}`). It opens reviews and never revokes. |
+| **S9-B service identity** | A review REVOKE executes as `ACS_SERVICE_PRINCIPAL_ID` (`svc-access-control`, seeded with `iam.assignment.revoke` + `iam.assignment.read` only). The reviewer and reason travel as the §16 purpose, with `reason_code ACCESS_REVIEW_REVOKE`. |
+| **authorization-svc contract** | Every retire / reactivate / revoke / end-date call sends `reason_code` + `purpose`; provisioning sends `approval_reference` = the request id. A grant authorization-svc parks `PENDING_APPROVAL` is withdrawn there and answered `409 authz_approval_pending`, never recorded as provisioned. |
+| **S9-1 DORMANT attribution** | authorization-svc records `matched_grants: ["assignment:<id>", …]` and attributes usage to the granting assignment, so one used role no longer marks the principal's other roles as used. |
+| **S1-4 event keys** | `iam.assignment.granted` / `.revoked` are both keyed by the authorization-svc assignment id (`assignmentKey`), so they land on one partition in order. The identity-context-svc tombstone is that service's change. |
+
+### Score (Authorization Standard §9, the 10 scored rows)
+
+| Row | 7 Oct third pass | Now |
+|---|---|---|
+| Access assignment | ⚠️ (groups only) | ✅ (group subjects, fanned out per member) |
+| Assignment review / attestation | ✅ | ✅ (+ event-triggered, + attributed dormancy) |
+| the other eight | ✅ | ✅ |
+| **Score** | **9/10 (90%, 95% weighted)** | **10/10 (100%, 100%)** |
+
+### Verified
+
+- Unit tests pass in golang:1.25-alpine. New: `groups_test.go` (7),
+  `subject_links_test.go` (4), `authz_contract_test.go` (3),
+  `hrevents/consumer_test.go` (9), `events/assignment_key_test.go`, and the
+  client contract test.
+- The store suite (`-tags=integration`, embedded Postgres 16, NOBYPASSRLS)
+  passes with 000014/000015 applied. 3 new: group isolation and membership
+  history, the group-assignment link, and subject-link observe.
+- Mutants killed: member SoD skipped, group entity binding removed, review
+  subject filter removed, observation recorded before the trigger.
+- openapi.yaml validates with openapi-spec-validator (35 paths). Every emitted
+  error code is in `ServiceErrorCode`; `authz_approval_pending` had been
+  missing. `audit.sh`'s code diff now reads groups.go and subject_links.go.
+  asyncapi.yaml documents the two consumed channels.
+
+### Still open — outside this service
+
+- **Employee links have to be recorded.** Until an employee is linked, their
+  HR events open nothing (by design). The right long-term owner of the
+  mapping is the identity plane (identity-context-svc or a directory/SCIM
+  feed).
+- **SCIM-provisioned groups**: `source = SCIM` is accepted, but there is no
+  SCIM feed yet.
+- identity-context-svc's revocation tombstone (S1-4, its side).
+- S9-D1: the 668 legacy action names are each owning service's to rename.
+
+### 8 Oct addendum: employment.changed (000016)
+
+A linked employee's exit now also publishes `employment.changed` (Doc 03 §8.3's consumed name), keyed by
+the principal, which authorization-svc projects as `TERMINATED` — the leaver loses access, not just gets
+reviewed. Exits only; never for an unlinked employee, a move or a temporary absence. Migration **000016**
+admits the type in the outbox CHECK; asyncapi.yaml publishes it. Store test + hrevents test.

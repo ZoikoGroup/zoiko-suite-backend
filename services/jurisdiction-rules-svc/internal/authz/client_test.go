@@ -9,9 +9,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
+	"zoiko.io/jurisdiction-rules-svc/internal/envelope"
 )
 
 // ── client selection ─────────────────────────────────────────────────────────
@@ -94,6 +96,104 @@ func TestHTTPClient_Granted(t *testing.T) {
 	}
 	if gotBody["action_type"] != "JURISDICTION_RULE_TRANSITION" {
 		t.Errorf("action_type = %q, want JURISDICTION_RULE_TRANSITION", gotBody["action_type"])
+	}
+}
+
+// TestHTTPClient_ForwardsRequestContextHeaders — audit X6 attribution: the
+// outbound authorize call must carry the caller's tenant, principal,
+// correlation, request and channel as headers (not only inside the JSON body)
+// so authorization-svc's middleware and decision log attribute it the same way.
+func TestHTTPClient_ForwardsRequestContextHeaders(t *testing.T) {
+	gotHeaders := make(http.Header)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED","decision_basis":"rbac","access_decision_id":"d-1"}`))
+	}))
+	defer srv.Close()
+
+	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
+	env := &envelope.Envelope{
+		TenantID:       "t-1",
+		ActorSubjectID: "p-1",
+		CorrelationID:  "c-1",
+		RequestID:      "r-1",
+		SourceChannel:  envelope.ChannelAPI,
+	}
+	err := c.Authorize(context.Background(), "p-1", "scope-1", "jurisdiction", "create", env)
+	if err != nil {
+		t.Fatalf("expected permit, got %v", err)
+	}
+
+	want := map[string]string{
+		"X-Tenant-Id":      "t-1",
+		"X-Principal-Id":   "p-1",
+		"X-Correlation-ID": "c-1",
+		"X-Request-Id":     "r-1",
+		"X-Source-Channel": "api",
+	}
+	for h, expected := range want {
+		if got := gotHeaders.Get(h); got != expected {
+			t.Errorf("%s header = %q, want %q", h, got, expected)
+		}
+	}
+}
+
+// TestHTTPClient_AlwaysSendsPrincipalHeader — even without an envelope (an
+// internal/legacy call), the acting principal must be attributed out-of-band.
+func TestHTTPClient_AlwaysSendsPrincipalHeader(t *testing.T) {
+	var principalHeader string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principalHeader = r.Header.Get("X-Principal-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED","decision_basis":"rbac","access_decision_id":"d-1"}`))
+	}))
+	defer srv.Close()
+
+	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
+	if err := c.Authorize(context.Background(), "principal-legacy", "scope-1", "jurisdiction", "create", nil); err != nil {
+		t.Fatalf("expected permit, got %v", err)
+	}
+	if principalHeader != "principal-legacy" {
+		t.Errorf("X-Principal-Id header = %q, want principal-legacy", principalHeader)
+	}
+}
+
+// TestHTTPClient_ForwardsTheEnvelopeHeaders is the regression test for the
+// defect this client just replaced: authorizeLive sent NO envelope headers
+// at all, so authorization-svc's canonical-envelope middleware answered 401
+// envelope_incomplete on every single admin write, and this client folded
+// that into the indistinguishable ErrAuthZUnavailable — a missing header
+// read as authorization-svc being down.
+func TestHTTPClient_ForwardsTheEnvelopeHeaders(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED"}`))
+	}))
+	defer srv.Close()
+
+	// A real inbound request carries a chi request id by the time this client
+	// runs; context.Background() alone (as the other tests use) would not.
+	ctx := context.WithValue(context.Background(), middleware.RequestIDKey, "req-123")
+	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
+	if err := c.Authorize(ctx, "principal-1", "scope-1", "jurisdiction", "create", nil); err != nil {
+		t.Fatalf("expected permit, got %v", err)
+	}
+
+	for _, header := range []string{"X-Request-Id", "X-Source-Channel", "Idempotency-Key", "X-Legal-Entity-Id", "X-Principal-Id"} {
+		if got.Get(header) == "" {
+			t.Errorf("request is missing %s — authorization-svc will answer 401 envelope_incomplete", header)
+		}
+	}
+	if got.Get("X-Legal-Entity-Id") != "scope-1" {
+		t.Errorf("X-Legal-Entity-Id sent as %q, want %q", got.Get("X-Legal-Entity-Id"), "scope-1")
+	}
+	if got.Get("X-Principal-Id") != "principal-1" {
+		t.Errorf("X-Principal-Id sent as %q, want %q", got.Get("X-Principal-Id"), "principal-1")
 	}
 }
 

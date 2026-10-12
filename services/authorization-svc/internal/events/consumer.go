@@ -19,7 +19,7 @@ import (
 // cannot touch roles, assignments or decisions.
 type DelegationProjector interface {
 	ProjectDelegation(ctx context.Context, params domain.ProjectDelegationParams) (*domain.DelegatedAuthority, error)
-	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error)
+	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string, version int64) (*domain.DelegatedAuthority, error)
 }
 
 // upstreamService is the source_service value written on every projected row.
@@ -90,18 +90,26 @@ var ConsumedEventTypes = map[string]bool{
 	"authority.delegated": true,
 	"authority.revoked":   true,
 	"authority.expired":   true,
+	// Produced since 5 Oct 2026 (ORG-06 lifecycle). Without these entries the
+	// gate below drops them before the switch ever sees them.
+	"authority.extended":  true,
+	"authority.suspended": true,
+	"authority.resumed":   true,
 }
 
 // inbound is the read side of the platform event contract (Doc 03 §19). Only
 // the fields this consumer acts on are declared, so a producer adding one does
 // not break consumption.
 type inbound struct {
-	EventID       string          `json:"event_id"`
-	EventType     string          `json:"event_type"`
-	TenantID      string          `json:"tenant_id"`
-	LegalEntityID string          `json:"legal_entity_id"`
-	CorrelationID string          `json:"correlation_id"`
-	Payload       json.RawMessage `json:"payload"`
+	EventID       string `json:"event_id"`
+	EventType     string `json:"event_type"`
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	CorrelationID string `json:"correlation_id"`
+	// EffectiveAt orders entity status changes (tenant-entity-registry-svc's
+	// envelope). Absent on producers that do not send it.
+	EffectiveAt *time.Time      `json:"effective_at,omitempty"`
+	Payload     json.RawMessage `json:"payload"`
 }
 
 // delegationPayload is delegated-authority-svc's authority.* payload.
@@ -118,6 +126,13 @@ type delegationPayload struct {
 	ActionType    string     `json:"action_type"`
 	EffectiveFrom *time.Time `json:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to"`
+	// Version orders events about one grant; 0 is an event from before the
+	// producer sent versions.
+	Version int64 `json:"version"`
+	// The delegation's own ceiling (producer field names).
+	LimitCents    *int64  `json:"authority_limit_cents"`
+	LimitCurrency *string `json:"authority_limit_currency"`
+	LimitQuantity *int64  `json:"authority_limit_quantity"`
 }
 
 // dedupeTTL bounds how long an event id is remembered — long enough to cover
@@ -179,6 +194,17 @@ func (c *Consumer) claim(eventID string) bool {
 	return true
 }
 
+// release forgets eventID, so a message whose apply failed is applied when it
+// is retried rather than skipped as already handled.
+func (c *Consumer) release(eventID string) {
+	if eventID == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.seen, eventID)
+	c.mu.Unlock()
+}
+
 // Run consumes until ctx is cancelled.
 //
 // A broker that is absent or unreachable must NOT stop the service. This is
@@ -198,13 +224,13 @@ func (c *Consumer) Run(ctx context.Context, reader *kafka.Reader) {
 	c.log.Info("delegation projection consumer started", zap.String("upstream", upstreamService))
 
 	for {
-		msg, err := reader.ReadMessage(ctx)
+		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				c.log.Info("delegation projection consumer stopping")
 				return
 			}
-			c.log.Warn("kafka read failed — retrying", zap.Error(err))
+			c.log.Warn("kafka fetch failed — retrying", zap.Error(err))
 			select {
 			case <-ctx.Done():
 				return
@@ -212,30 +238,34 @@ func (c *Consumer) Run(ctx context.Context, reader *kafka.Reader) {
 			}
 			continue
 		}
-		c.Handle(ctx, msg.Value)
+		if !applyUntilDone(ctx, c.log, string(msg.Key), func() error { return c.Handle(ctx, msg.Value) }) {
+			c.log.Info("delegation consumer stopping with an unapplied message — not committed, so it is redelivered")
+			return
+		}
+		if err := reader.CommitMessages(ctx, msg); err != nil {
+			c.log.Error("failed to commit offset", zap.Error(err))
+		}
 	}
 }
 
 // Handle applies one message. Exported so the dispatch logic is testable
 // without a broker — the shape identity-context-svc's consumer uses.
 //
-// It never returns an error, and that is deliberate: this consumer commits its
-// offset by reading the next message, so a returned error would either stall
-// the partition on one bad event or be discarded anyway. A message that cannot
-// be applied is logged with enough detail to replay it by hand, and the stream
-// keeps moving. The alternative — one malformed event blocking every
-// subsequent delegation — is worse for a projection whose staleness silently
-// denies people access.
-func (c *Consumer) Handle(ctx context.Context, raw []byte) {
+// Returns an error only for critical failures (DB unavailable) that should
+// cause the offset to NOT be committed, allowing a retry. Non-critical
+// failures (unknown event type, malformed payload, tenantless event) are
+// logged and return nil so the offset is committed and the partition keeps
+// moving.
+func (c *Consumer) Handle(ctx context.Context, raw []byte) error {
 	var env inbound
 	if err := json.Unmarshal(raw, &env); err != nil {
 		c.log.Error("delegation event: undecodable envelope — skipped",
 			zap.Error(err), zap.Int("bytes", len(raw)))
-		return
+		return nil // Malformed message, commit and move on
 	}
 
 	if !ConsumedEventTypes[env.EventType] {
-		return
+		return nil // Unknown event type, commit and move on
 	}
 
 	// A tenantless authority event cannot be projected: since 000006
@@ -247,7 +277,7 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 			zap.String("event_id", env.EventID),
 			zap.String("event_type", env.EventType),
 			zap.String("correlation_id", env.CorrelationID))
-		return
+		return nil // Tenantless event, commit and move on
 	}
 
 	var payload delegationPayload
@@ -256,30 +286,45 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 			zap.String("event_id", env.EventID),
 			zap.String("event_type", env.EventType),
 			zap.Error(err))
-		return
+		return nil // Malformed payload, commit and move on
 	}
 	if payload.DelegationID == "" {
 		c.log.Error("delegation event: payload names no delegation_id — cannot project or dedupe",
 			zap.String("event_id", env.EventID),
 			zap.String("event_type", env.EventType))
-		return
+		return nil // Missing delegation_id, commit and move on
 	}
 
 	if !c.claim(env.EventID) {
 		c.log.Debug("delegation event: already handled by this process",
 			zap.String("event_id", env.EventID))
-		return
+		return nil // Already processed, commit and move on
 	}
 
 	switch env.EventType {
-	case "authority.delegated":
-		c.applyDelegated(ctx, env, payload)
-	case "authority.revoked", "authority.expired":
-		c.applyEnded(ctx, env, payload)
+	// authority.extended carries the new window and authority.resumed the
+	// whole grant: both re-project it exactly as authority.delegated does.
+	// Extension used to be dropped, so /v1/authorize ended an extended
+	// delegation at its ORIGINAL end; a resume had no handler at all.
+	case "authority.delegated", "authority.extended", "authority.resumed":
+		return c.releaseOnError(env.EventID, c.applyDelegated(ctx, env, payload))
+	// A suspended grant confers nothing until resumed — the same as an ended one.
+	case "authority.revoked", "authority.expired", "authority.suspended":
+		return c.releaseOnError(env.EventID, c.applyEnded(ctx, env, payload))
 	}
+	return nil
 }
 
-func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload delegationPayload) {
+// releaseOnError releases eventID's claim when the apply failed, so the retry
+// in Run applies it instead of skipping it as already handled.
+func (c *Consumer) releaseOnError(eventID string, err error) error {
+	if err != nil {
+		c.release(eventID)
+	}
+	return err
+}
+
+func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload delegationPayload) error {
 	// The entity comes from the payload, falling back to the envelope. Nil —
 	// meaning tenant-wide — only when neither names one, which is a legitimate
 	// upstream state and not an error.
@@ -313,14 +358,24 @@ func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload dele
 		DelegatedActions:     actions,
 		EffectiveFrom:        effectiveFrom,
 		EffectiveTo:          payload.EffectiveTo,
+		SourceVersion:        payload.Version,
+		LimitMinor:           payload.LimitCents,
+		LimitCurrency:        payload.LimitCurrency,
+		LimitQuantity:        payload.LimitQuantity,
 	})
+	if errors.Is(err, domain.ErrStaleProjection) {
+		c.log.Info("delegation event older than the projection; ignored",
+			zap.String("event_id", env.EventID), zap.String("delegation_id", payload.DelegationID),
+			zap.Int64("version", payload.Version))
+		return nil
+	}
 	if err != nil {
 		c.log.Error("delegation event: projection failed — the delegation will not grant anything until this is replayed",
 			zap.String("event_id", env.EventID),
 			zap.String("delegation_id", payload.DelegationID),
 			zap.String("correlation_id", env.CorrelationID),
 			zap.Error(err))
-		return
+		return err
 	}
 
 	c.log.Info("delegation projected",
@@ -329,10 +384,11 @@ func (c *Consumer) applyDelegated(ctx context.Context, env inbound, payload dele
 		zap.String("delegate_principal_id", payload.Delegate),
 		zap.Strings("delegated_actions", actions),
 		zap.String("correlation_id", env.CorrelationID))
+	return nil
 }
 
-func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegationPayload) {
-	d, err := c.store.RevokeProjectedDelegation(ctx, upstreamService, payload.DelegationID, env.TenantID)
+func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegationPayload) error {
+	d, err := c.store.RevokeProjectedDelegation(ctx, upstreamService, payload.DelegationID, env.TenantID, payload.Version)
 	if err != nil {
 		if errors.Is(err, domain.ErrDelegatedAuthorityNotFound) {
 			// Nothing to end: either a redelivery of an event already applied,
@@ -342,7 +398,7 @@ func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegati
 			c.log.Debug("delegation event: no projected row to end",
 				zap.String("event_type", env.EventType),
 				zap.String("delegation_id", payload.DelegationID))
-			return
+			return nil
 		}
 		c.log.Error("delegation event: ending the projection failed — the delegation may still grant access",
 			zap.String("event_id", env.EventID),
@@ -350,7 +406,7 @@ func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegati
 			zap.String("delegation_id", payload.DelegationID),
 			zap.String("correlation_id", env.CorrelationID),
 			zap.Error(err))
-		return
+		return err
 	}
 
 	c.log.Info("delegation projection ended",
@@ -358,6 +414,7 @@ func (c *Consumer) applyEnded(ctx context.Context, env inbound, payload delegati
 		zap.String("source_delegation_id", payload.DelegationID),
 		zap.String("event_type", env.EventType),
 		zap.String("correlation_id", env.CorrelationID))
+	return nil
 }
 
 func firstNonEmpty(values ...string) string {

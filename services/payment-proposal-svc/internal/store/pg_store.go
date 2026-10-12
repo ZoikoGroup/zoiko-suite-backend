@@ -109,14 +109,14 @@ func (s *PgStore) recordEvent(ctx context.Context, tx pgx.Tx, tenantID *string, 
 
 const proposalColumns = `
 	proposal_id, tenant_id, legal_entity_id, paying_bank_account_ref, currency, payment_date, payment_method,
-	status, gross_amount, withholding_amount, net_amount, frozen_by_principal_id, frozen_at,
+	status, gross_amount, withholding_amount, net_amount, frozen_by_principal_id, frozen_at, frozen_fingerprint,
 	created_by_principal_id, created_at, updated_at`
 
 func scanProposal(row pgx.Row) (*domain.PaymentProposal, error) {
 	p := &domain.PaymentProposal{}
 	err := row.Scan(&p.ProposalID, &p.TenantID, &p.LegalEntityID, &p.PayingBankAccountRef, &p.Currency, &p.PaymentDate,
 		&p.PaymentMethod, &p.Status, &p.GrossAmount, &p.WithholdingAmount, &p.NetAmount, &p.FrozenByPrincipalID,
-		&p.FrozenAt, &p.CreatedByPrincipalID, &p.CreatedAt, &p.UpdatedAt)
+		&p.FrozenAt, &nullString{&p.FrozenFingerprint}, &p.CreatedByPrincipalID, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +130,7 @@ func (s *PgStore) CreateProposal(ctx context.Context, tenantID string, req domai
 		var err error
 		p, err = scanProposal(tx.QueryRow(ctx, `
 			INSERT INTO payment_proposals (`+proposalColumns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, 'DRAFT', 0, 0, 0, NULL, NULL, $8, NOW(), NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, 'DRAFT', 0, 0, 0, NULL, NULL, '', $8, NOW(), NOW())
 			RETURNING `+proposalColumns,
 			id, strPtrOrNil(tenantID), req.LegalEntityID, req.PayingBankAccountRef, req.Currency, req.PaymentDate,
 			req.PaymentMethod, principalID,
@@ -203,7 +203,10 @@ func (s *PgStore) AddItem(ctx context.Context, item domain.ProposalItem) (*domai
 			RETURNING `+itemColumns,
 			id, tenantID, item.ProposalID, item.PayableSource, item.PayableID, item.PayeeRef, item.GrossAmount,
 			item.WithholdingAmount, item.NetAmount, item.Currency, item.DueDate, item.PayeeSnapshotAt,
-			strPtrOrNil(item.TaxDeterminationID), strPtrOrNil(item.ExceptionRef),
+			// Both columns are NOT NULL DEFAULT '': an absent value is the
+			// empty string, never NULL (NULL would reject every ordinary
+			// item that has no exception).
+			item.TaxDeterminationID, item.ExceptionRef,
 		))
 		return err
 	})
@@ -342,15 +345,41 @@ func (s *PgStore) SubmitForReview(ctx context.Context, proposalID string, princi
 	return p, nil
 }
 
+// FreezeProposal locks the proposal row, computes the subject fingerprint
+// over the exact active items being frozen, and stores it in the same
+// transaction as the REVIEW -> FROZEN transition.
 func (s *PgStore) FreezeProposal(ctx context.Context, proposalID string, principalID string) (*domain.PaymentProposal, error) {
 	var p *domain.PaymentProposal
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
+		current, err := scanProposal(tx.QueryRow(ctx, `SELECT `+proposalColumns+` FROM payment_proposals WHERE proposal_id = $1 AND status = 'REVIEW' FOR UPDATE`, proposalID))
+		if err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT `+itemColumns+` FROM proposal_items WHERE proposal_id = $1 AND is_active = TRUE`, proposalID)
+		if err != nil {
+			return err
+		}
+		var items []domain.ProposalItem
+		for rows.Next() {
+			it, err := scanItem(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			items = append(items, *it)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		fingerprint := domain.ComputeFingerprint(current, items, domain.StatusFrozen)
 		p, err = scanProposal(tx.QueryRow(ctx, `
-			UPDATE payment_proposals SET status = 'FROZEN', frozen_by_principal_id = $2, frozen_at = NOW(), updated_at = NOW()
+			UPDATE payment_proposals SET status = 'FROZEN', frozen_by_principal_id = $2, frozen_at = NOW(),
+				frozen_fingerprint = $3, updated_at = NOW()
 			WHERE proposal_id = $1 AND status = 'REVIEW'
 			RETURNING `+proposalColumns,
-			proposalID, principalID,
+			proposalID, principalID, fingerprint,
 		))
 		if err != nil {
 			return err

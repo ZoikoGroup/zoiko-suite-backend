@@ -15,13 +15,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/goods-service-receipt-svc/internal/accounting"
 	"zoiko.io/goods-service-receipt-svc/internal/authz"
 	"zoiko.io/goods-service-receipt-svc/internal/config"
+	"zoiko.io/goods-service-receipt-svc/internal/envelope"
 	"zoiko.io/goods-service-receipt-svc/internal/events"
 	"zoiko.io/goods-service-receipt-svc/internal/handler"
 	"zoiko.io/goods-service-receipt-svc/internal/health"
-	"zoiko.io/goods-service-receipt-svc/internal/ledger"
+	"zoiko.io/goods-service-receipt-svc/internal/idempotency"
 	"zoiko.io/goods-service-receipt-svc/internal/middleware"
+	"zoiko.io/goods-service-receipt-svc/internal/outbox"
+	"zoiko.io/goods-service-receipt-svc/internal/progress"
 	"zoiko.io/goods-service-receipt-svc/internal/purchaseorder"
 	"zoiko.io/goods-service-receipt-svc/internal/store"
 )
@@ -58,18 +62,35 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	pgStore := store.NewPgStore(pool, logger)
+	pgStore := store.NewPgStore(pool, logger).WithAccounting(store.AccountingConfig{
+		DebitMappingKey: cfg.GRNIDebitMappingKey, CreditMappingKey: cfg.GRNICreditMappingKey,
+		PostingPolicyVersion: cfg.PostingPolicyVersion,
+	})
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	poClient := purchaseorder.NewHTTPClient(cfg.PurchaseOrderServiceURL, logger)
-	ledgerClient := ledger.NewHTTPClient(cfg.GeneralLedgerServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, poClient, ledgerClient, handler.Config{
-		GRNIDebitAccountCode:    cfg.GRNIDebitAccountCode,
-		GRNICreditAccountCode:   cfg.GRNICreditAccountCode,
-		OverReceiptTolerancePct: cfg.OverReceiptTolerancePct,
-	}, logger)
+	// Background workers, all stopped on shutdown: the transactional-outbox relay
+	// (ZS-STATE-001 I-13), the AP-03 received-quantity push worker, and the ACC-04
+	// GRNI posting dispatcher.
+	workerCtx, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
+	if pool != nil {
+		go outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, logger).Start(workerCtx)
+		if cfg.POProgressPrincipalID == "" {
+			logger.Warn("PO_PROGRESS_PRINCIPAL_ID is not set: AP-03 progress worker not started; received-quantity pushes stay PENDING")
+		} else {
+			go progress.New(pgStore, poClient, cfg.POProgressPrincipalID, 3*time.Second, 50, logger).Start(workerCtx)
+		}
+		if cfg.AccountingPrincipalID == "" {
+			logger.Warn("ACCOUNTING_PRINCIPAL_ID is not set: GRNI posting dispatcher not started; posting requests stay PENDING")
+		} else {
+			go accounting.New(pgStore, cfg.GeneralLedgerServiceURL, cfg.AccountingPrincipalID, 5*time.Second, 20, logger).Start(workerCtx)
+		}
+	}
+
+	h := handler.New(pgStore, authzClient, poClient, handler.Config{OverReceiptTolerancePct: cfg.OverReceiptTolerancePct}, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -81,6 +102,17 @@ func main() {
 
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.TenantContext())
+		// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 section 4): no
+		// request reaches business logic without a resolved tenant, actor,
+		// correlation and — on material writes — an idempotency key.
+		// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+		r.Use(envelope.Middleware(envelope.ServicePolicy(), envelope.DefaultReporter()))
+		// Idempotency-Key replay (spec section 16): a repeated confirmation or
+		// reversal returns the stored result and never runs twice.
+		r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), idempotency.Options{
+			TenantFromContext: middleware.TenantFromContext,
+			Log:               logger,
+		}))
 		handler.RegisterRoutes(r, h)
 	})
 
@@ -104,6 +136,7 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down goods-service-receipt-svc gracefully...")
+	stopWorkers()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

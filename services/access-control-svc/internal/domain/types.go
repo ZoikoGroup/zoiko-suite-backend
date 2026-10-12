@@ -23,6 +23,7 @@ package domain
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -50,6 +51,11 @@ type RoleDefinition struct {
 	CorrelationID        string    `json:"correlation_id"`
 	CreatedAt            time.Time `json:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at"`
+	// TemplateCode / TemplateVersion are set on a role instantiated from a
+	// system role template (§9): its provenance, and the version its
+	// template-managed bundle carries. Empty / 0 for a tenant custom role.
+	TemplateCode    string `json:"template_code,omitempty"`
+	TemplateVersion int    `json:"template_version,omitempty"`
 }
 
 // PermissionBundleDef is a named set of permitted actions attached to a
@@ -65,6 +71,10 @@ type PermissionBundleDef struct {
 	CreatedAt            time.Time `json:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at"`
 	UpdatedByPrincipalID string    `json:"updated_by_principal_id,omitempty"`
+	// TemplateCode marks the bundle a role template manages. Its actions are
+	// the template version's, and they change only by a template upgrade.
+	TemplateCode    string `json:"template_code,omitempty"`
+	TemplateVersion int    `json:"template_version,omitempty"`
 }
 
 // ProtectedPermission is a platform-admin action that tenant roles may not include.
@@ -151,22 +161,55 @@ type BundleListFilter struct {
 	Offset     int
 }
 
-// SoDCheckRequest represents a request to check SoD conflicts for a role/bundle.
+// SoDCheckRequest asks authorization-svc whether a role's action set is
+// internally conflicted (POST /v1/sod/validate, candidate-only form).
+//
+// CandidateActions is the WHOLE set the role would grant once the write lands:
+// its other active bundles plus the bundle being written. A conflict split
+// across two bundles of one role is still a conflict for everyone who holds
+// the role, so checking the new bundle alone would miss exactly the case a
+// second bundle is most often used to sneak in.
+//
+// No principal is sent in the body. Defining a role assigns it to nobody, so
+// the question is "is this role conflicted", not "may this caller hold it";
+// the caller rides X-Principal-Id only as the request's attribution.
 type SoDCheckRequest struct {
-	TenantID            string   `json:"tenant_id"`
-	LegalEntityID       string   `json:"legal_entity_id"`
-	PrincipalID         string   `json:"principal_id"`
-	RoleCode            string   `json:"role_code,omitempty"`
-	BundleCode          string   `json:"bundle_code,omitempty"`
-	PermittedActions    []string `json:"permitted_actions,omitempty"`
-	CorrelationID       string   `json:"correlation_id"`
+	TenantID         string
+	CallerID         string
+	CorrelationID    string
+	CandidateActions []string
+
+	// SubjectPrincipalID + LegalEntityID ask the principal-aware form: the
+	// candidates are checked against what the subject already holds in that
+	// entity. Set for an assignment, empty for a role definition.
+	SubjectPrincipalID string
+	LegalEntityID      string
 }
 
-// SoDCheckResponse represents the result of an SoD check.
-type SoDCheckResponse struct {
-	Conflict bool     `json:"conflict"`
-	Rules    []string `json:"rules,omitempty"` // names of conflicting rules
+// SoDConflict is one conflicting pair as authorization-svc reports it.
+type SoDConflict struct {
+	CandidateAction string `json:"candidate_action"`
+	ConflictsWith   string `json:"conflicts_with"`
+	Source          string `json:"source"`
 }
+
+// SoDConflictError carries the pairs behind a refusal, so the caller is told
+// which actions to split rather than only that something conflicted.
+// errors.Is(err, ErrSoDConflict) holds for it.
+type SoDConflictError struct{ Conflicts []SoDConflict }
+
+func (e *SoDConflictError) Error() string {
+	if len(e.Conflicts) == 0 {
+		return string(ErrSoDConflict)
+	}
+	pairs := make([]string, 0, len(e.Conflicts))
+	for _, c := range e.Conflicts {
+		pairs = append(pairs, c.CandidateAction+" conflicts with "+c.ConflictsWith)
+	}
+	return string(ErrSoDConflict) + ": " + strings.Join(pairs, "; ")
+}
+
+func (e *SoDConflictError) Is(target error) bool { return target == ErrSoDConflict }
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
@@ -237,5 +280,23 @@ var (
 
 	// ErrSoDConflict is returned when a role or bundle would create a
 	// segregation-of-duties violation (Authorization Standard §10.1).
-	ErrSoDConflict = errorString("segregation of duties conflict: the requested actions conflict with existing assignments")
+	ErrSoDConflict = errorString("segregation of duties conflict: the role's permitted actions conflict with each other")
+
+	// ErrSoDUnavailable is returned when authorization-svc's SoD check cannot
+	// be read: unreachable, non-200, or a body without a verdict. Fail closed.
+	// This used to be indistinguishable from a conflict (every non-2xx was a
+	// generic error, every error a 403 sod_conflict), and a 200 carrying
+	// conflict_free:false counted as a pass.
+	ErrSoDUnavailable = errorString("segregation-of-duties check unavailable")
+
+	// ErrProtectedCatalogueUnavailable is returned when the protected-action
+	// catalogue cannot be read, or reads empty. Fail closed: an empty list
+	// used to mean "no check", so a missing catalogue let every platform-admin
+	// action into a tenant bundle.
+	ErrProtectedCatalogueUnavailable = errorString("protected-action catalogue unavailable")
+
+	// ErrProvisioningForbidden is returned when authorization-svc's admin API
+	// refuses the caller (403). It is a refusal, not an outage: the caller
+	// lacks the iam.* grant authorization-svc requires for the write.
+	ErrProvisioningForbidden = errorString("authorization-svc refused the provisioning call for this caller")
 )

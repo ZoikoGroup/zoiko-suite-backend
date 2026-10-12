@@ -25,6 +25,12 @@ type Employee struct {
 	EmployeeID    string `json:"employee_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	Status        string `json:"status"`
+	// Monolith-aligned fields
+	WorkerType   string  `json:"worker_type,omitempty"`
+	DepartmentID *string `json:"department_id,omitempty"`
+	JobTitle     *string `json:"job_title,omitempty"`
+	WorkEmail    *string `json:"work_email,omitempty"`
+	HireDate     *string `json:"hire_date,omitempty"`
 }
 
 func (c *Client) ValidateEmployee(ctx context.Context, tenantID, principalID, employeeID string) (*Employee, error) {

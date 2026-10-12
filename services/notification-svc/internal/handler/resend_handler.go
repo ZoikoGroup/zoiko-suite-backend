@@ -9,7 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
-	"zoiko.io/notification-svc/internal/ncd"
+	"zoiko.io/notification-svc/internal/ncdcode"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
 
@@ -106,7 +106,7 @@ func (h *Handler) ResendNotification(w http.ResponseWriter, r *http.Request) {
 			RecipientPrincipalID: n.RecipientPrincipalID, Channel: n.Channel,
 		})
 		if resolveErr != nil {
-			outcome.Reason = ncd.Format(ncd.RecipientUnresolved) + ": recipient resolution failed: " + resolveErr.Error()
+			outcome.Reason = ncdcode.Format(ncdcode.RecipientUnresolved) + ": recipient resolution failed: " + resolveErr.Error()
 		} else if err := h.store.SetRecipientAddress(r.Context(), n.NotificationID, tenantID, addr, source); err != nil {
 			outcome.Reason = "resolved a recipient address but could not record it: " + err.Error()
 		} else {

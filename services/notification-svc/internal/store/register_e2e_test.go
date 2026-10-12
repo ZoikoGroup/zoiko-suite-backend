@@ -46,7 +46,7 @@ func registerRequest(event string) ledger.EventIngestRequest {
 // communication, visible and linked from both sides, and everything the direct path
 // guarantees about a register row holds for it.
 func TestRegister_E2E_OneCommunicationOneIdentity(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-reg-e2e"
 	ctx := svcmiddleware.WithTenant(context.Background(), tenant)
@@ -106,7 +106,7 @@ func TestRegister_E2E_OneCommunicationOneIdentity(t *testing.T) {
 }
 
 func TestRegister_E2E_FailedDeliveryIsConcludedAndNeverRetriedByTheDirectWorker(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-reg-fail"
 	ctx := svcmiddleware.WithTenant(context.Background(), tenant)
@@ -165,7 +165,7 @@ func outboxFor(t *testing.T, pool interface {
 // Step 6 end to end: a ledger delivery's events all name the SAME communication and
 // the intent it came from, so a consumer sees one identity.
 func TestRegister_E2E_EventsCarryOneCommunicationIdentity(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-events-identity"
 	ctx := svcmiddleware.WithTenant(context.Background(), tenant)
@@ -188,7 +188,7 @@ func TestRegister_E2E_EventsCarryOneCommunicationIdentity(t *testing.T) {
 
 // A direct send has no intent: its events say so by omitting the field.
 func TestRegister_E2E_DirectSendEventsOmitTheIntent(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := classed(t, s, "tenant-events-direct", "corr-events-direct", "T0")
 	require.NoError(t, complete(t, s, "tenant-events-direct", n.NotificationID, "SENT", "", receiptFor("<events-direct@example.com>")))

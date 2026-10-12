@@ -74,6 +74,15 @@ func (h *Handler) CreateComponent(w http.ResponseWriter, r *http.Request) {
 		Status:        "ACTIVE",
 		CreatedAt:     now,
 		UpdatedAt:     now,
+		// Monolith-aligned fields
+		StatutoryComponent: req.StatutoryComponent,
+		TaxCode:            req.TaxCode,
+		PFContributionType: req.PFContributionType,
+		ESICoverage:        req.ESICoverage,
+		PTApplicable:       req.PTApplicable,
+		IsFlexible:         req.IsFlexible,
+		MinValue:           req.MinValue,
+		MaxValue:           req.MaxValue,
 	}
 
 	if err := h.store.CreateComponent(r.Context(), c); errors.Is(err, domain.ErrComponentCodeExists) {
@@ -107,8 +116,8 @@ func (h *Handler) ListComponents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if componentType != "" &&
-		componentType != domain.ComponentEarning &&
-		componentType != domain.ComponentDeduction {
+		componentType != string(domain.ComponentEarning) &&
+		componentType != string(domain.ComponentDeduction) {
 		writeError(w, http.StatusBadRequest, "invalid_component_type", string(domain.ErrInvalidComponentType))
 		return
 	}

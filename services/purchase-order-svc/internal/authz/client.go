@@ -10,17 +10,17 @@
 package authz
 
 import (
-	svcenvelope "zoiko.io/purchase-order-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"io"
 	"net/http"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/purchase-order-svc/internal/envelope"
 
 	"go.uber.org/zap"
 
@@ -35,6 +35,12 @@ type Client interface {
 	// domain.ErrAuthorizationServiceUnavailable if it cannot be reached —
 	// callers must fail-closed on the latter.
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+	// CheckAllowedOwnObject is CheckAllowed plus authorization-svc's dynamic
+	// own-object segregation-of-duties layer: resourceOwnerPrincipalID is the
+	// principal who created the object being acted on (the PO's preparer), and
+	// authorization-svc denies the act when the caller is that principal. Never
+	// cached — the verdict depends on the object, not just the caller.
+	CheckAllowedOwnObject(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) error
 }
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
@@ -102,6 +108,8 @@ type authorizeRequest struct {
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
+	// ResourceOwnerPrincipalID drives the own-object SoD layer; omitted for a plain check.
+	ResourceOwnerPrincipalID string `json:"resource_owner_principal_id,omitempty"`
 }
 
 type authorizeResponse struct {
@@ -115,7 +123,7 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 		return decision
 	}
 
-	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType, "")
 
 	// Cache the decision itself (GRANTED or DENIED), never an unavailable
 	// outcome — see the doc comment on decisionCacheTTL.
@@ -165,8 +173,8 @@ func (c *HTTPClient) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
-func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType})
+func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) error {
+	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType, ResourceOwnerPrincipalID: resourceOwnerPrincipalID})
 	if err != nil {
 		return fmt.Errorf("marshal authorize request: %w", err)
 	}
@@ -239,4 +247,11 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 		return domain.ErrAuthorizationDenied
 	}
 	return nil
+}
+
+// CheckAllowedOwnObject asks authorization-svc with the object's owner so its
+// own-object SoD layer can deny an actor who owns the object. It is never
+// cached: the same principal may be allowed on one order and denied on another.
+func (c *HTTPClient) CheckAllowedOwnObject(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) error {
+	return c.checkAllowedLive(ctx, principalID, legalEntityID, actionType, resourceOwnerPrincipalID)
 }

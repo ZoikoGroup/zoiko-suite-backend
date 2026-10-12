@@ -34,7 +34,7 @@ func queuedNotification(t *testing.T, s *store.PgStore, tenant, corr string, not
 func tp(d time.Duration) *time.Time { v := time.Now().UTC().Add(d); return &v }
 
 func TestSchedule_AQueuedSendWaitsAndCarriesItsJob(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	n := queuedNotification(t, s, "tenant-sched", "corr-sched-1", tp(2*time.Hour), tp(48*time.Hour))
 
 	got, err := s.GetNotification(tenantCtx("tenant-sched"), n.NotificationID)
@@ -69,7 +69,7 @@ func TestSchedule_AQueuedSendWaitsAndCarriesItsJob(t *testing.T) {
 }
 
 func TestSchedule_EveryAttemptAndItsEventCarryTheJob(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	n := seedNotification(t, s, "tenant-sched-job", "corr-sched-job")
 	require.NoError(t, s.ScheduleRetry(tenantCtx("tenant-sched-job"), n.NotificationID, "tenant-sched-job", "421 later",
@@ -89,7 +89,7 @@ func TestSchedule_EveryAttemptAndItsEventCarryTheJob(t *testing.T) {
 }
 
 func TestSchedule_OnlyAQueuedCommunicationCanBeCancelled(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-cancel"
 	ctx := tenantCtx(tenant)
@@ -126,7 +126,7 @@ func TestSchedule_OnlyAQueuedCommunicationCanBeCancelled(t *testing.T) {
 }
 
 func TestSchedule_ACancellationNeverDescribesAMessageThatWasSent(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-cancel-race"
 	ctx := tenantCtx(tenant)
 
@@ -157,7 +157,7 @@ func TestSchedule_ACancellationNeverDescribesAMessageThatWasSent(t *testing.T) {
 }
 
 func TestSchedule_ACommunicationPastItsExpiryIsNeverSent(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-expire"
 	ctx := tenantCtx(tenant)
@@ -203,7 +203,7 @@ func TestSchedule_ACommunicationPastItsExpiryIsNeverSent(t *testing.T) {
 }
 
 func TestSchedule_ExpiryLeavesWhatIsInFlightOrConcludedAlone(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-expire-guard"
 	ctx := tenantCtx(tenant)
 
@@ -220,7 +220,7 @@ func TestSchedule_ExpiryLeavesWhatIsInFlightOrConcludedAlone(t *testing.T) {
 }
 
 func TestSchedule_TheDatabaseHoldsTheTimingRules(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-sched-db"
 	n := queuedNotification(t, s, tenant, "corr-sched-db", tp(time.Hour), tp(5*time.Hour))
@@ -260,7 +260,7 @@ func (schedResolver) ResolveEmail(context.Context, string, string, string) (stri
 }
 
 func TestSchedule_AWorkerSendsAScheduledMessageWhenDueAndNeverAnExpiredOne(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-sched-worker"
 	ctx := tenantCtx(tenant)
@@ -306,7 +306,7 @@ func TestSchedule_AWorkerSendsAScheduledMessageWhenDueAndNeverAnExpiredOne(t *te
 }
 
 func TestMigration000028_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000028_scheduling_cancel_expiry.down.sql", "000028_scheduling_cancel_expiry.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)

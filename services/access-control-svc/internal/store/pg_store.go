@@ -81,7 +81,8 @@ func uniqueViolation(err error, constraint string) bool {
 
 const roleColumns = `
 	role_definition_id, tenant_id, role_code, role_name, role_scope_type,
-	status, created_by_principal_id, COALESCE(updated_by_principal_id, '') AS updated_by_principal_id, correlation_id, created_at, updated_at
+	status, created_by_principal_id, COALESCE(updated_by_principal_id, '') AS updated_by_principal_id, correlation_id, created_at, updated_at,
+	COALESCE(template_code, '') AS template_code, COALESCE(template_version, 0) AS template_version
 `
 
 func scanRole(row pgx.Row, r *domain.RoleDefinition) error {
@@ -89,6 +90,7 @@ func scanRole(row pgx.Row, r *domain.RoleDefinition) error {
 	if err := row.Scan(
 		&r.RoleDefinitionID, &r.TenantID, &r.RoleCode, &r.RoleName, &r.RoleScopeType,
 		&status, &r.CreatedByPrincipalID, &r.UpdatedByPrincipalID, &r.CorrelationID, &r.CreatedAt, &r.UpdatedAt,
+		&r.TemplateCode, &r.TemplateVersion,
 	); err != nil {
 		return err
 	}
@@ -392,13 +394,15 @@ func (s *PgStore) UpdateRole(ctx context.Context, roleDefinitionID, roleName, st
 
 const bundleColumns = `
 	bundle_id, tenant_id, role_definition_id, bundle_code, permitted_actions,
-	active_flag, COALESCE(updated_by_principal_id, '') AS updated_by_principal_id, correlation_id, created_at, updated_at
+	active_flag, COALESCE(updated_by_principal_id, '') AS updated_by_principal_id, correlation_id, created_at, updated_at,
+	COALESCE(template_code, '') AS template_code, COALESCE(template_version, 0) AS template_version
 `
 
 func scanBundle(row pgx.Row, b *domain.PermissionBundleDef) error {
 	return row.Scan(
 		&b.BundleID, &b.TenantID, &b.RoleDefinitionID, &b.BundleCode, &b.PermittedActions,
 		&b.ActiveFlag, &b.UpdatedByPrincipalID, &b.CorrelationID, &b.CreatedAt, &b.UpdatedAt,
+		&b.TemplateCode, &b.TemplateVersion,
 	)
 }
 
@@ -815,6 +819,14 @@ func (s *PgStore) RecordRefusedEscalation(ctx context.Context, r *domain.Refused
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
+	// The row's tenant is the verified request tenant. Refusals made before
+	// the handler resolves its own tenant (invalid_json, missing_fields) used
+	// to pass "", which the RLS WITH CHECK compares against the GUC set from
+	// the context, so every such insert was refused and the denial was lost
+	// to a log line. A refusal carrying a DIFFERENT tenant is still refused.
+	if r.TenantID == "" {
+		r.TenantID = tenantID
+	}
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
@@ -826,4 +838,45 @@ func (s *PgStore) RecordRefusedEscalation(ctx context.Context, r *domain.Refused
 			r.ActionType, r.RefusalReason, r.RequestedPayload, r.ErrorCode, r.ErrorMessage, r.CreatedAt)
 		return err
 	})
+}
+
+// ProtectedCatalogue reads the protected platform-admin actions from this
+// service's own protected_permissions table (migrations 000005, 000007).
+//
+// The handler used to fetch this list from GET /v1/protected-permissions on
+// authorization-svc, a route nothing in the estate serves. Every call failed,
+// the handler returned an empty list, and an empty list meant "skip the
+// check", so the guard never fired and the seeded table was never read.
+type ProtectedCatalogue struct{ s *PgStore }
+
+func NewProtectedCatalogue(s *PgStore) *ProtectedCatalogue { return &ProtectedCatalogue{s: s} }
+
+// ListActive returns the active protected action names. The catalogue is
+// platform-wide (no tenant column, a read-all policy); the request tenant is
+// set only because every transaction here runs under withRLS.
+func (c *ProtectedCatalogue) ListActive(ctx context.Context) ([]string, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []string
+	err := c.s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, "SELECT action_name FROM protected_permissions WHERE active_flag ORDER BY action_name")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a string
+			if err := rows.Scan(&a); err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read protected_permissions: %w", err)
+	}
+	return out, nil
 }

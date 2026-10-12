@@ -27,16 +27,18 @@ type RegistryPublisher interface {
 	PublishRegistryEvent(ctx context.Context, eventType, aggregateID, actorID, correlationID string, payload map[string]any) error
 }
 
-// PublishRegistryEvent implements RegistryPublisher. aggregate_id keys the
-// Kafka partition so all events about one record stay ordered.
-func (p *KafkaPublisher) PublishRegistryEvent(ctx context.Context, eventType, aggregateID, actorID, correlationID string, payload map[string]any) error {
+// PublishRegistryEvent implements RegistryPublisher. The event goes to the
+// transactional outbox (the OutboxWorker relays it to Kafka), so a broker
+// outage cannot lose it. aggregate_id keys the partition so all events about
+// one record stay ordered.
+func (p *OutboxPublisher) PublishRegistryEvent(ctx context.Context, eventType, aggregateID, actorID, correlationID string, payload map[string]any) error {
 	body := make(map[string]any, len(payload)+1)
 	for k, v := range payload {
 		body[k] = v
 	}
 	body["aggregate_id"] = aggregateID
 	jurisdictionID, _ := payload["jurisdiction_id"].(string)
-	return p.emit(ctx, eventType, correlationID, jurisdictionID, actorID, body)
+	return p.emitToOutbox(ctx, p.store.Pool(), eventType, correlationID, jurisdictionID, actorID, body)
 }
 
 // PublishRegistryEvent implements RegistryPublisher by dropping the event.

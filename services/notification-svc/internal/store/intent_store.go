@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/notification-svc/internal/domain"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
@@ -21,7 +20,7 @@ import (
 const intentColumns = `intent_id, tenant_id, legal_entity_id, intent_key, display_name, domain_owner, status,
 	created_by_principal_id, created_at, retired_at`
 
-func scanIntent(s scannable, i *domain.CommunicationIntent) error {
+func scanCommunicationIntent(s scannable, i *domain.CommunicationIntent) error {
 	return s.Scan(&i.IntentID, &i.TenantID, &i.LegalEntityID, &i.IntentKey, &i.DisplayName, &i.DomainOwner, &i.Status,
 		&i.CreatedByPrincipalID, &i.CreatedAt, &i.RetiredAt)
 }
@@ -51,14 +50,6 @@ func scanIntentVersion(s scannable, v *domain.IntentVersion) error {
 	return nil
 }
 
-func pgCode(err error) string {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return pgErr.Code
-	}
-	return ""
-}
-
 // CreateIntent registers the stable identity of a purpose.
 func (s *PgStore) CreateIntent(ctx context.Context, p domain.CreateIntentParams) (*domain.CommunicationIntent, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
@@ -70,7 +61,7 @@ func (s *PgStore) CreateIntent(ctx context.Context, p domain.CreateIntentParams)
 	}
 	var out domain.CommunicationIntent
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanIntent(tx.QueryRow(ctx, `
+		return scanCommunicationIntent(tx.QueryRow(ctx, `
 			INSERT INTO communication_intents (tenant_id, legal_entity_id, intent_key, display_name, domain_owner, created_by_principal_id)
 			VALUES ($1,$2,$3,$4,$5,$6) RETURNING `+intentColumns,
 			tenantID, p.LegalEntityID, p.IntentKey, p.DisplayName, p.DomainOwner, p.CreatedByPrincipalID), &out)
@@ -92,7 +83,7 @@ func (s *PgStore) GetIntent(ctx context.Context, intentID string) (*domain.Commu
 	}
 	var out domain.CommunicationIntent
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanIntent(tx.QueryRow(ctx, `SELECT `+intentColumns+` FROM communication_intents
+		return scanCommunicationIntent(tx.QueryRow(ctx, `SELECT `+intentColumns+` FROM communication_intents
 			WHERE intent_id::text = $1 AND tenant_id = $2`, intentID, tenantID), &out)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -270,7 +261,7 @@ func (s *PgStore) RetireIntent(ctx context.Context, intentID, actor string) (*do
 	}
 	var out domain.CommunicationIntent
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return scanIntent(tx.QueryRow(ctx, `UPDATE communication_intents SET status='RETIRED', retired_at=now(), retired_by_principal_id=$3
+		return scanCommunicationIntent(tx.QueryRow(ctx, `UPDATE communication_intents SET status='RETIRED', retired_at=now(), retired_by_principal_id=$3
 			WHERE intent_id::text=$1 AND tenant_id=$2 AND status='ACTIVE' RETURNING `+intentColumns, intentID, tenantID, actor), &out)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

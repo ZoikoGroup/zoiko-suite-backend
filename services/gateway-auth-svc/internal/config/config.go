@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -60,6 +61,11 @@ type Config struct {
 	// provision this service's client identity for mTLS calls.
 	MTLSManagementServiceURL string
 
+	// MTLSBootstrapTokenPath is the shared provisioning token file
+	// mtls-management-svc authenticates a self-provisioning service by.
+	// Without it every provisioning call is refused.
+	MTLSBootstrapTokenPath string
+
 	// TenantRegistryURL is tenant-entity-registry-svc — the tenant and legal
 	// entity master GOV-01 resolves context against. Empty disables resolution
 	// entirely: the gateway then verifies the token and forwards, exactly as it
@@ -102,7 +108,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	return &Config{
+	cfg := &Config{
 		Port:                    port,
 		JWKSURL:                 strEnv("IDENTITY_JWKS_URL", "http://identity-svc:8080/.well-known/jwks.json"),
 		JWKSCacheTTL:            time.Duration(ttlSeconds) * time.Second,
@@ -115,11 +121,32 @@ func Load() (*Config, error) {
 		TenantRegistryMTLSEnabled: strEnv("TENANT_REGISTRY_MTLS_ENABLED", "false") == "true",
 		TenantRegistryMTLSURL:     strEnv("TENANT_REGISTRY_MTLS_URL", "https://tenant-entity-registry-svc:8449"),
 		MTLSManagementServiceURL:  strEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		MTLSBootstrapTokenPath:    strEnv("MTLS_BOOTSTRAP_TOKEN_PATH", "/bootstrap/token"),
 		TenantRegistryURL:       strEnv("TENANT_REGISTRY_URL", ""),
 		OTELExporterEndpoint:    strEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		TenantContextTTL:        time.Duration(ctxTTL) * time.Second,
 		TenantContextStaleGrace: time.Duration(ctxGrace) * time.Second,
-	}, nil
+	}
+
+	// Enabling mTLS for a peer switches that peer's calls to its mTLS URL.
+	// The 25 Sep wiring read the *_MTLS_URL values and never used them: the
+	// mTLS client was handed the plain http:// URL, and Go sends plain HTTP to
+	// an http:// URL whatever its TLS config says. So "enabled" changed
+	// nothing on the wire. A non-https mTLS URL is refused at boot for the
+	// same reason, instead of passing silently as plaintext.
+	if cfg.IdentityJWKSMTLSEnabled {
+		if !strings.HasPrefix(cfg.IdentityJWKSMTLSURL, "https://") {
+			return nil, fmt.Errorf("IDENTITY_JWKS_MTLS_ENABLED=true requires an https:// IDENTITY_JWKS_MTLS_URL, got %q", cfg.IdentityJWKSMTLSURL)
+		}
+		cfg.JWKSURL = cfg.IdentityJWKSMTLSURL
+	}
+	if cfg.TenantRegistryMTLSEnabled {
+		if !strings.HasPrefix(cfg.TenantRegistryMTLSURL, "https://") {
+			return nil, fmt.Errorf("TENANT_REGISTRY_MTLS_ENABLED=true requires an https:// TENANT_REGISTRY_MTLS_URL, got %q", cfg.TenantRegistryMTLSURL)
+		}
+		cfg.TenantRegistryURL = cfg.TenantRegistryMTLSURL
+	}
+	return cfg, nil
 }
 
 func strEnv(key, def string) string {

@@ -77,7 +77,7 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 const requirementColumns = `
 	evidence_requirement_id, tenant_id, legal_entity_id, domain_code, action_type,
 	evidence_type, requirement_payload, effective_from, effective_to,
-	created_at, created_by_principal_id, correlation_id`
+	created_at, created_by_principal_id, correlation_id, idempotency_key`
 
 func scanRequirement(row pgx.Row) (*domain.EvidenceRequirement, error) {
 	var r domain.EvidenceRequirement
@@ -85,7 +85,7 @@ func scanRequirement(row pgx.Row) (*domain.EvidenceRequirement, error) {
 	if err := row.Scan(
 		&r.EvidenceRequirementID, &r.TenantID, &r.LegalEntityID, &r.DomainCode, &r.ActionType,
 		&r.EvidenceType, &payload, &r.EffectiveFrom, &r.EffectiveTo,
-		&r.CreatedAt, &r.CreatedByPrincipalID, &r.CorrelationID,
+		&r.CreatedAt, &r.CreatedByPrincipalID, &r.CorrelationID, &r.IdempotencyKey,
 	); err != nil {
 		return nil, err
 	}
@@ -113,7 +113,7 @@ func mapPgError(err error) error {
 }
 
 // CreateRequirement inserts an evidence requirement. Idempotent on
-// (tenant_id, correlation_id): if a row already exists for that pair, r is
+// (tenant_id, idempotency_key): if a row already exists for that pair, r is
 // overwritten with the EXISTING row's values and created=false is returned.
 //
 // The unique constraint is real and enforced by the database — most
@@ -133,12 +133,12 @@ func (s *PgStore) CreateRequirement(ctx context.Context, r *domain.EvidenceRequi
 			INSERT INTO evidence_requirements (
 				evidence_requirement_id, tenant_id, legal_entity_id, domain_code, action_type,
 				evidence_type, requirement_payload, effective_from, effective_to,
-				created_at, created_by_principal_id, correlation_id
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,$10,$11)
-			ON CONFLICT (tenant_id, correlation_id) DO NOTHING
+				created_at, created_by_principal_id, correlation_id, idempotency_key
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,$10,$11,$12)
+			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
 		`, r.EvidenceRequirementID, r.TenantID, r.LegalEntityID, r.DomainCode, r.ActionType,
 			r.EvidenceType, []byte(payload), r.EffectiveFrom,
-			now, r.CreatedByPrincipalID, r.CorrelationID)
+			now, r.CreatedByPrincipalID, r.CorrelationID, r.IdempotencyKey)
 		if err != nil {
 			return err
 		}
@@ -150,13 +150,13 @@ func (s *PgStore) CreateRequirement(ctx context.Context, r *domain.EvidenceRequi
 			return nil
 		}
 
-		// Conflict: a requirement for this (tenant_id, correlation_id)
+		// Conflict: a requirement for this (tenant_id, idempotency_key)
 		// already exists — this is a retry. Return the existing row as-is so
 		// the handler can respond idempotently.
 		existing, err := scanRequirement(tx.QueryRow(ctx,
 			`SELECT `+requirementColumns+`
-			 FROM evidence_requirements WHERE tenant_id = $1 AND correlation_id = $2`,
-			r.TenantID, r.CorrelationID))
+			 FROM evidence_requirements WHERE tenant_id = $1 AND idempotency_key = $2`,
+			r.TenantID, r.IdempotencyKey))
 		if err != nil {
 			return err
 		}
@@ -334,11 +334,19 @@ func (s *PgStore) EndDateRequirement(ctx context.Context, tenantID, requirementI
 }
 
 // RecordEvaluation appends an evaluation record. Idempotent on
-// (tenant_id, correlation_id): a replayed evaluation returns the ORIGINAL
+// (tenant_id, idempotency_key): a replayed evaluation returns the ORIGINAL
 // determination with created=false, and the handler must not republish its
 // Kafka event in that case.
-func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvaluation) (created bool, err error) {
+// If outboxEvent is non-nil and the evaluation is newly created (not a replay),
+// the outbox event is written atomically in the same transaction.
+func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvaluation, outboxEvent *domain.OutboxEvent) (created bool, err error) {
 	tenantID := tenantFromCtxOrFallback(ctx, e.TenantID)
+
+	// Convert requirement_ids slice to PostgreSQL array format
+	reqIDs := e.RequirementIDs
+	if reqIDs == nil {
+		reqIDs = []string{}
+	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
@@ -346,25 +354,34 @@ func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvalua
 			INSERT INTO evidence_evaluations (
 				evaluation_id, tenant_id, legal_entity_id, domain_code, action_type,
 				outcome, unmet_payload, present_artifacts_payload,
-				evaluated_at, evaluated_for_principal_id, correlation_id
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-			ON CONFLICT (tenant_id, correlation_id) DO NOTHING
+				evaluated_at, evaluated_for_principal_id, correlation_id, idempotency_key, requirement_ids
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
 		`, e.EvaluationID, e.TenantID, e.LegalEntityID, e.DomainCode, e.ActionType,
 			string(e.Outcome), []byte(e.UnmetPayload), []byte(e.PresentArtifactsPayload),
-			now, e.EvaluatedForPrincipalID, e.CorrelationID)
+			now, e.EvaluatedForPrincipalID, e.CorrelationID, e.IdempotencyKey, reqIDs)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 1 {
 			created = true
 			e.EvaluatedAt = now
+			// Write outbox event atomically in the same transaction
+			if outboxEvent != nil {
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO outbox (outbox_id, aggregate_type, aggregate_id, event_type, payload)
+					VALUES (gen_random_uuid(), $1, $2, $3, $4)
+				`, outboxEvent.AggregateType, outboxEvent.AggregateID, outboxEvent.EventType, outboxEvent.Payload); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 
 		existing, err := scanEvaluation(tx.QueryRow(ctx,
 			`SELECT `+evaluationColumns+`
-			 FROM evidence_evaluations WHERE tenant_id = $1 AND correlation_id = $2`,
-			e.TenantID, e.CorrelationID))
+			 FROM evidence_evaluations WHERE tenant_id = $1 AND idempotency_key = $2`,
+			e.TenantID, e.IdempotencyKey))
 		if err != nil {
 			return err
 		}
@@ -378,22 +395,24 @@ func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvalua
 const evaluationColumns = `
 	evaluation_id, tenant_id, legal_entity_id, domain_code, action_type,
 	outcome, unmet_payload, present_artifacts_payload,
-	evaluated_at, evaluated_for_principal_id, correlation_id`
+	evaluated_at, evaluated_for_principal_id, correlation_id, idempotency_key, requirement_ids`
 
 func scanEvaluation(row pgx.Row) (*domain.EvidenceEvaluation, error) {
 	var e domain.EvidenceEvaluation
 	var outcome string
 	var unmet, present []byte
+	var reqIDs []string
 	if err := row.Scan(
 		&e.EvaluationID, &e.TenantID, &e.LegalEntityID, &e.DomainCode, &e.ActionType,
 		&outcome, &unmet, &present,
-		&e.EvaluatedAt, &e.EvaluatedForPrincipalID, &e.CorrelationID,
+		&e.EvaluatedAt, &e.EvaluatedForPrincipalID, &e.CorrelationID, &e.IdempotencyKey, &reqIDs,
 	); err != nil {
 		return nil, err
 	}
 	e.Outcome = domain.Outcome(outcome)
 	e.UnmetPayload = json.RawMessage(unmet)
 	e.PresentArtifactsPayload = json.RawMessage(present)
+	e.RequirementIDs = reqIDs
 	return &e, nil
 }
 
@@ -429,4 +448,14 @@ func (s *PgStore) GetEvaluation(ctx context.Context, evaluationID string) (*doma
 		return nil, err
 	}
 	return out, nil
+}
+
+// WriteOutbox writes an event to the outbox table within the current transaction.
+// The outbox table has no tenant_id, so we don't need RLS context for it.
+func (s *PgStore) WriteOutbox(ctx context.Context, aggregateType, aggregateID, eventType string, payload []byte) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO outbox (outbox_id, aggregate_type, aggregate_id, event_type, payload)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4)
+	`, aggregateType, aggregateID, eventType, payload)
+	return err
 }

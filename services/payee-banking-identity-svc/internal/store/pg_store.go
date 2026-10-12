@@ -196,8 +196,13 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationProposed, "", principalID); err != nil {
 			return err
 		}
+		// The safe projection, never the full PayeeDestination (which carries
+		// the unmasked AccountIdentifier) — same doctrine as maskIfNotPrivileged
+		// at the HTTP layer, applied here because this is the one place the
+		// full account identifier could otherwise leak into Kafka.
 		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.proposed", domain.EventPayeeDestinationProposed,
-			"payee-destination", destinationID, tenantID, req.LegalEntityID, principalID, correlationID, d)
+			"payee-destination", destinationID, tenantID, req.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, tenantID))
 	})
 	if isUniqueViolation(err) {
 		return nil, domain.ErrDuplicateDestination
@@ -309,8 +314,10 @@ func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, princip
 		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationApproved, "", principalID); err != nil {
 			return err
 		}
+		// Safe projection — see ProposeDestination's enqueueEvent call for why.
 		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.approved", domain.EventPayeeDestinationApproved,
-			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID, d)
+			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -371,8 +378,10 @@ func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, princi
 		// by the old dual-write — only the newly-activated destination's
 		// own event was. Not expanding scope here: only the activated
 		// event is enqueued, matching the exact prior behavior.
+		// Safe projection — see ProposeDestination's enqueueEvent call for why.
 		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.activated", domain.EventPayeeDestinationActivated,
-			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID, d)
+			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
 	})
 	if errors.Is(err, domain.ErrInvalidTransition) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -403,8 +412,10 @@ func (s *PgStore) SuspendDestination(ctx context.Context, destinationID string, 
 		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationSuspended, req.Reason, principalID); err != nil {
 			return err
 		}
+		// Safe projection — see ProposeDestination's enqueueEvent call for why.
 		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.suspended", domain.EventPayeeDestinationSuspended,
-			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID, d)
+			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -432,8 +443,10 @@ func (s *PgStore) SupersedeDestination(ctx context.Context, destinationID string
 		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationSuperseded, req.Reason, principalID); err != nil {
 			return err
 		}
+		// Safe projection — see ProposeDestination's enqueueEvent call for why.
 		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.superseded", domain.EventPayeeDestinationSuperseded,
-			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID, d)
+			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition

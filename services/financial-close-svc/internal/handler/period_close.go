@@ -150,7 +150,8 @@ func (h *Handler) decideReopen(w http.ResponseWriter, r *http.Request, approve b
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 	rr, err := h.store.GetReopenRequest(r.Context(), requestID)
@@ -177,6 +178,8 @@ func (h *Handler) decideReopen(w http.ResponseWriter, r *http.Request, approve b
 		return
 	}
 
+	// A copy of the period as it was before the reopen, for the REF-05 mirror.
+	periodBeforeReopen := *fp
 	now := time.Now().UTC()
 	correlationID := correlationIDOf(r)
 	if !approve {
@@ -193,6 +196,13 @@ func (h *Handler) decideReopen(w http.ResponseWriter, r *http.Request, approve b
 		h.writeReopenDecisionErr(w, err)
 		return
 	}
+	// period.reopened is enqueued inside ApproveReopenRequest's own
+	// transaction (the transactional outbox), not published here after the
+	// fact — see pg_store.go's ApplyPeriodTransition call sites.
+	//
+	// REF-05 phase 1: best-effort mirror (AUTHORIZE_REOPEN); off unless PERIOD_SERVICE_MIRROR=on.
+	// It can never fail the approval. See period_mirror.go.
+	h.mirrorReopen(r.Context(), tenantID, correlationIDOf(r), principalID, periodBeforeReopen, derefString(fp.EvidenceDocumentID), decided.Reason)
 	writeJSON(w, http.StatusOK, map[string]any{"reopen_request": decided, "period": reopened})
 }
 

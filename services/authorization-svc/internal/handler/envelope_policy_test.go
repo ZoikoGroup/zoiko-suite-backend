@@ -25,7 +25,7 @@ func newEnvelopeRouter(s *stubStore, mode svcenvelope.Mode) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcenvelope.MiddlewareWithMode(handler.EnvelopePolicy(), mode, nil))
 	h := handler.New(s, &stubPublisher{}, &stubValidator{},
-		siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", zap.NewNop())
+		siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", false, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }

@@ -110,7 +110,7 @@ func TestValidateAssetEvent_ImpairmentWithoutEvidence_Returns422(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	id := createActiveAsset(t, s, r, "le-1")
 	amount := 1000.0
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{Amount: &amount})
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{BookID: "book-1", Amount: &amount})
 
 	rr := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/validate", nil, "preparer-1")
 	if rr.Code != http.StatusUnprocessableEntity {
@@ -123,7 +123,7 @@ func TestValidateAssetEvent_ImpairmentWithEvidence_Succeeds(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	id := createActiveAsset(t, s, r, "le-1")
 	amount := 1000.0
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{BookID: "book-1", 
 		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-1",
 	})
 
@@ -140,7 +140,7 @@ func TestApproveAssetEvent_MaterialType_SelfApproval_Returns403(t *testing.T) {
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	id := createActiveAsset(t, s, r, "le-1")
 	amount := 1000.0
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{BookID: "book-1", 
 		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-1",
 	})
 	v := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/validate", nil, "preparer-1")
@@ -157,7 +157,7 @@ func TestApproveAssetEvent_NonMaterialType_SelfApproval_Allowed(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	id := createActiveAsset(t, s, r, "le-1")
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{})
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{BookID: "book-1"})
 	v := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/validate", nil, "preparer-1")
 	if v.Code != http.StatusOK {
 		t.Fatalf("validate failed: %d %s", v.Code, v.Body.String())
@@ -215,7 +215,7 @@ func TestApplyAssetEvent_PeriodLocked_Returns422(t *testing.T) {
 	ledger := &stubLedger{checkPeriodErr: domain.ErrPeriodLocked}
 	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
 	id := createActiveAsset(t, s, r, "le-1")
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{})
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{BookID: "book-1"})
 	walkToApproved(t, r, e.EventID)
 
 	rr := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/apply", nil, "approver-1")
@@ -232,7 +232,7 @@ func TestApplyAssetEvent_PeriodCheckUnavailable_Returns503(t *testing.T) {
 	ledger := &stubLedger{checkPeriodErr: domain.ErrPeriodCheckUnavailable}
 	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
 	id := createActiveAsset(t, s, r, "le-1")
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{})
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{BookID: "book-1"})
 	walkToApproved(t, r, e.EventID)
 
 	rr := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/apply", nil, "approver-1")
@@ -251,7 +251,7 @@ func TestApplyAssetEvent_WithAmountAndAccountCodes_PostsJournalAndEmits(t *testi
 	id := createActiveAsset(t, s, r, "le-1")
 	amount := 250.0
 	effDate := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{BookID: "book-1", 
 		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-1", Currency: "EUR", EffectiveDate: &effDate,
 		DebitAccountCode: "IMPAIRMENT-EXPENSE", CreditAccountCode: "ACCUM-IMPAIRMENT",
 	})
@@ -290,7 +290,7 @@ func TestApplyAssetEvent_AmountWithoutCurrency_Returns422AndNeverPosts(t *testin
 	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
 	id := createActiveAsset(t, s, r, "le-1")
 	amount := 250.0
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{BookID: "book-1", 
 		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-1",
 		DebitAccountCode: "IMPAIRMENT-EXPENSE", CreditAccountCode: "ACCUM-IMPAIRMENT",
 	})
@@ -314,7 +314,7 @@ func TestApplyAssetEvent_NoAmount_LandsInAppliedNeverEmitted(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newRouterWithLedger(s, pub, &stubAuthZ{}, ledger)
 	id := createActiveAsset(t, s, r, "le-1")
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{})
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{BookID: "book-1"})
 	walkToApproved(t, r, e.EventID)
 	callsBeforeApply := pub.calls
 
@@ -352,7 +352,7 @@ func TestAssetEvent_PublishesRemainingLifecycleEvents(t *testing.T) {
 	amount := 300.0
 
 	callsBeforeCreate := pub.calls
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeRevaluation, domain.CreateAssetEventRequest{
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeRevaluation, domain.CreateAssetEventRequest{BookID: "book-1", 
 		Amount: &amount, Currency: "USD", ValuationEvidenceRef: "APPRAISAL-2",
 		DebitAccountCode: "FIXED-ASSETS", CreditAccountCode: "REVALUATION-SURPLUS",
 	})
@@ -431,7 +431,7 @@ func TestReverseAssetEvent_MissingReason_Returns400(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	id := createActiveAsset(t, s, r, "le-1")
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{})
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{BookID: "book-1"})
 
 	rr := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/reverse", map[string]string{}, "preparer-1")
 	if rr.Code != http.StatusBadRequest {
@@ -447,7 +447,7 @@ func TestValidateAssetEvent_AlreadyValidated_Returns422(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	id := createActiveAsset(t, s, r, "le-1")
-	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{})
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{BookID: "book-1"})
 	first := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/validate", nil, "preparer-1")
 	if first.Code != http.StatusOK {
 		t.Fatalf("first validate failed: %d %s", first.Code, first.Body.String())
@@ -495,7 +495,7 @@ func TestExplainAssetState_ReturnsAssetAndEvents(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	id := createActiveAsset(t, s, r, "le-1")
-	createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{})
+	createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{BookID: "book-1"})
 
 	rr := doReq(r, http.MethodGet, "/v1/assets/"+id+"/explain-state", nil, "reader-1")
 	if rr.Code != http.StatusOK {

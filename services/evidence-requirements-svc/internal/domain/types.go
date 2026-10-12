@@ -52,10 +52,10 @@ type EvidenceRequirement struct {
 	EvidenceRequirementID string `json:"evidence_requirement_id"`
 	TenantID              string `json:"tenant_id"`
 	// LegalEntityID nil = applies tenant-wide. See package doc.
-	LegalEntityID *string `json:"legal_entity_id,omitempty"`
-	DomainCode    string  `json:"domain_code"`
-	ActionType    string  `json:"action_type"`
-	EvidenceType  string  `json:"evidence_type"`
+	LegalEntityID    *string `json:"legal_entity_id,omitempty"`
+	DomainCode       string  `json:"domain_code"`
+	ActionType       string  `json:"action_type"`
+	EvidenceType     string  `json:"evidence_type"`
 	// RequirementPayload carries the sufficiency parameters as DATA
 	// (minimum_count, artifact_subtype, description). This is the
 	// extensibility seam that keeps the doctrine rule "no service may
@@ -71,6 +71,7 @@ type EvidenceRequirement struct {
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 	CorrelationID        string    `json:"correlation_id"`
+	IdempotencyKey       string    `json:"idempotency_key"`
 }
 
 // RequirementSpec is the decoded shape of EvidenceRequirement.
@@ -99,20 +100,25 @@ type RequirementSpec struct {
 // evidence, satisfying 03-microservices.md §17.6 ("Every Material Service
 // Must Be Evidential") rather than only enforcing evidence on others.
 type EvidenceEvaluation struct {
-	EvaluationID  string  `json:"evaluation_id"`
-	TenantID      string  `json:"tenant_id"`
-	LegalEntityID string  `json:"legal_entity_id"`
-	DomainCode    string  `json:"domain_code"`
-	ActionType    string  `json:"action_type"`
-	Outcome       Outcome `json:"outcome"`
+	EvaluationID       string  `json:"evaluation_id"`
+	TenantID           string  `json:"tenant_id"`
+	LegalEntityID      string  `json:"legal_entity_id"`
+	DomainCode         string  `json:"domain_code"`
+	ActionType         string  `json:"action_type"`
+	Outcome            Outcome `json:"outcome"`
 	// UnmetPayload / PresentArtifactsPayload are frozen at decision time so
 	// the record stays truthful even after the catalog changes underneath it.
 	UnmetPayload            json.RawMessage `json:"unmet_payload"`
 	PresentArtifactsPayload json.RawMessage `json:"present_artifacts_payload"`
+	// RequirementIDs stores the IDs of all requirements that were evaluated
+	// (both satisfied and unmet), so a SATISFIED record can prove which
+	// rules it was tested against.
+	RequirementIDs []string `json:"requirement_ids"`
 
 	EvaluatedAt             time.Time `json:"evaluated_at"`
 	EvaluatedForPrincipalID string    `json:"evaluated_for_principal_id"`
 	CorrelationID           string    `json:"correlation_id"`
+	IdempotencyKey          string    `json:"idempotency_key"`
 }
 
 // ── wire types ───────────────────────────────────────────────────────────────
@@ -162,6 +168,8 @@ type EvaluateResponse struct {
 	Unmet         []UnmetRequirement `json:"unmet"`
 	EvaluatedAt   time.Time          `json:"evaluated_at"`
 	CorrelationID string             `json:"correlation_id"`
+	DomainCode    string             `json:"domain_code"`
+	ActionType    string             `json:"action_type"`
 }
 
 // CreateRequirementRequest is the body of POST /v1/admin/evidence-requirements.
@@ -196,6 +204,14 @@ type ListRequirementsFilter struct {
 	// Zero value means "no effective-date filter — return all, including
 	// retired ones", which is what an auditor reviewing history needs.
 	AsOf time.Time
+}
+
+// OutboxEvent represents an event to be written to the outbox table.
+type OutboxEvent struct {
+	AggregateType string
+	AggregateID   string
+	EventType     string
+	Payload       []byte
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────

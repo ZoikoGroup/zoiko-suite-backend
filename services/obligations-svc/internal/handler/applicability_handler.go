@@ -32,6 +32,7 @@ import (
 
 	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/domain"
+	"zoiko.io/obligations-svc/internal/envelope"
 )
 
 // RegisterApplicabilityRoutes mounts applicability-decision routes on the
@@ -159,6 +160,19 @@ func (h *Handler) CreateApplicabilityDecision(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Envelope LegalEntityID must match the parent obligation's legal entity.
+	// The envelope is required on writes (contract.go: LegalEntityID: RequiredOnWrite).
+	env, _ := envelope.FromContext(r.Context())
+	if env.LegalEntityID != "" && env.LegalEntityID != parent.LegalEntityID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":           "legal_entity_mismatch",
+			"detail":          "X-Legal-Entity-Id header must match parent obligation's legal_entity_id",
+			"header_value":    env.LegalEntityID,
+			"obligation_value": parent.LegalEntityID,
+		})
+		return
+	}
+
 	// Entity-scoped, like every other write in this service: the authority to
 	// decide applicability is held over a legal entity, not platform-wide.
 	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionApplicabilityDecide) {
@@ -212,17 +226,25 @@ func (h *Handler) ListApplicabilityDecisions(w http.ResponseWriter, r *http.Requ
 	jurisdictionCode := r.URL.Query().Get("jurisdiction_code")
 	entityRef := r.URL.Query().Get("entity_ref")
 
-	// Without this, a request carrying no tenant header reached the store, which
-	// returned ErrTenantMissing, which the switch below folded into the default
-	// branch — so the absence of an identity header reported itself as
-	// "store_unavailable", a 503 blaming the database for a request that was
-	// never scoped. The read is tenant-scoped through the parent obligation
-	// lookup inside the store; this only makes the missing scope say so.
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
 	if jurisdictionCode == "" || entityRef == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "jurisdiction_code and entity_ref query params are required"})
+		return
+	}
+
+	// Authorize against the parent obligation's legal entity.
+	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, "ListApplicabilityDecisions: parent lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionApplicabilityRead) {
 		return
 	}
 
@@ -253,13 +275,25 @@ func (h *Handler) GetCurrentApplicability(w http.ResponseWriter, r *http.Request
 	jurisdictionCode := r.URL.Query().Get("jurisdiction_code")
 	entityRef := r.URL.Query().Get("entity_ref")
 
-	// Same reason as ListApplicabilityDecisions: a missing tenant header was
-	// reporting itself as a 503.
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
 	if jurisdictionCode == "" || entityRef == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "jurisdiction_code and entity_ref query params are required"})
+		return
+	}
+
+	// Authorize against the parent obligation's legal entity.
+	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, "GetCurrentApplicability: parent lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionApplicabilityRead) {
 		return
 	}
 

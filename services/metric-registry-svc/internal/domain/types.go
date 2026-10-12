@@ -36,6 +36,11 @@ type ReportMetricDefinition struct {
 	EffectiveFrom          time.Time `json:"effective_from"`
 	CreatedAt              time.Time `json:"created_at"`
 	CreatedByPrincipalID   string    `json:"created_by_principal_id"`
+
+	// IdempotencyKey is the caller-supplied Idempotency-Key (INV-08) this
+	// row was created or superseded under, if any. Internal only — never
+	// echoed back to callers.
+	IdempotencyKey string `json:"-"`
 }
 
 // CreateReportMetricRequest is the wire shape for POST /v1/report-metrics

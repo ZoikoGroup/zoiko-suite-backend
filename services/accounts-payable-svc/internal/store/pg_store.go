@@ -1,21 +1,23 @@
 // Package store provides the PostgreSQL implementation of accounts-payable-svc's
-// persistence layer.
+// persistence layer (AP-05 supplier invoices and the AP-06 matching module).
 //
 // Every write is wrapped in withRLS, which sets app.tenant_id on the
-// transaction — the Row-Level Security policies in
-// deployments/migrations/000001_initial_schema.up.sql are real and correctly
-// written. But every method ALSO filters explicitly by tenant_id in its own
-// SQL, rather than relying on RLS alone: this pool connects as a Postgres
-// superuser (DB_USER=postgres, same as every other service in this
-// platform), and Postgres superusers unconditionally bypass Row-Level
-// Security regardless of policy. Found via a genuine CI failure in
-// general-ledger-svc (TestPgStore_RLS_TenantIsolation caught real
-// cross-tenant leakage there), so this service is built with the explicit
-// filter from day one rather than discovering the same gap a second time.
+// transaction -- the Row-Level Security policies in deployments/migrations are
+// real. But every method ALSO filters explicitly by tenant_id in its own SQL,
+// rather than relying on RLS alone: this pool connects as a Postgres superuser
+// (DB_USER=postgres, same as every other service in this platform), and
+// superusers unconditionally bypass Row-Level Security regardless of policy.
+//
+// State changes go through one primitive, mutateTx: lock the invoice row,
+// check expected_version, let the command mutate the invoice in memory, then
+// write the invoice, the append-only history row, the outbox events and any
+// side records (duplicate assessment, correction link, AP-08 payable-creation
+// queue row) in the SAME transaction.
 package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -32,177 +34,215 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/outbox"
 )
 
-// invoiceColumns is the single source of truth for the read shape.
-//
-// Every SELECT in this file derives both its column list AND its scan targets
-// from this slice, in this order. Three separate hand-written lists used to sit
-// here — two of 18 columns and one of 16 — and keeping them in step was manual.
-// That is the exact shape of the policy-svc defect, where one query had drifted
-// to 10 of 12 columns: the two it dropped stayed nil, serialised as null, and
-// every affected record read as "not recorded" while every test passed. Nothing
-// about that failure looks like a bug in the query that caused it.
-var invoiceColumns = []string{
-	"invoice_id",
-	"tenant_id",
-	"legal_entity_id",
-	"vendor_id",
-	"invoice_number",
-	"amount",
-	"currency_code",
-	"due_date",
-	"status",
-	"source_contract_id",
-	"created_by_principal_id",
-	"validated_by_principal_id",
-	"approved_by_principal_id",
-	"payment_requested_by_principal_id",
-	"correlation_id",
-	"created_at",
-	"validated_at",
-	"approved_at",
-	"payment_requested_at",
-
-	// AP-05 (migration 000006).
-	"invoice_date",
-	"supply_date",
-	"net_amount",
-	"tax_amount",
-	"purchase_order_id",
-	"goods_receipt_ref",
-	"po_vendor_profile_id",
-	"invoice_document_id",
-
-	// ACC-14: GL journal link from invoice approval posting.
-	"approval_journal_id",
+// identityColumns are written once at creation and never updated.
+var identityColumns = []string{
+	"invoice_id", "tenant_id", "legal_entity_id", "vendor_id", "invoice_number",
+	"currency_code", "source_contract_id", "created_by_principal_id", "correlation_id",
+	"created_at", "document_type", "invoice_number_normalized", "source_channel",
 }
+
+// mutableColumns are rewritten by every command (the same UPDATE for all of
+// them, so no command can forget a column). The immutability trigger -- not this
+// list -- is what stops changes to source columns after acceptance.
+var mutableColumns = []string{
+	"amount", "due_date", "invoice_date", "supply_date", "net_amount", "tax_amount",
+	"purchase_order_id", "goods_receipt_ref", "po_vendor_profile_id", "invoice_document_id",
+	"status",
+	"validated_by_principal_id", "approved_by_principal_id", "payment_requested_by_principal_id",
+	"validated_at", "approved_at", "payment_requested_at",
+	"intake_state", "match_state", "approval_state", "accounting_state", "settlement_state",
+	"hold_state", "hold_reason",
+	"source_hash", "attachment_hash", "source_accepted_at",
+	"duplicate_state", "quarantine_reason",
+	"submitted_by_principal_id", "submitted_at", "rejected_by_principal_id", "rejected_at", "reject_reason",
+	"tax_state", "tax_provenance", "tax_result_hash", "tax_verified_at",
+	"withholding_ref", "withholding_determination_id", "withholding_provenance",
+	"extracted_bank_details", "payee_state", "payee_check",
+	"supplier_profile_id", "supplier_profile_version", "po_revision",
+	"match_required", "match_cleared", "match_run_id",
+	"payable_id", "accounting_event_id", "approval_journal_id",
+}
+
+// invoiceColumns is the single source of truth for the read shape. Every SELECT
+// derives its column list from it and scans through scanRefs in the same order;
+// init() refuses to start if the two diverge.
+var invoiceColumns = append(append(append([]string{}, identityColumns...), mutableColumns...), "version")
 
 var invoiceSelectList = strings.Join(invoiceColumns, ", ")
 
-// scanTargets returns pointers in exactly invoiceColumns' order. Reordering one
-// without the other is the only way to break this pair, and init() below refuses
-// to start if their lengths ever diverge.
-func scanTargets(inv *domain.VendorInvoice, status *string) []any {
+// raw holds the columns that need conversion after the scan.
+type raw struct {
+	status, intake, match, approval, accounting, settlement, hold, dup, tax, payee string
+	taxProv, withholding, bank, payeeCheck                                         []byte
+	docType                                                                        string
+}
+
+func scanRefs(inv *domain.VendorInvoice, r *raw) []any {
 	return []any{
-		&inv.InvoiceID,
-		&inv.TenantID,
-		&inv.LegalEntityID,
-		&inv.VendorID,
-		&inv.InvoiceNumber,
-		&inv.Amount,
-		&inv.CurrencyCode,
-		&inv.DueDate,
-		status,
-		&inv.SourceContractID,
-		&inv.CreatedByPrincipalID,
-		&inv.ValidatedByPrincipalID,
-		&inv.ApprovedByPrincipalID,
-		&inv.PaymentRequestedByPrincipalID,
-		&inv.CorrelationID,
-		&inv.CreatedAt,
-		&inv.ValidatedAt,
-		&inv.ApprovedAt,
-		&inv.PaymentRequestedAt,
-
-		&inv.InvoiceDate,
-		&inv.SupplyDate,
-		&inv.NetAmount,
-		&inv.TaxAmount,
-		&inv.PurchaseOrderID,
-		&inv.GoodsReceiptRef,
-		&inv.POVendorProfileID,
-		&inv.InvoiceDocumentID,
-
-		&inv.ApprovalJournalID,
+		// identity
+		&inv.InvoiceID, &inv.TenantID, &inv.LegalEntityID, &inv.VendorID, &inv.InvoiceNumber,
+		&inv.CurrencyCode, &inv.SourceContractID, &inv.CreatedByPrincipalID, &inv.CorrelationID,
+		&inv.CreatedAt, &r.docType, &inv.InvoiceNumberNormalized, &inv.SourceChannel,
+		// mutable
+		&inv.Amount, &inv.DueDate, &inv.InvoiceDate, &inv.SupplyDate, &inv.NetAmount, &inv.TaxAmount,
+		&inv.PurchaseOrderID, &inv.GoodsReceiptRef, &inv.POVendorProfileID, &inv.InvoiceDocumentID,
+		&r.status,
+		&inv.ValidatedByPrincipalID, &inv.ApprovedByPrincipalID, &inv.PaymentRequestedByPrincipalID,
+		&inv.ValidatedAt, &inv.ApprovedAt, &inv.PaymentRequestedAt,
+		&r.intake, &r.match, &r.approval, &r.accounting, &r.settlement,
+		&r.hold, &inv.HoldReason,
+		&inv.SourceHash, &inv.AttachmentHash, &inv.SourceAcceptedAt,
+		&r.dup, &inv.QuarantineReason,
+		&inv.SubmittedByPrincipalID, &inv.SubmittedAt, &inv.RejectedByPrincipalID, &inv.RejectedAt, &inv.RejectReason,
+		&r.tax, &r.taxProv, &inv.TaxResultHash, &inv.TaxVerifiedAt,
+		&inv.WithholdingRef, &inv.WithholdingDeterminationID, &r.withholding,
+		&r.bank, &r.payee, &r.payeeCheck,
+		&inv.SupplierProfileID, &inv.SupplierProfileVersion, &inv.PORevision,
+		&inv.MatchRequired, &inv.MatchCleared, &inv.MatchRunID,
+		&inv.PayableID, &inv.AccountingEventID, &inv.ApprovalJournalID,
+		// version
+		&inv.Version,
 	}
 }
 
-// lineColumns and lineScanTargets are the same pair for vendor_invoice_lines,
-// guarded by the same init() check.
+// finish converts the raw columns into the typed invoice fields.
+func (r *raw) finish(inv *domain.VendorInvoice) error {
+	inv.DocumentType = r.docType
+	inv.Status = domain.InvoiceStatus(r.status)
+	inv.IntakeState = domain.IntakeState(r.intake)
+	inv.MatchState = domain.MatchState(r.match)
+	inv.ApprovalState = domain.ApprovalState(r.approval)
+	inv.AccountingState = domain.AccountingState(r.accounting)
+	inv.SettlementState = domain.SettlementState(r.settlement)
+	inv.HoldState = domain.HoldState(r.hold)
+	inv.DuplicateState = domain.DuplicateState(r.dup)
+	inv.TaxState = domain.TaxState(r.tax)
+	inv.PayeeState = domain.PayeeState(r.payee)
+	inv.TaxProvenance, inv.WithholdingProvenance, inv.ExtractedBankDetails, inv.PayeeCheck = nil, nil, nil, nil
+	if len(r.taxProv) > 0 {
+		if err := json.Unmarshal(r.taxProv, &inv.TaxProvenance); err != nil {
+			return fmt.Errorf("decode tax_provenance: %w", err)
+		}
+	}
+	if len(r.withholding) > 0 {
+		inv.WithholdingProvenance = new(domain.TaxProvenance)
+		if err := json.Unmarshal(r.withholding, inv.WithholdingProvenance); err != nil {
+			return fmt.Errorf("decode withholding_provenance: %w", err)
+		}
+	}
+	if len(r.bank) > 0 {
+		inv.ExtractedBankDetails = new(domain.BankDetails)
+		if err := json.Unmarshal(r.bank, inv.ExtractedBankDetails); err != nil {
+			return fmt.Errorf("decode extracted_bank_details: %w", err)
+		}
+	}
+	if len(r.payeeCheck) > 0 {
+		inv.PayeeCheck = new(domain.PayeeCheck)
+		if err := json.Unmarshal(r.payeeCheck, inv.PayeeCheck); err != nil {
+			return fmt.Errorf("decode payee_check: %w", err)
+		}
+	}
+	return nil
+}
+
+func jsonOrNil(v any, isNil bool) any {
+	if isNil {
+		return nil
+	}
+	b, _ := json.Marshal(v)
+	return b
+}
+
+// identityValues / mutableValues mirror identityColumns / mutableColumns.
+func identityValues(inv *domain.VendorInvoice) []any {
+	return []any{
+		inv.InvoiceID, inv.TenantID, inv.LegalEntityID, inv.VendorID, inv.InvoiceNumber,
+		inv.CurrencyCode, inv.SourceContractID, inv.CreatedByPrincipalID, inv.CorrelationID,
+		inv.CreatedAt, inv.DocumentType, inv.InvoiceNumberNormalized, inv.SourceChannel,
+	}
+}
+
+func mutableValues(inv *domain.VendorInvoice) []any {
+	return []any{
+		inv.Amount, inv.DueDate, inv.InvoiceDate, inv.SupplyDate, inv.NetAmount, inv.TaxAmount,
+		inv.PurchaseOrderID, inv.GoodsReceiptRef, inv.POVendorProfileID, inv.InvoiceDocumentID,
+		string(inv.Status),
+		inv.ValidatedByPrincipalID, inv.ApprovedByPrincipalID, inv.PaymentRequestedByPrincipalID,
+		inv.ValidatedAt, inv.ApprovedAt, inv.PaymentRequestedAt,
+		string(inv.IntakeState), string(inv.MatchState), string(inv.ApprovalState), string(inv.AccountingState),
+		string(inv.SettlementState), string(inv.HoldState), inv.HoldReason,
+		inv.SourceHash, inv.AttachmentHash, inv.SourceAcceptedAt,
+		string(inv.DuplicateState), inv.QuarantineReason,
+		inv.SubmittedByPrincipalID, inv.SubmittedAt, inv.RejectedByPrincipalID, inv.RejectedAt, inv.RejectReason,
+		string(inv.TaxState), jsonOrNil(inv.TaxProvenance, len(inv.TaxProvenance) == 0), inv.TaxResultHash, inv.TaxVerifiedAt,
+		inv.WithholdingRef, inv.WithholdingDeterminationID, jsonOrNil(inv.WithholdingProvenance, inv.WithholdingProvenance == nil),
+		jsonOrNil(inv.ExtractedBankDetails, inv.ExtractedBankDetails == nil), string(inv.PayeeState), jsonOrNil(inv.PayeeCheck, inv.PayeeCheck == nil),
+		inv.SupplierProfileID, inv.SupplierProfileVersion, inv.PORevision,
+		inv.MatchRequired, inv.MatchCleared, inv.MatchRunID,
+		inv.PayableID, inv.AccountingEventID, inv.ApprovalJournalID,
+	}
+}
+
+// lineColumns and lineScanTargets are the same pair for vendor_invoice_lines.
 var lineColumns = []string{
-	"invoice_line_id",
-	"invoice_id",
-	"line_number",
-	"description",
-	"quantity",
-	"unit_price",
-	"net_amount",
-	"tax_code",
-	"tax_amount",
-	"tax_determination_id",
-	"po_line_reference",
-	"dimensions",
+	"invoice_line_id", "invoice_id", "line_number", "description", "quantity", "unit_price",
+	"net_amount", "tax_code", "tax_amount", "tax_determination_id", "po_line_reference", "dimensions",
 }
 
 var lineSelectList = strings.Join(lineColumns, ", ")
 
 func lineScanTargets(l *domain.VendorInvoiceLine) []any {
 	return []any{
-		&l.InvoiceLineID,
-		&l.InvoiceID,
-		&l.LineNumber,
-		&l.Description,
-		&l.Quantity,
-		&l.UnitPrice,
-		&l.NetAmount,
-		&l.TaxCode,
-		&l.TaxAmount,
-		&l.TaxDeterminationID,
-		&l.POLineReference,
-		&l.Dimensions,
+		&l.InvoiceLineID, &l.InvoiceID, &l.LineNumber, &l.Description, &l.Quantity, &l.UnitPrice,
+		&l.NetAmount, &l.TaxCode, &l.TaxAmount, &l.TaxDeterminationID, &l.POLineReference, &l.Dimensions,
 	}
 }
 
 func init() {
 	// A count mismatch is a guaranteed runtime scan error on the first read, so
 	// failing at startup is strictly better than failing per-request later.
-	if n := len(scanTargets(&domain.VendorInvoice{}, new(string))); n != len(invoiceColumns) {
-		panic(fmt.Sprintf(
-			"store: %d scan targets for %d invoice columns — they are derived from one list and must stay in step",
-			n, len(invoiceColumns)))
+	if n, c := len(scanRefs(&domain.VendorInvoice{}, &raw{})), len(invoiceColumns); n != c {
+		panic(fmt.Sprintf("store: %d scan targets for %d invoice columns", n, c))
 	}
-	if n := len(lineScanTargets(&domain.VendorInvoiceLine{})); n != len(lineColumns) {
-		panic(fmt.Sprintf(
-			"store: %d scan targets for %d invoice line columns — they are derived from one list and must stay in step",
-			n, len(lineColumns)))
+	if n, c := len(identityValues(&domain.VendorInvoice{})), len(identityColumns); n != c {
+		panic(fmt.Sprintf("store: %d identity values for %d columns", n, c))
+	}
+	if n, c := len(mutableValues(&domain.VendorInvoice{})), len(mutableColumns); n != c {
+		panic(fmt.Sprintf("store: %d mutable values for %d columns", n, c))
+	}
+	if n, c := len(lineScanTargets(&domain.VendorInvoiceLine{})), len(lineColumns); n != c {
+		panic(fmt.Sprintf("store: %d scan targets for %d invoice line columns", n, c))
 	}
 }
 
-// Constraint names from the migrations. Matched by name rather than by column
-// guesswork so a future unique constraint cannot be silently reported as this
-// one.
+// Constraint names from the migrations.
 const (
 	constraintVendorInvoiceNumber = "vendor_invoices_tenant_id_vendor_id_invoice_number_key"
-	indexTenantCorrelation        = "idx_vendor_invoices_tenant_correlation"
 )
 
 // mapPgError translates the Postgres failures that are really caller mistakes
 // into domain errors, so they stop arriving as "the store is unavailable".
-//
-// Both of these previously reached the handler as generic errors and answered
-// 503 — a status that tells an operator to go and look at infrastructure. A
-// mistyped id in a URL and a re-keyed invoice number are neither of them an
-// outage, and reporting them as one is worse than a plain 500: it is confidently
-// wrong about where the problem is.
 func mapPgError(err error) error {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return err
 	}
-
 	switch pgErr.Code {
 	case "22P02":
-		// invalid_text_representation — a non-UUID compared against a uuid
-		// column. Dies inside the driver before any row is examined.
+		// invalid_text_representation -- a non-UUID compared against a uuid column.
 		return domain.ErrInvalidIdentifier
 	case "23505":
-		// unique_violation. Only the (tenant, vendor, number) constraint is a
-		// caller-facing duplicate; a correlation_id collision means the
-		// ON CONFLICT clause failed to do its job, which IS a real fault and
-		// must keep its loud generic error rather than being explained away.
 		if pgErr.ConstraintName == constraintVendorInvoiceNumber {
 			return domain.ErrDuplicateInvoiceNumber
 		}
 		return err
+	case "23000":
+		// The AP-06 match gate is a state-machine refusal, not an immutability one.
+		if strings.Contains(pgErr.Message, "AP-06 match") {
+			return fmt.Errorf("%w: %s", domain.ErrInvalidTransition, pgErr.Message)
+		}
+		// Raised by the immutability triggers.
+		return fmt.Errorf("%w: %s", domain.ErrInvoiceImmutable, pgErr.Message)
 	default:
 		return err
 	}
@@ -211,11 +251,15 @@ func mapPgError(err error) error {
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+	keys domain.PostingMappingKeys
 }
 
 func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
+
+// Pool exposes the pool to the background relays.
+func (s *PgStore) Pool() *pgxpool.Pool { return s.pool }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
 	return s.withRLSOpts(ctx, tenantID, pgx.TxOptions{}, fn)
@@ -237,186 +281,150 @@ func (s *PgStore) withRLSOpts(ctx context.Context, tenantID string, opts pgx.TxO
 	return tx.Commit(ctx)
 }
 
-// tenantFromCtxOrFallback used to live here, resolving the RLS scope from the
-// context but FALLING BACK to whatever the caller had supplied in the request
-// body. A request carrying no X-Tenant-Id therefore chose its own scope: the
-// body's tenant_id was handed to set_config('app.tenant_id') AND written into
-// the row, so the policy that should have refused the insert was satisfied by
-// the value under attack. The handler now resolves the tenant once from the
-// verified header; there is deliberately no fallback left to reach for.
+// ── create ───────────────────────────────────────────────────────────────────
 
-// CreateInvoice inserts a vendor invoice header in RECEIVED status.
+// CreateInvoice inserts an invoice (RECEIVED, or QUARANTINED when mut carries a
+// near-duplicate assessment) with its lines, history row, assessment and outbox
+// events in one transaction.
 //
-// Idempotent on (tenant_id, correlation_id): a retried call (e.g. a client
-// timeout on a POST that actually succeeded server-side) hits the partial
-// unique index added in 000002 and resolves to the ORIGINAL invoice —
-// mutating *inv in place to reflect it — rather than creating a duplicate
-// liability. Returns created=false when the row already existed.
-func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.VendorInvoice) (created bool, err error) {
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to the
+// ORIGINAL invoice -- mutating *inv in place -- and returns created=false.
+// A re-keyed invoice number surfaces as domain.ErrDuplicateInvoiceNumber.
+func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.VendorInvoice, mut *domain.Mutation) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return false, domain.ErrTenantScopeMissing
 	}
-	// The row is filed under the verified scope, not under inv.TenantID — which
-	// is what the INSERT used to write while app.tenant_id was set from the same
-	// unverified value.
 	inv.TenantID = tenantID
+	canonical := applyCreateDefaults(inv)
+	if mut == nil {
+		// The plain header/lines contract: record the received event and the
+		// canonical source payload atomically with the insert.
+		mut = &domain.Mutation{
+			Command: "CaptureSupplierInvoice", Actor: inv.CreatedByPrincipalID, CorrelationID: inv.CorrelationID,
+			NewSourcePayload: canonical,
+			Events: []domain.OutboxEvent{{EventType: "vendor.invoice.received", Payload: map[string]any{
+				"invoice_id": inv.InvoiceID, "tenant_id": inv.TenantID,
+				"legal_entity_id": inv.LegalEntityID, "vendor_id": inv.VendorID,
+			}}},
+		}
+	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
-		tag, err := tx.Exec(ctx, `
-			INSERT INTO vendor_invoices (
-				invoice_id, tenant_id, legal_entity_id, vendor_id, invoice_number,
-				amount, currency_code, due_date, status, source_contract_id, created_by_principal_id,
-				correlation_id, created_at,
-				invoice_date, supply_date, net_amount, tax_amount,
-				purchase_order_id, goods_receipt_ref, po_vendor_profile_id, invoice_document_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-			          $14, $15, $16, $17, $18, $19, $20, $21)
-			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
-		`, inv.InvoiceID, inv.TenantID, inv.LegalEntityID, inv.VendorID, inv.InvoiceNumber,
-			inv.Amount, inv.CurrencyCode, inv.DueDate, string(inv.Status), inv.SourceContractID, inv.CreatedByPrincipalID,
-			inv.CorrelationID, now,
-			inv.InvoiceDate.Time, inv.SupplyDate.Time, inv.NetAmount, inv.TaxAmount,
-			inv.PurchaseOrderID, inv.GoodsReceiptRef, inv.POVendorProfileID, inv.InvoiceDocumentID)
+		inv.CreatedAt = now
+		inv.Version = 1
+
+		cols := append(append([]string{}, identityColumns...), mutableColumns...)
+		vals := append(identityValues(inv), mutableValues(inv)...)
+		cols = append(cols, "version", "source_payload")
+		vals = append(vals, inv.Version, []byte(mut.NewSourcePayload))
+		ph := make([]string, len(cols))
+		for i := range ph {
+			ph[i] = fmt.Sprintf("$%d", i+1)
+		}
+		tag, err := tx.Exec(ctx, `INSERT INTO vendor_invoices (`+strings.Join(cols, ", ")+`) VALUES (`+strings.Join(ph, ", ")+`)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING`, vals...)
 		if err != nil {
 			return mapPgError(err)
 		}
 		if tag.RowsAffected() == 0 {
-			row := tx.QueryRow(ctx,
-				`SELECT `+invoiceSelectList+` FROM vendor_invoices WHERE tenant_id = $1 AND correlation_id = $2`,
-				inv.TenantID, inv.CorrelationID)
-			var status string
-			if err := row.Scan(scanTargets(inv, &status)...); err != nil {
-				return err
-			}
-			inv.Status = domain.InvoiceStatus(status)
-
-			// A replay must return the ORIGINAL invoice in full, lines included.
-			// Returning the header alone would report the stored invoice with an
-			// empty line list, which now reads as a pre-contract invoice — so a
-			// retried POST would look like a different, older document than the
-			// one it actually resolved to.
-			lines, err := queryLines(ctx, tx, inv.TenantID, inv.InvoiceID)
+			// Replay of a prior submission: return the ORIGINAL invoice in full.
+			existing, err := loadInvoice(ctx, tx, tenantID, "", inv.CorrelationID, false)
 			if err != nil {
 				return err
 			}
-			inv.Lines = lines
+			*inv = *existing
 			created = false
 			return nil
 		}
 
-		// Lines are written in the same transaction as the header: an invoice
-		// whose header committed without its lines would be a payable with no
-		// account of what it is for, and nothing later would know to add them.
 		for i := range inv.Lines {
 			inv.Lines[i].InvoiceLineID = uuid.NewString()
 			inv.Lines[i].InvoiceID = inv.InvoiceID
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO vendor_invoice_lines (
-					invoice_line_id, invoice_id, tenant_id, line_number,
-					description, quantity, unit_price, net_amount,
-					tax_code, tax_amount, tax_determination_id, po_line_reference, dimensions
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-			`, inv.Lines[i].InvoiceLineID, inv.InvoiceID, inv.TenantID, inv.Lines[i].LineNumber,
-				inv.Lines[i].Description, inv.Lines[i].Quantity, inv.Lines[i].UnitPrice, inv.Lines[i].NetAmount,
-				inv.Lines[i].TaxCode, inv.Lines[i].TaxAmount, inv.Lines[i].TaxDeterminationID,
-				inv.Lines[i].POLineReference, inv.Lines[i].Dimensions); err != nil {
-				return mapPgError(err)
+			if err := insertLine(ctx, tx, tenantID, &inv.Lines[i]); err != nil {
+				return err
 			}
 		}
-
-		inv.CreatedAt = now
 		created = true
 
-		env, envErr := outbox.NewVariantAEnvelope(
-			"vendor.invoice.received",
-			inv.CorrelationID,
-			inv.TenantID,
-			inv.LegalEntityID,
-			inv.CreatedByPrincipalID,
-			map[string]any{
-				"invoice_id":      inv.InvoiceID,
-				"tenant_id":       inv.TenantID,
-				"legal_entity_id": inv.LegalEntityID,
-				"vendor_id":       inv.VendorID,
-			},
-		)
-		if envErr != nil {
-			return fmt.Errorf("build outbox envelope: %w", envErr)
+		if err := s.writeSideRecords(ctx, tx, inv, nil, mut); err != nil {
+			return err
 		}
-		actorID := inv.CreatedByPrincipalID
-		if err := outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "VENDOR_INVOICE",
-			AggregateID:   inv.InvoiceID,
-			EventType:     "vendor.invoice.received",
-			TenantID:      inv.TenantID,
-			LegalEntityID: inv.LegalEntityID,
-			ActorID:       &actorID,
-			CorrelationID: inv.CorrelationID,
-			Payload:       env,
-		}); err != nil {
-			return fmt.Errorf("outbox insert: %w", err)
-		}
-
 		return nil
 	})
 	return created, err
 }
 
+func insertLine(ctx context.Context, tx pgx.Tx, tenantID string, l *domain.VendorInvoiceLine) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO vendor_invoice_lines (
+			invoice_line_id, invoice_id, tenant_id, line_number,
+			description, quantity, unit_price, net_amount,
+			tax_code, tax_amount, tax_determination_id, po_line_reference, dimensions
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		l.InvoiceLineID, l.InvoiceID, tenantID, l.LineNumber,
+		l.Description, l.Quantity, l.UnitPrice, l.NetAmount,
+		l.TaxCode, l.TaxAmount, l.TaxDeterminationID, l.POLineReference, l.Dimensions)
+	return mapPgError(err)
+}
+
+// ── read ─────────────────────────────────────────────────────────────────────
+
+// loadInvoice reads one invoice by id (or, when id is empty, by correlation id)
+// with its lines, scoped to the tenant.
+func loadInvoice(ctx context.Context, tx pgx.Tx, tenantID, invoiceID, correlationID string, forUpdate bool) (*domain.VendorInvoice, error) {
+	q := `SELECT ` + invoiceSelectList + ` FROM vendor_invoices WHERE tenant_id = $1 AND `
+	args := []any{tenantID}
+	if invoiceID != "" {
+		q += `invoice_id = $2`
+		args = append(args, invoiceID)
+	} else {
+		q += `correlation_id = $2`
+		args = append(args, correlationID)
+	}
+	if forUpdate {
+		q += ` FOR UPDATE`
+	}
+	var inv domain.VendorInvoice
+	var r raw
+	if err := tx.QueryRow(ctx, q, args...).Scan(scanRefs(&inv, &r)...); err != nil {
+		return nil, mapPgError(err)
+	}
+	if err := r.finish(&inv); err != nil {
+		return nil, err
+	}
+	lines, err := queryLines(ctx, tx, tenantID, inv.InvoiceID)
+	if err != nil {
+		return nil, err
+	}
+	inv.Lines = lines
+	return &inv, nil
+}
+
 // GetInvoice returns a vendor invoice by ID, scoped to the caller's tenant.
-// Returns (nil, nil) if not found — including when the caller's tenant scope
-// doesn't match the invoice's tenant (see package doc: explicit tenant_id
-// filter, not RLS-only).
+// Returns (nil, nil) if not found -- including another tenant's invoice and a
+// malformed id, which must be indistinguishable from outside.
 func (s *PgStore) GetInvoice(ctx context.Context, invoiceID string) (*domain.VendorInvoice, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, nil
 	}
-
-	var inv domain.VendorInvoice
-	var status string
+	var inv *domain.VendorInvoice
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx,
-			`SELECT `+invoiceSelectList+` FROM vendor_invoices WHERE invoice_id = $1 AND tenant_id = $2`,
-			invoiceID, tenantID)
-		if err := row.Scan(scanTargets(&inv, &status)...); err != nil {
-			return mapPgError(err)
-		}
-		inv.Status = domain.InvoiceStatus(status)
-
-		// Read in the same transaction as the header so a concurrent write
-		// cannot show a header from one moment with lines from another — which
-		// would make a balanced invoice read as unbalanced.
-		lines, err := queryLines(ctx, tx, tenantID, inv.InvoiceID)
-		if err != nil {
-			return err
-		}
-		inv.Lines = lines
-		return nil
+		var err error
+		inv, err = loadInvoice(ctx, tx, tenantID, invoiceID, "", false)
+		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	// A malformed invoice_id or tenant scope cannot name an existing row, so it
-	// is absent — not an outage. Reported identically to a well-formed id that
-	// happens not to exist, and to another tenant's invoice, which is the whole
-	// point: none of the three should be distinguishable from outside.
-	if errors.Is(err, domain.ErrInvalidIdentifier) {
+	if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, domain.ErrInvalidIdentifier) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &inv, nil
+	return inv, nil
 }
 
-// queryLines reads one invoice's lines, in line order.
-//
-// Scoped by tenant explicitly as well as by invoice_id, matching every other
-// query in this file: RLS alone is insufficient while the service connects as a
-// Postgres superuser (see migration 000004), so the predicate is what actually
-// isolates tenants.
 func queryLines(ctx context.Context, tx pgx.Tx, tenantID, invoiceID string) ([]domain.VendorInvoiceLine, error) {
 	rows, err := tx.Query(ctx,
 		`SELECT `+lineSelectList+`
@@ -439,8 +447,7 @@ func queryLines(ctx context.Context, tx pgx.Tx, tenantID, invoiceID string) ([]d
 	return lines, mapPgError(rows.Err())
 }
 
-// ListInvoices returns vendor invoices matching the given filter (tenant_id
-// is required; the others are optional).
+// ListInvoices returns vendor invoices matching the given filter.
 func (s *PgStore) ListInvoices(ctx context.Context, filter domain.ListInvoicesFilter) ([]domain.VendorInvoice, error) {
 	var out []domain.VendorInvoice
 	err := s.withRLS(ctx, filter.TenantID, func(tx pgx.Tx) error {
@@ -452,11 +459,6 @@ func (s *PgStore) ListInvoices(ctx context.Context, filter domain.ListInvoicesFi
 			  AND ($3 = '' OR vendor_id = $3)
 			  AND ($4 = '' OR status = $4)
 			ORDER BY created_at DESC`
-
-		// LIMIT/OFFSET are appended to the literal text (never interpolated with
-		// caller data) and their values ride alongside the four filter bounds as
-		// real parameters. An offset with no limit is meaningless — skipping rows
-		// only to read them all again — so it is ignored unless a limit is set.
 		args := []any{filter.TenantID, filter.LegalEntityID, filter.VendorID, filter.Status}
 		if filter.Limit > 0 {
 			query += fmt.Sprintf(" LIMIT $%d", len(args)+1)
@@ -466,7 +468,6 @@ func (s *PgStore) ListInvoices(ctx context.Context, filter domain.ListInvoicesFi
 				args = append(args, filter.Offset)
 			}
 		}
-
 		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return mapPgError(err)
@@ -474,11 +475,13 @@ func (s *PgStore) ListInvoices(ctx context.Context, filter domain.ListInvoicesFi
 		defer rows.Close()
 		for rows.Next() {
 			var inv domain.VendorInvoice
-			var status string
-			if err := rows.Scan(scanTargets(&inv, &status)...); err != nil {
+			var r raw
+			if err := rows.Scan(scanRefs(&inv, &r)...); err != nil {
 				return err
 			}
-			inv.Status = domain.InvoiceStatus(status)
+			if err := r.finish(&inv); err != nil {
+				return err
+			}
 			out = append(out, inv)
 		}
 		return mapPgError(rows.Err())
@@ -486,105 +489,233 @@ func (s *PgStore) ListInvoices(ctx context.Context, filter domain.ListInvoicesFi
 	return out, err
 }
 
-// TransitionInvoice atomically moves an invoice from fromStatus to toStatus,
-// stamping the actor and timestamp column appropriate to toStatus. Uses
-// WHERE status = $fromStatus AND tenant_id = $tenantID so the transition,
-// the state-machine check, and the tenant scope are one atomic UPDATE — no
-// separate read, no race window (same pattern as general-ledger-svc's
-// TransitionJournal). Returns domain.ErrInvalidTransition if zero rows were
-// affected (the invoice doesn't exist, wasn't in fromStatus, or belongs to a
-// different tenant).
-func (s *PgStore) TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string) error {
-	actorColumn, timeColumn := transitionColumns(toStatus)
-	query := fmt.Sprintf(`
-		UPDATE vendor_invoices
-		SET status = $1, %s = $2, %s = $3
-		WHERE invoice_id = $4 AND status = $5 AND tenant_id = $6
-		RETURNING legal_entity_id, correlation_id, amount, currency_code
-	`, actorColumn, timeColumn)
+// ── mutate ───────────────────────────────────────────────────────────────────
 
-	var found bool
+// MutateInvoice is the one primitive every AP-05 state change goes through.
+func (s *PgStore) MutateInvoice(ctx context.Context, tenantID, invoiceID string, expectedVersion *int, fn domain.MutateFn) (*domain.VendorInvoice, error) {
+	var out *domain.VendorInvoice
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var legalEntityID, correlationID, currencyCode string
-		var amount float64
-		row := tx.QueryRow(ctx, query, string(toStatus), actorPrincipalID, time.Now().UTC(), invoiceID, string(fromStatus), tenantID)
-		if err := row.Scan(&legalEntityID, &correlationID, &amount, &currencyCode); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				found = false
-				return nil
-			}
-			return mapPgError(err)
-		}
-		found = true
-
-		eventType, payload := transitionEventDetails(toStatus, invoiceID, amount, currencyCode)
-		if eventType != "" {
-			env, envErr := outbox.NewVariantAEnvelope(eventType, correlationID, tenantID, legalEntityID, actorPrincipalID, payload)
-			if envErr != nil {
-				return fmt.Errorf("build outbox envelope: %w", envErr)
-			}
-			actor := actorPrincipalID
-			if err := outbox.Insert(ctx, tx, outbox.Event{
-				AggregateType: "VENDOR_INVOICE",
-				AggregateID:   invoiceID,
-				EventType:     eventType,
-				TenantID:      tenantID,
-				LegalEntityID: legalEntityID,
-				ActorID:       &actor,
-				CorrelationID: correlationID,
-				Payload:       env,
-			}); err != nil {
-				return fmt.Errorf("outbox insert: %w", err)
-			}
-		}
-		return nil
+		inv, err := s.MutateInTx(ctx, tx, tenantID, invoiceID, expectedVersion, fn)
+		out = inv
+		return err
 	})
-	// A malformed id names no row, so this is the same answer as an unknown one:
-	// not found, which the handler turns into 404 rather than 503.
-	if errors.Is(err, domain.ErrInvalidIdentifier) {
-		return domain.ErrInvoiceNotFound
+	if errors.Is(err, domain.ErrInvalidIdentifier) || errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrInvoiceNotFound
 	}
 	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// MutateInTx is MutateInvoice's body, callable from another store method that
+// already owns a transaction (the AP-06 match store updates the invoice's match
+// dimension atomically with the run it saves).
+func (s *PgStore) MutateInTx(ctx context.Context, tx pgx.Tx, tenantID, invoiceID string, expectedVersion *int, fn domain.MutateFn) (*domain.VendorInvoice, error) {
+	inv, err := loadInvoice(ctx, tx, tenantID, invoiceID, "", true)
+	if err != nil {
+		return nil, err
+	}
+	if expectedVersion != nil && *expectedVersion != inv.Version {
+		return nil, domain.ErrStaleVersion
+	}
+	before, _ := json.Marshal(inv.StateDimensions())
+	oldVersion := inv.Version
+
+	mut, err := fn(inv)
+	if err != nil {
+		return nil, err
+	}
+	if mut == nil {
+		return inv, nil
+	}
+	inv.Status = domain.DeriveStatus(inv)
+	if !mut.KeepVersion {
+		inv.Version = oldVersion + 1
+	}
+
+	set := make([]string, 0, len(mutableColumns)+2)
+	vals := append([]any{}, mutableValues(inv)...)
+	for i, c := range mutableColumns {
+		set = append(set, fmt.Sprintf("%s = $%d", c, i+1))
+	}
+	n := len(vals)
+	set = append(set, fmt.Sprintf("version = $%d", n+1))
+	vals = append(vals, inv.Version)
+	n++
+	if mut.NewSourcePayload != nil {
+		set = append(set, fmt.Sprintf("source_payload = $%d", n+1))
+		vals = append(vals, []byte(mut.NewSourcePayload))
+		n++
+	}
+	vals = append(vals, invoiceID, tenantID, oldVersion)
+	tag, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE vendor_invoices SET %s WHERE invoice_id = $%d AND tenant_id = $%d AND version = $%d`,
+		strings.Join(set, ", "), n+1, n+2, n+3), vals...)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, domain.ErrStaleVersion
+	}
+
+	if mut.ReplaceLines != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM vendor_invoice_lines WHERE invoice_id = $1 AND tenant_id = $2`, invoiceID, tenantID); err != nil {
+			return nil, mapPgError(err)
+		}
+		inv.Lines = *mut.ReplaceLines
+		for i := range inv.Lines {
+			inv.Lines[i].InvoiceLineID = uuid.NewString()
+			inv.Lines[i].InvoiceID = invoiceID
+			inv.Lines[i].LineNumber = i + 1
+			if err := insertLine(ctx, tx, tenantID, &inv.Lines[i]); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := s.writeSideRecords(ctx, tx, inv, before, mut); err != nil {
+		return nil, err
+	}
+	return inv, nil
+}
+
+// writeSideRecords writes, in the caller's transaction, everything that must
+// commit atomically with an invoice change: history, duplicate assessment,
+// correction link, the AP-08 payable-creation queue row and the outbox events.
+func (s *PgStore) writeSideRecords(ctx context.Context, tx pgx.Tx, inv *domain.VendorInvoice, before []byte, mut *domain.Mutation) error {
+	after, _ := json.Marshal(inv.StateDimensions())
+	detail, _ := json.Marshal(mut.Detail)
+	if mut.Detail == nil {
+		detail = nil
+	}
+	if err := insertHistory(ctx, tx, inv.TenantID, domain.HistoryEntry{
+		InvoiceID: inv.InvoiceID, Version: inv.Version, Command: mut.Command, ActorID: mut.Actor,
+		Reason: mut.Reason, FromState: before, ToState: after, Detail: detail, CorrelationID: mut.CorrelationID,
+	}); err != nil {
 		return err
 	}
-	if !found {
-		return domain.ErrInvalidTransition
+
+	if a := mut.Assessment; a != nil {
+		a.AssessmentID = uuid.NewString()
+		a.TenantID, a.InvoiceID = inv.TenantID, inv.InvoiceID
+		a.TriggerCommand = mut.Command
+		inputs, _ := json.Marshal(a.Inputs)
+		cfg, _ := json.Marshal(a.Config)
+		ids, _ := json.Marshal(a.MatchedInvoiceIDs)
+		matches, _ := json.Marshal(a.Matches)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO invoice_duplicate_assessments (assessment_id, tenant_id, invoice_id, verdict, score,
+				exact_key, near_key, inputs, config, matched_invoice_ids, matches, trigger_command)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			a.AssessmentID, a.TenantID, a.InvoiceID, a.Verdict, a.Score, a.ExactKey, a.NearKey,
+			inputs, cfg, ids, matches, a.TriggerCommand); err != nil {
+			return mapPgError(err)
+		}
+	}
+
+	if l := mut.CorrectionLink; l != nil {
+		if l.LinkID == "" {
+			l.LinkID = uuid.NewString()
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO invoice_correction_links (link_id, tenant_id, original_invoice_id, linked_invoice_id, link_kind, reason, created_by)
+			VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			l.LinkID, inv.TenantID, l.OriginalInvoiceID, l.LinkedInvoiceID, l.LinkKind, l.Reason, l.CreatedBy); err != nil {
+			return mapPgError(err)
+		}
+		other := l.LinkedInvoiceID
+		if inv.InvoiceID == l.LinkedInvoiceID {
+			other = l.OriginalInvoiceID
+		}
+		// The linked document's own history records the link; its row is NOT touched.
+		d, _ := json.Marshal(map[string]any{"link_id": l.LinkID, "link_kind": l.LinkKind, "original": l.OriginalInvoiceID, "linked": l.LinkedInvoiceID})
+		var v int
+		if err := tx.QueryRow(ctx, `SELECT version FROM vendor_invoices WHERE invoice_id = $1 AND tenant_id = $2`, other, inv.TenantID).Scan(&v); err != nil {
+			return mapPgError(err)
+		}
+		if err := insertHistory(ctx, tx, inv.TenantID, domain.HistoryEntry{
+			InvoiceID: other, Version: v, Command: "CorrectionLinked", ActorID: mut.Actor, Reason: l.Reason, Detail: d, CorrelationID: mut.CorrelationID,
+		}); err != nil {
+			return err
+		}
+	}
+
+	if p := mut.PayableCreation; p != nil {
+		payload, _ := json.Marshal(p)
+		corr := mut.CorrelationID
+		if corr == "" {
+			corr = inv.CorrelationID
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO payable_creation_requests (request_id, tenant_id, legal_entity_id, invoice_id, source_reference, payload, principal_id, correlation_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			ON CONFLICT (tenant_id, invoice_id) DO NOTHING`,
+			uuid.NewString(), inv.TenantID, inv.LegalEntityID, inv.InvoiceID, p.SourceReference, payload, mut.PayablePrincipal, corr); err != nil {
+			return mapPgError(err)
+		}
+	}
+
+	if p := mut.AccountingPosting; p != nil {
+		payload, _ := json.Marshal(p)
+		corr := firstNonEmpty(mut.CorrelationID, inv.CorrelationID)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO accounting_posting_requests (request_id, tenant_id, legal_entity_id, invoice_id, source_event_id, request_payload, principal_id, correlation_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			ON CONFLICT (tenant_id, source_event_id) DO NOTHING`,
+			uuid.NewString(), inv.TenantID, inv.LegalEntityID, inv.InvoiceID, p.SourceEventID, payload, mut.Actor, corr); err != nil {
+			return mapPgError(err)
+		}
+	}
+
+	return EnqueueEvents(
+ctx, tx, inv.TenantID, inv.LegalEntityID, inv.InvoiceID, "VENDOR_INVOICE", mut.Actor, firstNonEmpty(mut.CorrelationID, inv.CorrelationID), mut.Events)
+}
+
+// EnqueueEvents writes the events to the outbox inside the caller's transaction.
+func EnqueueEvents(ctx context.Context, tx pgx.Tx, tenantID, legalEntityID, aggregateID, aggregateType, actor, correlationID string, evs []domain.OutboxEvent) error {
+	for _, ev := range evs {
+		env, err := outbox.NewVariantAEnvelope(ev.EventType, correlationID, tenantID, legalEntityID, actor, ev.Payload)
+		if err != nil {
+			return fmt.Errorf("build outbox envelope: %w", err)
+		}
+		a := actor
+		if err := outbox.Insert(ctx, tx, outbox.Event{
+			AggregateType: aggregateType, AggregateID: aggregateID, EventType: ev.EventType,
+			TenantID: tenantID, LegalEntityID: legalEntityID, ActorID: &a, CorrelationID: correlationID, Payload: env,
+		}); err != nil {
+			return fmt.Errorf("outbox insert: %w", err)
+		}
 	}
 	return nil
 }
 
-func transitionEventDetails(to domain.InvoiceStatus, invoiceID string, amount float64, currencyCode string) (string, any) {
-	switch to {
-	case domain.InvoiceStatusValidated:
-		return "vendor.invoice.validated", map[string]any{
-			"invoice_id": invoiceID,
+func insertHistory(ctx context.Context, tx pgx.Tx, tenantID string, h domain.HistoryEntry) error {
+	nz := func(b []byte) any {
+		if len(b) == 0 {
+			return nil
 		}
-	case domain.InvoiceStatusApproved:
-		return "vendor.invoice.approved", map[string]any{
-			"invoice_id": invoiceID,
-		}
-	case domain.InvoiceStatusPaymentRequested:
-		return "payment.requested", map[string]any{
-			"invoice_id":    invoiceID,
-			"amount":        amount,
-			"currency_code": currencyCode,
-		}
-	default:
-		return "", nil
+		return []byte(b)
 	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO invoice_history (tenant_id, invoice_id, version, command, actor_id, reason, from_state, to_state, detail, correlation_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		tenantID, h.InvoiceID, h.Version, h.Command, h.ActorID, nullable(h.Reason), nz(h.FromState), nz(h.ToState), nz(h.Detail), nullable(h.CorrelationID))
+	return mapPgError(err)
 }
 
-func transitionColumns(to domain.InvoiceStatus) (actorColumn, timeColumn string) {
-	switch to {
-	case domain.InvoiceStatusValidated:
-		return "validated_by_principal_id", "validated_at"
-	case domain.InvoiceStatusApproved:
-		return "approved_by_principal_id", "approved_at"
-	case domain.InvoiceStatusPaymentRequested:
-		return "payment_requested_by_principal_id", "payment_requested_at"
-	default:
-		return "approved_by_principal_id", "approved_at"
+func nullable(s string) any {
+	if s == "" {
+		return nil
 	}
+	return s
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // SetApprovalJournalID records the GL journal ID returned when the invoice

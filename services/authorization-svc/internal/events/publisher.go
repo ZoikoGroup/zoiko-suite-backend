@@ -19,9 +19,9 @@ import (
 // entity ID, jurisdiction context, actor ID, correlation ID, source
 // service, and payload schema version. domain.AccessDecisionLog carries a
 // real LegalEntityID and a natural actor (PrincipalID — the principal
-// whose access was evaluated). It has no tenant_id or jurisdiction field
-// (RecordAccessDecision never persists a tenant scope), so both are
-// correctly omitted rather than fabricated.
+// whose access was evaluated). It has carried the decision's tenant since
+// 000005, and tenant_id is set from it; it is omitted only for a tenantless
+// decision, never fabricated. There is no jurisdiction field to carry.
 type envelope struct {
 	EventID       string          `json:"event_id"`
 	EventType     string          `json:"event_type"`
@@ -29,6 +29,7 @@ type envelope struct {
 	EmittedAt     time.Time       `json:"emitted_at"`
 	SchemaVersion string          `json:"schema_version"`
 	SourceService string          `json:"source_service"`
+	TenantID      string          `json:"tenant_id,omitempty"`
 	LegalEntityID string          `json:"legal_entity_id,omitempty"`
 	ActorID       string          `json:"actor_id,omitempty"`
 	CorrelationID string          `json:"correlation_id"`
@@ -62,40 +63,19 @@ func NewPublisherWithWriter(log *zap.Logger, topic string, producer MessageWrite
 
 // PublishAuthorizationGranted publishes authorization.granted for a GRANTED decision.
 func (p *Publisher) PublishAuthorizationGranted(ctx context.Context, d domain.AccessDecisionLog) error {
-	return p.emit(ctx, "authorization.granted", d.CorrelationID, d.LegalEntityID, d.PrincipalID, d.AccessDecisionID, map[string]any{
-		"access_decision_id": d.AccessDecisionID,
-		"principal_id":       d.PrincipalID,
-		"legal_entity_id":    d.LegalEntityID,
-		"action_type":        d.ActionType,
-		"decision_basis":     d.DecisionBasis,
-		"decided_at":         d.DecidedAt,
-	})
+	return p.emitTenant(ctx, "authorization.granted", d.CorrelationID, tenantOf(d), d.LegalEntityID, d.PrincipalID, d.AccessDecisionID, decisionPayload(d))
 }
 
 // PublishAuthorizationDenied publishes authorization.denied for a DENIED decision.
 func (p *Publisher) PublishAuthorizationDenied(ctx context.Context, d domain.AccessDecisionLog) error {
-	return p.emit(ctx, "authorization.denied", d.CorrelationID, d.LegalEntityID, d.PrincipalID, d.AccessDecisionID, map[string]any{
-		"access_decision_id": d.AccessDecisionID,
-		"principal_id":       d.PrincipalID,
-		"legal_entity_id":    d.LegalEntityID,
-		"action_type":        d.ActionType,
-		"decision_basis":     d.DecisionBasis,
-		"decided_at":         d.DecidedAt,
-	})
+	return p.emitTenant(ctx, "authorization.denied", d.CorrelationID, tenantOf(d), d.LegalEntityID, d.PrincipalID, d.AccessDecisionID, decisionPayload(d))
 }
 
 // PublishSoDViolationDetected publishes sod.violation.detected — fired in
 // addition to authorization.denied specifically when the denial reason was
 // an SoD conflict, not a plain no-grant.
 func (p *Publisher) PublishSoDViolationDetected(ctx context.Context, d domain.AccessDecisionLog, conflictingAction string) error {
-	return p.emit(ctx, "sod.violation.detected", d.CorrelationID, d.LegalEntityID, d.PrincipalID, d.AccessDecisionID, map[string]any{
-		"access_decision_id": d.AccessDecisionID,
-		"principal_id":       d.PrincipalID,
-		"legal_entity_id":    d.LegalEntityID,
-		"candidate_action":   d.ActionType,
-		"conflicting_action": conflictingAction,
-		"decided_at":         d.DecidedAt,
-	})
+	return p.emitTenant(ctx, "sod.violation.detected", d.CorrelationID, tenantOf(d), d.LegalEntityID, d.PrincipalID, d.AccessDecisionID, sodPayload(d, conflictingAction))
 }
 
 // PublishBreakGlassStarted publishes security.break_glass.started (ZS-IAM-001 §23).
@@ -259,30 +239,14 @@ func ptrToString(ptr *string) string {
 }
 
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, legalEntityID, actorID, key string, payload map[string]any) error {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
-	}
-	env := envelope{
-		// A fresh UUID per publish, not a deterministic string — see
-		// docs/architecture/known-gaps.md's event_id collision writeup.
-		EventID:       "evt-" + uuid.New().String(),
-		EventType:     eventType,
-		EventVersion:  "1.0",
-		EmittedAt:     time.Now().UTC(),
-		SchemaVersion: "1.0",
-		SourceService: "authorization-svc",
-		LegalEntityID: legalEntityID,
-		ActorID:       actorID,
-		CorrelationID: correlationID,
-		Payload:       json.RawMessage(raw),
-	}
-	data, err := json.Marshal(env)
-	if err != nil {
-		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
-	}
+	return p.emitTenant(ctx, eventType, correlationID, "", legalEntityID, actorID, key, payload)
+}
 
-	msg := kafka.Message{Key: []byte(key), Value: data}
+func (p *Publisher) emitTenant(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) error {
+	msg, err := buildMessage(eventType, correlationID, tenantID, legalEntityID, actorID, key, payload)
+	if err != nil {
+		return err
+	}
 	if err := p.producer.WriteMessages(ctx, msg); err != nil {
 		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
 	}
@@ -293,4 +257,41 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID, legalEnt
 		zap.String("correlation_id", correlationID),
 	)
 	return nil
+}
+
+// buildMessage builds one event's envelope and Kafka message. Shared by the
+// direct publish path and by DecisionEvents, so an event relayed from the
+// outbox is byte-for-byte what a direct publish would have sent.
+func buildMessage(eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) (kafka.Message, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return kafka.Message{}, fmt.Errorf("event %q: marshal payload: %w", eventType, err)
+	}
+	env := envelope{
+		// A fresh UUID per publish, not a deterministic string — see
+		// docs/architecture/known-gaps.md's event_id collision writeup.
+		EventID:       "evt-" + uuid.New().String(),
+		EventType:     eventType,
+		EventVersion:  "1.0",
+		EmittedAt:     time.Now().UTC(),
+		SchemaVersion: "1.0",
+		SourceService: "authorization-svc",
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		ActorID:       actorID,
+		CorrelationID: correlationID,
+		Payload:       json.RawMessage(raw),
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return kafka.Message{}, fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
+	}
+	return kafka.Message{Key: []byte(key), Value: data}, nil
+}
+
+func tenantOf(d domain.AccessDecisionLog) string {
+	if d.TenantID == nil {
+		return ""
+	}
+	return *d.TenantID
 }

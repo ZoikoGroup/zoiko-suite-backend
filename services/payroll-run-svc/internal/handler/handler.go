@@ -157,7 +157,7 @@ func (h *Handler) InitiateRun(w http.ResponseWriter, r *http.Request) {
 		PayPeriodStart: req.PayPeriodStart,
 		PayPeriodEnd:   req.PayPeriodEnd,
 		PayDate:        req.PayDate,
-		Status:         "INITIATED",
+		Status:         domain.PayrollRunStatusInitiated,
 		IsShadowRun:    req.IsShadowRun,
 		CorrelationID:  req.CorrelationID,
 		CreatedAt:      now,
@@ -207,7 +207,7 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if run.Status == "COMPLETED" {
+	if run.Status == domain.PayrollRunStatusCompleted {
 		writeError(w, http.StatusConflict, "run_finalized", string(domain.ErrRunAlreadyFinalized))
 		return
 	}

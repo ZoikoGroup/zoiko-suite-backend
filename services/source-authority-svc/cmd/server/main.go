@@ -23,6 +23,7 @@ import (
 	"zoiko.io/source-authority-svc/internal/health"
 	"zoiko.io/source-authority-svc/internal/middleware"
 	"zoiko.io/source-authority-svc/internal/mtls"
+	"zoiko.io/source-authority-svc/internal/outbox"
 	"zoiko.io/source-authority-svc/internal/store"
 	"zoiko.io/source-authority-svc/internal/telemetry"
 )
@@ -66,6 +67,16 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+
+	// Transactional outbox relay: drains outbox_events (written atomically
+	// with each domain row by CreateSourceAuthorityMap/
+	// SupersedeSourceAuthorityMap/RecordFact) to Kafka via
+	// publisher.PublishOutbox, replacing the direct, error-swallowed publish
+	// this service used to rely on exclusively.
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relay := outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, logger)
+	go relay.Start(relayCtx)
 
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {

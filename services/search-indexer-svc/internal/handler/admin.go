@@ -16,6 +16,7 @@ import (
 
 	"zoiko.io/search-client/searchclient"
 	"zoiko.io/search-indexer-svc/internal/domain"
+	"zoiko.io/search-indexer-svc/internal/embedding"
 	"zoiko.io/search-indexer-svc/internal/envelope"
 	"zoiko.io/search-indexer-svc/internal/projection"
 )
@@ -211,7 +212,21 @@ type createContractRequest struct {
 	AnalyzerProfile string                 `json:"analyzer_profile"`
 	AuthzAction     string                 `json:"authz_action"`
 	Fields          []contractFieldRequest `json:"fields"`
+	// Embedding makes the scope semantic (§10.1). Omitted = lexical only.
+	Embedding *embeddingRequest `json:"embedding,omitempty"`
 }
+
+type embeddingRequest struct {
+	Model         string   `json:"model"`
+	ModelVersion  string   `json:"model_version"`
+	Dimensions    int      `json:"dimensions"`
+	SourceFields  []string `json:"source_fields"`
+	Preprocessing string   `json:"preprocessing"`
+	Similarity    string   `json:"similarity"`
+}
+
+// maxEmbeddingDimensions is the engine's knn_vector ceiling.
+const maxEmbeddingDimensions = 16000
 
 // CreateContract drafts a new contract version.
 //
@@ -261,6 +276,11 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_field_contract", err.Error())
 		return
 	}
+	spec, err := validateEmbedding(req.Embedding, fields)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_embedding_contract", err.Error())
+		return
+	}
 
 	version, err := h.store.NextContractVersion(r.Context(), scope)
 	if err != nil {
@@ -273,13 +293,14 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 		SourceID:             src.SourceID,
 		ScopeName:            scope,
 		Version:              version,
-		SchemaDigest:         schemaDigest(fields),
+		SchemaDigest:         schemaDigest(fields, spec),
 		State:                domain.ContractDraft,
 		FreshnessClass:       orDefault(req.FreshnessClass, src.FreshnessClass),
 		RetrievalClass:       retrieval,
 		AnalyzerProfile:      orDefault(req.AnalyzerProfile, "standard"),
 		AuthzAction:          req.AuthzAction,
 		Fields:               fields,
+		Embedding:            spec,
 		CreatedByPrincipalID: env.ActorSubjectID,
 	}
 
@@ -396,6 +417,72 @@ func (h *Handler) validateFields(reqFields []contractFieldRequest, src *domain.S
 		}
 	}
 	return out, nil
+}
+
+// validateEmbedding enforces §10.1's pin and INV-26's inheritance.
+//
+// The vector is built only from registered, non-prohibited TEXT or KEYWORD
+// fields of this contract. That is the inheritance rule made concrete: a
+// vector encodes content, and content the lexical projection was not allowed to
+// hold — an unregistered field, a SECRET_PROHIBITED one — must not reach the
+// semantic index by another route. The field sensitivities have already passed
+// the source ceiling and the R0 rule in validateFields, so the vector inherits
+// them without a second set of checks that could disagree with the first.
+func validateEmbedding(req *embeddingRequest, fields []domain.SearchFieldDefinition) (*domain.EmbeddingSpec, error) {
+	if req == nil {
+		return nil, nil
+	}
+	spec := &domain.EmbeddingSpec{
+		Model:         strings.TrimSpace(req.Model),
+		ModelVersion:  strings.TrimSpace(req.ModelVersion),
+		Dimensions:    req.Dimensions,
+		Preprocessing: orDefault(req.Preprocessing, embedding.ProfileNFKCWhitespaceV1),
+		Similarity:    orDefault(req.Similarity, "cosinesimil"),
+	}
+	if spec.Model == "" || spec.ModelVersion == "" {
+		// NP-35's premise: without an exact version there is nothing to pin,
+		// and "latest" is precisely the silent provider-side change the pin
+		// exists to refuse.
+		return nil, errors.New("embedding.model and embedding.model_version are both required; a model is pinned to an exact version")
+	}
+	if strings.EqualFold(spec.ModelVersion, "latest") {
+		return nil, errors.New("embedding.model_version must be an exact version, not latest")
+	}
+	if spec.Dimensions <= 0 || spec.Dimensions > maxEmbeddingDimensions {
+		return nil, fmt.Errorf("embedding.dimensions must be between 1 and %d", maxEmbeddingDimensions)
+	}
+	if !embedding.SupportedProfile(spec.Preprocessing) {
+		return nil, fmt.Errorf("embedding.preprocessing %q is not a supported pinned profile (supported: %s)",
+			spec.Preprocessing, embedding.ProfileNFKCWhitespaceV1)
+	}
+	if !embedding.SupportedSimilarity(spec.Similarity) {
+		return nil, errors.New("embedding.similarity must be cosinesimil, l2 or innerproduct")
+	}
+	if len(req.SourceFields) == 0 {
+		return nil, errors.New("embedding.source_fields must name at least one registered field")
+	}
+	byName := make(map[string]domain.SearchFieldDefinition, len(fields))
+	for _, f := range fields {
+		byName[f.FieldID] = f
+	}
+	seen := map[string]bool{}
+	for _, name := range req.SourceFields {
+		name = strings.TrimSpace(name)
+		f, ok := byName[name]
+		switch {
+		case !ok:
+			return nil, fmt.Errorf("embedding source field %q is not registered in this contract", name)
+		case f.SensitivityClass == domain.SensitivitySecretProhibited:
+			return nil, fmt.Errorf("embedding source field %q is SECRET_PROHIBITED and can never be embedded (INV-09)", name)
+		case f.Type != "TEXT" && f.Type != "KEYWORD":
+			return nil, fmt.Errorf("embedding source field %q is %s; only TEXT and KEYWORD fields are embedded", name, f.Type)
+		case seen[name]:
+			return nil, fmt.Errorf("embedding source field %q is listed twice", name)
+		}
+		seen[name] = true
+		spec.SourceFields = append(spec.SourceFields, name)
+	}
+	return spec, nil
 }
 
 func (h *Handler) GetContract(w http.ResponseWriter, r *http.Request) {
@@ -529,6 +616,18 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if contract.Embedding != nil && !h.embedder.Configured() {
+		// A semantic generation that nothing can fill: every document it
+		// receives would fail to embed and be dead-lettered. Refused here,
+		// where the cause is obvious, rather than discovered as an empty
+		// vector index at validation.
+		writeErrorCode(w, http.StatusConflict, "embedding_provider_not_configured",
+			"scope "+contract.ScopeName+" pins embedding model "+contract.Embedding.PinnedModel()+
+				" but no embedding provider is configured (EMBEDDING_PROVIDER_URL; OD-10)",
+			domain.ReasonSemanticModelMismatch)
+		return
+	}
+
 	generationID := uuid.NewString()
 	physical := searchclient.GenerationIndex(searchclient.IndexName(contract.ScopeName), shortID(generationID))
 	now := time.Now().UTC()
@@ -566,7 +665,21 @@ func (h *Handler) CreateGeneration(w http.ResponseWriter, r *http.Request) {
 	}
 	h.metrics.GenerationTransitions.WithLabelValues(contract.ScopeName, string(domain.GenerationBuilding)).Inc()
 
+	// Fill it from source. A generation is registered as a CANDIDATE on the
+	// reload, so live events are written into it from now on, and the backfill
+	// replays everything before now (INV-21: a parallel build, not an empty
+	// index waiting for new events). READY is refused until it COMPLETES.
+	if err := h.store.SetBackfillState(r.Context(), generationID, domain.BackfillPending, ""); err != nil {
+		h.internal(w, r, "mark backfill pending", err)
+		return
+	}
+	if err := h.indexer.Reload(r.Context()); err != nil {
+		h.log.Error("generation built but the projector registry could not reload", zap.Error(err))
+	}
+	h.indexer.StartBackfill(generationID)
+
 	gen.State = domain.GenerationBuilding
+	gen.BackfillState = domain.BackfillPending
 	writeJSON(w, http.StatusCreated, gen)
 }
 
@@ -632,6 +745,23 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 
 	switch next {
 	case domain.GenerationReady:
+		// §10.1's migration gate, checked BEFORE validation and without
+		// failing the generation: a missing certification is a missing
+		// precondition the operator can supply, not a defect in the build.
+		// The backfill must have finished. A generation that has not replayed
+		// its source is missing every record from before it was built, and
+		// "engine=0 ledger=4" passing validation is how activating a rebuild
+		// emptied a scope (found live, 30 Sep 2026).
+		if current.BackfillState != domain.BackfillComplete {
+			writeErrorCode(w, http.StatusConflict, "backfill_incomplete",
+				fmt.Sprintf("generation backfill is %q, not COMPLETE: %s", current.BackfillState, current.BackfillNote),
+				domain.ReasonReindexValidationFailed)
+			return
+		}
+		if code, msg := h.requireMigrationCertification(r.Context(), current); code != "" {
+			writeErrorCode(w, http.StatusConflict, code, msg, domain.ReasonReindexValidationFailed)
+			return
+		}
 		result, err := h.validateGeneration(r.Context(), current)
 		if err != nil {
 			_ = h.store.TransitionGeneration(r.Context(), generationID,
@@ -648,6 +778,13 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 		digest, note = result.digest, result.note
 
 	case domain.GenerationActive:
+		// Re-checked at cutover, not only at READY: the serving generation
+		// may have changed in between (a rollback), and certification is
+		// against what is serving at the moment of the switch.
+		if code, msg := h.requireMigrationCertification(r.Context(), current); code != "" {
+			writeErrorCode(w, http.StatusConflict, code, msg, domain.ReasonReindexValidationFailed)
+			return
+		}
 		// The alias swap and the state write are two systems that must agree.
 		// The ENGINE goes first: if the swap succeeds and the state write
 		// fails, the alias points at a generation the control plane does not
@@ -704,6 +841,12 @@ func (h *Handler) TransitionGeneration(w http.ResponseWriter, r *http.Request) {
 		if err := h.indexer.Reload(r.Context()); err != nil {
 			h.log.Error("generation transitioned but the projector registry could not reload", zap.Error(err))
 		}
+		// Measure the newly active generation now. It has no checkpoint row
+		// yet, so until the next sweep it would read UNKNOWN and every
+		// protected search would be refused with ESR-012.
+		if next == domain.GenerationActive {
+			h.indexer.RecordCheckpointForScope(r.Context(), current.ScopeName)
+		}
 	}
 
 	updated, err := h.store.GetGeneration(r.Context(), generationID)
@@ -738,8 +881,12 @@ func (h *Handler) validateGeneration(ctx context.Context, gen *domain.IndexGener
 	if err != nil {
 		return validationResult{}, fmt.Errorf("population could not be counted: %w", err)
 	}
-	untenanted, err := h.engine.CountProjections(ctx, gen.PhysicalIndex, map[string]string{"tenant_id": ""})
-	if err == nil && untenanted > 0 {
+	untenanted, err := h.engine.CountMissing(ctx, gen.PhysicalIndex, "tenant_id")
+	if err != nil {
+		// Fail closed: a contamination check that could not run has not passed.
+		return validationResult{}, fmt.Errorf("cross-tenant contamination check could not run: %w", err)
+	}
+	if untenanted > 0 {
 		return validationResult{}, fmt.Errorf(
 			"SECURITY: %d documents in this generation carry no tenant_id; generation refused", untenanted)
 	}
@@ -755,18 +902,95 @@ func (h *Handler) validateGeneration(ctx context.Context, gen *domain.IndexGener
 
 	note := fmt.Sprintf("engine=%d ledger=%d contract=%s v%d",
 		total, ledgerLive, contract.ContractID, contract.Version)
+	if contract.Embedding != nil {
+		// Recorded in the validation digest, so the evidence for a semantic
+		// generation says how much of it is actually semantically searchable
+		// under the pinned model (documents with no embeddable text carry no
+		// vector and are lexical-only candidates).
+		vectors, err := h.engine.CountProjections(ctx, gen.PhysicalIndex,
+			map[string]string{"embedding_model": contract.Embedding.PinnedModel()})
+		if err != nil {
+			return validationResult{}, fmt.Errorf("vector population could not be counted: %w", err)
+		}
+		note += fmt.Sprintf(" vectors=%d model=%s", vectors, contract.Embedding.PinnedModel())
+	}
 
-	// A brand-new generation legitimately holds nothing: it is built before
-	// it is filled. The comparison only bites once the ledger says there is
-	// something to have. A generation that has SOME documents but fewer than
-	// the ledger knows about is the incomplete build NP-18 describes.
-	if total > 0 && ledgerLive > 0 && total < ledgerLive {
+	// A generation holding fewer live documents than the ledger records is
+	// the incomplete build NP-18 describes — INCLUDING one holding none. The
+	// exemption this replaced ("a new generation legitimately holds nothing")
+	// let an empty rebuild pass as "engine=0 ledger=4" and replace a populated
+	// index at activation (INV-21, INV-22). Generations are backfilled now, so
+	// an empty one over a populated ledger is a failed build, not a new one.
+	if total < ledgerLive {
 		return validationResult{}, fmt.Errorf(
 			"incomplete build: index holds %d of the %d live projections the ledger records", total, ledgerLive)
 	}
 
 	sum := sha256.Sum256([]byte(note))
 	return validationResult{digest: hex.EncodeToString(sum[:]), note: note}, nil
+}
+
+// requireMigrationCertification is §10.1's "model migration requires parallel
+// rebuild and retrieval-evaluation certification before cutover".
+//
+// A generation is a MIGRATION when its contract's embedding pin differs from
+// the one serving the scope now — a new model, version, width, preprocessing
+// or space, or semantic retrieval introduced on a scope that served lexical
+// only. Such a generation may not become READY (and therefore never ACTIVE)
+// until its LATEST retrieval evaluation passed under its own pinned model. A
+// first build with nothing serving is not a migration: there is no prior
+// behaviour for callers to lose.
+//
+// Returns an error code and message, or "" when the gate is satisfied.
+func (h *Handler) requireMigrationCertification(ctx context.Context, gen *domain.IndexGeneration) (string, string) {
+	// Every read failure REFUSES. A gate that passes when it cannot tell is
+	// not a gate.
+	contract, err := h.store.GetContract(ctx, gen.ContractID)
+	if err != nil {
+		return "migration_check_failed", "the generation's contract could not be read: " + err.Error()
+	}
+	active, err := h.store.GetActiveGeneration(ctx, gen.ScopeName)
+	switch {
+	case errors.Is(err, domain.ErrNotFound):
+		return "", "" // first build: nothing serving, nothing to migrate from
+	case err != nil:
+		return "migration_check_failed", "the serving generation could not be read: " + err.Error()
+	case active.GenerationID == gen.GenerationID:
+		return "", ""
+	}
+	activeContract, err := h.store.GetContract(ctx, active.ContractID)
+	if err != nil {
+		return "migration_check_failed", "the serving generation's contract could not be read: " + err.Error()
+	}
+	if activeContract.Embedding.SamePin(contract.Embedding) {
+		// Same embedding space (including lexical → lexical): nothing to
+		// certify beyond validateGeneration.
+		return "", ""
+	}
+	if contract.Embedding == nil {
+		// Semantic → lexical is a removal of a capability, not a new
+		// embedding space; there is nothing to evaluate recall against.
+		return "", ""
+	}
+
+	eval, err := h.store.LatestRetrievalEvaluation(ctx, gen.GenerationID)
+	switch {
+	case errors.Is(err, domain.ErrNotFound):
+		return "retrieval_evaluation_required", fmt.Sprintf(
+			"this generation migrates scope %s from %q to %s; run POST "+
+				"/v1/index-generations/%s/retrieval-evaluations and pass it before READY (§10.1)",
+			gen.ScopeName, activeContract.Embedding.PinnedModel(), contract.Embedding.PinnedModel(), gen.GenerationID)
+	case err != nil:
+		return "migration_check_failed", "the retrieval evaluation could not be read: " + err.Error()
+	case eval.PinnedModel != contract.Embedding.PinnedModel():
+		return "retrieval_evaluation_required",
+			"the latest retrieval evaluation was run under " + eval.PinnedModel + ", not " + contract.Embedding.PinnedModel()
+	case !eval.Passed:
+		return "retrieval_evaluation_failed", fmt.Sprintf(
+			"the latest retrieval evaluation measured recall@%d %.3f against a required %.3f",
+			eval.K, eval.Recall, eval.MinRecall)
+	}
+	return "", ""
 }
 
 func (h *Handler) findGenerationByIndex(ctx context.Context, scope, physicalIndex string) (*domain.IndexGeneration, error) {
@@ -805,7 +1029,7 @@ func (h *Handler) ListCheckpoints(w http.ResponseWriter, r *http.Request) {
 // in whether a field is returnable are genuinely different contracts, and a
 // digest that collapsed them would let a generation claim lineage to a field
 // set it was not built from (TC-03).
-func schemaDigest(fields []domain.SearchFieldDefinition) string {
+func schemaDigest(fields []domain.SearchFieldDefinition, spec *domain.EmbeddingSpec) string {
 	sorted := append([]domain.SearchFieldDefinition{}, fields...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].FieldID < sorted[j].FieldID })
 
@@ -816,6 +1040,14 @@ func schemaDigest(fields []domain.SearchFieldDefinition) string {
 			f.Searchable, f.Filterable, f.Facetable, f.Sortable,
 			f.SnippetAllowed, f.Returnable, f.Exportable,
 			f.SensitivityClass)
+	}
+	if spec != nil {
+		// The embedding pin is part of what a contract version IS (§10.1).
+		// Two contracts identical but for the model are different contracts,
+		// and a digest that ignored the pin would let a generation claim
+		// lineage to an embedding space it was not built in.
+		fmt.Fprintf(h, "embedding|%s|%s|%d|%s|%s|%s;", spec.Model, spec.ModelVersion,
+			spec.Dimensions, spec.Preprocessing, spec.Similarity, strings.Join(spec.SourceFields, ","))
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

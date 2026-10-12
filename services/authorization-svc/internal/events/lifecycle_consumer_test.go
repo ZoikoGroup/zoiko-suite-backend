@@ -31,6 +31,9 @@ type lifecycleStub struct {
 	projectErr error
 
 	invalidatedTenants []string
+
+	entities  []domain.ProjectEntityStatusParams
+	entityErr error
 }
 
 func (s *lifecycleStub) ProjectPrincipalStatus(_ context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error) {
@@ -43,6 +46,14 @@ func (s *lifecycleStub) ProjectPrincipalStatus(_ context.Context, params domain.
 		TenantID:    params.TenantID,
 		Status:      params.Status,
 	}, nil
+}
+
+func (s *lifecycleStub) ProjectEntityStatus(_ context.Context, p domain.ProjectEntityStatusParams) error {
+	if s.entityErr != nil {
+		return s.entityErr
+	}
+	s.entities = append(s.entities, p)
+	return nil
 }
 
 func (s *lifecycleStub) InvalidateGrantSourcesForTenant(tenantID string) {

@@ -1,18 +1,14 @@
 package handler
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/ledger"
-	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 )
 
 // ── POST /v1/notifications/suppression ─────────────────────────────────────
@@ -127,139 +123,60 @@ func (h *Handler) ListSuppressions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
-// ── DELETE /v1/notifications/suppression/{email} ───────────────────────────
-//
-// RemoveSuppression removes an active suppression for a specific email address
-// and optional stream. The {email} path parameter is URL-encoded.
-func (h *Handler) RemoveSuppression(w http.ResponseWriter, r *http.Request) {
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-	tenantID, ok := h.requireTenant(w, r)
-	if !ok {
-		return
-	}
-
-	rawEmail := chi.URLParam(r, "email")
-	email, err := url.PathUnescape(rawEmail)
-	email = strings.ToLower(strings.TrimSpace(email))
-	if err != nil || email == "" {
-		writeError(w, http.StatusBadRequest, "invalid_email", "email path parameter is required and must be URL-encoded")
-		return
-	}
-
-	stream := r.URL.Query().Get("stream")
-	if stream == "" {
-		stream = "ALL"
-	}
-
-	if h.authz != nil {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionSuppressionManage); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
-	}
-
-	if h.suppressions == nil {
-		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "suppression store not configured")
-		return
-	}
-
-	if err := h.suppressions.RemoveSuppression(r.Context(), tenantID, email, stream); err != nil {
-		h.log.Error("failed to remove suppression", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 // ── POST /v1/notifications/unsubscribe ─────────────────────────────────────
 //
 // HandleUnsubscribe is the RFC 8058 one-click unsubscribe receiver. Mail clients
-// POST to this URL when the user clicks the unsubscribe button in their mail
-// client (not in the email itself). The request carries no ZoikoSuite auth
-// headers — it comes from the mail client — so this endpoint is exempted from
-// the envelope middleware in main.go.
+// POST to the List-Unsubscribe URL with no ZoikoSuite headers, so the route is
+// exempt from the envelope (main.go) and the token in the URL is the ONLY
+// credential: it is opened by internal/unsubscribe and names the tenant and
+// address. Nothing the request says outside the token is believed — a
+// tenant_id or email parameter is ignored, because accepting them is exactly
+// how one anonymous POST used to suppress any address in any tenant (and,
+// through the upsert, rewrite a recorded hard bounce as an unsubscribe).
 //
-// The tenant and recipient are resolved from the signed action token embedded in
-// the URL or request parameters. The orchestrator emits these params when
-// generating the List-Unsubscribe header.
-//
-// On success: adds a UNSUBSCRIBE suppression and returns 200.
-// Idempotent: AddSuppression uses ON CONFLICT DO UPDATE, so repeated requests
-// succeed idempotently. Fail-closed: missing parameters or store failure return error codes.
+// A refused token is 403 and writes nothing. Not configured is 503: the
+// service does not send marketing mail it cannot honour an unsubscribe for,
+// so no valid link can exist. Repeating a valid request is harmless — the
+// suppression store never weakens a stronger reason and an unsubscribe is
+// already the weakest.
 func (h *Handler) HandleUnsubscribe(w http.ResponseWriter, r *http.Request) {
-	if h.suppressions == nil {
-		h.log.Error("unsubscribe handler called but suppression store not configured")
-		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "suppression store not configured")
+	if h.suppressions == nil || h.unsubscribe == nil {
+		h.log.Error("unsubscribe receiver called but unsubscribe is not configured")
+		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "unsubscribe is not configured")
 		return
 	}
 
-	var actionToken string
-	var reqEmail string
-	var reqTenant string
-
-	ct := r.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "application/x-www-form-urlencoded") ||
-		strings.HasPrefix(ct, "multipart/form-data") {
-		if err := r.ParseForm(); err == nil {
-			actionToken = r.FormValue("action_token")
-			if e := r.FormValue("email"); e != "" {
-				reqEmail = e
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		ct := r.Header.Get("Content-Type")
+		if strings.HasPrefix(ct, "application/x-www-form-urlencoded") || strings.HasPrefix(ct, "multipart/form-data") {
+			if err := r.ParseForm(); err == nil {
+				token = r.PostFormValue("token")
 			}
-			if t := r.FormValue("tenant_id"); t != "" {
-				reqTenant = t
+		} else {
+			var req struct {
+				Token string `json:"token"`
 			}
-		}
-	} else {
-		var req struct {
-			ActionToken string `json:"action_token"`
-			TenantID    string `json:"tenant_id"`
-			Email       string `json:"email"`
-		}
-		_ = decodeJSONNoResponse(r, &req)
-		actionToken = req.ActionToken
-		reqTenant = req.TenantID
-		reqEmail = req.Email
-	}
-	if actionToken == "" {
-		actionToken = r.URL.Query().Get("action_token")
-	}
-	if reqEmail == "" {
-		reqEmail = r.URL.Query().Get("email")
-	}
-	if reqTenant == "" {
-		reqTenant = r.URL.Query().Get("tenant_id")
-	}
-
-	tenantID := reqTenant
-	if tenantID == "" && actionToken != "" {
-		if decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(actionToken)); err == nil {
-			parts := strings.Split(string(decoded), ".")
-			if len(parts) >= 2 {
-				tenantID = parts[0]
-			}
+			_ = decodeJSONNoResponse(r, &req)
+			token = req.Token
 		}
 	}
-
-	if tenantID == "" {
-		tenantID = svcmiddleware.TenantFromContext(r.Context())
+	if token == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "an unsubscribe token is required")
+		return
 	}
 
-	recipientEmail := strings.ToLower(strings.TrimSpace(reqEmail))
-
-	if tenantID == "" || recipientEmail == "" {
-		h.log.Warn("unsubscribe: cannot resolve tenant_id or email from request",
-			zap.String("action_token_present", actionToken))
-		writeError(w, http.StatusBadRequest, "invalid_request", "tenant_id and email are required")
+	claims, err := h.unsubscribe.Open(token)
+	if err != nil {
+		h.log.Warn("unsubscribe refused: token does not verify", zap.String("remote", r.RemoteAddr))
+		writeError(w, http.StatusForbidden, "invalid_token", "the unsubscribe link is not valid")
 		return
 	}
 
 	providerName := "rfc8058_one_click"
 	supp := &ledger.EmailSuppression{
-		TenantID:       tenantID,
-		RecipientEmail: recipientEmail,
+		TenantID:       claims.TenantID,
+		RecipientEmail: claims.Email,
 		Reason:         ledger.SuppressionReasonUnsubscribe,
 		SourceStream:   "ALL",
 		ProviderName:   &providerName,
@@ -267,19 +184,15 @@ func (h *Handler) HandleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.suppressions.AddSuppression(r.Context(), supp); err != nil {
 		h.log.Error("failed to record unsubscribe suppression", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "store_error", err.Error())
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "the unsubscribe could not be recorded; try again")
 		return
 	}
 
-	h.log.Info("unsubscribe recorded",
-		zap.String("tenant_id", tenantID),
-		zap.String("recipient_email", recipientEmail))
+	// The address is not logged (§13.3): the tenant is enough to find the row.
+	h.log.Info("unsubscribe recorded", zap.String("tenant_id", claims.TenantID))
 	w.WriteHeader(http.StatusOK)
 }
 
-// decodeJSONNoResponse decodes a JSON body without writing error responses.
-// Used for optional JSON bodies (e.g., RFC 8058 unsubscribe which may be
-// application/x-www-form-urlencoded instead).
 func decodeJSONNoResponse(r *http.Request, dst any) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()

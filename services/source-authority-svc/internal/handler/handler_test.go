@@ -18,16 +18,18 @@ import (
 	"zoiko.io/source-authority-svc/internal/domain"
 	"zoiko.io/source-authority-svc/internal/events"
 	svcmiddleware "zoiko.io/source-authority-svc/internal/middleware"
+	"zoiko.io/source-authority-svc/internal/outbox"
 )
 
 const testTenant = "tenant-abc"
 
 type stubStore struct {
-	maps  []domain.SourceAuthorityMap
-	facts []domain.NormalizedFact
+	maps         []domain.SourceAuthorityMap
+	facts        []domain.NormalizedFact
+	outboxEvents []outbox.Event
 }
 
-func (s *stubStore) CreateSourceAuthorityMap(_ context.Context, m *domain.SourceAuthorityMap) (bool, error) {
+func (s *stubStore) CreateSourceAuthorityMap(_ context.Context, m *domain.SourceAuthorityMap, outboxEvt outbox.Event) (bool, error) {
 	// Idempotency first, exactly as the real store orders it: a replay must not
 	// be reported as a uniqueness conflict with itself.
 	if m.CorrelationID != nil {
@@ -44,6 +46,7 @@ func (s *stubStore) CreateSourceAuthorityMap(_ context.Context, m *domain.Source
 		}
 	}
 	s.maps = append(s.maps, *m)
+	s.outboxEvents = append(s.outboxEvents, outboxEvt)
 	return true, nil
 }
 
@@ -93,7 +96,7 @@ func (s *stubStore) ListSourceAuthorityMaps(_ context.Context, f domain.ListSour
 	return out, nil
 }
 
-func (s *stubStore) SupersedeSourceAuthorityMap(_ context.Context, mapID string, effectiveTo time.Time, principalID string) (*domain.SourceAuthorityMap, error) {
+func (s *stubStore) SupersedeSourceAuthorityMap(_ context.Context, mapID string, effectiveTo time.Time, principalID string, outboxEvt outbox.Event) (*domain.SourceAuthorityMap, error) {
 	for i := range s.maps {
 		if s.maps[i].SourceAuthorityMapID != mapID {
 			continue
@@ -109,12 +112,13 @@ func (s *stubStore) SupersedeSourceAuthorityMap(_ context.Context, mapID string,
 		s.maps[i].SupersededAt = &now
 		s.maps[i].SupersededByPrincipalID = &principalID
 		cp := s.maps[i]
+		s.outboxEvents = append(s.outboxEvents, outboxEvt)
 		return &cp, nil
 	}
 	return nil, domain.ErrMapNotFound
 }
 
-func (s *stubStore) RecordFact(_ context.Context, f *domain.NormalizedFact) (bool, error) {
+func (s *stubStore) RecordFact(_ context.Context, f *domain.NormalizedFact, outboxEvt outbox.Event) (bool, error) {
 	if f.TenantID == "" {
 		return false, domain.ErrTenantMissing
 	}
@@ -127,6 +131,7 @@ func (s *stubStore) RecordFact(_ context.Context, f *domain.NormalizedFact) (boo
 		}
 	}
 	s.facts = append(s.facts, *f)
+	s.outboxEvents = append(s.outboxEvents, outboxEvt)
 	return true, nil
 }
 

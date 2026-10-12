@@ -14,7 +14,7 @@ import (
 )
 
 func TestPreferences_SetReadReplaceAndVersion(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	ctx := tenantCtx("tenant-pref")
 
 	_, err := s.GetPreferences(ctx, "alice")
@@ -42,13 +42,13 @@ func TestPreferences_SetReadReplaceAndVersion(t *testing.T) {
 }
 
 func TestPreferences_InvalidProfilesNeverReachTheDatabase(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	_, err := s.SetPreferences(tenantCtx("tenant-pref-bad"), domain.SetPreferencesParams{PrincipalID: "a", TimeZone: "Mars/Olympus", UpdatedBy: "a"})
 	assert.ErrorIs(t, err, domain.ErrPreferencesInvalid)
 }
 
 func TestPreferences_DatabaseRefusesWhatTheServiceShouldHaveCaught(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for name, c := range map[string][2]string{
 		"half a window":   {`INSERT INTO recipient_preferences (tenant_id, principal_id, time_zone, quiet_start, updated_by) VALUES ('t','p1','UTC','22:00','x')`, "ck_pref_quiet_pair"},
 		"empty window":    {`INSERT INTO recipient_preferences (tenant_id, principal_id, time_zone, quiet_start, quiet_end, updated_by) VALUES ('t','p2','UTC','22:00','22:00','x')`, "ck_pref_quiet_window"},
@@ -67,7 +67,7 @@ func TestPreferences_DatabaseRefusesWhatTheServiceShouldHaveCaught(t *testing.T)
 }
 
 func TestPreferences_TenantIsolated(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	_, err := s.SetPreferences(tenantCtx("tenant-pref-a"), domain.SetPreferencesParams{PrincipalID: "alice", TimeZone: "UTC", UpdatedBy: "alice"})
 	require.NoError(t, err)
 	_, err = s.GetPreferences(tenantCtx("tenant-pref-b"), "alice")
@@ -75,7 +75,7 @@ func TestPreferences_TenantIsolated(t *testing.T) {
 }
 
 func TestScheduleRetry_ADeferralIsStoredAsTheNextAttemptTime(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	ctx := tenantCtx("tenant-pref-defer")
 	n := seedNotification(t, s, "tenant-pref-defer", "corr-pref-defer")
 	until := time.Now().UTC().Add(7 * time.Hour).Truncate(time.Second)
@@ -89,7 +89,7 @@ func TestScheduleRetry_ADeferralIsStoredAsTheNextAttemptTime(t *testing.T) {
 }
 
 func TestMigration000023_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000023_recipient_preferences.down.sql", "000023_recipient_preferences.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)

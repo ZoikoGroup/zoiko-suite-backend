@@ -392,6 +392,28 @@ func (s *PgStore) checkNegativeStock(ctx context.Context, tx pgx.Tx, tenantID st
 	if m.SourceLocationID == nil {
 		return nil
 	}
+	// INV-01's effective negative-stock policy for this item. No policy row
+	// (or PROHIBITED) keeps the safe default: refuse.
+	var negPolicy string
+	err := tx.QueryRow(ctx, `
+		SELECT negative_stock_policy FROM inventory_tracking_policies
+		WHERE tenant_id = $1 AND item_id = $2 AND effective_to IS NULL
+	`, tenantID, m.ItemID).Scan(&negPolicy)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if negPolicy == domain.NegativeStockAllowed {
+		return nil
+	}
+	// Serialize concurrent removals from the same (item, location): without
+	// this, two commits can each read the pre-commit on-hand, both pass, and
+	// drive stock negative. The transaction-scoped lock is released at
+	// commit/rollback, and under READ COMMITTED the SUM below (a new
+	// statement, taken after the lock) sees the earlier committer's row.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		tenantID+"|"+m.ItemID+"|"+*m.SourceLocationID); err != nil {
+		return err
+	}
 	onHand, err := s.liveOnHand(ctx, tx, tenantID, m.ItemID, *m.SourceLocationID, nil)
 	if err != nil {
 		return err

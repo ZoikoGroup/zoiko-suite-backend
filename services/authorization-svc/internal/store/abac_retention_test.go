@@ -173,7 +173,7 @@ func TestPgStore_FindABACRules_ScopeAndActiveFlag(t *testing.T) {
 	mk("OTHER_ACTION_RULE", strptr(abacTenantA), "REPORT_VIEW")
 	retired := mk("RETIRED_RULE", strptr(abacTenantA), "PAYMENT_APPROVE")
 
-	if _, err := s.SetABACRuleActive(ctx, retired.ABACRuleID, abacTenantA, false); err != nil {
+	if _, err := s.SetABACRuleActive(ctx, retired.ABACRuleID, abacTenantA, false, 0); err != nil {
 		t.Fatalf("retire: %v", err)
 	}
 
@@ -227,7 +227,7 @@ func TestPgStore_SetABACRuleActive_CannotRetireAPlatformWideRule(t *testing.T) {
 		t.Fatalf("create platform-wide rule: %v", err)
 	}
 
-	if _, err := s.SetABACRuleActive(ctx, global.ABACRuleID, abacTenantA, false); !errors.Is(err, domain.ErrABACRuleNotFound) {
+	if _, err := s.SetABACRuleActive(ctx, global.ABACRuleID, abacTenantA, false, 0); !errors.Is(err, domain.ErrABACRuleNotFound) {
 		t.Fatalf("err = %v, want ErrABACRuleNotFound — one tenant must not be able to disable a control binding every tenant", err)
 	}
 

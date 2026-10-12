@@ -47,7 +47,7 @@ import (
 // schema is this service's schema on the managed single-database host. Under
 // the docker/local provider each service owns a whole database and this is the
 // database name instead; both resolve the same way through search_path.
-const schema = "identity_context"
+const schema = "public"
 
 // demoTenant is the console's DEMO_IDENTITY tenant. Every account below belongs
 // to it, and principal_credentials is RLS-FORCEd on exactly this column.

@@ -41,6 +41,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	for _, migration := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_idempotency.up.sql",
+		"000003_salary_breakdown.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {

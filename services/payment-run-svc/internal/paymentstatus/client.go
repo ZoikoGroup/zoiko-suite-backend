@@ -38,6 +38,10 @@ type RecordInitialStatusRequest struct {
 type PaymentState struct {
 	PaymentID string `json:"PaymentID"`
 	Status    string `json:"Status"`
+	// HasOpenConflict is BNK-07 flagging conflicting provider/statement
+	// evidence for this payment; AP-11 does not act on its status until
+	// BNK-07 resolves the conflict.
+	HasOpenConflict bool `json:"HasOpenConflict"`
 }
 
 type HTTPClient struct {

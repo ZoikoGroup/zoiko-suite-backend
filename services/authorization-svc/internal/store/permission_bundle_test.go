@@ -120,7 +120,7 @@ func TestPgStore_ListPermissionBundles_ReturnsActionsAndRetiredLast(t *testing.T
 			retiredID = b.PermissionBundleID
 		}
 	}
-	if _, err := s.SetPermissionBundleActive(ctx, retiredID, bundleTestTenant, false); err != nil {
+	if _, err := s.SetPermissionBundleActive(ctx, retiredID, bundleTestTenant, false, 0); err != nil {
 		t.Fatalf("retire bundle: %v", err)
 	}
 
@@ -246,7 +246,7 @@ func TestPgStore_SetPermissionBundleActive_WithdrawsTheGrant(t *testing.T) {
 		t.Fatal("could not find the bundle to retire")
 	}
 
-	retired, err := s.SetPermissionBundleActive(ctx, extraID, bundleTestTenant, false)
+	retired, err := s.SetPermissionBundleActive(ctx, extraID, bundleTestTenant, false, 0)
 	if err != nil {
 		t.Fatalf("retire bundle: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestPgStore_SetPermissionBundleActive_WithdrawsTheGrant(t *testing.T) {
 	}
 
 	// And back, restoring exactly what was suspended.
-	if _, err := s.SetPermissionBundleActive(ctx, extraID, bundleTestTenant, true); err != nil {
+	if _, err := s.SetPermissionBundleActive(ctx, extraID, bundleTestTenant, true, 0); err != nil {
 		t.Fatalf("reactivate bundle: %v", err)
 	}
 	granted, _, err = s.FindGrantedActions(ctx, principal, bundleTestEntity, bundleTestTenant)
@@ -304,7 +304,7 @@ func TestPgStore_SetPermissionBundleActive_IsIdempotent(t *testing.T) {
 	}
 
 	for i := 1; i <= 2; i++ {
-		got, err := s.SetPermissionBundleActive(ctx, bundle.PermissionBundleID, bundleTestTenant, false)
+		got, err := s.SetPermissionBundleActive(ctx, bundle.PermissionBundleID, bundleTestTenant, false, 0)
 		if err != nil {
 			t.Fatalf("retire #%d: %v", i, err)
 		}
@@ -339,7 +339,7 @@ func TestPgStore_SetPermissionBundleActive_DoesNotCrossTenants(t *testing.T) {
 		t.Fatalf("create bundle: %v", err)
 	}
 
-	if _, err := s.SetPermissionBundleActive(ctx, bundle.PermissionBundleID, bundleTestOtherTenant, false); !errors.Is(err, domain.ErrPermissionBundleNotFound) {
+	if _, err := s.SetPermissionBundleActive(ctx, bundle.PermissionBundleID, bundleTestOtherTenant, false, 0); !errors.Is(err, domain.ErrPermissionBundleNotFound) {
 		t.Fatalf("expected ErrPermissionBundleNotFound from another tenant, got %v", err)
 	}
 
@@ -360,7 +360,7 @@ func TestPgStore_SetPermissionBundleActive_UnknownIDIsNotFound(t *testing.T) {
 
 	s := store.New(pool, zap.NewNop())
 
-	_, err := s.SetPermissionBundleActive(context.Background(), "00000000-0000-0000-0000-0000000000ff", bundleTestTenant, false)
+	_, err := s.SetPermissionBundleActive(context.Background(), "00000000-0000-0000-0000-0000000000ff", bundleTestTenant, false, 0)
 	if !errors.Is(err, domain.ErrPermissionBundleNotFound) {
 		t.Fatalf("expected ErrPermissionBundleNotFound for an unknown id, got %v", err)
 	}
@@ -403,7 +403,7 @@ func TestPgStore_SetPermissionBundleActive_WithdrawsThroughDelegation(t *testing
 	if err != nil || len(bundles) == 0 {
 		t.Fatalf("list bundles: %v", err)
 	}
-	if _, err := s.SetPermissionBundleActive(ctx, bundles[0].PermissionBundleID, bundleTestTenant, false); err != nil {
+	if _, err := s.SetPermissionBundleActive(ctx, bundles[0].PermissionBundleID, bundleTestTenant, false, 0); err != nil {
 		t.Fatalf("retire bundle: %v", err)
 	}
 

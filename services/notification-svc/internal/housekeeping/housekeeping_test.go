@@ -12,12 +12,11 @@ import (
 )
 
 type mockHousekeepingStore struct {
-	expiredTokens   map[string]int64
-	purgedTokens    map[string]int64
-	staleIntents    map[string]int64
-	purgedLedger    map[string]int64
-	failDiscover    bool
-	failMutate      bool
+	expiredTokens map[string]int64
+	purgedTokens  map[string]int64
+	staleIntents  map[string]int64
+	failDiscover  bool
+	failMutate    bool
 }
 
 func newMockHousekeepingStore() *mockHousekeepingStore {
@@ -25,7 +24,6 @@ func newMockHousekeepingStore() *mockHousekeepingStore {
 		expiredTokens: make(map[string]int64),
 		purgedTokens:  make(map[string]int64),
 		staleIntents:  make(map[string]int64),
-		purgedLedger:  make(map[string]int64),
 	}
 }
 
@@ -89,38 +87,16 @@ func (m *mockHousekeepingStore) ExpireStaleIntentsForTenant(_ context.Context, t
 	return c, nil
 }
 
-func (m *mockHousekeepingStore) FindTenantsWithCompletedIntents(_ context.Context, _ time.Time, _ int) ([]string, error) {
-	if m.failDiscover {
-		return nil, errors.New("discovery failure")
-	}
-	var tenants []string
-	for t := range m.purgedLedger {
-		tenants = append(tenants, t)
-	}
-	return tenants, nil
-}
-
-func (m *mockHousekeepingStore) PurgeCompletedLedgerRecordsForTenant(_ context.Context, tenantID string, _ time.Time) (int64, error) {
-	if m.failMutate {
-		return 0, errors.New("mutation failure")
-	}
-	c := m.purgedLedger[tenantID]
-	m.purgedLedger[tenantID] = 0
-	return c, nil
-}
-
 func TestHousekeepingWorker_FullLifecyclePass(t *testing.T) {
 	store := newMockHousekeepingStore()
 	store.expiredTokens["tenant-alpha"] = 15
 	store.purgedTokens["tenant-alpha"] = 8
 	store.staleIntents["tenant-beta"] = 4
-	store.purgedLedger["tenant-gamma"] = 25
 
 	opts := housekeeping.Options{
 		Interval:             10 * time.Millisecond,
 		BatchSize:            100,
 		TokenRetention:       30 * 24 * time.Hour,
-		LedgerRetention:      90 * 24 * time.Hour,
 		StaleIntentThreshold: 24 * time.Hour,
 	}
 
@@ -139,9 +115,6 @@ func TestHousekeepingWorker_FullLifecyclePass(t *testing.T) {
 	}
 	if stats.StaleIntents != 4 {
 		t.Errorf("expected 4 stale intents, got %d", stats.StaleIntents)
-	}
-	if stats.PurgedLedgerRows != 25 {
-		t.Errorf("expected 25 purged ledger rows, got %d", stats.PurgedLedgerRows)
 	}
 }
 

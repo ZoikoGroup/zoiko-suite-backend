@@ -324,3 +324,76 @@ func TestPgStore_Outbox_SupersedeDestination_EnqueuesSupersededEvent(t *testing.
 		t.Fatalf("legacy event_type missing or wrong in payload: %s", payload)
 	}
 }
+
+// TestPgStore_Outbox_NeverCarriesFullAccountIdentifier is the real proof of
+// a property previously (and more weakly) tested at the handler layer in
+// internal/handler/event_payload_test.go, which asserted it against the
+// stub publisher's in-memory params — a test that could never catch a leak
+// introduced at the store layer, since publishing has moved there. This is
+// that same proof, against the actual bytes written to eventing_outbox:
+// every lifecycle event uses domain.NewDestinationEventPayload's safe
+// projection, never the raw *domain.PayeeDestination (which carries the
+// full, unmasked AccountIdentifier) — across every one of the 5
+// event-producing paths, not just propose.
+func TestPgStore_Outbox_NeverCarriesFullAccountIdentifier(t *testing.T) {
+	f := newFixture(t)
+	ctx := middleware.WithTenant(context.Background(), f.tenant)
+	const fullAccount = "GB29SECRET1234567890"
+	const institutionName = "Confidential Bank Of Testing"
+
+	d, err := f.s.ProposeDestination(ctx, f.tenant, domain.ProposeDestinationRequest{
+		LegalEntityID: f.entity, PartyRef: "party-" + uuid.New().String(), FinancialInstitution: institutionName,
+		AccountIdentifier: fullAccount, CountryCode: "GB", Currency: "GBP",
+		PayeeName: "Secret Payee Ltd", SourceType: domain.SourceManualEntry,
+	}, "proposer-1", "corr-secret-propose")
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if _, err := f.s.VerifyDestination(ctx, d.DestinationID, domain.VerifyDestinationRequest{
+		VerificationMethod: "INDEPENDENT_CALL", VerificationEvidenceRef: "evidence-secret",
+	}, "verifier-1"); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if _, err := f.s.ApproveDestination(ctx, d.DestinationID, "approver-1", "corr-secret-approve"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	active, err := f.s.ActivateDestination(ctx, d.DestinationID, "activator-1", "corr-secret-activate")
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	if _, err := f.s.SuspendDestination(ctx, active.DestinationID, domain.SuspendDestinationRequest{
+		Reason: "fraud review",
+	}, "suspender-1", "corr-secret-suspend"); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+
+	events := outboxEventsFor(t, ctx, f, f.tenant, d.DestinationID)
+	wantTypes := map[string]bool{
+		"com.zoikosuite.banking.payee-destination.proposed":  false,
+		"com.zoikosuite.banking.payee-destination.approved":  false,
+		"com.zoikosuite.banking.payee-destination.activated": false,
+		"com.zoikosuite.banking.payee-destination.suspended": false,
+	}
+	secrets := []string{fullAccount, institutionName}
+	for _, e := range events {
+		wantTypes[e.eventType] = true
+		raw := legacyEventTypeOf(t, ctx, f, f.tenant, d.DestinationID, e.eventType)
+		for _, s := range secrets {
+			if strings.Contains(raw, s) {
+				t.Errorf("%s: outbox payload contains %q, the safe projection must never carry it: %s", e.eventType, s, raw)
+			}
+		}
+		lower := strings.ToLower(raw)
+		if strings.Contains(lower, "accountidentifier") || strings.Contains(lower, "account_identifier") {
+			t.Errorf("%s: outbox payload carries an account-identifier field at all: %s", e.eventType, raw)
+		}
+		if !strings.Contains(raw, d.DestinationID) {
+			t.Errorf("%s: projection lost its own destination_id: %s", e.eventType, raw)
+		}
+	}
+	for et, seen := range wantTypes {
+		if !seen {
+			t.Errorf("no %s event was found in the outbox", et)
+		}
+	}
+}

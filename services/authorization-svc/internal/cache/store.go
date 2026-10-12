@@ -66,11 +66,11 @@ import (
 // most are pass-throughs, and the ones that are not are grouped below.
 type Inner interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
-	SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error)
+	SetRoleActive(ctx context.Context, roleID, tenantID string, active bool, expectedVersion int64) (*domain.Role, error)
 	FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error)
 	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, bool, error)
 	ListPermissionBundles(ctx context.Context, roleID, tenantID string) ([]domain.PermissionBundle, error)
-	SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool) (*domain.PermissionBundle, error)
+	SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool, expectedVersion int64) (*domain.PermissionBundle, error)
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 	ListRoleAssignments(ctx context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error)
@@ -80,12 +80,15 @@ type Inner interface {
 	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	ProjectDelegation(ctx context.Context, params domain.ProjectDelegationParams) (*domain.DelegatedAuthority, error)
-	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error)
+	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string, version int64) (*domain.DelegatedAuthority, error)
+	FindDelegationCeilings(ctx context.Context, principalID, legalEntityID, tenantID, actionType string) ([]domain.DelegationCeiling, error)
+	FindEntityStatus(ctx context.Context, legalEntityID, tenantID string) (string, error)
+	ProjectEntityStatus(ctx context.Context, params domain.ProjectEntityStatusParams) error
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
 	ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error)
-	SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error)
+	SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool, expectedVersion int64) (*domain.SoDRule, error)
 	CreateABACRule(ctx context.Context, params domain.CreateABACRuleParams) (*domain.ABACRule, error)
-	SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool) (*domain.ABACRule, error)
+	SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool, expectedVersion int64) (*domain.ABACRule, error)
 	ListABACRules(ctx context.Context, tenantID, actionType string) ([]domain.ABACRule, error)
 	FindABACRules(ctx context.Context, actionType, tenantID string) ([]domain.ABACRule, error)
 	FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
@@ -192,6 +195,20 @@ type Store struct {
 	gen       map[string]uint64
 	globalGen map[string]uint64
 
+	// watermark is the data's own "policy_version|assignment_version"
+	// (migration 000028), refreshed by RunWatermark and part of every key.
+	// The generation counters above only see writes through THIS process;
+	// the watermark sees every write, on any replica or straight to the
+	// database, within one refresh (ZS-IAM-001 §19 "assignment version,
+	// policy version" in the key). watermarkMode is set once RunWatermark
+	// starts; from then on a watermark older than watermarkMaxAge bypasses
+	// the cache, so an unreadable watermark costs round-trips, never
+	// freshness.
+	watermarkMode   bool
+	watermark       string
+	watermarkAt     time.Time
+	watermarkMaxAge time.Duration
+
 	hits   uint64
 	misses uint64
 }
@@ -227,6 +244,7 @@ func (s *Store) key(ns, tenantID string, parts ...string) string {
 	s.mu.Lock()
 	g := s.gen[ns+"|"+tenantID]
 	gg := s.globalGen[ns]
+	wm := s.watermark
 	s.mu.Unlock()
 
 	var b strings.Builder
@@ -237,6 +255,8 @@ func (s *Store) key(ns, tenantID string, parts ...string) string {
 	b.WriteString(strconv.FormatUint(g, 10))
 	b.WriteByte('|')
 	b.WriteString(strconv.FormatUint(gg, 10))
+	b.WriteByte('|')
+	b.WriteString(wm)
 	for _, p := range parts {
 		b.WriteByte('|')
 		b.WriteString(p)
@@ -250,6 +270,10 @@ func (s *Store) load(key string) (any, bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.watermarkFreshLocked() {
+		s.misses++
+		return nil, false
+	}
 	e, ok := s.entries[key]
 	if !ok || time.Now().After(e.expiresAt) {
 		s.misses++
@@ -265,10 +289,70 @@ func (s *Store) save(key string, value any) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.watermarkFreshLocked() {
+		return
+	}
 	if len(s.entries) >= maxEntries {
 		s.sweepLocked()
 	}
 	s.entries[key] = entry{value: value, expiresAt: time.Now().Add(s.ttl)}
+}
+
+// watermarkFreshLocked reports whether cached entries may be used. Without a
+// watermark source (tests, AUTHZ_CACHE_TTL_SECONDS with no refresher) the
+// generation counters and the TTL are the only bounds, as before. With one,
+// the cache is used only while the watermark is recent. Caller holds s.mu.
+func (s *Store) watermarkFreshLocked() bool {
+	if !s.watermarkMode {
+		return true
+	}
+	return !s.watermarkAt.IsZero() && time.Since(s.watermarkAt) <= s.watermarkMaxAge
+}
+
+// SetWatermark records a watermark read. Exported for RunWatermark and tests.
+func (s *Store) SetWatermark(policy, assignment int64, at time.Time) {
+	wm := strconv.FormatInt(policy, 10) + "." + strconv.FormatInt(assignment, 10)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.watermarkMode = true
+	if s.watermarkMaxAge <= 0 {
+		s.watermarkMaxAge = 3 * time.Second
+	}
+	s.watermark, s.watermarkAt = wm, at
+}
+
+// RunWatermark refreshes the version watermark every interval until ctx ends.
+// read is the store's VersionWatermark. A failed read is logged and leaves
+// the old watermark ageing out, after which reads bypass the cache.
+func (s *Store) RunWatermark(ctx context.Context, read func(context.Context) (int64, int64, error), every time.Duration) {
+	if every <= 0 {
+		every = time.Second
+	}
+	s.mu.Lock()
+	s.watermarkMode, s.watermarkMaxAge = true, 3*every
+	s.mu.Unlock()
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	failing := false
+	for {
+		p, a, err := read(ctx)
+		switch {
+		case err == nil:
+			s.SetWatermark(p, a, time.Now())
+			if failing {
+				s.log.Info("authorization cache watermark readable again")
+				failing = false
+			}
+		case ctx.Err() == nil && !failing:
+			s.log.Warn("authorization cache watermark unreadable — the cache is bypassed until it is", zap.Error(err))
+			failing = true
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // sweepLocked drops expired entries, and everything if that was not enough.
@@ -446,8 +530,8 @@ func (s *Store) CreateRole(ctx context.Context, params domain.CreateRoleParams) 
 	return role, created, err
 }
 
-func (s *Store) SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error) {
-	role, err := s.inner.SetRoleActive(ctx, roleID, tenantID, active)
+func (s *Store) SetRoleActive(ctx context.Context, roleID, tenantID string, active bool, expectedVersion int64) (*domain.Role, error) {
+	role, err := s.inner.SetRoleActive(ctx, roleID, tenantID, active, expectedVersion)
 	if err == nil {
 		s.invalidateGrantSources(tenantID)
 	}
@@ -478,8 +562,8 @@ func (s *Store) CreatePermissionBundle(ctx context.Context, params domain.Create
 //
 // Across every tenant, for the reason above: the bundle names a role, not a
 // tenant, and this method deliberately does not spend a query resolving one.
-func (s *Store) SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool) (*domain.PermissionBundle, error) {
-	bundle, err := s.inner.SetPermissionBundleActive(ctx, permissionBundleID, tenantID, active)
+func (s *Store) SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool, expectedVersion int64) (*domain.PermissionBundle, error) {
+	bundle, err := s.inner.SetPermissionBundleActive(ctx, permissionBundleID, tenantID, active, expectedVersion)
 	if err == nil {
 		s.invalidateGrantSources("")
 	}
@@ -545,8 +629,27 @@ func (s *Store) ProjectPrincipalStatus(ctx context.Context, params domain.Projec
 	return p, err
 }
 
-func (s *Store) RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error) {
-	d, err := s.inner.RevokeProjectedDelegation(ctx, sourceService, sourceDelegationID, tenantID)
+// FindGrantedActionsInTenant is not cached: it answers a segregation check in
+// front of a privileged command, where a stale "no conflicting duty" is the
+// wrong way to be wrong.
+func (s *Store) FindGrantedActionsInTenant(ctx context.Context, principalID, tenantID string) ([]string, error) {
+	if f, ok := s.inner.(interface {
+		FindGrantedActionsInTenant(ctx context.Context, principalID, tenantID string) ([]string, error)
+	}); ok {
+		return f.FindGrantedActionsInTenant(ctx, principalID, tenantID)
+	}
+	return nil, domain.ErrStoreUnavailable
+}
+
+// FindDelegationCeilings is not cached: a ceiling is consulted only on a
+// decision granted through a delegation that names an amount, and a stale
+// ceiling would be the wrong way to be wrong.
+func (s *Store) FindDelegationCeilings(ctx context.Context, principalID, legalEntityID, tenantID, actionType string) ([]domain.DelegationCeiling, error) {
+	return s.inner.FindDelegationCeilings(ctx, principalID, legalEntityID, tenantID, actionType)
+}
+
+func (s *Store) RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string, version int64) (*domain.DelegatedAuthority, error) {
+	d, err := s.inner.RevokeProjectedDelegation(ctx, sourceService, sourceDelegationID, tenantID, version)
 	if err == nil {
 		s.invalidate(nsDelegation, tenantID)
 	}
@@ -576,16 +679,16 @@ func (s *Store) CreateABACRule(ctx context.Context, params domain.CreateABACRule
 // Invalidates nsSoD for the same reason CreateSoDRule does: retiring a rule
 // changes what CheckSoDConflict answers, and a cached conflict would keep
 // denying an action the operator has just stopped enforcing.
-func (s *Store) SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error) {
-	rule, err := s.inner.SetSoDRuleActive(ctx, sodRuleID, tenantID, active)
+func (s *Store) SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool, expectedVersion int64) (*domain.SoDRule, error) {
+	rule, err := s.inner.SetSoDRuleActive(ctx, sodRuleID, tenantID, active, expectedVersion)
 	if err == nil {
 		s.invalidate(nsSoD, tenantID)
 	}
 	return rule, err
 }
 
-func (s *Store) SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool) (*domain.ABACRule, error) {
-	rule, err := s.inner.SetABACRuleActive(ctx, abacRuleID, tenantID, active)
+func (s *Store) SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool, expectedVersion int64) (*domain.ABACRule, error) {
+	rule, err := s.inner.SetABACRuleActive(ctx, abacRuleID, tenantID, active, expectedVersion)
 	if err == nil {
 		s.invalidate(nsABAC, tenantID)
 	}
@@ -621,6 +724,17 @@ func (s *Store) InvalidateGrantSourcesForTenant(tenantID string) {
 	s.invalidateGrantSources(tenantID)
 }
 
+// InvalidateTenant drops every cached read for a tenant — grants,
+// delegations, SoD and ABAC rules and principal status — or for every tenant
+// when tenantID is empty. The GOV-03 InvalidateAuthorizationCache command and
+// the per-replica invalidator use it: a policy-set change or an explicit
+// invalidation must leave nothing stale behind.
+func (s *Store) InvalidateTenant(tenantID string) {
+	for _, ns := range []string{nsGrants, nsDelegation, nsSoD, nsABAC, nsPrincipal} {
+		s.invalidate(ns, tenantID)
+	}
+}
+
 // invalidateGrantSources drops BOTH the grants and the delegation namespaces.
 //
 // Delegation too, always: FindDelegatedActions resolves the delegator's own
@@ -645,6 +759,190 @@ func (s *Store) FindRoleByID(ctx context.Context, roleID string) (*domain.Role, 
 
 func (s *Store) ListRoleAssignments(ctx context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error) {
 	return s.inner.ListRoleAssignments(ctx, tenantID, principalID, roleID, activeOnly)
+}
+
+// QueryRoleAssignments is a paged read for access reviews; not cached.
+func (s *Store) QueryRoleAssignments(ctx context.Context, q domain.AssignmentQuery) ([]domain.PrincipalRoleAssignment, error) {
+	if f, ok := s.inner.(interface {
+		QueryRoleAssignments(ctx context.Context, q domain.AssignmentQuery) ([]domain.PrincipalRoleAssignment, error)
+	}); ok {
+		return f.QueryRoleAssignments(ctx, q)
+	}
+	return nil, domain.ErrStoreUnavailable
+}
+
+// ScheduleRoleAssignmentEnd moves an assignment's end earlier, so cached grant
+// sources are invalidated like any revoke: a cached grant must not outlive the
+// end the store now records.
+func (s *Store) ScheduleRoleAssignmentEnd(ctx context.Context, assignmentID, tenantID string, at time.Time) (*domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		ScheduleRoleAssignmentEnd(ctx context.Context, assignmentID, tenantID string, at time.Time) (*domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	a, err := f.ScheduleRoleAssignmentEnd(ctx, assignmentID, tenantID, at)
+	if err == nil {
+		s.invalidateGrantSources(tenantID)
+	}
+	return a, err
+}
+
+// FindGrantingAssignments is the attribution read for an RBAC grant. Cached in
+// the grants namespace, so any role, bundle or assignment change drops it with
+// the grant reads it mirrors.
+func (s *Store) FindGrantingAssignments(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID, actionType string) ([]domain.GrantingAssignment, error) {
+	f, ok := s.inner.(interface {
+		FindGrantingAssignments(ctx context.Context, principalID, legalEntityID, tenantID, bookID, orgUnitID, actionType string) ([]domain.GrantingAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	k := s.key(nsGrants, tenantID, "granting", principalID, legalEntityID, bookID, orgUnitID, actionType)
+	if v, ok := s.load(k); ok {
+		return v.([]domain.GrantingAssignment), nil
+	}
+	out, err := f.FindGrantingAssignments(ctx, principalID, legalEntityID, tenantID, bookID, orgUnitID, actionType)
+	if err != nil {
+		return nil, err
+	}
+	s.save(k, out)
+	return out, nil
+}
+
+// FindDelegationSource is the attribution read for a delegated decision; not
+// cached, and forwarded explicitly because the handler finds it by assertion.
+func (s *Store) FindDelegationSource(ctx context.Context, delegatePrincipalID, legalEntityID, tenantID, bookID, orgUnitID, actionType string) (string, string, error) {
+	f, ok := s.inner.(interface {
+		FindDelegationSource(ctx context.Context, delegatePrincipalID, legalEntityID, tenantID, bookID, orgUnitID, actionType string) (string, string, error)
+	})
+	if !ok {
+		return "", "", domain.ErrStoreUnavailable
+	}
+	return f.FindDelegationSource(ctx, delegatePrincipalID, legalEntityID, tenantID, bookID, orgUnitID, actionType)
+}
+
+// DecideRoleAssignment approves or rejects a pending privileged assignment.
+// An approval starts granting, so cached grant sources are dropped.
+func (s *Store) DecideRoleAssignment(ctx context.Context, assignmentID, tenantID, decision, deciderPrincipalID string) (*domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		DecideRoleAssignment(ctx context.Context, assignmentID, tenantID, decision, deciderPrincipalID string) (*domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	a, err := f.DecideRoleAssignment(ctx, assignmentID, tenantID, decision, deciderPrincipalID)
+	if err == nil {
+		s.invalidateGrantSources(tenantID)
+	}
+	return a, err
+}
+
+// The GOV-04 exception lifecycle and its evaluation read are forwarded
+// uncached: an exception must stop applying the instant it is revoked or
+// expires, and FindActiveSoDException evaluates the time itself.
+func (s *Store) sodExceptions() (interface {
+	CreateSoDException(ctx context.Context, p domain.CreateSoDExceptionParams) (*domain.SoDException, error)
+	FindSoDException(ctx context.Context, id, tenantID string) (*domain.SoDException, error)
+	ListSoDExceptions(ctx context.Context, tenantID, principalID, status string) ([]domain.SoDException, error)
+	TransitionSoDException(ctx context.Context, id, tenantID, from, to, actor string) (*domain.SoDException, error)
+	FindActiveSoDException(ctx context.Context, principalID, tenantID, actionA, actionB string) (*domain.SoDException, error)
+}, bool) {
+	f, ok := s.inner.(interface {
+		CreateSoDException(ctx context.Context, p domain.CreateSoDExceptionParams) (*domain.SoDException, error)
+		FindSoDException(ctx context.Context, id, tenantID string) (*domain.SoDException, error)
+		ListSoDExceptions(ctx context.Context, tenantID, principalID, status string) ([]domain.SoDException, error)
+		TransitionSoDException(ctx context.Context, id, tenantID, from, to, actor string) (*domain.SoDException, error)
+		FindActiveSoDException(ctx context.Context, principalID, tenantID, actionA, actionB string) (*domain.SoDException, error)
+	})
+	return f, ok
+}
+
+func (s *Store) CreateSoDException(ctx context.Context, p domain.CreateSoDExceptionParams) (*domain.SoDException, error) {
+	f, ok := s.sodExceptions()
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.CreateSoDException(ctx, p)
+}
+
+func (s *Store) FindSoDException(ctx context.Context, id, tenantID string) (*domain.SoDException, error) {
+	f, ok := s.sodExceptions()
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.FindSoDException(ctx, id, tenantID)
+}
+
+func (s *Store) ListSoDExceptions(ctx context.Context, tenantID, principalID, status string) ([]domain.SoDException, error) {
+	f, ok := s.sodExceptions()
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.ListSoDExceptions(ctx, tenantID, principalID, status)
+}
+
+func (s *Store) TransitionSoDException(ctx context.Context, id, tenantID, from, to, actor string) (*domain.SoDException, error) {
+	f, ok := s.sodExceptions()
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.TransitionSoDException(ctx, id, tenantID, from, to, actor)
+}
+
+// FindActiveSoDException fails closed without the capability: an error, so
+// the decision is a 503 rather than a conflict silently excepted or not.
+func (s *Store) FindActiveSoDException(ctx context.Context, principalID, tenantID, actionA, actionB string) (*domain.SoDException, error) {
+	f, ok := s.sodExceptions()
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.FindActiveSoDException(ctx, principalID, tenantID, actionA, actionB)
+}
+
+// EmitEvent forwards an outbox write (GOV-03 cache invalidation command).
+func (s *Store) EmitEvent(ctx context.Context, m domain.OutboxMessage) error {
+	f, ok := s.inner.(interface {
+		EmitEvent(ctx context.Context, m domain.OutboxMessage) error
+	})
+	if !ok {
+		return domain.ErrStoreUnavailable
+	}
+	return f.EmitEvent(ctx, m)
+}
+
+// FindEntityStatus is not cached: it is one indexed read, and a dissolution
+// must take effect on the next decision, not after a TTL.
+func (s *Store) FindEntityStatus(ctx context.Context, legalEntityID, tenantID string) (string, error) {
+	return s.inner.FindEntityStatus(ctx, legalEntityID, tenantID)
+}
+
+func (s *Store) ProjectEntityStatus(ctx context.Context, params domain.ProjectEntityStatusParams) error {
+	return s.inner.ProjectEntityStatus(ctx, params)
+}
+
+// FindRoleAssignmentByID and FindPermissionBundleByID are the pre-reads behind
+// the handler's platform-scope and own-role checks. Admin reads, uncached, and
+// forwarded explicitly: the handler finds them by type assertion on THIS type,
+// so without these the checks would see no capability and answer 503.
+func (s *Store) FindRoleAssignmentByID(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error) {
+	f, ok := s.inner.(interface {
+		FindRoleAssignmentByID(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.FindRoleAssignmentByID(ctx, assignmentID, tenantID)
+}
+
+func (s *Store) FindPermissionBundleByID(ctx context.Context, permissionBundleID, tenantID string) (*domain.PermissionBundle, error) {
+	f, ok := s.inner.(interface {
+		FindPermissionBundleByID(ctx context.Context, permissionBundleID, tenantID string) (*domain.PermissionBundle, error)
+	})
+	if !ok {
+		return nil, domain.ErrStoreUnavailable
+	}
+	return f.FindPermissionBundleByID(ctx, permissionBundleID, tenantID)
 }
 
 func (s *Store) FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error) {

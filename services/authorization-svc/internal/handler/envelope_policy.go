@@ -29,9 +29,18 @@ var evaluatePaths = map[string]bool{
 	// principal in scope for", "is this authority borrowed" — and none of them
 	// writes anything at all, not even the decision artifact /v1/authorize
 	// writes. See internal/handler/validation.go.
-	EntityScopeValidatePath:     true,
-	SoDValidatePath:             true,
+	EntityScopeValidatePath: true,
+	SoDValidatePath:         true,
+	// The maker-checker question (5 Oct 2026). Answers; writes nothing.
+	SoDEvaluatePath:             true,
 	DelegatedAccessEvaluatePath: true,
+
+	// The canonical decision API (ZS-IAM-001 §21) is /v1/authorize in the
+	// §8.1 shape: a question, recorded as evidence every time it is asked.
+	// Classified as a write it was refused for want of an Idempotency-Key and,
+	// with the idempotency middleware, a repeated question would have been
+	// answered from the first one's record instead of being evaluated.
+	CanonicalDecisionsPath: true,
 }
 
 // EnvelopePolicy is this service's §4 policy: the generated ServicePolicy plus

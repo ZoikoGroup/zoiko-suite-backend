@@ -185,6 +185,9 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// com.zoikosuite.banking.payee-destination.proposed is enqueued inside
+	// ProposeDestination's own transaction (the transactional outbox), not
+	// published here after the fact — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, req.LegalEntityID, created)
 	writeJSON(w, http.StatusCreated, created)
 }
@@ -342,6 +345,8 @@ func (h *Handler) ApprovePayeeDestination(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+	// com.zoikosuite.banking.payee-destination.approved is enqueued inside
+	// ApproveDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -375,6 +380,8 @@ func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+	// com.zoikosuite.banking.payee-destination.activated is enqueued inside
+	// ActivateDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -412,6 +419,8 @@ func (h *Handler) SuspendDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+	// com.zoikosuite.banking.payee-destination.suspended is enqueued inside
+	// SuspendDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -449,6 +458,8 @@ func (h *Handler) SupersedeDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+	// com.zoikosuite.banking.payee-destination.superseded is enqueued inside
+	// SupersedeDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
