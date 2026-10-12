@@ -8,6 +8,8 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -102,6 +104,9 @@ type Store interface {
 	// ancestors at a point in time — one winning rule per (domain, code).
 	FindRulePack(ctx context.Context, jurisdictionID, ruleDomain string, at time.Time) (*domain.RulePack, error)
 
+	// ResolveRulePack is FindRulePack on two time axes with required codes.
+	ResolveRulePack(ctx context.Context, q domain.RulePackQuery) (*domain.RulePack, error)
+
 	// CreateJurisdiction inserts a new jurisdiction idempotently.
 	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
 
@@ -162,6 +167,19 @@ type TransitionParams struct {
 	EffectiveTo *time.Time
 
 	ActorID string
+
+	// RequireIndependentActor refuses the transition when ActorID created the
+	// rule (maker-checker; set for activation).
+	RequireIndependentActor bool
+
+	// ApprovalReference is the approval evidence the transition rests on. It
+	// is written to the change_reason of the status-history row the
+	// transition opens, so the basis of an activation can be read back.
+	ApprovalReference string
+
+	// ExpectedRowVersion, when set (If-Match), refuses the transition unless
+	// the rule still has that row_version: ErrPreconditionFailed.
+	ExpectedRowVersion *int64
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -291,6 +309,7 @@ var jurisdictionColumnNames = []string{
 	"schema_version",
 	"updated_at",
 	"updated_by_principal_id",
+	"row_version",
 }
 
 var (
@@ -315,6 +334,7 @@ func jurisdictionScanTargets(j *domain.Jurisdiction) []any {
 		&j.SchemaVersion,
 		&j.UpdatedAt,
 		&j.UpdatedByPrincipalID,
+		&j.RowVersion,
 	}
 }
 
@@ -342,6 +362,7 @@ var ruleColumnNames = []string{
 	"schema_version",
 	"updated_at",
 	"updated_by_principal_id",
+	"row_version",
 }
 
 var (
@@ -372,6 +393,7 @@ func ruleScanTargets(r *domain.JurisdictionRule) []any {
 		&r.SchemaVersion,
 		&r.UpdatedAt,
 		&r.UpdatedByPrincipalID,
+		&r.RowVersion,
 	}
 }
 
@@ -897,6 +919,69 @@ func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*dom
 // CONFLICTED: equal precedence_level with overlapping periods.
 // INSUFFICIENT: no rule found in entire ancestor chain for a given domain/code.
 func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain string, at time.Time) (*domain.RulePack, error) {
+	return s.ResolveRulePack(ctx, domain.RulePackQuery{JurisdictionID: jurisdictionID, RuleDomain: ruleDomain, At: at})
+}
+
+// singleAxisRulePredicate is FindRulePack's original filter: the status KNOWN
+// to the platform at `at` ($4) decides, the effective window is the stored one.
+//
+// Status is bitemporal: a rule is in a historical pack when the status known
+// at the queried point-in-time was live, not when its CURRENT status is live.
+// The latter would drop a since-RETIRED rule from every earlier pack and make
+// a since-activated rule answer for dates on which it was still DRAFT. Where
+// the history does not cover the point-in-time -- rules created before 000007,
+// or a query before the rule was created -- the stored status governs.
+const singleAxisRulePredicate = `
+	  AND  (
+	      ( NOT EXISTS (
+	            SELECT 1 FROM rule_status_history h
+	            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+	              AND  h.known_from <= $4
+	              AND  (h.known_to IS NULL OR h.known_to > $4)
+	        )
+	        AND  r.rule_status NOT IN ('DRAFT', 'RETIRED') )
+	      OR EXISTS (
+	            SELECT 1 FROM rule_status_history h
+	            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+	              AND  h.known_from <= $4
+	              AND  (h.known_to IS NULL OR h.known_to > $4)
+	              AND  h.rule_status NOT IN ('DRAFT', 'RETIRED')
+	        )
+	  )
+	  AND  r.effective_from <= $4
+	  AND  (r.effective_to IS NULL OR r.effective_to > $4)`
+
+// bitemporalRulePredicate answers "what did the platform know at known_at
+// ($5) about valid time at ($4)". Status AND effective window come from the
+// history row in force at known_at: a later end-dating (supersede, retire) or
+// activation is not visible, and a rule recorded after known_at does not
+// exist. A rule with no history at all (created before 000007) falls back to
+// its stored row, but only if it was created by known_at.
+const bitemporalRulePredicate = `
+	  AND  (
+	      EXISTS (
+	            SELECT 1 FROM rule_status_history h
+	            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+	              AND  h.known_from <= $5
+	              AND  (h.known_to IS NULL OR h.known_to > $5)
+	              AND  h.rule_status NOT IN ('DRAFT', 'RETIRED')
+	              AND  h.effective_from <= $4
+	              AND  (h.effective_to IS NULL OR h.effective_to > $4)
+	        )
+	      OR ( NOT EXISTS (
+	            SELECT 1 FROM rule_status_history h
+	            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+	        )
+	        AND  r.created_at <= $5
+	        AND  r.rule_status NOT IN ('DRAFT', 'RETIRED')
+	        AND  r.effective_from <= $4
+	        AND  (r.effective_to IS NULL OR r.effective_to > $4) )
+	  )`
+
+// ResolveRulePack is FindRulePack with a knowledge-time axis and the caller's
+// required rule codes; see domain.RulePackQuery.
+func (s *PgStore) ResolveRulePack(ctx context.Context, rq domain.RulePackQuery) (*domain.RulePack, error) {
+	jurisdictionID, ruleDomain, at := rq.JurisdictionID, rq.RuleDomain, rq.At
 	chain, err := s.findChain(ctx, jurisdictionID)
 	if err != nil {
 		return nil, err
@@ -926,6 +1011,13 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 		resolvedFrom = append(resolvedFrom, j.JurisdictionID)
 	}
 
+	predicate := singleAxisRulePredicate
+	args := []any{jurisdictionID, maxAncestorDepth, ruleDomain, at}
+	if rq.KnownAt != nil {
+		predicate = bitemporalRulePredicate
+		args = append(args, *rq.KnownAt)
+	}
+
 	// First, get all matching rules with their precedence and depth
 	query := fmt.Sprintf(`
 		WITH RECURSIVE chain AS (
@@ -946,38 +1038,14 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 		JOIN   chain c ON c.jurisdiction_id = r.jurisdiction_id
 		JOIN   jurisdictions jj ON jj.jurisdiction_id = c.jurisdiction_id
 		WHERE  ($3 = '' OR r.rule_domain = $3)
-		  -- Status is bitemporal: a rule is in a historical pack when the status
-		  -- KNOWN to the platform at the queried point-in-time was live, not when
-		  -- its CURRENT status is live. The latter would drop a since-RETIRED
-		  -- rule from every earlier pack and make a since-activated rule answer
-		  -- for dates on which it was still DRAFT. Where the history does not
-		  -- cover the point-in-time -- rules created before 000007, or a query
-		  -- before the rule was created -- the stored status governs.
-		  AND  (
-		      ( NOT EXISTS (
-		            SELECT 1 FROM rule_status_history h
-		            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
-		              AND  h.known_from <= $4
-		              AND  (h.known_to IS NULL OR h.known_to > $4)
-		        )
-		        AND  r.rule_status NOT IN ('DRAFT', 'RETIRED') )
-		      OR EXISTS (
-		            SELECT 1 FROM rule_status_history h
-		            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
-		              AND  h.known_from <= $4
-		              AND  (h.known_to IS NULL OR h.known_to > $4)
-		              AND  h.rule_status NOT IN ('DRAFT', 'RETIRED')
-		        )
-		  )
-		  AND  r.effective_from <= $4
-		  AND  (r.effective_to IS NULL OR r.effective_to > $4)
+		  %s
 		  AND  (jj.effective_from IS NULL OR jj.effective_from <= $4)
 		  AND  (jj.effective_to IS NULL OR jj.effective_to > $4)
 		ORDER BY r.rule_domain ASC, r.rule_code ASC, r.precedence_level ASC, c.depth ASC, r.effective_from DESC`,
-		ruleColumnsR,
+		ruleColumnsR, predicate,
 	)
 
-	rows, err := s.pool.Query(ctx, query, jurisdictionID, maxAncestorDepth, ruleDomain, at)
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		s.log.Error("pg FindRulePack failed",
 			zap.String("jurisdiction_id", jurisdictionID),
@@ -1064,14 +1132,82 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 		}
 	}
 
-	// Check for INSUFFICIENT: we could query all possible domain/code combinations
-	// but for now just return empty if no rules matched
-	if len(pack.Rules) == 0 && len(pack.Conflicts) == 0 {
-		// Could query a rules registry for expected combinations
-		// For now, leave Insufficient empty
+	// Map iteration order is random; a pack is evidence and must be stable.
+	sort.Slice(pack.Rules, func(i, j int) bool {
+		if pack.Rules[i].RuleDomain != pack.Rules[j].RuleDomain {
+			return pack.Rules[i].RuleDomain < pack.Rules[j].RuleDomain
+		}
+		return pack.Rules[i].RuleCode < pack.Rules[j].RuleCode
+	})
+
+	// INSUFFICIENT: a code the caller requires resolved to nothing. A code
+	// in conflict did resolve to something, so it is CONFLICTED, not missing.
+	present := make(map[string]bool, len(pack.Rules)+len(pack.Conflicts))
+	for _, r := range pack.Rules {
+		present[r.RuleCode] = true
+	}
+	for _, c := range pack.Conflicts {
+		present[c.RuleCode] = true
+	}
+	for _, code := range rq.RequiredCodes {
+		if !present[code] {
+			pack.Insufficient = append(pack.Insufficient, code)
+		}
 	}
 
+	if rq.KnownAt != nil {
+		known := rq.KnownAt.UTC()
+		pack.KnownAt = &known
+	}
+	switch {
+	case len(pack.Conflicts) > 0:
+		pack.Outcome = domain.RulePackConflicted
+	case len(pack.Insufficient) > 0, len(pack.Rules) == 0:
+		pack.Outcome = domain.RulePackInsufficient
+	default:
+		pack.Outcome = domain.RulePackResolved
+	}
+	pack.PackDigest = rulePackDigest(pack)
 	return pack, nil
+}
+
+// rulePackDigest canonicalises the pack's identity and hashes it. Rules are
+// already sorted; conflict ids keep their resolution order.
+func rulePackDigest(p *domain.RulePack) string {
+	type ruleRef struct {
+		ID         string `json:"id"`
+		RowVersion int64  `json:"row_version"`
+	}
+	refs := make([]ruleRef, 0, len(p.Rules))
+	for _, r := range p.Rules {
+		refs = append(refs, ruleRef{r.JurisdictionRuleID, r.RowVersion})
+	}
+	canon, _ := json.Marshal(struct {
+		JurisdictionID string                `json:"jurisdiction_id"`
+		EffectiveAt    string                `json:"effective_at"`
+		KnownAt        string                `json:"known_at,omitempty"`
+		ResolvedFrom   []string              `json:"resolved_from"`
+		Outcome        string                `json:"outcome"`
+		Rules          []ruleRef             `json:"rules"`
+		Conflicts      []domain.RuleConflict `json:"conflicts"`
+		Insufficient   []string              `json:"insufficient"`
+	}{
+		JurisdictionID: p.JurisdictionID,
+		EffectiveAt:    p.EffectiveAt.UTC().Format(time.RFC3339Nano),
+		KnownAt: func() string {
+			if p.KnownAt == nil {
+				return ""
+			}
+			return p.KnownAt.UTC().Format(time.RFC3339Nano)
+		}(),
+		ResolvedFrom: p.ResolvedFrom,
+		Outcome:      p.Outcome,
+		Rules:        refs,
+		Conflicts:    p.Conflicts,
+		Insufficient: p.Insufficient,
+	})
+	sum := sha256.Sum256(canon)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // periodsOverlap checks if two half-open intervals [from1, to1) and [from2, to2)
@@ -1118,6 +1254,35 @@ func (s *PgStore) CreateRuleWithQuerier(ctx context.Context, q Querier, params d
 	if _, err := s.FindByID(ctx, params.JurisdictionID); err != nil {
 		return nil, false, err
 	}
+
+	// rule_version follows the version chain: 1 for a new rule, the
+	// superseded version + 1 for a successor. It is never the caller's to
+	// choose; a caller that states one must state the right one. (The create
+	// path used to insert params.RuleVersion as given — 0, since nothing set
+	// it.)
+	version := 1
+	if params.SupersedesRuleID != nil {
+		var predJur, predDomain, predCode string
+		var predVersion int
+		err := q.QueryRow(ctx, `
+			SELECT jurisdiction_id::text, rule_domain, rule_code, rule_version
+			FROM jurisdiction_rules WHERE jurisdiction_rule_id::text = $1`, *params.SupersedesRuleID).
+			Scan(&predJur, &predDomain, &predCode, &predVersion)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, domain.ErrInvalidSupersedes
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if predJur != params.JurisdictionID || predDomain != params.RuleDomain || predCode != params.RuleCode {
+			return nil, false, domain.ErrInvalidSupersedes
+		}
+		version = max(predVersion, 1) + 1
+	}
+	if params.RuleVersion != 0 && params.RuleVersion != version {
+		return nil, false, domain.ErrRuleVersionMismatch
+	}
+	params.RuleVersion = version
 
 	// Two live rules with the same code and overlapping periods make "the
 	// effective rule at date X" ambiguous. DRAFT rules are exempt so a
@@ -1166,6 +1331,9 @@ func (s *PgStore) CreateRuleWithQuerier(ctx context.Context, q Querier, params d
 	if isStringDataRightTruncation(err) {
 		return nil, false, domain.ErrInputTooLong
 	}
+	if isUniqueViolation(err, "uq_jurisdiction_rules_single_successor") {
+		return nil, false, domain.ErrSupersedesTaken
+	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		s.log.Error("pg CreateRule failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -1186,7 +1354,10 @@ func (s *PgStore) CreateRuleWithQuerier(ctx context.Context, q Querier, params d
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	if !jsonEquivalent(r.RulePayload, params.RulePayload) || r.RuleName != params.RuleName {
+	// A replay must be the same rule: precedence and version-chain position
+	// are part of what a rule says, not incidental attributes.
+	if !jsonEquivalent(r.RulePayload, params.RulePayload) || r.RuleName != params.RuleName ||
+		r.PrecedenceLevel != params.PrecedenceLevel || !equalStrPtr(r.SupersedesRuleID, params.SupersedesRuleID) {
 		s.log.Warn("rule dedup match but payload/name mismatch (409 conflict)",
 			zap.String("existing_id", r.JurisdictionRuleID),
 			zap.String("req_id", params.JurisdictionRuleID),
@@ -1225,6 +1396,16 @@ func (s *PgStore) TransitionRuleStatusWithQuerier(ctx context.Context, q Querier
 		return current, false, nil
 	}
 
+	// created_by never changes after insert, so this read outside the
+	// transaction cannot race the UPDATE below.
+	if params.ExpectedRowVersion != nil && current.RowVersion != *params.ExpectedRowVersion {
+		return nil, false, domain.ErrPreconditionFailed
+	}
+
+	if params.RequireIndependentActor && current.CreatedByPrincipalID == params.ActorID {
+		return nil, false, domain.ErrSelfApproval
+	}
+
 	// Activating a rule whose period overlaps another live rule with the same
 	// code would create the ambiguity CreateRule deliberately let through for
 	// DRAFT records. This is where that debt comes due.
@@ -1258,11 +1439,21 @@ func (s *PgStore) TransitionRuleStatusWithQuerier(ctx context.Context, q Querier
 		    updated_at              = NOW(),
 		    updated_by_principal_id = $2
 		WHERE jurisdiction_rule_id = $3 AND rule_status = ANY($4::text[])
+		  AND ($6::bigint IS NULL OR row_version = $6)
 		RETURNING ` + ruleColumns + `;`
 
-	r, err := scanJurisdictionRule(q.QueryRow(ctx, query, params.NewStatus, params.ActorID, params.RuleID, params.AllowedPriors, endDate))
+	r, err := scanJurisdictionRule(q.QueryRow(ctx, query, params.NewStatus, params.ActorID, params.RuleID, params.AllowedPriors, endDate, params.ExpectedRowVersion))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// Lost a race since the pre-read: if the row moved past the
+			// version the caller asserted, that is the answer, not the state
+			// machine.
+			if params.ExpectedRowVersion != nil {
+				var now int64
+				if qerr := q.QueryRow(ctx, `SELECT row_version FROM jurisdiction_rules WHERE jurisdiction_rule_id = $1`, params.RuleID).Scan(&now); qerr == nil && now != *params.ExpectedRowVersion {
+					return nil, false, domain.ErrPreconditionFailed
+				}
+			}
 			return nil, false, domain.ErrInvalidTransition
 		}
 		if isExclusionViolation(err) {
@@ -1270,6 +1461,18 @@ func (s *PgStore) TransitionRuleStatusWithQuerier(ctx context.Context, q Querier
 		}
 		s.log.Error("pg TransitionRuleStatus failed", zap.String("id", params.RuleID), zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	// The UPDATE above fired trg_record_rule_status_change, which opened the
+	// history row for the new status with change_reason NULL.
+	if params.ApprovalReference != "" {
+		if _, err := q.Exec(ctx, `
+			UPDATE rule_status_history SET change_reason = $1
+			WHERE jurisdiction_rule_id = $2 AND known_to IS NULL`,
+			params.ApprovalReference, params.RuleID); err != nil {
+			s.log.Error("pg TransitionRuleStatus: approval reference write failed", zap.String("id", params.RuleID), zap.Error(err))
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 	}
 	return r, true, nil
 }
@@ -1329,6 +1532,11 @@ func (s *PgStore) RecordDriftWithQuerier(ctx context.Context, q Querier, params 
 			}
 		}
 		return current, nil, false, nil
+	}
+
+	// The row is locked FOR UPDATE, so this check cannot race the UPDATE.
+	if params.ExpectedRowVersion != nil && current.RowVersion != *params.ExpectedRowVersion {
+		return nil, nil, false, domain.ErrPreconditionFailed
 	}
 
 	updateQuery := `
@@ -1578,10 +1786,14 @@ func (s *PgStore) GetPendingOutboxEvents(ctx context.Context, limit int) ([]Outb
 		SELECT outbox_id, event_type, event_payload, topic, partition_key, created_at, publish_attempts
 		FROM event_outbox
 		WHERE published_at IS NULL
+		  -- A message the broker keeps refusing (e.g. too large) is parked after
+		  -- MaxOutboxAttempts instead of blocking every event behind it; it stays
+		  -- in the table (published_at NULL) for an operator to inspect.
+		  AND publish_attempts < $2
 		ORDER BY created_at ASC
 		LIMIT $1;`
 
-	rows, err := s.pool.Query(ctx, query, limit)
+	rows, err := s.pool.Query(ctx, query, limit, MaxOutboxAttempts)
 	if err != nil {
 		s.log.Error("pg GetPendingOutboxEvents failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -1630,3 +1842,20 @@ func (s *PgStore) MarkOutboxEventFailed(ctx context.Context, outboxID, errMsg st
 	}
 	return nil
 }
+
+// isUniqueViolation reports whether err is SQLSTATE 23505 on the named constraint.
+func isUniqueViolation(err error, constraint string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == constraint
+}
+
+func equalStrPtr(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// MaxOutboxAttempts is how many failed publishes an outbox event gets before
+// the worker parks it.
+const MaxOutboxAttempts = 10

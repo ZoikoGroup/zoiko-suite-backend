@@ -85,6 +85,12 @@ type Metrics struct {
 	// what is committed and what has reached the broker. Source for an
 	// alert on a stalled OutboxWorker.
 	OutboxPendingEvents prometheus.Gauge
+	// OutboxParkedTotal counts events the worker gave up on after
+	// store.MaxOutboxAttempts failed publishes. Any increase needs a person.
+	OutboxParkedTotal *prometheus.CounterVec
+	// EntityEventsTotal counts consumed tenant-entity-registry events by
+	// result: applied, duplicate, skipped (unappliable) or retry (store down).
+	EntityEventsTotal *prometheus.CounterVec
 }
 
 // NewMetrics constructs and registers this service's Prometheus
@@ -119,7 +125,17 @@ func NewMetrics(serviceName string) *Metrics {
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
 	}
-	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp, m.OutboxPublishFailuresTotal, m.OutboxPendingEvents)
+	m.OutboxParkedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        "outbox_parked_events_total",
+		Help:        "Outbox events parked after repeated publish failures.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{"event_type"})
+	m.EntityEventsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name:        "entity_events_consumed_total",
+		Help:        "Consumed entity events by result.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{"event_type", "result"})
+	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp, m.OutboxPublishFailuresTotal, m.OutboxPendingEvents, m.OutboxParkedTotal, m.EntityEventsTotal)
 	return m
 }
 

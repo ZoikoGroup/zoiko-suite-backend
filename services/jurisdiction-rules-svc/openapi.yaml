@@ -36,6 +36,25 @@ info:
     from the Authorization Service. Both a denial and an unreachable Authorization
     Service block the mutation.
 
+    **Authorization decision cache.** Decisions from the Authorization Service are cached
+    in-process for 5 seconds per (principal, scope, action, target), grants and denials
+    alike. A revoked grant can therefore still authorize a write for up to 5 seconds on
+    a replica that cached it; a new grant can be refused for the same window. An
+    unreachable Authorization Service is never cached.
+
+    **Optimistic concurrency.** Every rule carries a `row_version` that increases on any
+    change, returned as the `ETag` of `GET /v1/rules/{id}` and of the transition and drift
+    responses. Send it back as `If-Match` on transition or drift to apply the change only
+    to the version you read: `412 precondition_failed` if the rule has moved on.
+    `If-Match` is optional; `*` means any version. A retried transition into the status
+    the rule already holds is still a 200 no-op, whatever `If-Match` says.
+
+    **Immutable versions.** Once a rule leaves DRAFT its content — payload, name, code,
+    domain, jurisdiction, `effective_from`, `precedence_level`, `rule_version`,
+    `supersedes_rule_id` — cannot change (enforced in the database). A correction is a
+    new rule with `supersedes_rule_id` naming the old one; its `rule_version` is the
+    superseded version + 1, and a rule has at most one successor.
+
     **Fail-closed status codes.** `503` means "cannot answer", never "no". A caller
     that treats `503` as `404` breaks the validation contract.
 
@@ -186,9 +205,14 @@ paths:
         §8.2, in one call.
 
         Walks the jurisdiction and its whole ancestor chain and returns exactly one
-        winning rule per (`rule_domain`, `rule_code`): the nearest jurisdiction wins,
-        ties broken by the later `effective_from`. DRAFT and RETIRED rules never enter
-        a pack.
+        winning rule per (`rule_domain`, `rule_code`): the lowest explicit
+        `precedence_level` wins, then the nearest jurisdiction, then the later
+        `effective_from`. Equal precedence at the same depth is a conflict, never a
+        silent pick. DRAFT and RETIRED rules never enter a pack.
+
+        `outcome` is the verdict: `RESOLVED`, `CONFLICTED` (see `conflicts`; do not
+        execute against those codes without human resolution) or `INSUFFICIENT` (a
+        `required_codes` entry resolved to nothing, or nothing resolved at all).
 
         `resolved_from` names the jurisdictions the pack was assembled from, self first,
         so the caller can record the rule basis of a governed action — §8.2's evidence
@@ -204,6 +228,25 @@ paths:
           description: Restrict the pack to one rule_domain.
           schema: { type: string }
         - $ref: '#/components/parameters/EffectiveAt'
+        - name: known_at
+          in: query
+          required: false
+          description: |
+            Knowledge time (V-001 §8.1): replay what the platform had recorded at this
+            instant about `effective_at`. Status and effective window come from the
+            status history in force at `known_at`, so a later activation, supersede or
+            retirement is not visible, and a rule recorded after `known_at` does not
+            exist. Omitted, the status known at `effective_at` decides (the original
+            behaviour). Jurisdiction effective windows are not versioned and are read
+            as currently stored. `400 invalid_known_at` if not RFC 3339.
+          schema: { type: string, format: date-time }
+        - name: required_codes
+          in: query
+          required: false
+          description: |
+            Comma-separated rule codes the caller needs. Any that resolve to no rule
+            are listed in `insufficient` and make the outcome `INSUFFICIENT`.
+          schema: { type: string }
         - $ref: '#/components/parameters/CorrelationID'
       responses:
         "200":
@@ -213,6 +256,56 @@ paths:
               schema: { $ref: '#/components/schemas/RulePack' }
         "400": { $ref: '#/components/responses/BadRequest' }
         "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/entities/{legal_entity_id}/jurisdictions:
+    get:
+      tags: [Rules]
+      summary: Resolve the jurisdictions that apply to a legal entity
+      description: |
+        The "resolve jurisdiction set" capability of §8.2 from the entity's side:
+        the jurisdictions applying to a legal entity at `effective_at`. Projected from
+        tenant-entity-registry-svc's `entity.created` (the entity's primary
+        jurisdiction, `applicability_type: ENTITY_PRIMARY`) and
+        `entity.jurisdiction.changed` (assignments, typed PRIMARY / SECONDARY /
+        TAX_ONLY / FILING_ONLY) on `zoiko.entity.events`. The registry remains the
+        system of record; this is the projection §8.2 says this service owns. Resolve
+        each `jurisdiction_id` with `/v1/jurisdictions/{id}/rule-pack`.
+
+        Tenant data, unlike the reference reads: `X-Tenant-Id` is required and scopes
+        every row. An entity of another tenant answers an empty list, exactly like an
+        unknown one. The projection lags the registry by broker latency and covers
+        only events still within the topic's retention when the consumer group first
+        started.
+      operationId: getEntityJurisdictions
+      parameters:
+        - name: legal_entity_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/TenantID'
+        - $ref: '#/components/parameters/EffectiveAt'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The jurisdictions in force for the entity at `effective_at` (possibly none).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [legal_entity_id, effective_at, jurisdictions]
+                properties:
+                  legal_entity_id: { type: string }
+                  effective_at: { type: string, format: date-time }
+                  jurisdictions:
+                    type: array
+                    items: { $ref: '#/components/schemas/EntityJurisdictionApplicability' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401":
+          description: "`missing_tenant` — no X-Tenant-Id."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
         "503": { $ref: '#/components/responses/StoreUnavailable' }
 
   /v1/rules/{jurisdiction_rule_id}:
@@ -343,8 +436,9 @@ paths:
         "409":
           description: |
             `conflict` — the dedup key matches an existing jurisdiction with different
-            attributes. `cyclic_hierarchy` — the parent assignment would make the
-            jurisdiction its own ancestor.
+            attributes. (`cyclic_hierarchy` is reserved for a future re-parent
+            operation: the id is server-generated and a new jurisdiction cannot be
+            its own ancestor, so create never returns it.)
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -433,9 +527,11 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         "409":
           description: |
-            `conflict` — dedup key matches an existing rule with a different payload or
-            name. `overlapping_rule` — the effective period overlaps another live rule
-            with the same `rule_code`.
+            `conflict` — dedup key matches an existing rule with a different payload,
+            name, precedence or predecessor. `overlapping_rule` — the effective period overlaps another live rule
+            with the same `rule_code`. `supersedes_taken` — the superseded rule already
+            has a successor. `rule_version_mismatch` — a supplied `rule_version` is not
+            the one the chain implies.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -457,6 +553,12 @@ paths:
         `effective_to` to say when it stopped applying; omitted, it closes at the
         current time. Without this a superseded rule keeps matching every
         point-in-time query alongside its own replacement.
+
+        Activation is maker-checker (ZS-JUR-001 §3, V-001 §18.1): DRAFT→ACTIVE needs
+        the `X-Approval-Reference` header, and the principal who created the rule
+        cannot activate it (`403 self_approval_forbidden`). The reference is recorded
+        as the `change_reason` of the status-history row the activation opens. It is
+        not yet verified against an approval record (needs workflow-svc).
       operationId: transitionRuleStatus
       security: [{ principalHeader: [] }]
       parameters:
@@ -465,6 +567,7 @@ paths:
         - $ref: '#/components/parameters/SourceChannel'
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/RuleID'
+        - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/PrincipalID'
         - $ref: '#/components/parameters/CorrelationID'
       requestBody:
@@ -482,13 +585,24 @@ paths:
               schema: { $ref: '#/components/schemas/JurisdictionRule' }
         "400": { $ref: '#/components/responses/BadRequest' }
         "401": { $ref: '#/components/responses/MissingPrincipal' }
-        "403": { $ref: '#/components/responses/Forbidden' }
+        "403":
+          description: |
+            `unauthorized` — authorization denied. `self_approval_forbidden` — the
+            rule's creator tried to activate it.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
         "404": { $ref: '#/components/responses/NotFound' }
         "409":
           description: |
             `invalid_transition` — the current status is not a legal prior state.
             `overlapping_rule` — activating this rule would overlap another live rule
             with the same `rule_code`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "412":
+          description: "`precondition_failed` — If-Match named a row_version the rule no longer has."
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -517,6 +631,7 @@ paths:
         - $ref: '#/components/parameters/SourceChannel'
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/RuleID'
+        - $ref: '#/components/parameters/IfMatch'
         - $ref: '#/components/parameters/PrincipalID'
         - $ref: '#/components/parameters/CorrelationID'
       requestBody:
@@ -534,6 +649,11 @@ paths:
         "401": { $ref: '#/components/responses/MissingPrincipal' }
         "403": { $ref: '#/components/responses/Forbidden' }
         "404": { $ref: '#/components/responses/NotFound' }
+        "412":
+          description: "`precondition_failed` — If-Match named a row_version the rule no longer has."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
         "413": { $ref: '#/components/responses/BodyTooLarge' }
         "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
 
@@ -1740,9 +1860,27 @@ components:
       required: true
       description: |
         Client-generated idempotency key for safe retries on material state changes
-        (INV-08). Mandatory on every write; outside the envelope a missing key is a
-        400 `envelope_incomplete`, a conflict on replay is a 409.
+        (INV-08). Mandatory on every write; a missing key is a 400
+        `envelope_incomplete`.
+
+        On `/v1/admin/*` writes a key is scoped to the principal and the exact method
+        and path, and held for 24 hours. A retry with the same key and the same
+        request (body, query, `X-Approval-Reference`) gets the first response back
+        with `Idempotent-Replayed: true`, without running again. The same key with a
+        different request is `409 idempotency_key_reused`; while the first request is
+        still running, `409 request_in_progress`. A 5xx response is not kept, so the
+        same key may be retried.
       schema: { type: string, maxLength: 128 }
+
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: |
+        The rule's ETag (its row_version, e.g. `"3"`) as last read. The change applies only
+        to that version; otherwise `412 precondition_failed`. Omitted or `*`: any version.
+        Malformed: `400 invalid_if_match`.
+      schema: { type: string }
 
     EffectiveAt:
       name: effective_at
@@ -1954,6 +2092,9 @@ components:
         schema_version: { type: string }
         updated_at: { type: [string, "null"], format: date-time }
         updated_by_principal_id: { type: [string, "null"] }
+        row_version:
+          type: integer
+          description: Increases on every change; the ETag and the If-Match value, and the events' aggregate_version.
 
     JurisdictionRule:
       type: object
@@ -2029,14 +2170,55 @@ components:
         schema_version: { type: string }
         updated_at: { type: [string, "null"], format: date-time }
         updated_by_principal_id: { type: [string, "null"] }
+        row_version:
+          type: integer
+          description: Increases on every change; the ETag and the If-Match value, and the events' aggregate_version.
+
+    EntityJurisdictionApplicability:
+      type: object
+      description: One jurisdiction applying to a legal entity over a period (projection of tenant-entity-registry-svc events).
+      required: [applicability_id, tenant_id, legal_entity_id, jurisdiction_id, applicability_type, effective_from, source_object_version, source_event_type, source_event_id]
+      properties:
+        applicability_id: { type: string, description: "assignment_id, or primary:<legal_entity_id> for the entity's primary jurisdiction" }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        jurisdiction_id: { type: string, format: uuid }
+        applicability_type: { type: string, description: "ENTITY_PRIMARY, or the registry's assignment_type" }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: [string, "null"], format: date-time }
+        source_object_version: { type: integer, description: The registry object_version this row reflects. }
+        source_event_type: { type: string }
+        source_event_id: { type: string }
+        evidence_ref: { type: [string, "null"] }
+        recorded_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
 
     RulePack:
       type: object
       description: The resolved, runtime-ready rule set for a jurisdiction at a point in time.
-      required: [jurisdiction_id, effective_at, resolved_from, rules]
+      required: [jurisdiction_id, effective_at, resolved_from, rules, outcome]
       properties:
         jurisdiction_id: { type: string, format: uuid }
         effective_at: { type: string, format: date-time }
+        known_at:
+          type: string
+          format: date-time
+          description: The knowledge time the pack was replayed at; present only when requested.
+        pack_digest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: |
+            Pins this exact answer: sha256 over the jurisdiction, both time axes, the
+            chain, the outcome and every (rule id, row_version). Rule content is
+            immutable past DRAFT, so record this with a governed action as its rule
+            basis (§8.2 evidence obligation).
+        outcome:
+          type: string
+          enum: [RESOLVED, CONFLICTED, INSUFFICIENT]
+          description: |
+            V-001 §11.1/§12.2 resolution verdict. CONFLICTED when `conflicts` is
+            non-empty; otherwise INSUFFICIENT when a required code is missing or
+            the pack is empty; otherwise RESOLVED.
         resolved_from:
           type: array
           description: |
@@ -2054,10 +2236,9 @@ components:
           items: { $ref: '#/components/schemas/RuleConflict' }
         insufficient:
           type: array
-          description: (rule_domain, rule_code) pairs with no rule in the ancestor chain.
+          description: The `required_codes` entries, as supplied, that resolved to no rule in the ancestor chain.
           items:
             type: string
-            description: "Format: rule_domain|rule_code"
 
     DriftEvent:
       type: object
@@ -2131,16 +2312,27 @@ components:
             through the transition endpoint.
         rule_version:
           type: integer
-          default: 1
-          description: Immutable version number. Defaults to 1 for new rules.
+          minimum: 1
+          description: |
+            Optional. The server computes it: 1 for a new rule, the superseded rule's
+            version + 1 for a successor. If supplied it must equal that value, or
+            `409 rule_version_mismatch`.
         supersedes_rule_id:
           type: [string, "null"]
           format: uuid
-          description: The rule this rule supersedes, forming a version chain.
+          description: |
+            The earlier version of the same rule (same jurisdiction, rule_domain and
+            rule_code), forming a version chain; otherwise `400 invalid_supersedes`.
+            A rule has at most one successor (`409 supersedes_taken`).
         precedence_level:
           type: integer
           default: 0
-          description: Explicit precedence level. Lower = higher precedence.
+          minimum: 0
+          maximum: 1000
+          description: |
+            Explicit precedence in the rule pack: lower wins. Outside 0..1000 is
+            `400 invalid_precedence_level`. Equal precedence at the same depth is
+            CONFLICTED, never a silent pick.
 
     TransitionRuleStatusRequest:
       type: object
@@ -2282,7 +2474,7 @@ components:
     EventEnvelope:
       type: object
       description: The standard event envelope published by this service (Event Catalogue §19).
-      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, correlation_id, payload]
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, correlation_id, classification, payload_hash, payload]
       properties:
         event_id:
           type: string
@@ -2311,6 +2503,21 @@ components:
           type: [string, "null"]
         correlation_id:
           type: string
+        request_id:
+          type: string
+          description: X-Request-Id of the request that caused the event (causation), when there was one.
+        aggregate_version:
+          type: integer
+          description: |
+            The jurisdiction's or rule's row_version after the change. Lets a consumer
+            discard a stale or duplicate event. Absent on registry (ZS-JUR-001) events.
+        classification:
+          type: string
+          description: Data classification of the payload (PUBLIC for jurisdictions, INTERNAL for rules).
+        payload_hash:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: sha256 of the exact `payload` bytes, so a consumer can verify the payload.
         payload:
           type: object
           description: The event-specific payload.

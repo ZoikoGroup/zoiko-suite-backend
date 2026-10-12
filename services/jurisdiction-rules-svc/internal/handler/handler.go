@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
@@ -33,8 +35,9 @@ type JurisdictionStore interface {
 
 	FindRules(ctx context.Context, params store.FindRulesParams) ([]*domain.JurisdictionRule, error)
 
-	// FindRulePack resolves the runtime rule pack across the ancestor chain.
-	FindRulePack(ctx context.Context, jurisdictionID, ruleDomain string, at time.Time) (*domain.RulePack, error)
+	// ResolveRulePack resolves the runtime rule pack across the ancestor
+	// chain, on valid time and (optionally) knowledge time.
+	ResolveRulePack(ctx context.Context, q domain.RulePackQuery) (*domain.RulePack, error)
 
 	// CreateJurisdiction inserts a new jurisdiction idempotently.
 	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
@@ -90,6 +93,9 @@ type Handler struct {
 	minReviews  int
 	resolver    *resolver.Resolver
 	ops         OpsPolicy
+
+	// entities is the optional entity-jurisdiction applicability projection (see WithEntityApplicability).
+	entities EntityApplicabilityReader
 }
 
 // New constructs a Handler.
@@ -171,6 +177,15 @@ type CreateRuleRequest struct {
 	SourceReference       *string         `json:"source_reference"`
 	ExternalFeedReference *string         `json:"external_feed_reference"`
 	RuleStatus            string          `json:"rule_status"`
+
+	// The three fields openapi's CreateRuleRequest always documented and this
+	// struct refused as unknown (400). precedence_level: lower wins, 0..1000,
+	// default 0. supersedes_rule_id: the earlier version of the same rule.
+	// rule_version: optional; when given it must equal the version the chain
+	// implies (the server computes it either way).
+	PrecedenceLevel  *int    `json:"precedence_level"`
+	SupersedesRuleID *string `json:"supersedes_rule_id"`
+	RuleVersion      *int    `json:"rule_version"`
 }
 
 // TransitionRuleStatusRequest is the caller-facing request body for
@@ -221,6 +236,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/drift", h.RecordDrift)
 
 	// ZS-JUR-001 registries: mounted only when WithRegistry was called.
+	// Entity applicability: mounted only when WithEntityApplicability was called.
+	if h.entities != nil {
+		r.Get("/v1/entities/{legal_entity_id}/jurisdictions", h.GetEntityJurisdictions)
+	}
+
 	if h.registry != nil {
 		registerRegistryRoutes(r, h)
 	}
@@ -458,7 +478,32 @@ func (h *Handler) GetRulePack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pack, err := h.store.FindRulePack(r.Context(), jurisdictionID, q.Get("domain"), effectiveAt)
+	// known_at: replay what the platform knew then (bitemporal, V-001 §8.1).
+	var knownAt *time.Time
+	if v := q.Get("known_at"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_known_at", "known_at must be a valid RFC3339 timestamp")
+			return
+		}
+		knownAt = &t
+	}
+	// required_codes: the rule codes the caller needs. Any that resolve to
+	// nothing are listed in `insufficient` and the outcome is INSUFFICIENT.
+	var required []string
+	for _, c := range strings.Split(q.Get("required_codes"), ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			required = append(required, c)
+		}
+	}
+
+	pack, err := h.store.ResolveRulePack(r.Context(), domain.RulePackQuery{
+		JurisdictionID: jurisdictionID,
+		RuleDomain:     q.Get("domain"),
+		At:             effectiveAt,
+		KnownAt:        knownAt,
+		RequiredCodes:  required,
+	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
@@ -489,6 +534,7 @@ func (h *Handler) GetRule(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreError(w, err, correlationID)
 		return
 	}
+	setETag(w, rule.RowVersion)
 	writeJSON(w, http.StatusOK, rule)
 }
 
@@ -623,6 +669,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 	var j *domain.Jurisdiction
 	var created bool
 	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		ctx := events.WithBatch(r.Context())
 		var err error
 		j, created, err = h.store.CreateJurisdictionWithQuerier(r.Context(), q, domain.CreateJurisdictionParams{
 			JurisdictionCode:     req.JurisdictionCode,
@@ -639,11 +686,11 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if created {
-			if err := h.publisher.PublishJurisdictionCreated(r.Context(), *j, correlationID); err != nil {
+			if err := h.publisher.PublishJurisdictionCreated(ctx, *j, correlationID); err != nil {
 				return err
 			}
 		}
-		return h.publisher.FlushPending(r.Context(), q)
+		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -688,6 +735,7 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 	var j *domain.Jurisdiction
 	var changed bool
 	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		ctx := events.WithBatch(r.Context())
 		var err error
 		j, changed, err = h.store.DeactivateJurisdictionWithQuerier(r.Context(), q, jurisdictionID, principalID)
 		if err != nil {
@@ -699,10 +747,10 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 			// no second jurisdiction.deactivated may be emitted.
 			return nil
 		}
-		if err := h.publisher.PublishJurisdictionDeactivated(r.Context(), *j, correlationID); err != nil {
+		if err := h.publisher.PublishJurisdictionDeactivated(ctx, *j, correlationID); err != nil {
 			return err
 		}
-		return h.publisher.FlushPending(r.Context(), q)
+		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -793,9 +841,34 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	precedence := 0
+	if req.PrecedenceLevel != nil {
+		precedence = *req.PrecedenceLevel
+		if precedence < 0 || precedence > domain.MaxPrecedenceLevel {
+			writeError(w, http.StatusBadRequest, "invalid_precedence_level",
+				fmt.Sprintf("precedence_level must be between 0 and %d (lower wins)", domain.MaxPrecedenceLevel))
+			return
+		}
+	}
+	if req.SupersedesRuleID != nil {
+		if _, err := uuid.Parse(*req.SupersedesRuleID); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_supersedes", "supersedes_rule_id must be a rule id")
+			return
+		}
+	}
+	requestedVersion := 0
+	if req.RuleVersion != nil {
+		if *req.RuleVersion < 1 {
+			writeError(w, http.StatusBadRequest, "invalid_rule_version", "rule_version must be at least 1")
+			return
+		}
+		requestedVersion = *req.RuleVersion
+	}
+
 	var rule *domain.JurisdictionRule
 	var created bool
 	err = h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		ctx := events.WithBatch(r.Context())
 		var err error
 		rule, created, err = h.store.CreateRuleWithQuerier(r.Context(), q, domain.CreateRuleParams{
 			JurisdictionID:        jurisdictionID,
@@ -809,23 +882,26 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 			ExternalFeedReference: req.ExternalFeedReference,
 			RuleStatus:            ruleStatus,
 			CreatedByPrincipalID:  principalID,
+			PrecedenceLevel:       precedence,
+			SupersedesRuleID:      req.SupersedesRuleID,
+			RuleVersion:           requestedVersion,
 		})
 		if err != nil {
 			return err
 		}
 		if created {
-			if err := h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID); err != nil {
+			if err := h.publisher.PublishRuleUpdated(ctx, *rule, correlationID); err != nil {
 				return err
 			}
 			// A rule created directly in ACTIVE never passes through the
 			// transition endpoint, so activation is announced here instead.
 			if rule.RuleStatus == "ACTIVE" {
-				if err := h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID); err != nil {
+				if err := h.publisher.PublishRuleActivated(ctx, *rule, correlationID); err != nil {
 					return err
 				}
 			}
 		}
-		return h.publisher.FlushPending(r.Context(), q)
+		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -871,6 +947,11 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ifMatch, ok := parseIfMatch(w, r)
+	if !ok {
+		return
+	}
+
 	var req TransitionRuleStatusRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -884,9 +965,13 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Maker-checker: transitioning to ACTIVE requires an approval reference.
 	// The envelope's X-Approval-Reference header carries the independent approval
-	// evidence (ZS-JUR-001 §3, V-001 §18.1).
+	// evidence (ZS-JUR-001 §3, V-001 §18.1). The reference alone is the
+	// caller's own assertion, so the store also refuses an activation by the
+	// rule's author (403 self_approval_forbidden) and records the reference on
+	// the status-history row.
+	var approvalRef string
 	if req.NewStatus == "ACTIVE" {
-		approvalRef := strings.TrimSpace(r.Header.Get("X-Approval-Reference"))
+		approvalRef = strings.TrimSpace(r.Header.Get("X-Approval-Reference"))
 		if approvalRef == "" {
 			writeError(w, http.StatusBadRequest, "missing_approval_reference",
 				"transition to ACTIVE requires X-Approval-Reference header with approval evidence")
@@ -897,6 +982,7 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 	var rule *domain.JurisdictionRule
 	var transitioned bool
 	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		ctx := events.WithBatch(r.Context())
 		var err error
 		rule, transitioned, err = h.store.TransitionRuleStatusWithQuerier(r.Context(), q, store.TransitionParams{
 			RuleID:        ruleID,
@@ -905,6 +991,10 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 			EndDate:       endDatingStatuses[req.NewStatus],
 			EffectiveTo:   req.EffectiveTo,
 			ActorID:       principalID,
+
+			RequireIndependentActor: req.NewStatus == "ACTIVE",
+			ApprovalReference:       approvalRef,
+			ExpectedRowVersion:      ifMatch,
 		})
 		if err != nil {
 			return err
@@ -913,16 +1003,16 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		// A replayed transition must not re-emit — a consumer that saw
 		// rule.activated twice would double-apply whatever it does on activation.
 		if transitioned {
-			if err := h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID); err != nil {
+			if err := h.publisher.PublishRuleUpdated(ctx, *rule, correlationID); err != nil {
 				return err
 			}
 			if req.NewStatus == "ACTIVE" {
-				if err := h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID); err != nil {
+				if err := h.publisher.PublishRuleActivated(ctx, *rule, correlationID); err != nil {
 					return err
 				}
 			}
 		}
-		return h.publisher.FlushPending(r.Context(), q)
+		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -936,6 +1026,7 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, rule.RowVersion)
 	writeJSON(w, http.StatusOK, rule)
 }
 
@@ -968,6 +1059,11 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ifMatch, ok := parseIfMatch(w, r)
+	if !ok {
+		return
+	}
+
 	var req RecordDriftRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -981,6 +1077,7 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 	var event *domain.DriftEvent
 	var changed bool
 	err := h.store.WithTransaction(r.Context(), func(q store.Querier) error {
+		ctx := events.WithBatch(r.Context())
 		var err error
 		rule, event, changed, err = h.store.RecordDriftWithQuerier(r.Context(), q, domain.RecordDriftParams{
 			JurisdictionRuleID:    ruleID,
@@ -988,6 +1085,7 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 			Reason:                req.Reason,
 			RecordedByPrincipalID: principalID,
 			CorrelationID:         correlationID,
+			ExpectedRowVersion:    ifMatch,
 		})
 		if err != nil {
 			return err
@@ -996,11 +1094,11 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 		// Only a real divergence is news. Returning to CURRENT is a resolution,
 		// carried by the history rather than by a "drift detected" fact.
 		if changed && req.DriftState != "CURRENT" {
-			if err := h.publisher.PublishLegalDriftDetected(r.Context(), *rule, *event, correlationID); err != nil {
+			if err := h.publisher.PublishLegalDriftDetected(ctx, *rule, *event, correlationID); err != nil {
 				return err
 			}
 		}
-		return h.publisher.FlushPending(r.Context(), q)
+		return h.publisher.FlushPending(ctx, q)
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -1014,6 +1112,7 @@ func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
 		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
+	setETag(w, rule.RowVersion)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"rule":        rule,
 		"drift_event": event,
@@ -1045,7 +1144,26 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 // service self-authorizes a material action.
 func (h *Handler) checkAuthz(r *http.Request, principalID, resource, action string) error {
 	env := svcenvelope.MustFromContext(r.Context())
-	return h.authz.Authorize(r.Context(), principalID, h.authzScopeID, resource, action, &env)
+	ctx := authz.WithResourceID(r.Context(), routeResourceID(r))
+	return h.authz.Authorize(ctx, principalID, h.authzScopeID, resource, action, &env)
+}
+
+// routeResourceID is the most specific path parameter of the matched route —
+// the rule in /v1/admin/rules/{jurisdiction_rule_id}/transition, the parent
+// jurisdiction in /v1/admin/jurisdictions/{jurisdiction_id}/rules — so the
+// authorization decision names the record it was taken on. A create with no
+// path id (POST /v1/admin/jurisdictions) has none.
+func routeResourceID(r *http.Request) string {
+	rctx := chi.RouteContext(r.Context())
+	if rctx == nil {
+		return ""
+	}
+	for i := len(rctx.URLParams.Values) - 1; i >= 0; i-- {
+		if v := strings.TrimSpace(rctx.URLParams.Values[i]); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // writeAuthzError maps an AuthorizationClient error to an HTTP response.
@@ -1085,6 +1203,16 @@ func (h *Handler) writeStoreError(w http.ResponseWriter, err error, correlationI
 		status, code = http.StatusConflict, "cyclic_hierarchy"
 	case errors.Is(err, domain.ErrInvalidTransition):
 		status, code = http.StatusConflict, "invalid_transition"
+	case errors.Is(err, domain.ErrInvalidSupersedes):
+		status, code = http.StatusBadRequest, "invalid_supersedes"
+	case errors.Is(err, domain.ErrSupersedesTaken):
+		status, code = http.StatusConflict, "supersedes_taken"
+	case errors.Is(err, domain.ErrRuleVersionMismatch):
+		status, code = http.StatusConflict, "rule_version_mismatch"
+	case errors.Is(err, domain.ErrPreconditionFailed):
+		status, code = http.StatusPreconditionFailed, "precondition_failed"
+	case errors.Is(err, domain.ErrSelfApproval):
+		status, code = http.StatusForbidden, "self_approval_forbidden"
 	case errors.Is(err, domain.ErrInvalidEffectivePeriod):
 		status, code = http.StatusBadRequest, "invalid_effective_period"
 	default:

@@ -120,6 +120,9 @@ var migrationFiles = []string{
 	"000009_enforce_drift_append_only.up.sql",
 	"000016_fix_rule_status_history_trigger.up.sql",
 	"000017_append_only_rbac.up.sql",
+	"000018_idempotency_keys.up.sql",
+	"000019_entity_jurisdiction_applicability.up.sql",
+	"000020_row_version_and_rule_immutability.up.sql",
 }
 
 // setupTestDB drops and recreates the schema from the migration files.
@@ -130,7 +133,7 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	// — 000007's CREATE TABLE IF NOT EXISTS would otherwise let rows from a
 	// previous test survive (the FK to the dropped jurisdiction_rules is
 	// removed by CASCADE, but the table and its rows are not).
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS rule_status_history, jurisdiction_rule_drift_events, jurisdiction_rules, jurisdictions CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS consumed_events, entity_jurisdiction_applicability, idempotency_keys, rule_status_history, jurisdiction_rule_drift_events, jurisdiction_rules, jurisdictions CASCADE;")
 
 	_, thisFile, _, _ := runtime.Caller(0)
 	migDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "deployments", "migrations")
