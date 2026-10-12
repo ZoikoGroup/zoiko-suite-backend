@@ -14,7 +14,7 @@
 // Scope of verification in v1: existence plus tenant/legal-entity match. It
 // does NOT gate on the document's status — document-vault-svc owns that
 // lifecycle and no spec section says which statuses count as valid evidence,
-// so asserting one here would be scope invention. Recorded in context.md §10.
+// so asserting one would be scope invention. Recorded in context.md §10.
 //
 // Fail-closed throughout: any network error, timeout, or unexpected response
 // means the artifact does not count, rather than silently counting.
@@ -41,7 +41,7 @@ type Client interface {
 	// domain.ErrDocumentNotFound, domain.ErrDocumentMismatch, or
 	// domain.ErrDocumentServiceUnavailable otherwise — all of which mean
 	// "this artifact does not count as evidence".
-	VerifyDocument(ctx context.Context, tenantID, legalEntityID, documentID string) error
+	VerifyDocument(ctx context.Context, tenantID, legalEntityID, documentID, principalID string) error
 }
 
 // summary is the subset of document-vault-svc's Document this service needs.
@@ -71,7 +71,7 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 	}
 }
 
-func (c *HTTPClient) VerifyDocument(ctx context.Context, tenantID, legalEntityID, documentID string) error {
+func (c *HTTPClient) VerifyDocument(ctx context.Context, tenantID, legalEntityID, documentID, principalID string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/documents/"+documentID, nil)
 	if err != nil {
 		return domain.ErrDocumentServiceUnavailable
@@ -79,10 +79,14 @@ func (c *HTTPClient) VerifyDocument(ctx context.Context, tenantID, legalEntityID
 	// document-vault-svc resolves tenant scope from this header via its own
 	// TenantContext middleware, not a query param.
 	req.Header.Set("X-Tenant-Id", tenantID)
-
 	requestID := middleware.GetReqID(ctx)
 	sourceChannel := "system"
-	principalID := "evidence-requirements-svc"
+	// document-vault-svc requires X-Principal-Id (handler.go:191, 529-531);
+	// without it every document-backed evaluation fails closed with 503. The
+	// caller's principal is the default, the request envelope's actor wins.
+	if principalID == "" {
+		principalID = "evidence-requirements-svc"
+	}
 
 	if env, ok := svcenvelope.FromContext(ctx); ok {
 		if env.TenantID != "" {

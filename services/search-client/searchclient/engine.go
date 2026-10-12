@@ -79,11 +79,43 @@ type FieldMapping struct {
 	// where results can materially change". Empty means the engine default,
 	// which is only acceptable for non-text types.
 	Analyzer string
+
+	// Dimensions and SpaceType apply only to Type VECTOR — the one
+	// contract-pinned embedding field of a semantic scope (§10.1). Both come
+	// from the IndexContract, never from the embedding provider: a provider
+	// that started returning a different width must be refused at write
+	// time, not silently accommodated by a mapping that followed it.
+	Dimensions int
+	SpaceType  string
+}
+
+// EmbeddingVectorField is the one field name a semantic generation stores its
+// vector under.
+//
+// Server-owned, like the governance fields: a contract cannot register it, so
+// a source cannot supply its own vector — which would let a producer choose
+// which queries its documents are "similar" to. It lives in the SAME document
+// as the lexical projection rather than in a parallel vector index, which is
+// what makes INV-26 structural: the vector carries the document's tenant,
+// residency, restriction epoch and tombstone because it IS the document, and a
+// tombstone that replaces the document removes the vector with it (NP-34).
+const EmbeddingVectorField = "embedding_vector"
+
+// VectorMapping builds the FieldMapping for a semantic generation's vector.
+func VectorMapping(dimensions int, spaceType string) FieldMapping {
+	return FieldMapping{
+		Name:       EmbeddingVectorField,
+		Type:       "VECTOR",
+		Dimensions: dimensions,
+		SpaceType:  spaceType,
+	}
 }
 
 // osType maps an ESR field type onto an OpenSearch field type.
 func (f FieldMapping) osType() string {
 	switch strings.ToUpper(f.Type) {
+	case "VECTOR":
+		return "knn_vector"
 	case "TEXT":
 		return "text"
 	case "DATE":
@@ -106,6 +138,29 @@ func (f FieldMapping) osType() string {
 func (f FieldMapping) property() map[string]any {
 	t := f.osType()
 	p := map[string]any{"type": t}
+
+	if t == "knn_vector" {
+		space := f.SpaceType
+		if space == "" {
+			space = "cosinesimil"
+		}
+		p["dimension"] = f.Dimensions
+		p["method"] = map[string]any{
+			"name": "hnsw",
+			// Lucene, not nmslib or faiss, for one reason: it is the engine
+			// whose k-NN query accepts a `filter` that is applied DURING the
+			// graph walk. §10.1 requires that "approximate-nearest-neighbor
+			// execution occurs only within server-selected eligible
+			// partitions/filter sets"; a post-filter would walk the whole
+			// corpus — every tenant — and drop the ineligible neighbours
+			// afterwards, which is NP-33's cross-tenant candidate set with a
+			// cleanup step.
+			"engine":     "lucene",
+			"space_type": space,
+			"parameters": map[string]any{"m": 16, "ef_construction": 128},
+		}
+		return p
+	}
 
 	if t == "text" {
 		if f.Analyzer != "" {
@@ -161,18 +216,25 @@ func GovernanceProperties() map[string]any {
 		"tombstoned":             map[string]any{"type": "boolean"},
 		"tombstone_reason":       map[string]any{"type": "keyword"},
 		"tombstone_source_event": map[string]any{"type": "keyword"},
+		// embedding_model is the pinned "model@version" that produced this
+		// document's vector. A semantic query filters on it, so a document
+		// embedded by any other model is not a candidate at all (NP-35) —
+		// comparing vectors from two models is not a similarity, it is noise.
+		"embedding_model": map[string]any{"type": "keyword"},
 	}
 }
 
 // ReservedFields lists the projection field names the control plane owns. A
 // contract that registered one of these would let a source overwrite its own
 // tenant or its own restriction epoch — INV-02 and INV-18 defeated in one move.
+// The vector field is reserved too, though only semantic generations map it.
 func ReservedFields() []string {
 	props := GovernanceProperties()
-	out := make([]string, 0, len(props))
+	out := make([]string, 0, len(props)+1)
 	for k := range props {
 		out = append(out, k)
 	}
+	out = append(out, EmbeddingVectorField)
 	sort.Strings(out)
 	return out
 }
@@ -203,38 +265,11 @@ func (c *client) EnsureGeneration(ctx context.Context, physicalIndex string, fie
 		return nil
 	}
 
-	props := GovernanceProperties()
-	for _, f := range fields {
-		if f.Name == "" {
-			continue
-		}
-		if _, reserved := props[f.Name]; reserved {
-			return fmt.Errorf(
-				"searchclient: field %q is a reserved governance field and cannot be registered by a contract", f.Name)
-		}
-		props[f.Name] = f.property()
+	mapping, err := generationBody(fields)
+	if err != nil {
+		return err
 	}
-
-	body, err := json.Marshal(map[string]any{
-		"settings": map[string]any{
-			"index": map[string]any{
-				// One shard locally. The partitioning that matters here is
-				// logical (tenant / residency filters), not physical; OD-02
-				// leaves the physical strategy open and this is the
-				// single-node development answer to it.
-				"number_of_shards":   1,
-				"number_of_replicas": 0,
-			},
-		},
-		"mappings": map[string]any{
-			// NP-51. Not "false" (ignore silently) but "strict" (reject the
-			// write): a source that starts emitting an unregistered field
-			// must produce a loud projection failure that routes to the
-			// quarantine path, not a document quietly missing data.
-			"dynamic":    "strict",
-			"properties": props,
-		},
-	})
+	body, err := json.Marshal(mapping)
 	if err != nil {
 		return fmt.Errorf("searchclient: EnsureGeneration marshal mapping: %w", err)
 	}
@@ -259,6 +294,63 @@ func (c *client) EnsureGeneration(ctx context.Context, physicalIndex string, fie
 		return fmt.Errorf("searchclient: EnsureGeneration create %s failed: %s", physicalIndex, raw)
 	}
 	return nil
+}
+
+// generationBody renders the create-index body for one generation: strict
+// mapping over the governance fields plus the contract's, and the k-NN
+// setting when the contract pins an embedding. Pure, so the translation — where
+// the security properties live — is testable without a cluster.
+func generationBody(fields []FieldMapping) (map[string]any, error) {
+	props := GovernanceProperties()
+	vector := false
+	for _, f := range fields {
+		if f.Name == "" {
+			continue
+		}
+		if strings.EqualFold(f.Type, "VECTOR") {
+			// Only the server-owned vector field may be a vector, and only
+			// with a positive width. A zero-width knn_vector is refused by the
+			// engine anyway; refusing it here names the cause.
+			if f.Name != EmbeddingVectorField || f.Dimensions <= 0 {
+				return nil, fmt.Errorf("searchclient: vector field must be %q with positive dimensions, got %q/%d",
+					EmbeddingVectorField, f.Name, f.Dimensions)
+			}
+			props[f.Name] = f.property()
+			vector = true
+			continue
+		}
+		if _, reserved := props[f.Name]; reserved || f.Name == EmbeddingVectorField {
+			return nil, fmt.Errorf(
+				"searchclient: field %q is a reserved governance field and cannot be registered by a contract", f.Name)
+		}
+		props[f.Name] = f.property()
+	}
+
+	indexSettings := map[string]any{
+		// One shard locally. The partitioning that matters here is
+		// logical (tenant / residency filters), not physical; OD-02
+		// leaves the physical strategy open and this is the
+		// single-node development answer to it.
+		"number_of_shards":   1,
+		"number_of_replicas": 0,
+	}
+	if vector {
+		indexSettings["knn"] = true
+	}
+
+	return map[string]any{
+		"settings": map[string]any{
+			"index": indexSettings,
+		},
+		"mappings": map[string]any{
+			// NP-51. Not "false" (ignore silently) but "strict" (reject the
+			// write): a source that starts emitting an unregistered field
+			// must produce a loud projection failure that routes to the
+			// quarantine path, not a document quietly missing data.
+			"dynamic":    "strict",
+			"properties": props,
+		},
+	}, nil
 }
 
 // ActivateGeneration atomically repoints alias at physicalIndex, removing it

@@ -63,6 +63,15 @@ var (
 		"publishing an S2/S3 definition requires an approval reference")
 	ErrFlagNotRetired = newCodedError("flag_not_retired",
 		"only a RETIRED flag key can be marked removed")
+	// AA-001 §8.1: C2 needs WFC approval and C3 "segregated approval"; the
+	// proposer approving their own change is neither (S3-1 / R-4).
+	ErrChangeSelfApproval = newCodedError("change_self_approval",
+		"the proposer of a C2/C3 change cannot approve it; segregated approval needs another principal")
+	// §8 lifecycle: only a change still awaiting a decision can be approved
+	// or rejected. A VERIFIED change sent back to APPROVED became
+	// activatable again (S3-2 / R-5).
+	ErrChangeNotApprovable = newCodedError("change_not_approvable",
+		"only a PROPOSED or VALIDATED change can be approved or rejected")
 )
 
 // AllowsRegion reports whether a declaration admits delivery to region. An

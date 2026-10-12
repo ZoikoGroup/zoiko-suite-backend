@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
@@ -31,6 +33,7 @@ import (
 	"zoiko.io/delegated-authority-svc/internal/expiry"
 	"zoiko.io/delegated-authority-svc/internal/handler"
 	"zoiko.io/delegated-authority-svc/internal/health"
+	"zoiko.io/delegated-authority-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/delegated-authority-svc/internal/middleware"
 	"zoiko.io/delegated-authority-svc/internal/mtls"
 	"zoiko.io/delegated-authority-svc/internal/outbox"
@@ -139,78 +142,91 @@ func (a *httpAuthzClient) storeCache(key string, decision error) {
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
 func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	reqBody, _ := json.Marshal(map[string]string{
+	_, err := a.authorize(ctx, principalID, legalEntityID, actionType, nil, actionType)
+	return err
+}
+
+// CheckHeldInOwnRight asks whether principalID holds actionType through their
+// own grants, not only through a delegation to them. authorization-svc checks
+// role grants first and answers basis "delegated:from=…" only when a delegation
+// is the sole source, and it confers through a delegation only what the
+// delegator holds in their own right — so authority held by delegation cannot
+// be passed on. Never cached: it is asked once per grant decision.
+func (a *httpAuthzClient) CheckHeldInOwnRight(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	basis, err := a.authorize(ctx, principalID, legalEntityID, actionType, nil, actionType+":own-right")
+	// A delegation's own ceiling is evaluated only when a delegation is the
+	// grant's sole source, so a denial on "delegation_limit:…" (a capped
+	// delegation asked about with no amount) means the same as a grant on
+	// "delegated:…": the principal holds this only by delegation.
+	if strings.HasPrefix(basis, "delegated:") || strings.HasPrefix(basis, "delegation_limit:") {
+		return domain.ErrDelegatorAuthorityDelegated
+	}
+	return err
+}
+
+// CheckAllowedAtLimit asks whether principalID may perform actionType at the
+// given monetary ceiling: authorization-svc evaluates the principal's own
+// authority limits against the amount (ORG-06 negative case 11, "delegator
+// grants higher limit than own authority → reject"). Never cached — the
+// answer depends on the amount.
+//
+// The limit is NOT required. It used to be, so a delegator with no limit for
+// the action was refused any CAPPED delegation while the same delegator's
+// uncapped one went through: delegating less was refused and delegating more
+// allowed. A principal with no limit is held to what authorization-svc holds
+// them to when they act themselves, and a ceiling within that narrows.
+func (a *httpAuthzClient) CheckAllowedAtLimit(ctx context.Context, principalID, legalEntityID, actionType, amount, currency string) error {
+	_, err := a.authorize(ctx, principalID, legalEntityID, actionType, map[string]string{
+		"amount":   amount,
+		"currency": currency,
+	}, actionType+":limit:"+amount+currency)
+	return err
+}
+
+// authorize returns the decision's basis, for a denial as well as a grant.
+func (a *httpAuthzClient) authorize(ctx context.Context, principalID, legalEntityID, actionType string, attributes map[string]string, idemSuffix string) (string, error) {
+	body := map[string]any{
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
 		"action_type":     actionType,
-	})
+	}
+	if len(attributes) > 0 {
+		body["attributes"] = attributes
+	}
+	reqBody, _ := json.Marshal(body)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/authorize", bytes.NewReader(reqBody))
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	// authorization-svc validates the same canonical envelope contract this
-	// service does and answers 400 envelope_incomplete without it. A non-200 is
-	// treated as unavailable below, so an unforwarded envelope turned EVERY
-	// gated write into a 503 that reads like an outage rather than a missing
-	// header. Same defect, same fix as 3c618c2 (HR) and dbf6e45 (notification).
-	//
-	// The values are the CALLER's, taken from the envelope the middleware
-	// already parsed into this request's context. Minting fresh ones would
-	// satisfy the contract and lose the only thing it is for: a decision in
-	// access_decision_log traceable to the request that caused it.
-	req.Header.Set("X-Principal-Id", principalID)
-	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
-
-	authzRequestID := middleware.GetReqID(ctx)
-	// Service-to-service. "system" is in the contract's accepted set; the
-	// caller's own channel replaces it when the envelope carries one.
-	authzSourceChannel := "system"
-	if env, ok := svcenvelope.FromContext(ctx); ok {
-		if env.TenantID != "" {
-			req.Header.Set("X-Tenant-Id", env.TenantID)
-		}
-		if env.RequestID != "" {
-			authzRequestID = env.RequestID
-		}
-		if env.SourceChannel != "" {
-			authzSourceChannel = string(env.SourceChannel)
-		}
-		if env.CorrelationID != "" {
-			req.Header.Set("X-Correlation-ID", env.CorrelationID)
-		}
-		if env.CausationID != "" {
-			req.Header.Set("X-Causation-Id", env.CausationID)
-		}
-	}
-	req.Header.Set("X-Request-Id", authzRequestID)
-	req.Header.Set("X-Source-Channel", authzSourceChannel)
-	// One decision per (request, action): an inbound request may authorize
-	// several actions, and each is its own decision to record.
-	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
+	// service does and answers 400 envelope_incomplete without it; a non-200
+	// is treated as unavailable below. One decision per (request, question).
+	forwardEnvelope(ctx, req, principalID, legalEntityID, idemSuffix)
 	resp, err := a.client.Do(req)
 	if err != nil {
 		a.log.Error("failed to call authorization-svc", zap.Error(err))
-		return domain.ErrAuthzServiceUnavailable
+		return "", domain.ErrAuthzServiceUnavailable
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return domain.ErrAuthzServiceUnavailable
+		return "", domain.ErrAuthzServiceUnavailable
 	}
 
 	var res struct {
 		DecisionOutcome string `json:"decision_outcome"`
+		DecisionBasis   string `json:"decision_basis"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return err
+		return "", err
 	}
 	if res.DecisionOutcome != "GRANTED" {
-		return domain.ErrAuthorizationDenied
+		return res.DecisionBasis, domain.ErrAuthorizationDenied
 	}
-	return nil
+	return res.DecisionBasis, nil
 }
 
 // Ping reports whether authorization-svc is reachable, for readiness.
@@ -242,10 +258,19 @@ func (a *httpAuthzClient) Ping(ctx context.Context) error {
 	return nil
 }
 
-// httpSoDClient calls authorization-svc's SoD engine to check whether a
-// proposed delegation would create a segregation-of-duties conflict.
-// ORG-06 §4.6: "Cannot delegate around SoD" — authorization alone cannot see
-// a duties conflict.
+// httpSoDClient asks authorization-svc's SoD engine whether giving the
+// delegate this action would combine duties that must stay apart (ORG-06 §4.6
+// "cannot delegate around SoD").
+//
+// It speaks authorization-svc's real contract — POST /v1/sod/validate with
+// candidate_actions and the principal whose CURRENT holdings are checked — and
+// that principal is the DELEGATE: the question is whether the person receiving
+// the authority would then hold a conflicting pair. It used to POST to
+// /v1/sod/check, a route nothing serves, so every create answered 503; and it
+// decoded a "conflict" field the engine never sends, so correcting the path
+// alone would have read every answer as "no conflict". The answer is now
+// decoded strictly: a response without conflict_free is unreadable, and an
+// unreadable answer refuses (fail closed), never permits.
 type httpSoDClient struct {
 	baseURL string
 	client  *http.Client
@@ -254,48 +279,97 @@ type httpSoDClient struct {
 
 // CheckConflict implements handler.SoDClient.
 func (s *httpSoDClient) CheckConflict(ctx context.Context, tenantID, legalEntityID, delegatorPrincipalID, delegatePrincipalID, actionType string) error {
-	reqBody, _ := json.Marshal(map[string]string{
-		"tenant_id":              tenantID,
-		"legal_entity_id":        legalEntityID,
-		"delegator_principal_id": delegatorPrincipalID,
-		"delegate_principal_id":  delegatePrincipalID,
-		"action_type":            actionType,
+	reqBody, _ := json.Marshal(map[string]any{
+		"candidate_actions": []string{actionType},
+		"principal_id":      delegatePrincipalID,
+		"legal_entity_id":   legalEntityID,
+		"tenant_id":         tenantID,
 	})
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/v1/sod/check", bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/v1/sod/validate", bytes.NewReader(reqBody))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-
-	// authorization-svc validates the canonical envelope contract.
-	// The values are the CALLER's (the delegator in this case).
-	req.Header.Set("X-Principal-Id", delegatorPrincipalID)
-	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
-	req.Header.Set("X-Tenant-Id", tenantID)
+	// The caller asks; the delegator is only the fallback when the envelope
+	// carries no actor (service-to-service paths).
+	caller := delegatorPrincipalID
+	if env, ok := svcenvelope.FromContext(ctx); ok && env.ActorSubjectID != "" {
+		caller = env.ActorSubjectID
+	}
+	forwardEnvelope(ctx, req, caller, legalEntityID, "sod:"+actionType)
+	if req.Header.Get("X-Tenant-Id") == "" && tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		s.log.Error("failed to call authorization-svc SoD check", zap.Error(err))
+		s.log.Error("failed to call authorization-svc SoD validate", zap.Error(err))
 		return domain.ErrAuthzServiceUnavailable
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		s.log.Error("authorization-svc SoD check returned non-200", zap.Int("status", resp.StatusCode))
+		s.log.Error("authorization-svc SoD validate returned non-200", zap.Int("status", resp.StatusCode))
 		return domain.ErrAuthzServiceUnavailable
 	}
-
 	var res struct {
-		Conflict bool `json:"conflict"`
+		ConflictFree *bool `json:"conflict_free"`
+		Conflicts    []struct {
+			CandidateAction string `json:"candidate_action"`
+			ConflictsWith   string `json:"conflicts_with"`
+			Source          string `json:"source"`
+		} `json:"conflicts"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return err
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&res); err != nil || res.ConflictFree == nil {
+		s.log.Error("authorization-svc SoD validate answered without conflict_free; refusing", zap.Error(err))
+		return domain.ErrAuthzServiceUnavailable
 	}
-	if res.Conflict {
+	if !*res.ConflictFree {
+		if len(res.Conflicts) > 0 {
+			c := res.Conflicts[0]
+			return fmt.Errorf("%w: %s conflicts with %s (%s)", domain.ErrSODConflict, c.CandidateAction, c.ConflictsWith, c.Source)
+		}
 		return domain.ErrSODConflict
 	}
 	return nil
+}
+
+// forwardEnvelope sets the canonical §4 envelope authorization-svc validates
+// on every call. The values are the CALLER's, from the envelope the middleware
+// already parsed, so a decision is traceable to the request that caused it.
+// idemSuffix makes one Idempotency-Key per (request, question).
+func forwardEnvelope(ctx context.Context, req *http.Request, principalID, legalEntityID, idemSuffix string) {
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	requestID := middleware.GetReqID(ctx)
+	sourceChannel := "system"
+	if requestID == "" {
+		// A background path has no inbound request; an empty id is a 400 at
+		// authorization-svc, so mint one rather than send none.
+		requestID = uuid.NewString()
+	}
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			sourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	if req.Header.Get("X-Correlation-ID") == "" {
+		req.Header.Set("X-Correlation-ID", requestID)
+	}
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Source-Channel", sourceChannel)
+	req.Header.Set("Idempotency-Key", requestID+":"+idemSuffix)
 }
 
 func main() {
@@ -455,6 +529,10 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Idempotency-Key replay (cross-service finding 2): after the envelope has
+	// resolved tenant and actor, before any handler runs the command.
+	r.Use(idempotency.Middleware(pgStore, log))
 
 	h := handler.New(pgStore, authzClient, sodClient, log, domainMetrics)
 	handler.RegisterRoutes(r, h)

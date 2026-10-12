@@ -20,12 +20,16 @@ func NewClient(baseURL string, httpClient *http.Client) *Client {
 }
 
 type Employee struct {
-	EmployeeID     string `json:"employee_id"`
-	EmployeeNumber string `json:"employee_number"`
-	FirstName      string `json:"first_name"`
-	LastName       string `json:"last_name"`
-	LegalEntityID  string `json:"legal_entity_id"`
-	Status         string `json:"status"`
+	EmployeeID     string  `json:"employee_id"`
+	EmployeeNumber string  `json:"employee_number"`
+	FirstName      string  `json:"first_name"`
+	LastName       string  `json:"last_name"`
+	LegalEntityID  string  `json:"legal_entity_id"`
+	Status         string  `json:"status"`
+	WorkerType     string  `json:"worker_type"`
+	DepartmentID   *string `json:"department_id,omitempty"`
+	JobTitle       *string `json:"job_title,omitempty"`
+	WorkEmail      *string `json:"work_email,omitempty"`
 }
 
 func (c *Client) ListActiveEmployeesByEntity(ctx context.Context, tenantID, principalID, legalEntityID string) ([]Employee, error) {

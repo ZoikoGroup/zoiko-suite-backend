@@ -103,6 +103,8 @@ channels:
       message:
         oneOf:
           - $ref: "#/components/messages/RoleUpdated"
+          - $ref: "#/components/messages/AssignmentRevoked"
+          - $ref: "#/components/messages/AssignmentGranted"
 
   zoiko.entity.events:
     description: Owned by tenant-entity-registry-svc. Consumed only.
@@ -453,6 +455,32 @@ components:
         Envelopes already issued carry the permission bundles the role granted
         BEFORE the change, so every holder's sessions are revoked and the next
         resolve re-derives them.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentGranted:
+      name: iam.assignment.granted
+      title: An access assignment became effective
+      summary: |
+        Emitted by access-control-svc once a governed assignment is
+        provisioned in authorization-svc. Projected into
+        principal_role_assignments, the table the resolver frames session
+        roles from and handleRoleUpdated finds a role's holders in; it had no
+        other feed. A principal unknown here is skipped. Revokes nothing.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    AssignmentRevoked:
+      name: iam.assignment.revoked
+      title: An access assignment was revoked
+      summary: |
+        Emitted by access-control-svc when a governed assignment is revoked
+        (POST /v1/iam/access-assignments/{id}:revoke, or a REVOKE decision in
+        an access review). role.updated cannot cover this: it re-resolves the
+        role's CURRENT holders, and the revoked principal is no longer one.
+        The subject is read from `payload.principal_id`, never from
+        `actor_id` (the revoker). Every session of the subject is revoked;
+        events older than the envelope TTL plus one minute are skipped.
       payload:
         $ref: "#/components/schemas/Envelope"
 

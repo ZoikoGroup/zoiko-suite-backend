@@ -11,7 +11,7 @@ asyncapi: 2.6.0
 
 info:
   title: access-control-svc events
-  version: "1.1.0"
+  version: "1.3.0"
   description: |
     Role and permission-bundle lifecycle events, published to
     `zoiko.access-control.events` through a **transactional outbox**.
@@ -72,9 +72,87 @@ channels:
           - $ref: '#/components/messages/RoleCreated'
           - $ref: '#/components/messages/RoleUpdated'
           - $ref: '#/components/messages/PermissionBundleUpdated'
+          - $ref: '#/components/messages/RolePublished'
+          - $ref: '#/components/messages/AssignmentRequested'
+          - $ref: '#/components/messages/AssignmentGranted'
+          - $ref: '#/components/messages/AssignmentRevoked'
+          - $ref: '#/components/messages/AccessReviewStarted'
+          - $ref: '#/components/messages/AccessReviewCompleted'
+          - $ref: '#/components/messages/EmploymentChanged'
+
+  # ── consumed (S9-C2 event-triggered reviews; internal/hrevents) ─────────────
+  # This file's convention puts what this service PUBLISHES under `publish`;
+  # the two channels below are the other direction: produced elsewhere and
+  # READ here (consumer group ACS_HR_EVENT_GROUP_ID, default
+  # access-control-svc-hr-reviews), so they sit under `subscribe`.
+  zoiko.employee.events:
+    description: |
+      Produced by employee-master-svc, keyed by employee_id. Consumed for
+      employee.updated (a manager change = mover), employee.status.changed
+      (into TERMINATED / RESIGNED / DEACTIVATED / INACTIVE / ARCHIVED = leaver,
+      "contractor end" for a CONTRACTOR) and employee.terminated. Each opens an
+      EVENT_TRIGGERED review of the LINKED subject only (POST
+      /v1/iam/subject-links); other event types are ignored.
+    subscribe:
+      operationId: readEmployeeEvents
+      message: { $ref: '#/components/messages/HRLifecycleEvent' }
+  zoiko.offboarding.events:
+    description: |
+      Produced by offboarding-severance-svc. Only employee.terminated is read;
+      the same exit already seen from employee-master-svc opens nothing new.
+    subscribe:
+      operationId: readOffboardingEvents
+      message: { $ref: '#/components/messages/HRLifecycleEvent' }
 
 components:
   messages:
+    EmploymentChanged:
+      name: employment.changed
+      title: A linked employee left (Doc 03 §8.3)
+      summary: |
+        Published when a LINKED employee exits (employee.terminated, or a
+        status move into TERMINATED / RESIGNED / DEACTIVATED / INACTIVE /
+        ARCHIVED). Keyed by principal_id. authorization-svc projects the
+        principal TERMINATED, so layer 0 denies every action. Never published
+        for an unlinked employee, a move or a temporary absence.
+      payload:
+        type: object
+        required: [principal_id, tenant_id, employment_status]
+        properties:
+          principal_id: { type: string }
+          employee_id: { type: string }
+          tenant_id: { type: string }
+          legal_entity_id: { type: string }
+          employment_status: { type: string }
+          previous_status: { type: string }
+          worker_type: { type: string }
+          status_changed_at: { type: string, format: date-time }
+          source_event_id: { type: string }
+    HRLifecycleEvent:
+      name: employee.*
+      title: An HR lifecycle event (consumed)
+      summary: |
+        The producers' envelope. Only the fields below are read; event_id makes
+        the review idempotent (campaign correlation_id = "hr-" + event_id).
+      payload:
+        type: object
+        required: [event_id, event_type, tenant_id, payload]
+        properties:
+          event_id: { type: string }
+          event_type: { type: string, enum: [employee.updated, employee.status.changed, employee.terminated] }
+          tenant_id: { type: string }
+          legal_entity_id: { type: string }
+          payload:
+            type: object
+            required: [employee_id]
+            properties:
+              employee_id: { type: string }
+              legal_entity_id: { type: string }
+              manager_employee_id: { type: string }
+              status: { type: string }
+              old_status: { type: string }
+              new_status: { type: string }
+              worker_type: { type: string }
     RoleCreated:
       name: role.created
       title: A role definition was created and provisioned
@@ -143,6 +221,92 @@ components:
             properties:
               event_type: { const: permission.bundle.updated }
               payload: { $ref: '#/components/schemas/BundleUpdatedPayload' }
+
+    RolePublished:
+      name: iam.role.published
+      title: A role version was activated (§23)
+      summary: |
+        Emitted when a role is instantiated from a system role template version and when it is
+        upgraded to a newer one, alongside role.created / role.updated.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.role.published }
+              payload: { $ref: '#/components/schemas/RolePublishedPayload' }
+
+    AssignmentRequested:
+      name: iam.assignment.requested
+      title: An assignment request awaits an independent approver
+      summary: |
+        HIGH/CRITICAL risk or a self-request. Nothing is granted yet.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.assignment.requested }
+              payload: { $ref: '#/components/schemas/AssignmentPayload' }
+
+    AssignmentGranted:
+      name: iam.assignment.granted
+      title: An access assignment became effective (§23)
+      summary: |
+        Provisioned in authorization-svc under the request id before this is enqueued.
+        Carries `effective_to` when the assignment was granted with an end date;
+        identity-context-svc projects it as the assignment's end.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.assignment.granted }
+              payload: { $ref: '#/components/schemas/AssignmentPayload' }
+
+    AssignmentRevoked:
+      name: iam.assignment.revoked
+      title: An access assignment was revoked (§23)
+      summary: |
+        From a revoke command, a REVOKE review decision, or the expiry sweep once an
+        assignment's `effective_to` has passed ("revoked/expired"; `status` is then
+        EXPIRED for an end set at grant time, REVOKED for one scheduled by a revoke,
+        and `actor_id` is the scheduler or `system:assignment-expiry`). `principal_id` is the SUBJECT;
+        identity-context-svc ends every session of that principal on it (role.updated
+        cannot: the subject is no longer a holder of the role).
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.assignment.revoked }
+              payload: { $ref: '#/components/schemas/AssignmentPayload' }
+
+    AccessReviewStarted:
+      name: iam.access_review.started
+      title: A certification campaign was started (§23, §24)
+      summary: |
+        Carries the campaign and the number of items snapshotted.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.access_review.started }
+              payload: { $ref: '#/components/schemas/AccessReviewPayload' }
+
+    AccessReviewCompleted:
+      name: iam.access_review.completed
+      title: A certification campaign was completed (§23, §24)
+      summary: |
+        Carries the outcome summary (decisions, revocations, expired STANDARD items).
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: iam.access_review.completed }
+              payload: { $ref: '#/components/schemas/AccessReviewPayload' }
 
   schemas:
     Envelope:
@@ -242,3 +406,43 @@ components:
         active_flag:
           type: boolean
           description: False means detached — withdrawn, contents kept.
+
+    RolePublishedPayload:
+      type: object
+      required: [role_id, role_code, template_code, template_version, permitted_actions]
+      properties:
+        role_id: { type: string, format: uuid }
+        role_code: { type: string }
+        template_code: { type: string }
+        template_version: { type: integer }
+        permitted_actions: { type: array, items: { type: string } }
+
+    AssignmentPayload:
+      type: object
+      required: [principal_id, role_id]
+      properties:
+        request_id: { type: string, format: uuid }
+        assignment_id: { type: string, format: uuid }
+        principal_id: { type: string, description: The subject of the assignment. Never the actor. }
+        target_principal_id: { type: string }
+        role_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
+        risk_tier: { type: string, enum: [STANDARD, HIGH, CRITICAL] }
+        status: { type: string }
+        approval_reason: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time, description: 'The end date, when the assignment has one.' }
+        revocation_reason: { type: string }
+        review_item_id: { type: string, format: uuid }
+        campaign_id: { type: string, format: uuid }
+
+    AccessReviewPayload:
+      type: object
+      required: [campaign_id, campaign_name, review_type]
+      properties:
+        campaign_id: { type: string, format: uuid }
+        campaign_name: { type: string }
+        review_type: { type: string, enum: [PERIODIC, EVENT_TRIGGERED, PRIVILEGED] }
+        due_at: { type: string, format: date-time }
+        items: { type: integer }
+        summary: { type: object, additionalProperties: { type: integer } }

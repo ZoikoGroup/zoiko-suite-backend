@@ -491,6 +491,13 @@ func main() {
 	// are built after the resolver.
 	resolver.WithSupportVerifier(supportService)
 
+	// §4 entitlement context reference from COM-03 (commercial-account-svc).
+	// Non-blocking: a commercial outage records UPSTREAM_UNAVAILABLE, never
+	// refuses a login.
+	if cfg.CommercialAccountURL != "" {
+		resolver.WithEntitlementResolver(upstream.NewEntitlementClient(cfg.CommercialAccountURL, cfg.ServicePrincipalID, 30*time.Second))
+	}
+
 	// ── Break-glass reconciliation (§1) ───────────────────────────────────
 	//
 	// SupportService.Reconcile has always documented a "reconciler goroutine in

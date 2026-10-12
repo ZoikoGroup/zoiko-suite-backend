@@ -28,7 +28,7 @@ func subjectVersion(t *testing.T, s *store.PgStore, tenant, subject string, subj
 
 // F-05: the subject is stored with the version and comes back with it.
 func TestTemplateSubject_IsStoredAndRendered(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	ctx := tenantCtx("tenant-subj")
 	v := subjectVersion(t, s, "tenant-subj", "Payslip for {{.period}}", []string{"period"})
 	if v.Subject == nil || *v.Subject != "Payslip for {{.period}}" || len(v.SubjectVariables) != 1 {
@@ -52,7 +52,7 @@ func TestTemplateSubject_IsStoredAndRendered(t *testing.T) {
 
 // The subject is frozen with the body: no later UPDATE can change what was reviewed.
 func TestTemplateSubject_IsFrozenByTheDatabase(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	v := subjectVersion(t, s, "tenant-subj", "Payslip for {{.period}}", []string{"period"})
 	bg := context.Background()
@@ -70,7 +70,7 @@ func TestTemplateSubject_IsFrozenByTheDatabase(t *testing.T) {
 
 // The database enforces the shape without the store.
 func TestTemplateSubject_DatabaseRefusesBadShapes(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tmpl := newTestTemplate(t, s, tenantCtx("tenant-subj"), "owner-subj")
 	bg := context.Background()
@@ -99,7 +99,7 @@ func TestTemplateSubject_DatabaseRefusesBadShapes(t *testing.T) {
 
 // An existing version has no subject and keeps working unchanged.
 func TestTemplateSubject_LegacyVersionIsUnaffected(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	ctx := tenantCtx("tenant-subj")
 	v := subjectVersion(t, s, "tenant-subj", "", nil)
 	if v.Subject != nil || len(v.SubjectVariables) != 0 {
@@ -115,7 +115,7 @@ func TestTemplateSubject_LegacyVersionIsUnaffected(t *testing.T) {
 // Creating a version with an unsafe subject is refused before anything is stored,
 // and validation refuses one that slipped past (defence in depth).
 func TestTemplateSubject_StoreRefusesUnsafeSubjects(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	ctx := tenantCtx("tenant-subj")
 	tmpl := newTestTemplate(t, s, ctx, "owner-subj")
 	for name, p := range map[string]domain.CreateVersionParams{
@@ -132,7 +132,7 @@ func TestTemplateSubject_StoreRefusesUnsafeSubjects(t *testing.T) {
 }
 
 func TestMigration000018_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000018_template_version_subject.down.sql", "000018_template_version_subject.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		if err != nil {

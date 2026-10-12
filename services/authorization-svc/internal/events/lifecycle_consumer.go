@@ -27,6 +27,10 @@ type LifecycleProjector interface {
 	// cache.Store.InvalidateGrantSourcesForTenant for why a consumer is the
 	// right caller for it.
 	InvalidateGrantSourcesForTenant(tenantID string)
+
+	// ProjectEntityStatus records an entity's standing, which /v1/authorize
+	// evaluates as a negative control (SUSPENDED / DISSOLVED deny).
+	ProjectEntityStatus(ctx context.Context, params domain.ProjectEntityStatusParams) error
 }
 
 // LifecycleConsumer consumes the three §8.3 event concepts that were recorded
@@ -56,6 +60,13 @@ type LifecycleProjector interface {
 //	                         — identity-context-svc. The only one of the
 //	                           candidates keyed on principal_id. See below on
 //	                           employee.terminated, which is not usable.
+//	                       employment.changed                zoiko.access-control.events
+//	                         — access-control-svc, since 7 Oct 2026: it holds
+//	                           the ADMINISTERED employee→principal link
+//	                           (its 000015) and publishes a linked employee's
+//	                           exit under the spec's own name, keyed on the
+//	                           principal. Projected as TERMINATED; HR never
+//	                           reinstates (that stays identity-context-svc's).
 //
 //	entity.scope.updated   entity.status.changed,            zoiko.entity.events
 //	                       entity.hierarchy.changed,
@@ -144,6 +155,7 @@ var (
 	// principalStatusEvents is the projecting group.
 	principalStatusEvents = map[string]bool{
 		"principal.status.changed": true,
+		EventEmploymentChanged:     true,
 	}
 
 	// grantGraphEvents is the invalidating group: every event that changes
@@ -156,6 +168,14 @@ var (
 		"role.created":              true,
 		"role.updated":              true,
 		"permission.bundle.updated": true,
+		// access-control-svc's governance surface (Authorization Standard
+		// §9, §23). Assignments it provisions are written through this
+		// service's admin API, which invalidates the writing replica; these
+		// reach every OTHER replica, whose cached grant sources would
+		// otherwise keep a revoked assignment live until the TTL.
+		"iam.role.published":     true,
+		"iam.assignment.granted": true,
+		"iam.assignment.revoked": true,
 
 		// tenant-entity-registry-svc — the entities grants are scoped to.
 		// entity.status.changed matters because a DORMANT, SUSPENDED or
@@ -193,6 +213,24 @@ func LifecycleConsumedEventTypes() map[string]bool {
 // refuse a STALE event, and nil means "upstream did not say", which that
 // method handles by applying the write. Declaring it now means a producer that
 // starts sending it gets replay protection with no change here.
+// EventEmploymentChanged is Doc 03 §8.3's consumed employment.changed, as
+// access-control-svc publishes it for a linked employee's exit.
+const EventEmploymentChanged = "employment.changed"
+
+// employmentEndedStatuses are the employment states that end a principal's
+// authority. Anything else (ON_LEAVE, SUSPENDED, a rehire's ACTIVE) projects
+// nothing: a temporary absence is not an exit, and reinstatement is the
+// identity plane's decision, not HR's.
+var employmentEndedStatuses = map[string]bool{"TERMINATED": true, "RESIGNED": true, "DEACTIVATED": true, "INACTIVE": true, "ARCHIVED": true}
+
+// employmentChangedPayload is access-control-svc's employment.changed.
+type employmentChangedPayload struct {
+	PrincipalID      string     `json:"principal_id"`
+	TenantID         string     `json:"tenant_id"`
+	EmploymentStatus string     `json:"employment_status"`
+	StatusChangedAt  *time.Time `json:"status_changed_at"`
+}
+
 type principalStatusPayload struct {
 	PrincipalID     string     `json:"principal_id"`
 	TenantID        string     `json:"tenant_id"`
@@ -229,6 +267,17 @@ func (c *LifecycleConsumer) claim(eventID string) bool {
 	return true
 }
 
+// release forgets eventID, so a message whose apply failed is applied when it
+// is retried rather than skipped as already handled.
+func (c *LifecycleConsumer) release(eventID string) {
+	if eventID == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.seen, eventID)
+	c.mu.Unlock()
+}
+
 // Run consumes until ctx is cancelled.
 //
 // A broker that is absent or unreachable must NOT stop the service, for the
@@ -248,13 +297,13 @@ func (c *LifecycleConsumer) Run(ctx context.Context, reader *kafka.Reader) {
 		zap.Int("event_types", len(LifecycleConsumedEventTypes())))
 
 	for {
-		msg, err := reader.ReadMessage(ctx)
+		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				c.log.Info("lifecycle consumer stopping")
 				return
 			}
-			c.log.Warn("kafka read failed — retrying", zap.Error(err))
+			c.log.Warn("kafka fetch failed — retrying", zap.Error(err))
 			select {
 			case <-ctx.Done():
 				return
@@ -262,23 +311,30 @@ func (c *LifecycleConsumer) Run(ctx context.Context, reader *kafka.Reader) {
 			}
 			continue
 		}
-		c.Handle(ctx, msg.Value)
+		if !applyUntilDone(ctx, c.log, string(msg.Key), func() error { return c.Handle(ctx, msg.Value) }) {
+			c.log.Info("lifecycle consumer stopping with an unapplied message — not committed, so it is redelivered")
+			return
+		}
+		if err := reader.CommitMessages(ctx, msg); err != nil {
+			c.log.Error("failed to commit offset", zap.Error(err))
+		}
 	}
 }
 
 // Handle applies one message. Exported so dispatch is testable without a
 // broker.
 //
-// Never returns an error, on the same terms as Consumer.Handle: the offset is
-// committed by reading the next message, so a returned error would either stall
-// the partition on one bad event or be discarded. A message that cannot be
-// applied is logged with enough detail to replay it by hand.
-func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) {
+// Returns an error only for critical failures (DB unavailable) that should
+// cause the offset to NOT be committed, allowing a retry. Non-critical
+// failures (unknown event type, malformed payload, missing tenant for status)
+// are logged and return nil so the offset is committed and the partition keeps
+// moving.
+func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) error {
 	var env inbound
 	if err := json.Unmarshal(raw, &env); err != nil {
 		c.log.Error("lifecycle event: undecodable envelope — skipped",
 			zap.Error(err), zap.Int("bytes", len(raw)))
-		return
+		return nil // Malformed message, commit and move on
 	}
 
 	isStatus := principalStatusEvents[env.EventType]
@@ -287,29 +343,101 @@ func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) {
 		// Three topics are subscribed and each carries events this service has
 		// no interest in. Silently skipped, not logged: at this volume a line
 		// per uninteresting event is how the log stops being readable.
-		return
+		return nil
 	}
 
 	if !c.claim(env.EventID) {
 		c.log.Debug("lifecycle event: already handled by this process",
 			zap.String("event_id", env.EventID),
 			zap.String("event_type", env.EventType))
-		return
+		return nil // Already processed, commit and move on
 	}
 
 	if isStatus {
-		c.handlePrincipalStatus(ctx, env)
-		return
+		err := c.handlePrincipalStatus(ctx, env)
+		if err != nil {
+			// Released so the retry in Run applies it rather than skipping it.
+			c.release(env.EventID)
+		}
+		return err
+	}
+	if env.EventType == "entity.status.changed" {
+		if err := c.handleEntityStatus(ctx, env); err != nil {
+			c.release(env.EventID)
+			return err
+		}
 	}
 	c.handleInvalidation(env)
+	return nil
 }
 
-func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbound) {
+// entityStatusPayload is tenant-entity-registry-svc's entity.status.changed.
+type entityStatusPayload struct {
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	NewStatus     string `json:"new_status"`
+}
+
+// handleEntityStatus projects an entity's standing. Until this existed the
+// event only invalidated the cache, so a DISSOLVED entity stayed one anybody
+// holding a grant could act in. A failed write is returned so Run retries it:
+// losing a dissolution would leave the entity operational indefinitely.
+func (c *LifecycleConsumer) handleEntityStatus(ctx context.Context, env inbound) error {
+	var p entityStatusPayload
+	if err := json.Unmarshal(env.Payload, &p); err != nil {
+		c.log.Error("entity status event: undecodable payload — skipped", zap.String("event_id", env.EventID), zap.Error(err))
+		return nil
+	}
+	tenantID := strings.TrimSpace(p.TenantID)
+	if tenantID == "" {
+		tenantID = strings.TrimSpace(env.TenantID)
+	}
+	entityID := strings.TrimSpace(p.LegalEntityID)
+	if entityID == "" {
+		entityID = strings.TrimSpace(env.LegalEntityID)
+	}
+	status := strings.ToUpper(strings.TrimSpace(p.NewStatus))
+	if tenantID == "" || entityID == "" || status == "" {
+		c.log.Error("entity status event: missing tenant, entity or status — skipped", zap.String("event_id", env.EventID))
+		return nil
+	}
+	at := time.Now().UTC()
+	if env.EffectiveAt != nil && !env.EffectiveAt.IsZero() {
+		at = env.EffectiveAt.UTC()
+	}
+	if err := c.store.ProjectEntityStatus(ctx, domain.ProjectEntityStatusParams{
+		LegalEntityID: entityID, TenantID: tenantID, Status: status, StatusChangedAt: at,
+	}); err != nil {
+		c.log.Error("entity status event: projection failed — the entity's standing is unchanged until it is replayed",
+			zap.String("event_id", env.EventID), zap.String("legal_entity_id", entityID), zap.Error(err))
+		return err
+	}
+	c.log.Info("entity status projected", zap.String("legal_entity_id", entityID), zap.String("status", status))
+	return nil
+}
+
+func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbound) error {
 	var payload principalStatusPayload
-	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+	source := LifecycleSourceService
+	if env.EventType == EventEmploymentChanged {
+		var e employmentChangedPayload
+		if err := json.Unmarshal(env.Payload, &e); err != nil {
+			c.log.Error("employment.changed: undecodable payload — skipped",
+				zap.String("event_id", env.EventID), zap.Error(err))
+			return nil
+		}
+		if !employmentEndedStatuses[strings.ToUpper(strings.TrimSpace(e.EmploymentStatus))] {
+			c.log.Debug("employment.changed is not an exit — nothing projected",
+				zap.String("event_id", env.EventID), zap.String("employment_status", e.EmploymentStatus))
+			return nil
+		}
+		payload = principalStatusPayload{PrincipalID: e.PrincipalID, TenantID: e.TenantID,
+			NewStatus: "TERMINATED", StatusChangedAt: e.StatusChangedAt}
+		source = "access-control-svc"
+	} else if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		c.log.Error("principal status event: undecodable payload — skipped",
 			zap.String("event_id", env.EventID), zap.Error(err))
-		return
+		return nil // Malformed payload, commit and move on
 	}
 
 	principalID := strings.TrimSpace(payload.PrincipalID)
@@ -317,7 +445,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 		c.log.Error("principal status event: payload names no principal_id — cannot project",
 			zap.String("event_id", env.EventID),
 			zap.String("correlation_id", env.CorrelationID))
-		return
+		return nil // Missing principal_id, commit and move on
 	}
 
 	status := strings.ToUpper(strings.TrimSpace(payload.NewStatus))
@@ -331,7 +459,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 			zap.String("event_id", env.EventID),
 			zap.String("principal_id", principalID),
 			zap.String("correlation_id", env.CorrelationID))
-		return
+		return nil // Empty status, commit and move on
 	}
 
 	// Payload first, envelope second: identity-context-svc puts the tenant in
@@ -346,14 +474,14 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 			zap.String("event_id", env.EventID),
 			zap.String("principal_id", principalID),
 			zap.String("correlation_id", env.CorrelationID))
-		return
+		return nil // Missing tenant, commit and move on
 	}
 
 	projected, err := c.store.ProjectPrincipalStatus(ctx, domain.ProjectPrincipalStatusParams{
 		PrincipalID:     principalID,
 		TenantID:        tenantID,
 		Status:          status,
-		SourceService:   LifecycleSourceService,
+		SourceService:   source,
 		StatusChangedAt: payload.StatusChangedAt,
 	})
 	if err != nil {
@@ -364,7 +492,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 			c.log.Debug("principal status event: a newer status is already projected — skipped",
 				zap.String("principal_id", principalID),
 				zap.String("status", status))
-			return
+			return nil
 		}
 		// Logged at Error with the consequence spelled out, because the
 		// direction of this failure matters: a SUSPENSION that fails to
@@ -375,7 +503,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 			zap.String("status", status),
 			zap.String("correlation_id", env.CorrelationID),
 			zap.Error(err))
-		return
+		return err // DB error - return error to allow retry
 	}
 
 	// At Warn rather than Info when the projected status is not ACTIVE: a
@@ -393,6 +521,7 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 	} else {
 		c.log.Warn("principal status projected — this principal is now denied EVERY action until reinstated", fields...)
 	}
+	return nil
 }
 
 // handleInvalidation drops the cached grant and delegation reads for the

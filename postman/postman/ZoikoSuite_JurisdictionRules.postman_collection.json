@@ -1,0 +1,397 @@
+{
+    "info": {
+        "_postman_id": "zoiko-jurisdiction-rules",
+        "name": "ZoikoSuite - Jurisdiction Rules",
+        "description": "Minimal collection for jurisdiction-rules-svc (port 8082). Reads are open platform reference data. Writes require the authorization principal header (X-Principal-Id) plus the write-strict envelope headers (X-Request-Id, X-Source-Channel, Idempotency-Key). Error bodies are RFC 9457 application/problem+json. Fill jurisdictionId/ruleId from a Create response before calling the path-parameter requests.",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+        {
+            "key": "baseUrl",
+            "value": "http://localhost:8082"
+        },
+        {
+            "key": "principalId",
+            "value": "demo-rule-admin-01"
+        },
+        {
+            "key": "tenantId",
+            "value": "tenant-demo-01"
+        },
+        {
+            "key": "correlationId",
+            "value": "jur-rules-demo-01"
+        },
+        {
+            "key": "idempotencyKey",
+            "value": "jur-rules-demo-write-01"
+        },
+        {
+            "key": "jurisdictionId",
+            "value": ""
+        },
+        {
+            "key": "ruleId",
+            "value": ""
+        }
+    ],
+    "item": [
+        {
+            "name": "01 - Health",
+            "item": [
+                {
+                    "name": "Health /healthz",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/healthz",
+                        "header": []
+                    }
+                }
+            ]
+        },
+        {
+            "name": "02 - Read surface (open reference data)",
+            "item": [
+                {
+                    "name": "List Jurisdictions",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/jurisdictions",
+                        "header": [
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Jurisdiction",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/jurisdictions/{{jurisdictionId}}",
+                        "header": [
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Ancestors",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/jurisdictions/{{jurisdictionId}}/ancestors",
+                        "header": [
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Rules",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/jurisdictions/{{jurisdictionId}}/rules",
+                        "header": [
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Rule Pack",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/jurisdictions/{{jurisdictionId}}/rule-pack",
+                        "header": [
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Rule",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/rules/{{ruleId}}",
+                        "header": [
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "Get Drift Events",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/rules/{{ruleId}}/drift-events",
+                        "header": [
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "name": "03 - Admin writes (authorized, write-strict envelope)",
+            "item": [
+                {
+                    "name": "Create Jurisdiction",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/admin/jurisdictions",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{idempotencyKey}}"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n  \"jurisdiction_code\": \"GB-ENG\",\n  \"jurisdiction_name\": \"England (Demo)\",\n  \"jurisdiction_type\": \"NATIONAL_PROVINCE\",\n  \"authority_type\": \"PARLIAMENT\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\"\n}"
+                        }
+                    },
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 201 && pm.response.json().jurisdiction_id) { pm.collectionVariables.set('jurisdictionId', pm.response.json().jurisdiction_id); }"
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "List Jurisdictions (post-create)",
+                    "request": {
+                        "method": "GET",
+                        "url": "{{baseUrl}}/v1/jurisdictions",
+                        "header": []
+                    }
+                },
+                {
+                    "name": "Create Rule",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/admin/jurisdictions/{{jurisdictionId}}/rules",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{idempotencyKey}}"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n  \"rule_domain\": \"TAX\",\n  \"rule_code\": \"GB-ENG-VAT-RATE\",\n  \"rule_name\": \"England VAT Standard Rate (Demo)\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"rule_payload\": {\"rate_percent\": 20.0},\n  \"rule_status\": \"DRAFT\"\n}"
+                        }
+                    },
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "if (pm.response.code === 201 && pm.response.json().jurisdiction_rule_id) { pm.collectionVariables.set('ruleId', pm.response.json().jurisdiction_rule_id); }"
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "Transition Rule to ACTIVE",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/admin/rules/{{ruleId}}/transition",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{idempotencyKey}}"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n  \"new_status\": \"ACTIVE\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Record Drift",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/admin/rules/{{ruleId}}/drift",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{idempotencyKey}}"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{\n  \"drift_state\": \"DRIFTED\",\n  \"reason\": \"HMRC amended the rate effective 1 Feb 2026 (demo).\"\n}"
+                        }
+                    }
+                },
+                {
+                    "name": "Deactivate Jurisdiction",
+                    "request": {
+                        "method": "POST",
+                        "url": "{{baseUrl}}/v1/admin/jurisdictions/{{jurisdictionId}}/deactivate",
+                        "header": [
+                            {
+                                "key": "Content-Type",
+                                "value": "application/json"
+                            },
+                            {
+                                "key": "X-Principal-Id",
+                                "value": "{{principalId}}"
+                            },
+                            {
+                                "key": "X-Tenant-Id",
+                                "value": "{{tenantId}}"
+                            },
+                            {
+                                "key": "X-Correlation-ID",
+                                "value": "{{correlationId}}"
+                            },
+                            {
+                                "key": "X-Request-Id",
+                                "value": "{{$guid}}"
+                            },
+                            {
+                                "key": "X-Source-Channel",
+                                "value": "API"
+                            },
+                            {
+                                "key": "Idempotency-Key",
+                                "value": "{{idempotencyKey}}"
+                            }
+                        ],
+                        "body": {
+                            "mode": "raw",
+                            "raw": "{}"
+                        }
+                    },
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "exec": [
+                                    "pm.test('replay is an idempotent 200', function () { pm.response.to.have.status(200); const b = pm.response.json(); pm.expect(b).to.have.property('changed'); });"
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

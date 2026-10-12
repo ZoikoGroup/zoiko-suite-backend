@@ -505,12 +505,16 @@ func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T
 		t.Fatalf("failed to activate global version: %v", err)
 	}
 
-	// Tenant-A-specific override, more specific than global.
+	// Tenant-A-specific override, more specific than global. Effective in
+	// the PAST, not an hour from now: FindApplicableVersions gates on the
+	// version's effective window (effective_from <= now), so a future
+	// version is deliberately not yet applicable and this assertion would
+	// see only the global row.
 	tenantSpecific, _, err := s.CreatePolicyVersion(ctx, domain.CreatePolicyVersionParams{
 		PolicyID:             p.PolicyID,
 		TenantID:             tenantA,
 		RulePayload:          []byte(`{"threshold_amount":9000}`),
-		EffectiveFrom:        time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond),
+		EffectiveFrom:        time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond),
 		CreatedByPrincipalID: "admin-1",
 	})
 	if err != nil {
@@ -531,7 +535,7 @@ func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T
 	}
 
 	// Tenant A: should see BOTH (tenant-specific first, most specific; global second).
-	resultsA, err := s.FindApplicableVersions(ctx, "APPROVAL_THRESHOLD", tenantA, nil)
+	resultsA, err := s.FindApplicableVersions(ctx, "APPROVAL_THRESHOLD", tenantA, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error for tenant A: %v", err)
 	}
@@ -565,7 +569,7 @@ func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T
 	}
 
 	// Tenant B: must NOT see tenant A's override — only the global fallback.
-	resultsB, err := s.FindApplicableVersions(ctx, "APPROVAL_THRESHOLD", tenantB, nil)
+	resultsB, err := s.FindApplicableVersions(ctx, "APPROVAL_THRESHOLD", tenantB, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error for tenant B: %v", err)
 	}
@@ -577,7 +581,7 @@ func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T
 	}
 
 	// No tenant specified at all: only the global version applies.
-	resultsNone, err := s.FindApplicableVersions(ctx, "APPROVAL_THRESHOLD", nil, nil)
+	resultsNone, err := s.FindApplicableVersions(ctx, "APPROVAL_THRESHOLD", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error with no tenant: %v", err)
 	}
@@ -586,7 +590,7 @@ func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T
 	}
 
 	// Wrong policy_type: no matches.
-	resultsWrongType, err := s.FindApplicableVersions(ctx, "SPEND_CONTROL", tenantA, nil)
+	resultsWrongType, err := s.FindApplicableVersions(ctx, "SPEND_CONTROL", tenantA, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error for wrong policy_type: %v", err)
 	}

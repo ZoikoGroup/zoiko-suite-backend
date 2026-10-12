@@ -349,7 +349,7 @@ func TestAttachSupportRoute_AuthorizesAgainstTheTargetTenant(t *testing.T) {
 
 	// The caller's own tenant header says tenant-support; the request targets
 	// tenant-a. The denial proves the check ran against something.
-	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", "support-lead-9", req)
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, req)
 	assert.Equal(t, http.StatusForbidden, w.Code)
 	assert.Empty(t, h.support.contexts)
 }
@@ -359,19 +359,26 @@ func TestAttachSupportRoute_RequiresATargetTenant(t *testing.T) {
 	req := validAttachRequest()
 	req.TenantID = ""
 
-	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", "support-lead-9", req)
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestAttachSupportRoute_GrantsAndReturnsEvidence(t *testing.T) {
 	h := newGov01Harness(t, &permittingAuthz{})
 
-	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", "support-lead-9", validAttachRequest())
-	require.Equal(t, http.StatusCreated, w.Code)
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
 
 	var resp domain.AttachSupportContextResponse
 	decodeBody(t, w, &resp)
 	assert.NotEmpty(t, resp.SupportContextID)
+	assert.Equal(t, domain.SupportPendingApproval, resp.ApprovalStatus, "an attach is a request, not a grant")
+
+	// The named approver's own call makes it live.
+	w = do(h.router, http.MethodPost, "/v1/context/support/"+resp.SupportContextID+"/approve", "tenant-a", "support-lead-9", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	decodeBody(t, w, &resp)
+	assert.Equal(t, domain.SupportApproved, resp.ApprovalStatus)
 	assert.NotEmpty(t, resp.EvidenceID)
 	assert.True(t, resp.ExpiresAt.After(time.Now()), "a grant must not be issued already expired")
 }
@@ -381,7 +388,7 @@ func TestAttachSupportRoute_SelfApprovalIsRefusedWithAStableCode(t *testing.T) {
 	req := validAttachRequest()
 	req.ApproverPrincipalID = req.SupportPrincipalID
 
-	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", "support-lead-9", req)
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 
 	var body map[string]any
@@ -403,7 +410,7 @@ func TestAttachSupportRoute_SoDConflictIs409WithItsOwnCode(t *testing.T) {
 	r := chi.NewRouter()
 	identityctx.RegisterRoutes(r, h)
 
-	w := do(r, http.MethodPost, "/v1/context/support", "tenant-support", "support-lead-9", validAttachRequest())
+	w := do(r, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
 
 	require.Equal(t, http.StatusConflict, w.Code)
 	var body map[string]any
@@ -428,7 +435,7 @@ func TestAttachSupportRoute_SoDOutageIs503NotAGrant(t *testing.T) {
 	r := chi.NewRouter()
 	identityctx.RegisterRoutes(r, h)
 
-	w := do(r, http.MethodPost, "/v1/context/support", "tenant-support", "support-lead-9", validAttachRequest())
+	w := do(r, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
 
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
 	assert.Empty(t, store.contexts, "no grant may be written when the conflict check did not run")
@@ -448,7 +455,7 @@ func TestSupportRoutes_AreUnavailableRatherThanOpenWhenUnconfigured(t *testing.T
 	r := chi.NewRouter()
 	identityctx.RegisterRoutes(r, h)
 
-	w := do(r, http.MethodPost, "/v1/context/support", "tenant-support", "support-lead-9", validAttachRequest())
+	w := do(r, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
 	assert.Equal(t, http.StatusNotImplemented, w.Code)
 
 	w = do(r, http.MethodPost, "/v1/context/cache/refresh", "tenant-a", "p-1", domain.RefreshCacheRequest{Reason: "x"})
@@ -459,8 +466,8 @@ func TestRevokeSupportRoute_RequiresItsOwnAction(t *testing.T) {
 	az := &permittingAuthz{}
 	h := newGov01Harness(t, az)
 
-	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", "support-lead-9", validAttachRequest())
-	require.Equal(t, http.StatusCreated, w.Code)
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
 	var created domain.AttachSupportContextResponse
 	decodeBody(t, w, &created)
 
@@ -483,8 +490,8 @@ func TestRevokeSupportRoute_UnknownContextIs404(t *testing.T) {
 
 func TestRevokeSupportRoute_AcceptsAnEmptyBody(t *testing.T) {
 	h := newGov01Harness(t, &permittingAuthz{})
-	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", "support-lead-9", validAttachRequest())
-	require.Equal(t, http.StatusCreated, w.Code)
+	w := do(h.router, http.MethodPost, "/v1/context/support", "tenant-support", requesterID, validAttachRequest())
+	require.Equal(t, http.StatusAccepted, w.Code)
 	var created domain.AttachSupportContextResponse
 	decodeBody(t, w, &created)
 

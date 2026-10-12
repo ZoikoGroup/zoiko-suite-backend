@@ -102,10 +102,12 @@ MVP on it now.
 Authorization / Workflow call it directly (sync or via event), it does
 not subscribe back to them.
 
-**Governance dependencies**: none upstream. This service sits beneath
-Policy/Authorization/Workflow, not behind them — it must never itself
-require a governance check to accept a write (that would be circular
-and could deadlock the evidence path).
+**Governance dependencies**: none upstream for governance logic, but writes
+are authorized via authorization-svc (action `GOVERNANCE_DECISION_RECORD`).
+Reads are also authorized (`GOVERNANCE_DECISION_READ`). Replay requires
+`GOVERNANCE_DECISION_REPLAY`. This service sits beneath
+Policy/Authorization/Workflow for governance decisions, but requires
+authorization-svc to confirm the caller may append to the ledger.
 
 ## Evidence obligations
 
@@ -124,31 +126,23 @@ file's doc comment for why).
 ## Event publishing — FINALIZED
 
 After a successful `POST /v1/decisions` write, publish
-`governance.decision.recorded`.
+`governance.decision.recorded` via a **transactional outbox** (Event Catalogue §6).
+The event is enqueued in the same database transaction as the decision insert,
+then published asynchronously by a background worker. This ensures at-least-once
+delivery even if the broker is temporarily unavailable or the request context
+is cancelled.
 
-Mirror the existing publisher convention exactly — see
-`services/identity-context-svc/internal/events/publisher.go` and
-`services/tenant-entity-registry-svc/internal/events/publisher.go`. Both:
-- wrap payloads in the same `envelope` struct shape (`EventType`,
-  `EmittedAt`, `SchemaVersion`, `SourceService`, `CorrelationID`, `Payload`)
-- have a `// producer *kafka.Writer — TODO: inject kafka.Writer before
-  Phase 1 exit criteria` comment on the `Publisher` struct
-- log the fully-marshaled envelope at `Info` level instead of writing to
-  Kafka (`p.log.Info("event emitted (stub — wire Kafka writer)", ...)`)
+The `Publisher` struct in `internal/events/publisher.go` remains for reference
+and testing, but the production write path uses `store.EnqueueEvent` to write
+to the `outbox` table (migration 000009). A background worker (to be
+implemented) will poll `GetUnpublishedEvents` and publish via Kafka.
 
-**Important nuance**: neither existing envelope struct hoists
-`tenant_id`/`legal_entity_id`/jurisdiction context to the top level —
-those live inside the `payload` map, and neither existing publisher
-emits jurisdiction context at all today. Don't invent new top-level
-envelope fields to satisfy `03-microservices.md` §19 (event name,
-version, timestamp, tenant ID, legal entity ID, jurisdiction context,
-actor ID, correlation ID, source service, payload schema version) —
-instead make sure the `payload` map for `governance.decision.recorded`
-includes `tenant_id`, `legal_entity_id`, `actor_id` (from `actor_id`
-column), and jurisdiction context (populate from `rule_basis` — it's
-the closest thing this schema has to a jurisdiction reference). Schema
-version goes in the envelope's existing `SchemaVersion` field, same as
-today's services.
+Mirror the existing publisher convention for the envelope shape (`EventType`,
+`EmittedAt`, `SchemaVersion`, `SourceService`, `CorrelationID`, `Payload`).
+The payload includes `tenant_id`, `legal_entity_id`, `actor_id`, and
+jurisdiction context (populated from `rule_basis` — it's the closest thing
+this schema has to a jurisdiction reference). Schema version goes in the
+envelope's existing `SchemaVersion` field, same as today's services.
 
 ## Doctrine constraints that apply here
 

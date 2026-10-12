@@ -15,8 +15,6 @@ type Store interface {
 	PurgeActionTokensForTenant(ctx context.Context, tenantID string, olderThan time.Time) (int64, error)
 	FindTenantsWithStaleIntents(ctx context.Context, staleCutoff time.Time, limit int) ([]string, error)
 	ExpireStaleIntentsForTenant(ctx context.Context, tenantID string, staleCutoff time.Time) (int64, error)
-	FindTenantsWithCompletedIntents(ctx context.Context, completedCutoff time.Time, limit int) ([]string, error)
-	PurgeCompletedLedgerRecordsForTenant(ctx context.Context, tenantID string, olderThan time.Time) (int64, error)
 }
 
 // Options configures the housekeeping worker.
@@ -24,16 +22,14 @@ type Options struct {
 	Interval             time.Duration
 	BatchSize            int
 	TokenRetention       time.Duration // Age after which terminal tokens are purged (e.g. 30 days)
-	LedgerRetention      time.Duration // Age after which completed ledger records are purged (e.g. 90 days)
 	StaleIntentThreshold time.Duration // Age after which stuck PENDING/RENDERING intents are DROPPED (e.g. 24h)
 }
 
 // Stats returns the summary counts of records processed during a housekeeping pass.
 type Stats struct {
-	ExpiredTokens    int64
-	PurgedTokens     int64
-	StaleIntents     int64
-	PurgedLedgerRows int64
+	ExpiredTokens int64
+	PurgedTokens  int64
+	StaleIntents  int64
 }
 
 // Worker periodically runs automated expiry and retention cleanup across all tenants.
@@ -52,9 +48,6 @@ func NewWorker(store Store, opts Options, log *zap.Logger) *Worker {
 	}
 	if opts.TokenRetention <= 0 {
 		opts.TokenRetention = 30 * 24 * time.Hour
-	}
-	if opts.LedgerRetention <= 0 {
-		opts.LedgerRetention = 90 * 24 * time.Hour
 	}
 	if opts.StaleIntentThreshold <= 0 {
 		opts.StaleIntentThreshold = 24 * time.Hour
@@ -79,7 +72,6 @@ func (w *Worker) Start(ctx context.Context) {
 		zap.Duration("interval", w.opts.Interval),
 		zap.Int("batch_size", w.opts.BatchSize),
 		zap.Duration("token_retention", w.opts.TokenRetention),
-		zap.Duration("ledger_retention", w.opts.LedgerRetention),
 		zap.Duration("stale_intent_threshold", w.opts.StaleIntentThreshold),
 	)
 
@@ -92,12 +84,11 @@ func (w *Worker) Start(ctx context.Context) {
 			stats, err := w.RunOnce(ctx)
 			if err != nil {
 				w.log.Error("housekeeping pass encountered error", zap.Error(err))
-			} else if stats.ExpiredTokens > 0 || stats.PurgedTokens > 0 || stats.StaleIntents > 0 || stats.PurgedLedgerRows > 0 {
+			} else if stats.ExpiredTokens > 0 || stats.PurgedTokens > 0 || stats.StaleIntents > 0 {
 				w.log.Info("housekeeping pass completed with mutations",
 					zap.Int64("expired_tokens", stats.ExpiredTokens),
 					zap.Int64("purged_tokens", stats.PurgedTokens),
 					zap.Int64("stale_intents", stats.StaleIntents),
-					zap.Int64("purged_ledger_rows", stats.PurgedLedgerRows),
 				)
 			}
 		}
@@ -169,26 +160,13 @@ func (w *Worker) RunOnce(ctx context.Context) (Stats, error) {
 		}
 	}
 
-	// 4. Purge completed delivery ledger records older than LedgerRetention
-	if w.opts.LedgerRetention > 0 {
-		ledgerPurgeCutoff := now.Add(-w.opts.LedgerRetention)
-		completedTenants, err := w.store.FindTenantsWithCompletedIntents(ctx, ledgerPurgeCutoff, w.opts.BatchSize)
-		if err != nil {
-			w.log.Error("housekeeping: failed to discover tenants with completed intents for purge", zap.Error(err))
-			return stats, err
-		}
-		for _, tenantID := range completedTenants {
-			count, err := w.store.PurgeCompletedLedgerRecordsForTenant(ctx, tenantID, ledgerPurgeCutoff)
-			if err != nil {
-				w.log.Error("housekeeping: failed to purge completed ledger records for tenant",
-					zap.String("tenant_id", tenantID),
-					zap.Error(err),
-				)
-				continue
-			}
-			stats.PurgedLedgerRows += count
-		}
-	}
+	// There is deliberately no step that deletes delivery-ledger records. One
+	// used to purge concluded intents older than 90 days, and the foreign-key
+	// cascade took their renders, attempts and delivery events with them: the
+	// evidence of what was sent to whom, destroyed on a timer, with no legal
+	// hold check. ZS-SVC-Y-001 keeps that evidence (§8.4, §9.2, INV-28) and
+	// gives its retention to DRC; migration 000023 makes the tables refuse
+	// DELETE so the purge cannot quietly come back.
 
 	return stats, nil
 }

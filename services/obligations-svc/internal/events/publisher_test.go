@@ -51,7 +51,7 @@ func decode(t *testing.T, msg kafka.Message) envelope {
 
 func TestPublishObligationClosed_EnvelopeCarriesJurisdictionAndActor(t *testing.T) {
 	w := &fakeWriter{}
-	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w)
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w, nil)
 
 	err := p.PublishObligationClosed(context.Background(), domain.Obligation{
 		ObligationID: "obl-1", LegalEntityID: "entity-1", JurisdictionID: "uk-england",
@@ -72,7 +72,7 @@ func TestPublishObligationClosed_EnvelopeCarriesJurisdictionAndActor(t *testing.
 
 func TestPublishObligationUpdated_RepeatEventsOnSameObligation_GetDistinctEventIDs(t *testing.T) {
 	w := &fakeWriter{}
-	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w)
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w, nil)
 
 	for i := 0; i < 2; i++ {
 		err := p.PublishObligationUpdated(context.Background(), domain.Obligation{
@@ -96,7 +96,7 @@ func TestPublishObligationUpdated_RepeatEventsOnSameObligation_GetDistinctEventI
 // lacked it — not from the payload, and not from a second lookup.
 func TestPublish_EnvelopeCarriesTheVerifiedTenant(t *testing.T) {
 	w := &fakeWriter{}
-	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w)
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w, nil)
 
 	const tenant = "11111111-1111-1111-1111-111111111111"
 	ctx := middleware.WithTenant(context.Background(), tenant)
@@ -125,7 +125,7 @@ func TestPublish_EnvelopeCarriesTheVerifiedTenant(t *testing.T) {
 // present one to anything doing a bare presence check.
 func TestPublish_OmitsTenantWhenTheContextCarriesNone(t *testing.T) {
 	w := &fakeWriter{}
-	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w)
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w, nil)
 
 	require.NoError(t, p.PublishObligationCreated(context.Background(),
 		domain.Obligation{ObligationID: "ob-1", LegalEntityID: "le-1"}, "corr-1"))

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sort"
@@ -185,6 +186,14 @@ func (h *Handler) ValidateEntityScope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+		return
+	}
+	// Anyone may ask what they themselves hold. Asking about somebody else
+	// reads their grant map — who holds what, entity by entity — which is the
+	// Authorization Standard's iam.assignment.read (Appendix A); without this
+	// any principal in the tenant could enumerate any other's permissions.
+	if req.PrincipalID != callerPrincipal &&
+		!h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.assignment.read") {
 		return
 	}
 
@@ -437,37 +446,15 @@ func (h *Handler) ValidateSoDConflicts(w http.ResponseWriter, r *http.Request) {
 		held = dedupeSorted(append(rbacActions, delegatedActions...))
 	}
 
-	resp := sodValidateResponse{Conflicts: []sodConflict{}}
+	conflicts, err := h.sodConflictsFor(r.Context(), held, candidates, tenantScope)
+	if err != nil {
+		h.log.Error("ValidateSoDConflicts: store unavailable (sod check)",
+			zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	resp := sodValidateResponse{Conflicts: conflicts}
 	for _, candidate := range candidates {
-		// The "other actions" for this candidate: everything held, plus every
-		// OTHER candidate. The candidate itself is excluded — CheckSoDConflict
-		// searches for a rule pairing the candidate with something else, and
-		// leaving it in the held set would make a self-referential
-		// OWN_OBJECT_FORBIDDEN row look like a static pair conflict.
-		others := removeAll(append(append([]string{}, held...), candidates...), candidate)
-
-		conflictingAction, hasConflict, err := h.store.CheckSoDConflict(r.Context(), others, candidate, tenantScope)
-		if err != nil {
-			h.log.Error("ValidateSoDConflicts: store unavailable (sod check)",
-				zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-			return
-		}
-		if hasConflict {
-			source := "candidate"
-			if contains(held, conflictingAction) {
-				// Held wins the label when it is both: the remedy is to
-				// revoke something the principal has, which is a different
-				// and larger act than splitting a bundle.
-				source = "held"
-			}
-			resp.Conflicts = append(resp.Conflicts, sodConflict{
-				CandidateAction: candidate,
-				ConflictsWith:   conflictingAction,
-				Source:          source,
-			})
-		}
-
 		ownObject, err := h.store.CheckOwnObjectSoD(r.Context(), candidate, tenantScope)
 		if err != nil {
 			h.log.Error("ValidateSoDConflicts: store unavailable (own-object sod check)",
@@ -712,4 +699,40 @@ func dedupeSorted(in []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// sodConflictsFor returns every static conflict between candidates and the
+// actions already held, or among the candidates themselves. Shared by
+// /v1/sod/validate (advisory) and CreateRoleAssignment (enforced), so the
+// question asked before a grant and the one that refuses it are the same.
+func (h *Handler) sodConflictsFor(ctx context.Context, held, candidates []string, tenantScope string) ([]sodConflict, error) {
+	conflicts := []sodConflict{}
+	for _, candidate := range candidates {
+		// The "other actions" for this candidate: everything held, plus every
+		// OTHER candidate. The candidate itself is excluded — CheckSoDConflict
+		// searches for a rule pairing the candidate with something else, and
+		// leaving it in the held set would make a self-referential
+		// OWN_OBJECT_FORBIDDEN row look like a static pair conflict.
+		others := removeAll(append(append([]string{}, held...), candidates...), candidate)
+
+		conflictingAction, hasConflict, err := h.store.CheckSoDConflict(ctx, others, candidate, tenantScope)
+		if err != nil {
+			return nil, err
+		}
+		if hasConflict {
+			source := "candidate"
+			if contains(held, conflictingAction) {
+				// Held wins the label when it is both: the remedy is to
+				// revoke something the principal has, which is a different
+				// and larger act than splitting a bundle.
+				source = "held"
+			}
+			conflicts = append(conflicts, sodConflict{
+				CandidateAction: candidate,
+				ConflictsWith:   conflictingAction,
+				Source:          source,
+			})
+		}
+	}
+	return conflicts, nil
 }

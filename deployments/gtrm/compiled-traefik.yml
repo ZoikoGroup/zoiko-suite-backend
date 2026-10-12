@@ -6,7 +6,7 @@
 #   map_version:      47
 #   compiler_version: 0.1.0
 #   commit:           unknown
-#   generated_at:     2026-09-25T09:23:07Z
+#   generated_at:     2026-09-29T09:32:58Z
 # ─────────────────────────────────────────────────────────────────────────────
 http:
     routers:
@@ -15,8 +15,8 @@ http:
             service: gtrm-svc-acme
             middlewares:
                 - gtrm-edge-strip
-                - gateway-auth
                 - gtrm-ctx-acme
+                - gateway-auth
             priority: 100
             entryPoints:
                 - web
@@ -26,8 +26,8 @@ http:
             service: gtrm-svc-atlas
             middlewares:
                 - gtrm-edge-strip
-                - gateway-auth
                 - gtrm-ctx-atlas
+                - gateway-auth
             priority: 100
             entryPoints:
                 - web
@@ -41,8 +41,8 @@ http:
             service: gtrm-svc-globex
             middlewares:
                 - gtrm-edge-strip
-                - gateway-auth
                 - gtrm-ctx-globex
+                - gateway-auth
             priority: 100
             entryPoints:
                 - web
@@ -68,12 +68,17 @@ http:
         gateway-auth:
             forwardAuth:
                 address: http://gateway-auth-svc:8092/verify
-                trustForwardHeader: true
                 authResponseHeaders:
                     - X-Principal-Id
                     - X-Tenant-Id
+                    - X-Legal-Entity-Id
+                    - X-Correlation-Id
+                    - X-Jurisdiction-Context
+                    - X-Timezone
+                    - X-Residency-Policy-Id
+                    - X-Tenant-Context-Stale
                     - X-Workload-Id
-                    - X-Carta-Decision
+                    - X-Support-Context-Id
         gtrm-ctx-acme:
             headers:
                 customRequestHeaders:
@@ -101,15 +106,7 @@ http:
         gtrm-edge-strip:
             headers:
                 customRequestHeaders:
-                    X-Approval-Reference: ""
-                    X-Book-Id: ""
-                    X-Causation-Id: ""
-                    X-Evidence-Refs: ""
-                    X-Expected-Version: ""
-                    X-Purpose-Context: ""
-                    X-Source-Channel: ""
                     X-Support-Context-Id: ""
-                    X-Workflow-Instance-Id: ""
                     X-Workload-Id: ""
                     X-Zoiko-GTRM-Map-Version: ""
                     X-Zoiko-GTRM-State: ""

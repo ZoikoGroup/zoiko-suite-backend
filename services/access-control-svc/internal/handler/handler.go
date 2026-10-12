@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,14 +71,28 @@ type AuthzAdmin interface {
 	SetPermissionBundleActive(ctx context.Context, roleID, bundleCode string, active bool, s clients.Scope) error
 }
 
-// SoDClient checks segregation-of-duties conflicts before a role/bundle is provisioned.
+// SoDClient checks segregation-of-duties conflicts before a bundle is
+// provisioned. nil means conflict-free; a conflict is errors.Is
+// domain.ErrSoDConflict; no readable verdict is errors.Is
+// domain.ErrSoDUnavailable.
 type SoDClient interface {
 	CheckConflict(ctx context.Context, req domain.SoDCheckRequest) error
 }
 
-// ProtectedActionsClient provides the list of active protected platform-admin actions.
-type ProtectedActionsClient interface {
+// ProtectedCatalogue lists the active protected platform-admin actions: the
+// actions a tenant role may not grant (Authorization Standard §9). Served by
+// this service's own protected_permissions table.
+type ProtectedCatalogue interface {
 	ListActive(ctx context.Context) ([]string, error)
+}
+
+// PermissionTaxonomy is the registry of stable capabilities (Authorization
+// Standard §5, §22 permission_definition; migration 000008). Every action a
+// bundle grants must be registered: an unregistered name is a grant that no
+// service checks, which the register would display as real.
+type PermissionTaxonomy interface {
+	Lookup(ctx context.Context, actions []string) (map[string]domain.PermissionDefinition, error)
+	List(ctx context.Context, naming, query string) ([]domain.PermissionDefinition, error)
 }
 
 // actionRoleManage is the action every write on this service is authorized
@@ -115,21 +130,23 @@ type Handler struct {
 	authz                 AuthZClient
 	authzAdmin            AuthzAdmin
 	sod                   SoDClient
-	protectedActions      ProtectedActionsClient
+	protectedActions      ProtectedCatalogue
 	protectedActionsCache []string
 	protectedActionsMu    sync.RWMutex
 	protectedActionsTTL   time.Time
+	taxonomy              PermissionTaxonomy
 	metrics               *telemetry.Domain
 	log                   *zap.Logger
 }
 
-func New(store Store, authz AuthZClient, authzAdmin AuthzAdmin, sod SoDClient, protectedActions ProtectedActionsClient, metrics *telemetry.Domain, log *zap.Logger) *Handler {
+func New(store Store, authz AuthZClient, authzAdmin AuthzAdmin, sod SoDClient, protectedActions ProtectedCatalogue, taxonomy PermissionTaxonomy, metrics *telemetry.Domain, log *zap.Logger) *Handler {
 	return &Handler{
 		store:            store,
 		authz:            authz,
 		authzAdmin:       authzAdmin,
 		sod:              sod,
 		protectedActions: protectedActions,
+		taxonomy:         taxonomy,
 		metrics:          metrics,
 		log:              log,
 	}
@@ -203,15 +220,12 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SoD check: validate the role_code against existing assignments.
-	// The role itself has no actions yet, but its code may imply a role
-	// archetype that conflicts with the caller's existing assignments.
-	if err := h.checkSoDConflict(r.Context(), tenantID, req.LegalEntityID, principalID, req.RoleCode, "", nil, req.CorrelationID); err != nil {
-		h.roleWrite(telemetry.WriteForbidden)
-		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_ROLE", "sod_conflict", "sod_conflict", err.Error(), req)
-		writeError(w, http.StatusForbidden, "sod_conflict", err.Error())
-		return
-	}
+	// No SoD check here. A new role has no actions, so it cannot be
+	// conflicted, and defining a role assigns it to nobody. The call that used
+	// to sit here sent no actions at all; authorization-svc refused it 400 and
+	// the handler reported that as 403 sod_conflict, so no role could ever be
+	// created. Segregation is checked where actions arrive: on every bundle
+	// write, against the role's whole action set.
 
 	// Asked BEFORE provisioning. The UNIQUE (tenant_id, role_code) index is the
 	// backstop and holds under a race, but reaching it only after the role had
@@ -242,11 +256,10 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 		CorrelationID: req.CorrelationID,
 	}
 	if err := h.authzAdmin.CreateRole(r.Context(), roleID, req.RoleCode, req.RoleName, req.RoleScopeType, authzScope); err != nil {
-		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateRole, telemetry.AdminUnavailable).Inc()
+		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateRole, adminOutcome(err)).Inc()
 		h.log.Error("failed to provision role in authorization-svc", zap.Error(err))
-		h.roleWrite(telemetry.WriteAuthzAdminUnavail)
-		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_ROLE", "authz_admin_unavailable", "authz_admin_unavailable", err.Error(), req)
-		writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
+		code := h.writeGuardErr(w, err, h.metrics.RoleWrites)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_ROLE", code, code, err.Error(), req)
 		return
 	}
 	h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateRole, telemetry.AdminOK).Inc()
@@ -384,6 +397,7 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.checkAllowed(r.Context(), principalID, req.LegalEntityID); err != nil {
 		h.writeAuthzErr(w, err, h.metrics.RoleWrites)
+		h.recordRefusal(r.Context(), updateTenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_ROLE", "forbidden", "forbidden", err.Error(), req)
 		return
 	}
 
@@ -433,13 +447,13 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 				LegalEntityID: req.LegalEntityID,
 				CorrelationID: req.CorrelationID,
 			}); err != nil {
-				h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetRoleState, telemetry.AdminUnavailable).Inc()
+				h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetRoleState, adminOutcome(err)).Inc()
 				h.log.Error("failed to propagate role status to authorization-svc",
 					zap.String("role_definition_id", roleDefinitionID),
 					zap.String("status", req.Status),
 					zap.Error(err))
-				h.roleWrite(telemetry.WriteAuthzAdminUnavail)
-				writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
+				code := h.writeGuardErr(w, err, h.metrics.RoleWrites)
+				h.recordRefusal(r.Context(), updateTenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_ROLE", code, code, err.Error(), req)
 				return
 			}
 			h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetRoleState, telemetry.AdminOK).Inc()
@@ -495,27 +509,32 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Protected actions check: tenant bundles may not include platform-admin actions.
-	if err := h.checkProtectedActions(req.PermittedActions); err != nil {
-		h.bundleWrite(telemetry.WriteForbidden)
-		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "protected_action", "protected_action", err.Error(), req)
-		writeError(w, http.StatusForbidden, "protected_action", err.Error())
+	// No protected platform-admin action (§9), then every action must be a
+	// registered capability (§5). Protected first: it matches regardless of
+	// case and spacing, so " IAM.Role.Manage" is answered as the escalation
+	// attempt it is rather than as a mere misspelling.
+	if err := h.checkProtectedActions(r.Context(), req.PermittedActions); err != nil {
+		code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", code, code, err.Error(), req)
+		return
+	}
+	if err := h.checkTaxonomy(r.Context(), req.PermittedActions); err != nil {
+		code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", code, code, err.Error(), req)
 		return
 	}
 
-	// Get the role to find its role_code for SoD check.
-	role, err := h.store.GetRole(r.Context(), roleDefinitionID)
-	if err != nil {
+	// The role must exist in this tenant before anything is attached to it.
+	if _, err := h.store.GetRole(r.Context(), roleDefinitionID); err != nil {
 		h.writeStoreErr(w, err, h.metrics.BundleWrites)
 		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "role_not_found", "not_found", err.Error(), req)
 		return
 	}
 
-	// SoD check: validate the bundle's actions against existing assignments.
-	if err := h.checkSoDConflict(r.Context(), bundleTenantID, req.LegalEntityID, principalID, role.RoleCode, req.BundleCode, req.PermittedActions, req.CorrelationID); err != nil {
-		h.bundleWrite(telemetry.WriteForbidden)
-		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "sod_conflict", "sod_conflict", err.Error(), req)
-		writeError(w, http.StatusForbidden, "sod_conflict", err.Error())
+	// SoD check: the role's whole action set once this bundle is attached.
+	if err := h.checkSoDConflict(r.Context(), bundleTenantID, principalID, req.CorrelationID, roleDefinitionID, "", req.PermittedActions); err != nil {
+		code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", code, code, err.Error(), req)
 		return
 	}
 
@@ -544,11 +563,10 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 		LegalEntityID: req.LegalEntityID,
 		CorrelationID: req.CorrelationID,
 	}); err != nil {
-		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateBundle, telemetry.AdminUnavailable).Inc()
+		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateBundle, adminOutcome(err)).Inc()
 		h.log.Error("failed to provision permission bundle in authorization-svc", zap.Error(err))
-		h.bundleWrite(telemetry.WriteAuthzAdminUnavail)
-		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", "authz_admin_unavailable", "authz_admin_unavailable", err.Error(), req)
-		writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
+		code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), bundleTenantID, req.LegalEntityID, principalID, req.CorrelationID, "CREATE_BUNDLE", code, code, err.Error(), req)
 		return
 	}
 	h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateBundle, telemetry.AdminOK).Inc()
@@ -710,30 +728,52 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Protected actions check: tenant bundles may not include platform-admin actions.
-	if actionsChanged {
-		if err := h.checkProtectedActions(req.PermittedActions); err != nil {
-			h.bundleWrite(telemetry.WriteForbidden)
-			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "protected_action", "protected_action", err.Error(), req)
-			writeError(w, http.StatusForbidden, "protected_action", err.Error())
-			return
-		}
-	}
-
-	// Get the role to find its role_code for SoD check.
-	role, err := h.store.GetRole(r.Context(), roleDefinitionID)
-	if err != nil {
-		h.writeStoreErr(w, err, h.metrics.BundleWrites)
-		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "role_not_found", "not_found", err.Error(), req)
+	// A template-managed bundle's actions ARE the template version's (§9:
+	// "customers cannot mutate canonical template silently"). Editing them
+	// here would leave a role that claims template provenance while granting
+	// something else; the supported change is a template upgrade. Detaching
+	// and reattaching it is still allowed.
+	if actionsChanged && current.TemplateCode != "" {
+		h.bundleWrite(telemetry.WriteConflict)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "template_managed_bundle", "template_managed_bundle", string(domain.ErrTemplateManagedBundle), req)
+		writeError(w, http.StatusConflict, "template_managed_bundle", string(domain.ErrTemplateManagedBundle))
 		return
 	}
 
-	// SoD check: validate the bundle's actions against existing assignments.
-	if actionsChanged {
-		if err := h.checkSoDConflict(r.Context(), tenantID, req.LegalEntityID, principalID, role.RoleCode, current.BundleCode, req.PermittedActions, req.CorrelationID); err != nil {
-			h.bundleWrite(telemetry.WriteForbidden)
-			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "sod_conflict", "sod_conflict", err.Error(), req)
-			writeError(w, http.StatusForbidden, "sod_conflict", err.Error())
+	// The guards run whenever the write leaves the bundle ACTIVE with actions
+	// it did not actively grant a moment ago: an action edit, or a
+	// reactivation. Reactivation used to skip both, so a bundle detached
+	// before a conflicting sibling was attached (or before an action joined
+	// the protected catalogue) came back with no check at all.
+	resultActive := current.ActiveFlag
+	if req.ActiveFlag != nil {
+		resultActive = *req.ActiveFlag
+	}
+	resultActions := current.PermittedActions
+	if req.PermittedActions != nil {
+		resultActions = req.PermittedActions
+	}
+	if resultActive && (actionsChanged || activeChanged) {
+		// A template-managed bundle carries the template's own actions, which
+		// may include protected ones (the IAM Access Administrator archetype
+		// grants iam.assignment.grant): §9 reserves those from TENANT CUSTOM
+		// roles, and this bundle is not tenant-authored. Its actions cannot
+		// be edited here (above), so only a reactivation reaches this point.
+		if current.TemplateCode == "" {
+			if err := h.checkProtectedActions(r.Context(), resultActions); err != nil {
+				code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+				h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", code, code, err.Error(), req)
+				return
+			}
+		}
+		if err := h.checkTaxonomy(r.Context(), resultActions); err != nil {
+			code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", code, code, err.Error(), req)
+			return
+		}
+		if err := h.checkSoDConflict(r.Context(), tenantID, principalID, req.CorrelationID, roleDefinitionID, bundleID, resultActions); err != nil {
+			code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", code, code, err.Error(), req)
 			return
 		}
 	}
@@ -748,24 +788,22 @@ func (h *Handler) UpdateBundle(w http.ResponseWriter, r *http.Request) {
 		// Upsert-replace into authorization-svc: idempotent on
 		// (role_id, bundle_code), so this is an edit rather than a duplicate.
 		if err := h.authzAdmin.CreatePermissionBundle(r.Context(), roleDefinitionID, current.BundleCode, req.PermittedActions, scope); err != nil {
-			h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateBundle, telemetry.AdminUnavailable).Inc()
+			h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateBundle, adminOutcome(err)).Inc()
 			h.log.Error("failed to propagate permission bundle actions to authorization-svc",
 				zap.String("bundle_id", bundleID), zap.Error(err))
-			h.bundleWrite(telemetry.WriteAuthzAdminUnavail)
-			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "authz_admin_unavailable", "authz_admin_unavailable", err.Error(), req)
-			writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
+			code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", code, code, err.Error(), req)
 			return
 		}
 		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminCreateBundle, telemetry.AdminOK).Inc()
 	}
 	if activeChanged {
 		if err := h.authzAdmin.SetPermissionBundleActive(r.Context(), roleDefinitionID, current.BundleCode, *req.ActiveFlag, scope); err != nil {
-			h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetBundle, telemetry.AdminUnavailable).Inc()
+			h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetBundle, adminOutcome(err)).Inc()
 			h.log.Error("failed to propagate permission bundle active state to authorization-svc",
 				zap.String("bundle_id", bundleID), zap.Error(err))
-			h.bundleWrite(telemetry.WriteAuthzAdminUnavail)
-			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", "authz_admin_unavailable", "authz_admin_unavailable", err.Error(), req)
-			writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
+			code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+			h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "UPDATE_BUNDLE", code, code, err.Error(), req)
 			return
 		}
 		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetBundle, telemetry.AdminOK).Inc()
@@ -831,6 +869,7 @@ func (h *Handler) DetachBundle(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.checkAllowed(r.Context(), principalID, req.LegalEntityID); err != nil {
 		h.writeAuthzErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "DETACH_BUNDLE", "forbidden", "forbidden", err.Error(), req)
 		return
 	}
 
@@ -852,11 +891,11 @@ func (h *Handler) DetachBundle(w http.ResponseWriter, r *http.Request) {
 		CorrelationID: req.CorrelationID,
 	}
 	if err := h.authzAdmin.SetPermissionBundleActive(r.Context(), roleDefinitionID, current.BundleCode, false, scope); err != nil {
-		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetBundle, telemetry.AdminUnavailable).Inc()
+		h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetBundle, adminOutcome(err)).Inc()
 		h.log.Error("failed to retire permission bundle in authorization-svc",
 			zap.String("bundle_id", bundleID), zap.Error(err))
-		h.bundleWrite(telemetry.WriteAuthzAdminUnavail)
-		writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
+		code := h.writeGuardErr(w, err, h.metrics.BundleWrites)
+		h.recordRefusal(r.Context(), tenantID, req.LegalEntityID, principalID, req.CorrelationID, "DETACH_BUNDLE", code, code, err.Error(), req)
 		return
 	}
 	h.metrics.AuthzAdminCalls.WithLabelValues(telemetry.AdminSetBundle, telemetry.AdminOK).Inc()
@@ -971,73 +1010,215 @@ func count(c *prometheus.CounterVec, outcome string) {
 func (h *Handler) roleWrite(outcome string)   { h.metrics.RoleWrites.WithLabelValues(outcome).Inc() }
 func (h *Handler) bundleWrite(outcome string) { h.metrics.BundleWrites.WithLabelValues(outcome).Inc() }
 
-// getProtectedActions returns the cached list of protected actions, refreshing
-// if the TTL has expired (30 seconds). Returns empty slice on error (fail-open
-// for availability, but metrics will show the failure).
-func (h *Handler) getProtectedActions(ctx context.Context) []string {
+// protectedCacheTTL bounds how long a catalogue read is reused. Only a
+// successful, non-empty read is cached.
+const protectedCacheTTL = 30 * time.Second
+
+// getProtectedActions returns the active protected actions, cached for
+// protectedCacheTTL. It FAILS CLOSED: an unreadable or empty catalogue is
+// domain.ErrProtectedCatalogueUnavailable.
+//
+// It used to fail open twice over. A fetch error returned the (empty) cache,
+// and checkProtectedActions read an empty list as "no protected list
+// configured, skip check". Since the fetch went to a route nothing serves,
+// every bundle skipped the check.
+func (h *Handler) getProtectedActions(ctx context.Context) ([]string, error) {
 	h.protectedActionsMu.RLock()
 	if time.Now().Before(h.protectedActionsTTL) && len(h.protectedActionsCache) > 0 {
 		cached := h.protectedActionsCache
 		h.protectedActionsMu.RUnlock()
-		return cached
+		return cached, nil
 	}
 	h.protectedActionsMu.RUnlock()
 
 	h.protectedActionsMu.Lock()
 	defer h.protectedActionsMu.Unlock()
-	// Double-check after acquiring write lock
 	if time.Now().Before(h.protectedActionsTTL) && len(h.protectedActionsCache) > 0 {
-		return h.protectedActionsCache
+		return h.protectedActionsCache, nil
 	}
 
 	actions, err := h.protectedActions.ListActive(ctx)
 	if err != nil {
-		h.log.Error("failed to fetch protected actions", zap.Error(err))
-		h.metrics.AuthzAdminCalls.WithLabelValues("list_protected_actions", telemetry.AdminUnavailable).Inc()
-		return h.protectedActionsCache // return stale cache on error
+		h.log.Error("failed to read the protected-action catalogue", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrProtectedCatalogueUnavailable, err)
+	}
+	if len(actions) == 0 {
+		h.log.Error("the protected-action catalogue is empty; refusing bundle writes until it is seeded")
+		return nil, fmt.Errorf("%w: the catalogue has no active entries", domain.ErrProtectedCatalogueUnavailable)
 	}
 	h.protectedActionsCache = actions
-	h.protectedActionsTTL = time.Now().Add(30 * time.Second)
-	h.metrics.AuthzAdminCalls.WithLabelValues("list_protected_actions", telemetry.AdminOK).Inc()
-	return actions
+	h.protectedActionsTTL = time.Now().Add(protectedCacheTTL)
+	return actions, nil
 }
 
-// checkProtectedActions validates that none of the requested actions are
-// protected platform-admin actions. Returns ErrProtectedAction if any match.
-func (h *Handler) checkProtectedActions(actions []string) error {
-	protected := h.getProtectedActions(context.Background()) // cached, no context needed
-	if len(protected) == 0 {
-		return nil // no protected list configured, skip check
+// checkProtectedActions refuses any action in the protected catalogue, and
+// names the offending actions. Matching ignores case and surrounding space,
+// so "iam.role.manage " or "Platform_Admin" cannot slip past by spelling.
+func (h *Handler) checkProtectedActions(ctx context.Context, actions []string) error {
+	protected, err := h.getProtectedActions(ctx)
+	if err != nil {
+		return err
 	}
 	protectedSet := make(map[string]struct{}, len(protected))
 	for _, a := range protected {
-		protectedSet[a] = struct{}{}
+		protectedSet[strings.ToLower(strings.TrimSpace(a))] = struct{}{}
 	}
+	var hit []string
 	for _, a := range actions {
-		if _, ok := protectedSet[a]; ok {
-			return domain.ErrProtectedAction
+		if _, ok := protectedSet[strings.ToLower(strings.TrimSpace(a))]; ok {
+			hit = append(hit, a)
 		}
+	}
+	if len(hit) > 0 {
+		return fmt.Errorf("%w: %s", domain.ErrProtectedAction, strings.Join(hit, ", "))
 	}
 	return nil
 }
 
-// checkSoDConflict consults authorization-svc's SoD engine before provisioning.
-func (h *Handler) checkSoDConflict(ctx context.Context, tenantID, legalEntityID, principalID, roleCode, bundleCode string, actions []string, correlationID string) error {
-	req := domain.SoDCheckRequest{
-		TenantID:         tenantID,
-		LegalEntityID:    legalEntityID,
-		PrincipalID:      principalID,
-		RoleCode:         roleCode,
-		BundleCode:       bundleCode,
-		PermittedActions: actions,
-		CorrelationID:    correlationID,
+// ErrTaxonomyUnavailable: the permission registry could not be read. Fail
+// closed, the same posture as the protected catalogue.
+var ErrTaxonomyUnavailable = errors.New("permission taxonomy unavailable")
+
+// checkTaxonomy refuses any action that is not an active registered
+// capability, and names each one. Exact match: the registry holds the
+// spelling every service checks, and a near miss grants nothing.
+func (h *Handler) checkTaxonomy(ctx context.Context, actions []string) error {
+	known, err := h.taxonomy.Lookup(ctx, actions)
+	if err != nil {
+		h.log.Error("failed to read the permission taxonomy", zap.Error(err))
+		return fmt.Errorf("%w: %v", ErrTaxonomyUnavailable, err)
 	}
-	if err := h.sod.CheckConflict(ctx, req); err != nil {
-		h.metrics.AuthZDecisions.WithLabelValues("sod_check", telemetry.AuthZDenied).Inc()
-		return err
+	var unknown []string
+	for _, a := range actions {
+		if _, ok := known[a]; !ok {
+			unknown = append(unknown, a)
+		}
 	}
-	h.metrics.AuthZDecisions.WithLabelValues("sod_check", telemetry.AuthZGranted).Inc()
+	if len(unknown) > 0 {
+		return fmt.Errorf("%w: %s", domain.ErrUnknownPermission, strings.Join(unknown, ", "))
+	}
 	return nil
+}
+
+// roleRisk is the highest risk tier among actions, CRITICAL for any protected
+// action, plus the actions that set it (for the approval reason).
+func (h *Handler) roleRisk(ctx context.Context, actions []string) (string, []string, error) {
+	known, err := h.taxonomy.Lookup(ctx, actions)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: %v", ErrTaxonomyUnavailable, err)
+	}
+	tier := domain.RiskStandard
+	var drivers []string
+	for _, a := range actions {
+		d, ok := known[a]
+		t := d.RiskTier
+		if !ok {
+			// An action registered nowhere cannot be rated; treat it as high
+			// rather than let an unknown name lower the bar.
+			t = domain.RiskHigh
+		}
+		if d.Protected {
+			t = domain.RiskCritical
+		}
+		if domain.RiskRank(t) > domain.RiskRank(domain.RiskStandard) {
+			drivers = append(drivers, a+"="+t)
+		}
+		if domain.RiskRank(t) > domain.RiskRank(tier) {
+			tier = t
+		}
+	}
+	return tier, drivers, nil
+}
+
+// checkSoDConflict asks authorization-svc whether the role's action set, as
+// it will stand after this write, is conflict-free.
+//
+// The candidate set is the role's other ACTIVE bundles plus the actions being
+// written; exceptBundleID names the bundle being edited, whose stored actions
+// are replaced by the new ones. Checking the new bundle alone (as before)
+// cleared a role that grants PAYMENT_INITIATE in one bundle and
+// PAYMENT_APPROVE in another, which conflicts for every holder exactly as if
+// both sat in one bundle.
+func (h *Handler) checkSoDConflict(ctx context.Context, tenantID, principalID, correlationID, roleDefinitionID, exceptBundleID string, actions []string) error {
+	bundles, err := h.store.ListBundles(ctx, roleDefinitionID)
+	if err != nil {
+		return fmt.Errorf("%w: list the role's bundles: %v", domain.ErrStoreUnavailable, err)
+	}
+	seen := make(map[string]struct{})
+	var candidates []string
+	add := func(a string) {
+		if _, dup := seen[a]; !dup {
+			seen[a] = struct{}{}
+			candidates = append(candidates, a)
+		}
+	}
+	for _, a := range actions {
+		add(a)
+	}
+	for _, b := range bundles {
+		if !b.ActiveFlag || b.BundleID == exceptBundleID {
+			continue
+		}
+		for _, a := range b.PermittedActions {
+			add(a)
+		}
+	}
+
+	err = h.sod.CheckConflict(ctx, domain.SoDCheckRequest{
+		TenantID:         tenantID,
+		CallerID:         principalID,
+		CorrelationID:    correlationID,
+		CandidateActions: candidates,
+	})
+	switch {
+	case err == nil:
+		h.metrics.AuthZDecisions.WithLabelValues("sod_check", telemetry.AuthZGranted).Inc()
+	case errors.Is(err, domain.ErrSoDConflict):
+		h.metrics.AuthZDecisions.WithLabelValues("sod_check", telemetry.AuthZDenied).Inc()
+	default:
+		h.metrics.AuthZDecisions.WithLabelValues("sod_check", telemetry.AuthZUnavailable).Inc()
+	}
+	return err
+}
+
+// adminOutcome labels an admin-call failure: refused, or unavailable.
+func adminOutcome(err error) string {
+	if errors.Is(err, domain.ErrProvisioningForbidden) {
+		return telemetry.AdminForbidden
+	}
+	return telemetry.AdminUnavailable
+}
+
+// writeGuardErr answers a refusal from a pre-provisioning guard (protected
+// catalogue, SoD) or from authorization-svc's admin API, and returns the error
+// code it sent so the refusal record carries the same one.
+//
+// Refusals are 403 and outages 503, and they are never mixed. Before this, an
+// SoD outage and a malformed SoD request were both 403 sod_conflict, and
+// authorization-svc refusing the caller was 503 authz_admin_unavailable.
+func (h *Handler) writeGuardErr(w http.ResponseWriter, err error, counter *prometheus.CounterVec) string {
+	status, code, outcome := http.StatusServiceUnavailable, "authz_admin_unavailable", telemetry.WriteAuthzAdminUnavail
+	switch {
+	case errors.Is(err, domain.ErrUnknownPermission):
+		status, code, outcome = http.StatusBadRequest, "unknown_permission", telemetry.WriteInvalidRequest
+	case errors.Is(err, ErrTaxonomyUnavailable):
+		code, outcome = "taxonomy_unavailable", telemetry.WriteStoreUnavailable
+	case errors.Is(err, domain.ErrProtectedAction):
+		status, code, outcome = http.StatusForbidden, "protected_action", telemetry.WriteForbidden
+	case errors.Is(err, domain.ErrSoDConflict):
+		status, code, outcome = http.StatusForbidden, "sod_conflict", telemetry.WriteForbidden
+	case errors.Is(err, domain.ErrProvisioningForbidden):
+		status, code, outcome = http.StatusForbidden, "provisioning_forbidden", telemetry.WriteForbidden
+	case errors.Is(err, domain.ErrSoDUnavailable):
+		code, outcome = "sod_unavailable", telemetry.WriteAuthzUnavailable
+	case errors.Is(err, domain.ErrProtectedCatalogueUnavailable):
+		code, outcome = "protected_catalogue_unavailable", telemetry.WriteStoreUnavailable
+	case errors.Is(err, domain.ErrStoreUnavailable):
+		code, outcome = "store_unavailable", telemetry.WriteStoreUnavailable
+	}
+	count(counter, outcome)
+	writeError(w, status, code, err.Error())
+	return code
 }
 
 // recordRefusal writes a durable refused_escalations row for evidence/audit.

@@ -29,6 +29,7 @@ import (
 
 	"zoiko.io/evidence-requirements-svc/internal/domain"
 	svcmiddleware "zoiko.io/evidence-requirements-svc/internal/middleware"
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 )
 
 // Store is the persistence contract the handler depends on.
@@ -38,11 +39,17 @@ type Store interface {
 	ListRequirements(ctx context.Context, filter domain.ListRequirementsFilter) ([]domain.EvidenceRequirement, error)
 	EffectiveRequirements(ctx context.Context, tenantID, legalEntityID, domainCode, actionType string, asOf time.Time) ([]domain.EvidenceRequirement, error)
 	EndDateRequirement(ctx context.Context, tenantID, requirementID string, effectiveTo time.Time, reason, actorPrincipalID string) (*domain.EvidenceRequirement, error)
-	RecordEvaluation(ctx context.Context, e *domain.EvidenceEvaluation) (created bool, err error)
+	// RecordEvaluation appends an evaluation record and optionally writes an
+	// outbox event atomically in the same transaction. If outboxEvent is non-nil,
+	// it is written to the outbox table only when the evaluation is newly created
+	// (not a replay). This ensures the event is never lost even if the broker
+	// is unavailable or the client disconnects.
+	RecordEvaluation(ctx context.Context, e *domain.EvidenceEvaluation, outboxEvent *domain.OutboxEvent) (created bool, err error)
 	GetEvaluation(ctx context.Context, evaluationID string) (*domain.EvidenceEvaluation, error)
 }
 
 // Publisher is the event-publishing contract the handler depends on.
+// DEPRECATED: Events are now published via transactional outbox.
 type Publisher interface {
 	PublishEvaluation(ctx context.Context, e domain.EvidenceEvaluation)
 }
@@ -56,7 +63,7 @@ type AuthZClient interface {
 // depends on — see internal/documentvault's package doc for why asserted
 // artifacts are verified rather than trusted.
 type DocumentVaultClient interface {
-	VerifyDocument(ctx context.Context, tenantID, legalEntityID, documentID string) error
+	VerifyDocument(ctx context.Context, tenantID, legalEntityID, documentID, principalID string) error
 }
 
 // Action types checked against authorization-svc for catalog mutation.
@@ -66,15 +73,14 @@ const (
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	docs      DocumentVaultClient
-	log       *zap.Logger
+	store Store
+	authz AuthZClient
+	docs  DocumentVaultClient
+	log   *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, docs DocumentVaultClient, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, docs: docs, log: log}
+func New(store Store, authz AuthZClient, docs DocumentVaultClient, log *zap.Logger) *Handler {
+	return &Handler{store: store, authz: authz, docs: docs, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -130,8 +136,42 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get the Idempotency-Key and LegalEntityID from the envelope for replay
+	// protection and cross-validation with the body.
+	env, _ := svcenvelope.FromContext(r.Context())
+	idempotencyKey := env.IdempotencyKey
+	if idempotencyKey == "" {
+		// Should never happen in write-strict mode, but defensive
+		writeError(w, http.StatusBadRequest, "missing_field", "idempotency_key")
+		return
+	}
+	envelopeLegalEntityID := env.LegalEntityID
+
+	// Validate body's legal_entity_id is a valid UUID before hitting the DB
+	// (otherwise 22P02 maps to 503 store_unavailable per X10).
+	if !isUUID(req.LegalEntityID) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
+
+	// The body's legal_entity_id MUST match the envelope's X-Legal-Entity-Id.
+	// The envelope requires this header on material writes (LegalEntityID:
+	// RequiredOnWrite), so a mismatch means the caller is trying to evaluate
+	// for a different entity than the one their identity context establishes.
+	if envelopeLegalEntityID != "" && req.LegalEntityID != envelopeLegalEntityID {
+		writeError(w, http.StatusBadRequest, "legal_entity_mismatch",
+			"body legal_entity_id does not match envelope X-Legal-Entity-Id")
+		return
+	}
+	// If envelope doesn't have it (should not happen in write-strict), fall back
+	// to body value but log a warning.
+	effectiveLegalEntityID := req.LegalEntityID
+	if envelopeLegalEntityID != "" {
+		effectiveLegalEntityID = envelopeLegalEntityID
+	}
+
 	asOf := time.Now().UTC()
-	effective, err := h.store.EffectiveRequirements(r.Context(), tenantID, req.LegalEntityID, req.DomainCode, req.ActionType, asOf)
+	effective, err := h.store.EffectiveRequirements(r.Context(), tenantID, effectiveLegalEntityID, req.DomainCode, req.ActionType, asOf)
 	if err != nil {
 		h.log.Error("Evaluate: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
@@ -143,7 +183,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	// recording MISSING off the back of an infrastructure failure would write
 	// a false fact into an append-only evidence ledger, which is worse than
 	// returning an honest 503.
-	checked, err := h.checkArtifacts(r.Context(), tenantID, req.LegalEntityID, req.PresentArtifacts)
+	checked, err := h.checkArtifacts(r.Context(), tenantID, effectiveLegalEntityID, principalID, req.PresentArtifacts)
 	if err != nil {
 		h.log.Error("Evaluate: artifact verification unavailable — failing closed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "document_service_unavailable", "")
@@ -165,19 +205,55 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Collect all requirement IDs that were evaluated (both satisfied and unmet)
+	requirementIDs := make([]string, len(effective))
+	for i, r := range effective {
+		requirementIDs[i] = r.EvidenceRequirementID
+	}
+
 	eval := &domain.EvidenceEvaluation{
-		EvaluationID:            uuid.NewString(),
-		TenantID:                tenantID,
-		LegalEntityID:           req.LegalEntityID,
-		DomainCode:              req.DomainCode,
-		ActionType:              req.ActionType,
-		Outcome:                 outcome,
-		UnmetPayload:            unmetJSON,
+		EvaluationID:       uuid.NewString(),
+		TenantID:           tenantID,
+		LegalEntityID:      effectiveLegalEntityID,
+		DomainCode:         req.DomainCode,
+		ActionType:         req.ActionType,
+		Outcome:            outcome,
+		UnmetPayload:       unmetJSON,
 		PresentArtifactsPayload: presentJSON,
 		EvaluatedForPrincipalID: principalID,
-		CorrelationID:           req.CorrelationID,
+		CorrelationID:      req.CorrelationID,
+		IdempotencyKey:     idempotencyKey,
+		RequirementIDs:     requirementIDs,
 	}
-	created, err := h.store.RecordEvaluation(r.Context(), eval)
+
+	// Prepare outbox event for atomic write with evaluation (only for SATISFIED/MISSING)
+	var outboxEvent *domain.OutboxEvent
+	if outcome == domain.OutcomeSatisfied || outcome == domain.OutcomeMissing {
+		eventType := "evidence.requirement.satisfied"
+		if outcome == domain.OutcomeMissing {
+			eventType = "evidence.requirement.missing"
+		}
+		payload := map[string]any{
+			"evaluation_id":   eval.EvaluationID,
+			"tenant_id":       eval.TenantID,
+			"legal_entity_id": eval.LegalEntityID,
+			"domain_code":     eval.DomainCode,
+			"action_type":     eval.ActionType,
+			"outcome":         string(eval.Outcome),
+		}
+		if outcome == domain.OutcomeMissing {
+			payload["unmet"] = json.RawMessage(eval.UnmetPayload)
+		}
+		payloadBytes, _ := json.Marshal(payload)
+		outboxEvent = &domain.OutboxEvent{
+			AggregateType: "evidence_evaluation",
+			AggregateID:   eval.EvaluationID,
+			EventType:     eventType,
+			Payload:       payloadBytes,
+		}
+	}
+
+	created, err := h.store.RecordEvaluation(r.Context(), eval, outboxEvent)
 	if err != nil {
 		h.log.Error("Evaluate: failed to record evaluation", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
@@ -185,7 +261,8 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if created {
-		h.publisher.PublishEvaluation(r.Context(), *eval)
+		// Event was written to outbox atomically; background worker will publish it.
+		// No direct Kafka publish here anymore.
 	} else {
 		// Replay: return the ORIGINAL determination and do not republish.
 		// The stored unmet payload is authoritative — the catalog may have
@@ -202,6 +279,8 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		Unmet:         unmet,
 		EvaluatedAt:   eval.EvaluatedAt,
 		CorrelationID: eval.CorrelationID,
+		DomainCode:    eval.DomainCode,
+		ActionType:    eval.ActionType,
 	})
 }
 
@@ -222,27 +301,41 @@ type checkedArtifact struct {
 // not an error.
 //
 // Results are memoised per reference_id so a requirement set that names the
-// same document twice does not double-call document-vault.
-func (h *Handler) checkArtifacts(ctx context.Context, tenantID, legalEntityID string, artifacts []domain.PresentArtifact) ([]checkedArtifact, error) {
+// same document twice does not double-call document-vault. A duplicate
+// reference_id is NOT counted twice toward minimum_count (fixes Gap 8).
+func (h *Handler) checkArtifacts(ctx context.Context, tenantID, legalEntityID, principalID string, artifacts []domain.PresentArtifact) ([]checkedArtifact, error) {
 	out := make([]checkedArtifact, 0, len(artifacts))
 	seen := make(map[string]checkedArtifact, len(artifacts))
 
 	for _, a := range artifacts {
-		if a.EvidenceType != domain.EvidenceTypeSupportingDocument || a.ReferenceID == "" {
+		if a.EvidenceType != domain.EvidenceTypeSupportingDocument {
 			// Not a document-vault reference. Taken on the caller's word in
 			// v1 — there is no service that owns these references yet
-			// (context.md §11.2).
+			// (context.md §11.2). Require a non-empty reference_id to count
+			// (prevents empty reference_id from satisfying minimum_count).
+			if a.ReferenceID == "" {
+				out = append(out, checkedArtifact{artifact: a, counts: false, rejectReason: "empty reference_id for non-document artifact"})
+				continue
+			}
+			// Deduplicate by reference_id for non-documents too
+			if _, ok := seen[a.ReferenceID]; ok {
+				continue // duplicate reference_id does not count again
+			}
 			out = append(out, checkedArtifact{artifact: a, counts: true})
+			seen[a.ReferenceID] = checkedArtifact{artifact: a, counts: true}
 			continue
 		}
-		if prev, ok := seen[a.ReferenceID]; ok {
-			prev.artifact = a
-			out = append(out, prev)
+		// Supporting document: require reference_id
+		if a.ReferenceID == "" {
+			out = append(out, checkedArtifact{artifact: a, counts: false, rejectReason: "empty reference_id for supporting document"})
 			continue
+		}
+		if _, ok := seen[a.ReferenceID]; ok {
+			continue // duplicate reference_id does not count again
 		}
 
 		c := checkedArtifact{artifact: a, counts: true}
-		switch err := h.docs.VerifyDocument(ctx, tenantID, legalEntityID, a.ReferenceID); {
+		switch err := h.docs.VerifyDocument(ctx, tenantID, legalEntityID, a.ReferenceID, principalID); {
 		case err == nil:
 		case errors.Is(err, domain.ErrDocumentNotFound):
 			c.counts, c.rejectReason = false, "referenced document does not exist in document-vault-svc"
@@ -504,6 +597,16 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	// Get the Idempotency-Key from the envelope for replay protection
+	env, _ := svcenvelope.FromContext(r.Context())
+	idempotencyKey := env.IdempotencyKey
+	if idempotencyKey == "" {
+		// Should never happen in write-strict mode for admin writes
+		writeError(w, http.StatusBadRequest, "missing_field", "idempotency_key")
+		return
+	}
+
 	// Authorization is scoped to the legal entity when the requirement is
 	// entity-specific; tenant-wide requirements authorize against the tenant
 	// itself, which is the broadest scope and therefore the correct one to
@@ -520,6 +623,25 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 	effectiveFrom := time.Now().UTC()
 	if req.EffectiveFrom != nil {
 		effectiveFrom = req.EffectiveFrom.UTC()
+		// Prevent retroactive effective_from (before now) — a requirement
+		// cannot govern actions that already happened.
+		if effectiveFrom.Before(time.Now().UTC().Add(-time.Minute)) {
+			writeError(w, http.StatusBadRequest, "invalid_field",
+				"effective_from cannot be retroactive (before now)")
+			return
+		}
+	}
+
+	// Validate requirement_payload is a JSON object (not array, scalar, or null)
+	// DB constraint chk_requirement_payload_is_object will also enforce this,
+	// but we catch it early for a clearer error.
+	if len(req.RequirementPayload) > 0 {
+		var payloadMap map[string]any
+		if err := json.Unmarshal(req.RequirementPayload, &payloadMap); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_field",
+				"requirement_payload must be a valid JSON object")
+			return
+		}
 	}
 
 	er := &domain.EvidenceRequirement{
@@ -533,6 +655,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 		EffectiveFrom:         effectiveFrom,
 		CreatedByPrincipalID:  principalID,
 		CorrelationID:         req.CorrelationID,
+		IdempotencyKey:        idempotencyKey,
 	}
 	created, err := h.store.CreateRequirement(r.Context(), er)
 	if err != nil {
@@ -597,6 +720,18 @@ func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 	effectiveTo := time.Now().UTC()
 	if req.EffectiveTo != nil {
 		effectiveTo = req.EffectiveTo.UTC()
+	}
+	// Validate effective_to is after effective_from (DB constraint also enforces this)
+	if !effectiveTo.After(existing.EffectiveFrom) {
+		writeError(w, http.StatusBadRequest, "invalid_field",
+			"effective_to must be after effective_from")
+		return
+	}
+	// Prevent retroactive retirement that changes historical governance
+	if effectiveTo.Before(time.Now().UTC().Add(-time.Minute)) {
+		writeError(w, http.StatusBadRequest, "invalid_field",
+			"effective_to cannot be retroactive (before now)")
+		return
 	}
 
 	updated, err := h.store.EndDateRequirement(r.Context(), tenantID, requirementID, effectiveTo, req.Reason, principalID)

@@ -58,6 +58,20 @@ OTHER_H=(-H "Content-Type: application/json"
 
 json() { python -c "import sys,json;d=json.load(sys.stdin);print(d.get('$1',''))" 2>/dev/null; }
 
+# wait_backfill GENERATION_ID -> prints the generation's backfill_state once it
+# is COMPLETE or FAILED (or whatever it is after 60s).
+wait_backfill() {
+  local gid=$1 st=""
+  for _ in $(seq 1 30); do
+    st=$(curl -s -m 10 "$B/v1/index-generations?scope=$SCOPE" "${H[@]}" \
+           -H "X-Request-Id: bf-$STAMP-$RANDOM" -H "X-Correlation-ID: bf-$STAMP" |
+         python -c "import sys,json;print(next((g.get('backfill_state','') for g in json.load(sys.stdin).get('generations',[]) if g['generation_id']=='$gid'),''))" 2>/dev/null)
+    case "$st" in COMPLETE|FAILED) break;; esac
+    sleep 2
+  done
+  echo "$st"
+}
+
 post()     { local p=$1 body=$2 id=$3; shift 3
   curl -s -m 25 -X POST "$B$p" "$@" -H "X-Request-Id: $id" -H "Idempotency-Key: $id" -H "X-Correlation-ID: $id" -d "$body"; }
 postcode() { local p=$1 body=$2 id=$3; shift 3
@@ -89,6 +103,16 @@ for _ in 1 2 3 4 5; do
   echo "$OUT" | grep -q "Application Control" && continue
   break
 done
+# Some binaries stay blocked on every retry. That is the host, not the code,
+# so the suite is re-run where Application Control does not apply — a Linux
+# container with the race detector — rather than reported as a failure it
+# is not, or skipped as if it had passed.
+if echo "$OUT" | grep -q "Application Control" && command -v docker >/dev/null 2>&1; then
+  echo "        host test binaries blocked by Application Control; re-running in golang:1.25 (-race)"
+  SRC=$(cd "$SVC/.." && (cygpath -w "$(pwd)" 2>/dev/null || pwd))
+  OUT=$(MSYS_NO_PATHCONV=1 docker run --rm -v "$SRC:/src" -w /src/search-indexer-svc golang:1.25 \
+        go test -race -count=1 ./... 2>&1)
+fi
 chk "packages failing" "$(echo "$OUT" | grep -cE '^FAIL')" "0"
 echo "        packages passing: $(echo "$OUT" | grep -cE '^ok ')"
 
@@ -142,6 +166,8 @@ for metric in \
   search_indexer_index_lag_seconds \
   search_indexer_restriction_lag_seconds \
   search_indexer_restriction_backlog \
+  search_indexer_checkpoint_lag_seconds \
+  search_indexer_scope_freshness \
   search_indexer_retrieval_decisions_total \
   search_indexer_searches_total \
   search_indexer_query_rejections_total \
@@ -292,6 +318,11 @@ else
 
       chk "generation BUILDING -> VALIDATING" \
         "$(postcode "/v1/index-generations/$GEN_ID/state" '{"state":"VALIDATING"}' "v1-$STAMP" "${H[@]}")" "200"
+      # INV-21: a generation is backfilled from source before it may be
+      # READY. The backfill runs asynchronously, so wait for it rather than
+      # racing it — READY answers 409 backfill_incomplete until it finishes.
+      BF=$(wait_backfill "$GEN_ID")
+      chk "INV-21 generation backfill completes before READY" "$BF" "COMPLETE"
       RDY=$(post "/v1/index-generations/$GEN_ID/state" '{"state":"READY"}' "v2-$STAMP" "${H[@]}")
       chk "generation VALIDATING -> READY runs validation" "$(echo "$RDY" | json validation_state)" "READY"
       # TC-09: every activation traces to a validation digest.
@@ -542,6 +573,70 @@ if [ -f "$OBL" ]; then
 fi
 
 echo
+echo "-- 16. 30 Sep 2026 remediation, live -------------------------------"
+# Each check pins a defect found by the Group 1 re-audit (docs/audit_files,
+# 6/9) and fixed. Guarded on the live scope from section 7.
+if [ -n "$GEN_ID" ] && [ -n "$SCOPE" ]; then
+  # ESR-012 / §4: freshness status on every response, and a real
+  # measurement right after activation (not UNKNOWN until the next sweep).
+  SR=$(post /v1/search "{\"scope\":\"$SCOPE\",\"query\":\"anything\"}" "fr-$STAMP" "${H[@]}")
+  has "ESR-012 responses carry index_freshness" "$SR" '"index_freshness"'
+  CPS=$(get "/v1/checkpoints?scope=$SCOPE" "cp16-$STAMP" "${H[@]}")
+  hasnt "the active generation is measured on activation (not UNKNOWN)" "$CPS" '"freshness":"UNKNOWN"'
+
+  # CRITICAL fix: an HTTP restriction is stamped into the projection ledger at
+  # its epoch, so a later ordinary update cannot resurrect the record.
+  LEDGER=$(docker exec "$PG" psql -U postgres -d search_indexer -tAc \
+    "SELECT tombstoned::text || '|' || (restriction_epoch > 0)::text FROM projection_ledger WHERE source_id='audit-doc-1' AND scope_name='$SCOPE'" 2>/dev/null | head -1)
+  chk "NP-48 HTTP restriction is stamped into the ledger at its epoch" "$LEDGER" "true|true"
+
+  # ESR-002 on the semantic route for a scope that pins no embedding model.
+  chk "a lexical scope is not registered for semantic retrieval" \
+    "$(postcode /v1/search/semantic "{\"scope\":\"$SCOPE\",\"query\":\"anything\"}" "sem-$STAMP" "${H[@]}")" "404"
+
+  # Idempotency-Key honoured: the same export twice is answered from the
+  # record; the same key with a different body is refused.
+  IK="idem-$STAMP"
+  E1=$(curl -s -m 25 -o /dev/null -w '%{http_code}' -X POST "$B/v1/search-exports" "${H[@]}" \
+        -H "X-Request-Id: $IK" -H "Idempotency-Key: $IK" -H "X-Correlation-ID: $IK" \
+        -d "{\"scope\":\"$SCOPE\",\"reason\":\"audit\"}")
+  RH=$(curl -s -m 25 -D - -o /dev/null -X POST "$B/v1/search-exports" "${H[@]}" \
+        -H "X-Request-Id: $IK-2" -H "Idempotency-Key: $IK" -H "X-Correlation-ID: $IK" \
+        -d "{\"scope\":\"$SCOPE\",\"reason\":\"audit\"}")
+  if [ "$E1" = "202" ] || [ "$E1" = "403" ]; then
+    has "Idempotency-Key: a retried command is replayed, not re-run" "$RH" "X-Idempotent-Replay: true"
+  else
+    skip "export returned $E1; idempotency replay not exercised"
+  fi
+  chk "Idempotency-Key reused with a different body is refused" \
+    "$(curl -s -m 25 -o /dev/null -w '%{http_code}' -X POST "$B/v1/search-exports" "${H[@]}" \
+        -H "X-Request-Id: $IK-3" -H "Idempotency-Key: $IK" -H "X-Correlation-ID: $IK" \
+        -d "{\"scope\":\"$SCOPE\",\"reason\":\"different\"}")" "409"
+
+  # INV-21 / NP-18: a rebuild is backfilled, validated against the ledger,
+  # and cut over without emptying the scope.
+  GEN2=$(post /v1/index-generations "{\"scope\":\"$SCOPE\"}" "g16-$STAMP" "${H[@]}")
+  GEN2_ID=$(echo "$GEN2" | json generation_id)
+  PHYS2=$(echo "$GEN2" | json engine_ref)
+  if [ -n "$GEN2_ID" ]; then
+    postcode "/v1/index-generations/$GEN2_ID/state" '{"state":"VALIDATING"}' "g16v-$STAMP" "${H[@]}" >/dev/null
+    chk "rebuild backfill completes" "$(wait_backfill "$GEN2_ID")" "COMPLETE"
+    chk "rebuild VALIDATING -> READY" \
+      "$(postcode "/v1/index-generations/$GEN2_ID/state" '{"state":"READY"}' "g16r-$STAMP" "${H[@]}")" "200"
+    chk "rebuild READY -> ACTIVE" \
+      "$(postcode "/v1/index-generations/$GEN2_ID/state" '{"state":"ACTIVE"}' "g16a-$STAMP" "${H[@]}")" "200"
+    has "the alias now serves the rebuild" "$(curl -s -m 10 "$OS_URL/_alias/$SCOPE")" "$PHYS2"
+    # The restricted ref stays restricted in the rebuild (ledger authority).
+    TOMB=$(curl -s -m 10 "$OS_URL/$PHYS2/_doc/$TEN:$STYPE:audit-doc-1")
+    hasnt "an erased ref is not resurrected by the rebuild" "$TOMB" '"tombstoned":false'
+  else
+    bad "rebuild generation could not be created: $(echo "$GEN2" | head -c 200)"
+  fi
+else
+  skip "section 16 needs the live scope from section 7"
+fi
+
+echo
 echo "-- 14. Documentation and contracts ---------------------------------"
 for f in README.md openapi.yaml asyncapi.yaml RUNBOOK.md context.md progress.md; do
   if [ -s "$SVC/$f" ]; then ok "$f present"; else bad "$f missing or empty"; fi
@@ -554,6 +649,19 @@ if (cd "$SVC" && python -c "import yaml; yaml.safe_load(open('openapi.yaml',enco
   ok "openapi.yaml parses"
 else
   bad "openapi.yaml does not parse"
+fi
+# Parsing is not validity: a route-parity check passed while openapi.yaml was
+# not valid OpenAPI. Validated against the schema when the validator exists.
+if python -c "import openapi_spec_validator" 2>/dev/null; then
+  if (cd "$SVC" && python -c "
+from openapi_spec_validator import validate
+import yaml; validate(yaml.safe_load(open('openapi.yaml',encoding='utf8')))" 2>/dev/null); then
+    ok "openapi.yaml is valid OpenAPI (openapi-spec-validator)"
+  else
+    bad "openapi.yaml is not valid OpenAPI"
+  fi
+else
+  skip "openapi-spec-validator not installed"
 fi
 if (cd "$SVC" && python -c "import yaml; yaml.safe_load(open('asyncapi.yaml',encoding='utf8'))" 2>/dev/null); then
   ok "asyncapi.yaml parses"

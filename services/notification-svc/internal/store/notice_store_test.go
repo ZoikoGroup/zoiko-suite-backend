@@ -58,7 +58,7 @@ func mailboxAccepted(t *testing.T, s *store.PgStore, tenant, attemptID, fact str
 }
 
 func TestNotice_LifecycleFromPreparedToAcknowledged(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-notice"
 	ctx := tenantCtx(tenant)
@@ -124,7 +124,7 @@ func TestNotice_LifecycleFromPreparedToAcknowledged(t *testing.T) {
 }
 
 func TestNotice_NoAcknowledgementRequiredIsSatisfiedByPolicyNotLegallyServed(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-notice-none"
 	iv := regulatedIntentVersion(t, s, tenant, "legal.fyi")
 	n, err := s.CreateNotice(tenantCtx(tenant), noticeParams(iv, domain.AckNone, time.Time{}))
@@ -141,7 +141,7 @@ func TestNotice_NoAcknowledgementRequiredIsSatisfiedByPolicyNotLegallyServed(t *
 }
 
 func TestNotice_ABounceOrAFailureIsAnExceptionNeverEvidence(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-notice-bounce"
 	ctx := tenantCtx(tenant)
 	iv := regulatedIntentVersion(t, s, tenant, "legal.bounce")
@@ -161,7 +161,7 @@ func TestNotice_ABounceOrAFailureIsAnExceptionNeverEvidence(t *testing.T) {
 }
 
 func TestNotice_NoResponseByTheDeadlineExpiresAndNeverAcknowledges(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-notice-expire"
 	ctx := tenantCtx(tenant)
@@ -195,7 +195,7 @@ func TestNotice_NoResponseByTheDeadlineExpiresAndNeverAcknowledges(t *testing.T)
 }
 
 func TestNotice_ASweeperFindsOpenNoticesAcrossTenants(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	for _, tenant := range []string{"tenant-sweep-a", "tenant-sweep-b"} {
 		iv := regulatedIntentVersion(t, s, tenant, "legal.sweep")
 		n, err := s.CreateNotice(tenantCtx(tenant), noticeParams(iv, domain.AckReceipt, time.Now().Add(time.Hour)))
@@ -212,7 +212,7 @@ func TestNotice_ASweeperFindsOpenNoticesAcrossTenants(t *testing.T) {
 }
 
 func TestNotice_ACorrectionIsANewVersionAndTheOriginalStaysVisible(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-notice-correct"
 	ctx := tenantCtx(tenant)
@@ -253,7 +253,7 @@ func TestNotice_ACorrectionIsANewVersionAndTheOriginalStaysVisible(t *testing.T)
 }
 
 func TestNotice_TheDatabaseHoldsTheLineEvenIfTheServiceDoesNot(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	tenant := "tenant-notice-db"
 	iv := regulatedIntentVersion(t, s, tenant, "legal.db")
@@ -293,7 +293,7 @@ func TestNotice_TheDatabaseHoldsTheLineEvenIfTheServiceDoesNot(t *testing.T) {
 }
 
 func TestNotice_RowLevelSecurityKeepsTenantsApart(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	iv := regulatedIntentVersion(t, s, "tenant-notice-a", "legal.rls")
 	n, err := s.CreateNotice(tenantCtx("tenant-notice-a"), noticeParams(iv, domain.AckNone, time.Time{}))
 	require.NoError(t, err)
@@ -302,7 +302,7 @@ func TestNotice_RowLevelSecurityKeepsTenantsApart(t *testing.T) {
 }
 
 func TestMigration000025_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000025_regulated_notices.down.sql", "000025_regulated_notices.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)
@@ -316,7 +316,7 @@ func TestMigration000025_DownThenUp(t *testing.T) {
 }
 
 func TestMigration000026_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000026_notice_event_sequence.down.sql", "000026_notice_event_sequence.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		require.NoError(t, err)
@@ -332,7 +332,7 @@ func TestMigration000026_DownThenUp(t *testing.T) {
 // The transitions of one transaction share a timestamp; the history must still come back in
 // the order they happened, every time.
 func TestNotice_HistoryOrderIsStableWithinOneTransaction(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	tenant := "tenant-notice-order"
 	iv := regulatedIntentVersion(t, s, tenant, "legal.order")
 	for i := 0; i < 15; i++ {

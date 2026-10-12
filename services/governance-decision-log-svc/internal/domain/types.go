@@ -43,13 +43,9 @@ var ErrDecisionIDConflict = errors.New("decision_id already exists in another te
 //
 // This is the MVP schema (see CONTEXT.md "FINALIZED — MVP schema"): a
 // deliberate simplification of the full GovernanceDecision entity in
-// docs/architecture/04-data-model.md §7.1. Fields not promoted to columns
-// here (policy_version_id, action_subject_type, action_subject_id) belong
-// inside EvaluationContext until there's a concrete need to query on them
-// directly. workflow_instance_id and causation_id WERE in that category but
-// were promoted to first-class columns (migration 000003): this is the
-// platform's canonical governance evidence log, and "every decision made
-// during workflow instance X" is a real query, not a hypothetical one.
+// docs/architecture/04-data-model.md §7.1. Fields promoted to columns
+// (policy_version_id, action_subject_type, action_subject_id) to support
+// queryability per Doc 04 §7.1.
 type GovernanceDecision struct {
 	// DecisionID is caller-supplied and is the idempotency/dedup key.
 	DecisionID string `json:"decision_id"`
@@ -69,9 +65,12 @@ type GovernanceDecision struct {
 	// Outcome — doctrine requires basis, not just outcome, to be stored.
 	RuleBasis string `json:"rule_basis"`
 
+	// PolicyVersionID is the exact policy version that produced this decision.
+	// Populated from rule_basis or provided directly by the caller.
+	PolicyVersionID *string `json:"policy_version_id,omitempty"`
+
 	// EvaluationContext is a JSONB catch-all for caller-supplied context
-	// that doesn't yet have a first-class column (e.g. policy_version_id,
-	// workflow_instance_id). Optional.
+	// that doesn't yet have a first-class column. Optional.
 	EvaluationContext json.RawMessage `json:"evaluation_context,omitempty"`
 
 	CorrelationID string `json:"correlation_id"`
@@ -82,9 +81,16 @@ type GovernanceDecision struct {
 	// CausationID is nil when the causing event/decision is not known.
 	CausationID *string `json:"causation_id,omitempty"`
 
+	// ActionSubjectType and ActionSubjectId identify the subject of the
+	// action (e.g., the entity being acted upon). Per Doc 04 §7.1.
+	ActionSubjectType *string `json:"action_subject_type,omitempty"`
+	ActionSubjectID   *string `json:"action_subject_id,omitempty"`
+
 	// DecidedAt is when the governance decision was made upstream (by
 	// Policy/Authorization/Workflow), not when it was logged here. If the
 	// caller omits it, the handler defaults it to server-receipt time.
+	// Must be within bounds: not in the future (beyond clock skew) and
+	// not before the retention window floor.
 	DecidedAt time.Time `json:"decided_at"`
 }
 
@@ -112,4 +118,5 @@ type ReplayManifest struct {
 	ReplayNotes           *string   `json:"replay_notes,omitempty"`
 	ReplayedAt            time.Time `json:"replayed_at"`
 	ReplayedByPrincipalID string    `json:"replayed_by_principal_id"`
+	TenantID              string    `json:"tenant_id"`
 }

@@ -2,31 +2,63 @@ package domain
 
 import "time"
 
+type WorkerType string
+
+const (
+	WorkerTypeFullTime   WorkerType = "FULL_TIME"
+	WorkerTypePartTime   WorkerType = "PART_TIME"
+	WorkerTypeContractor WorkerType = "CONTRACTOR"
+	WorkerTypeIntern     WorkerType = "INTERN"
+	WorkerTypeProbation  WorkerType = "PROBATION"
+)
+
+type EmployeeStatus string
+
+const (
+	EmployeeStatusOnboarding   EmployeeStatus = "ONBOARDING"
+	EmployeeStatusActive       EmployeeStatus = "ACTIVE"
+	EmployeeStatusInactive     EmployeeStatus = "INACTIVE"
+	EmployeeStatusPending      EmployeeStatus = "PENDING"
+	EmployeeStatusOnLeave      EmployeeStatus = "ON_LEAVE"
+	EmployeeStatusTerminated   EmployeeStatus = "TERMINATED"
+	EmployeeStatusResigned     EmployeeStatus = "RESIGNED"
+	EmployeeStatusDeactivated  EmployeeStatus = "DEACTIVATED"
+	EmployeeStatusSuspended    EmployeeStatus = "SUSPENDED"
+	EmployeeStatusLocked       EmployeeStatus = "LOCKED"
+	EmployeeStatusArchived     EmployeeStatus = "ARCHIVED"
+	EmployeeStatusPasswordReset EmployeeStatus = "PASSWORD_RESET_REQUIRED"
+)
+
+type Gender string
+
+const (
+	GenderMale   Gender = "MALE"
+	GenderFemale Gender = "FEMALE"
+	GenderOther  Gender = "OTHER"
+)
+
 type Employee struct {
-	EmployeeID        string     `json:"employee_id"`
-	TenantID          string     `json:"tenant_id"`
-	LegalEntityID     string     `json:"legal_entity_id"`
-	EmployeeNumber    string     `json:"employee_number"`
-	FirstName         string     `json:"first_name"`
-	LastName          string     `json:"last_name"`
-	Email             string     `json:"email"`
-	Phone             *string    `json:"phone,omitempty"`
-	JobTitle          string     `json:"job_title"`
-	DepartmentID      *string    `json:"department_id,omitempty"`
-	ManagerEmployeeID *string    `json:"manager_employee_id,omitempty"`
-	WorkerType        string     `json:"worker_type"` // FULL_TIME, PART_TIME, CONTRACTOR
-	Status            string     `json:"status"`      // ONBOARDING, ACTIVE, SUSPENDED, TERMINATED
-	HireDate          string     `json:"hire_date"`   // YYYY-MM-DD
-	TerminationDate   *string    `json:"termination_date,omitempty"`
-	EffectiveFrom     time.Time  `json:"effective_from"`
-	EffectiveTo       *time.Time `json:"effective_to,omitempty"`
+	EmployeeID        string         `json:"employee_id"`
+	TenantID          string         `json:"tenant_id"`
+	LegalEntityID     string         `json:"legal_entity_id"`
+	EmployeeNumber    string         `json:"employee_number"`
+	FirstName         string         `json:"first_name"`
+	LastName          string         `json:"last_name"`
+	Email             string         `json:"email"`
+	Phone             *string        `json:"phone,omitempty"`
+	JobTitle          string         `json:"job_title"`
+	DepartmentID      *string        `json:"department_id,omitempty"`
+	ManagerEmployeeID *string        `json:"manager_employee_id,omitempty"`
+	WorkerType        WorkerType     `json:"worker_type"`
+	Status            EmployeeStatus `json:"status"`
+	HireDate          string         `json:"hire_date"`   // YYYY-MM-DD
+	TerminationDate   *string        `json:"termination_date,omitempty"`
+	EffectiveFrom     time.Time      `json:"effective_from"`
+	EffectiveTo       *time.Time     `json:"effective_to,omitempty"`
 
 	// ── Personal profile ──────────────────────────────────────────────────
-	// Personal data, not employment data: it is deliberately absent from the
-	// list projection so a directory listing never spreads date-of-birth or a
-	// home address further than the one caller who asked for that employee.
 	DateOfBirth       *string `json:"date_of_birth,omitempty"` // YYYY-MM-DD
-	Gender            *string `json:"gender,omitempty"`
+	Gender            Gender  `json:"gender,omitempty"`
 	ProfilePictureURL *string `json:"profile_picture_url,omitempty"`
 	PersonalEmail     *string `json:"personal_email,omitempty"`
 	WorkEmail         *string `json:"work_email,omitempty"`
@@ -40,9 +72,6 @@ type Employee struct {
 	PostalCode       *string `json:"postal_code,omitempty"`
 
 	// ── Org placement ─────────────────────────────────────────────────────
-	// Reporting labels that sit alongside the authoritative department_id —
-	// org-structure-svc owns the real hierarchy, these are the free-text
-	// groupings an HR system needs for reporting and payroll cost splits.
 	Company          *string `json:"company,omitempty"`
 	BusinessUnit     *string `json:"business_unit,omitempty"`
 	Division         *string `json:"division,omitempty"`
@@ -50,8 +79,20 @@ type Employee struct {
 	DesignationID    *string `json:"designation_id,omitempty"`
 	ConfirmationDate *string `json:"confirmation_date,omitempty"` // YYYY-MM-DD, end of probation
 
+	// ── Compensation (for payroll integration) ────────────────────────────
+	BasicSalary *string `json:"basic_salary,omitempty"` // numeric string
+	CTC         *string `json:"ctc,omitempty"`          // numeric string
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (e *Employee) FullName() string {
+	return e.FirstName + " " + e.LastName
+}
+
+func (e *Employee) IsActive() bool {
+	return e.Status == EmployeeStatusActive
 }
 
 type CreateEmployeeRequest struct {
@@ -64,11 +105,11 @@ type CreateEmployeeRequest struct {
 	JobTitle          string  `json:"job_title,omitempty"`
 	DepartmentID      *string `json:"department_id,omitempty"`
 	ManagerEmployeeID *string `json:"manager_employee_id,omitempty"`
-	WorkerType        string  `json:"worker_type"` // FULL_TIME, PART_TIME, CONTRACTOR
+	WorkerType        string  `json:"worker_type"` // FULL_TIME, PART_TIME, CONTRACTOR, INTERN, PROBATION
 	HireDate          string  `json:"hire_date"`   // YYYY-MM-DD
 
 	DateOfBirth       *string `json:"date_of_birth,omitempty"`
-	Gender            *string `json:"gender,omitempty"`
+	Gender            *string `json:"gender,omitempty"` // MALE, FEMALE, OTHER
 	ProfilePictureURL *string `json:"profile_picture_url,omitempty"`
 	PersonalEmail     *string `json:"personal_email,omitempty"`
 	WorkEmail         *string `json:"work_email,omitempty"`
@@ -86,6 +127,9 @@ type CreateEmployeeRequest struct {
 	Team             *string `json:"team,omitempty"`
 	DesignationID    *string `json:"designation_id,omitempty"`
 	ConfirmationDate *string `json:"confirmation_date,omitempty"`
+
+	BasicSalary *string `json:"basic_salary,omitempty"`
+	CTC         *string `json:"ctc,omitempty"`
 }
 
 type UpdateEmployeeRequest struct {
@@ -96,6 +140,7 @@ type UpdateEmployeeRequest struct {
 	DepartmentID      *string `json:"department_id,omitempty"`
 	ManagerEmployeeID *string `json:"manager_employee_id,omitempty"`
 	WorkerType        *string `json:"worker_type,omitempty"`
+	Status            *string `json:"status,omitempty"`
 
 	DateOfBirth       *string `json:"date_of_birth,omitempty"`
 	Gender            *string `json:"gender,omitempty"`
@@ -116,10 +161,13 @@ type UpdateEmployeeRequest struct {
 	Team             *string `json:"team,omitempty"`
 	DesignationID    *string `json:"designation_id,omitempty"`
 	ConfirmationDate *string `json:"confirmation_date,omitempty"`
+
+	BasicSalary *string `json:"basic_salary,omitempty"`
+	CTC         *string `json:"ctc,omitempty"`
 }
 
 type UpdateStatusRequest struct {
-	Status          string  `json:"status"` // ACTIVE, SUSPENDED, TERMINATED
+	Status          string  `json:"status"` // ONBOARDING, ACTIVE, INACTIVE, PENDING, ON_LEAVE, TERMINATED, RESIGNED, DEACTIVATED, SUSPENDED, LOCKED, ARCHIVED, PASSWORD_RESET_REQUIRED
 	TerminationDate *string `json:"termination_date,omitempty"`
 }
 

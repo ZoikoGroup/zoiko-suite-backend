@@ -480,6 +480,15 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		}
 	}
 
+	// ── Source inputs (§4 server-resolved context) ──────────────────────────
+	// Resolved before signing: the verified channel travels on the envelope,
+	// and gateway-auth-svc stamps X-Source-Channel from it (S1-B1).
+	sourceChannel, sourceChannelBasis := resolveSourceChannelForClient(principal, req.SourceChannel, r.cfg.IDPClientChannels[claims.ClientID])
+	envelopeChannel := ""
+	if sourceChannelBasis == domain.BasisVerifiedClient || sourceChannelBasis == domain.BasisServerDerived {
+		envelopeChannel = sourceChannel
+	}
+
 	envelope := &domain.IdentityContextEnvelope{
 		JTI: jti,
 		ISS: r.cfg.JWTIssuer,
@@ -511,6 +520,7 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		// serving support traffic; recording it only in session_contexts left
 		// that fact inside this service's database.
 		SupportContextID: req.SupportContextID,
+		SourceChannel:    envelopeChannel,
 
 		CorrelationID: req.CorrelationID,
 		SchemaVersion: "1.0",
@@ -521,8 +531,6 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		return nil, fmt.Errorf("envelope signing failed: %w", err)
 	}
 
-	// ── Source inputs (§4 server-resolved context) ──────────────────────────
-	sourceChannel, sourceChannelBasis := resolveSourceChannel(principal, req.SourceChannel)
 	workloadID, workloadBasis := resolveWorkloadID(principal, req.WorkloadID)
 	if sourceChannelBasis == domain.BasisRejectedInconsistent || workloadBasis == domain.BasisRejectedInconsistent {
 		// Not a refusal: the session is still the verified principal's own.

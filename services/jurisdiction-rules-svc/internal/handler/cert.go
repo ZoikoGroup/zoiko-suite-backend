@@ -11,6 +11,7 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
+	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -51,8 +52,8 @@ func (h *Handler) writeCertError(w http.ResponseWriter, err error, corr string) 
 	var blocked *store.CertificationBlocked
 	switch {
 	case errors.As(err, &blocked):
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"error": "certification_blocked", "message": "one or more certification gates are not met", "reasons": blocked.Reasons})
+		problem.Write(w, problem.New(http.StatusConflict, "certification_blocked",
+			"one or more certification gates are not met").With("reasons", blocked.Reasons))
 	case errors.Is(err, domain.ErrBundleInvalid):
 		writeError(w, http.StatusBadRequest, "invalid_test_bundle", err.Error())
 	case errors.Is(err, domain.ErrNoTestBundle):

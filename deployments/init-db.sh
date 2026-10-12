@@ -48,9 +48,17 @@ apply_migrations() {
         exit 1
     fi
 
+    # schema_migrations records what ran, so deployments/migrate.py can bring an
+    # EXISTING volume up to date later (this script only runs on a fresh one).
+    # Same table and checksum (sha256 of the file with CRLF normalised) as
+    # migrate.py, so a fresh volume is "tracked" from its first boot.
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" -q -c         "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), method TEXT NOT NULL);"
+
     for f in $(LC_ALL=C ls "$path"/*.up.sql 2>/dev/null | LC_ALL=C sort); do
         echo "    $db <- $(basename "$f")"
         psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" -f "$f"
+        sum=$(tr -d '\r' < "$f" | sha256sum | cut -d' ' -f1)
+        psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" -q -c             "INSERT INTO schema_migrations (filename, checksum, method) VALUES ('$(basename "$f")', '$sum', 'init-db.sh') ON CONFLICT DO NOTHING;"
         applied=$((applied + 1))
     done
 
