@@ -116,6 +116,9 @@ notification:notification
 procurement_workflow:procurement-workflow
 performance_review:performance-review
 delegated_authority:delegated-authority
+currency_registry:currency-registry
+fiscal_calendar:fiscal-calendar
+accounting_period:accounting-period
 access_control:access-control
 decision_support:decision-support
 treasury:treasury
@@ -231,6 +234,7 @@ zoiko_app_granted=0
 zoiko_app_skipped=0
 for db in \
     access_control accounts_payable accounts_receivable ai_governance asset_management audit_event_store \
+    currency_registry fiscal_calendar accounting_period \
     inventory_management project_accounting \
     authorization_svc bank_reconciliation benefits board_resolutions capability_registry \
     clause_template commercial_account compensation configuration_feature_flag consolidation_svc \

@@ -24,8 +24,10 @@ func seedInvoice(t *testing.T, pool *pgxpool.Pool, tenant, entity, number, amoun
 		_, err := tx.Exec(context.Background(), `
 			INSERT INTO vendor_invoices (invoice_id, tenant_id, legal_entity_id, vendor_id, invoice_number,
 				amount, currency_code, due_date, status, created_by_principal_id, correlation_id, created_at,
-				invoice_date, supply_date, net_amount, tax_amount)
-			VALUES ($1,$2,$3,'vendor-1',$4,$5::numeric,$6,'2026-12-31',$7,'seed',$8,$9,'2026-01-01','2026-01-01',$5::numeric,0)`,
+				invoice_date, supply_date, net_amount, tax_amount,
+				source_hash, source_channel, invoice_number_normalized)
+			VALUES ($1,$2,$3,'vendor-1',$4,$5::numeric,$6,'2026-12-31',$7,'seed',$8,$9,'2026-01-01','2026-01-01',$5::numeric,0,
+				repeat('0',64),'seed',lower($4::varchar))`,
 			id, tenant, entity, number, amount, currency, status, "c-"+id, createdAt)
 		if err != nil {
 			t.Fatalf("seed invoice: %v", err)

@@ -39,6 +39,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
 		project_profitability_snapshots, project_profitability_projections,
+		project_recognition_run_milestones, project_milestones,
 		project_recognition_runs, project_recognition_estimates,
 		project_cost_certifications, project_cost_entries,
 		project_financial_profiles, project_work_packages, projects

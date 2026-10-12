@@ -7,6 +7,16 @@ import (
 )
 
 type tenantCtxKey struct{}
+type correlationCtxKey struct{}
+
+func WithCorrelation(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, correlationCtxKey{}, id)
+}
+
+func CorrelationFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(correlationCtxKey{}).(string)
+	return v
+}
 
 func WithTenant(ctx context.Context, tenantID string) context.Context {
 	return context.WithValue(ctx, tenantCtxKey{}, tenantID)
@@ -23,7 +33,26 @@ func TenantContext() func(http.Handler) http.Handler {
 			if tenantID := r.Header.Get("X-Tenant-Id"); tenantID != "" {
 				r = r.WithContext(WithTenant(r.Context(), tenantID))
 			}
+			if cid := r.Header.Get("X-Correlation-ID"); cid != "" {
+				r = r.WithContext(WithCorrelation(r.Context(), cid))
+			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// RequireTenant refuses a request that carries no tenant. Every row this
+// service writes is tenant-scoped (row-level security has no NULL-tenant
+// escape hatch), so a tenant-less request can neither read nor write
+// anything and is rejected up front with a stable code.
+func RequireTenant(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if TenantFromContext(r.Context()) == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"X-Tenant-Id header is required","code":"VALIDATION_FAILED"}` + "\n"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

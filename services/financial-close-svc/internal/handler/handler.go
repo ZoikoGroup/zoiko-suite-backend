@@ -356,6 +356,13 @@ type Handler struct {
 	// bankReconCutoffDays — see config.BankReconCutoffDays. Zero means the
 	// statement must be dated on the period's last day itself.
 	bankReconCutoffDays int
+
+
+	// REF-05 cutover phase 1 (see period_mirror.go). All nil/empty by default,
+	// which means: no mirroring, and the workflow-ref endpoint refuses everyone.
+	mirror             PeriodMirror
+	workflowRefs       WorkflowRefReader
+	workflowRefCallers map[string]struct{}
 }
 
 // SetCloseGateEnforced turns the financial-control-svc close-gate dependency
@@ -409,6 +416,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/remove", h.RemoveCloseRequirement)
 	})
 	r.Get("/v1/control-populations/migration-batch-tieout", h.GetMigrationBatchTieoutPopulation)
+	r.Get("/v1/close/workflow-refs/{ref}", h.GetWorkflowRef)
+	r.Get("/v1/close/workflow-refs/{ref}", h.GetWorkflowRef)
 	r.Route("/v1/close/periods", func(r chi.Router) {
 		r.Post("/", h.CreateFiscalPeriod)
 		r.Get("/", h.ListFiscalPeriods)
@@ -426,6 +435,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/reopen", h.RetiredReopen)
 		r.Get("/{id}/history", h.GetCloseHistory)
 		r.Get("/{id}/available-actions", h.GetAvailableCloseActions)
+		r.Post("/{id}:mirror-to-period-service", h.MirrorPeriodToPeriodService)
 	})
 	r.Route("/v1/subledger-control/runs", func(r chi.Router) {
 		r.Post("/", h.RunSubledgerControl)
@@ -1086,6 +1096,10 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 	} else {
 		h.publisher.PublishClosed(r.Context(), correlationID, principalID, *fp, docID)
 	}
+
+	// REF-05 phase 1: best-effort mirror. Runs only when PERIOD_SERVICE_MIRROR=on,
+	// is bounded by a short deadline, and can neither fail nor change this response.
+	h.mirrorLock(r.Context(), tenantID, correlationID, principalID, fp, docID, blockingIssues)
 
 	writeJSON(w, http.StatusOK, domain.PeriodLockResponse{
 		FiscalPeriodID:     id,

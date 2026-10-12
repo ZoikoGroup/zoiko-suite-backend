@@ -11,17 +11,17 @@
 package authz
 
 import (
-	svcenvelope "zoiko.io/purchase-request-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"io"
 	"net/http"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/purchase-request-svc/internal/envelope"
 
 	"go.uber.org/zap"
 
@@ -36,6 +36,11 @@ type Client interface {
 	// domain.ErrAuthorizationServiceUnavailable if it cannot be reached —
 	// callers must fail-closed on the latter.
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+
+	// CheckAllowedOwnObject is CheckAllowed plus the principal who owns the
+	// object being acted on, so authorization-svc's dynamic own-object
+	// segregation-of-duties rule can deny a maker acting as their own checker.
+	CheckAllowedOwnObject(ctx context.Context, principalID, legalEntityID, actionType, resourceOwnerPrincipalID string) error
 }
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
@@ -103,9 +108,10 @@ func NewHTTPClientWithHTTPClient(baseURL string, httpClient *http.Client, log *z
 }
 
 type authorizeRequest struct {
-	PrincipalID   string `json:"principal_id"`
-	LegalEntityID string `json:"legal_entity_id"`
-	ActionType    string `json:"action_type"`
+	PrincipalID              string `json:"principal_id"`
+	LegalEntityID            string `json:"legal_entity_id"`
+	ActionType               string `json:"action_type"`
+	ResourceOwnerPrincipalID string `json:"resource_owner_principal_id,omitempty"`
 }
 
 type authorizeResponse struct {
@@ -113,13 +119,18 @@ type authorizeResponse struct {
 }
 
 func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	return c.CheckAllowedOwnObject(ctx, principalID, legalEntityID, actionType, "")
+}
+
+// CheckAllowedOwnObject — see Client.
+func (c *HTTPClient) CheckAllowedOwnObject(ctx context.Context, principalID, legalEntityID, actionType, ownerPrincipalID string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType + "|" + ownerPrincipalID
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType, ownerPrincipalID)
 
 	// Cache the decision itself (GRANTED or DENIED), never an unavailable
 	// outcome — see the doc comment on decisionCacheTTL.
@@ -169,8 +180,8 @@ func (c *HTTPClient) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
-func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType})
+func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType, ownerPrincipalID string) error {
+	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType, ResourceOwnerPrincipalID: ownerPrincipalID})
 	if err != nil {
 		return fmt.Errorf("marshal authorize request: %w", err)
 	}

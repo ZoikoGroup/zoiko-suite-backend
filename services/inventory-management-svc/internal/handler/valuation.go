@@ -425,13 +425,29 @@ func (h *Handler) EmitInventoryAccountingEvent(w http.ResponseWriter, r *http.Re
 			totalOutbound += e.Value
 		}
 	}
-	if totalOutbound == 0 {
-		writeError(w, http.StatusUnprocessableEntity, "no_valuation_to_emit", "this run's frozen population has no OUTBOUND (COGS) value to post")
+	inbound, err := h.store.GetRunInboundValue(r.Context(), id)
+	if err != nil {
+		h.log.Error("EmitInventoryAccountingEvent: could not split inbound value", zap.String("run_id", id), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-	lines := []clients.LedgerLine{
-		{AccountCode: run.COGSAccountCode, DebitAmount: totalOutbound},
-		{AccountCode: run.InventoryAccountCode, CreditAmount: totalOutbound},
+	if totalOutbound == 0 && inbound.ReceiptLinked == 0 {
+		writeError(w, http.StatusUnprocessableEntity, "no_valuation_to_emit", "this run's frozen population has no OUTBOUND (COGS) value and no AP-receipt-linked INBOUND value to post")
+		return
+	}
+	var lines []clients.LedgerLine
+	if totalOutbound != 0 {
+		lines = append(lines,
+			clients.LedgerLine{AccountCode: run.COGSAccountCode, DebitAmount: totalOutbound},
+			clients.LedgerLine{AccountCode: run.InventoryAccountCode, CreditAmount: totalOutbound})
+	}
+	// Reclass: AP-03 already expensed the receipt via GRNI (Dr AP_GRNI_EXPENSE
+	// / Cr AP_GRNI_ACCRUAL); INV-04 owns the inventory value, so move that
+	// cost out of expense into the asset.
+	if inbound.ReceiptLinked != 0 {
+		lines = append(lines,
+			clients.LedgerLine{AccountCode: run.InventoryAccountCode, DebitAmount: inbound.ReceiptLinked},
+			clients.LedgerLine{MappingKey: h.grniReclassMappingKey, CreditAmount: inbound.ReceiptLinked})
 	}
 
 	correlationID := getCorrelationID(r)
@@ -451,7 +467,13 @@ func (h *Handler) EmitInventoryAccountingEvent(w http.ResponseWriter, r *http.Re
 		return
 	}
 	h.publisher.PublishInventoryAccountingEventEmitted(r.Context(), correlationID, principalID, tenantID, run.LegalEntityID, id, journalID)
-	writeJSON(w, http.StatusOK, map[string]any{"run_id": id, "status": domain.ValuationRunStatusAccountingEventEmitted, "journal_id": journalID})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"run_id": id, "status": domain.ValuationRunStatusAccountingEventEmitted, "journal_id": journalID,
+		"cogs_posted": totalOutbound, "inbound_reclass_posted": inbound.ReceiptLinked,
+		// INBOUND value with no AP receipt link is not posted: without the
+		// link INV cannot know the cost was already expensed via GRNI.
+		"inbound_unposted_no_ap_link": inbound.Unlinked,
+	})
 }
 
 // ── POST /v1/valuation/write-downs ────────────────────────────────────────────
@@ -625,6 +647,16 @@ func (h *Handler) writeValuationErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "valuation_run_not_found", "")
 	case errors.Is(err, domain.ErrWriteDownNotFound):
 		writeError(w, http.StatusNotFound, "write_down_not_found", "")
+	case errors.Is(err, domain.ErrLandedCostNotFound):
+		writeError(w, http.StatusNotFound, "landed_cost_not_found", "")
+	case errors.Is(err, domain.ErrNoCostLayerForMovement), errors.Is(err, domain.ErrLandedCostNotApplicable):
+		writeError(w, http.StatusUnprocessableEntity, "landed_cost_not_applicable", err.Error())
+	case errors.Is(err, domain.ErrLayerOverConsumed):
+		writeError(w, http.StatusUnprocessableEntity, "layer_over_consumed", err.Error())
+	case errors.Is(err, domain.ErrRebuildReasonRequired):
+		writeError(w, http.StatusBadRequest, "reason_required", err.Error())
+	case errors.Is(err, domain.ErrLandedCostKeyConflict):
+		writeError(w, http.StatusConflict, "idempotency_key_conflict", err.Error())
 	case errors.Is(err, domain.ErrMovementAlreadyValued),
 		errors.Is(err, domain.ErrMovementNotCommitted),
 		errors.Is(err, domain.ErrUnitCostRequired),

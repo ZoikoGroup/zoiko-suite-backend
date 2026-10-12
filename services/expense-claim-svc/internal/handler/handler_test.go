@@ -17,7 +17,6 @@ import (
 	"zoiko.io/expense-claim-svc/internal/documentvault"
 	"zoiko.io/expense-claim-svc/internal/domain"
 	"zoiko.io/expense-claim-svc/internal/employeemaster"
-	"zoiko.io/expense-claim-svc/internal/events"
 	"zoiko.io/expense-claim-svc/internal/handler"
 	"zoiko.io/expense-claim-svc/internal/middleware"
 	"zoiko.io/expense-claim-svc/internal/payableopenitem"
@@ -25,59 +24,72 @@ import (
 	"zoiko.io/expense-claim-svc/internal/tax"
 )
 
-// ── stub publisher ───────────────────────────────────────────────────────────
+const (
+	tenantA      = "tenant-ap07-a"
+	tenantB      = "tenant-ap07-b"
+	legalEntity  = "le-ap07-1"
+	claimant     = "principal-claimant"
+	approver     = "principal-approver"
+	otherApprove = "principal-approver-2"
+)
 
-type stubPublisher struct{ calls int }
+func ver(n int) *int { return &n }
 
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	p.calls++
-	return nil
-}
+// ── stubs ────────────────────────────────────────────────────────────────────
 
-var _ events.Publisher = (*stubPublisher)(nil)
-
-// ── stub authz — including the own-object SoD layer ─────────────────────────
-
+// stubAuthz stands in for authorization-svc: a blanket deny, a per-action deny,
+// "down", and — with sodRules — the own-object SoD layer that denies a
+// principal acting on an object they own.
 type stubAuthz struct {
-	deny       bool
-	sodRules   bool
-	lastAction string
+	deny        bool
+	down        bool
+	denyActions map[string]bool
+	sodRules    bool
+	actions     []string
 }
 
-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, actionType string) error {
-	a.lastAction = actionType
-	if a.deny {
+func (a *stubAuthz) check(action string) error {
+	a.actions = append(a.actions, action)
+	switch {
+	case a.down:
+		return authzpkg.ErrAuthzServiceUnavailable
+	case a.deny || a.denyActions[action]:
 		return authzpkg.ErrAuthorizationDenied
 	}
 	return nil
 }
 
-func (a *stubAuthz) CheckAllowedOwnObject(_ context.Context, principalID, _, actionType, resourceOwnerPrincipalID string) error {
-	a.lastAction = actionType
-	if a.deny {
-		return authzpkg.ErrAuthorizationDenied
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, action string) error {
+	return a.check(action)
+}
+
+func (a *stubAuthz) CheckAllowedOwnObject(_ context.Context, principal, _, action, owner string) error {
+	if err := a.check(action); err != nil {
+		return err
 	}
-	if a.sodRules && principalID == resourceOwnerPrincipalID {
+	if a.sodRules && principal == owner {
 		return authzpkg.ErrAuthorizationDenied
 	}
 	return nil
 }
 
-// ── stub employee-master-svc client ─────────────────────────────────────────
+func (a *stubAuthz) last() string {
+	if len(a.actions) == 0 {
+		return ""
+	}
+	return a.actions[len(a.actions)-1]
+}
 
 type stubEmployee struct {
-	active map[string]string // claimantID -> legalEntityID, if ACTIVE
-}
-
-func newStubEmployee() *stubEmployee { return &stubEmployee{active: map[string]string{}} }
-
-func (e *stubEmployee) addActive(claimantID, legalEntityID string) {
-	e.active[claimantID] = legalEntityID
+	active map[string]string
+	down   bool
 }
 
 func (e *stubEmployee) VerifyActiveClaimant(_ context.Context, _, legalEntityID, claimantID string) error {
-	le, ok := e.active[claimantID]
-	if !ok || le != legalEntityID {
+	if e.down {
+		return domain.ErrClaimantServiceUnavailable
+	}
+	if le, ok := e.active[claimantID]; !ok || le != legalEntityID {
 		return domain.ErrClaimantNotEligible
 	}
 	return nil
@@ -85,39 +97,31 @@ func (e *stubEmployee) VerifyActiveClaimant(_ context.Context, _, legalEntityID,
 
 var _ employeemaster.Client = (*stubEmployee)(nil)
 
-// ── stub document-vault-svc client ──────────────────────────────────────────
-
-type stubDoc struct {
-	Status        string
-	TenantID      string
-	LegalEntityID string
+type stubDocs struct {
+	docs map[string][3]string // id -> status, tenant, legal entity
+	down bool
 }
 
-type stubDocs struct{ docs map[string]stubDoc }
+func (d *stubDocs) add(id, tenantID, le, status string) { d.docs[id] = [3]string{status, tenantID, le} }
 
-func newStubDocs() *stubDocs { return &stubDocs{docs: map[string]stubDoc{}} }
-
-func (d *stubDocs) add(id, tenantID, legalEntityID, status string) {
-	d.docs[id] = stubDoc{Status: status, TenantID: tenantID, LegalEntityID: legalEntityID}
-}
-
-func (d *stubDocs) VerifyReceipt(_ context.Context, _, tenantID, legalEntityID, documentID string) error {
-	doc, ok := d.docs[documentID]
+func (d *stubDocs) VerifyReceipt(_ context.Context, _, tenantID, le, id string) error {
+	if d.down {
+		return domain.ErrDocumentServiceUnavailable
+	}
+	doc, ok := d.docs[id]
 	if !ok {
 		return domain.ErrDocumentNotFound
 	}
-	if doc.TenantID != tenantID || doc.LegalEntityID != legalEntityID {
+	if doc[1] != tenantID || doc[2] != le {
 		return domain.ErrDocumentMismatch
 	}
-	if doc.Status == "PURGE_PENDING" {
+	if doc[0] == "PURGE_PENDING" {
 		return domain.ErrDocumentNotUsable
 	}
 	return nil
 }
 
 var _ documentvault.Client = (*stubDocs)(nil)
-
-// ── stub tax-determination-svc client ───────────────────────────────────────
 
 type stubTax struct {
 	fail  bool
@@ -134,13 +138,15 @@ func (t *stubTax) Determine(_ context.Context, _ string, r tax.DetermineRequest)
 
 var _ tax.Client = (*stubTax)(nil)
 
-// ── stub policy-svc client ──────────────────────────────────────────────────
-
 type stubPolicy struct {
-	result string // "" defaults to WITHIN_THRESHOLD
+	result string
+	err    error
 }
 
-func (p *stubPolicy) EvaluateApprovalThreshold(_ context.Context, _, _, _ string, _ float64) (string, string, error) {
+func (p *stubPolicy) EvaluateApprovalThreshold(context.Context, string, string, string, float64) (string, string, error) {
+	if p.err != nil {
+		return "", "", p.err
+	}
 	if p.result == "" {
 		return string(domain.PolicyWithinThreshold), "policy-version-1", nil
 	}
@@ -149,528 +155,994 @@ func (p *stubPolicy) EvaluateApprovalThreshold(_ context.Context, _, _, _ string
 
 var _ policy.Client = (*stubPolicy)(nil)
 
-// ── stub payable-open-item-svc (AP-08) client ───────────────────────────────
-
 type stubPayable struct {
-	fail  bool
-	calls int
+	status string // GetPayable status
+	down   bool
+	gets   int
 }
 
 func (p *stubPayable) CreatePayableFromApprovedSource(_ context.Context, _, _ string, req payableopenitem.CreatePayableRequest) (*payableopenitem.PayableOpenItem, error) {
-	p.calls++
-	if p.fail {
+	return &payableopenitem.PayableOpenItem{PayableID: "payable-" + req.SourceReference, Status: "OPEN"}, nil
+}
+
+func (p *stubPayable) GetPayable(_ context.Context, _, _, id string) (*payableopenitem.PayableOpenItem, error) {
+	p.gets++
+	if p.down {
 		return nil, domain.ErrPayableServiceUnavailable
 	}
-	return &payableopenitem.PayableOpenItem{PayableID: "payable-" + req.SourceReference, Status: "OPEN"}, nil
+	return &payableopenitem.PayableOpenItem{PayableID: id, Status: p.status}, nil
 }
 
 var _ payableopenitem.Client = (*stubPayable)(nil)
 
-// ── stub configuration-feature-flag-svc client ──────────────────────────────
-
-// stubConfigFlags defaults to "no override found," so every pre-existing
-// test keeps exercising only the static handler.Config.ReceiptRequiredThreshold
-// fallback, exactly as before this integration existed.
 type stubConfigFlags struct {
 	threshold float64
 	found     bool
 	err       error
+	terms     float64
+	termsSet  bool
 	calls     int
 }
 
-func (c *stubConfigFlags) ResolveReceiptThreshold(_ context.Context, _, _ string) (float64, bool, error) {
+func (c *stubConfigFlags) ResolveReceiptThreshold(context.Context, string, string) (float64, bool, error) {
 	c.calls++
 	return c.threshold, c.found, c.err
 }
 
-var _ configflag.Client = (*stubConfigFlags)(nil)
-
-// ── test harness ─────────────────────────────────────────────────────────────
-
-const testTenant = "tenant-ap07-1"
-const testLegalEntity = "le-ap07-1"
-const testClaimant = "principal-claimant"
-
-func newTestRouterWithPayable(st *stubStore, pub *stubPublisher, az *stubAuthz, emp *stubEmployee, docs *stubDocs, tx *stubTax, pol *stubPolicy, payable *stubPayable) chi.Router {
-	return newTestRouterFull(st, pub, az, emp, docs, tx, pol, payable, &stubConfigFlags{})
+func (c *stubConfigFlags) ResolveReimbursementTermsDays(context.Context, string, string) (float64, bool, error) {
+	return c.terms, c.termsSet, nil
 }
 
-func newTestRouterFull(st *stubStore, pub *stubPublisher, az *stubAuthz, emp *stubEmployee, docs *stubDocs, tx *stubTax, pol *stubPolicy, payable *stubPayable, cf *stubConfigFlags) chi.Router {
-	logger := zap.NewNop()
-	h := handler.New(st, pub, az, emp, docs, tx, pol, payable, cf, handler.Config{ReceiptRequiredThreshold: 25.0, Environment: "test"}, logger)
+var _ configflag.Client = (*stubConfigFlags)(nil)
+
+// stubRelay emulates the payable relay's best-effort immediate hand-off by
+// completing the claim's payable request in the store.
+type stubRelay struct {
+	store *stubStore
+	calls []string
+}
+
+func (r *stubRelay) ProcessClaim(ctx context.Context, claimID string) {
+	r.calls = append(r.calls, claimID)
+	if req := r.store.payReqs[claimID]; req != nil {
+		_ = r.store.CompletePayableRequest(ctx, *req, "payable-"+claimID, "payee-ref", "dest-1")
+	}
+}
+
+// ── harness ──────────────────────────────────────────────────────────────────
+
+type env struct {
+	store    *stubStore
+	authz    *stubAuthz
+	emp      *stubEmployee
+	docs     *stubDocs
+	tax      *stubTax
+	policy   *stubPolicy
+	payable  *stubPayable
+	cf       *stubConfigFlags
+	relay    *stubRelay
+	cfg      handler.Config
+	useRelay bool
+}
+
+func newEnv() *env {
+	e := &env{
+		store: newStubStore(), authz: &stubAuthz{}, emp: &stubEmployee{active: map[string]string{claimant: legalEntity}},
+		docs: &stubDocs{docs: map[string][3]string{}}, tax: &stubTax{}, policy: &stubPolicy{}, payable: &stubPayable{},
+		cf:  &stubConfigFlags{},
+		cfg: handler.Config{ReceiptRequiredThreshold: 25.0, Environment: "test"},
+	}
+	e.relay = &stubRelay{store: e.store}
+	return e
+}
+
+func (e *env) router() chi.Router {
+	d := handler.Deps{
+		Store: e.store, Authz: e.authz, Employee: e.emp, Docs: e.docs, Tax: e.tax, Policy: e.policy,
+		Payable: e.payable, ConfigFlags: e.cf, Config: e.cfg, Log: zap.NewNop(),
+	}
+	if e.useRelay {
+		d.Relay = e.relay
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
-	handler.RegisterRoutes(r, h)
+	handler.RegisterRoutes(r, handler.New(d))
 	return r
 }
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, emp *stubEmployee, docs *stubDocs, tx *stubTax, pol *stubPolicy) chi.Router {
-	return newTestRouterWithPayable(st, pub, az, emp, docs, tx, pol, &stubPayable{})
+type call struct {
+	method, path string
+	body         any
+	principal    string
+	tenant       string
+	key          string
 }
 
-func doRequestAs(r http.Handler, method, path string, body interface{}, tenantID, principalID string) *httptest.ResponseRecorder {
+func (e *env) do(r chi.Router, c call) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
-	if body != nil {
-		_ = json.NewEncoder(&buf).Encode(body)
+	if c.body != nil {
+		_ = json.NewEncoder(&buf).Encode(c.body)
 	}
-	req := httptest.NewRequest(method, path, &buf)
+	req := httptest.NewRequest(c.method, c.path, &buf)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Principal-Id", principalID)
-	if tenantID != "" {
-		req.Header.Set("X-Tenant-Id", tenantID)
+	if c.principal != "" {
+		req.Header.Set("X-Principal-Id", c.principal)
 	}
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	return w
+	if c.tenant != "" {
+		req.Header.Set("X-Tenant-Id", c.tenant)
+	}
+	if c.key != "" {
+		req.Header.Set("Idempotency-Key", c.key)
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
 }
 
-func doRequest(r http.Handler, method, path string, body interface{}, tenantID string) *httptest.ResponseRecorder {
-	return doRequestAs(r, method, path, body, tenantID, "principal-approver")
+func as(principal, method, path string, body any) call {
+	return call{method: method, path: path, body: body, principal: principal, tenant: tenantA}
 }
 
-func createClaim(t *testing.T, r http.Handler, emp *stubEmployee) *domain.ExpenseClaim {
+const base = "/ap07/expense-claims/"
+
+type apiErr struct{ Error, Code string }
+
+func codeOf(t *testing.T, rec *httptest.ResponseRecorder) string {
 	t.Helper()
-	emp.addActive(testClaimant, testLegalEntity)
-	req := domain.CreateExpenseClaimRequest{
-		LegalEntityID: testLegalEntity, ClaimantPrincipalID: testClaimant, Currency: "USD",
-		BusinessPurpose: "client dinner", ProjectCostCenter: "CC-100",
+	var e struct {
+		Code string `json:"code"`
 	}
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/", req, testTenant, testClaimant)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("createClaim: expected 201, got %d: %s", w.Code, w.Body.String())
-	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &e)
+	return e.Code
+}
+
+func decodeClaim(t *testing.T, rec *httptest.ResponseRecorder) domain.ExpenseClaim {
+	t.Helper()
 	var c domain.ExpenseClaim
-	_ = json.Unmarshal(w.Body.Bytes(), &c)
+	if err := json.Unmarshal(rec.Body.Bytes(), &c); err != nil {
+		t.Fatalf("decoding claim: %v (%s)", err, rec.Body.String())
+	}
+	return c
+}
+
+func createReq() domain.CreateExpenseClaimRequest {
+	return domain.CreateExpenseClaimRequest{
+		LegalEntityID: legalEntity, ClaimantPrincipalID: claimant, Currency: "USD", BusinessPurpose: "client dinner", ProjectCostCenter: "CC-100",
+	}
+}
+
+func lineReq(amount float64) domain.AddExpenseLineRequest {
+	return domain.AddExpenseLineRequest{Merchant: "Acme Diner", ExpenseDate: time.Now().UTC(), Amount: amount, Currency: "USD", Category: "MEALS"}
+}
+
+func (e *env) claim(t *testing.T, r chi.Router) *domain.ExpenseClaim {
+	t.Helper()
+	rec := e.do(r, as(claimant, http.MethodPost, base, createReq()))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	c := decodeClaim(t, rec)
 	return &c
 }
 
-func addLine(t *testing.T, r http.Handler, claimID string, req domain.AddExpenseLineRequest) *domain.ExpenseLine {
+func (e *env) addLine(t *testing.T, r chi.Router, id string, req domain.AddExpenseLineRequest) *domain.ExpenseLine {
 	t.Helper()
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+claimID+"/lines", req, testTenant, testClaimant)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("addLine: expected 201, got %d: %s", w.Code, w.Body.String())
+	rec := e.do(r, as(claimant, http.MethodPost, base+id+"/lines", req))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("addLine: expected 201, got %d: %s", rec.Code, rec.Body.String())
 	}
 	var l domain.ExpenseLine
-	_ = json.Unmarshal(w.Body.Bytes(), &l)
+	_ = json.Unmarshal(rec.Body.Bytes(), &l)
 	return &l
 }
 
-func newLineReq(amount float64) domain.AddExpenseLineRequest {
-	return domain.AddExpenseLineRequest{
-		Merchant: "Acme Diner", ExpenseDate: time.Now().UTC(), Amount: amount, Currency: "USD", Category: "MEALS",
+func (e *env) submit(t *testing.T, r chi.Router, id string) *httptest.ResponseRecorder {
+	t.Helper()
+	return e.do(r, as(claimant, http.MethodPost, base+id+"/submit", nil))
+}
+
+// pending returns a claim routed to PENDING_APPROVAL with one line of amount.
+func (e *env) pending(t *testing.T, r chi.Router, amount float64) *domain.ExpenseClaim {
+	t.Helper()
+	c := e.claim(t, r)
+	e.addLine(t, r, c.ClaimID, lineReq(amount))
+	if rec := e.submit(t, r, c.ClaimID); rec.Code != http.StatusOK {
+		t.Fatalf("submit: %d %s", rec.Code, rec.Body.String())
+	}
+	if e.store.claims[c.ClaimID].Status != domain.StatusPendingApproval {
+		t.Fatalf("expected PENDING_APPROVAL, got %s", e.store.claims[c.ClaimID].Status)
+	}
+	return c
+}
+
+func (e *env) approve(r chi.Router, id, principal, key string) *httptest.ResponseRecorder {
+	c := as(principal, http.MethodPost, base+id+"/approve", domain.VersionedRequest{ExpectedVersion: ver(e.store.claims[id].Version)})
+	c.key = key
+	return e.do(r, c)
+}
+
+// ── CreateExpenseClaim ───────────────────────────────────────────────────────
+
+func TestCreate_Draft_RecordsClaimantAndEvent(t *testing.T) {
+	e := newEnv()
+	c := e.claim(t, e.router())
+	if c.Status != domain.StatusDraft || c.Version != 1 || c.ClaimantPrincipalID != claimant || c.TenantID == nil || *c.TenantID != tenantA {
+		t.Fatalf("expected a DRAFT v1 for the claimant in the verified tenant, got %+v", c)
+	}
+	if len(e.store.events[c.ClaimID]) != 1 || e.store.events[c.ClaimID][0].EventType != domain.EventClaimCreated {
+		t.Fatalf("expected the created event, got %v", e.store.events[c.ClaimID])
+	}
+	if len(e.store.outbox) != 2 || e.store.outbox[0] != "ExpenseClaimCreated" {
+		t.Fatalf("expected the spec event and its alias in the outbox, got %v", e.store.outbox)
 	}
 }
 
-// ── tests ────────────────────────────────────────────────────────────────────
-
-func TestCreateExpenseClaim_Draft(t *testing.T) {
-	emp := newStubEmployee()
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-	if c.Status != domain.StatusDraft {
-		t.Fatalf("expected DRAFT, got %s", c.Status)
+func TestCreate_ClaimantNotEligible_Unavailable_AndValidation(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	bad := createReq()
+	bad.ClaimantPrincipalID = "nobody"
+	if rec := e.do(r, as(claimant, http.MethodPost, base, bad)); rec.Code != http.StatusBadRequest || codeOf(t, rec) != "CLAIMANT_NOT_ELIGIBLE" {
+		t.Fatalf("expected 400 CLAIMANT_NOT_ELIGIBLE, got %d %s", rec.Code, rec.Body.String())
+	}
+	e.emp.down = true
+	if rec := e.do(r, as(claimant, http.MethodPost, base, createReq())); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("an unverifiable claimant must fail closed (503), got %d", rec.Code)
+	}
+	e.emp.down = false
+	missing := createReq()
+	missing.Currency = ""
+	if rec := e.do(r, as(claimant, http.MethodPost, base, missing)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing currency: expected 400, got %d", rec.Code)
+	}
+	if len(e.store.claims) != 0 {
+		t.Fatal("a refused create must write nothing")
 	}
 }
 
-func TestCreateExpenseClaim_ClaimantNotEligible_Rejected(t *testing.T) {
-	emp := newStubEmployee() // no active claimants registered
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	req := domain.CreateExpenseClaimRequest{LegalEntityID: testLegalEntity, ClaimantPrincipalID: "nobody", Currency: "USD"}
-	w := doRequest(r, http.MethodPost, "/ap07/expense-claims/", req, testTenant)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for ineligible claimant, got %d: %s", w.Code, w.Body.String())
+func TestCreate_Auth_Tenant_AndIdentity(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	e.authz.deny = true
+	if rec := e.do(r, as(claimant, http.MethodPost, base, createReq())); rec.Code != http.StatusForbidden || codeOf(t, rec) != "FORBIDDEN" {
+		t.Fatalf("expected 403 FORBIDDEN, got %d", rec.Code)
+	}
+	e.authz.deny, e.authz.down = false, true
+	if rec := e.do(r, as(claimant, http.MethodPost, base, createReq())); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("authorization-svc down must fail closed (503), got %d", rec.Code)
+	}
+	e.authz.down = false
+	if rec := e.do(r, call{method: http.MethodPost, path: base, body: createReq(), tenant: tenantA}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no principal: expected 401, got %d", rec.Code)
+	}
+	if rec := e.do(r, call{method: http.MethodPost, path: base, body: createReq(), principal: claimant}); rec.Code != http.StatusBadRequest || codeOf(t, rec) != "VALIDATION_FAILED" {
+		t.Fatalf("no tenant scope: expected 400 VALIDATION_FAILED, got %d", rec.Code)
+	}
+	if len(e.store.claims) != 0 {
+		t.Fatal("refused creates must write nothing")
 	}
 }
 
-func TestAddExpenseLine_WithVerifiedReceipt(t *testing.T) {
-	emp := newStubEmployee()
-	docs := newStubDocs()
-	docs.add("doc-1", testTenant, testLegalEntity, "ACTIVE")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, docs, &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
+func TestCreate_IdempotencyKey_ReplaysAndRejectsReuse(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := as(claimant, http.MethodPost, base, createReq())
+	c.key = "key-1"
+	first := e.do(r, c)
+	second := e.do(r, c)
+	if first.Code != http.StatusCreated || second.Header().Get("Idempotent-Replay") != "true" {
+		t.Fatalf("expected 201 then a replay, got %d / replay=%q", first.Code, second.Header().Get("Idempotent-Replay"))
+	}
+	if len(e.store.claims) != 1 || decodeClaim(t, first).ClaimID != decodeClaim(t, second).ClaimID {
+		t.Fatalf("a replay must resolve to the same single claim, got %d claims", len(e.store.claims))
+	}
+	other := createReq()
+	other.BusinessPurpose = "something else"
+	c2 := as(claimant, http.MethodPost, base, other)
+	c2.key = "key-1"
+	if rec := e.do(r, c2); rec.Code != http.StatusUnprocessableEntity || codeOf(t, rec) != "IDEMPOTENCY_KEY_REUSED" {
+		t.Fatalf("expected 422 IDEMPOTENCY_KEY_REUSED, got %d %s", rec.Code, rec.Body.String())
+	}
+}
 
-	req := newLineReq(50)
+func TestGet_NotFound_And_CrossTenantIsAbsent(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	if rec := e.do(r, as(approver, http.MethodGet, base+"does-not-exist", nil)); rec.Code != http.StatusNotFound || codeOf(t, rec) != "NOT_FOUND" {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+	c := e.pending(t, r, 10)
+	if rec := e.do(r, call{method: http.MethodGet, path: base + c.ClaimID, principal: approver, tenant: tenantB}); rec.Code != http.StatusNotFound {
+		t.Fatalf("another tenant's claim must look absent, got %d", rec.Code)
+	}
+	if rec := e.do(r, call{method: http.MethodPost, path: base + c.ClaimID + "/cancel", body: domain.CancelClaimRequest{Reason: "x"}, principal: claimant, tenant: tenantB}); rec.Code != http.StatusNotFound {
+		t.Fatalf("another tenant must not be able to command it, got %d", rec.Code)
+	}
+	if e.store.claims[c.ClaimID].Status != domain.StatusPendingApproval {
+		t.Fatal("a cross-tenant command must change nothing")
+	}
+}
+
+// ── AddExpenseLine / void ────────────────────────────────────────────────────
+
+func TestAddLine_VerifiedReceipt_AndRefusals(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	e.docs.add("doc-1", tenantA, legalEntity, "ACTIVE")
+	e.docs.add("doc-other-tenant", tenantB, legalEntity, "ACTIVE")
+	e.docs.add("doc-purged", tenantA, legalEntity, "PURGE_PENDING")
+	c := e.claim(t, r)
+
+	req := lineReq(50)
 	req.ReceiptDocumentID = "doc-1"
-	line := addLine(t, r, c.ClaimID, req)
-	if line.ReceiptDocumentID != "doc-1" {
-		t.Fatalf("expected receipt attached, got %q", line.ReceiptDocumentID)
+	if l := e.addLine(t, r, c.ClaimID, req); l.ReceiptDocumentID != "doc-1" {
+		t.Fatalf("expected the receipt attached, got %q", l.ReceiptDocumentID)
+	}
+	for doc, want := range map[string]int{"does-not-exist": 400, "doc-other-tenant": 403, "doc-purged": 409} {
+		bad := lineReq(5)
+		bad.ReceiptDocumentID = doc
+		if rec := e.do(r, as(claimant, http.MethodPost, base+c.ClaimID+"/lines", bad)); rec.Code != want {
+			t.Fatalf("%s: expected %d, got %d %s", doc, want, rec.Code, rec.Body.String())
+		}
+	}
+	e.docs.down = true
+	down := lineReq(5)
+	down.ReceiptDocumentID = "doc-1"
+	if rec := e.do(r, as(claimant, http.MethodPost, base+c.ClaimID+"/lines", down)); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("an unverifiable receipt must fail closed (503), got %d", rec.Code)
 	}
 }
 
-func TestAddExpenseLine_UnknownReceipt_Rejected(t *testing.T) {
-	emp := newStubEmployee()
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-
-	req := newLineReq(50)
-	req.ReceiptDocumentID = "does-not-exist"
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/lines", req, testTenant, testClaimant)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for unknown receipt, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
-// TestAddExpenseLine_DuplicateReceipt_Rejected is negative-path scenario #2.
-func TestAddExpenseLine_DuplicateReceipt_Rejected(t *testing.T) {
-	emp := newStubEmployee()
-	docs := newStubDocs()
-	docs.add("doc-shared", testTenant, testLegalEntity, "ACTIVE")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, docs, &stubTax{}, &stubPolicy{})
-
-	claim1 := createClaim(t, r, emp)
-	req := newLineReq(50)
+// Negative path 2: the same receipt used on two claims.
+func TestAddLine_SameReceiptOnTwoClaims_Refused_UntilVoided(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	e.docs.add("doc-shared", tenantA, legalEntity, "ACTIVE")
+	c1, c2 := e.claim(t, r), e.claim(t, r)
+	req := lineReq(50)
 	req.ReceiptDocumentID = "doc-shared"
-	addLine(t, r, claim1.ClaimID, req)
+	l1 := e.addLine(t, r, c1.ClaimID, req)
 
-	claim2 := createClaim(t, r, emp)
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+claim2.ClaimID+"/lines", req, testTenant, testClaimant)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("expected 409 for duplicate receipt across claims, got %d: %s", w.Code, w.Body.String())
+	rec := e.do(r, as(claimant, http.MethodPost, base+c2.ClaimID+"/lines", req))
+	if rec.Code != http.StatusConflict || codeOf(t, rec) != "DUPLICATE_RISK" {
+		t.Fatalf("expected 409 DUPLICATE_RISK, got %d %s", rec.Code, rec.Body.String())
+	}
+	assess := e.do(r, as(approver, http.MethodGet, "/ap07/receipts/doc-shared/duplicate-assessment?legal_entity_id="+legalEntity, nil))
+	var a struct {
+		InUse   bool   `json:"in_use"`
+		ClaimID string `json:"claim_id"`
+	}
+	_ = json.Unmarshal(assess.Body.Bytes(), &a)
+	if !a.InUse || a.ClaimID != c1.ClaimID {
+		t.Fatalf("the duplicate assessment must name the claim holding the receipt, got %+v", a)
+	}
+
+	// Voiding (never deleting) the first line frees the receipt for a corrected claim.
+	if rec := e.do(r, as(claimant, http.MethodPost, base+c1.ClaimID+"/lines/"+l1.LineID+"/void", domain.VoidLineRequest{Reason: "wrong claim"})); rec.Code != http.StatusOK {
+		t.Fatalf("void: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := e.do(r, as(claimant, http.MethodPost, base+c2.ClaimID+"/lines", req)); rec.Code != http.StatusCreated {
+		t.Fatalf("a voided line frees its receipt, got %d %s", rec.Code, rec.Body.String())
+	}
+	if len(e.store.lines[c1.ClaimID]) != 1 || e.store.lines[c1.ClaimID][0].VoidedAt == nil {
+		t.Fatal("a voided line is kept as evidence, never deleted")
+	}
+	if rec := e.do(r, as(claimant, http.MethodPost, base+c1.ClaimID+"/lines/"+l1.LineID+"/void", domain.VoidLineRequest{})); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a void needs a reason, got %d", rec.Code)
 	}
 }
 
-func TestSubmitExpenseClaim_TaxRecoveryLine_CallsRealDetermination(t *testing.T) {
-	emp := newStubEmployee()
-	tx := &stubTax{}
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), tx, &stubPolicy{})
-	c := createClaim(t, r, emp)
-
-	req := newLineReq(100)
-	req.ClaimTaxRecovery = true
-	req.Jurisdiction = "US-CA"
-	req.TaxCategory = "STANDARD"
-	addLine(t, r, c.ClaimID, req)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 submitting, got %d: %s", w.Code, w.Body.String())
+func TestAddLine_Validation_Currency_AndNotEditable(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.claim(t, r)
+	for name, mod := range map[string]func(*domain.AddExpenseLineRequest){
+		"no merchant":         func(l *domain.AddExpenseLineRequest) { l.Merchant = "" },
+		"zero amount":         func(l *domain.AddExpenseLineRequest) { l.Amount = 0 },
+		"no currency":         func(l *domain.AddExpenseLineRequest) { l.Currency = "" },
+		"no date":             func(l *domain.AddExpenseLineRequest) { l.ExpenseDate = time.Time{} },
+		"reclaim without tax": func(l *domain.AddExpenseLineRequest) { l.ClaimTaxRecovery = true },
+		"currency != claim's": func(l *domain.AddExpenseLineRequest) { l.Currency = "EUR" },
+	} {
+		l := lineReq(10)
+		mod(&l)
+		if rec := e.do(r, as(claimant, http.MethodPost, base+c.ClaimID+"/lines", l)); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d: %s", name, rec.Code, rec.Body.String())
+		}
 	}
-	if tx.calls != 1 {
-		t.Fatalf("expected exactly one real tax determination call, got %d", tx.calls)
-	}
-}
-
-// TestSubmitExpenseClaim_TaxDeterminationFails_Blocked is negative-path
-// scenario #4: never infer a tax reclaim without a real TAX result.
-func TestSubmitExpenseClaim_TaxDeterminationFails_Blocked(t *testing.T) {
-	emp := newStubEmployee()
-	tx := &stubTax{fail: true}
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), tx, &stubPolicy{})
-	c := createClaim(t, r, emp)
-
-	req := newLineReq(100)
-	req.ClaimTaxRecovery = true
-	req.Jurisdiction = "US-CA"
-	req.TaxCategory = "STANDARD"
-	addLine(t, r, c.ClaimID, req)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-	if w.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 blocked submission on tax determination failure, got %d: %s", w.Code, w.Body.String())
+	p := e.pending(t, r, 10)
+	if rec := e.do(r, as(claimant, http.MethodPost, base+p.ClaimID+"/lines", lineReq(5))); rec.Code != http.StatusConflict {
+		t.Fatalf("a claim under review accepts no new lines, got %d", rec.Code)
 	}
 }
 
-// TestApproveExpenseClaim_SelfApproval_Denied is negative-path scenario #1.
-func TestApproveExpenseClaim_SelfApproval_Denied(t *testing.T) {
-	emp := newStubEmployee()
-	az := &stubAuthz{sodRules: true}
-	r := newTestRouter(newStubStore(), &stubPublisher{}, az, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(10))
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+// ── SubmitExpenseClaim ───────────────────────────────────────────────────────
 
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, testClaimant)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 self-approval denied, got %d: %s", w.Code, w.Body.String())
+func TestSubmit_FreezesSnapshot_RoutesToPendingApproval_RecordsPolicy(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.pending(t, r, 10)
+	got := e.store.claims[c.ClaimID]
+	if got.PolicyAssessmentResult != domain.PolicyWithinThreshold || got.PolicyVersionID != "policy-version-1" || got.SubmittedVersion != 1 {
+		t.Fatalf("expected the policy result and submission version recorded, got %+v", got)
+	}
+	subs := e.store.subs[c.ClaimID]
+	if len(subs) != 1 || subs[0].VersionNo != 1 || len(subs[0].SnapshotHash) != 64 {
+		t.Fatalf("expected one hash-addressed snapshot, got %+v", subs)
 	}
 }
 
-func TestApproveExpenseClaim_IndependentApprover_Succeeds(t *testing.T) {
-	emp := newStubEmployee()
-	az := &stubAuthz{sodRules: true}
-	r := newTestRouter(newStubStore(), &stubPublisher{}, az, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(10))
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 independent approval, got %d: %s", w.Code, w.Body.String())
+func TestSubmit_Preconditions(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	empty := e.claim(t, r)
+	if rec := e.submit(t, r, empty.ClaimID); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a claim with no lines cannot be submitted, got %d", rec.Code)
 	}
-	var approved domain.ExpenseClaim
-	_ = json.Unmarshal(w.Body.Bytes(), &approved)
-	if approved.Status != domain.StatusReimbursable {
-		t.Fatalf("expected REIMBURSABLE, got %s", approved.Status)
+	req := createReq()
+	req.BusinessPurpose = "  "
+	rec := e.do(r, as(claimant, http.MethodPost, base, req))
+	nop := decodeClaim(t, rec)
+	e.addLine(t, r, nop.ClaimID, lineReq(10))
+	if rec := e.submit(t, r, nop.ClaimID); rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("a claim with no business purpose cannot be submitted, got %d", rec.Code)
 	}
-}
-
-// TestApproveExpenseClaim_CreatesRealAP08Payable is the first real
-// consumer expense-claim-svc has ever had for its approved claims —
-// replacing the previously-unconsumed EXPENSE_CLAIM_PAYABLE_REQUESTED
-// event with a real call to payable-open-item-svc (AP-08).
-func TestApproveExpenseClaim_CreatesRealAP08Payable(t *testing.T) {
-	emp := newStubEmployee()
-	payable := &stubPayable{}
-	r := newTestRouterWithPayable(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, payable)
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(10))
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if payable.calls != 1 {
-		t.Fatalf("expected exactly one real CreatePayableFromApprovedSource call to AP-08, got %d", payable.calls)
+	c := e.claim(t, r)
+	e.addLine(t, r, c.ClaimID, lineReq(10))
+	stale := as(claimant, http.MethodPost, base+c.ClaimID+"/submit", domain.VersionedRequest{ExpectedVersion: ver(9)})
+	if rec := e.do(r, stale); rec.Code != http.StatusConflict || codeOf(t, rec) != "STALE_VERSION" {
+		t.Fatalf("expected 409 STALE_VERSION, got %d", rec.Code)
 	}
 }
 
-// TestApproveExpenseClaim_AP08Unavailable_ApprovalStillStands verifies the
-// AP-08 call is genuinely best-effort — mirroring goods-service-receipt-svc's
-// own GRNI-posting doctrine — and never undoes an approval that already
-// succeeded.
-func TestApproveExpenseClaim_AP08Unavailable_ApprovalStillStands(t *testing.T) {
-	emp := newStubEmployee()
-	payable := &stubPayable{fail: true}
-	r := newTestRouterWithPayable(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, payable)
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(10))
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+// Negative path 4: a tax reclaim is never inferred without a TAX result.
+func TestSubmit_TaxRecoveryLine_UsesRealDetermination_AndFailureBlocks(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.claim(t, r)
+	l := lineReq(100)
+	l.ClaimTaxRecovery, l.Jurisdiction, l.TaxCategory = true, "US-CA", "STANDARD"
+	line := e.addLine(t, r, c.ClaimID, l)
 
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 approval to stand despite AP-08 failure, got %d: %s", w.Code, w.Body.String())
+	e.tax.fail = true
+	rec := e.submit(t, r, c.ClaimID)
+	if rec.Code != http.StatusUnprocessableEntity || codeOf(t, rec) != "TAX_UNAVAILABLE" {
+		t.Fatalf("expected 422 TAX_UNAVAILABLE, got %d %s", rec.Code, rec.Body.String())
 	}
-	var approved domain.ExpenseClaim
-	_ = json.Unmarshal(w.Body.Bytes(), &approved)
-	if approved.Status != domain.StatusReimbursable {
-		t.Fatalf("expected REIMBURSABLE despite AP-08 failure, got %s", approved.Status)
+	if e.store.claims[c.ClaimID].Status != domain.StatusDraft || len(e.store.subs[c.ClaimID]) != 0 {
+		t.Fatal("a failed determination must leave the claim a DRAFT with no snapshot")
 	}
-}
 
-// TestApproveExpenseClaim_OverThresholdNoReceipt_Blocked is negative-path
-// scenario #3.
-func TestApproveExpenseClaim_OverThresholdNoReceipt_Blocked(t *testing.T) {
-	emp := newStubEmployee()
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(100)) // over the 25.0 threshold, no receipt
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
-	if w.Code != http.StatusConflict {
-		t.Fatalf("expected 409 missing required receipt, got %d: %s", w.Code, w.Body.String())
+	e.tax.fail = false
+	if rec := e.submit(t, r, c.ClaimID); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d %s", rec.Code, rec.Body.String())
+	}
+	got := e.store.lines[c.ClaimID][0]
+	if e.tax.calls != 2 || got.TaxDeterminationID != "det-"+line.LineID || got.CalculatedTaxAmount != 10 {
+		t.Fatalf("the reclaim figure must come from the determination, got %+v (calls %d)", got, e.tax.calls)
 	}
 }
 
-// TestApproveExpenseClaim_ConfigRegistryLowersThreshold_Blocks proves the
-// registry override actually takes effect, not just that it's consulted:
-// a $15 line has no receipt and would clear the static 25.0 default, but
-// a tenant-specific 10.0 override from configuration-feature-flag-svc
-// must block it instead.
-func TestApproveExpenseClaim_ConfigRegistryLowersThreshold_Blocks(t *testing.T) {
-	emp := newStubEmployee()
-	cf := &stubConfigFlags{threshold: 10.0, found: true}
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, &stubPayable{}, cf)
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(15)) // under the static 25.0 default, over a 10.0 override
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+func TestSubmit_ControlledCategory_NoPolicy_FailsClosed_AndResumes(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.claim(t, r)
+	e.addLine(t, r, c.ClaimID, lineReq(10))
 
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
-	if w.Code != http.StatusConflict {
-		t.Fatalf("expected 409 — the 10.0 tenant override should have blocked this, got %d: %s", w.Code, w.Body.String())
+	e.policy.err = domain.ErrNoApplicablePolicy
+	rec := e.submit(t, r, c.ClaimID)
+	if rec.Code != http.StatusUnprocessableEntity || codeOf(t, rec) != "POLICY_UNAVAILABLE" {
+		t.Fatalf("expected 422 POLICY_UNAVAILABLE, got %d %s", rec.Code, rec.Body.String())
 	}
-	if cf.calls == 0 {
-		t.Fatalf("expected the configuration-feature-flag-svc client to actually be consulted")
+	if e.store.claims[c.ClaimID].Status != domain.StatusSubmitted {
+		t.Fatalf("the claim must stay SUBMITTED so routing can resume, got %s", e.store.claims[c.ClaimID].Status)
 	}
-}
-
-// TestApproveExpenseClaim_ConfigRegistryRaisesThreshold_Allows is the
-// mirror: a $100 line has no receipt and would be blocked by the static
-// 25.0 default (see TestApproveExpenseClaim_OverThresholdNoReceipt_Blocked
-// above), but a 200.0 tenant override must let it through.
-func TestApproveExpenseClaim_ConfigRegistryRaisesThreshold_Allows(t *testing.T) {
-	emp := newStubEmployee()
-	cf := &stubConfigFlags{threshold: 200.0, found: true}
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, &stubPayable{}, cf)
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(100))
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 — the 200.0 tenant override should have allowed this, got %d: %s", w.Code, w.Body.String())
+	e.policy.err = domain.ErrPolicyServiceUnavailable
+	if rec := e.submit(t, r, c.ClaimID); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("policy-svc down on a controlled category must fail closed (503), got %d", rec.Code)
+	}
+	e.policy.err = nil
+	if rec := e.submit(t, r, c.ClaimID); rec.Code != http.StatusOK || e.store.claims[c.ClaimID].Status != domain.StatusPendingApproval {
+		t.Fatalf("resuming must route the claim, got %d / %s", rec.Code, e.store.claims[c.ClaimID].Status)
+	}
+	if len(e.store.subs[c.ClaimID]) != 1 {
+		t.Fatalf("resuming must not write a second snapshot, got %d", len(e.store.subs[c.ClaimID]))
 	}
 }
 
-// TestApproveExpenseClaim_ConfigRegistryUnavailable_FallsBackToStaticDefault
-// confirms this integration fails OPEN, not closed — unlike the
-// kill-switch integration, a config-lookup outage must not block claim
-// approval; it falls back to the static default exactly as if the
-// registry had never been wired in at all.
-func TestApproveExpenseClaim_ConfigRegistryUnavailable_FallsBackToStaticDefault(t *testing.T) {
-	emp := newStubEmployee()
-	cf := &stubConfigFlags{err: configflag.ErrServiceUnavailable}
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, &stubPayable{}, cf)
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(100)) // over the static 25.0 default
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+func TestSubmit_NonControlledCategories_MayProceedUnassessed(t *testing.T) {
+	e := newEnv()
+	e.cfg.PolicyControlledCategories = []string{"TRAVEL"}
+	e.policy.err = domain.ErrNoApplicablePolicy
+	r := e.router()
+	c := e.claim(t, r)
+	e.addLine(t, r, c.ClaimID, lineReq(10)) // MEALS, not controlled
+	if rec := e.submit(t, r, c.ClaimID); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d %s", rec.Code, rec.Body.String())
+	}
+	if got := e.store.claims[c.ClaimID]; got.Status != domain.StatusPendingApproval || got.PolicyAssessmentResult != domain.PolicyNotAssessed {
+		t.Fatalf("expected PENDING_APPROVAL explicitly NOT_ASSESSED, got %+v", got)
+	}
+	e.policy.err = nil
+}
 
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
-	if w.Code != http.StatusConflict {
-		t.Fatalf("expected 409 from the static default despite the registry being unreachable, got %d: %s", w.Code, w.Body.String())
+// ── ApproveExpenseClaim ──────────────────────────────────────────────────────
+
+func TestApprove_RequiresIdempotencyKey_AndExpectedVersion(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.pending(t, r, 10)
+	if rec := e.approve(r, c.ClaimID, approver, ""); rec.Code != http.StatusBadRequest || codeOf(t, rec) != "IDEMPOTENCY_KEY_REQUIRED" {
+		t.Fatalf("expected 400 IDEMPOTENCY_KEY_REQUIRED, got %d %s", rec.Code, rec.Body.String())
+	}
+	noVer := as(approver, http.MethodPost, base+c.ClaimID+"/approve", nil)
+	noVer.key = "k"
+	if rec := e.do(r, noVer); rec.Code != http.StatusBadRequest || codeOf(t, rec) != "VALIDATION_FAILED" {
+		t.Fatalf("expected 400 VALIDATION_FAILED without expected_version, got %d", rec.Code)
+	}
+	stale := as(approver, http.MethodPost, base+c.ClaimID+"/approve", domain.VersionedRequest{ExpectedVersion: ver(99)})
+	stale.key = "k2"
+	if rec := e.do(r, stale); rec.Code != http.StatusConflict || codeOf(t, rec) != "STALE_VERSION" {
+		t.Fatalf("expected 409 STALE_VERSION, got %d", rec.Code)
+	}
+	if e.store.claims[c.ClaimID].Status != domain.StatusPendingApproval {
+		t.Fatal("refused approvals must change nothing")
 	}
 }
 
-func TestApproveExpenseClaim_PolicyExceptionWaivesReceiptRequirement(t *testing.T) {
-	emp := newStubEmployee()
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(100))
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/policy-exception",
-		domain.RecordPolicyExceptionRequest{Reason: "receipt lost, manager approved"}, testTenant, "principal-approver")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 recording exception, got %d: %s", w.Code, w.Body.String())
+// Negative path 1: the claimant approves their own expense — refused locally
+// (no authorization-svc needed) and again by its own-object layer.
+func TestApprove_ClaimantCannotApproveOwnClaim(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.pending(t, r, 10)
+	rec := e.approve(r, c.ClaimID, claimant, "k1")
+	if rec.Code != http.StatusForbidden || codeOf(t, rec) != "SOD_CONFLICT" {
+		t.Fatalf("expected 403 SOD_CONFLICT, got %d %s", rec.Code, rec.Body.String())
 	}
-
-	w = doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 approval after exception, got %d: %s", w.Code, w.Body.String())
+	e.authz.sodRules = true
+	e.store.claims[c.ClaimID].ClaimantPrincipalID = "someone-else" // local rule out of the picture; authz layer must still refuse
+	if rec := e.approve(r, c.ClaimID, "someone-else", "k2"); rec.Code != http.StatusForbidden || codeOf(t, rec) != "SOD_CONFLICT" {
+		t.Fatalf("authorization-svc's own-object layer must refuse too, got %d %s", rec.Code, rec.Body.String())
 	}
-}
-
-func TestApproveExpenseClaim_ApprovalRequired_UsesExceptionAction(t *testing.T) {
-	emp := newStubEmployee()
-	az := &stubAuthz{}
-	r := newTestRouter(newStubStore(), &stubPublisher{}, az, emp, newStubDocs(), &stubTax{}, &stubPolicy{result: string(domain.PolicyApprovalRequired)})
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(10))
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if az.lastAction != handler.ExpenseExceptionApprove {
-		t.Fatalf("expected APPROVAL_REQUIRED claim to check %s, got %s", handler.ExpenseExceptionApprove, az.lastAction)
+	if e.store.claims[c.ClaimID].Status != domain.StatusPendingApproval || len(e.store.payReqs) != 0 || len(e.store.postings) != 0 {
+		t.Fatal("a refused self-approval must have no financial consequence")
 	}
 }
 
-func TestRejectExpenseClaim(t *testing.T) {
-	emp := newStubEmployee()
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(10))
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+func TestApprove_Independent_WritesPayableAndPostingRequestsAtomically(t *testing.T) {
+	e := newEnv()
+	e.cfg.Posting = domain.PostingConfig{ExpenseKey: "EXP", PayableKey: "PAY", TaxRecoverableKey: "TAXREC", FiscalPeriodLayout: "2006-01"}
+	r := e.router()
+	c := e.claim(t, r)
+	e.addLine(t, r, c.ClaimID, lineReq(20))
+	e.cf.threshold, e.cf.found = 1000, true // receipts not required in this test
+	e.submit(t, r, c.ClaimID)
 
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/reject",
-		domain.RejectClaimRequest{Reason: "not a business expense"}, testTenant, "principal-approver")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 rejecting, got %d: %s", w.Code, w.Body.String())
+	rec := e.approve(r, c.ClaimID, approver, "approve-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	got := e.store.claims[c.ClaimID]
+	if got.Status != domain.StatusApproved || got.ApprovedByPrincipalID == nil || *got.ApprovedByPrincipalID != approver || got.PayableState != domain.PayablePending {
+		t.Fatalf("expected APPROVED by the approver with a PENDING payable, got %+v", got)
+	}
+	pr := e.store.payReqs[c.ClaimID]
+	if pr == nil || pr.Amount != 20 || pr.Currency != "USD" || pr.State != domain.PayablePending {
+		t.Fatalf("expected a durable AP-08 payable request for 20 USD, got %+v", pr)
+	}
+	if len(e.store.postings) != 1 || e.store.postings[0].SourceEventID != domain.ApprovalSourceEventID(c.ClaimID) || e.store.postings[0].Status != domain.PostingPending {
+		t.Fatalf("expected one PENDING ACC-04 posting request keyed by the claim, got %+v", e.store.postings)
+	}
+	var p domain.GLPostingRequest
+	_ = json.Unmarshal(e.store.postings[0].Payload, &p)
+	var dr, cr float64
+	for _, ln := range p.Lines {
+		dr += ln.DebitAmount
+		cr += ln.CreditAmount
+	}
+	if dr != 20 || cr != 20 || p.Lines[0].MappingKey != "EXP" || p.Lines[len(p.Lines)-1].MappingKey != "PAY" {
+		t.Fatalf("expected a balanced posting using the configured mapping keys, got %+v", p)
+	}
+	seen := map[string]bool{}
+	for _, ev := range e.store.outbox {
+		seen[ev] = true
+	}
+	for _, want := range []string{"ExpenseClaimApproved", "ExpenseClaimPayableRequested", "accounting.event.requested"} {
+		if !seen[want] {
+			t.Fatalf("expected %s in the outbox, got %v", want, e.store.outbox)
+		}
 	}
 }
 
-func TestReturnForCorrection_ThenResubmit(t *testing.T) {
-	emp := newStubEmployee()
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-	addLine(t, r, c.ClaimID, newLineReq(10))
-	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/return",
-		domain.ReturnClaimRequest{Reason: "wrong cost center"}, testTenant, "principal-approver")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 returning, got %d: %s", w.Code, w.Body.String())
+func TestApprove_Replay_NeverDuplicatesTheFinancialConsequence(t *testing.T) {
+	e := newEnv()
+	e.cf.threshold, e.cf.found = 1000, true
+	r := e.router()
+	c := e.pending(t, r, 20)
+	// The client sends the same request, key and version both times; a lost
+	// response makes it retry exactly this.
+	v := e.store.claims[c.ClaimID].Version
+	send := func() *httptest.ResponseRecorder {
+		x := as(approver, http.MethodPost, base+c.ClaimID+"/approve", domain.VersionedRequest{ExpectedVersion: ver(v)})
+		x.key = "same-key"
+		return e.do(r, x)
 	}
-	var returned domain.ExpenseClaim
-	_ = json.Unmarshal(w.Body.Bytes(), &returned)
-	if returned.Status != domain.StatusReturned {
-		t.Fatalf("expected RETURNED, got %s", returned.Status)
+	first := send()
+	outboxAfter := len(e.store.outbox)
+	second := send()
+	if first.Code != http.StatusOK || second.Code != http.StatusOK || second.Header().Get("Idempotent-Replay") != "true" {
+		t.Fatalf("expected 200 then a stored replay, got %d / %d replay=%q", first.Code, second.Code, second.Header().Get("Idempotent-Replay"))
 	}
-
-	w = doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 resubmitting, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
-func TestCancelExpenseClaim(t *testing.T) {
-	emp := newStubEmployee()
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-
-	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/cancel",
-		domain.CancelClaimRequest{Reason: "duplicate entry"}, testTenant, testClaimant)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 cancelling, got %d: %s", w.Code, w.Body.String())
+	if len(e.store.payReqs) != 1 || len(e.store.postings) != 1 || len(e.store.outbox) != outboxAfter {
+		t.Fatalf("a replay must not duplicate payable/posting requests or events: %d / %d / %d vs %d",
+			len(e.store.payReqs), len(e.store.postings), len(e.store.outbox), outboxAfter)
 	}
 }
 
-func TestGetAvailableActions_Draft(t *testing.T) {
-	emp := newStubEmployee()
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-
-	w := doRequest(r, http.MethodGet, "/ap07/expense-claims/"+c.ClaimID+"/available-actions", nil, testTenant)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+func TestApprove_NotPending_Refused(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.claim(t, r)
+	rec := e.do(r, func() call {
+		x := as(approver, http.MethodPost, base+c.ClaimID+"/approve", domain.VersionedRequest{ExpectedVersion: ver(1)})
+		x.key = "k"
+		return x
+	}())
+	if rec.Code != http.StatusConflict || codeOf(t, rec) != "INVALID_TRANSITION" {
+		t.Fatalf("a DRAFT claim cannot be approved: expected 409 INVALID_TRANSITION, got %d", rec.Code)
 	}
+}
+
+// Negative path 3: an expense over the receipt threshold approved without evidence.
+func TestApprove_OverThresholdWithoutReceipt_Blocked_UntilReceiptOrException(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.pending(t, r, 100) // over the 25.0 default, no receipt
+	rec := e.approve(r, c.ClaimID, approver, "k1")
+	if rec.Code != http.StatusConflict || codeOf(t, rec) != "RECEIPT_REQUIRED" {
+		t.Fatalf("expected 409 RECEIPT_REQUIRED, got %d %s", rec.Code, rec.Body.String())
+	}
+	if len(e.store.payReqs) != 0 || len(e.store.postings) != 0 {
+		t.Fatal("a blocked approval must have no financial consequence")
+	}
+
+	// The delegated exception (a stronger authority) waives the requirement.
+	e.authz.actions = nil
+	ex := e.do(r, as(otherApprove, http.MethodPost, base+c.ClaimID+"/policy-exception",
+		domain.RecordPolicyExceptionRequest{Reason: "receipt lost, manager approved", ExpectedVersion: ver(e.store.claims[c.ClaimID].Version)}))
+	if ex.Code != http.StatusOK || e.authz.last() != handler.ExpenseExceptionApprove {
+		t.Fatalf("expected 200 under %s, got %d (last action %s) %s", handler.ExpenseExceptionApprove, ex.Code, e.authz.last(), ex.Body.String())
+	}
+	if rec := e.approve(r, c.ClaimID, approver, "k2"); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 after the exception, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestApprove_ReceiptThreshold_ComesFromTheConfigRegistry_FallsBackWhenUnavailable(t *testing.T) {
+	cases := []struct {
+		name  string
+		cf    stubConfigFlags
+		amt   float64
+		want  int
+		calls bool
+	}{
+		{"override lowers the threshold", stubConfigFlags{threshold: 10, found: true}, 15, http.StatusConflict, true},
+		{"override raises the threshold", stubConfigFlags{threshold: 200, found: true}, 100, http.StatusOK, true},
+		{"registry down falls back to the static 25", stubConfigFlags{err: configflag.ErrServiceUnavailable}, 100, http.StatusConflict, true},
+		{"registry has no entry", stubConfigFlags{}, 15, http.StatusOK, true},
+	}
+	for _, tc := range cases {
+		e := newEnv()
+		cf := tc.cf
+		e.cf = &cf
+		r := e.router()
+		c := e.pending(t, r, tc.amt)
+		if rec := e.approve(r, c.ClaimID, approver, "k"); rec.Code != tc.want {
+			t.Fatalf("%s: expected %d, got %d %s", tc.name, tc.want, rec.Code, rec.Body.String())
+		}
+		if tc.calls && e.cf.calls == 0 {
+			t.Fatalf("%s: the registry must actually be consulted", tc.name)
+		}
+	}
+}
+
+func TestApprove_BusinessPurposeAndPolicyAssessment_AreRequired(t *testing.T) {
+	e := newEnv()
+	e.cf.threshold, e.cf.found = 1000, true
+	r := e.router()
+	c := e.pending(t, r, 10)
+	e.store.claims[c.ClaimID].BusinessPurpose = ""
+	if rec := e.approve(r, c.ClaimID, approver, "k1"); rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("a missing business purpose blocks approval, got %d", rec.Code)
+	}
+	e.store.claims[c.ClaimID].BusinessPurpose = "dinner"
+	e.store.claims[c.ClaimID].PolicyAssessmentResult = domain.PolicyNotAssessed
+	rec := e.approve(r, c.ClaimID, approver, "k2")
+	if rec.Code != http.StatusUnprocessableEntity || codeOf(t, rec) != "POLICY_UNAVAILABLE" {
+		t.Fatalf("no policy assessment on a controlled category blocks approval, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Negative path 4, defence in depth at the approval boundary.
+func TestApprove_TaxReclaimWithoutDetermination_Blocked(t *testing.T) {
+	e := newEnv()
+	e.cf.threshold, e.cf.found = 1000, true
+	r := e.router()
+	c := e.pending(t, r, 10)
+	e.store.lines[c.ClaimID][0].ClaimTaxRecovery = true // reclaim flagged, determination id absent
+	rec := e.approve(r, c.ClaimID, approver, "k")
+	if rec.Code != http.StatusUnprocessableEntity || codeOf(t, rec) != "TAX_UNAVAILABLE" {
+		t.Fatalf("expected 422 TAX_UNAVAILABLE, got %d %s", rec.Code, rec.Body.String())
+	}
+	if len(e.store.postings) != 0 {
+		t.Fatal("no recoverable tax may be posted without a TAX result")
+	}
+}
+
+func TestApprove_ApprovalRequired_NeedsTheStrongerExceptionAuthority(t *testing.T) {
+	e := newEnv()
+	e.policy.result = string(domain.PolicyApprovalRequired)
+	e.cf.threshold, e.cf.found = 1000, true
+	r := e.router()
+	c := e.pending(t, r, 10)
+	e.authz.denyActions = map[string]bool{handler.ExpenseExceptionApprove: true}
+	if rec := e.approve(r, c.ClaimID, approver, "k1"); rec.Code != http.StatusForbidden {
+		t.Fatalf("an APPROVAL_REQUIRED claim needs %s, got %d", handler.ExpenseExceptionApprove, rec.Code)
+	}
+	e.authz.denyActions = nil
+	if rec := e.approve(r, c.ClaimID, approver, "k2"); rec.Code != http.StatusOK || e.authz.last() != handler.ExpenseExceptionApprove {
+		t.Fatalf("expected 200 under the exception action, got %d (last %s)", rec.Code, e.authz.last())
+	}
+}
+
+func TestApprove_ImmediateHandOff_IsBestEffort_AndPayableDueDateComesFromTerms(t *testing.T) {
+	e := newEnv()
+	e.useRelay = true
+	e.cf.threshold, e.cf.found = 1000, true
+	e.cf.terms, e.cf.termsSet = 30, true
+	r := e.router()
+	c := e.pending(t, r, 10)
+	rec := e.approve(r, c.ClaimID, approver, "k")
+	if rec.Code != http.StatusOK || len(e.relay.calls) != 1 || e.relay.calls[0] != c.ClaimID {
+		t.Fatalf("expected the relay asked once to hand off immediately, got %d %v", rec.Code, e.relay.calls)
+	}
+	if got := decodeClaim(t, rec); got.Status != domain.StatusReimbursable {
+		t.Fatalf("the response must reflect the hand-off outcome, got %s", got.Status)
+	}
+	due := e.store.payReqs[c.ClaimID].DueDate
+	if d := time.Until(due); d < 29*24*time.Hour || d > 31*24*time.Hour {
+		t.Fatalf("the payable's due date must come from the 30-day terms, never 'now': %v", due)
+	}
+
+	// Without the relay the approval still stands, with the payable PENDING.
+	e2 := newEnv()
+	e2.cf.threshold, e2.cf.found = 1000, true
+	r2 := e2.router()
+	c2 := e2.pending(t, r2, 10)
+	if rec := e2.approve(r2, c2.ClaimID, approver, "k"); rec.Code != http.StatusOK || e2.store.claims[c2.ClaimID].Status != domain.StatusApproved {
+		t.Fatalf("approval must stand without the immediate hand-off, got %d %s", rec.Code, e2.store.claims[c2.ClaimID].Status)
+	}
+}
+
+// ── Reject / Return / Cancel / exception ─────────────────────────────────────
+
+func TestReject_NeedsReasonVersionAndAnIndependentDecider(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.pending(t, r, 10)
+	v := e.store.claims[c.ClaimID].Version
+	if rec := e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/reject", domain.RejectClaimRequest{ExpectedVersion: ver(v)})); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a rejection needs a reason, got %d", rec.Code)
+	}
+	if rec := e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/reject", domain.RejectClaimRequest{Reason: "no"})); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a rejection needs expected_version, got %d", rec.Code)
+	}
+	if rec := e.do(r, as(claimant, http.MethodPost, base+c.ClaimID+"/reject", domain.RejectClaimRequest{Reason: "self", ExpectedVersion: ver(v)})); rec.Code != http.StatusForbidden || codeOf(t, rec) != "SOD_CONFLICT" {
+		t.Fatalf("the claimant cannot reject their own claim, got %d", rec.Code)
+	}
+	rec := e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/reject", domain.RejectClaimRequest{Reason: "not a business expense", ExpectedVersion: ver(v)}))
+	if rec.Code != http.StatusOK || e.store.claims[c.ClaimID].Status != domain.StatusRejected || e.store.claims[c.ClaimID].RejectionReason != "not a business expense" {
+		t.Fatalf("expected REJECTED with the reason, got %d", rec.Code)
+	}
+	if len(e.store.payReqs) != 0 || len(e.store.postings) != 0 {
+		t.Fatal("a rejection has no financial consequence")
+	}
+	if rec := e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/reject", domain.RejectClaimRequest{Reason: "again", ExpectedVersion: ver(v + 1)})); rec.Code != http.StatusConflict {
+		t.Fatalf("a rejected claim is terminal, got %d", rec.Code)
+	}
+}
+
+// Corrections preserve the prior submitted version and its evidence.
+func TestReturnForCorrection_PreservesPriorSubmission_AndResubmitsAsVersion2(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.pending(t, r, 10)
+	v1 := e.store.subs[c.ClaimID][0]
+
+	rec := e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/return", domain.ReturnClaimRequest{Reason: "wrong cost center", ExpectedVersion: ver(e.store.claims[c.ClaimID].Version)}))
+	if rec.Code != http.StatusOK || e.store.claims[c.ClaimID].Status != domain.StatusReturned {
+		t.Fatalf("expected RETURNED, got %d", rec.Code)
+	}
+
+	// The returned claim is correctable: void the wrong line, add a corrected one.
+	old := e.store.lines[c.ClaimID][0]
+	if rec := e.do(r, as(claimant, http.MethodPost, base+c.ClaimID+"/lines/"+old.LineID+"/void", domain.VoidLineRequest{Reason: "wrong"})); rec.Code != http.StatusOK {
+		t.Fatalf("void on a RETURNED claim: %d", rec.Code)
+	}
+	e.addLine(t, r, c.ClaimID, lineReq(12))
+	if rec := e.submit(t, r, c.ClaimID); rec.Code != http.StatusOK {
+		t.Fatalf("resubmit: %d %s", rec.Code, rec.Body.String())
+	}
+	subs := e.store.subs[c.ClaimID]
+	if len(subs) != 2 || subs[0].SnapshotHash != v1.SnapshotHash || string(subs[0].Snapshot) != string(v1.Snapshot) || subs[1].VersionNo != 2 || subs[1].SnapshotHash == v1.SnapshotHash {
+		t.Fatalf("version 1 must be untouched and version 2 added, got %+v", subs)
+	}
+	list := e.do(r, as(approver, http.MethodGet, base+c.ClaimID+"/submissions", nil))
 	var resp struct {
-		AvailableActions []string `json:"available_actions"`
+		Count int `json:"count"`
 	}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	found := map[string]bool{}
-	for _, a := range resp.AvailableActions {
-		found[a] = true
-	}
-	if !found["AddExpenseLine"] || !found["SubmitExpenseClaim"] || !found["CancelExpenseClaim"] {
-		t.Fatalf("expected DRAFT claim to allow add-line/submit/cancel, got %v", resp.AvailableActions)
-	}
-	if found["ApproveExpenseClaim"] {
-		t.Fatalf("did not expect ApproveExpenseClaim available on a DRAFT claim, got %v", resp.AvailableActions)
+	_ = json.Unmarshal(list.Body.Bytes(), &resp)
+	if list.Code != http.StatusOK || resp.Count != 2 {
+		t.Fatalf("expected both submission versions to be readable, got %d %s", list.Code, list.Body.String())
 	}
 }
 
-func TestGetDuplicateReceiptAssessment(t *testing.T) {
-	emp := newStubEmployee()
-	docs := newStubDocs()
-	docs.add("doc-check", testTenant, testLegalEntity, "ACTIVE")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, docs, &stubTax{}, &stubPolicy{})
-	c := createClaim(t, r, emp)
-	req := newLineReq(30)
-	req.ReceiptDocumentID = "doc-check"
-	addLine(t, r, c.ClaimID, req)
-
-	w := doRequest(r, http.MethodGet, "/ap07/receipts/doc-check/duplicate-assessment", nil, testTenant)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+func TestCancel_ByClaimant_AndNotAfterApproval(t *testing.T) {
+	e := newEnv()
+	e.cf.threshold, e.cf.found = 1000, true
+	r := e.router()
+	c := e.claim(t, r)
+	if rec := e.do(r, as(claimant, http.MethodPost, base+c.ClaimID+"/cancel", domain.CancelClaimRequest{Reason: "duplicate entry"})); rec.Code != http.StatusOK || e.store.claims[c.ClaimID].Status != domain.StatusCancelled {
+		t.Fatalf("expected CANCELLED, got %d", rec.Code)
 	}
-	var resp struct {
-		InUse bool `json:"in_use"`
-	}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if !resp.InUse {
-		t.Fatalf("expected in_use=true for an already-attached receipt")
+	p := e.pending(t, r, 10)
+	e.approve(r, p.ClaimID, approver, "k")
+	if rec := e.do(r, as(claimant, http.MethodPost, base+p.ClaimID+"/cancel", domain.CancelClaimRequest{Reason: "changed mind"})); rec.Code != http.StatusConflict {
+		t.Fatalf("an approved claim can no longer be cancelled, got %d", rec.Code)
 	}
 }
 
-func TestGetExpenseClaim_NotFound(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubEmployee(), newStubDocs(), &stubTax{}, &stubPolicy{})
-	w := doRequest(r, http.MethodGet, "/ap07/expense-claims/does-not-exist", nil, testTenant)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+// ── CloseExpenseClaim ────────────────────────────────────────────────────────
+
+func TestClose_OnlyWhenAP08ReportsTheLivePayableSettled(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.pending(t, r, 10)
+	reimb := func() { e.store.claims[c.ClaimID].Status = domain.StatusReimbursable }
+	closeReq := func() *httptest.ResponseRecorder {
+		return e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/close", domain.CloseClaimRequest{Reason: "settled"}))
+	}
+
+	if rec := closeReq(); rec.Code != http.StatusConflict || codeOf(t, rec) != "INVALID_TRANSITION" {
+		t.Fatalf("only a reimbursable claim closes, got %d", rec.Code)
+	}
+	reimb()
+	if rec := closeReq(); rec.Code != http.StatusConflict || codeOf(t, rec) != "PAYABLE_NOT_SETTLED" {
+		t.Fatalf("no payable: expected 409 PAYABLE_NOT_SETTLED, got %d %s", rec.Code, rec.Body.String())
+	}
+	e.store.claims[c.ClaimID].PayableID = "payable-1"
+	e.payable.status = "OPEN"
+	if rec := closeReq(); rec.Code != http.StatusConflict || codeOf(t, rec) != "PAYABLE_NOT_SETTLED" {
+		t.Fatalf("an unsettled payable cannot close the claim, got %d", rec.Code)
+	}
+	e.payable.down = true
+	if rec := closeReq(); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("AP-08 unreachable must fail closed, got %d", rec.Code)
+	}
+	e.payable.down, e.payable.status = false, payableopenitem.StatusSettled
+	if rec := closeReq(); rec.Code != http.StatusOK || e.store.claims[c.ClaimID].Status != domain.StatusClosed {
+		t.Fatalf("a SETTLED payable closes the claim, got %d", rec.Code)
+	}
+	if rec := e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/close", domain.CloseClaimRequest{})); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a close needs a reason, got %d", rec.Code)
 	}
 }
 
-func TestCreateExpenseClaim_AuthorizationDenied(t *testing.T) {
-	emp := newStubEmployee()
-	emp.addActive(testClaimant, testLegalEntity)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{deny: true}, emp, newStubDocs(), &stubTax{}, &stubPolicy{})
-	req := domain.CreateExpenseClaimRequest{LegalEntityID: testLegalEntity, ClaimantPrincipalID: testClaimant, Currency: "USD"}
-	w := doRequest(r, http.MethodPost, "/ap07/expense-claims/", req, testTenant)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+// ── queries ──────────────────────────────────────────────────────────────────
+
+func TestAvailableActions_FollowState(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	actions := func(id string) map[string]bool {
+		rec := e.do(r, as(approver, http.MethodGet, base+id+"/available-actions", nil))
+		var resp struct {
+			AvailableActions []string `json:"available_actions"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		m := map[string]bool{}
+		for _, a := range resp.AvailableActions {
+			m[a] = true
+		}
+		return m
+	}
+	c := e.claim(t, r)
+	if a := actions(c.ClaimID); !a["AddExpenseLine"] || !a["SubmitExpenseClaim"] || !a["CancelExpenseClaim"] || a["ApproveExpenseClaim"] {
+		t.Fatalf("DRAFT actions wrong: %v", a)
+	}
+	p := e.pending(t, r, 10)
+	if a := actions(p.ClaimID); !a["ApproveExpenseClaim"] || !a["RejectExpenseClaim"] || !a["ReturnForCorrection"] || !a["RecordExpensePolicyException"] || a["AddExpenseLine"] {
+		t.Fatalf("PENDING_APPROVAL actions wrong: %v", a)
+	}
+	e.store.claims[p.ClaimID].Status = domain.StatusReimbursable
+	if a := actions(p.ClaimID); !a["CloseExpenseClaim"] || a["ApproveExpenseClaim"] {
+		t.Fatalf("REIMBURSABLE actions wrong: %v", a)
+	}
+}
+
+func TestHistory_PolicyAssessment_AndReadAuthorization(t *testing.T) {
+	e := newEnv()
+	r := e.router()
+	c := e.pending(t, r, 10)
+	rec := e.do(r, as(approver, http.MethodGet, base+c.ClaimID+"/history", nil))
+	var hist struct {
+		Count int `json:"count"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &hist)
+	if rec.Code != http.StatusOK || hist.Count < 3 {
+		t.Fatalf("expected the created/submitted/routed trail, got %d %s", rec.Code, rec.Body.String())
+	}
+	rec = e.do(r, as(approver, http.MethodGet, base+c.ClaimID+"/policy-assessment", nil))
+	var pa struct {
+		Result string `json:"result"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &pa)
+	if rec.Code != http.StatusOK || pa.Result != string(domain.PolicyWithinThreshold) {
+		t.Fatalf("expected WITHIN_THRESHOLD, got %d %s", rec.Code, rec.Body.String())
+	}
+	e.authz.denyActions = map[string]bool{handler.ExpenseRead: true}
+	if rec := e.do(r, as(approver, http.MethodGet, base+c.ClaimID+"/history", nil)); rec.Code != http.StatusForbidden {
+		t.Fatalf("reads need %s, got %d", handler.ExpenseRead, rec.Code)
+	}
+	if rec := e.do(r, call{method: http.MethodGet, path: base + c.ClaimID + "/history", tenant: tenantA}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("reads need a principal, got %d", rec.Code)
+	}
+	if rec := e.do(r, as(approver, http.MethodGet, "/ap07/receipts/x/duplicate-assessment", nil)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("the duplicate assessment needs legal_entity_id, got %d", rec.Code)
+	}
+}
+
+// The accounting consequence is visible and recoverable, never silent.
+func TestAccountingStatus_AndRequeue(t *testing.T) {
+	e := newEnv()
+	e.cf.threshold, e.cf.found = 1000, true
+	r := e.router()
+	c := e.pending(t, r, 20)
+	status := func() (string, []any) {
+		rec := e.do(r, as(approver, http.MethodGet, base+c.ClaimID+"/accounting-status", nil))
+		var resp struct {
+			Status   string `json:"status"`
+			Postings []any  `json:"postings"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		return resp.Status, resp.Postings
+	}
+	if st, _ := status(); st != "NOT_APPLICABLE" {
+		t.Fatalf("an unapproved claim has no accounting consequence, got %s", st)
+	}
+	e.approve(r, c.ClaimID, approver, "k")
+	if st, p := status(); st != "PENDING" || len(p) != 1 {
+		t.Fatalf("expected one PENDING posting, got %s %v", st, p)
+	}
+
+	e.store.postings[0].Status = domain.PostingQuarantined
+	e.authz.denyActions = map[string]bool{handler.ExpenseExceptionApprove: true}
+	if rec := e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/accounting/requeue", nil)); rec.Code != http.StatusForbidden {
+		t.Fatalf("a requeue re-opens a financial consequence and needs the exception authority, got %d", rec.Code)
+	}
+	e.authz.denyActions = nil
+	rec := e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/accounting/requeue", nil))
+	var rq struct {
+		Requeued int64 `json:"requeued"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &rq)
+	if rec.Code != http.StatusOK || rq.Requeued != 1 || e.store.postings[0].Status != domain.PostingPending {
+		t.Fatalf("expected 1 requeued, got %d %+v", rec.Code, rq)
+	}
+	e.store.postings[0].Status = domain.PostingPosted
+	rec = e.do(r, as(approver, http.MethodPost, base+c.ClaimID+"/accounting/requeue", nil))
+	_ = json.Unmarshal(rec.Body.Bytes(), &rq)
+	if rq.Requeued != 0 || e.store.postings[0].Status != domain.PostingPosted {
+		t.Fatal("a POSTED request must never be requeued")
 	}
 }

@@ -125,6 +125,18 @@ func (h *Handler) fetchDestinationForAuth(w http.ResponseWriter, r *http.Request
 	return d, true
 }
 
+// publishDestinationEvent is the single place a destination event is built. It
+// publishes the safe projection, never the PayeeDestination (which carries the
+// full account identifier), and always stamps the verified request tenant.
+func (h *Handler) publishDestinationEvent(r *http.Request, eventType, principalID string, d *domain.PayeeDestination) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	_ = h.pub.Publish(r.Context(), events.PublishParams{
+		EventType: eventType, EntityID: d.DestinationID, TenantID: tenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: domain.NewDestinationEventPayload(d, tenantID),
+	})
+}
+
 // maskIfNotPrivileged is the literal enforcement of "full account never
 // overexposed": AccountIdentifier is cleared for every reader except one
 // holding PayeeMasterPrivilegedRead. AccountLast4 always stays — it's the
@@ -187,10 +199,7 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationProposed, EntityID: created.DestinationID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: created,
-	})
+	h.publishDestinationEvent(r, domain.EventPayeeDestinationProposed, principalID, created)
 	h.maskIfNotPrivileged(r, principalID, req.LegalEntityID, created)
 	writeJSON(w, http.StatusCreated, created)
 }
@@ -348,10 +357,7 @@ func (h *Handler) ApprovePayeeDestination(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationApproved, EntityID: updated.DestinationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
+	h.publishDestinationEvent(r, domain.EventPayeeDestinationApproved, principalID, updated)
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -385,10 +391,7 @@ func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationActivated, EntityID: updated.DestinationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
+	h.publishDestinationEvent(r, domain.EventPayeeDestinationActivated, principalID, updated)
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -426,10 +429,7 @@ func (h *Handler) SuspendDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationSuspended, EntityID: updated.DestinationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
+	h.publishDestinationEvent(r, domain.EventPayeeDestinationSuspended, principalID, updated)
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -467,10 +467,7 @@ func (h *Handler) SupersedeDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationSuperseded, EntityID: updated.DestinationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
+	h.publishDestinationEvent(r, domain.EventPayeeDestinationSuperseded, principalID, updated)
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }

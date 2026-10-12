@@ -148,32 +148,31 @@ type orderFixture struct {
 	tenantID string
 	entityID string
 	orderID  string
+	lineID   string
 }
 
+// setupIsolationFixture seeds one tenant with an ISSUED order that has a line, so
+// the isolation probes below reach the order, line, progress, revision and event
+// tables and not just the header.
 func setupIsolationFixture(t *testing.T, tenantLabel string) orderFixture {
 	t.Helper()
 	ctx := context.Background()
 
-	f := orderFixture{
-		tenantID: uuid.New().String(),
-		entityID: uuid.New().String(),
-		orderID:  uuid.New().String(),
-	}
+	f := orderFixture{tenantID: uuid.New().String(), entityID: uuid.New().String()}
 	tctx := svcmiddleware.WithTenant(ctx, f.tenantID)
 
-	o := &domain.PurchaseOrder{
-		PurchaseOrderID:     f.orderID,
-		TenantID:            f.tenantID,
-		LegalEntityID:       f.entityID,
-		IssuedByPrincipalID: "test-" + tenantLabel,
-		TotalAmount:         1000,
-		CurrencyCode:        "USD",
-		CorrelationID:       "corr-" + tenantLabel,
-	}
-	created, err := testStore.CreateOrder(tctx, o)
+	d, created, err := testStore.CreateIssued(tctx, store.IssuedInput{
+		CreateDraftInput: store.CreateDraftInput{
+			TenantID: f.tenantID, LegalEntityID: f.entityID, CurrencyCode: "USD",
+			CorrelationID: "corr-" + tenantLabel, PreparedBy: "test-" + tenantLabel,
+			Lines: []domain.LineInput{{ItemRef: "SKU-1", Quantity: 10, UnitPrice: 100, UOM: "EA"}},
+		},
+		ApprovalBasis: domain.ApprovalBasisProcurementCase, ApprovalRef: "case-" + tenantLabel, ApprovedBy: "case-approver",
+	})
 	require.NoError(t, err)
 	require.True(t, created)
-
+	f.orderID = d.PurchaseOrderID
+	f.lineID = d.Lines[0].LineID
 	return f
 }
 
@@ -187,6 +186,10 @@ func TestPgStore_TenantIsolation_GetOrder(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, got, "ISOLATION FAILURE: GetOrder returned Tenant A's row under Tenant B's context")
 
+	detail, err := testStore.GetOrderDetail(ctxB, a.orderID)
+	require.NoError(t, err)
+	assert.Nil(t, detail, "ISOLATION FAILURE: GetOrderDetail returned Tenant A's order and lines under Tenant B's context")
+
 	// Sanity: tenant B can still read its own order.
 	gotOwn, err := testStore.GetOrder(ctxB, b.orderID)
 	require.NoError(t, err)
@@ -194,6 +197,9 @@ func TestPgStore_TenantIsolation_GetOrder(t *testing.T) {
 	assert.Equal(t, b.orderID, gotOwn.PurchaseOrderID)
 }
 
+// An amendment aimed at another tenant's order finds no order at all — and an
+// order that does not exist in the caller's tenant is "not found", not "found in
+// the wrong state".
 func TestPgStore_TenantIsolation_AmendOrder(t *testing.T) {
 	a := setupIsolationFixture(t, "A-Amend")
 	b := setupIsolationFixture(t, "B-Amend")
@@ -202,8 +208,9 @@ func TestPgStore_TenantIsolation_AmendOrder(t *testing.T) {
 	// tenantID as the scope argument — exactly what a handler bug would
 	// look like if TenantID were taken from the request body instead of
 	// the caller's real context.
-	_, err := testStore.AmendOrder(context.Background(), b.tenantID, a.orderID, 9999, "attacker amend", "attacker")
-	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
+	_, err := testStore.AmendOrder(context.Background(), b.tenantID, a.orderID, "attacker",
+		domain.AmendOrderRequest{NewTotalAmount: 9999, Reason: "attacker amend"})
+	assert.ErrorIs(t, err, domain.ErrOrderNotFound,
 		"ISOLATION FAILURE: tenant B was able to amend tenant A's order")
 
 	// Verify tenant A's order is unchanged.
@@ -214,33 +221,73 @@ func TestPgStore_TenantIsolation_AmendOrder(t *testing.T) {
 	assert.Equal(t, float64(1000), got.TotalAmount,
 		"ISOLATION FAILURE: tenant A's order total_amount was mutated by tenant B")
 	assert.Equal(t, 1, got.Version)
-
-	// Sanity: tenant B can still amend its OWN order.
-	updated, err := testStore.AmendOrder(context.Background(), b.tenantID, b.orderID, 2000, "legit amend", "b-admin")
-	require.NoError(t, err)
-	assert.Equal(t, float64(2000), updated.TotalAmount)
-	assert.Equal(t, 2, updated.Version)
+	assert.Equal(t, domain.OrderStatusIssued, got.Status)
 }
 
-func TestPgStore_TenantIsolation_CloseOrder(t *testing.T) {
+func TestPgStore_TenantIsolation_Transitions(t *testing.T) {
 	a := setupIsolationFixture(t, "A-Close")
 	b := setupIsolationFixture(t, "B-Close")
 
-	_, err := testStore.CloseOrder(context.Background(), b.tenantID, a.orderID, "attacker")
-	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
-		"ISOLATION FAILURE: tenant B was able to close tenant A's order")
+	for _, cmd := range []store.Command{store.CmdClose, store.CmdHold, store.CmdCancel} {
+		_, err := testStore.Transition(context.Background(), store.TransitionInput{
+			TenantID: b.tenantID, OrderID: a.orderID, Actor: "attacker", Command: cmd, Reason: "attack",
+		})
+		assert.ErrorIs(t, err, domain.ErrOrderNotFound,
+			"ISOLATION FAILURE: tenant B was able to run %s on tenant A's order", cmd)
+	}
 
 	ctxA := svcmiddleware.WithTenant(context.Background(), a.tenantID)
 	got, err := testStore.GetOrder(ctxA, a.orderID)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, domain.OrderStatusIssued, got.Status,
-		"ISOLATION FAILURE: tenant A's order status was mutated by tenant B's close attempt")
+		"ISOLATION FAILURE: tenant A's order status was mutated by tenant B")
 
 	// Sanity: tenant B can still close its OWN order.
-	updated, err := testStore.CloseOrder(context.Background(), b.tenantID, b.orderID, "b-admin")
+	updated, err := testStore.Transition(context.Background(), store.TransitionInput{
+		TenantID: b.tenantID, OrderID: b.orderID, Actor: "b-admin", Command: store.CmdClose,
+	})
 	require.NoError(t, err)
 	assert.Equal(t, domain.OrderStatusClosed, updated.Status)
+}
+
+// Progress, lines, revisions, history and open quantity are all reached through
+// the order, and each must be tenant-scoped on its own.
+func TestPgStore_TenantIsolation_ProgressAndReads(t *testing.T) {
+	a := setupIsolationFixture(t, "A-Progress")
+	b := setupIsolationFixture(t, "B-Progress")
+	ctxB := svcmiddleware.WithTenant(context.Background(), b.tenantID)
+
+	// Tenant B pushing progress against tenant A's order/line.
+	_, err := testStore.RecordProgress(context.Background(), b.tenantID, a.orderID, a.lineID, "attacker",
+		domain.ProgressRequest{Kind: domain.ProgressReceived, Quantity: 1, SourceRef: "attack-1", DeltaSign: 1}, "")
+	assert.ErrorIs(t, err, domain.ErrOrderNotFound, "ISOLATION FAILURE: tenant B pushed progress onto tenant A's order")
+
+	// ... and onto tenant A's line through its OWN order id.
+	_, err = testStore.RecordProgress(context.Background(), b.tenantID, b.orderID, a.lineID, "attacker",
+		domain.ProgressRequest{Kind: domain.ProgressReceived, Quantity: 1, SourceRef: "attack-2", DeltaSign: 1}, "")
+	assert.ErrorIs(t, err, domain.ErrLineNotFound, "ISOLATION FAILURE: tenant B reached tenant A's line through its own order")
+
+	lines, ok, err := testStore.OpenQuantity(ctxB, a.orderID)
+	require.NoError(t, err)
+	assert.False(t, ok, "ISOLATION FAILURE: OpenQuantity answered for another tenant's order")
+	assert.Empty(t, lines)
+
+	events, err := testStore.ListEvents(ctxB, a.orderID)
+	require.NoError(t, err)
+	assert.Empty(t, events, "ISOLATION FAILURE: another tenant's order history was readable")
+
+	revs, err := testStore.ListRevisions(ctxB, a.orderID)
+	require.NoError(t, err)
+	assert.Empty(t, revs, "ISOLATION FAILURE: another tenant's revisions were readable")
+
+	// Tenant A's own order was never touched.
+	ctxA := svcmiddleware.WithTenant(context.Background(), a.tenantID)
+	qty, ok, err := testStore.OpenQuantity(ctxA, a.orderID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, qty, 1)
+	assert.Equal(t, float64(0), qty[0].ReceivedQuantity)
 }
 
 func TestPgStore_TenantIsolation_ListOrders(t *testing.T) {

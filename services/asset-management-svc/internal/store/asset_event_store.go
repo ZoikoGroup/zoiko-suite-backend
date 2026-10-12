@@ -20,7 +20,7 @@ const assetEventColumns = `
 	created_at, created_by_principal_id, validated_at,
 	approved_at, approved_by_principal_id, applied_at, emitted_at,
 	reversed_at, reversed_by_principal_id, reversal_reason,
-	superseded_at, superseded_by_principal_id, supersession_reason`
+	superseded_at, superseded_by_principal_id, supersession_reason, book_id`
 
 func scanAssetEvent(row pgx.Row) (*domain.AssetEvent, error) {
 	var e domain.AssetEvent
@@ -32,7 +32,7 @@ func scanAssetEvent(row pgx.Row) (*domain.AssetEvent, error) {
 		&e.CreatedAt, &e.CreatedByPrincipalID, &e.ValidatedAt,
 		&e.ApprovedAt, &e.ApprovedByPrincipalID, &e.AppliedAt, &e.EmittedAt,
 		&e.ReversedAt, &e.ReversedByPrincipalID, &e.ReversalReason,
-		&e.SupersededAt, &e.SupersededByPrincipalID, &e.SupersessionReason,
+		&e.SupersededAt, &e.SupersededByPrincipalID, &e.SupersessionReason, &e.BookID,
 	); err != nil {
 		return nil, err
 	}
@@ -55,13 +55,13 @@ func (s *PgStore) CreateAssetEvent(ctx context.Context, e *domain.AssetEvent) er
 				source_document_ref, valuation_evidence_ref, amount, currency, effective_date, fiscal_period,
 				proceeds_amount, destination_custodian_id, destination_location_id, destination_legal_entity_id,
 				debit_account_code, credit_account_code, correction_of_event_id,
-				created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+				created_at, created_by_principal_id, book_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 		`, e.EventID, tenantID, e.LegalEntityID, e.AssetID, e.ComponentID, e.EventType, e.Status,
 			e.SourceDocumentRef, e.ValuationEvidenceRef, e.Amount, e.Currency, e.EffectiveDate, e.FiscalPeriod,
 			e.ProceedsAmount, e.DestinationCustodianID, e.DestinationLocationID, e.DestinationLegalEntityID,
 			e.DebitAccountCode, e.CreditAccountCode, e.CorrectionOfEventID,
-			e.CreatedAt, e.CreatedByPrincipalID)
+			e.CreatedAt, e.CreatedByPrincipalID, e.BookID)
 		return mapAssetEventPgError(err)
 	})
 }
@@ -160,6 +160,22 @@ func (s *PgStore) ApproveAssetEvent(ctx context.Context, eventID, principalID st
 // can never disagree. journalID/emittedAt are nil when the event carries
 // no $ amount — the row lands in APPLIED and stays there.
 func (s *PgStore) ApplyAssetEvent(ctx context.Context, eventID string, at time.Time, journalID *string) error {
+	return s.applyAssetEvent(ctx, eventID, at, journalID, false)
+}
+
+// PreflightApplyAssetEvent runs the exact apply logic (status guard, disposal
+// eligibility, book re-base preconditions) inside a transaction that is always
+// rolled back. The handler calls it BEFORE posting the GL journal so a store-side
+// refusal can never leave a posted journal behind with the event still APPROVED.
+func (s *PgStore) PreflightApplyAssetEvent(ctx context.Context, eventID string, at time.Time) error {
+	err := s.applyAssetEvent(ctx, eventID, at, nil, true)
+	if errors.Is(err, errPreflightRollback) {
+		return nil
+	}
+	return err
+}
+
+func (s *PgStore) applyAssetEvent(ctx context.Context, eventID string, at time.Time, journalID *string, dryRun bool) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
@@ -189,6 +205,12 @@ func (s *PgStore) ApplyAssetEvent(ctx context.Context, eventID string, at time.T
 			}
 		}
 
+		// IMPAIRMENT/REVALUATION/ADDITION re-base the book's depreciation
+		// schedule in this same transaction; every other type is a no-op here.
+		if err := applyBookEffect(ctx, tx, tenantID, eventID, assetID, eventType, at); err != nil {
+			return err
+		}
+
 		finalStatus := domain.AssetEventStatusApplied
 		var emittedAt *time.Time
 		if journalID != nil {
@@ -204,6 +226,9 @@ func (s *PgStore) ApplyAssetEvent(ctx context.Context, eventID string, at time.T
 		}
 		if tag.RowsAffected() == 0 {
 			return domain.ErrInvalidAssetEventTransition
+		}
+		if dryRun {
+			return errPreflightRollback
 		}
 		return nil
 	})
@@ -253,6 +278,12 @@ func (s *PgStore) correctAssetEvent(ctx context.Context, eventID, principalID, r
 			`, domain.AssetStatusActive, assetID, tenantID, domain.AssetStatusDisposed); err != nil {
 				return err
 			}
+		}
+
+		// Undo an applied re-base (no-op for other types, or for events
+		// applied before migration 000004, which have no effects row).
+		if err := reverseBookEffect(ctx, tx, tenantID, eventID, assetID, eventType, principalID, at); err != nil {
+			return err
 		}
 
 		tag, err := tx.Exec(ctx, fmt.Sprintf(`

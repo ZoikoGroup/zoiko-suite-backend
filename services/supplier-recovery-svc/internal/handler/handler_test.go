@@ -14,22 +14,10 @@ import (
 	authzpkg "zoiko.io/supplier-recovery-svc/internal/authz"
 	"zoiko.io/supplier-recovery-svc/internal/bankreconciliation"
 	"zoiko.io/supplier-recovery-svc/internal/domain"
-	"zoiko.io/supplier-recovery-svc/internal/events"
 	"zoiko.io/supplier-recovery-svc/internal/handler"
 	"zoiko.io/supplier-recovery-svc/internal/middleware"
 	"zoiko.io/supplier-recovery-svc/internal/payableopenitem"
 )
-
-// ── stub publisher ───────────────────────────────────────────────────────────
-
-type stubPublisher struct{ calls int }
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	p.calls++
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 // ── stub authz — including the own-object SoD layer ─────────────────────────
 
@@ -130,11 +118,12 @@ var _ bankreconciliation.Client = (*stubBankRec)(nil)
 const testTenant = "tenant-ap12-1"
 const testLegalEntity = "le-ap12-1"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, payables *stubPayables, bankrec *stubBankRec) chi.Router {
+func newTestRouter(st *stubStore, az *stubAuthz, payables *stubPayables, bankrec *stubBankRec) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, payables, bankrec, logger)
+	h := handler.New(st, az, payables, bankrec, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
+	r.Use(middleware.RequireTenant)
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -184,7 +173,7 @@ func approveCase(t *testing.T, r http.Handler, caseID, ownerPrincipal string) *h
 func TestCreateSupplierRecoveryCase(t *testing.T) {
 	payables := newStubPayables()
 	payables.add("payable-1", testLegalEntity, 500)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, payables, newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, payables, newStubBankRec())
 
 	c := createCase(t, r, "payable-1", 500)
 	if c.Status != domain.StatusOpen {
@@ -193,7 +182,7 @@ func TestCreateSupplierRecoveryCase(t *testing.T) {
 }
 
 func TestCreateSupplierRecoveryCase_UnknownPayable_Rejected(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPayables(), newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, newStubPayables(), newStubBankRec())
 	w := doRequest(r, http.MethodPost, "/ap12/cases/", domain.CreateCaseRequest{
 		LegalEntityID: testLegalEntity, SupplierRef: "vendor-1", RecoveryBasis: domain.BasisOverpayment,
 		SourcePayableID: "does-not-exist", TotalAmount: 100, Currency: "USD",
@@ -206,7 +195,7 @@ func TestCreateSupplierRecoveryCase_UnknownPayable_Rejected(t *testing.T) {
 func TestApproveRecoveryPlan_SelfApproval_Denied(t *testing.T) {
 	payables := newStubPayables()
 	payables.add("payable-2", testLegalEntity, 200)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, payables, newStubBankRec())
 	c := createCase(t, r, "payable-2", 200) // created by "principal-case-owner"
 
 	w := doRequestAs(r, http.MethodPost, "/ap12/cases/"+c.CaseID+"/approve", nil, testTenant, "principal-case-owner")
@@ -218,7 +207,7 @@ func TestApproveRecoveryPlan_SelfApproval_Denied(t *testing.T) {
 func TestApproveRecoveryPlan_IndependentApprover_Succeeds(t *testing.T) {
 	payables := newStubPayables()
 	payables.add("payable-3", testLegalEntity, 200)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, payables, newStubBankRec())
 	c := createCase(t, r, "payable-3", 200)
 
 	w := approveCase(t, r, c.CaseID, "principal-case-owner")
@@ -237,7 +226,7 @@ func TestApproveRecoveryPlan_IndependentApprover_Succeeds(t *testing.T) {
 func TestApplyApprovedOffset_RealAP08Call(t *testing.T) {
 	payables := newStubPayables()
 	payables.add("payable-4", testLegalEntity, 500)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, payables, newStubBankRec())
 	c := createCase(t, r, "payable-4", 300)
 	approveCase(t, r, c.CaseID, "principal-case-owner")
 
@@ -261,7 +250,7 @@ func TestApplyApprovedOffset_RealAP08Call(t *testing.T) {
 func TestApplyApprovedOffset_SelfApproval_Denied(t *testing.T) {
 	payables := newStubPayables()
 	payables.add("payable-5", testLegalEntity, 500)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, payables, newStubBankRec())
 	c := createCase(t, r, "payable-5", 300)
 	approveCase(t, r, c.CaseID, "principal-case-owner")
 
@@ -281,7 +270,7 @@ func TestLinkConfirmedSupplierRefund_UnmatchedLine_Rejected(t *testing.T) {
 	payables.add("payable-6", testLegalEntity, 400)
 	bankrec := newStubBankRec()
 	bankrec.add("stmt-1", testLegalEntity, "UNMATCHED", 150)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, payables, bankrec)
+	r := newTestRouter(newStubStore(), &stubAuthz{}, payables, bankrec)
 	c := createCase(t, r, "payable-6", 150)
 	approveCase(t, r, c.CaseID, "principal-case-owner")
 
@@ -296,7 +285,7 @@ func TestLinkConfirmedSupplierRefund_MatchedLine_Succeeds(t *testing.T) {
 	payables.add("payable-7", testLegalEntity, 400)
 	bankrec := newStubBankRec()
 	bankrec.add("stmt-2", testLegalEntity, "MATCHED", 150)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, payables, bankrec)
+	r := newTestRouter(newStubStore(), &stubAuthz{}, payables, bankrec)
 	c := createCase(t, r, "payable-7", 150)
 	approveCase(t, r, c.CaseID, "principal-case-owner")
 
@@ -317,7 +306,7 @@ func TestLinkConfirmedSupplierRefund_MatchedLine_Succeeds(t *testing.T) {
 func TestCloseRecoveryCase_RequiresFullyRecovered(t *testing.T) {
 	payables := newStubPayables()
 	payables.add("payable-8", testLegalEntity, 400)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, payables, newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, payables, newStubBankRec())
 	c := createCase(t, r, "payable-8", 300)
 	approveCase(t, r, c.CaseID, "principal-case-owner")
 
@@ -339,7 +328,7 @@ func TestCloseRecoveryCase_RequiresFullyRecovered(t *testing.T) {
 func TestWriteOffRecovery_SelfApproval_Denied(t *testing.T) {
 	payables := newStubPayables()
 	payables.add("payable-9", testLegalEntity, 400)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, payables, newStubBankRec())
 	c := createCase(t, r, "payable-9", 300)
 
 	w := doRequestAs(r, http.MethodPost, "/ap12/cases/"+c.CaseID+"/write-off", domain.WriteOffRequest{Reason: "uncollectible"}, testTenant, "principal-case-owner")
@@ -351,7 +340,7 @@ func TestWriteOffRecovery_SelfApproval_Denied(t *testing.T) {
 func TestWriteOffRecovery_IndependentApprover_Succeeds(t *testing.T) {
 	payables := newStubPayables()
 	payables.add("payable-10", testLegalEntity, 400)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, payables, newStubBankRec())
 	c := createCase(t, r, "payable-10", 300)
 
 	w := doRequestAs(r, http.MethodPost, "/ap12/cases/"+c.CaseID+"/write-off", domain.WriteOffRequest{Reason: "uncollectible"}, testTenant, "principal-checker")
@@ -365,7 +354,7 @@ func TestWriteOffRecovery_IndependentApprover_Succeeds(t *testing.T) {
 func TestApplyApprovedOffset_ReplayedRef_Idempotent(t *testing.T) {
 	payables := newStubPayables()
 	payables.add("payable-11", testLegalEntity, 500)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, payables, newStubBankRec())
 	c := createCase(t, r, "payable-11", 300)
 	approveCase(t, r, c.CaseID, "principal-case-owner")
 
@@ -389,9 +378,82 @@ func TestApplyApprovedOffset_ReplayedRef_Idempotent(t *testing.T) {
 }
 
 func TestGetRecoveryCase_NotFound(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubPayables(), newStubBankRec())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, newStubPayables(), newStubBankRec())
 	w := doRequest(r, http.MethodGet, "/ap12/cases/does-not-exist", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// An offset larger than what is still outstanding is refused BEFORE AP-08 is
+// called: otherwise AP-08 would reduce the payable and this service would then
+// reject the same amount locally, leaving the two out of step.
+func TestApplyApprovedOffset_ExceedsOutstanding_RefusedBeforeAP08(t *testing.T) {
+	payables := newStubPayables()
+	payables.add("payable-x", testLegalEntity, 500)
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	c := createCase(t, r, "payable-x", 100)
+	approveCase(t, r, c.CaseID, "principal-case-owner")
+
+	w := doRequestAs(r, http.MethodPost, "/ap12/cases/"+c.CaseID+"/apply-offset",
+		domain.ApplyOffsetRequest{Amount: 100.50, RecoveryRef: "too-much"}, testTenant, "principal-checker")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+	if payables.offsetCalls != 0 {
+		t.Fatalf("AP-08 must not be called for an over-recovery, got %d calls", payables.offsetCalls)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if body["code"] != "STATE_CONFLICT" {
+		t.Fatalf("expected the stable code STATE_CONFLICT, got %v", body)
+	}
+}
+
+// If AP-08 refuses the offset, nothing is recorded locally.
+func TestApplyApprovedOffset_AP08Failure_LeavesCaseUnchanged(t *testing.T) {
+	payables := newStubPayables()
+	payables.add("payable-f", testLegalEntity, 500)
+	payables.offsetFail = true
+	st := newStubStore()
+	r := newTestRouter(st, &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	c := createCase(t, r, "payable-f", 100)
+	approveCase(t, r, c.CaseID, "principal-case-owner")
+
+	w := doRequestAs(r, http.MethodPost, "/ap12/cases/"+c.CaseID+"/apply-offset",
+		domain.ApplyOffsetRequest{Amount: 40, RecoveryRef: "r1"}, testTenant, "principal-checker")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := st.cases[c.CaseID]; got.RecoveredAmount != 0 || got.Status != domain.StatusInRecovery || len(st.applications[c.CaseID]) != 0 {
+		t.Fatalf("the case must be untouched, got %+v", got)
+	}
+}
+
+func TestRequests_WithoutTenant_AreRefused_WithStableCode(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubAuthz{}, newStubPayables(), newStubBankRec())
+	w := doRequest(r, http.MethodGet, "/ap12/cases/?legal_entity_id="+testLegalEntity, nil, "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if body["code"] != "VALIDATION_FAILED" {
+		t.Fatalf("expected VALIDATION_FAILED, got %v", body)
+	}
+}
+
+func TestEscalate_AfterFullyRecovered_Refused(t *testing.T) {
+	payables := newStubPayables()
+	payables.add("payable-e", testLegalEntity, 500)
+	r := newTestRouter(newStubStore(), &stubAuthz{sodRules: true}, payables, newStubBankRec())
+	c := createCase(t, r, "payable-e", 50)
+	approveCase(t, r, c.CaseID, "principal-case-owner")
+	doRequestAs(r, http.MethodPost, "/ap12/cases/"+c.CaseID+"/apply-offset",
+		domain.ApplyOffsetRequest{Amount: 50, RecoveryRef: "full"}, testTenant, "principal-checker")
+
+	w := doRequest(r, http.MethodPost, "/ap12/cases/"+c.CaseID+"/escalate", domain.EscalateRequest{Reason: "late"}, testTenant)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("a fully recovered case cannot be escalated, got %d: %s", w.Code, w.Body.String())
 	}
 }

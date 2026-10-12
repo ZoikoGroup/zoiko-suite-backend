@@ -41,6 +41,11 @@ func (h *Handler) createMovement(w http.ResponseWriter, r *http.Request, req dom
 		return
 	}
 
+	if req.APReceiptID != "" && req.MovementType != domain.MovementTypeReceipt {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_ap_receipt_link", domain.ErrAPReceiptOnlyForReceipt.Error())
+		return
+	}
+
 	switch req.MovementType {
 	case domain.MovementTypeReceipt:
 		if req.DestinationLocationID == "" || req.SourceLocationID != "" {
@@ -118,6 +123,19 @@ func (h *Handler) createMovement(w http.ResponseWriter, r *http.Request, req dom
 		h.log.Error("failed to create inventory movement", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
+	}
+	// m.MovementID is the original's when the idempotency key already
+	// existed, so a retried create re-links the same movement.
+	if req.APReceiptID != "" {
+		if err := h.store.LinkMovementReceipt(r.Context(), m.MovementID, req.APReceiptID, principalID, time.Now().UTC()); err != nil {
+			if errors.Is(err, domain.ErrReceiptLinkConflict) {
+				writeError(w, http.StatusConflict, "receipt_link_conflict", err.Error())
+				return
+			}
+			h.log.Error("failed to link movement to AP receipt", zap.String("movement_id", m.MovementID), zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusCreated, m)
 }

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"math"
 	"errors"
 	"net/http"
 	"time"
@@ -15,7 +16,7 @@ import (
 // is NUMERIC(18,2), and a delta that doesn't land on a whole cent is
 // wrong, not merely imprecise.
 func roundCents(v float64) float64 {
-	return float64(int64(v*100+0.5)) / 100
+	return math.Round(v*100) / 100 // half away from zero; the old int64(v*100+0.5) truncated toward zero and lost a cent on negatives
 }
 
 // ── POST /v1/profitability/projections/refresh, /rebuild ────────────────────

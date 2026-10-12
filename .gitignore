@@ -39,6 +39,7 @@ deployments/supabase/supabase-bootstrap.exe
 # -o into .servicectl/ above.
 tools/servicectl/servicectl
 tools/servicectl/servicectl.exe
+tools/period-backfill/period-backfill.exe
 # New company-provided spec docs, landed 2026-08-27 as .docx alongside the
 # original zoiko_suite_doc1-7 (kept tracked, above). Left untracked for now
 # by explicit request — large (tens of MB total), not yet reviewed for
