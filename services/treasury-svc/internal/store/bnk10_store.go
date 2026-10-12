@@ -127,7 +127,7 @@ func (s *PgStore) CreateFXExposureSnapshot(ctx context.Context, p domain.Calcula
 		}
 		// Enqueue fx_exposure.became_stale event if HasStaleComponent is true
 		if snap.HasStaleComponent {
-			return s.enqueueFXExposureEvent(ctx, tx, "became_stale", "fx_exposure.became_stale", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+			return s.enqueueFXExposureEvent(ctx, tx, "became-stale", "fx_exposure.became_stale", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
 				"snapshot_id":         snap.SnapshotID,
 				"tenant_id":           snap.TenantID,
 				"legal_entity_id":     snap.LegalEntityID,

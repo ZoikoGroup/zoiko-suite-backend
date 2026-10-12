@@ -30,7 +30,7 @@ import (
 // of "ownership verification state is orthogonal and versioned."
 func (s *PgStore) VerifyBankAccountOwnership(ctx context.Context, p domain.VerifyOwnershipParams) (*domain.OwnershipEvidence, error) {
 	var evidence *domain.OwnershipEvidence
-	var acct *domain.BankAccount
+	acct := &domain.BankAccount{}
 	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `SELECT `+bankAccountColumns+` FROM bank_accounts WHERE bank_account_id = $1 AND tenant_id = $2`,
 			p.BankAccountID, p.TenantID).Scan(
@@ -63,7 +63,7 @@ func (s *PgStore) VerifyBankAccountOwnership(ctx context.Context, p domain.Verif
 			return err
 		}
 		// Enqueue bank_account.ownership_verified event
-		return s.enqueueBankAccountEvent(ctx, tx, "ownership_verified", "bank_account.ownership_verified", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.VerifiedByPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "ownership-verified", "bank_account.ownership_verified", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.VerifiedByPrincipalID, "", map[string]any{
 			"bank_account_id":      acct.BankAccountID,
 			"tenant_id":            acct.TenantID,
 			"legal_entity_id":      acct.LegalEntityID,
@@ -174,7 +174,7 @@ func (s *PgStore) AmendBankAccountMetadata(ctx context.Context, p domain.AmendBa
 			return err
 		}
 		// Enqueue bank_account.metadata_amended event
-		return s.enqueueBankAccountEvent(ctx, tx, "metadata_amended", "bank_account.metadata_amended", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "metadata-amended", "bank_account.metadata_amended", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
 			"bank_account_id": acct.BankAccountID,
 			"tenant_id":       acct.TenantID,
 			"legal_entity_id": acct.LegalEntityID,
@@ -206,7 +206,7 @@ func (s *PgStore) ChangeOperationalUse(ctx context.Context, p domain.ChangeOpera
 			return err
 		}
 		// Enqueue bank_account.operational_use_changed event
-		return s.enqueueBankAccountEvent(ctx, tx, "operational_use_changed", "bank_account.operational_use_changed", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "operational-use-changed", "bank_account.operational_use_changed", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
 			"bank_account_id":          acct.BankAccountID,
 			"tenant_id":                acct.TenantID,
 			"legal_entity_id":          acct.LegalEntityID,
@@ -341,7 +341,7 @@ func (s *PgStore) RotateAccountIdentifierToken(ctx context.Context, p domain.Rot
 			return err
 		}
 		// Enqueue bank_account.token_rotated event
-		return s.enqueueBankAccountEvent(ctx, tx, "token_rotated", "bank_account.token_rotated", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
+		return s.enqueueBankAccountEvent(ctx, tx, "token-rotated", "bank_account.token_rotated", p.TenantID, acct.LegalEntityID, p.BankAccountID, p.ActorPrincipalID, "", map[string]any{
 			"bank_account_id": acct.BankAccountID,
 			"tenant_id":       acct.TenantID,
 			"legal_entity_id": acct.LegalEntityID,

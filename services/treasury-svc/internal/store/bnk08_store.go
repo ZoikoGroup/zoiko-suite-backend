@@ -85,7 +85,7 @@ func (s *PgStore) CreateCashPositionSnapshot(ctx context.Context, p domain.Calcu
 		}
 		// Enqueue cash_position.became_stale event if HasStaleComponent is true
 		if snap.HasStaleComponent {
-			return s.enqueueCashPositionEvent(ctx, tx, "became_stale", "cash_position.became_stale", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+			return s.enqueueCashPositionEvent(ctx, tx, "became-stale", "cash_position.became_stale", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
 				"snapshot_id":        snap.SnapshotID,
 				"tenant_id":          snap.TenantID,
 				"legal_entity_id":    snap.LegalEntityID,

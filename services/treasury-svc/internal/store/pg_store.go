@@ -36,17 +36,17 @@ func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
 	return s
 }
 
-// enqueueBankAccountEvent builds and enqueues a bank_account.* event.
+// enqueueBankAccountEvent builds and enqueues a bank-account.* event.
 func (s *PgStore) enqueueBankAccountEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
 	env, err := envelope.New(envelope.Spec{
-		Type:            "com.zoikosuite.treasury.bank_account." + fact,
+		Type:            "com.zoikosuite.treasury.bank-account." + fact,
 		LegacyType:      legacyType,
 		Service:         "treasury-svc",
 		SchemaVersion:   "1.0.0",
 		OccurredAt:      time.Now().UTC(),
 		TenantID:        tenantID,
 		LegalEntityID:   legalEntityID,
-		AggregateType:   "bank_account",
+		AggregateType:   "bank-account",
 		AggregateID:     aggregateID,
 		CorrelationID:   correlationID,
 		ActorID:         actorID,
@@ -60,17 +60,17 @@ func (s *PgStore) enqueueBankAccountEvent(ctx context.Context, tx pgx.Tx, fact, 
 	return outbox.Enqueue(ctx, tx, env)
 }
 
-// enqueueTreasuryTransferEvent builds and enqueues a treasury_transfer.* event.
+// enqueueTreasuryTransferEvent builds and enqueues a treasury-transfer.* event.
 func (s *PgStore) enqueueTreasuryTransferEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
 	env, err := envelope.New(envelope.Spec{
-		Type:            "com.zoikosuite.treasury.treasury_transfer." + fact,
+		Type:            "com.zoikosuite.treasury.treasury-transfer." + fact,
 		LegacyType:      legacyType,
 		Service:         "treasury-svc",
 		SchemaVersion:   "1.0.0",
 		OccurredAt:      time.Now().UTC(),
 		TenantID:        tenantID,
 		LegalEntityID:   legalEntityID,
-		AggregateType:   "treasury_transfer",
+		AggregateType:   "treasury-transfer",
 		AggregateID:     aggregateID,
 		CorrelationID:   correlationID,
 		ActorID:         actorID,
@@ -84,17 +84,17 @@ func (s *PgStore) enqueueTreasuryTransferEvent(ctx context.Context, tx pgx.Tx, f
 	return outbox.Enqueue(ctx, tx, env)
 }
 
-// enqueueCashPositionEvent builds and enqueues a cash_position.* event.
+// enqueueCashPositionEvent builds and enqueues a cash-position.* event.
 func (s *PgStore) enqueueCashPositionEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
 	env, err := envelope.New(envelope.Spec{
-		Type:            "com.zoikosuite.treasury.cash_position." + fact,
+		Type:            "com.zoikosuite.treasury.cash-position." + fact,
 		LegacyType:      legacyType,
 		Service:         "treasury-svc",
 		SchemaVersion:   "1.0.0",
 		OccurredAt:      time.Now().UTC(),
 		TenantID:        tenantID,
 		LegalEntityID:   legalEntityID,
-		AggregateType:   "cash_position",
+		AggregateType:   "cash-position",
 		AggregateID:     aggregateID,
 		CorrelationID:   correlationID,
 		ActorID:         actorID,
@@ -108,17 +108,17 @@ func (s *PgStore) enqueueCashPositionEvent(ctx context.Context, tx pgx.Tx, fact,
 	return outbox.Enqueue(ctx, tx, env)
 }
 
-// enqueueFXExposureEvent builds and enqueues an fx_exposure.* event.
+// enqueueFXExposureEvent builds and enqueues an fx-exposure.* event.
 func (s *PgStore) enqueueFXExposureEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
 	env, err := envelope.New(envelope.Spec{
-		Type:            "com.zoikosuite.treasury.fx_exposure." + fact,
+		Type:            "com.zoikosuite.treasury.fx-exposure." + fact,
 		LegacyType:      legacyType,
 		Service:         "treasury-svc",
 		SchemaVersion:   "1.0.0",
 		OccurredAt:      time.Now().UTC(),
 		TenantID:        tenantID,
 		LegalEntityID:   legalEntityID,
-		AggregateType:   "fx_exposure",
+		AggregateType:   "fx-exposure",
 		AggregateID:     aggregateID,
 		CorrelationID:   correlationID,
 		ActorID:         actorID,
@@ -135,14 +135,14 @@ func (s *PgStore) enqueueFXExposureEvent(ctx context.Context, tx pgx.Tx, fact, l
 // enqueueEffectiveCashEvent builds and enqueues effective cash / liquidity events.
 func (s *PgStore) enqueueEffectiveCashEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
 	env, err := envelope.New(envelope.Spec{
-		Type:            "com.zoikosuite.treasury.effective_cash." + fact,
+		Type:            "com.zoikosuite.treasury.effective-cash." + fact,
 		LegacyType:      legacyType,
 		Service:         "treasury-svc",
 		SchemaVersion:   "1.0.0",
 		OccurredAt:      time.Now().UTC(),
 		TenantID:        tenantID,
 		LegalEntityID:   legalEntityID,
-		AggregateType:   "effective_cash",
+		AggregateType:   "effective-cash",
 		AggregateID:     aggregateID,
 		CorrelationID:   correlationID,
 		ActorID:         actorID,
