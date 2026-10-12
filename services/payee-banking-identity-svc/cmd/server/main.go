@@ -18,11 +18,12 @@ import (
 	"zoiko.io/payee-banking-identity-svc/internal/authz"
 	"zoiko.io/payee-banking-identity-svc/internal/config"
 	"zoiko.io/payee-banking-identity-svc/internal/counterparty"
-	"zoiko.io/payee-banking-identity-svc/internal/events"
 	"zoiko.io/payee-banking-identity-svc/internal/handler"
 	"zoiko.io/payee-banking-identity-svc/internal/health"
 	"zoiko.io/payee-banking-identity-svc/internal/middleware"
 	"zoiko.io/payee-banking-identity-svc/internal/store"
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 )
 
 func main() {
@@ -57,13 +58,45 @@ func main() {
 		logger.Info("connected to postgres database")
 	}
 
-	pgStore := store.NewPgStore(pool, logger)
+	// The eventing outbox table must exist before the first business write
+	// tries to enqueue into it; fail here, at deploy time, not on a request.
+	if err := outbox.VerifySchema(ctx, pool); err != nil {
+		logger.Fatal("eventing outbox schema missing", zap.Error(err))
+	}
+
+	pgStore := store.NewPgStore(pool, logger, store.WithEventRegion(cfg.EventResidencyRegion))
+
+	// Transactional outbox relay (ZS-EVENT-001 §6). Every ORG-10 event is
+	// written to eventing_outbox in the same transaction as the state
+	// change it reports; this relay delivers them. kafkaout builds its own
+	// writer because delivery must be acknowledged (RequireAll) — a
+	// fire-and-forget writer must never back the outbox, or a "published"
+	// event could be one no broker actually stored.
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+	outboxWriter, err := kafkaout.New(kafkaout.Config{
+		Brokers: brokers,
+		Topic:   cfg.KafkaEventsTopic,
+	})
+	if err != nil {
+		logger.Fatal("outbox kafka writer", zap.Error(err))
+	}
+	defer func() { _ = outboxWriter.Close() }()
+	relay, err := outbox.NewRelay(pool, outboxWriter, outbox.DefaultConfig(), logger)
+	if err != nil {
+		logger.Fatal("outbox relay", zap.Error(err))
+	}
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relayDone := make(chan struct{}, 1)
+	go func() {
+		relay.Run(relayCtx)
+		relayDone <- struct{}{}
+	}()
+
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	partyClient := counterparty.NewHTTPClient(cfg.CounterpartyServiceURL, logger)
 
-	h := handler.New(pgStore, publisher, authzClient, partyClient, logger)
+	h := handler.New(pgStore, authzClient, partyClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -104,6 +137,17 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
 	}
+
+	// Stop the relay after the server: requests finishing during Shutdown
+	// may still commit events. Anything not delivered stays in the outbox
+	// for the next process — stopping loses nothing.
+	cancelRelay()
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("outbox relay did not stop before the shutdown deadline")
+	}
+
 	if pool != nil {
 		pool.Close()
 	}
