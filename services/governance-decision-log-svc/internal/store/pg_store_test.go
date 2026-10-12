@@ -141,7 +141,7 @@ func TestPgStore_Insert_Integration(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 
 	d := sampleDecision("dec-int-001")
-	created, err := s.Insert(ctx, d)
+	created, err := insertDecision(ctx, s, d)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestPgStore_FindByID_ScopedToTenant(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 
 	d := sampleDecision("dec-cross-tenant")
-	if _, err := s.Insert(ctx, d); err != nil {
+	if _, err := insertDecision(ctx, s, d); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -187,7 +187,7 @@ func TestPgStore_Insert_IdempotentOnDuplicateDecisionID(t *testing.T) {
 
 	d := sampleDecision("dec-int-dup")
 
-	created1, err := s.Insert(ctx, d)
+	created1, err := insertDecision(ctx, s, d)
 	if err != nil {
 		t.Fatalf("unexpected error on first insert: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestPgStore_Insert_IdempotentOnDuplicateDecisionID(t *testing.T) {
 	// must be a silent no-op, not an overwrite (append-only evidence rule).
 	dup := d
 	dup.Outcome = "GRANTED"
-	created2, err := s.Insert(ctx, dup)
+	created2, err := insertDecision(ctx, s, dup)
 	if err != nil {
 		t.Fatalf("unexpected error on duplicate insert: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestPgStore_ErrorsWrapErrStoreUnavailable(t *testing.T) {
 		t.Fatalf("failed to drop table for test setup: %v", err)
 	}
 
-	if _, err := s.Insert(ctx, sampleDecision("dec-unavailable")); !errors.Is(err, domain.ErrStoreUnavailable) {
+	if _, err := insertDecision(ctx, s, sampleDecision("dec-unavailable")); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("Insert: expected error to wrap ErrStoreUnavailable, got %v", err)
 	}
 	if _, err := s.FindByID(ctx, "tenant-1", "dec-unavailable"); !errors.Is(err, domain.ErrStoreUnavailable) {
@@ -292,7 +292,7 @@ func seedListFixtures(t *testing.T, ctx context.Context, s *store.PgStore) {
 		},
 	}
 	for _, d := range fixtures {
-		if _, err := s.Insert(ctx, d); err != nil {
+		if _, err := insertDecision(ctx, s, d); err != nil {
 			t.Fatalf("failed to seed fixture %q: %v", d.DecisionID, err)
 		}
 	}

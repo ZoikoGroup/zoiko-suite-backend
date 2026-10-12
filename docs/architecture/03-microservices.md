@@ -547,6 +547,10 @@ The sections below apply this structure to the most important services first.
 
 - legal.drift.detected
 
+- jurisdiction.created
+
+- jurisdiction.deactivated
+
 **Consumed Events**
 
 - entity.created
@@ -777,9 +781,18 @@ The sections below apply this structure to the most important services first.
 
 - correlation IDs
 
+**Inbound APIs** *(recorded 12 Oct 2026 from the implemented, audited surface; full contract in `services/governance-decision-log-svc/openapi.yaml`)*
+
+- `POST /v1/decisions` — append a decision (idempotent on `Idempotency-Key` and on `decision_id` within the tenant)
+- `GET /v1/decisions` — query by actor, entity, action, rule basis and time range
+- `GET /v1/decisions/{decision_id}` — read one decision (contract activation verifies its grant decision through this)
+- `POST /v1/decisions/{decision_id}/replay` — re-evaluate a decision against the exact policy version it used and record a replay manifest (GCP §2 invariant #11)
+- `GET /v1/decisions/{decision_id}/replay-manifests` — replay history of one decision
+
 **Published Events**
 
 - governance.decision.recorded
+- governance.decision.replayed *(12 Oct 2026: a replay writes a permanent manifest)*
 
 **Critical Constraint**
  Every governance decision must be queryable by audit, actor, entity, action, rule basis, and time range.

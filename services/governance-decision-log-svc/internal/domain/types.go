@@ -32,12 +32,11 @@ var ErrTenantScopeMissing = errors.New("caller tenant scope missing")
 // the decision in that tenant's log.
 var ErrTenantScopeMismatch = errors.New("request tenant_id does not match the caller's verified tenant scope")
 
-// ErrDecisionIDConflict is returned when decision_id already exists in ANOTHER
-// tenant. decision_id is client-supplied and the table's primary key is the id
-// alone, so the idempotency conflict target was global: a repeat POST of an id
-// another tenant had used answered 200 "already recorded" and silently dropped
-// the write, which made the endpoint both an existence oracle and a black hole.
-var ErrDecisionIDConflict = errors.New("decision_id already exists in another tenant")
+// ErrIdempotencyKeyInUse is returned when a concurrent request committed the
+// same Idempotency-Key first. The write that lost the race is rolled back whole
+// -- decision, key and outbox row -- so the caller re-reads the winner's key and
+// answers as a replay or a mismatch.
+var ErrIdempotencyKeyInUse = errors.New("idempotency key already used by a concurrent request")
 
 // GovernanceDecision is the durable record of one governance evaluation.
 //
@@ -64,6 +63,11 @@ type GovernanceDecision struct {
 	// RuleBasis references the policy/jurisdiction rule that produced
 	// Outcome — doctrine requires basis, not just outcome, to be stored.
 	RuleBasis string `json:"rule_basis"`
+
+	// JurisdictionContext is the jurisdiction the decision was made in (the
+	// request's X-Jurisdiction-Context). With RuleBasis it is Doc 04 §7.1's
+	// jurisdiction_rule_basis. Nil when the request carried none.
+	JurisdictionContext *string `json:"jurisdiction_context,omitempty"`
 
 	// PolicyVersionID is the exact policy version that produced this decision.
 	// Populated from rule_basis or provided directly by the caller.
@@ -92,6 +96,11 @@ type GovernanceDecision struct {
 	// Must be within bounds: not in the future (beyond clock skew) and
 	// not before the retention window floor.
 	DecidedAt time.Time `json:"decided_at"`
+
+	// RecordedAt is when this service stored the decision (stored_at). It is
+	// server-assigned and is the trustworthy time: DecidedAt is the caller's
+	// claim, bounded but not verifiable here.
+	RecordedAt time.Time `json:"recorded_at"`
 }
 
 // ErrReplayNotSupportedForActionType is returned when a decision's
@@ -119,4 +128,9 @@ type ReplayManifest struct {
 	ReplayedAt            time.Time `json:"replayed_at"`
 	ReplayedByPrincipalID string    `json:"replayed_by_principal_id"`
 	TenantID              string    `json:"tenant_id"`
+
+	// IdempotencyKey and RequestHash make a replay retry-safe (000014). They
+	// are bookkeeping, not part of the manifest a caller reads.
+	IdempotencyKey string `json:"-"`
+	RequestHash    []byte `json:"-"`
 }

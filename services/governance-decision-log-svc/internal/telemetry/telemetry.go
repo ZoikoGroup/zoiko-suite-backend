@@ -57,6 +57,11 @@ type Metrics struct {
 	HTTPRequestsTotal   *prometheus.CounterVec
 	HTTPRequestDuration *prometheus.HistogramVec
 	ReadinessUp         prometheus.Gauge
+
+	// Outbox relay health (audit R-8): alert on outbox_oldest_pending_seconds.
+	OutboxPending              prometheus.Gauge
+	OutboxOldestPendingSeconds prometheus.Gauge
+	OutboxPrunedTotal          prometheus.Counter
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -78,8 +83,35 @@ func NewMetrics(serviceName string) *Metrics {
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
 	}
-	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp)
+	m.OutboxPending = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:        "outbox_pending_events",
+		Help:        "Events written to the outbox and not yet published.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	})
+	m.OutboxOldestPendingSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:        "outbox_oldest_pending_seconds",
+		Help:        "Age of the oldest unpublished outbox event; grows without bound when the relay is stalled.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	})
+	m.OutboxPrunedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name:        "outbox_pruned_events_total",
+		Help:        "Published outbox rows removed by retention.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	})
+	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp,
+		m.OutboxPending, m.OutboxOldestPendingSeconds, m.OutboxPrunedTotal)
 	return m
+}
+
+// ObserveOutboxBacklog implements outbox.Observer.
+func (m *Metrics) ObserveOutboxBacklog(pending int, oldest time.Duration) {
+	m.OutboxPending.Set(float64(pending))
+	m.OutboxOldestPendingSeconds.Set(oldest.Seconds())
+}
+
+// ObserveOutboxPruned implements outbox.Observer.
+func (m *Metrics) ObserveOutboxPruned(n int) {
+	m.OutboxPrunedTotal.Add(float64(n))
 }
 
 type statusRecorder struct {
