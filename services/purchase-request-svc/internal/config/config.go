@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for purchase-request-svc.
@@ -35,6 +36,36 @@ type Config struct {
 	// MTLSManagementServiceURL is where this service provisions its own
 	// client-side mTLS identity when AuthzMTLSEnabled is true.
 	MTLSManagementServiceURL string
+
+	// SpendControlsURL is spend-controls-svc (POST /v1/spend-checks), the budget /
+	// spend-policy check made when a requisition is submitted (spec §5: budget
+	// check on controlled categories; fail closed when it is unavailable).
+	SpendControlsURL string
+
+	// PurchaseOrderURL is purchase-order-svc, which ConvertToPurchaseOrder asks
+	// to create the PO.
+	PurchaseOrderURL string
+
+	// ControlledCategories lists the line categories whose submission REQUIRES an
+	// ALLOWED budget decision; "*" (the default, the safer reading) means every
+	// category. A controlled requisition cannot be submitted, nor approved,
+	// without that decision, and an unreachable spend-controls-svc blocks it.
+	ControlledCategories []string
+
+	// RequisitionApprovalThreshold: above this amount the approver must be
+	// independent of the requester, last amender and submitter (spec §5 SoD).
+	// 0 disables the threshold (every amount then counts as above it only when
+	// maker-checker is on).
+	RequisitionApprovalThreshold float64
+
+	// MakerChecker, when true (default), applies maker-checker at every amount:
+	// the requester can never approve their own requisition. When false the
+	// requester may self-approve at or below the threshold.
+	MakerChecker bool
+
+	// ExpirySweepInterval is how often approved/pending requisitions past their
+	// expires_at are moved to EXPIRED.
+	ExpirySweepInterval time.Duration
 
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
@@ -87,11 +118,17 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "purchase-request-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.purchase-request.events"),
 		},
-		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
-		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
-		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
-		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		AuthZServiceURL:              env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:             env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:                 env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL:     env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		SpendControlsURL:             env("SPEND_CONTROLS_URL", "http://spend-controls-svc:8131"),
+		PurchaseOrderURL:             env("PURCHASE_ORDER_URL", "http://purchase-order-svc:8129"),
+		ControlledCategories:         splitList(env("CONTROLLED_CATEGORIES", "*")),
+		RequisitionApprovalThreshold: envFloat("REQUISITION_APPROVAL_THRESHOLD", 0),
+		MakerChecker:                 env("REQUISITION_MAKER_CHECKER", "true") != "false",
+		ExpirySweepInterval:          time.Duration(envInt("REQUISITION_EXPIRY_SWEEP_SECONDS", 60)) * time.Second,
+		OTELExporterEndpoint:         env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 
@@ -112,4 +149,26 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envFloat(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return def
+	}
+	return f
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

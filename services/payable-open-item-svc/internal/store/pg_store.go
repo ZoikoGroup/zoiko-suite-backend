@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -95,13 +96,21 @@ func nullableTenant(tenantID string) *string {
 	return &tenantID
 }
 
-func (s *PgStore) recordApplication(ctx context.Context, tx pgx.Tx, tenantID *string, payableID, appType string, amount float64, idempotencyRef, detail, actorPrincipalID string) error {
-	_, err := tx.Exec(ctx, `
+// recordApplication inserts one settlement application. It reports
+// inserted=false when the idempotency reference was already recorded. ON
+// CONFLICT DO NOTHING (rather than catching the unique violation) keeps the
+// surrounding transaction usable — a failed INSERT would abort it.
+func (s *PgStore) recordApplication(ctx context.Context, tx pgx.Tx, tenantID *string, payableID, appType string, amount float64, idempotencyRef, detail, actorPrincipalID string) (bool, error) {
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO settlement_applications (application_id, tenant_id, payable_id, application_type, amount, idempotency_ref, detail, actor_principal_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT DO NOTHING`,
 		uuid.New().String(), tenantID, payableID, appType, amount, idempotencyRef, detail, actorPrincipalID,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 func (s *PgStore) CreatePayable(ctx context.Context, tenantID string, req domain.CreatePayableRequest, principalID string) (*domain.PayableOpenItem, error) {
@@ -210,7 +219,23 @@ func (s *PgStore) GetSupplierBalance(ctx context.Context, payeeRef string) (floa
 // refuses to let it go negative unless allowNegative is set (only
 // ApplySupplierCredit sets it, per the spec's own "residual cannot go
 // negative except explicit supplier-credit state").
+// application is one settlement_applications row: its type, signed delta
+// against the residual, and idempotency reference.
+type application struct {
+	appType        string
+	delta          float64
+	idempotencyRef string
+}
+
 func (s *PgStore) applyResidualDelta(ctx context.Context, payableID, appType string, delta float64, idempotencyRef, detail, principalID string, allowNegative bool) (*domain.PayableOpenItem, bool, error) {
+	return s.applyApplications(ctx, payableID, []application{{appType, delta, idempotencyRef}}, detail, principalID, allowNegative)
+}
+
+// applyApplications records one or more applications against a payable in
+// a single transaction and moves the residual by their sum. Idempotency is
+// decided by the first application: if its reference was already recorded,
+// the whole set is a replay and nothing changes.
+func (s *PgStore) applyApplications(ctx context.Context, payableID string, apps []application, detail, principalID string, allowNegative bool) (*domain.PayableOpenItem, bool, error) {
 	var p *domain.PayableOpenItem
 	var applied bool
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
@@ -230,21 +255,30 @@ func (s *PgStore) applyResidualDelta(ctx context.Context, payableID, appType str
 		// payable on its first application would otherwise be rejected as
 		// "already settled" on replay instead of returning the idempotent
 		// no-op it actually is.
-		if err := s.recordApplication(ctx, tx, tenantID, payableID, appType, delta, idempotencyRef, detail, principalID); err != nil {
-			if isUniqueViolation(err) {
-				applied = false
-				var err2 error
-				p, err2 = scanPayable(tx.QueryRow(ctx, `SELECT `+payableColumns+` FROM payable_open_items WHERE payable_id = $1`, payableID))
-				return err2
+		var total float64
+		for i, a := range apps {
+			inserted, err := s.recordApplication(ctx, tx, tenantID, payableID, a.appType, a.delta, a.idempotencyRef, detail, principalID)
+			if err != nil {
+				return err
 			}
-			return err
+			if !inserted {
+				if i > 0 {
+					return fmt.Errorf("application %s %q partially recorded before", a.appType, a.idempotencyRef)
+				}
+				applied = false
+				p, err = scanPayable(tx.QueryRow(ctx, `SELECT `+payableColumns+` FROM payable_open_items WHERE payable_id = $1`, payableID))
+				return err
+			}
+			total += a.delta
 		}
 
 		if !domain.CanApplySettlement(status) {
 			return domain.ErrInvalidTransition
 		}
 
-		newResidual := residual + delta
+		// NUMERIC(18,2) on disk: compare and store in cents so float noise
+		// can neither block a full settlement nor leave a phantom residual.
+		newResidual := math.Round((residual+total)*100) / 100
 		if newResidual < 0 && !allowNegative {
 			return domain.ErrResidualWouldGoNegative
 		}
@@ -281,8 +315,15 @@ func (s *PgStore) ApplySupplierCredit(ctx context.Context, payableID string, req
 	return p, err
 }
 
+// ApplyConfirmedPayment settles the net payment and, when present, the
+// withheld portion (paid to the tax authority rather than the supplier) in
+// one transaction, both keyed by the same Banking payment reference.
 func (s *PgStore) ApplyConfirmedPayment(ctx context.Context, payableID string, req domain.ApplyConfirmedPaymentRequest, principalID string) (*domain.PayableOpenItem, bool, error) {
-	return s.applyResidualDelta(ctx, payableID, "PAYMENT", -req.Amount, req.ProviderPaymentRef, "", principalID, false)
+	apps := []application{{"PAYMENT", -req.Amount, req.ProviderPaymentRef}}
+	if req.WithholdingAmount > 0 {
+		apps = append(apps, application{"WITHHOLDING", -req.WithholdingAmount, req.ProviderPaymentRef})
+	}
+	return s.applyApplications(ctx, payableID, apps, "bnk07:"+req.Bnk07PaymentID, principalID, false)
 }
 
 func (s *PgStore) ApplyRecovery(ctx context.Context, payableID string, req domain.ApplyRecoveryRequest, principalID string) (*domain.PayableOpenItem, error) {

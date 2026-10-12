@@ -9,9 +9,12 @@ type FiscalPeriod struct {
 	PeriodName         string     `json:"period_name"`
 	PeriodStart        time.Time  `json:"period_start"`
 	PeriodEnd          time.Time  `json:"period_end"`
-	CloseStatus        string     `json:"close_status"` // OPEN, CLOSED, LOCKED
+	CloseStatus        string     `json:"close_status"` // see period_state.go
 	CloseLockedAt      *time.Time `json:"close_locked_at,omitempty"`
 	EvidenceDocumentID *string    `json:"evidence_document_id,omitempty"`
+	// Set while AUTHORIZED_REOPEN (migration 000018).
+	ReopenedAt      *time.Time `json:"reopened_at,omitempty"`
+	ReopenExpiresAt *time.Time `json:"reopen_expires_at,omitempty"`
 }
 
 // PeriodReopenEvent is a permanent, append-only record that a LOCKED period
@@ -37,11 +40,14 @@ type ReopenPeriodRequest struct {
 // migration 000004's doc comment for why the run and its exception
 // outcome are one row, not two separately-lifecycled objects.
 type SubledgerControlRun struct {
-	ControlRunID           string    `json:"control_run_id"`
-	TenantID               string    `json:"tenant_id"`
-	LegalEntityID          string    `json:"legal_entity_id"`
-	FiscalPeriod           string    `json:"fiscal_period"`
-	Subledger              string    `json:"subledger"` // AP | AR
+	ControlRunID  string `json:"control_run_id"`
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
+	Subledger     string `json:"subledger"` // AP | AR | ASSETS | DEPRECIATION_COMPLETENESS | INVENTORY_QUANTITY | INVENTORY_VALUE | PROJECT_REVENUE | STOCK_COUNT
+	// BookID is the asset book an ASSETS run proved (e.g. STATUTORY); empty
+	// for every other subledger. Migration 000015.
+	BookID                 string    `json:"book_id,omitempty"`
 	ControlAccountCode     string    `json:"control_account_code"`
 	SubledgerTotalAmount   float64   `json:"subledger_total_amount"`
 	GLControlBalanceAmount float64   `json:"gl_control_balance_amount"`
@@ -746,6 +752,65 @@ type CloseEvidence struct {
 	TrialBalanceHash string    `json:"trial_balance_hash"`
 	Signature        string    `json:"signature"`
 	GeneratedAt      time.Time `json:"generated_at"`
+
+	// RelianceManifest is the exact JSON of the CloseReliance this close
+	// rested on, kept as the signed bytes (migration 000017). RelianceHash is
+	// its sha256 hex; RelianceSignature the HMAC over that hash, with the same
+	// key as Signature. Empty for closes recorded before the migration.
+	RelianceManifest  string `json:"-"`
+	RelianceHash      string `json:"reliance_hash,omitempty"`
+	RelianceSignature string `json:"reliance_signature,omitempty"`
+}
+
+// CloseEvidenceView is a close's evidence as the API returns it: the stored
+// row plus the manifest, decoded for reading, and the exact signed text for
+// verification.
+type CloseEvidenceView struct {
+	CloseEvidence
+	Reliance             *CloseReliance `json:"reliance,omitempty"`
+	RelianceManifestText string         `json:"reliance_manifest,omitempty"`
+}
+
+// CloseReliance is what a period close relied on (ZS-CONTROL-001 §22:
+// "Control run IDs and evidence packages pinned to close instance"). Built
+// by the readiness check, signed and stored when the period locks.
+type CloseReliance struct {
+	// Gate settings in force, so the evidence shows if a gate was off.
+	SubledgerControlGate         string    `json:"subledger_control_gate"`
+	BankReconciliationGate       string    `json:"bank_reconciliation_gate"`
+	BankReconciliationCutoffDays int       `json:"bank_reconciliation_cutoff_days"`
+	FinancialControlGate         string    `json:"financial_control_gate"`
+	PostingBacklogCutoff         time.Time `json:"posting_backlog_cutoff"`
+	// ReperformedAfter is set on a reclose: every control run and bank
+	// reconciliation relied on postdates this reopen time.
+	ReperformedAfter *time.Time `json:"reperformed_after,omitempty"`
+	// ChecklistRequirementIDs are the active checklist items when it ran.
+	ChecklistRequirementIDs []string                `json:"checklist_requirement_ids"`
+	SubledgerControls       []RelianceControlRun    `json:"subledger_controls"`
+	BankReconciliations     []RelianceBankRecon     `json:"bank_reconciliations"`
+	ExcludedBankAccounts    []RelianceBankExclusion `json:"excluded_bank_accounts"`
+}
+
+// RelianceControlRun is the run that satisfied one required control.
+type RelianceControlRun struct {
+	Subledger    string    `json:"subledger"`
+	BookID       string    `json:"book_id,omitempty"`
+	ControlRunID string    `json:"control_run_id"`
+	RunAt        time.Time `json:"run_at"`
+}
+
+// RelianceBankRecon is the certified reconciliation that proved one account.
+type RelianceBankRecon struct {
+	BankAccountID string `json:"bank_account_id"`
+	RunID         string `json:"run_id"`
+	StatementDate string `json:"statement_date"`
+}
+
+// RelianceBankExclusion is an in-scope account the checklist waived.
+type RelianceBankExclusion struct {
+	BankAccountID string `json:"bank_account_id"`
+	RequirementID string `json:"requirement_id"`
+	Reason        string `json:"reason"`
 }
 
 type PeriodCreateRequest struct {
@@ -809,6 +874,15 @@ var (
 	// ErrFinancialControlUnavailable: financial-control-svc could not answer the
 	// close-gate question. Under enforce mode the close fails closed on it.
 	ErrFinancialControlUnavailable = errorString("financial-control-svc unavailable")
+	// ErrPostingBacklogForbidden: general-ledger-svc refused this principal
+	// its posting-backlog population (GL_CONTROL_POPULATION_READ). The close
+	// cannot prove nothing is left unposted, so it does not proceed — and the
+	// caller is told it is a permission, not an outage.
+	ErrTreasuryUnavailable           = errorString("treasury-svc unavailable")
+	ErrBankReconciliationUnavailable = errorString("bank-reconciliation-svc unavailable")
+	ErrUnknownBankAccount            = errorString("bank account is not registered to this legal entity in treasury-svc")
+	ErrCloseRequirementNotFound      = errorString("close requirement not found or already removed")
+	ErrPostingBacklogForbidden       = errorString("not permitted to read general-ledger-svc's posting backlog (GL_CONTROL_POPULATION_READ)")
 
 	// ErrLedgerPageTruncated is returned when the ledger answered with a full
 	// page, so there may be journals this service never saw. A trial balance
@@ -1042,3 +1116,111 @@ var (
 
 	ErrReconciliationMismatch = errorString("posted journal balances do not match the batch's own crosswalk totals")
 )
+
+// PostingBacklog is general-ledger-svc's posting backlog for one entity as a
+// close sees it: accounting events GL accepted before the cutoff that have not
+// reached COMMITTED (SUBMITTED, VALIDATING, READY, FAILED or QUARANTINED).
+// Each is a business fact whose accounting consequence is not in the ledger.
+type PostingBacklog struct {
+	// Count is the whole backlog, from the population's declared row count —
+	// not the length of Samples.
+	Count int64
+	// TooLarge: GL refused to enumerate the population (over its size limit).
+	// The count is unknown but certainly not zero.
+	TooLarge bool
+	// Samples are the first few items, for a blocker message a person can act
+	// on without opening another system.
+	Samples []PostingBacklogItem
+}
+
+// PostingBacklogItem is one unposted accounting event.
+type PostingBacklogItem struct {
+	Reference     string // the source event id, else the execution id
+	Status        string
+	FailureReason string
+}
+
+// Close requirement kinds (migration 000016).
+const (
+	CloseRequirementSubledgerControl     = "SUBLEDGER_CONTROL"
+	CloseRequirementBankAccountExclusion = "BANK_ACCOUNT_EXCLUSION"
+)
+
+// BaselineSubledgerControls are required at every entity's close and cannot be
+// removed: ZS-CONTROL-001 §22 names AR and AP among the mandatory subledger
+// controls without qualification.
+var BaselineSubledgerControls = []string{"AR", "AP"}
+
+// OptionalSubledgerControls are the subledger controls an entity's close
+// checklist may add (each is a RunSubledgerControl type).
+var OptionalSubledgerControls = []string{"ASSETS", "DEPRECIATION_COMPLETENESS", "INVENTORY_QUANTITY",
+	"INVENTORY_VALUE", "PROJECT_REVENUE", "STOCK_COUNT"}
+
+// CloseRequirement is one item of an entity's close checklist (ACC-14).
+type CloseRequirement struct {
+	RequirementID        string     `json:"requirement_id"`
+	TenantID             string     `json:"tenant_id"`
+	LegalEntityID        string     `json:"legal_entity_id"`
+	Kind                 string     `json:"kind"`
+	Subledger            string     `json:"subledger,omitempty"`
+	BookID               string     `json:"book_id,omitempty"`
+	BankAccountID        string     `json:"bank_account_id,omitempty"`
+	Reason               string     `json:"reason,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	RemovedAt            *time.Time `json:"removed_at,omitempty"`
+	RemovedByPrincipalID string     `json:"removed_by_principal_id,omitempty"`
+	RemovalReason        string     `json:"removal_reason,omitempty"`
+}
+
+// CloseRequirementRequest adds one checklist item.
+type CloseRequirementRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	Kind          string `json:"kind"`
+	Subledger     string `json:"subledger,omitempty"`
+	BookID        string `json:"book_id,omitempty"`
+	BankAccountID string `json:"bank_account_id,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+// RemoveCloseRequirementRequest removes one; the reason is mandatory.
+type RemoveCloseRequirementRequest struct {
+	Reason string `json:"reason"`
+}
+
+// CloseChecklist is an entity's whole close checklist: the fixed baseline
+// plus its active requirements.
+type CloseChecklist struct {
+	LegalEntityID             string             `json:"legal_entity_id"`
+	BaselineSubledgerControls []string           `json:"baseline_subledger_controls"`
+	RequiredSubledgerControls []CloseRequirement `json:"required_subledger_controls"`
+	ExcludedBankAccounts      []CloseRequirement `json:"excluded_bank_accounts"`
+}
+
+// BankAccountRef is a bank account as treasury-svc (BNK-01) reports it — the
+// fields the close needs to decide scope and name an account in a blocker.
+type BankAccountRef struct {
+	BankAccountID       string    `json:"bank_account_id"`
+	LegalEntityID       string    `json:"legal_entity_id"`
+	AccountName         string    `json:"account_name"`
+	MaskedAccountNumber string    `json:"masked_account_number"`
+	AccountStatus       string    `json:"account_status"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
+// BankReconRunDigest mirrors bank-reconciliation-svc's RunStatusDigest.
+type BankReconRunDigest struct {
+	RunID         string     `json:"run_id"`
+	StatementDate string     `json:"statement_date"`
+	Status        string     `json:"status"`
+	CertifiedAt   *time.Time `json:"certified_at,omitempty"`
+}
+
+// BankAccountReconStatus mirrors bank-reconciliation-svc's
+// AccountReconciliationStatus: per account, the latest certified run in the
+// period and the latest run of any status.
+type BankAccountReconStatus struct {
+	BankAccountID   string              `json:"bank_account_id"`
+	LatestCertified *BankReconRunDigest `json:"latest_certified,omitempty"`
+	LatestRun       *BankReconRunDigest `json:"latest_run,omitempty"`
+}

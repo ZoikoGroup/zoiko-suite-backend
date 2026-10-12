@@ -23,6 +23,39 @@ package domain
 
 import "time"
 
+type ExecutionRiskClass string
+
+const (
+	ExecutionRiskLow      ExecutionRiskClass = "LOW"
+	ExecutionRiskMedium   ExecutionRiskClass = "MEDIUM"
+	ExecutionRiskHigh     ExecutionRiskClass = "HIGH"
+	ExecutionRiskCritical ExecutionRiskClass = "CRITICAL"
+)
+
+func (s ExecutionRiskClass) Valid() bool {
+	switch s {
+	case ExecutionRiskLow, ExecutionRiskMedium, ExecutionRiskHigh, ExecutionRiskCritical:
+		return true
+	}
+	return false
+}
+
+type LegalApprovalStatus string
+
+const (
+	LegalApprovalApproved LegalApprovalStatus = "APPROVED"
+	LegalApprovalPending  LegalApprovalStatus = "PENDING"
+	LegalApprovalRejected LegalApprovalStatus = "REJECTED"
+)
+
+func (s LegalApprovalStatus) Valid() bool {
+	switch s {
+	case LegalApprovalApproved, LegalApprovalPending, LegalApprovalRejected:
+		return true
+	}
+	return false
+}
+
 // Capability is DATA per §B1's doctrine applied here too: CapabilityCode is
 // never a code switch/case in this service — only the owning feature's own
 // handler would ever branch on it, and this service doesn't implement
@@ -59,6 +92,18 @@ const (
 	MarketReleaseSuspended  MarketReleaseState = "SUSPENDED"
 	MarketReleaseRetired    MarketReleaseState = "RETIRED"
 )
+
+// Valid reports whether s is one of the 7 states doc7 §29 defines. A caller
+// must reject an invalid state at write time — ResolveCapability's fail-open
+// consequence otherwise was exactly the gap this method closes.
+func (s MarketReleaseState) Valid() bool {
+	switch s {
+	case MarketReleaseInternal, MarketReleasePilot, MarketReleaseBeta, MarketReleaseGA,
+		MarketReleaseRestricted, MarketReleaseSuspended, MarketReleaseRetired:
+		return true
+	}
+	return false
+}
 
 // MarketRelease answers "is this capability approved in this market/entity
 // jurisdiction and language" (doc7 §7 table, §Q1) — independent of whether
@@ -127,6 +172,38 @@ const (
 	ReleaseStateDisabled           ReleaseState = "DISABLED"
 	ReleaseStateIncidentRestricted ReleaseState = "INCIDENT_RESTRICTED"
 )
+
+// Valid reports whether s is one of the 6 states doc7 §7 defines.
+func (s ReleaseState) Valid() bool {
+	switch s {
+	case ReleaseStateGA, ReleaseStateBeta, ReleaseStatePilot, ReleaseStateInternal,
+		ReleaseStateDisabled, ReleaseStateIncidentRestricted:
+		return true
+	}
+	return false
+}
+
+// IntegrationHealthStatus is doc7 §29's "Integration health" value set,
+// verbatim. IntegrationCapability.HealthStatus and the request types below
+// stay plain string (their existing wire/storage shape) — this type exists
+// only to carry the defined value set and its Valid() check to the one
+// place (the handler) that must reject anything outside it.
+type IntegrationHealthStatus string
+
+const (
+	HealthStatusHealthy  IntegrationHealthStatus = "HEALTHY"
+	HealthStatusDegraded IntegrationHealthStatus = "DEGRADED"
+	HealthStatusFailed   IntegrationHealthStatus = "FAILED"
+	HealthStatusUnknown  IntegrationHealthStatus = "UNKNOWN"
+)
+
+func (s IntegrationHealthStatus) Valid() bool {
+	switch s {
+	case HealthStatusHealthy, HealthStatusDegraded, HealthStatusFailed, HealthStatusUnknown:
+		return true
+	}
+	return false
+}
 
 // Release is the capability's current operational state — e.g. flipped to
 // INCIDENT_RESTRICTED during an incident without touching market approval
@@ -202,4 +279,38 @@ var (
 	ErrReleaseNotFound               = errorString("release not found")
 	ErrClaimNotFound                 = errorString("capability claim not found")
 	ErrConflict                      = errorString("conflict: capability_code already exists")
+
+	// ErrIdempotencyKeyReused is INV-08's replay-safety guarantee: the same
+	// (operation, principal_id, idempotency_key) was already claimed by a
+	// request whose body hashed differently. Reusing a key for a materially
+	// different request is refused outright, never silently applied.
+	ErrIdempotencyKeyReused = errorString("idempotency key was already used for a different request")
 )
+
+// IdempotencyClaim is recorded in the same transaction as the write it
+// guards. Operation is the fixed per-endpoint scope; ResponseStatus and
+// ResponseBody preserve the original successful HTTP response for replays.
+type IdempotencyClaim struct {
+	Operation      string
+	TenantID       string
+	PrincipalID    string
+	Key            string
+	RequestSHA256  string
+	ResourceID     string
+	ResponseStatus int
+	ResponseBody   []byte
+	OutboxEventID  string
+	OutboxEntityID string
+	OutboxPayload  []byte
+}
+
+// IdempotentReplayError reports that this exact (operation, principal,
+// key, request body) was already successfully processed. The caller
+// returns the original persisted response rather than creating anything new.
+type IdempotentReplayError struct {
+	ResourceID     string
+	ResponseStatus int
+	ResponseBody   []byte
+}
+
+func (e *IdempotentReplayError) Error() string { return "idempotent replay of " + e.ResourceID }

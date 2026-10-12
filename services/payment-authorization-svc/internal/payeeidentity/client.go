@@ -29,6 +29,20 @@ type Destination struct {
 	DestinationID string `json:"DestinationID"`
 	LegalEntityID string `json:"LegalEntityID"`
 	Status        string `json:"Status"`
+	// The principals who changed this destination (ORG-10's own maker/
+	// verifier/approver record). AP-10 refuses to let any of them authorize
+	// a payment to it (spec §AP-10 SoD: payee-bank changer conflicts with
+	// payment authorization).
+	ProposedByPrincipalID string `json:"ProposedByPrincipalID"`
+	VerifiedByPrincipalID string `json:"VerifiedByPrincipalID"`
+	ApprovedByPrincipalID string `json:"ApprovedByPrincipalID"`
+}
+
+// ChangedBy reports whether principalID proposed, verified or approved this
+// destination.
+func (d *Destination) ChangedBy(principalID string) bool {
+	return principalID != "" && (d.ProposedByPrincipalID == principalID ||
+		d.VerifiedByPrincipalID == principalID || d.ApprovedByPrincipalID == principalID)
 }
 
 type Client interface {

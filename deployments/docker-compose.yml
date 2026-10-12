@@ -72,6 +72,9 @@ services:
       - ../services/procurement-workflow-svc/deployments/migrations:/migrations/procurement-workflow:ro
       - ../services/performance-review-svc/deployments/migrations:/migrations/performance-review:ro
       - ../services/delegated-authority-svc/deployments/migrations:/migrations/delegated-authority:ro
+      - ../services/currency-registry-svc/deployments/migrations:/migrations/currency-registry:ro
+      - ../services/fiscal-calendar-svc/deployments/migrations:/migrations/fiscal-calendar:ro
+      - ../services/accounting-period-svc/deployments/migrations:/migrations/accounting-period:ro
       - ../services/access-control-svc/deployments/migrations:/migrations/access-control:ro
       - ../services/decision-support-svc/deployments/migrations:/migrations/decision-support:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
@@ -933,7 +936,13 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "audit-event-store-svc"
-      KAFKA_TOPICS: "zoiko.identity.events,zoiko.entity.events,zoiko.workflow.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # AUD-01 requires this service to ingest every platform domain event, not
+      # just identity/entity/workflow — handleGenericDomainEvent (consumer.go)
+      # already stores any canonical-envelope event generically; this list was
+      # the missing half: without a Reader subscribed to a topic, no event on
+      # it is ever received regardless of how generic the handler is.
+      KAFKA_TOPICS: "zoiko.access-control.events,zoiko.accounts-payable.events,zoiko.accounts-receivable.events,zoiko.ai-governance.events,zoiko.asset.events,zoiko.authorization.events,zoiko.bank-reconciliation.events,zoiko.benefits.events,zoiko.board-resolutions.events,zoiko.capability-registry.events,zoiko.clause.events,zoiko.close.events,zoiko.comments-collaboration.events,zoiko.commercial-account.events,zoiko.compensation.events,zoiko.compliance.events,zoiko.configuration.events,zoiko.consolidation.events,zoiko.contract.events,zoiko.corporate-actions.events,zoiko.corporate-tax.events,zoiko.counterparty.events,zoiko.decision-support.events,zoiko.delegated-authority.events,zoiko.employee.events,zoiko.entity.events,zoiko.evidence-requirements.events,zoiko.evidence.events,zoiko.expense-claim.events,zoiko.financial-control.events,zoiko.general-ledger.events,zoiko.goods-service-receipt.events,zoiko.governance.events,zoiko.identity.events,zoiko.intercompany.events,zoiko.inventory.events,zoiko.invoice-approval.events,zoiko.jurisdiction.events,zoiko.kill-switch-registry.events,zoiko.leaveabsence.events,zoiko.metric-registry.events,zoiko.notification.events,zoiko.obligation-tracking.events,zoiko.obligations.events,zoiko.offboarding.events,zoiko.orgstructure.events,zoiko.payable-open-item.events,zoiko.payee-banking-identity.events,zoiko.payment-authorization.events,zoiko.payment-initiation.events,zoiko.payment-proposal.events,zoiko.payment-run.events,zoiko.payment-status.events,zoiko.payroll.events,zoiko.payrollexceptions.events,zoiko.payrolltax.events,zoiko.performance-review.events,zoiko.policy.events,zoiko.privacy-consent.events,zoiko.privacy-decision.events,zoiko.privacy-purpose-registry.events,zoiko.privacy-rights.events,zoiko.privacy-transfer.events,zoiko.procurement-workflow.events,zoiko.project.events,zoiko.purchase-order.events,zoiko.purchase-request.events,zoiko.retention-registry.events,zoiko.secretvault.events,zoiko.source-authority.events,zoiko.spend-controls.events,zoiko.supplier-financial-profile.events,zoiko.supplier-recovery.events,zoiko.tax-determination.events,zoiko.tax-rules.events,zoiko.treasury.events,zoiko.vat-gst.events,zoiko.vendor-due-diligence.events,zoiko.workflow.events"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -1401,12 +1410,22 @@ services:
       # This service had no authorization at all — every route was open,
       # including the one that returns the bytes of a RESTRICTED document.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Without this, config.go's own default ("localhost:9092") resolves
+      # inside this container to its own loopback, where nothing listens —
+      # Kafka is a separate container reachable only as "kafka:9094". Every
+      # outbox publish attempt failed with "connection refused" until this
+      # was added; combined with a since-fixed code bug (the Writer and the
+      # Message both carrying a Topic), the transactional outbox had never
+      # actually delivered a single event to Kafka.
+      KAFKA_BROKERS: "kafka:9094"
     volumes:
       - document_vault_storage:/data/documents
     depends_on:
       postgres:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
       document-vault-storage-init:
         condition: service_completed_successfully
@@ -1600,6 +1619,8 @@ services:
         condition: service_healthy
       workflow-svc:
         condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8097/healthz"]
       interval: 10s
@@ -1616,8 +1637,9 @@ services:
   # enforces tenant isolation, same posture as tenant-entity-registry-svc.
   general-ledger-svc:
     build:
-      context: ../services/general-ledger-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: general-ledger-svc/Dockerfile
     container_name: general-ledger-svc
     mem_limit: 256m
     cpus: "0.5"
@@ -1625,6 +1647,13 @@ services:
       - "8098:8098"
     environment:
       PORT: "8098"
+      # REF-05 cutover phase 2. off = today's behavior exactly. shadow = also ask
+      # accounting-period-svc by posting date and COMPARE (never changes the
+      # outcome). "enforce" is rejected at startup: that is phase 4 and needs
+      # separate sign-off. Leave off until periods are backfilled, or every
+      # comparison reports not_found.
+      PERIOD_GATE_MODE: "off"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: general_ledger
@@ -1633,6 +1662,8 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.general-ledger.events"
+      # Required, no default (ZS-EVENT-001 §4 residencyregion).
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
@@ -1770,6 +1801,10 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-order.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PURCHASE_REQUEST_SERVICE_URL: "http://purchase-request-svc:8100"
+      SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
+      PROCUREMENT_WORKFLOW_SERVICE_URL: "http://procurement-workflow-svc:8134"
+      PO_HIGH_VALUE_THRESHOLD: "${PO_HIGH_VALUE_THRESHOLD:-0}"
+      PO_OVER_TOLERANCE_PERCENT: "${PO_OVER_TOLERANCE_PERCENT:-0}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2195,6 +2230,130 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # Currency Registry Service (REF-02). Global reference data: ISO 4217
+  # currencies, versioned minor-unit metadata and the platform support
+  # lifecycle. Owns NO FX rates, functional-currency assignment or amounts.
+  # Reads (validate/get/list) do not call authorization-svc; commands do and
+  # fail closed. Port 8172 was the next unused service port at the time of
+  # writing (8171 was the highest registered).
+  currency-registry-svc:
+    build:
+      context: ../services/currency-registry-svc
+      dockerfile: Dockerfile
+    container_name: currency-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8172:8172"
+    environment:
+      PORT: "8172"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: currency_registry
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.currency-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8172/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Fiscal Calendar Service (REF-04). Calendar definitions and versions as data;
+  # deterministic period preview. Owns NO period state (REF-05) and NO postings.
+  # Activating a non-first calendar version asks accounting-period-svc whether
+  # periods are already closed, and fails closed if it cannot be reached.
+  # Needs authz actions FISCAL_CALENDAR_PROPOSE / _APPROVE / _ACTIVATE seeded.
+  fiscal-calendar-svc:
+    build:
+      context: ../services/fiscal-calendar-svc
+      dockerfile: Dockerfile
+    container_name: fiscal-calendar-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8173:8173"
+    environment:
+      PORT: "8173"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: fiscal_calendar
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.fiscal-calendar.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8173/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Accounting Period Service (REF-05). Authoritative period state and the
+  # posting gate. A missing period is "not allowed", never OPEN. Close and
+  # reopen commands are refused until financial-close-svc serves
+  # /v1/close/workflow-refs/{ref} (not built yet) — fail closed by design.
+  # Needs authz actions PERIOD_STATE_COMMAND / PERIOD_MATERIALIZE seeded.
+  accounting-period-svc:
+    build:
+      context: ../services/accounting-period-svc
+      dockerfile: Dockerfile
+    container_name: accounting-period-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8174:8174"
+    environment:
+      PORT: "8174"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: accounting_period
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.accounting-period.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      FISCAL_CALENDAR_URL: "http://fiscal-calendar-svc:8173"
+      FINANCIAL_CLOSE_URL: "http://financial-close-svc:8104"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8174/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   # Access Control Service — 03-microservices.md §9.4. Owns role/permission-
   # bundle DEFINITIONS (the catalogue); previously unbuilt. Scope decision:
   # authorization-svc keeps owning live RBAC role/assignment data — this
@@ -2496,6 +2655,14 @@ services:
       - "8104:8104"
     environment:
       PORT: "8104"
+      # REF-05 cutover phase 1. The mirror is best-effort dual-write of lock and
+      # reopen into accounting-period-svc; financial-close-svc stays
+      # authoritative. off = no outbound calls, no workflow refs written. The
+      # provenance endpoint /v1/close/workflow-refs/{ref} is served either way.
+      PERIOD_SERVICE_MIRROR: "off"
+      ACCOUNTING_PERIOD_URL: "http://accounting-period-svc:8174"
+      WORKFLOW_REF_CALLERS: "accounting-period-svc"
+      PERIOD_MIRROR_REOPEN_WINDOW: "24h"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: financial_close
@@ -2529,6 +2696,18 @@ services:
       # FINCTRL_CLOSE_GATE_MODE=enforce; off until mandatory controls are configured.
       FINCTRL_SERVICE_URL: "http://financial-control-svc:8171"
       FINCTRL_CLOSE_GATE_MODE: "off"
+      # ACC-06: close requires the period's latest AR and AP subledger-to-GL
+      # control runs to have MATCHED. Default enforce; "off" only while the
+      # AR/AP control-account mappings are not configured.
+      SUBLEDGER_CONTROL_GATE_MODE: "enforce"
+      # ACC-14 bank recon: every operational bank account (treasury) needs a
+      # certified reconciliation (bank-reconciliation) for a statement dated in
+      # the period, within BANK_RECON_CUTOFF_DAYS of period end. "off" only
+      # where no bank feed exists yet.
+      TREASURY_SERVICE_URL: "http://treasury-svc:8103"
+      BANK_RECONCILIATION_SERVICE_URL: "http://bank-reconciliation-svc:8102"
+      BANK_RECON_GATE_MODE: "enforce"
+      BANK_RECON_CUTOFF_DAYS: "4"
       # The three topics this service's own ACC-18 lineage Kafka consumer
       # subscribes to (asset-management-svc's, inventory-management-svc's
       # and project-accounting-svc's own events topics) — satisfies the
@@ -3768,7 +3947,16 @@ services:
       - "8144:8144"
     environment:
       PORT: "8144"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/commercial_account?sslmode=disable"
+      # zoiko_app, not the postgres superuser: commercial_account has no
+      # dedicated app_ role of its own (absent from create-app-roles.sh's
+      # SERVICES list), so it uses the shared least-privilege runtime role
+      # init-db.sh provisions for every database that doesn't claim one.
+      # zoiko_app is NOSUPERUSER NOBYPASSRLS, which is what makes this
+      # database's tenant RLS policies (migration 000005_add_rls.up.sql)
+      # actually apply instead of being silently inert to a superuser
+      # connection — same fix already applied to the 5 privacy-domain
+      # services.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/commercial_account?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3803,7 +3991,19 @@ services:
       - "8145:8145"
     environment:
       PORT: "8145"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/capability_registry?sslmode=disable"
+      # zoiko_app, not the postgres superuser. This database has no RLS
+      # policies (capabilities/market_releases/releases/etc. are a
+      # deliberate platform-wide registry with no tenant_id column — see
+      # the audit's own note on this), so there is no bypassed-RLS
+      # vulnerability here the way there was for the 5 privacy services
+      # and commercial-account-svc. This flip is purely the same
+      # least-privilege hardening those fixes used: capability_registry
+      # has no dedicated app_ role of its own, zoiko_app already has
+      # complete grants on all 7 tables here, and running as an ordinary,
+      # non-superuser role is still strictly safer defense-in-depth
+      # (limits blast radius of a SQL-injection or migration mistake)
+      # even with no RLS to activate.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/capability_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3827,7 +4027,8 @@ services:
   # keeping and gate-checking for AI runs, action-risk classification,
   # automation allowlists, provider/model registry, and maker-checker
   # self-approval blocking — never runs models or executes automations
-  # itself.
+  # itself. Keep the service private to the compose network; authenticated
+  # browser requests must pass through gateway-auth-svc.
   ai-governance-svc:
     build:
       context: ../services/ai-governance-svc
@@ -3839,7 +4040,16 @@ services:
       - "8146:8146"
     environment:
       PORT: "8146"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/ai_governance?sslmode=disable"
+      # zoiko_app, not the postgres superuser: ai_governance has no
+      # dedicated app_ role of its own, and this database genuinely has
+      # active RLS policies (ai_runs, ai_use_cases, ai_executions,
+      # ai_incidents, ai_output_dispositions, automation_policies,
+      # automation_actions, ai_impact_assessments — confirmed live via
+      # pg_class) that a superuser connection silently bypasses — the
+      # same platform-wide issue already fixed for the 5 privacy services
+      # and commercial-account-svc. zoiko_app already has complete grants
+      # on all 13 tables here.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/ai_governance?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3893,7 +4103,18 @@ services:
       - "8147:8147"
     environment:
       PORT: "8147"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/kill_switch_registry?sslmode=disable"
+      # Migration 000002_add_rls.up.sql FORCEs row-level security specifically
+      # because this is "the one service in the tier where a naive tenant
+      # policy is not an outage or a leak but a SILENT SAFETY BYPASS" (its own
+      # words). FORCE ROW LEVEL SECURITY does not apply to a true superuser —
+      # this was connecting as ${DB_USER:-postgres}, which defaulted to the
+      # postgres superuser (rolsuper=true, rolbypassrls=true) with nothing in
+      # this repo ever overriding it, so every carefully-designed RLS policy
+      # here was unconditionally bypassed. zoiko_app (NOSUPERUSER, NOBYPASSRLS)
+      # already holds the needed grants on kill_switch_events/outbox_events —
+      # same least-privilege role every other RLS-dependent service in this
+      # file uses.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/kill_switch_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.kill-switch-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3928,7 +4149,18 @@ services:
       - "8148:8148"
     environment:
       PORT: "8148"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/retention_registry?sslmode=disable"
+      # Migration 000002_add_rls.up.sql FORCEs row-level security specifically
+      # because, in its own words, this is a case where the naive policy
+      # failure "is IRREVERSIBLE" (a hidden legal hold or retention policy
+      # leads straight to spoliation, not just a leak). FORCE ROW LEVEL
+      # SECURITY does not bind a true superuser — this was connecting as
+      # ${DB_USER:-postgres}, which defaulted to the postgres superuser
+      # (rolsuper=true, rolbypassrls=true) with nothing in this repo ever
+      # overriding it, exactly the defect found and fixed for
+      # kill-switch-registry-svc in this same pass. zoiko_app (NOSUPERUSER,
+      # NOBYPASSRLS) already holds the needed grants on retention_policies,
+      # legal_holds, and outbox_events.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/retention_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.retention-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4004,7 +4236,15 @@ services:
       - "8151:8151"
     environment:
       PORT: "8151"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_purpose_registry?sslmode=disable"
+      # zoiko_app, not the postgres superuser: privacy_purpose_registry has no
+      # dedicated app_ role of its own (absent from create-app-roles.sh's
+      # SERVICES list), so it uses the shared least-privilege runtime role
+      # init-db.sh provisions for every database that doesn't claim one — see
+      # that script's "Runtime role: zoiko_app" section. zoiko_app is
+      # NOSUPERUSER NOBYPASSRLS, which is what makes this database's
+      # tenant_isolation_policy actually apply instead of being silently
+      # inert to a superuser connection.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_purpose_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-purpose-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4042,7 +4282,9 @@ services:
       - "8152:8152"
     environment:
       PORT: "8152"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_consent?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_consent?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-consent.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4089,7 +4331,9 @@ services:
       - "8153:8153"
     environment:
       PORT: "8153"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_decision?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_decision?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-decision.events"
       PURPOSE_REGISTRY_URL: "http://privacy-purpose-registry-svc:8151"
@@ -4143,7 +4387,9 @@ services:
       - "8154:8154"
     environment:
       PORT: "8154"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_rights?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_rights?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-rights.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4187,7 +4433,9 @@ services:
       - "8155:8155"
     environment:
       PORT: "8155"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_transfer?sslmode=disable"
+      # zoiko_app, not the postgres superuser — see the same note on
+      # privacy-purpose-registry-svc above.
+      DATABASE_URL: "postgres://${DB_USER:-zoiko_app}:${DB_PASSWORD:-zoiko_app_password}@postgres:5432/privacy_transfer?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.privacy-transfer.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -4287,6 +4535,15 @@ services:
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PURCHASE_ORDER_SERVICE_URL: "http://purchase-order-svc:8129"
       GENERAL_LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      # Service identities for the two background workers. Deliberately no
+      # default: while one is empty its worker stays off and the work waits
+      # PENDING (visible, nothing lost) rather than acting under an invented id.
+      #   ACCOUNTING_PRINCIPAL_ID  must hold GL_POSTING_EXECUTE (GRNI postings).
+      #   PO_PROGRESS_PRINCIPAL_ID must hold PO_PROGRESS_RECORD (received-quantity
+      #                            deltas to purchase-order-svc).
+      ACCOUNTING_PRINCIPAL_ID: "${GOODS_RECEIPT_ACCOUNTING_PRINCIPAL_ID:-}"
+      PO_PROGRESS_PRINCIPAL_ID: "${GOODS_RECEIPT_PO_PROGRESS_PRINCIPAL_ID:-}"
+      OVER_RECEIPT_TOLERANCE_PCT: "${OVER_RECEIPT_TOLERANCE_PCT:-0}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4341,6 +4598,9 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.payable-open-item.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # BNK-07: a payment is applied to a payable only once Banking reports
+      # it SETTLED. Not a depends_on (AP-08 fails closed per call instead).
+      PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4587,6 +4847,12 @@ services:
       SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
       PAYEE_IDENTITY_SERVICE_URL: "http://payee-banking-identity-svc:8166"
       POLICY_SERVICE_URL: "http://policy-svc:8085"
+      # AP-10 controls: how long an unused authorization stays valid, how often
+      # overdue ones are expired, and how many distinct signers a high-value
+      # payment needs.
+      AUTHORIZATION_TTL: "24h"
+      EXPIRY_SWEEP_INTERVAL: "1m"
+      HIGH_VALUE_REQUIRED_SIGNATURES: "2"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4653,6 +4919,14 @@ services:
       PAYMENT_AUTHORIZATION_SERVICE_URL: "http://payment-authorization-svc:8160"
       PAYMENT_INITIATION_ADAPTER_URL: "http://payment-initiation-adapter-svc:8162"
       PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
+      PAYMENT_PROPOSAL_SERVICE_URL: "http://payment-proposal-svc:8159"
+      PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
+      # ACC-04 settlement postings. The principal must hold GL_POSTING_EXECUTE in
+      # authorization-svc (an internal service identity, never a human role).
+      # Deliberately no default: while it is empty the dispatcher stays off and
+      # posting requests wait PENDING rather than posting under an invented id.
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      ACCOUNTING_PRINCIPAL_ID: "${PAYMENT_RUN_ACCOUNTING_PRINCIPAL_ID:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -4665,6 +4939,10 @@ services:
       payment-initiation-adapter-svc:
         condition: service_healthy
       payment-status-svc:
+        condition: service_healthy
+      payment-proposal-svc:
+        condition: service_healthy
+      payable-open-item-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

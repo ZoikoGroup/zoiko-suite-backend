@@ -38,7 +38,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
-		asset_events,
+		asset_event_schedule_effects, asset_events,
 		depreciation_lines, depreciation_run_population, depreciation_runs, depreciation_schedules,
 		asset_book_assignments, asset_components, fixed_assets
 		CASCADE;`)

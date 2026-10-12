@@ -90,6 +90,14 @@ type Store interface {
 	// internal/store/profitability_store.go's own doc comments.
 	GetLatestCertifiedSnapshot(ctx context.Context, projectID string) (*domain.ProfitabilitySnapshot, error)
 	GetProfitabilitySnapshotAsOf(ctx context.Context, projectID string, asOf time.Time) (*domain.ProfitabilitySnapshot, error)
+
+	// PRJ-03 milestone-based recognition and PRJ-02 batch ingestion helpers.
+	DefineMilestone(ctx context.Context, m *domain.Milestone) error
+	GetMilestone(ctx context.Context, milestoneID string) (*domain.Milestone, error)
+	ListMilestones(ctx context.Context, projectID string) ([]domain.Milestone, error)
+	MarkMilestoneAchieved(ctx context.Context, milestoneID, principalID, evidenceRef string, at time.Time) error
+	ApproveMilestoneAchievement(ctx context.Context, milestoneID, principalID string, at time.Time) error
+	ListRunMilestones(ctx context.Context, runID string) ([]domain.RunMilestone, error)
 }
 
 // RecognitionLedgerClient is PRJ-03's own real "ACC-04" dependency — see
@@ -197,6 +205,11 @@ const (
 	// with real certification consequence and gets its own action.
 	actionProjectProfitabilityRead    = "PROJECT_PROFITABILITY_READ"
 	actionProjectProfitabilityCertify = "PROJECT_PROFITABILITY_CERTIFY"
+
+	// PRJ-03 milestone actions. Approval is deliberately distinct from
+	// manage (define / mark achieved) - SoD on achievement.
+	actionProjectMilestoneManage  = "PROJECT_MILESTONE_MANAGE"
+	actionProjectMilestoneApprove = "PROJECT_MILESTONE_APPROVE"
 )
 
 type Handler struct {
@@ -247,6 +260,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}/financial-profile", h.GetFinancialProfile)
 		r.Get("/{id}/available-actions", h.GetAvailableActions)
 		r.Post("/{id}/certify-costs", h.CertifyCostPopulation)
+
+		r.Post("/{id}/costs/ingest", h.IngestProjectCosts)
+		r.Post("/{id}/milestones", h.DefineMilestone)
+		r.Get("/{id}/milestones", h.ListMilestones)
+		r.Post("/{id}/milestones/{milestone_id}/achieve", h.MarkMilestoneAchieved)
+		r.Post("/{id}/milestones/{milestone_id}/approve", h.ApproveMilestoneAchievement)
 	})
 	r.Route("/v1/cost-entries", func(r chi.Router) {
 		r.Post("/", h.CaptureProjectCost)
@@ -273,6 +292,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Route("/runs", func(r chi.Router) {
 			r.Post("/", h.CreateRecognitionRun)
 			r.Get("/{id}", h.GetRecognitionRun)
+			r.Get("/{id}/milestones", h.GetRunMilestones)
 			r.Post("/{id}/calculate", h.CalculateRecognitionRun)
 			r.Post("/{id}/validate", h.ValidateRecognitionRun)
 			r.Post("/{id}/approve", h.ApproveRecognitionRun)
@@ -750,9 +770,9 @@ func (h *Handler) AmendFinancialProfile(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	switch req.RecognitionMethod {
-	case domain.RecognitionMethodPercentageOfCompletion, domain.RecognitionMethodCompletedContract, domain.RecognitionMethodTimeAndMaterials:
+	case domain.RecognitionMethodPercentageOfCompletion, domain.RecognitionMethodCompletedContract, domain.RecognitionMethodTimeAndMaterials, domain.RecognitionMethodMilestone:
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_recognition_method", "recognition_method must be one of PERCENTAGE_OF_COMPLETION, COMPLETED_CONTRACT, TIME_AND_MATERIALS")
+		writeError(w, http.StatusBadRequest, "invalid_recognition_method", "recognition_method must be one of PERCENTAGE_OF_COMPLETION, COMPLETED_CONTRACT, TIME_AND_MATERIALS, MILESTONE")
 		return
 	}
 	switch req.BillingType {

@@ -39,6 +39,18 @@ func newSubscriptionStubData() *subscriptionStubData {
 	}
 }
 
+// SeedAccount registers an account in the stub store so subscription handlers
+// can resolve its owning OrganizationID during authorization checks (tracker row 84a).
+func (s *stubStore) SeedAccount(accountID, orgID string) {
+	s.accounts[accountID] = &domain.CommercialAccount{
+		CommercialAccountID: accountID,
+		OrganizationID:      orgID,
+		LegalCustomerName:   "Test Org " + orgID,
+		BillingCurrencyCode: "USD",
+		Status:              domain.CommercialAccountStatusActive,
+	}
+}
+
 func (s *stubStore) CreatePriceCatalog(_ context.Context, c *domain.PriceCatalog) error {
 	for _, existing := range s.sub.catalogs {
 		if existing.CatalogCode == c.CatalogCode {

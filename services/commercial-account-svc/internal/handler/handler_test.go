@@ -285,3 +285,79 @@ func TestGetCommercialAccount_NotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
+
+func TestReadEndpoints_AuthzDenied_Refused(t *testing.T) {
+	store := newStubStore()
+	store.accounts["ca-test-001"] = &domain.CommercialAccount{
+		CommercialAccountID: "ca-test-001",
+		OrganizationID:      "org-test-01",
+		Status:              domain.CommercialAccountStatusActive,
+	}
+	store.memberships["mem-test-001"] = &domain.Membership{
+		MembershipID:   "mem-test-001",
+		OrganizationID: "org-test-01",
+		PrincipalID:    "principal-test-01",
+		Status:         domain.MembershipStatusActive,
+	}
+	deniedAuthz := &stubAuthz{err: authz.ErrAuthorizationDenied}
+	logger, _ := zap.NewDevelopment()
+	h := New(store, &stubPublisher{}, deniedAuthz, logger)
+	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
+	RegisterRoutes(r, h)
+
+	for _, tc := range []struct {
+		name, method, path string
+	}{
+		{"get commercial account", http.MethodGet, "/v1/commercial-accounts/ca-test-001"},
+		{"get membership", http.MethodGet, "/v1/memberships/mem-test-001"},
+		{"list memberships", http.MethodGet, "/v1/organizations/org-test-01/memberships"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, buildRequest(tc.method, tc.path, nil))
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 Forbidden on authz denial, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestReadEndpoints_MissingPrincipal_Refused(t *testing.T) {
+	store := newStubStore()
+	store.accounts["ca-test-001"] = &domain.CommercialAccount{
+		CommercialAccountID: "ca-test-001",
+		OrganizationID:      "org-test-01",
+		Status:              domain.CommercialAccountStatusActive,
+	}
+	store.memberships["mem-test-001"] = &domain.Membership{
+		MembershipID:   "mem-test-001",
+		OrganizationID: "org-test-01",
+		PrincipalID:    "principal-test-01",
+		Status:         domain.MembershipStatusActive,
+	}
+	logger, _ := zap.NewDevelopment()
+	h := New(store, &stubPublisher{}, &stubAuthz{}, logger)
+	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
+	RegisterRoutes(r, h)
+
+	for _, tc := range []struct {
+		name, method, path string
+	}{
+		{"get commercial account", http.MethodGet, "/v1/commercial-accounts/ca-test-001"},
+		{"get membership", http.MethodGet, "/v1/memberships/mem-test-001"},
+		{"list memberships", http.MethodGet, "/v1/organizations/org-test-01/memberships"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := buildRequest(tc.method, tc.path, nil)
+			req.Header.Del("X-Principal-Id")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 Unauthorized with missing X-Principal-Id, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+

@@ -71,9 +71,10 @@ func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) *Client {
 	}
 }
 
-// Authorize is a legacy no-op stub retained for backward compatibility.
-// It is not used by any handler; CheckAllowed enforces the real fail-closed
-// authorization contract and should be used for all write actions.
+// CheckAllowed asks authorization-svc whether principalID may perform
+// actionType within legalEntityID, enforcing the real fail-closed
+// authorization contract (see checkAllowedLive) behind a short-TTL cache of
+// only real GRANTED/DENIED decisions.
 func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
 	key := principalID + "|" + legalEntityID + "|" + actionType
 

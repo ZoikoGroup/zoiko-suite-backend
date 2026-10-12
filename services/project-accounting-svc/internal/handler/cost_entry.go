@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -34,20 +35,37 @@ func (h *Handler) AllocateSharedCostToProject(w http.ResponseWriter, r *http.Req
 	h.captureProjectCost(w, r, req, actionProjectCostCapture)
 }
 
-func (h *Handler) captureProjectCost(w http.ResponseWriter, r *http.Request, req domain.CaptureProjectCostRequest, action string) {
+// captureFailure is a pure-data description of why one capture line was
+// refused — the single-line endpoint writes it as an HTTP error, the batch
+// endpoint (IngestProjectCosts) reports it per line. Both paths therefore
+// share one set of guards and one set of error codes.
+type captureFailure struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+// validateCaptureLine is the request-shape validation every capture path
+// runs before touching identity, the store or authz.
+func validateCaptureLine(req domain.CaptureProjectCostRequest) *captureFailure {
 	if req.ProjectID == "" || req.SourceReference == "" || req.Currency == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "project_id, source_reference and currency are required")
-		return
+		return &captureFailure{http.StatusBadRequest, "missing_fields", "project_id, source_reference and currency are required"}
 	}
 	if req.SourceType == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", domain.ErrSourceTypeRequired.Error())
-		return
+		return &captureFailure{http.StatusBadRequest, "missing_fields", domain.ErrSourceTypeRequired.Error()}
 	}
 	switch req.SourceType {
 	case domain.CostSourceTypeAP, domain.CostSourceTypePayroll, domain.CostSourceTypeInventory,
 		domain.CostSourceTypeAsset, domain.CostSourceTypeAllocation, domain.CostSourceTypeManual:
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_source_type", "source_type must be one of AP, PAYROLL, INVENTORY, ASSET, ALLOCATION, MANUAL")
+		return &captureFailure{http.StatusBadRequest, "invalid_source_type", "source_type must be one of AP, PAYROLL, INVENTORY, ASSET, ALLOCATION, MANUAL"}
+	}
+	return nil
+}
+
+func (h *Handler) captureProjectCost(w http.ResponseWriter, r *http.Request, req domain.CaptureProjectCostRequest, action string) {
+	if f := validateCaptureLine(req); f != nil {
+		writeError(w, f.Status, f.Code, f.Message)
 		return
 	}
 	principalID, ok := h.requirePrincipal(w, r)
@@ -57,25 +75,51 @@ func (h *Handler) captureProjectCost(w http.ResponseWriter, r *http.Request, req
 	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
-	p, err := h.store.GetProject(r.Context(), req.ProjectID)
-	if err != nil {
-		h.writeProjectErr(w, err)
+	e, _, p, f := h.captureCostLine(r.Context(), principalID, req, action)
+	if f != nil {
+		writeError(w, f.Status, f.Code, f.Message)
 		return
+	}
+	// Single-line behaviour is unchanged: the event is published and the
+	// entry returned whether it was newly captured or an idempotent hit.
+	h.publisher.PublishProjectCostCaptured(r.Context(), getCorrelationID(r), principalID, p.TenantID, *e)
+	writeJSON(w, http.StatusCreated, e)
+}
+
+// captureCostLine is the ONE real capture code path — project lookup, the
+// project-must-be-ACTIVE guard, authz, and the idempotent store insert on
+// (tenant, source_type, source_reference). duplicate is true when the store
+// returned a pre-existing entry instead of inserting. It never posts to the
+// GL. Callers must have run validateCaptureLine and resolved identity.
+func (h *Handler) captureCostLine(ctx context.Context, principalID string, req domain.CaptureProjectCostRequest, action string) (e *domain.CostEntry, duplicate bool, p *domain.Project, f *captureFailure) {
+	p, err := h.store.GetProject(ctx, req.ProjectID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrProjectNotFound):
+			return nil, false, nil, &captureFailure{http.StatusNotFound, "project_not_found", ""}
+		case errors.Is(err, domain.ErrInvalidProjectTransition):
+			return nil, false, nil, &captureFailure{http.StatusUnprocessableEntity, "invalid_transition", err.Error()}
+		default:
+			h.log.Error("project accounting store unavailable", zap.Error(err))
+			return nil, false, nil, &captureFailure{http.StatusServiceUnavailable, "store_unavailable", err.Error()}
+		}
 	}
 	if p.Status != domain.ProjectStatusActive {
-		writeError(w, http.StatusUnprocessableEntity, "project_not_active", domain.ErrProjectNotActiveForCostCapture.Error())
-		return
+		return nil, false, nil, &captureFailure{http.StatusUnprocessableEntity, "project_not_active", domain.ErrProjectNotActiveForCostCapture.Error()}
 	}
-	if err := h.authz.CheckAllowed(r.Context(), principalID, p.LegalEntityID, action); err != nil {
-		h.writeAuthzErr(w, err)
-		return
+	if err := h.authz.CheckAllowed(ctx, principalID, p.LegalEntityID, action); err != nil {
+		if errors.Is(err, domain.ErrAuthorizationDenied) {
+			return nil, false, nil, &captureFailure{http.StatusForbidden, "forbidden", err.Error()}
+		}
+		h.log.Error("authorization check failed", zap.Error(err))
+		return nil, false, nil, &captureFailure{http.StatusServiceUnavailable, "authz_unavailable", err.Error()}
 	}
 
 	transactionDate := time.Now().UTC()
 	if req.TransactionDate != nil {
 		transactionDate = *req.TransactionDate
 	}
-	e := &domain.CostEntry{
+	e = &domain.CostEntry{
 		EntryID: uuid.NewString(), LegalEntityID: p.LegalEntityID, ProjectID: req.ProjectID,
 		SourceType: req.SourceType, SourceReference: req.SourceReference, CostCategory: req.CostCategory,
 		Quantity: req.Quantity, Amount: req.Amount, Currency: req.Currency, TransactionDate: transactionDate,
@@ -84,13 +128,14 @@ func (h *Handler) captureProjectCost(w http.ResponseWriter, r *http.Request, req
 	if req.WBSID != "" {
 		e.WBSID = &req.WBSID
 	}
-	if err := h.store.CaptureProjectCost(r.Context(), e); err != nil {
+	newID := e.EntryID
+	if err := h.store.CaptureProjectCost(ctx, e); err != nil {
 		h.log.Error("failed to capture project cost", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
+		return nil, false, nil, &captureFailure{http.StatusServiceUnavailable, "store_unavailable", err.Error()}
 	}
-	h.publisher.PublishProjectCostCaptured(r.Context(), getCorrelationID(r), principalID, p.TenantID, *e)
-	writeJSON(w, http.StatusCreated, e)
+	// On an idempotent hit the store overwrites *e with the EXISTING row,
+	// so its id differs from the one we just generated.
+	return e, e.EntryID != newID, p, nil
 }
 
 // ── GET /v1/cost-entries/{id}, GET /v1/cost-entries ──────────────────────────

@@ -13,7 +13,6 @@ import (
 	authzpkg "zoiko.io/supplier-recovery-svc/internal/authz"
 	"zoiko.io/supplier-recovery-svc/internal/bankreconciliation"
 	"zoiko.io/supplier-recovery-svc/internal/domain"
-	"zoiko.io/supplier-recovery-svc/internal/events"
 	svcmiddleware "zoiko.io/supplier-recovery-svc/internal/middleware"
 	"zoiko.io/supplier-recovery-svc/internal/payableopenitem"
 	"zoiko.io/supplier-recovery-svc/internal/store"
@@ -41,15 +40,14 @@ type AuthzChecker interface {
 
 type Handler struct {
 	store    store.Store
-	pub      events.Publisher
 	authz    AuthzChecker
 	payables payableopenitem.Client
 	bankrec  bankreconciliation.Client
 	log      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, payables payableopenitem.Client, bankrec bankreconciliation.Client, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, payables: payables, bankrec: bankrec, log: log}
+func New(st store.Store, az AuthzChecker, payables payableopenitem.Client, bankrec bankreconciliation.Client, log *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, payables: payables, bankrec: bankrec, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -76,8 +74,28 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// errorCode is the stable, machine-readable class of a failure; callers branch on
+// it rather than on the human-readable message.
+func errorCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "VALIDATION_FAILED"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "FORBIDDEN"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "STATE_CONFLICT"
+	case http.StatusServiceUnavailable:
+		return "DEPENDENCY_UNAVAILABLE"
+	}
+	return "ERROR"
+}
+
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeJSON(w, status, map[string]string{"error": msg, "code": errorCode(status)})
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -185,10 +203,6 @@ func (h *Handler) CreateSupplierRecoveryCase(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRecoveryCaseCreated, EntityID: created.CaseID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: created,
-	})
 	writeJSON(w, http.StatusCreated, created)
 }
 
@@ -309,10 +323,6 @@ func (h *Handler) ApproveRecoveryPlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRecoveryPlanApproved, EntityID: updated.CaseID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -349,10 +359,6 @@ func (h *Handler) RecordSupplierCommitment(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventCommitmentRecorded, EntityID: caseID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: commitment,
-	})
 	writeJSON(w, http.StatusCreated, commitment)
 }
 
@@ -403,6 +409,13 @@ func (h *Handler) ApplyApprovedOffset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Refuse an over-recovery BEFORE AP-08 is touched: AP-08 would otherwise reduce
+	// the payable and this service would then reject the same amount locally.
+	if req.Amount > c.TotalAmount-c.RecoveredAmount+0.005 {
+		writeError(w, http.StatusConflict, domain.ErrRecoveryExceedsOutstanding.Error())
+		return
+	}
+
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
 	if _, err := h.payables.ApplyRecovery(r.Context(), verifiedTenant, principalID, c.SourcePayableID, payableopenitem.ApplyRecoveryRequest{
 		Amount: req.Amount, RecoveryRef: req.RecoveryRef, Reason: "supplier recovery case " + caseID,
@@ -415,12 +428,6 @@ func (h *Handler) ApplyApprovedOffset(w http.ResponseWriter, r *http.Request) {
 	updated, applied, err := h.store.ApplyRecovery(r.Context(), caseID, "OFFSET", req.Amount, req.RecoveryRef, "", principalID)
 	if h.writeApplyErr(w, err) {
 		return
-	}
-	if applied {
-		_ = h.pub.Publish(r.Context(), events.PublishParams{
-			EventType: domain.EventRecoveryOffsetApplied, EntityID: updated.CaseID, ActorID: principalID,
-			CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"case": updated, "applied": applied})
 }
@@ -476,12 +483,6 @@ func (h *Handler) LinkConfirmedSupplierRefund(w http.ResponseWriter, r *http.Req
 	if h.writeApplyErr(w, err) {
 		return
 	}
-	if applied {
-		_ = h.pub.Publish(r.Context(), events.PublishParams{
-			EventType: domain.EventSupplierRefundConfirmed, EntityID: updated.CaseID, ActorID: principalID,
-			CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-		})
-	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"case": updated, "applied": applied})
 }
 
@@ -518,10 +519,6 @@ func (h *Handler) EscalateRecovery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRecoveryEscalated, EntityID: updated.CaseID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -560,10 +557,6 @@ func (h *Handler) WriteOffRecovery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRecoveryWrittenOff, EntityID: updated.CaseID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -599,10 +592,6 @@ func (h *Handler) CloseRecoveryCase(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventRecoveryClosed, EntityID: updated.CaseID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 

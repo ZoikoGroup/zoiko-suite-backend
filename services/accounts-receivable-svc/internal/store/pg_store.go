@@ -76,6 +76,9 @@ var invoiceColumns = []string{
 	// AR-08 cash application.
 	"payment_date",
 	"payment_reference",
+
+	// ACC-14: GL journal link from invoice issuance posting.
+	"issuance_journal_id",
 }
 
 var invoiceSelectList = strings.Join(invoiceColumns, ", ")
@@ -114,6 +117,8 @@ func scanTargets(inv *domain.CustomerInvoice, status *string) []any {
 
 		&inv.PaymentDate,
 		&inv.PaymentReference,
+
+		&inv.IssuanceJournalID,
 	}
 }
 
@@ -614,4 +619,15 @@ func transitionColumns(to domain.InvoiceStatus) (actorColumn, timeColumn string)
 	default:
 		return "sent_by_principal_id", "sent_at"
 	}
+}
+
+// SetIssuanceJournalID records the GL journal ID returned when the invoice
+// issuance accounting event was posted (ACC-14).
+func (s *PgStore) SetIssuanceJournalID(ctx context.Context, tenantID, invoiceID, journalID string) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE customer_invoices SET issuance_journal_id = $1 WHERE invoice_id = $2 AND tenant_id = $3`,
+			journalID, invoiceID, tenantID)
+		return err
+	})
 }

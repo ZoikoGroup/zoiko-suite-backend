@@ -1,3 +1,10 @@
+# BUILD CONTEXT IS services/, NOT THIS DIRECTORY:
+#   docker build -f general-ledger-svc/Dockerfile services/
+# go.mod replaces zoiko.io/eventing with ../eventing (the shared event
+# envelope + outbox module), and Docker can only COPY from inside the build
+# context. Dockerfile.dockerignore next to this file trims the context to the
+# two directories the build reads.
+
 # ─── Stage 1: builder ─────────────────────────────────────────────────────────
 # Use the exact Go toolchain version from go.mod (go 1.25).
 # The builder image produces a statically-linked binary so it runs on distroless.
@@ -7,15 +14,19 @@ FROM golang:1.25-alpine AS builder
 # ca-certificates is needed for HTTPS module downloads.
 RUN apk add --no-cache git ca-certificates
 
-WORKDIR /build
+# The service sits at /build/general-ledger-svc so the go.mod replace
+# directive's ../eventing resolves to /build/eventing.
+WORKDIR /build/general-ledger-svc
 
 # Copy dependency manifests first to leverage Docker layer caching:
 # if go.mod / go.sum are unchanged the module download layer is reused.
-COPY go.mod go.sum ./
+# The replaced module must be present before go mod download can resolve it.
+COPY eventing/ /build/eventing/
+COPY general-ledger-svc/go.mod general-ledger-svc/go.sum ./
 RUN go mod download
 
 # Copy the rest of the source.
-COPY . .
+COPY general-ledger-svc/ ./
 
 # Build a statically-linked binary.
 # CGO_ENABLED=0     — pure Go; no libc dependency, runs on distroless/static.

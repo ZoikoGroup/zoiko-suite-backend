@@ -24,6 +24,7 @@ import (
 	"zoiko.io/ai-governance-svc/internal/killswitch"
 	"zoiko.io/ai-governance-svc/internal/middleware"
 	"zoiko.io/ai-governance-svc/internal/mtls"
+	"zoiko.io/ai-governance-svc/internal/outbox"
 	"zoiko.io/ai-governance-svc/internal/store"
 	"zoiko.io/ai-governance-svc/internal/telemetry"
 )
@@ -66,7 +67,23 @@ func main() {
 
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+	kafkaPublisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+	var eventHook events.Publisher
+	var relayDone chan struct{}
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	if pool != nil {
+		if err := outbox.VerifySchema(ctx, pool); err != nil {
+			logger.Fatal("transactional outbox migration is required", zap.Error(err))
+		}
+		eventHook = outbox.NewHook(pool, logger)
+		relayDone = make(chan struct{})
+		relay := outbox.NewRelay(pool, kafkaPublisher, logger)
+		go func() {
+			defer close(relayDone)
+			relay.Run(relayCtx)
+		}()
+	}
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
 		bootstrapToken := loadMTLSBootstrapToken(cfg.MTLSBootstrapTokenPath, logger)
@@ -82,7 +99,7 @@ func main() {
 
 	killswitchClient := killswitch.NewClient(cfg.KillSwitchRegistryServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, killswitchClient, logger)
+	h := handler.New(pgStore, eventHook, authzClient, killswitchClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -122,6 +139,10 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down ai-governance-svc gracefully...")
+	stopRelay()
+	if relayDone != nil {
+		<-relayDone
+	}
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

@@ -193,9 +193,10 @@ type LegalHold struct {
 	IssuedAt               time.Time       `json:"issued_at"`
 	ActivatedByPrincipalID *string         `json:"activated_by_principal_id,omitempty"`
 	ActivatedAt            *time.Time      `json:"activated_at,omitempty"`
-	ReleaseReason          *string         `json:"release_reason,omitempty"`
-	ReleasedByPrincipalID  *string         `json:"released_by_principal_id,omitempty"`
-	ReleasedAt             *time.Time      `json:"released_at,omitempty"`
+	ReleaseReason                *string    `json:"release_reason,omitempty"`
+	ReleasedByPrincipalID        *string    `json:"released_by_principal_id,omitempty"`
+	ReleaseApprovedByPrincipalID *string    `json:"release_approved_by_principal_id,omitempty"`
+	ReleasedAt                   *time.Time `json:"released_at,omitempty"`
 }
 
 type CreateLegalHoldParams struct {
@@ -218,9 +219,10 @@ type AddLegalHoldTargetParams struct {
 }
 
 type ReleaseLegalHoldParams struct {
-	HoldID                string
-	ReleaseReason         string
-	ReleasedByPrincipalID string
+	HoldID                       string
+	ReleaseReason                string
+	ReleasedByPrincipalID        string
+	ReleaseApprovedByPrincipalID string
 }
 
 // LegalHoldTarget is one record covered (or formerly covered) by a
@@ -262,4 +264,8 @@ var (
 	ErrLegalHoldNotActive    = errors.New("legal hold is not ACTIVE")
 	ErrLegalHoldTargetExists = errors.New("this record is already a target of this legal hold")
 	ErrNoRecordIDsForHold    = errors.New("at least one record_id is required")
+	// ErrLegalHoldSelfRelease is ZS-SVC-S-001 §5.5's "release_approved_by:
+	// Separate release authority; self-release restrictions apply" —
+	// the principal executing the release cannot also be its own approver.
+	ErrLegalHoldSelfRelease = errors.New("the principal releasing a legal hold cannot also be its own release approver")
 )

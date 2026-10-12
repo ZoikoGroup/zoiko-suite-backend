@@ -1,17 +1,21 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
+	"zoiko.io/commercial-account-svc/internal/authz"
 	"zoiko.io/commercial-account-svc/internal/domain"
 	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
 )
@@ -24,11 +28,21 @@ func newSubscriptionTestRouter(h *Handler) *chi.Mux {
 	return r
 }
 
+func seedTestAccount(h *Handler, accountID, orgID string) {
+	if ss, ok := h.store.(*stubStore); ok {
+		ss.SeedAccount(accountID, orgID)
+	}
+}
+
 // createTestCatalogAndPlan seeds a doc7 catalog and plan through the store.
 // The HTTP catalog write routes are retired (410); existing doc7 plans are
 // still what the doc7 subscription endpoints under test bind to.
 func createTestCatalogAndPlan(t *testing.T, h *Handler, orgID string) (catalogID, planID string) {
 	t.Helper()
+	seedTestAccount(h, "ca-"+orgID, "org-test-01")
+	if strings.HasPrefix(orgID, "org-") {
+		seedTestAccount(h, "ca-"+strings.TrimPrefix(orgID, "org-"), "org-test-01")
+	}
 	return seedLegacyPlan(t, h, "2026-Q1-"+orgID, "GROWTH", 499, true)
 }
 
@@ -375,5 +389,331 @@ func TestBillingSourceTransfer_CancelsOldAndPreventsDoubleBilling(t *testing.T) 
 	}))
 	if wDup.Code != http.StatusConflict {
 		t.Fatalf("expected 409 preventing a second concurrent subscription, got %d — %s", wDup.Code, wDup.Body.String())
+	}
+}
+
+// ── Gap 1 (Tracker Row 84a) Authorization Scope Verification Tests ─────────
+
+type recordingAuthz struct {
+	mu     sync.Mutex
+	calls  []authzCall
+	grants map[string]bool // key: principal|legalEntityID|actionType
+}
+
+type authzCall struct {
+	Principal     string
+	LegalEntityID string
+	ActionType    string
+}
+
+func newRecordingAuthz() *recordingAuthz {
+	return &recordingAuthz{grants: make(map[string]bool)}
+}
+
+func (a *recordingAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, actionType string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls = append(a.calls, authzCall{
+		Principal:     principalID,
+		LegalEntityID: legalEntityID,
+		ActionType:    actionType,
+	})
+	if a.grants[principalID+"|"+legalEntityID+"|"+actionType] {
+		return nil
+	}
+	return authz.ErrAuthorizationDenied
+}
+
+func (a *recordingAuthz) grant(principalID, legalEntityID, actionType string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.grants[principalID+"|"+legalEntityID+"|"+actionType] = true
+}
+
+func (a *recordingAuthz) lastCall() authzCall {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.calls) == 0 {
+		return authzCall{}
+	}
+	return a.calls[len(a.calls)-1]
+}
+
+func newTestHandlerWithAuthz(az AuthzChecker) (*Handler, *stubStore) {
+	logger, _ := zap.NewDevelopment()
+	st := newStubStore()
+	return New(st, &stubPublisher{}, az, logger), st
+}
+
+func buildRequestWithHeaders(method, path string, body interface{}, tenantID, principalID string) *http.Request {
+	var buf bytes.Buffer
+	if body != nil {
+		_ = json.NewEncoder(&buf).Encode(body)
+	}
+	r := httptest.NewRequest(method, path, &buf)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Tenant-Id", tenantID)
+	r.Header.Set("X-Principal-Id", principalID)
+	return r
+}
+
+// TestSubscriptionAuthorization_AllSevenMutationsUseOrganizationScope proves that all
+// seven subscription mutation operations evaluate authorization against the owning commercial
+// account's authoritative OrganizationID, NOT its CommercialAccountID (tracker row 84a).
+func TestSubscriptionAuthorization_AllSevenMutationsUseOrganizationScope(t *testing.T) {
+	az := newRecordingAuthz()
+	h, st := newTestHandlerWithAuthz(az)
+	r := newSubscriptionTestRouter(h)
+
+	const (
+		orgID       = "org-scope-test-01"
+		accountID   = "ca-scope-test-01"
+		principalID = "principal-test-01"
+	)
+
+	// Seed commercial account belonging to orgID.
+	st.SeedAccount(accountID, orgID)
+
+	// Seed catalog and plan.
+	_, planID := seedLegacyPlan(t, h, "2026-Q1-scope", "GROWTH", 100, true)
+	_, targetPlanID := seedLegacyPlan(t, h, "2026-Q2-scope", "PRO", 200, false)
+
+	// Grant all 7 operations to principalID on orgID.
+	az.grant(principalID, orgID, SubscriptionCreate)
+	az.grant(principalID, orgID, EvaluationProgramCreate)
+	az.grant(principalID, orgID, OverlayCreate)
+	az.grant(principalID, orgID, SubscriptionChangePreview)
+	az.grant(principalID, orgID, SubscriptionChangeConfirm)
+	az.grant(principalID, orgID, SubscriptionStatusSet)
+	az.grant(principalID, orgID, BillingSourceTransferSet)
+
+	// 1. CreateSubscription (POST /v1/subscriptions)
+	wSub := httptest.NewRecorder()
+	r.ServeHTTP(wSub, buildRequestWithHeaders(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
+		CommercialAccountID: accountID,
+		PlanID:              planID,
+		StartAsEvaluation:   true,
+	}, orgID, principalID))
+	if wSub.Code != http.StatusCreated {
+		t.Fatalf("CreateSubscription failed: %d - %s", wSub.Code, wSub.Body.String())
+	}
+	last := az.lastCall()
+	if last.LegalEntityID != orgID {
+		t.Errorf("CreateSubscription authorized against %q, want organization_id %q", last.LegalEntityID, orgID)
+	}
+	if last.LegalEntityID == accountID {
+		t.Errorf("CreateSubscription incorrectly authorized against commercial_account_id %q", accountID)
+	}
+	if last.ActionType != SubscriptionCreate {
+		t.Errorf("expected action %q, got %q", SubscriptionCreate, last.ActionType)
+	}
+
+	var sub domain.CommercialSubscription
+	_ = json.NewDecoder(wSub.Body).Decode(&sub)
+
+	// 2. CreateEvaluationProgram (POST /v1/subscriptions/{id}/evaluation-program)
+	wEval := httptest.NewRecorder()
+	r.ServeHTTP(wEval, buildRequestWithHeaders(http.MethodPost, "/v1/subscriptions/"+sub.SubscriptionID+"/evaluation-program", domain.CreateEvaluationProgramRequest{
+		DurationDays:     14,
+		PaymentRequired:  false,
+		ConversionPolicy: "MANUAL",
+		ExpiryAction:     "SUSPEND",
+	}, orgID, principalID))
+	if wEval.Code != http.StatusCreated {
+		t.Fatalf("CreateEvaluationProgram failed: %d - %s", wEval.Code, wEval.Body.String())
+	}
+	last = az.lastCall()
+	if last.LegalEntityID != orgID {
+		t.Errorf("CreateEvaluationProgram authorized against %q, want organization_id %q", last.LegalEntityID, orgID)
+	}
+	if last.LegalEntityID == accountID {
+		t.Errorf("CreateEvaluationProgram incorrectly authorized against commercial_account_id %q", accountID)
+	}
+	if last.ActionType != EvaluationProgramCreate {
+		t.Errorf("expected action %q, got %q", EvaluationProgramCreate, last.ActionType)
+	}
+
+	// 3. CreateOverlay (POST /v1/contract-entitlement-overlays)
+	wOverlay := httptest.NewRecorder()
+	r.ServeHTTP(wOverlay, buildRequestWithHeaders(http.MethodPost, "/v1/contract-entitlement-overlays", domain.CreateOverlayRequest{
+		CommercialAccountID:   accountID,
+		MetricType:            "USERS",
+		OverrideLimitValue:    int64Ptr(999),
+		ApprovedByPrincipalID: principalID,
+		EffectiveFrom:         "2020-01-01T00:00:00Z",
+	}, orgID, principalID))
+	if wOverlay.Code != http.StatusCreated {
+		t.Fatalf("CreateOverlay failed: %d - %s", wOverlay.Code, wOverlay.Body.String())
+	}
+	last = az.lastCall()
+	if last.LegalEntityID != orgID {
+		t.Errorf("CreateOverlay authorized against %q, want organization_id %q", last.LegalEntityID, orgID)
+	}
+	if last.LegalEntityID == accountID {
+		t.Errorf("CreateOverlay incorrectly authorized against commercial_account_id %q", accountID)
+	}
+	if last.ActionType != OverlayCreate {
+		t.Errorf("expected action %q, got %q", OverlayCreate, last.ActionType)
+	}
+
+	// 4. PreviewSubscriptionChange (POST /v1/subscription-change-requests)
+	wPreview := httptest.NewRecorder()
+	r.ServeHTTP(wPreview, buildRequestWithHeaders(http.MethodPost, "/v1/subscription-change-requests", domain.PreviewChangeRequest{
+		SubscriptionID: sub.SubscriptionID,
+		TargetPlanID:   targetPlanID,
+	}, orgID, principalID))
+	if wPreview.Code != http.StatusCreated {
+		t.Fatalf("PreviewSubscriptionChange failed: %d - %s", wPreview.Code, wPreview.Body.String())
+	}
+	last = az.lastCall()
+	if last.LegalEntityID != orgID {
+		t.Errorf("PreviewSubscriptionChange authorized against %q, want organization_id %q", last.LegalEntityID, orgID)
+	}
+	if last.LegalEntityID == accountID {
+		t.Errorf("PreviewSubscriptionChange incorrectly authorized against commercial_account_id %q", accountID)
+	}
+	if last.ActionType != SubscriptionChangePreview {
+		t.Errorf("expected action %q, got %q", SubscriptionChangePreview, last.ActionType)
+	}
+
+	var change domain.SubscriptionChangeRequest
+	_ = json.NewDecoder(wPreview.Body).Decode(&change)
+
+	// 5. ConfirmSubscriptionChange (POST /v1/subscription-change-requests/{id}/confirm)
+	wConfirm := httptest.NewRecorder()
+	r.ServeHTTP(wConfirm, buildRequestWithHeaders(http.MethodPost, "/v1/subscription-change-requests/"+change.ChangeRequestID+"/confirm", nil, orgID, principalID))
+	if wConfirm.Code != http.StatusOK {
+		t.Fatalf("ConfirmSubscriptionChange failed: %d - %s", wConfirm.Code, wConfirm.Body.String())
+	}
+	last = az.lastCall()
+	if last.LegalEntityID != orgID {
+		t.Errorf("ConfirmSubscriptionChange authorized against %q, want organization_id %q", last.LegalEntityID, orgID)
+	}
+	if last.LegalEntityID == accountID {
+		t.Errorf("ConfirmSubscriptionChange incorrectly authorized against commercial_account_id %q", accountID)
+	}
+	if last.ActionType != SubscriptionChangeConfirm {
+		t.Errorf("expected action %q, got %q", SubscriptionChangeConfirm, last.ActionType)
+	}
+
+	// 6. SetSubscriptionStatus (POST /v1/subscriptions/{id}/status)
+	wStatus := httptest.NewRecorder()
+	r.ServeHTTP(wStatus, buildRequestWithHeaders(http.MethodPost, "/v1/subscriptions/"+sub.SubscriptionID+"/status", domain.SetSubscriptionStatusRequest{
+		NewStatus: "ACTIVE",
+		Reason:    "trial conversion",
+	}, orgID, principalID))
+	if wStatus.Code != http.StatusOK {
+		t.Fatalf("SetSubscriptionStatus failed: %d - %s", wStatus.Code, wStatus.Body.String())
+	}
+	last = az.lastCall()
+	if last.LegalEntityID != orgID {
+		t.Errorf("SetSubscriptionStatus authorized against %q, want organization_id %q", last.LegalEntityID, orgID)
+	}
+	if last.LegalEntityID == accountID {
+		t.Errorf("SetSubscriptionStatus incorrectly authorized against commercial_account_id %q", accountID)
+	}
+	if last.ActionType != SubscriptionStatusSet {
+		t.Errorf("expected action %q, got %q", SubscriptionStatusSet, last.ActionType)
+	}
+
+	// 7. TransferBillingSource (POST /v1/billing-source-transfers)
+	wTransfer := httptest.NewRecorder()
+	r.ServeHTTP(wTransfer, buildRequestWithHeaders(http.MethodPost, "/v1/billing-source-transfers", domain.TransferBillingSourceRequest{
+		CommercialAccountID: accountID,
+		OldSubscriptionID:   sub.SubscriptionID,
+		NewBillingSource:    "ZOIKO_ONE_BUNDLE",
+	}, orgID, principalID))
+	if wTransfer.Code != http.StatusCreated {
+		t.Fatalf("TransferBillingSource failed: %d - %s", wTransfer.Code, wTransfer.Body.String())
+	}
+	last = az.lastCall()
+	if last.LegalEntityID != orgID {
+		t.Errorf("TransferBillingSource authorized against %q, want organization_id %q", last.LegalEntityID, orgID)
+	}
+	if last.LegalEntityID == accountID {
+		t.Errorf("TransferBillingSource incorrectly authorized against commercial_account_id %q", accountID)
+	}
+	if last.ActionType != BillingSourceTransferSet {
+		t.Errorf("expected action %q, got %q", BillingSourceTransferSet, last.ActionType)
+	}
+}
+
+// TestSubscriptionAuthorization_SameOrgGrantSucceeds_And_MissingGrantDenied tests that:
+// (a) when the principal has the grant for their organization scope, the request succeeds.
+// (b) when the principal lacks the grant for their organization scope, the request is denied (403).
+func TestSubscriptionAuthorization_SameOrgGrantSucceeds_And_MissingGrantDenied(t *testing.T) {
+	az := newRecordingAuthz()
+	h, st := newTestHandlerWithAuthz(az)
+	r := newSubscriptionTestRouter(h)
+
+	const (
+		orgID       = "org-granted-01"
+		accountID   = "ca-granted-01"
+		principalID = "principal-user-01"
+	)
+
+	st.SeedAccount(accountID, orgID)
+	_, planID := seedLegacyPlan(t, h, "2026-Q1-grant", "GROWTH", 100, true)
+
+	// Step 1: Request with NO grant -> Expect 403 Forbidden.
+	wNoGrant := httptest.NewRecorder()
+	r.ServeHTTP(wNoGrant, buildRequestWithHeaders(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
+		CommercialAccountID: accountID,
+		PlanID:              planID,
+	}, orgID, principalID))
+	if wNoGrant.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when principal lacks grant, got %d - %s", wNoGrant.Code, wNoGrant.Body.String())
+	}
+
+	// Step 2: Grant permission to principalID on orgID -> Expect 201 Created.
+	az.grant(principalID, orgID, SubscriptionCreate)
+
+	wGranted := httptest.NewRecorder()
+	r.ServeHTTP(wGranted, buildRequestWithHeaders(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
+		CommercialAccountID: accountID,
+		PlanID:              planID,
+	}, orgID, principalID))
+	if wGranted.Code != http.StatusCreated {
+		t.Fatalf("expected 201 after grant, got %d - %s", wGranted.Code, wGranted.Body.String())
+	}
+}
+
+// TestSubscriptionAuthorization_CrossOrgDenied verifies tenant isolation and fail-closed security:
+// When an authenticated principal in Organization B attempts to perform an operation on
+// an account or subscription belonging to Organization A, the request is refused (404/not found),
+// preventing cross-tenant mutation and data leakage.
+func TestSubscriptionAuthorization_CrossOrgDenied(t *testing.T) {
+	az := newRecordingAuthz()
+	h, st := newTestHandlerWithAuthz(az)
+	r := newSubscriptionTestRouter(h)
+
+	const (
+		orgA       = "11111111-1111-1111-1111-111111111111"
+		accountA   = "ca-org-a"
+		orgB       = "22222222-2222-2222-2222-222222222222"
+		principalB = "principal-org-b"
+	)
+
+	// Seed account belonging to Org A.
+	st.SeedAccount(accountA, orgA)
+	_, planID := seedLegacyPlan(t, h, "2026-Q1-cross", "GROWTH", 100, true)
+
+	// Grant all permissions to principalB for orgB (and even falsely for orgA to prove RLS backstop).
+	az.grant(principalB, orgB, SubscriptionCreate)
+	az.grant(principalB, orgA, SubscriptionCreate)
+
+	// Principal B (in tenant orgB) attempts to create a subscription on accountA (owned by orgA).
+	wCross := httptest.NewRecorder()
+	r.ServeHTTP(wCross, buildRequestWithHeaders(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
+		CommercialAccountID: accountA,
+		PlanID:              planID,
+	}, orgB, principalB))
+
+	// Must be rejected with 404 Not Found (account not found in caller's verified tenant scope).
+	if wCross.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for cross-organization account access, got %d - %s", wCross.Code, wCross.Body.String())
+	}
+	if !strings.Contains(wCross.Body.String(), "commercial account not found") {
+		t.Errorf("expected 'commercial account not found', got %s", wCross.Body.String())
 	}
 }

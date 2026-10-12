@@ -275,7 +275,7 @@ func TestSegregationOfDuties_MakerCannotRejectOwnActivity(t *testing.T) {
 func createPublishedPurpose(t *testing.T, r http.Handler, statement string) *domain.PurposeVersion {
 	t.Helper()
 	w := doRequest(r, http.MethodPost, "/privacy/purposes", domain.CreatePurposeRequest{
-		Statement: statement, CompatibilityClass: "PRIMARY",
+		Statement: statement, CompatibilityClass: "PRIMARY", LawfulBasisRefs: []string{"legitimate-interest"},
 	}, testTenant)
 	var v domain.PurposeVersion
 	_ = json.Unmarshal(w.Body.Bytes(), &v)
@@ -380,6 +380,85 @@ func TestValidateActivity_Gate6_RetentionMissing_EmitsPRV014(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected PRV-014 finding for retention_rule_refs, got %+v", got.ValidationFindings)
+	}
+}
+
+func TestValidateActivity_Gate4_NoLawfulBasis_EmitsPRV005(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	// A purpose published with no lawful-basis reference at all.
+	w := doRequest(r, http.MethodPost, "/privacy/purposes", domain.CreatePurposeRequest{
+		Statement: "no lawful basis", CompatibilityClass: "PRIMARY",
+	}, testTenant)
+	var pv domain.PurposeVersion
+	_ = json.Unmarshal(w.Body.Bytes(), &pv)
+	wPub := doRequestWithPrincipal(r, http.MethodPost, "/privacy/purposes/"+pv.PurposeID+"/versions/"+pv.PurposeVersionID+"/publish", nil, testTenant, "reviewer-01")
+	var purpose domain.PurposeVersion
+	_ = json.Unmarshal(wPub.Body.Bytes(), &purpose)
+
+	activity := createDraftActivity(t, r, []string{purpose.PurposeID})
+	wVal := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+activity.ActivityID+"/versions/"+activity.ActivityVersionID+"/validate", nil, testTenant)
+	var got domain.ProcessingActivityVersion
+	_ = json.Unmarshal(wVal.Body.Bytes(), &got)
+	if got.VersionStatus != domain.ActivityStatusDraft {
+		t.Fatalf("expected DRAFT, got %s", got.VersionStatus)
+	}
+	found := false
+	for _, f := range got.ValidationFindings {
+		if f.Code == "PRV-005" && f.Field == "purpose_ids" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected PRV-005 finding for a purpose with no lawful-basis reference, got %+v", got.ValidationFindings)
+	}
+}
+
+func TestValidateActivity_Gate6_MultiJurisdictionNoTransferRefs_EmitsPRV015(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{})
+
+	purpose := createPublishedPurpose(t, r, "cross-border processing")
+	w := doRequest(r, http.MethodPost, "/privacy/processing-activities", domain.CreateActivityRequest{
+		PrivacyRole:              string(domain.RoleController),
+		Owner:                    "privacy-team",
+		PurposeIDs:               []string{purpose.PurposeID},
+		SubjectClasses:           []string{"CUSTOMER"},
+		DataCategories:           []string{"CONTACT_INFO"},
+		Jurisdictions:            []string{"US", "EU"}, // multiple jurisdictions, no transfer refs
+		RetentionRuleRefs:        []string{"retention-rule-7y"},
+		NoticeConsentDependency: string(domain.NoticeConsentRequired),
+		DPIATIAStatus:            string(domain.DPIATIAResolved),
+	}, testTenant)
+	var v domain.ProcessingActivityVersion
+	_ = json.Unmarshal(w.Body.Bytes(), &v)
+
+	wVal := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+v.ActivityID+"/versions/"+v.ActivityVersionID+"/validate", nil, testTenant)
+	var got domain.ProcessingActivityVersion
+	_ = json.Unmarshal(wVal.Body.Bytes(), &got)
+	if got.VersionStatus != domain.ActivityStatusDraft {
+		t.Fatalf("expected DRAFT, got %s", got.VersionStatus)
+	}
+	found := false
+	for _, f := range got.ValidationFindings {
+		if f.Code == "PRV-015" && f.Field == "transfer_refs" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected PRV-015 finding for multi-jurisdiction activity with no transfer refs, got %+v", got.ValidationFindings)
+	}
+
+	// Single-jurisdiction activities must not be required to populate this.
+	singleJurisdiction := createDraftActivity(t, r, []string{purpose.PurposeID})
+	wVal2 := doRequest(r, http.MethodPost, "/privacy/processing-activities/"+singleJurisdiction.ActivityID+"/versions/"+singleJurisdiction.ActivityVersionID+"/validate", nil, testTenant)
+	var got2 domain.ProcessingActivityVersion
+	_ = json.Unmarshal(wVal2.Body.Bytes(), &got2)
+	for _, f := range got2.ValidationFindings {
+		if f.Code == "PRV-015" {
+			t.Fatalf("single-jurisdiction activity must not require transfer_refs, got finding %+v", f)
+		}
 	}
 }
 

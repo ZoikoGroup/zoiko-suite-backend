@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
@@ -29,6 +31,7 @@ import (
 	svckafka "zoiko.io/financial-close-svc/internal/kafka"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
 	"zoiko.io/financial-close-svc/internal/mtls"
+	"zoiko.io/financial-close-svc/internal/periodmirror"
 	"zoiko.io/financial-close-svc/internal/store"
 	"zoiko.io/financial-close-svc/internal/telemetry"
 )
@@ -143,10 +146,27 @@ func main() {
 	}
 
 	clientsWrapper.WithFinancialControlURL(cfg.FinancialControlServiceURL)
+	clientsWrapper.WithBankingURLs(cfg.TreasuryServiceURL, cfg.BankReconciliationServiceURL)
 	if cfg.CloseGateModeInvalid {
 		log.Warn("unrecognised FINCTRL_CLOSE_GATE_MODE; treating as enforce (fail closed)")
 	}
 	log.Info("financial-control close gate", zap.String("mode", cfg.CloseGateMode))
+	if cfg.SubledgerControlGateModeInvalid {
+		log.Warn("unrecognised SUBLEDGER_CONTROL_GATE_MODE; treating as enforce (fail closed)")
+	}
+	if cfg.BankReconGateModeInvalid {
+		log.Warn("unrecognised BANK_RECON_GATE_MODE; treating as enforce (fail closed)")
+	}
+	if cfg.BankReconGateMode == "off" {
+		log.Warn("bank reconciliation close gate is OFF: periods can close without reconciled cash. Use only where no bank feed exists yet.")
+	} else {
+		log.Info("bank reconciliation close gate", zap.String("mode", cfg.BankReconGateMode), zap.Int("cutoff_days", cfg.BankReconCutoffDays))
+	}
+	if cfg.SubledgerControlGateMode == "off" {
+		log.Warn("subledger control close gate is OFF: periods can close without proving AR/AP agree with the GL (ACC-06). Use only until control-account mappings are configured.")
+	} else {
+		log.Info("subledger control close gate", zap.String("mode", cfg.SubledgerControlGateMode))
+	}
 
 	// ── 4b. Lineage Kafka consumer ─────────────────────────────────────────────
 	// Consumes asset-management-svc's, inventory-management-svc's and
@@ -189,7 +209,32 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, clientsWrapper, clientsWrapper, []byte(cfg.CloseSigningKey), log).SetCloseGateEnforced(cfg.CloseGateMode == "enforce")
+	// REF-05 cutover phase 1. financial-close-svc stays authoritative: the mirror
+	// is a best-effort dual-write, OFF unless PERIOD_SERVICE_MIRROR=on, and the
+	// workflow-ref endpoint is read-only and limited to WORKFLOW_REF_CALLERS.
+	if cfg.PeriodMirrorModeInvalid {
+		log.Warn("unrecognised PERIOD_SERVICE_MIRROR; treating as off")
+	}
+	if cfg.PeriodMirrorReopenWindowAdjusted {
+		log.Warn("PERIOD_MIRROR_REOPEN_WINDOW unusable or above the REF-05 maximum; using", zap.Duration("window", cfg.PeriodMirrorReopenWindow))
+	}
+	log.Info("REF-05 period mirror",
+		zap.Bool("enabled", cfg.PeriodMirrorEnabled),
+		zap.String("accounting_period_url", cfg.AccountingPeriodURL),
+		zap.Duration("reopen_window", cfg.PeriodMirrorReopenWindow),
+		zap.Strings("workflow_ref_callers", cfg.WorkflowRefCallers))
+	periodMirror := periodmirror.New(periodmirror.Config{
+		Enabled:      cfg.PeriodMirrorEnabled,
+		BaseURL:      strings.TrimRight(cfg.AccountingPeriodURL, "/"),
+		ReopenWindow: cfg.PeriodMirrorReopenWindow,
+	}, pgStore, nil, periodmirror.NewMetrics(prometheus.DefaultRegisterer), log)
+
+	h := handler.New(pgStore, publisher, clientsWrapper, clientsWrapper, []byte(cfg.CloseSigningKey), log).
+		SetCloseGateEnforced(cfg.CloseGateMode == "enforce").
+		SetWorkflowRefs(pgStore, cfg.WorkflowRefCallers).
+		SetSubledgerControlGateEnforced(cfg.SubledgerControlGateMode == "enforce").
+		SetBankReconciliationGate(cfg.BankReconGateMode == "enforce", cfg.BankReconCutoffDays).
+		SetPeriodMirror(periodMirror)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

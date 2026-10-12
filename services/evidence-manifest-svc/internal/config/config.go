@@ -55,7 +55,7 @@ func Load() (*Config, error) {
 			SSLMode:  strEnv("DB_SSLMODE", "disable"),
 		},
 		Kafka: KafkaConfig{
-			Brokers: strings.Split(strEnv("KAFKA_BROKERS", "localhost:9092"), ","),
+			Brokers: splitBrokers(os.Getenv("KAFKA_BROKERS")),
 			Topic:   strEnv("KAFKA_EVENTS_TOPIC", "zoiko.evidence.events"),
 		},
 		GovernanceDecisionLogURL: strEnv("GOVERNANCE_DECISION_LOG_SERVICE_URL", "http://governance-svc:8083"),
@@ -82,4 +82,14 @@ func intEnv(key string, def int) (int, error) {
 		return 0, fmt.Errorf("invalid %s: %w", key, err)
 	}
 	return n, nil
+}
+
+func splitBrokers(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }

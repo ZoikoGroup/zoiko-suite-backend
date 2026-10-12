@@ -1,0 +1,334 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/exaring/otelpgx"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/riandyrn/otelchi"
+	"github.com/segmentio/kafka-go"
+	"go.uber.org/zap"
+
+	"zoiko.io/fiscal-calendar-svc/internal/config"
+	"zoiko.io/fiscal-calendar-svc/internal/domain"
+	svcenvelope "zoiko.io/fiscal-calendar-svc/internal/envelope"
+	"zoiko.io/fiscal-calendar-svc/internal/events"
+	"zoiko.io/fiscal-calendar-svc/internal/handler"
+	"zoiko.io/fiscal-calendar-svc/internal/health"
+	svcmiddleware "zoiko.io/fiscal-calendar-svc/internal/middleware"
+	"zoiko.io/fiscal-calendar-svc/internal/mtls"
+	"zoiko.io/fiscal-calendar-svc/internal/outbox"
+	"zoiko.io/fiscal-calendar-svc/internal/periodhistory"
+	"zoiko.io/fiscal-calendar-svc/internal/service"
+	"zoiko.io/fiscal-calendar-svc/internal/store"
+	"zoiko.io/fiscal-calendar-svc/internal/telemetry"
+)
+
+// decisionCacheTTL bounds how long a GRANTED/DENIED decision from
+// authorization-svc may be reused locally (same bound and reasoning as the
+// sibling services: Doc 05 section 6.5). Unavailable outcomes are never cached.
+const decisionCacheTTL = 5 * time.Second
+
+type cachedDecision struct {
+	deniedErr error
+	expiresAt time.Time
+}
+
+type httpAuthzClient struct {
+	baseURL string
+	client  *http.Client
+	log     *zap.Logger
+
+	cacheMu     sync.Mutex
+	cache       map[string]cachedDecision
+	cacheWrites int
+}
+
+func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType
+	if decision, hit := a.lookupCache(key); hit {
+		return decision
+	}
+	err := a.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	if err == nil || errors.Is(err, domain.ErrAuthorizationDenied) {
+		a.storeCache(key, err)
+	}
+	return err
+}
+
+func (a *httpAuthzClient) lookupCache(key string) (error, bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	d, ok := a.cache[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(d.expiresAt) {
+		delete(a.cache, key)
+		return nil, false
+	}
+	return d.deniedErr, true
+}
+
+func (a *httpAuthzClient) storeCache(key string, decision error) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	a.cache[key] = cachedDecision{deniedErr: decision, expiresAt: time.Now().Add(decisionCacheTTL)}
+	a.cacheWrites++
+	if a.cacheWrites%1000 == 0 {
+		now := time.Now()
+		for k, v := range a.cache {
+			if now.After(v.expiresAt) {
+				delete(a.cache, k)
+			}
+		}
+	}
+}
+
+// checkAllowedLive is the real, uncached call to authorization-svc. It
+// forwards the caller's canonical envelope values so the decision in
+// access_decision_log is traceable to the request that caused it.
+func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	reqBody, _ := json.Marshal(map[string]string{
+		"principal_id":    principalID,
+		"legal_entity_id": legalEntityID,
+		"action_type":     actionType,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/authorize", bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := middleware.GetReqID(ctx)
+	authzSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		a.log.Error("failed to call authorization-svc", zap.Error(err))
+		return domain.ErrAuthzServiceUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return domain.ErrAuthzServiceUnavailable
+	}
+	var res struct {
+		DecisionOutcome string `json:"decision_outcome"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return err
+	}
+	if res.DecisionOutcome != "GRANTED" {
+		return domain.ErrAuthorizationDenied
+	}
+	return nil
+}
+
+func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		_, _ = os.Stderr.WriteString("fatal: failed to load config: " + err.Error() + "\n")
+		os.Exit(1)
+	}
+	log, err := zap.NewProduction()
+	if err != nil {
+		_, _ = os.Stderr.WriteString("fatal: failed to init logger: " + err.Error() + "\n")
+		os.Exit(1)
+	}
+	defer func() { _ = log.Sync() }()
+
+	log.Info("fiscal-calendar-svc starting",
+		zap.Int("port", cfg.Port), zap.String("db_host", cfg.DB.Host), zap.String("authz_url", cfg.AuthZServiceURL), zap.String("accounting_period_url", cfg.AccountingPeriodURL))
+
+	shutdownTracing, err := telemetry.InitTracing(context.Background(), "fiscal-calendar-svc", cfg.OTELExporterEndpoint)
+	if err != nil {
+		log.Fatal("otel tracing init failed", zap.Error(err))
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			log.Error("otel tracer provider shutdown failed", zap.Error(err))
+		}
+	}()
+
+	metrics := telemetry.NewMetrics("fiscal-calendar-svc")
+	domainMetrics := telemetry.NewDomain("fiscal-calendar-svc")
+
+	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
+	if err != nil {
+		log.Fatal("failed to parse db pool config", zap.Error(err))
+	}
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		log.Fatal("failed to create db pool", zap.Error(err))
+	}
+	defer pool.Close()
+
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		log.Fatal("db unreachable at startup", zap.Error(err))
+	}
+	log.Info("db pool connected")
+
+	pgStore := store.New(pool)
+
+	kafkaWriter := &kafka.Writer{
+		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:                  cfg.Kafka.Topic,
+		Balancer:               &kafka.LeastBytes{},
+		AllowAutoTopicCreation: true,
+		BatchTimeout:           10 * time.Millisecond,
+	}
+	defer func() { _ = kafkaWriter.Close() }()
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+
+	var httpClientForAuthz *http.Client
+	authzBaseURL := cfg.AuthZServiceURL
+	if cfg.AuthzMTLSEnabled {
+		c, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "fiscal-calendar-svc", handler.PlatformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		httpClientForAuthz = c
+		authzBaseURL = cfg.AuthzMTLSURL
+	} else {
+		httpClientForAuthz = &http.Client{Timeout: 5 * time.Second}
+	}
+	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
+
+	// Outbox relay: events are written by the store inside the state-change
+	// transaction; this loop delivers them.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		relay.Run(relayCtx)
+	}()
+
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Recoverer)
+	r.Use(otelchi.Middleware("fiscal-calendar-svc", otelchi.WithChiRoutes(r)))
+	r.Use(metrics.HTTPMiddleware)
+	r.Use(correlationIDMiddleware)
+	r.Use(svcmiddleware.TenantContext())
+	r.Use(middleware.Logger)
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 section 4).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Period history (REF-05): consulted before any non-first calendar version is
+	// activated. Unreachable => activation fails closed (DEPENDENCY_UNAVAILABLE).
+	svc := service.New(pgStore).WithPeriodHistory(periodhistory.New(cfg.AccountingPeriodURL, &http.Client{Timeout: 5 * time.Second}))
+	h := handler.New(svc, authzClient, log, domainMetrics)
+	handler.RegisterRoutes(r, h)
+
+	// Readiness depends on the database only. authorization-svc is deliberately
+	// NOT a readiness dependency: reads (validate, get, list) do not call it and
+	// must keep serving during an authz outage; commands fail closed with 503
+	// DEPENDENCY_UNAVAILABLE on their own.
+	healthH := health.New(pool, log)
+	r.Get("/healthz", healthH.Liveness)
+	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
+	r.Handle("/metrics", metrics.MetricsHandler(healthH.Readiness, promhttp.Handler()))
+
+	addr := ":" + strconv.Itoa(cfg.Port)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Info("HTTP server listening", zap.String("addr", addr))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case err := <-serverErr:
+		log.Fatal("server error", zap.Error(err))
+	case sig := <-quit:
+		log.Info("shutdown signal received", zap.String("signal", sig.String()))
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+
+	// Stop the relay AFTER the server and wait for it, so events committed by
+	// requests still draining are delivered rather than left for the next start.
+	relayCancel()
+	select {
+	case <-relayDone:
+	case <-time.After(10 * time.Second):
+		log.Warn("outbox relay did not stop within 10s; undelivered events remain queued and will be drained at next start")
+	}
+	log.Info("server stopped")
+}
+
+func correlationIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Correlation-ID") == "" {
+			r.Header.Set("X-Correlation-ID", middleware.GetReqID(r.Context()))
+		}
+		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
+		next.ServeHTTP(w, r)
+	})
+}

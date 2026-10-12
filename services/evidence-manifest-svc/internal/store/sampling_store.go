@@ -124,7 +124,7 @@ func (s *PgStore) ApproveSampleDesign(ctx context.Context, p domain.ApproveSampl
 			return domain.ErrSampleDesignInvalidState
 		}
 		if current.CreatedByPrincipalID == p.ActorPrincipalID {
-			return domain.ErrSampleDesignInvalidState
+			return domain.ErrSelfApprovalForbidden
 		}
 		out, err = scanSampleDesign(tx.QueryRow(ctx, `UPDATE sample_designs SET status=$1, approved_by_principal_id=$2 WHERE design_id=$3 RETURNING `+sampleDesignColumns,
 			domain.SampleDesignApproved, p.ActorPrincipalID, p.DesignID))
@@ -134,7 +134,7 @@ func (s *PgStore) ApproveSampleDesign(ctx context.Context, p domain.ApproveSampl
 		changed = true
 		return nil
 	})
-	if errors.Is(err, domain.ErrSampleDesignNotFound) || errors.Is(err, domain.ErrSampleDesignInvalidState) {
+	if errors.Is(err, domain.ErrSampleDesignNotFound) || errors.Is(err, domain.ErrSampleDesignInvalidState) || errors.Is(err, domain.ErrSelfApprovalForbidden) {
 		return nil, false, err
 	}
 	if err != nil {

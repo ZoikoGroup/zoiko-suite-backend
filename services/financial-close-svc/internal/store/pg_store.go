@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -117,10 +118,10 @@ func (s *PgStore) GetFiscalPeriod(ctx context.Context, id string) (*domain.Fisca
 	var fp domain.FiscalPeriod
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT fiscal_period_id, tenant_id, legal_entity_id, period_name, period_start, period_end, close_status, close_locked_at, evidence_document_id
+			SELECT `+fiscalPeriodColumns+`
 			FROM fiscal_periods WHERE fiscal_period_id = $1 AND tenant_id = $2
 		`, id, tenantID).Scan(
-			&fp.FiscalPeriodID, &fp.TenantID, &fp.LegalEntityID, &fp.PeriodName, &fp.PeriodStart, &fp.PeriodEnd, &fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID,
+			&fp.FiscalPeriodID, &fp.TenantID, &fp.LegalEntityID, &fp.PeriodName, &fp.PeriodStart, &fp.PeriodEnd, &fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID, &fp.ReopenedAt, &fp.ReopenExpiresAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -141,10 +142,10 @@ func (s *PgStore) GetFiscalPeriodByName(ctx context.Context, legalEntityID, name
 	var fp domain.FiscalPeriod
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT fiscal_period_id, tenant_id, legal_entity_id, period_name, period_start, period_end, close_status, close_locked_at, evidence_document_id
+			SELECT `+fiscalPeriodColumns+`
 			FROM fiscal_periods WHERE legal_entity_id = $1 AND period_name = $2 AND tenant_id = $3
 		`, legalEntityID, name, tenantID).Scan(
-			&fp.FiscalPeriodID, &fp.TenantID, &fp.LegalEntityID, &fp.PeriodName, &fp.PeriodStart, &fp.PeriodEnd, &fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID,
+			&fp.FiscalPeriodID, &fp.TenantID, &fp.LegalEntityID, &fp.PeriodName, &fp.PeriodStart, &fp.PeriodEnd, &fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID, &fp.ReopenedAt, &fp.ReopenExpiresAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -165,7 +166,7 @@ func (s *PgStore) ListFiscalPeriods(ctx context.Context, legalEntityID string) (
 	var out []domain.FiscalPeriod
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT fiscal_period_id, tenant_id, legal_entity_id, period_name, period_start, period_end, close_status, close_locked_at, evidence_document_id
+			SELECT `+fiscalPeriodColumns+`
 			FROM fiscal_periods WHERE legal_entity_id = $1 AND tenant_id = $2
 			ORDER BY period_start DESC
 		`, legalEntityID, tenantID)
@@ -177,7 +178,7 @@ func (s *PgStore) ListFiscalPeriods(ctx context.Context, legalEntityID string) (
 		for rows.Next() {
 			var fp domain.FiscalPeriod
 			if err := rows.Scan(
-				&fp.FiscalPeriodID, &fp.TenantID, &fp.LegalEntityID, &fp.PeriodName, &fp.PeriodStart, &fp.PeriodEnd, &fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID,
+				&fp.FiscalPeriodID, &fp.TenantID, &fp.LegalEntityID, &fp.PeriodName, &fp.PeriodStart, &fp.PeriodEnd, &fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID, &fp.ReopenedAt, &fp.ReopenExpiresAt,
 			); err != nil {
 				return err
 			}
@@ -191,60 +192,90 @@ func (s *PgStore) ListFiscalPeriods(ctx context.Context, legalEntityID string) (
 	return out, nil
 }
 
-func (s *PgStore) LockFiscalPeriod(ctx context.Context, id string, lockedAt time.Time, evidenceDocID string) error {
+// fiscalPeriodColumns are read in the order every fiscal-period scan expects.
+const fiscalPeriodColumns = `fiscal_period_id, tenant_id, legal_entity_id, period_name, period_start, period_end,
+	close_status, close_locked_at, evidence_document_id, reopened_at, reopen_expires_at`
+
+// ApplyPeriodTransition moves a period to u.To, but only from one of
+// allowedFrom, and records the transition in the same transaction.
+//
+// The period row is locked (FOR UPDATE) for the whole transaction, so two
+// commands racing the same period serialise: the second sees the state the
+// first left and is refused if its transition no longer applies — rather
+// than both "succeeding" against the state they each read earlier.
+func (s *PgStore) ApplyPeriodTransition(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate) (*domain.FiscalPeriod, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return nil, domain.ErrIdentityMissing
 	}
-
+	var out *domain.FiscalPeriod
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
-			UPDATE fiscal_periods
-			SET close_status = 'LOCKED', close_locked_at = $1, evidence_document_id = $2
-			WHERE fiscal_period_id = $3 AND tenant_id = $4 AND close_status = 'OPEN'
-		`, lockedAt, evidenceDocID, id, tenantID)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrPeriodAlreadyLocked
-		}
-		return nil
+		fp, err := applyPeriodTransition(ctx, tx, tenantID, id, allowedFrom, u)
+		out = fp
+		return err
 	})
-	// A malformed id names no period, so nothing was locked. Reported as absent
-	// rather than as a dead store, and never as success.
-	return mapPgError(err)
+	if err != nil {
+		// On ErrInvalidPeriodTransition out is the period as it actually is,
+		// so the caller can say which state refused the command.
+		return out, mapPgError(err)
+	}
+	return out, nil
 }
 
-// ReopenFiscalPeriod transitions id from LOCKED back to OPEN, atomically and
-// only from LOCKED — the WHERE guard mirrors LockFiscalPeriod's own
-// OPEN-only guard, so a period that isn't currently LOCKED (already OPEN,
-// or somehow both requests raced) reopens nothing rather than corrupting
-// state. evidence_document_id is cleared: the PRIOR close's own
-// CloseEvidence row is untouched in close_evidences and stays permanently
-// queryable by fiscal_period_id; only the pointer on the period itself is
-// reset, since the next close will produce a new evidence document.
-func (s *PgStore) ReopenFiscalPeriod(ctx context.Context, id string, reopenedAt time.Time) error {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return domain.ErrIdentityMissing
+func applyPeriodTransition(ctx context.Context, tx pgx.Tx, tenantID, id string, allowedFrom []string, u domain.PeriodUpdate) (*domain.FiscalPeriod, error) {
+	var fp domain.FiscalPeriod
+	err := tx.QueryRow(ctx, `SELECT `+fiscalPeriodColumns+`
+		FROM fiscal_periods WHERE fiscal_period_id = $1 AND tenant_id = $2 FOR UPDATE`, id, tenantID).Scan(
+		&fp.FiscalPeriodID, &fp.TenantID, &fp.LegalEntityID, &fp.PeriodName, &fp.PeriodStart, &fp.PeriodEnd,
+		&fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID, &fp.ReopenedAt, &fp.ReopenExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrFiscalPeriodNotFound
 	}
+	if err != nil {
+		return nil, err
+	}
+	allowed := false
+	for _, from := range allowedFrom {
+		allowed = allowed || fp.CloseStatus == from
+	}
+	if !allowed {
+		return &fp, domain.ErrInvalidPeriodTransition
+	}
+	from := fp.CloseStatus
 
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
-			UPDATE fiscal_periods
-			SET close_status = 'OPEN', close_locked_at = NULL, evidence_document_id = NULL
-			WHERE fiscal_period_id = $1 AND tenant_id = $2 AND close_status = 'LOCKED'
-		`, id, tenantID)
-		if err != nil {
-			return err
-		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrPeriodNotLocked
-		}
-		return nil
-	})
-	return mapPgError(err)
+	fp.CloseStatus = u.To
+	if u.LockedAt != nil {
+		fp.CloseLockedAt = u.LockedAt
+	}
+	if u.EvidenceDocID != nil {
+		fp.EvidenceDocumentID = u.EvidenceDocID
+	}
+	if u.ReopenedAt != nil {
+		fp.ReopenedAt, fp.ReopenExpiresAt = u.ReopenedAt, u.ReopenExpiresAt
+	}
+	if u.ClearReopen {
+		fp.ReopenedAt, fp.ReopenExpiresAt = nil, nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE fiscal_periods
+		   SET close_status = $3, close_locked_at = $4, evidence_document_id = $5,
+		       reopened_at = $6, reopen_expires_at = $7
+		 WHERE fiscal_period_id = $1 AND tenant_id = $2`,
+		id, tenantID, fp.CloseStatus, fp.CloseLockedAt, fp.EvidenceDocumentID, fp.ReopenedAt, fp.ReopenExpiresAt); err != nil {
+		return nil, err
+	}
+	var requestID any
+	if u.ReopenRequestID != "" {
+		requestID = u.ReopenRequestID
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO period_state_transitions (transition_id, tenant_id, fiscal_period_id, from_state, to_state,
+		    principal_id, reason, reopen_request_id, occurred_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		uuid.NewString(), tenantID, id, from, u.To, u.PrincipalID, u.Reason, requestID, u.At); err != nil {
+		return nil, err
+	}
+	return &fp, nil
 }
 
 // CreateReopenEvent inserts one permanent, append-only reopen record — a
@@ -275,9 +306,11 @@ func (s *PgStore) CreateCloseEvidence(ctx context.Context, evidence *domain.Clos
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO close_evidences (
-				evidence_id, tenant_id, fiscal_period_id, trial_balance_hash, signature, generated_at
-			) VALUES ($1, $2, $3, $4, $5, $6)
-		`, evidence.EvidenceID, tenantID, evidence.FiscalPeriodID, evidence.TrialBalanceHash, evidence.Signature, evidence.GeneratedAt)
+				evidence_id, tenant_id, fiscal_period_id, trial_balance_hash, signature, generated_at,
+				reliance_manifest, reliance_hash, reliance_signature
+			) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''))
+		`, evidence.EvidenceID, tenantID, evidence.FiscalPeriodID, evidence.TrialBalanceHash, evidence.Signature, evidence.GeneratedAt,
+			evidence.RelianceManifest, evidence.RelianceHash, evidence.RelianceSignature)
 		return err
 	})
 }
@@ -295,11 +328,11 @@ func (s *PgStore) CreateControlRun(ctx context.Context, run *domain.SubledgerCon
 			INSERT INTO subledger_control_runs (
 				control_run_id, tenant_id, legal_entity_id, fiscal_period, subledger,
 				control_account_code, subledger_total_amount, gl_control_balance_amount,
-				difference_amount, status, run_at, run_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				difference_amount, status, run_at, run_by_principal_id, book_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULLIF($13, ''))
 		`, run.ControlRunID, tenantID, run.LegalEntityID, run.FiscalPeriod, run.Subledger,
 			run.ControlAccountCode, run.SubledgerTotalAmount, run.GLControlBalanceAmount,
-			run.DifferenceAmount, run.Status, run.RunAt, run.RunByPrincipalID)
+			run.DifferenceAmount, run.Status, run.RunAt, run.RunByPrincipalID, run.BookID)
 		return err
 	})
 }
@@ -315,7 +348,7 @@ func (s *PgStore) ListControlRuns(ctx context.Context, legalEntityID, fiscalPeri
 		rows, err := tx.Query(ctx, `
 			SELECT control_run_id, tenant_id, legal_entity_id, fiscal_period, subledger,
 			       control_account_code, subledger_total_amount, gl_control_balance_amount,
-			       difference_amount, status, run_at, run_by_principal_id
+			       difference_amount, status, run_at, run_by_principal_id, COALESCE(book_id, '')
 			FROM subledger_control_runs
 			WHERE tenant_id = $1 AND legal_entity_id = $2 AND fiscal_period = $3
 			ORDER BY run_at DESC
@@ -329,7 +362,7 @@ func (s *PgStore) ListControlRuns(ctx context.Context, legalEntityID, fiscalPeri
 			if err := rows.Scan(
 				&run.ControlRunID, &run.TenantID, &run.LegalEntityID, &run.FiscalPeriod, &run.Subledger,
 				&run.ControlAccountCode, &run.SubledgerTotalAmount, &run.GLControlBalanceAmount,
-				&run.DifferenceAmount, &run.Status, &run.RunAt, &run.RunByPrincipalID,
+				&run.DifferenceAmount, &run.Status, &run.RunAt, &run.RunByPrincipalID, &run.BookID,
 			); err != nil {
 				return err
 			}
@@ -2183,4 +2216,384 @@ func (s *PgStore) UpsertLineageProjectionStatus(ctx context.Context, legalEntity
 		`, tenantID, legalEntityID, status, degradedReason, at)
 		return mapPgError(err)
 	})
+}
+
+// ── Close requirements (ACC-14 checklist, migration 000016) ─────────────────
+
+const closeRequirementColumns = `
+	requirement_id::text, tenant_id, legal_entity_id, kind, COALESCE(subledger, ''),
+	COALESCE(book_id, ''), COALESCE(bank_account_id, ''), reason, created_at,
+	created_by_principal_id, removed_at, COALESCE(removed_by_principal_id, ''),
+	COALESCE(removal_reason, '')`
+
+func scanCloseRequirement(row pgx.Row) (*domain.CloseRequirement, error) {
+	var cr domain.CloseRequirement
+	if err := row.Scan(&cr.RequirementID, &cr.TenantID, &cr.LegalEntityID, &cr.Kind, &cr.Subledger,
+		&cr.BookID, &cr.BankAccountID, &cr.Reason, &cr.CreatedAt, &cr.CreatedByPrincipalID,
+		&cr.RemovedAt, &cr.RemovedByPrincipalID, &cr.RemovalReason); err != nil {
+		return nil, err
+	}
+	return &cr, nil
+}
+
+// CreateCloseRequirement adds a checklist item. Adding one that is already
+// active is a replay: cr is overwritten with the existing row and created is
+// false.
+func (s *PgStore) CreateCloseRequirement(ctx context.Context, cr *domain.CloseRequirement) (created bool, err error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return false, domain.ErrIdentityMissing
+	}
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO close_requirements (
+				requirement_id, tenant_id, legal_entity_id, kind, subledger, book_id,
+				bank_account_id, reason, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8, $9, $10)
+			ON CONFLICT (tenant_id, legal_entity_id, kind, (COALESCE(subledger, '')),
+			             (COALESCE(book_id, '')), (COALESCE(bank_account_id, '')))
+			WHERE removed_at IS NULL DO NOTHING`,
+			cr.RequirementID, tenantID, cr.LegalEntityID, cr.Kind, cr.Subledger, cr.BookID,
+			cr.BankAccountID, cr.Reason, cr.CreatedAt, cr.CreatedByPrincipalID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 1 {
+			created = true
+			return nil
+		}
+		existing, err := scanCloseRequirement(tx.QueryRow(ctx, `SELECT `+closeRequirementColumns+`
+			FROM close_requirements
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND kind = $3
+			  AND COALESCE(subledger, '') = $4 AND COALESCE(book_id, '') = $5
+			  AND COALESCE(bank_account_id, '') = $6 AND removed_at IS NULL`,
+			tenantID, cr.LegalEntityID, cr.Kind, cr.Subledger, cr.BookID, cr.BankAccountID))
+		if err != nil {
+			return err
+		}
+		*cr = *existing
+		return nil
+	})
+	return created, err
+}
+
+// GetCloseRequirement returns one requirement, removed or not.
+func (s *PgStore) GetCloseRequirement(ctx context.Context, requirementID string) (*domain.CloseRequirement, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.CloseRequirement
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		cr, err := scanCloseRequirement(tx.QueryRow(ctx, `SELECT `+closeRequirementColumns+`
+			FROM close_requirements WHERE tenant_id = $1 AND requirement_id::text = $2`, tenantID, requirementID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrCloseRequirementNotFound
+		}
+		out = cr
+		return err
+	})
+	return out, err
+}
+
+// ListCloseRequirements returns an entity's ACTIVE requirements, oldest first.
+func (s *PgStore) ListCloseRequirements(ctx context.Context, legalEntityID string) ([]domain.CloseRequirement, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.CloseRequirement
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT `+closeRequirementColumns+`
+			FROM close_requirements
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND removed_at IS NULL
+			ORDER BY created_at, requirement_id`, tenantID, legalEntityID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			cr, err := scanCloseRequirement(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *cr)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// RemoveCloseRequirement stamps an active requirement removed. Never deletes:
+// the row stays as evidence of what the checklist was and who changed it.
+func (s *PgStore) RemoveCloseRequirement(ctx context.Context, requirementID, principalID, reason string, at time.Time) (*domain.CloseRequirement, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.CloseRequirement
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		cr, err := scanCloseRequirement(tx.QueryRow(ctx, `
+			UPDATE close_requirements
+			   SET removed_at = $3, removed_by_principal_id = $4, removal_reason = $5
+			 WHERE tenant_id = $1 AND requirement_id::text = $2 AND removed_at IS NULL
+			RETURNING `+closeRequirementColumns, tenantID, requirementID, at, principalID, reason))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrCloseRequirementNotFound
+		}
+		out = cr
+		return err
+	})
+	return out, err
+}
+
+// ListCloseEvidence returns every evidence row for a period, oldest first: a
+// period reopened and closed again has one per close, and each stays.
+func (s *PgStore) ListCloseEvidence(ctx context.Context, fiscalPeriodID string) ([]domain.CloseEvidence, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.CloseEvidence
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT evidence_id::text, tenant_id, fiscal_period_id::text, trial_balance_hash, signature,
+			       generated_at, COALESCE(reliance_manifest, ''), COALESCE(reliance_hash, ''),
+			       COALESCE(reliance_signature, '')
+			  FROM close_evidences
+			 WHERE tenant_id = $1 AND fiscal_period_id::text = $2
+			 ORDER BY generated_at, evidence_id`, tenantID, fiscalPeriodID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e domain.CloseEvidence
+			if err := rows.Scan(&e.EvidenceID, &e.TenantID, &e.FiscalPeriodID, &e.TrialBalanceHash, &e.Signature,
+				&e.GeneratedAt, &e.RelianceManifest, &e.RelianceHash, &e.RelianceSignature); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// ── Reopen requests and close history (migration 000018) ────────────────────
+
+const reopenRequestColumns = `request_id::text, tenant_id, fiscal_period_id::text, requested_by_principal_id,
+	reason, reopen_until, status, COALESCE(decided_by_principal_id, ''), decided_at,
+	COALESCE(decision_reason, ''), created_at`
+
+func scanReopenRequest(row pgx.Row) (*domain.ReopenRequest, error) {
+	var r domain.ReopenRequest
+	if err := row.Scan(&r.RequestID, &r.TenantID, &r.FiscalPeriodID, &r.RequestedByPrincipalID, &r.Reason,
+		&r.ReopenUntil, &r.Status, &r.DecidedByPrincipalID, &r.DecidedAt, &r.DecisionReason, &r.CreatedAt); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// CreateReopenRequest records a request to reopen a closed period. The
+// period must be HARD_CLOSED or RECLOSED; at most one request per period may
+// be pending.
+func (s *PgStore) CreateReopenRequest(ctx context.Context, req *domain.ReopenRequest) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var status string
+		err := tx.QueryRow(ctx, `SELECT close_status FROM fiscal_periods
+			WHERE fiscal_period_id = $1 AND tenant_id = $2 FOR UPDATE`, req.FiscalPeriodID, tenantID).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrFiscalPeriodNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if status != domain.PeriodHardClosed && status != domain.PeriodReclosed {
+			return domain.ErrInvalidPeriodTransition
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO period_reopen_requests (request_id, tenant_id, fiscal_period_id, requested_by_principal_id,
+			    reason, reopen_until, status, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', $7)`,
+			req.RequestID, tenantID, req.FiscalPeriodID, req.RequestedByPrincipalID, req.Reason, req.ReopenUntil, req.CreatedAt)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return domain.ErrReopenRequestPending
+		}
+		return err
+	})
+	return mapPgError(err)
+}
+
+// GetReopenRequest returns one request, decided or not.
+func (s *PgStore) GetReopenRequest(ctx context.Context, requestID string) (*domain.ReopenRequest, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.ReopenRequest
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		r, err := scanReopenRequest(tx.QueryRow(ctx, `SELECT `+reopenRequestColumns+`
+			FROM period_reopen_requests WHERE tenant_id = $1 AND request_id::text = $2`, tenantID, requestID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrReopenRequestNotFound
+		}
+		out = r
+		return err
+	})
+	return out, err
+}
+
+// ApproveReopenRequest decides a pending request APPROVED and reopens its
+// period until the requested time, atomically: the request is never approved
+// without the period reopening, nor the period reopened without an approved
+// request. The approver must differ from the requester (also a CHECK in the
+// table). The window runs from approval, so a request approved late still
+// ends when it said it would.
+func (s *PgStore) ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time) (*domain.ReopenRequest, *domain.FiscalPeriod, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, nil, domain.ErrIdentityMissing
+	}
+	var req *domain.ReopenRequest
+	var fp *domain.FiscalPeriod
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		r, err := scanReopenRequest(tx.QueryRow(ctx, `SELECT `+reopenRequestColumns+`
+			FROM period_reopen_requests WHERE tenant_id = $1 AND request_id::text = $2 FOR UPDATE`, tenantID, requestID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrReopenRequestNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if r.Status != domain.ReopenPending {
+			return domain.ErrReopenRequestNotFound
+		}
+		if r.RequestedByPrincipalID == approverID {
+			return domain.ErrReopenSelfApproval
+		}
+		if !r.ReopenUntil.After(at) {
+			return domain.ErrReopenWindowInvalid
+		}
+		until := r.ReopenUntil
+		approvedAt := at
+		fp, err = applyPeriodTransition(ctx, tx, tenantID, r.FiscalPeriodID,
+			[]string{domain.PeriodHardClosed, domain.PeriodReclosed}, domain.PeriodUpdate{
+				To: domain.PeriodAuthorizedReopen, PrincipalID: approverID, Reason: r.Reason,
+				ReopenRequestID: r.RequestID, At: at, ReopenedAt: &approvedAt, ReopenExpiresAt: &until,
+			})
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE period_reopen_requests
+			   SET status = 'APPROVED', decided_by_principal_id = $3, decided_at = $4, decision_reason = $5
+			 WHERE tenant_id = $1 AND request_id::text = $2`, tenantID, requestID, approverID, at, reason); err != nil {
+			return err
+		}
+		r.Status, r.DecidedByPrincipalID, r.DecidedAt, r.DecisionReason = domain.ReopenApproved, approverID, &approvedAt, reason
+		req = r
+		return nil
+	})
+	if err != nil {
+		return nil, nil, mapPgError(err)
+	}
+	return req, fp, nil
+}
+
+// RejectReopenRequest decides a pending request REJECTED; the period is
+// untouched. The decider must not be the requester, as for approval.
+func (s *PgStore) RejectReopenRequest(ctx context.Context, requestID, deciderID, reason string, at time.Time) (*domain.ReopenRequest, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out *domain.ReopenRequest
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		r, err := scanReopenRequest(tx.QueryRow(ctx, `SELECT `+reopenRequestColumns+`
+			FROM period_reopen_requests WHERE tenant_id = $1 AND request_id::text = $2 FOR UPDATE`, tenantID, requestID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrReopenRequestNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if r.Status != domain.ReopenPending {
+			return domain.ErrReopenRequestNotFound
+		}
+		if r.RequestedByPrincipalID == deciderID {
+			return domain.ErrReopenSelfApproval
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE period_reopen_requests
+			   SET status = 'REJECTED', decided_by_principal_id = $3, decided_at = $4, decision_reason = $5
+			 WHERE tenant_id = $1 AND request_id::text = $2`, tenantID, requestID, deciderID, at, reason); err != nil {
+			return err
+		}
+		decidedAt := at
+		r.Status, r.DecidedByPrincipalID, r.DecidedAt, r.DecisionReason = domain.ReopenRejected, deciderID, &decidedAt, reason
+		out = r
+		return nil
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return out, nil
+}
+
+// GetCloseHistory returns a period's transitions and reopen requests, oldest first.
+func (s *PgStore) GetCloseHistory(ctx context.Context, fiscalPeriodID string) (*domain.CloseHistory, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	h := &domain.CloseHistory{FiscalPeriodID: fiscalPeriodID, Transitions: []domain.PeriodTransition{}, ReopenRequests: []domain.ReopenRequest{}}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT transition_id::text, tenant_id, fiscal_period_id::text, from_state, to_state, principal_id,
+			       reason, COALESCE(reopen_request_id::text, ''), occurred_at
+			  FROM period_state_transitions
+			 WHERE tenant_id = $1 AND fiscal_period_id::text = $2
+			 ORDER BY occurred_at, transition_id`, tenantID, fiscalPeriodID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var t domain.PeriodTransition
+			if err := rows.Scan(&t.TransitionID, &t.TenantID, &t.FiscalPeriodID, &t.FromState, &t.ToState,
+				&t.PrincipalID, &t.Reason, &t.ReopenRequestID, &t.OccurredAt); err != nil {
+				rows.Close()
+				return err
+			}
+			h.Transitions = append(h.Transitions, t)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `SELECT `+reopenRequestColumns+`
+			FROM period_reopen_requests WHERE tenant_id = $1 AND fiscal_period_id::text = $2
+			ORDER BY created_at, request_id`, tenantID, fiscalPeriodID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, err := scanReopenRequest(rows)
+			if err != nil {
+				return err
+			}
+			h.ReopenRequests = append(h.ReopenRequests, *r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return h, nil
 }

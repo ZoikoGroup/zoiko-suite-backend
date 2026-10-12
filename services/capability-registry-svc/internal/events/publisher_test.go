@@ -22,11 +22,12 @@ import (
 
 type fakeWriter struct {
 	msgs []kafka.Message
+	err  error
 }
 
 func (f *fakeWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) error {
 	f.msgs = append(f.msgs, msgs...)
-	return nil
+	return f.err
 }
 
 type envelope struct {
@@ -83,4 +84,35 @@ func TestPublish_RepeatEventsOnSameCapability_GetDistinctEventIDs(t *testing.T) 
 	first := decode(t, w.msgs[0])
 	second := decode(t, w.msgs[1])
 	assert.NotEqual(t, first.EventID, second.EventID)
+}
+
+func TestPublishOutbox_PropagatesKafkaFailureAndPreservesPayloadOnRetry(t *testing.T) {
+	writeErr := assert.AnError
+	w := &fakeWriter{err: writeErr}
+	p := events.NewKafkaPublisherWithWriter(w, "zoiko.capability-registry.events", zap.NewNop())
+	payload := []byte(`{"event_id":"evt-stable","event_type":"capability.created"}`)
+
+	err := p.PublishOutbox(context.Background(), "cap-1", payload)
+	require.ErrorIs(t, err, writeErr)
+	require.Len(t, w.msgs, 1)
+
+	w.err = nil
+	require.NoError(t, p.PublishOutbox(context.Background(), "cap-1", payload))
+	require.Len(t, w.msgs, 2)
+	assert.Equal(t, w.msgs[0].Value, w.msgs[1].Value)
+	assert.Equal(t, w.msgs[0].Key, w.msgs[1].Key)
+	assert.Equal(t, payload, w.msgs[1].Value)
+	require.Len(t, w.msgs[1].Headers, 1)
+	assert.Equal(t, "X-Event-ID", w.msgs[1].Headers[0].Key)
+	assert.Equal(t, "evt-stable", string(w.msgs[0].Headers[0].Value))
+	assert.Equal(t, string(w.msgs[0].Headers[0].Value), string(w.msgs[1].Headers[0].Value))
+}
+
+func TestPublishOutbox_RejectsMissingEventID(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewKafkaPublisherWithWriter(w, "zoiko.capability-registry.events", zap.NewNop())
+
+	err := p.PublishOutbox(context.Background(), "cap-1", []byte(`{"event_type":"capability.created"}`))
+	require.ErrorContains(t, err, "event_id is required")
+	assert.Empty(t, w.msgs)
 }

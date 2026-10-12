@@ -21,10 +21,14 @@ import (
 
 // ── stub publisher ───────────────────────────────────────────────────────────
 
-type stubPublisher struct{ calls int }
+type stubPublisher struct {
+	calls  int
+	params []events.PublishParams
+}
 
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
+func (p *stubPublisher) Publish(_ context.Context, params events.PublishParams) error {
 	p.calls++
+	p.params = append(p.params, params)
 	return nil
 }
 

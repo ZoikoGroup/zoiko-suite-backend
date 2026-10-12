@@ -1,0 +1,3 @@
+DROP TRIGGER IF EXISTS aig_outbox_ai_output_dispositions_update ON ai_output_dispositions;
+DROP TRIGGER IF EXISTS aig_outbox_ai_output_dispositions_insert ON ai_output_dispositions;
+DROP TABLE IF EXISTS ai_output_dispositions;

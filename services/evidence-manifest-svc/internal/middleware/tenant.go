@@ -14,6 +14,7 @@ import (
 )
 
 type tenantCtxKey struct{}
+type principalCtxKey struct{}
 
 // WithTenant returns a context carrying the caller's verified tenant.
 func WithTenant(ctx context.Context, tenantID string) context.Context {
@@ -33,21 +34,19 @@ func TenantFromContext(ctx context.Context) string {
 	return v
 }
 
+// WithPrincipal returns a context carrying the caller's verified principal ID.
+func WithPrincipal(ctx context.Context, principalID string) context.Context {
+	return context.WithValue(ctx, principalCtxKey{}, principalID)
+}
+
+// PrincipalFromContext returns the verified principal ID, or "" when missing.
+func PrincipalFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(principalCtxKey{}).(string)
+	return v
+}
+
 // TenantContext requires a gateway-verified X-Tenant-Id on every request and
-// refuses those without one.
-//
-// Unlike ai-governance-svc and commercial-account-svc, this service gets a
-// blanket refusal rather than a per-handler check, because it has no
-// platform-scope routes: all three of its endpoints operate on one tenant's
-// evidence. There is no catalog or taxonomy here that every tenant reads in
-// common, so nothing legitimately arrives without a tenant.
-//
-// This is the whole of the service's request-level access control at
-// present. It has no authorization client at all — no internal/authz
-// package, no CheckAllowed call on any route — so within a tenant every
-// principal can read and generate every manifest. That gap is tracked
-// separately; it needs its own action constants and an authz client, and is
-// not something a tenant-isolation change should invent quietly.
+// refuses those without one. It also propagates X-Principal-Id if present.
 func TenantContext() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -59,7 +58,11 @@ func TenantContext() func(http.Handler) http.Handler {
 					`"message":"X-Tenant-Id is required — the gateway sets it from a verified identity envelope"}`))
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(WithTenant(r.Context(), tenantID)))
+			ctx := WithTenant(r.Context(), tenantID)
+			if principalID := r.Header.Get("X-Principal-Id"); principalID != "" {
+				ctx = WithPrincipal(ctx, principalID)
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }

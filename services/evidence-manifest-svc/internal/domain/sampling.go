@@ -181,6 +181,7 @@ type SupersedeSampleParams struct {
 var (
 	ErrSampleDesignNotFound       = errors.New("sample design not found")
 	ErrSampleDesignInvalidState   = errors.New("sample design is not in a state that permits this action")
+	ErrSelfApprovalForbidden      = errors.New("self-approval is forbidden: creator cannot approve their own sample design")
 	ErrSampleItemNotFound         = errors.New("sample item not found")
 	ErrSampleItemInvalidState     = errors.New("sample item is not in a state that permits this action")
 	ErrSampleSelectionInvalidated = errors.New("sample selection is invalidated — its parameter set has changed since selection; supersede the design")

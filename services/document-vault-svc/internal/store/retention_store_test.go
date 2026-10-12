@@ -192,12 +192,42 @@ func TestDRC03_LegalHold_BlocksApproveForDisposition(t *testing.T) {
 
 	// After release, approval succeeds — the hold, not a permanent
 	// change, was the only thing blocking disposition.
-	_, err = s.ReleaseLegalHold(tenantCtx(), domain.ReleaseLegalHoldParams{HoldID: hold.HoldID, ReleaseReason: "matter closed", ReleasedByPrincipalID: "counsel-frank"})
+	_, err = s.ReleaseLegalHold(tenantCtx(), domain.ReleaseLegalHoldParams{
+		HoldID: hold.HoldID, ReleaseReason: "matter closed", ReleasedByPrincipalID: "counsel-frank", ReleaseApprovedByPrincipalID: "legal-ops-director-dana",
+	})
 	require.NoError(t, err)
 
 	approved, err := s.ApproveForDisposition(tenantCtx(), domain.ApproveForDispositionParams{RetentionStateID: st.RetentionStateID, ApprovedByPrincipalID: "approver-grace"})
 	require.NoError(t, err)
 	require.Equal(t, domain.RetentionApprovedForDisposition, approved.State)
+}
+
+// ZS-SVC-S-001 §5.5: "release_approved_by: Separate release authority;
+// self-release restrictions apply." The principal who issued (and here,
+// also executes) the release cannot also be its own approver.
+func TestDRC03_LegalHold_ReleaseRejectsSelfApproval(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	rec := createTestRecord(t, s, "hold-self-release", string(domain.RecordClassLegalMatterRecord), "US-DE")
+
+	hold, err := s.CreateLegalHold(tenantCtx(), domain.CreateLegalHoldParams{
+		MatterRef: "Matter-2026-002", HoldReasonCode: "LITIGATION", RecordIDs: []string{rec.RecordID}, IssuedByPrincipalID: "counsel-frank",
+	})
+	require.NoError(t, err)
+	_, err = s.ActivateLegalHold(tenantCtx(), domain.ActivateLegalHoldParams{HoldID: hold.HoldID, ActivatedByPrincipalID: "counsel-frank"})
+	require.NoError(t, err)
+
+	_, err = s.ReleaseLegalHold(tenantCtx(), domain.ReleaseLegalHoldParams{
+		HoldID: hold.HoldID, ReleaseReason: "self-release attempt", ReleasedByPrincipalID: "counsel-frank", ReleaseApprovedByPrincipalID: "counsel-frank",
+	})
+	require.ErrorIs(t, err, domain.ErrLegalHoldSelfRelease)
+
+	// An independent approver still succeeds.
+	released, err := s.ReleaseLegalHold(tenantCtx(), domain.ReleaseLegalHoldParams{
+		HoldID: hold.HoldID, ReleaseReason: "matter closed", ReleasedByPrincipalID: "counsel-frank", ReleaseApprovedByPrincipalID: "legal-ops-director-dana",
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.LegalHoldReleased, released.Status)
 }
 
 // Without any legal hold, the full dry-run pipeline reaches
@@ -271,7 +301,9 @@ func TestDRC03_LegalHold_MultipleTargetsReleasedTogether(t *testing.T) {
 		require.Nil(t, tgt.ReleasedAt)
 	}
 
-	_, err = s.ReleaseLegalHold(tenantCtx(), domain.ReleaseLegalHoldParams{HoldID: hold.HoldID, ReleaseReason: "resolved", ReleasedByPrincipalID: "counsel-frank"})
+	_, err = s.ReleaseLegalHold(tenantCtx(), domain.ReleaseLegalHoldParams{
+		HoldID: hold.HoldID, ReleaseReason: "resolved", ReleasedByPrincipalID: "counsel-frank", ReleaseApprovedByPrincipalID: "legal-ops-director-dana",
+	})
 	require.NoError(t, err)
 
 	released, err := s.ListLegalHoldTargets(tenantCtx(), hold.HoldID)

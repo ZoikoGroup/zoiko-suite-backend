@@ -765,6 +765,13 @@ func (h *PriceBookHandler) PriceVersionAction(w http.ResponseWriter, r *http.Req
 	case "submit":
 		v, err = h.store.SubmitForApproval(ctx, id, cmd.ifMatch, principal, now, cmd.claim)
 	case "approve":
+		if existing, err := h.store.GetPriceVersion(ctx, id, true); err == nil && existing != nil {
+			if principal == existing.CreatedByPrincipalID || (existing.SubmittedByPrincipalID != nil && principal == *existing.SubmittedByPrincipalID) {
+				writeProblem(w, r, Problem{Status: http.StatusForbidden, Code: CodeSoDViolation,
+					Detail: "proposer cannot approve own price version (segregation of duties)"})
+				return
+			}
+		}
 		v, err = h.store.ApprovePriceVersion(ctx, id, cmd.ifMatch, principal, now, cmd.claim)
 	case "reject":
 		v, err = h.store.RejectPriceVersion(ctx, id, cmd.ifMatch, principal, reason, now, cmd.claim)

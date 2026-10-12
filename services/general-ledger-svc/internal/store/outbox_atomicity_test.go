@@ -12,15 +12,57 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
-	"zoiko.io/general-ledger-svc/internal/outbox"
 	"zoiko.io/general-ledger-svc/internal/store"
 )
 
+// storedEvent is one eventing_outbox row with its rendered envelope decoded.
+type storedEvent struct {
+	EventID, EventType, TenantID, Region, PayloadHash string
+	Body                                              map[string]json.RawMessage
+}
+
+func (e storedEvent) str(t *testing.T, key string) string {
+	t.Helper()
+	var v string
+	require.NoError(t, json.Unmarshal(e.Body[key], &v), "member %q", key)
+	return v
+}
+
+func loadEvent(t *testing.T, pool interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, aggregateID, fact string) storedEvent {
+	t.Helper()
+	var e storedEvent
+	var payload []byte
+	err := pool.QueryRow(context.Background(), `
+		SELECT event_id, event_type, tenant_id, region, payload_hash, payload
+		  FROM eventing_outbox
+		 WHERE aggregate_id = $1 AND event_type = $2`,
+		aggregateID, "com.zoikosuite.accounting.journal."+fact).
+		Scan(&e.EventID, &e.EventType, &e.TenantID, &e.Region, &e.PayloadHash, &payload)
+	require.NoError(t, err, "expected an outbox row for journal.%s", fact)
+	require.NoError(t, json.Unmarshal(payload, &e.Body))
+	return e
+}
+
+func countEvents(t *testing.T, pool interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, aggregateID, fact string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM eventing_outbox WHERE aggregate_id = $1 AND event_type = $2`,
+		aggregateID, "com.zoikosuite.accounting.journal."+fact).Scan(&n))
+	return n
+}
+
 func TestPgStore_Outbox_CreateJournal_Atomicity_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -51,42 +93,36 @@ func TestPgStore_Outbox_CreateJournal_Atomicity_RealDB(t *testing.T) {
 	assert.True(t, created)
 	assert.Len(t, resultLines, 2)
 
-	// Verify outbox row committed atomically with the domain state
-	var eventType, aggType, aggID, storedTenantID, storedEntityID string
-	var payloadBytes []byte
-	err = pool.QueryRow(ctx, `
-		SELECT event_type, aggregate_type, aggregate_id, tenant_id::text, legal_entity_id::text, payload
-		FROM outbox_events
-		WHERE aggregate_id = $1
-	`, journalID).Scan(&eventType, &aggType, &aggID, &storedTenantID, &storedEntityID, &payloadBytes)
-	require.NoError(t, err, "expected outbox row for journal.created to be present")
-
-	assert.Equal(t, "journal.created", eventType)
-	assert.Equal(t, "JOURNAL", aggType)
-	assert.Equal(t, journalID, aggID)
-	assert.Equal(t, tenantID, storedTenantID)
-	assert.Equal(t, legalEntityID, storedEntityID)
-
-	var env outbox.VariantAEnvelope
-	require.NoError(t, json.Unmarshal(payloadBytes, &env))
-	assert.Equal(t, "journal.created", env.EventType)
-	assert.Equal(t, "general-ledger-svc", env.SourceService)
-	assert.Equal(t, correlationID, env.CorrelationID)
+	// The event committed with the journal, carrying the canonical envelope
+	// (ZS-EVENT-001 §4) and the legacy names existing consumers parse.
+	e := loadEvent(t, pool, journalID, "created")
+	assert.Equal(t, tenantID, e.TenantID)
+	assert.Equal(t, "uk", e.Region)
+	assert.Equal(t, e.EventID, e.str(t, "id"), "row event_id and envelope id must be the same identity")
+	assert.Equal(t, "com.zoikosuite.accounting.journal.created", e.str(t, "type"))
+	assert.Equal(t, "urn:zoikosuite:service:general-ledger-svc", e.str(t, "source"))
+	assert.Equal(t, "urn:zoikosuite:journal:"+journalID, e.str(t, "subject"))
+	assert.Equal(t, legalEntityID, e.str(t, "legalentityid"))
+	assert.Equal(t, correlationID, e.str(t, "correlationid"))
+	assert.Equal(t, "preparer-1", e.str(t, "actorid"))
+	assert.Equal(t, "uk", e.str(t, "residencyregion"))
+	assert.Equal(t, "confidential", e.str(t, "classification"))
+	assert.Equal(t, e.PayloadHash, e.str(t, "payloadhash"))
+	assert.Equal(t, envelope.PayloadHash(e.Body["data"]), e.PayloadHash, "payloadhash must verify against the stored data bytes")
+	assert.Equal(t, "journal.created", e.str(t, "event_type"), "legacy event_type kept for existing consumers")
+	assert.Equal(t, e.EventID, e.str(t, "event_id"))
 
 	// Idempotent Replay: zero duplicate outbox events
 	_, createdRetry, err := s.CreateJournal(ctx, h, lines)
 	require.NoError(t, err)
 	assert.False(t, createdRetry, "expected replay to return created=false")
 
-	var outboxCount int
-	err = pool.QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE aggregate_id = $1", journalID).Scan(&outboxCount)
-	require.NoError(t, err)
-	assert.Equal(t, 1, outboxCount, "expected exactly 1 outbox event across idempotent retries")
+	assert.Equal(t, 1, countEvents(t, pool, journalID, "created"), "expected exactly 1 outbox event across idempotent retries")
 }
 
 func TestPgStore_Outbox_TransitionJournal_ValidatedAndPosted_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -118,26 +154,15 @@ func TestPgStore_Outbox_TransitionJournal_ValidatedAndPosted_RealDB(t *testing.T
 	err = s.TransitionJournal(ctx, tenantID, journalID, domain.JournalStatusPending, domain.JournalStatusValidated, "validator-1")
 	require.NoError(t, err)
 
-	var validatedCount int
-	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM outbox_events
-		WHERE aggregate_id = $1 AND event_type = 'journal.validated'
-	`, journalID).Scan(&validatedCount)
-	require.NoError(t, err)
-	assert.Equal(t, 1, validatedCount)
+	assert.Equal(t, 1, countEvents(t, pool, journalID, "validated"))
+	assert.Equal(t, "validator-1", loadEvent(t, pool, journalID, "validated").str(t, "actorid"))
 
 	// Transition VALIDATED -> FINALIZED
 	err = s.TransitionJournal(ctx, tenantID, journalID, domain.JournalStatusValidated, domain.JournalStatusFinalized, "poster-1")
 	require.NoError(t, err)
 
 	// Verify both ledger entries and journal.posted outbox row committed atomically
-	var postedCount int
-	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM outbox_events
-		WHERE aggregate_id = $1 AND event_type = 'journal.posted'
-	`, journalID).Scan(&postedCount)
-	require.NoError(t, err)
-	assert.Equal(t, 1, postedCount)
+	assert.Equal(t, 1, countEvents(t, pool, journalID, "posted"))
 
 	var ledgerEntriesCount int
 	err = pool.QueryRow(ctx, `
@@ -150,7 +175,7 @@ func TestPgStore_Outbox_TransitionJournal_ValidatedAndPosted_RealDB(t *testing.T
 
 func TestPgStore_Outbox_ReverseJournal_Atomicity_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	legalEntityID := uuid.New().String()
@@ -210,31 +235,17 @@ func TestPgStore_Outbox_ReverseJournal_Atomicity_RealDB(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, string(domain.JournalStatusReversed), originalStatus)
 
-	// Verify outbox event for journal.reversed exists with aggregate_id = originalJournalID
-	var reversedPayloadBytes []byte
-	err = pool.QueryRow(ctx, `
-		SELECT payload FROM outbox_events
-		WHERE aggregate_id = $1 AND event_type = 'journal.reversed'
-	`, originalJournalID).Scan(&reversedPayloadBytes)
-	require.NoError(t, err)
-
-	var env outbox.VariantAEnvelope
-	require.NoError(t, json.Unmarshal(reversedPayloadBytes, &env))
-	assert.Equal(t, "journal.reversed", env.EventType)
-
+	// journal.reversed is a fact about the ORIGINAL journal's aggregate.
+	rev := loadEvent(t, pool, originalJournalID, "reversed")
 	var payloadData map[string]any
-	require.NoError(t, json.Unmarshal(env.Payload, &payloadData))
+	require.NoError(t, json.Unmarshal(rev.Body["data"], &payloadData))
 	assert.Equal(t, originalJournalID, payloadData["journal_id"])
 	assert.Equal(t, reversingJournalID, payloadData["reversing_journal_id"])
+	assert.Equal(t, "reverser-1", rev.str(t, "actorid"))
 
 	// Critical check: DO NOT create a separate journal.posted event for the reversing journal
-	var reversingPostedCount int
-	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM outbox_events
-		WHERE aggregate_id = $1 AND event_type = 'journal.posted'
-	`, reversingJournalID).Scan(&reversingPostedCount)
-	require.NoError(t, err)
-	assert.Equal(t, 0, reversingPostedCount, "reversing journal must NOT emit a separate journal.posted event")
+	assert.Equal(t, 0, countEvents(t, pool, reversingJournalID, "posted"),
+		"reversing journal must NOT emit a separate journal.posted event")
 }
 
 func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
@@ -245,7 +256,6 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 	legalEntityID := uuid.New().String()
 	journalID := uuid.New().String()
 	correlationID := uuid.New().String()
-	outboxEventID := uuid.New().String()
 
 	// 1. Begin raw transaction
 	tx, err := pool.Begin(ctx)
@@ -278,23 +288,27 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	// 3. Write the outbox row
-	err = outbox.Insert(ctx, tx, outbox.Event{
-		OutboxEventID: outboxEventID,
-		AggregateType: "JOURNAL",
-		AggregateID:   journalID,
-		EventType:     "journal.proposed",
-		TenantID:      tenantID,
-		LegalEntityID: legalEntityID,
-		CorrelationID: correlationID,
-		Payload:       map[string]any{"journal_id": journalID},
+	// 3. Write the outbox row through the shared library, in the same tx
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.journal.created",
+		Service:         "general-ledger-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "journal",
+		AggregateID:     journalID,
+		CorrelationID:   correlationID,
+		ResidencyRegion: "uk",
+		Classification:  envelope.Confidential,
+		Data:            map[string]any{"journal_id": journalID},
 	})
 	require.NoError(t, err)
+	require.NoError(t, outbox.Enqueue(ctx, tx, env))
 
-	// 4. Deliberately fail the transaction before commit
-	// (Trigger duplicate primary key on outbox_events)
-	_, err = tx.Exec(ctx, "INSERT INTO outbox_events (outbox_event_id) VALUES ($1)", outboxEventID)
-	require.Error(t, err, "expected duplicate primary key constraint collision")
+	// 4. Deliberately fail the transaction before commit: enqueueing the same
+	// envelope again collides on event_id.
+	require.Error(t, outbox.Enqueue(ctx, tx, env), "expected duplicate event_id collision")
 
 	err = tx.Rollback(ctx)
 	require.NoError(t, err)
@@ -305,7 +319,7 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 		err := verifyTx.QueryRow(ctx, "SELECT count(*) FROM journal_headers WHERE journal_id = $1", journalID).Scan(&journalCount)
 		require.NoError(t, err)
 
-		err = verifyTx.QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE aggregate_id = $1", journalID).Scan(&outboxCount)
+		err = verifyTx.QueryRow(ctx, "SELECT count(*) FROM eventing_outbox WHERE aggregate_id = $1", journalID).Scan(&outboxCount)
 		require.NoError(t, err)
 	})
 

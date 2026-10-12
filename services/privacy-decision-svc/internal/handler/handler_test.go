@@ -99,14 +99,14 @@ func newStubPurposeRegistry() *stubPurposeRegistry {
 	}
 }
 
-func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, activityID string) (*purposeregistry.ActivityVersion, error) {
+func (p *stubPurposeRegistry) ResolveActivity(_ context.Context, _, activityID string) (*purposeregistry.ActivityVersion, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
 	return p.activities[activityID], nil
 }
 
-func (p *stubPurposeRegistry) ResolvePurpose(_ context.Context, purposeID string) (*purposeregistry.PurposeVersion, error) {
+func (p *stubPurposeRegistry) ResolvePurpose(_ context.Context, _, purposeID string) (*purposeregistry.PurposeVersion, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -122,7 +122,7 @@ type stubConsentRegistry struct {
 	err              error
 }
 
-func (c *stubConsentRegistry) ResolveStatus(_ context.Context, _, _ string) (*consentregistry.ConsentResolution, error) {
+func (c *stubConsentRegistry) ResolveStatus(_ context.Context, _, _, _ string) (*consentregistry.ConsentResolution, error) {
 	if c.err != nil {
 		return nil, c.err
 	}

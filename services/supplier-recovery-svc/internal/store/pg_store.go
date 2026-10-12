@@ -14,16 +14,12 @@ import (
 
 	"zoiko.io/supplier-recovery-svc/internal/domain"
 	"zoiko.io/supplier-recovery-svc/internal/middleware"
+	"zoiko.io/supplier-recovery-svc/internal/outbox"
 )
 
 func isInvalidUUID(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
-}
-
-func isUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 type Store interface {
@@ -51,6 +47,9 @@ func NewPgStore(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
+// Pool exposes the pool so the outbox relay can share it.
+func (s *PgStore) Pool() *pgxpool.Pool { return s.pool }
+
 func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -69,7 +68,7 @@ func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
 
 const caseColumns = `
 	case_id, tenant_id, legal_entity_id, supplier_ref, recovery_basis, source_payable_id,
-	total_amount, recovered_amount, currency, recovery_reason, status,
+	total_amount::float8, recovered_amount::float8, currency, recovery_reason, status,
 	escalation_reason, write_off_reason, close_note,
 	created_by_principal_id, approved_by_principal_id, created_at, updated_at`
 
@@ -85,6 +84,11 @@ func scanCase(row pgx.Row) (*domain.SupplierRecoveryCase, error) {
 	return c, nil
 }
 
+// tenantOf is the request's verified tenant. Every query also filters on it
+// explicitly: row-level security is the backstop, not the only isolation, so a
+// deployment that connects as a role which bypasses RLS is still tenant-safe.
+func tenantOf(ctx context.Context) string { return middleware.TenantFromContext(ctx) }
+
 func nullableTenant(tenantID string) *string {
 	if tenantID == "" {
 		return nil
@@ -92,13 +96,26 @@ func nullableTenant(tenantID string) *string {
 	return &tenantID
 }
 
-func (s *PgStore) recordApplication(ctx context.Context, tx pgx.Tx, tenantID *string, caseID, appType string, amount float64, idempotencyRef, detail, actorPrincipalID string) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO recovery_applications (application_id, tenant_id, case_id, application_type, amount, idempotency_ref, detail, actor_principal_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		uuid.New().String(), tenantID, caseID, appType, amount, idempotencyRef, detail, actorPrincipalID,
-	)
-	return err
+// emit writes one domain event to outbox_events inside the caller's
+// transaction, so the state change and its event commit or roll back
+// together. The payload is the Variant B envelope the relay publishes verbatim.
+func (s *PgStore) emit(ctx context.Context, tx pgx.Tx, c *domain.SupplierRecoveryCase, eventType, actorPrincipalID string, payload any) error {
+	id := uuid.New().String()
+	var corr *string
+	if v := middleware.CorrelationFromContext(ctx); v != "" {
+		corr = &v
+	}
+	actor := actorPrincipalID
+	return outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: id, AggregateType: "supplier_recovery_case", AggregateID: c.CaseID, EventType: eventType,
+		TenantID: c.TenantID, LegalEntityID: c.LegalEntityID, ActorID: &actor, CorrelationID: corr,
+		Payload: outbox.NewVariantBEnvelope(id, eventType, c.CaseID, c.TenantID, &actor, corr, payload),
+	})
+}
+
+func (s *PgStore) unavailable(op string, err error) error {
+	s.log.Error("pg "+op+" failed", zap.Error(err))
+	return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 }
 
 func (s *PgStore) CreateCase(ctx context.Context, tenantID string, req domain.CreateCaseRequest, principalID string) (*domain.SupplierRecoveryCase, error) {
@@ -107,17 +124,23 @@ func (s *PgStore) CreateCase(ctx context.Context, tenantID string, req domain.Cr
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
 		c, err = scanCase(tx.QueryRow(ctx, `
-			INSERT INTO supplier_recovery_cases (`+caseColumns+`)
+			INSERT INTO supplier_recovery_cases (
+				case_id, tenant_id, legal_entity_id, supplier_ref, recovery_basis, source_payable_id,
+				total_amount, recovered_amount, currency, recovery_reason, status,
+				escalation_reason, write_off_reason, close_note,
+				created_by_principal_id, approved_by_principal_id, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, 'OPEN', '', '', '', $10, '', NOW(), NOW())
 			RETURNING `+caseColumns,
 			caseID, nullableTenant(tenantID), req.LegalEntityID, req.SupplierRef, req.RecoveryBasis, req.SourcePayableID,
 			req.TotalAmount, req.Currency, req.RecoveryReason, principalID,
 		))
-		return err
+		if err != nil {
+			return err
+		}
+		return s.emit(ctx, tx, c, domain.EventRecoveryCaseCreated, principalID, c)
 	})
 	if err != nil {
-		s.log.Error("pg CreateCase failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, s.unavailable("CreateCase", err)
 	}
 	return c, nil
 }
@@ -126,15 +149,14 @@ func (s *PgStore) FindCase(ctx context.Context, caseID string) (*domain.Supplier
 	var c *domain.SupplierRecoveryCase
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
-		c, err = scanCase(tx.QueryRow(ctx, `SELECT `+caseColumns+` FROM supplier_recovery_cases WHERE case_id = $1`, caseID))
+		c, err = scanCase(tx.QueryRow(ctx, `SELECT `+caseColumns+` FROM supplier_recovery_cases WHERE case_id = $1 AND tenant_id::text = $2`, caseID, tenantOf(ctx)))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrCaseNotFound
 	}
 	if err != nil {
-		s.log.Error("pg FindCase failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, s.unavailable("FindCase", err)
 	}
 	return c, nil
 }
@@ -144,8 +166,8 @@ func (s *PgStore) ListOpenCases(ctx context.Context, legalEntityID string) ([]do
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT `+caseColumns+` FROM supplier_recovery_cases
-			WHERE legal_entity_id = $1 AND status NOT IN ('CLOSED', 'WRITTEN_OFF')
-			ORDER BY created_at ASC`, legalEntityID)
+			WHERE legal_entity_id = $1 AND tenant_id::text = $2 AND status NOT IN ('CLOSED', 'WRITTEN_OFF')
+			ORDER BY created_at ASC`, legalEntityID, tenantOf(ctx))
 		if err != nil {
 			return err
 		}
@@ -160,117 +182,130 @@ func (s *PgStore) ListOpenCases(ctx context.Context, legalEntityID string) ([]do
 		return rows.Err()
 	})
 	if err != nil {
-		s.log.Error("pg ListOpenCases failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, s.unavailable("ListOpenCases", err)
 	}
 	return out, nil
 }
 
-func (s *PgStore) ApproveRecoveryPlan(ctx context.Context, caseID, principalID string) (*domain.SupplierRecoveryCase, error) {
+// transition runs one guarded status UPDATE and the matching outbox event in a
+// single transaction. The guard lives in the UPDATE's WHERE clause (the same
+// rule as the domain's Can* predicates), so a concurrent command cannot slip
+// past a stale read: no row means the case is not in a state that allows it.
+func (s *PgStore) transition(ctx context.Context, op, eventType, principalID, sql string, args ...any) (*domain.SupplierRecoveryCase, error) {
 	var c *domain.SupplierRecoveryCase
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
-		c, err = scanCase(tx.QueryRow(ctx, `
-			UPDATE supplier_recovery_cases SET status = 'IN_RECOVERY', approved_by_principal_id = $1, updated_at = NOW()
-			WHERE case_id = $2 AND status = 'OPEN'
-			RETURNING `+caseColumns,
-			principalID, caseID,
-		))
-		return err
+		c, err = scanCase(tx.QueryRow(ctx, sql, args...))
+		if err != nil {
+			return err
+		}
+		return s.emit(ctx, tx, c, eventType, principalID, c)
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
 	}
 	if err != nil {
-		s.log.Error("pg ApproveRecoveryPlan failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, s.unavailable(op, err)
 	}
 	return c, nil
+}
+
+func (s *PgStore) ApproveRecoveryPlan(ctx context.Context, caseID, principalID string) (*domain.SupplierRecoveryCase, error) {
+	return s.transition(ctx, "ApproveRecoveryPlan", domain.EventRecoveryPlanApproved, principalID, `
+		UPDATE supplier_recovery_cases SET status = 'IN_RECOVERY', approved_by_principal_id = $1, updated_at = NOW()
+		WHERE case_id = $2 AND tenant_id::text = $3 AND status = 'OPEN'
+		RETURNING `+caseColumns, principalID, caseID, tenantOf(ctx))
 }
 
 func (s *PgStore) RecordCommitment(ctx context.Context, caseID string, req domain.RecordCommitmentRequest, principalID string) (*domain.RecoveryCommitment, error) {
 	var commitment *domain.RecoveryCommitment
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var tenantID *string
-		if err := tx.QueryRow(ctx, `SELECT tenant_id FROM supplier_recovery_cases WHERE case_id = $1`, caseID).Scan(&tenantID); err != nil {
+		c, err := scanCase(tx.QueryRow(ctx, `SELECT `+caseColumns+` FROM supplier_recovery_cases WHERE case_id = $1 AND tenant_id::text = $2`, caseID, tenantOf(ctx)))
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrCaseNotFound
 			}
 			return err
 		}
 		commitment = &domain.RecoveryCommitment{}
-		return tx.QueryRow(ctx, `
+		if err := tx.QueryRow(ctx, `
 			INSERT INTO recovery_commitments (commitment_id, tenant_id, case_id, detail, expected_method, actor_principal_id)
 			VALUES ($1, $2, $3, $4, $5, $6)
 			RETURNING commitment_id, tenant_id, case_id, detail, expected_method, actor_principal_id, created_at`,
-			uuid.New().String(), tenantID, caseID, req.Detail, req.ExpectedMethod, principalID,
+			uuid.New().String(), c.TenantID, caseID, req.Detail, req.ExpectedMethod, principalID,
 		).Scan(&commitment.CommitmentID, &commitment.TenantID, &commitment.CaseID, &commitment.Detail,
-			&commitment.ExpectedMethod, &commitment.ActorPrincipalID, &commitment.CreatedAt)
+			&commitment.ExpectedMethod, &commitment.ActorPrincipalID, &commitment.CreatedAt); err != nil {
+			return err
+		}
+		return s.emit(ctx, tx, c, domain.EventCommitmentRecorded, principalID, commitment)
 	})
 	if errors.Is(err, domain.ErrCaseNotFound) || isInvalidUUID(err) {
 		return nil, domain.ErrCaseNotFound
 	}
 	if err != nil {
-		s.log.Error("pg RecordCommitment failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, s.unavailable("RecordCommitment", err)
 	}
 	return commitment, nil
 }
 
 // ApplyRecovery is the shared path both ApplyApprovedOffset and
-// LinkConfirmedSupplierRefund go through — it recomputes RecoveredAmount
-// and status server-side from the case's own row (never a caller-supplied
-// total), and the idempotency insert is attempted BEFORE the
-// state-transition guard, exactly like payable-open-item-svc's own
-// applyResidualDelta: a replayed application that already fully recovered
-// the case on its first application must return the idempotent no-op, not
-// a wrongly-rejected "already terminal" error.
+// LinkConfirmedSupplierRefund go through. The recovered amount and status are
+// recomputed in SQL from the case's own row (never from a caller-supplied
+// total), with NUMERIC arithmetic so cents never drift.
+//
+// Idempotency is decided FIRST, by INSERT ... ON CONFLICT DO NOTHING on
+// (case, type, reference): a replay that already fully recovered the case
+// returns the idempotent no-op rather than a wrongly-rejected "already
+// terminal" error. (A plain INSERT that failed on the unique index would abort
+// the transaction and make the follow-up read impossible.) Every refusal after
+// the insert rolls the application row back with the transaction.
 func (s *PgStore) ApplyRecovery(ctx context.Context, caseID, appType string, amount float64, idempotencyRef, detail, principalID string) (*domain.SupplierRecoveryCase, bool, error) {
 	var c *domain.SupplierRecoveryCase
 	var applied bool
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var tenantID *string
-		var recovered, total float64
-		var status domain.CaseStatus
-		if err := tx.QueryRow(ctx, `SELECT tenant_id, recovered_amount, total_amount, status FROM supplier_recovery_cases WHERE case_id = $1 FOR UPDATE`, caseID).
-			Scan(&tenantID, &recovered, &total, &status); err != nil {
+		cur, err := scanCase(tx.QueryRow(ctx, `SELECT `+caseColumns+` FROM supplier_recovery_cases WHERE case_id = $1 AND tenant_id::text = $2 FOR UPDATE`, caseID, tenantOf(ctx)))
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.ErrCaseNotFound
 			}
 			return err
 		}
 
-		if err := s.recordApplication(ctx, tx, tenantID, caseID, appType, amount, idempotencyRef, detail, principalID); err != nil {
-			if isUniqueViolation(err) {
-				applied = false
-				var err2 error
-				c, err2 = scanCase(tx.QueryRow(ctx, `SELECT `+caseColumns+` FROM supplier_recovery_cases WHERE case_id = $1`, caseID))
-				return err2
-			}
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO recovery_applications (application_id, tenant_id, case_id, application_type, amount, idempotency_ref, detail, actor_principal_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (case_id, application_type, idempotency_ref) DO NOTHING`,
+			uuid.New().String(), cur.TenantID, caseID, appType, amount, idempotencyRef, detail, principalID)
+		if err != nil {
 			return err
 		}
+		if tag.RowsAffected() == 0 {
+			applied, c = false, cur
+			return nil
+		}
 
-		if !domain.CanApplyRecovery(status) {
+		if !domain.CanApplyRecovery(cur.Status) {
 			return domain.ErrInvalidTransition
 		}
-		newRecovered := recovered + amount
-		if newRecovered > total {
+		c, err = scanCase(tx.QueryRow(ctx, `
+			UPDATE supplier_recovery_cases
+			SET recovered_amount = recovered_amount + $1::numeric,
+			    status = CASE WHEN recovered_amount + $1::numeric >= total_amount THEN 'RECOVERED' ELSE 'PARTIALLY_RECOVERED' END,
+			    updated_at = NOW()
+			WHERE case_id = $2 AND tenant_id::text = $3 AND recovered_amount + $1::numeric <= total_amount
+			RETURNING `+caseColumns, amount, caseID, tenantOf(ctx)))
+		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrRecoveryExceedsOutstanding
 		}
-		newStatus := domain.StatusPartiallyRecovered
-		if newRecovered >= total {
-			newStatus = domain.StatusRecovered
+		if err != nil {
+			return err
 		}
-
-		var err error
-		c, err = scanCase(tx.QueryRow(ctx, `
-			UPDATE supplier_recovery_cases SET recovered_amount = $1, status = $2, updated_at = NOW()
-			WHERE case_id = $3
-			RETURNING `+caseColumns,
-			newRecovered, newStatus, caseID,
-		))
+		eventType := domain.EventRecoveryOffsetApplied
+		if appType == "REFUND" {
+			eventType = domain.EventSupplierRefundConfirmed
+		}
 		applied = true
-		return err
+		return s.emit(ctx, tx, c, eventType, principalID, c)
 	})
 	if errors.Is(err, domain.ErrCaseNotFound) || isInvalidUUID(err) {
 		return nil, false, domain.ErrCaseNotFound
@@ -279,84 +314,41 @@ func (s *PgStore) ApplyRecovery(ctx context.Context, caseID, appType string, amo
 		return nil, false, err
 	}
 	if err != nil {
-		s.log.Error("pg ApplyRecovery failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, s.unavailable("ApplyRecovery", err)
 	}
 	return c, applied, nil
 }
 
+// EscalateCase mirrors domain.CanEscalate: OPEN or an active recovery status.
 func (s *PgStore) EscalateCase(ctx context.Context, caseID string, req domain.EscalateRequest, principalID string) (*domain.SupplierRecoveryCase, error) {
-	var c *domain.SupplierRecoveryCase
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		c, err = scanCase(tx.QueryRow(ctx, `
-			UPDATE supplier_recovery_cases SET status = 'ESCALATED', escalation_reason = $1, updated_at = NOW()
-			WHERE case_id = $2 AND status NOT IN ('CLOSED', 'WRITTEN_OFF', 'ESCALATED')
-			RETURNING `+caseColumns,
-			req.Reason, caseID,
-		))
-		return err
-	})
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-		return nil, domain.ErrInvalidTransition
-	}
-	if err != nil {
-		s.log.Error("pg EscalateCase failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return c, nil
+	return s.transition(ctx, "EscalateCase", domain.EventRecoveryEscalated, principalID, `
+		UPDATE supplier_recovery_cases SET status = 'ESCALATED', escalation_reason = $1, updated_at = NOW()
+		WHERE case_id = $2 AND tenant_id::text = $3 AND status IN ('OPEN', 'APPROVED', 'IN_RECOVERY', 'PARTIALLY_RECOVERED')
+		RETURNING `+caseColumns, req.Reason, caseID, tenantOf(ctx))
 }
 
+// WriteOffCase mirrors domain.CanWriteOff: OPEN, an active recovery status, or ESCALATED.
 func (s *PgStore) WriteOffCase(ctx context.Context, caseID string, req domain.WriteOffRequest, principalID string) (*domain.SupplierRecoveryCase, error) {
-	var c *domain.SupplierRecoveryCase
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		c, err = scanCase(tx.QueryRow(ctx, `
-			UPDATE supplier_recovery_cases SET status = 'WRITTEN_OFF', write_off_reason = $1, updated_at = NOW()
-			WHERE case_id = $2 AND status NOT IN ('CLOSED', 'WRITTEN_OFF', 'RECOVERED')
-			RETURNING `+caseColumns,
-			req.Reason, caseID,
-		))
-		return err
-	})
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-		return nil, domain.ErrInvalidTransition
-	}
-	if err != nil {
-		s.log.Error("pg WriteOffCase failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return c, nil
+	return s.transition(ctx, "WriteOffCase", domain.EventRecoveryWrittenOff, principalID, `
+		UPDATE supplier_recovery_cases SET status = 'WRITTEN_OFF', write_off_reason = $1, updated_at = NOW()
+		WHERE case_id = $2 AND tenant_id::text = $3 AND status IN ('OPEN', 'APPROVED', 'IN_RECOVERY', 'PARTIALLY_RECOVERED', 'ESCALATED')
+		RETURNING `+caseColumns, req.Reason, caseID, tenantOf(ctx))
 }
 
+// CloseCase mirrors domain.CanClose: only a fully RECOVERED case closes.
 func (s *PgStore) CloseCase(ctx context.Context, caseID string, req domain.CloseCaseRequest, principalID string) (*domain.SupplierRecoveryCase, error) {
-	var c *domain.SupplierRecoveryCase
-	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		c, err = scanCase(tx.QueryRow(ctx, `
-			UPDATE supplier_recovery_cases SET status = 'CLOSED', close_note = $1, updated_at = NOW()
-			WHERE case_id = $2 AND status = 'RECOVERED'
-			RETURNING `+caseColumns,
-			req.Note, caseID,
-		))
-		return err
-	})
-	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
-		return nil, domain.ErrInvalidTransition
-	}
-	if err != nil {
-		s.log.Error("pg CloseCase failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return c, nil
+	return s.transition(ctx, "CloseCase", domain.EventRecoveryClosed, principalID, `
+		UPDATE supplier_recovery_cases SET status = 'CLOSED', close_note = $1, updated_at = NOW()
+		WHERE case_id = $2 AND tenant_id::text = $3 AND status = 'RECOVERED'
+		RETURNING `+caseColumns, req.Note, caseID, tenantOf(ctx))
 }
 
 func (s *PgStore) ListApplications(ctx context.Context, caseID string) ([]domain.RecoveryApplication, error) {
 	var out []domain.RecoveryApplication
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT application_id, tenant_id, case_id, application_type, amount, idempotency_ref, detail, actor_principal_id, created_at
-			FROM recovery_applications WHERE case_id = $1 ORDER BY created_at ASC`, caseID)
+			SELECT application_id, tenant_id, case_id, application_type, amount::float8, idempotency_ref, detail, actor_principal_id, created_at
+			FROM recovery_applications WHERE case_id = $1 AND tenant_id::text = $2 ORDER BY created_at ASC`, caseID, tenantOf(ctx))
 		if err != nil {
 			return err
 		}
@@ -375,8 +367,7 @@ func (s *PgStore) ListApplications(ctx context.Context, caseID string) ([]domain
 		return nil, nil
 	}
 	if err != nil {
-		s.log.Error("pg ListApplications failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, s.unavailable("ListApplications", err)
 	}
 	return out, nil
 }
@@ -386,7 +377,7 @@ func (s *PgStore) ListCommitments(ctx context.Context, caseID string) ([]domain.
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT commitment_id, tenant_id, case_id, detail, expected_method, actor_principal_id, created_at
-			FROM recovery_commitments WHERE case_id = $1 ORDER BY created_at ASC`, caseID)
+			FROM recovery_commitments WHERE case_id = $1 AND tenant_id::text = $2 ORDER BY created_at ASC`, caseID, tenantOf(ctx))
 		if err != nil {
 			return err
 		}
@@ -404,8 +395,7 @@ func (s *PgStore) ListCommitments(ctx context.Context, caseID string) ([]domain.
 		return nil, nil
 	}
 	if err != nil {
-		s.log.Error("pg ListCommitments failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, s.unavailable("ListCommitments", err)
 	}
 	return out, nil
 }

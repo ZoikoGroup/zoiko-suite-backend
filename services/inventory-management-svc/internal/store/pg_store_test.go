@@ -43,6 +43,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		inventory_stock_count_lines, inventory_stock_count_locations, inventory_stock_counts,
 		inventory_write_downs, inventory_layer_consumptions, inventory_valuation_entries,
 		inventory_valuation_runs, inventory_cost_layers,
+		inventory_movement_receipt_links, inventory_landed_cost_allocations, inventory_layer_rebuilds,
 		inventory_serial_residency, inventory_movements,
 		inventory_location_hierarchy, inventory_locations,
 		inventory_valuation_policies, inventory_tracking_policies, inventory_items

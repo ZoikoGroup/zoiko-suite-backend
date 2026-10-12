@@ -1,9 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -52,6 +54,31 @@ type Config struct {
 	CloseGateMode        string
 	CloseGateModeInvalid bool
 
+	// SubledgerControlGateMode is "enforce" (the default) or "off". Enforced,
+	// a period closes only when its latest AR and AP subledger-to-GL control
+	// runs MATCHED (ACC-06). "off" is for an environment whose control-account
+	// mappings are not configured yet. Unlike FINCTRL_CLOSE_GATE_MODE this
+	// defaults ON: it needs no external service, and an unchecked subledger is
+	// exactly what a close must not certify. Any value other than "off" is
+	// treated as enforce; SubledgerControlGateModeInvalid records a typo.
+	SubledgerControlGateMode        string
+	SubledgerControlGateModeInvalid bool
+
+	// Bank reconciliation close gate (ACC-14 "bank recon"; ZS-CONTROL-001
+	// §22). TreasuryServiceURL lists the entity's bank accounts;
+	// BankReconciliationServiceURL says which are reconciled.
+	TreasuryServiceURL           string
+	BankReconciliationServiceURL string
+	// BankReconGateMode is "enforce" (default) or "off" — off only where no
+	// bank feed exists yet. Any other value enforces and sets the Invalid flag.
+	BankReconGateMode        string
+	BankReconGateModeInvalid bool
+	// BankReconCutoffDays: the certified reconciliation that proves a period
+	// must be for a statement dated no more than this many days before period
+	// end (BNK-05 "bank cut-off"). Covers a weekend month end; stops a close
+	// passing on a week-old reconciliation while the last statement is late.
+	BankReconCutoffDays int
+
 	// AssetEventsTopic/InventoryEventsTopic/ProjectEventsTopic are the
 	// three Kafka topics this service's own ACC-18 lineage consumer
 	// subscribes to — asset-management-svc's, inventory-management-svc's
@@ -71,8 +98,36 @@ type Config struct {
 	// startup failure instead.
 	CloseSigningKey string
 
+	// REF-05 cutover, phase 1. financial-close-svc stays authoritative; these
+	// flags only govern (a) the best-effort dual-write mirror into
+	// accounting-period-svc and (b) who may call the workflow-ref provenance
+	// endpoint. Every default is the safe/off state.
+	//
+	// PeriodMirrorEnabled is PERIOD_SERVICE_MIRROR=on. Anything other than
+	// exactly "on" (case-insensitive) is off, so a typo can never switch on an
+	// outbound write path; PeriodMirrorModeInvalid records that it happened.
+	PeriodMirrorEnabled     bool
+	PeriodMirrorModeInvalid bool
+	// AccountingPeriodURL is accounting-period-svc (REF-05).
+	AccountingPeriodURL string
+	// PeriodMirrorReopenWindow is how long a mirrored AUTHORIZE_REOPEN stays
+	// valid in REF-05. Default 24h; capped at MaxPeriodMirrorReopenWindow (REF-05's
+	// REOPEN_MAX_WINDOW default) -- PeriodMirrorReopenWindowAdjusted records a
+	// clamp or an unparseable/non-positive value replaced by the default.
+	PeriodMirrorReopenWindow         time.Duration
+	PeriodMirrorReopenWindowAdjusted bool
+	// WorkflowRefCallers are the X-Workload-Id values allowed to call
+	// GET /v1/close/workflow-refs/{ref}. Default: accounting-period-svc.
+	WorkflowRefCallers []string
+
 	OTELExporterEndpoint string
 }
+
+// MaxPeriodMirrorReopenWindow is accounting-period-svc's REOPEN_MAX_WINDOW default.
+const MaxPeriodMirrorReopenWindow = 72 * time.Hour
+
+// DefaultPeriodMirrorReopenWindow is PERIOD_MIRROR_REOPEN_WINDOW's default.
+const DefaultPeriodMirrorReopenWindow = 24 * time.Hour
 
 // ErrSigningKeyMissing is returned by Load when CLOSE_SIGNING_KEY is unset.
 type ErrSigningKeyMissing struct{}
@@ -121,6 +176,20 @@ func Load() (*Config, error) {
 	}
 
 	gateMode, gateModeInvalid := normalizeCloseGateMode(os.Getenv("FINCTRL_CLOSE_GATE_MODE"))
+	mirrorOn, mirrorInvalid := normalizeMirrorMode(os.Getenv("PERIOD_SERVICE_MIRROR"))
+	reopenWindow, reopenAdjusted := normalizeReopenWindow(os.Getenv("PERIOD_MIRROR_REOPEN_WINDOW"))
+	subledgerMode, subledgerModeInvalid := normalizeSubledgerControlGateMode(os.Getenv("SUBLEDGER_CONTROL_GATE_MODE"))
+	bankReconMode, bankReconModeInvalid := normalizeSubledgerControlGateMode(os.Getenv("BANK_RECON_GATE_MODE"))
+	cutoffDays := 4
+	if raw := strings.TrimSpace(os.Getenv("BANK_RECON_CUTOFF_DAYS")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 || n > 31 {
+			// Not silently defaulted: this decides what counts as a
+			// reconciled month, and a typo must not change that unnoticed.
+			return nil, fmt.Errorf("BANK_RECON_CUTOFF_DAYS must be a whole number of days between 0 and 31, got %q", raw)
+		}
+		cutoffDays = n
+	}
 
 	return &Config{
 		Env:  env("ENV", "local"),
@@ -159,7 +228,23 @@ func Load() (*Config, error) {
 		FinancialControlServiceURL: env("FINCTRL_SERVICE_URL", "http://financial-control-svc:8171"),
 		CloseGateMode:              gateMode,
 		CloseGateModeInvalid:       gateModeInvalid,
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+
+		PeriodMirrorEnabled:              mirrorOn,
+		PeriodMirrorModeInvalid:          mirrorInvalid,
+		AccountingPeriodURL:              env("ACCOUNTING_PERIOD_URL", "http://accounting-period-svc:8174"),
+		PeriodMirrorReopenWindow:         reopenWindow,
+		PeriodMirrorReopenWindowAdjusted: reopenAdjusted,
+		WorkflowRefCallers:               splitList(env("WORKFLOW_REF_CALLERS", "accounting-period-svc")),
+
+		SubledgerControlGateMode:        subledgerMode,
+		SubledgerControlGateModeInvalid: subledgerModeInvalid,
+
+		TreasuryServiceURL:           env("TREASURY_SERVICE_URL", "http://treasury-svc:8103"),
+		BankReconciliationServiceURL: env("BANK_RECONCILIATION_SERVICE_URL", "http://bank-reconciliation-svc:8102"),
+		BankReconGateMode:            bankReconMode,
+		BankReconGateModeInvalid:     bankReconModeInvalid,
+		BankReconCutoffDays:          cutoffDays,
+		OTELExporterEndpoint:         env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 
@@ -172,6 +257,61 @@ func normalizeCloseGateMode(raw string) (mode string, invalid bool) {
 		return "off", false
 	case "enforce":
 		return "enforce", false
+	default:
+		return "enforce", true
+	}
+}
+
+// normalizeMirrorMode maps PERIOD_SERVICE_MIRROR to on/off. Only "on" turns the
+// mirror on; unset/"off" is off; anything else is off AND reported invalid.
+func normalizeMirrorMode(raw string) (on bool, invalid bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "off":
+		return false, false
+	case "on":
+		return true, false
+	default:
+		return false, true
+	}
+}
+
+// normalizeReopenWindow parses PERIOD_MIRROR_REOPEN_WINDOW: unset -> 24h;
+// unparseable or <= 0 -> 24h (adjusted); above REF-05's 72h cap -> 72h (adjusted).
+func normalizeReopenWindow(raw string) (time.Duration, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return DefaultPeriodMirrorReopenWindow, false
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return DefaultPeriodMirrorReopenWindow, true
+	}
+	if d > MaxPeriodMirrorReopenWindow {
+		return MaxPeriodMirrorReopenWindow, true
+	}
+	return d, false
+}
+
+// splitList splits a comma list, trimming blanks and dropping empties.
+func splitList(raw string) []string {
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// normalizeSubledgerControlGateMode maps SUBLEDGER_CONTROL_GATE_MODE to
+// "enforce" or "off". Unset/empty/"enforce" is enforce, "off" is off, and
+// anything else is enforce with the second return reporting the typo.
+func normalizeSubledgerControlGateMode(raw string) (mode string, invalid bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "enforce":
+		return "enforce", false
+	case "off":
+		return "off", false
 	default:
 		return "enforce", true
 	}

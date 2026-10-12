@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -314,6 +315,193 @@ func TestPgStore_CommitMovement_NegativeStockRefused(t *testing.T) {
 	}
 	if err := s.CommitMovement(ctx, issue.MovementID, "preparer-1", now); err != domain.ErrNegativeStockNotAllowed {
 		t.Fatalf("expected ErrNegativeStockNotAllowed, got %v", err)
+	}
+}
+
+// TestPgStore_NegativeStockPolicy_AllowedCommitsAndCarriesForward proves the
+// INV-01 policy against real Postgres: ALLOWED lets an over-issue commit
+// (on-hand goes to -5), and a later policy version that omits the field
+// carries ALLOWED forward instead of silently resetting to PROHIBITED.
+func TestPgStore_NegativeStockPolicy_AllowedCommitsAndCarriesForward(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemID := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-MV-NEGPOL")
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-MV-NEGPOL")
+	createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-negpol-r", 5)
+
+	now := time.Now().UTC()
+	setPolicy := func(neg string) *domain.TrackingPolicy {
+		p := &domain.TrackingPolicy{
+			PolicyVersionID: uuid.NewString(), ItemID: itemID, NegativeStockPolicy: neg,
+			EffectiveFrom: now, CreatedAt: now, CreatedByPrincipalID: "policy-1",
+		}
+		if err := s.SetTrackingPolicy(ctx, p, now); err != nil {
+			t.Fatalf("SetTrackingPolicy failed: %v", err)
+		}
+		return p
+	}
+	issue := func(key string) error {
+		m := &domain.InventoryMovement{
+			MovementID: uuid.New().String(), LegalEntityID: legalEntityID, MovementType: domain.MovementTypeIssue, Status: domain.MovementStatusDraft,
+			ItemID: itemID, SourceLocationID: &locID, Quantity: 10, UOM: "EACH",
+			SourceReference: "SO-NEG", SourceIdempotencyKey: key, BusinessDate: now, FiscalPeriod: "2026-09",
+			CreatedAt: now, CreatedByPrincipalID: "preparer-1",
+		}
+		if err := s.CreateMovement(ctx, m); err != nil {
+			t.Fatalf("CreateMovement failed: %v", err)
+		}
+		if err := s.ValidateMovement(ctx, m.MovementID, now); err != nil {
+			t.Fatalf("ValidateMovement failed: %v", err)
+		}
+		return s.CommitMovement(ctx, m.MovementID, "preparer-1", now)
+	}
+
+	if p := setPolicy(""); p.NegativeStockPolicy != domain.NegativeStockProhibited {
+		t.Fatalf("expected default PROHIBITED, got %q", p.NegativeStockPolicy)
+	}
+	if err := issue("idem-negpol-1"); err != domain.ErrNegativeStockNotAllowed {
+		t.Fatalf("expected ErrNegativeStockNotAllowed under PROHIBITED, got %v", err)
+	}
+	setPolicy(domain.NegativeStockAllowed)
+	if err := issue("idem-negpol-2"); err != nil {
+		t.Fatalf("expected over-issue to commit under ALLOWED, got %v", err)
+	}
+	if onHand, err := s.GetOnHand(ctx, itemID, locID); err != nil || onHand != -5 {
+		t.Fatalf("expected on-hand -5, got %v (err %v)", onHand, err)
+	}
+	if p := setPolicy(""); p.NegativeStockPolicy != domain.NegativeStockAllowed {
+		t.Fatalf("expected ALLOWED carried forward, got %q", p.NegativeStockPolicy)
+	}
+}
+
+// TestPgStore_CommitMovement_BlocksOnItemLocationLock is the deterministic
+// proof of the per-(item, location) lock: while another transaction holds the
+// advisory lock for that key, CommitMovement of an issue from that location
+// must wait; it proceeds once the lock is released. (The race itself is too
+// narrow to hit reliably, so the concurrent test below is only a smoke test.)
+func TestPgStore_CommitMovement_BlocksOnItemLocationLock(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemID := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-MV-LOCK")
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-MV-LOCK")
+	createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-lock-r", 10)
+
+	now := time.Now().UTC()
+	issue := &domain.InventoryMovement{
+		MovementID: uuid.New().String(), LegalEntityID: legalEntityID, MovementType: domain.MovementTypeIssue, Status: domain.MovementStatusDraft,
+		ItemID: itemID, SourceLocationID: &locID, Quantity: 5, UOM: "EACH",
+		SourceReference: "SO-LOCK", SourceIdempotencyKey: "idem-lock-i", BusinessDate: now, FiscalPeriod: "2026-09",
+		CreatedAt: now, CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateMovement(ctx, issue); err != nil {
+		t.Fatalf("CreateMovement failed: %v", err)
+	}
+	if err := s.ValidateMovement(ctx, issue.MovementID, now); err != nil {
+		t.Fatalf("ValidateMovement failed: %v", err)
+	}
+
+	// Hold the lock in a separate transaction.
+	holder, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin holder tx failed: %v", err)
+	}
+	defer func() { _ = holder.Rollback(context.Background()) }()
+	if _, err := holder.Exec(context.Background(), `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		tenantID+"|"+itemID+"|"+locID); err != nil {
+		t.Fatalf("acquiring holder lock failed: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.CommitMovement(ctx, issue.MovementID, "preparer-1", time.Now().UTC()) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("CommitMovement finished while the item/location lock was held (err=%v) — it is not taking the lock", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := holder.Rollback(context.Background()); err != nil {
+		t.Fatalf("releasing holder lock failed: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected CommitMovement to succeed once the lock was released, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("CommitMovement did not proceed after the lock was released")
+	}
+}
+
+// TestPgStore_CommitMovement_ConcurrentIssues_OnlyOneSucceeds proves the
+// per-(item, location) lock: stock of 10, two concurrent issues of 10 —
+// exactly one may commit, the other must get ErrNegativeStockNotAllowed.
+func TestPgStore_CommitMovement_ConcurrentIssues_OnlyOneSucceeds(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemID := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-MV-CONC")
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-MV-CONC")
+	createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-conc-r", 10)
+
+	const n = 8
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		issue := &domain.InventoryMovement{
+			MovementID: uuid.New().String(), LegalEntityID: legalEntityID, MovementType: domain.MovementTypeIssue, Status: domain.MovementStatusDraft,
+			ItemID: itemID, SourceLocationID: &locID, Quantity: 10, UOM: "EACH",
+			SourceReference: "SO-CONC", SourceIdempotencyKey: "idem-conc-" + uuid.NewString(), BusinessDate: time.Now().UTC(), FiscalPeriod: "2026-09",
+			CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+		}
+		if err := s.CreateMovement(ctx, issue); err != nil {
+			t.Fatalf("CreateMovement failed: %v", err)
+		}
+		if err := s.ValidateMovement(ctx, issue.MovementID, time.Now().UTC()); err != nil {
+			t.Fatalf("ValidateMovement failed: %v", err)
+		}
+		ids[i] = issue.MovementID
+	}
+
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range ids {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = s.CommitMovement(ctx, ids[i], "preparer-1", time.Now().UTC())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	ok := 0
+	for _, err := range errs {
+		switch err {
+		case nil:
+			ok++
+		case domain.ErrNegativeStockNotAllowed:
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("expected exactly 1 of %d concurrent issues to commit, got %d", n, ok)
+	}
+	onHand, err := s.GetOnHand(ctx, itemID, locID)
+	if err != nil || onHand != 0 {
+		t.Fatalf("expected on-hand 0, got %v (err %v)", onHand, err)
 	}
 }
 

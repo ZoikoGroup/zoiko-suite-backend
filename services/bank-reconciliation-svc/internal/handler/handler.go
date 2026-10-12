@@ -43,6 +43,7 @@ type Store interface {
 	// Reconciliation run lifecycle (BNK-05 backlog).
 	StartRun(ctx context.Context, tenantID string, req domain.StartRunRequest, principalID string) (*domain.ReconciliationRun, bool, error)
 	GetRun(ctx context.Context, tenantID, runID string) (*domain.ReconciliationRun, error)
+	PeriodReconciliationStatus(ctx context.Context, tenantID, legalEntityID, periodStart, periodEnd string) ([]domain.AccountReconciliationStatus, error)
 	FreezePopulation(ctx context.Context, tenantID, runID, principalID, correlationID string) (*domain.ReconciliationPopulation, bool, error)
 	GetPopulation(ctx context.Context, tenantID, populationID string) (*domain.ReconciliationPopulation, error)
 	AdvanceRunStatus(ctx context.Context, tenantID, runID string, from, to domain.ReconciliationRunStatus) error
@@ -136,6 +137,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// Reconciliation run lifecycle.
 	r.Route("/v1/reconciliation-runs", func(r chi.Router) {
 		r.Post("/", h.StartRun)
+		r.Get("/period-status", h.GetPeriodReconciliationStatus)
 		r.Get("/{run_id}", h.GetRun)
 		r.Post("/{run_id}/freeze", h.FreezePopulation)
 		r.Get("/{run_id}/population", h.GetRunPopulation)

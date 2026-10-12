@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
@@ -114,11 +115,11 @@ func TestHTTPClient_ForwardsRequestContextHeaders(t *testing.T) {
 
 	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
 	env := &envelope.Envelope{
-		TenantID:      "t-1",
+		TenantID:       "t-1",
 		ActorSubjectID: "p-1",
-		CorrelationID: "c-1",
-		RequestID:     "r-1",
-		SourceChannel: envelope.ChannelAPI,
+		CorrelationID:  "c-1",
+		RequestID:      "r-1",
+		SourceChannel:  envelope.ChannelAPI,
 	}
 	err := c.Authorize(context.Background(), "p-1", "scope-1", "jurisdiction", "create", env)
 	if err != nil {
@@ -126,10 +127,10 @@ func TestHTTPClient_ForwardsRequestContextHeaders(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"X-Tenant-Id":     "t-1",
-		"X-Principal-Id":  "p-1",
+		"X-Tenant-Id":      "t-1",
+		"X-Principal-Id":   "p-1",
 		"X-Correlation-ID": "c-1",
-		"X-Request-Id":    "r-1",
+		"X-Request-Id":     "r-1",
 		"X-Source-Channel": "api",
 	}
 	for h, expected := range want {
@@ -159,6 +160,45 @@ func TestHTTPClient_AlwaysSendsPrincipalHeader(t *testing.T) {
 		t.Errorf("X-Principal-Id header = %q, want principal-legacy", principalHeader)
 	}
 }
+
+// TestHTTPClient_ForwardsTheEnvelopeHeaders is the regression test for the
+// defect this client just replaced: authorizeLive sent NO envelope headers
+// at all, so authorization-svc's canonical-envelope middleware answered 401
+// envelope_incomplete on every single admin write, and this client folded
+// that into the indistinguishable ErrAuthZUnavailable — a missing header
+// read as authorization-svc being down.
+func TestHTTPClient_ForwardsTheEnvelopeHeaders(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED"}`))
+	}))
+	defer srv.Close()
+
+	// A real inbound request carries a chi request id by the time this client
+	// runs; context.Background() alone (as the other tests use) would not.
+	ctx := context.WithValue(context.Background(), middleware.RequestIDKey, "req-123")
+	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
+	if err := c.Authorize(ctx, "principal-1", "scope-1", "jurisdiction", "create", nil); err != nil {
+		t.Fatalf("expected permit, got %v", err)
+	}
+
+	for _, header := range []string{"X-Request-Id", "X-Source-Channel", "Idempotency-Key", "X-Legal-Entity-Id", "X-Principal-Id"} {
+		if got.Get(header) == "" {
+			t.Errorf("request is missing %s — authorization-svc will answer 401 envelope_incomplete", header)
+		}
+	}
+	if got.Get("X-Legal-Entity-Id") != "scope-1" {
+		t.Errorf("X-Legal-Entity-Id sent as %q, want %q", got.Get("X-Legal-Entity-Id"), "scope-1")
+	}
+	if got.Get("X-Principal-Id") != "principal-1" {
+		t.Errorf("X-Principal-Id sent as %q, want %q", got.Get("X-Principal-Id"), "principal-1")
+	}
+}
+
+// TestHTTPClient_Denied — authorization-svc answers DENIED with HTTP 200, so
+// a client that only checked the status code would permit the action.
 func TestHTTPClient_Denied(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"decision_outcome":"DENIED","decision_basis":"no_grant"}`))

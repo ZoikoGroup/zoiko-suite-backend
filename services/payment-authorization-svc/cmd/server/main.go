@@ -18,6 +18,7 @@ import (
 	"zoiko.io/payment-authorization-svc/internal/authz"
 	"zoiko.io/payment-authorization-svc/internal/config"
 	"zoiko.io/payment-authorization-svc/internal/events"
+	"zoiko.io/payment-authorization-svc/internal/expiry"
 	"zoiko.io/payment-authorization-svc/internal/handler"
 	"zoiko.io/payment-authorization-svc/internal/health"
 	"zoiko.io/payment-authorization-svc/internal/middleware"
@@ -74,9 +75,11 @@ func main() {
 	if pool != nil {
 		relay := outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger)
 		go relay.Start(relayCtx)
+		go expiry.New(pgStore, cfg.ExpirySweepInterval, 100, logger).Start(relayCtx)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, proposalClient, supplierClient, payeeClient, policyClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, proposalClient, supplierClient, payeeClient, policyClient, logger).
+		WithOptions(handler.Options{AuthorizationTTL: cfg.AuthorizationTTL, HighValueSignatures: cfg.HighValueSignatures})
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

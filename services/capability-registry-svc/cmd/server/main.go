@@ -23,6 +23,7 @@ import (
 	"zoiko.io/capability-registry-svc/internal/health"
 	"zoiko.io/capability-registry-svc/internal/middleware"
 	"zoiko.io/capability-registry-svc/internal/mtls"
+	"zoiko.io/capability-registry-svc/internal/outbox"
 	"zoiko.io/capability-registry-svc/internal/store"
 	"zoiko.io/capability-registry-svc/internal/telemetry"
 )
@@ -66,6 +67,17 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	relayDone := make(chan struct{})
+	if pool != nil {
+		relay := outbox.NewRelay(pool, publisher, 5*time.Second, 50, logger)
+		go func() {
+			defer close(relayDone)
+			relay.Start(relayCtx)
+		}()
+	} else {
+		close(relayDone)
+	}
 
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
@@ -79,7 +91,7 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, authzClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -124,6 +136,11 @@ func main() {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
+	}
+	stopRelay()
+	<-relayDone
+	if err := publisher.Close(); err != nil {
+		logger.Warn("failed to close Kafka publisher", zap.Error(err))
 	}
 	if pool != nil {
 		pool.Close()

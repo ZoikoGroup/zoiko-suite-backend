@@ -45,7 +45,22 @@ type Store interface {
 	// domain.ErrVersionRaced rather than writing: the proposed schema was
 	// validated against a baseline that is no longer latest, so retrying
 	// server-side would skip the check against the version that actually won.
+	//
+	// If s.IdempotencyKey is non-empty and a row already exists for
+	// (s.EventName, s.IdempotencyKey) — including one that won a concurrent
+	// race against this same call — Insert returns that existing row and a
+	// nil error rather than writing a new version. This is the INV-08 replay
+	// guarantee: a retried registration must return the original outcome, not
+	// claim a new version number.
 	Insert(ctx context.Context, s *domain.EventSchema, expectedVersion int) (*domain.EventSchema, error)
+
+	// FindByIdempotencyKey returns the version previously registered for
+	// eventName under this idempotency key, or nil if none exists. Callers
+	// check this before running the (expensive, and here irrelevant)
+	// compatibility check — a genuine replay must return the original
+	// result unconditionally, not re-evaluate compatibility against whatever
+	// is latest now.
+	FindByIdempotencyKey(ctx context.Context, eventName, idempotencyKey string) (*domain.EventSchema, error)
 }
 
 type PgStore struct {
@@ -57,13 +72,13 @@ func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
-const schemaColumns = `event_name, version, json_schema, compatibility_mode, owning_service, registered_by, registered_at`
+const schemaColumns = `event_name, version, json_schema, compatibility_mode, owning_service, registered_by, registered_at, idempotency_key`
 
 func scanEventSchema(row pgx.Row) (*domain.EventSchema, error) {
 	var s domain.EventSchema
-	var registeredBy, owningService *string
+	var registeredBy, owningService, idempotencyKey *string
 	var rawSchema []byte
-	if err := row.Scan(&s.EventName, &s.Version, &rawSchema, &s.CompatibilityMode, &owningService, &registeredBy, &s.RegisteredAt); err != nil {
+	if err := row.Scan(&s.EventName, &s.Version, &rawSchema, &s.CompatibilityMode, &owningService, &registeredBy, &s.RegisteredAt, &idempotencyKey); err != nil {
 		return nil, err
 	}
 	s.JSONSchema = json.RawMessage(rawSchema)
@@ -72,6 +87,9 @@ func scanEventSchema(row pgx.Row) (*domain.EventSchema, error) {
 	}
 	if owningService != nil {
 		s.OwningService = *owningService
+	}
+	if idempotencyKey != nil {
+		s.IdempotencyKey = *idempotencyKey
 	}
 	return &s, nil
 }
@@ -156,12 +174,15 @@ func (s *PgStore) EventNames(ctx context.Context, limit, offset int) ([]string, 
 }
 
 func (s *PgStore) Insert(ctx context.Context, sch *domain.EventSchema, expectedVersion int) (*domain.EventSchema, error) {
-	var registeredBy, owningService *string
+	var registeredBy, owningService, idempotencyKey *string
 	if sch.RegisteredBy != "" {
 		registeredBy = &sch.RegisteredBy
 	}
 	if sch.OwningService != "" {
 		owningService = &sch.OwningService
+	}
+	if sch.IdempotencyKey != "" {
+		idempotencyKey = &sch.IdempotencyKey
 	}
 
 	// The version is derived inside the statement from the current maximum,
@@ -175,32 +196,74 @@ func (s *PgStore) Insert(ctx context.Context, sch *domain.EventSchema, expectedV
 	// type for both uses — it fails with "inconsistent types deduced for
 	// parameter $1" (42P08) rather than anything that names the real problem.
 	const query = `
-		INSERT INTO event_schemas (event_name, version, json_schema, compatibility_mode, owning_service, registered_by)
-		SELECT $1::varchar, COALESCE(MAX(version), 0) + 1, $2::jsonb, $3::varchar, $4::varchar, $5::varchar
+		INSERT INTO event_schemas (event_name, version, json_schema, compatibility_mode, owning_service, registered_by, idempotency_key)
+		SELECT $1::varchar, COALESCE(MAX(version), 0) + 1, $2::jsonb, $3::varchar, $4::varchar, $5::varchar, $7::varchar
 		FROM   event_schemas
 		WHERE  event_name = $1::varchar
 		HAVING COALESCE(MAX(version), 0) = $6::int
 		RETURNING ` + schemaColumns + `;`
 
 	row := s.pool.QueryRow(ctx, query,
-		sch.EventName, []byte(sch.JSONSchema), sch.CompatibilityMode, owningService, registeredBy, expectedVersion)
+		sch.EventName, []byte(sch.JSONSchema), sch.CompatibilityMode, owningService, registeredBy, expectedVersion, idempotencyKey)
 
 	stored, err := scanEventSchema(row)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// HAVING excluded the row: the latest version moved between the
-			// caller's read and this write.
-			return nil, domain.ErrVersionRaced
-		}
-		if isUniqueViolation(err) {
-			// Belt and braces — the primary key would also catch a collision
-			// the HAVING guard somehow missed. Same meaning, same answer, and
-			// specifically not reported as a store outage.
+		if errors.Is(err, pgx.ErrNoRows) || isUniqueViolation(err) {
+			// Two distinct races land here, and both report as either the
+			// HAVING guard excluding the row (another writer's INSERT already
+			// committed and moved the latest version before this one ran) or
+			// a unique-constraint violation (this one's INSERT reached
+			// Postgres after that commit) — which of the two Postgres reports
+			// is a timing accident, not a reliable signal of WHICH race this
+			// is. It is also not a reliable signal of which of the two unique
+			// constraints (the primary key, or the (event_name,
+			// idempotency_key) index added for INV-08) is the relevant one:
+			// when every racer in a fresh registration computes the identical
+			// (version, idempotency_key) pair, a collision on either implies
+			// a collision on both.
+			//
+			// So the question this call actually needs answered — "was this
+			// a replay?" — is answered directly rather than inferred from
+			// which error Postgres happened to raise: if this call carried an
+			// idempotency key, check whether a row now exists under it. If
+			// one does, this was a replay — INV-08 requires returning that
+			// ORIGINAL row, not an error, even though this particular call
+			// lost the write race to produce it. If none exists despite the
+			// key being set, the conflict was a genuine version race against
+			// unrelated writers.
+			if sch.IdempotencyKey != "" {
+				existing, findErr := s.FindByIdempotencyKey(ctx, sch.EventName, sch.IdempotencyKey)
+				if findErr != nil {
+					return nil, fmt.Errorf("re-read after insert conflict: %w", findErr)
+				}
+				if existing != nil {
+					return existing, nil
+				}
+			}
 			return nil, domain.ErrVersionRaced
 		}
 		return nil, fmt.Errorf("insert schema version: %w", mapPgError(err))
 	}
 	return stored, nil
+}
+
+func (s *PgStore) FindByIdempotencyKey(ctx context.Context, eventName, idempotencyKey string) (*domain.EventSchema, error) {
+	if idempotencyKey == "" {
+		return nil, nil
+	}
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+schemaColumns+`
+		FROM event_schemas
+		WHERE event_name = $1 AND idempotency_key = $2`, eventName, idempotencyKey)
+
+	schema, err := scanEventSchema(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query by idempotency key: %w", err)
+	}
+	return schema, nil
 }
 
 // isUniqueViolation reports whether err is a Postgres unique/PK violation

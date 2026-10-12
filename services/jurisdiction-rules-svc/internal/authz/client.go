@@ -27,9 +27,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 
-	"zoiko.io/jurisdiction-rules-svc/internal/envelope"
+	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 )
 
 // AuthorizationClient is the contract for authorizing mutations.
@@ -48,7 +49,7 @@ type AuthorizationClient interface {
 	// Authorize returns nil if the action is permitted.
 	// Returns ErrUnauthorized if denied; ErrAuthZUnavailable if the service
 	// is unreachable or answers in a way that cannot be read as a decision.
-	Authorize(ctx context.Context, principalID, scopeID, resource, action string, envelope *envelope.Envelope) error
+	Authorize(ctx context.Context, principalID, scopeID, resource, action string, envelope *svcenvelope.Envelope) error
 }
 
 // Sentinel errors — mapped to HTTP status codes in handlers.
@@ -71,7 +72,7 @@ func NewStubAuthZClient(log *zap.Logger) *StubAuthZClient {
 	return &StubAuthZClient{log: log}
 }
 
-func (c *StubAuthZClient) Authorize(_ context.Context, principalID, _, resource, action string, _ *envelope.Envelope) error {
+func (c *StubAuthZClient) Authorize(_ context.Context, principalID, _, resource, action string, _ *svcenvelope.Envelope) error {
 	c.log.Debug("authz stub — permitted (wire real AuthZ before production)",
 		zap.String("principal_id", principalID),
 		zap.String("resource", resource),
@@ -144,14 +145,14 @@ func NewHTTPAuthZClientWithHTTPClient(baseURL string, httpClient *http.Client, l
 // fields are required — an empty one is answered with 400, which this
 // client treats as unavailable (fail-closed), not as a denial.
 type authorizeRequest struct {
-	PrincipalID     string `json:"principal_id"`
-	LegalEntityID   string `json:"legal_entity_id"`
-	ActionType      string `json:"action_type"`
-	TenantID        string `json:"tenant_id,omitempty"`
-	RequestID       string `json:"request_id,omitempty"`
-	CorrelationID   string `json:"correlation_id,omitempty"`
-	SourceChannel   string `json:"source_channel,omitempty"`
-	IdempotencyKey  string `json:"idempotency_key,omitempty"`
+	PrincipalID    string `json:"principal_id"`
+	LegalEntityID  string `json:"legal_entity_id"`
+	ActionType     string `json:"action_type"`
+	TenantID       string `json:"tenant_id,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
+	CorrelationID  string `json:"correlation_id,omitempty"`
+	SourceChannel  string `json:"source_channel,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // authorizeResponse matches authorization-svc's response. Both GRANTED and
@@ -170,7 +171,7 @@ func ActionType(resource, action string) string {
 	return strings.ToUpper(resource + "_" + action)
 }
 
-func (c *HTTPAuthZClient) Authorize(ctx context.Context, principalID, scopeID, resource, action string, env *envelope.Envelope) error {
+func (c *HTTPAuthZClient) Authorize(ctx context.Context, principalID, scopeID, resource, action string, env *svcenvelope.Envelope) error {
 	key := principalID + "|" + scopeID + "|" + resource + "|" + action
 
 	if decision, hit := c.lookupCache(key); hit {
@@ -225,7 +226,7 @@ func (c *HTTPAuthZClient) storeCache(key string, decision error) {
 }
 
 // authorizeLive is the real, uncached call to authorization-svc.
-func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeID, resource, action string, env *envelope.Envelope) error {
+func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeID, resource, action string, env *svcenvelope.Envelope) error {
 	actionType := ActionType(resource, action)
 
 	reqBody := authorizeRequest{
@@ -252,26 +253,45 @@ func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeI
 		return ErrAuthZUnavailable
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// Forward the canonical request context as headers so authorization-svc's
-	// middleware and decision log attribute the outbound call to the same
-	// tenant/principal/correlation/request/channel the caller used (audit X6
-	// attribution). The acting principal always names the caller; the rest are
-	// only set when the envelope supplies them.
-	req.Header.Set(envelope.HeaderActorSubjectID, principalID)
-	if env != nil {
-		if env.TenantID != "" {
-			req.Header.Set(envelope.HeaderTenantID, env.TenantID)
-		}
-		if env.CorrelationID != "" {
-			req.Header.Set(envelope.HeaderCorrelationID, env.CorrelationID)
-		}
-		if env.RequestID != "" {
-			req.Header.Set(envelope.HeaderRequestID, env.RequestID)
-		}
-		if env.SourceChannel != "" {
-			req.Header.Set(envelope.HeaderSourceChannel, string(env.SourceChannel))
+	// authorization-svc validates the same canonical envelope contract this
+	// service does and answers 401 envelope_incomplete without it — which
+	// this client folded into the indistinguishable ErrAuthZUnavailable, so
+	// a missing header on every single admin write read as authorization-svc
+	// being down rather than a fixable gap in this client.
+	//
+	// The values are the CALLER's (audit X6 attribution): the envelope the
+	// handler passed, else the one this service's middleware parsed into the
+	// request's context — minting fresh ones would satisfy the contract and
+	// lose a decision in access_decision_log traceable to its request.
+	req.Header.Set(svcenvelope.HeaderActorSubjectID, principalID)
+	req.Header.Set(svcenvelope.HeaderLegalEntityID, scopeID)
+
+	if env == nil {
+		if ctxEnv, ok := svcenvelope.FromContext(ctx); ok {
+			env = &ctxEnv
 		}
 	}
+	authzRequestID := middleware.GetReqID(ctx)
+	authzSourceChannel := "system"
+	if env != nil {
+		if env.TenantID != "" {
+			req.Header.Set(svcenvelope.HeaderTenantID, env.TenantID)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set(svcenvelope.HeaderCorrelationID, env.CorrelationID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+	}
+	req.Header.Set(svcenvelope.HeaderRequestID, authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	// One decision per (request, action): an inbound request may authorize
+	// several actions, and each is its own decision to record.
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
 	resp, err := c.client.Do(req)
 	if err != nil {

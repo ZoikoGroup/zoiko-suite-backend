@@ -25,27 +25,32 @@ type MessageWriter interface {
 
 type Publisher struct {
 	writer MessageWriter
+	topic  string
 	log    *zap.Logger
 }
 
-func NewPublisher(writer *kafka.Writer, log *zap.Logger) *Publisher {
-	return &Publisher{writer: writer, log: log}
+func NewPublisher(writer MessageWriter, log *zap.Logger, topic ...string) *Publisher {
+	t := "zoiko.evidence.events"
+	if len(topic) > 0 && topic[0] != "" {
+		t = topic[0]
+	}
+	return &Publisher{writer: writer, topic: t, log: log}
 }
 
 // NewPublisherWithWriter is NewPublisher but with a caller-supplied
 // MessageWriter — used by tests to substitute a fake.
-func NewPublisherWithWriter(writer MessageWriter, log *zap.Logger) *Publisher {
-	return &Publisher{writer: writer, log: log}
+func NewPublisherWithWriter(writer MessageWriter, log *zap.Logger, topic ...string) *Publisher {
+	return NewPublisher(writer, log, topic...)
 }
 
-// manifestGeneratedEvent is this platform's event contract (Doc 03 §19):
+// ManifestGeneratedEvent is this platform's event contract (Doc 03 §19):
 // every published event must carry event name, event version, timestamp,
 // tenant ID, legal entity ID, jurisdiction context, actor ID, correlation
 // ID, source service, and payload schema version. domain.EvidenceManifest
 // carries real TenantID/LegalEntityID and RequestedBy as its actor; it has
 // no jurisdiction or correlation_id field, so correlation_id is threaded
 // through explicitly from the request's X-Correlation-ID header.
-type manifestGeneratedEvent struct {
+type ManifestGeneratedEvent struct {
 	EventID       string `json:"event_id"`
 	EventType     string `json:"event_type"`
 	EventVersion  string `json:"event_version"`
@@ -61,11 +66,37 @@ type manifestGeneratedEvent struct {
 	GeneratedAt    time.Time `json:"generated_at"`
 }
 
-// PublishManifestGenerated is fire-and-forget from the handler's perspective
-// (a Kafka outage must not fail manifest generation, which already succeeded
-// and was durably recorded in Postgres) — but the error is always returned to
-// the caller to log loudly, per this platform's "never silently swallow a
-// publish failure" doctrine.
+// PublishOutbox sends a pre-serialized outbox event payload to Kafka with
+// the aggregateID as the message key and X-Event-ID as a header. Kafka
+// errors are returned so the outbox relay can track them for retry.
+func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	// Topic is deliberately NOT set on the message: p.writer (a *kafka.Writer
+	// in production, constructed in cmd/server with its own Topic field set)
+	// already pins the topic at the writer level, and kafka-go's
+	// Writer.WriteMessages refuses a message that ALSO carries a Topic —
+	// "Topic must not be specified for both Writer and Message", unconditionally,
+	// on every call, regardless of whether a broker is even reachable. Same
+	// defect found and fixed in document-vault-svc's internal/events/publisher.go.
+	msg := kafka.Message{
+		Key:   []byte(aggregateID),
+		Value: payload,
+		Headers: []kafka.Header{
+			{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+		},
+	}
+	if err := p.writer.WriteMessages(ctx, msg); err != nil {
+		p.log.Error("failed to publish outbox event to kafka",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.String("topic", p.topic),
+			zap.Error(err),
+		)
+		return err
+	}
+	return nil
+}
+
+// PublishManifestGenerated emits the manifest generated event directly.
 func (p *Publisher) PublishManifestGenerated(ctx context.Context, m *domain.EvidenceManifest, correlationID string) error {
 	checksum := ""
 	if m.ChecksumSHA256 != nil {
@@ -76,9 +107,7 @@ func (p *Publisher) PublishManifestGenerated(ctx context.Context, m *domain.Evid
 		generatedAt = *m.GeneratedAt
 	}
 
-	evt := manifestGeneratedEvent{
-		// A fresh UUID per publish, not a deterministic string — see
-		// docs/architecture/known-gaps.md's event_id collision writeup.
+	evt := ManifestGeneratedEvent{
 		EventID:        "evt-" + uuid.New().String(),
 		EventType:      "evidence.manifest.generated",
 		EventVersion:   "1.0",
@@ -97,8 +126,44 @@ func (p *Publisher) PublishManifestGenerated(ctx context.Context, m *domain.Evid
 		return fmt.Errorf("marshal evidence.manifest.generated: %w", err)
 	}
 
-	if err := p.writer.WriteMessages(ctx, kafka.Message{Key: []byte(m.ManifestID), Value: data}); err != nil {
+	// Same reason Topic is omitted in PublishOutbox above — p.writer already
+	// pins it.
+	msg := kafka.Message{
+		Key:   []byte(m.ManifestID),
+		Value: data,
+		Headers: []kafka.Header{
+			{Key: "X-Event-ID", Value: []byte(evt.EventID)},
+		},
+	}
+	if err := p.writer.WriteMessages(ctx, msg); err != nil {
 		return fmt.Errorf("evidence.manifest.generated: kafka write: %w", err)
 	}
+	return nil
+}
+
+// LogOnlyPublisher satisfies outbox.Publisher without a broker. Selected
+// only when KAFKA_BROKERS is explicitly empty (local/dev), same posture as
+// document-vault-svc and accounts-payable-svc.
+type LogOnlyPublisher struct {
+	log *zap.Logger
+}
+
+func NewLogOnlyPublisher(log *zap.Logger) *LogOnlyPublisher {
+	log.Warn("no Kafka brokers configured — outbox events will be logged, not published")
+	return &LogOnlyPublisher{log: log}
+}
+
+func (p *LogOnlyPublisher) PublishOutbox(_ context.Context, outboxEventID, aggregateID string, _ []byte) error {
+	p.log.Info("outbox event not published (no broker configured)",
+		zap.String("outbox_event_id", outboxEventID),
+		zap.String("aggregate_id", aggregateID),
+	)
+	return nil
+}
+
+func (p *LogOnlyPublisher) PublishManifestGenerated(_ context.Context, m *domain.EvidenceManifest, _ string) error {
+	p.log.Info("manifest event not published (no broker configured)",
+		zap.String("manifest_id", m.ManifestID),
+	)
 	return nil
 }

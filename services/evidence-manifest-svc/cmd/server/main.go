@@ -24,6 +24,7 @@ import (
 	"zoiko.io/evidence-manifest-svc/internal/handler"
 	"zoiko.io/evidence-manifest-svc/internal/health"
 	svcmiddleware "zoiko.io/evidence-manifest-svc/internal/middleware"
+	"zoiko.io/evidence-manifest-svc/internal/outbox"
 	"zoiko.io/evidence-manifest-svc/internal/store"
 )
 
@@ -62,26 +63,40 @@ func main() {
 	}
 	log.Info("Postgres connection established", zap.String("db_name", cfg.DB.Name))
 
-	// AllowAutoTopicCreation is required even though the broker itself has
-	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
-	// this to false and never asks the broker to auto-create in its
-	// metadata request, so every write to a not-yet-existing topic fails
-	// with "Unknown Topic Or Partition" regardless of the broker-side
-	// setting.
-	kafkaWriter := &kafka.Writer{
-		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:                  cfg.Kafka.Topic,
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
+	// ── Transactional outbox relay (ZS-STATE-001 Invariant I-13) ─────────────
+	// An empty KAFKA_BROKERS selects the log-only publisher instead — same
+	// posture as document-vault-svc/accounts-payable-svc/general-ledger-svc:
+	// a local run needs Postgres and this service and nothing else.
+	var outboxPub outbox.Publisher
+	var publisher handler.Publisher
+	if len(cfg.Kafka.Brokers) == 0 {
+		logPub := events.NewLogOnlyPublisher(log)
+		outboxPub = logPub
+		publisher = logPub
+	} else {
+		kafkaWriter := &kafka.Writer{
+			Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
+			Topic:                  cfg.Kafka.Topic,
+			Balancer:               &kafka.LeastBytes{},
+			AllowAutoTopicCreation: true,
+			BatchTimeout:           10 * time.Millisecond,
+		}
+		defer func() { _ = kafkaWriter.Close() }()
+		evPub := events.NewPublisher(kafkaWriter, log, cfg.Kafka.Topic)
+		outboxPub = evPub
+		publisher = evPub
 	}
-	defer func() { _ = kafkaWriter.Close() }()
+
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relay := outbox.NewRelay(pool, outboxPub, 500*time.Millisecond, 50, log)
+	go relay.Start(relayCtx)
 
 	pgStore := store.New(pool, log)
 	governanceClient := aggregator.NewGovernanceDecisionClient(cfg.GovernanceDecisionLogURL, log)
 	accessClient := aggregator.NewAccessDecisionClient(cfg.AuthorizationServiceURL, log)
 	workflowClient := aggregator.NewWorkflowClient(cfg.WorkflowServiceURL, log)
 	workflowHistoryClient := aggregator.NewWorkflowHistoryClient(cfg.WorkflowHistoryURL, log)
-	publisher := events.NewPublisher(kafkaWriter, log)
 
 	// authorization-svc client. Reuses AuthorizationServiceURL, already
 	// configured for the access-decision aggregator client above — same

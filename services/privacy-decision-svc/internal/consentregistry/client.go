@@ -35,11 +35,17 @@ func NewClient(baseURL string) *Client {
 // ResolveStatus calls GET /privacy/consents?subject_ref=&purpose_id= —
 // always 200, distinguishing NOT_REQUESTED/GRANTED/DENIED/WITHDRAWN by
 // the response body, same contract PRV-02 documents for that route.
-func (c *Client) ResolveStatus(ctx context.Context, subjectRef, purposeID string) (*ConsentResolution, error) {
+// tenantID is forwarded via X-Tenant-Id — PRV-02's own RLS scopes consent
+// receipts by tenant, same convention as every other cross-service client
+// in this domain (see retentionregistry.Client.Resolve).
+func (c *Client) ResolveStatus(ctx context.Context, tenantID, subjectRef, purposeID string) (*ConsentResolution, error) {
 	u := c.baseURL + "/privacy/consents?subject_ref=" + url.QueryEscape(subjectRef) + "&purpose_id=" + url.QueryEscape(purposeID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

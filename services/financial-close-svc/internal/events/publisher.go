@@ -106,6 +106,25 @@ func (p *Publisher) PublishReopened(ctx context.Context, correlationID, actorID 
 	})
 }
 
+// PublishPeriodTransition announces a period close state change that has no
+// dedicated event (period.soft_closed, period.close_review_started,
+// period.reopen_requested, period.reopen_rejected, period.reclosed). The
+// period identity is always carried; details add what the transition knows.
+func (p *Publisher) PublishPeriodTransition(ctx context.Context, eventType, correlationID, actorID string, fp domain.FiscalPeriod, details map[string]any) {
+	payload := map[string]any{
+		"tenant_id":        fp.TenantID,
+		"legal_entity_id":  fp.LegalEntityID,
+		"fiscal_period_id": fp.FiscalPeriodID,
+		"period_name":      fp.PeriodName,
+		"period_state":     fp.CloseStatus,
+		"timestamp":        time.Now().UTC(),
+	}
+	for k, v := range details {
+		payload[k] = v
+	}
+	p.emit(ctx, eventType, correlationID, fp.TenantID, fp.LegalEntityID, actorID, fp.FiscalPeriodID, payload)
+}
+
 // PublishSubledgerControlException announces an ACC-06 control run that
 // found a genuine subledger-to-GL discrepancy — the balance comparison
 // itself, not merely an existence-count of open items. Only EXCEPTION

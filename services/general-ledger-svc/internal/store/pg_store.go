@@ -30,9 +30,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
-	"zoiko.io/general-ledger-svc/internal/outbox"
 )
 
 // DefaultListLimit bounds ListJournals when the caller names no limit. A
@@ -62,7 +63,7 @@ const journalHeaderColumns = `
 	approved_at, approved_by_principal_id,
 	rejected_at, rejected_by_principal_id, rejection_reason,
 	posting_requested_at, posting_requested_by_principal_id,
-	correction_of_journal_id`
+	correction_of_journal_id, soft_close_override_reason`
 
 // scanHeaderTargets returns scan destinations matching journalHeaderColumns,
 // column for column. status and approvalStatus are scanned into plain
@@ -86,7 +87,7 @@ func scanHeaderTargets(h *domain.JournalHeader, status, approvalStatus *string) 
 		&h.ApprovedAt, &h.ApprovedByPrincipalID,
 		&h.RejectedAt, &h.RejectedByPrincipalID, &h.RejectionReason,
 		&h.PostingRequestedAt, &h.PostingRequestedByPrincipalID,
-		&h.CorrectionOfJournalID,
+		&h.CorrectionOfJournalID, &h.SoftCloseOverrideReason,
 	}
 }
 
@@ -129,10 +130,63 @@ func mapPgError(err error) error {
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+
+	// eventRegion is the residencyregion stamped on every journal event.
+	// Empty means no region was configured, and every event-emitting write
+	// then fails (envelope.New refuses it) rather than emitting an event
+	// with a guessed region.
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
-	return &PgStore{pool: pool, log: log}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (config EVENT_RESIDENCY_REGION).
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// enqueueJournalEvent writes one journal lifecycle event to the transactional
+// outbox inside tx, the transaction that made the change it reports.
+//
+// fact is the past-tense lifecycle fact (created, validated, posted,
+// reversed). The canonical type is com.zoikosuite.accounting.journal.<fact>
+// (ZS-EVENT-001 §5.1); the pre-standard "journal.<fact>" is kept as the
+// legacy event_type so nothing filtering on the old name breaks.
+func (s *PgStore) enqueueJournalEvent(ctx context.Context, tx pgx.Tx, fact, tenantID, legalEntityID, journalID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.journal." + fact,
+		LegacyType:      "journal." + fact,
+		Service:         "general-ledger-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "journal",
+		AggregateID:     journalID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		// Journal facts are financial records of a tenant's books.
+		Classification: envelope.Confidential,
+		Data:           data,
+	})
+	if err != nil {
+		return fmt.Errorf("build journal.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue journal.%s event: %w", fact, err)
+	}
+	return nil
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
@@ -213,9 +267,10 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			correlation_id, created_at, validated_at, posted_at, reversed_at,
 			source_event_id, governance_decision_id,
 			journal_type, transaction_date, posting_date, currency_code,
-			book_id, reporting_basis, evidence_refs, approval_status
+			book_id, reporting_basis, evidence_refs, approval_status,
+			soft_close_override_reason
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-		          $19, $20, $21, $22, $23, $24, $25, $26)
+		          $19, $20, $21, $22, $23, $24, $25, $26, $27)
 		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 	`, h.JournalID, tenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
 		h.ReversalOfJournalID, h.Description, h.CreatedByPrincipalID,
@@ -223,7 +278,8 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 		h.CorrelationID, h.CreatedAt, h.ValidatedAt, h.PostedAt, h.ReversedAt,
 		h.SourceEventID, h.GovernanceDecisionID,
 		h.JournalType, h.TransactionDate, h.PostingDate, h.CurrencyCode,
-		h.BookID, h.ReportingBasis, h.EvidenceRefs, string(h.ApprovalStatus))
+		h.BookID, h.ReportingBasis, h.EvidenceRefs, string(h.ApprovalStatus),
+		h.SoftCloseOverrideReason)
 	if err != nil {
 		return nil, false, mapPgError(err)
 	}
@@ -326,34 +382,22 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 			return nil
 		}
 
-		env, envErr := outbox.NewVariantAEnvelope(
-			"journal.created",
-			h.CorrelationID,
-			h.TenantID,
-			h.LegalEntityID,
-			h.CreatedByPrincipalID,
-			map[string]any{
-				"journal_id":      h.JournalID,
-				"tenant_id":       h.TenantID,
-				"legal_entity_id": h.LegalEntityID,
-				"fiscal_period":   h.FiscalPeriod,
-			},
-		)
-		if envErr != nil {
-			return fmt.Errorf("build journal.created envelope: %w", envErr)
+		createdData := map[string]any{
+			"journal_id":      h.JournalID,
+			"tenant_id":       h.TenantID,
+			"legal_entity_id": h.LegalEntityID,
+			"fiscal_period":   h.FiscalPeriod,
 		}
-		actorID := h.CreatedByPrincipalID
-		if err := outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "JOURNAL",
-			AggregateID:   h.JournalID,
-			EventType:     "journal.created",
-			TenantID:      h.TenantID,
-			LegalEntityID: h.LegalEntityID,
-			ActorID:       &actorID,
-			CorrelationID: h.CorrelationID,
-			Payload:       env,
-		}); err != nil {
-			return fmt.Errorf("insert outbox event for journal.created: %w", err)
+		// Soft-close override is evidence: migration 000015's own doc comment
+		// promises it is "emitted in the JournalCreated outbox event for audit
+		// traceability" — a soft-close exception must be independently
+		// discoverable from the event stream, not only by querying this row.
+		if h.SoftCloseOverrideReason != nil && *h.SoftCloseOverrideReason != "" {
+			createdData["soft_close_override_reason"] = *h.SoftCloseOverrideReason
+		}
+		if err := s.enqueueJournalEvent(ctx, tx, "created", h.TenantID, h.LegalEntityID,
+			h.JournalID, h.CreatedByPrincipalID, h.CorrelationID, createdData); err != nil {
+			return err
 		}
 
 		return nil
@@ -427,31 +471,12 @@ func (s *PgStore) ReverseJournal(
 			origLegalEntityID = reversing.LegalEntityID
 		}
 
-		env, envErr := outbox.NewVariantAEnvelope(
-			"journal.reversed",
-			origCorrelationID,
-			tenantID,
-			origLegalEntityID,
-			actorPrincipalID,
-			map[string]any{
+		if err := s.enqueueJournalEvent(ctx, tx, "reversed", tenantID, origLegalEntityID,
+			originalJournalID, actorPrincipalID, origCorrelationID, map[string]any{
 				"journal_id":           originalJournalID,
 				"reversing_journal_id": reversing.JournalID,
-			},
-		)
-		if envErr != nil {
-			return fmt.Errorf("build journal.reversed envelope: %w", envErr)
-		}
-		if err := outbox.Insert(ctx, tx, outbox.Event{
-			AggregateType: "JOURNAL",
-			AggregateID:   originalJournalID,
-			EventType:     "journal.reversed",
-			TenantID:      tenantID,
-			LegalEntityID: origLegalEntityID,
-			ActorID:       &actorPrincipalID,
-			CorrelationID: origCorrelationID,
-			Payload:       env,
-		}); err != nil {
-			return fmt.Errorf("insert outbox event for journal.reversed: %w", err)
+			}); err != nil {
+			return err
 		}
 
 		// AK-INV-003 / AK-INV-001: the reversing journal is born FINALIZED, so
@@ -639,31 +664,11 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 		}
 
 		if toStatus == domain.JournalStatusValidated {
-			env, envErr := outbox.NewVariantAEnvelope(
-				"journal.validated",
-				correlationID,
-				tenantID,
-				legalEntityID,
-				actorPrincipalID,
-				map[string]any{
+			if err := s.enqueueJournalEvent(ctx, tx, "validated", tenantID, legalEntityID,
+				journalID, actorPrincipalID, correlationID, map[string]any{
 					"journal_id": journalID,
-				},
-			)
-			if envErr != nil {
-				return fmt.Errorf("build journal.validated envelope: %w", envErr)
-			}
-			actorID := actorPrincipalID
-			if err := outbox.Insert(ctx, tx, outbox.Event{
-				AggregateType: "JOURNAL",
-				AggregateID:   journalID,
-				EventType:     "journal.validated",
-				TenantID:      tenantID,
-				LegalEntityID: legalEntityID,
-				ActorID:       &actorID,
-				CorrelationID: correlationID,
-				Payload:       env,
-			}); err != nil {
-				return fmt.Errorf("insert outbox event for journal.validated: %w", err)
+				}); err != nil {
+				return err
 			}
 		} else if toStatus == domain.JournalStatusFinalized {
 			// ACC-05: every journal that reaches FINALIZED appends its
@@ -675,31 +680,11 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 				return err
 			}
 
-			env, envErr := outbox.NewVariantAEnvelope(
-				"journal.posted",
-				correlationID,
-				tenantID,
-				legalEntityID,
-				actorPrincipalID,
-				map[string]any{
+			if err := s.enqueueJournalEvent(ctx, tx, "posted", tenantID, legalEntityID,
+				journalID, actorPrincipalID, correlationID, map[string]any{
 					"journal_id": journalID,
-				},
-			)
-			if envErr != nil {
-				return fmt.Errorf("build journal.posted envelope: %w", envErr)
-			}
-			actorID := actorPrincipalID
-			if err := outbox.Insert(ctx, tx, outbox.Event{
-				AggregateType: "JOURNAL",
-				AggregateID:   journalID,
-				EventType:     "journal.posted",
-				TenantID:      tenantID,
-				LegalEntityID: legalEntityID,
-				ActorID:       &actorID,
-				CorrelationID: correlationID,
-				Payload:       env,
-			}); err != nil {
-				return fmt.Errorf("insert outbox event for journal.posted: %w", err)
+				}); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -751,11 +736,11 @@ func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID str
 	}
 	type entryRow struct {
 		lineID, accountCode, legalEntityID, bookID, fiscalPeriod, currencyCode, correlationID string
-		lineNumber                                                                             int
-		debit, credit                                                                          float64
-		dimensions                                                                              domain.Dimensions
-		transactionDate, postingDate                                                            domain.Date
-		sourceEventID                                                                           *string
+		lineNumber                                                                            int
+		debit, credit                                                                         float64
+		dimensions                                                                            domain.Dimensions
+		transactionDate, postingDate                                                          domain.Date
+		sourceEventID                                                                         *string
 	}
 	var entries []entryRow
 	for rows.Next() {
@@ -1323,16 +1308,20 @@ func (s *PgStore) DeactivateAccount(ctx context.Context, tenantID, accountCode s
 const postingExecutionColumns = `
 	execution_id, tenant_id, legal_entity_id, kind, source_event_id, idempotency_key,
 	status, journal_id, calculation_trace::text, failure_reason, correlation_id,
-	created_at, created_by_principal_id, committed_at`
+	created_at, created_by_principal_id, committed_at, request_payload::text`
 
 func scanPostingExecution(row pgx.Row) (*domain.PostingExecution, error) {
 	var e domain.PostingExecution
+	var payload *string
 	if err := row.Scan(
 		&e.ExecutionID, &e.TenantID, &e.LegalEntityID, &e.Kind, &e.SourceEventID, &e.IdempotencyKey,
 		&e.Status, &e.JournalID, &e.CalculationTrace, &e.FailureReason, &e.CorrelationID,
-		&e.CreatedAt, &e.CreatedByPrincipalID, &e.CommittedAt,
+		&e.CreatedAt, &e.CreatedByPrincipalID, &e.CommittedAt, &payload,
 	); err != nil {
 		return nil, err
+	}
+	if payload != nil {
+		e.RequestPayload = []byte(*payload)
 	}
 	return &e, nil
 }
@@ -1349,13 +1338,21 @@ func (s *PgStore) CreatePostingExecution(ctx context.Context, e *domain.PostingE
 		return domain.ErrIdentityMissing
 	}
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// NULL rather than an empty document when nothing was captured, so
+		// "no request to replay" is unambiguous.
+		var payload any
+		if len(e.RequestPayload) > 0 {
+			payload = string(e.RequestPayload)
+		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO posting_executions (
 				execution_id, tenant_id, legal_entity_id, kind, source_event_id, idempotency_key,
-				status, calculation_trace, correlation_id, created_at, created_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
+				status, calculation_trace, correlation_id, created_at, created_by_principal_id,
+				request_payload
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb)
 		`, e.ExecutionID, tenantID, e.LegalEntityID, e.Kind, e.SourceEventID, e.IdempotencyKey,
-			e.Status, e.CalculationTrace, e.CorrelationID, e.CreatedAt, e.CreatedByPrincipalID)
+			e.Status, e.CalculationTrace, e.CorrelationID, e.CreatedAt, e.CreatedByPrincipalID,
+			payload)
 		return mapPgError(err)
 	})
 }
@@ -1402,6 +1399,75 @@ func (s *PgStore) GetPostingExecutionBySource(ctx context.Context, tenantID, sou
 // the journal this execution produced. No fromStatus guard: this is
 // always the one terminal write a given execution makes, called exactly
 // once per successful attempt (initial or reprocessed).
+// ReprocessClaimTimeout is how long a reprocess claim (status VALIDATING)
+// holds before another reprocess may take it over. Far longer than one replay
+// takes; it exists only so a claim abandoned by a crashed process does not
+// strand the execution in VALIDATING for ever.
+const ReprocessClaimTimeout = 15 * time.Minute
+
+// ClaimPostingExecutionForReprocess moves a FAILED or QUARANTINED execution
+// to VALIDATING in one conditional UPDATE, so of two concurrent reprocesses
+// exactly one proceeds — without it both could replay the request and post
+// the same source fact twice. Also takes over a VALIDATING claim older than
+// ReprocessClaimTimeout. Reports false when the execution is in neither state.
+func (s *PgStore) ClaimPostingExecutionForReprocess(ctx context.Context, tenantID, executionID string, now time.Time) (bool, error) {
+	var claimed bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE posting_executions
+			   SET status = 'VALIDATING', reprocess_claimed_at = $3
+			 WHERE tenant_id = $1 AND execution_id = $2
+			   AND (status IN ('FAILED', 'QUARANTINED')
+			        OR (status = 'VALIDATING' AND reprocess_claimed_at IS NOT NULL
+			            AND reprocess_claimed_at < $4))`,
+			tenantID, executionID, now, now.Add(-ReprocessClaimTimeout))
+		claimed = tag.RowsAffected() == 1
+		return mapPgError(err)
+	})
+	return claimed, err
+}
+
+// SetPostingExecutionTrace replaces an execution's calculation trace. A replay
+// re-resolves account mappings (the failure was often a missing one, since
+// fixed), and ExplainPosting must show the resolution that actually posted.
+func (s *PgStore) SetPostingExecutionTrace(ctx context.Context, tenantID, executionID, trace string) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE posting_executions SET calculation_trace = $3::jsonb
+			 WHERE tenant_id = $1 AND execution_id = $2`, tenantID, executionID, trace)
+		return mapPgError(err)
+	})
+}
+
+// FindJournalIDsBySourceEvent lists journals that carry sourceEventID.
+//
+// The double-posting guard for a replay: journal_headers has no uniqueness on
+// source_event_id, so if the failed attempt's journal write did in fact commit
+// (an acknowledgement lost after commit), replaying blindly would post the
+// same fact twice. The replay adopts a single existing journal instead.
+func (s *PgStore) FindJournalIDsBySourceEvent(ctx context.Context, tenantID, sourceEventID string) ([]string, error) {
+	var ids []string
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT journal_id::text FROM journal_headers
+			 WHERE tenant_id = $1 AND source_event_id = $2
+			 ORDER BY created_at`, tenantID, sourceEventID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		return rows.Err()
+	})
+	return ids, err
+}
+
 func (s *PgStore) MarkPostingExecutionCommitted(ctx context.Context, tenantID, executionID, journalID string, committedAt time.Time) error {
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `

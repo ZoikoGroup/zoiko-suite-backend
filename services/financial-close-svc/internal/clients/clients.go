@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
@@ -58,6 +59,11 @@ type Clients struct {
 	// financialControlURL is financial-control-svc, set via
 	// WithFinancialControlURL so the New constructors keep their signatures.
 	financialControlURL string
+
+	// treasuryURL and bankReconURL serve the close's bank reconciliation
+	// blocker; set via WithBankingURLs.
+	treasuryURL  string
+	bankReconURL string
 
 	// authzHTTP, when set, is used instead of http for calls to
 	// authorization-svc only — the mTLS pilot's Transport carries this
@@ -321,6 +327,94 @@ func (c *Clients) GetUnpostedJournalsCount(ctx context.Context, tenantID, legalE
 		unposted += len(journals)
 	}
 	return unposted, nil
+}
+
+// postingBacklogSampleLimit is how many backlog items a blocker message
+// names. The count comes from the population's declared total, so this only
+// bounds the detail, never the answer.
+const postingBacklogSampleLimit = 5
+
+// unpostedEventsPopulation mirrors the one part of general-ledger-svc's
+// control-population response the close reads (its controlPopulationResponse;
+// duplicated rather than imported, as with glJournal — no shared module).
+type unpostedEventsPopulation struct {
+	Records []struct {
+		Reference  string            `json:"reference"`
+		Attributes map[string]string `json:"attributes"`
+	} `json:"records"`
+	DeclaredTotals struct {
+		RowCount int64 `json:"row_count"`
+	} `json:"declared_totals"`
+}
+
+// GetPostingBacklog asks general-ledger-svc for accounting events created
+// before cutoff that have not been COMMITTED — ACC-14's "posting backlog"
+// close input (ZS-SVC-B-001 §17), read through GL's own unposted-events
+// control population (docs/architecture/control-population-contract.md).
+//
+// This is what the close used to approximate by counting unpaid invoices,
+// which answered a different question: an unpaid invoice is a correct
+// receivable, while an accepted event that never reached the ledger is a
+// month whose books are incomplete.
+//
+// The population is authorized per principal (GL_CONTROL_POPULATION_READ), so
+// the closing principal is forwarded; a 403 is reported as such rather than as
+// an outage. Any other failure is an error, never an empty backlog — "could
+// not check" must not read as "nothing to report".
+func (c *Clients) GetPostingBacklog(ctx context.Context, tenantID, principalID, legalEntityID string, cutoff time.Time) (domain.PostingBacklog, error) {
+	u, err := url.Parse(c.ledgerURL + "/v1/control-populations/unposted-events")
+	if err != nil {
+		return domain.PostingBacklog{}, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("created_before", cutoff.UTC().Format(time.RFC3339))
+	q.Set("limit", strconv.Itoa(postingBacklogSampleLimit))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return domain.PostingBacklog{}, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return domain.PostingBacklog{}, domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusForbidden:
+		return domain.PostingBacklog{}, domain.ErrPostingBacklogForbidden
+	case http.StatusUnprocessableEntity:
+		// population_too_large: GL will not enumerate it. More unposted events
+		// than the population limit is a blocker in its own right.
+		return domain.PostingBacklog{TooLarge: true}, nil
+	default:
+		return domain.PostingBacklog{}, domain.ErrGLServiceUnavailable
+	}
+
+	var pop unpostedEventsPopulation
+	if err := json.NewDecoder(resp.Body).Decode(&pop); err != nil {
+		return domain.PostingBacklog{}, fmt.Errorf("decode posting backlog: %w", err)
+	}
+	backlog := domain.PostingBacklog{Count: pop.DeclaredTotals.RowCount}
+	// A page with records but a zero declared total would be a GL defect; trust
+	// the larger number so it can only over-block, never under-block.
+	if int64(len(pop.Records)) > backlog.Count {
+		backlog.Count = int64(len(pop.Records))
+	}
+	for _, r := range pop.Records {
+		backlog.Samples = append(backlog.Samples, domain.PostingBacklogItem{
+			Reference:     r.Reference,
+			Status:        r.Attributes["status"],
+			FailureReason: r.Attributes["failure_reason"],
+		})
+	}
+	return backlog, nil
 }
 
 // ledgerPageLimit is the largest page general-ledger-svc will serve
@@ -953,90 +1047,6 @@ func (c *Clients) GetAPSubledgerTotal(ctx context.Context, tenantID, legalEntity
 	return total, nil
 }
 
-// GetUnsettledAPInvoicesCount counts payables belonging to THIS period that have
-// not reached PAYMENT_REQUESTED.
-//
-// The period bounds are the fix, not a refinement. This counted every unsettled
-// invoice for the legal entity regardless of date, so a single invoice raised in
-// December blocked the close of every month of the year — and since a going
-// concern always has something outstanding, no period could ever be closed at
-// all. The service's central operation was unreachable in normal operation.
-//
-// accounts-payable-svc's list endpoint has no date filter, so the period bound
-// is applied here. That means the whole register is fetched to count a subset;
-// acceptable because it is bounded by the entity and this runs once per close,
-// and preferable to a count that is wrong.
-func (c *Clients) GetUnsettledAPInvoicesCount(ctx context.Context, tenantID, legalEntityID string, periodStart, periodEnd time.Time) (int, error) {
-	u, err := url.Parse(c.apURL + "/v1/invoices")
-	if err != nil {
-		return 0, err
-	}
-	q := u.Query()
-	q.Set("tenant_id", tenantID)
-	q.Set("legal_entity_id", legalEntityID)
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return 0, domain.ErrAPServiceUnavailable
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, domain.ErrAPServiceUnavailable
-	}
-
-	var list []apInvoice
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return 0, err
-	}
-
-	unsettled := 0
-	for _, inv := range list {
-		if !withinPeriod(inv.DueDate, periodStart, periodEnd) {
-			continue
-		}
-		// PAYMENT_REQUESTED is terminal in accounts-payable-svc — executing the
-		// payment belongs to Treasury — so it is as settled as that service can
-		// report.
-		if inv.Status != "PAYMENT_REQUESTED" {
-			unsettled++
-		}
-	}
-	return unsettled, nil
-}
-
-// withinPeriod reports whether a business date falls inside the fiscal period,
-// inclusive of both ends.
-//
-// Compared as calendar days in UTC. The period bounds are timestamps, and an
-// invoice due on the last day of the period carries midnight UTC, so a
-// strict instant comparison against a period_end of that same midnight would
-// include it while one against 00:00:00.000001 would not — a boundary an
-// operator cannot see and would never predict.
-func withinPeriod(date, start, end time.Time) bool {
-	if date.IsZero() {
-		// No business date at all. Counted as in-period rather than skipped: an
-		// invoice that cannot be placed in time is exactly the kind of thing a
-		// close should stop for, and silently excluding it would let it slip
-		// past every period forever.
-		return true
-	}
-	d := day(date)
-	return !d.Before(day(start)) && !d.After(day(end))
-}
-
-func day(t time.Time) time.Time {
-	u := t.UTC()
-	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
-}
-
 // ---------------------------------------------------------------------------
 // Accounts Receivable Client
 // ---------------------------------------------------------------------------
@@ -1465,51 +1475,6 @@ func (c *Clients) GetProjectPostedRevenueTotal(ctx context.Context, tenantID, le
 	return out.PostedRevenueTotal, nil
 }
 
-// GetUnsettledARInvoicesCount counts receivables belonging to THIS period that
-// are not PAID. Period-bounded for the same reason as the payables count above.
-func (c *Clients) GetUnsettledARInvoicesCount(ctx context.Context, tenantID, legalEntityID string, periodStart, periodEnd time.Time) (int, error) {
-	u, err := url.Parse(c.arURL + "/v1/invoices")
-	if err != nil {
-		return 0, err
-	}
-	q := u.Query()
-	q.Set("tenant_id", tenantID)
-	q.Set("legal_entity_id", legalEntityID)
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("X-Tenant-Id", tenantID)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return 0, domain.ErrARServiceUnavailable
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, domain.ErrARServiceUnavailable
-	}
-
-	var list []arInvoice
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return 0, err
-	}
-
-	unsettled := 0
-	for _, inv := range list {
-		if !withinPeriod(inv.DueDate, periodStart, periodEnd) {
-			continue
-		}
-		if inv.Status != "PAID" {
-			unsettled++
-		}
-	}
-	return unsettled, nil
-}
-
 // ---------------------------------------------------------------------------
 // Document Vault Client
 // ---------------------------------------------------------------------------
@@ -1629,4 +1594,96 @@ func (c *Clients) UploadCloseEvidence(ctx context.Context, tenantID, legalEntity
 	}
 
 	return dResp.DocumentID, nil
+}
+
+// WithBankingURLs sets treasury-svc (the entity's bank accounts, BNK-01) and
+// bank-reconciliation-svc (their reconciliation status, BNK-05).
+func (c *Clients) WithBankingURLs(treasuryURL, bankReconURL string) *Clients {
+	c.treasuryURL, c.bankReconURL = treasuryURL, bankReconURL
+	return c
+}
+
+// ListBankAccounts returns the entity's bank accounts from treasury-svc.
+// Any failure is an error, never an empty list: "no accounts" would close a
+// period with no cash reconciliation at all.
+func (c *Clients) ListBankAccounts(ctx context.Context, tenantID, principalID, legalEntityID string) ([]domain.BankAccountRef, error) {
+	if c.treasuryURL == "" || strings.TrimSpace(legalEntityID) == "" {
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	u, err := url.Parse(c.treasuryURL + "/v1/treasury/accounts")
+	if err != nil {
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("treasury-svc unreachable", zap.Error(err))
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		c.log.Error("treasury-svc account list returned non-200", zap.Int("status", resp.StatusCode))
+		return nil, domain.ErrTreasuryUnavailable
+	}
+	var accounts []domain.BankAccountRef
+	if err := json.NewDecoder(resp.Body).Decode(&accounts); err != nil {
+		return nil, fmt.Errorf("%w: decode accounts: %v", domain.ErrTreasuryUnavailable, err)
+	}
+	// Defence in depth: treasury filters by entity, but an account of another
+	// entity must never be counted, or excluded, on this one's behalf.
+	out := accounts[:0]
+	for _, a := range accounts {
+		if a.LegalEntityID == legalEntityID {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+// GetBankReconciliationStatus asks bank-reconciliation-svc for each account's
+// latest certified and latest run with a statement date in [start, end].
+func (c *Clients) GetBankReconciliationStatus(ctx context.Context, tenantID, principalID, legalEntityID string, start, end time.Time) ([]domain.BankAccountReconStatus, error) {
+	if c.bankReconURL == "" {
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	u, err := url.Parse(c.bankReconURL + "/v1/reconciliation-runs/period-status")
+	if err != nil {
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("period_start", start.UTC().Format("2006-01-02"))
+	q.Set("period_end", end.UTC().Format("2006-01-02"))
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("bank-reconciliation-svc unreachable", zap.Error(err))
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		c.log.Error("bank-reconciliation-svc period status returned non-200", zap.Int("status", resp.StatusCode))
+		return nil, domain.ErrBankReconciliationUnavailable
+	}
+	var out struct {
+		Accounts []domain.BankAccountReconStatus `json:"accounts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("%w: decode period status: %v", domain.ErrBankReconciliationUnavailable, err)
+	}
+	return out.Accounts, nil
 }

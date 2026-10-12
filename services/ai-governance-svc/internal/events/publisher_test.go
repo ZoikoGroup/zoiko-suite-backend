@@ -8,6 +8,7 @@ package events_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/segmentio/kafka-go"
@@ -20,11 +21,12 @@ import (
 
 type fakeWriter struct {
 	msgs []kafka.Message
+	err  error
 }
 
 func (f *fakeWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) error {
 	f.msgs = append(f.msgs, msgs...)
-	return nil
+	return f.err
 }
 
 type envelope struct {
@@ -83,9 +85,26 @@ func TestPublish_RepeatEventsOnSameEntity_GetDistinctEventIDs(t *testing.T) {
 		})
 		require.NoError(t, err)
 	}
-
 	require.Len(t, w.msgs, 2)
 	first := decode(t, w.msgs[0])
 	second := decode(t, w.msgs[1])
 	assert.NotEqual(t, first.EventID, second.EventID)
+}
+
+func TestPublishEvent_RetainsIDAcrossRetryAndReturnsBrokerFailure(t *testing.T) {
+	w := &fakeWriter{err: errors.New("broker unavailable")}
+	p := events.NewKafkaPublisherWithWriter(w, "zoiko.ai-governance.events", zap.NewNop())
+	evt := events.Event{
+		EventID:   "evt-stable-id",
+		EventType: "ai.execution.blocked",
+		EntityID:  "execution-1",
+		Payload:   map[string]string{"state": "BLOCKED"},
+	}
+
+	require.Error(t, p.PublishEvent(context.Background(), evt))
+	w.err = nil
+	require.NoError(t, p.PublishEvent(context.Background(), evt))
+	require.Len(t, w.msgs, 2)
+	assert.Equal(t, "evt-stable-id", decode(t, w.msgs[0]).EventID)
+	assert.Equal(t, "evt-stable-id", decode(t, w.msgs[1]).EventID)
 }

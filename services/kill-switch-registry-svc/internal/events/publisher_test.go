@@ -9,6 +9,7 @@ package events_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/segmentio/kafka-go"
@@ -21,9 +22,13 @@ import (
 
 type fakeWriter struct {
 	msgs []kafka.Message
+	err  error
 }
 
 func (f *fakeWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) error {
+	if f.err != nil {
+		return f.err
+	}
 	f.msgs = append(f.msgs, msgs...)
 	return nil
 }
@@ -102,4 +107,24 @@ func TestPublish_RepeatEventsOnSameScope_GetDistinctEventIDs(t *testing.T) {
 	first := decode(t, w.msgs[0])
 	second := decode(t, w.msgs[1])
 	assert.NotEqual(t, first.EventID, second.EventID)
+}
+
+// TestPublish_WriterError_IsNotSwallowed is the regression test for a
+// defect found this pass: Publish logged "kafka publish failed — event
+// dropped" on a write error but then unconditionally returned nil, so the
+// caller believed the event was delivered. Publish has no live call site in
+// this service today (every mutation goes through PublishOutbox instead),
+// but the exported method must not silently claim success on failure if it
+// is ever used.
+func TestPublish_WriterError_IsNotSwallowed(t *testing.T) {
+	w := &fakeWriter{err: errors.New("broker unreachable")}
+	p := events.NewKafkaPublisherWithWriter(w, "zoiko.kill-switch-registry.events", zap.NewNop())
+
+	err := p.Publish(context.Background(), events.PublishParams{
+		EventType: "kill_switch.engaged", EntityID: "event-1",
+		ActorID: "approver-1", CorrelationID: "corr-1",
+		Payload: map[string]string{"action": "ENGAGE"},
+	})
+	require.Error(t, err, "a Kafka write failure must be returned to the caller, not swallowed")
+	assert.Empty(t, w.msgs, "no message should be recorded as delivered when the writer failed")
 }

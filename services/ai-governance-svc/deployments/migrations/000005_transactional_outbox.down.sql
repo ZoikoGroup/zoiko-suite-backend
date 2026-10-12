@@ -1,0 +1,18 @@
+DROP TRIGGER IF EXISTS aig_outbox_model_releases ON ai_model_releases;
+DROP TRIGGER IF EXISTS aig_outbox_ai_incidents ON ai_incidents;
+DROP TRIGGER IF EXISTS aig_outbox_ai_executions ON ai_executions;
+DROP TRIGGER IF EXISTS aig_outbox_use_cases_update ON ai_use_cases;
+DROP TRIGGER IF EXISTS aig_outbox_use_cases_insert ON ai_use_cases;
+DROP TRIGGER IF EXISTS aig_outbox_policy_change_approvals_update ON policy_change_approvals;
+DROP TRIGGER IF EXISTS aig_outbox_policy_change_approvals_insert ON policy_change_approvals;
+DROP TRIGGER IF EXISTS aig_outbox_model_provider_registrations ON model_provider_registrations;
+DROP TRIGGER IF EXISTS aig_outbox_automation_actions_update ON automation_actions;
+DROP TRIGGER IF EXISTS aig_outbox_automation_actions_insert ON automation_actions;
+DROP TRIGGER IF EXISTS aig_outbox_automation_policies ON automation_policies;
+DROP TRIGGER IF EXISTS aig_outbox_action_risk_classifications ON action_risk_classifications;
+DROP TRIGGER IF EXISTS aig_outbox_ai_runs ON ai_runs;
+DROP FUNCTION IF EXISTS aig_enqueue_model_release_outbox();
+DROP FUNCTION IF EXISTS aig_enqueue_outbox();
+DROP TABLE IF EXISTS ai_incidents;
+DROP TABLE IF EXISTS ai_executions;
+DROP TABLE IF EXISTS ai_governance_outbox;

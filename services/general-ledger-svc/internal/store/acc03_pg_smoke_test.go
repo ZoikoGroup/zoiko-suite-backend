@@ -23,7 +23,7 @@ import (
 
 func TestPgStore_ACC03_SubmitApproveRequestPosting_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -78,7 +78,7 @@ func TestPgStore_ACC03_SubmitApproveRequestPosting_RealDB(t *testing.T) {
 
 func TestPgStore_ACC03_AmendDraftJournal_ReplacesLines_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)

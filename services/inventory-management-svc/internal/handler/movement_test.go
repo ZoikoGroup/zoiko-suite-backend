@@ -206,6 +206,61 @@ func TestCommitMovement_ReceiveDuplicateSerial_Returns422(t *testing.T) {
 	}
 }
 
+func issueOver(t *testing.T, r chi.Router, itemID, locID, key string) int {
+	t.Helper()
+	req := domain.CreateInventoryMovementRequest{
+		ItemID: itemID, SourceLocationID: locID, Quantity: 10, UOM: "EACH",
+		SourceReference: "SO-1", SourceIdempotencyKey: key, FiscalPeriod: "2026-09",
+	}
+	create := doReq(r, http.MethodPost, "/v1/movements/issue", req, "preparer-1")
+	var m domain.InventoryMovement
+	_ = json.NewDecoder(create.Body).Decode(&m)
+	if v := doReq(r, http.MethodPost, "/v1/movements/"+m.MovementID+"/validate", nil, "preparer-1"); v.Code != http.StatusOK {
+		t.Fatalf("validate failed: %d %s", v.Code, v.Body.String())
+	}
+	return doReq(r, http.MethodPost, "/v1/movements/"+m.MovementID+"/commit", nil, "preparer-1").Code
+}
+
+// INV-01 negative-stock policy: ALLOWED lets an over-issue commit; the
+// default (no policy / PROHIBITED) still refuses, and omitting the field on
+// a later policy version must not silently flip ALLOWED back.
+func TestCommitMovement_NegativeStockAllowedPolicy_Commits(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, locA, _ := movementFixture(t, s, r)
+	createAndCommitReceipt(t, r, itemID, locA, "idem-recv-neg", 5)
+
+	if code := issueOver(t, r, itemID, locA, "idem-issue-prohibited"); code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 under default PROHIBITED policy, got %d", code)
+	}
+
+	set := doReq(r, http.MethodPost, "/v1/items/"+itemID+"/tracking-policy",
+		domain.SetTrackingPolicyRequest{NegativeStockPolicy: domain.NegativeStockAllowed}, "policy-1")
+	if set.Code != http.StatusCreated {
+		t.Fatalf("set tracking policy failed: %d %s", set.Code, set.Body.String())
+	}
+	if code := issueOver(t, r, itemID, locA, "idem-issue-allowed"); code != http.StatusOK {
+		t.Fatalf("expected 200 under ALLOWED policy, got %d", code)
+	}
+
+	// A later version that omits the field carries ALLOWED forward.
+	doReq(r, http.MethodPost, "/v1/items/"+itemID+"/tracking-policy", domain.SetTrackingPolicyRequest{}, "policy-1")
+	if got := s.trackingPolicies[itemID].NegativeStockPolicy; got != domain.NegativeStockAllowed {
+		t.Fatalf("expected ALLOWED carried forward, got %q", got)
+	}
+}
+
+func TestSetTrackingPolicy_InvalidNegativeStockPolicy_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, _, _ := movementFixture(t, s, r)
+	rr := doReq(r, http.MethodPost, "/v1/items/"+itemID+"/tracking-policy",
+		domain.SetTrackingPolicyRequest{NegativeStockPolicy: "MAYBE"}, "policy-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 // ── Negative path #3: negative stock ─────────────────────────────────────────
 
 func TestCommitMovement_IssueMoreThanOnHand_Returns422(t *testing.T) {

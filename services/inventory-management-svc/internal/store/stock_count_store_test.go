@@ -207,6 +207,80 @@ func TestPgStore_GenerateAdjustment_CreatesRealMovement(t *testing.T) {
 	}
 }
 
+// TestPgStore_CertifyStockCount_UnapprovedVarianceRefused proves the guard
+// against real Postgres: two lines, one approved+adjusted, one observed with
+// a variance and never approved — the count reaches ADJUSTMENTS_GENERATED
+// but must not certify.
+func TestPgStore_CertifyStockCount_UnapprovedVarianceRefused(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemA := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-CERT-A")
+	itemB := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-CERT-B")
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-CERT-1")
+	createCommittedReceipt(t, s, ctx, legalEntityID, itemA, locID, "idem-cert-a", 10)
+	createCommittedReceipt(t, s, ctx, legalEntityID, itemB, locID, "idem-cert-b", 10)
+
+	sc := &domain.StockCount{
+		CountID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: "2026-09",
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "planner-1",
+	}
+	if err := s.CreateStockCount(ctx, sc, []string{locID}); err != nil {
+		t.Fatalf("CreateStockCount failed: %v", err)
+	}
+	if _, err := s.FreezeCountPopulation(ctx, sc.CountID, time.Now().UTC()); err != nil {
+		t.Fatalf("FreezeCountPopulation failed: %v", err)
+	}
+	got, err := s.GetStockCount(ctx, sc.CountID)
+	if err != nil || len(got.Lines) != 2 {
+		t.Fatalf("expected 2 frozen lines, got %d (err %v)", len(got.Lines), err)
+	}
+
+	for _, l := range got.Lines {
+		if _, err := s.RecordBlindCount(ctx, l.LineID, "counter-1", l.SystemQuantity+1, time.Now().UTC()); err != nil {
+			t.Fatalf("RecordBlindCount failed: %v", err)
+		}
+	}
+	// Approve and adjust only the first line.
+	first := got.Lines[0]
+	if err := s.ApproveCountVariance(ctx, first.LineID, "reviewer-2", time.Now().UTC()); err != nil {
+		t.Fatalf("ApproveCountVariance failed: %v", err)
+	}
+	adj := &domain.InventoryMovement{
+		MovementID: uuid.New().String(), LegalEntityID: legalEntityID, MovementType: domain.MovementTypeAdjustment, Status: domain.MovementStatusDraft,
+		ItemID: first.ItemID, Quantity: 1, UOM: "EACH",
+		SourceReference: "STOCK-COUNT-" + sc.CountID, SourceIdempotencyKey: "count-" + first.LineID, FiscalPeriod: "2026-09",
+		BusinessDate: time.Now().UTC(), CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "reviewer-2",
+	}
+	adj.DestinationLocationID = &locID
+	if err := s.CreateMovement(ctx, adj); err != nil {
+		t.Fatalf("CreateMovement failed: %v", err)
+	}
+	if err := s.ValidateMovement(ctx, adj.MovementID, time.Now().UTC()); err != nil {
+		t.Fatalf("ValidateMovement failed: %v", err)
+	}
+	if err := s.CommitMovement(ctx, adj.MovementID, "reviewer-2", time.Now().UTC()); err != nil {
+		t.Fatalf("CommitMovement failed: %v", err)
+	}
+	if err := s.LinkCountLineAdjustment(ctx, first.LineID, adj.MovementID); err != nil {
+		t.Fatalf("LinkCountLineAdjustment failed: %v", err)
+	}
+	if err := s.MarkCountAdjustmentsGenerated(ctx, sc.CountID); err != nil {
+		t.Fatalf("MarkCountAdjustmentsGenerated failed: %v", err)
+	}
+
+	if err := s.CertifyStockCount(ctx, sc.CountID, "certifier-3", time.Now().UTC()); err != domain.ErrUnresolvedCountVariance {
+		t.Fatalf("expected ErrUnresolvedCountVariance with a never-approved variance left behind, got %v", err)
+	}
+	final, _ := s.GetStockCount(ctx, sc.CountID)
+	if final.Status == domain.StockCountStatusCertified {
+		t.Fatalf("count must not be CERTIFIED with an unresolved variance")
+	}
+}
+
 // TestPgStore_GetUnapprovedVarianceCount_RealDB proves the real
 // aggregation query — the source financial-close-svc's ACC-06
 // reconciles against for the AST/INV/PRJ domain spec's own §9 "Stock

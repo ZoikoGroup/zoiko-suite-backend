@@ -36,10 +36,16 @@ func NewClient(baseURL string) *Client {
 // ResolvePurposeAsOf) — a 404 there means either the purpose doesn't
 // exist or it exists but has never been published, and either way this
 // method reports it as not usable.
-func (c *Client) IsPublished(ctx context.Context, purposeID string) (bool, error) {
+// tenantID is forwarded via X-Tenant-Id — PRV-01's own RLS scopes this
+// read by tenant, same convention as every other cross-service client in
+// this domain (see retentionregistry-style clients elsewhere).
+func (c *Client) IsPublished(ctx context.Context, tenantID, purposeID string) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/privacy/purposes/"+purposeID, nil)
 	if err != nil {
 		return false, err
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

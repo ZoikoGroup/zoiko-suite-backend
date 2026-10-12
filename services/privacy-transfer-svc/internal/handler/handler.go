@@ -28,6 +28,13 @@ const (
 	PrivacyTransferRelationshipManage = "PRIVACY_TRANSFER_RELATIONSHIP_MANAGE"
 	PrivacyTransferMechanismManage    = "PRIVACY_TRANSFER_MECHANISM_MANAGE"
 	PrivacyTransferAssessmentRecord   = "PRIVACY_TRANSFER_ASSESSMENT_RECORD"
+	// PrivacyTransferDecisionEvaluate gates EvaluateTransfer — distinct from
+	// the three *_MANAGE/_RECORD actions above, which govern creating or
+	// amending the underlying relationship/mechanism/assessment records.
+	// Evaluating a transfer authorization is a separate capability: it reads
+	// those records and writes a durable, event-published decision, but
+	// does not by itself let the caller manage any of them.
+	PrivacyTransferDecisionEvaluate = "PRIVACY_TRANSFER_DECISION_EVALUATE"
 )
 
 const platformScopeID = "00000000-0000-0000-0000-00000000f001"
@@ -40,7 +47,7 @@ type AuthzChecker interface {
 // package's doc comment on why purpose_activity_refs are validated, not
 // trusted as opaque strings.
 type PurposeChecker interface {
-	ResolveActivity(ctx context.Context, activityID string) (*purposeregistry.ActivityVersion, error)
+	ResolveActivity(ctx context.Context, tenantID, activityID string) (*purposeregistry.ActivityVersion, error)
 }
 
 type Handler struct {
@@ -233,7 +240,7 @@ func (h *Handler) CreateRelationship(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, activityID := range req.PurposeActivityRefs {
-		activity, err := h.purposes.ResolveActivity(r.Context(), activityID)
+		activity, err := h.purposes.ResolveActivity(r.Context(), tenantID, activityID)
 		if err != nil {
 			h.log.Error("CreateRelationship: purpose registry unavailable", zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "purpose registry unavailable")
@@ -604,6 +611,10 @@ func (h *Handler) EvaluateTransfer(w http.ResponseWriter, r *http.Request) {
 	tenantID := req.TenantID
 	if tenantID == "" {
 		tenantID = verifiedTenant
+	}
+
+	if !h.authorize(w, r, principalID, tenantID, PrivacyTransferDecisionEvaluate) {
+		return
 	}
 
 	// Check idempotency (§18.1)

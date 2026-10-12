@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
@@ -501,4 +503,50 @@ func (h *Handler) GetCurrentPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, pol)
+}
+
+// GetPeriodReconciliationStatus — GET /v1/reconciliation-runs/period-status
+// ?legal_entity_id=&period_start=YYYY-MM-DD&period_end=YYYY-MM-DD
+//
+// Per bank account of the entity: the latest certified run with a statement
+// date in the period, and the latest run of any status. Period close reads it
+// to decide whether cash is reconciled (ACC-14 "bank recon"; ZS-CONTROL-001
+// §22 "Bank reconciliations complete for material accounts").
+func (h *Handler) GetPeriodReconciliationStatus(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	entity := strings.TrimSpace(q.Get("legal_entity_id"))
+	start, end := q.Get("period_start"), q.Get("period_end")
+	if _, err := uuid.Parse(entity); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
+	startDate, err1 := time.Parse("2006-01-02", start)
+	endDate, err2 := time.Parse("2006-01-02", end)
+	if err1 != nil || err2 != nil || endDate.Before(startDate) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "period_start and period_end are required as YYYY-MM-DD, with period_end not before period_start")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entity, actionRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	accounts, err := h.store.PeriodReconciliationStatus(r.Context(), tenantID, entity, start, end)
+	if err != nil {
+		h.writeStoreErr(w, "PeriodReconciliationStatus", err)
+		return
+	}
+	if accounts == nil {
+		accounts = []domain.AccountReconciliationStatus{}
+	}
+	writeJSON(w, http.StatusOK, domain.PeriodReconciliationStatus{
+		LegalEntityID: entity, PeriodStart: start, PeriodEnd: end, Accounts: accounts,
+	})
 }

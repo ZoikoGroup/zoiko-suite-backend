@@ -4,6 +4,11 @@
 
 package envelope
 
+import (
+	"net/http"
+	"strings"
+)
+
 // ServicePolicy is this service's §4 conditional-field policy.
 //
 // The unconditionally mandatory fields — tenant_id, actor_subject_id,
@@ -21,5 +26,12 @@ func ServicePolicy() Policy {
 
 		// This service does not post to an accounting book.
 		BookID: NotRequired,
+
+		MaterialWrite: func(r *http.Request) bool {
+			if strings.HasSuffix(r.URL.Path, "/verify") {
+				return false
+			}
+			return defaultMaterialWrite(r)
+		},
 	}
 }

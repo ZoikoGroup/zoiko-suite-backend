@@ -55,7 +55,7 @@ type stubPurposeRegistry struct {
 	err       error
 }
 
-func (p *stubPurposeRegistry) IsPublished(_ context.Context, purposeID string) (bool, error) {
+func (p *stubPurposeRegistry) IsPublished(_ context.Context, _, purposeID string) (bool, error) {
 	if p.err != nil {
 		return false, p.err
 	}
@@ -249,6 +249,38 @@ func TestRecordPresentation(t *testing.T) {
 	}
 	if pr.DeliveryEvidence == nil || *pr.DeliveryEvidence != evidence {
 		t.Fatalf("expected delivery_evidence %s, got %v", evidence, pr.DeliveryEvidence)
+	}
+}
+
+// TestRecordPresentation_MissingPrincipal_Returns401 and
+// TestRecordPresentation_AuthorizationDenied prove recordPresentationInternal
+// is gated the same way every other mutating handler in this service already
+// is: previously it read X-Principal-Id directly with no requirePrincipal or
+// authorize check at all, so any caller — even one sending no principal — could
+// record presentation-receipt evidence for any notice.
+func TestRecordPresentation_MissingPrincipal_Returns401(t *testing.T) {
+	st := newStubStore()
+	r := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	notice := createPublishedNotice(t, r)
+
+	w := doRequestWithHeaders(r, http.MethodPost, "/privacy/notices/"+notice.NoticeID+"/versions/"+notice.NoticeVersionID+"/presentation-receipts",
+		domain.RecordPresentationRequest{SubjectRef: "subject-1", Channel: "WEB_SIGNUP"}, testTenant, "",
+		map[string]string{"X-Principal-Id": ""})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no principal, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRecordPresentation_AuthorizationDenied(t *testing.T) {
+	st := newStubStore()
+	setupRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{}, grantingPurposeRegistry())
+	notice := createPublishedNotice(t, setupRouter)
+
+	deniedRouter := newTestRouter(st, &stubPublisher{}, &stubAuthz{deny: true}, grantingPurposeRegistry())
+	w := doRequest(deniedRouter, http.MethodPost, "/privacy/notices/"+notice.NoticeID+"/versions/"+notice.NoticeVersionID+"/presentation-receipts",
+		domain.RecordPresentationRequest{SubjectRef: "subject-1", Channel: "WEB_SIGNUP"}, testTenant)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

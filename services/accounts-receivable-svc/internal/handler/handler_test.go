@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/accounts-receivable-svc/internal/domain"
@@ -128,13 +129,38 @@ func (s *stubStore) TransitionInvoice(
 	return &copied, nil
 }
 
+// SetIssuanceJournalID stores the GL journal ID on the invoice (test stub).
+func (s *stubStore) SetIssuanceJournalID(_ context.Context, tenantID, invoiceID, journalID string) error {
+	inv, ok := s.invoices[invoiceID]
+	if !ok || inv.TenantID != tenantID {
+		return nil // not found, ignore like real store would
+	}
+	inv.IssuanceJournalID = &journalID
+	return nil
+}
+
 // stubLedger stands in for general-ledger-svc when a test cares about the
 // handler's branching rather than the client's HTTP behaviour. Tests that care
 // about the AMOUNT check drive the real ledger.HTTPClient against a fake server
 // instead — that is where the comparison lives.
-type stubLedger struct{ err error }
+type stubLedger struct {
+	err         error
+	journalID   string
+	postErr     error
+}
 
 func (l *stubLedger) Verify(_ context.Context, _, _, _ string, _ float64) error { return l.err }
+
+// PostInvoiceIssuedAccountingEvent is the test stub for posting AR issuance events to GL.
+func (l *stubLedger) PostInvoiceIssuedAccountingEvent(_ context.Context, _, _ string, _ *domain.CustomerInvoice) (string, error) {
+	if l.postErr != nil {
+		return "", l.postErr
+	}
+	if l.journalID == "" {
+		l.journalID = "journal-" + uuid.New().String()
+	}
+	return l.journalID, nil
+}
 
 // stubEntities stands in for tenant-entity-registry-svc. The zero value ACCEPTS,
 // so every pre-existing test keeps testing what it was written to test rather
@@ -178,12 +204,12 @@ const testTenant = "t1"
 // client, so a stub there would test nothing. The entity registry accepts by
 // default; tests that care pass their own via newRouterWith.
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ, ledgerURL string) chi.Router {
-	return newRouterWith(s, p, a, ledger.NewHTTPClient(ledgerURL), &stubEntities{}, nil)
+	return newRouterWith(s, p, a, ledger.NewHTTPClient(ledgerURL, zap.NewNop()), &stubEntities{}, nil)
 }
 
 // newRouterAtTime is newRouter with the clock pinned, for the overdue check.
 func newRouterAtTime(s *stubStore, p *stubPublisher, a *stubAuthZ, ledgerURL string, now time.Time) chi.Router {
-	return newRouterWith(s, p, a, ledger.NewHTTPClient(ledgerURL), &stubEntities{},
+	return newRouterWith(s, p, a, ledger.NewHTTPClient(ledgerURL, zap.NewNop()), &stubEntities{},
 		func() time.Time { return now })
 }
 
@@ -304,7 +330,8 @@ func validCreateReq() domain.CreateCustomerInvoiceRequest {
 func ptr(s string) *string { return &s }
 
 func TestCreateInvoice_Success(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, "")
+	r := newRouterWith(newStubStore(), &stubPublisher{}, &stubAuthZ{},
+		&stubLedger{}, &stubEntities{}, nil)
 	rec := doRequest(r, http.MethodPost, "/v1/invoices/", validCreateReq(), "principal-1")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
@@ -323,7 +350,8 @@ func TestCreateInvoice_MissingCorrelationID_Rejected(t *testing.T) {
 
 func TestCreateInvoice_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t *testing.T) {
 	pub := &stubPublisher{}
-	r := newRouter(newStubStore(), pub, &stubAuthZ{}, "")
+	r := newRouterWith(newStubStore(), pub, &stubAuthZ{},
+		&stubLedger{}, &stubEntities{}, nil)
 	req := validCreateReq()
 
 	first := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
@@ -360,6 +388,33 @@ func TestCreateInvoice_AuthorizationDenied_Returns403(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/invoices/", validCreateReq(), "principal-1")
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+}
+
+// TestCreateInvoice_LedgerPostingFails_Returns503AndLeavesNoJournalLink is the
+// literal enforcement of handler.go's own comment at the PostInvoiceIssuedAccountingEvent
+// call site: "an invoice that cannot be booked is unpayable ... Fail the request
+// so the caller knows to retry. Do not leave an unpayable invoice in the system."
+// Before this test, stubLedger.postErr existed but nothing ever set it, so this
+// branch — the entire point of wiring AR to ACC-04 — had never actually run.
+func TestCreateInvoice_LedgerPostingFails_Returns503AndLeavesNoJournalLink(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWith(s, &stubPublisher{}, &stubAuthZ{},
+		&stubLedger{postErr: ledger.ErrUnavailable}, &stubEntities{}, nil)
+
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/", validCreateReq(), "principal-1")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when GL posting fails, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The invoice row itself was already written by store.CreateInvoice before
+	// the GL call — that's unavoidable without a distributed transaction — but
+	// it must never carry a journal ID it doesn't actually have.
+	for _, inv := range s.invoices {
+		if inv.IssuanceJournalID != nil {
+			t.Fatalf("invoice %s has IssuanceJournalID set despite GL posting having failed: %q",
+				inv.InvoiceID, *inv.IssuanceJournalID)
+		}
 	}
 }
 
@@ -759,7 +814,8 @@ func TestCreateInvoice_BodyTenantOtherThanVerified_Returns403(t *testing.T) {
 // stored tenant must be the verified one.
 func TestCreateInvoice_StoresTheVerifiedTenant_WhenBodyOmitsIt(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, "")
+	r := newRouterWith(s, &stubPublisher{}, &stubAuthZ{},
+		&stubLedger{}, &stubEntities{}, nil)
 
 	req := validCreateReq()
 	req.TenantID = ""
@@ -782,7 +838,8 @@ func TestCreateInvoice_StoresTheVerifiedTenant_WhenBodyOmitsIt(t *testing.T) {
 
 func TestCreateInvoice_NoVerifiedTenant_Returns401(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, "")
+	r := newRouterWith(s, &stubPublisher{}, &stubAuthZ{},
+		&stubLedger{}, &stubEntities{}, nil)
 
 	rec := doRequestAs(r, http.MethodPost, "/v1/invoices/", validCreateReq(), "principal-1", "")
 	if rec.Code != http.StatusUnauthorized {
@@ -1451,7 +1508,9 @@ func TestHandler_ZeroSynchronousPublishCalls_AllOperations(t *testing.T) {
 	// TestSendInvoice_WithoutDocument_Returns422), so the invoice carries one.
 	createReq.InvoiceDocumentID = ptr("doc-zero")
 
-	r := newRouterAtTime(s, pub, &stubAuthZ{}, "", dueDate.AddDate(0, 0, 2))
+	// First create with stub ledger (doesn't need real GL)
+	r := newRouterWith(s, pub, &stubAuthZ{}, &stubLedger{}, &stubEntities{},
+		func() time.Time { return dueDate.AddDate(0, 0, 2) })
 
 	// 1. CreateInvoice
 	recCreate := doRequest(r, http.MethodPost, "/v1/invoices/", createReq, "principal-1")
@@ -1468,6 +1527,7 @@ func TestHandler_ZeroSynchronousPublishCalls_AllOperations(t *testing.T) {
 	}
 	invoiceID := createdInv.InvoiceID
 
+	// Now switch to real ledger client against fake server for Send/Overdue/Pay
 	gl := fakeLedger(t,
 		[]map[string]any{journalFor("j-zero", invoiceID, "FINALIZED", 1500.0)},
 		map[string]map[string]any{"j-zero": journalFor("j-zero", invoiceID, "FINALIZED", 1500.0)},

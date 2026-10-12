@@ -232,6 +232,11 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.store.CreateDocument(r.Context(), doc, firstVersion, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.log.Error("CreateDocument: store unavailable", zap.Error(err))
+		if delErr := h.storage.Delete(r.Context(), tempKey); delErr != nil {
+			h.log.Error("CreateDocument: failed to cleanup storage blob after store error", zap.String("storage_key", tempKey), zap.Error(delErr))
+		} else {
+			h.log.Info("CreateDocument: cleaned up orphaned storage blob after store error", zap.String("storage_key", tempKey))
+		}
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
@@ -1264,6 +1269,11 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 
 	doc, err := h.store.AddVersion(r.Context(), documentID, v, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
+		if delErr := h.storage.Delete(r.Context(), tempKey); delErr != nil {
+			h.log.Error("AddVersion: failed to cleanup storage blob after store error", zap.String("storage_key", tempKey), zap.Error(delErr))
+		} else {
+			h.log.Info("AddVersion: cleaned up orphaned storage blob after store error", zap.String("storage_key", tempKey))
+		}
 		h.handleStoreError(w, err)
 		return
 	}
