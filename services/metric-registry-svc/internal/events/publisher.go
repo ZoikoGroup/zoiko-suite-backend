@@ -108,3 +108,34 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 	}
 	return nil
 }
+
+// PublishOutbox delivers a pre-serialized outbox event payload to Kafka,
+// for the outbox relay worker (internal/outbox). Unlike Publish above, this
+// returns the real error so the relay can track failed attempts and retry —
+// the whole point of moving report_metric.created/version_published off the
+// direct Publish path this service used to rely on exclusively.
+//
+// Topic is deliberately NOT set on the message: p.writer (a *kafka.Writer
+// constructed in cmd/server with its own Topic field set) already pins the
+// topic, and kafka-go's Writer.WriteMessages refuses a message that ALSO
+// carries one — the exact defect found and fixed in document-vault-svc and
+// evidence-manifest-svc's own publisher.go this same audit pass.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	headers := []kafka.Header{
+		{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+	}
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(aggregateID),
+		Value:   payload,
+		Headers: headers,
+	})
+	if err != nil {
+		p.logger.Warn("kafka outbox publish failed",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.Error(err),
+		)
+		return err
+	}
+	return nil
+}

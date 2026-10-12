@@ -519,4 +519,72 @@ func TestListSourceAuthorityMaps_FieldFamilyIsOptional(t *testing.T) {
 	}
 }
 
+// ── GAP 10: swallowed Kafka publish errors / no transactional outbox ────────
+
+// All three writes used to call `_ = h.publisher.Publish(...)` directly after
+// the store call, discarding the error — a Kafka outage silently and
+// permanently lost the event. They now insert into the transactional outbox
+// atomically with the domain row instead.
+func TestCreateSourceAuthorityMap_OutboxEventRecorded(t *testing.T) {
+	h, st, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	createMap(t, r, "PAYROLL_GROSS_PAY", "ADP", 1)
+
+	if len(st.outboxEvents) != 1 {
+		t.Fatalf("expected 1 outbox event, got %d", len(st.outboxEvents))
+	}
+	if st.outboxEvents[0].EventType != "source_authority_map.created" {
+		t.Fatalf("expected source_authority_map.created, got %s", st.outboxEvents[0].EventType)
+	}
+}
+
+func TestCreateSourceAuthorityMap_ReplayDoesNotRecordASecondOutboxEvent(t *testing.T) {
+	h, st, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	correlationID := uuid.NewString()
+	body := domain.CreateSourceAuthorityMapRequest{
+		FieldFamily: "X", SourceSystem: "Y", PrecedenceRank: 1,
+		ConflictRoute: "x", EffectiveFrom: "2026-01-01T00:00:00Z",
+		CorrelationID: correlationID,
+	}
+	do(r, buildRequest(http.MethodPost, "/v1/source-authority-maps", body))
+	do(r, buildRequest(http.MethodPost, "/v1/source-authority-maps", body))
+
+	if len(st.outboxEvents) != 1 {
+		t.Fatalf("a replay must not record a second outbox event, got %d", len(st.outboxEvents))
+	}
+}
+
+func TestSupersede_OutboxEventRecorded(t *testing.T) {
+	h, st, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	m := createMap(t, r, "F", "S", 1)
+	do(r, buildRequest(http.MethodPost, "/v1/source-authority-maps/"+m.SourceAuthorityMapID+"/supersede",
+		domain.SupersedeSourceAuthorityMapRequest{CorrelationID: uuid.NewString()}))
+
+	if len(st.outboxEvents) != 2 { // source_authority_map.created + .superseded
+		t.Fatalf("expected 2 outbox events, got %d", len(st.outboxEvents))
+	}
+	if st.outboxEvents[1].EventType != "source_authority_map.superseded" {
+		t.Fatalf("expected the second outbox event to be source_authority_map.superseded, got %s", st.outboxEvents[1].EventType)
+	}
+}
+
+func TestRecordFact_OutboxEventRecorded(t *testing.T) {
+	h, st, _ := newTestHandler()
+	r := newTestRouter(h)
+
+	recordFact(t, r, "PAYROLL_GROSS_PAY", "emp-1", "ADP", `"120000"`, "2026-01-05T00:00:00Z")
+
+	if len(st.outboxEvents) != 1 {
+		t.Fatalf("expected 1 outbox event, got %d", len(st.outboxEvents))
+	}
+	if st.outboxEvents[0].EventType != "normalized_fact.recorded" {
+		t.Fatalf("expected normalized_fact.recorded, got %s", st.outboxEvents[0].EventType)
+	}
+}
+
 func errDenied() error { return authzpkg.ErrAuthorizationDenied }
