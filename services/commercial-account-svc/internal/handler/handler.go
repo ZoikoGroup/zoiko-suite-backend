@@ -187,10 +187,6 @@ func (h *Handler) GetCommercialAccount(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireTenant(w, r, ""); !ok {
 		return
 	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
 	id := chi.URLParam(r, "id")
 	acct, err := h.store.GetCommercialAccount(r.Context(), id)
 	if err != nil {
@@ -266,10 +262,6 @@ func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, ok := h.requireTenant(w, r, ""); !ok {
-		return
-	}
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
 		return
 	}
 	id := chi.URLParam(r, "id")
