@@ -182,6 +182,59 @@ $BUNDLES = @(
         Actions = @("AR01_CREDIT_LIMIT_APPROVE")
     },
     @{
+        # AR-02 Quote / Estimate. Preparing, approving and converting are separate
+        # roles; the service refuses a discount above 10% approved by its preparer.
+        Code    = "AR02_QUOTE_PREPARER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR02_QUOTE_MANAGE", "AR02_QUOTE_CONVERT")
+    },
+    @{
+        Code    = "AR02_QUOTE_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR02_QUOTE_APPROVE", "AR02_QUOTE_DISCOUNT_APPROVE")
+    },
+    @{
+        # AR-03 Sales Order. Managing, approving and the credit-exception authority
+        # are separate roles; the service refuses self-approval above thresholds and
+        # release of a CREDIT hold by the principal who needs it released.
+        Code    = "AR03_ORDER_MANAGER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR03_ORDER_MANAGE", "AR03_ORDER_CONFIRM", "AR03_ORDER_HOLD", "AR03_ORDER_CANCEL")
+    },
+    @{
+        Code    = "AR03_ORDER_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR03_ORDER_APPROVE", "AR03_ORDER_CREDIT_EXCEPTION_APPROVE")
+    },
+    @{
+        # AR-04 Customer Invoice. Drafting/issuing, approval and legal-cancellation
+        # decisions are separate roles: the service refuses an approver who is the
+        # creator or submitter, and the issuer approving a material invoice.
+        Code    = "AR04_INVOICE_BILLER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR04_INVOICE_MANAGE", "AR04_INVOICE_ISSUE", "AR04_INVOICE_CANCEL_REQUEST",
+                    "AR04_INVOICE_CORRECTION_LINK", "AR04_INVOICE_DELIVERY_RECORD")
+    },
+    @{
+        Code    = "AR04_INVOICE_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR04_INVOICE_APPROVE", "AR04_INVOICE_CANCEL_APPROVE")
+    },
+    @{
+        # AR-05 Electronic Invoice. Submitting, reconciling against the provider and
+        # the manual-evidence admin path are separate: the issuer needs no provider
+        # permission, and the principal who started an attempt cannot resolve it by
+        # manual evidence.
+        Code    = "AR05_EINVOICE_OPERATOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR05_EINVOICE_SUBMIT", "AR05_EINVOICE_RECONCILE")
+    },
+    @{
+        Code    = "AR05_ADAPTER_ADMIN"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR05_ADAPTER_ADMIN", "AR05_EINVOICE_RECONCILE")
+    },
+    @{
         # bank-reconciliation-svc gates ingest, match, exception and statement
         # completion separately. Its two READ routes are not authorized at all
         # -- they are scoped by the verified X-Tenant-Id instead, the same

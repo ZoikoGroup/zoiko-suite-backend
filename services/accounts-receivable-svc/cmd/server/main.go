@@ -20,6 +20,10 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/accounts-receivable-svc/internal/ar01"
+	"zoiko.io/accounts-receivable-svc/internal/ar02"
+	"zoiko.io/accounts-receivable-svc/internal/ar03"
+	"zoiko.io/accounts-receivable-svc/internal/ar04"
+	"zoiko.io/accounts-receivable-svc/internal/ar05"
 	"zoiko.io/accounts-receivable-svc/internal/authz"
 	"zoiko.io/accounts-receivable-svc/internal/config"
 	"zoiko.io/accounts-receivable-svc/internal/entity"
@@ -33,6 +37,7 @@ import (
 	"zoiko.io/accounts-receivable-svc/internal/mtls"
 	"zoiko.io/accounts-receivable-svc/internal/outbox"
 	"zoiko.io/accounts-receivable-svc/internal/store"
+	"zoiko.io/accounts-receivable-svc/internal/taxdet"
 	"zoiko.io/accounts-receivable-svc/internal/telemetry"
 )
 
@@ -166,7 +171,14 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	//
+	// The AR-05 provider callback is exempt: an external e-invoice provider has no
+	// tenant, principal or idempotency key to send. It is authenticated by its
+	// HMAC signature instead (see internal/ar05 callback.go). The gateway must
+	// route this exact path around ForwardAuth, ideally IP-allowlisted.
+	envPolicy := svcenvelope.ServicePolicy()
+	envPolicy.ExemptPaths = append(envPolicy.ExemptPaths, ar05.CallbackPath)
+	r.Use(svcenvelope.Middleware(envPolicy, svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, authzClient, ledgerClient, entityClient, log)
 	handler.RegisterRoutes(r, h)
@@ -175,7 +187,63 @@ func main() {
 	// AR-07 open items for exposure; until that module is wired it reports
 	// exposure_available:false rather than guessing.
 	kitDeps := kit.Deps{DB: kit.NewDB(pool), Log: log, Authz: authzClient, Entities: entityClient}
-	ar01.New(kitDeps, ar01.NewCounterpartyDirectory(cfg.CounterpartyMgmtURL), nil).Register(r)
+	ar01m := ar01.New(kitDeps, ar01.NewCounterpartyDirectory(cfg.CounterpartyMgmtURL), nil)
+	ar01m.Register(r)
+
+	// AR-03 Sales Order. kit.OpenItems is AR-07's; until it is wired the credit
+	// check compares only the order's own value and records exposure_available:false.
+	// (Pass a literal nil: a typed-nil module would count as non-nil.)
+	ar03m := ar03.New(kitDeps, ar01m, nil)
+	ar03m.Register(r)
+
+	// AR-02 Quote / Estimate. AR-03 is the order creator, so quote conversion
+	// and order creation commit atomically.
+	ar02m := ar02.New(kitDeps, ar01m, taxdet.NewHTTPClient(cfg.TaxDeterminationURL), ar03m)
+	ar02m.Register(r)
+
+	// AR-04 Customer Invoice. Receivable creation needs AR-07 (kit.OpenItems,
+	// literal nil until it exists): until then issueInvoice answers 503 and
+	// changes nothing, because an issued invoice with no receivable is a control
+	// defect. e-invoice requirement (AR-05) nil = NOT_REQUIRED.
+	// AR-04 takes the AR-05 requirement and AR-05 takes AR-04's kit.Invoices; the
+	// forwarding proxy (late-bound below) breaks the construction cycle without
+	// handing AR-04 a typed-nil pointer.
+	einvoiceReq := &einvoiceRequirementProxy{}
+	ar04m := ar04.New(kitDeps, ar01m, ar03m, nil,
+		taxdet.NewHTTPClient(cfg.TaxDeterminationURL),
+		ar04.NewHTTPPeriodGate(cfg.AccountingPeriodURL), einvoiceReq)
+	ar04m.Register(r)
+
+	// AR-05 Electronic Invoice. No transport exists in the platform yet:
+	// Transports nil = UnconfiguredTransports (submit answers 503
+	// EINVOICE_PROVIDER_NOT_CONFIGURED, never a fake success). Which profile a
+	// jurisdiction uses is deployment configuration, e.g.
+	// AR_EINVOICE_PROFILES="GB|INVOICE=PEPPOL_INVOICE,DE|INVOICE=XRECHNUNG".
+	// Provider callback secrets: AR_EINVOICE_CALLBACK_SECRET_<PROVIDER>.
+	eiCatalog, err := ar05.ParseProfileCatalog(os.Getenv("AR_EINVOICE_PROFILES"))
+	if err != nil {
+		log.Fatal("AR_EINVOICE_PROFILES is invalid", zap.Error(err))
+	}
+	ar05m := ar05.New(kitDeps, ar05.Collaborators{
+		Invoices: ar04m,
+		Profiles: ar05.NewHTTPProfileResolver(cfg.JurisdictionRulesURL),
+		Catalog:  eiCatalog,
+		Entities: ar05.NewHTTPEntityJurisdictions(cfg.TenantRegistryURL, cfg.JurisdictionRulesURL),
+		Registry: ar05.NewHTTPRegistry(cfg.JurisdictionRulesURL),
+	})
+	ar05m.Register(r)
+	einvoiceReq.m = ar05m
+
+	// Durable ACC-04 posting queue (spec invariant 14: AR never writes the GL
+	// directly). Each module that owns a posting source registers its listener.
+	postingDispatcher := kit.NewPostingDispatcher(kitDeps.DB, kit.NewHTTPLedgerPoster(cfg.LedgerServiceURL), cfg.PostingPrincipalID, log)
+	postingDispatcher.Register(kit.SourceInvoice, ar04m)
+	go postingDispatcher.Start(relayCtx)
+
+	// Legacy /v1/invoices create and pay are deprecated in favour of AR-04 / AR-08.
+	// They stay on by default; AR_LEGACY_INVOICE_API=false retires them (410), and
+	// pay on any new-path invoice is always refused (CASH_APPLICATION_REQUIRED).
+	h.WithLegacyInvoiceAPI(os.Getenv("AR_LEGACY_INVOICE_API") != "false").WithNewPathGuard(ar04m)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
@@ -224,6 +292,17 @@ func main() {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
 	log.Info("server stopped")
+}
+
+// einvoiceRequirementProxy forwards kit.EInvoiceRequirement to AR-05 once it is
+// built; until then an e-invoice is not required.
+type einvoiceRequirementProxy struct{ m kit.EInvoiceRequirement }
+
+func (p *einvoiceRequirementProxy) Required(ctx context.Context, tenantID, legalEntityID, jurisdictionID, documentType string) (bool, error) {
+	if p.m == nil {
+		return false, nil
+	}
+	return p.m.Required(ctx, tenantID, legalEntityID, jurisdictionID, documentType)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
