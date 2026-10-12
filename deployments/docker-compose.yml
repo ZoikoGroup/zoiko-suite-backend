@@ -5065,7 +5065,16 @@ services:
       - "8149:8149"
     environment:
       PORT: "8149"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/metric_registry?sslmode=disable"
+      # Least-privilege hardening, NOT an RLS-bypass fix: report_metric_definitions
+      # has no tenant_id and no RLS policy at all (this registry is platform-wide
+      # reference data, same posture as schema-registry-svc/capability-registry-svc),
+      # so there is no tenant-isolation policy for a superuser connection to defeat.
+      # Still changed from the postgres superuser default to the least-privilege
+      # zoiko_app role (already granted arwd on this service's own tables) —
+      # a compromised or buggy connection from this service has no business
+      # holding CREATEROLE/DROP-anything rights on a Postgres instance shared
+      # with every other service's data.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/metric_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.metric-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -5100,7 +5109,15 @@ services:
       - "8150:8150"
     environment:
       PORT: "8150"
-      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/source_authority?sslmode=disable"
+      # Genuine RLS-bypass fix, not least-privilege hardening alone:
+      # normalized_facts carries FORCE ROW LEVEL SECURITY (migration 000002),
+      # but the postgres superuser default unconditionally bypasses RLS
+      # regardless of FORCE (rolsuper/rolbypassrls), silently defeating the
+      # tenant_isolation_policy that migration correctly set up. Switched to
+      # the pre-provisioned, NOSUPERUSER/NOBYPASSRLS zoiko_app role, already
+      # holding the needed arwd grants on both source_authority_maps and
+      # normalized_facts.
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/source_authority?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.source-authority.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"

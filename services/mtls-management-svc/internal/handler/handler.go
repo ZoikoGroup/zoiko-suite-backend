@@ -329,7 +329,11 @@ func (h *Handler) ListCerts(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, legalEntityID, MtlsCertRead) {
 		return
 	}
-	certs, _ := h.store.ListCerts(r.Context(), tenantID, legalEntityID, r.URL.Query().Get("status"))
+	certs, err := h.store.ListCerts(r.Context(), tenantID, legalEntityID, r.URL.Query().Get("status"))
+	if err != nil {
+		h.errJSON(w, 500, "failed to list certificates")
+		return
+	}
 	if certs == nil {
 		certs = []domain.MtlsCertificate{}
 	}
@@ -445,7 +449,10 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		Action:        req.Action,
 		RequiresMtls:  req.RequiresMtls,
 	}
-	_ = h.store.CreatePolicy(r.Context(), tenantID, pol)
+	if err := h.store.CreatePolicy(r.Context(), tenantID, pol); err != nil {
+		h.errJSON(w, 500, "failed to create policy")
+		return
+	}
 	h.okJSON(w, 201, pol)
 }
 
@@ -461,7 +468,11 @@ func (h *Handler) ListPolicies(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, tenantID, MtlsPolicyRead) {
 		return
 	}
-	pols, _ := h.store.ListPolicies(r.Context(), tenantID)
+	pols, err := h.store.ListPolicies(r.Context(), tenantID)
+	if err != nil {
+		h.errJSON(w, 500, "failed to list policies")
+		return
+	}
 	if pols == nil {
 		pols = []domain.CommunicationPolicy{}
 	}
