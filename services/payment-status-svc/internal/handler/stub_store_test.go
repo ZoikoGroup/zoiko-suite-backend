@@ -41,7 +41,7 @@ func (s *stubStore) recordEvent(p *domain.PaymentExecutionState, eventType, from
 	})
 }
 
-func (s *stubStore) RecordPaymentStatus(_ context.Context, tenantID string, req domain.RecordPaymentStatusRequest, principalID string) (*domain.PaymentExecutionState, error) {
+func (s *stubStore) RecordPaymentStatus(_ context.Context, tenantID string, req domain.RecordPaymentStatusRequest, principalID, _ string) (*domain.PaymentExecutionState, error) {
 	now := time.Now().UTC()
 	p := &domain.PaymentExecutionState{
 		PaymentID: uuid.New().String(), TenantID: strp(tenantID), LegalEntityID: req.LegalEntityID,
@@ -61,7 +61,7 @@ func (s *stubStore) FindPayment(_ context.Context, paymentID string) (*domain.Pa
 	return p, nil
 }
 
-func (s *stubStore) ApplyCallbackStatus(_ context.Context, paymentID string, payload domain.ProviderCallbackPayload, eventType, finalitySource, actorPrincipalID string) (*domain.PaymentExecutionState, bool, error) {
+func (s *stubStore) ApplyCallbackStatus(_ context.Context, paymentID string, payload domain.ProviderCallbackPayload, eventType, finalitySource, actorPrincipalID, _ string, _ bool) (*domain.PaymentExecutionState, bool, error) {
 	p, ok := s.payments[paymentID]
 	if !ok {
 		return nil, false, domain.ErrPaymentNotFound
@@ -83,7 +83,7 @@ func (s *stubStore) ApplyCallbackStatus(_ context.Context, paymentID string, pay
 	return p, true, nil
 }
 
-func (s *stubStore) LinkStatement(_ context.Context, paymentID string, req domain.LinkStatementRequest, principalID string) (*domain.PaymentExecutionState, bool, error) {
+func (s *stubStore) LinkStatement(_ context.Context, paymentID string, req domain.LinkStatementRequest, principalID, _ string) (*domain.PaymentExecutionState, bool, error) {
 	p, ok := s.payments[paymentID]
 	if !ok {
 		return nil, false, domain.ErrPaymentNotFound
@@ -97,7 +97,7 @@ func (s *stubStore) LinkStatement(_ context.Context, paymentID string, req domai
 	return p, false, nil
 }
 
-func (s *stubStore) ResolveConflict(_ context.Context, paymentID string, req domain.ResolveConflictRequest, principalID string) (*domain.PaymentExecutionState, error) {
+func (s *stubStore) ResolveConflict(_ context.Context, paymentID string, req domain.ResolveConflictRequest, principalID, _ string) (*domain.PaymentExecutionState, error) {
 	p, ok := s.payments[paymentID]
 	if !ok || !p.HasOpenConflict {
 		return nil, domain.ErrInvalidTransition
@@ -129,7 +129,7 @@ func (s *stubStore) RecordReturn(_ context.Context, paymentID string, req domain
 	return p, nil
 }
 
-func (s *stubStore) CancelPayment(_ context.Context, paymentID string, req domain.CancelRequest, principalID string) (*domain.PaymentExecutionState, error) {
+func (s *stubStore) CancelPayment(_ context.Context, paymentID string, req domain.CancelRequest, principalID, _ string) (*domain.PaymentExecutionState, error) {
 	p, ok := s.payments[paymentID]
 	if !ok || !domain.CanCancel(p.Status) {
 		return nil, domain.ErrInvalidTransition
