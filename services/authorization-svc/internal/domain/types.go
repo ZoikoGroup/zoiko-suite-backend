@@ -449,16 +449,33 @@ type PrivilegedSession struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy        *string    `json:"revoked_by,omitempty"`
+	// 000030: §13 request fields, approval and post-session review.
+	RequestedBy       *string    `json:"requested_by,omitempty"`
+	ResourceScope     *string    `json:"resource_scope,omitempty"`
+	TargetEnvironment *string    `json:"target_environment,omitempty"`
+	HighImpact        bool       `json:"high_impact"`
+	ApprovedBy        *string    `json:"approved_by,omitempty"`
+	ApprovedAt        *time.Time `json:"approved_at,omitempty"`
+	ReviewStatus      string     `json:"review_status"`
+	ReviewedBy        *string    `json:"reviewed_by,omitempty"`
+	ReviewedAt        *time.Time `json:"reviewed_at,omitempty"`
+	ReviewNotes       *string    `json:"review_notes,omitempty"`
 }
 
 // CreatePrivilegedSessionParams holds the parameters to issue a new JIT privileged session.
 type CreatePrivilegedSessionParams struct {
-	TenantID         string
-	PrincipalID      string
-	RequestedActions []string
-	TicketRef        string
-	Reason           string
-	DurationSeconds  int
+	TenantID          string
+	PrincipalID       string
+	RequestedActions  []string
+	TicketRef         string
+	Reason            string
+	DurationSeconds   int
+	RequestedBy       string
+	ResourceScope     string
+	TargetEnvironment string
+	// HighImpact sessions start PENDING_APPROVAL and grant nothing until an
+	// independent approver approves (§13).
+	HighImpact bool
 }
 
 // BreakGlassSessionStatus represents the lifecycle state of an emergency break-glass session (ZS-IAM-001 §14 & §21).
@@ -482,6 +499,12 @@ type BreakGlassSession struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	RevokedAt        *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy        *string    `json:"revoked_by,omitempty"`
+	// 000030: requester and the mandatory post-event review (§14).
+	RequestedBy  *string    `json:"requested_by,omitempty"`
+	ReviewStatus string     `json:"review_status"`
+	ReviewedBy   *string    `json:"reviewed_by,omitempty"`
+	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
+	ReviewNotes  *string    `json:"review_notes,omitempty"`
 }
 
 type CreateBreakGlassSessionParams struct {
@@ -491,6 +514,7 @@ type CreateBreakGlassSessionParams struct {
 	Reason           string
 	RequestedActions []string
 	DurationSeconds  int
+	RequestedBy      string
 }
 
 // SupportSessionStatus represents the lifecycle state of a tenant support session (ZS-IAM-001 §15 & §21).
@@ -517,6 +541,7 @@ type SupportSession struct {
 	CreatedAt             time.Time  `json:"created_at"`
 	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
 	RevokedBy             *string    `json:"revoked_by,omitempty"`
+	RequestedBy           *string    `json:"requested_by,omitempty"`
 }
 
 type CreateSupportSessionParams struct {
@@ -529,6 +554,7 @@ type CreateSupportSessionParams struct {
 	AllowedActions        []string
 	DurationSeconds       int
 	TenantConsentObtained bool
+	RequestedBy           string
 }
 
 // ── params ───────────────────────────────────────────────────────────────────

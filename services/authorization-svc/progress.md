@@ -2212,3 +2212,176 @@ Verified: unit suites; cache watermark tests (3) and employment.changed tests (2
 | **8 Oct** | **60** | **8** | **0** | **88.2%** | **94.1%** |
 
 The 8 ⚠️ left are all outside this service: the console sending `reason_code` / `purpose` / delegation `reason` (2 rows; then `AUTHZ_COMMAND_CONTRACT=enforce`), the 55 tenantless `/v1/authorize` callers (3 rows; then `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE=true`), the mTLS / workload-identity rollout via mtls-management-svc (2 rows), and per-service grant seeding (1 row).
+
+## 12 Oct: server-resolved tenant on `/v1/authorize` — 60 ✅ / 8 ⚠️ / 0 ❌ (true baseline 59 / 9 / 0)
+
+Re-checked the 8 open rows against code at `10d1ffa7`. Five still wait outside this
+service (console `reason` / `effective_to`, mTLS rollout ×2, grant seeding). The three
+tenant rows had an in-service lever: the registry already tells this service which
+tenant owns every entity, and nothing used it.
+
+**Defect found while re-checking (hidden ✅).** "A cross-tenant resource ID is denied
+without disclosure" (GOV-03 negative path #3) was scored on the admin routes only. On
+`/v1/authorize`, a caller sending `X-Tenant-Id: A` about tenant B's entity was answered
+from tenant A's **tenant-wide** assignments (`pra.legal_entity_id IS NULL AND
+r.tenant_id = A`) → `GRANTED`. Reproduced by mutant M1 below. The 8 Oct "before" was
+therefore 59 ✅ / 9 ⚠️ (86.8% / 93.4%), not 60 / 8.
+
+| Change | Where |
+|---|---|
+| `FindEntityTenant` (platform-scope read of `entity_status_projection`; positive answers memoised in `cache.Store`, misses re-asked) | `store/pg_store.go`, `cache/store.go` |
+| `resolveTenantScope`: header/body tenant ≠ registry owner → `403 tenant_scope_mismatch`; no tenant + known entity → scoped and **recorded** in the owner's tenant; lookup error → 503; enforce mode only refuses entities the registry never mentioned | `handler/handler.go` |
+| `entity.created` projected (owner known from the entity's first moment) | `events/lifecycle_consumer.go` |
+
+No migration. Behaviour change is narrowing only (a cross-tenant question that used to be
+`GRANTED` is now `403`); legitimate callers are unaffected, so no flag.
+
+Verified: unit suites (handler, cache, events, store); 5 new handler tests + consumer +
+cache tests; mutants M1 (header check removed), M2 (body check removed), M3 (owner not
+used when tenantless), M4 (lookup error ignored) all killed; `TestSecondPassIT_EntityTenant`
+plus the whole `AUTHZ_IT_DSN` suite (15 pass, 1 pre-existing skip) on scratch postgres:16
+with 000001–000028 as the NOBYPASSRLS `app_authorization` role.
+
+| Row | Was | Now | Still needs (outside) |
+|---|---|---|---|
+| Cross-tenant resource ID denied (GOV-03 #3) | ✅ (over-scored; ⚠️ in fact) | ✅ | — |
+| Trusted tenant resolved before authorization | ⚠️ (55 callers must change) | ⚠️ | only entities the registry never published: tenant-entity-registry-svc to replay `entity.created` for pre-existing entities (Kafka retention dropped them), then `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE=true` — **no caller change needed** |
+| Client-supplied tenant never authoritative | ⚠️ | ⚠️ | same backfill (body is checked against the owner whenever the owner is known) |
+| Denials evidentially retrievable | ⚠️ | ⚠️ | same backfill (tenantless decisions on known entities now carry the tenant) |
+
+| | ✅ | ⚠️ | ❌ | Full | Weighted |
+|---|---|---|---|---|---|
+| 8 Oct as recorded | 60 | 8 | 0 | 88.2% | 94.1% |
+| 8 Oct, corrected (hidden defect) | 59 | 9 | 0 | 86.8% | 93.4% |
+| **12 Oct** | **60** | **8** | **0** | **88.2%** | **94.1%** |
+
+## 12 Oct, second pass: tenants of older entities checked with the registry — 63 ✅ / 5 ⚠️ / 0 ❌
+
+tenant-entity-registry-svc is complete, so the backfill dependency is gone, and it closes
+from this side without the registry changing. The registry can't answer "who owns X?"
+(every read is `WHERE tenant_id = <request tenant>`), but it does answer "is X in tenant
+T?": `GET /v1/entities/{id}/status` gives 200 with the tenant, or 404.
+
+- `internal/registry`: HTTP client (2 s timeout, full read envelope, fail closed on anything
+  but 200/404, a 200 for another tenant is not membership).
+- `FindPrincipalTenants`: tenants of the principal's live APPROVED assignments, live
+  delegations and identity standing — the only tenants whose grants could answer.
+- `resolveTenantScope`, for an entity with no projection: a claimed tenant is confirmed with
+  the registry or refused (403); a tenantless question tries the principal's tenants — the
+  owner scopes and records the decision, none → 403; a confirmation is projected so the
+  next call is local. `AUTHZ_ENTITY_REGISTRY_URL` (compose: `http://tenant-entity-registry-svc:8081`,
+  no depends_on); unset = previous behaviour.
+
+**Verified live** (scratch postgres:16 with both services' migrations; the real
+tenant-entity-registry-svc and authorization-svc binaries; entity B inserted straight into
+the registry DB, so it is "old" and absent from the projection):
+
+| Request | Without registry URL | With it |
+|---|---|---|
+| alice (tenant-wide role in A), `X-Tenant-Id: A`, entity B | **200 GRANTED** (the leak) | 403 tenant_scope_mismatch |
+| alice, no tenant, entity B | — | 403 (B is in none of alice's tenants) |
+| bob (role in B), no tenant, entity B | — | 200 GRANTED, decision `tenant_id` = B, projection row written |
+| bob again | — | 200, answered from the projection (no registry call) |
+
+Plus: registry 200/404 confirmed by hand; 7 handler tests + client tests; mutants R1–R5
+(unconfirmed claim admitted, tenantless foreign evaluated, registry error ignored, no
+projection, resolved owner dropped) all killed; `TestSecondPassIT_PrincipalTenants` and the
+full `AUTHZ_IT_DSN` suite as the NOBYPASSRLS role.
+
+Remaining residual, stated rather than scored away: a tenantless question from a principal who
+holds nothing in any tenant is still evaluated with no tenant (it can only be DENIED) and its
+denial is recorded tenantless.
+
+| | ✅ | ⚠️ | ❌ | Full | Weighted |
+|---|---|---|---|---|---|
+| 8 Oct, corrected | 59 | 9 | 0 | 86.8% | 93.4% |
+| 12 Oct, first pass | 60 | 8 | 0 | 88.2% | 94.1% |
+| **12 Oct, second pass** | **63** | **5** | **0** | **92.6%** | **96.3%** |
+
+The 5 ⚠️ left, and who has to act:
+
+| Row | Service |
+|---|---|
+| reason_code / purpose on destructive commands | zoiko-suite-frontend-platform (admin console), then compose `AUTHZ_COMMAND_CONTRACT=enforce` |
+| Delegation approval_reference and reason | zoiko-suite-frontend-platform (`delegateAuthorityAction` sends no `reason`; `effective_to` optional) |
+| Caller identity / tenant authenticated by the server | mtls-management-svc + gateway-auth-svc |
+| Only internal PEPs call `/v1/authorize` | mtls-management-svc (workload identity) |
+| Action names callers use but nothing grants | access-control-svc (role catalogue / grant seeding) |
+
+## 12 Oct, third pass: §16 command contract enforced — 65 ✅ / 3 ⚠️ / 0 ❌
+
+- **Console** (zoiko-suite-frontend-platform): every command that removes or restores access —
+  role, permission-set, SoD-rule and ABAC-condition retire/reactivate, assignment revoke,
+  delegation withdraw — now opens a two-step panel asking for a reason (`reason_code`) and one
+  sentence (`purpose`) before it submits (`ReasonedSubmit`, `command-reason.ts`); the server
+  actions re-check both. Delegation create requires an end date and a reason, and records an
+  approval reference when given.
+- **Defect found and fixed — migration 000029.** The reason was demanded on assignment revoke and
+  delegation withdraw but recorded nowhere: those tables have no history row, and
+  `authz_emit_event` dropped `app.reason`. Every IAM event envelope now carries
+  `command_reason`. Added to `setupTestDB`.
+- **Enforced.** `AUTHZ_COMMAND_CONTRACT` now defaults to `enforce` (`warn` is the explicit way
+  back; config test pins it), and compose sets `enforce`. Both callers comply: access-control-svc
+  already sent `reason_code` on every gated call, and nothing else in the estate calls them.
+
+Verified live against an authorization-svc in enforce mode (scratch postgres, migrations
+000001–000029): the old console shapes are refused (`{}` on retire → 400 `reason_code`; delegation
+without an end date → 400 `effective_to`); the console's own API functions, run under tsx, pass all
+11 commands; `authz_config_history` records "ACCESS_REVIEW: …" with the admin's id for the role,
+bundle, SoD and ABAC changes; the delegation row holds its reason, approval reference and end date;
+the `iam.assignment.revoked` / `iam.delegation.revoked` events carry `command_reason`. Console
+type-check and lint are clean (it has no test runner).
+
+| | ✅ | ⚠️ | ❌ | Full | Weighted |
+|---|---|---|---|---|---|
+| 8 Oct, corrected | 59 | 9 | 0 | 86.8% | 93.4% |
+| 12 Oct, pass 2 | 63 | 5 | 0 | 92.6% | 96.3% |
+| **12 Oct, pass 3** | **65** | **3** | **0** | **95.6%** | **97.8%** |
+
+Held:
+- mTLS rows ×2 (user decision: on hold) — mtls-management-svc, gateway-auth-svc.
+- "Action names callers use but nothing grants": access-control-svc is now the governed way to grant
+  (permission registry + role templates, provisioned through this service's admin API), but
+  **68 action names that services authorize against are not in its registry**
+  (000008), so no role can be authored with them and those checks always deny. They are in
+  purchase-order, purchase-request, contract-lifecycle, clause-template, currency-registry,
+  fiscal-calendar, accounting-period, financial-close, obligation-tracking, document-vault,
+  board-resolutions, accounts-payable, project-accounting, general-ledger and identity-context.
+  The fix is a registry migration in access-control-svc.
+
+Deploy: 000029 before or with this build (without it the only effect is no `command_reason` on events).
+
+## 12 Oct, fourth pass: grant seeding through access-control-svc — 66 ✅ / 2 ⚠️ / 0 ❌ (Docker-verified)
+
+access-control-svc migration **000017** registers the 68 missing action names (see its
+`progress.md`). Verified end to end on scratch Docker postgres with both binaries: role created in
+access-control-svc → `PO_APPROVE` bundle refused before 000017 (`400 unknown_permission`), accepted
+after (`201`) and provisioned here → grantee `DENIED no_grant` before the assignment, `GRANTED
+rbac:role=PO_APPROVER` after. Row "Action names callers use but nothing grants" → ✅, **pending apply
+of access-control 000017 (and this service's 000029) on the real databases.**
+
+| | ✅ | ⚠️ | ❌ | Full | Weighted |
+|---|---|---|---|---|---|
+| 8 Oct, corrected | 59 | 9 | 0 | 86.8% | 93.4% |
+| 12 Oct, pass 3 | 65 | 3 | 0 | 95.6% | 97.8% |
+| **12 Oct, pass 4** | **66** | **2** | **0** | **97.1%** | **98.5%** |
+
+Held: the 2 mTLS rows (mtls-management-svc, gateway-auth-svc).
+
+Real-DB checklist when available: authorization_svc → 000029 (and 000020–000028 if not yet);
+access_control → 000017; compose already sets `AUTHZ_COMMAND_CONTRACT=enforce` and
+`AUTHZ_ENTITY_REGISTRY_URL`.
+
+## 12 Oct, final: re-audit and session controls — 81 ✅ / 3 ⚠️ / 1 ❌ of 85
+
+Final re-audit added 17 rows for JIT / break-glass / support sessions (ZS-IAM-001 §13–15), never
+scored before; three were proven open live (self-issued `["*"]` sessions, read-only support granting
+`PAYMENT_RELEASE`). Fixed with migration 000030 and `internal/handler/sessions.go` (+ access-control
+000018 for the four new permissions). Detail and verification: audit file "Closure, 12 October 2026 —
+session controls fixed"; contract: ADMIN-API.md "Sessions".
+
+Parked: mTLS ×2 (mtls-management-svc, gateway-auth-svc), S-3 step-up (gateway-auth-svc),
+S-4 duration numbers (Security sign-off).
+
+Deploy: authorization_svc 000029 + 000030; access_control 000017 + 000018; then grant the eligibility,
+approval and review permissions (until then JIT and break-glass requests are refused).

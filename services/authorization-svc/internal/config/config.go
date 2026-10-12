@@ -102,13 +102,21 @@ type Config struct {
 	// set to true.
 	EnforceTenantOnAuthorize bool
 
+	// EntityRegistryURL is tenant-entity-registry-svc. /v1/authorize asks it
+	// whether an entity the projection has not heard of is in the claimed
+	// tenant (or, with no claim, in one the principal holds authority in), so
+	// no evaluation is scoped by an unverified tenant or run across tenants.
+	// Empty disables the check and keeps the projection-only behaviour.
+	EntityRegistryURL string
+
 	// CommandContractEnforce refuses a privileged or destructive admin
 	// command without purpose / reason_code, and a delegation without an end
 	// date (Governance Control Plane §16; ZS-IAM-001 §11). False is the
 	// migration state: such commands are admitted, marked
 	// X-Command-Contract: violated and logged, and an open-ended delegation
-	// is bounded to the default term. Set AUTHZ_COMMAND_CONTRACT=enforce once
-	// the console and access-control-svc send the fields.
+	// is bounded to the default term. Enforce is the default since 12 Oct
+	// 2026, when the console and access-control-svc both send the fields;
+	// AUTHZ_COMMAND_CONTRACT=warn is the explicit, logged way back.
 	CommandContractEnforce bool
 }
 
@@ -348,7 +356,8 @@ func Load() (*Config, error) {
 		// do not yet forward X-Tenant-Id; once they are all migrated, this should be
 		// set to true.
 		EnforceTenantOnAuthorize: envBool("AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE", false),
-		CommandContractEnforce:   strings.EqualFold(env("AUTHZ_COMMAND_CONTRACT", "warn"), "enforce"),
+		CommandContractEnforce:   !strings.EqualFold(env("AUTHZ_COMMAND_CONTRACT", "enforce"), "warn"),
+		EntityRegistryURL:        env("AUTHZ_ENTITY_REGISTRY_URL", ""),
 	}, nil
 }
 

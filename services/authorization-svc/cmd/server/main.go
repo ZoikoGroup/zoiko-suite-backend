@@ -40,6 +40,7 @@ import (
 	"zoiko.io/authorization-svc/internal/idempotency"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
 	"zoiko.io/authorization-svc/internal/outbox"
+	"zoiko.io/authorization-svc/internal/registry"
 	"zoiko.io/authorization-svc/internal/mtls"
 	"zoiko.io/authorization-svc/internal/retention"
 	"zoiko.io/authorization-svc/internal/siem"
@@ -200,6 +201,12 @@ func main() {
 		h.SetCommandContract(handler.CommandContractEnforce)
 	} else {
 		log.Warn("AUTHZ_COMMAND_CONTRACT=warn — admin commands without reason_code are admitted and marked; set enforce once callers send it")
+	}
+	if cfg.EntityRegistryURL != "" {
+		h.SetEntityRegistry(registry.NewHTTPClient(cfg.EntityRegistryURL, log))
+		log.Info("entity registry check wired", zap.String("url", cfg.EntityRegistryURL))
+	} else {
+		log.Warn("AUTHZ_ENTITY_REGISTRY_URL unset — tenants of unprojected entities are not verified; tenantless questions about them are evaluated across tenants")
 	}
 	handler.RegisterRoutes(r, h)
 

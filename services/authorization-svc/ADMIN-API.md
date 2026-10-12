@@ -106,13 +106,34 @@ watermark — replay it from `authz_config_history`), `obligations`,
 values), session assurance, `on_behalf_of` / `delegation_id` for a delegated
 grant, and `expires_at`. The log is append-only in the database.
 
-## Sessions and reviews
+## Sessions (ZS-IAM-001 §13–15) and reviews
 
-Privileged, break-glass and support session registers need the permission that
-administers them (`iam.pam.manage`, `iam.break_glass.manage`,
-`iam.support.manage`); your own sessions are readable without it, and another
-principal's session by id is `404`. `GET /v1/iam/access-reviews` and
-`POST /v1/iam/access-reviews/{id}/decide` act for the verified caller only.
+Each route exists under `/admin/v1/…` and `/v1/admin/…` (support under `/v1/support/sessions`).
+Registers need the administering permission; your own sessions are readable without it,
+another principal's session by id is `404`. A session grants only to its subject, only while
+ACTIVE and unexpired, and only the actions it names — no wildcard is accepted anywhere.
+
+| Route | Permission | Rules |
+|---|---|---|
+| `POST …/privileged-sessions` | `iam.pam.manage` | Body: `principal_id` (default the caller), `requested_actions`, `ticket_ref`, `reason`, `duration_seconds`, `resource_scope`, `target_environment` — all mandatory (§13). The subject must hold `iam.pam.eligible`. Any high-impact action (`iam.*`, protected platform, payment / posting / filing) → `202` `PENDING_APPROVAL`, granting nothing; otherwise `201` ACTIVE. Max 24 h. |
+| `POST …/privileged-sessions/{id}/approve` · `/reject` | `iam.pam.approve` | **R**. Never the subject or the requester (`403 checker_not_independent`; also a DB CHECK). The clock starts at approval. Pending requests expire after 24 h. |
+| `POST …/privileged-sessions/{id}/revoke` | `iam.pam.manage` | **R**. |
+| `POST …/break-glass-sessions` | `iam.break_glass.manage` | `incident_id` (A16), `reason`, `requested_actions`. The subject must hold `iam.break_glass.eligible`. No payment / posting / filing power (§14 "separately constrained"). CRITICAL SIEM alert on issue. Max 2 h. |
+| `POST …/break-glass-sessions/{id}/revoke` | `iam.break_glass.manage` | **R**. |
+| `POST /v1/support/sessions` | `iam.support.manage` | `ticket_ref`, `purpose`, and `tenant_consent_obtained` stated explicitly (400 if omitted). Read-only by default: grants read verbs only (`…READ/VIEW/LIST/GET/SEARCH/QUERY/LOOKUP/INSPECT/DISCOVER`). A writable session also grants only the writes named in `allowed_actions`. No consent → nothing granted. Bulk export off unless `allow_bulk_export`. Max 24 h. |
+| `POST /v1/support/sessions/{id}/revoke` | `iam.support.manage` | **R**. |
+| `POST …/privileged-sessions/{id}/review` · `…/break-glass-sessions/{id}/review` | `iam.session.review` | `{"outcome": "ATTESTED" \| "FLAGGED", "notes"}`; FLAGGED needs notes and raises a CRITICAL SIEM alert. Reviewer is never the subject or the requester. A review is opened when a high-impact JIT session or any break-glass session ends (revoked or expired). |
+
+Events (outbox, 000030): `security.privileged_session.started` / `.ended`,
+`security.break_glass.started` / `.ended`, `support.session.started` / `.ended`; a revoke's
+reason travels as `command_reason`. The expiry sweep (every minute) ends sessions that ran out.
+
+`POST /internal/authorization/decisions` is the ZS-IAM-001 §8 canonical decision API: the same
+pipeline as `/v1/authorize`, with `subject_id`, `action`, `resource_*`, `environment` and an
+optional `session_id`; it returns the §8.2 decision.
+
+`GET /v1/iam/access-reviews` and `POST /v1/iam/access-reviews/{id}/decide` act for the verified
+caller only.
 
 ## Read surfaces
 
@@ -121,3 +142,32 @@ the verified caller only; the former answers for another principal with
 `iam.assignment.read`. Available actions are classified by the same pipeline as
 `/v1/authorize`. `POST /v1/entity-scope/validate` for another principal needs
 `iam.assignment.read`.
+
+## Command reasons (§16)
+
+`AUTHZ_COMMAND_CONTRACT` defaults to `enforce`: every command marked **R** above needs
+`reason_code` or `purpose` in its body (400 `missing_field` otherwise), and a delegation needs
+`effective_to` and `reason`. Roles, bundles, SoD and ABAC rules record the reason in
+`authz_config_history`; every IAM event carries it as `command_reason` (000029). `warn` admits
+and marks such commands (`X-Command-Contract: violated`).
+
+## Tenant scope of `/v1/authorize` (and the canonical decision API)
+
+The tenant is resolved on the server from tenant-entity-registry-svc's
+`entity.created` / `entity.status.changed` (projected into
+`entity_status_projection`):
+
+| Caller sends | Registry knows the entity | Result |
+|---|---|---|
+| `X-Tenant-Id` or body `tenant_id` = owner | yes | evaluated in that tenant |
+| `X-Tenant-Id` or body `tenant_id` ≠ owner | yes | `403 tenant_scope_mismatch`, nothing evaluated or recorded |
+| no tenant | yes | evaluated **and recorded** in the owner's tenant |
+| tenant claimed | no | asked of the registry (`AUTHZ_ENTITY_REGISTRY_URL`, `GET /v1/entities/{id}/status` as that tenant): confirmed → evaluated and the owner projected; not confirmed → `403 tenant_scope_mismatch` |
+| no tenant | no | the registry is asked about each tenant the principal holds a live approved assignment, live delegation or identity standing in: the one holding the entity scopes and records the decision; none → `403 tenant_scope_mismatch` |
+| no tenant, principal holds nothing anywhere | no | `400 missing_tenant_scope` under `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE=true`; otherwise evaluated with no tenant (no tenant grant can apply) with a WARN naming the caller |
+| anything | lookup fails | `503 store_unavailable`; registry unreachable or non-200/404 → `503 entity_registry_unavailable` |
+
+With `AUTHZ_ENTITY_REGISTRY_URL` unset the registry rows fall back to the
+pre-12-Oct behaviour (claimed tenant used, tenantless evaluated across tenants).
+
+The platform-scope entity is exempt (tenantless by design).

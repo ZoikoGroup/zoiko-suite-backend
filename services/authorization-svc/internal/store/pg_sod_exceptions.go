@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -176,10 +177,18 @@ func (s *PgStore) ExpireDue(ctx context.Context) (int, error) {
 		SELECT tenant_id FROM sod_exceptions WHERE status = 'APPROVED' AND expires_at <= NOW()
 		UNION
 		SELECT r.tenant_id FROM principal_role_assignments pra JOIN roles r ON r.role_id = pra.role_id
-		 WHERE pra.approval_status = 'PENDING_APPROVAL' AND pra.approval_expires_at <= NOW()`
+		 WHERE pra.approval_status = 'PENDING_APPROVAL' AND pra.approval_expires_at <= NOW()
+		UNION
+		SELECT tenant_id FROM privileged_sessions
+		 WHERE (status = 'ACTIVE' AND expires_at <= NOW())
+		    OR (status = 'PENDING_APPROVAL' AND created_at <= NOW() - make_interval(secs => $1))
+		UNION
+		SELECT tenant_id FROM break_glass_sessions WHERE status = 'ACTIVE' AND expires_at <= NOW()
+		UNION
+		SELECT tenant_id FROM support_sessions WHERE status = 'ACTIVE' AND expires_at <= NOW()`
 	var tenants []string
 	err := s.withPlatformScope(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, dueTenants)
+		rows, err := tx.Query(ctx, dueTenants, domain.PrivilegedSessionApprovalWindow.Seconds())
 		if err != nil {
 			return err
 		}
@@ -212,6 +221,19 @@ func (s *PgStore) ExpireDue(ctx context.Context) (int, error) {
 				return err
 			}
 			total += int(tag.RowsAffected())
+			// Sessions past their time: EXPIRED is what fires the §23 ".ended"
+			// event and opens the post-session review (000030 triggers).
+			for _, q := range sessionExpiryUpdates {
+				args := []any{t}
+				if strings.Contains(q, "$2") {
+					args = append(args, domain.PrivilegedSessionApprovalWindow.Seconds())
+				}
+				tag, err = tx.Exec(ctx, q, args...)
+				if err != nil {
+					return err
+				}
+				total += int(tag.RowsAffected())
+			}
 			return nil
 		})
 		if err != nil {
@@ -219,6 +241,15 @@ func (s *PgStore) ExpireDue(ctx context.Context) (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// sessionExpiryUpdates mark JIT, break-glass and support sessions that have
+// run out, and JIT requests whose approval window passed.
+var sessionExpiryUpdates = []string{
+	`UPDATE privileged_sessions SET status = 'EXPIRED' WHERE tenant_id = $1::uuid AND status = 'ACTIVE' AND expires_at <= NOW()`,
+	`UPDATE privileged_sessions SET status = 'EXPIRED' WHERE tenant_id = $1::uuid AND status = 'PENDING_APPROVAL' AND created_at <= NOW() - make_interval(secs => $2)`,
+	`UPDATE break_glass_sessions SET status = 'EXPIRED' WHERE tenant_id = $1::uuid AND status = 'ACTIVE' AND expires_at <= NOW()`,
+	`UPDATE support_sessions SET status = 'EXPIRED' WHERE tenant_id = $1::uuid AND status = 'ACTIVE' AND expires_at <= NOW()`,
 }
 
 // expirySweepInterval is how often ExpireDue runs; see RunExpirySweeper.

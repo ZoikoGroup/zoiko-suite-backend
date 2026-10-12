@@ -31,7 +31,9 @@ func TestPrivilegedSession_Create_Success(t *testing.T) {
 		"requested_actions": ["emergency.override", "tax.reconcile"],
 		"ticket_ref": "INC-88992",
 		"reason": "Emergency tax reconciliation for month end",
-		"duration_seconds": 1800
+		"duration_seconds": 1800,
+		"resource_scope": "tax-ledger/2026-09",
+		"target_environment": "production"
 	}`
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/v1/privileged-sessions", bytes.NewBufferString(body))

@@ -52,3 +52,26 @@ func TestLifecycle_EntityStatusFailureIsRetryable(t *testing.T) {
 		t.Fatalf("retry did not apply: err=%v rows=%d", err, len(store.entities))
 	}
 }
+
+// entity.created is projected too: it carries the owning tenant from the
+// entity's first moment, which /v1/authorize uses to scope a tenantless
+// question (resolveTenantScope).
+func TestLifecycle_EntityCreatedProjectsOwner(t *testing.T) {
+	store := &lifecycleStub{}
+	c := newLifecycle(store)
+	at := time.Date(2026, 10, 12, 9, 0, 0, 0, time.UTC)
+	raw, _ := json.Marshal(map[string]any{
+		"event_id": "e-created-1", "event_type": "entity.created", "tenant_id": "t-1",
+		"legal_entity_id": "e-1", "effective_at": at,
+		"payload": map[string]any{"tenant_id": "t-1", "legal_entity_id": "e-1", "entity_status": "DRAFT"},
+	})
+	if err := c.Handle(context.Background(), raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.entities) != 1 {
+		t.Fatalf("projected %d entity rows, want 1", len(store.entities))
+	}
+	if got := store.entities[0]; got.TenantID != "t-1" || got.LegalEntityID != "e-1" || got.Status != "DRAFT" || !got.StatusChangedAt.Equal(at) {
+		t.Errorf("projection = %+v", got)
+	}
+}

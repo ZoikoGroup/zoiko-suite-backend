@@ -19,6 +19,7 @@ import (
 
 	"zoiko.io/authorization-svc/internal/domain"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
+	"zoiko.io/authorization-svc/internal/registry"
 	"zoiko.io/authorization-svc/internal/siem"
 )
 
@@ -107,11 +108,26 @@ type AuthorizationStore interface {
 	// registry has published none (negative control layer 0.1).
 	FindEntityStatus(ctx context.Context, legalEntityID, tenantID string) (string, error)
 
+	// FindEntityTenant is the tenant tenant-entity-registry-svc says owns the
+	// entity, "" when it has published nothing for it. resolveTenantScope uses
+	// it to resolve the tenant on the server rather than take the caller's
+	// word for it (Governance Control Plane invariants #1 and #2).
+	FindEntityTenant(ctx context.Context, legalEntityID string) (string, error)
+
+	// FindPrincipalTenants lists the tenants a principal holds any authority
+	// or standing in — the candidates for a tenantless question about an
+	// entity the projection has not heard of.
+	FindPrincipalTenants(ctx context.Context, principalID string) ([]string, error)
+
 	// Privileged Access Management (JIT Elevation - ZS-IAM-001 §13 & §21).
 	CreatePrivilegedSession(ctx context.Context, params domain.CreatePrivilegedSessionParams) (*domain.PrivilegedSession, error)
 	FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error)
 	ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error)
 	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
+	// DecidePrivilegedSession approves or rejects a PENDING_APPROVAL JIT
+	// session; ReviewSession records the post-session review (000030).
+	DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error)
+	ReviewSession(ctx context.Context, kind, sessionID, tenantID, reviewer, outcome, notes string) error
 
 	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21).
 	CreateBreakGlassSession(ctx context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error)
@@ -181,6 +197,19 @@ type Handler struct {
 	// commandContract is the §16 enforcement mode for privileged and
 	// destructive commands — see SetCommandContract.
 	commandContract CommandContractMode
+
+	// entityRegistry answers "is this entity in tenant T?" for an entity the
+	// projection has not heard of. Nil keeps the projection as the only
+	// source — see SetEntityRegistry.
+	entityRegistry registry.Client
+}
+
+// SetEntityRegistry lets resolveTenantScope check, with
+// tenant-entity-registry-svc, the tenant of an entity whose entity.created
+// predates the projection. With it set, no evaluation is ever scoped by an
+// unverified tenant and none runs across tenants.
+func (h *Handler) SetEntityRegistry(c registry.Client) {
+	h.entityRegistry = c
 }
 
 // UseOutbox routes authorization.granted / .denied and sod.violation.detected
@@ -249,19 +278,27 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/admin/v1/privileged-sessions", h.CreatePrivilegedSession)
 	r.Get("/admin/v1/privileged-sessions", h.ListPrivilegedSessions)
 	r.Post("/admin/v1/privileged-sessions/{session_id}/revoke", h.RevokePrivilegedSession)
+	r.Post("/admin/v1/privileged-sessions/{session_id}/approve", h.ApprovePrivilegedSession)
+	r.Post("/admin/v1/privileged-sessions/{session_id}/reject", h.RejectPrivilegedSession)
+	r.Post("/admin/v1/privileged-sessions/{session_id}/review", h.ReviewPrivilegedSession)
 	r.Post("/v1/admin/privileged-sessions", h.CreatePrivilegedSession)
 	r.Get("/v1/admin/privileged-sessions", h.ListPrivilegedSessions)
 	r.Post("/v1/admin/privileged-sessions/{session_id}/revoke", h.RevokePrivilegedSession)
+	r.Post("/v1/admin/privileged-sessions/{session_id}/approve", h.ApprovePrivilegedSession)
+	r.Post("/v1/admin/privileged-sessions/{session_id}/reject", h.RejectPrivilegedSession)
+	r.Post("/v1/admin/privileged-sessions/{session_id}/review", h.ReviewPrivilegedSession)
 
 	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21)
 	r.Post("/admin/v1/break-glass-sessions", h.CreateBreakGlassSession)
 	r.Get("/admin/v1/break-glass-sessions", h.ListBreakGlassSessions)
 	r.Get("/admin/v1/break-glass-sessions/{session_id}", h.GetBreakGlassSession)
 	r.Post("/admin/v1/break-glass-sessions/{session_id}/revoke", h.RevokeBreakGlassSession)
+	r.Post("/admin/v1/break-glass-sessions/{session_id}/review", h.ReviewBreakGlassSession)
 	r.Post("/v1/admin/break-glass-sessions", h.CreateBreakGlassSession)
 	r.Get("/v1/admin/break-glass-sessions", h.ListBreakGlassSessions)
 	r.Get("/v1/admin/break-glass-sessions/{session_id}", h.GetBreakGlassSession)
 	r.Post("/v1/admin/break-glass-sessions/{session_id}/revoke", h.RevokeBreakGlassSession)
+	r.Post("/v1/admin/break-glass-sessions/{session_id}/review", h.ReviewBreakGlassSession)
 
 	// Tenant Support Sessions (ZS-IAM-001 §15 & §21)
 	r.Post("/v1/support/sessions", h.CreateSupportSession)
@@ -2469,7 +2506,9 @@ type authorizeResponse struct {
 // HTTP status reflects "the evaluation succeeded", not the outcome) /
 // 400 missing field, or legal_entity_id=PLATFORM on a deployment with no
 // platform-scope entity configured / 403 body tenant_id disagrees with the
-// verified header / 503 store unavailable (fail-closed, no decision recorded).
+// verified header, or the header or body tenant is not the one the entity
+// registry says owns legal_entity_id / 503 store unavailable (fail-closed, no
+// decision recorded).
 // resolveTenantScope decides which tenant's SoD rules apply to this
 // evaluation: the verified X-Tenant-Id header if the caller forwards one,
 // otherwise the body's tenant_id, otherwise none.
@@ -2498,18 +2537,118 @@ type authorizeResponse struct {
 // without a tenant even when enforceTenantOnAuthorize is set. Without that
 // exemption, enforcement could not be switched on at all: every platform-scope
 // check (decision log, configuration, vault) sends no tenant.
-func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bodyTenantID, evaluationEntityID string) (string, bool) {
+//
+// THE SERVER'S OWN ANSWER COMES FIRST. tenant-entity-registry-svc publishes
+// which tenant owns each legal entity (projected into entity_status_projection
+// from entity.created and entity.status.changed). When it has spoken:
+//   - a header or body tenant that disagrees with it is refused — otherwise a
+//     tenant-wide assignment in tenant A matches tenant B's entity, header or
+//     not, because the grant query keys on the role's tenant;
+//   - a body tenant that agrees with it is no longer a bare client claim;
+//   - a caller that sends no tenant at all is scoped to the owning tenant,
+//     not evaluated across tenants, and its decision is recorded with that
+//     tenant, so the tenant-scoped audit read can see it.
+//
+// This also makes AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE switchable long before
+// every tenantless caller is migrated: under enforce, only a question about
+// an entity the registry has never mentioned is refused.
+func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, principalID, bodyTenantID, evaluationEntityID string) (string, bool) {
 	headerTenantID := r.Header.Get("X-Tenant-Id")
+	if headerTenantID != "" && bodyTenantID != "" && bodyTenantID != headerTenantID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "tenant_scope_mismatch",
+			"message": "request tenant_id does not match the caller's verified tenant scope",
+		})
+		return "", false
+	}
 
-	if headerTenantID != "" {
-		if bodyTenantID != "" && bodyTenantID != headerTenantID {
+	// A platform-scope question is tenantless by design (see above), so the
+	// registry is not consulted for it.
+	platformScope := h.isPlatformScopeEntity(evaluationEntityID)
+	ownerTenantID := ""
+	if !platformScope {
+		owner, err := h.store.FindEntityTenant(r.Context(), evaluationEntityID)
+		if err != nil {
+			// Fail closed: without the owner the scope cannot be trusted.
+			h.log.Error("authorize: entity owner lookup failed — refusing",
+				zap.String("correlation_id", r.Header.Get("X-Correlation-ID")), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			return "", false
+		}
+		ownerTenantID = owner
+	}
+	// Not projected yet (an entity older than the entity.created consumer):
+	// ask the registry about the tenants that could matter — the one the
+	// caller claims, or, with no claim, those the principal holds authority
+	// in. Nothing else could make a grant apply.
+	if !platformScope && ownerTenantID == "" && h.entityRegistry != nil {
+		candidates := []string{headerTenantID}
+		if headerTenantID == "" {
+			candidates = []string{bodyTenantID}
+		}
+		if candidates[0] == "" {
+			held, err := h.store.FindPrincipalTenants(r.Context(), principalID)
+			if err != nil {
+				h.log.Error("authorize: principal tenant lookup failed — refusing",
+					zap.String("correlation_id", r.Header.Get("X-Correlation-ID")), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return "", false
+			}
+			candidates = held
+		}
+		owner, ok := h.confirmEntityTenant(w, r, evaluationEntityID, candidates)
+		if !ok {
+			return "", false
+		}
+		if owner == "" && validUUIDString(candidates[0]) && (headerTenantID != "" || bodyTenantID != "") {
+			// The registry says the entity is not in the claimed tenant.
+			h.log.Warn("authorize: legal entity is not in the claimed tenant (registry) — refused",
+				zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
+				zap.String("source_system", r.Header.Get("X-Source-System")),
+				zap.String("legal_entity_id", evaluationEntityID))
 			writeJSON(w, http.StatusForbidden, map[string]string{
 				"error":   "tenant_scope_mismatch",
-				"message": "request tenant_id does not match the caller's verified tenant scope",
+				"message": "legal_entity_id is outside the request's tenant scope",
 			})
 			return "", false
 		}
+		if owner == "" && headerTenantID == "" && bodyTenantID == "" && len(candidates) > 0 {
+			// Tenantless, and the entity is in none of the tenants the
+			// principal holds anything in: the only grants that could answer
+			// are another tenant's. Refused rather than evaluated across
+			// tenants.
+			h.log.Warn("authorize: legal entity is in no tenant the principal holds authority in — refused",
+				zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
+				zap.String("source_system", r.Header.Get("X-Source-System")),
+				zap.String("legal_entity_id", evaluationEntityID))
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error":   "tenant_scope_mismatch",
+				"message": "legal_entity_id is outside every tenant the principal holds authority in",
+			})
+			return "", false
+		}
+		ownerTenantID = owner
+	}
+	refuseForeignEntity := func(claimed string) bool {
+		if ownerTenantID == "" || strings.EqualFold(ownerTenantID, claimed) {
+			return false
+		}
+		h.log.Warn("authorize: legal entity belongs to another tenant — refused",
+			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
+			zap.String("source_system", r.Header.Get("X-Source-System")),
+			zap.String("legal_entity_id", evaluationEntityID))
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "tenant_scope_mismatch",
+			"message": "legal_entity_id is outside the request's tenant scope",
+		})
+		return true
+	}
+
+	if headerTenantID != "" {
 		if !validTenantScope(w, headerTenantID, "X-Tenant-Id") {
+			return "", false
+		}
+		if refuseForeignEntity(headerTenantID) {
 			return "", false
 		}
 		return headerTenantID, true
@@ -2519,17 +2658,27 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bod
 		if !validTenantScope(w, bodyTenantID, "tenant_id") {
 			return "", false
 		}
+		if refuseForeignEntity(bodyTenantID) {
+			return "", false
+		}
 		// Logged, not refused: this is the pre-header calling convention, and
 		// the log is what makes the remaining callers findable.
 		h.log.Debug("authorize: tenant scope taken from request body — caller does not forward X-Tenant-Id",
-			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")))
+			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
+			zap.Bool("registry_confirmed", ownerTenantID != ""))
 		return bodyTenantID, true
 	}
 
 	// No tenant anywhere: only globally-applicable SoD rules can be
 	// considered.
-	if h.isPlatformScopeEntity(evaluationEntityID) {
+	if platformScope {
 		return "", true
+	}
+	if ownerTenantID != "" {
+		h.log.Debug("authorize: tenant scope resolved from the entity registry — caller sends none",
+			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
+			zap.String("source_system", r.Header.Get("X-Source-System")))
+		return ownerTenantID, true
 	}
 	if h.enforceTenantOnAuthorize {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -2551,6 +2700,49 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bod
 		zap.String("user_agent", r.UserAgent()),
 		zap.String("legal_entity_id", evaluationEntityID))
 	return "", true
+}
+
+// confirmEntityTenant asks the registry whether the entity is in each
+// candidate tenant and returns the first that holds it ("" when none does).
+// A confirmed owner is projected, so the next question is answered locally.
+// Any registry failure refuses (503): an unverified tenant is not used.
+func (h *Handler) confirmEntityTenant(w http.ResponseWriter, r *http.Request, entityID string, candidates []string) (string, bool) {
+	ctx := registry.WithCorrelationID(r.Context(), r.Header.Get("X-Correlation-ID"))
+	for _, tenantID := range candidates {
+		if !validUUIDString(tenantID) {
+			continue // validTenantScope answers a malformed claim with 400 below
+		}
+		m, err := h.entityRegistry.EntityInTenant(ctx, entityID, tenantID)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "entity_registry_unavailable"})
+			return "", false
+		}
+		if !m.Found {
+			continue
+		}
+		if p, ok := h.store.(entityProjector); ok && m.Status != "" {
+			if err := p.ProjectEntityStatus(r.Context(), domain.ProjectEntityStatusParams{
+				LegalEntityID: entityID, TenantID: tenantID, Status: m.Status, StatusChangedAt: time.Now().UTC(),
+			}); err != nil {
+				// The registry's answer stands for this decision; only the
+				// local copy is missing, and the next call asks again.
+				h.log.Warn("authorize: could not project the registry's answer", zap.Error(err))
+			}
+		}
+		return tenantID, true
+	}
+	return "", true
+}
+
+func validUUIDString(v string) bool {
+	_, err := uuid.Parse(v)
+	return err == nil
+}
+
+// entityProjector is the projection write a registry confirmation is kept
+// with. cache.Store and PgStore both have it.
+type entityProjector interface {
+	ProjectEntityStatus(ctx context.Context, p domain.ProjectEntityStatusParams) error
 }
 
 func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
@@ -2585,7 +2777,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenantScope, ok := h.resolveTenantScope(w, r, req.TenantID, evaluationEntityID)
+	tenantScope, ok := h.resolveTenantScope(w, r, req.PrincipalID, req.TenantID, evaluationEntityID)
 	if !ok {
 		return
 	}
@@ -3201,6 +3393,10 @@ type createPrivilegedSessionRequest struct {
 	TicketRef        string   `json:"ticket_ref"`
 	Reason           string   `json:"reason"`
 	DurationSeconds  int      `json:"duration_seconds"`
+	// §13 "Resource, requested actions, reason/ticket, duration and target
+	// environment are mandatory."
+	ResourceScope     string `json:"resource_scope"`
+	TargetEnvironment string `json:"target_environment"`
 }
 
 func (h *Handler) CreatePrivilegedSession(w http.ResponseWriter, r *http.Request) {
@@ -3245,14 +3441,30 @@ func (h *Handler) CreatePrivilegedSession(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "requested_actions"})
 		return
 	}
+	if !h.checkSessionRequest(w, r, sessionRequest{
+		kind: "privileged", subject: targetPrincipal, tenant: tenantScope, actions: req.RequestedActions,
+		resourceScope: req.ResourceScope, environment: req.TargetEnvironment, duration: req.DurationSeconds,
+	}) {
+		return
+	}
+	highImpact := false
+	for _, a := range req.RequestedActions {
+		if domain.IsHighImpactAction(a) {
+			highImpact = true
+		}
+	}
 
 	ps, err := h.store.CreatePrivilegedSession(r.Context(), domain.CreatePrivilegedSessionParams{
-		TenantID:         tenantScope,
-		PrincipalID:      targetPrincipal,
-		RequestedActions: req.RequestedActions,
-		TicketRef:        req.TicketRef,
-		Reason:           req.Reason,
-		DurationSeconds:  req.DurationSeconds,
+		TenantID:          tenantScope,
+		PrincipalID:       targetPrincipal,
+		RequestedActions:  req.RequestedActions,
+		TicketRef:         req.TicketRef,
+		Reason:            req.Reason,
+		DurationSeconds:   req.DurationSeconds,
+		RequestedBy:       callerPrincipalID,
+		ResourceScope:     req.ResourceScope,
+		TargetEnvironment: req.TargetEnvironment,
+		HighImpact:        highImpact,
 	})
 	if err != nil {
 		h.log.Error("CreatePrivilegedSession: store failed", zap.String("correlation_id", correlationID), zap.Error(err))
@@ -3266,7 +3478,13 @@ func (h *Handler) CreatePrivilegedSession(w http.ResponseWriter, r *http.Request
 		zap.String("ticket_ref", ps.TicketRef),
 		zap.String("correlation_id", correlationID),
 	)
-	writeJSON(w, http.StatusCreated, ps)
+	// A high-impact request grants nothing yet: 202, awaiting an independent
+	// approver (§13).
+	status := http.StatusCreated
+	if ps.Status == domain.PrivilegedSessionStatusPendingApproval {
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, ps)
 }
 
 func (h *Handler) ListPrivilegedSessions(w http.ResponseWriter, r *http.Request) {
@@ -3313,6 +3531,11 @@ func (h *Handler) RevokePrivilegedSession(w http.ResponseWriter, r *http.Request
 	sessionID := chi.URLParam(r, "session_id")
 	if sessionID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_session_id"})
+		return
+	}
+	// §16: a reason on every destructive command; recorded on the ".ended"
+	// event as command_reason.
+	if _, ok := h.readCommand(w, &r); !ok {
 		return
 	}
 
@@ -3394,6 +3617,12 @@ func (h *Handler) CreateBreakGlassSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if !h.checkSessionRequest(w, r, sessionRequest{
+		kind: "break_glass", subject: targetPrincipal, tenant: tenantScope, actions: req.RequestedActions,
+	}) {
+		return
+	}
+
 	bg, err := h.store.CreateBreakGlassSession(r.Context(), domain.CreateBreakGlassSessionParams{
 		TenantID:         tenantScope,
 		PrincipalID:      targetPrincipal,
@@ -3401,6 +3630,7 @@ func (h *Handler) CreateBreakGlassSession(w http.ResponseWriter, r *http.Request
 		Reason:           req.Reason,
 		RequestedActions: req.RequestedActions,
 		DurationSeconds:  req.DurationSeconds,
+		RequestedBy:      callerPrincipalID,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrBreakGlassIncidentRequired) {
@@ -3415,7 +3645,11 @@ func (h *Handler) CreateBreakGlassSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	_ = h.publisher.PublishBreakGlassStarted(r.Context(), *bg)
+	// §14 "immediate security/governance alert to independent recipients".
+	// security.break_glass.started itself is written to the outbox with the
+	// session (000030), so it is delayed by a Kafka outage, never lost.
+	h.siem.Stream(r.Context(), tenantScope, "security.break_glass.started", siem.SeverityCritical,
+		"Break-glass session "+bg.SessionID+" for "+bg.PrincipalID+" (incident "+bg.IncidentID+") issued by "+callerPrincipalID)
 
 	h.log.Warn("break-glass emergency session created",
 		zap.String("session_id", bg.SessionID),
@@ -3515,6 +3749,11 @@ func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_session_id"})
 		return
 	}
+	// §16: a reason on every destructive command; recorded on the ".ended"
+	// event as command_reason.
+	if _, ok := h.readCommand(w, &r); !ok {
+		return
+	}
 
 	bg, err := h.store.RevokeBreakGlassSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
@@ -3593,9 +3832,16 @@ func (h *Handler) CreateSupportSession(w http.ResponseWriter, r *http.Request) {
 		readOnly = *req.ReadOnly
 	}
 
-	consent := true
-	if req.TenantConsentObtained != nil {
-		consent = *req.TenantConsentObtained
+	// §15 consent/policy: stated, never assumed. A session recorded as
+	// consented because the caller said nothing grants on a claim nobody made.
+	if req.TenantConsentObtained == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "tenant_consent_obtained",
+			"message": "state whether the tenant's consent or support agreement covers this session"})
+		return
+	}
+	consent := *req.TenantConsentObtained
+	if !h.checkSessionRequest(w, r, sessionRequest{kind: "support", subject: targetOperator, tenant: tenantScope, actions: req.AllowedActions}) {
+		return
 	}
 
 	ss, err := h.store.CreateSupportSession(r.Context(), domain.CreateSupportSessionParams{
@@ -3608,6 +3854,7 @@ func (h *Handler) CreateSupportSession(w http.ResponseWriter, r *http.Request) {
 		AllowedActions:        req.AllowedActions,
 		DurationSeconds:       req.DurationSeconds,
 		TenantConsentObtained: consent,
+		RequestedBy:           callerPrincipalID,
 	})
 	if err != nil {
 		h.log.Error("CreateSupportSession: store failed", zap.String("correlation_id", correlationID), zap.Error(err))
@@ -3615,7 +3862,6 @@ func (h *Handler) CreateSupportSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.PublishSupportSessionStarted(r.Context(), *ss)
 
 	h.log.Info("support session created",
 		zap.String("session_id", ss.SessionID),
@@ -3717,6 +3963,11 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_session_id"})
 		return
 	}
+	// §16: a reason on every destructive command; recorded on the ".ended"
+	// event as command_reason.
+	if _, ok := h.readCommand(w, &r); !ok {
+		return
+	}
 
 	ss, err := h.store.RevokeSupportSession(r.Context(), sessionID, tenantScope, callerPrincipalID)
 	if err != nil {
@@ -3732,6 +3983,5 @@ func (h *Handler) RevokeSupportSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.PublishSupportSessionEnded(r.Context(), *ss)
 	writeJSON(w, http.StatusOK, ss)
 }

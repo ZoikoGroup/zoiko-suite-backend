@@ -30,9 +30,9 @@ import (
 // CommandContractEnforce selects how a command missing its §16 fields is
 // treated. Warn admits it and marks the response (X-Command-Contract:
 // violated), the way the envelope's write-strict mode admits a violating
-// evaluate call; Enforce refuses it with 400. Warn is the migration state:
-// the console and access-control-svc send neither reason_code nor a
-// delegation end date yet.
+// evaluate call; Enforce refuses it with 400. Production runs Enforce (the
+// config default since both callers send the fields); New still starts at
+// Warn so a handler built without config keeps the pre-contract behaviour.
 type CommandContractMode int
 
 const (

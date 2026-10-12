@@ -234,7 +234,7 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 		if err == nil && ps != nil {
 			if ps.PrincipalID == in.PrincipalID && ps.Status == domain.PrivilegedSessionStatusActive && time.Now().UTC().Before(ps.ExpiresAt) {
 				allHeldActions = append(allHeldActions, ps.RequestedActions...)
-				if !granted && (contains(ps.RequestedActions, in.ActionType) || contains(ps.RequestedActions, "*")) {
+				if !granted && contains(ps.RequestedActions, in.ActionType) {
 					granted = true
 					basis = fmt.Sprintf("pam:session=%s:ticket=%s", ps.SessionID, ps.TicketRef)
 					res.MatchedGrants = append(res.MatchedGrants, basis)
@@ -252,7 +252,7 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 		if err == nil && bg != nil {
 			if bg.PrincipalID == in.PrincipalID && bg.IncidentID != "" && bg.Status == domain.BreakGlassSessionStatusActive && time.Now().UTC().Before(bg.ExpiresAt) {
 				allHeldActions = append(allHeldActions, bg.RequestedActions...)
-				if !granted && (contains(bg.RequestedActions, in.ActionType) || contains(bg.RequestedActions, "*")) {
+				if !granted && contains(bg.RequestedActions, in.ActionType) {
 					granted = true
 					basis = fmt.Sprintf("break_glass:session=%s:incident=%s", bg.SessionID, bg.IncidentID)
 					res.MatchedGrants = append(res.MatchedGrants, basis)
@@ -269,8 +269,21 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 		}
 		if err == nil && ss != nil {
 			if ss.SupportOperatorID == in.PrincipalID && ss.Status == domain.SupportSessionStatusActive && time.Now().UTC().Before(ss.ExpiresAt) {
-				isExportAction := strings.HasSuffix(in.ActionType, ".export") || in.ActionType == "export" || strings.Contains(in.ActionType, "export")
-				isMutationAction := strings.HasSuffix(in.ActionType, ".create") || strings.HasSuffix(in.ActionType, ".edit") || strings.HasSuffix(in.ActionType, ".post") || strings.HasSuffix(in.ActionType, ".delete") || strings.HasSuffix(in.ActionType, ".release") || strings.HasSuffix(in.ActionType, ".revoke")
+				// §15: consent stated, export off by default, read-only by
+				// default, and writes only when named. "Write" is anything that
+				// is not a read verb — so a legacy name like PAYMENT_RELEASE is
+				// a write, which the old suffix list (.create, .post, ...) missed.
+				if !ss.TenantConsentObtained {
+					res.Decision = domain.CanonicalDecisionDeny
+					res.Outcome = domain.OutcomeDenied
+					res.Basis = "support:consent_not_obtained"
+					res.Reason = "Support session has no tenant consent or support agreement on record"
+					res.ReasonCodes = []string{"SUPPORT_CONSENT_NOT_OBTAINED"}
+					res.NegativeControls = []string{"support:consent_not_obtained"}
+					return res, nil
+				}
+				isExportAction := strings.Contains(strings.ToLower(in.ActionType), "export")
+				isMutationAction := !domain.IsReadAction(in.ActionType)
 
 				if isExportAction && !ss.AllowBulkExport && !contains(ss.AllowedActions, in.ActionType) {
 					res.Decision = domain.CanonicalDecisionDeny
@@ -282,7 +295,7 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 					return res, nil
 				}
 
-				if ss.ReadOnly && isMutationAction && !contains(ss.AllowedActions, in.ActionType) {
+				if isMutationAction && (ss.ReadOnly || !contains(ss.AllowedActions, in.ActionType)) {
 					res.Decision = domain.CanonicalDecisionDeny
 					res.Outcome = domain.OutcomeDenied
 					res.Basis = "support:read_only_session"
@@ -292,7 +305,7 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 					return res, nil
 				}
 
-				if contains(ss.AllowedActions, in.ActionType) || contains(ss.AllowedActions, "*") || (!ss.ReadOnly && len(ss.AllowedActions) == 0) || (ss.ReadOnly && !isMutationAction) {
+				if !isMutationAction || contains(ss.AllowedActions, in.ActionType) {
 					granted = true
 					basis = fmt.Sprintf("support:session=%s:operator=%s:ticket=%s", ss.SessionID, ss.SupportOperatorID, ss.TicketRef)
 					res.MatchedGrants = append(res.MatchedGrants, basis)
@@ -744,7 +757,7 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	tenantScope, ok := h.resolveTenantScope(w, r, req.TenantID, evaluationEntityID)
+	tenantScope, ok := h.resolveTenantScope(w, r, subjectID, req.TenantID, evaluationEntityID)
 	if !ok {
 		return
 	}

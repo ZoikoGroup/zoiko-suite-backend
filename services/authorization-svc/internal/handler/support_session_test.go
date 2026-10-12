@@ -109,11 +109,12 @@ func TestSupportSession_Create_ValidationFailures(t *testing.T) {
 func TestSupportSession_Get_And_List(t *testing.T) {
 	store := &stubStore{
 		supportSession: &domain.SupportSession{
-			SessionID:         "sup-uuid-1",
-			TenantID:          testSupportTenantID,
-			SupportOperatorID: testSupportOperator,
-			TicketRef:         "SUP-991",
-			Status:            domain.SupportSessionStatusActive,
+			SessionID:             "sup-uuid-1",
+			TenantID:              testSupportTenantID,
+			SupportOperatorID:     testSupportOperator,
+			TicketRef:             "SUP-991",
+			Status:                domain.SupportSessionStatusActive,
+			TenantConsentObtained: true,
 		},
 		listSupportSessions: []domain.SupportSession{
 			{SessionID: "sup-uuid-1", TenantID: testSupportTenantID, SupportOperatorID: testSupportOperator, TicketRef: "SUP-991"},
@@ -170,15 +171,16 @@ func TestAuthorize_SupportSession_DiagnosticRead_Success(t *testing.T) {
 		rbacActions:      []string{},
 		delegatedActions: []string{},
 		supportSession: &domain.SupportSession{
-			SessionID:         "sup-session-12",
-			TenantID:          testSupportTenantID,
-			SupportOperatorID: testSupportOperator,
-			TicketRef:         "SUP-TICKET-44",
-			ReadOnly:          true,
-			AllowBulkExport:   false,
-			AllowedActions:    []string{"invoice.read", "audit.read"},
-			Status:            domain.SupportSessionStatusActive,
-			ExpiresAt:         time.Now().UTC().Add(time.Hour),
+			SessionID:             "sup-session-12",
+			TenantID:              testSupportTenantID,
+			SupportOperatorID:     testSupportOperator,
+			TicketRef:             "SUP-TICKET-44",
+			ReadOnly:              true,
+			AllowBulkExport:       false,
+			AllowedActions:        []string{"invoice.read", "audit.read"},
+			Status:                domain.SupportSessionStatusActive,
+			TenantConsentObtained: true,
+			ExpiresAt:             time.Now().UTC().Add(time.Hour),
 		},
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
@@ -216,15 +218,16 @@ func TestAuthorize_SupportSession_ScenarioA14_BulkExportDenied(t *testing.T) {
 		rbacActions:      []string{},
 		delegatedActions: []string{},
 		supportSession: &domain.SupportSession{
-			SessionID:         "sup-session-12",
-			TenantID:          testSupportTenantID,
-			SupportOperatorID: testSupportOperator,
-			TicketRef:         "SUP-TICKET-44",
-			ReadOnly:          true,
-			AllowBulkExport:   false, // Bulk export disabled
-			AllowedActions:    []string{"invoice.read"},
-			Status:            domain.SupportSessionStatusActive,
-			ExpiresAt:         time.Now().UTC().Add(time.Hour),
+			SessionID:             "sup-session-12",
+			TenantID:              testSupportTenantID,
+			SupportOperatorID:     testSupportOperator,
+			TicketRef:             "SUP-TICKET-44",
+			ReadOnly:              true,
+			AllowBulkExport:       false, // Bulk export disabled
+			AllowedActions:        []string{"invoice.read"},
+			Status:                domain.SupportSessionStatusActive,
+			TenantConsentObtained: true,
+			ExpiresAt:             time.Now().UTC().Add(time.Hour),
 		},
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
@@ -261,15 +264,16 @@ func TestAuthorize_SupportSession_ReadOnlyMutation_Denied(t *testing.T) {
 		rbacActions:      []string{},
 		delegatedActions: []string{},
 		supportSession: &domain.SupportSession{
-			SessionID:         "sup-session-12",
-			TenantID:          testSupportTenantID,
-			SupportOperatorID: testSupportOperator,
-			TicketRef:         "SUP-TICKET-44",
-			ReadOnly:          true,
-			AllowBulkExport:   false,
-			AllowedActions:    []string{"invoice.read"},
-			Status:            domain.SupportSessionStatusActive,
-			ExpiresAt:         time.Now().UTC().Add(time.Hour),
+			SessionID:             "sup-session-12",
+			TenantID:              testSupportTenantID,
+			SupportOperatorID:     testSupportOperator,
+			TicketRef:             "SUP-TICKET-44",
+			ReadOnly:              true,
+			AllowBulkExport:       false,
+			AllowedActions:        []string{"invoice.read"},
+			Status:                domain.SupportSessionStatusActive,
+			TenantConsentObtained: true,
+			ExpiresAt:             time.Now().UTC().Add(time.Hour),
 		},
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
@@ -302,12 +306,13 @@ func TestAuthorize_SupportSession_OperatorMismatch(t *testing.T) {
 		rbacActions:      []string{},
 		delegatedActions: []string{},
 		supportSession: &domain.SupportSession{
-			SessionID:         "sup-session-12",
-			TenantID:          testSupportTenantID,
-			SupportOperatorID: testSupportOperator,
-			TicketRef:         "SUP-TICKET-44",
-			Status:            domain.SupportSessionStatusActive,
-			ExpiresAt:         time.Now().UTC().Add(time.Hour),
+			SessionID:             "sup-session-12",
+			TenantID:              testSupportTenantID,
+			SupportOperatorID:     testSupportOperator,
+			TicketRef:             "SUP-TICKET-44",
+			Status:                domain.SupportSessionStatusActive,
+			TenantConsentObtained: true,
+			ExpiresAt:             time.Now().UTC().Add(time.Hour),
 		},
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})

@@ -42,6 +42,21 @@ type stubStore struct {
 	// entityStatus is FindEntityStatus's answer ("" = nothing projected).
 	entityStatus    string
 	entityStatusErr error
+	// entityTenant is FindEntityTenant's answer ("" = registry has not spoken).
+	entityTenant    string
+	entityTenantErr error
+	// Session approval / review (000030).
+	decidedBy        string
+	decidedApprove   bool
+	sessionDecideErr error
+	reviewedKind     string
+	reviewedOutcome  string
+	reviewErr        error
+	// FindPrincipalTenants' answer, and what the handler projected after a
+	// registry confirmation.
+	principalTenants    []string
+	principalTenantsErr error
+	projectedEntities   []domain.ProjectEntityStatusParams
 	// FindDelegationSource's answer for a delegated grant.
 	delegationSourceDelegator string
 	delegationSourceID        string
@@ -378,6 +393,8 @@ var stubAdminActions = []string{
 	"iam.delegation.grant", "iam.delegation.revoke", "iam.pam.manage", "iam.permission_bundle.manage",
 	"iam.role.manage", "iam.sod_rule.manage", "iam.support.manage",
 	"iam.role.read", "iam.delegation.read", "iam.sod_rule.read",
+	// 000030 session controls: eligibility, approval, review.
+	"iam.pam.eligible", "iam.pam.approve", "iam.break_glass.eligible", "iam.session.review",
 }
 
 // FindGrantedActions returns the seeded RBAC actions. requirePermission asks
@@ -447,6 +464,16 @@ func (s *stubStore) FindDelegationSource(_ context.Context, _, _, _, _, _, _ str
 func (s *stubStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) {
 	return s.entityStatus, s.entityStatusErr
 }
+func (s *stubStore) FindEntityTenant(_ context.Context, _ string) (string, error) {
+	return s.entityTenant, s.entityTenantErr
+}
+func (s *stubStore) FindPrincipalTenants(_ context.Context, _ string) ([]string, error) {
+	return s.principalTenants, s.principalTenantsErr
+}
+func (s *stubStore) ProjectEntityStatus(_ context.Context, p domain.ProjectEntityStatusParams) error {
+	s.projectedEntities = append(s.projectedEntities, p)
+	return nil
+}
 func (s *stubStore) RecordAccessDecision(_ context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
 	s.recordedParams = params
 	if s.decision != nil {
@@ -501,11 +528,37 @@ func (s *stubStore) CreatePrivilegedSession(_ context.Context, params domain.Cre
 		RequestedActions: params.RequestedActions,
 		TicketRef:        params.TicketRef,
 		Reason:           params.Reason,
-		Status:           domain.PrivilegedSessionStatusActive,
+		Status:           privilegedStatusFor(params),
 		DurationSeconds:  params.DurationSeconds,
 		ExpiresAt:        time.Now().UTC().Add(time.Hour),
 		CreatedAt:        time.Now().UTC(),
+		RequestedBy:      &params.RequestedBy,
+		HighImpact:       params.HighImpact,
 	}, nil
+}
+
+func privilegedStatusFor(p domain.CreatePrivilegedSessionParams) string {
+	if p.HighImpact {
+		return domain.PrivilegedSessionStatusPendingApproval
+	}
+	return domain.PrivilegedSessionStatusActive
+}
+
+func (s *stubStore) DecidePrivilegedSession(_ context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error) {
+	s.decidedBy, s.decidedApprove = approver, approve
+	if s.sessionDecideErr != nil {
+		return nil, s.sessionDecideErr
+	}
+	status := domain.PrivilegedSessionStatusRejected
+	if approve {
+		status = domain.PrivilegedSessionStatusActive
+	}
+	return &domain.PrivilegedSession{SessionID: sessionID, TenantID: tenantID, Status: status, ApprovedBy: &approver}, nil
+}
+
+func (s *stubStore) ReviewSession(_ context.Context, kind, sessionID, tenantID, reviewer, outcome, notes string) error {
+	s.reviewedKind, s.reviewedOutcome = kind, outcome
+	return s.reviewErr
 }
 
 func (s *stubStore) FindPrivilegedSessionByID(_ context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error) {

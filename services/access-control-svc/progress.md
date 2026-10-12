@@ -474,3 +474,21 @@ A linked employee's exit now also publishes `employment.changed` (Doc 03 §8.3's
 the principal, which authorization-svc projects as `TERMINATED` — the leaver loses access, not just gets
 reviewed. Exits only; never for an unlinked employee, a move or a temporary absence. Migration **000016**
 admits the type in the outbox CHECK; asyncapi.yaml publishes it. Store test + hrevents test.
+
+## 12 Oct 2026: 000017 registers 68 missing legacy actions
+
+Requested from the authorization-svc audit closure ("action names callers use but nothing grants").
+A scan of every service's Go action constants against `permission_definitions` found 68 actions
+enforced at `/v1/authorize` but absent from 000008, so no bundle could name them (`400
+unknown_permission`) and those checks could only deny. 000017 registers them as LEGACY / STANDARD,
+each described with the service that enforces it; the down migration refuses while any bundle
+still grants one. Risk tiering (HIGH = assignment needs approval) is left to the IAM policy owner —
+candidates: PO_APPROVE_HIGHVALUE, GL_SOFT_CLOSE_POSTING_OVERRIDE, PERIOD_REOPEN_APPROVE.
+
+Verified on a scratch Docker postgres only (no real DB available): 000001–000017 apply; up is
+idempotent; down refuses with a bundle on PO_APPROVE and succeeds without; live with both binaries,
+a PO_APPROVE bundle was `400 unknown_permission` before 000017 and `201` after, provisioned into
+authorization-svc, and the grantee then got `GRANTED rbac:role=PO_APPROVER` (was `DENIED no_grant`).
+
+**Still to do on the real database:** `python deployments/migrate.py up` (or apply 000017 by hand),
+then `SELECT count(*) FROM permission_definitions WHERE description LIKE 'Enforced by %'` → 68.
