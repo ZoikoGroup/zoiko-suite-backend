@@ -898,6 +898,11 @@ services:
       # policy version a past decision used (doc7 backlog item 34) — never
       # for authorization.
       POLICY_SERVICE_URL: "http://policy-svc:8085"
+      # Reads are authorized on GOVERNANCE_DECISION_READ. warn logs a refusal
+      # instead of making it, because contract-lifecycle-svc (contract
+      # activation) and decision-support-svc still read with no X-Principal-Id.
+      # Set to enforce (the code default) once both forward the caller.
+      DECISION_LOG_READ_AUTHZ: "warn"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "governance-decision-log-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.governance.events"
@@ -1245,9 +1250,15 @@ services:
       # purpose / reason_code on privileged and destructive commands, a finite
       # end date on a delegation. "warn" admits a command without them, marks
       # it X-Command-Contract: violated and bounds an open delegation to 90
-      # days; "enforce" refuses. Stays warn until the console and
-      # access-control-svc send the fields.
-      AUTHZ_COMMAND_CONTRACT: "warn"
+      # days; "enforce" refuses. Enforced since 12 Oct 2026: access-control-svc
+      # sends reason_code on every command, and the admin console asks for a
+      # reason, one sentence and (delegations) an end date before it calls.
+      AUTHZ_COMMAND_CONTRACT: "enforce"
+      # Tenant of an entity /v1/authorize has no projection for (created before
+      # entity.created was consumed): checked with the registry, never taken
+      # on the caller's word or evaluated across tenants. No depends_on on
+      # purpose — the registry being down refuses only those entities (503).
+      AUTHZ_ENTITY_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # siem-integration-svc lives in docker-compose.phase6.yml — reachable
       # only when that file is up alongside this one. Streaming degrades to
