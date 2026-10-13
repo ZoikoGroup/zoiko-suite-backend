@@ -235,8 +235,8 @@ func (s *PgStore) TransitionSubscriptionStatus(ctx context.Context, subscription
 		return err
 	}
 
-	var currentStatus string
-	err = tx.QueryRow(ctx, `SELECT status FROM commercial_subscriptions WHERE subscription_id = $1`, subscriptionID).Scan(&currentStatus)
+	var currentStatus, commercialAccountID string
+	err = tx.QueryRow(ctx, `SELECT status, commercial_account_id FROM commercial_subscriptions WHERE subscription_id = $1`, subscriptionID).Scan(&currentStatus, &commercialAccountID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrSubscriptionNotFound
 	}
@@ -280,6 +280,17 @@ func (s *PgStore) TransitionSubscriptionStatus(ctx context.Context, subscription
 	`, subscriptionID, currentStatus, string(newStatus), reason, now, principalID)
 	if err != nil {
 		return fmt.Errorf("insert status event: %w", err)
+	}
+
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "commercial_subscription", AggregateID: subscriptionID,
+		EventType: "commercial_subscription.status_changed",
+		Payload: map[string]any{
+			"subscription_id": subscriptionID, "previous_status": currentStatus, "new_status": string(newStatus),
+		},
+		TenantID: &commercialAccountID,
+	}); err != nil {
+		return err
 	}
 
 	return tx.Commit(ctx)
@@ -354,6 +365,14 @@ func (s *PgStore) CreateBillingSourceTransfer(ctx context.Context, transfer *dom
 	)
 	if err != nil {
 		return fmt.Errorf("insert billing source transfer: %w", err)
+	}
+
+	tenantID := transfer.CommercialAccountID
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "billing_source_transfer", AggregateID: transfer.TransferID,
+		EventType: "commercial_subscription.billing_source_transferred", Payload: transfer, TenantID: &tenantID,
+	}); err != nil {
+		return err
 	}
 
 	return tx.Commit(ctx)
@@ -661,10 +680,12 @@ func (s *PgStore) ApplyChangeRequest(ctx context.Context, changeRequestID string
 	}
 
 	now := time.Now().UTC()
-	if _, err := tx.Exec(ctx, `
+	var commercialAccountID string
+	if err := tx.QueryRow(ctx, `
 		UPDATE commercial_subscriptions SET plan_id = $1, catalog_version_id = $2, updated_at = $3
 		WHERE subscription_id = $4
-	`, targetPlanID, catalogVersionID, now, subscriptionID); err != nil {
+		RETURNING commercial_account_id
+	`, targetPlanID, catalogVersionID, now, subscriptionID).Scan(&commercialAccountID); err != nil {
 		return nil, fmt.Errorf("update subscription: %w", err)
 	}
 
@@ -673,6 +694,17 @@ func (s *PgStore) ApplyChangeRequest(ctx context.Context, changeRequestID string
 		WHERE change_request_id = $2
 	`, now, changeRequestID); err != nil {
 		return nil, fmt.Errorf("update change request: %w", err)
+	}
+
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "commercial_subscription", AggregateID: subscriptionID,
+		EventType: "commercial_subscription.plan_changed",
+		Payload: map[string]any{
+			"subscription_id": subscriptionID, "target_plan_id": targetPlanID, "change_request_id": changeRequestID,
+		},
+		TenantID: &commercialAccountID,
+	}); err != nil {
+		return nil, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
