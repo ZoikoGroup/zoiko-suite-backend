@@ -144,7 +144,7 @@ func TestPgStore_DecisionIDIsTenantScoped(t *testing.T) {
 // role, tenant-2 sees none of tenant-1's manifests even by naming the decision.
 func TestPgStore_ReplayManifestsAreTenantIsolated(t *testing.T) {
 	ctx := context.Background()
-	pool := openTestPool(t)
+	pool := appRolePool(t, openTestPool(t))
 	s := store.New(pool, zap.NewNop())
 
 	if _, err := insertDecision(ctx, s, sampleDecision("dec-rm")); err != nil {

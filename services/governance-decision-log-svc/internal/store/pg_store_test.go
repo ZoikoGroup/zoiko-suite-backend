@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -88,6 +89,62 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		}
 	}
 
+	return pool
+}
+
+// appRolePool returns a pool connected as a NOSUPERUSER NOBYPASSRLS role, the
+// shape of the service's real runtime role. Call it after openTestPool, which
+// has just recreated the tables the grants below cover.
+//
+// TEST_DATABASE_URL is the `postgres` superuser in CI, and a superuser bypasses
+// row-level security unconditionally, FORCE included: an isolation assertion
+// made over openTestPool's connection fails there although the policy is
+// correct, and would pass there even if the policy were missing.
+func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+
+	const appRole = "gdl_app_test"
+	const appPassword = "gdl_app_test_pw"
+
+	if _, err := admin.Exec(ctx, `DO $do$ BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '`+appRole+`') THEN
+			CREATE ROLE `+appRole+` LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+		END IF;
+	END $do$;`); err != nil {
+		t.Fatalf("create role %s: %v", appRole, err)
+	}
+	for _, stmt := range []string{
+		`ALTER ROLE ` + appRole + ` WITH LOGIN PASSWORD '` + appPassword + `' NOSUPERUSER NOBYPASSRLS`,
+		`GRANT USAGE ON SCHEMA public TO ` + appRole,
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ` + appRole,
+		`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ` + appRole,
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("grant to %s (%s): %v", appRole, stmt, err)
+		}
+	}
+
+	u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.User = url.UserPassword(appRole, appPassword)
+	pool, err := pgxpool.New(ctx, u.String())
+	if err != nil {
+		t.Fatalf("connect as %s: %v", appRole, err)
+	}
+	t.Cleanup(pool.Close)
+
+	var isSuper, bypassRLS bool
+	if err := pool.QueryRow(ctx,
+		`SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user`,
+	).Scan(&isSuper, &bypassRLS); err != nil {
+		t.Fatalf("verify %s privileges: %v", appRole, err)
+	}
+	if isSuper || bypassRLS {
+		t.Fatalf("%s must be NOSUPERUSER and NOBYPASSRLS, got rolsuper=%v rolbypassrls=%v", appRole, isSuper, bypassRLS)
+	}
 	return pool
 }
 
