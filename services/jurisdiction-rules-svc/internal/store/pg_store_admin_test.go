@@ -99,7 +99,11 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 // 000005-000006 (outbox, pack registries, pack artifacts) are deliberately
 // not applied: the store suite only exercises jurisdictions,
 // jurisdiction_rules and jurisdiction_rule_drift_events, and those pack
-// tables are neither dropped nor asserted here. 000007/000008 are required —
+// tables are neither dropped nor asserted here. The OTHER 000006,
+// add_exclusion_constraint, is required: it is the database guard against two
+// overlapping live rules. Without it the suite tested only the SELECT-then-
+// UPDATE pre-check, and concurrent activations raced past it in CI (5 of 8
+// admitted). 000007/000008 are required —
 // ruleColumnNames (pg_store.go) reads rule_version, supersedes_rule_id and
 // precedence_level, and without them every CreateRule fails with 42703.
 // 000009 must be applied because DeactivateJurisdiction's idempotency relies
@@ -115,6 +119,7 @@ var migrationFiles = []string{
 	"000002_add_audit_columns.up.sql",
 	"000003_add_data_classification.up.sql",
 	"000004_add_rule_code_index.up.sql",
+	"000006_add_exclusion_constraint.up.sql",
 	"000007_add_bitemporal_replay.up.sql",
 	"000008_add_precedence_metadata.up.sql",
 	"000009_enforce_drift_append_only.up.sql",
