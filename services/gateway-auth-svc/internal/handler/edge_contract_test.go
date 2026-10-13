@@ -27,13 +27,14 @@ const (
 // Identity-class headers the gateway never sets. They are on both lists so
 // that Traefik strips any client copy: no client can assert a workload
 // identity or a support session.
-var strippedByForwardAuth = []string{"X-Workload-Id", "X-Support-Context-Id"}
+var strippedByForwardAuth = []string{"X-Workload-Id", "X-Support-Context-Id", "X-Authn-Age-Seconds",
+	"X-Audience", "X-Token-Audience", "X-Initiating-Subject-Id", "X-On-Behalf-Of"}
 
 // §4 caller assertions. The envelope contract makes the owning service
 // validate these, so the edge must let them through.
 var callerAssertions = []string{
 	"X-Purpose-Context", "X-Approval-Reference", "X-Evidence-Refs", "X-Causation-Id",
-	"X-Workflow-Instance-Id", "X-Book-Id", "X-Source-Channel", "X-Expected-Version",
+	"X-Workflow-Instance-Id", "X-Book-Id", "X-Expected-Version",
 }
 
 // headersVerifySets returns every X- header a successful Verify writes, taken
@@ -46,7 +47,9 @@ func headersVerifySets(t *testing.T) []string {
 	})
 	require.Equal(t, http.StatusOK, rec.Code)
 
-	set := map[string]bool{"X-Tenant-Context-Stale": true, "X-Correlation-Id": true}
+	// Set only when the envelope or request carries them, so named here.
+	set := map[string]bool{"X-Tenant-Context-Stale": true, "X-Correlation-Id": true,
+		"X-Source-Channel": true, "X-Source-Channel-Basis": true, "X-Assurance-Level": true, "X-Support-Context-Id": true}
 	for name := range rec.Header() {
 		if strings.HasPrefix(name, "X-") {
 			set[name] = true

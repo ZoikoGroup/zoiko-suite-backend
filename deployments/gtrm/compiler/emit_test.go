@@ -167,19 +167,26 @@ func TestEmit_EnvelopeSanitation_SplitPolicy(t *testing.T) {
 	for _, h := range []string{
 		"X-Principal-Id", "X-Tenant-Id", "X-Legal-Entity-Id", "X-Correlation-Id",
 		"X-Jurisdiction-Context", "X-Timezone", "X-Residency-Policy-Id", "X-Tenant-Context-Stale",
+		"X-Source-Channel", "X-Source-Channel-Basis", "X-Assurance-Level", "X-Support-Context-Id",
 	} {
 		if !overwritten[h] {
 			t.Errorf("%s is set by gateway-auth but not in authResponseHeaders — client copy passes through", h)
 		}
 	}
-	for _, h := range []string{"X-Workload-Id", "X-Support-Context-Id"} {
+	for _, h := range []string{"X-Workload-Id", "X-Support-Context-Id", "X-Assurance-Level", "X-Authn-Age-Seconds",
+		"X-Audience", "X-Token-Audience", "X-Initiating-Subject-Id", "X-On-Behalf-Of", "X-Source-Channel-Basis"} {
 		if _, ok := strip[h]; !ok || !overwritten[h] {
 			t.Errorf("%s must be stripped at the edge and by ForwardAuth", h)
 		}
 	}
+	// The caller's channel must reach /verify (for the "asserted" fallback),
+	// and the gateway's answer must replace it on the way to the backend.
+	if _, ok := strip["X-Source-Channel"]; ok || !overwritten["X-Source-Channel"] {
+		t.Errorf("X-Source-Channel must reach gateway-auth and be replaced by its answer (S1-B1)")
+	}
 	for _, h := range []string{
 		"X-Purpose-Context", "X-Approval-Reference", "X-Evidence-Refs", "X-Causation-Id",
-		"X-Workflow-Instance-Id", "X-Book-Id", "X-Source-Channel", "X-Expected-Version",
+		"X-Workflow-Instance-Id", "X-Book-Id", "X-Expected-Version",
 	} {
 		if _, ok := strip[h]; ok || overwritten[h] {
 			t.Errorf("%s is a §4 caller assertion and must reach the owning service", h)
