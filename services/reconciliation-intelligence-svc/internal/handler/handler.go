@@ -11,7 +11,6 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
 	svcenvelope "zoiko.io/reconciliation-intelligence-svc/internal/envelope"
-	"zoiko.io/reconciliation-intelligence-svc/internal/events"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/health"
 	customMiddleware "zoiko.io/reconciliation-intelligence-svc/internal/middleware"
@@ -26,16 +25,14 @@ const (
 
 type Handler struct {
 	store            store.Store
-	publisher        *events.Publisher
 	authz            *authz.Client
 	financialControl *financialcontrol.Client
 	logger           *zap.Logger
 }
 
-func NewHandler(s store.Store, p *events.Publisher, a *authz.Client, fc *financialcontrol.Client, l *zap.Logger) *Handler {
+func NewHandler(s store.Store, a *authz.Client, fc *financialcontrol.Client, l *zap.Logger) *Handler {
 	return &Handler{
 		store:            s,
-		publisher:        p,
 		authz:            a,
 		financialControl: fc,
 		logger:           l,
@@ -134,29 +131,10 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 		Status:              "COMPLETED",
 	}
 
-	if err := h.store.CreateJob(r.Context(), tenantID, job, items); err != nil {
+	if err := h.store.CreateJob(r.Context(), tenantID, job, items, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.logger.Error("failed to save reconciliation job", zap.Error(err))
 		h.respondError(w, http.StatusInternalServerError, "failed to run reconciliation analysis")
 		return
-	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "reconciliation.analyzed", SubjectID: job.ID, TenantID: tenantID,
-		LegalEntityID: job.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: job,
-	})
-
-	if unmatched > 0 {
-		_ = h.publisher.Publish(r.Context(), events.PublishParams{
-			EventType: "reconciliation.unmatched_flagged", SubjectID: job.ID, TenantID: tenantID,
-			LegalEntityID: job.LegalEntityID, ActorID: principalID,
-			CorrelationID: r.Header.Get("X-Correlation-ID"),
-			Payload: map[string]interface{}{
-				"job_id":          job.ID,
-				"unmatched_count": unmatched,
-				"rate":            rate,
-			},
-		})
 	}
 
 	h.respondJSON(w, http.StatusCreated, job)
@@ -228,17 +206,12 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.ResolutionStatus, req.ResolutionNotes)
+	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.ResolutionStatus, req.ResolutionNotes,
+		job.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		h.respondError(w, http.StatusNotFound, err.Error())
 		return
 	}
-
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "reconciliation.resolution_recommended", SubjectID: itemID, TenantID: tenantID,
-		LegalEntityID: job.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: item,
-	})
 
 	h.respondJSON(w, http.StatusOK, item)
 }

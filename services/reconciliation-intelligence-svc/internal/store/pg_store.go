@@ -7,7 +7,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
 )
 
@@ -28,22 +31,76 @@ func appendResolutionNote(existing, human string) string {
 }
 
 type Store interface {
-	CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem) error
+	// CreateJob enqueues "reconciliation.analyzed" (and, when the job found
+	// unmatched items, "reconciliation.unmatched_flagged") in the same
+	// transaction as the insert.
+	CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem, actorID, correlationID string) error
 	GetJobByID(ctx context.Context, tenantID, id string) (*domain.ReconciliationJob, error)
 	ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA, status string) ([]domain.ReconciliationJob, error)
-	ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.ResolutionStatus, notes string) (*domain.UnmatchedItem, error)
+	// ApplyResolution enqueues "reconciliation.resolution_recommended" in
+	// the same transaction as the update.
+	ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.ResolutionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.UnmatchedItem, error)
 	ArchiveJob(ctx context.Context, tenantID, id string) error
 }
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// eventRegion is the residencyregion stamped on every reconciliation
+	// event. Empty means no region was configured, and every event-emitting
+	// write then fails (envelope.New refuses it) rather than emitting an
+	// event with a guessed region.
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (config EVENT_RESIDENCY_REGION).
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
 }
 
-func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem) error {
+func NewPgStore(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// enqueueReconciliationEvent writes one reconciliation lifecycle event to
+// the transactional outbox inside tx, the transaction that made the change
+// it reports (ZS-EVENT-001 §6).
+func (s *PgStore) enqueueReconciliationEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, subjectID, tenantID, legalEntityID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.reconciliation.job." + fact,
+		LegacyType:      legacyType,
+		Service:         "reconciliation-intelligence-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "reconciliation-job",
+		AggregateID:     subjectID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		// Reconciliation findings are financial records of a tenant's books.
+		Classification: envelope.Confidential,
+		Data:           data,
+	})
+	if err != nil {
+		return fmt.Errorf("build reconciliation.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue reconciliation.%s event: %w", fact, err)
+	}
+	return nil
+}
+
+func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem, actorID, correlationID string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -99,6 +156,35 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 	}
 
 	job.UnmatchedItems = items
+
+	if err := s.enqueueReconciliationEvent(ctx, tx, "analyzed", "reconciliation.analyzed",
+		job.ID, tenantID, job.LegalEntityID, actorID, correlationID, map[string]any{
+			"job_id":                job.ID,
+			"tenant_id":             tenantID,
+			"legal_entity_id":       job.LegalEntityID,
+			"job_name":              job.JobName,
+			"source_system_a":       string(job.SourceSystemA),
+			"source_system_b":       string(job.SourceSystemB),
+			"total_processed_count": job.TotalProcessedCount,
+			"matched_count":         job.MatchedCount,
+			"unmatched_count":       job.UnmatchedCount,
+			"reconciliation_rate":   job.ReconciliationRate,
+			"status":                job.Status,
+		}); err != nil {
+		return err
+	}
+
+	if job.UnmatchedCount > 0 {
+		if err := s.enqueueReconciliationEvent(ctx, tx, "unmatched-flagged", "reconciliation.unmatched_flagged",
+			job.ID, tenantID, job.LegalEntityID, actorID, correlationID, map[string]any{
+				"job_id":          job.ID,
+				"unmatched_count": job.UnmatchedCount,
+				"rate":            job.ReconciliationRate,
+			}); err != nil {
+			return err
+		}
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -198,7 +284,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA
 	return jobs, nil
 }
 
-func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.ResolutionStatus, notes string) (*domain.UnmatchedItem, error) {
+func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.ResolutionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.UnmatchedItem, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -244,7 +330,19 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 		return nil, err
 	}
 
-	_ = tx.Commit(ctx)
+	if err := s.enqueueReconciliationEvent(ctx, tx, "resolution-recommended", "reconciliation.resolution_recommended",
+		itemID, tenantID, legalEntityID, actorID, correlationID, map[string]any{
+			"item_id":           item.ID,
+			"job_id":            item.JobID,
+			"resolution_status": string(item.ResolutionStatus),
+			"resolution_notes":  item.ResolutionNotes,
+		}); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
 	return &item, nil
 }
 
@@ -282,7 +380,11 @@ func NewMemoryStore() *MemoryStore {
 	}
 }
 
-func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem) error {
+// CreateJob never emits an event: MemoryStore is the degraded fallback used
+// when Postgres itself is unreachable (see cmd/server/main.go), and it
+// already sacrifices durability for the job data — there is no outbox
+// without a real transaction to enqueue it in.
+func (m *MemoryStore) CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem, actorID, correlationID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -338,7 +440,7 @@ func (m *MemoryStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sou
 	return result, nil
 }
 
-func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.ResolutionStatus, notes string) (*domain.UnmatchedItem, error) {
+func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID string, status domain.ResolutionStatus, notes, legalEntityID, actorID, correlationID string) (*domain.UnmatchedItem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
