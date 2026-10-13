@@ -25,7 +25,7 @@ func seedEntry(s *stubStoreReal, id, matchStatus string) *domain.IntercompanyEnt
 func TestAcknowledgeCounterparty_FromOpen_MovesToAwaitingCounterparty(t *testing.T) {
 	s := newStubStoreReal()
 	seedEntry(s, "e1", domain.MatchStatusUnmatched)
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/acknowledge", nil, "user-1")
 	if resp.Code != http.StatusOK {
@@ -39,7 +39,7 @@ func TestAcknowledgeCounterparty_FromOpen_MovesToAwaitingCounterparty(t *testing
 func TestAcknowledgeCounterparty_AlreadyMatched_Refused(t *testing.T) {
 	s := newStubStoreReal()
 	seedEntry(s, "e1", domain.MatchStatusMatched)
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/acknowledge", nil, "user-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -52,7 +52,7 @@ func TestAcknowledgeCounterparty_AlreadyMatched_Refused(t *testing.T) {
 func TestDisputeIntercompany_MissingReason_Returns400(t *testing.T) {
 	s := newStubStoreReal()
 	seedEntry(s, "e1", domain.MatchStatusMismatch)
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/dispute", map[string]string{}, "user-1")
 	if resp.Code != http.StatusBadRequest {
@@ -63,7 +63,7 @@ func TestDisputeIntercompany_MissingReason_Returns400(t *testing.T) {
 func TestDisputeIntercompany_FromMismatch_MovesToDisputed(t *testing.T) {
 	s := newStubStoreReal()
 	seedEntry(s, "e1", domain.MatchStatusMismatch)
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/dispute", map[string]string{"reason": "amount looks wrong"}, "user-1")
 	if resp.Code != http.StatusOK {
@@ -80,7 +80,7 @@ func TestDisputeIntercompany_FromMismatch_MovesToDisputed(t *testing.T) {
 func TestDisputeIntercompany_FromOpen_Refused(t *testing.T) {
 	s := newStubStoreReal()
 	seedEntry(s, "e1", domain.MatchStatusUnmatched)
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/dispute", map[string]string{"reason": "x"}, "user-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -93,7 +93,7 @@ func TestDisputeIntercompany_FromOpen_Refused(t *testing.T) {
 func TestResolveMismatch_MissingNote_Returns400(t *testing.T) {
 	s := newStubStoreReal()
 	seedEntry(s, "e1", domain.MatchStatusDisputed)
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/resolve", map[string]string{}, "user-1")
 	if resp.Code != http.StatusBadRequest {
@@ -104,7 +104,7 @@ func TestResolveMismatch_MissingNote_Returns400(t *testing.T) {
 func TestResolveMismatch_FromDisputed_MovesToResolved(t *testing.T) {
 	s := newStubStoreReal()
 	seedEntry(s, "e1", domain.MatchStatusDisputed)
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/resolve", map[string]string{"resolution_note": "FX rounding, accepted as-is"}, "user-1")
 	if resp.Code != http.StatusOK {
@@ -120,7 +120,7 @@ func TestResolveMismatch_FromMismatch_Refused(t *testing.T) {
 	// that was never disputed has no dispute to resolve.
 	s := newStubStoreReal()
 	seedEntry(s, "e1", domain.MatchStatusMismatch)
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/resolve", map[string]string{"resolution_note": "x"}, "user-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -135,7 +135,7 @@ func TestMatchEntry_CounterpartyJournalMissing_RecordsMismatchNotOutage(t *testi
 	seedEntry(s, "e1", domain.MatchStatusUnmatched)
 	// Default stubLedger{} (no journal, no err) reports the journal as not
 	// found — exactly ACC-11's own negative path, "One side missing."
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	resp := doReq(r, http.MethodPost, "/v1/intercompany/entries/e1/match", map[string]string{"target_journal_id": "nonexistent-journal"}, "user-1")
 	if resp.Code != http.StatusUnprocessableEntity {
@@ -154,7 +154,7 @@ func TestMatchEntry_CounterpartyJournalMissing_RecordsMismatchNotOutage(t *testi
 func TestMatchEntry_Rematch_AfterMismatch_Allowed(t *testing.T) {
 	s := newStubStoreReal()
 	seedEntry(s, "e1", domain.MatchStatusMismatch)
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	r := newRouter(s, &stubAuthZ{}, &stubLedger{})
 
 	// Still missing the counterparty journal, so it stays MISMATCH — the
 	// point of this test is that the attempt itself is not refused as
