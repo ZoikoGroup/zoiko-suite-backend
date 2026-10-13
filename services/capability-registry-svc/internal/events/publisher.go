@@ -69,6 +69,15 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 		Topic:                  topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
+		// RequiredAcks is explicit: kafka-go defaults to RequireNone
+		// (fire-and-forget), under which WriteMessages returns success
+		// before any broker has durably stored the record. The outbox
+		// relay then marks the row published and never retries — a lost
+		// broker write becomes a silently lost event, exactly what the
+		// transactional outbox exists to prevent (ZS-EVENT-001 §6-7;
+		// tracker item 106, which found this unset across the whole
+		// estate except services/eventing's adopters).
+		RequiredAcks: kafka.RequireAll,
 	}
 	return &KafkaPublisher{writer: w, topic: topic, logger: logger}
 }
