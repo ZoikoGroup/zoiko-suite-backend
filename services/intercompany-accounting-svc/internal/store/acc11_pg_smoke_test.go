@@ -20,13 +20,13 @@ import (
 
 func TestPgStore_ACC11_FullLifecycle_AcknowledgeDisputeResolve_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	entry := newTestEntry(tenantID, uuid.New().String())
-	if _, err := s.CreateEntry(ctx, entry); err != nil {
+	if _, err := s.CreateEntry(ctx, entry, "actor-1", "corr-1"); err != nil {
 		t.Fatalf("CreateEntry: %v", err)
 	}
 
@@ -48,7 +48,11 @@ func TestPgStore_ACC11_FullLifecycle_AcknowledgeDisputeResolve_RealDB(t *testing
 	// path (the real mismatch decision is the handler's job, not this
 	// store method's — see handler.go's MatchEntry).
 	reason := "amount_mismatch: test"
-	if err := s.UpdateMatch(ctx, entry.IntercompanyEntryID, uuid.New().String(), domain.MatchStatusMismatch, &reason); err != nil {
+	targetJ := uuid.New().String()
+	entry.TargetJournalID = &targetJ
+	entry.MatchStatus = domain.MatchStatusMismatch
+	entry.MismatchReason = &reason
+	if err := s.UpdateMatch(ctx, entry, "actor-1", "corr-2"); err != nil {
 		t.Fatalf("UpdateMatch: %v", err)
 	}
 
@@ -86,13 +90,13 @@ func TestPgStore_ACC11_FullLifecycle_AcknowledgeDisputeResolve_RealDB(t *testing
 // if-statement.
 func TestPgStore_ACC11_DisputeFromWrongStatus_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	entry := newTestEntry(tenantID, uuid.New().String()) // starts UNMATCHED
-	if _, err := s.CreateEntry(ctx, entry); err != nil {
+	if _, err := s.CreateEntry(ctx, entry, "actor-1", "corr-1"); err != nil {
 		t.Fatalf("CreateEntry: %v", err)
 	}
 
@@ -107,17 +111,20 @@ func TestPgStore_ACC11_DisputeFromWrongStatus_Refused(t *testing.T) {
 // negative-path control for the closed state set.
 func TestPgStore_ACC11_InvalidMatchStatus_RejectedByCheckConstraint(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	entry := newTestEntry(tenantID, uuid.New().String())
-	if _, err := s.CreateEntry(ctx, entry); err != nil {
+	if _, err := s.CreateEntry(ctx, entry, "actor-1", "corr-1"); err != nil {
 		t.Fatalf("CreateEntry: %v", err)
 	}
 
-	if err := s.UpdateMatch(ctx, entry.IntercompanyEntryID, uuid.New().String(), "NOT_A_REAL_STATUS", nil); err == nil {
+	targetJ := uuid.New().String()
+	entry.TargetJournalID = &targetJ
+	entry.MatchStatus = "NOT_A_REAL_STATUS"
+	if err := s.UpdateMatch(ctx, entry, "actor-1", "corr-2"); err == nil {
 		t.Fatal("expected the CHECK constraint to reject an unrecognized match_status value")
 	}
 }

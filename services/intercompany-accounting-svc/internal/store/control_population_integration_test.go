@@ -43,6 +43,9 @@ func cpPool(t *testing.T) *pgxpool.Pool {
 	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS intercompany_entries CASCADE`); err != nil {
 		t.Fatalf("drop: %v", err)
 	}
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS eventing_outbox CASCADE`); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
 	files, err := filepath.Glob(filepath.Join("..", "..", "deployments", "migrations", "*.up.sql"))
 	if err != nil || len(files) == 0 {
 		t.Fatalf("no migrations found: %v", err)
@@ -120,7 +123,7 @@ func cpSum(t *testing.T, amounts ...string) string {
 
 func TestControlPopulation_SourceVsTargetScope(t *testing.T) {
 	pool := cpPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 	tj1, tj2 := uuid.NewString(), uuid.NewString()
 
 	// A->B (matched, has target journal), A->C (no target journal yet), B->A (matched)
@@ -178,7 +181,7 @@ func TestControlPopulation_SourceVsTargetScope(t *testing.T) {
 
 func TestControlPopulation_TargetExcludesEntriesWithoutTargetJournal(t *testing.T) {
 	pool := cpPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 	cpInsert(t, pool, cpEntry{tenant: cpTenant1, src: "le-A", tgt: "le-B", amount: "10.0000"})
 	cpInsert(t, pool, cpEntry{tenant: cpTenant1, src: "le-A", tgt: "le-B", amount: "20.0000", status: "AWAITING_COUNTERPARTY"})
 
@@ -196,7 +199,7 @@ func TestControlPopulation_TargetExcludesEntriesWithoutTargetJournal(t *testing.
 
 func TestControlPopulation_ExactAmountAndAllStatuses(t *testing.T) {
 	pool := cpPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 	statuses := []string{"UNMATCHED", "AWAITING_COUNTERPARTY", "MATCHED", "MISMATCH", "DISPUTED", "RESOLVED"}
 	for i, st := range statuses {
 		amount := "1.0000"
@@ -235,7 +238,7 @@ func TestControlPopulation_ExactAmountAndAllStatuses(t *testing.T) {
 
 func TestControlPopulation_PagingStableWatermarkAndExactTotals(t *testing.T) {
 	pool := cpPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 	amounts := map[string][]string{"USD": {"0.1000", "0.2000", "1234.5678", "99999999999999.9999"}, "EUR": {"5.0001"}}
 	want := map[string]bool{}
 	for cur, list := range amounts {
@@ -300,7 +303,7 @@ func TestControlPopulation_PagingStableWatermarkAndExactTotals(t *testing.T) {
 
 func TestControlPopulation_TenantIsolation(t *testing.T) {
 	pool := cpPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 	mine := cpInsert(t, pool, cpEntry{tenant: cpTenant1, src: "le-A", tgt: "le-B", amount: "1.0000"})
 	cpInsert(t, pool, cpEntry{tenant: cpTenant2, src: "le-A", tgt: "le-B", amount: "999.0000"})
 
@@ -319,7 +322,7 @@ func TestControlPopulation_TenantIsolation(t *testing.T) {
 
 func TestControlPopulation_StatusChangeChangesWatermark(t *testing.T) {
 	pool := cpPool(t)
-	s := store.New(pool)
+	s := store.New(pool, store.WithEventRegion("test"))
 	id := cpInsert(t, pool, cpEntry{tenant: cpTenant1, src: "le-A", tgt: "le-B", amount: "10.0000"})
 	cpInsert(t, pool, cpEntry{tenant: cpTenant1, src: "le-A", tgt: "le-B", amount: "20.0000"})
 
