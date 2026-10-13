@@ -217,6 +217,12 @@ type stubStore struct {
 	principalStatusErr       error
 	gotPrincipalStatusArgs   []string
 	principalStatusCallCount int
+	// principalStatusByID overrides principalStatus for one principal, so a
+	// test can suspend the subject without suspending the admin calling.
+	principalStatusByID map[string]string
+	// principalStatusQueried is every principal FindPrincipalStatus was asked
+	// about, in order.
+	principalStatusQueried []string
 
 	privilegedSession       *domain.PrivilegedSession
 	privilegedSessionErr    error
@@ -250,16 +256,6 @@ type stubStore struct {
 	createdWorkloadBinding   *domain.WorkloadBinding
 	createWorkloadBindingErr error
 
-	accessReview                  *domain.AccessReview
-	getAccessReviewErr            error
-	createdAccessReview           *domain.AccessReview
-	createAccessReviewErr         error
-	accessReviews                 []domain.AccessReview
-	listAccessReviewsErr          error
-	gotAccessReviewTenant         string
-	gotAccessReviewReviewer       string
-	gotAccessReviewStatus         string
-	recordAccessReviewDecisionErr error
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -467,7 +463,14 @@ func (s *stubStore) FindEntityStatus(_ context.Context, _, _ string) (string, er
 func (s *stubStore) FindEntityTenant(_ context.Context, _ string) (string, error) {
 	return s.entityTenant, s.entityTenantErr
 }
+// FindPrincipalTenants answers principalTenants when the test set it. When it
+// did not, a principal the stub grants anything (RBAC or delegated) holds
+// authority in one tenant — the consistent world — so tests about other layers
+// are not refused by C-01's "holds nothing anywhere" rule.
 func (s *stubStore) FindPrincipalTenants(_ context.Context, _ string) ([]string, error) {
+	if s.principalTenants == nil && s.principalTenantsErr == nil && (len(s.rbacActions) > 0 || len(s.delegatedActions) > 0) {
+		return []string{"11111111-1111-4111-8111-111111111111"}, nil
+	}
 	return s.principalTenants, s.principalTenantsErr
 }
 func (s *stubStore) ProjectEntityStatus(_ context.Context, p domain.ProjectEntityStatusParams) error {
@@ -506,6 +509,10 @@ func (s *stubStore) FindPrincipalStatus(_ context.Context, principalID, tenantID
 	s.gotPrincipalStatusArgs = []string{principalID, tenantID}
 	if s.principalStatusErr != nil {
 		return "", s.principalStatusErr
+	}
+	s.principalStatusQueried = append(s.principalStatusQueried, principalID)
+	if st, ok := s.principalStatusByID[principalID]; ok {
+		return st, nil
 	}
 	if s.principalStatus == "" {
 		return domain.PrincipalStatusActive, nil
@@ -743,55 +750,6 @@ func (s *stubStore) CreateWorkloadBinding(_ context.Context, binding domain.Work
 	return &binding, nil
 }
 
-func (s *stubStore) CreateAccessReview(_ context.Context, review domain.AccessReview) (*domain.AccessReview, error) {
-	s.createdAccessReview = &review
-	if s.createAccessReviewErr != nil {
-		return nil, s.createAccessReviewErr
-	}
-	return &review, nil
-}
-
-func (s *stubStore) GetAccessReview(_ context.Context, reviewID, tenantID string) (*domain.AccessReview, error) {
-	if s.getAccessReviewErr != nil {
-		return nil, s.getAccessReviewErr
-	}
-	if s.accessReview != nil {
-		return s.accessReview, nil
-	}
-	return nil, domain.ErrAccessReviewNotFound
-}
-
-func (s *stubStore) ListAccessReviews(_ context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error) {
-	s.gotAccessReviewTenant = tenantID
-	s.gotAccessReviewReviewer = reviewerPrincipalID
-	s.gotAccessReviewStatus = status
-	if s.listAccessReviewsErr != nil {
-		return nil, s.listAccessReviewsErr
-	}
-	return s.accessReviews, nil
-}
-
-func (s *stubStore) RecordAccessReviewDecision(_ context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error) {
-	if s.recordAccessReviewDecisionErr != nil {
-		return nil, s.recordAccessReviewDecisionErr
-	}
-	now := time.Now().UTC()
-	st := domain.ReviewStatusCompleted
-	if decision == domain.ReviewDecisionEscalate {
-		st = domain.ReviewStatusEscalated
-	}
-	return &domain.AccessReview{
-		ReviewID:            reviewID,
-		TenantID:            tenantID,
-		ReviewerPrincipalID: decidedBy,
-		Decision:            &decision,
-		DecisionReason:      &decisionReason,
-		DecidedAt:           &now,
-		DecidedBy:           &decidedBy,
-		Status:              st,
-	}, nil
-}
-
 // ── stub publisher ───────────────────────────────────────────────────────────
 
 type stubPublisher struct {
@@ -822,12 +780,6 @@ func (p *stubPublisher) PublishSupportSessionStarted(_ context.Context, _ domain
 	return nil
 }
 func (p *stubPublisher) PublishSupportSessionEnded(_ context.Context, _ domain.SupportSession) error {
-	return nil
-}
-func (p *stubPublisher) PublishAccessReviewStarted(_ context.Context, _ domain.AccessReview) error {
-	return nil
-}
-func (p *stubPublisher) PublishAccessReviewCompleted(_ context.Context, _ domain.AccessReview) error {
 	return nil
 }
 func (p *stubPublisher) PublishPrivilegedSessionStarted(_ context.Context, _ domain.PrivilegedSession) error {
@@ -897,7 +849,9 @@ func TestAuthorize_NoGrant_Denied(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
+	// A tenant, so the question reaches the decision layers: a tenantless
+	// one from a principal holding nothing anywhere is refused (C-01).
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","tenant_id":"11111111-1111-4111-8111-111111111111"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -991,7 +945,9 @@ func TestAuthorize_StoreUnavailable_FailsClosed(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
+	// A tenant, so the question reaches the decision layers: a tenantless
+	// one from a principal holding nothing anywhere is refused (C-01).
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","tenant_id":"11111111-1111-4111-8111-111111111111"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

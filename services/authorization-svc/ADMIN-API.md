@@ -23,9 +23,9 @@ until 7 Oct 2026 existed only in code. For the evaluation endpoints see
   `200`); the same key with a different body is `409 idempotency_mismatch`.
 - **§16 command fields.** Privileged and destructive commands (marked **R**)
   take `reason_code` and/or `purpose`, recorded with the change in
-  `authz_config_history`. With `AUTHZ_COMMAND_CONTRACT=warn` (default) a missing
-  reason is admitted and marked `X-Command-Contract: violated`; with `enforce`
-  it is `400`.
+  `authz_config_history`. With `AUTHZ_COMMAND_CONTRACT=enforce` (the default) a
+  missing reason is `400`; with `warn` it is admitted and marked
+  `X-Command-Contract: violated`.
 - **Optimistic concurrency.** Commands marked **V** take an optional
   `expected_version`; a stale one is `409 version_conflict`. Every role, bundle,
   SoD and ABAC rule carries `version`.
@@ -129,17 +129,36 @@ Events (outbox, 000030): `security.privileged_session.started` / `.ended`,
 reason travels as `command_reason`. The expiry sweep (every minute) ends sessions that ran out.
 
 `POST /internal/authorization/decisions` is the ZS-IAM-001 §8 canonical decision API: the same
-pipeline as `/v1/authorize`, with `subject_id`, `action`, `resource_*`, `environment` and an
-optional `session_id`; it returns the §8.2 decision.
+pipeline as `/v1/authorize`, with `subject_id`, `action`, `resource_*`, `environment` and the
+optional `session_id` (JIT), `break_glass_session_id` and `support_session_id`; it returns the
+§8.2 decision.
 
-`GET /v1/iam/access-reviews` and `POST /v1/iam/access-reviews/{id}/decide` act for the verified
-caller only.
+Access reviews (§24) are **not** served here. They belong to access-control-svc (campaigns,
+items, decisions; `GET /v1/iam/access-reviews` there). This service's copy of the routes was
+removed on 13 Oct 2026 (Governance audit N-03 / N-10): it had no way to create a review, and a
+REVOKE decision discarded every revocation error while marking the review completed.
+
+## Workload bindings (ZS-IAM-001 §16)
+
+| Route | Permission | Notes |
+|---|---|---|
+| `POST /v1/admin/workload-bindings` | `iam.workload.manage` | **R**. `{workload_id, allowed_audience, allowed_actions[]}`; creates or replaces the binding in the caller's tenant. Wildcard audience or action, or no actions → `400`. |
+| `GET /v1/admin/workload-bindings` | `iam.workload.manage` | The tenant's bindings, active and not. |
+| `POST /v1/admin/workload-bindings/{workload_id}/deactivate` · `/reactivate` | `iam.workload.manage` | **R**. Unknown binding → `404`. |
+
+Events: `iam.workload_binding.saved` / `.deactivated` / `.reactivated`, committed with the change.
+At decision time a workload may take only the actions its binding lists
+(`DENIED workload:action_not_bound`); the binding narrows, it never grants. A principal bound as
+a workload in any tenant is evaluated as one whether or not the request declares
+`principal_type: WORKLOAD`. `iam.workload.manage` is not yet in access-control-svc's permission
+registry; until it is, grant it through this service's own admin API.
 
 ## Read surfaces
 
 `GET /v1/{resource}/{id}/available-actions` and `GET /v1/me/capabilities` use
 the verified caller only; the former answers for another principal with
-`iam.assignment.read`. Available actions are classified by the same pipeline as
+`iam.assignment.read`. The legal entity must belong to the caller's tenant, resolved as for
+`/v1/authorize` (`403 tenant_scope_mismatch` otherwise; 13 Oct, N-06). Available actions are classified by the same pipeline as
 `/v1/authorize`. `POST /v1/entity-scope/validate` for another principal needs
 `iam.assignment.read`.
 
@@ -164,10 +183,63 @@ The tenant is resolved on the server from tenant-entity-registry-svc's
 | no tenant | yes | evaluated **and recorded** in the owner's tenant |
 | tenant claimed | no | asked of the registry (`AUTHZ_ENTITY_REGISTRY_URL`, `GET /v1/entities/{id}/status` as that tenant): confirmed → evaluated and the owner projected; not confirmed → `403 tenant_scope_mismatch` |
 | no tenant | no | the registry is asked about each tenant the principal holds a live approved assignment, live delegation or identity standing in: the one holding the entity scopes and records the decision; none → `403 tenant_scope_mismatch` |
-| no tenant, principal holds nothing anywhere | no | `400 missing_tenant_scope` under `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE=true`; otherwise evaluated with no tenant (no tenant grant can apply) with a WARN naming the caller |
+| no tenant, principal holds nothing anywhere | no | `400 missing_tenant_scope` under `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE=true`; otherwise `403 tenant_required`, nothing evaluated or recorded (13 Oct, C-01) |
 | anything | lookup fails | `503 store_unavailable`; registry unreachable or non-200/404 → `503 entity_registry_unavailable` |
 
 With `AUTHZ_ENTITY_REGISTRY_URL` unset the registry rows fall back to the
-pre-12-Oct behaviour (claimed tenant used, tenantless evaluated across tenants).
+pre-12-Oct behaviour (claimed tenant used, tenantless evaluated across tenants). Since 13 Oct it
+is required outside `ENV=local`: the service will not start without it (N-12).
 
 The platform-scope entity is exempt (tenantless by design).
+
+## Which service may ask for a decision (12 Oct, pass 5)
+
+The evaluation routes are `/v1/authorize`, `/v1/sod/evaluate`, `/v1/sod/validate`,
+`/v1/entity-scope/validate`, `/v1/delegated-access/evaluate` and every `/internal/*` route.
+They are gated by the caller's client certificate (`internal/workload`). The certificate's CN is
+the `service_name` mtls-management-svc issued it for. Admin, session and console routes are
+not gated.
+
+| Caller | `AUTHZ_EVALUATION_MTLS=require` (default outside `ENV=local`) | `permit` (local) |
+|---|---|---|
+| plaintext port, no certificate | `401 client_certificate_required` | admitted |
+| mTLS, certificate CN on `AUTHZ_PEP_ALLOWLIST` | admitted; `X-Workload-Id` set to the CN | same |
+| mTLS, CN not on the allow-list | `403 workload_not_registered` | same (when a list is set) |
+| mTLS, `X-Workload-Id` names someone other than the CN | `403 workload_identity_mismatch` | same |
+| mTLS, certificate from another CA, or none | TLS handshake refused | same |
+
+Require mode will not start without `MTLS_ENABLED=true` and a non-empty `AUTHZ_PEP_ALLOWLIST`.
+A PEP joins by setting its own `AUTHZ_MTLS_ENABLED=true` / `AUTHZ_MTLS_URL` and being added
+to the list.
+
+## Changes of 13 Oct 2026 (Governance audit fresh-audit fixes)
+
+- **Admin gates check standing (N-01, N-13).** Every admin, approval, eligibility and read
+  gate reads the caller's projected principal status first. A SUSPENDED / DISABLED /
+  TERMINATED principal is refused (`403`, recorded with basis `principal_status:<status>`)
+  wherever they hold the permission. Every gate check is recorded, including approvals and
+  read gates.
+- **Delegations end with the delegator's standing (N-02).** A delegation from a principal
+  who is not ACTIVE in the delegation's tenant confers nothing, and flows again on
+  reinstatement.
+- **Step-up is the server's (N-07).** Reopen-class actions and the actions in
+  `AUTHZ_STEP_UP_ACTIONS` need a recent login: at most `AUTHZ_STEP_UP_MAX_AUTHN_AGE_SECONDS`
+  (300) old, and a caller may only tighten that. A request that states no authentication age
+  (`X-Authn-Age-Seconds`, `attributes.authn_age_seconds`, `environment.authn_age_seconds`) is
+  answered `STEP_UP` under `AUTHZ_STEP_UP_UNKNOWN_AGE=step_up` (the default), or treated as
+  recent under `permit`. Compose sets `permit`, because no PEP forwards an age yet (see the
+  compose comment).
+- **JIT approval is default-deny (N-08).** Any requested action that is not a pure read
+  (last token READ / VIEW / LIST / GET / SEARCH / QUERY / LOOKUP / INSPECT / DISCOVER) makes
+  the session `PENDING_APPROVAL` (`202`) until an independent `iam.pam.approve` holder approves.
+- **Outbox (N-04, N-14).** The relay publishes a claimed batch in one Kafka write and drains
+  a backlog without waiting a tick; the shared writer flushes after 10 ms and hashes the
+  message key. The retention sweep purges published outbox rows after
+  `AUTHZ_OUTBOX_RETENTION_HOURS` (168) and Idempotency-Key records after
+  `AUTHZ_IDEMPOTENCY_RETENTION_HOURS` (168); 0 keeps them. Migration **000031**.
+- **Principal status ordering (N-05).** A status event without `status_changed_at` is
+  ordered by its envelope `emitted_at`, so a replayed or late event cannot undo a newer one.
+- **mTLS identity renews (N-11).** The server certificate is re-provisioned at two thirds of
+  its lifetime; new handshakes use the new certificate.
+- **Replica id (N-15).** `AUTHZ_REPLICA_ID` names this replica's cache-invalidation consumer
+  group; it defaults to the hostname.

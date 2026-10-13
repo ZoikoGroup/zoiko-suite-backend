@@ -144,12 +144,6 @@ type AuthorizationStore interface {
 	// Workload Identity (ZS-IAM-001 §16)
 	FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error)
 	CreateWorkloadBinding(ctx context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error)
-
-	// Access Reviews & Continuous Access Certification (ZS-IAM-001 §21, §24)
-	CreateAccessReview(ctx context.Context, review domain.AccessReview) (*domain.AccessReview, error)
-	GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error)
-	ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error)
-	RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on.
@@ -161,8 +155,6 @@ type EventPublisher interface {
 	PublishBreakGlassEnded(ctx context.Context, session domain.BreakGlassSession) error
 	PublishSupportSessionStarted(ctx context.Context, session domain.SupportSession) error
 	PublishSupportSessionEnded(ctx context.Context, session domain.SupportSession) error
-	PublishAccessReviewStarted(ctx context.Context, review domain.AccessReview) error
-	PublishAccessReviewCompleted(ctx context.Context, review domain.AccessReview) error
 	PublishPrivilegedSessionStarted(ctx context.Context, session domain.PrivilegedSession) error
 	PublishPrivilegedSessionEnded(ctx context.Context, session domain.PrivilegedSession) error
 	PublishAuthorityLimitChanged(ctx context.Context, limit domain.AuthorityLimit, action string) error
@@ -197,6 +189,10 @@ type Handler struct {
 	// commandContract is the §16 enforcement mode for privileged and
 	// destructive commands — see SetCommandContract.
 	commandContract CommandContractMode
+
+	// stepUp is the server's step-up policy (N-07); nil is the default. See
+	// SetStepUpPolicy.
+	stepUp *StepUpPolicy
 
 	// entityRegistry answers "is this entity in tenant T?" for an entity the
 	// projection has not heard of. Nil keeps the projection as the only
@@ -273,6 +269,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/admin/abac-rules", h.ListABACRules)
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/retire", h.RetireABACRule)
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/reactivate", h.ReactivateABACRule)
+	// Workload bindings (ZS-IAM-001 §16; Governance audit N-09).
+	r.Post("/v1/admin/workload-bindings", h.SaveWorkloadBinding)
+	r.Get("/v1/admin/workload-bindings", h.ListWorkloadBindings)
+	r.Post("/v1/admin/workload-bindings/{workload_id}/deactivate", h.DeactivateWorkloadBinding)
+	r.Post("/v1/admin/workload-bindings/{workload_id}/reactivate", h.ReactivateWorkloadBinding)
 
 	// Privileged Access Management (ZS-IAM-001 §13 & §21)
 	r.Post("/admin/v1/privileged-sessions", h.CreatePrivilegedSession)
@@ -311,10 +312,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	// Canonical Authorization Decision API (ZS-IAM-001 §8.1, §8.2, §21)
 	r.Post("/internal/authorization/decisions", h.HandleCanonicalDecision)
 
-	// Access Reviews & Continuous Access Certification (ZS-IAM-001 §21, §24)
-	r.Get("/v1/iam/access-reviews", h.ListAccessReviews)
-	r.Post("/v1/iam/access-reviews/{id}:decide", h.DecideAccessReview)
-	r.Post("/v1/iam/access-reviews/{id}/decide", h.DecideAccessReview)
+	// Access reviews (ZS-IAM-001 §24) are NOT served here. access-control-svc
+	// owns them — campaigns, items, decisions, and the revocation it
+	// provisions back through this service's admin API (its 000011; see its
+	// domain/governance.go "Ownership, stated once"). The copy this service
+	// carried had no way to create a review and, on REVOKE, discarded every
+	// revocation error and still marked the review completed (Governance
+	// audit N-03 / N-10, 13 Oct 2026), so it was removed rather than mended.
 
 	// Available Actions (ZS-IAM-001 §21, ZS-STATE-001)
 	r.Get("/v1/{resource}/{id}/available-actions", h.GetAvailableActions)
@@ -454,47 +458,70 @@ func (h *Handler) refuseOwnRole(w http.ResponseWriter, r *http.Request, principa
 	return false
 }
 
+// checkPermission is the one question every admin gate asks: may principalID
+// perform actionType, held against scopeEntityID within tenantID? It RECORDS
+// the decision whichever way it goes.
+//
+// Layer 0 first (Governance audit N-01, 13 Oct 2026). The gates used to read
+// RBAC grants only, so a principal identity-context-svc had suspended — or an
+// HR exit had terminated — was denied on /v1/authorize yet kept every IAM
+// administration power: creating roles, granting others access, issuing
+// break-glass sessions, approving exceptions. A tenantless check (platform
+// scope) reads the most restrictive status across tenants, as /v1/authorize
+// does.
+//
+// Recorded on every path (N-13): approvals, eligibility checks and read gates
+// used to leave no artifact. A failure to record is an error, never an allow.
+func (h *Handler) checkPermission(r *http.Request, principalID, scopeEntityID, tenantID, actionType string) (bool, error) {
+	ctx := r.Context()
+
+	outcome, decisionBasis := "DENIED", "no_grant"
+	status, err := h.store.FindPrincipalStatus(ctx, principalID, tenantID)
+	if err != nil {
+		return false, err
+	}
+	if status != domain.PrincipalStatusActive {
+		decisionBasis = principalStatusBasisPrefix + status
+	} else {
+		actions, basis, err := h.store.FindGrantedActions(ctx, principalID, scopeEntityID, tenantID)
+		if err != nil {
+			return false, err
+		}
+		if contains(actions, actionType) {
+			outcome, decisionBasis = "GRANTED", basis
+		}
+	}
+
+	if _, err := h.store.RecordAccessDecision(ctx, domain.RecordAccessDecisionParams{
+		PrincipalID:   principalID,
+		LegalEntityID: scopeEntityID,
+		ActionType:    actionType,
+		Outcome:       outcome,
+		Basis:         decisionBasis,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		TenantID:      tenantID,
+	}); err != nil {
+		return false, err
+	}
+	return outcome == "GRANTED", nil
+}
+
 // requirePermission confirms the caller holds actionType in their tenant scope,
-// and records the decision like any other.
+// and records the decision like any other (see checkPermission).
 //
 // This service is the authorization engine, so it does not call itself over
 // HTTP — it asks its own store the same question /v1/authorize asks.
 func (h *Handler) requirePermission(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
-	correlationID := r.Header.Get("X-Correlation-ID")
-
-	actions, basis, err := h.store.FindGrantedActions(r.Context(), principalID, tenantID, tenantID)
+	granted, err := h.checkPermission(r, principalID, tenantID, tenantID, actionType)
 	if err != nil {
 		h.log.Error("permission check failed — refusing",
-			zap.String("correlation_id", correlationID),
+			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")),
 			zap.String("action_type", actionType),
 			zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return false
 	}
-
-	outcome, decisionBasis := "DENIED", "no_grant"
-	if contains(actions, actionType) {
-		outcome, decisionBasis = "GRANTED", basis
-	}
-
-	if _, recErr := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
-		PrincipalID:   principalID,
-		LegalEntityID: tenantID,
-		ActionType:    actionType,
-		Outcome:       outcome,
-		Basis:         decisionBasis,
-		CorrelationID: correlationID,
-		TenantID:      tenantID,
-	}); recErr != nil {
-		h.log.Error("permission check: failed to record decision — refusing",
-			zap.String("correlation_id", correlationID),
-			zap.String("action_type", actionType),
-			zap.Error(recErr))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		return false
-	}
-
-	if outcome != "GRANTED" {
+	if !granted {
 		h.siem.Stream(r.Context(), tenantID, "authorization.denied", siem.SeverityHigh,
 			"Admin action "+actionType+" denied for principal "+principalID)
 		writeJSON(w, http.StatusForbidden, map[string]string{
@@ -507,11 +534,9 @@ func (h *Handler) requirePermission(w http.ResponseWriter, r *http.Request, prin
 }
 
 // requirePlatformAction confirms the caller holds actionType at platform
-// scope, and records the decision like any other.
+// scope, and records the decision like any other (see checkPermission).
 //
-// This service is the authorization engine, so it does not call itself over
-// HTTP — it asks its own store the same question /v1/authorize asks. What it
-// asks about is the synthetic platform-scope legal entity (config
+// What it asks about is the synthetic platform-scope legal entity (config
 // AUTHZ_PLATFORM_SCOPE_ENTITY_ID, the same pattern policy-svc uses for a
 // policy with no owning entity), because a platform-wide act has no legal
 // entity of its own.
@@ -523,7 +548,8 @@ func (h *Handler) requirePermission(w http.ResponseWriter, r *http.Request, prin
 // does not match it (see FindGrantedActionsScoped), and making or ending an
 // assignment on that entity itself requires a platform-scope grant (see
 // CreateRoleAssignment and RevokeRoleAssignment). The assigned role may be
-// owned by any tenant — this query runs with no tenant filter.
+// owned by any tenant — the check runs with an empty tenant, deliberately:
+// scoping it to the caller's tenant would refuse every platform act.
 func (h *Handler) requirePlatformAction(w http.ResponseWriter, r *http.Request, principalID, actionType string) bool {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -538,10 +564,7 @@ func (h *Handler) requirePlatformAction(w http.ResponseWriter, r *http.Request, 
 		return false
 	}
 
-	// Empty tenant, deliberately: a platform-wide grant is held against the
-	// platform-scope entity and is NOT satisfied by any tenant-level role, so
-	// scoping this to the caller's tenant would refuse every platform act.
-	actions, basis, err := h.store.FindGrantedActions(r.Context(), principalID, h.platformScopeEntityID, "")
+	granted, err := h.checkPermission(r, principalID, h.platformScopeEntityID, "", actionType)
 	if err != nil {
 		h.log.Error("platform-scope action check failed — refusing",
 			zap.String("correlation_id", correlationID),
@@ -550,34 +573,7 @@ func (h *Handler) requirePlatformAction(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return false
 	}
-
-	outcome, decisionBasis := "DENIED", "no_grant"
-	if contains(actions, actionType) {
-		outcome, decisionBasis = "GRANTED", basis
-	}
-
-	// A platform-wide governance act is a material action, so it gets a
-	// decision artifact whichever way it goes — the same constraint
-	// /v1/authorize is held to. A failure to record is not a reason to
-	// proceed: it is logged and the act is refused below if denied, and
-	// allowed only when the decision was recorded.
-	if _, recErr := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
-		PrincipalID:   principalID,
-		LegalEntityID: h.platformScopeEntityID,
-		ActionType:    actionType,
-		Outcome:       outcome,
-		Basis:         decisionBasis,
-		CorrelationID: correlationID,
-	}); recErr != nil {
-		h.log.Error("platform-scope action: failed to record decision — refusing",
-			zap.String("correlation_id", correlationID),
-			zap.String("action_type", actionType),
-			zap.Error(recErr))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		return false
-	}
-
-	if outcome != "GRANTED" {
+	if !granted {
 		h.siem.Stream(r.Context(), "", "authorization.denied", siem.SeverityHigh,
 			"Platform-scope action "+actionType+" denied for principal "+principalID)
 		writeJSON(w, http.StatusForbidden, map[string]string{
@@ -2688,6 +2684,25 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, pri
 		return "", false
 	}
 
+	// A principal that holds nothing in any tenant could only ever be
+	// answered DENIED, and the decision row would carry no tenant, so no
+	// tenant-scoped audit read would ever show it (Governance audit C-01).
+	// Refused instead of evaluated across tenants.
+	held, err := h.store.FindPrincipalTenants(r.Context(), principalID)
+	if err != nil {
+		h.log.Error("authorize: principal tenant lookup failed — refusing",
+			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return "", false
+	}
+	if len(held) == 0 {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "tenant_required",
+			"message": "the principal holds authority in no tenant; send X-Tenant-Id",
+		})
+		return "", false
+	}
+
 	// Warned at every call so "this tenant's SoD rules never
 	// fired" is diagnosable from the logs rather than from an incident.
 	// The caller is named so the remaining tenantless callers can be listed and
@@ -2789,11 +2804,11 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		req.OrgUnitID = r.Header.Get("X-Org-Unit-Id")
 	}
 
-	authnAge := 0
+	authnAge, authnAgeKnown := 0, false
 	if req.Attributes != nil && req.Attributes["authn_age_seconds"] != "" {
-		authnAge, _ = strconv.Atoi(req.Attributes["authn_age_seconds"])
+		authnAge, authnAgeKnown = parseAuthnAge(req.Attributes["authn_age_seconds"])
 	} else if rawAge := r.Header.Get("X-Authn-Age-Seconds"); rawAge != "" {
-		authnAge, _ = strconv.Atoi(rawAge)
+		authnAge, authnAgeKnown = parseAuthnAge(rawAge)
 	}
 	aud := req.Audience
 	if aud == "" {
@@ -2822,7 +2837,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		ActionType:          req.ActionType,
 		ResourceOwnerID:     req.ResourceOwnerPrincipalID,
 		Attributes:          req.Attributes,
-		Environment:         domain.EnvironmentContext{AuthnAgeSeconds: authnAge, Assurance: r.Header.Get("X-Assurance-Level"), Risk: risk, Audience: aud},
+		Environment:         domain.EnvironmentContext{AuthnAgeSeconds: authnAge, AuthnAgeKnown: authnAgeKnown, Assurance: r.Header.Get("X-Assurance-Level"), Risk: risk, Audience: aud},
 		PrivilegedSessionID: req.PrivilegedSessionID,
 		BreakGlassSessionID: req.BreakGlassSessionID,
 		SupportSessionID:    req.SupportSessionID,
@@ -3769,7 +3784,11 @@ func (h *Handler) RevokeBreakGlassSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	_ = h.publisher.PublishBreakGlassEnded(r.Context(), *bg)
+	// security.break_glass.ended is emitted by the 000030 trigger into the
+	// outbox, in the revoke's own transaction. This handler also wrote it
+	// straight to Kafka and discarded the error, so every revoke published the
+	// event twice — the second copy without a tenant (second-pass scan,
+	// 13 Oct 2026). The started event had already moved to the trigger alone.
 	writeJSON(w, http.StatusOK, bg)
 }
 

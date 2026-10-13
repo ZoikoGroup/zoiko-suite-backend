@@ -67,6 +67,20 @@ var financialTokens = map[string]bool{
 	"FILE": true, "FILING": true, "SUBMISSION": true,
 }
 
+// HasActionToken reports whether any of tokens (upper case) is one of the
+// action's tokens. Matching whole tokens, not substrings: "post" is in
+// "postcode" and "compost", "release" in "prerelease" (Governance audit N-16).
+func HasActionToken(action string, tokens ...string) bool {
+	for _, t := range actionTokens(action) {
+		for _, want := range tokens {
+			if t == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // IsFinancialAction reports whether an action posts, pays or files.
 func IsFinancialAction(action string) bool {
 	for _, t := range actionTokens(action) {
@@ -77,10 +91,19 @@ func IsFinancialAction(action string) bool {
 	return false
 }
 
-// IsHighImpactAction is what makes a JIT session need independent approval:
-// access/platform administration (IsPrivilegedAction) or a financial power.
+// IsHighImpactAction is what makes a JIT session need independent approval
+// (§13 "independent approval for high-impact privileges").
+//
+// Default-deny (Governance audit N-08, 13 Oct 2026): every action that is not
+// a pure read is high-impact, as is any access/platform administration
+// (IsPrivilegedAction) or financial power, read or not. It used to be the
+// reverse — a token denylist of administration and payment/posting/filing —
+// so an approval, a submission, a bank-detail change, a period reopen or a
+// payroll run (PO_APPROVE, TAX_RETURN_SUBMIT, VENDOR_BANK_UPDATE,
+// PERIOD_REOPEN) went ACTIVE at once, self-issued, with no approver. A list of
+// what is dangerous is never complete; the list of what only reads is short.
 func IsHighImpactAction(action string) bool {
-	return IsPrivilegedAction(action) || IsFinancialAction(action)
+	return !IsReadAction(action) || IsPrivilegedAction(action) || IsFinancialAction(action)
 }
 
 // readVerbs are the final tokens of an action that only reads.

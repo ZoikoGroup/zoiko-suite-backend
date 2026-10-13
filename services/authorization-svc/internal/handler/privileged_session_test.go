@@ -28,9 +28,9 @@ func TestPrivilegedSession_Create_Success(t *testing.T) {
 
 	body := `{
 		"principal_id": "` + testPAMElevatedUser + `",
-		"requested_actions": ["emergency.override", "tax.reconcile"],
+		"requested_actions": ["tax.ledger.view", "tax.return.read"],
 		"ticket_ref": "INC-88992",
-		"reason": "Emergency tax reconciliation for month end",
+		"reason": "Investigate month-end tax reconciliation",
 		"duration_seconds": 1800,
 		"resource_scope": "tax-ledger/2026-09",
 		"target_environment": "production"

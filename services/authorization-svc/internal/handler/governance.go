@@ -253,11 +253,7 @@ func (h *Handler) holdsPrivilegedApproval(r *http.Request, principalID, tenantID
 	case legalEntityID != "":
 		scope = legalEntityID
 	}
-	actions, _, err := h.store.FindGrantedActions(r.Context(), principalID, scope, tenant)
-	if err != nil {
-		return false, err
-	}
-	return contains(actions, PermissionApprovePrivileged), nil
+	return h.checkPermission(r, principalID, scope, tenant, PermissionApprovePrivileged)
 }
 
 // assignmentDecider is the store capability behind approve / reject.

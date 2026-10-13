@@ -9,6 +9,7 @@ package domain
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -1005,8 +1006,6 @@ var ErrJurisdictionServiceUnavailable = errorString("jurisdiction-rules-svc unav
 var ErrAuthorityLimitNotFound = errorString("authority limit not found")
 var ErrAuthorityLimitTargetRequired = errorString("authority limit requires at least one of principal_id or role_id")
 var ErrWorkloadBindingNotFound = errorString("workload binding not found")
-var ErrAccessReviewNotFound = errorString("access review not found")
-var ErrAccessReviewAlreadyCompleted = errorString("access review is already completed")
 
 // AuthorityLimit defines the foundational approval and signing limit for a principal
 // or role within an optional legal entity, book, or org-unit scope (ZS-IAM-001 §12, §21, §22).
@@ -1064,10 +1063,30 @@ const (
 // EnvironmentContext captures contextual environment attributes including authentication age,
 // assurance level, operational risk, and audience (ZS-IAM-001 §8.1, §16).
 type EnvironmentContext struct {
-	AuthnAgeSeconds int    `json:"authn_age_seconds,omitempty"`
-	Assurance       string `json:"assurance,omitempty"`
-	Risk            string `json:"risk,omitempty"`
-	Audience        string `json:"audience,omitempty"`
+	AuthnAgeSeconds int `json:"authn_age_seconds,omitempty"`
+	// AuthnAgeKnown says whether the caller stated an authentication age at
+	// all. AuthnAgeSeconds 0 with AuthnAgeKnown false is "not said", which a
+	// step-up action treats as not recent (Governance audit N-07) — it used to
+	// read as a login zero seconds old.
+	AuthnAgeKnown bool   `json:"-"`
+	Assurance     string `json:"assurance,omitempty"`
+	Risk          string `json:"risk,omitempty"`
+	Audience      string `json:"audience,omitempty"`
+}
+
+// UnmarshalJSON records whether authn_age_seconds was present.
+func (e *EnvironmentContext) UnmarshalJSON(b []byte) error {
+	type plain EnvironmentContext
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(b, &keys); err == nil {
+		_, p.AuthnAgeKnown = keys["authn_age_seconds"]
+	}
+	*e = EnvironmentContext(p)
+	return nil
 }
 
 // StepUpRequirement details the required assurance and authentication freshness needed
@@ -1096,6 +1115,10 @@ type CanonicalDecisionRequest struct {
 	DelegationID        *string            `json:"delegation_id,omitempty"`
 	CorrelationID       string             `json:"correlation_id,omitempty"`
 	InitiatingSubjectID string             `json:"initiating_subject_id,omitempty"`
+	// The emergency and support session layers, as on /v1/authorize. The
+	// canonical API accepted only a JIT session_id (Governance audit N-16).
+	BreakGlassSessionID string `json:"break_glass_session_id,omitempty"`
+	SupportSessionID    string `json:"support_session_id,omitempty"`
 }
 
 // CanonicalDecisionResponse matches ZS-IAM-001 §8.2 for POST /internal/authorization/decisions.
@@ -1150,51 +1173,6 @@ type CapabilitiesResponse struct {
 	Permissions   []string        `json:"permissions"`
 	Modules       []string        `json:"modules"`
 	Features      map[string]bool `json:"features"`
-}
-
-// Phase 5: Access Reviews & Continuous Governance (ZS-IAM-001 §21, §24)
-const (
-	ReviewTypePeriodic       = "PERIODIC"
-	ReviewTypeEventTriggered = "EVENT_TRIGGERED"
-	ReviewTypePrivileged     = "PRIVILEGED"
-
-	ReviewStatusOpen      = "OPEN"
-	ReviewStatusCompleted = "COMPLETED"
-	ReviewStatusEscalated = "ESCALATED"
-	ReviewStatusExpired   = "EXPIRED"
-
-	ReviewDecisionKeep     = "KEEP"
-	ReviewDecisionRevoke   = "REVOKE"
-	ReviewDecisionModify   = "MODIFY"
-	ReviewDecisionEscalate = "ESCALATE"
-)
-
-// AccessReview matches ZS-IAM-001 §21, §22, §24 access_reviews table and API.
-type AccessReview struct {
-	ReviewID            string     `json:"review_id"`
-	TenantID            string     `json:"tenant_id"`
-	CampaignID          string     `json:"campaign_id"`
-	CampaignName        string     `json:"campaign_name"`
-	ReviewerPrincipalID string     `json:"reviewer_principal_id"`
-	TargetPrincipalID   string     `json:"target_principal_id"`
-	RoleID              string     `json:"role_id"`
-	LegalEntityID       string     `json:"legal_entity_id"`
-	BookID              *string    `json:"book_id,omitempty"`
-	OrgUnitID           *string    `json:"org_unit_id,omitempty"`
-	ReviewType          string     `json:"review_type"`
-	Status              string     `json:"status"`
-	Decision            *string    `json:"decision,omitempty"`
-	DecisionReason      *string    `json:"decision_reason,omitempty"`
-	DecidedAt           *time.Time `json:"decided_at,omitempty"`
-	DecidedBy           *string    `json:"decided_by,omitempty"`
-	DueAt               time.Time  `json:"due_at"`
-	CreatedAt           time.Time  `json:"created_at"`
-}
-
-// AccessReviewDecideRequest matches POST /v1/iam/access-reviews/{id}:decide body.
-type AccessReviewDecideRequest struct {
-	Decision string `json:"decision"`
-	Reason   string `json:"reason"`
 }
 
 // WorkloadBinding matches ZS-IAM-001 §16 workload_bindings table.

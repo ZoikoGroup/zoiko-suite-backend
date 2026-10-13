@@ -128,6 +128,8 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000028_version_watermark.up.sql",
 		"000029_command_reason_on_events.up.sql",
 		"000030_session_controls.up.sql",
+		"000031_purge_outbox_and_idempotency.up.sql",
+		"000032_regrant_definer_functions.up.sql",
 	}
 	// Three migrations have now been missed from this list. Refuse to run
 	// against a schema the list does not fully describe.

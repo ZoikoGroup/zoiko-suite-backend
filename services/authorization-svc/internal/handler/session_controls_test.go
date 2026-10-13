@@ -96,11 +96,22 @@ func TestSessionControls_JITNeedsEligibleSubjectAndMandatoryFields(t *testing.T)
 }
 
 // High-impact JIT waits for approval; a low-risk one is active at once.
+//
+// Governance audit N-08: "high-impact" used to be a denylist of
+// administration and payment/posting/filing tokens, so the approvals,
+// submissions, bank changes and reopens below went ACTIVE at once,
+// self-issuable. Anything that is not a pure read now waits.
 func TestSessionControls_HighImpactJITIsPending(t *testing.T) {
 	for _, tc := range []struct {
 		action string
 		code   int
-	}{{`"PAYMENT_RELEASE"`, http.StatusAccepted}, {`"iam.role.manage"`, http.StatusAccepted}, {`"ledger.view"`, http.StatusCreated}} {
+	}{
+		{`"PAYMENT_RELEASE"`, http.StatusAccepted}, {`"iam.role.manage"`, http.StatusAccepted},
+		{`"PO_APPROVE"`, http.StatusAccepted}, {`"VENDOR_BANK_UPDATE"`, http.StatusAccepted},
+		{`"PERIOD_REOPEN"`, http.StatusAccepted}, {`"TAX_RETURN_SUBMIT"`, http.StatusAccepted},
+		{`"emergency.override"`, http.StatusAccepted}, {`"payroll.run.execute"`, http.StatusAccepted},
+		{`"ledger.view"`, http.StatusCreated}, {`"tax.return.read"`, http.StatusCreated},
+	} {
 		s := &stubStore{}
 		w := scPost(scRouter(s, false), scAdmin, "/admin/v1/privileged-sessions", jit(tc.action))
 		if w.Code != tc.code {

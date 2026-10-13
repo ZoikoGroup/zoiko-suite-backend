@@ -176,10 +176,6 @@ type Store interface {
 	// Phase 5: Workload Identity & Access Reviews (ZS-IAM-001 §16, §21, §24).
 	FindWorkloadBinding(ctx context.Context, workloadID, tenantID string) (*domain.WorkloadBinding, error)
 	CreateWorkloadBinding(ctx context.Context, wb domain.WorkloadBinding) (*domain.WorkloadBinding, error)
-	ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error)
-	GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error)
-	RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, reason, decidedBy string) (*domain.AccessReview, error)
-	CreateAccessReview(ctx context.Context, r domain.AccessReview) (*domain.AccessReview, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -1249,7 +1245,14 @@ func (s *PgStore) FindDelegationCeilings(ctx context.Context, principalID, legal
 		   AND da.revocation_status = 'ACTIVE'
 		   AND da.effective_from <= NOW()
 		   AND (da.effective_to IS NULL OR da.effective_to > NOW())
-		   AND (da.delegated_actions IS NULL OR da.delegated_actions @> jsonb_build_array($4::text))`
+		   AND (da.delegated_actions IS NULL OR da.delegated_actions @> jsonb_build_array($4::text))
+		   -- the delegator still stands (Governance audit N-02): a suspended
+		   -- or terminated delegator's authority does not flow on through
+		   -- their delegations
+		   AND NOT EXISTS (SELECT 1 FROM principal_status_projection psp
+		                    WHERE psp.principal_id = da.delegator_principal_id
+		                      AND psp.tenant_id = da.tenant_id
+		                      AND psp.status <> 'ACTIVE')`
 	var out []domain.DelegationCeiling
 	evaluate := func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, query, principalID, legalEntityID, tenantID, actionType)
@@ -2027,6 +2030,13 @@ func (s *PgStore) FindDelegationSource(ctx context.Context, delegatePrincipalID,
 		   AND (pra.effective_to IS NULL OR pra.effective_to > NOW())
 		   AND pb.permitted_actions @> jsonb_build_array($6::text)
 		   AND (da.delegated_actions IS NULL OR da.delegated_actions @> jsonb_build_array($6::text))
+		   -- the delegator still stands (Governance audit N-02): a suspended
+		   -- or terminated delegator's authority does not flow on through
+		   -- their delegations
+		   AND NOT EXISTS (SELECT 1 FROM principal_status_projection psp
+		                    WHERE psp.principal_id = da.delegator_principal_id
+		                      AND psp.tenant_id = da.tenant_id
+		                      AND psp.status <> 'ACTIVE')
 		 ORDER BY da.created_at, da.delegated_authority_id
 		 LIMIT 1;`
 	var delegator, delegationID string
@@ -2083,6 +2093,13 @@ func (s *PgStore) FindDelegatedActionsScoped(ctx context.Context, principalID, l
 		   AND (pra.org_unit_id IS NULL OR pra.org_unit_id = NULLIF($5, '')::uuid)
 		   AND pra.effective_from <= NOW()
 		   AND (pra.effective_to IS NULL OR pra.effective_to > NOW())
+		   -- the delegator still stands (Governance audit N-02): a suspended
+		   -- or terminated delegator's authority does not flow on through
+		   -- their delegations
+		   AND NOT EXISTS (SELECT 1 FROM principal_status_projection psp
+		                    WHERE psp.principal_id = da.delegator_principal_id
+		                      AND psp.tenant_id = da.tenant_id
+		                      AND psp.status <> 'ACTIVE')
 		 ORDER BY da.delegator_principal_id;`
 
 	seen := map[string]bool{}
@@ -2288,6 +2305,28 @@ func (s *PgStore) ReleaseRetentionLock(ctx context.Context) error {
 		s.log.Warn("pg ReleaseRetentionLock: this session did not hold the lock")
 	}
 	return nil
+}
+
+// PurgePublishedOutbox deletes outbox rows the relay published longer ago than
+// olderThan (000031; Governance audit N-14). Pending rows are never touched.
+func (s *PgStore) PurgePublishedOutbox(ctx context.Context, olderThan time.Duration) (int64, error) {
+	var n int64
+	if err := s.pool.QueryRow(ctx, `SELECT authz_purge_published_outbox(make_interval(secs => $1));`,
+		olderThan.Seconds()).Scan(&n); err != nil {
+		return 0, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return n, nil
+}
+
+// PurgeIdempotencyKeys deletes Idempotency-Key records older than olderThan,
+// across every tenant (000031; N-14). A retry after that window executes anew.
+func (s *PgStore) PurgeIdempotencyKeys(ctx context.Context, olderThan time.Duration) (int64, error) {
+	var n int64
+	if err := s.pool.QueryRow(ctx, `SELECT authz_purge_idempotency_keys(make_interval(secs => $1));`,
+		olderThan.Seconds()).Scan(&n); err != nil {
+		return 0, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return n, nil
 }
 
 // EnsureAccessDecisionPartition creates the monthly partition covering month.
@@ -3787,187 +3826,4 @@ func (s *PgStore) CreateWorkloadBinding(ctx context.Context, wb domain.WorkloadB
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return &wb, nil
-}
-
-func (s *PgStore) ListAccessReviews(ctx context.Context, tenantID, reviewerID, status string) ([]domain.AccessReview, error) {
-	query := `
-		SELECT review_id, tenant_id, campaign_id, campaign_name, reviewer_principal_id,
-		       target_principal_id, role_id, legal_entity_id, book_id, org_unit_id,
-		       review_type, status, decision, decision_reason, decided_at, decided_by,
-		       due_at, created_at
-		FROM access_reviews
-		WHERE reviewer_principal_id = $1
-		  AND tenant_id = NULLIF($2, '')::uuid`
-	args := []any{reviewerID, tenantID}
-
-	if status != "" {
-		query += ` AND status = $3`
-		args = append(args, strings.ToUpper(status))
-	}
-	query += ` ORDER BY due_at ASC;`
-
-	var results []domain.AccessReview
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var r domain.AccessReview
-			var rID, tID, cID, leID uuid.UUID
-			if err := rows.Scan(
-				&rID, &tID, &cID, &r.CampaignName, &r.ReviewerPrincipalID,
-				&r.TargetPrincipalID, &r.RoleID, &leID, &r.BookID, &r.OrgUnitID,
-				&r.ReviewType, &r.Status, &r.Decision, &r.DecisionReason, &r.DecidedAt, &r.DecidedBy,
-				&r.DueAt, &r.CreatedAt,
-			); err != nil {
-				return err
-			}
-			r.ReviewID = rID.String()
-			r.TenantID = tID.String()
-			r.CampaignID = cID.String()
-			r.LegalEntityID = leID.String()
-			results = append(results, r)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		if isUndefinedTable(err) {
-			return []domain.AccessReview{}, nil
-		}
-		s.log.Error("pg ListAccessReviews failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	if results == nil {
-		results = []domain.AccessReview{}
-	}
-	return results, nil
-}
-
-func (s *PgStore) GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error) {
-	const query = `
-		SELECT review_id, tenant_id, campaign_id, campaign_name, reviewer_principal_id,
-		       target_principal_id, role_id, legal_entity_id, book_id, org_unit_id,
-		       review_type, status, decision, decision_reason, decided_at, decided_by,
-		       due_at, created_at
-		FROM access_reviews
-		WHERE review_id = $1
-		  AND tenant_id = NULLIF($2, '')::uuid
-		LIMIT 1;`
-
-	var r domain.AccessReview
-	var rID, tID, cID, leID uuid.UUID
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, query, reviewID, tenantID)
-		return row.Scan(
-			&rID, &tID, &cID, &r.CampaignName, &r.ReviewerPrincipalID,
-			&r.TargetPrincipalID, &r.RoleID, &leID, &r.BookID, &r.OrgUnitID,
-			&r.ReviewType, &r.Status, &r.Decision, &r.DecisionReason, &r.DecidedAt, &r.DecidedBy,
-			&r.DueAt, &r.CreatedAt,
-		)
-	})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) || isUndefinedTable(err) {
-			return nil, domain.ErrAccessReviewNotFound
-		}
-		s.log.Error("pg GetAccessReview failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	r.ReviewID = rID.String()
-	r.TenantID = tID.String()
-	r.CampaignID = cID.String()
-	r.LegalEntityID = leID.String()
-	return &r, nil
-}
-
-func (s *PgStore) RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, reason, decidedBy string) (*domain.AccessReview, error) {
-	const query = `
-		UPDATE access_reviews
-		SET status = CASE WHEN $3 = 'ESCALATE' THEN 'ESCALATED' ELSE 'COMPLETED' END,
-		    decision = $3,
-		    decision_reason = $4,
-		    decided_at = NOW(),
-		    decided_by = $5
-		WHERE review_id = $1
-		  AND tenant_id = NULLIF($2, '')::uuid
-		  AND status = 'OPEN'
-		RETURNING review_id, tenant_id, campaign_id, campaign_name, reviewer_principal_id,
-		          target_principal_id, role_id, legal_entity_id, book_id, org_unit_id,
-		          review_type, status, decision, decision_reason, decided_at, decided_by,
-		          due_at, created_at;`
-
-	var r domain.AccessReview
-	var rID, tID, cID, leID uuid.UUID
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, query, reviewID, tenantID, decision, reason, decidedBy)
-		return row.Scan(
-			&rID, &tID, &cID, &r.CampaignName, &r.ReviewerPrincipalID,
-			&r.TargetPrincipalID, &r.RoleID, &leID, &r.BookID, &r.OrgUnitID,
-			&r.ReviewType, &r.Status, &r.Decision, &r.DecisionReason, &r.DecidedAt, &r.DecidedBy,
-			&r.DueAt, &r.CreatedAt,
-		)
-	})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) || isUndefinedTable(err) {
-			return nil, domain.ErrAccessReviewNotFound
-		}
-		s.log.Error("pg RecordAccessReviewDecision failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	r.ReviewID = rID.String()
-	r.TenantID = tID.String()
-	r.CampaignID = cID.String()
-	r.LegalEntityID = leID.String()
-	return &r, nil
-}
-
-func (s *PgStore) CreateAccessReview(ctx context.Context, r domain.AccessReview) (*domain.AccessReview, error) {
-	const query = `
-		INSERT INTO access_reviews (
-			review_id, tenant_id, campaign_id, campaign_name, reviewer_principal_id,
-			target_principal_id, role_id, legal_entity_id, book_id, org_unit_id,
-			review_type, status, due_at, created_at
-		) VALUES (
-			COALESCE(NULLIF($1, '')::uuid, gen_random_uuid()), $2, $3, $4, $5,
-			$6, $7, $8, $9, $10,
-			$11, $12, $13, $14
-		);`
-
-	tUUID, err := uuid.Parse(r.TenantID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid tenant_id: %w", err)
-	}
-	cUUID, err := uuid.Parse(r.CampaignID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid campaign_id: %w", err)
-	}
-	leUUID, err := uuid.Parse(r.LegalEntityID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid legal_entity_id: %w", err)
-	}
-
-	createdAt := r.CreatedAt
-	if createdAt.IsZero() {
-		createdAt = time.Now().UTC()
-	}
-	status := r.Status
-	if status == "" {
-		status = domain.ReviewStatusOpen
-	}
-
-	err = s.withRLS(ctx, r.TenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, query,
-			r.ReviewID, tUUID, cUUID, r.CampaignName, r.ReviewerPrincipalID,
-			r.TargetPrincipalID, r.RoleID, leUUID, r.BookID, r.OrgUnitID,
-			r.ReviewType, status, r.DueAt, createdAt,
-		)
-		return err
-	})
-	if err != nil {
-		s.log.Error("pg CreateAccessReview failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return &r, nil
 }

@@ -486,12 +486,25 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 		return nil // Missing tenant, commit and move on
 	}
 
+	// The ordering key ProjectPrincipalStatus refuses a stale event by. Neither
+	// producer sends status_changed_at, so with the payload alone the guard
+	// never fired: a replayed or late ACTIVE could re-activate a principal
+	// suspended or terminated after it (Governance audit N-05) — including
+	// across topics, where an HR exit on access-control's topic and a status
+	// change on identity-context's are not ordered by Kafka at all. The
+	// envelope's emitted_at is stamped as the change is written, so it is the
+	// fallback.
+	changedAt := payload.StatusChangedAt
+	if changedAt == nil {
+		changedAt = env.EmittedAt
+	}
+
 	projected, err := c.store.ProjectPrincipalStatus(ctx, domain.ProjectPrincipalStatusParams{
 		PrincipalID:     principalID,
 		TenantID:        tenantID,
 		Status:          status,
 		SourceService:   source,
-		StatusChangedAt: payload.StatusChangedAt,
+		StatusChangedAt: changedAt,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrPrincipalStatusStale) {

@@ -50,6 +50,13 @@ type evalContext struct {
 	SkipAvailable bool
 }
 
+// boundWorkloadFinder is the store capability that says whether a principal
+// is a bound workload anywhere (N-09). Optional: without it only a declared
+// workload is evaluated as one.
+type boundWorkloadFinder interface {
+	IsBoundWorkload(ctx context.Context, principalID string) (bool, error)
+}
+
 type evalResult struct {
 	Decision         string // PERMIT, DENY, STEP_UP, REQUIRE_APPROVAL (ZS-IAM-001 §7 stage 9)
 	Outcome          string // GRANTED, DENIED, STEP_UP — the /v1/authorize decision_outcome vocabulary
@@ -106,6 +113,19 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 	isWorkload := strings.EqualFold(in.PrincipalType, "WORKLOAD") ||
 		(in.Attributes != nil && strings.EqualFold(in.Attributes["principal_type"], "WORKLOAD")) ||
 		(in.Attributes != nil && in.Attributes["workload_id"] != "")
+	// Not opt-in (Governance audit N-09): a principal that IS a bound
+	// workload in some tenant is evaluated as one whether or not the request
+	// says so. Before, omitting principal_type stepped a workload outside its
+	// binding and into whatever RBAC grants its id held.
+	if !isWorkload {
+		if f, ok := h.store.(boundWorkloadFinder); ok {
+			bound, err := f.IsBoundWorkload(ctx, in.PrincipalID)
+			if err != nil {
+				return nil, fmt.Errorf("workload lookup: %w", err)
+			}
+			isWorkload = bound
+		}
+	}
 
 	if isWorkload {
 		workloadID := in.PrincipalID
@@ -157,6 +177,20 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 				res.NegativeControls = []string{"workload:audience_mismatch"}
 				return res, nil
 			}
+		}
+
+		// The binding's actions bound what the workload may do in this
+		// tenant (N-09: allowed_actions was stored and never read). An
+		// action outside them is denied whatever RBAC would say; one inside
+		// still needs its grant below — the binding narrows, never grants.
+		if !contains(binding.AllowedActions, in.ActionType) {
+			res.Decision = domain.CanonicalDecisionDeny
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = "workload:action_not_bound"
+			res.Reason = "WORKLOAD_ACTION_NOT_BOUND"
+			res.ReasonCodes = []string{"WORKLOAD_ACTION_NOT_BOUND"}
+			res.NegativeControls = []string{"workload:action_not_bound"}
+			return res, nil
 		}
 	}
 
@@ -282,10 +316,12 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 					res.NegativeControls = []string{"support:consent_not_obtained"}
 					return res, nil
 				}
-				isExportAction := strings.Contains(strings.ToLower(in.ActionType), "export")
+				// Whole tokens (N-16): "export" is in SIEM_EXPORTER_READ, which
+				// names an exporter and moves no data.
+				exporting := isExportAction(in.ActionType)
 				isMutationAction := !domain.IsReadAction(in.ActionType)
 
-				if isExportAction && !ss.AllowBulkExport && !contains(ss.AllowedActions, in.ActionType) {
+				if exporting && !ss.AllowBulkExport && !contains(ss.AllowedActions, in.ActionType) {
 					res.Decision = domain.CanonicalDecisionDeny
 					res.Outcome = domain.OutcomeDenied
 					res.Basis = "support:bulk_export_prohibited"
@@ -597,7 +633,7 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 
 	// ── Layer 7: Stage 7 Assurance / Step-Up Handling (Scenario A26, §7, §8.2) ─
 	// Scenario A26: Session authentication too old for period reopen -> STEP_UP
-	if isStepUpRequired(in.ActionType, in.Attributes, in.Environment) {
+	if h.isStepUpRequired(in.ActionType, in.Attributes, in.Environment) {
 		res.Decision = domain.CanonicalDecisionStepUp
 		res.Outcome = domain.OutcomeStepUp
 		res.Basis = "assurance:recent_authn_required"
@@ -606,7 +642,7 @@ func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluati
 		res.Obligations = []string{"REQUIRE_RECENT_AUTHN"}
 		res.StepUp = &domain.StepUpRequirement{
 			RequiredAssurance:  "PHISHING_RESISTANT",
-			MaxAuthnAgeSeconds: DefaultMaxAuthnAgeSecs,
+			MaxAuthnAgeSeconds: h.stepUpPolicy().MaxAuthnAgeSeconds,
 			Reason:             "PERIOD_REOPEN_REQUIRES_RECENT_AUTHN",
 		}
 
@@ -686,7 +722,7 @@ func (h *Handler) computeAvailableActions(ctx context.Context, in evalContext, e
 			res.StepUpActions = append(res.StepUpActions, domain.StepUpActionInfo{
 				Action:             act,
 				RequiredAssurance:  "PHISHING_RESISTANT",
-				MaxAuthnAgeSeconds: DefaultMaxAuthnAgeSecs,
+				MaxAuthnAgeSeconds: h.stepUpPolicy().MaxAuthnAgeSeconds,
 				Reason:             r.Reason,
 			})
 		default:
@@ -827,6 +863,8 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 		Attributes:          req.ResourceAttributes,
 		Environment:         req.Environment,
 		PrivilegedSessionID: req.SessionID,
+		BreakGlassSessionID: req.BreakGlassSessionID,
+		SupportSessionID:    req.SupportSessionID,
 		CorrelationID:       correlationID,
 		InitiatingSubjectID: initiatingSubjectID,
 	}
@@ -940,6 +978,14 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The entity must be in the caller's tenant, as on /v1/authorize
+	// (Governance audit N-06). Without this, tenant A's tenant-wide grants
+	// were listed as usable on tenant B's entity: the UI offered actions
+	// /v1/authorize then refused (GOV-03 negative path #4), and a foreign
+	// entity id could be probed for what it would allow.
+	if _, ok := h.resolveTenantScope(w, r, principalID, "", evaluationEntityID); !ok {
+		return
+	}
 
 	bookID := r.Header.Get("X-Book-Id")
 	if bookID == "" {
@@ -957,13 +1003,14 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	authnAge := 0
+	authnAge, authnAgeKnown := 0, false
 	if rawAge := r.URL.Query().Get("authn_age_seconds"); rawAge != "" {
-		authnAge, _ = strconv.Atoi(rawAge)
+		authnAge, authnAgeKnown = parseAuthnAge(rawAge)
 	}
 
 	env := domain.EnvironmentContext{
 		AuthnAgeSeconds: authnAge,
+		AuthnAgeKnown:   authnAgeKnown,
 		Assurance:       r.URL.Query().Get("assurance"),
 		Risk:            r.URL.Query().Get("risk"),
 	}
@@ -1069,14 +1116,20 @@ func (h *Handler) emitDecisionTelemetry(
 
 // ── Helper Predicates ────────────────────────────────────────────────────────
 
+// The verb classifiers match whole tokens of the action name (split on "." and
+// "_"), not substrings (Governance audit N-16): "release" is in "prerelease",
+// "post" in "postcode".
+
 func isApprovalAction(action string) bool {
-	lower := strings.ToLower(action)
-	return strings.HasSuffix(lower, ".approve") || lower == "approve" || strings.Contains(lower, "approve")
+	return domain.HasActionToken(action, "APPROVE", "APPROVAL")
 }
 
 func isReleaseAction(action string) bool {
-	lower := strings.ToLower(action)
-	return strings.HasSuffix(lower, ".release") || lower == "release" || strings.Contains(lower, "release")
+	return domain.HasActionToken(action, "RELEASE")
+}
+
+func isExportAction(action string) bool {
+	return domain.HasActionToken(action, "EXPORT", "EXPORTS")
 }
 
 func isGrantAction(action string) bool {
@@ -1084,24 +1137,91 @@ func isGrantAction(action string) bool {
 	return strings.HasSuffix(lower, ".grant") || strings.HasSuffix(lower, ".assign") || strings.Contains(lower, "access_assign")
 }
 
-func isStepUpRequired(action string, attrs map[string]string, env domain.EnvironmentContext) bool {
-	lower := strings.ToLower(action)
-	isPeriodReopen := strings.Contains(lower, "period.reopen") || strings.Contains(lower, "period_reopen") || strings.Contains(lower, "reopen")
-	explicitRequire := attrs != nil && (attrs["requires_recent_authn"] == "true" || attrs["step_up_required"] == "true")
+// StepUpPolicy is the server's own step-up rule (ZS-IAM-001 §7 stage 7,
+// Scenario A26; Governance audit N-07).
+//
+// It used to live in the request: the PEP could raise max_authn_age_seconds to
+// any value, and an absent authentication age read as a login zero seconds
+// old, so a caller that sent nothing always passed. Now:
+//   - which actions need step-up is the server's: any "reopen" action plus
+//     Actions (exact names, case-insensitive). A caller may ADD the
+//     requirement (step_up_required / requires_recent_authn) but not remove it;
+//   - the maximum age is MaxAuthnAgeSeconds. A caller may only tighten it;
+//   - an age the caller did not state is unknown, and UnknownAgeStepsUp
+//     decides it: true (the default) answers STEP_UP. False keeps the old
+//     reading, for a deployment whose PEPs cannot yet forward an age —
+//     gateway-auth-svc does not assert one (register A-03).
+type StepUpPolicy struct {
+	Actions            []string
+	MaxAuthnAgeSeconds int
+	UnknownAgeStepsUp  bool
+}
 
-	if isPeriodReopen || explicitRequire {
-		maxAge := DefaultMaxAuthnAgeSecs
-		if attrs != nil && attrs["max_authn_age_seconds"] != "" {
-			if parsed, err := strconv.Atoi(attrs["max_authn_age_seconds"]); err == nil && parsed > 0 {
-				maxAge = parsed
-			}
-		}
-		// If authn age exceeds threshold or is not recent (Scenario A26)
-		if env.AuthnAgeSeconds > maxAge || env.Assurance == "NONE" {
-			return true
+// DefaultStepUpPolicy: five minutes, and an unknown age steps up.
+func DefaultStepUpPolicy() StepUpPolicy {
+	return StepUpPolicy{MaxAuthnAgeSeconds: DefaultMaxAuthnAgeSecs, UnknownAgeStepsUp: true}
+}
+
+// SetStepUpPolicy replaces the step-up policy. A non-positive age keeps the
+// default.
+func (h *Handler) SetStepUpPolicy(p StepUpPolicy) {
+	if p.MaxAuthnAgeSeconds <= 0 {
+		p.MaxAuthnAgeSeconds = DefaultMaxAuthnAgeSecs
+	}
+	h.stepUp = &p
+}
+
+func (h *Handler) stepUpPolicy() StepUpPolicy {
+	if h.stepUp == nil {
+		return DefaultStepUpPolicy()
+	}
+	return *h.stepUp
+}
+
+func (h *Handler) isStepUpRequired(action string, attrs map[string]string, env domain.EnvironmentContext) bool {
+	p := h.stepUpPolicy()
+	required := strings.Contains(strings.ToLower(action), "reopen")
+	for _, a := range p.Actions {
+		if strings.EqualFold(strings.TrimSpace(a), action) {
+			required = true
 		}
 	}
-	return false
+	if attrs != nil && (attrs["requires_recent_authn"] == "true" || attrs["step_up_required"] == "true") {
+		required = true
+	}
+	if !required {
+		return false
+	}
+
+	maxAge := p.MaxAuthnAgeSeconds
+	if attrs != nil && attrs["max_authn_age_seconds"] != "" {
+		// Tighten only: a caller asking for a fresher login is honoured, one
+		// asking to accept an older login is not.
+		if parsed, err := strconv.Atoi(attrs["max_authn_age_seconds"]); err == nil && parsed > 0 && parsed < maxAge {
+			maxAge = parsed
+		}
+	}
+	if env.Assurance == "NONE" {
+		return true
+	}
+	if !env.AuthnAgeKnown {
+		return p.UnknownAgeStepsUp
+	}
+	return env.AuthnAgeSeconds > maxAge
+}
+
+// parseAuthnAge reads a stated authentication age. Anything that is not a
+// non-negative whole number of seconds is NOT a known age (second-pass scan,
+// 13 Oct 2026): "abc" used to parse as 0 and count as a login zero seconds
+// old, and "-600" as one younger than now — both passed step-up, the same
+// fail-open N-07 closed for an absent age. An unknown age is decided by
+// StepUpPolicy.UnknownAgeStepsUp.
+func parseAuthnAge(raw string) (int, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 func checkCoolingWindowActive(changedAtStr string) bool {
@@ -1158,13 +1278,8 @@ func isTerminalLifecycleState(status string) bool {
 }
 
 func isMutationOrApprovalAction(action string) bool {
-	lower := strings.ToLower(action)
-	return strings.HasSuffix(lower, ".edit") || strings.HasSuffix(lower, ".modify") ||
-		strings.HasSuffix(lower, ".update") || strings.HasSuffix(lower, ".approve") ||
-		strings.HasSuffix(lower, ".release") || strings.HasSuffix(lower, ".post") ||
-		strings.HasSuffix(lower, ".cancel") || strings.HasSuffix(lower, ".void") ||
-		strings.HasSuffix(lower, ".reopen") || strings.Contains(lower, "approve") ||
-		strings.Contains(lower, "release") || strings.Contains(lower, "post")
+	return domain.HasActionToken(action, "EDIT", "MODIFY", "UPDATE", "APPROVE", "APPROVAL", "RELEASE",
+		"POST", "POSTING", "CANCEL", "VOID", "REOPEN")
 }
 
 // GetMyCapabilities handles GET /v1/me/capabilities (ZS-IAM-001 §21).
@@ -1192,6 +1307,14 @@ func (h *Handler) GetMyCapabilities(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	evaluationEntityID, ok := h.resolvePlatformScope(w, legalEntityID, correlationID)
 	if !ok {
+		return
+	}
+	// The entity must be in the caller's tenant, as on /v1/authorize
+	// (Governance audit N-06). Without this, tenant A's tenant-wide grants
+	// were listed as usable on tenant B's entity: the UI offered actions
+	// /v1/authorize then refused (GOV-03 negative path #4), and a foreign
+	// entity id could be probed for what it would allow.
+	if _, ok := h.resolveTenantScope(w, r, principalID, "", evaluationEntityID); !ok {
 		return
 	}
 
@@ -1246,17 +1369,20 @@ func (h *Handler) GetMyCapabilities(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		lower := strings.ToLower(perm)
-		if strings.Contains(lower, "release") {
+		// Whole tokens, like every other classifier here (N-16). These used
+		// substrings, so ADDRESS_POSTCODE_UPDATE advertised can_post_journals
+		// and SIEM_EXPORTER_READ can_export — the console then offered actions
+		// /v1/authorize refuses.
+		if isReleaseAction(perm) {
 			features["can_release_payments"] = true
 		}
-		if strings.Contains(lower, "approve") {
+		if isApprovalAction(perm) {
 			features["can_approve"] = true
 		}
-		if strings.Contains(lower, "post") {
+		if domain.HasActionToken(perm, "POST", "POSTING") {
 			features["can_post_journals"] = true
 		}
-		if strings.Contains(lower, "export") {
+		if isExportAction(perm) {
 			features["can_export"] = true
 		}
 	}

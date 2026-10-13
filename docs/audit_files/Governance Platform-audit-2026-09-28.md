@@ -2690,17 +2690,85 @@ run the *Verify* scenario, then re-score the listed audit row. "Row" is the row 
 
 # authorization-svc — open gap register (12 October 2026)
 
-**Status: CLOSED, parked.** Every gap that can be closed inside this service is closed.
-Re-open the service when **mtls-management-svc** and **gateway-auth-svc** are available.
+**Status: CLOSED, parked on gateway-auth-svc.** mtls-management-svc became usable on 12 Oct
+(main `6d003474` exempts `/v1/mtls/certificates` from the envelope, so services can bootstrap
+their certificates), and **A-02 is now closed** (pass 5 below). A-01's remaining half and A-03
+wait on a signed identity assertion and an assurance level from **gateway-auth-svc**.
 
-**Current score:** 81 ✅ / 3 ⚠️ / 1 ❌ of 85 scored = **95.3% full, 97.1% weighted**. That is the
-68 original rows (66 ✅ / 2 ⚠️) plus the 17 session-control rows S-1 to S-17 (15 ✅ / 1 ⚠️ / 1 ❌).
+**Current score:** 82 ✅ / 2 ⚠️ / 1 ❌ of 85 scored = **96.5% full, 97.6% weighted**. That is the
+68 original rows (67 ✅ / 1 ⚠️) plus the 17 session-control rows S-1 to S-17 (15 ✅ / 1 ⚠️ / 1 ❌).
 
 | | ✅ | ⚠️ | ❌ | Full | Weighted |
 |---|---|---|---|---|---|
 | 28 Sep audit (68 rows) | 29 | 20 | 19 | 42.6% | 57.4% |
 | Final re-audit, 12 Oct (85 rows) | 69 | 10 | 6 | 81.2% | 87.1% |
-| **After the session fixes, 12 Oct (85 rows)** | **81** | **3** | **1** | **95.3%** | **97.1%** |
+| After the session fixes, 12 Oct (85 rows) | 81 | 3 | 1 | 95.3% | 97.1% |
+| **After the mTLS workload gate, 12 Oct pass 5 (85 rows)** | **82** | **2** | **1** | **96.5%** | **97.6%** |
+
+### Pass 5, 12 October 2026: mTLS workload gate (A-02 closed, A-01 narrowed)
+
+**What changed:**
+- **New `internal/workload` gate**, mounted ahead of the envelope in `cmd/server/main.go`.
+  - **Covered routes:** `/v1/authorize`, `/v1/sod/evaluate`, `/v1/sod/validate`,
+    `/v1/entity-scope/validate`, `/v1/delegated-access/evaluate` and every `/internal/*` route.
+  - **Caller identity:** taken from the client certificate the mTLS handshake verified
+    (`VerifiedChains`, not `PeerCertificates`). Its CN is the `service_name` that
+    mtls-management-svc issued it for.
+  - **Refusals:** a certificate for a service not on `AUTHZ_PEP_ALLOWLIST` → 403
+    `workload_not_registered`. A certificate whose `X-Workload-Id` claims another name → 403
+    `workload_identity_mismatch`.
+  - **Header rewrite:** `X-Workload-Id` is overwritten with the verified name, so the envelope's
+    actor is the certificate's name, not a header.
+- **`AUTHZ_EVALUATION_MTLS`:**
+  - **`require`** (the default outside `ENV=local`): a plaintext evaluation call is refused 401
+    `client_certificate_required`.
+  - **`permit`** (local): a plaintext call is admitted, but a call that presents a certificate is
+    still checked against the allow-list.
+  - **Startup checks** (`Config.Validate`): require mode refuses to start without
+    `MTLS_ENABLED=true` or with an empty `AUTHZ_PEP_ALLOWLIST`.
+- **Compose:**
+  - The `8089` host port is now bound to `127.0.0.1` (A-01's infra half).
+  - `AUTHZ_EVALUATION_MTLS: "permit"` is set explicitly. The mTLS listener was already on.
+
+**Tests:**
+- **`internal/workload/gate_test.go`:** real TLS handshakes through the production
+  `mtls.ServerTLSConfig`, plus a rogue-CA case that must fail the handshake.
+- **`internal/config/evaluation_mtls_test.go`:** the default mode per `ENV`, and the startup
+  validation.
+- **Mutation check:** five mutants (no allow-list check, no mismatch check, no require mode, no
+  `/internal/` prefix, no header rewrite) are each killed. The full unit suite passes.
+
+**Live check** (compose, `ENV=production`, allow-list `ai-governance-svc`). authz provisioned its
+server certificate from the real mtls-management-svc. Client certificates were minted through
+mtls-svc's bootstrap path.
+
+| Probe | Result |
+|---|---|
+| plaintext `/v1/authorize` and `/internal/authorization/decisions` | 401 `client_certificate_required` |
+| plaintext `/healthz` | 200 |
+| `:8449` with no client certificate | TLS handshake refused |
+| `:8449` with the `ai-governance-svc` certificate | admitted past the gate into the decision engine (see note) |
+| `:8449` with the `payroll-svc` certificate | 403 `workload_not_registered` |
+| `:8449` with the `ai-governance-svc` certificate claiming `payroll-svc` | 403 `workload_identity_mismatch` |
+| `docker port` | `8089 -> 127.0.0.1:8089` |
+
+**Note:** the admitted call then answered 503, because the local `authorization_svc` database
+lacks 000020+ (E-1). The 200-with-decision step of the verify scenario needs E-1 first.
+
+**New cross-service items found in this pass:**
+- **M-01: the mtls-management-svc bootstrap token is not bound to a service.**
+  - **Gap:** any holder of the shared token can mint a certificate for any `service_name`,
+    including a registered PEP's. Three services mount it today: gateway-auth-svc,
+    authorization-svc and ai-governance-svc.
+  - **Effect on A-02:** this weakens A-02 to "any token holder or registered PEP".
+  - **Fix (in mtls-management-svc):** per-service bootstrap tokens, or one-time enrolment.
+- **M-02: PEPs cannot reach the mTLS listener yet.**
+  - **Gap:** 85 of the 88 per-service `internal/mtls` clients send no bootstrap token, so they
+    cannot provision a client certificate. Only ai-governance-svc has `AUTHZ_MTLS_ENABLED=true`.
+  - **Before `require` mode can go live:** each PEP needs its token (or M-01's enrolment),
+    `AUTHZ_MTLS_ENABLED=true` and an entry in `AUTHZ_PEP_ALLOWLIST`.
+  - **Until then:** a non-local deployment must set `AUTHZ_EVALUATION_MTLS=permit` explicitly,
+    or every un-migrated PEP gets 401.
 
 **How to use this register:** pick an item up when its *Waits on* is cleared, apply the fix,
 run the *Verify* scenario, then re-score the listed audit row. Rows A-01 and A-02 are in the
@@ -2717,8 +2785,8 @@ section's *Tenant scope and caller identity* table; S-3 and S-4 are in the *Fina
 
 | ID | Row | Gap | Waits on | Fix in this service once unblocked | Verify |
 |---|---|---|---|---|---|
-| A-01 | "subject_id and tenant are authenticated and server-resolved" ⚠️ | `X-Principal-Id` and `X-Tenant-Id` are trusted as sent. Compose publishes `8089:8089`, the local Traefik route has no ForwardAuth, and the mTLS listener is off (`MTLS_ENABLED` is unset, so false). Anyone who can reach the port can act as any principal in any tenant (X5). The tenant is cross-checked against the registry, but the principal is not checked at all. | **gateway-auth-svc** (a signed identity assertion on forwarded requests) and **mtls-management-svc** (certificates for the listener). Shared infra: remove or loopback-bind the `8089` host port and add ForwardAuth to the Traefik route. | Verify the gateway assertion in `requirePrincipal` (`internal/handler/handler.go:350`) and take principal and tenant from it rather than from the raw headers; mandatory outside `ENV=local`. Turn on the existing mTLS pilot in compose (`MTLS_ENABLED=true`, `MTLS_BOOTSTRAP_TOKEN_PATH`; listener on 8449, `cmd/server/main.go`). Same pattern as secret-vault-integration-svc `inboundmtls`. | A write straight to :8089 with a forged `X-Principal-Id` and no assertion or certificate → 401. The same request through the gateway → normal. An assertion for tenant A with `X-Tenant-Id: B` → 403. |
-| A-02 | "Only internal PEPs call the evaluation endpoint" ⚠️ | `POST /v1/authorize` (`Authorize`, `handler.go:2748`) and `POST /internal/authorization/decisions` do not check which workload is calling. Anyone who can reach the service can probe any principal's grants, and each probe writes a decision-log row. | **mtls-management-svc** (workload certificates for every calling service). | Require a verified client certificate on both evaluation routes, and check its service identity against an allow-list of registered PEPs. Refuse those routes on the plaintext port outside `ENV=local`. | A call with no certificate → 401. A certificate for a service not on the list → 403. A registered PEP's certificate → 200 with the decision recorded. |
+| A-01 | "subject_id and tenant are authenticated and server-resolved" ⚠️ | **Narrowed in pass 5.** The `8089` host port is loopback-bound, the mTLS listener is on, and evaluation calls are bound to a verified workload certificate (the PEP vouches for the principal it forwards). **Still open:** the admin, session and console routes on the plaintext port trust `X-Principal-Id` / `X-Tenant-Id` as sent, from anything on the container network. The local Traefik route stays unauthenticated by design (`all-services.yml:12-16`). authz is not in GTRM's routing map. | **gateway-auth-svc** (a signed identity assertion on forwarded requests; today it sets plain headers, `gateway-auth-svc/internal/handler/handler.go:280-282`). | Verify the gateway assertion in `requirePrincipal` (`internal/handler/handler.go:350`) and take principal and tenant from it rather than from the raw headers; mandatory outside `ENV=local`. | A write straight to :8089 with a forged `X-Principal-Id` and no assertion → 401. The same request through the gateway → normal. An assertion for tenant A with `X-Tenant-Id: B` → 403. |
+| A-02 | "Only internal PEPs call the evaluation endpoint" ✅ | **CLOSED 12 Oct pass 5** (see above): `internal/workload` gate, `AUTHZ_EVALUATION_MTLS` (require outside local) and `AUTHZ_PEP_ALLOWLIST`. | — (rollout waits on M-02; strength waits on M-01) | — | Live: 401 / handshake refused / 403 / 403 / admitted, as in the pass 5 table. |
 | A-03 | S-3 ❌ | No step-up authentication before a privileged (JIT) or break-glass session is issued (ZS-IAM-001 §13 Step-up, §14 Authentication). | **gateway-auth-svc** asserting a verified assurance level (how strong and how recent the login was), plus the standard's open decision on the assurance taxonomy. | In `CreatePrivilegedSession` (`handler.go:3402`), `CreateBreakGlassSession` (`handler.go:3570`) and the approve route (`internal/handler/sessions.go`), require the caller's asserted assurance to be at or above a configured level and recent enough; otherwise 401 `step_up_required`. Store the level on the session row (new migration) and in the decision evidence (the "session assurance" field). | No assurance claim → 401 `step_up_required`. A stale or too-weak claim → 401. A fresh, strong claim → 201 or 202, with the level stored on the session. |
 
 ## B. Needs a decision (no service dependency)
@@ -2743,19 +2811,179 @@ section's *Tenant scope and caller identity* table; S-3 and S-4 are in the *Fina
 | E-2 | **Session permissions start ungranted.** Until `iam.pam.eligible`, `iam.break_glass.eligible`, `iam.pam.approve` and `iam.session.review` are granted (through access-control-svc), every JIT and break-glass request is refused (fail closed). | Grant them to the named people before anyone needs a session. |
 | E-3 | **Roll out the backend and console together.** Compose sets `AUTHZ_COMMAND_CONTRACT=enforce` (also the code default) and `AUTHZ_ENTITY_REGISTRY_URL`. A console without the pass-3 reason forms gets 400 on every revoke, retire and reactivate. | Deploy zoiko-suite-frontend-platform's changes with authorization-svc. Use `AUTHZ_COMMAND_CONTRACT=warn` only as a temporary rollback. |
 | E-4 | **Running the tests safely.** The legacy store tests wipe their target database and skip silently when `TEST_DATABASE_URL` is unset. The `AUTHZ_IT_DSN` suite runs as the NOBYPASSRLS app role (19 pass). Windows Application Control intermittently blocks Go test binaries. | Run the store tests only against a scratch database. Retry a blocked binary per package, or run the suite in `golang:1.25-alpine`. |
-| E-5 | **Everything from 7–12 Oct is uncommitted** on `shashi-changes`: authorization-svc (handler, store, cache, registry client, config, migrations 000029–000030, tests, `ADMIN-API.md`, `progress.md`), access-control-svc migrations 000017–000018, the console forms in zoiko-suite-frontend-platform, the authorization-svc block of `deployments/docker-compose.yml`, and this file. | Review, then commit. |
+| E-5 | The 7–12 Oct work was committed and pushed on `shashi-changes` (`c39cafec`, `5bf822c5`). **Pass 5 is uncommitted:** `internal/workload`, `internal/config` (mode, allow-list, `Validate`), `cmd/server/main.go`, the authorization-svc block of `deployments/docker-compose.yml`, and this file. | Review, then commit. |
 
 ## Re-check order when resuming
 
 1. **E-1, E-2, E-3:** apply the migrations, grant the session permissions, deploy backend and
    console together. Re-run the live session probes from the *Closure* section.
 2. **B-01:** as soon as Security signs off the numbers (no service needed).
-3. **A-01 and A-02:** after mtls-management-svc and gateway-auth-svc, plus the infra change
-   (port and ForwardAuth).
+3. **A-01:** after gateway-auth-svc signs its forwarded identity. A-02 is closed. Before
+   switching a deployment to `AUTHZ_EVALUATION_MTLS=require`, clear M-02 (PEP certificates).
 4. **A-03:** after gateway-auth-svc asserts assurance and the taxonomy is decided.
 5. **C-01, C-02:** any time.
 6. Then re-run the full 85-row re-audit and replace this register. Expected after A-01 to A-03
    and B-01: 85 ✅ / 0 ⚠️ / 0 ❌ (100%).
+
+## Fresh audit, 13 October 2026
+
+A full code read of `services/authorization-svc` on `shashi-changes` (`f0b8f380` plus the
+uncommitted pass 5). It did not rely on the earlier row verdicts. `go build`, `go vet` and
+`go test ./...` are all green. The store integration suites skip without a DSN, and nothing was
+run live. **Nothing has been fixed yet.**
+
+**Verdict:** the 96.5% / 97.6% above is overstated. N-01, N-02 and N-03 contradict rows scored ✅:
+- "Suspension as a negative control"
+- delegation evaluation
+- access reviews (§24)
+
+### N. New gaps (local to this service, not held)
+
+| ID | Sev | Gap | Where | Fix |
+|---|---|---|---|---|
+| N-01 | High | **Admin gates ignore principal suspension.** `requirePermission`, `requirePlatformAction`, `holdsPermission` and `holdsPrivilegedApproval` read RBAC grants only. A principal that identity-context-svc suspended, or an HR exit terminated, is denied on `/v1/authorize` but keeps every IAM admin power: roles, bundles, assignments to others, delegations, SoD/ABAC rules, issuing JIT, break-glass and support sessions, and approving sessions, SoD exceptions and privileged assignments. | `internal/handler/handler.go:462`, `:527`; `access_decisions.go:239`; `governance.go:248` | Run the layer-0 `FindPrincipalStatus` check (tenant-scoped) in all four helpers; deny with basis `principal_status:*` and record the decision. |
+| N-02 | High | **Delegations survive the delegator's suspension.** `FindDelegatedActionsScoped` re-checks that the delegator still holds the role, but not the delegator's `principal_status_projection` row. Layer 0 checks only the delegate. | `internal/store/pg_store.go:2053`; same in `FindDelegationCeilings` / `FindDelegationSource` | `NOT EXISTS (… principal_status_projection … status <> 'ACTIVE')` on the delegator, in the delegation queries. |
+| N-03 | High | **An access-review REVOKE can be recorded without revoking anything.** If listing the assignments fails, the error is skipped. Each `RevokeRoleAssignment` error is discarded (`_, _ =`). The review is then recorded as COMPLETED / REVOKE while the access remains. Also: not atomic, no §16 reason on the revoke, reviewer = target (self-certification) not refused, MODIFY is a no-op, and `iam.access_review.completed` is a direct publish (lost on a Kafka error). | `internal/handler/access_reviews.go:150-178` | Revoke and record in one transaction, and fail with 503 on any error. Refuse reviewer == target. Send the event through the outbox. |
+| N-04 | High (ops) | **The outbox relay publishes about 1 event per second.** It makes one single-message `WriteMessages` call per row. kafka-go v0.4.51 flushes an incomplete batch only after `BatchTimeout` (default 1 s), and `main.go` sets none. Every decision (granted or denied) writes a row, so under real load the backlog grows without bound. The IAM, session and SoD events written by the 000026/000029/000030 triggers queue behind it, so downstream services learn of revocations late. The relay transaction holds its row locks for up to ~100 s per batch. Published rows are never purged. | `internal/outbox/relay.go:109`; `cmd/server/main.go` (kafka.Writer) | One `WriteMessages(batch...)` per pass, and/or `BatchTimeout` of about 10 ms. Add a purge of published rows (with a DELETE grant). Load-test it. |
+| N-05 | Medium | **Replay protection on principal status is inert.** The stale-event guard keys on payload `status_changed_at`, which identity-context-svc never sends. It does send envelope `emitted_at`, but `inbound` doesn't decode it. Two things can therefore re-activate a TERMINATED principal: a replayed or out-of-order `principal.status.changed` ACTIVE, or an ACTIVE event arriving on another topic after `employment.changed`. | `internal/events/lifecycle_consumer.go:235`; `consumer.go:103` | Decode `emitted_at` and fall back to it when the payload timestamp is absent. |
+| N-06 | Medium | **Available-actions and capabilities don't verify the entity's tenant.** `X-Legal-Entity-Id` (or the query) is used without `resolveTenantScope`. Tenant A's tenant-wide grants are therefore listed as available on tenant B's entity. The UI offers actions `/v1/authorize` refuses (GOV-03 negative path #4), and a foreign entity id can be probed. This is the defect fixed on `/v1/authorize` on 12 Oct; these two routes were missed. | `internal/handler/canonical_decisions.go:899`, `:1171` | Call `resolveTenantScope` (registry-verified) on both routes. |
+| N-07 | Medium | **Step-up fails open.** A missing authn age parses as 0 and is treated as fresh. Step-up triggers only for action names containing "reopen" or for caller-set attributes. The caller can raise `max_authn_age_seconds` itself. There is no server-side step-up policy per action. (This is separate from S-3 / A-03, which is about session *issue*.) | `internal/handler/canonical_decisions.go:1087` | A missing age or assurance on a step-up action → STEP_UP. Keep the threshold and the action list server-side (config or table), and ignore caller overrides. |
+| N-08 | Medium | **High-impact JIT classification is a token denylist.** `IsHighImpactAction` misses approve, submit, bank-detail changes, period reopen, payroll and corporate actions. A holder of `iam.pam.manage` who also holds `iam.pam.eligible` can self-issue a session that is ACTIVE at once for `PO_APPROVE`, `VENDOR_BANK_UPDATE`, `PERIOD_REOPEN` or `TAX_RETURN_SUBMIT`. Eligibility is one blanket permission rather than per-capability (§13). | `internal/domain/session_controls.go:82` | Default to high-impact and allow-list the low-risk actions, or use a per-action classification table. Refuse requester == subject for JIT. |
+| N-09 | Medium | **Workload identity is unusable as built.** Nothing creates `workload_bindings`: no API, and no caller of `CreateWorkloadBinding`. So every WORKLOAD-typed request is denied. A binding's `allowed_actions` is never enforced. The workload layer is opt-in: a caller that omits `principal_type` is evaluated as a human. | `canonical_decisions.go:106-158`; `domain/types.go:1205` | Add an admin route for bindings, enforce `allowed_actions`, and derive WORKLOAD from the verified certificate (`internal/workload`) rather than the body. |
+| N-10 | Medium | **Access-review campaigns have no creator.** `CreateAccessReview` and `PublishAccessReviewStarted` are never called; there is no campaign API and no scheduler. §24 certification here is decide-only. | `internal/store/pg_store.go:3926` | Add a campaign API and a periodic generator, or document that access-control-svc owns campaigns and remove the dead path. |
+| N-11 | Medium | **The mTLS server certificate never rotates, and client certificates are not checked for revocation.** The 90-day certificate is provisioned once at boot and `ServerTLSConfig` is static. Once it expires every handshake fails, which in require mode stops all evaluation. With no CRL/OCSP check, a revoked PEP certificate is admitted until it expires. | `cmd/server/main.go:273`; `internal/mtls/mtls.go` | Use `GetCertificate` with background re-provisioning before expiry, plus a revocation check (`VerifyPeerCertificate`) against mtls-management-svc. |
+| N-12 | Low-Med | **`AUTHZ_ENTITY_REGISTRY_URL` is optional outside local.** `Validate()` does not require it. When it is unset, a header tenant is accepted unverified for unprojected entities, and the 12 Oct cross-tenant fix silently regresses (only a WARN is logged). | `internal/config/config.go:404` | Make it required when `ENV` is not local. |
+| N-13 | Low | Session approvals, eligibility checks and privileged-assignment approvals leave no decision artifact: `holdsPermission` / `holdsPrivilegedApproval` don't record one. | `access_decisions.go:239`; `governance.go:248` | Record them as `requirePermission` does. |
+| N-14 | Low | `idempotency_keys` and published `outbox_events` are never purged. | migrations 000020 / 000021 | Retention sweep. |
+| N-15 | Low | The cache-invalidation consumer group is named per hostname, so every pod restart leaves an orphaned group on the broker. It also reads the whole decision topic only to filter it. | `cmd/server/main.go` (invalidationReader) | Use a stable replica id or a group-less reader. |
+| N-16 | Low | The canonical decision API accepts only a JIT session id; break-glass and support sessions can't be used through `/internal/authorization/decisions`. The substring classifiers over-match (`post` matches "postcode", for example), which can only over-deny. | `canonical_decisions.go:810`, `:1153` | Add the two session fields; classify by token. |
+
+### Still held (unchanged from the register above)
+
+| ID | Gap | Waits on |
+|---|---|---|
+| A-01 | Admin, session and console routes trust `X-Principal-Id` / `X-Tenant-Id` from anything on the network | gateway-auth-svc signed identity assertion |
+| A-03 / S-3 | No step-up before a JIT or break-glass session is issued | gateway-auth-svc assurance level + the assurance-taxonomy decision |
+| B-01 / S-4 | Session caps (24 h / 2 h / 24 h) hard-coded; an over-long request is silently shortened | Security sign-off on the numbers |
+| B-02 | Errors are not RFC 9457 problem+json | Platform-wide X9 decision |
+| M-01 | mtls bootstrap token not bound to a service name (weakens A-02) | mtls-management-svc |
+| M-02 | 85 PEPs cannot provision client certificates, so require mode cannot go live | Every PEP (token / enrolment + allow-list entry) |
+| X-1 | About 55 tenantless `/v1/authorize` callers; `AUTHZ_ENFORCE_TENANT_ON_AUTHORIZE` stays false | Calling services; registry replay of `entity.created` |
+| X-2 | PEPs must send the preparer for own-object actions, or they get REQUIRE_APPROVAL | Calling services |
+| E-1 to E-3 | Real DBs lack authorization_svc 000020–000030 and access_control 000017–000018; session permissions ungranted; backend and console must roll out together | Deploy (user) |
+
+Not held but still open: C-01 (tenantless with no grants evaluated tenantless), C-02 (stale
+Postman collection), and E-5 (pass 5 is uncommitted).
+
+**Suggested order:** N-01, N-02, N-03 (authority leaks), N-04 (it will surface the moment real
+traffic arrives), then N-05 to N-09. N-01, N-02, N-03, N-05 and N-06 are small, local changes.
+
+### Fixes, 13 October 2026 (same day, uncommitted)
+
+Every gap this service can close alone is closed. Details are in the service's `progress.md`
+("13 Oct: fresh-audit gaps closed") and `ADMIN-API.md` ("Changes of 13 Oct 2026").
+
+**Verification:**
+- **Unit:** the full suite plus `-race`.
+- **Mutation-checked** where marked (MC).
+- **Integration (IT):** `AUTHZ_IT_DSN` as the NOBYPASSRLS role.
+- **Legacy owner suite:** 66/66.
+- **Live:** an 11-probe smoke of the built binary on scratch Postgres.
+
+| ID | Outcome | Proof |
+|---|---|---|
+| N-01 | ✅ Every admin, approval, eligibility and read gate checks principal status first (`checkPermission`). | unit, MC, live |
+| N-02 | ✅ The delegation queries exclude a delegator who is not ACTIVE in the delegation's tenant. | IT, MC, live |
+| N-03 | ✅ The duplicate access-review surface is removed; access-control-svc owns reviews (its 000011). | unit (routes 404), live |
+| N-04 | ✅ One Kafka write per batch; backlog drained without waiting a tick; 10 ms `BatchTimeout`; Hash balancer. | IT (1 write for 150 rows; partial failure keeps only the failed row) |
+| N-05 | ✅ Envelope `emitted_at` orders principal status events. | unit |
+| N-06 | ✅ Available-actions and capabilities verify the entity's tenant. | unit, MC, live |
+| N-07 | ✅ Server-side step-up policy: callers may only tighten; an unknown age steps up. Compose keeps `permit` until PEPs forward the age. | unit, live |
+| N-08 | ✅ JIT high-impact is default-deny: anything not a pure read waits for approval. | unit |
+| N-09 | ✅ `/v1/admin/workload-bindings`; `allowed_actions` enforced; bound workloads detected whether or not they declare themselves. | unit, MC, IT, live |
+| N-10 | ✅ Resolved with N-03: campaigns are access-control-svc's. | — |
+| N-11 | ⚠️ Rotation ✅ (`mtls.RotatingIdentity`, renews at 2/3 of the certificate's life). Revocation is **held** as M-03. | unit (real handshakes, rogue CA refused) |
+| N-12 | ✅ `AUTHZ_ENTITY_REGISTRY_URL` is required outside `ENV=local`. | unit |
+| N-13 | ✅ Every gate check is recorded. | unit |
+| N-14 | ✅ Migration 000031: purge functions plus the retention sweep. The `FOR ALL` policy admits only the definer function. | IT under a NOSUPERUSER owner, flag theft refused; down/up |
+| N-15 | ✅ `AUTHZ_REPLICA_ID`. | — |
+| N-16 | ✅ Token classifiers; the canonical API takes break-glass and support session ids. | unit |
+| C-01 | ✅ A tenantless question from a principal holding nothing gets `403 tenant_required`. | unit, live |
+| C-02 | ✅ Postman: §16 reasons on 11 commands; session and workload-binding folders. | JSON valid; not run against a stack |
+
+**Held after this pass:**
+- **A-01, A-03 / S-3:** wait on gateway-auth-svc.
+- **B-01 / S-4:** waits on Security.
+- **B-02:** waits on the platform.
+- **M-01, M-02:** wait on mtls-management-svc and the PEPs.
+- **New M-03:** mtls-management-svc publishes no CRL or OCSP, and no certificate-status endpoint a
+  service can call without a principal. A revoked PEP certificate is therefore admitted until it
+  expires. Once it publishes one, add `VerifyPeerCertificate` in `internal/mtls`.
+- **Tenantless callers (X-1) and preparer (X-2):** wait on the calling services.
+- **Deploy (E-1 to E-3, plus 000031):** waits on the user.
+
+**Follow-ups outside this service:**
+- register `iam.workload.manage` in access-control-svc's permission registry;
+- PEPs forward `X-Authn-Age-Seconds`; then set `AUTHZ_STEP_UP_UNKNOWN_AGE=step_up`.
+
+### Coordinated pass with mtls-management-svc, 13 October 2026
+
+Full detail, including the live E2E table, is in `Security & Trust.md` §14. Everything is
+uncommitted.
+
+**Held items cleared:**
+- **M-01: CLOSED** (in mtls-management-svc). Each service has its own bootstrap token, and a
+  token issues a certificate only for its own service name and CN. With M-01 closed, A-02's
+  strength is restored: a token holder can no longer become another PEP.
+- **M-03 / N-11 revocation: CLOSED.**
+  - mtls-management-svc publishes a CA-signed CRL at `GET /v1/mtls/crl`, backed by a durable
+    ledger.
+  - This service's `internal/mtls/revocation.go` checks it on every handshake.
+  - It fails closed with no current CRL and refuses a forged or rolled-back CRL.
+  - `MTLS_REVOCATION_CHECK=require` is the default; `off` is accepted only with `ENV=local`.
+  - Live: a PEP certificate was admitted, revoked, and then refused at the handshake.
+- **E-1: APPLIED on the dev stack.** `migrate.py up` took authorization_svc from 000019 to
+  000032, with a `pg_dump` taken first. The `pra.book_id` error was already gone: the 503 had
+  become `entity_status_projection does not exist`.
+
+**New, fixed and verified:**
+- **AZ-2 (000032).** The guarded `GRANT EXECUTE` in 000011 and 000031 is skipped on a fresh
+  volume, because `init-db.sh` creates roles *after* it migrates. Live, every retention pass
+  failed with `permission denied for function create_access_decision_log_partition`.
+  Reproduced in init order (the IT failed on all 4 functions) and fixed (the IT passes). Live,
+  the runway now reaches 2027-01.
+- **AZ-3: two more substring classifiers.** `/v1/me/capabilities` feature flags, and the
+  support-session export check.
+- **AZ-4: a malformed or negative authn age read as a fresh login.** Step-up failed open; it
+  is now an unknown age.
+- **AZ-5: duplicate `security.break_glass.ended` event.** The trigger outbox *and* a direct
+  Kafka write. The direct write is removed.
+
+**Proof:**
+- `-race` unit and IT: 517 pass, 0 fail.
+- Legacy owner suite: 66/66.
+- Mutants: 9/9 killed.
+- 000031 down/up ×2 under a NOSUPERUSER owner. The purge IT passes under that owner.
+- Live E2E: 24/24, with `ENV=production`, `require` mode and allow-list
+  `mtls-management-svc`. Allow, deny, wrong tenant, missing tenant or principal, and
+  revocation were all covered.
+
+**Score:** the 85 scored rows are unchanged at 82 ✅ / 2 ⚠️ / 1 ❌ (96.5% / 97.6%). A-01 and
+S-4 are still ⚠️ and S-3 is still ❌; all three wait on gateway-auth-svc or Security. Every
+fresh-audit N-gap this service owns is closed, as are AZ-2 to AZ-5.
+
+**Still held:**
+- **A-01, A-03 / S-3:** gateway-auth-svc.
+- **B-01 / S-4:** Security.
+- **B-02:** platform.
+- **M-02:** each PEP. mtls-management-svc is itself migrated: `AUTHZ_MTLS_URL` with a
+  self-issued certificate.
+- **X-1, X-2:** calling services.
+- **`iam.workload.manage` and the six `MTLS_*` actions:** absent from access-control-svc's
+  registry and from `seed-demo-rbac.ps1`. A cross-service and environment item; nothing was
+  fabricated.
+- **Platform:** fix `init-db.sh`'s migrate-then-roles order (AZ-2's root cause), and delete the
+  stale `docker-compose.override.yml`, which still sets `MTLS_ENABLED=false` (user decision).
 
 ---
 

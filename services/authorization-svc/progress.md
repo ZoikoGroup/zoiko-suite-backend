@@ -2385,3 +2385,96 @@ S-4 duration numbers (Security sign-off).
 
 Deploy: authorization_svc 000029 + 000030; access_control 000017 + 000018; then grant the eligibility,
 approval and review permissions (until then JIT and break-glass requests are refused).
+
+## 12 Oct, fifth pass: mTLS workload gate — 82 ✅ / 2 ⚠️ / 1 ❌ of 85 (96.5% / 97.6%)
+
+mtls-management-svc is now usable: main `6d003474` exempts certificate provisioning from the
+envelope. That closed **A-02**, "only internal PEPs call the evaluation endpoint".
+
+**Changes:**
+- **`internal/workload`:** a gate on the evaluation routes and `/internal/*`. Identity comes from
+  the handshake-verified client certificate's CN. The allow-list is `AUTHZ_PEP_ALLOWLIST`; a
+  claimed `X-Workload-Id` must match the certificate and is then overwritten with the verified
+  name.
+- **`AUTHZ_EVALUATION_MTLS`:** require outside `ENV=local`, permit locally. `Config.Validate`
+  refuses require mode without the listener or the allow-list.
+- **Compose:** the `8089` host port is bound to loopback.
+
+**Verification:**
+- **Unit tests:** real TLS tests through `mtls.ServerTLSConfig`; five mutants each killed.
+- **Live:** against the real mtls-management-svc, every verify scenario passed except the final
+  200, which waits on the local DB migrations (E-1).
+
+**Still open:**
+- **A-01:** the admin routes still trust headers, waiting on a gateway-auth-svc signed assertion.
+- **A-03:** step-up, also waiting on gateway-auth-svc.
+- **New cross-service item M-01:** the bootstrap token is not bound to a service name.
+- **New cross-service item M-02:** 85 PEP mTLS clients send no bootstrap token, so they cannot
+  provision certificates.
+- **Before any non-local deployment:** set `AUTHZ_EVALUATION_MTLS=permit` explicitly until M-02
+  is cleared.
+
+## 13 Oct: fresh-audit gaps closed (N-01 to N-16, C-01, C-02)
+
+A fresh code audit on 13 Oct found 16 gaps the earlier passes had missed (register in the
+Governance audit file, "Fresh audit, 13 October 2026"). All the local ones are fixed. Uncommitted.
+
+**Fixed:**
+- **N-01, N-13:** `checkPermission` sits behind every admin, approval, eligibility and read
+  gate. It reads principal status first, then grants, and records the decision on every path.
+  A suspended admin used to keep every IAM power.
+- **N-02:** the three delegation queries exclude a delegator who is not ACTIVE in the
+  delegation's tenant. The cache drops delegation reads on a status change.
+- **N-03, N-10:** the duplicate access-review routes, handler and store code are removed.
+  access-control-svc owns access reviews (its 000011). The copy here could not create a review,
+  and on REVOKE it discarded revocation errors.
+- **N-04:** the relay publishes a batch in one write and drains a backlog. The writer uses a
+  10 ms `BatchTimeout` and the Hash balancer. A whole-batch failure is logged once.
+- **N-05:** `emitted_at` from the envelope orders principal status events.
+- **N-06:** available-actions and capabilities verify the entity's tenant.
+- **N-07:** `StepUpPolicy` is server-side: an action list, a maximum age callers can only
+  tighten, and an unknown age that steps up. Compose sets `AUTHZ_STEP_UP_UNKNOWN_AGE=permit`.
+- **N-08:** `IsHighImpactAction` is default-deny: anything not a pure read waits for approval.
+- **N-09:** `/v1/admin/workload-bindings`. `allowed_actions` is enforced, and a bound workload
+  is detected whether or not it declares itself.
+- **N-11:** `mtls.RotatingIdentity` renews the server certificate at two thirds of its life.
+- **N-12:** `AUTHZ_ENTITY_REGISTRY_URL` is required outside `ENV=local`.
+- **N-14:** migration **000031** adds purge functions, wired into the retention sweep. A
+  `FOR ALL` policy admits only the definer function; a `FOR DELETE` policy purged nothing
+  under a non-superuser owner (measured).
+- **N-15:** `AUTHZ_REPLICA_ID`.
+- **N-16:** the classifiers match whole tokens. The canonical API takes break-glass and
+  support session ids.
+- **C-01:** a tenantless question from a principal holding nothing anywhere gets
+  `403 tenant_required`.
+- **C-02:** the Postman collection now has §16 reasons on 11 commands, plus folders 13
+  (sessions) and 14 (workload bindings).
+
+**Verification:**
+- **Unit:** the full suite, `go vet`, and `-race` in `golang:1.25`.
+- **Mutants:** each was killed (status check, delegator predicate, tenant check, both workload
+  rules).
+- **Integration, `AUTHZ_IT_DSN`, NOBYPASSRLS:** all pass, including four new tests:
+  - delegator suspension;
+  - one Kafka write per batch, with a partial failure;
+  - purge across tenants, plus the refused flag theft, under a NOSUPERUSER owner;
+  - workload bindings.
+- **Legacy owner suite:** 66/66.
+- **Migration 000031:** down / up / down / up on scratch Postgres.
+- **Live smoke:** the built binary on scratch Postgres, 11/11 probes.
+
+**Still held:**
+- **A-01, A-03:** wait on gateway-auth-svc.
+- **B-01:** waits on Security.
+- **B-02:** waits on the platform.
+- **M-01, M-02:** wait on mtls-management-svc and the PEPs.
+- **New M-03:** mtls-management-svc offers no revocation list, OCSP or status endpoint, so a
+  revoked PEP certificate is admitted until it expires.
+- **Follow-ups:**
+  - register `iam.workload.manage` in access-control-svc;
+  - PEPs forward `X-Authn-Age-Seconds`, then set `AUTHZ_STEP_UP_UNKNOWN_AGE=step_up`.
+
+**Deploy:** apply 000031 (with 000020–000030 where missing). Then:
+- outside local, set `AUTHZ_ENTITY_REGISTRY_URL`, or the service will not start;
+- outside compose, set `AUTHZ_STEP_UP_UNKNOWN_AGE=permit` until PEPs forward the
+  authentication age, or financial-close-svc's `PERIOD_REOPEN_APPROVE` gets `STEP_UP`.

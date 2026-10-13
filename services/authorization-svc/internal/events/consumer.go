@@ -108,8 +108,13 @@ type inbound struct {
 	CorrelationID string `json:"correlation_id"`
 	// EffectiveAt orders entity status changes (tenant-entity-registry-svc's
 	// envelope). Absent on producers that do not send it.
-	EffectiveAt *time.Time      `json:"effective_at,omitempty"`
-	Payload     json.RawMessage `json:"payload"`
+	EffectiveAt *time.Time `json:"effective_at,omitempty"`
+	// EmittedAt is when the producer rendered the event — identity-context-svc
+	// and access-control-svc stamp it as the change is written to their
+	// outbox, so it orders their status events and a redelivery carries the
+	// same value. The fallback ordering key for principal status (N-05).
+	EmittedAt *time.Time      `json:"emitted_at,omitempty"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
 // delegationPayload is delegated-authority-svc's authority.* payload.
