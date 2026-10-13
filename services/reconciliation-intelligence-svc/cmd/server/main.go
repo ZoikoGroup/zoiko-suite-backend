@@ -11,9 +11,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+	"zoiko.io/eventing/kafkaout"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
 	"zoiko.io/reconciliation-intelligence-svc/internal/config"
-	"zoiko.io/reconciliation-intelligence-svc/internal/events"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
 	"zoiko.io/reconciliation-intelligence-svc/internal/mtls"
@@ -26,7 +27,11 @@ import (
 const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		_, _ = os.Stderr.WriteString("fatal: failed to load config: " + err.Error() + "\n")
+		os.Exit(1)
+	}
 
 	logger, err := telemetry.NewLogger(cfg.LogLevel)
 	if err != nil {
@@ -51,20 +56,55 @@ func main() {
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 1 * time.Minute
 	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
-	if err != nil {
+
+	// relayCtx/relayDone/cancelRelay stay nil/no-op unless Postgres is up:
+	// MemoryStore has no transaction to enqueue an outbox row into, so there
+	// is nothing for a relay to deliver in that degraded mode either — it
+	// already sacrifices durability for the job data itself.
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relayDone := make(chan struct{}, 1)
+	close(relayDone)
+
+	switch {
+	case err != nil:
 		logger.Warn("Failed to connect to database, falling back to MemoryStore", zap.Error(err))
 		dataStore = store.NewMemoryStore()
-	} else if err := dbPool.Ping(ctx); err != nil {
-		logger.Warn("Database ping failed, falling back to MemoryStore", zap.Error(err))
+	case dbPool.Ping(ctx) != nil:
+		logger.Warn("Database ping failed, falling back to MemoryStore")
 		dataStore = store.NewMemoryStore()
-	} else {
+	default:
 		logger.Info("Connected to PostgreSQL database")
-		dataStore = store.NewPgStore(dbPool)
-	}
+		if err := outbox.VerifySchema(ctx, dbPool); err != nil {
+			logger.Fatal("eventing outbox schema missing", zap.Error(err))
+		}
+		dataStore = store.NewPgStore(dbPool, store.WithEventRegion(cfg.EventResidencyRegion))
 
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewPublisher(brokers, cfg.KafkaTopic, logger)
-	defer publisher.Close()
+		// Reconciliation lifecycle events are written to eventing_outbox in
+		// the same transaction as the job/resolution change; this relay
+		// delivers them. kafkaout requires broker acknowledgement
+		// (RequireAll) — a fire-and-forget writer here would turn a
+		// "published" event into one no broker stored, the exact loss the
+		// outbox exists to prevent.
+		outboxWriter, err := kafkaout.New(kafkaout.Config{
+			Brokers:                strings.Split(cfg.KafkaBrokers, ","),
+			Topic:                  cfg.KafkaTopic,
+			AllowAutoTopicCreation: true,
+		})
+		if err != nil {
+			logger.Fatal("outbox kafka writer", zap.Error(err))
+		}
+		defer func() { _ = outboxWriter.Close() }()
+		relay, err := outbox.NewRelay(dbPool, outboxWriter, outbox.DefaultConfig(), logger)
+		if err != nil {
+			logger.Fatal("outbox relay", zap.Error(err))
+		}
+		relayDone = make(chan struct{}, 1)
+		go func() {
+			relay.Run(relayCtx)
+			relayDone <- struct{}{}
+		}()
+	}
 
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
@@ -80,7 +120,7 @@ func main() {
 
 	financialControlClient := financialcontrol.NewClient(cfg.FinancialControlURL, logger)
 
-	h := handler.NewHandler(dataStore, publisher, authzClient, financialControlClient, logger)
+	h := handler.NewHandler(dataStore, authzClient, financialControlClient, logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{
@@ -110,6 +150,17 @@ func main() {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("Server forced to shutdown", zap.Error(err))
+	}
+
+	// Stop the relay after the server: requests finishing during Shutdown
+	// may still commit events. Anything not delivered stays in the outbox
+	// for the next process — stopping loses nothing. A no-op (MemoryStore
+	// mode) select falls through immediately on the already-closed channel.
+	cancelRelay()
+	select {
+	case <-relayDone:
+	case <-shutdownCtx.Done():
+		logger.Warn("outbox relay did not stop before the shutdown deadline")
 	}
 
 	logger.Info("Server exiting")

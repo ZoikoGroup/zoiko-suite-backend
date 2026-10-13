@@ -10,7 +10,6 @@ import (
 	"go.uber.org/zap"
 	"zoiko.io/reconciliation-intelligence-svc/internal/authz"
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
-	"zoiko.io/reconciliation-intelligence-svc/internal/events"
 	"zoiko.io/reconciliation-intelligence-svc/internal/financialcontrol"
 	"zoiko.io/reconciliation-intelligence-svc/internal/handler"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
@@ -54,12 +53,11 @@ func newFixedToleranceServer(t *testing.T) *httptest.Server {
 func setupTestRouter(t *testing.T) http.Handler {
 	logger := zap.NewNop()
 	memStore := store.NewMemoryStore()
-	publisher := events.NewPublisher([]string{"localhost:9092"}, "zoiko.reconciliation-intelligence.events", logger)
 	authzSrv := newGrantingAuthzServer(t)
 	authzClient := authz.NewClient(authzSrv.URL, logger)
 	financialControlSrv := newFixedToleranceServer(t)
 	financialControlClient := financialcontrol.NewClient(financialControlSrv.URL, logger)
-	h := handler.NewHandler(memStore, publisher, authzClient, financialControlClient, logger)
+	h := handler.NewHandler(memStore, authzClient, financialControlClient, logger)
 
 	return handler.NewRouter(h)
 }
