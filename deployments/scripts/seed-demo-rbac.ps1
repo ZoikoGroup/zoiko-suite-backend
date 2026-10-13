@@ -235,6 +235,93 @@ $BUNDLES = @(
         Actions = @("AR05_ADAPTER_ADMIN", "AR05_EINVOICE_RECONCILE")
     },
     @{
+        # AR-07 Receivables. Disputes/holds are operational; a privileged balance
+        # correction is a separate authority. No role can set a balance directly.
+        Code    = "AR07_RECEIVABLES_OPERATOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR07_DISPUTE_MANAGE", "AR07_HOLD_MANAGE", "AR07_RECEIVABLE_MANAGE")
+    },
+    @{
+        Code    = "AR07_RECEIVABLES_CORRECTOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR07_RECEIVABLE_ADJUST")
+    },
+    @{
+        # AR-06 Credit / Debit Note. Preparing, approving and issuing are separate
+        # roles; the service refuses an approver who is the creator or submitter.
+        Code    = "AR06_CORRECTION_PREPARER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR06_CORRECTION_MANAGE", "AR06_CORRECTION_ISSUE", "AR06_CORRECTION_LINK")
+    },
+    @{
+        Code    = "AR06_CORRECTION_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR06_CORRECTION_APPROVE")
+    },
+    @{
+        # AR-08 Cash Application. Registering/applying cash, approving a manual
+        # match and unapplying are separate authorities; the service refuses the
+        # proposer or registrant as approver and the applier as unapplier.
+        Code    = "AR08_CASH_APPLIER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR08_RECEIPT_REGISTER", "AR08_APPLICATION_MANAGE")
+    },
+    @{
+        Code    = "AR08_CASH_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR08_MANUALMATCH_APPROVE", "AR08_UNAPPLY", "AR08_REAPPLY")
+    },
+    @{
+        # AR-10 Refund / Write-Off. Requesting, approving, submitting for payment,
+        # tax review and committing are separate authorities; write-off approval is
+        # tiered (T1 <= 500, T2 <= 5,000, T3 <= 50,000, T4 unlimited) and the service
+        # refuses the requester, dispute resolver or collector as approver.
+        Code    = "AR10_REFUND_REQUESTER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_REFUND_CREATE", "AR10_REFUND_SUBMIT", "AR10_REFUND_RECONCILE", "AR10_WRITEOFF_CREATE")
+    },
+    @{
+        # AR-09 Collections & Dunning. No role here carries any write-off, refund,
+        # credit or approval authority: collections never changes a balance.
+        Code    = "AR09_COLLECTOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR09_COLLECTIONS_MANAGE", "AR09_DUNNING_SEND", "AR09_HOLD_MANAGE")
+    },
+    @{
+        # AR-to-GL controls. Running a reconciliation and acknowledging its findings
+        # are separate: the principal who ran it cannot acknowledge its findings, and
+        # an acknowledgement only annotates (it never clears) a finding.
+        Code    = "AR_CTL_RECONCILER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR_CTL_RUN_RECONCILIATION")
+    },
+    @{
+        Code    = "AR_CTL_REVIEWER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR_CTL_ACKNOWLEDGE_FINDING")
+    },
+    @{
+        Code    = "AR09_COLLECTIONS_LEAD"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR09_COLLECTIONS_ESCALATE", "AR09_POLICY_MANAGE")
+    },
+    @{
+        Code    = "AR10_REFUND_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_REFUND_APPROVE")
+    },
+    @{
+        Code    = "AR10_WRITEOFF_APPROVER_T1"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_WRITEOFF_APPROVE_T1", "AR10_WRITEOFF_COMMIT")
+    },
+    @{
+        Code    = "AR10_WRITEOFF_APPROVER_T4"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_WRITEOFF_APPROVE_T1", "AR10_WRITEOFF_APPROVE_T2", "AR10_WRITEOFF_APPROVE_T3",
+                    "AR10_WRITEOFF_APPROVE_T4", "AR10_WRITEOFF_TAX_REVIEW", "AR10_WRITEOFF_COMMIT")
+    },
+    @{
         # bank-reconciliation-svc gates ingest, match, exception and statement
         # completion separately. Its two READ routes are not authorized at all
         # -- they are scoped by the verified X-Tenant-Id instead, the same

@@ -62,6 +62,11 @@ type Config struct {
 	// master that AR-01 validates a customer against.
 	CounterpartyMgmtURL string
 
+	// PayeeBankingURL is payee-banking-identity-svc: refund destination
+	// verification (AR-10). AR stores only the destination reference and
+	// fingerprint, never account numbers.
+	PayeeBankingURL string
+
 	// OTELExporterEndpoint is where telemetry sends trace data.
 	OTELExporterEndpoint string
 }
@@ -126,6 +131,7 @@ func Load() (*Config, error) {
 		AccountingPeriodURL:   env("ACCOUNTING_PERIOD_URL", "http://accounting-period-svc:8174"),
 		PostingPrincipalID:    env("AR_POSTING_PRINCIPAL_ID", ""),
 		CounterpartyMgmtURL:   env("COUNTERPARTY_MGMT_URL", "http://counterparty-management-svc:8124"),
+		PayeeBankingURL:       env("PAYEE_BANKING_URL", "http://payee-banking-identity-svc:8166"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
