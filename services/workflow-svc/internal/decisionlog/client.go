@@ -24,24 +24,24 @@ type Client interface {
 }
 
 type RecordDecisionParams struct {
-	TenantID            string
-	LegalEntityID       string
-	ActorPrincipalID    string
-	ActionType          string      // e.g. "WORKFLOW_APPROVED", "WORKFLOW_REJECTED", "WORKFLOW_ESCALATED", "WORKFLOW_CANCELLED", "WORKFLOW_INVALIDATED"
-	ResourceType        string      // "workflow_instance"
-	ResourceID          string
-	Outcome             string      // "APPROVED", "REJECTED", "ESCALATED", "CANCELLED", "INVALIDATED"
-	Rationale           *string
-	CorrelationID       string
-	CausationID         *string
-	WorkflowType        string
-	WorkflowDefinitionID *string
+	TenantID                  string
+	LegalEntityID             string
+	ActorPrincipalID          string
+	ActionType                string // e.g. "WORKFLOW_APPROVED", "WORKFLOW_REJECTED", "WORKFLOW_ESCALATED", "WORKFLOW_CANCELLED", "WORKFLOW_INVALIDATED"
+	ResourceType              string // "workflow_instance"
+	ResourceID                string
+	Outcome                   string // "APPROVED", "REJECTED", "ESCALATED", "CANCELLED", "INVALIDATED"
+	Rationale                 *string
+	CorrelationID             string
+	CausationID               *string
+	WorkflowType              string
+	WorkflowDefinitionID      *string
 	WorkflowDefinitionVersion *int
-	EvidenceRefs        []string
-	SubjectType         *string
-	SubjectID           *string
-	SubjectVersion      *int
-	SubjectFingerprint  *string
+	EvidenceRefs              []string
+	SubjectType               *string
+	SubjectID                 *string
+	SubjectVersion            *int
+	SubjectFingerprint        *string
 }
 
 type decisionLogResponse struct {

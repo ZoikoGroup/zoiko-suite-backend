@@ -444,8 +444,87 @@ func (s *PgStore) workflowBodyDiffers(existing *domain.WorkflowInstance, params 
 	if existing.SubjectFingerprint != nil && params.SubjectFingerprint != nil && *existing.SubjectFingerprint != *params.SubjectFingerprint {
 		return true
 	}
-	// TODO: Compare stages when needed
+
+	// Compare stages: stage order, type, approver, required approvals, quorum pool
+	existingStages, err := s.FindStagesByWorkflowID(context.Background(), existing.WorkflowInstanceID)
+	if err != nil {
+		// If we can't fetch stages, assume they differ to be safe
+		return true
+	}
+	if len(existingStages) != len(params.Stages) {
+		return true
+	}
+	for i := range existingStages {
+		existingStage := existingStages[i]
+		newStage := params.Stages[i]
+		if existingStage.StageOrder != i+1 {
+			return true
+		}
+		existingStageType := existingStage.StageType
+		if existingStageType == "" {
+			existingStageType = domain.StageTypeSingle
+		}
+		newStageType := newStage.StageType
+		if newStageType == "" {
+			newStageType = domain.StageTypeSingle
+		}
+		if existingStageType != newStageType {
+			return true
+		}
+		switch existingStageType {
+		case domain.StageTypeSingle:
+			if existingStage.ApproverPrincipalID != newStage.ApproverPrincipalID {
+				return true
+			}
+		case domain.StageTypeQuorum:
+			requiredApprovals := 0
+			if existingStage.RequiredApprovals != nil {
+				requiredApprovals = *existingStage.RequiredApprovals
+			}
+			if requiredApprovals != newStage.RequiredApprovals {
+				return true
+			}
+			// Fetch quorum approvers from DB for comparison
+			existingApprovers, err := s.fetchQuorumApprovers(context.Background(), existingStage.WorkflowStageID)
+			if err != nil {
+				return true
+			}
+			if !slicesEqual(existingApprovers, newStage.QuorumApprovers) {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *PgStore) fetchQuorumApprovers(ctx context.Context, workflowStageID string) ([]string, error) {
+	const query = `SELECT approver_principal_id FROM workflow_stage_quorum_approvers WHERE workflow_stage_id = $1 ORDER BY approver_principal_id;`
+	rows, err := s.pool.Query(ctx, query, workflowStageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var approvers []string
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			return nil, err
+		}
+		approvers = append(approvers, a)
+	}
+	return approvers, rows.Err()
 }
 
 // findExistingByCorrelation resolves the instance+stages an idempotent

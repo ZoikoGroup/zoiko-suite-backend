@@ -323,6 +323,18 @@ func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed, verifiedTe
 	return false
 }
 
+// requireCorrelationID reads the X-Correlation-ID header, rejecting the
+// request if absent. Used by mutation endpoints that require an explicit
+// correlation ID for idempotency and traceability.
+func (h *Handler) requireCorrelationID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if correlationID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_correlation_id"})
+		return "", false
+	}
+	return correlationID, true
+}
+
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if id := r.Header.Get("X-Correlation-ID"); id != "" {
@@ -800,6 +812,17 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 				actionType = "WORKFLOW_REJECTED"
 				outcome = "REJECTED"
 			}
+			// Populate evidence refs from the stage's rationale and transition metadata
+			evidenceRefs := []string{}
+			if stage.Rationale != nil && *stage.Rationale != "" {
+				evidenceRefs = append(evidenceRefs, "stage_rationale:"+*stage.Rationale)
+			}
+			if req.Rationale != nil && *req.Rationale != "" {
+				evidenceRefs = append(evidenceRefs, "action_rationale:"+*req.Rationale)
+			}
+			if req.CausationID != nil && *req.CausationID != "" {
+				evidenceRefs = append(evidenceRefs, "causation_id:"+*req.CausationID)
+			}
 			decisionID, dlErr := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
 				TenantID:         instance.TenantID,
 				LegalEntityID:    instance.LegalEntityID,
@@ -824,7 +847,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 					}
 					return nil
 				}(),
-				EvidenceRefs:       []string{}, // TODO: populate from stage/transition
+				EvidenceRefs:       evidenceRefs,
 				SubjectType:        instance.SubjectType,
 				SubjectID:          instance.SubjectID,
 				SubjectVersion:     instance.SubjectVersion,
@@ -991,6 +1014,7 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 
 		// Record governance decision per GOV §1 "No evidence afterthought"
 		if h.decisionLog != nil {
+			evidenceRefs := []string{"escalation_reason:stage_timeout_or_manual"}
 			decisionID, dlErr := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
 				TenantID:         instance.TenantID,
 				LegalEntityID:    instance.LegalEntityID,
@@ -1015,7 +1039,7 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 					}
 					return nil
 				}(),
-				EvidenceRefs:       []string{},
+				EvidenceRefs:       evidenceRefs,
 				SubjectType:        instance.SubjectType,
 				SubjectID:          instance.SubjectID,
 				SubjectVersion:     instance.SubjectVersion,
@@ -1081,6 +1105,7 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 
 		// Record governance decision per GOV §1 "No evidence afterthought"
 		if h.decisionLog != nil {
+			evidenceRefs := []string{"cancellation_reason:manual_or_policy"}
 			decisionID, dlErr := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
 				TenantID:         instance.TenantID,
 				LegalEntityID:    instance.LegalEntityID,
@@ -1105,7 +1130,7 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 					}
 					return nil
 				}(),
-				EvidenceRefs:       []string{},
+				EvidenceRefs:       evidenceRefs,
 				SubjectType:        instance.SubjectType,
 				SubjectID:          instance.SubjectID,
 				SubjectVersion:     instance.SubjectVersion,
