@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"zoiko.io/privacy-purpose-registry-svc/internal/middleware"
 )
 
 var ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
@@ -107,9 +109,16 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 	req.Header.Set("X-Principal-Id", principalID)
 	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
 
-	tenantID := legalEntityID
-	if tenantID == "" || tenantID == "00000000-0000-0000-0000-00000000f001" {
-		tenantID = "11111111-1111-1111-1111-111111111111"
+	// X-Tenant-Id is the caller's own VERIFIED tenant, read from the request
+	// context — the same value the handler used for RLS. For a platform-scope
+	// check that is the platform-scope id the caller explicitly sent. It used
+	// to be replaced by one hard-coded tenant UUID for every platform-scope
+	// check, so authorization-svc evaluated platform grants under an
+	// unrelated fake tenant. Only when no tenant is known at all does it fall
+	// back to the scope being asked about.
+	tenantID := middleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		tenantID = legalEntityID
 	}
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Request-Id", uuid.New().String())
