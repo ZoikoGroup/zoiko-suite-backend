@@ -3271,3 +3271,216 @@ access-control-svc suite; race clean in the golang:1.25 container (it also ran t
 Application Control blocks locally); 8 new mutants, all killed; a second live run with the **real
 authorization-svc** (grants seeded as the seed script makes them), the real decision-log and
 policy-svc in full enforce mode against a JWKS: 24/24, plus 3/3 for the own-object SoD forwarding.
+
+
+---
+
+# workflow-svc — re-audit and open gap register (14 October 2026)
+
+Every row of section 6/7 was re-checked against the code as of 14 Oct, with gap #1 (lifecycle
+authorization) already fixed in the working tree (uncommitted). Code was read row by row. Every
+suspected defect below marked **proven** was reproduced against a throwaway Postgres 16 (the real
+migrations; NOBYPASSRLS role where RLS matters) or the real HTTP clients against a fake server.
+The temporary probe tests were deleted afterwards.
+
+**Result:** 26 ✅ / 23 ⚠️ / 12 ❌ / 2 ❓ over **61** scored rows, **42.6% full, 61.5% weighted**
+(28 Sep: 21 / 61, 34% / 49.2%. The 12 Oct code-only re-score, 32 / 23 / 6 (52% / 71%), over-counted:
+the outbox, idempotency, delegation, concurrency and decision-log "fixes" it credited each have a
+hole that only a live run shows).
+
+## Per-row results
+
+| # | Row | 28 Sep | 14 Oct | Why |
+|---|---|---|---|---|
+| 1 | Create approval workflow | ✅ | ✅ | |
+| 2 | Resolve next approver | ⚠️ | ⚠️ | A terminal or ESCALATED workflow is still 404 `workflow_not_found`, same as a missing id; only the current stage is returned |
+| 3 | Submit approval action | ✅ | ✅ | |
+| 4 | Escalate endpoint | ✅ | ✅ | |
+| 5 | Cancel workflow | ✅ | ✅ | |
+| 6 | GetWorkflow | ✅ | ✅ | Transitions still not exposed (row 8) |
+| 7 | ListPendingApprovals | ❌ | ❌ | No route |
+| 8 | GetApprovalEvidence | ❌ | ❌ | No route; `workflow_transitions` is write-only through the API |
+| 9 | RequestChanges | ❌ | ❌ | APPROVE / REJECT only |
+| 10 | Expire | ❌ | ❌ | `due_at` / `next_action_at` added (000015) but never written; no timer, no EXPIRED state |
+| 11 | Subject binding and invalidation | ❌ | ⚠️ | Subject type/id/version/fingerprint (optional), `/invalidate`, `/verify-release`, `workflow.approval.invalidated`. Binding is optional and nothing invalidates automatically (H-5) |
+| 12 | Path and command shape | ❓ | ❓ | C4 |
+| 13 | Versioned definitions, instance pinned | ❌ | ❌ | `workflow_definitions` (000016) and four store methods exist, but no route calls them, CreateWorkflow never sets `workflow_definition_id`, and the table has no RLS |
+| 14 | Route server-resolved | ❌ | ⚠️ | Each named approver is now checked for `WORKFLOW_APPROVE` at create, but the initiator still chooses the approvers |
+| 15 | Initiator not an approver (create) | ✅ | ✅ | SINGLE and QUORUM |
+| 16 | No self-approval (decision) | ✅ | ✅ | Still no `self_approval_blocked` event |
+| 17 | Approver authority fail-closed | ✅ | ✅ | |
+| 18 | Authz call carries tenant and envelope | ❌ | ✅ | `X-Tenant-Id`, legal entity, principal, request id, correlation, causation, source channel and Idempotency-Key are forwarded; authorization-svc resolves the entity owner |
+| 19 | Underlying approval authority | ⚠️ | ⚠️ | One `WORKFLOW_APPROVE` for every workflow type; registered (access-control 000008) but carried by no role template (H-2) |
+| 20 | Independence beyond requester ≠ approver | ⚠️ | ⚠️ | The initiator now goes as `resource_owner_principal_id`; R-INV-09 relationship independence has no data source (H-6) |
+| 21 | Eligibility re-checked at decision | ✅ | ✅ | |
+| 22 | Authorization on escalate / cancel | ❌ | ✅ | Gap #1, 14 Oct (uncommitted): `WORKFLOW_CANCEL` / `WORKFLOW_ESCALATE` for participants, `WORKFLOW_ADMINISTER` otherwise, `WORKFLOW_INVALIDATE` on `/invalidate`. Denies everyone until H-1 |
+| 23 | Delegation paths | ❌ | ❌ | **Proven:** the client calls `POST /v1/authorize/delegation`, which authorization-svc does not have; the 404 is read as "unavailable", so every caller who is not the assigned approver (delegate or stranger) gets **503**, never 200 or 403 |
+| 24 | Quorum / parallel approvals | ❌ | ⚠️ | N-of-M quorum stages exist (000012), but see row 32; no parallel stages |
+| 25 | Duplicate approver across stages | ❌ | ✅ | Handler check plus unique index (000014) |
+| 26 | Required source inputs | ❌ | ⚠️ | Subject ref / version / fingerprint, optional; no requested transition, amount, risk or jurisdiction |
+| 27 | Deadlines, SLA timers, timer recovery | ❌ | ❌ | Columns only; main.go starts no job besides the outbox relay |
+| 28 | Escalation semantics | ⚠️ | ⚠️ | **Proven still a dead end:** escalate sets `current_stage = 0`, so FindCurrentStage answers not-found and the stage approver gets `wrong_approver`, although the store and the edge table now say ESCALATED can be approved. No target or owner change |
+| 29 | A timeout never counts as approval | ✅ | ✅ | Trivially |
+| 30 | Durable state, stuck-instance recovery | ❌ | ❌ | |
+| 31 | Duplicate approval idempotent | ✅ | ✅ | |
+| 32 | Concurrency control | ❌ | ⚠️ | SINGLE approve, cancel, escalate and invalidate use `row_version`. **Proven:** the quorum path updates stage and instance with no version predicate and never bumps `row_version`; concurrent final votes produced two `workflow.completed` in **14 of 15** runs, and a cancel that read first can overwrite APPROVED. No client `expected_version` |
+| 33 | Idempotency-Key honoured | ❌ | ❌ | Key stored (000013), but **proven:** (a) a same-key, same-body retry under the runtime role (NOBYPASSRLS) gets **409 `idempotency_mismatch`**: the body comparison reloads stages with `context.Background()`, RLS hides them, and "can't read" counts as "differs" (passes only as superuser); (b) 000003's `(tenant_id, correlation_id)` unique index is still there, so a second start in the same saga under a new key is **503** (23505); (c) quorum pools compare sorted to caller order. Action endpoints ignore the key |
+| 34 | correlation_id mandatory | ⚠️ | ⚠️ | main.go still generates it before the envelope runs |
+| 35 | Every transition preserved | ✅ | ✅ | `from_state` is hard-coded `PENDING` on approve/reject, wrong after ESCALATED |
+| 36 | Transition log append-only | ⚠️ | ⚠️ | **Proven:** an app-grant role can UPDATE and DELETE `workflow_transitions`; no trigger or REVOKE |
+| 37 | Approver identity and outcome | ✅ | ✅ | |
+| 38 | Rationale where required | ⚠️ | ⚠️ | User rationale only on the mutable stage row (and the dead ledger call); transition text synthetic; REJECT never requires one |
+| 39 | Evidence / decision-log write; evidence_id | ❌ | ❌ | **Proven:** `RecordDecisionParams` has no JSON tags, so the body has Go-cased keys and no `decision_id` or `rule_basis`, and no `X-Purpose-Context`, `Idempotency-Key`, `X-Request-Id`, `X-Source-Channel` or `X-Legal-Entity-Id`: every append is refused (decision-log D-01). Called after commit and only logged on failure; quorum votes never call it; no `evidence_id` in responses. Last hop H-3 |
+| 40 | Evidence lineage, authority snapshot | ❌ | ❌ | `/v1/authorize` returns `access_decision_id`; workflow-svc discards it. No route version |
+| 41 | Published event names (Doc 03) | ✅ | ✅ | Plus `workflow.approval.invalidated`, not in Doc 03 (C3) |
+| 42 | Event names per GOV-06 / R-001 | ❓ | ❓ | C3 |
+| 43 | Outbox, publish after commit | ❌ | ✅ | `outbox_events` written in the business transaction (000011); relay with `FOR UPDATE SKIP LOCKED`, stable `X-Event-ID`, 10-attempt cap |
+| 44 | Publish context | ⚠️ | ✅ | The relay runs on its own context |
+| 45 | Cancellation event | ⚠️ | ⚠️ | Still `workflow.completed` with CANCELLED (C3) |
+| 46 | Event envelope minimum | ⚠️ | ⚠️ | Unchanged: event_id header only; no causation, process version, plane, payload hash or evidence refs; jurisdiction empty |
+| 47 | Per-aggregate ordering | ⚠️ | ⚠️ | Still no message key (LeastBytes) |
+| 48 | Consumed events | ❌ | ❌ | No consumer. All three now have producers (`authority.delegated` delegated-authority-svc, `authorization.denied` authorization-svc, `policy.updated` policy-svc); what to do with them is still unspecified (Q-4) |
+| 49 | Tenant required | ✅ | ✅ | |
+| 50 | Client tenant not authoritative | ✅ | ✅ | |
+| 51 | RLS with NULLIF | ✅ | ✅ | `workflow_instances` only |
+| 52 | Isolation for stages / transitions | ⚠️ | ⚠️ | Still no RLS on stages, transitions, quorum tables, outbox or definitions; reads use the pool. Row 33(a) is a live consequence |
+| 53 | Legal entity server-validated | ⚠️ | ⚠️ | Body `legal_entity_id` not compared with `X-Legal-Entity-Id`; only the approver checks at create make authorization-svc look up its owner |
+| 54 | Malformed id → 400/404 | ⚠️ | ⚠️ | Path ids validated on most routes (not `/quorum-votes`); a non-UUID tenant header or legal entity still reaches the cast → 503 |
+| 55 | Stable error classes | ⚠️ | ⚠️ | Mixed `writeError` and ad-hoc maps |
+| 56 | Actor from verified identity | ✅ | ✅ | |
+| 57 | Gateway authentication | ⚠️ | ⚠️ | Traefik route still stripPrefix only; compose still publishes 8090 (H-4) |
+| 58 | Instance state model | ⚠️ | ⚠️ | INVALIDATED added; ESCALATED undocumented; no InProgress / Expired |
+| 59 | Workflow vs approval state | ⚠️ | ⚠️ | One column |
+| 60 | Approval does not execute the business transition | ✅ | ✅ | |
+| 61 | Common columns | ❌ | ⚠️ | `row_version`, `updated_at`, `plane`, `data_class`, `residency_region` added (000012); `created_by` is never written (always `''`) |
+| 62 | Observability | ✅ | ✅ | |
+| 63 | Health / readiness | ✅ | ✅ | |
+
+## New defects (not separate rows in the 28 Sep audit)
+
+| ID | Defect | Proof |
+|---|---|---|
+| N-1 | Invalidating an already-INVALIDATED workflow is 409 (`INVALIDATED -> INVALIDATED` edge), so a plain retry never reaches the store's idempotent path | Handler probe: 409 `invalid_transition` |
+| N-2 | `POST /v1/workflows/{id}/verify-release` has no authorization call (any tenant principal can probe an approval's subject fingerprint) | Code: handler.go VerifyRelease |
+| N-3 | invoice-approval-svc (caller, not this service) posts to `/v1/workflows/instances`, which does not exist, with a body workflow-svc does not accept and only `X-Tenant-Id`; on any failure it makes up a random workflow id, so its approvals never go through workflow-svc | invoice-approval-svc clients.go StartWorkflowInstance |
+| N-4 | Duplicate migration versions (two `000010_*`, two `000012_*`, no `000008`). Harmless under migrate.py (keyed by filename, sorted), fatal under golang-migrate | `ls deployments/migrations` |
+
+## A. Blocked on another service (on hold)
+
+| ID | Rows | What waits | Service | Why it depends on that service |
+|---|---|---|---|---|
+| H-1 | 22 | Granting cancel / escalate / invalidate to anyone | **access-control-svc** | Must register `WORKFLOW_CANCEL`, `WORKFLOW_ESCALATE`, `WORKFLOW_INVALIDATE`, `WORKFLOW_ADMINISTER` (HIGH) in `permission_definitions` (same shape as its 000019). A permission bundle may only name registered actions (000009 raises otherwise), so until then no role can hold them and the three endpoints answer 403 to everyone |
+| H-2 | 19 | Approvals working on a fresh deployment | **access-control-svc** | `WORKFLOW_APPROVE` is registered but no role template carries it, so every approval is denied until someone grants it by hand. Per-workflow-type action codes are also a decision (Q-6) |
+| H-3 | 39 | Decisions reaching the ledger | **authorization-svc** (grant) + **governance-decision-log-svc** (contract) | The ledger checks `GOVERNANCE_DECISION_RECORD` against the `X-Principal-Id` it receives; workflow-svc sends the human actor, who will not hold it. policy-svc solved the same thing with its own service principal (`svc-policy`, P-06), which needs the grant in authorization-svc. The decision log also requires `X-Purpose-Context` on appends (its D-06). The wire shape, headers and a durable outbox are local and not held |
+| H-4 | 57 | Trusting `X-Tenant-Id` / `X-Principal-Id` | **gateway-auth-svc** / shared deployments | The traefik route and the published port live in `deployments/`, not in this service; the forward-auth middleware is the gateway's, held for every service (as policy-svc P-02) |
+| H-5 | 11 | Automatic material-change invalidation | **The business-object owners** (invoice-approval-svc first, then AP / AR / PO) | workflow-svc does not own the subject, so it only learns of a material change if the owner calls `/invalidate` or emits a change event it consumes (Q-4). invoice-approval-svc does not even start workflows correctly yet (N-3) |
+| H-6 | 20 | R-INV-09 relationship independence (same reporting line, same team) | **org-structure / HR source** (e.g. orgstructure-svc), via authorization-svc | Needs manager / team relationship data that workflow-svc does not hold; authorization-svc's own-object layer covers only "preparer = approver" |
+| H-7 | 17, 18 | Calling authorization-svc once its evaluation gate is set to `require` | **mtls-management-svc** + authorization-svc config | Compose runs `AUTHZ_EVALUATION_MTLS=permit` with an empty allow-list, so the plaintext call works today. Under `require`, workflow-svc needs a client certificate and a place on `AUTHZ_PEP_ALLOWLIST`. Not a gap yet; deploy note |
+
+## B. Needs a decision (no service dependency)
+
+| ID | Rows | Question |
+|---|---|---|
+| Q-1 (C1) | 9, 10, 13, 14, 26, 27, 30, 58, 59 | Is workflow-svc WFC-02 + WFC-03, or only the Doc 03 §8.4 v1? Decides whether RequestChanges, Expire, definitions-driven routes, source inputs, timers and the split state model are defects or roadmap |
+| Q-2 (C4) | 12 | Which API surface binds (Doc 03 capabilities, R-001 §10.1 paths, GOV-06 `/internal/v1/gov06/*`) |
+| Q-3 (C3) | 41, 42, 45 | Event catalogue (dotted, PascalCase or snake_case), incl. a separate cancellation event and `workflow.approval.invalidated` |
+| Q-4 | 48, 11 | What workflow-svc does on `authorization.denied`, `policy.updated`, `authority.delegated` (and on a subject-changed event). The producers exist now; only the behaviour is missing |
+| Q-5 | 15, 16 | R-INV-08: how to tell a service account from a human approver |
+| Q-6 | 19 | One `WORKFLOW_APPROVE`, or an action code per workflow type |
+
+## C. Fixable now in this service (no dependency)
+
+| ID | Rows | Fix |
+|---|---|---|
+| L-1 | 33 | Replay comparison inside the tenant context; drop or narrow 000003's correlation unique index now that the key exists; compare quorum pools as sets |
+| L-2 | 32, 24 | Quorum path: lock the stage (`FOR UPDATE`) or check `row_version` on stage and instance, bump `row_version`; honour `If-Match` / `expected_version` |
+| L-3 | 23 | Delegation through authorization-svc's existing `POST /v1/delegated-access/evaluate` (its `basis` names the delegator; `held_directly` stops the delegator's own grant passing as the delegate's). A stranger then gets 403 again, not 503 |
+| L-4 | 28, 2 | Keep `current_stage` on escalate so the stage stays actionable; escalation target / owner per Q-1 |
+| L-5 | 39, 40, 38 | Ledger wire shape and full envelope through an in-transaction outbox (as policy-svc); record quorum votes; store `access_decision_id`; return `evidence_id`; rationale required on REJECT and kept on the transition |
+| L-6 | 36 | Append-only trigger (or REVOKE UPDATE, DELETE) on `workflow_transitions` and quorum decisions |
+| L-7 | 7, 8 | ListPendingApprovals and GetApprovalEvidence (transitions + decisions) reads |
+| L-8 | 52, 13 | RLS on stages, transitions, quorum tables, outbox and definitions (outbox relay needs a policy that lets it read across tenants) |
+| L-9 | 53, 54, 55, 34 | Body vs `X-Legal-Entity-Id`; UUID checks on every route and header; one error helper; stop generating correlation ids |
+| L-10 | 47, 46, 35, 61 | Kafka key = aggregate id; envelope fields; true `from_state`; write `created_by` |
+| L-11 | N-1, N-2 | Already-INVALIDATED skips the edge check; authorize VerifyRelease |
+
+## Suggested order
+
+1. L-1, L-2, L-3 (data integrity: retries, races, delegation, all proven live).
+2. L-5 + H-3 (evidence: nothing reaches the ledger today).
+3. H-1, H-2 in access-control-svc (so the lifecycle and approve permissions can be granted).
+4. L-4, L-6, L-8, L-11; then the cosmetic L-9 / L-10.
+5. Q-1 … Q-6, then the scope-dependent rows.
+
+
+---
+
+# authorization-svc — auth plane closure (14 October 2026)
+
+**Status:** the three held rows are closed. The 85 scored rows now stand at 85 ✅ / 0 ⚠️ /
+0 ❌. Two of them carry an organisational sign-off that no code can provide; see the last
+table. Everything is uncommitted.
+
+The same pass changed identity-context-svc, gateway-auth-svc and access-control-svc. That
+detail is in `Identity, Scope & Foundation-audit-2026-09-23.md`, "Auth plane closure, 14
+October 2026", and in `services/authorization-svc/progress.md` and `ADMIN-API.md`.
+
+| | ✅ | ⚠️ | ❌ | Full | Weighted |
+|---|---|---|---|---|---|
+| 13 Oct (85 rows) | 82 | 2 | 1 | 96.5% | 97.6% |
+| **14 Oct (85 rows)** | **85** | **0** | **0** | **100%** | **100%** |
+
+## Rows closed
+
+| ID | Before | After | Change | Proof |
+|---|---|---|---|---|
+| **A-01** "subject_id and tenant are authenticated and server-resolved" | ⚠️ | ✅ | `internal/identity`: every non-evaluation route verifies the identity envelope against identity-context-svc's JWKS (RS256, iss, aud, exp) and takes principal and tenant from it. A contradicting header → 403; a failed envelope → 401 in every mode; a delegate counts only by its verified mTLS CN (`AUTHZ_ADMIN_DELEGATES`). `require` is the default outside ENV=local. access-control-svc forwards the person's envelope, or calls over mTLS as a delegate. | 7 gate tests; live (header-only 401, forged principal 403, forged tenant 403, tampered 401, valid 200, evaluation route untouched); mutants killed: header check, require mode, delegate-by-header |
+| **S-3 / A-03** step-up before JIT / break-glass issue | ❌ | ✅ | JIT issue, JIT approval and break-glass issue require `mfa_verified` with `auth_time` ≤ `AUTHZ_SESSION_STEP_UP_MAX_AGE_SECONDS` (900), read only from the verified assertion. Otherwise 401 `step_up_required` with `WWW-Authenticate: insufficient_user_authentication`. Each check is recorded as `iam.session.step_up.*`. What was proven is stored on the row (000033) and returned as `requester_step_up` / `approver_step_up`. The factor is identity-context-svc's TOTP (000012). | 7-way refusal test; IT for 000033 (stored, read back, CHECK pairs level and time); live (refused password-only, issued after step-up, approval refused until the approver stepped up); mutants killed: single factor, stale, delegate, approve |
+| **S-4 / B-01** session maximums | ⚠️ | ✅ | `AUTHZ_MAX_JIT_SECONDS` / `_BREAK_GLASS_` / `_SUPPORT_` (8 h / 2 h / 4 h, chosen 14 Oct). An over-long request → 400 `duration_exceeds_maximum` in the handler and in the store; never clamped. | unit + IT; live (28801 s → 400, 28800 s → 201); mutants killed: handler and store |
+
+**Verification.**
+- Unit: four services, full suites.
+- IT as NOBYPASSRLS: 29 / 29.
+- Legacy owner suite: 68 / 68.
+- Mutants: 18 / 18 killed.
+- Live E2E: 41 / 41.
+- Evidence checked in both databases.
+
+## Two defects the live E2E found elsewhere in the plane (fixed)
+
+- **gateway-auth-svc: nil JWKS HTTP client when mTLS is off.** Every `/verify` returned 500.
+- **identity-context-svc: VERIFIED_CLIENT missing from a CHECK.** Every verified-client
+  resolve returned 503 (000013).
+
+Details are in the Identity audit.
+
+## Sign-off and dependency register after this pass
+
+| ID | Item | Owner |
+|---|---|---|
+| SO-1 | Approve TOTP as the interim "tenant/security-approved high-assurance" factor (ZS-IAM-001 §13; §31 assurance taxonomy). A WebAuthn factor follows. | Security |
+| SO-2 | Approve the session maximums 8 h / 2 h / 4 h (§31 "Numeric JIT and break-glass session limits require Security approval"). | Security |
+| F-1 | The console forwards `Authorization: Bearer <envelope>` on every authorization-svc call; then compose → `AUTHZ_IDENTITY_ASSERTION=require`. | Frontend |
+| F-2 | MFA UI: enrol (QR), activate, step-up prompt on `401 step_up_required` → re-resolve → retry; admin reset page. | Frontend |
+| F-3 | The console's server tier logs in with `client_id` / `client_secret`; then `IDP_CLIENT_AUTH=required`. | Frontend |
+| M-02 | PEP client certificates, then `AUTHZ_EVALUATION_MTLS=require`. | Every PEP |
+| X-1 / X-2 | Tenantless `/v1/authorize` callers; the preparer on own-object actions. | Calling services |
+| X-3 | PEPs forward the gateway's `X-Authn-Age-Seconds` to `/v1/authorize`; then `AUTHZ_STEP_UP_UNKNOWN_AGE=step_up`. | Calling services |
+| R-3 | Every other service verifies the envelope instead of trusting `X-Principal-Id`. | Each service |
+| B-02 | RFC 9457 problem+json (X9). | Platform |
+| P-1 | Delete the stale `docker-compose.override.yml`, which turns authorization-svc's mTLS off. Until then the https JWKS fetch with this service's own certificate is unexercised live. | User / Platform |
+
+## Deploy checklist (additions)
+
+- **Migrations:**
+  - authorization_svc **000033** (after 000032);
+  - identity_context **000012**, **000013**;
+  - access_control **000020** (`IDENTITY_MFA_RESET`, `iam.workload.manage`, `MTLS_*`).
+- **Staging / production secrets:** `MFA_SECRET_KEY` (+ `MFA_SECRET_KEY_ID`) from the secret
+  store. identity-context-svc refuses to start without it.
+- **authorization-svc:** `AUTHZ_IDENTITY_JWKS_URL`
+  (`https://identity-context-svc:8449/.well-known/jwks.json` with `MTLS_ENABLED`) and
+  `AUTHZ_ADMIN_DELEGATES=access-control-svc`.
+- **Enrolment:** everyone who issues or approves sessions enrols TOTP before they need to.
+- **Grants:** `IDENTITY_MFA_RESET` goes to named recovery administrators (HIGH; independent
+  approval).

@@ -57,6 +57,22 @@ components:
         password:
           type: string
           format: password
+        client_id:
+          type: string
+          description: |
+            The confidential OAuth client the person signs in through (the
+            console's server tier). When it proves `client_secret`, the token
+            carries it as a VERIFIED `azp`, which IDP_CLIENT_CHANNELS maps to a
+            verified source channel. Optional unless IDP_CLIENT_AUTH=required.
+            A presented client that fails is refused (401 `invalid_client`),
+            never downgraded to "no client".
+          example: zoiko-console
+        client_secret:
+          type: string
+          format: password
+          description: The client's secret. Never sent from a browser.
+        correlation_id:
+          type: string
       additionalProperties: false
 
     AuthenticateResponse:
@@ -88,10 +104,127 @@ components:
         mfa_required:
           type: boolean
           description: |
-            Whether a second factor is needed before trust posture can reach
-            MFA_VERIFIED. Always false today — no step-up factor is implemented
-            in the estate, so there is nothing a client could do in response to
-            true.
+            Always false: login is password-baseline (ZS-IAM-001 §3, "where
+            permitted by tenant policy"). A second factor is demanded at
+            POST /v1/authenticate/step-up, before a privileged session.
+        mfa_enrolled:
+          type: boolean
+          description: |
+            The principal holds an ACTIVE TOTP factor, so the client can offer
+            step-up rather than enrolment.
+        auth_time:
+          type: integer
+          format: int64
+          description: |
+            When this authentication happened (Unix seconds). Carried on the
+            token and then the envelope as `auth_time`; unlike the envelope's
+            `iat` it does not move on re-resolve.
+        amr:
+          type: array
+          items:
+            type: string
+          description: |
+            Authentication methods (RFC 8176): `["pwd"]` after a password,
+            `["pwd","otp"]` after a TOTP step-up.
+
+    StepUpRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: The current 6-digit code from the enrolled authenticator.
+          example: "123456"
+        correlation_id:
+          type: string
+
+    TOTPEnrollment:
+      type: object
+      description: Returned once. The secret is never readable again.
+      properties:
+        factor_id:
+          type: string
+        secret:
+          type: string
+          description: Unpadded base32 shared secret (160 bits).
+        otpauth_uri:
+          type: string
+          description: Key Uri Format for an authenticator app's QR code.
+        algorithm:
+          type: string
+          enum: [SHA1]
+        digits:
+          type: integer
+          example: 6
+        period:
+          type: integer
+          example: 30
+        status:
+          type: string
+          enum: [PENDING]
+
+    MFAFactor:
+      type: object
+      description: A factor without any secret material.
+      properties:
+        factor_id:
+          type: string
+        principal_id:
+          type: string
+        type:
+          type: string
+          enum: [TOTP]
+        status:
+          type: string
+          enum: [PENDING, ACTIVE, RETIRED]
+        created_at:
+          type: string
+          format: date-time
+        activated_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+        retired_reason:
+          type: string
+        failed_attempts:
+          type: integer
+        locked_until:
+          type: string
+          format: date-time
+
+    ActivateTOTPRequest:
+      type: object
+      required: [factor_id, code]
+      properties:
+        factor_id:
+          type: string
+        code:
+          type: string
+        correlation_id:
+          type: string
+
+    RevokeTOTPRequest:
+      type: object
+      required: [factor_id]
+      properties:
+        factor_id:
+          type: string
+        reason_code:
+          type: string
+        correlation_id:
+          type: string
+
+    ResetMFARequest:
+      type: object
+      required: [reason_code]
+      properties:
+        reason_code:
+          type: string
+          example: LOST_DEVICE
+        purpose:
+          type: string
 
     JWKSResponse:
       type: object
@@ -578,6 +711,9 @@ paths:
           description: |
             Invalid credentials. Covers unknown principal, absent credential,
             locked account and password mismatch — indistinguishable by design.
+            A presented client that does not authenticate is a separate 401
+            with `error_code: invalid_client`; it is checked before the account
+            is touched, so it costs the account no lockout attempt.
           content:
             application/json:
               schema:
@@ -1257,6 +1393,212 @@ paths:
           description: Idempotency key reused with a different request body
         "501":
           description: Support context is not configured in this deployment
+
+  /v1/authenticate/step-up:
+    post:
+      summary: Step up the current session with a TOTP code
+      operationId: stepUp
+      description: |
+        ZS-IAM-001 §3: "Step-up creates a new assurance assertion with bounded
+        age." The caller's session envelope (Authorization) and a code from its
+        ACTIVE factor return a NEW login token with `mfa_done`, `auth_time` =
+        now and `amr` `["pwd","otp"]`. Exchange it at /v1/context/resolve for an
+        envelope with `mfa_verified: true`, which authorization-svc requires
+        before issuing or approving a JIT or break-glass session.
+
+        The caller is identified by the envelope, verified with this service's
+        key and checked against its live session record; X-Principal-Id and
+        X-Tenant-Id, when sent, must name the same principal and tenant (403
+        `identity_mismatch`). The session's verified client (azp) is carried
+        over. A code is accepted once (its time step is recorded), and the
+        factor locks after MFA_MAX_FAILED_ATTEMPTS wrong codes. The response is
+        never stored for idempotent replay: it is a credential.
+      parameters:
+        - name: X-Correlation-ID
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StepUpRequest"
+      responses:
+        "200":
+          description: Stepped up — a new login token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthenticateResponse"
+        "400":
+          description: The code is not 6 digits
+        "401":
+          description: |
+            `session_invalid` (bearer missing, forged, expired, or its session
+            invalidated, or the principal no longer active) or `invalid_code`
+            (wrong, replayed, or the factor is locked — one answer for all three).
+        "403":
+          description: "`identity_mismatch`: a header names someone other than the session"
+        "409":
+          description: "`mfa_not_enrolled`: no ACTIVE factor"
+        "503":
+          description: "`mfa_unavailable` (no MFA_SECRET_KEY) or the store is unreachable"
+
+  /v1/mfa/totp/enroll:
+    post:
+      summary: Start a TOTP enrolment
+      operationId: enrollTOTP
+      description: |
+        Creates a PENDING factor and returns its secret and otpauth:// URI
+        exactly once (no-store; never recorded for idempotent replay). A first
+        factor needs a login no older than MFA_RECENT_AUTH_SECONDS (401
+        `reauthentication_required`). Replacing an ACTIVE factor needs a recent
+        step-up with it (403 `step_up_required`), so a stolen password alone
+        cannot swap someone's second factor. The secret is AES-256-GCM
+        encrypted at rest, bound to its row.
+      responses:
+        "201":
+          description: Enrolment started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TOTPEnrollment"
+        "401":
+          description: "`session_invalid` or `reauthentication_required`"
+        "403":
+          description: "`step_up_required` or `identity_mismatch`"
+        "503":
+          description: "`mfa_unavailable`"
+
+  /v1/mfa/totp/activate:
+    post:
+      summary: Prove a pending factor and make it active
+      operationId: activateTOTP
+      description: |
+        A code from the PENDING factor makes it ACTIVE and retires any previous
+        factor in the same transaction. Activation does not raise the current
+        session's assurance; step up for that.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ActivateTOTPRequest"
+      responses:
+        "200":
+          description: Factor active
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MFAFactor"
+        "400":
+          description: factor_id missing or the code is not 6 digits
+        "401":
+          description: "`session_invalid` or `invalid_code`"
+        "404":
+          description: "`factor_not_found`: no PENDING factor with that id for this principal"
+        "503":
+          description: "`mfa_unavailable`"
+
+  /v1/mfa/totp/revoke:
+    post:
+      summary: Revoke one of the caller's own factors
+      operationId: revokeTOTP
+      description: |
+        Needs a recent step-up (403 `step_up_required`): removing the factor
+        that guards privileged sessions is itself sensitive. A person who has
+        lost their device asks an administrator for a reset instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokeTOTPRequest"
+      responses:
+        "200":
+          description: Retired
+        "401":
+          description: "`session_invalid`"
+        "403":
+          description: "`step_up_required` or `identity_mismatch`"
+        "404":
+          description: "`factor_not_found`"
+
+  /v1/mfa/factors:
+    get:
+      summary: List the caller's own factors
+      operationId: listMFAFactors
+      responses:
+        "200":
+          description: Factors, without secrets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  factors:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/MFAFactor"
+                  count:
+                    type: integer
+        "401":
+          description: "`session_invalid`"
+
+  /v1/principals/{principalId}/mfa/reset:
+    post:
+      summary: Reset another principal's second factor (administrator)
+      operationId: resetPrincipalMFA
+      description: |
+        Credential recovery for a lost device, "separately controlled"
+        (ZS-IAM-001 §3). The administrator is identified by their own session
+        envelope, must hold `IDENTITY_MFA_RESET` in authorization-svc, must have
+        stepped up within MFA_RECENT_AUTH_SECONDS, and cannot reset themselves.
+        Every ACTIVE and PENDING factor of the subject is retired;
+        `identity.mfa_factor.reset` is written with the change and streamed to
+        SIEM at high severity.
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResetMFARequest"
+      responses:
+        "200":
+          description: Factors retired
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  principal_id:
+                    type: string
+                  factors_retired:
+                    type: integer
+        "400":
+          description: reason_code missing
+        "401":
+          description: "`session_invalid`"
+        "403":
+          description: |
+            `self_reset_refused`, `step_up_required`, `identity_mismatch`, or
+            the administrator lacks IDENTITY_MFA_RESET.
+        "404":
+          description: No such principal in the tenant
+        "503":
+          description: authorization-svc or the store is unreachable
 
   /health:
     get:

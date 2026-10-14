@@ -162,6 +162,40 @@ type Config struct {
 	// ReplicaID names this replica's cache-invalidation consumer group. Set it
 	// to something stable across restarts; empty falls back to the hostname.
 	ReplicaID string
+
+	// IdentityAssertion is "require", "warn" or "off" (internal/identity.Mode):
+	// whether a caller of the admin, session and console routes must prove who
+	// it is with the identity envelope (or a registered delegate certificate)
+	// instead of X-Principal-Id (Governance audit register A-01). Defaults to
+	// require everywhere except ENV=local; "off" is refused outside local, and
+	// "warn" outside local is an explicit, logged rollback.
+	IdentityAssertion string
+	// IdentityJWKSURL is identity-context-svc's /.well-known/jwks.json.
+	IdentityJWKSURL string
+	// IdentityIssuer / IdentityAudience are the envelope's iss and aud.
+	IdentityIssuer   string
+	IdentityAudience string
+	// AdminDelegates are services (client certificate CNs) that may act on
+	// the admin routes for a principal they forward, without that principal's
+	// envelope: access-control-svc provisioning an approved grant.
+	AdminDelegates []string
+
+	// SessionStepUp is "enforce" (default) or "off" (ENV=local only): whether
+	// issuing or approving a JIT or break-glass session needs a recent MFA
+	// authentication (ZS-IAM-001 §13/§14; register A-03 / S-3).
+	SessionStepUp string
+	// SessionStepUpMaxAgeSeconds is the oldest MFA authentication that
+	// qualifies, as "bounded age" (§3).
+	SessionStepUpMaxAgeSeconds int
+
+	// MaxJITSeconds, MaxBreakGlassSeconds and MaxSupportSeconds are the session
+	// maximums (register B-01 / S-4). A longer request is refused 400, never
+	// shortened. "Numeric limits require Security approval" (ZS-IAM-001 §31):
+	// the defaults (8 h, 2 h, 4 h) were chosen 14 Oct 2026 and await that
+	// sign-off.
+	MaxJITSeconds        int
+	MaxBreakGlassSeconds int
+	MaxSupportSeconds    int
 }
 
 // Validate refuses a configuration under which no PEP could ever be admitted,
@@ -179,6 +213,42 @@ func (c *Config) Validate() error {
 	// those entities and the 12 Oct cross-tenant fix silently stops applying.
 	if c.Env != "" && !strings.EqualFold(c.Env, "local") && strings.TrimSpace(c.EntityRegistryURL) == "" {
 		return fmt.Errorf("AUTHZ_ENTITY_REGISTRY_URL is required outside ENV=local: without it the tenant of an unprojected entity is not verified")
+	}
+	local := c.Env == "" || strings.EqualFold(c.Env, "local")
+	switch c.IdentityAssertion {
+	case "", "require", "warn":
+	case "off":
+		if !local {
+			return fmt.Errorf("AUTHZ_IDENTITY_ASSERTION=off is only allowed with ENV=local: every admin route would trust X-Principal-Id from anything on the network")
+		}
+	default:
+		return fmt.Errorf("AUTHZ_IDENTITY_ASSERTION must be \"require\", \"warn\" or \"off\", got %q", c.IdentityAssertion)
+	}
+	// "" and 0 below are a Config built without Load (tests); Load always sets
+	// them, so the checks apply to every real configuration.
+	if c.IdentityAssertion != "" && c.IdentityAssertion != "off" && strings.TrimSpace(c.IdentityJWKSURL) == "" {
+		return fmt.Errorf("AUTHZ_IDENTITY_JWKS_URL is required unless AUTHZ_IDENTITY_ASSERTION=off: no envelope could be verified")
+	}
+	switch c.SessionStepUp {
+	case "", "enforce":
+	case "off":
+		if !local {
+			return fmt.Errorf("AUTHZ_SESSION_STEP_UP=off is only allowed with ENV=local: ZS-IAM-001 forbids password-only privileged sessions")
+		}
+	default:
+		return fmt.Errorf("AUTHZ_SESSION_STEP_UP must be \"enforce\" or \"off\", got %q", c.SessionStepUp)
+	}
+	if c.SessionStepUpMaxAgeSeconds != 0 && c.SessionStepUpMaxAgeSeconds < 60 {
+		return fmt.Errorf("AUTHZ_SESSION_STEP_UP_MAX_AGE_SECONDS must be at least 60")
+	}
+	for name, v := range map[string]int{
+		"AUTHZ_MAX_JIT_SECONDS":         c.MaxJITSeconds,
+		"AUTHZ_MAX_BREAK_GLASS_SECONDS": c.MaxBreakGlassSeconds,
+		"AUTHZ_MAX_SUPPORT_SECONDS":     c.MaxSupportSeconds,
+	} {
+		if v != 0 && (v < 60 || v > 86400) {
+			return fmt.Errorf("%s must be between 60 and 86400 seconds, got %d", name, v)
+		}
 	}
 	switch c.MTLSRevocationCheck {
 	case "", "require": // "" is Load's default, require
@@ -466,7 +536,28 @@ func Load() (*Config, error) {
 		StepUpMaxAuthnAgeSeconds: envInt("AUTHZ_STEP_UP_MAX_AUTHN_AGE_SECONDS", 300),
 		StepUpUnknownAge:         strings.ToLower(env("AUTHZ_STEP_UP_UNKNOWN_AGE", "step_up")),
 		ReplicaID:                strings.TrimSpace(env("AUTHZ_REPLICA_ID", "")),
+
+		IdentityAssertion: strings.ToLower(env("AUTHZ_IDENTITY_ASSERTION", defaultIdentityAssertion(envName))),
+		IdentityJWKSURL:   env("AUTHZ_IDENTITY_JWKS_URL", ""),
+		IdentityIssuer:    env("AUTHZ_IDENTITY_ISSUER", "identity-context-svc"),
+		IdentityAudience:  env("AUTHZ_IDENTITY_AUDIENCE", "zoiko-internal"),
+		AdminDelegates:    splitTopics(env("AUTHZ_ADMIN_DELEGATES", "")),
+
+		SessionStepUp:              strings.ToLower(env("AUTHZ_SESSION_STEP_UP", "enforce")),
+		SessionStepUpMaxAgeSeconds: envInt("AUTHZ_SESSION_STEP_UP_MAX_AGE_SECONDS", 900),
+
+		MaxJITSeconds:        envInt("AUTHZ_MAX_JIT_SECONDS", 8*3600),
+		MaxBreakGlassSeconds: envInt("AUTHZ_MAX_BREAK_GLASS_SECONDS", 2*3600),
+		MaxSupportSeconds:    envInt("AUTHZ_MAX_SUPPORT_SECONDS", 4*3600),
 	}, nil
+}
+
+// defaultIdentityAssertion is require outside a local stack.
+func defaultIdentityAssertion(envName string) string {
+	if strings.EqualFold(envName, "local") {
+		return "warn"
+	}
+	return "require"
 }
 
 func env(key, def string) string {

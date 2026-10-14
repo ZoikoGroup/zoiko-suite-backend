@@ -428,3 +428,70 @@ kubectl logs deploy/identity-context-svc | grep -i "authorization client"
   second replica is how a tenant-isolation policy ends up missing.
 - **Do not "fix" a residency denial by adding the policy to the allow-list**
   without checking which region the pod is in. The denial may be correct.
+- **Do not rotate `MFA_SECRET_KEY` by replacing it.** Every enrolled factor was
+  sealed under the old key and would stop working at once (step-up answers 503,
+  `identity.mfa_factor.secret_unusable` in SIEM). Rotate as in §11.2.
+
+## 11. Second factor (TOTP) and login clients
+
+Added 14 Oct 2026 (migrations 000012, 000013). ZS-IAM-001 §3/§13/§14 forbid
+password-only privileged sessions; authorization-svc refuses to issue or
+approve a JIT or break-glass session unless the caller's envelope carries
+`mfa_verified` with an `auth_time` at most 15 minutes old.
+
+### 11.1 How a person gets a stepped-up session
+
+1. Log in (`POST /v1/authenticate`), resolve (`/v1/context/resolve`).
+2. First time only: `POST /v1/mfa/totp/enroll` (within 15 min of the login),
+   scan the `otpauth_uri`, then `POST /v1/mfa/totp/activate` with a code.
+3. `POST /v1/authenticate/step-up` with a current code → a new login token
+   (`mfa_done`, `amr: ["pwd","otp"]`, `auth_time` now) → resolve again.
+4. Use the new envelope for the privileged request.
+
+All MFA routes identify the caller by the envelope in `Authorization`; a
+contract header naming someone else is 403 `identity_mismatch`.
+
+### 11.2 The encryption key
+
+- `MFA_SECRET_KEY` (base64, 32 bytes) + `MFA_SECRET_KEY_ID`. Required in staging
+  and production (the service refuses to start without it); locally, unset
+  means the MFA routes answer 503.
+- Rotation: deploy with the NEW key as `MFA_SECRET_KEY` / `MFA_SECRET_KEY_ID`
+  and the old one in `MFA_SECRET_PREVIOUS_KEYS="<old-id>:<old-base64>"`. New
+  enrolments use the new key; existing factors keep working. Remove the old key
+  only when `SELECT count(*) FROM principal_credentials WHERE credential_type =
+  'TOTP' AND status = 'ACTIVE' AND secret_key_id = '<old-id>'` is 0.
+
+### 11.3 Lost device
+
+An administrator holding `IDENTITY_MFA_RESET` (access-control-svc 000020; HIGH,
+so the grant needs independent approval), with their own recent step-up, calls
+`POST /v1/principals/{id}/mfa/reset` with a `reason_code`. Every factor of the
+subject is retired; the person re-enrols after a fresh login. Self-reset is
+refused. Each reset is `identity.mfa_factor.reset` on the outbox and a HIGH
+SIEM event.
+
+### 11.4 Lockout
+
+`MFA_MAX_FAILED_ATTEMPTS` (5) wrong codes lock the factor for
+`MFA_LOCK_DURATION_SECONDS` (900); it lapses on its own. A replayed code (same
+30 s step) is refused like a wrong one. The reason is in `access_decision_log`
+(`totp_mismatch`, `totp_replayed`, `totp_factor_locked`) and on
+`identity.step_up.failed`, never on the wire.
+
+### 11.5 Login clients (verified source channel)
+
+`IDP_CLIENT_SECRETS_FILE` maps each confidential client to the SHA-256 of its
+secret (`{"zoiko-console": "sha256:<hex>"}`); `IDP_CLIENT_CHANNELS` maps it to a
+channel (`zoiko-console=web`). A login that proves the client gets a verified
+`azp`, and its session a VERIFIED source channel (`X-Source-Channel-Basis:
+verified` at the gateway). `IDP_CLIENT_AUTH=optional` admits logins without a
+client; switch to `required` once the console's server tier sends
+`client_id` / `client_secret`. A presented client that fails is 401
+`invalid_client`, decided before the account is touched (no lockout attempt).
+To mint a secret: `openssl rand -base64 32`, then store
+`sha256:$(printf %s "$SECRET" | sha256sum | cut -d' ' -f1)`.
+
+TOTP is not phishing-resistant. It is the interim high-assurance factor
+pending Security's approval (ZS-IAM-001 §31, "session assurance taxonomy") and
+a WebAuthn factor.

@@ -522,6 +522,15 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		SupportContextID: req.SupportContextID,
 		SourceChannel:    envelopeChannel,
 
+		// From the VERIFIED login token: when the person authenticated and how
+		// (a password, or a TOTP step-up), and the client they authenticated
+		// through. iat above is when this envelope was minted, which a
+		// re-resolve refreshes; auth_time does not move until the person
+		// authenticates again (Group 1 register R-2).
+		AuthTime:        unixOrZero(claims.AuthTime),
+		AMR:             claims.AMR,
+		AuthorizedParty: claims.ClientID,
+
 		CorrelationID: req.CorrelationID,
 		SchemaVersion: "1.0",
 	}
@@ -970,3 +979,12 @@ func detach(ctx context.Context) (context.Context, context.CancelFunc) {
 // broker round trip including a metadata refresh, short enough that Drain's
 // budget is not consumed by one stuck write.
 const eventPublishTimeout = 5 * time.Second
+
+// unixOrZero is t in Unix seconds, or 0 (omitted from the envelope) for the
+// zero time, so an unknown authentication time is absent rather than 1970.
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}

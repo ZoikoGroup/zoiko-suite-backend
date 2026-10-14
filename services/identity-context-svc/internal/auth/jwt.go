@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 
@@ -34,6 +35,10 @@ type idpClaims struct {
 	MFADone  bool   `json:"mfa_done"`
 	// AuthorizedParty is the OIDC azp: the client the token was issued to.
 	AuthorizedParty string `json:"azp"`
+	// AuthTime is the OIDC auth_time: when the person authenticated.
+	AuthTime *jwt.NumericDate `json:"auth_time,omitempty"`
+	// AMR is the authentication methods (RFC 8176).
+	AMR []string `json:"amr,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -69,12 +74,89 @@ func (v *JWTVerifier) VerifyBearer(_ context.Context, token string) (*domain.Ver
 	if claims.TenantID == "" {
 		return nil, errors.New("token missing tenant_id claim")
 	}
+	// A token minted before auth_time existed authenticated when it was
+	// issued, so iat is its auth_time. jwt.WithIssuedAt above has already
+	// refused one issued in the future.
+	authTime := claims.IssuedAt
+	if claims.AuthTime != nil {
+		authTime = claims.AuthTime
+	}
+	if authTime == nil {
+		return nil, errors.New("token carries neither auth_time nor iat")
+	}
+	if authTime.After(time.Now().Add(time.Minute)) {
+		return nil, errors.New("token auth_time is in the future")
+	}
 	return &domain.VerifiedClaims{
 		Subject:  claims.Subject,
 		TenantID: claims.TenantID,
 		MFADone:  claims.MFADone,
+		AuthTime: authTime.Time.UTC(),
+		AMR:      claims.AMR,
 		ClientID: claims.AuthorizedParty,
 	}, nil
+}
+
+// EnvelopeVerifier verifies an identity envelope this service signed.
+//
+// The MFA routes and the step-up route authenticate their caller by the
+// envelope itself, never by X-Principal-Id. Enrolling, revoking or using a
+// second factor on someone else's behalf must take their session, not a header
+// anyone on the network can write (the same gap authorization-svc's A-01
+// closes). The envelope is RS256 under the key published at
+// /.well-known/jwks.json, so this is the exact check every other relying party
+// makes, run with the public half of this process's own key.
+type EnvelopeVerifier struct {
+	key      *rsa.PublicKey
+	issuer   string
+	audience string
+}
+
+// NewEnvelopeVerifier builds a verifier for envelopes signed by key.
+func NewEnvelopeVerifier(key *rsa.PublicKey, issuer, audience string) *EnvelopeVerifier {
+	return &EnvelopeVerifier{key: key, issuer: issuer, audience: audience}
+}
+
+// Verify parses and checks token, returning the envelope it carries. Any
+// failure (signature, algorithm, issuer, audience, expiry, missing principal or
+// tenant) is an error, never a partial envelope.
+func (v *EnvelopeVerifier) Verify(token string) (*domain.IdentityContextEnvelope, error) {
+	if v == nil || v.key == nil {
+		return nil, errors.New("envelope verifier not configured")
+	}
+	parsed, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
+		if t.Method.Alg() != jwt.SigningMethodRS256.Alg() {
+			return nil, errors.New("unexpected signing method")
+		}
+		return v.key, nil
+	},
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithIssuer(v.issuer),
+		jwt.WithAudience(v.audience),
+	)
+	if err != nil {
+		return nil, err
+	}
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	if !ok || !parsed.Valid {
+		return nil, errors.New("invalid envelope claims")
+	}
+	raw, err := json.Marshal(claims)
+	if err != nil {
+		return nil, fmt.Errorf("re-encode envelope: %w", err)
+	}
+	var env domain.IdentityContextEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("decode envelope: %w", err)
+	}
+	if env.Principal.PrincipalID == "" || env.TenantID == "" {
+		return nil, errors.New("envelope missing principal or tenant")
+	}
+	if env.Principal.TenantID != "" && env.Principal.TenantID != env.TenantID {
+		return nil, errors.New("envelope principal and tenant disagree")
+	}
+	return &env, nil
 }
 
 // JWTSigner signs IdentityContextEnvelopes as short-lived JWTs (Q2 resolution).

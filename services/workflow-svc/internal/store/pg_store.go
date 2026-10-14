@@ -223,6 +223,37 @@ func (s *PgStore) FindCurrentStage(ctx context.Context, workflowInstanceID strin
 	return st, nil
 }
 
+// IsCurrentStageApprover reports whether principalID is an approver on the
+// workflow's current stage: the one approver of a SINGLE stage, or anyone in
+// a QUORUM stage's pool. The join starts from workflow_instances, scoped both
+// by the tenant GUC (RLS) and by an explicit tenant predicate, so a workflow
+// in another tenant, or a call with no tenant, answers false, never true.
+func (s *PgStore) IsCurrentStageApprover(ctx context.Context, workflowInstanceID, principalID string) (bool, error) {
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			  FROM workflow_instances i
+			  JOIN workflow_stages st
+			    ON st.workflow_instance_id = i.workflow_instance_id
+			   AND st.stage_order = i.current_stage
+			  LEFT JOIN workflow_stage_quorum_approvers q
+			    ON q.workflow_stage_id = st.workflow_stage_id
+			 WHERE i.workflow_instance_id = $1
+			   AND i.tenant_id = NULLIF($3, '')::uuid
+			   AND (st.approver_principal_id = $2 OR q.approver_principal_id = $2)
+		);`
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	var onStage bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, workflowInstanceID, principalID, tenantID).Scan(&onStage)
+	})
+	if err != nil {
+		s.log.Error("pg IsCurrentStageApprover failed", zap.Error(err))
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return onStage, nil
+}
+
 // CreateWorkflow inserts a new workflow instance plus its ordered stage
 // chain, and records the initial "" -> PENDING transition, all in one
 // transaction.

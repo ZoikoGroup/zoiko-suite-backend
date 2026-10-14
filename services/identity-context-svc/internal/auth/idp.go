@@ -8,6 +8,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"zoiko.io/identity-context-svc/internal/config"
+	"zoiko.io/identity-context-svc/internal/domain"
 )
 
 // IdPTokenIssuer mints the bearer token that JWTVerifier.VerifyBearer accepts.
@@ -91,19 +92,41 @@ func (i *IdPTokenIssuer) TTLSeconds() int { return i.ttlSeconds }
 // resolved by /v1/context/resolve against live state at the moment of use, so
 // a role revoked after login cannot be replayed from a stale token.
 func (i *IdPTokenIssuer) Issue(subject, tenantID string, mfaDone bool) (string, error) {
-	if subject == "" {
+	amr := []string{domain.AMRPassword}
+	if mfaDone {
+		amr = append(amr, domain.AMROTP)
+	}
+	return i.IssueGrant(domain.TokenGrant{Subject: subject, TenantID: tenantID, MFADone: mfaDone, AMR: amr})
+}
+
+// IssueGrant mints a token carrying everything g asserts.
+//
+// auth_time is the moment of authentication, which is NOT iat once a token is
+// re-issued: a TOTP step-up mints a new token whose auth_time is the step-up,
+// and a relying party asking "how recently did this person prove who they
+// are?" reads auth_time, never iat (OIDC Core §2). azp is set only from a
+// client this service verified, never from anything the caller named.
+func (i *IdPTokenIssuer) IssueGrant(g domain.TokenGrant) (string, error) {
+	if g.Subject == "" {
 		return "", errors.New("subject is required")
 	}
-	if tenantID == "" {
+	if g.TenantID == "" {
 		return "", errors.New("tenant_id is required")
 	}
 
 	now := time.Now().UTC()
+	authTime := g.AuthTime
+	if authTime.IsZero() {
+		authTime = now
+	}
 	claims := idpClaims{
-		TenantID: tenantID,
-		MFADone:  mfaDone,
+		TenantID:        g.TenantID,
+		MFADone:         g.MFADone,
+		AuthorizedParty: g.ClientID,
+		AuthTime:        jwt.NewNumericDate(authTime),
+		AMR:             g.AMR,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:  subject,
+			Subject:  g.Subject,
 			Issuer:   i.issuer,
 			Audience: jwt.ClaimStrings{i.audience},
 			// VerifyBearer parses with jwt.WithExpirationRequired(), so exp is

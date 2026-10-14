@@ -31,6 +31,16 @@ const (
 	EventAuthenticationSucceeded = "identity.authentication.succeeded"
 	EventAuthenticationFailed    = "identity.authentication.failed"
 
+	// The TOTP second factor (migration 000012). Enrolment, revocation and
+	// reset commit through the outbox with the row change; a step-up success
+	// commits with the accepted code. Doc 05 §13.2 names "MFA/step-up events"
+	// a required SIEM signal, so failures are also streamed.
+	EventMFAFactorEnrolled = "identity.mfa_factor.enrolled"
+	EventMFAFactorRevoked  = "identity.mfa_factor.revoked"
+	EventMFAFactorReset    = "identity.mfa_factor.reset"
+	EventStepUpSucceeded   = "identity.step_up.succeeded"
+	EventStepUpFailed      = "identity.step_up.failed"
+
 	// EventRiskSignalUnavailable replaces the "session.risk.changed" this
 	// service used to publish when its risk cache missed.
 	//
@@ -296,6 +306,23 @@ func (p *Publisher) PublishAuthenticationFailed(
 		"principal_id":    principalID,
 		"tenant_id":       tenantID,
 		"credential_type": "PASSWORD",
+		"failure_reason":  reason,
+		"correlation_id":  correlationID,
+	})
+}
+
+// PublishStepUpFailed records a refused second-factor attempt (a wrong,
+// replayed or locked code). reason is the internal basis, as for
+// PublishAuthenticationFailed: on the event, never on the wire.
+func (p *Publisher) PublishStepUpFailed(
+	ctx context.Context,
+	principalID, tenantID, correlationID, action, reason string,
+) error {
+	return p.emit(ctx, EventStepUpFailed, tenantID, "", principalID, correlationID, principalID, map[string]any{
+		"principal_id":    principalID,
+		"tenant_id":       tenantID,
+		"credential_type": "TOTP",
+		"action":          action,
 		"failure_reason":  reason,
 		"correlation_id":  correlationID,
 	})

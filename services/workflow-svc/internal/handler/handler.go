@@ -29,6 +29,7 @@ type WorkflowStore interface {
 	FindWorkflowByID(ctx context.Context, workflowInstanceID string) (*domain.WorkflowInstance, error)
 	FindStagesByWorkflowID(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowStage, error)
 	FindCurrentStage(ctx context.Context, workflowInstanceID string) (*domain.WorkflowStage, error)
+	IsCurrentStageApprover(ctx context.Context, workflowInstanceID, principalID string) (bool, error)
 	SubmitAction(ctx context.Context, params domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
 	SubmitQuorumVote(ctx context.Context, params domain.SubmitQuorumVoteParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
 	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
@@ -964,6 +965,42 @@ func (h *Handler) SubmitQuorumVote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, workflowResponse{WorkflowInstance: instance, Stages: []*domain.WorkflowStage{stage}})
 }
 
+// ── Lifecycle authorization (cancel / escalate / invalidate) ─────────────────
+
+// Cancel and escalate used to be checked against WORKFLOW_APPROVE, and
+// invalidate against nothing, so anyone who could approve in a legal entity
+// could cancel or escalate every workflow in it. Each now has its own action,
+// and acting on a workflow you take no part in needs the administrative one.
+const (
+	actionWorkflowCancel     = "WORKFLOW_CANCEL"
+	actionWorkflowEscalate   = "WORKFLOW_ESCALATE"
+	actionWorkflowInvalidate = "WORKFLOW_INVALIDATE"
+	actionWorkflowAdminister = "WORKFLOW_ADMINISTER"
+)
+
+// authorizeLifecycle asks authorization-svc whether principalID may perform
+// action on instance, failing closed. The initiator goes along as the resource
+// owner, so an own-object rule declared for the action still applies. Writes
+// the 403 / 503 itself and returns false when the caller must stop.
+func (h *Handler) authorizeLifecycle(w http.ResponseWriter, r *http.Request, instance *domain.WorkflowInstance, principalID, action, correlationID, op string) bool {
+	err := h.authz.CheckAllowed(r.Context(), principalID, instance.LegalEntityID, action, instance.InitiatedBy)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, domain.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "authorization_denied", "principal is not authorized for "+action+" on this workflow", correlationID, map[string]any{
+			"action_type": action,
+		})
+		return false
+	}
+	h.log.Error(op+": authorization-svc unavailable — failing closed",
+		zap.String("correlation_id", correlationID), zap.String("action_type", action), zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "authorization_service_unavailable", "authorization service unavailable", correlationID, map[string]any{
+		"retryable": true,
+	})
+	return false
+}
+
 // ── POST /v1/workflows/{id}/escalate ─────────────────────────────────────────
 
 // EscalateWorkflow handles POST /v1/workflows/{workflow_instance_id}/escalate.
@@ -991,15 +1028,23 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, h.log, err, correlationID, "EscalateWorkflow")
 		return
 	}
-	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy); err != nil {
-		switch {
-		case errors.Is(err, domain.ErrAuthorizationDenied):
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
-		default:
-			h.log.Error("EscalateWorkflow: authorization-svc unavailable — failing closed",
-				zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
+	// The initiator chasing their request, or an approver sitting on the
+	// current stage, escalates under WORKFLOW_ESCALATE; anyone else is acting
+	// on someone else's workflow and needs WORKFLOW_ADMINISTER.
+	action := actionWorkflowAdminister
+	if principalID == instanceForAuthzCheck.InitiatedBy {
+		action = actionWorkflowEscalate
+	} else {
+		onStage, err := h.store.IsCurrentStageApprover(r.Context(), workflowInstanceID, principalID)
+		if err != nil {
+			writeStoreErr(w, h.log, err, correlationID, "EscalateWorkflow")
+			return
 		}
+		if onStage {
+			action = actionWorkflowEscalate
+		}
+	}
+	if !h.authorizeLifecycle(w, r, instanceForAuthzCheck, principalID, action, correlationID, "EscalateWorkflow") {
 		return
 	}
 
@@ -1082,15 +1127,14 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, h.log, err, correlationID, "CancelWorkflow")
 		return
 	}
-	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID, instanceForAuthzCheck.InitiatedBy); err != nil {
-		switch {
-		case errors.Is(err, domain.ErrAuthorizationDenied):
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
-		default:
-			h.log.Error("CancelWorkflow: authorization-svc unavailable — failing closed",
-				zap.String("correlation_id", correlationID), zap.Error(err))
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_service_unavailable"})
-		}
+	// The initiator withdrawing their own request cancels under
+	// WORKFLOW_CANCEL; cancelling anyone else's workflow is an administrative
+	// act and needs WORKFLOW_ADMINISTER.
+	action := actionWorkflowAdminister
+	if principalID == instanceForAuthzCheck.InitiatedBy {
+		action = actionWorkflowCancel
+	}
+	if !h.authorizeLifecycle(w, r, instanceForAuthzCheck, principalID, action, correlationID, "CancelWorkflow") {
 		return
 	}
 
@@ -1160,7 +1204,7 @@ type invalidateWorkflowRequest struct {
 // Transitions a PENDING or APPROVED workflow to INVALIDATED when its bound business
 // object has materially changed or an authoritative policy invalidates it.
 //
-// Response: 200 invalidated (or idempotent no-op) / 400 invalid UUID / 400 invalid reason / 401 no verified principal or tenant / 404 not found / 409 illegal transition / 503 unavailable.
+// Response: 200 invalidated (or idempotent no-op) / 400 invalid UUID / 400 invalid reason / 401 no verified principal or tenant / 403 authorization denied / 404 not found / 409 illegal transition / 503 unavailable.
 func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
@@ -1248,23 +1292,32 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify transition edge exists in pinned state-machine definition (ZS-STATE-001 §4 step 4)
 	existing, findErr := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
-	if findErr == nil && existing != nil {
-		if edgeErr := svcenvelope.ValidateTransitionEdge("workflow_instance", existing.WorkflowStatus, "INVALIDATED"); edgeErr != nil {
-			var illegalErr *svcenvelope.IllegalEdgeError
-			if errors.As(edgeErr, &illegalErr) {
-				writeJSON(w, http.StatusConflict, map[string]any{
-					"error":           "invalid_transition",
-					"message":         illegalErr.Error(),
-					"from_state":      illegalErr.FromState,
-					"to_state":        illegalErr.ToState,
-					"reason_family":   string(illegalErr.ReasonFamily),
-					"reason_code":     string(illegalErr.ReasonCode),
-					"exception_class": string(illegalErr.ExceptionClass),
-				})
-				return
-			}
+	if findErr != nil {
+		writeStoreErr(w, h.log, findErr, correlationID, "InvalidateWorkflow")
+		return
+	}
+	// Invalidation is a system transition: the service that owns the bound
+	// business object calls it when that object changes. It has no participant
+	// rule, only its own permission.
+	if !h.authorizeLifecycle(w, r, existing, principalID, actionWorkflowInvalidate, correlationID, "InvalidateWorkflow") {
+		return
+	}
+
+	// Verify transition edge exists in pinned state-machine definition (ZS-STATE-001 §4 step 4)
+	if edgeErr := svcenvelope.ValidateTransitionEdge("workflow_instance", existing.WorkflowStatus, "INVALIDATED"); edgeErr != nil {
+		var illegalErr *svcenvelope.IllegalEdgeError
+		if errors.As(edgeErr, &illegalErr) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "invalid_transition",
+				"message":         illegalErr.Error(),
+				"from_state":      illegalErr.FromState,
+				"to_state":        illegalErr.ToState,
+				"reason_family":   string(illegalErr.ReasonFamily),
+				"reason_code":     string(illegalErr.ReasonCode),
+				"exception_class": string(illegalErr.ExceptionClass),
+			})
+			return
 		}
 	}
 

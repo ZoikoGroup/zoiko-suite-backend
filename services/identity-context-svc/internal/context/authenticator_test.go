@@ -81,6 +81,9 @@ type issuedToken struct {
 	subject  string
 	tenantID string
 	mfaDone  bool
+	authTime time.Time
+	amr      []string
+	clientID string
 }
 
 type mockTokenIssuer struct {
@@ -89,8 +92,8 @@ type mockTokenIssuer struct {
 	err    error
 }
 
-func (m *mockTokenIssuer) Issue(subject, tenantID string, mfaDone bool) (string, error) {
-	m.issued = append(m.issued, issuedToken{subject, tenantID, mfaDone})
+func (m *mockTokenIssuer) IssueGrant(g domain.TokenGrant) (string, error) {
+	m.issued = append(m.issued, issuedToken{g.Subject, g.TenantID, g.MFADone, g.AuthTime, g.AMR, g.ClientID})
 	if m.err != nil {
 		return "", m.err
 	}

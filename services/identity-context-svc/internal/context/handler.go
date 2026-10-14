@@ -62,6 +62,15 @@ type Handler struct {
 
 	// cache backs RefreshTenantContextCache and InvalidateTenantContext.
 	cache *ContextCacheService
+
+	// mfa backs the second-factor routes. Nil answers 501, like support.
+	mfa *MFAService
+}
+
+// WithMFA wires the TOTP second factor and step-up routes.
+func (h *Handler) WithMFA(m *MFAService) *Handler {
+	h.mfa = m
+	return h
 }
 
 func NewHandler(
@@ -232,6 +241,16 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/authenticate", h.Authenticate)
+
+		// ── Second factor (TOTP) and step-up ─────────────────────────────────
+		// Each identifies its caller by the session envelope in Authorization,
+		// never by X-Principal-Id. See handler_mfa.go.
+		r.Post("/authenticate/step-up", h.StepUp)
+		r.Post("/mfa/totp/enroll", h.EnrollTOTP)
+		r.Post("/mfa/totp/activate", h.ActivateTOTP)
+		r.Post("/mfa/totp/revoke", h.RevokeTOTP)
+		r.Get("/mfa/factors", h.ListMFAFactors)
+		r.Post("/principals/{principalID}/mfa/reset", h.ResetPrincipalMFA)
 
 		// ── GOV-01 queries ───────────────────────────────────────────────────
 		// ResolveTenantContext
@@ -694,6 +713,11 @@ func (h *Handler) Authenticate(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, ErrRequestInvalid):
 			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, ErrInvalidClient):
+			// The OAuth client did not authenticate (R-1). Distinct from a wrong
+			// password: it says nothing about the account, and was decided
+			// before the account was touched.
+			writeCoded(w, http.StatusUnauthorized, "invalid_client", "invalid client credentials")
 		case errors.Is(err, ErrInvalidCredentials):
 			// One message for every rejection reason. See ErrInvalidCredentials
 			// — the reason is in access_decision_log and the event stream, not

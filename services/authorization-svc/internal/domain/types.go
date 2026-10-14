@@ -461,6 +461,9 @@ type PrivilegedSession struct {
 	ReviewedBy        *string    `json:"reviewed_by,omitempty"`
 	ReviewedAt        *time.Time `json:"reviewed_at,omitempty"`
 	ReviewNotes       *string    `json:"review_notes,omitempty"`
+	// 000033: the step-up the requester and the approver each proved (A-03).
+	RequesterStepUp *StepUpEvidence `json:"requester_step_up,omitempty"`
+	ApproverStepUp  *StepUpEvidence `json:"approver_step_up,omitempty"`
 }
 
 // CreatePrivilegedSessionParams holds the parameters to issue a new JIT privileged session.
@@ -477,6 +480,11 @@ type CreatePrivilegedSessionParams struct {
 	// HighImpact sessions start PENDING_APPROVAL and grant nothing until an
 	// independent approver approves (§13).
 	HighImpact bool
+	// MaxDurationSeconds is the configured maximum (B-01); a longer request is
+	// ErrSessionDurationExceeded. Zero applies the built-in 24 h ceiling.
+	MaxDurationSeconds int
+	// StepUp is the requester's proven authentication (A-03), recorded.
+	StepUp *StepUpEvidence
 }
 
 // BreakGlassSessionStatus represents the lifecycle state of an emergency break-glass session (ZS-IAM-001 §14 & §21).
@@ -506,6 +514,8 @@ type BreakGlassSession struct {
 	ReviewedBy   *string    `json:"reviewed_by,omitempty"`
 	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
 	ReviewNotes  *string    `json:"review_notes,omitempty"`
+	// 000033: the step-up the requester proved (A-03, §14).
+	RequesterStepUp *StepUpEvidence `json:"requester_step_up,omitempty"`
 }
 
 type CreateBreakGlassSessionParams struct {
@@ -516,6 +526,9 @@ type CreateBreakGlassSessionParams struct {
 	RequestedActions []string
 	DurationSeconds  int
 	RequestedBy      string
+	// MaxDurationSeconds: see CreatePrivilegedSessionParams. Zero applies 2 h.
+	MaxDurationSeconds int
+	StepUp             *StepUpEvidence
 }
 
 // SupportSessionStatus represents the lifecycle state of a tenant support session (ZS-IAM-001 §15 & §21).
@@ -556,6 +569,8 @@ type CreateSupportSessionParams struct {
 	DurationSeconds       int
 	TenantConsentObtained bool
 	RequestedBy           string
+	// MaxDurationSeconds: see CreatePrivilegedSessionParams. Zero applies 24 h.
+	MaxDurationSeconds int
 }
 
 // ── params ───────────────────────────────────────────────────────────────────

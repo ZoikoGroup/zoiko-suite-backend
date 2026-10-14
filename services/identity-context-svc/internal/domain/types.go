@@ -267,6 +267,23 @@ type IdentityContextEnvelope struct {
 	// header. Empty when only an assertion was available.
 	SourceChannel string `json:"source_channel,omitempty"`
 
+	// AuthTime is when the person last authenticated (OIDC auth_time, Unix
+	// seconds): the password login, or a later TOTP step-up. NOT iat, which is
+	// when this envelope was minted and moves on every resolve.
+	// authorization-svc's session step-up and gateway-auth-svc's
+	// X-Authn-Age-Seconds both read it (ZS-IAM-001 §3 "Reauthentication age",
+	// §13 step-up).
+	AuthTime int64 `json:"auth_time,omitempty"`
+
+	// AMR is the authentication methods behind AuthTime (RFC 8176): ["pwd"]
+	// after a password, ["pwd","otp"] after a TOTP step-up. MFAVerified on the
+	// trust posture is the same fact as a boolean.
+	AMR []string `json:"amr,omitempty"`
+
+	// AuthorizedParty is the verified OAuth client the person signed in through
+	// (OIDC azp). Carried so a step-up re-issue keeps the verified channel.
+	AuthorizedParty string `json:"azp,omitempty"`
+
 	// Propagation
 	CorrelationID string `json:"correlation_id"`
 	SchemaVersion string `json:"schema_version"`
@@ -403,6 +420,15 @@ type AuthenticateRequest struct {
 	Email         string `json:"email"`
 	Password      string `json:"password"`
 	CorrelationID string `json:"correlation_id"`
+
+	// ClientID and ClientSecret authenticate the OAuth client the person is
+	// signing in through (the console's server tier), so the token can carry a
+	// VERIFIED azp and the session a verified source channel (Group 1 register
+	// R-1). Optional unless IDP_CLIENT_AUTH=required. A client_id that is
+	// presented must verify: a wrong secret is refused, never downgraded to
+	// "no client".
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
 }
 
 // AuthenticateResponse carries the IdP-shaped bearer token that
@@ -426,11 +452,109 @@ type AuthenticateResponse struct {
 	// authorization-svc, not this service, decides whether a posture is
 	// sufficient for an action.
 	//
-	// FALSE for every principal today, and that is accurate rather than
-	// permissive: no step-up factor is implemented anywhere in the estate, so
-	// there is nothing a client could do in response to true. It becomes a real
-	// per-principal answer when a factor lands.
+	// Still FALSE: login itself is password-baseline (ZS-IAM-001 §3, "where
+	// permitted by tenant policy"). The second factor is demanded where the
+	// standard demands it, before a privileged session: POST
+	// /v1/authenticate/step-up, which authorization-svc's session routes
+	// require.
 	MFARequired bool `json:"mfa_required"`
+
+	// MFAEnrolled reports that the principal holds an ACTIVE TOTP factor, so a
+	// client can offer step-up rather than enrolment.
+	MFAEnrolled bool `json:"mfa_enrolled"`
+
+	// AuthTime is when this authentication happened (Unix seconds). It travels
+	// on the token, then on the envelope, as auth_time.
+	AuthTime int64 `json:"auth_time"`
+
+	// AMR lists the authentication methods behind the token (RFC 8176).
+	AMR []string `json:"amr"`
+}
+
+// TokenGrant is everything a minted IdP token asserts. A struct rather than a
+// growing parameter list so a new claim cannot be dropped by a caller that
+// passes positional values.
+type TokenGrant struct {
+	Subject  string
+	TenantID string
+	// MFADone is true only after a second factor was verified (step-up).
+	MFADone bool
+	// AuthTime is when this authentication happened. Zero means now.
+	AuthTime time.Time
+	// AMR is the methods behind it (RFC 8176).
+	AMR []string
+	// ClientID is the VERIFIED OAuth client (azp). Empty when none
+	// authenticated.
+	ClientID string
+}
+
+// StepUpRequest is POST /v1/authenticate/step-up: the current session's
+// envelope travels in Authorization, the one-time code in the body.
+type StepUpRequest struct {
+	Code          string `json:"code"`
+	CorrelationID string `json:"correlation_id"`
+}
+
+// TOTPEnrollment is returned exactly once, by POST /v1/mfa/totp/enroll. The
+// secret is never readable again: it is stored encrypted and decrypted only to
+// compute a code.
+type TOTPEnrollment struct {
+	FactorID   string `json:"factor_id"`
+	Secret     string `json:"secret"`
+	OTPAuthURI string `json:"otpauth_uri"`
+	Algorithm  string `json:"algorithm"`
+	Digits     int    `json:"digits"`
+	Period     int    `json:"period"`
+	Status     string `json:"status"`
+}
+
+// MFAFactor is a factor as listed to its owner or an administrator. It never
+// carries secret material, encrypted or otherwise.
+type MFAFactor struct {
+	FactorID       string     `json:"factor_id"`
+	PrincipalID    string     `json:"principal_id"`
+	Type           string     `json:"type"`
+	Status         string     `json:"status"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ActivatedAt    *time.Time `json:"activated_at,omitempty"`
+	LastUsedAt     *time.Time `json:"last_used_at,omitempty"`
+	RetiredReason  *string    `json:"retired_reason,omitempty"`
+	FailedAttempts int        `json:"failed_attempts"`
+	LockedUntil    *time.Time `json:"locked_until,omitempty"`
+}
+
+// ErrTOTPReplayed is a code whose time step was already accepted for the
+// factor (or the factor changed state under the request). It is refused like a
+// wrong code: a replayed code is exactly what an observer of the real one
+// would send.
+var ErrTOTPReplayed = errors.New("totp code already used")
+
+// TOTPAcceptance records a verified code: the step it matched, and whether it
+// activates a PENDING factor (enrolment) rather than authenticating with an
+// ACTIVE one (step-up).
+type TOTPAcceptance struct {
+	FactorID      string
+	PrincipalID   string
+	TenantID      string
+	Step          int64
+	Activate      bool
+	Action        string
+	CorrelationID string
+}
+
+// TOTPFactorSecret is a TOTP factor as the store hands it to the MFA service:
+// the secret still encrypted. No JSON tags, so it cannot be serialised by
+// accident.
+type TOTPFactorSecret struct {
+	FactorID       string
+	PrincipalID    string
+	TenantID       string
+	Status         string
+	Ciphertext     string
+	KeyID          string
+	LastUsedStep   *int64
+	FailedAttempts int
+	LockedUntil    *time.Time
 }
 
 // PrincipalCredential is the stored password material for one principal.
@@ -456,8 +580,22 @@ const (
 	CredentialStatusRetired = "RETIRED"
 )
 
-// CredentialTypePassword is the only factor issued today.
-const CredentialTypePassword = "PASSWORD"
+// Credential types. A TOTP factor is another principal_credentials row, as
+// 000004 anticipated, holding an encrypted secret instead of a digest.
+const (
+	CredentialTypePassword = "PASSWORD"
+	CredentialTypeTOTP     = "TOTP"
+)
+
+// CredentialStatusPending is a TOTP factor generated but not yet proven: it
+// grants nothing until a code from it verifies.
+const CredentialStatusPending = "PENDING"
+
+// Authentication method references (RFC 8176), carried as amr.
+const (
+	AMRPassword = "pwd"
+	AMROTP      = "otp"
+)
 
 // ErrPrincipalNotFound is returned when a principal does not exist in the caller's tenant scope.
 var ErrPrincipalNotFound = errors.New("principal not found")
@@ -496,6 +634,11 @@ type VerifiedClaims struct {
 	Subject  string
 	TenantID string
 	MFADone  bool
+	// AuthTime is when the person authenticated: the token's auth_time, or
+	// its iat for a token minted before auth_time existed.
+	AuthTime time.Time
+	// AMR is the token's authentication methods (RFC 8176).
+	AMR []string
 	// ClientID is the IdP token's azp: the OAuth client the person signed in
 	// through (the web console, the mobile app). Verified with the token, so
 	// the channel derived from it is a fact, not an assertion.

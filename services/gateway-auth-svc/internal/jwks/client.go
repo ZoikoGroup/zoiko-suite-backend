@@ -49,6 +49,11 @@ func NewClient(url string, ttl time.Duration) *Client {
 // NewClientWithHTTPClient constructs a Client with a custom *http.Client
 // (e.g. one provisioned for mTLS). The caller owns the client's lifetime.
 func NewClientWithHTTPClient(url string, ttl time.Duration, httpClient *http.Client) *Client {
+	if httpClient == nil {
+		// A nil client panics on the first fetch; that was every /verify on a
+		// deployment without JWKS mTLS until 14 Oct 2026.
+		httpClient = &http.Client{Timeout: 5 * time.Second}
+	}
 	return &Client{
 		url:        url,
 		ttl:        ttl,

@@ -27,7 +27,15 @@ type AuthzAdminClient struct {
 }
 
 func NewAuthzAdminClient(baseURL string) *AuthzAdminClient {
-	return &AuthzAdminClient{baseURL: baseURL, http: &http.Client{Timeout: 5 * time.Second}}
+	return NewAuthzAdminClientWithHTTP(baseURL, &http.Client{Timeout: 5 * time.Second})
+}
+
+// NewAuthzAdminClientWithHTTP uses hc — the mTLS client when AUTHZ_MTLS_ENABLED,
+// so authorization-svc sees this service's verified certificate and can admit
+// it as a registered delegate — and forwards the caller's identity envelope
+// where it names the principal the call acts for (see forward.go).
+func NewAuthzAdminClientWithHTTP(baseURL string, hc *http.Client) *AuthzAdminClient {
+	return &AuthzAdminClient{baseURL: baseURL, http: withForwarding(hc)}
 }
 
 // Scope is the verified caller context every admin call must carry.

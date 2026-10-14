@@ -35,6 +35,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/idempotency"
+	"zoiko.io/identity-context-svc/internal/mfa"
 	"zoiko.io/identity-context-svc/internal/mtlslistener"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/retention"
@@ -375,7 +376,42 @@ func main() {
 			MaxFailedAttempts: cfg.AuthMaxFailedAttempts,
 			LockDuration:      time.Duration(cfg.AuthLockDurationSeconds) * time.Second,
 		},
-	)
+	).WithMFAStatus(principalRepo)
+
+	// ── Login clients (Group 1 register R-1) ──────────────────────────────
+	// A confidential client proving its secret at /v1/authenticate is what
+	// puts a VERIFIED azp on the token, so IDP_CLIENT_CHANNELS can turn a human
+	// login into a verified source channel.
+	clientRegistry, err := auth.LoadClientRegistry(cfg.IDPClientSecretsFile, cfg.IDPClientAuth == "required")
+	if err != nil {
+		log.Fatal("failed to load login client registry", zap.Error(err))
+	}
+	authenticator.WithClients(clientRegistry)
+	log.Info("login client authentication",
+		zap.String("mode", cfg.IDPClientAuth), zap.Int("clients", clientRegistry.Count()))
+
+	// ── Second factor (TOTP) and step-up ──────────────────────────────────
+	// Without a key the routes answer 503 (local only: config.Load refuses a
+	// staging or production boot without MFA_SECRET_KEY).
+	var mfaKeys *mfa.Keyring
+	if len(cfg.MFASecretKeys) > 0 {
+		mfaKeys, err = mfa.NewKeyring(cfg.MFASecretKeyID, cfg.MFASecretKeys)
+		if err != nil {
+			log.Fatal("failed to initialise MFA keyring", zap.Error(err))
+		}
+	} else {
+		log.Warn("MFA_SECRET_KEY unset: TOTP enrolment and step-up are unavailable, so no privileged session can be issued")
+	}
+	mfaService := identityctx.NewMFAService(log, principalRepo, mfaKeys,
+		auth.NewEnvelopeVerifier(signer.PublicKey(), cfg.JWTIssuer, cfg.JWTAudienceInternal),
+		idpIssuer, publisher, siemClient,
+		identityctx.MFAPolicy{
+			MaxFailedAttempts: cfg.MFAMaxFailedAttempts,
+			LockDuration:      time.Duration(cfg.MFALockDurationSeconds) * time.Second,
+			RecentAuth:        time.Duration(cfg.MFARecentAuthSeconds) * time.Second,
+			SkewSteps:         cfg.MFATOTPSkewSteps,
+			IssuerLabel:       cfg.MFAIssuerLabel,
+		})
 
 	// ── HTTP router ───────────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -532,7 +568,8 @@ func main() {
 	h := identityctx.NewHandler(resolver, authenticator, sessionCache, principalRepo, authzClient, log).
 		WithEnvironment(domain.Environment(cfg.Environment)).
 		WithSupport(supportService).
-		WithContextCache(cacheService)
+		WithContextCache(cacheService).
+		WithMFA(mfaService)
 	identityctx.RegisterRoutes(r, h)
 
 	// ── Retention / disposition sweep (GOV-09) ────────────────────────────
@@ -651,6 +688,9 @@ func main() {
 	}
 	if err := authenticator.Drain(drainCtx); err != nil {
 		log.Warn("authenticator drain incomplete", zap.Error(err))
+	}
+	if err := mfaService.Drain(drainCtx); err != nil {
+		log.Warn("mfa drain incomplete", zap.Error(err))
 	}
 	log.Info("identity-context-svc stopped")
 }

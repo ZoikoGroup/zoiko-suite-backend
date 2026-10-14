@@ -2512,3 +2512,89 @@ Uncommitted.
 | S5-D1–D3 | WAF/DDoS/rate limits; CARTA fail-open; real client IP behind the GCP LB. | Platform / security decisions. |
 | M-01 (via mtls-management-svc) | Any bootstrap-token holder can mint a certificate for any CN, which weakens the `MTLS_ALLOWED_CLIENTS` allow-lists. | mtls-management-svc: per-service enrolment. |
 
+
+# Auth plane closure, 14 October 2026: gateway-auth-svc and identity-context-svc
+
+Done together with authorization-svc (its register A-01, A-03 / S-3 and B-01 / S-4; see the
+Governance Platform audit, "authorization-svc — auth plane closure"). Decisions taken by the
+user before the pass:
+- the whole auth plane, not one service;
+- TOTP as the second factor;
+- session caps of 8 h / 2 h / 4 h;
+- a confidential client at login.
+
+Everything is uncommitted.
+
+## Rows closed
+
+| ID | Before | After | What changed | Proof |
+|---|---|---|---|---|
+| R-2 (A-03 remainder) — no `auth_time`; `mfa_verified` always false | open | ✅ | identity-context-svc: login tokens and envelopes carry `auth_time`, `amr` and `azp`. A TOTP second factor (migration **000012**: an encrypted `principal_credentials` row, replay and lockout guards) is exposed through these routes, each of which identifies the caller by its own envelope: `POST /v1/mfa/totp/enroll`, `/activate` and `/revoke`, `GET /v1/mfa/factors`, `POST /v1/authenticate/step-up`, and the admin route `POST /v1/principals/{id}/mfa/reset` (`IDENTITY_MFA_RESET`). The gateway sets `X-Authn-Age-Seconds` from `auth_time`, never from `iat`. | unit (RFC 4226/6238 vectors, keyring, service, handler); store IT as NOBYPASSRLS (lifecycle, tenant scope, 000012 shape + down guard); live E2E |
+| R-1 (S1-B1 remainder) — a human login never gets a verified channel | open | ✅ backend / console pending | `/v1/authenticate` takes `client_id` + `client_secret`. Secrets are stored as SHA-256 in `IDP_CLIENT_SECRETS_FILE`; `IDP_CLIENT_AUTH` is `optional` or `required`. A client that fails gets 401 `invalid_client` before the account is touched. A verified client becomes `azp`, which `IDP_CLIENT_CHANNELS` maps to a VERIFIED channel. | unit; live E2E (`X-Source-Channel-Basis: verified` for a human) |
+| R-3 (A-01) — consumers trust `X-Principal-Id` | open | ✅ for authorization-svc and the identity MFA routes; ❌ estate-wide | authorization-svc verifies the envelope on every non-evaluation route; access-control-svc forwards the person's envelope, or calls as an mTLS delegate. | see the Governance audit |
+
+## Defects found by the live E2E (both pre-existing, both fixed)
+
+- **G-4 (high), gateway-auth-svc: every `/verify` panicked when JWKS mTLS was off.**
+  - `cmd/server/main.go` handed a nil `*http.Client` to the JWKS client whenever
+    `IDENTITY_JWKS_MTLS_ENABLED` was unset. Every gated request answered 500.
+  - The tenant-registry client had the same latent bug: `TENANT_REGISTRY_URL` set without
+    `TENANT_REGISTRY_MTLS_ENABLED`.
+  - Compose sets the flag, so it never showed there.
+  - Fixed in `main.go`; the JWKS constructor is nil-safe as well. Test:
+    `TestNewClientWithHTTPClient_NilClientFetches`.
+- **IC-13 (high), identity-context-svc: every verified-client resolve failed 503.**
+  - 000009's CHECK on `session_contexts.source_channel_basis` did not list `VERIFIED_CLIENT`,
+    the basis S1-B1 added.
+  - Nothing produced it until R-1, so it was invisible.
+  - Fixed by migration **000013**, whose down migration refuses while such rows exist.
+
+## Live E2E (14 Oct, 41 / 41)
+
+**Setup.**
+- Native binaries of identity-context-svc, gateway-auth-svc and authorization-svc (in
+  `AUTHZ_IDENTITY_ASSERTION=require`).
+- Scratch Postgres with NOBYPASSRLS service roles, and Redis.
+- A stub stands in only for the tenant registry and access-control reads that resolve makes.
+
+**Covered.**
+- Login with a verified client, then resolve: the envelope carries `auth_time`, `amr` and
+  `azp`, and the channel is verified as `web`.
+- Gateway age and assurance: the age is the real one, a client-written value is ignored, and
+  the level goes from SINGLE_FACTOR to MFA after step-up.
+- authorization-svc identity checks:
+  - header only → 401;
+  - forged principal → 403;
+  - forged tenant → 403;
+  - tampered envelope → 401;
+  - valid envelope → 200;
+  - evaluation route not gated.
+- Session issue:
+  - JIT and break-glass refused for a password-only session;
+  - enrol, activate, wrong code, step-up, replay refused;
+  - JIT and break-glass issued with stored evidence;
+  - over-long requests → 400;
+  - approval refused until the approver stepped up, then recorded with approver evidence.
+- Admin MFA reset:
+  - without the permission → 403;
+  - without a step-up → 403;
+  - with both → 200;
+  - self-reset → 403.
+
+**Evidence checked in both databases:**
+- the `iam.session.step_up.*` and `MFA_*` decision rows;
+- the outbox events;
+- `VERIFIED_CLIENT` sessions;
+- ciphertext-only factor rows.
+
+**Mutation check.** 18 / 18 mutants killed across the plane.
+
+## Still open after this pass (what each needs)
+
+| ID | Issue | Needs |
+|---|---|---|
+| R-1 console | The console does not send `client_id` / `client_secret` yet, so compose stays `IDP_CLIENT_AUTH=optional`. | Frontend (console server tier); then set `required`. |
+| R-3 estate | Roughly 100 other services still take `X-Principal-Id` on trust when called directly. | Each consumer verifies the envelope (authorization-svc's `internal/identity` is the pattern). |
+| MFA UI | Nothing in the console calls the MFA routes. | Frontend: enrolment QR, step-up prompt on `401 step_up_required`, admin reset page. |
+| Assurance | TOTP is not phishing-resistant. | Security approval of TOTP as the interim factor (ZS-IAM-001 §31 "session assurance taxonomy"); WebAuthn later. |
+| S5-B2, S4-B1, S3-D1, S5-D1–D3 | Unchanged from the 13 Oct table above. | As listed there. |

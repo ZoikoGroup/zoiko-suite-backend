@@ -59,6 +59,9 @@ type stubStore struct {
 	invalidateTransitioned bool
 	invalidateErr          error
 
+	currentStageApprover    bool
+	currentStageApproverErr error
+
 	verifyReleaseResult *domain.ReleaseVerificationResult
 	verifyReleaseErr    error
 
@@ -218,6 +221,9 @@ func (s *stubStore) FindStagesByWorkflowID(_ context.Context, _ string) ([]*doma
 }
 func (s *stubStore) FindCurrentStage(_ context.Context, _ string) (*domain.WorkflowStage, error) {
 	return s.currentStage, s.currentStageErr
+}
+func (s *stubStore) IsCurrentStageApprover(_ context.Context, _, _ string) (bool, error) {
+	return s.currentStageApprover, s.currentStageApproverErr
 }
 func (s *stubStore) SubmitAction(_ context.Context, _ domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error) {
 	return s.submitInstance, s.submitStage, s.submitTransitioned, s.submitErr
@@ -416,11 +422,21 @@ func (p *stubPublisher) PublishFormEvent(_ context.Context, eventType string, _ 
 
 // ── stub authz client ────────────────────────────────────────────────────────
 
-type stubAuthz struct{ err error }
+// stubAuthz records the action_type and resource owner of every CheckAllowed
+// call, so a test can assert which permission a route actually asked for.
+type stubAuthz struct {
+	err    error
+	asked  []string
+	owners []string
+}
 
 func (a *stubAuthz) CheckApprovalAllowed(_ context.Context, _, _, _ string) error { return a.err }
-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _, _ string) error      { return a.err }
-func (a *stubAuthz) CheckDelegation(_ context.Context, _, _, _ string) error      { return a.err }
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, action, owner string) error {
+	a.asked = append(a.asked, action)
+	a.owners = append(a.owners, owner)
+	return a.err
+}
+func (a *stubAuthz) CheckDelegation(_ context.Context, _, _, _ string) error { return a.err }
 
 type stubDocuments struct {
 	version int
@@ -1024,6 +1040,7 @@ func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
 	code := "CONTROL_FAILURE"
 
 	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "t-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
 		invalidateInstance: &domain.WorkflowInstance{
 			WorkflowInstanceID:     testWorkflowID,
 			WorkflowStatus:         domain.WorkflowStatusInvalidated,
@@ -1055,6 +1072,7 @@ func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
 func TestInvalidateWorkflow_Approved_Success(t *testing.T) {
 	code := "CANCEL_CUSTOMER_REQUEST"
 	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testApprovedID, TenantID: "t-1", LegalEntityID: "le-1", WorkflowStatus: "APPROVED", InitiatedBy: "requester-1"},
 		invalidateInstance: &domain.WorkflowInstance{
 			WorkflowInstanceID:     testApprovedID,
 			WorkflowStatus:         domain.WorkflowStatusInvalidated,
@@ -1083,6 +1101,9 @@ func TestInvalidateWorkflow_Approved_Success(t *testing.T) {
 func TestInvalidateWorkflow_IdempotentReplay_DoesNotRepublish(t *testing.T) {
 	code := "CONTROL_FAILURE"
 	store := &stubStore{
+		// PENDING when the handler read it; an identical invalidate committed
+		// in between, so the store reports no transition.
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "t-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
 		invalidateInstance: &domain.WorkflowInstance{
 			WorkflowInstanceID:     testWorkflowID,
 			WorkflowStatus:         domain.WorkflowStatusInvalidated,
@@ -1133,7 +1154,10 @@ func TestInvalidateWorkflow_MissingReasonCode_BadRequest(t *testing.T) {
 }
 
 func TestInvalidateWorkflow_TerminalState_Conflict(t *testing.T) {
-	store := &stubStore{invalidateErr: domain.ErrInvalidTransition}
+	store := &stubStore{
+		findInstance:  &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, TenantID: "t-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
+		invalidateErr: domain.ErrInvalidTransition,
+	}
 	r := newTestRouter(store)
 
 	body := `{"reason_code":"CONTROL_FAILURE"}`

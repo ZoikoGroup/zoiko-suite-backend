@@ -178,3 +178,52 @@ func (ri *RotatingIdentity) Run(ctx context.Context, provision func(context.Cont
 		log.Info("mtls: server certificate renewed", zap.Time("not_after", ri.NotAfter()))
 	}
 }
+
+// ClientTLSConfig presents the identity get returns as a CLIENT certificate
+// and verifies the server against that identity's current platform CA.
+//
+// get is called per handshake, so a rotated certificate or CA is used as soon
+// as it is installed, and it may return nil before the identity is provisioned:
+// the handshake then fails rather than falling back to plaintext or to
+// unverified TLS. Used to fetch identity-context-svc's JWKS from its mTLS
+// listener, which allow-lists authorization-svc (register A-01).
+//
+// InsecureSkipVerify only disables the default chain check so that
+// VerifyConnection can run it against the CURRENT rotating pool; every
+// connection is still verified, including the server name.
+func ClientTLSConfig(get func() *RotatingIdentity) *tls.Config {
+	return &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, //nolint:gosec // verified in VerifyConnection against the rotating CA pool
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			ri := get()
+			if ri == nil {
+				return &tls.Certificate{}, nil
+			}
+			ri.mu.RLock()
+			defer ri.mu.RUnlock()
+			return ri.cert, nil
+		},
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			ri := get()
+			if ri == nil {
+				return fmt.Errorf("mtls client identity not provisioned yet")
+			}
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("server presented no certificate")
+			}
+			ri.mu.RLock()
+			pool := ri.pool
+			ri.mu.RUnlock()
+			inter := x509.NewCertPool()
+			for _, c := range cs.PeerCertificates[1:] {
+				inter.AddCert(c)
+			}
+			_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{
+				Roots: pool, Intermediates: inter, DNSName: cs.ServerName,
+				KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			})
+			return err
+		},
+	}
+}

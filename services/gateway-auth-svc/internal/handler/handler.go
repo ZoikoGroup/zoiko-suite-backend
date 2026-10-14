@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -128,8 +129,20 @@ type envelopeClaims struct {
 		MFAVerified *bool `json:"mfa_verified"`
 	} `json:"session_trust_posture"`
 
+	// AuthTime is when the person last authenticated (OIDC auth_time, Unix
+	// seconds): the password login or a later TOTP step-up. NOT iat, which is
+	// when the envelope was minted and moves on every re-resolve. Zero when the
+	// envelope predates the claim, in which case no age is asserted.
+	AuthTime int64 `json:"auth_time"`
+
 	jwt.RegisteredClaims
 }
+
+// maxAuthTimeSkew is how far in the future an auth_time may be before it is
+// treated as unknown rather than as a fresh login. The signature proves
+// identity-context-svc minted it; a clock ahead of ours must still never make a
+// login look more recent than "now".
+const maxAuthTimeSkew = time.Minute
 
 // Source-channel provenance, on X-Source-Channel-Basis.
 const (
@@ -364,19 +377,26 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 //     caller could claim "system" or "scheduled_job". The verified value now
 //     wins. When the envelope names none, the caller's value is passed on, and
 //     X-Source-Channel-Basis says which of the two a backend is reading.
+//
 //   - X-Assurance-Level: MFA or SINGLE_FACTOR, from the session's
 //     mfa_verified. authorization-svc's step-up reads this header; through the
 //     edge it was whatever the client sent.
+//
 //   - X-Support-Context-Id: only a support elevation identity-context-svc
 //     verified at resolve time. Before, the edge stripped it outright, so no
 //     backend could see that a request ran under one.
 //
-// Nothing here can state how recently the user authenticated: the envelope's
-// iat is when the envelope was minted, not when the user logged in, and no
-// auth_time claim exists. X-Authn-Age-Seconds is therefore stripped and never
-// set (see the edge lists) rather than derived from a value that would
-// overstate freshness.
+//   - X-Authn-Age-Seconds (Group 1 register R-2, ZS-IAM-001 §3
+//     "Reauthentication age"): seconds since the envelope's auth_time, the
+//     moment the person last authenticated. Never derived from iat, which is
+//     when the envelope was minted and would overstate freshness on every
+//     re-resolve. With no auth_time (an envelope minted before the claim), or
+//     one more than maxAuthTimeSkew in the future, the header is not set: a
+//     backend reads an absent age as unknown, which authorization-svc's
+//     step-up treats as not recent. A client copy is always stripped (edge
+//     lists), so the only age a backend ever sees is this one.
 func setSessionContext(w http.ResponseWriter, r *http.Request, claims *envelopeClaims) {
+	setAuthnAge(w, claims.AuthTime, time.Now())
 	if ch := strings.TrimSpace(claims.SourceChannel); ch != "" {
 		w.Header().Set("X-Source-Channel", ch)
 		w.Header().Set("X-Source-Channel-Basis", channelVerified)
@@ -572,4 +592,20 @@ func (h *Handler) denyMismatch(w http.ResponseWriter, msg string) {
 	w.Header().Set(denialReasonHeader, outcomeTenantHostnameMismatch)
 	w.WriteHeader(http.StatusForbidden)
 	_, _ = w.Write([]byte(msg))
+}
+
+// setAuthnAge stamps X-Authn-Age-Seconds from authTime (Unix seconds), or
+// leaves it unset when the age cannot be stated honestly.
+func setAuthnAge(w http.ResponseWriter, authTime int64, now time.Time) {
+	if authTime <= 0 {
+		return
+	}
+	age := now.Unix() - authTime
+	if age < -int64(maxAuthTimeSkew/time.Second) {
+		return
+	}
+	if age < 0 {
+		age = 0
+	}
+	w.Header().Set("X-Authn-Age-Seconds", strconv.FormatInt(age, 10))
 }
