@@ -5,8 +5,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,11 +39,6 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 // whole suite failed the moment TEST_DATABASE_URL was set.
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	ctx := context.Background()
-	// Every table any migration creates must be dropped here, or the second
-	// test in a run replays a CREATE TABLE against one that already exists.
-	// applicability_decisions was missing from this list, which stayed invisible
-	// only while the suite replayed 000001 alone.
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS applicability_decisions, filing_requirements, obligations CASCADE;")
 
 	// Every up migration in order — DISCOVERED, not listed, so migration 000004
 	// cannot reintroduce this. Sorting by filename is what orders them, which is
@@ -58,16 +55,42 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	}
 	sort.Strings(migrations)
 
-	for _, path := range migrations {
+	scripts := make([]string, len(migrations))
+	var tables []string
+	seen := map[string]bool{}
+	for i, path := range migrations {
 		sql, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("failed to read migration %s: %v", filepath.Base(path), err)
 		}
-		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+		scripts[i] = string(sql)
+		for _, m := range createTableRe.FindAllStringSubmatch(scripts[i], -1) {
+			if name := strings.ToLower(m[1]); !seen[name] {
+				seen[name] = true
+				tables = append(tables, name)
+			}
+		}
+	}
+
+	// Every table any migration creates must be dropped first, or the second
+	// test in a run replays a CREATE TABLE against one that already exists.
+	// The list is discovered from the migrations for the same reason they are:
+	// a hand-kept list missed applicability_decisions, and later
+	// idempotency_keys and event_outbox (000009/000010), failing every test
+	// after the first.
+	if _, err := pool.Exec(ctx, "DROP TABLE IF EXISTS "+strings.Join(tables, ", ")+" CASCADE;"); err != nil {
+		t.Fatalf("failed to drop tables %v: %v", tables, err)
+	}
+
+	for i, path := range migrations {
+		if _, err := pool.Exec(ctx, scripts[i]); err != nil {
 			t.Fatalf("failed to execute migration %s: %v", filepath.Base(path), err)
 		}
 	}
 }
+
+// createTableRe finds the tables a migration creates, for setupTestDB's drop.
+var createTableRe = regexp.MustCompile(`(?i)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)`)
 
 // testTenantID and otherTenantID are the two scopes the suite runs under.
 // Obligations are tenant-scoped as of migration 000003.
