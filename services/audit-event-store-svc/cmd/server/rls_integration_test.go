@@ -34,9 +34,14 @@ func startRLSPostgres(t *testing.T, ctx context.Context, dbName string) (*pgxpoo
 
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			// Pinned for the same reason as every other suite here — see
-			// the comment in main_integration_test.go.
-			Version(embeddedpostgres.V16).
+			// Pinned to a concrete patch version rather than the V16
+			// constant. In embedded-postgres v1.34.0 the constant resolves
+			// to "16.9.0", which does not exist in the zonkyio binary
+			// repository — causing the download to fail with "no version
+			// found matching 16.9.0". 16.15.0 is the latest PG16 binary
+			// available in that repo as of 2026-08-28. Do NOT revert to
+			// embeddedpostgres.PostgresVersion("16.15.0").
+			Version(embeddedpostgres.PostgresVersion("16.15.0")).
 			Port(uint32(port)).
 			Database(dbName).
 			Username("postgres").
