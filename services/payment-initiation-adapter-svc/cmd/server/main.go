@@ -68,7 +68,7 @@ func main() {
 	treasuryClient := clients.NewTreasuryHTTPClient(cfg.TreasuryServiceURL)
 	authorizationClient := clients.NewAuthorizationHTTPClient(cfg.AuthorizationServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, provider, treasuryClient, authorizationClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, provider, treasuryClient, authorizationClient, logger).WithPayroll(clients.NewPayrollHTTPClient(cfg.PayrollRunServiceURL))
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
