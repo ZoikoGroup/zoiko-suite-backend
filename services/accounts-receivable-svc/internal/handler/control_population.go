@@ -36,7 +36,9 @@ func (h *Handler) GetControlPopulation(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if chi.URLParam(r, "population") != populationOpenInvoices {
+	population := chi.URLParam(r, "population")
+	provider, found := populationProvider(population)
+	if !found && population != populationOpenInvoices {
 		writeError(w, http.StatusNotFound, "population_not_found", "")
 		return
 	}
@@ -94,7 +96,11 @@ func (h *Handler) GetControlPopulation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	page, err := h.store.ControlPopulation(r.Context(), domain.ControlPopulationQuery{
+	if !found {
+		// legacy behaviour: `open-invoices` is served by the legacy store unless a provider replaced it.
+		provider = h.store.ControlPopulation
+	}
+	page, err := provider(r.Context(), domain.ControlPopulationQuery{
 		TenantID:      tenantID,
 		LegalEntityID: legalEntityID,
 		CutOff:        cutOff,
