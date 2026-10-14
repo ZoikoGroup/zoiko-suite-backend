@@ -17,6 +17,29 @@ type Config struct {
 	EmployeeMasterURL      string
 	EmploymentContractsURL string
 	CompensationURL        string
+	// BenefitsURL is benefits-svc, read by WFP-03 payroll input batches.
+	BenefitsURL string
+
+	// LedgerServiceURL is general-ledger-svc, the ONLY way payroll reaches the ledger.
+	// GLPostingPrincipalID is the service identity the dispatcher posts as; it must
+	// hold GL_POSTING_EXECUTE and GL_POSTING_REVERSE. AccountingBook is the single
+	// default book (carried, not sent: the ledger has no book field yet).
+	LedgerServiceURL string
+
+	// CounterpartyURL validates WFP-06 liability authorities; PaymentStatusURL is the Banking
+	// evidence for a settlement. Both fail closed.
+	CounterpartyURL  string
+	PaymentStatusURL string
+
+	// WFP-07 payment instruction dependencies (all fail closed).
+	PayeeBankingURL      string
+	TreasuryURL          string
+	PolicyURL            string
+	PaymentAdapterURL    string
+	HighValueSignatures  int
+	GLPostingPrincipalID string
+	AccountingBook       string
+	PostingIntervalSecs  int
 
 	// DefaultTaxRate is applied to a payslip's taxable amount when no
 	// jurisdiction rule is available. A placeholder until payroll-tax-svc
@@ -144,6 +167,18 @@ func Load() (*Config, error) {
 		EmployeeMasterURL:      env("EMPLOYEE_MASTER_URL", "http://employee-master-svc:8108"),
 		EmploymentContractsURL: env("EMPLOYMENT_CONTRACTS_URL", "http://employment-contracts-svc:8109"),
 		CompensationURL:        env("COMPENSATION_URL", "http://compensation-svc:8111"),
+		BenefitsURL:            env("BENEFITS_URL", "http://benefits-svc:8112"),
+		LedgerServiceURL:       env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		CounterpartyURL:        env("COUNTERPARTY_URL", "http://counterparty-management-svc:8124"),
+		PaymentStatusURL:       env("PAYMENT_STATUS_URL", "http://payment-status-svc:8163"),
+		PayeeBankingURL:        env("PAYEE_BANKING_URL", "http://payee-banking-identity-svc:8166"),
+		TreasuryURL:            env("TREASURY_URL", "http://treasury-svc:8103"),
+		PolicyURL:              env("POLICY_URL", "http://policy-svc:8085"),
+		PaymentAdapterURL:      env("PAYMENT_INITIATION_ADAPTER_URL", "http://payment-initiation-adapter-svc:8162"),
+		HighValueSignatures:    envInt("PAYROLL_PAYMENT_HIGH_VALUE_SIGNATURES", 2),
+		GLPostingPrincipalID:   env("GL_POSTING_PRINCIPAL_ID", "payroll-run-svc"),
+		AccountingBook:         env("PAYROLL_ACCOUNTING_BOOK", "PRIMARY"),
+		PostingIntervalSecs:    envInt("PAYROLL_POSTING_INTERVAL_SECONDS", 5),
 		DefaultTaxRate:         envFloat("PAYROLL_DEFAULT_TAX_RATE", 0.20),
 		AuthZServiceURL:        env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 
