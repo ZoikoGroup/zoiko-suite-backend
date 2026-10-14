@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
 
 	"go.uber.org/zap"
@@ -530,6 +532,41 @@ func (c *Clients) compileTrialBalance(ctx context.Context, tenantID, legalEntity
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Principal-Id", principalID)
+
+	// Forward canonical envelope headers so general-ledger-svc's envelope
+	// middleware (write-strict mode) accepts this write request. Mirrors
+	// the pattern in checkAllowedLive.
+	ledgerRequestID := middleware.GetReqID(ctx)
+	ledgerSourceChannel := "system"
+	ledgerCorrelationID := ""
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			ledgerRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			ledgerSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			ledgerCorrelationID = env.CorrelationID
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	// If no request ID from middleware or envelope, generate one for traceability.
+	if ledgerRequestID == "" {
+		ledgerRequestID = uuid.NewString()
+	}
+	req.Header.Set("X-Request-Id", ledgerRequestID)
+	req.Header.Set("X-Source-Channel", ledgerSourceChannel)
+	// If no correlation ID from envelope, generate one for end-to-end traceability.
+	if ledgerCorrelationID == "" {
+		ledgerCorrelationID = uuid.NewString()
+	}
+	req.Header.Set("X-Correlation-ID", ledgerCorrelationID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

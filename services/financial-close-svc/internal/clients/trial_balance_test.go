@@ -92,13 +92,16 @@ func newClients(t *testing.T, ledgerURL string) *clients.Clients {
 // ledger semantics a second time.
 func TestCompileTrialBalance_ParsesLinesIntoMap(t *testing.T) {
 	var gotBody map[string]string
-	var gotTenant, gotPrincipal string
+	var gotTenant, gotPrincipal, gotRequestID, gotSourceChannel, gotCorrelationID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/trial-balance/compile" || r.Method != http.MethodPost {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
 		gotTenant = r.Header.Get("X-Tenant-Id")
 		gotPrincipal = r.Header.Get("X-Principal-Id")
+		gotRequestID = r.Header.Get("X-Request-Id")
+		gotSourceChannel = r.Header.Get("X-Source-Channel")
+		gotCorrelationID = r.Header.Get("X-Correlation-ID")
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -127,6 +130,15 @@ func TestCompileTrialBalance_ParsesLinesIntoMap(t *testing.T) {
 	}
 	if gotTenant != "tenant-1" || gotPrincipal != "principal-1" {
 		t.Fatalf("expected tenant/principal forwarded, got tenant=%q principal=%q", gotTenant, gotPrincipal)
+	}
+	if gotRequestID == "" {
+		t.Fatalf("expected X-Request-Id forwarded, got empty")
+	}
+	if gotSourceChannel == "" {
+		t.Fatalf("expected X-Source-Channel forwarded, got empty")
+	}
+	if gotCorrelationID == "" {
+		t.Fatalf("expected X-Correlation-ID forwarded, got empty")
 	}
 	if gotBody["legal_entity_id"] != "le-1" || gotBody["fiscal_period"] != "2026-01" {
 		t.Fatalf("expected legal_entity_id/fiscal_period sent in the request body, got %+v", gotBody)
