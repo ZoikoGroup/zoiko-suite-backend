@@ -2687,8 +2687,9 @@ services:
 
   financial-close-svc:
     build:
-      context: ../services/financial-close-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing — see the Dockerfile.
+      context: ../services
+      dockerfile: financial-close-svc/Dockerfile
     container_name: financial-close-svc
     mem_limit: 256m
     cpus: "0.5"
