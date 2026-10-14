@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/financial-close-svc/internal/clients"
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
 )
@@ -155,6 +156,8 @@ type AuthZClient interface {
 type Clients interface {
 	GetUnpostedJournalsCount(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (int, error)
 	CompileTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (map[string]float64, error)
+	CompileTrialBalanceDecimal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (*clients.TrialBalanceForSnapshot, error)
+	ListChartOfAccounts(ctx context.Context, tenantID, principalID string) ([]clients.ChartOfAccountsEntry, error)
 	// The AP/AR counts take the period bounds: an unsettled invoice only blocks
 	// the period it belongs to. Without them a single outstanding invoice
 	// anywhere blocked every period forever.
@@ -486,6 +489,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 	r.Route("/v1/financial-snapshots", func(r chi.Router) {
 		r.Post("/", h.CreateFinancialSnapshot)
+		r.Post("/from-trial-balance", h.CreateFinancialSnapshotFromTrialBalance)
 		r.Get("/supersession", h.ListSnapshotSupersession)
 		r.Get("/{id}", h.GetFinancialSnapshotHandler)
 		r.Post("/{id}/seal", h.SealSnapshot)
@@ -3842,6 +3846,104 @@ func (h *Handler) CreateFinancialSnapshot(w http.ResponseWriter, r *http.Request
 		Status:                  domain.SnapshotStatusDraft,
 		CreatedAt:               time.Now().UTC(),
 		CreatedByPrincipalID:    principalID,
+	}
+	if err := h.store.CreateFinancialSnapshot(r.Context(), snap); err != nil {
+		h.log.Error("failed to create financial snapshot", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, snap)
+}
+
+// CreateFinancialSnapshotFromTrialBalance is the ACC-15->ACC-16 glue command:
+// it compiles the trial balance (ACC-15, via general-ledger-svc) and maps
+// every line to its chart-of-accounts category itself, instead of requiring
+// the caller to assemble the snapshot Content by hand. Fails closed if any
+// trial-balance line's account code is missing from the chart of accounts —
+// an unclassified balance must not silently end up in a signed snapshot.
+func (h *Handler) CreateFinancialSnapshotFromTrialBalance(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateFinancialSnapshotFromTrialBalanceRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LegalEntityID == "" || req.FiscalPeriod == "" || req.Purpose == "" || req.Currency == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, fiscal_period, purpose and currency are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSnapshotCreate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	tb, err := h.clients.CompileTrialBalanceDecimal(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod, principalID)
+	if err != nil {
+		h.log.Error("CreateFinancialSnapshotFromTrialBalance: failed to compile trial balance", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
+		return
+	}
+	accounts, err := h.clients.ListChartOfAccounts(r.Context(), tenantID, principalID)
+	if err != nil {
+		h.log.Error("CreateFinancialSnapshotFromTrialBalance: failed to list chart of accounts", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
+		return
+	}
+	byCode := make(map[string]clients.ChartOfAccountsEntry, len(accounts))
+	for _, a := range accounts {
+		byCode[a.AccountCode] = a
+	}
+
+	// Sorted for a deterministic Content byte sequence — the snapshot's hash
+	// and signature are computed over this exact JSON, so unstable map
+	// iteration order here would make SealSnapshot non-reproducible.
+	codes := make([]string, 0, len(tb.Lines))
+	for code := range tb.Lines {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+
+	content := domain.SnapshotContent{Currency: req.Currency}
+	for _, code := range codes {
+		acc, ok := byCode[code]
+		if !ok {
+			writeError(w, http.StatusUnprocessableEntity, "chart_of_accounts_entry_missing",
+				fmt.Sprintf("account %s appears in the trial balance but has no chart-of-accounts entry", code))
+			return
+		}
+		content.Accounts = append(content.Accounts, domain.SnapshotContentAccount{
+			AccountCode: code,
+			AccountName: acc.AccountName,
+			Category:    acc.AccountType,
+			Balance:     tb.Lines[code],
+		})
+	}
+
+	contentBytes, err := json.Marshal(content)
+	if err != nil {
+		h.log.Error("CreateFinancialSnapshotFromTrialBalance: failed to marshal content", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to build snapshot content")
+		return
+	}
+
+	snap := &domain.FinancialSnapshot{
+		SnapshotID:    uuid.NewString(),
+		TenantID:      tenantID,
+		LegalEntityID: req.LegalEntityID,
+		Purpose:       req.Purpose,
+		Content:       string(contentBytes),
+		SourceReferences: fmt.Sprintf("trial_balance_snapshot_id=%s;ledger_watermark=%d",
+			tb.TrialBalanceSnapshotID, tb.LedgerWatermark),
+		Status:               domain.SnapshotStatusDraft,
+		CreatedAt:            time.Now().UTC(),
+		CreatedByPrincipalID: principalID,
 	}
 	if err := h.store.CreateFinancialSnapshot(r.Context(), snap); err != nil {
 		h.log.Error("failed to create financial snapshot", zap.Error(err))

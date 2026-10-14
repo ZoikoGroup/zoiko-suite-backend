@@ -408,6 +408,9 @@ const (
 const (
 	AccountTypeAsset     = "ASSET"
 	AccountTypeLiability = "LIABILITY"
+	AccountTypeEquity    = "EQUITY"
+	AccountTypeRevenue   = "REVENUE"
+	AccountTypeExpense   = "EXPENSE"
 )
 
 // FXRevaluationRun is ACC-10's own authority — "RevaluationRun, item
@@ -622,7 +625,42 @@ type CertifySnapshotRequest struct {
 	Reason string `json:"reason"`
 }
 
+// CreateFinancialSnapshotFromTrialBalanceRequest is the ACC-15->ACC-16 glue
+// command: instead of the caller assembling Content by hand, this service
+// compiles the trial balance itself (via general-ledger-svc) and maps each
+// account to its category using the chart of accounts, then creates the
+// Draft snapshot from that.
+type CreateFinancialSnapshotFromTrialBalanceRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
+	Purpose       string `json:"purpose"`
+	Currency      string `json:"currency"`
+}
+
+// SnapshotContent and SnapshotContentAccount mirror financial-statements-svc's
+// schema for FinancialSnapshot.Content exactly (SnapshotContentAccount ==
+// financial-statements-svc's internal/domain.SnapshotContentAccount). Amounts
+// are decimal strings, never float64 (ZS-DATA-001 D06). Duplicated rather
+// than imported, matching this codebase's no-shared-domain-types-across-
+// services convention.
+type SnapshotContent struct {
+	Currency string                   `json:"currency"`
+	Accounts []SnapshotContentAccount `json:"accounts"`
+}
+
+type SnapshotContentAccount struct {
+	AccountCode string `json:"account_code"`
+	AccountName string `json:"account_name"`
+	Category    string `json:"category"`
+	Balance     string `json:"balance"`
+}
+
 var (
+	// ErrChartOfAccountsEntryMissing is returned when a trial-balance line's
+	// account_code has no matching entry in the chart of accounts — the
+	// snapshot cannot be built with an unclassified account, so this fails
+	// closed rather than guessing a category.
+	ErrChartOfAccountsEntryMissing = errorString("trial balance line references an account code not found in the chart of accounts")
 	ErrFinancialSnapshotNotFound = errorString("financial snapshot not found")
 	ErrInvalidSnapshotTransition = errorString("financial snapshot is not in a status that allows this action")
 	ErrSigningKeyUnavailable     = errorString("no valid signing key is available to seal this snapshot")

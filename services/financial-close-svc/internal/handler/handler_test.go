@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/financial-close-svc/internal/clients"
 	"zoiko.io/financial-close-svc/internal/domain"
 	"zoiko.io/financial-close-svc/internal/handler"
 	"zoiko.io/financial-close-svc/internal/middleware"
@@ -1235,6 +1236,11 @@ type stubClients struct {
 
 	accountTypes         map[string]string // account_code -> account_type
 	accountTypeErr       error
+
+	trialBalanceDecimal *clients.TrialBalanceForSnapshot
+	trialBalDecimalErr  error
+	chartOfAccounts     []clients.ChartOfAccountsEntry
+	chartOfAccountsErr  error
 	postMultiLineErr     error
 	postedMultiJournalID string
 	lastMultiLines       []domain.JournalLineInput
@@ -1252,6 +1258,32 @@ func (c *stubClients) CompileTrialBalance(_ context.Context, _, _, _, _ string) 
 		return c.trialBalances, nil
 	}
 	return map[string]float64{"1000-Cash": 10000.00}, nil
+}
+
+func (c *stubClients) CompileTrialBalanceDecimal(_ context.Context, _, _, _, _ string) (*clients.TrialBalanceForSnapshot, error) {
+	if c.trialBalDecimalErr != nil {
+		return nil, c.trialBalDecimalErr
+	}
+	if c.trialBalanceDecimal != nil {
+		return c.trialBalanceDecimal, nil
+	}
+	return &clients.TrialBalanceForSnapshot{
+		TrialBalanceSnapshotID: "tb-stub-1",
+		LedgerWatermark:        1,
+		Lines:                  map[string]string{"1000-Cash": "10000.00"},
+	}, nil
+}
+
+func (c *stubClients) ListChartOfAccounts(_ context.Context, _, _ string) ([]clients.ChartOfAccountsEntry, error) {
+	if c.chartOfAccountsErr != nil {
+		return nil, c.chartOfAccountsErr
+	}
+	if c.chartOfAccounts != nil {
+		return c.chartOfAccounts, nil
+	}
+	return []clients.ChartOfAccountsEntry{
+		{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset},
+	}, nil
 }
 
 func (c *stubClients) ListBankAccounts(_ context.Context, _, _, _ string) ([]domain.BankAccountRef, error) {
@@ -3598,6 +3630,99 @@ func TestCreateFinancialSnapshot_MissingFields_Returns400(t *testing.T) {
 	rr := doReq(r, http.MethodPost, "/v1/financial-snapshots/", domain.CreateFinancialSnapshotRequest{LegalEntityID: "le-1"}, "preparer-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreateFinancialSnapshotFromTrialBalance_HappyPath(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
+	rr := doReq(r, http.MethodPost, "/v1/financial-snapshots/from-trial-balance", domain.CreateFinancialSnapshotFromTrialBalanceRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-01", Purpose: "month_end_close", Currency: "USD",
+	}, "preparer-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var snap domain.FinancialSnapshot
+	if err := json.NewDecoder(rr.Body).Decode(&snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if snap.Status != domain.SnapshotStatusDraft {
+		t.Fatalf("expected DRAFT, got %q", snap.Status)
+	}
+	var content domain.SnapshotContent
+	if err := json.Unmarshal([]byte(snap.Content), &content); err != nil {
+		t.Fatalf("snapshot content is not valid JSON: %v, content=%q", err, snap.Content)
+	}
+	if content.Currency != "USD" {
+		t.Fatalf("expected currency USD, got %q", content.Currency)
+	}
+	if len(content.Accounts) != 1 || content.Accounts[0].AccountCode != "1000-Cash" ||
+		content.Accounts[0].Category != domain.AccountTypeAsset || content.Accounts[0].Balance != "10000.00" {
+		t.Fatalf("unexpected accounts: %+v", content.Accounts)
+	}
+	if snap.SourceReferences != "trial_balance_snapshot_id=tb-stub-1;ledger_watermark=1" {
+		t.Fatalf("expected source references to record the compiled trial balance's provenance, got %q", snap.SourceReferences)
+	}
+}
+
+func TestCreateFinancialSnapshotFromTrialBalance_MissingFields_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{})
+	rr := doReq(r, http.MethodPost, "/v1/financial-snapshots/from-trial-balance", domain.CreateFinancialSnapshotFromTrialBalanceRequest{
+		LegalEntityID: "le-1",
+	}, "preparer-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreateFinancialSnapshotFromTrialBalance_AuthzDenied_Returns403(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubClients{})
+	rr := doReq(r, http.MethodPost, "/v1/financial-snapshots/from-trial-balance", domain.CreateFinancialSnapshotFromTrialBalanceRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-01", Purpose: "month_end_close", Currency: "USD",
+	}, "preparer-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreateFinancialSnapshotFromTrialBalance_TrialBalanceUnavailable_Returns503(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{trialBalDecimalErr: domain.ErrGLServiceUnavailable})
+	rr := doReq(r, http.MethodPost, "/v1/financial-snapshots/from-trial-balance", domain.CreateFinancialSnapshotFromTrialBalanceRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-01", Purpose: "month_end_close", Currency: "USD",
+	}, "preparer-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreateFinancialSnapshotFromTrialBalance_ChartOfAccountsUnavailable_Returns503(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{chartOfAccountsErr: domain.ErrGLServiceUnavailable})
+	rr := doReq(r, http.MethodPost, "/v1/financial-snapshots/from-trial-balance", domain.CreateFinancialSnapshotFromTrialBalanceRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-01", Purpose: "month_end_close", Currency: "USD",
+	}, "preparer-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// An account code present in the trial balance but absent from the chart of
+// accounts must fail closed rather than produce a signed snapshot with an
+// unclassified balance.
+func TestCreateFinancialSnapshotFromTrialBalance_UnknownAccountCode_Returns422(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{}, &stubClients{
+		trialBalanceDecimal: &clients.TrialBalanceForSnapshot{
+			TrialBalanceSnapshotID: "tb-2",
+			LedgerWatermark:        5,
+			Lines:                  map[string]string{"9999-Unmapped": "100.00"},
+		},
+		chartOfAccounts: []clients.ChartOfAccountsEntry{
+			{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset},
+		},
+	})
+	rr := doReq(r, http.MethodPost, "/v1/financial-snapshots/from-trial-balance", domain.CreateFinancialSnapshotFromTrialBalanceRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-01", Purpose: "month_end_close", Currency: "USD",
+	}, "preparer-1")
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
