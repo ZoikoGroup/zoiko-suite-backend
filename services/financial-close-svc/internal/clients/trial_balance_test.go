@@ -105,8 +105,11 @@ func TestCompileTrialBalance_ParsesLinesIntoMap(t *testing.T) {
 			"trial_balance_snapshot_id": "tb-1",
 			"ledger_watermark":          42,
 			"lines": []map[string]any{
-				{"account_code": "1000-Cash", "net_balance": 250},
-				{"account_code": "4000-Rev", "net_balance": -250},
+				// Decimal strings, matching general-ledger-svc's real wire
+				// format (NUMERIC(18,2) scanned into a Go string, never a
+				// float64 — ZS-DATA-001 D06).
+				{"account_code": "1000-Cash", "net_balance": "250.00"},
+				{"account_code": "4000-Rev", "net_balance": "-250.00"},
 			},
 		})
 	}))
