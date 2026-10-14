@@ -433,9 +433,17 @@ type tbCompileRequest struct {
 	FiscalPeriod  string `json:"fiscal_period"`
 }
 
+// NetBalance is a decimal string on the wire (general-ledger-svc fixed a
+// ZS-DATA-001 D06 violation: NUMERIC(18,2) was previously round-tripped
+// through a Go float64). Parsed to float64 immediately below, at the one
+// place this service's existing map[string]float64 contract meets GL's
+// wire format, rather than threading a wire-format change through every
+// caller of CompileTrialBalance — those callers have their own float64
+// domain types (e.g. domain.AllocationRun.SourceAmount) that are a
+// separate, pre-existing D06 gap, out of scope here.
 type tbLine struct {
-	AccountCode string  `json:"account_code"`
-	NetBalance  float64 `json:"net_balance"`
+	AccountCode string `json:"account_code"`
+	NetBalance  string `json:"net_balance"`
 }
 
 type tbSnapshot struct {
@@ -489,7 +497,11 @@ func (c *Clients) CompileTrialBalance(ctx context.Context, tenantID, legalEntity
 
 	balances := make(map[string]float64, len(snap.Lines))
 	for _, l := range snap.Lines {
-		balances[l.AccountCode] = l.NetBalance
+		bal, err := strconv.ParseFloat(l.NetBalance, 64)
+		if err != nil {
+			return nil, fmt.Errorf("account %s: net_balance %q is not a decimal number: %w", l.AccountCode, l.NetBalance, err)
+		}
+		balances[l.AccountCode] = bal
 	}
 	return balances, nil
 }
