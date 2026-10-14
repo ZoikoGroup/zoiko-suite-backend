@@ -53,7 +53,7 @@ func seedLine(t *testing.T, ctx context.Context, tenantID, legalEntityID, bankAc
 		CorrelationID:     newCorr(),
 		CreatedAt:         time.Now().UTC(),
 	}
-	created, err := testStore.CreateStatementLine(ctx, l)
+	created, err := testStore.CreateStatementLine(ctx, l, "ingest-fixture")
 	require.NoError(t, err)
 	require.True(t, created)
 	return l

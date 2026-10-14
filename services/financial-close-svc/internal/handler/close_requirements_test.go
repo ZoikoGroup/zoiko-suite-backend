@@ -37,7 +37,7 @@ func checklistRouter(s *stubStore, authz *actionAuthZ) chi.Router {
 		{BankAccountID: "acct-1", LegalEntityID: "le-1", AccountStatus: "ACTIVE"},
 		{BankAccountID: "acct-petty", LegalEntityID: "le-1", AccountStatus: "ACTIVE"},
 	}}
-	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, authz, cl, testSigningKey, zap.NewNop()))
+	handler.RegisterRoutes(r, handler.New(s, authz, cl, testSigningKey, zap.NewNop()))
 	return r
 }
 
@@ -47,7 +47,7 @@ func checklistRouter(s *stubStore, authz *actionAuthZ) chi.Router {
 func checklistRouterWithClients(s *stubStore, authz *actionAuthZ, cl *stubClients) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
-	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, authz, cl, testSigningKey, zap.NewNop()))
+	handler.RegisterRoutes(r, handler.New(s, authz, cl, testSigningKey, zap.NewNop()))
 	return r
 }
 
@@ -179,7 +179,7 @@ func TestAddBankExclusion_AccountMustBelongToTheEntity(t *testing.T) {
 
 	down := chi.NewRouter()
 	down.Use(middleware.TenantContext())
-	handler.RegisterRoutes(down, handler.New(s, &stubPublisher{}, &actionAuthZ{},
+	handler.RegisterRoutes(down, handler.New(s, &actionAuthZ{},
 		&stubClients{bankAccountsErr: domain.ErrTreasuryUnavailable}, testSigningKey, zap.NewNop()))
 	rr := doReq(down, http.MethodPost, "/v1/close/requirements/", domain.CloseRequirementRequest{
 		LegalEntityID: "le-1", Kind: "BANK_ACCOUNT_EXCLUSION", BankAccountID: "acct-1", Reason: "dormant"}, "controller-1")

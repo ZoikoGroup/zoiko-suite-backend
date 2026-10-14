@@ -110,7 +110,32 @@ func (s *PgStore) CreateFXExposureSnapshot(ctx context.Context, p domain.Calcula
 			buckets, calc.GrossExposureAmount, calc.NetExposureAmount,
 			calc.HasStaleComponent, p.ActorPrincipalID, p.CorrelationID,
 		)
-		return scanFXExposureSnapshot(row, &snap)
+		if err := scanFXExposureSnapshot(row, &snap); err != nil {
+			return err
+		}
+		// Enqueue fx_exposure.calculated event
+		if err := s.enqueueFXExposureEvent(ctx, tx, "calculated", "fx_exposure.calculated", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+			"snapshot_id":         snap.SnapshotID,
+			"tenant_id":           snap.TenantID,
+			"legal_entity_id":     snap.LegalEntityID,
+			"exposure_currency":   snap.ExposureCurrency,
+			"functional_currency": snap.FunctionalCurrency,
+			"status":              snap.Status,
+			"has_stale_component": snap.HasStaleComponent,
+		}); err != nil {
+			return err
+		}
+		// Enqueue fx_exposure.became_stale event if HasStaleComponent is true
+		if snap.HasStaleComponent {
+			return s.enqueueFXExposureEvent(ctx, tx, "became-stale", "fx_exposure.became_stale", p.TenantID, p.LegalEntityID, snap.SnapshotID, p.ActorPrincipalID, p.CorrelationID, map[string]any{
+				"snapshot_id":         snap.SnapshotID,
+				"tenant_id":           snap.TenantID,
+				"legal_entity_id":     snap.LegalEntityID,
+				"exposure_currency":   snap.ExposureCurrency,
+				"functional_currency": snap.FunctionalCurrency,
+			})
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -229,7 +254,18 @@ func (s *PgStore) PublishFXExposureSnapshot(ctx context.Context, p domain.Publis
 			WHERE snapshot_id=$1 AND tenant_id=$2 AND status='CALCULATED'
 			RETURNING `+fxExposureColumns,
 			p.SnapshotID, p.TenantID, p.ActorPrincipalID)
-		return scanFXExposureSnapshot(row, &snap)
+		if err := scanFXExposureSnapshot(row, &snap); err != nil {
+			return err
+		}
+		// Enqueue fx_exposure.published event
+		return s.enqueueFXExposureEvent(ctx, tx, "published", "fx_exposure.published", p.TenantID, snap.LegalEntityID, p.SnapshotID, p.ActorPrincipalID, "", map[string]any{
+			"snapshot_id":         snap.SnapshotID,
+			"tenant_id":           snap.TenantID,
+			"legal_entity_id":     snap.LegalEntityID,
+			"exposure_currency":   snap.ExposureCurrency,
+			"functional_currency": snap.FunctionalCurrency,
+			"status":              snap.Status,
+		})
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrInvalidFXExposureTransition

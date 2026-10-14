@@ -41,7 +41,7 @@ func (s *stubStore) recordEvent(destinationID string, tenantID *string, eventTyp
 	})
 }
 
-func (s *stubStore) ProposeDestination(_ context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID string) (*domain.PayeeDestination, error) {
+func (s *stubStore) ProposeDestination(_ context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID, _ string) (*domain.PayeeDestination, error) {
 	fingerprint := domain.Fingerprint(req.FinancialInstitution, req.AccountIdentifier, req.Currency)
 	key := fpKey(req.PartyRef, fingerprint)
 	if _, taken := s.byFingerprint[key]; taken {
@@ -109,7 +109,7 @@ func (s *stubStore) VerifyDestination(_ context.Context, destinationID string, r
 	return d, nil
 }
 
-func (s *stubStore) ApproveDestination(_ context.Context, destinationID, principalID string) (*domain.PayeeDestination, error) {
+func (s *stubStore) ApproveDestination(_ context.Context, destinationID, principalID, _ string) (*domain.PayeeDestination, error) {
 	d, ok := s.destinations[destinationID]
 	if !ok || !domain.CanApprove(d.Status) {
 		return nil, domain.ErrInvalidTransition
@@ -123,7 +123,7 @@ func (s *stubStore) ApproveDestination(_ context.Context, destinationID, princip
 	return d, nil
 }
 
-func (s *stubStore) ActivateDestination(_ context.Context, destinationID, principalID string) (*domain.PayeeDestination, error) {
+func (s *stubStore) ActivateDestination(_ context.Context, destinationID, principalID, _ string) (*domain.PayeeDestination, error) {
 	d, ok := s.destinations[destinationID]
 	if !ok || !domain.CanActivate(d.Status) {
 		return nil, domain.ErrInvalidTransition
@@ -142,7 +142,7 @@ func (s *stubStore) ActivateDestination(_ context.Context, destinationID, princi
 	return d, nil
 }
 
-func (s *stubStore) SuspendDestination(_ context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID string) (*domain.PayeeDestination, error) {
+func (s *stubStore) SuspendDestination(_ context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID, _ string) (*domain.PayeeDestination, error) {
 	d, ok := s.destinations[destinationID]
 	if !ok || !domain.CanSuspend(d.Status) {
 		return nil, domain.ErrInvalidTransition
@@ -154,7 +154,7 @@ func (s *stubStore) SuspendDestination(_ context.Context, destinationID string, 
 	return d, nil
 }
 
-func (s *stubStore) SupersedeDestination(_ context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID string) (*domain.PayeeDestination, error) {
+func (s *stubStore) SupersedeDestination(_ context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID, _ string) (*domain.PayeeDestination, error) {
 	d, ok := s.destinations[destinationID]
 	if !ok || !domain.CanSupersede(d.Status) {
 		return nil, domain.ErrInvalidTransition

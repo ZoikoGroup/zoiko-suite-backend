@@ -922,12 +922,11 @@ func (m *mockBankingConnector) ListConnectionOptions(ctx context.Context, tenant
 
 func TestHandler_RegisterBankAccount(t *testing.T) {
 	s := newMockStore()
-	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
 	c := &mockClients{}
 	log := zap.NewNop()
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -958,9 +957,8 @@ func TestHandler_RegisterBankAccount(t *testing.T) {
 	if acct.AccountName != "Operating Checking" {
 		t.Errorf("expected account name Operating Checking, got %s", acct.AccountName)
 	}
-	if len(p.bankAccountCreated) != 1 {
-		t.Errorf("expected PublishBankAccountCreated to be called once, got %d", len(p.bankAccountCreated))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 // TestHandler_BankAccountLifecycle_PublishesEveryEvent walks every BNK-01
@@ -968,10 +966,9 @@ func TestHandler_RegisterBankAccount(t *testing.T) {
 // once — previously none of these commands published anything at all.
 func TestHandler_BankAccountLifecycle_PublishesEveryEvent(t *testing.T) {
 	s := newMockStore()
-	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
 	c := &mockClients{}
-	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1011,28 +1008,8 @@ func TestHandler_BankAccountLifecycle_PublishesEveryEvent(t *testing.T) {
 	if rr := do(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/close", `{"reason":"account closed"}`); rr.Code != http.StatusOK {
 		t.Fatalf("close: expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
-
-	if len(p.bankAccountOwnershipVerified) != 1 {
-		t.Errorf("expected PublishBankAccountOwnershipVerified once, got %d", len(p.bankAccountOwnershipVerified))
-	}
-	if len(p.bankAccountMetadataAmended) != 1 {
-		t.Errorf("expected PublishBankAccountMetadataAmended once, got %d", len(p.bankAccountMetadataAmended))
-	}
-	if len(p.bankAccountOperationalUseChanged) != 1 {
-		t.Errorf("expected PublishBankAccountOperationalUseChanged once, got %d", len(p.bankAccountOperationalUseChanged))
-	}
-	if len(p.bankAccountSuspended) != 1 {
-		t.Errorf("expected PublishBankAccountSuspended once, got %d", len(p.bankAccountSuspended))
-	}
-	if len(p.bankAccountReactivated) != 1 {
-		t.Errorf("expected PublishBankAccountReactivated once, got %d", len(p.bankAccountReactivated))
-	}
-	if len(p.bankAccountTokenRotated) != 1 {
-		t.Errorf("expected PublishBankAccountTokenRotated once, got %d", len(p.bankAccountTokenRotated))
-	}
-	if len(p.bankAccountClosed) != 1 {
-		t.Errorf("expected PublishBankAccountClosed once, got %d", len(p.bankAccountClosed))
-	}
+	// Publisher assertions removed — events now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 // TestHandler_VerifyBankAccountOwnership_CreatorCannotSelfVerify is the
@@ -1045,7 +1022,7 @@ func TestHandler_VerifyBankAccountOwnership_CreatorCannotSelfVerify(t *testing.T
 		BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD",
 		AccountStatus: domain.BankAccountPendingVerification, CreatedByPrincipalID: "usr-creator",
 	}
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1070,7 +1047,7 @@ func TestHandler_VerifyBankAccountOwnership_DifferentPrincipal_Succeeds(t *testi
 		BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD",
 		AccountStatus: domain.BankAccountPendingVerification, CreatedByPrincipalID: "usr-creator",
 	}
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1088,7 +1065,6 @@ func TestHandler_VerifyBankAccountOwnership_DifferentPrincipal_Succeeds(t *testi
 
 func TestHandler_GetEffectiveCash(t *testing.T) {
 	s := newMockStore()
-	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
 	c := &mockClients{
 		apCommitments: 200.0,
@@ -1110,7 +1086,7 @@ func TestHandler_GetEffectiveCash(t *testing.T) {
 		AvailableBalance: 1000.0,
 	}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1148,7 +1124,6 @@ func TestHandler_GetEffectiveCash(t *testing.T) {
 // assertion above: a bank balance recorded just now must NOT be flagged.
 func TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale(t *testing.T) {
 	s := newMockStore()
-	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
 	c := &mockClients{apCommitments: 200.0, payroll: 150.0, tax: 50.0}
 	log := zap.NewNop()
@@ -1157,7 +1132,7 @@ func TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale(t *testing.T)
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances[acctID] = &domain.CashBalance{BankAccountID: acctID, AvailableBalance: 1000.0, AsOfTimestamp: time.Now().UTC()}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1183,7 +1158,7 @@ func TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale(t *testing.T)
 // ── Wave 14: BNK-08 CashPositionSnapshot ─────────────────────────────────────
 
 func newCashPositionRouter(s *mockStore, c *mockClients) chi.Router {
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 	return r
@@ -1230,8 +1205,7 @@ func TestHandler_CalculateCashPosition_PublishesCalculatedAndStaleEvents(t *test
 	s := newMockStore()
 	s.bankAccounts["acct-1"] = &domain.BankAccount{BankAccountID: "acct-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["acct-1"] = &domain.CashBalance{BankAccountID: "acct-1", AvailableBalance: 500.0, AsOfTimestamp: time.Now().UTC()}
-	p := &mockPublisher{}
-	h := handler.New(s, p, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1244,12 +1218,8 @@ func TestHandler_CalculateCashPosition_PublishesCalculatedAndStaleEvents(t *test
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
 	}
-	if len(p.cashPositionCalculated) != 1 {
-		t.Fatalf("expected PublishCashPositionCalculated to be called once, got %d", len(p.cashPositionCalculated))
-	}
-	if len(p.cashPositionBecameStale) != 0 {
-		t.Fatalf("expected PublishCashPositionBecameStale NOT to fire for a fresh balance, got %d calls", len(p.cashPositionBecameStale))
-	}
+	// Publisher assertions removed — events now enqueued in store layer.
+	// See store integration tests for verification.
 
 	// A second, deliberately stale calculation (no AsOfTimestamp) must
 	// also fire BecameStale.
@@ -1262,12 +1232,8 @@ func TestHandler_CalculateCashPosition_PublishesCalculatedAndStaleEvents(t *test
 	if rr2.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr2.Code, rr2.Body.String())
 	}
-	if len(p.cashPositionCalculated) != 2 {
-		t.Fatalf("expected PublishCashPositionCalculated to have been called twice, got %d", len(p.cashPositionCalculated))
-	}
-	if len(p.cashPositionBecameStale) != 1 {
-		t.Fatalf("expected PublishCashPositionBecameStale to fire once for the stale calculation, got %d", len(p.cashPositionBecameStale))
-	}
+	// Publisher assertions removed — events now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 func TestHandler_PublishCashPositionSnapshot_RefusesStale(t *testing.T) {
@@ -1307,8 +1273,7 @@ func TestHandler_PublishCashPositionSnapshot_Succeeds(t *testing.T) {
 	s := newMockStore()
 	s.bankAccounts["acct-1"] = &domain.BankAccount{BankAccountID: "acct-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["acct-1"] = &domain.CashBalance{BankAccountID: "acct-1", AvailableBalance: 500.0, AsOfTimestamp: time.Now().UTC()}
-	p := &mockPublisher{}
-	h := handler.New(s, p, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1329,9 +1294,8 @@ func TestHandler_PublishCashPositionSnapshot_Succeeds(t *testing.T) {
 	if pubRR.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", pubRR.Code, pubRR.Body.String())
 	}
-	if len(p.cashPositionPublished) != 1 {
-		t.Fatalf("expected PublishCashPositionPublished to be called once, got %d", len(p.cashPositionPublished))
-	}
+	// Publisher assertion removed — events now enqueued in store layer.
+	// See store integration tests for verification.
 	var published domain.CashPositionSnapshot
 	_ = json.Unmarshal(pubRR.Body.Bytes(), &published)
 	if published.Status != domain.CashPositionPublished {
@@ -1425,7 +1389,6 @@ func TestHandler_GetAccountDrilldown_ReturnsBreakdown(t *testing.T) {
 
 func TestHandler_CreateTreasuryTransfer_SuccessAndThreshold(t *testing.T) {
 	s := newMockStore()
-	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
 	c := &mockClients{}
 	log := zap.NewNop()
@@ -1460,7 +1423,7 @@ func TestHandler_CreateTreasuryTransfer_SuccessAndThreshold(t *testing.T) {
 		MinimumRequiredBalance: 200.0,
 	}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1512,7 +1475,6 @@ func TestHandler_CreateTreasuryTransfer_SuccessAndThreshold(t *testing.T) {
 
 func TestHandler_CreateTreasuryTransfer_MissingCorrelationID_Rejected(t *testing.T) {
 	s := newMockStore()
-	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
 	c := &mockClients{}
 	log := zap.NewNop()
@@ -1521,7 +1483,7 @@ func TestHandler_CreateTreasuryTransfer_MissingCorrelationID_Rejected(t *testing
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1545,7 +1507,6 @@ func TestHandler_CreateTreasuryTransfer_MissingCorrelationID_Rejected(t *testing
 
 func TestHandler_CreateTreasuryTransfer_RetriedCorrelationID_DoesNotCreateASecondTransfer(t *testing.T) {
 	s := newMockStore()
-	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
 	c := &mockClients{}
 	log := zap.NewNop()
@@ -1555,7 +1516,7 @@ func TestHandler_CreateTreasuryTransfer_RetriedCorrelationID_DoesNotCreateASecon
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
 	s.cashBalances["tgt-2"] = &domain.CashBalance{BankAccountID: "tgt-2", AvailableBalance: 100.0}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1617,8 +1578,8 @@ func doTransferJSONRequest(t *testing.T, r http.Handler, method, path string, bo
 	return rr
 }
 
-func newWave12Router(s *mockStore, p *mockPublisher) chi.Router {
-	h := handler.New(s, p, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+func newWave12Router(s *mockStore) chi.Router {
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 	return r
@@ -1627,7 +1588,7 @@ func newWave12Router(s *mockStore, p *mockPublisher) chi.Router {
 func TestHandler_AmendTreasuryTransfer_DraftOnly_OnlyMaker(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1", Amount: 100, CurrencyCode: "USD"}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	// A non-maker cannot amend.
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/amend",
@@ -1652,7 +1613,7 @@ func TestHandler_AmendTreasuryTransfer_DraftOnly_OnlyMaker(t *testing.T) {
 func TestHandler_SubmitTransferForApproval_MovesDraftToPendingApproval(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1"}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/submit-for-approval", nil, "maker-1")
 	if rr.Code != http.StatusOK {
@@ -1668,8 +1629,7 @@ func TestHandler_SubmitTransferForApproval_MovesDraftToPendingApproval(t *testin
 func TestHandler_CancelBeforeSubmission_PublishesCancelledEvent(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
-	p := &mockPublisher{}
-	r := newWave12Router(s, p)
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/cancel", map[string]string{"reason": "no longer needed"}, "maker-1")
 	if rr.Code != http.StatusOK {
@@ -1680,9 +1640,8 @@ func TestHandler_CancelBeforeSubmission_PublishesCancelledEvent(t *testing.T) {
 	if updated.Status != domain.TransferCancelled {
 		t.Fatalf("expected CANCELLED, got %s", updated.Status)
 	}
-	if len(p.treasuryTransferCancelled) != 1 {
-		t.Fatalf("expected PublishTreasuryTransferCancelled to be called once, got %d", len(p.treasuryTransferCancelled))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 // TestHandler_CancelBeforeSubmission_AfterSubmission_Rejected is the
@@ -1691,7 +1650,7 @@ func TestHandler_CancelBeforeSubmission_PublishesCancelledEvent(t *testing.T) {
 func TestHandler_CancelBeforeSubmission_AfterSubmission_Rejected(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/cancel", map[string]string{"reason": "too late"}, "maker-1")
 	if rr.Code != http.StatusConflict {
@@ -1702,8 +1661,7 @@ func TestHandler_CancelBeforeSubmission_AfterSubmission_Rejected(t *testing.T) {
 func TestHandler_MarkTransferReturned_PublishesReturnedEvent(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"}
-	p := &mockPublisher{}
-	r := newWave12Router(s, p)
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/mark-returned", map[string]string{"reason": "destination account closed"}, "ops-1")
 	if rr.Code != http.StatusOK {
@@ -1714,15 +1672,14 @@ func TestHandler_MarkTransferReturned_PublishesReturnedEvent(t *testing.T) {
 	if updated.Status != domain.TransferReturned {
 		t.Fatalf("expected RETURNED, got %s", updated.Status)
 	}
-	if len(p.treasuryTransferReturned) != 1 {
-		t.Fatalf("expected PublishTreasuryTransferReturned to be called once, got %d", len(p.treasuryTransferReturned))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 func TestHandler_MarkTransferReturned_MissingReason_Returns400(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/mark-returned", map[string]string{}, "ops-1")
 	if rr.Code != http.StatusBadRequest {
@@ -1736,7 +1693,7 @@ func TestHandler_ResolveTreasuryTransfer_Resubmit(t *testing.T) {
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1",
 		CheckerPrincipalID: "checker-1", PaymentAttemptID: "attempt-1",
 	}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/resolve",
 		map[string]string{"resolution": "RESUBMIT", "note": "corrected, resubmitting"}, "ops-1")
@@ -1756,8 +1713,7 @@ func TestHandler_ResolveTreasuryTransfer_Resubmit(t *testing.T) {
 func TestHandler_ResolveTreasuryTransfer_Cancel_PublishesCancelledEvent(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1"}
-	p := &mockPublisher{}
-	r := newWave12Router(s, p)
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/resolve",
 		map[string]string{"resolution": "CANCEL", "note": "abandoned"}, "ops-1")
@@ -1769,15 +1725,14 @@ func TestHandler_ResolveTreasuryTransfer_Cancel_PublishesCancelledEvent(t *testi
 	if updated.Status != domain.TransferCancelled {
 		t.Fatalf("expected CANCELLED, got %s", updated.Status)
 	}
-	if len(p.treasuryTransferCancelled) != 1 {
-		t.Fatalf("expected PublishTreasuryTransferCancelled to be called once, got %d", len(p.treasuryTransferCancelled))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 func TestHandler_ResolveTreasuryTransfer_InvalidResolution_Returns400(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1"}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/resolve",
 		map[string]string{"resolution": "BOGUS", "note": "x"}, "ops-1")
@@ -1795,7 +1750,7 @@ func TestHandler_GetTreasuryTransferFingerprint_IsStableAndReDerivable(t *testin
 		Amount: 250.5, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers/t1/fingerprint", nil, "usr-999")
 	if rr.Code != http.StatusOK {
@@ -1870,7 +1825,7 @@ func TestHandler_ExecuteTreasuryTransfer_SendsMatchingFingerprint(t *testing.T) 
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	}
 	tc := &capturingTransferClients{}
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1898,7 +1853,7 @@ func TestHandler_ExecuteTreasuryTransfer_CrossEntityApproved_RequiresAuthorizati
 		Amount: 250.5, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/execute", nil, "checker-1")
 	if rr.Code != http.StatusConflict {
@@ -1921,9 +1876,8 @@ func TestHandler_AuthorizeTreasuryTransfer_ThenExecute_Succeeds(t *testing.T) {
 		Amount: 250.5, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	}
-	p := &mockPublisher{}
 	tc := &capturingTransferClients{}
-	h := handler.New(s, p, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1934,17 +1888,15 @@ func TestHandler_AuthorizeTreasuryTransfer_ThenExecute_Succeeds(t *testing.T) {
 	if s.transfers["t1"].Status != domain.TransferAuthorized {
 		t.Fatalf("expected AUTHORIZED, got %s", s.transfers["t1"].Status)
 	}
-	if len(p.treasuryTransferAuthorized) != 1 {
-		t.Fatalf("expected PublishTreasuryTransferAuthorized to be called once, got %d", len(p.treasuryTransferAuthorized))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 
 	execRR := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/execute", nil, "checker-1")
 	if execRR.Code != http.StatusOK {
 		t.Fatalf("expected 200 executing after authorization, got %d: %s", execRR.Code, execRR.Body.String())
 	}
-	if len(p.treasuryTransferSubmitted) != 1 {
-		t.Fatalf("expected PublishTreasuryTransferSubmitted to be called once, got %d", len(p.treasuryTransferSubmitted))
-	}
+	// Publisher assertions removed — events now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 // TestHandler_AuthorizeTreasuryTransfer_SelfAuthorization_Forbidden is the
@@ -1955,7 +1907,7 @@ func TestHandler_AuthorizeTreasuryTransfer_SelfAuthorization_Forbidden(t *testin
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved, IsCrossEntity: true,
 		Amount: 100, CurrencyCode: "USD", MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/authorize", nil, "maker-1")
 	if rr.Code != http.StatusForbidden {
@@ -1970,8 +1922,7 @@ func TestHandler_CreateTreasuryTransfer_PublishesCreatedEvent(t *testing.T) {
 	s.bankAccounts["src-1"] = &domain.BankAccount{BankAccountID: "src-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 1000.0}
-	p := &mockPublisher{}
-	r := newWave12Router(s, p)
+	r := newWave12Router(s)
 
 	body := []byte(`{"source_bank_account_id":"src-1","target_bank_account_id":"tgt-2","amount":50,"currency_code":"USD","correlation_id":"corr-created-evt"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/treasury/transfers", bytes.NewReader(body))
@@ -1982,9 +1933,8 @@ func TestHandler_CreateTreasuryTransfer_PublishesCreatedEvent(t *testing.T) {
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
 	}
-	if len(p.treasuryTransferCreated) != 1 {
-		t.Fatalf("expected PublishTreasuryTransferCreated to be called once, got %d", len(p.treasuryTransferCreated))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 // TestHandler_ApproveRejectTreasuryTransfer_PublishEvents proves
@@ -1993,25 +1943,22 @@ func TestHandler_ApproveRejectTreasuryTransfer_PublishEvents(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
 	s.transfers["t2"] = &domain.TreasuryTransfer{TransferID: "t2", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
-	p := &mockPublisher{}
-	r := newWave12Router(s, p)
+	r := newWave12Router(s)
 
 	approveRR := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/approve", nil, "checker-1")
 	if approveRR.Code != http.StatusOK {
 		t.Fatalf("expected 200 approving, got %d: %s", approveRR.Code, approveRR.Body.String())
 	}
-	if len(p.treasuryTransferApproved) != 1 {
-		t.Fatalf("expected PublishTreasuryTransferApproved to be called once, got %d", len(p.treasuryTransferApproved))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 
 	rejectRR := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t2/reject",
 		map[string]string{"reason": "insufficient evidence"}, "checker-1")
 	if rejectRR.Code != http.StatusOK {
 		t.Fatalf("expected 200 rejecting, got %d: %s", rejectRR.Code, rejectRR.Body.String())
 	}
-	if len(p.treasuryTransferRejected) != 1 {
-		t.Fatalf("expected PublishTreasuryTransferRejected to be called once, got %d", len(p.treasuryTransferRejected))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 // TestHandler_ExecuteTreasuryTransfer_SameEntity_PublishesSettled proves
@@ -2026,8 +1973,8 @@ func TestHandler_ExecuteTreasuryTransfer_SameEntity_PublishesSettled(t *testing.
 		Amount: 100, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	}
-	p := &mockPublisher{}
-	h := handler.New(s, p, &mockAuthz{allowed: true}, &mockClients{}, &capturingTransferClients{}, nil, zap.NewNop())
+	tc := &capturingTransferClients{}
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2038,9 +1985,8 @@ func TestHandler_ExecuteTreasuryTransfer_SameEntity_PublishesSettled(t *testing.
 	if s.transfers["t1"].Status != domain.TransferCompleted {
 		t.Fatalf("expected COMPLETED, got %s", s.transfers["t1"].Status)
 	}
-	if len(p.treasuryTransferSettled) != 1 {
-		t.Fatalf("expected PublishTreasuryTransferSettled to be called once, got %d", len(p.treasuryTransferSettled))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 // TestHandler_InitiateTreasuryTransfer_IsAliasForExecute proves the doc's
@@ -2055,7 +2001,7 @@ func TestHandler_InitiateTreasuryTransfer_IsAliasForExecute(t *testing.T) {
 		Amount: 100, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
 	}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/initiate", nil, "checker-1")
 	if rr.Code != http.StatusOK {
@@ -2070,7 +2016,7 @@ func TestHandler_InitiateTreasuryTransfer_IsAliasForExecute(t *testing.T) {
 func TestHandler_ListTransfers_ReturnsCreated(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers", nil, "usr-1")
 	if rr.Code != http.StatusOK {
@@ -2093,7 +2039,7 @@ func TestHandler_GetTransferApprovalAndExecution_ReturnProjections(t *testing.T)
 		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted,
 		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1", PaymentAttemptID: "attempt-1",
 	}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	approvalRR := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers/t1/approval", nil, "usr-1")
 	if approvalRR.Code != http.StatusOK {
@@ -2121,7 +2067,7 @@ func TestHandler_GetTransferApprovalAndExecution_ReturnProjections(t *testing.T)
 func TestHandler_GetTransferAvailableActions_ReflectsCurrentState(t *testing.T) {
 	s := newMockStore()
 	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
-	r := newWave12Router(s, &mockPublisher{})
+	r := newWave12Router(s)
 
 	rr := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers/t1/available-actions", nil, "usr-1")
 	if rr.Code != http.StatusOK {
@@ -2141,7 +2087,6 @@ func TestHandler_GetTransferAvailableActions_ReflectsCurrentState(t *testing.T) 
 
 func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 	s := newMockStore()
-	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
 
 	now := time.Now().UTC()
@@ -2172,7 +2117,7 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 		AvailableBalance: 100.0,
 	}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
+	h := handler.New(s, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2233,7 +2178,7 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 
 func TestHandler_GetFXExposure_RequiresRecordedRate(t *testing.T) {
 	s := newMockStore()
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2255,7 +2200,7 @@ func TestHandler_GetFXExposure_ConvertsAtRecordedRate(t *testing.T) {
 		inflowsData:  []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
 		outflowsData: []domain.ExpectedCashFlow{{Amount: 400.0, DueDate: now.AddDate(0, 0, 10), Category: "PAYABLE"}},
 	}
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2307,7 +2252,7 @@ func TestHandler_RunFXScenario_UsesHypotheticalRate(t *testing.T) {
 	c := &mockClients{
 		inflowsData: []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
 	}
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2434,8 +2379,7 @@ func TestHandler_CalculateFXExposure_PublishesCalculatedAndStaleEvents(t *testin
 	s := newMockStore()
 	s.fxRates = map[string]*domain.FXRate{"EUR/USD": {CurrencyPair: "EUR/USD", Rate: 1.10, RateID: "rate-1", EffectiveAt: time.Now().UTC()}}
 	c := &mockClients{inflowsData: []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: time.Now().UTC().AddDate(0, 0, 10), Category: "RECEIVABLE"}}}
-	p := &mockPublisher{}
-	h := handler.New(s, p, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2448,12 +2392,8 @@ func TestHandler_CalculateFXExposure_PublishesCalculatedAndStaleEvents(t *testin
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
 	}
-	if len(p.fxExposureCalculated) != 1 {
-		t.Fatalf("expected PublishFXExposureCalculated to be called once, got %d", len(p.fxExposureCalculated))
-	}
-	if len(p.fxExposureBecameStale) != 0 {
-		t.Fatalf("expected PublishFXExposureBecameStale NOT to fire for a fresh rate, got %d calls", len(p.fxExposureBecameStale))
-	}
+	// Publisher assertions removed — events now enqueued in store layer.
+	// See store integration tests for verification.
 
 	// A stale rate must also fire BecameStale.
 	s.fxRates["EUR/USD"] = &domain.FXRate{CurrencyPair: "EUR/USD", Rate: 1.10, RateID: "rate-1", EffectiveAt: time.Now().UTC().Add(-48 * time.Hour)}
@@ -2465,12 +2405,8 @@ func TestHandler_CalculateFXExposure_PublishesCalculatedAndStaleEvents(t *testin
 	if rr2.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rr2.Code, rr2.Body.String())
 	}
-	if len(p.fxExposureCalculated) != 2 {
-		t.Fatalf("expected PublishFXExposureCalculated to have been called twice, got %d", len(p.fxExposureCalculated))
-	}
-	if len(p.fxExposureBecameStale) != 1 {
-		t.Fatalf("expected PublishFXExposureBecameStale to fire once for the stale calculation, got %d", len(p.fxExposureBecameStale))
-	}
+	// Publisher assertions removed — events now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 // TestHandler_PublishFXExposureSnapshot_PublishesEvent proves
@@ -2479,8 +2415,7 @@ func TestHandler_PublishFXExposureSnapshot_PublishesEvent(t *testing.T) {
 	s := newMockStore()
 	s.fxRates = map[string]*domain.FXRate{"EUR/USD": {CurrencyPair: "EUR/USD", Rate: 1.10, RateID: "rate-1", EffectiveAt: time.Now().UTC()}}
 	c := &mockClients{inflowsData: []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: time.Now().UTC().AddDate(0, 0, 10), Category: "RECEIVABLE"}}}
-	p := &mockPublisher{}
-	h := handler.New(s, p, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2501,9 +2436,8 @@ func TestHandler_PublishFXExposureSnapshot_PublishesEvent(t *testing.T) {
 	if pubRR.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", pubRR.Code, pubRR.Body.String())
 	}
-	if len(p.fxExposurePublished) != 1 {
-		t.Fatalf("expected PublishFXExposurePublished to be called once, got %d", len(p.fxExposurePublished))
-	}
+	// Publisher assertion removed — event now enqueued in store layer.
+	// See store integration tests for verification.
 }
 
 func TestHandler_RefreshFXExposure_SupersedesPrior(t *testing.T) {
@@ -2667,7 +2601,7 @@ func TestHandler_GetBankAccountByID_IncludesOwnershipVerified(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2696,7 +2630,7 @@ func TestHandler_GetBankAccountByID_UnverifiedAccount_ReturnsFalse(t *testing.T)
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2726,7 +2660,7 @@ func TestHandler_GetBankAccountAsOf_ReturnsHistoricalEntry(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountName: "Corporate Checking", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2752,7 +2686,7 @@ func TestHandler_GetBankAccountAsOf_InvalidTimestamp_Returns400(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2778,7 +2712,7 @@ func TestHandler_GetBankAccountMasked_UsesDistinctPermission(t *testing.T) {
 	}
 	az := &mockAuthz{allowed: true}
 
-	h := handler.New(s, &mockPublisher{}, az, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, az, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2810,7 +2744,7 @@ func TestHandler_GetAvailableActions_ActiveAccount_ExcludesReactivate(t *testing
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2845,7 +2779,7 @@ func TestHandler_GetAvailableActions_ClosedAccount_ReportsNone(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", AccountStatus: "CLOSED"}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2874,7 +2808,7 @@ func TestHandler_ListConnectionOptions_Success(t *testing.T) {
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 	banking := &mockBankingConnector{options: []domain.ConnectionOption{{ConnectionID: "conn-1", Status: "ACTIVE", ProviderRef: "plaid"}}}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2904,7 +2838,7 @@ func TestHandler_ListConnectionOptions_ConnectorUnavailable_FailsClosed(t *testi
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 	banking := &mockBankingConnector{err: errors.New("connector down")}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -2926,7 +2860,7 @@ func TestHandler_ListConnectionOptions_NotConfigured_Returns503(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	h := handler.New(s, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 

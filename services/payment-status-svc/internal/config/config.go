@@ -12,6 +12,12 @@ type Config struct {
 	KafkaEventsTopic    string
 	AuthzServiceURL     string
 	WebhookSharedSecret string
+	// EventResidencyRegion is the authoritative regional data-bearing
+	// context (ZS-EVENT-001 §4, envelope.Spec.ResidencyRegion) stamped on
+	// every event this service emits through the transactional outbox. No
+	// safe default exists; left empty here, envelope.New refuses to build
+	// an event without it.
+	EventResidencyRegion string
 }
 
 func Load() (*Config, error) {
@@ -37,8 +43,9 @@ func Load() (*Config, error) {
 		DatabaseURL:         dbURL,
 		KafkaBrokers:        getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
 		KafkaEventsTopic:    getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.payment-status.events"),
-		AuthzServiceURL:     getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		WebhookSharedSecret: secret,
+		AuthzServiceURL:      getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		WebhookSharedSecret:  secret,
+		EventResidencyRegion: getEnvOrDefault("EVENT_RESIDENCY_REGION", ""),
 	}, nil
 }
 

@@ -15,22 +15,10 @@ import (
 	authzpkg "zoiko.io/payment-initiation-adapter-svc/internal/authz"
 	"zoiko.io/payment-initiation-adapter-svc/internal/clients"
 	"zoiko.io/payment-initiation-adapter-svc/internal/domain"
-	"zoiko.io/payment-initiation-adapter-svc/internal/events"
 	"zoiko.io/payment-initiation-adapter-svc/internal/handler"
 	"zoiko.io/payment-initiation-adapter-svc/internal/middleware"
 	"zoiko.io/payment-initiation-adapter-svc/internal/provideradapter"
 )
-
-// ── stub publisher ───────────────────────────────────────────────────────────
-
-type stubPublisher struct{ calls int }
-
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
-	p.calls++
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 // ── stub authz ───────────────────────────────────────────────────────────────
 
@@ -90,17 +78,17 @@ func (a *stubAuthorization) VerifyFingerprint(_ context.Context, _, _, _ string)
 const testTenant = "tenant-bnk06-1"
 const testLegalEntity = "le-bnk06-1"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, provider *provideradapter.StubProviderAdapter) chi.Router {
-	return newTestRouterWithTreasury(st, pub, az, provider, &stubTreasury{})
+func newTestRouter(st *stubStore, az *stubAuthz, provider *provideradapter.StubProviderAdapter) chi.Router {
+	return newTestRouterWithTreasury(st, az, provider, &stubTreasury{})
 }
 
-func newTestRouterWithTreasury(st *stubStore, pub *stubPublisher, az *stubAuthz, provider *provideradapter.StubProviderAdapter, treasury *stubTreasury) chi.Router {
-	return newTestRouterFull(st, pub, az, provider, treasury, &stubAuthorization{})
+func newTestRouterWithTreasury(st *stubStore, az *stubAuthz, provider *provideradapter.StubProviderAdapter, treasury *stubTreasury) chi.Router {
+	return newTestRouterFull(st, az, provider, treasury, &stubAuthorization{})
 }
 
-func newTestRouterFull(st *stubStore, pub *stubPublisher, az *stubAuthz, provider *provideradapter.StubProviderAdapter, treasury *stubTreasury, authorization *stubAuthorization) chi.Router {
+func newTestRouterFull(st *stubStore, az *stubAuthz, provider *provideradapter.StubProviderAdapter, treasury *stubTreasury, authorization *stubAuthorization) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, provider, treasury, authorization, logger)
+	h := handler.New(st, az, provider, treasury, authorization, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -150,7 +138,7 @@ func prepareAttempt(t *testing.T, r http.Handler, req domain.PrepareAttemptReque
 // ── tests ────────────────────────────────────────────────────────────────────
 
 func TestPrepareAttempt_Prepared(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	a := prepareAttempt(t, r, newPrepareReq("idem-1", "invoice-payment"))
 	if a.Status != domain.StatusPrepared {
 		t.Fatalf("expected PREPARED, got %s", a.Status)
@@ -158,7 +146,7 @@ func TestPrepareAttempt_Prepared(t *testing.T) {
 }
 
 func TestPrepareAttempt_NotVerified_Rejected(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	req := newPrepareReq("idem-2", "invoice-payment")
 	req.PayerAccountVerified = false
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", req, testTenant)
@@ -172,7 +160,7 @@ func TestPrepareAttempt_NotVerified_Rejected(t *testing.T) {
 // it to true, but if treasury-svc's real BNK-01 record says the account
 // isn't ACTIVE/ownership-verified, PrepareAttempt must still refuse.
 func TestPrepareAttempt_TreasuryRejectsAccount_Returns422(t *testing.T) {
-	r := newTestRouterWithTreasury(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterWithTreasury(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{err: clients.ErrPayerAccountNotEligible})
 	req := newPrepareReq("idem-treasury-1", "invoice-payment")
 	// PayerAccountVerified is still (falsely) asserted true by the caller.
@@ -186,7 +174,7 @@ func TestPrepareAttempt_TreasuryRejectsAccount_Returns422(t *testing.T) {
 // unreachable treasury-svc blocks the attempt rather than silently
 // trusting the caller's flag.
 func TestPrepareAttempt_TreasuryUnavailable_FailsClosed(t *testing.T) {
-	r := newTestRouterWithTreasury(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterWithTreasury(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{err: clients.ErrPayerAccountUnavailable})
 	req := newPrepareReq("idem-treasury-2", "invoice-payment")
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", req, testTenant)
@@ -198,7 +186,7 @@ func TestPrepareAttempt_TreasuryUnavailable_FailsClosed(t *testing.T) {
 // TestPrepareAttempt_TreasuryVerifies_Succeeds is the positive control:
 // a real, ACTIVE, ownership-verified account still succeeds.
 func TestPrepareAttempt_TreasuryVerifies_Succeeds(t *testing.T) {
-	r := newTestRouterWithTreasury(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterWithTreasury(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{})
 	a := prepareAttempt(t, r, newPrepareReq("idem-treasury-3", "invoice-payment"))
 	if a.Status != domain.StatusPrepared {
@@ -221,7 +209,7 @@ func newAuthorizationSourceReq(idempotencyKey string) domain.PrepareAttemptReque
 // either the fingerprint or the ID it's supposed to verify against — both
 // are required together, not silently accepted as an unverified attempt.
 func TestPrepareAttempt_AuthorizationSourceRequiresFingerprintAndID(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 
 	missingFingerprint := newAuthorizationSourceReq("idem-auth-1")
 	missingFingerprint.AuthorizationFingerprint = ""
@@ -243,7 +231,7 @@ func TestPrepareAttempt_AuthorizationSourceRequiresFingerprintAndID(t *testing.T
 // match payment-authorization-svc's live record is rejected, not stored
 // and trusted.
 func TestPrepareAttempt_AuthorizationFingerprintMismatch_Returns422(t *testing.T) {
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterFull(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{}, &stubAuthorization{err: domain.ErrAuthorizationFingerprintMismatch})
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newAuthorizationSourceReq("idem-auth-3"), testTenant)
 	if w.Code != http.StatusUnprocessableEntity {
@@ -255,7 +243,7 @@ func TestPrepareAttempt_AuthorizationFingerprintMismatch_Returns422(t *testing.T
 // unreachable payment-authorization-svc blocks the attempt rather than
 // silently trusting the caller-supplied fingerprint.
 func TestPrepareAttempt_AuthorizationServiceUnavailable_FailsClosed(t *testing.T) {
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterFull(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{}, &stubAuthorization{err: domain.ErrAuthorizationServiceUnavailable})
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newAuthorizationSourceReq("idem-auth-4"), testTenant)
 	if w.Code != http.StatusServiceUnavailable {
@@ -266,7 +254,7 @@ func TestPrepareAttempt_AuthorizationServiceUnavailable_FailsClosed(t *testing.T
 // TestPrepareAttempt_AuthorizationFingerprintVerified_Succeeds is the
 // positive control: a real, matching fingerprint still succeeds.
 func TestPrepareAttempt_AuthorizationFingerprintVerified_Succeeds(t *testing.T) {
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterFull(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{}, &stubAuthorization{})
 	a := prepareAttempt(t, r, newAuthorizationSourceReq("idem-auth-5"))
 	if a.Status != domain.StatusPrepared {
@@ -286,7 +274,7 @@ func TestPrepareAttempt_AuthorizationFingerprintVerified_Succeeds(t *testing.T) 
 // longer treasury-svc's shape — see the AuthorizationSourceTreasury tests
 // below for that.
 func TestPrepareAttempt_EmptySource_SkipsFingerprintCheck(t *testing.T) {
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterFull(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{}, &stubAuthorization{err: domain.ErrAuthorizationFingerprintMismatch})
 	req := newPrepareReq("idem-auth-6", "invoice-payment")
 	req.AuthorizationFingerprint = ""
@@ -300,7 +288,7 @@ func TestPrepareAttempt_EmptySource_SkipsFingerprintCheck(t *testing.T) {
 // non-recognized AuthorizationSource is refused (400) rather than
 // silently trusted like the empty case above.
 func TestPrepareAttempt_UnrecognizedSource_Rejected(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	req := newPrepareReq("idem-auth-7", "invoice-payment")
 	req.AuthorizationSource = "SOME_OTHER_SERVICE"
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", req, testTenant)
@@ -323,7 +311,7 @@ func newTreasurySourceReq(idempotencyKey string) domain.PrepareAttemptRequest {
 // TestPrepareAttempt_AuthorizationSourceRequiresFingerprintAndID for the
 // treasury path.
 func TestPrepareAttempt_TreasurySourceRequiresFingerprintAndID(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 
 	missingFingerprint := newTreasurySourceReq("idem-treasury-fp-1")
 	missingFingerprint.AuthorizationFingerprint = ""
@@ -345,7 +333,7 @@ func TestPrepareAttempt_TreasurySourceRequiresFingerprintAndID(t *testing.T) {
 // treasury-svc's live GetTreasuryTransferFingerprint record is rejected,
 // not stored and trusted — closing the exact carve-out Wave 11a left open.
 func TestPrepareAttempt_TreasuryFingerprintMismatch_Returns422(t *testing.T) {
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterFull(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{fingerprintErr: domain.ErrTreasuryFingerprintMismatch}, &stubAuthorization{})
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newTreasurySourceReq("idem-treasury-fp-3"), testTenant)
 	if w.Code != http.StatusUnprocessableEntity {
@@ -357,7 +345,7 @@ func TestPrepareAttempt_TreasuryFingerprintMismatch_Returns422(t *testing.T) {
 // proves an unreachable treasury-svc blocks the attempt rather than
 // silently trusting the caller-supplied fingerprint.
 func TestPrepareAttempt_TreasuryFingerprintServiceUnavailable_FailsClosed(t *testing.T) {
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterFull(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{fingerprintErr: clients.ErrTransferFingerprintUnavailable}, &stubAuthorization{})
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newTreasurySourceReq("idem-treasury-fp-4"), testTenant)
 	if w.Code != http.StatusServiceUnavailable {
@@ -368,7 +356,7 @@ func TestPrepareAttempt_TreasuryFingerprintServiceUnavailable_FailsClosed(t *tes
 // TestPrepareAttempt_TreasuryFingerprintVerified_Succeeds is the positive
 // control: a real, matching treasury transfer fingerprint still succeeds.
 func TestPrepareAttempt_TreasuryFingerprintVerified_Succeeds(t *testing.T) {
-	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+	r := newTestRouterFull(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{}, &stubAuthorization{})
 	a := prepareAttempt(t, r, newTreasurySourceReq("idem-treasury-fp-5"))
 	if a.Status != domain.StatusPrepared {
@@ -383,7 +371,7 @@ func TestPrepareAttempt_TreasuryFingerprintVerified_Succeeds(t *testing.T) {
 // structural fix for "provider timeout triggers new payment ID": a repeat
 // prepare with the same key never creates a second row.
 func TestPrepareAttempt_DuplicateIdempotencyKey_ReturnsExisting(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	first := prepareAttempt(t, r, newPrepareReq("idem-3", "invoice-payment"))
 
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newPrepareReq("idem-3", "invoice-payment"), testTenant)
@@ -398,7 +386,7 @@ func TestPrepareAttempt_DuplicateIdempotencyKey_ReturnsExisting(t *testing.T) {
 }
 
 func TestSubmitAttempt_Submitted(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	a := prepareAttempt(t, r, newPrepareReq("idem-4", "invoice-payment"))
 
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/"+a.AttemptID+"/submit", nil, testTenant)
@@ -416,7 +404,7 @@ func TestSubmitAttempt_Submitted(t *testing.T) {
 // "UNKNOWN is a first-class financial state": a timeout must never become
 // Rejected.
 func TestSubmitAttempt_Timeout_PendingUnknown(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	a := prepareAttempt(t, r, newPrepareReq("idem-5", "SIMULATE_TIMEOUT-invoice-payment"))
 
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/"+a.AttemptID+"/submit", nil, testTenant)
@@ -431,7 +419,7 @@ func TestSubmitAttempt_Timeout_PendingUnknown(t *testing.T) {
 }
 
 func TestSubmitAttempt_Rejected(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	a := prepareAttempt(t, r, newPrepareReq("idem-6", "SIMULATE_REJECT-invoice-payment"))
 
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/"+a.AttemptID+"/submit", nil, testTenant)
@@ -448,7 +436,7 @@ func TestSubmitAttempt_Rejected(t *testing.T) {
 // TestRetrySameAttempt_ReusesSameAttemptID is the structural fix for
 // "provider timeout triggers new payment ID."
 func TestRetrySameAttempt_ReusesSameAttemptID(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	a := prepareAttempt(t, r, newPrepareReq("idem-7", "SIMULATE_TIMEOUT-invoice-payment"))
 	doRequest(r, http.MethodPost, "/bnk06/attempts/"+a.AttemptID+"/submit", nil, testTenant)
 
@@ -464,7 +452,7 @@ func TestRetrySameAttempt_ReusesSameAttemptID(t *testing.T) {
 }
 
 func TestCancelBeforeSubmission(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	a := prepareAttempt(t, r, newPrepareReq("idem-8", "invoice-payment"))
 
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/"+a.AttemptID+"/cancel", nil, testTenant)
@@ -474,7 +462,7 @@ func TestCancelBeforeSubmission(t *testing.T) {
 }
 
 func TestCancelBeforeSubmission_AlreadySubmitted_Rejected(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	a := prepareAttempt(t, r, newPrepareReq("idem-9", "invoice-payment"))
 	doRequest(r, http.MethodPost, "/bnk06/attempts/"+a.AttemptID+"/submit", nil, testTenant)
 
@@ -485,7 +473,7 @@ func TestCancelBeforeSubmission_AlreadySubmitted_Rejected(t *testing.T) {
 }
 
 func TestResolveAmbiguousSubmission(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	a := prepareAttempt(t, r, newPrepareReq("idem-10", "SIMULATE_TIMEOUT-invoice-payment"))
 	doRequest(r, http.MethodPost, "/bnk06/attempts/"+a.AttemptID+"/submit", nil, testTenant)
 
@@ -502,7 +490,7 @@ func TestResolveAmbiguousSubmission(t *testing.T) {
 }
 
 func TestQuarantineAttempt(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	a := prepareAttempt(t, r, newPrepareReq("idem-11", "invoice-payment"))
 
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/"+a.AttemptID+"/quarantine",
@@ -513,7 +501,7 @@ func TestQuarantineAttempt(t *testing.T) {
 }
 
 func TestGetPaymentAttempt_NotFound(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter())
 	w := doRequest(r, http.MethodGet, "/bnk06/attempts/does-not-exist", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
@@ -521,7 +509,7 @@ func TestGetPaymentAttempt_NotFound(t *testing.T) {
 }
 
 func TestPrepareAttempt_AuthorizationDenied(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{deny: true}, provideradapter.NewStubProviderAdapter())
+	r := newTestRouter(newStubStore(), &stubAuthz{deny: true}, provideradapter.NewStubProviderAdapter())
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newPrepareReq("idem-12", "invoice-payment"), testTenant)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,14 +12,64 @@ import (
 
 	"zoiko.io/banking-connector-svc/internal/domain"
 	"zoiko.io/banking-connector-svc/internal/middleware"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 )
 
 type PgStore struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore at construction.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (ZS-EVENT-001 §4, envelope.Spec.ResidencyRegion — required, a controlled
+// lower-case code such as "uk" or "eu-west").
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func NewPgStore(pool *pgxpool.Pool, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// enqueueEvent builds and enqueues one event inside the caller's own
+// transaction — the entire point of the transactional outbox (ZS-EVENT-001
+// §6): the event and the state change it reports commit atomically, or
+// neither does. legacyType is the pre-standard event_type string existing
+// consumers filter on; always pass it explicitly — envelope.New silently
+// defaults it to the canonical type when empty, which would silently break
+// any consumer still reading the old name.
+func (p *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, canonicalType, legacyType, aggregateType, aggregateID, tenantID, legalEntityID, actorID, correlationID string, data any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            canonicalType,
+		LegacyType:      legacyType,
+		Service:         "banking-connector-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   aggregateType,
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: p.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", canonicalType, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue %s event: %w", canonicalType, err)
+	}
+	return nil
 }
 
 // withTenant runs fn inside a transaction with app.tenant_id set from the
@@ -50,7 +101,7 @@ func (p *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
 	return tx.Commit(ctx)
 }
 
-func (p *PgStore) CreateConnection(ctx context.Context, c *domain.BankConnection) error {
+func (p *PgStore) CreateConnection(ctx context.Context, c *domain.BankConnection, actorID, correlationID string) error {
 	tenantID := middleware.GetTenantID(ctx)
 	if c.ConnectionID == "" {
 		c.ConnectionID = uuid.New().String()
@@ -65,8 +116,11 @@ func (p *PgStore) CreateConnection(ctx context.Context, c *domain.BankConnection
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`
 	return p.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, query, c.ConnectionID, c.TenantID, c.LegalEntityID, c.BankName, c.BIC, c.AccountNumber, c.Currency, c.Status, c.CreatedAt, c.UpdatedAt)
-		return err
+		if _, err := tx.Exec(ctx, query, c.ConnectionID, c.TenantID, c.LegalEntityID, c.BankName, c.BIC, c.AccountNumber, c.Currency, c.Status, c.CreatedAt, c.UpdatedAt); err != nil {
+			return err
+		}
+		return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.bank-connection.created", "banking.connection.created",
+			"bank-connection", c.ConnectionID, c.TenantID, c.LegalEntityID, actorID, correlationID, c)
 	})
 }
 
@@ -139,7 +193,7 @@ func (p *PgStore) ListConnections(ctx context.Context, legalEntityID string) ([]
 	return res, nil
 }
 
-func (p *PgStore) RecordStatement(ctx context.Context, stmt *domain.BankStatement) error {
+func (p *PgStore) RecordStatement(ctx context.Context, stmt *domain.BankStatement, legalEntityID, actorID, correlationID string) error {
 	tenantID := middleware.GetTenantID(ctx)
 	if stmt.StatementID == "" {
 		stmt.StatementID = uuid.New().String()
@@ -152,8 +206,14 @@ func (p *PgStore) RecordStatement(ctx context.Context, stmt *domain.BankStatemen
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`
 	return p.withTenant(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, query, stmt.StatementID, stmt.ConnectionID, stmt.TenantID, stmt.StatementFormat, stmt.StatementDate, stmt.OpeningBalance, stmt.ClosingBalance, stmt.TransactionCount, stmt.IngestedAt)
-		return err
+		if _, err := tx.Exec(ctx, query, stmt.StatementID, stmt.ConnectionID, stmt.TenantID, stmt.StatementFormat, stmt.StatementDate, stmt.OpeningBalance, stmt.ClosingBalance, stmt.TransactionCount, stmt.IngestedAt); err != nil {
+			return err
+		}
+		// BankStatement itself carries no legal_entity_id (it links back to a
+		// connection by id only) — the caller resolves it from the owning
+		// connection, same as the pre-outbox Publisher call site this replaces.
+		return p.enqueueEvent(ctx, tx, "com.zoikosuite.banking.bank-statement.ingested", "banking.statement.ingested",
+			"bank-statement", stmt.StatementID, stmt.TenantID, legalEntityID, actorID, correlationID, stmt)
 	})
 }
 

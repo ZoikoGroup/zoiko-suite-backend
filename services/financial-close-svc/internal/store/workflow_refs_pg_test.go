@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -47,7 +48,7 @@ func newRef(fp *domain.FiscalPeriod, cmd string) *domain.WorkflowRef {
 
 func TestPgStore_WorkflowRefs_RoundTripAndTenantIsolation_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenantA, tenantB := uuid.NewString(), uuid.NewString()
 	ctxA := svcmiddleware.WithTenant(context.Background(), tenantA)
 	ctxB := svcmiddleware.WithTenant(context.Background(), tenantB)
@@ -123,7 +124,7 @@ func TestPgStore_WorkflowRefs_RoundTripAndTenantIsolation_RealDB(t *testing.T) {
 // DIFFERENT connection: CreateWorkflowRef must have committed on return.
 func TestPgStore_WorkflowRefs_CommittedOnReturn_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenant := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenant)
 	fp := seedPeriodForRefs(t, s, tenant)
@@ -153,7 +154,7 @@ func TestPgStore_WorkflowRefs_CommittedOnReturn_RealDB(t *testing.T) {
 
 func TestPgStore_WorkflowRefs_AppendOnlyAndChecks_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenant := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenant)
 	fp := seedPeriodForRefs(t, s, tenant)

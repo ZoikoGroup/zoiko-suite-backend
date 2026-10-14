@@ -85,7 +85,15 @@ func (s *PgStore) RaiseEvidenceConflict(ctx context.Context, tenantID string, re
 			return err
 		}
 		created = true
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "evidence-conflict.raised", "reconciliation.evidence_conflict.raised",
+			tenantID, conflict.LegalEntityID, conflict.ConflictID, conflict.RaisedByPrincipalID, conflict.CorrelationID, map[string]any{
+				"conflict_id":               conflict.ConflictID,
+				"statement_line_id":         conflict.StatementLineID,
+				"payment_id":                conflict.PaymentID,
+				"bank_rec_status":           conflict.BankRecStatus,
+				"provider_confirmed_status": conflict.ProviderConfirmedStatus,
+				"conflict_type":             conflict.ConflictType,
+			})
 	})
 	if err != nil {
 		return nil, false, mapPgError(err)
@@ -220,7 +228,15 @@ func (s *PgStore) ResolveEvidenceConflict(ctx context.Context, tenantID, conflic
 			}
 			return domain.ErrConflictNotFound
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		return s.enqueueReconciliationEvent(ctx, tx, "evidence-conflict.resolved", "reconciliation.evidence_conflict.resolved",
+			tenantID, conflict.LegalEntityID, conflict.ConflictID, principalID, conflict.CorrelationID, map[string]any{
+				"conflict_id":       conflict.ConflictID,
+				"statement_line_id": conflict.StatementLineID,
+				"payment_id":        conflict.PaymentID,
+			})
 	})
 	if err != nil {
 		return nil, mapPgError(err)

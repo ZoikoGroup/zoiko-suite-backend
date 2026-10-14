@@ -7,10 +7,10 @@ import (
 )
 
 type Store interface {
-	CreateConnection(ctx context.Context, c *domain.BankConnection) error
+	CreateConnection(ctx context.Context, c *domain.BankConnection, actorID, correlationID string) error
 	GetConnectionByID(ctx context.Context, id string) (*domain.BankConnection, error)
 	ListConnections(ctx context.Context, legalEntityID string) ([]domain.BankConnection, error)
-	RecordStatement(ctx context.Context, stmt *domain.BankStatement) error
+	RecordStatement(ctx context.Context, stmt *domain.BankStatement, legalEntityID, actorID, correlationID string) error
 	ListStatements(ctx context.Context, connectionID string) ([]domain.BankStatement, error)
 }
 
@@ -47,7 +47,7 @@ type ControlPopulationStore interface {
 // as BNK02Store, colocated because normalization reads BNK-03's evidence
 // synchronously.
 type BNK0304Store interface {
-	IngestStatement(ctx context.Context, tenantID string, req domain.IngestStatementLinesRequest, actorPrincipalID string) (*domain.IngestStatementResult, error)
+	IngestStatement(ctx context.Context, tenantID string, req domain.IngestStatementLinesRequest, actorPrincipalID, correlationID string) (*domain.IngestStatementResult, error)
 	ValidateStatement(ctx context.Context, tenantID, statementID string) error
 	AcceptStatement(ctx context.Context, tenantID, statementID string) error
 	QuarantineStatement(ctx context.Context, tenantID, statementID, reason string) error

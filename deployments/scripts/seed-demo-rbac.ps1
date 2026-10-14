@@ -194,6 +194,160 @@ $BUNDLES = @(
         Actions = @("AR_INVOICE_ISSUE", "AR_INVOICE_SEND", "AR_MARK_OVERDUE", "AR_PAYMENT_RECEIVE")
     },
     @{
+        # AR-01 Customer Financial Profile (ZS-SVC-C-001). Maintaining a profile
+        # and approving an out-of-policy credit-limit increase are separate roles
+        # on purpose: the service refuses self-approval (SEGREGATION_OF_DUTIES), and
+        # a role holding both would let one person staff both sides in a demo.
+        Code    = "AR01_PROFILE_MANAGER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR01_PROFILE_MANAGE", "AR01_CREDIT_LIMIT_MANAGE", "AR01_CREDIT_HOLD_MANAGE")
+    },
+    @{
+        Code    = "AR01_CREDIT_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR01_CREDIT_LIMIT_APPROVE")
+    },
+    @{
+        # AR-02 Quote / Estimate. Preparing, approving and converting are separate
+        # roles; the service refuses a discount above 10% approved by its preparer.
+        Code    = "AR02_QUOTE_PREPARER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR02_QUOTE_MANAGE", "AR02_QUOTE_CONVERT")
+    },
+    @{
+        Code    = "AR02_QUOTE_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR02_QUOTE_APPROVE", "AR02_QUOTE_DISCOUNT_APPROVE")
+    },
+    @{
+        # AR-03 Sales Order. Managing, approving and the credit-exception authority
+        # are separate roles; the service refuses self-approval above thresholds and
+        # release of a CREDIT hold by the principal who needs it released.
+        Code    = "AR03_ORDER_MANAGER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR03_ORDER_MANAGE", "AR03_ORDER_CONFIRM", "AR03_ORDER_HOLD", "AR03_ORDER_CANCEL")
+    },
+    @{
+        Code    = "AR03_ORDER_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR03_ORDER_APPROVE", "AR03_ORDER_CREDIT_EXCEPTION_APPROVE")
+    },
+    @{
+        # AR-04 Customer Invoice. Drafting/issuing, approval and legal-cancellation
+        # decisions are separate roles: the service refuses an approver who is the
+        # creator or submitter, and the issuer approving a material invoice.
+        Code    = "AR04_INVOICE_BILLER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR04_INVOICE_MANAGE", "AR04_INVOICE_ISSUE", "AR04_INVOICE_CANCEL_REQUEST",
+                    "AR04_INVOICE_CORRECTION_LINK", "AR04_INVOICE_DELIVERY_RECORD")
+    },
+    @{
+        Code    = "AR04_INVOICE_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR04_INVOICE_APPROVE", "AR04_INVOICE_CANCEL_APPROVE")
+    },
+    @{
+        # AR-05 Electronic Invoice. Submitting, reconciling against the provider and
+        # the manual-evidence admin path are separate: the issuer needs no provider
+        # permission, and the principal who started an attempt cannot resolve it by
+        # manual evidence.
+        Code    = "AR05_EINVOICE_OPERATOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR05_EINVOICE_SUBMIT", "AR05_EINVOICE_RECONCILE")
+    },
+    @{
+        Code    = "AR05_ADAPTER_ADMIN"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR05_ADAPTER_ADMIN", "AR05_EINVOICE_RECONCILE")
+    },
+    @{
+        # AR-07 Receivables. Disputes/holds are operational; a privileged balance
+        # correction is a separate authority. No role can set a balance directly.
+        Code    = "AR07_RECEIVABLES_OPERATOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR07_DISPUTE_MANAGE", "AR07_HOLD_MANAGE", "AR07_RECEIVABLE_MANAGE")
+    },
+    @{
+        Code    = "AR07_RECEIVABLES_CORRECTOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR07_RECEIVABLE_ADJUST")
+    },
+    @{
+        # AR-06 Credit / Debit Note. Preparing, approving and issuing are separate
+        # roles; the service refuses an approver who is the creator or submitter.
+        Code    = "AR06_CORRECTION_PREPARER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR06_CORRECTION_MANAGE", "AR06_CORRECTION_ISSUE", "AR06_CORRECTION_LINK")
+    },
+    @{
+        Code    = "AR06_CORRECTION_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR06_CORRECTION_APPROVE")
+    },
+    @{
+        # AR-08 Cash Application. Registering/applying cash, approving a manual
+        # match and unapplying are separate authorities; the service refuses the
+        # proposer or registrant as approver and the applier as unapplier.
+        Code    = "AR08_CASH_APPLIER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR08_RECEIPT_REGISTER", "AR08_APPLICATION_MANAGE")
+    },
+    @{
+        Code    = "AR08_CASH_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR08_MANUALMATCH_APPROVE", "AR08_UNAPPLY", "AR08_REAPPLY")
+    },
+    @{
+        # AR-10 Refund / Write-Off. Requesting, approving, submitting for payment,
+        # tax review and committing are separate authorities; write-off approval is
+        # tiered (T1 <= 500, T2 <= 5,000, T3 <= 50,000, T4 unlimited) and the service
+        # refuses the requester, dispute resolver or collector as approver.
+        Code    = "AR10_REFUND_REQUESTER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_REFUND_CREATE", "AR10_REFUND_SUBMIT", "AR10_REFUND_RECONCILE", "AR10_WRITEOFF_CREATE")
+    },
+    @{
+        # AR-09 Collections & Dunning. No role here carries any write-off, refund,
+        # credit or approval authority: collections never changes a balance.
+        Code    = "AR09_COLLECTOR"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR09_COLLECTIONS_MANAGE", "AR09_DUNNING_SEND", "AR09_HOLD_MANAGE")
+    },
+    @{
+        # AR-to-GL controls. Running a reconciliation and acknowledging its findings
+        # are separate: the principal who ran it cannot acknowledge its findings, and
+        # an acknowledgement only annotates (it never clears) a finding.
+        Code    = "AR_CTL_RECONCILER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR_CTL_RUN_RECONCILIATION")
+    },
+    @{
+        Code    = "AR_CTL_REVIEWER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR_CTL_ACKNOWLEDGE_FINDING")
+    },
+    @{
+        Code    = "AR09_COLLECTIONS_LEAD"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR09_COLLECTIONS_ESCALATE", "AR09_POLICY_MANAGE")
+    },
+    @{
+        Code    = "AR10_REFUND_APPROVER"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_REFUND_APPROVE")
+    },
+    @{
+        Code    = "AR10_WRITEOFF_APPROVER_T1"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_WRITEOFF_APPROVE_T1", "AR10_WRITEOFF_COMMIT")
+    },
+    @{
+        Code    = "AR10_WRITEOFF_APPROVER_T4"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR10_WRITEOFF_APPROVE_T1", "AR10_WRITEOFF_APPROVE_T2", "AR10_WRITEOFF_APPROVE_T3",
+                    "AR10_WRITEOFF_APPROVE_T4", "AR10_WRITEOFF_TAX_REVIEW", "AR10_WRITEOFF_COMMIT")
+    },
+    @{
         # bank-reconciliation-svc gates ingest, match, exception and statement
         # completion separately. Its two READ routes are not authorized at all
         # -- they are scoped by the verified X-Tenant-Id instead, the same

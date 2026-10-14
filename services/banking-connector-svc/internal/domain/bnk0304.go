@@ -118,6 +118,7 @@ type NormalizeTransactionParams struct {
 	Amount                                  float64
 	Currency                                string
 	ActorPrincipalID                        string
+	CorrelationID                           string
 }
 
 // NormalizeTransactionResult is exactly one of its two fields: either the
@@ -157,10 +158,12 @@ type ReNormalizeTransactionParams struct {
 	Amount                                                 float64
 	Currency                                               string
 	ActorPrincipalID                                       string
+	CorrelationID                                          string
 }
 
 type QuarantineTransactionParams struct {
 	TenantID, StatementLineID, Reason, ActorPrincipalID string
+	CorrelationID                                       string
 }
 
 // ApproveMappingExceptionParams is BNK-04's maker-checker resolution: the
@@ -173,6 +176,7 @@ type ApproveMappingExceptionParams struct {
 	Amount                                          float64
 	Currency                                        string
 	ApproverPrincipalID                             string
+	CorrelationID                                   string
 }
 
 var (
