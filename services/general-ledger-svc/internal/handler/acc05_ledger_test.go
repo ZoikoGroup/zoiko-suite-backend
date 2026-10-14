@@ -101,7 +101,7 @@ func TestQueryAccountBalance_MissingFields_Returns400(t *testing.T) {
 
 func TestQueryAccountBalance_ReturnsProjectionRow(t *testing.T) {
 	s := newStubStore()
-	s.ledgerBalance = &domain.LedgerBalance{AccountCode: "1000", DebitTotal: 500, CreditTotal: 200, NetBalance: 300}
+	s.ledgerBalance = &domain.LedgerBalance{AccountCode: "1000", DebitTotal: "500", CreditTotal: "200", NetBalance: "300"}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	resp := doRequest(r, http.MethodGet, "/v1/ledger/balance?legal_entity_id=entity-a&account_code=1000&fiscal_period=2026-07", nil, "reader-1")
 	if resp.Code != http.StatusOK {
@@ -111,7 +111,7 @@ func TestQueryAccountBalance_ReturnsProjectionRow(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if got.NetBalance != 300 {
+	if got.NetBalance != "300" {
 		t.Fatalf("expected net_balance 300, got %v", got.NetBalance)
 	}
 }
