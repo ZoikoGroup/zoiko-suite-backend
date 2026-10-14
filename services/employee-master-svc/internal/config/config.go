@@ -16,6 +16,11 @@ type Config struct {
 
 	AuthZServiceURL string
 
+	// PayrollRunServiceURL owns the WFP source trust profiles; JurisdictionRulesURL
+	// is the jurisdiction registry. WFP-01 fails closed when either is unreachable.
+	PayrollRunServiceURL string
+	JurisdictionRulesURL string
+
 	// AuthzMTLSEnabled opts this service into calling authorization-svc over
 	// mutual TLS instead of plain HTTP. OFF by default — see internal/mtls.
 	AuthzMTLSEnabled bool
@@ -132,6 +137,8 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.employee.events"),
 		},
 		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		PayrollRunServiceURL:     env("PAYROLL_RUN_SERVICE_URL", "http://payroll-run-svc:8110"),
+		JurisdictionRulesURL:     env("JURISDICTION_RULES_SERVICE_URL", "http://jurisdiction-rules-svc:8082"),
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
