@@ -464,6 +464,21 @@ The sections below apply this structure to the most important services first.
 
 - validate threshold applicability
 
+*Physical routes (recorded 14 Oct 2026 from the implemented, audited surface; the GOV-05 operation each one realises in brackets — GOV-05's `/internal/v1/gov05/...` paths are its "illustrative contract surface"; route and permission table in `services/policy-svc/progress.md`):*
+
+- `GET /v1/policies?policy_type=` — get applicable policy set (as of a business time and a knowledge time)
+- `GET /v1/policies/resolve?policy_type=` — validate threshold applicability (ResolveEffectivePolicy: RESOLVED / NOT_APPLICABLE / CONFLICTED)
+- `GET /v1/policies/explain?policy_type=` — ExplainPolicyResolution (every candidate version and why it does or does not govern)
+- `POST /v1/policies/evaluate` — evaluate policy against action context (returns `evidence_id`; a repeated `decision_id` returns the original result)
+- `POST /v1/policies`, `GET /v1/policies/{policy_id}` — policy families (tenant-owned by default; `scope: GLOBAL` for platform families)
+- `POST /v1/policies/{policy_id}/versions`, `GET /v1/policies/{policy_id}/versions` — CreatePolicyDraft; retrieve policy version history
+- `POST /v1/policies/{policy_id}/versions/{version_id}/submit-review | approve | activate | schedule | suspend | review-suspension | retire` — SubmitPolicyReview, ApprovePolicy, ActivatePolicy, ScheduleActivation, EmergencySuspendPolicy (and its independent review), retirement; SupersedePolicy is the activation of a successor. Each needs `If-Match` / `expected_version`
+- `GET /v1/policy-versions/{version_id}`, `GET /v1/policy-versions/compare?base=&target=`, `GET /v1/policy-versions/{version_id}/transitions` — GetPolicyVersion, ComparePolicyVersions, lifecycle evidence
+- `GET /v1/policy-evaluations/{evidence_id}` — evaluation evidence
+- Control tests and attestations (doc7 §E3 / §E6, traceability GOV-02): `POST /v1/control-test-definitions`, `GET /v1/control-test-definitions/{id}`, `POST`/`GET /v1/control-test-definitions/{id}/executions`, `GET /v1/controls/{control_ref}/effectiveness`, `POST /v1/attestations`, `GET /v1/attestations/{id}`, `POST /v1/attestations/{id}/revoke`
+
+Errors carry the GCP §16 stable class in `code`. A conflict between two equally specific policies is `POLICY_CONFLICTED`, V-001 §5's applicability state CONFLICTED, for which §16 has no class.
+
 **Published Events**
 
 - policy.created
@@ -473,6 +488,8 @@ The sections below apply this structure to the most important services first.
 - policy.version.activated
 
 - policy.rule.retired
+
+*Also published (recorded 14 Oct 2026 for the GOV-05 lifecycle, in the same naming pending group decision C3):* `policy.version.submitted`, `policy.version.approved`, `policy.version.scheduled`, `policy.version.suspended`, `policy.version.suspension_reviewed`, `policy.applicability.conflicted`. `policy.rule.retired` covers both supersession and retirement (its payload names which).
 
 **Consumed Events**
 

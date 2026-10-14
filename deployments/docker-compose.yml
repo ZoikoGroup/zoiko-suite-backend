@@ -1049,6 +1049,11 @@ services:
       DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      # The principal policy-svc writes evaluation evidence to the governance
+      # ledger as (decision D-02). It needs GOVERNANCE_DECISION_RECORD; until
+      # it has it, evaluations still succeed and their evidence waits, durable,
+      # in policy_evidence_outbox.
+      POLICY_LEDGER_PRINCIPAL_ID: "${POLICY_LEDGER_PRINCIPAL_ID:-svc-policy}"
       # Authorization gate. policy-svc had none: anyone able to reach the
       # port could define a policy, publish a version and activate it.
       # Role assignments granting POLICY_CREATE / POLICY_VERSION_CREATE /
@@ -1056,6 +1061,24 @@ services:
       # legal_entity_id for policies that are not entity-scoped.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # POLICY_EVALUATE and POLICY_READ gates. Enforced: access-control-svc
+      # registers both actions (its 000019), seed-demo-rbac.ps1 grants them,
+      # and every caller forwards X-Principal-Id (expense-claim-svc and
+      # payment-authorization-svc since 14 Oct; governance-decision-log-svc's
+      # replay through its envelope).
+      POLICY_EVALUATE_AUTHZ: "${POLICY_EVALUATE_AUTHZ:-enforce}"
+      POLICY_READ_AUTHZ: "${POLICY_READ_AUTHZ:-enforce}"
+      # Identity headers (X5): enforce needs identity-context-svc's signed
+      # envelope (Authorization, verified against its JWKS) agreeing with
+      # X-Tenant-Id / X-Principal-Id, or a peer certificate on the :8449 mTLS
+      # listener. warn until governance-decision-log-svc's replay forwards the
+      # envelope (its generated ForwardTo carries no Authorization) and the
+      # peers call over mTLS; the code default is enforce.
+      POLICY_IDENTITY_VERIFY: "${POLICY_IDENTITY_VERIFY:-warn}"
+      IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      EXPECTED_ISSUER: "identity-context-svc"
+      EXPECTED_AUDIENCE: "zoiko-internal"
+      EVENT_RESIDENCY_REGION: "${EVENT_RESIDENCY_REGION:-local}"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "policy-svc"

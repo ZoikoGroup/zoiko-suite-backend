@@ -1,222 +1,137 @@
-// Package decisionlog provides a client for recording policy evaluations
-// as governance decisions in governance-decision-log-svc — satisfying the
-// "preserve evaluation basis for governed decisions" evidence obligation
-// (docs/architecture/03-microservices.md §8.1) that Evaluate's response
-// alone does not: returning rule_basis/policy_version_id in an HTTP
-// response is not durable evidence, only a record actually written to
-// governance-decision-log-svc is.
+// Package decisionlog delivers policy evaluations to
+// governance-decision-log-svc's POST /v1/decisions — the governance ledger
+// half of the "preserve evaluation basis for governed decisions" evidence
+// obligation (Doc 03 §8.1). The other half, the evaluation's own evidence
+// row, is written by Evaluate in policy-svc's database before it answers;
+// this client is called by the evidence relay (internal/evidence), never
+// on the request path.
+//
+// The ledger writer is policy-svc's own service principal (decision D-02,
+// 14 Oct 2026): it alone needs GOVERNANCE_DECISION_RECORD. The user whose
+// action was evaluated travels in evaluation_context.requested_by_principal_id.
 package decisionlog
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
-
-	svcenvelope "zoiko.io/policy-svc/internal/envelope"
 )
 
-// globalScopeSentinel is substituted for TenantID/LegalEntityID when a
-// policy evaluation had no tenant/entity scope (a global policy).
-// governance-decision-log-svc requires both fields non-empty on every
-// decision; policy-svc legitimately supports nil scope for global
-// policies (see internal/domain "TenantID nil means ... applies
-// globally"). This sentinel bridges that contract mismatch without
-// requiring a schema or validation change on the decision-log side —
-// confirmed against a real governance-decision-log-svc instance that
-// this value is accepted with no special-casing needed.
-const globalScopeSentinel = "GLOBAL"
+// PurposeContext is sent as X-Purpose-Context. governance-decision-log-svc's
+// envelope contract requires it on every append (whether it should is held as
+// that service's open decision D-06), so every write names its purpose.
+const PurposeContext = "policy_evaluation_evidence"
 
-// RecordDecisionParams holds the fields forwarded to
-// governance-decision-log-svc's POST /v1/decisions.
-type RecordDecisionParams struct {
-	DecisionID            string
-	TenantID              *string
-	LegalEntityID         *string
-	ActorID               string
-	ActionType            string
-	Outcome               string
-	RuleBasis             string
-	EvaluationContext     json.RawMessage
-	CorrelationID         string
-	PolicyVersionID       *string
-	ActionSubjectType     *string
-	ActionSubjectID       *string
-	WorkflowInstanceID    *string
-	CausationID           *string
-	DecidedAt             *time.Time
+// PlatformScope is governance-decision-log-svc's (and authorization-svc's)
+// literal for "not scoped to one legal entity". It is the one non-UUID
+// legal_entity_id that service accepts.
+const PlatformScope = "PLATFORM"
+
+// ErrPermanent marks a refusal that will not change on retry: the ledger
+// already holds a different decision under this id or key. The relay parks
+// such a record instead of retrying.
+var ErrPermanent = errors.New("governance-decision-log-svc refused the record permanently")
+
+// Record is one decision to append to the ledger.
+type Record struct {
+	// Envelope.
+	TenantID       string
+	LegalEntityID  string // a UUID, or PlatformScope
+	PrincipalID    string // the ledger writer
+	CorrelationID  string
+	CausationID    string
+	RequestID      string
+	IdempotencyKey string
+
+	// Body.
+	DecisionID        string
+	ActionType        string
+	Outcome           string
+	RuleBasis         string
+	PolicyVersionID   string
+	EvaluationContext json.RawMessage
+	DecidedAt         time.Time
 }
 
-// Client is the narrow interface Evaluate depends on for recording
-// decisions. Allows the handler to be tested without a real HTTP call.
+// Client appends decisions to the governance ledger.
 type Client interface {
-	RecordDecision(ctx context.Context, params RecordDecisionParams) error
+	RecordDecision(ctx context.Context, rec Record) error
 }
 
-// HTTPClient implements Client against a real governance-decision-log-svc
-// instance.
-//
-// Called synchronously from within Evaluate's request handling, matching
-// this codebase's existing convention for calling out on the write path
-// (identity-context-svc's and tenant-entity-registry-svc's real Kafka
-// producers are also invoked synchronously, not fire-and-forget in a
-// goroutine — see their internal/events/publisher.go). Failures are
-// logged, not surfaced: Evaluate must not fail or block indefinitely
-// because the evidence store is unavailable (Policy Service is Tier 0,
-// "high execution criticality" per §8.1's Scaling Characteristics, and
-// §3.9 requires governance enforcement not become a latency bottleneck).
-//
-// Timeout is deliberately tight (2s), not the more common 5s default —
-// verified live against a fully-down governance-decision-log-svc that a
-// DNS resolution failure alone took ~2.5s wall-clock with an unbounded
-// client, which would otherwise silently become Evaluate's worst-case
-// latency floor whenever the evidence store is unreachable. Revisit if
-// this call proves to be an actual bottleneck in practice under normal
-// (not fully-down) conditions — moving to async/best-effort delivery
-// would be the next step, not a redesign.
+// HTTPClient implements Client against a real governance-decision-log-svc.
 type HTTPClient struct {
-	baseURL          string
-	platformScopeID  string
-	http             *http.Client
+	baseURL string
+	http    *http.Client
 }
 
 // NewHTTPClient constructs an HTTPClient bound to baseURL, e.g.
-// "http://governance-decision-log-svc:8083" (no trailing slash).
-// platformScopeID is the UUID of the synthetic platform-scope legal entity
-// used for global (cross-tenant) policies. It is sent as X-Tenant-Id header
-// to governance-decision-log-svc when the evaluation has no tenant scope,
-// replacing the "GLOBAL" sentinel which is not a valid UUID.
-func NewHTTPClient(baseURL, platformScopeID string) *HTTPClient {
+// "http://governance-decision-log-svc:8083".
+func NewHTTPClient(baseURL string) *HTTPClient {
 	return &HTTPClient{
-		baseURL:          baseURL,
-		platformScopeID:  platformScopeID,
-		http:             &http.Client{Timeout: 2 * time.Second},
+		baseURL: strings.TrimRight(baseURL, "/"),
+		http:    &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
-// createDecisionRequest mirrors governance-decision-log-svc's own
-// createDecisionRequest wire shape exactly (internal/handler/handler.go).
+// createDecisionRequest mirrors governance-decision-log-svc's
+// createDecisionRequest. tenant_id is deliberately omitted: that service
+// files the decision under the verified X-Tenant-Id and refuses a body that
+// names a different one (the "GLOBAL" sentinel this client used to send got
+// 403 TENANT_SCOPE_MISMATCH on every global-scope evaluation).
 type createDecisionRequest struct {
-	DecisionID            string          `json:"decision_id"`
-	TenantID              string          `json:"tenant_id"`
-	LegalEntityID         string          `json:"legal_entity_id"`
-	ActorID               string          `json:"actor_id"`
-	ActionType            string          `json:"action_type"`
-	Outcome               string          `json:"outcome"`
-	RuleBasis             string          `json:"rule_basis"`
-	EvaluationContext     json.RawMessage `json:"evaluation_context,omitempty"`
-	CorrelationID         string          `json:"correlation_id"`
-	PolicyVersionID       *string         `json:"policy_version_id,omitempty"`
-	ActionSubjectType     *string         `json:"action_subject_type,omitempty"`
-	ActionSubjectID       *string         `json:"action_subject_id,omitempty"`
-	WorkflowInstanceID    *string         `json:"workflow_instance_id,omitempty"`
-	CausationID           *string         `json:"causation_id,omitempty"`
-	DecidedAt             *time.Time      `json:"decided_at,omitempty"`
+	DecisionID        string          `json:"decision_id"`
+	LegalEntityID     string          `json:"legal_entity_id"`
+	ActionType        string          `json:"action_type"`
+	Outcome           string          `json:"outcome"`
+	RuleBasis         string          `json:"rule_basis"`
+	EvaluationContext json.RawMessage `json:"evaluation_context,omitempty"`
+	CorrelationID     string          `json:"correlation_id"`
+	PolicyVersionID   string          `json:"policy_version_id,omitempty"`
+	DecidedAt         time.Time       `json:"decided_at"`
 }
 
-// RecordDecision POSTs to governance-decision-log-svc's /v1/decisions.
-// Idempotent on DecisionID (that service's own idempotency key) — a
-// caller-supplied DecisionID makes retries safe.
-func (c *HTTPClient) RecordDecision(ctx context.Context, params RecordDecisionParams) error {
-	// Extract the envelope from context to forward all required headers
-	env, hasEnv := svcenvelope.FromContext(ctx)
-
-	// Body uses "GLOBAL" sentinel for global scope (governance-decision-log-svc accepts this in body)
-	tenantID := globalScopeSentinel
-	if params.TenantID != nil && *params.TenantID != "" {
-		tenantID = *params.TenantID
-	}
-	legalEntityID := globalScopeSentinel
-	if params.LegalEntityID != nil && *params.LegalEntityID != "" {
-		legalEntityID = *params.LegalEntityID
-	}
-
-	// Header X-Tenant-Id must be a valid UUID for governance-decision-log-svc's envelope middleware.
-	// Use platformScopeID for global scope instead of "GLOBAL" sentinel.
-	headerTenantID := tenantID
-	if tenantID == globalScopeSentinel && c.platformScopeID != "" {
-		headerTenantID = c.platformScopeID
-	}
-
+// RecordDecision POSTs rec with the full canonical envelope that
+// governance-decision-log-svc's write-strict contract requires. 200 (replay)
+// and 201 (recorded) are both success, which makes redelivery after a lost
+// response safe.
+func (c *HTTPClient) RecordDecision(ctx context.Context, rec Record) error {
 	body, err := json.Marshal(createDecisionRequest{
-		DecisionID:            params.DecisionID,
-		TenantID:              tenantID,
-		LegalEntityID:         legalEntityID,
-		ActorID:               params.ActorID,
-		ActionType:            params.ActionType,
-		Outcome:               params.Outcome,
-		RuleBasis:             params.RuleBasis,
-		EvaluationContext:     params.EvaluationContext,
-		CorrelationID:         params.CorrelationID,
-		PolicyVersionID:       params.PolicyVersionID,
-		ActionSubjectType:     params.ActionSubjectType,
-		ActionSubjectID:       params.ActionSubjectID,
-		WorkflowInstanceID:    params.WorkflowInstanceID,
-		CausationID:           params.CausationID,
-		DecidedAt:             params.DecidedAt,
+		DecisionID:        rec.DecisionID,
+		LegalEntityID:     rec.LegalEntityID,
+		ActionType:        rec.ActionType,
+		Outcome:           rec.Outcome,
+		RuleBasis:         rec.RuleBasis,
+		EvaluationContext: rec.EvaluationContext,
+		CorrelationID:     rec.CorrelationID,
+		PolicyVersionID:   rec.PolicyVersionID,
+		DecidedAt:         rec.DecidedAt.UTC(),
 	})
 	if err != nil {
-		return fmt.Errorf("marshal decision request: %w", err)
+		return fmt.Errorf("%w: marshal decision: %v", ErrPermanent, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/decisions", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build decision request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	// Forward the complete envelope headers that governance-decision-log-svc requires
-	// governance-decision-log-svc now authenticates writers to its ledger:
-	// an append with no identified caller is a forged governance decision.
-	// The acting principal that produced this evaluation is forwarded as the
-	// writer, in the header the gateway would otherwise set.
-	if params.ActorID != "" {
-		req.Header.Set("X-Principal-Id", params.ActorID)
-	}
-
-	// The tenant is forwarded in the header too, not only in the body.
-	// governance-decision-log-svc now files a decision under its VERIFIED tenant
-	// scope and refuses a body that names a different one — a body-only tenant
-	// used to be believed outright, which is what made its log cross-writable.
-	// For global scope, use platformScopeID (a valid UUID) instead of "GLOBAL" sentinel.
-	req.Header.Set("X-Tenant-Id", headerTenantID)
-
-	if params.CorrelationID != "" {
-		req.Header.Set("X-Correlation-ID", params.CorrelationID)
-	}
-
-	// Forward additional envelope headers if available
-	if hasEnv {
-		if env.RequestID != "" {
-			req.Header.Set("X-Request-Id", env.RequestID)
-		}
-		if env.SourceChannel != "" {
-			req.Header.Set("X-Source-Channel", string(env.SourceChannel))
-		}
-		if env.CorrelationID != "" {
-			req.Header.Set("X-Correlation-ID", env.CorrelationID)
-		}
-		if env.CausationID != "" {
-			req.Header.Set("X-Causation-Id", env.CausationID)
-		}
-		// Use envelope's IdempotencyKey if present; otherwise fall back to DecisionID
-		// so that governance-decision-log-svc's write-strict envelope has an idempotency key.
-		idempotencyKey := env.IdempotencyKey
-		if idempotencyKey == "" && params.DecisionID != "" {
-			idempotencyKey = params.DecisionID
-		}
-		if idempotencyKey != "" {
-			req.Header.Set("Idempotency-Key", idempotencyKey)
-		}
-		if env.LegalEntityID != "" {
-			req.Header.Set("X-Legal-Entity-Id", env.LegalEntityID)
-		}
-		if env.PurposeContext != "" {
-			req.Header.Set("X-Purpose-Context", env.PurposeContext)
-		}
+	h := req.Header
+	h.Set("Content-Type", "application/json")
+	h.Set("X-Tenant-Id", rec.TenantID)
+	h.Set("X-Principal-Id", rec.PrincipalID)
+	h.Set("X-Legal-Entity-Id", rec.LegalEntityID)
+	h.Set("X-Correlation-ID", rec.CorrelationID)
+	h.Set("X-Request-Id", rec.RequestID)
+	h.Set("X-Source-Channel", "system")
+	h.Set("Idempotency-Key", rec.IdempotencyKey)
+	h.Set("X-Purpose-Context", PurposeContext)
+	if rec.CausationID != "" {
+		h.Set("X-Causation-Id", rec.CausationID)
 	}
 
 	resp, err := c.http.Do(req)
@@ -225,9 +140,21 @@ func (c *HTTPClient) RecordDecision(ctx context.Context, params RecordDecisionPa
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("governance-decision-log-svc returned %d: %s", resp.StatusCode, respBody)
+	switch {
+	case resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK:
+		return nil
+	case resp.StatusCode == http.StatusConflict:
+		// A different decision already holds this id or key: sending the
+		// same record again cannot succeed.
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("%w: %d: %s", ErrPermanent, resp.StatusCode, msg)
+	default:
+		// 400 (a contract mismatch between the two services' versions), 401
+		// and 403 (writer grant missing), 5xx: a deploy, a grant or time
+		// fixes these, and the relay rebuilds the record from the stored
+		// evaluation on every attempt, so it retries with backoff rather than
+		// give up on evidence.
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("governance-decision-log-svc returned %d: %s", resp.StatusCode, msg)
 	}
-	return nil
 }

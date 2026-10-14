@@ -50,7 +50,7 @@ marked ❓ are not scored.
 |---|---|---|---|---|---|
 | 1 | jurisdiction-rules-svc | 8082 | Doc 03 §8.2 + own `openapi.yaml`; ZS-JUR-001; V-001 PDC-02 | 49% → **92.4%** (12 Oct) | 64% → **94.9%** (12 Oct) |
 | 2 | governance-decision-log-svc | 8083 | Doc 03 §8.7 + Doc 04 §7.1; GOV-07 (nearest section) | 34% → **87.2%** (12 Oct; 87.5% on 56 rows incl. re-audit) | 59% → **93.6%** (12 Oct; 92.9% on 56 rows) |
-| 3 | policy-svc | 8085 | Doc 03 §8.1; GOV-05; V-001 PDC-01…05 | 27% | 41% |
+| 3 | policy-svc | 8085 | Doc 03 §8.1; GOV-05 (binding, decided 14 Oct); V-001 PDC-05 roadmap | 27% → **96.4%** (14 Oct) | 41% → **98.2%** (14 Oct) |
 | 4 | obligations-svc | 8088 | Doc 03 §8.5 + Doc 04 §13 (R-001 WFC-05 unscored) | 45% | **65%** |
 | 5 | authorization-svc | 8089 | Doc 03 §8.3; GOV-03 (+ GOV-04 / GOV-12); ZS-IAM-001 | 43% → **95.3%** (12 Oct) | 57% → **97.1%** (12 Oct) |
 | 6 | workflow-svc | 8090 | Doc 03 §8.4; GOV-06; R-001 WFC-02 / WFC-03 | 34% | 49% |
@@ -61,7 +61,7 @@ marked ❓ are not scored.
 |---|---|---|---|---|---|
 | jurisdiction-rules-svc | 39 → **73** | 23 → **4** | 17 → **2** | 3 | 79 |
 | governance-decision-log-svc | 16 → **41** | 23 → **6** | 8 → **0** | 5 | 47 |
-| policy-svc | 15 | 15 | 25 | 2 | 55 |
+| policy-svc | 15 → **54** | 15 → **2** | 25 → **0** | 2 → **1** | 55 → **56** |
 | obligations-svc | 29 | 27 | 9 | 1 (+16 WFC-05 rows) | 65 |
 | authorization-svc | 29 → **81** | 20 → **3** | 19 → **1** | 4 → **0** (decided 7 Oct) | 68 → **85** (+17 session rows) |
 | workflow-svc | 21 | 18 | 22 | 2 | 61 |
@@ -72,8 +72,9 @@ The group totals are the 28 September baseline. Two services carry a re-verified
 score (12 October): jurisdiction-rules-svc (all 79 rows re-checked) and authorization-svc (all
 68 original rows plus 17 session-control rows re-checked; the service is **closed**, parked on
 mtls-management-svc and gateway-auth-svc). governance-decision-log-svc was also re-verified
-live on 12 October (all 47 rows; see its *Gap closure, 12 October 2026*). Their open items are in the *open gap registers* at
-the end of this file.
+live on 12 October (all 47 rows; see its *Gap closure, 12 October 2026*). policy-svc was closed and
+re-verified live on 14 October (all 57 rows; see *policy-svc — gap closure (14 October 2026)*). Their
+open items are in the *open gap registers* at the end of this file.
 
 **Read the percentages with the risk ranking below, not on their own.** On 28 Sep
 authorization-svc scored 57%, but two of its ❌ items let any tenant principal take over
@@ -924,6 +925,12 @@ service or on a decision.
 ---
 
 # 3/7 — policy-svc (:8085) vs Doc 03 §8.1, GOV-05 and V-001 (PDC-01…05)
+
+> **Status, 14 October 2026 (round 2): 54 ✅ / 2 ⚠️ / 0 ❌ / 1 ❓ over 56 scored rows — 96.4% full,
+> 98.2% weighted** (was 27% / 41%; 85.7% / 92.9% after round 1). The two ⚠️ rows need business rules. Every row below keeps its 28 September verdict; the
+> per-row before/after, the decisions taken (C1, C5, C6, D-02, Q5), what is held on other
+> services, the proposed doc corrections and the deploy order are in
+> *policy-svc — gap closure (14 October 2026)* at the end of this file. Uncommitted.
 
 **Contract extracted from:**
 - `03-microservices.md` §8.1 Policy Service (L428-508), the primary per-service spec, plus
@@ -3019,7 +3026,7 @@ listed, run *Verify*, and re-score the row. Row ids are the ones used in this se
 | ID | Row | Gap | Waits on | Then here | Verify |
 |---|---|---|---|---|---|
 | D-01 | R-5 | **No workflow-svc decision reaches the ledger.** Its client sends 4 of the 8 envelope headers, and `RecordDecisionParams` has no JSON tags: no `decision_id` and no `rule_basis`. Every approve, reject, escalate or cancel decision is refused (400) and logged as "best-effort" | **workflow-svc** (`internal/decisionlog/client.go`): send this service's wire shape (`openapi.yaml`) and the full envelope (`svcenvelope.ForwardTo`, Idempotency-Key, X-Legal-Entity-Id, X-Purpose-Context) | Nothing | A workflow approval → 201 here; the decision is readable by `workflow_instance_id`; its event is on `zoiko.governance.events` |
-| D-02 | A10 | **policy-svc's global-scope writes are refused.** It sends body `tenant_id: "GLOBAL"` (and `legal_entity_id: "GLOBAL"`) with header `X-Tenant-Id: <platform UUID>`, which gets 403 `TENANT_SCOPE_MISMATCH` (and would get 400 on the entity). It also forwards the *end user* as the writer, so that user would need `GOVERNANCE_DECISION_RECORD` | **policy-svc** (`internal/decisionlog/client.go`): put the header tenant in the body (or omit it), and send a UUID or `PLATFORM` entity. Plus a **decision**: end user or workload identity as the writer | Nothing | A global-policy Evaluate → decision recorded (201), actor as decided |
+| D-02 | A10 | ✅ **14 Oct: policy-svc side delivered and verified live** (tenant in the header only, `PLATFORM` entity, full envelope incl. `X-Purpose-Context`, writer = `svc-policy`; ledger rows observed for tenant-scoped and global evaluations). Re-score A10 in this service's next pass. Was: **policy-svc's global-scope writes are refused.** It sends body `tenant_id: "GLOBAL"` (and `legal_entity_id: "GLOBAL"`) with header `X-Tenant-Id: <platform UUID>`, which gets 403 `TENANT_SCOPE_MISMATCH` (and would get 400 on the entity). It also forwards the *end user* as the writer, so that user would need `GOVERNANCE_DECISION_RECORD` | **policy-svc** (`internal/decisionlog/client.go`): put the header tenant in the body (or omit it), and send a UUID or `PLATFORM` entity. Plus a **decision**: end user or workload identity as the writer | Nothing | A global-policy Evaluate → decision recorded (201), actor as decided |
 | D-03 | A7 | **Read authorization is only logged on the stack.** Compose runs `DECISION_LOG_READ_AUTHZ=warn` because two readers send no principal | **contract-lifecycle-svc** (`internal/governancelog/client.go`) and **decision-support-svc** (`internal/clients/governancelog.go`) forward `X-Principal-Id`; **access-control-svc** grants `GOVERNANCE_DECISION_READ` (entity or platform scope) to each reader's principal, evidence-manifest-svc's included | Set `DECISION_LOG_READ_AUTHZ=enforce` in compose (the code default) | Contract activation still passes; a reader without a grant → 403; no "read admitted" warnings in the logs |
 | D-04 | A11 | **The read callers are out of envelope contract.** contract-lifecycle sends X-Tenant-Id only; decision-support has no request id or source channel; evidence-manifest has no request id or source channel. They pass only because write-strict admits incomplete reads | **contract-lifecycle-svc**, **decision-support-svc**, **evidence-manifest-svc**: forward the envelope with `svcenvelope.ForwardTo` | Optionally `ZS_ENVELOPE_ENFORCEMENT=strict` | No `X-Envelope-Contract: violated` on their reads |
 | D-05 | A1 | **`X-Tenant-Id` / `X-Principal-Id` are trusted as sent (X5).** Host port 8083 is published, the local Traefik route has no gateway-auth, and GTRM has no route for this service | **gateway-auth-svc** (ForwardAuth on the route; GTRM entry) and **mtls-management-svc** (workload identity for service-to-service calls) | Optionally verify the workload identity on writes | A direct call with a forged principal is refused at the edge |
@@ -3056,3 +3063,211 @@ listed, run *Verify*, and re-score the row. Row ids are the ones used in this se
 3. **D-05**: once gateway-auth-svc and mtls-management-svc are complete.
 4. **D-06 and D-07**: whenever the decisions are made.
 5. Re-run the full re-audit and replace this register. Expected after D-01…D-05: 56 rows at 54 ✅ / 2 ⚠️ / 0 ❌ (96.4% / 98.2%); after D-06/D-07 as well: 100%.
+
+---
+
+# policy-svc — gap closure (14 October 2026)
+
+All 57 rows of section 3/7 were re-checked against the code after the fixes, and every
+negative path the *Notes* column describes was exercised. Uncommitted.
+
+**Result:** 48 ✅ / 8 ⚠️ / 0 ❌ / 1 ❓ over **56** scored rows (E5 was ❓ and is now answered),
+**85.7% full, 92.9% weighted** (28 Sep: 15 / 15 / 25 / 2 over 55, 27% / 41%). If the four
+proposed doc corrections below are accepted, 52 / 4 / 0 (92.9% / 96.4%).
+
+## Decisions
+
+| # | Question | Decided | By |
+|---|---|---|---|
+| C1 / Q1 | Which spec binds policy-svc | GOV-05 + Doc 03 §8.1. V-001's PDC-05 parts (simulation, certification suites, decision-model and rule registries, authority sources) are roadmap, not defects | User |
+| C6 / Q4 | Must evidence block the decision | Evaluate stores the evaluation and its ledger outbox row in one transaction and answers 200 only after that commit; a relay delivers to governance-decision-log-svc with retries. 503 only if the local commit fails | User |
+| D-02 | Who writes to the ledger | policy-svc's own principal (`POLICY_LEDGER_PRINCIPAL_ID`, compose `svc-policy`); the requesting user travels in `evaluation_context.requested_by_principal_id` and in policy-svc's own evidence row | User |
+| Q5 | Are policy families tenant-owned | Yes, by default; a platform family needs `"scope":"GLOBAL"` and `POLICY_CREATE_GLOBAL`; `policy_code` is unique per owner | User |
+| C5 / Q3 | Is evaluate a material write | No: exempt from `MaterialWrite` like `/v1/authorize`; its replay key is `decision_id` | From the documents |
+| Q6 | Does anything consume `zoiko.policy.events` | Yes: audit-event-store-svc (compose `audit-svc`, `KAFKA_TOPICS`) | From the code |
+| Q2 / C3 | Event naming | Unchanged: Doc 03 dotted names, as every service; held on the group decision | Held |
+
+## Start point
+
+The 12 Oct code re-score (55% / 68%, not written here) counted several 9 Oct "fixes" that did not
+work: the outbox was written outside the business transaction and its relay set a topic kafka-go
+refuses, so nothing was ever published; activate with no body was still 400; the overlap check
+blocked tenant overrides of global policies and could not see tenant rows under FORCE RLS; Evaluate
+had no authorization; every decision-log write was still refused (`"GLOBAL"` body tenant, missing
+`X-Purpose-Context`); `version_number` was always 1; and a legacy version with a NULL `rationale`
+could not be read at all (scan error → 503).
+
+## Per-row results
+
+| Row | Item | Classification | Before | After | Verified how |
+|---|---|---|---|---|---|
+| A1 | Get applicable policy set | — | ✅ | ✅ | Now the resolved set at as_of / known_at (handler `TestListApplicable_*`) |
+| A2 | Evaluate: only APPROVAL_THRESHOLD | Needs business input | ⚠️ | ⚠️ | Other types still 501; their payload semantics are undefined (P-01) |
+| A3 | Version history | — | ✅ | ✅ | `TestListVersionHistory`; store migration test |
+| A4 | Validate threshold applicability | CODE BUG | ⚠️ | ✅ | `GET /v1/policies/resolve` → RESOLVED / NOT_APPLICABLE / CONFLICTED; handler `TestResolveAndExplain`; live |
+| A5 | Command paths vs `/internal/v1/gov05/...` | DOC DRIFT | ⚠️ | ⚠️ | GOV-05 calls the surface "illustrative"; route map in `progress.md`; DC-1 proposed |
+| A6 | GetPolicyVersion | — | ✅ | ✅ | `TestGetPolicyVersion_AuthorizedOnItsOwnEntity` |
+| A7 | ResolveEffectivePolicy as of a time | CODE BUG | ❌ | ✅ | `internal/resolve` (as_of + known_at); `TestHistoricalRequestResolvesOriginalVersion`; store `TestLifecycle_SupersessionAndHistoricalResolution`; live: as_of before any version → 404, after a scheduled version's time → that version |
+| A8 | Compare / Explain | CODE BUG | ❌ | ✅ | `TestCompareVersions`, `TestResolveAndExplain`; live: trace names `suspended_or_retired` / `not_yet_effective` / `selected` |
+| A9 | Submit / Approve / Schedule / Suspend / Supersede | CODE BUG | ❌ | ✅ | Store `TestLifecycle_*`; live. Supersession is activation of a successor (`superseded_by_version_id` recorded) |
+| A10 | Control-test routes undocumented | DOC DRIFT | ⚠️ | ⚠️ | Documented in `progress.md`; DC-1 proposed |
+| B1 | Actor from trusted identity | CODE BUG | ❌ | ✅ | `TestEvaluate_ActorFromHeaderAndAuthorized`; live: body `evaluated_by_principal_id: forged-ceo` → evidence records `clerk-1` |
+| B2 | Evaluate is authorized | CODE BUG | ❌ | ✅ | `POLICY_EVALUATE`, enforce by default (mutant killed); live 403 / 401. Compose runs `warn` until P-05 |
+| B3 | Reads are authorized | CODE BUG | ⚠️ | ✅ | `POLICY_READ` on every read (`TestReads_EnforcedByDefault`); compose `warn` until P-05 |
+| B4 | Mutations authorized per scope | — | ✅ | ✅ | New commands added with `_GLOBAL` variants |
+| B5 | Tenant never trusted from the client | CROSS-SERVICE | ⚠️ | ⚠️ | Here: non-UUID tenant 400, body/header legal entity reconciled (live 400). Raw-header trust (X5) waits on gateway-auth-svc (P-02) |
+| B6 | Envelope contract | CODE BUG + C5 | ⚠️ | ✅ | Live: evaluate without `Idempotency-Key` → 200; families no longer need `X-Legal-Entity-Id`; mismatch → 400 |
+| B7 | Maker-checker on activation | CODE BUG | ❌ | ✅ | Author cannot approve or activate; DRAFT/REVIEW cannot activate. Store test, 2 mutants killed; live 403 `SOD_CONFLICT`, 409 `APPROVAL_REQUIRED` |
+| B8 | Emergency suspension is privileged | CODE BUG | ❌ | ✅ | `POLICY_VERSION_SUSPEND`, `reason_code` required, transition logged; live |
+| B9 | Control-test reads scoped | CODE BUG | ❌ | ✅ | Tenant required + FORCE RLS on executions/attestations; store `TestControlTests_TenantIsolation` (mutant killed); live: tenant B sees `[]` |
+| B10 | RLS on tenant data | — | ✅ | ✅ | Extended to policies, transitions, evaluations, control tests; suite runs as NOBYPASSRLS |
+| B11 | Malformed id → 400 | CODE BUG | ❌ | ✅ | Every path and body id validated; live 400 for both policy and control-test ids |
+| B12 | Request size cap | — | ✅ | ✅ | `TestRequestTooLarge413` |
+| C1 | Effective dating gates | CODE BUG | ❌ | ✅ | `TestFutureVersionDoesNotApplyEarly` (mutant killed); live: scheduled version does not decide today |
+| C2 | Expiry honoured | CODE BUG | ❌ | ✅ | `TestExpiredVersionStopsDeciding` |
+| C3 | Valid temporal range | CODE BUG | ❌ | ✅ | 400 for `effective_to <= effective_from`; DB CHECK (NOT VALID for legacy rows) |
+| C4 | No latest-by-timestamp; CONFLICTED | CODE BUG | ❌ | ✅ | `TestTiedPoliciesAreConflicted` (mutant killed); 409 `POLICY_CONFLICTED` + `policy.applicability.conflicted` event |
+| C5 | Overlapping rules blocked | CODE BUG | ❌ | ✅ | Same-scope same-type overlap refused at activation under an advisory lock; tenant/entity overrides allowed; store test (mutant killed); live |
+| C6 | Released versions immutable | CODE BUG | ⚠️ | ✅ | Triggers refuse UPDATE of content, DELETE, TRUNCATE; live: even a superuser UPDATE is refused |
+| C7 | Every version preserved | — | ✅ | ✅ | DELETE now refused in the database too |
+| C8 | Effective-dated activation preserved | — | ✅ | ✅ | Plus approval actor/time/reference and the transition log |
+| C9 | Atomic supersede | — | ✅ | ✅ | Unchanged guarantee; supersede time is the successor's takeover instant |
+| C10 | State model | CODE BUG | ❌ | ✅ | Draft / Review / Approved / Scheduled / Active / Suspended / Superseded / Retired (DB CHECK) |
+| C11 | Explicit GLOBAL scope | — | ✅ | ✅ | |
+| C12 | Exact decimal comparison | — | ✅ | ✅ | `TestEvaluate_ExactDecimalBoundaries` (strings refused, not guessed) |
+| C13 | Idempotent create | — | ✅ | ✅ | Version replay now keyed on `Idempotency-Key` / id (the old key made a same-date correction impossible); `TestVersions_NumberingReplayAndScope` |
+| C14 | Evaluation safely repeatable | CODE BUG | ⚠️ | ✅ | Same `decision_id` + input → stored result; different input → 409; live |
+| C15 | Activate with no body | CODE BUG | ❌ | ✅ | `TestActivate_EmptyBodyIsAccepted` (mutant killed); live 200 |
+| C16 | No applicable policy: stable error | CODE BUG | ⚠️ | ✅ | 404 `POLICY_NOT_EFFECTIVE`; live |
+| C17 | Stable error classes | CODE BUG | ❌ | ✅ | `code` field on every error (legacy `error` kept); every handler test asserts it |
+| C18 | Optimistic concurrency | CODE BUG | ❌ | ✅ | `If-Match` / `expected_version` against `row_version`; optional, enforced when sent (P-09); store test; live 409 |
+| D1 | Preserve evaluation basis (ledger write) | CROSS-SERVICE (policy side) | ❌ | ✅ | Live with the real decision-log binary: rows for tenant-scoped and global evaluations, writer `svc-policy`, entity `PLATFORM`, requester kept |
+| D2 | evidence_id returned | CODE BUG | ❌ | ✅ | Server-generated evaluation id; live |
+| D3 | Evidence content | CODE BUG | ❌ | ✅ | Input fingerprint, evaluator version, selected rule ids, digest, as_of / known_at; `TestEvaluate_EvidenceContent` |
+| D4 | Decision cache + invalidation | CODE BUG | ❌ | ✅ | Candidate cache valid only while the DB watermark is unchanged; `internal/cache` tests; store watermark test |
+| E1 | Doc 03 events published | — | ✅ | ✅ | |
+| E2 | GOV-05 events (Approved, Suspended, …) | CODE BUG | ⚠️ | ✅ | `policy.version.submitted/approved/scheduled/suspended` added (Doc 03 naming, C3 held) |
+| E3 | Outbox after commit | CODE BUG | ❌ | ✅ | Events in the business transaction; relay retries with stable event ids (store test with a failing then working writer); live: 25 events durable while the broker was down; backlog gauges |
+| E4 | Event envelope fields | Needs decision | ⚠️ | ⚠️ | Actor now on retirements; real payload hash and aggregate version. `jurisdiction_context` / `residency_region` have no source in this service (P-03) |
+| E5 | Consumers of policy events exist | ❓ → answered | ❓ | ✅ | audit-event-store-svc consumes the topic |
+| E6 | Consumed events | CODE BUG | ❌ | ✅ | Readers exist (since 9 Oct) and now refresh the tenant's cache; their error log printed `%v` instead of the error (fixed, seen live) |
+| F1 | Policy fields | DOC DRIFT | ⚠️ | ⚠️ | `tenant_id`, `policy_status`, `versioning_mode` now written and returned; `policy_type` vs Doc 04 `policy_domain` (DC-2) |
+| F2 | PolicyVersion fields | DOC DRIFT | ⚠️ | ⚠️ | `version_number` now sequential per policy and owner; `rule_payload` / `version_status` vs Doc 04 names (DC-2) |
+| F3 | Source, rationale, digest, known_from | CODE BUG | ❌ | ✅ | Accepted on create; digest server-derived and checked before every evaluation (live: mismatch path unit-tested) |
+| F4 | Policy types owned | Needs business input | ⚠️ | ⚠️ | Only APPROVAL_THRESHOLD evaluable (P-01) |
+| G1 | Tier-0 timeouts, readiness, telemetry | — | ✅ | ✅ | |
+| G2 | Evidence must not block evaluation | — | ✅ | ✅ | Evidence is local and durable before 200; a ledger outage only delays the copy |
+| G3 | Postman collection | ❓ | ❓ | ❓ | Not an obligation |
+
+## Open register
+
+| ID | Rows | Gap | Waits on | Then |
+|---|---|---|---|---|
+| P-01 | A2, F4 | SPEND_CONTROL, SIGNATORY_MATRIX and SOD_RULE have no defined payload or evaluation semantics | Business input | Add an evaluator per type; `validateRulePayload` per type |
+| P-02 | B5 | X5: identity headers trusted as sent | gateway-auth-svc ForwardAuth (held, as for every service) | Nothing here |
+| P-03 | E4 | `jurisdiction_context` / `residency_region` on events | Decision: whether policies carry jurisdiction (V-001 PDC-02 applicability) | Add to versions and envelopes |
+| P-04 | A5, A10, F1, F2 | Doc drift | Approval of DC-1…DC-4 below | Re-score to ✅ |
+| P-05 | B2, B3 | Gates run `warn` in compose | **access-control-svc** registers `POLICY_EVALUATE`, `POLICY_READ`, `POLICY_CREATE_GLOBAL`, `POLICY_VERSION_{APPROVE,SUSPEND,RETIRE}[_GLOBAL]`; **expense-claim-svc** and **payment-authorization-svc** forward the envelope (they send `X-Tenant-Id` only and have been answered 401 by Evaluate since 9 Oct in enforce); **governance-decision-log-svc** replay principal gets `POLICY_READ` | Set `POLICY_EVALUATE_AUTHZ` / `POLICY_READ_AUTHZ` to `enforce` |
+| P-06 | D1 | The ledger writer needs `GOVERNANCE_DECISION_RECORD` | **authorization-svc** grant to `svc-policy` (platform scope and the entities it records for) | Until then evidence waits, durable, in `policy_evidence_outbox` |
+| P-07 | D1 | `X-Purpose-Context: policy_evaluation_evidence` is sent because the decision log requires it on appends | decision-log D-06 | Drop it if D-06 moves purpose to reads |
+| P-08 | B8 | GOV-05 negative path #3 says suspension is "evidenced **and reviewed**": it is evidenced; no review workflow exists | GOV-12 has no owning service | Route suspensions to the GOV-12 owner |
+| P-09 | C18 | `expected_version` is optional; GCP §16 says mandatory for "protected" updates without defining which | Decision | Make it mandatory for the chosen commands |
+| P-10 | — | V-001 PDC-05 (certification suites, simulation, waivers), decision models, authority sources | Roadmap (C1) | — |
+| P-11 | B9 | A pre-000007 control-test execution or attestation has no tenant and is now readable by no one (fail closed) | Data owner, if any such rows exist | Assign `tenant_id` |
+
+## Proposed doc corrections (DOC DRIFT — not applied)
+
+- **DC-1, Doc 03 §8.1 Inbound APIs:** add the REST route map (in `services/policy-svc/progress.md`)
+  as the physical form of the GOV-05 operations, including the control-test and attestation routes
+  (doc7 §E3 / §E6).
+- **DC-2, Doc 04 §7.1:** a physical-name note: `policy_domain` → `policy_type`, `policy_payload` →
+  `rule_payload`, `activation_status` → `version_status` (values: the GOV-05 state model).
+- **DC-3, Doc 03 §8.1 Published Events:** add `policy.version.submitted`, `.approved`, `.scheduled`,
+  `.suspended` and `policy.applicability.conflicted` (subject to C3).
+- **DC-4, GCP §16:** add `POLICY_CONFLICTED` (V-001 §5 applicability CONFLICTED) to the stable
+  classes, or name the existing class conflicts should use.
+
+## Deploy checklist
+
+1. Apply `000007_gov05_lifecycle` before the new binary (`deployments/migrate.py up`). It renumbers
+   versions, recomputes digests, and adds triggers and RLS; its down migration refuses while any
+   version is in a GOV-05-only state.
+2. Set `POLICY_LEDGER_PRINCIPAL_ID` and grant it `GOVERNANCE_DECISION_RECORD` (P-06).
+3. Compose sets `POLICY_EVALUATE_AUTHZ` / `POLICY_READ_AUTHZ` to `warn`; flip after P-05.
+4. Behaviour changes: activation needs submit-review and an independent approval (no caller in the
+   repo uses activate); a create-version retry is replayed by `Idempotency-Key`; new families are
+   owned by the creating tenant; control-test routes need `X-Tenant-Id`; an APPROVAL_THRESHOLD
+   version must carry a non-negative `threshold_amount`.
+5. Alert on `policy_evidence_failed > 0`, `policy_evidence_pending` growth and
+   `outbox_oldest_pending_seconds`. A parked record is requeued with
+   `UPDATE policy_evidence_outbox SET failed_at = NULL, next_attempt_at = now() WHERE …`.
+
+## Verification
+
+Unit and handler suites; 13 store tests on Postgres 16 run as a NOSUPERUSER NOBYPASSRLS role
+(including 000007 applied over legacy rows and its down/up round trip); 10 mutants, each removing
+one fix, all killed; race detector clean (golang:1.25 container); a live run of the real policy-svc
+and governance-decision-log-svc binaries with a stub authorization-svc: 44/44 negative-path checks.
+The live run found the missing `X-Purpose-Context` that unit tests could not. One store-suite run
+failed once with its output lost; 8 runs since passed and it did not reproduce.
+
+## Round 2 (14 October 2026, later): the held items closed
+
+With access-control-svc and authorization-svc in scope, the open register was worked through. All
+uncommitted.
+
+**Result:** 54 ✅ / 2 ⚠️ / 0 ❌ / 1 ❓ over 56 scored rows — **96.4% full, 98.2% weighted**. The two
+⚠️ rows (A2, F4) need business rules nobody has written (P-01).
+
+| Row | Before (round 1) | After | Fix | Verified how |
+|---|---|---|---|---|
+| A5 | ⚠️ | ✅ | DC-1 applied: Doc 03 §8.1 lists the physical routes against the GOV-05 operations | Doc diff |
+| A10 | ⚠️ | ✅ | DC-1 applied: control-test and attestation routes in Doc 03 §8.1 | Doc diff |
+| B2, B3 | ✅ (compose `warn`) | ✅ (compose `enforce`) | access-control-svc **000019** registers the 9 actions; `seed-demo-rbac.ps1` grants them; expense-claim-svc and payment-authorization-svc forward `X-Principal-Id`, the signed envelope, request and correlation ids (no body actor) | Live with the **real authorization-svc**: granted evaluate 200, ungranted principal 403 on evaluate and read; caller client tests (2 mutants killed) |
+| B5 | ⚠️ | ✅ | `internal/identity`: a request needs identity-context-svc's signed envelope (RS256, JWKS, issuer and audience pinned) whose claims agree with `X-Tenant-Id` / `X-Principal-Id` (headers it lacks are filled from the claims), or an mTLS peer certificate on the new `:8449` listener (`internal/mtlslistener`, the same file identity-context-svc uses). Code default `enforce`; compose `warn` until P-12 | 9 unit cases (forged key, expired, wrong issuer/audience, HMAC, unknown kid, mismatched tenant or principal; 2 mutants killed); live in **enforce**: bare headers 401, unpublished key 401, contradicting tenant or principal 401, envelope alone 200 |
+| B7 | ✅ | ✅ | Approve, activate and schedule also send the version's author to authorization-svc as `resource_owner_principal_id`, so an own-object SoD rule applies centrally too | Live: with a real `OWN_OBJECT_FORBIDDEN` rule on `POLICY_VERSION_APPROVE`, authorization-svc itself refused the author (`sod:own_object_forbidden`) and granted the approver (without the owner it would have answered REQUIRE_APPROVAL); client test (mutant killed) |
+| B8 | ✅ | ✅ | GOV-05 negative path #3 "evidenced **and reviewed**": `POST …/review-suspension` (outcome UPHELD / OVERTURNED, `reason_code`, approver permission); the suspender cannot review; migration **000008** | Store test (mutant killed); live: suspender 403, approver 200 |
+| C18 | ✅ (optional) | ✅ (mandatory) | GOV-05 "Idempotency-Key + expected_version where stateful": every lifecycle command without `If-Match` / `expected_version` is **428** | Handler test over all 7 commands (mutant killed); live 428 then 200 |
+| D1 | ✅ | ✅ | `svc-policy` holds `GOVERNANCE_DECISION_RECORD` (seed script, platform scope and entity) | Live: real authorization-svc granted the relay, ledger row written by `svc-policy` |
+| E4 | ⚠️ | ✅ | `jurisdiction_context` from the request's `X-Jurisdiction-Context` stored on the outbox row (000008); `residency_region` from `EVENT_RESIDENCY_REGION` | Store test (mutant killed); live: outbox row carries `IN-KA` |
+| F1, F2 | ⚠️ | ✅ | DC-2 applied: Doc 04 §7.1 physical-name note (policy_type, rule_payload, version_status values, version_number) | Doc diff |
+
+DC-3 (the new events, pending C3) is in Doc 03 §8.1. DC-4 is recorded there too (`POLICY_CONFLICTED`
+as V-001's CONFLICTED); the GCP itself is a .docx and was not edited.
+
+### Register after round 2
+
+| ID | Status |
+|---|---|
+| P-01 (A2, F4) | **Open — business input.** No spec defines payloads or evaluation for SPEND_CONTROL, SIGNATORY_MATRIX or SOD_RULE (Doc 03 gives spend evaluation to the Spend Controls Service §12.12, and SoD evaluation sits with authorization-svc). |
+| P-02 (B5) | Closed in code. Residual = P-12. |
+| P-03 (E4) | Closed. |
+| P-04 | Closed (DC-1…DC-4). |
+| P-05 | Closed (registry, callers, seed, compose `enforce`). Production grants remain an IAM administrator's act. |
+| P-06 | Closed for the demo stack (seed script); production: grant `svc-policy` the same. |
+| P-07 | **Held** on decision-log D-06 (`X-Purpose-Context` on appends). |
+| P-08 | Closed inside GOV-05 (suspension review). GOV-12 still has no owning service for maker-checker in general. |
+| P-09 | Closed (mandatory). |
+| P-10 | Roadmap (V-001 PDC-05). |
+| P-11 | Data: any pre-000007 control-test execution or attestation needs a `tenant_id` (none exists in the scratch or test data). |
+| **P-12 (new)** | Compose runs `POLICY_IDENTITY_VERIFY=warn` because governance-decision-log-svc's replay reads policy versions without the signed envelope (its generated `ForwardTo` carries no `Authorization`) and no peer calls over mTLS yet. When it forwards the envelope (or calls `:8449`), set `enforce`. |
+| P-13 (new, not scored) | expense-claim-svc and payment-authorization-svc answer a policy-svc 401/403 as 503 `policy-svc unavailable` (status logged). Worth a distinct error there. |
+
+### Deploy checklist (additions)
+
+1. access-control-svc migration **000019** (registers the 9 actions); policy-svc migration **000008**.
+2. Re-run `deployments/scripts/seed-demo-rbac.ps1` on a dev stack (extends `POLICY_FULL`, adds
+   `CONTROL_TESTS_FULL` and the `svc-policy` ledger grant).
+3. New policy-svc settings: `POLICY_IDENTITY_VERIFY` (default `enforce`), `IDENTITY_JWKS_URL`,
+   `EXPECTED_ISSUER`, `EXPECTED_AUDIENCE`, `EVENT_RESIDENCY_REGION`, `MTLS_*` (listener off unless
+   `MTLS_ENABLED=true`). Compose sets identity to `warn` (P-12); the kind manifest sets `warn`
+   (no identity service there).
+4. Every lifecycle command now needs `If-Match` / `expected_version` (428 otherwise).
+
+### Verification (round 2)
+
+Unit, handler and store suites (15 store tests as NOBYPASSRLS); both callers' suites;
+access-control-svc suite; race clean in the golang:1.25 container (it also ran the two packages
+Application Control blocks locally); 8 new mutants, all killed; a second live run with the **real
+authorization-svc** (grants seeded as the seed script makes them), the real decision-log and
+policy-svc in full enforce mode against a JWKS: 24/24, plus 3/3 for the own-object SoD forwarding.
