@@ -251,6 +251,26 @@ func TestSecondPassIT_EntityStatus(t *testing.T) {
 	}
 }
 
+// The owner of an entity is readable by the NOBYPASSRLS app role with no
+// tenant installed — resolveTenantScope asks it precisely when the caller
+// sent none — and an unknown entity answers "", not an error.
+func TestSecondPassIT_EntityTenant(t *testing.T) {
+	f := newFixture(t)
+	entity := uuid.NewString()
+	if err := f.s.ProjectEntityStatus(f.ctx, domain.ProjectEntityStatusParams{LegalEntityID: entity, TenantID: f.tenant, Status: "ACTIVE", StatusChangedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.s.FindEntityTenant(context.Background(), entity); err != nil || got != f.tenant {
+		t.Fatalf("owner = %q %v, want %q", got, err, f.tenant)
+	}
+	if got, err := f.s.FindEntityTenant(context.Background(), uuid.NewString()); err != nil || got != "" {
+		t.Errorf("unknown entity: owner = %q %v, want \"\"", got, err)
+	}
+	if got, err := f.s.FindEntityTenant(context.Background(), "not-a-uuid"); err != nil || got != "" {
+		t.Errorf("malformed entity: owner = %q %v, want \"\" (never a 500)", got, err)
+	}
+}
+
 // §11: delegations do not carry protected privileges, and the delegation a
 // grant rests on can be named.
 func TestSecondPassIT_DelegationAttributionAndProtectedPrivileges(t *testing.T) {
@@ -368,5 +388,25 @@ func TestSecondPassIT_UsageAttributedToGrantingAssignment(t *testing.T) {
 	}
 	if !used[aa.PrincipalRoleAssignmentID] || used[ab.PrincipalRoleAssignmentID] {
 		t.Fatalf("usage: role A used=%v (want true), role B used=%v (want false — it granted nothing)", used[aa.PrincipalRoleAssignmentID], used[ab.PrincipalRoleAssignmentID])
+	}
+}
+
+// The candidates for a tenantless question: tenants where the principal holds
+// an APPROVED live assignment (a pending one grants nothing, so it is not a
+// candidate), read with no tenant installed as the NOBYPASSRLS role.
+func TestSecondPassIT_PrincipalTenants(t *testing.T) {
+	f := newFixture(t)
+	principal := "pt-" + uuid.NewString()[:8]
+	r := f.role(t, "x.do")
+	f.assign(t, principal, r.RoleID, domain.ApprovalApproved)
+	got, err := f.s.FindPrincipalTenants(context.Background(), principal)
+	if err != nil || len(got) != 1 || got[0] != f.tenant {
+		t.Fatalf("tenants = %v %v, want [%s]", got, err, f.tenant)
+	}
+	other := newFixture(t)
+	pending := "pp-" + uuid.NewString()[:8]
+	other.assign(t, pending, other.role(t, "x.do").RoleID, domain.ApprovalPending)
+	if got, err := other.s.FindPrincipalTenants(context.Background(), pending); err != nil || len(got) != 0 {
+		t.Errorf("pending-only principal: tenants = %v %v, want none", got, err)
 	}
 }

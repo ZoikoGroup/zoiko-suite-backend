@@ -1,200 +1,278 @@
-// Package outbox provides a background worker that polls the transactional
-// outbox table and publishes events to Kafka — satisfying the
-// "transactional outbox; event loss not allowed" requirement (Event
-// Catalogue §6, GCP §2 invariant #10) that the synchronous publisher does not.
+// Package outbox relays the transactional outbox to Kafka — the publishing
+// half of the "transactional outbox; event loss not allowed" requirement
+// (Event Catalogue §6, GCP §2 invariant #10). store.RecordDecision writes the
+// event in the decision's own transaction; this worker delivers it, at least
+// once, for as long as the broker takes to come back.
 package outbox
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+
+	"zoiko.io/governance-decision-log-svc/internal/events"
 )
 
 const (
-	// outboxPollInterval is how often the worker polls for new events.
-	outboxPollInterval = 500 * time.Millisecond
-	// outboxBatchSize is the maximum number of events to process in one batch.
-	outboxBatchSize = 100
+	// pollInterval is how often the worker polls for new events.
+	pollInterval = 500 * time.Millisecond
+	// batchSize is the maximum number of events claimed in one transaction.
+	batchSize = 100
+	// pruneInterval is how often published rows past retention are removed.
+	pruneInterval = time.Minute
+	// pruneBatch bounds one DELETE so a large backlog of old rows never holds
+	// a long lock; several batches run per sweep.
+	pruneBatch = 1000
+	// maxPruneBatchesPerSweep bounds one sweep; the rest waits a minute.
+	maxPruneBatchesPerSweep = 20
 )
 
-// outboxEvent represents a row from the outbox table.
-type outboxEvent struct {
-	OutboxID        int64
-	EventType       string
-	Payload         []byte
-	TenantID        string
-	LegalEntityID   string
-	ActorID         string
-	CorrelationID   string
-	IdempotencyKey  string
-	CreatedAt       time.Time
-	PublishedAt     *time.Time
-	Attempts        int
-	LastError       *string
+// Observer receives the relay's health: how many events wait and for how
+// long, and how many published rows retention removed. Without it a stalled
+// relay shows only in logs (audit R-8).
+type Observer interface {
+	ObserveOutboxBacklog(pending int, oldest time.Duration)
+	ObserveOutboxPruned(n int)
 }
+
+// Option configures a Worker.
+type Option func(*Worker)
+
+// WithObserver reports backlog and pruning to o.
+func WithObserver(o Observer) Option { return func(w *Worker) { w.observer = o } }
+
+// WithRetention removes published rows older than d. Zero keeps them forever.
+// Unpublished rows are never removed, however old.
+func WithRetention(d time.Duration) Option { return func(w *Worker) { w.retention = d } }
 
 // Worker polls the outbox table and publishes events to Kafka.
 type Worker struct {
-	pool       *pgxpool.Pool
-	producer   *kafka.Writer
-	topic      string
-	log        *zap.Logger
-	stopCh     chan struct{}
-	doneCh     chan struct{}
+	pool      *pgxpool.Pool
+	producer  events.MessageWriter
+	log       *zap.Logger
+	observer  Observer
+	retention time.Duration
+
+	cancel context.CancelFunc
+	doneCh chan struct{}
 }
 
-// NewWorker constructs an outbox worker.
-func NewWorker(pool *pgxpool.Pool, producer *kafka.Writer, topic string, log *zap.Logger) *Worker {
-	return &Worker{
+// NewWorker constructs an outbox worker. The topic is the writer's own:
+// kafka-go refuses a message that names a topic when the writer already does,
+// which is how every publish this worker attempted used to fail.
+func NewWorker(pool *pgxpool.Pool, producer events.MessageWriter, log *zap.Logger, opts ...Option) *Worker {
+	w := &Worker{
 		pool:     pool,
 		producer: producer,
-		topic:    topic,
 		log:      log,
-		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	return w
 }
 
 // Start begins the outbox polling loop in a background goroutine.
 func (w *Worker) Start(ctx context.Context) {
+	ctx, w.cancel = context.WithCancel(ctx)
 	go w.run(ctx)
 }
 
-// Stop signals the worker to stop and waits for it to finish.
+// Stop cancels the loop — including a relay pass blocked on an unreachable
+// broker, which used to hold shutdown for as long as kafka-go's timeouts across
+// a whole batch — and waits for it to finish. Anything not marked published
+// stays in the outbox and is relayed again (at least once).
 func (w *Worker) Stop() {
-	close(w.stopCh)
+	if w.cancel != nil {
+		w.cancel()
+	}
 	<-w.doneCh
 }
 
-// run is the main polling loop.
 func (w *Worker) run(ctx context.Context) {
 	defer close(w.doneCh)
 
-	ticker := time.NewTicker(outboxPollInterval)
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	lastPrune := time.Time{}
 
 	for {
 		select {
-		case <-w.stopCh:
+		case <-ctx.Done():
 			w.log.Info("outbox worker stopped")
 			return
 		case <-ticker.C:
-			w.processBatch(ctx)
-		case <-ctx.Done():
-			w.log.Info("outbox worker context cancelled")
-			return
+			if _, err := w.RelayOnce(ctx); err != nil && ctx.Err() == nil {
+				w.log.Error("outbox: relay pass failed", zap.Error(err))
+			}
+			if w.observer != nil {
+				if pending, oldest, err := w.Backlog(ctx); err == nil {
+					w.observer.ObserveOutboxBacklog(pending, oldest)
+				} else if ctx.Err() == nil {
+					w.log.Error("outbox: backlog query failed", zap.Error(err))
+				}
+			}
+			if w.retention > 0 && time.Since(lastPrune) >= pruneInterval {
+				lastPrune = time.Now()
+				n, err := w.Prune(ctx, w.retention)
+				if err != nil && ctx.Err() == nil {
+					w.log.Error("outbox: retention sweep failed", zap.Error(err))
+				}
+				if n > 0 && w.observer != nil {
+					w.observer.ObserveOutboxPruned(n)
+				}
+			}
 		}
 	}
 }
 
-// processBatch fetches and publishes a batch of pending outbox events.
-func (w *Worker) processBatch(ctx context.Context) {
-	// Fetch pending events (those not yet published, ordered by created_at)
-	const fetchQuery = `
-		SELECT outbox_id, event_type, payload, tenant_id, legal_entity_id, actor_id, correlation_id, idempotency_key, created_at, published_at, attempts, last_error
+// relayTx begins a transaction carrying the app.outbox_relay marker the
+// outbox's row-level security policy admits (000012).
+func (w *Worker) relayTx(ctx context.Context) (pgx.Tx, error) {
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.outbox_relay', 'on', true)`); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, fmt.Errorf("mark relay transaction: %w", err)
+	}
+	return tx, nil
+}
+
+// Backlog reports how many events await publishing across all tenants and how
+// long the oldest has waited.
+func (w *Worker) Backlog(ctx context.Context) (int, time.Duration, error) {
+	tx, err := w.relayTx(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var pending int
+	var oldestSeconds float64
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(EXTRACT(EPOCH FROM now() - MIN(created_at)), 0)::float8
+		FROM outbox WHERE published_at IS NULL`).Scan(&pending, &oldestSeconds); err != nil {
+		return 0, 0, fmt.Errorf("backlog: %w", err)
+	}
+	return pending, time.Duration(oldestSeconds * float64(time.Second)), nil
+}
+
+// Prune deletes published rows whose publication is older than olderThan, in
+// bounded batches, and returns how many it removed. Unpublished rows are never
+// touched. The outbox is a delivery mechanism, not evidence: the decision and
+// its replay manifests are the record, and they stay append-only.
+func (w *Worker) Prune(ctx context.Context, olderThan time.Duration) (int, error) {
+	total := 0
+	for i := 0; i < maxPruneBatchesPerSweep; i++ {
+		tx, err := w.relayTx(ctx)
+		if err != nil {
+			return total, err
+		}
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM outbox WHERE outbox_id IN (
+				SELECT outbox_id FROM outbox
+				WHERE published_at IS NOT NULL
+				  AND published_at < now() - make_interval(secs => $1)
+				ORDER BY outbox_id
+				LIMIT $2)`, olderThan.Seconds(), pruneBatch)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			return total, fmt.Errorf("prune: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return total, fmt.Errorf("prune commit: %w", err)
+		}
+		n := int(tag.RowsAffected())
+		total += n
+		if n < pruneBatch {
+			break
+		}
+	}
+	return total, nil
+}
+
+type pending struct {
+	id          int64
+	payload     []byte
+	aggregateID string
+	idemKey     string
+}
+
+// RelayOnce claims up to batchSize unpublished events, publishes each, and
+// records the result, all in one transaction. It returns how many events were
+// published.
+//
+// The transaction is marked app.outbox_relay = 'on', the one marker the
+// outbox's row-level security policy (000012) admits without a tenant: the
+// relay drains every tenant's events. Without it the runtime role saw an empty
+// outbox and nothing was ever published.
+//
+// FOR UPDATE SKIP LOCKED lets several replicas relay at once without
+// publishing the same row twice from two of them.
+func (w *Worker) RelayOnce(ctx context.Context) (int, error) {
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.outbox_relay', 'on', true)`); err != nil {
+		return 0, fmt.Errorf("mark relay transaction: %w", err)
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT outbox_id, payload, COALESCE(aggregate_id, ''), idempotency_key
 		FROM outbox
 		WHERE published_at IS NULL
-		ORDER BY created_at
-		LIMIT $1;`
-
-	rows, err := w.pool.Query(ctx, fetchQuery, outboxBatchSize)
+		ORDER BY outbox_id
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`, batchSize)
 	if err != nil {
-		w.log.Error("outbox: fetch failed", zap.Error(err))
-		return
+		return 0, fmt.Errorf("claim: %w", err)
 	}
-	defer rows.Close()
+	batch, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (pending, error) {
+		var p pending
+		err := row.Scan(&p.id, &p.payload, &p.aggregateID, &p.idemKey)
+		return p, err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("scan: %w", err)
+	}
 
-	var events []outboxEvent
-	for rows.Next() {
-		var e outboxEvent
-		var publishedAt *time.Time
-		var lastError *string
-		if err := rows.Scan(
-			&e.OutboxID, &e.EventType, &e.Payload, &e.TenantID, &e.LegalEntityID, &e.ActorID, &e.CorrelationID, &e.IdempotencyKey, &e.CreatedAt, &publishedAt, &e.Attempts, &lastError,
-		); err != nil {
-			w.log.Error("outbox: scan failed", zap.Error(err))
-			return
+	published := 0
+	for _, p := range batch {
+		msg := kafka.Message{
+			// Keyed by the aggregate (Event Catalogue §5), so every event about
+			// one decision lands on one partition in order.
+			Key:     []byte(p.aggregateID),
+			Value:   p.payload,
+			Headers: []kafka.Header{{Key: "Idempotency-Key", Value: []byte(p.idemKey)}},
 		}
-		e.PublishedAt = publishedAt
-		e.LastError = lastError
-		events = append(events, e)
-	}
-	if err := rows.Err(); err != nil {
-		w.log.Error("outbox: rows error", zap.Error(err))
-		return
-	}
-
-	if len(events) == 0 {
-		return
-	}
-
-	w.log.Debug("outbox: processing batch", zap.Int("count", len(events)))
-
-	// Publish each event
-	for _, e := range events {
-		if err := w.publishEvent(ctx, e); err != nil {
-			w.log.Error("outbox: publish failed",
-				zap.Int64("outbox_id", e.OutboxID),
-				zap.String("event_type", e.EventType),
-				zap.Error(err),
-			)
-			// Increment attempts and record error
-			if incErr := w.incrementAttempts(ctx, e.OutboxID, err.Error()); incErr != nil {
-				w.log.Error("outbox: increment attempts failed", zap.Int64("outbox_id", e.OutboxID), zap.Error(incErr))
+		if pubErr := w.producer.WriteMessages(ctx, msg); pubErr != nil {
+			w.log.Error("outbox: publish failed; will retry",
+				zap.Int64("outbox_id", p.id), zap.Error(pubErr))
+			if _, err := tx.Exec(ctx,
+				`UPDATE outbox SET attempts = attempts + 1, last_error = $1 WHERE outbox_id = $2`,
+				pubErr.Error(), p.id); err != nil {
+				return published, fmt.Errorf("record failed attempt: %w", err)
 			}
-			// Continue with other events; failed event will be retried on next poll
 			continue
 		}
-
-		// Mark as published
-		if err := w.markPublished(ctx, e.OutboxID); err != nil {
-			w.log.Error("outbox: mark published failed",
-				zap.Int64("outbox_id", e.OutboxID),
-				zap.Error(err),
-			)
+		if _, err := tx.Exec(ctx, `UPDATE outbox SET published_at = NOW() WHERE outbox_id = $1`, p.id); err != nil {
+			return published, fmt.Errorf("mark published: %w", err)
 		}
-	}
-}
-
-// publishEvent publishes a single event to Kafka.
-func (w *Worker) publishEvent(ctx context.Context, e outboxEvent) error {
-	// Parse the payload to get correlation_id for message key
-	var payload map[string]any
-	if err := json.Unmarshal(e.Payload, &payload); err != nil {
-		return fmt.Errorf("unmarshal payload: %w", err)
+		published++
 	}
 
-	correlationID := ""
-	if cid, ok := payload["correlation_id"].(string); ok {
-		correlationID = cid
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
 	}
-
-	msg := kafka.Message{
-		Key:       []byte(correlationID),
-		Value:     e.Payload,
-		Headers:   []kafka.Header{{Key: "Idempotency-Key", Value: []byte(e.IdempotencyKey)}},
-		Topic:     w.topic,
-		Time:      time.Now().UTC(),
-	}
-
-	return w.producer.WriteMessages(ctx, msg)
-}
-
-// markPublished marks an outbox event as published.
-func (w *Worker) markPublished(ctx context.Context, outboxID int64) error {
-	const query = `UPDATE outbox SET published_at = NOW() WHERE outbox_id = $1;`
-	_, err := w.pool.Exec(ctx, query, outboxID)
-	return err
-}
-
-// incrementAttempts increments the attempt counter and records the error.
-func (w *Worker) incrementAttempts(ctx context.Context, outboxID int64, errMsg string) error {
-	const query = `UPDATE outbox SET attempts = attempts + 1, last_error = $1 WHERE outbox_id = $2`
-	_, err := w.pool.Exec(ctx, query, errMsg, outboxID)
-	return err
+	return published, nil
 }

@@ -36,6 +36,9 @@ type countingStore struct {
 	// failGrantsOnce makes the next FindGrantedActions fail and then clears
 	// itself, for the "errors are not cached" case.
 	failGrantsOnce bool
+
+	entityTenant      string
+	entityTenantCalls int
 }
 
 func (c *countingStore) FindGrantedActions(_ context.Context, _, _, _ string) ([]string, string, error) {
@@ -195,6 +198,10 @@ func (c *countingStore) ListPrivilegedSessions(_ context.Context, _, _ string, _
 func (c *countingStore) RevokePrivilegedSession(_ context.Context, _, _, _ string) (*domain.PrivilegedSession, error) {
 	return nil, nil
 }
+func (c *countingStore) DecidePrivilegedSession(_ context.Context, _, _, _ string, _ bool) (*domain.PrivilegedSession, error) {
+	return nil, nil
+}
+func (c *countingStore) ReviewSession(_ context.Context, _, _, _, _, _, _ string) error { return nil }
 func (c *countingStore) CreateBreakGlassSession(_ context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error) {
 	return &domain.BreakGlassSession{
 		SessionID:        "bg-stub",
@@ -258,18 +265,6 @@ func (c *countingStore) FindWorkloadBinding(_ context.Context, _, _ string) (*do
 }
 func (c *countingStore) CreateWorkloadBinding(_ context.Context, wb domain.WorkloadBinding) (*domain.WorkloadBinding, error) {
 	return &wb, nil
-}
-func (c *countingStore) CreateAccessReview(_ context.Context, r domain.AccessReview) (*domain.AccessReview, error) {
-	return &r, nil
-}
-func (c *countingStore) GetAccessReview(_ context.Context, _, _ string) (*domain.AccessReview, error) {
-	return nil, nil
-}
-func (c *countingStore) ListAccessReviews(_ context.Context, _, _, _ string) ([]domain.AccessReview, error) {
-	return nil, nil
-}
-func (c *countingStore) RecordAccessReviewDecision(_ context.Context, _, _, _, _, _ string) (*domain.AccessReview, error) {
-	return nil, nil
 }
 
 const (
@@ -801,6 +796,38 @@ func TestCache_RevokedDelegationIsNotServedFromCache(t *testing.T) {
 
 
 func (c *countingStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) { return "", nil }
+func (c *countingStore) FindPrincipalTenants(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+func (c *countingStore) FindEntityTenant(_ context.Context, _ string) (string, error) {
+	c.entityTenantCalls++
+	return c.entityTenant, nil
+}
 func (c *countingStore) ProjectEntityStatus(_ context.Context, _ domain.ProjectEntityStatusParams) error {
 	return nil
+}
+
+// An entity's owner never changes, so a positive answer is memoised; an
+// unknown entity is asked again, so entity.created takes effect at once.
+func TestFindEntityTenant_MemoisesOwnerOnly(t *testing.T) {
+	inner := &countingStore{}
+	c := cache.New(inner, time.Minute, zap.NewNop())
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if got, _ := c.FindEntityTenant(ctx, "e-1"); got != "" {
+			t.Fatalf("unknown entity answered %q", got)
+		}
+	}
+	if inner.entityTenantCalls != 2 {
+		t.Fatalf("unknown entity: %d store reads, want 2 (a miss must not be memoised)", inner.entityTenantCalls)
+	}
+	inner.entityTenant = "t-1"
+	for i := 0; i < 3; i++ {
+		if got, _ := c.FindEntityTenant(ctx, "e-1"); got != "t-1" {
+			t.Fatalf("known entity answered %q", got)
+		}
+	}
+	if inner.entityTenantCalls != 3 {
+		t.Fatalf("known entity: %d store reads in total, want 3", inner.entityTenantCalls)
+	}
 }

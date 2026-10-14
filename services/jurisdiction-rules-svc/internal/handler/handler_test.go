@@ -32,6 +32,7 @@ type stubStore struct {
 
 	rulePack    *domain.RulePack
 	rulePackErr error
+	rulePackQuery domain.RulePackQuery
 
 	// admin-mutation fields — configured per-test, unused by the read tests above
 	createdJurisdiction    *domain.Jurisdiction
@@ -137,7 +138,8 @@ func (s *stubStore) FindAncestors(_ context.Context, _ string) ([]*domain.Jurisd
 	return s.ancestors, s.err
 }
 
-func (s *stubStore) FindRulePack(_ context.Context, _, _ string, _ time.Time) (*domain.RulePack, error) {
+func (s *stubStore) ResolveRulePack(_ context.Context, q domain.RulePackQuery) (*domain.RulePack, error) {
+	s.rulePackQuery = q
 	s.storeCalled = true
 	return s.rulePack, s.rulePackErr
 }

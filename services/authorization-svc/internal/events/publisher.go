@@ -135,40 +135,6 @@ func (p *Publisher) PublishSupportSessionEnded(ctx context.Context, session doma
 	})
 }
 
-// PublishAccessReviewStarted publishes iam.access_review.started (ZS-IAM-001 §23).
-func (p *Publisher) PublishAccessReviewStarted(ctx context.Context, r domain.AccessReview) error {
-	return p.emit(ctx, "iam.access_review.started", "", r.LegalEntityID, r.ReviewerPrincipalID, r.ReviewID, map[string]any{
-		"review_id":              r.ReviewID,
-		"tenant_id":              r.TenantID,
-		"campaign_id":            r.CampaignID,
-		"campaign_name":          r.CampaignName,
-		"reviewer_principal_id":  r.ReviewerPrincipalID,
-		"target_principal_id":    r.TargetPrincipalID,
-		"role_id":                r.RoleID,
-		"legal_entity_id":        r.LegalEntityID,
-		"review_type":            r.ReviewType,
-		"status":                 r.Status,
-		"due_at":                 r.DueAt,
-	})
-}
-
-// PublishAccessReviewCompleted publishes iam.access_review.completed (ZS-IAM-001 §23).
-func (p *Publisher) PublishAccessReviewCompleted(ctx context.Context, r domain.AccessReview) error {
-	return p.emit(ctx, "iam.access_review.completed", "", r.LegalEntityID, r.ReviewerPrincipalID, r.ReviewID, map[string]any{
-		"review_id":              r.ReviewID,
-		"tenant_id":              r.TenantID,
-		"campaign_id":            r.CampaignID,
-		"reviewer_principal_id":  r.ReviewerPrincipalID,
-		"target_principal_id":    r.TargetPrincipalID,
-		"role_id":                r.RoleID,
-		"status":                 r.Status,
-		"decision":               r.Decision,
-		"decision_reason":        r.DecisionReason,
-		"decided_at":             r.DecidedAt,
-		"decided_by":             r.DecidedBy,
-	})
-}
-
 // PublishPrivilegedSessionStarted publishes security.privileged_session.started (ZS-IAM-001 §23).
 func (p *Publisher) PublishPrivilegedSessionStarted(ctx context.Context, s domain.PrivilegedSession) error {
 	return p.emit(ctx, "security.privileged_session.started", "", "", s.PrincipalID, s.SessionID, map[string]any{

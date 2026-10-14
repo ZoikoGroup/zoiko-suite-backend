@@ -137,6 +137,14 @@ paths:
               $ref: "#/components/headers/ResidencyPolicyId"
             X-Tenant-Context-Stale:
               $ref: "#/components/headers/TenantContextStale"
+            X-Source-Channel:
+              $ref: "#/components/headers/SourceChannel"
+            X-Source-Channel-Basis:
+              $ref: "#/components/headers/SourceChannelBasis"
+            X-Assurance-Level:
+              $ref: "#/components/headers/AssuranceLevel"
+            X-Support-Context-Id:
+              $ref: "#/components/headers/SupportContextId"
         "401":
           description: |
             The caller could not be verified. One of `no_token`,
@@ -348,6 +356,30 @@ components:
         confirm. Only ever set on non-material reads — a write is refused
         rather than served from a stale context.
       schema: { type: string, enum: ["true"] }
+    SourceChannel:
+      description: |
+        GOV-01 §4 source channel. The signed envelope's `source_channel` when
+        identity-context-svc established one; otherwise the caller's own
+        `X-Source-Channel`, passed on and labelled by `X-Source-Channel-Basis`.
+        Traefik replaces any client copy with this value.
+      schema: { type: string, enum: [web, mobile, api, import, integration, scheduled_job, system] }
+    SourceChannelBasis:
+      description: |
+        `verified` when `X-Source-Channel` came from the signed envelope,
+        `asserted` when it is the caller's own value. Absent with no channel.
+      schema: { type: string, enum: [verified, asserted] }
+    AssuranceLevel:
+      description: |
+        Authentication assurance of the session, from the envelope's
+        `session_trust_posture.mfa_verified`. Absent when the envelope states
+        none. No login age is ever asserted: the envelope carries no
+        `auth_time`, so `X-Authn-Age-Seconds` is stripped at the edge.
+      schema: { type: string, enum: [MFA, SINGLE_FACTOR] }
+    SupportContextId:
+      description: |
+        The support elevation identity-context-svc verified when it issued the
+        session. Only ever from the envelope; a client copy is stripped.
+      schema: { type: string }
     DenialReason:
       description: |
         Why the request was refused, on every refusal. Traefik returns an

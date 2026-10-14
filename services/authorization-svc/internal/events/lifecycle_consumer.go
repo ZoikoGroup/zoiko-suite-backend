@@ -183,7 +183,11 @@ var (
 		// entity.hierarchy.changed and entity.jurisdiction.changed matter
 		// because they move an entity relative to the scopes and
 		// jurisdiction-scoped SoD rules that apply to it.
-		"entity.status.changed":       true,
+		"entity.status.changed": true,
+		// entity.created carries the owning tenant from the entity's first
+		// moment; projecting it is what lets /v1/authorize resolve the tenant
+		// of a tenantless question itself (resolveTenantScope).
+		"entity.created":              true,
 		"entity.hierarchy.changed":    true,
 		"entity.jurisdiction.changed": true,
 		"entity.updated":              true,
@@ -361,7 +365,7 @@ func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) error {
 		}
 		return err
 	}
-	if env.EventType == "entity.status.changed" {
+	if env.EventType == "entity.status.changed" || env.EventType == "entity.created" {
 		if err := c.handleEntityStatus(ctx, env); err != nil {
 			c.release(env.EventID)
 			return err
@@ -371,11 +375,13 @@ func (c *LifecycleConsumer) Handle(ctx context.Context, raw []byte) error {
 	return nil
 }
 
-// entityStatusPayload is tenant-entity-registry-svc's entity.status.changed.
+// entityStatusPayload is tenant-entity-registry-svc's entity.status.changed
+// (new_status) or entity.created (entity_status).
 type entityStatusPayload struct {
 	TenantID      string `json:"tenant_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	NewStatus     string `json:"new_status"`
+	EntityStatus  string `json:"entity_status"`
 }
 
 // handleEntityStatus projects an entity's standing. Until this existed the
@@ -397,6 +403,9 @@ func (c *LifecycleConsumer) handleEntityStatus(ctx context.Context, env inbound)
 		entityID = strings.TrimSpace(env.LegalEntityID)
 	}
 	status := strings.ToUpper(strings.TrimSpace(p.NewStatus))
+	if status == "" {
+		status = strings.ToUpper(strings.TrimSpace(p.EntityStatus))
+	}
 	if tenantID == "" || entityID == "" || status == "" {
 		c.log.Error("entity status event: missing tenant, entity or status — skipped", zap.String("event_id", env.EventID))
 		return nil
@@ -477,12 +486,25 @@ func (c *LifecycleConsumer) handlePrincipalStatus(ctx context.Context, env inbou
 		return nil // Missing tenant, commit and move on
 	}
 
+	// The ordering key ProjectPrincipalStatus refuses a stale event by. Neither
+	// producer sends status_changed_at, so with the payload alone the guard
+	// never fired: a replayed or late ACTIVE could re-activate a principal
+	// suspended or terminated after it (Governance audit N-05) — including
+	// across topics, where an HR exit on access-control's topic and a status
+	// change on identity-context's are not ordered by Kafka at all. The
+	// envelope's emitted_at is stamped as the change is written, so it is the
+	// fallback.
+	changedAt := payload.StatusChangedAt
+	if changedAt == nil {
+		changedAt = env.EmittedAt
+	}
+
 	projected, err := c.store.ProjectPrincipalStatus(ctx, domain.ProjectPrincipalStatusParams{
 		PrincipalID:     principalID,
 		TenantID:        tenantID,
 		Status:          status,
 		SourceService:   source,
-		StatusChangedAt: payload.StatusChangedAt,
+		StatusChangedAt: changedAt,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrPrincipalStatusStale) {

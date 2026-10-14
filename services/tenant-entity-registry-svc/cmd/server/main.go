@@ -38,6 +38,7 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/idempotency"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
 	svcmiddleware "zoiko.io/tenant-entity-registry-svc/internal/middleware"
+	"zoiko.io/tenant-entity-registry-svc/internal/mtlslistener"
 	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
@@ -254,6 +255,22 @@ func main() {
 		}
 	}()
 
+	// Mutual-TLS listener for gateway-auth-svc and other platform callers
+	// (SEC-INV-05, S5-B1). Same router; provisioned in the background, so an
+	// unavailable mtls-management-svc never stops the plaintext listener.
+	mtlsCtx, stopMTLS := context.WithCancel(context.Background())
+	defer stopMTLS()
+	var mtlsListener *mtlslistener.Listener
+	if cfg.MTLSEnabled {
+		mtlsListener = mtlslistener.Start(mtlsCtx, mtlslistener.Options{
+			ServiceName:        "tenant-entity-registry-svc",
+			Port:               cfg.MTLSPort,
+			ManagementURL:      cfg.MTLSManagementURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+			AllowedClients:     cfg.MTLSAllowedClients,
+		}, r, log)
+	}
+
 	// Wait for SIGINT or SIGTERM.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -268,6 +285,12 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	if mtlsListener != nil {
+		stopMTLS()
+		if err := mtlsListener.Shutdown(shutdownCtx); err != nil {
+			log.Error("mtls listener shutdown failed", zap.Error(err))
+		}
 	}
 	// Stop the relay after the HTTP server, not before: a request in flight
 	// during shutdown can still enqueue an event, and draining first would

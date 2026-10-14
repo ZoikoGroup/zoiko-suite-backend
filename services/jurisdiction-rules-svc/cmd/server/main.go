@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,6 +34,7 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/config"
+	"zoiko.io/jurisdiction-rules-svc/internal/consumer"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
@@ -125,7 +127,7 @@ func main() {
 		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
 		authzClient = authz.NewHTTPAuthZClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, log)
 	} else {
-		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, cfg.AuthZAllowStub, log)
 		if err != nil {
 			log.Fatal("authz client construction failed", zap.Error(err))
 		}
@@ -158,6 +160,10 @@ func main() {
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	// Idempotency-Key replay on admin writes (runs after the envelope, which
+	// guarantees the key is present).
+	r.Use(handler.IdempotencyMiddleware(pgStore, log))
 
 	h := handler.New(pgStore, authzClient, publisher, cfg.AuthZPlatformScopeID, log)
 	var registryPub events.RegistryPublisher
@@ -207,7 +213,40 @@ func main() {
 	} else {
 		log.Warn("pack signing disabled: PACK_SIGNING_KEY_REF/PACK_SIGNING_KEY_FILE are not set; the sign command will answer 503")
 	}
+	h.WithEntityApplicability(pgStore)
 	handler.RegisterRoutes(r, h)
+
+	// Entity consumer (Doc 03 §8.2 consumed events): projects entity.created and
+	// entity.jurisdiction.changed from tenant-entity-registry-svc.
+	consumerCtx, stopConsumers := context.WithCancel(context.Background())
+	defer stopConsumers()
+	if len(cfg.Kafka.Brokers) == 0 || cfg.Kafka.EntityTopic == "" {
+		log.Warn("entity consumer disabled (no KAFKA_BROKERS or KAFKA_ENTITY_TOPIC): entity jurisdiction mappings will not be projected")
+	} else {
+		entityReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers:  cfg.Kafka.Brokers,
+			GroupID:  cfg.Kafka.GroupID,
+			Topic:    cfg.Kafka.EntityTopic,
+			MinBytes: 1,
+			MaxBytes: 10e6,
+			MaxWait:  500 * time.Millisecond,
+			// A new group starts at the earliest retained offset, so entities
+			// created before this consumer existed are projected — as far back
+			// as the topic's retention.
+			StartOffset: kafka.FirstOffset,
+			// kafka-go discards group errors without an ErrorLogger, and a
+			// member assigned zero partitions on a bad first join never
+			// re-checks without the partition watch: a dead consumer that
+			// looks idle (authorization-svc measured both).
+			ErrorLogger: kafka.LoggerFunc(func(msg string, args ...any) {
+				log.Error("kafka consumer error", zap.String("topic", cfg.Kafka.EntityTopic), zap.String("detail", fmt.Sprintf(msg, args...)))
+			}),
+			WatchPartitionChanges:  true,
+			PartitionWatchInterval: 30 * time.Second,
+		})
+		go consumer.NewEntityConsumer(log, pgStore).WithMetrics(metrics).Run(consumerCtx, entityReader)
+		log.Info("entity consumer wired", zap.String("topic", cfg.Kafka.EntityTopic), zap.String("group_id", cfg.Kafka.GroupID))
+	}
 
 	// ── 7. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

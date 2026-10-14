@@ -1074,3 +1074,79 @@ func TestRecordDrift_PublishFailureDoesNotFailRequest(t *testing.T) {
 		t.Fatalf("expected 200 with outbox pattern, got %d", rr.Code)
 	}
 }
+
+// Audit gap 3: activation is maker-checker. The handler asks the store to
+// refuse the rule's author and hands it the approval reference to record; the
+// store's refusal is a 403, not a conflict or an outage.
+func TestTransitionRuleStatus_ActivationIsMakerChecker(t *testing.T) {
+	st := &stubStore{transitionErr: domain.ErrSelfApproval}
+	h := newTestRouterWithAuthz(st, permitAll())
+
+	rr := postJSONWithApprovalAs(t, h, "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "ACTIVE"}, "maker", "APR-7")
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rr.Code)
+	}
+	if got := decodeError(t, rr)["code"]; got != "self_approval_forbidden" {
+		t.Fatalf("expected code=self_approval_forbidden, got %q", got)
+	}
+	if !st.transitionArgs.RequireIndependentActor || st.transitionArgs.ApprovalReference != "APR-7" || st.transitionArgs.ActorID != "maker" {
+		t.Fatalf("activation must require an independent actor and carry the reference, got %+v", st.transitionArgs)
+	}
+
+	// Retiring is not an approval: no checker is required for it.
+	st2 := &stubStore{transitionedRule: &domain.JurisdictionRule{RuleStatus: "RETIRED"}, transitionDidRun: true}
+	rr = postJSON(t, newTestRouterWithAuthz(st2, permitAll()), "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "RETIRED"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for RETIRED, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if st2.transitionArgs.RequireIndependentActor {
+		t.Fatal("RETIRED must not require an independent actor")
+	}
+}
+
+// recordingAuthz permits and records the target each decision named.
+type recordingAuthz struct{ resourceIDs []string }
+
+func (a *recordingAuthz) Authorize(ctx context.Context, _, _, _, _ string, _ *envelope.Envelope) error {
+	a.resourceIDs = append(a.resourceIDs, authz.ResourceIDFrom(ctx))
+	return nil
+}
+
+// Audit gap 4: the decision for a transition names the rule in the path.
+func TestCheckAuthz_NamesTheRouteResource(t *testing.T) {
+	az := &recordingAuthz{}
+	st := &stubStore{transitionedRule: &domain.JurisdictionRule{RuleStatus: "RETIRED"}, transitionDidRun: true}
+	rr := postJSON(t, newTestRouterWithAuthz(st, az), "/v1/admin/rules/rule-77/transition", map[string]any{"new_status": "RETIRED"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(az.resourceIDs) != 1 || az.resourceIDs[0] != "rule-77" {
+		t.Fatalf("authz decision must name rule-77, got %v", az.resourceIDs)
+	}
+}
+
+// Audit gaps 7 and 8 at the boundary: known_at and required_codes reach the
+// store, and a malformed known_at is the caller's error, never a store call.
+func TestGetRulePack_KnownAtAndRequiredCodes(t *testing.T) {
+	st := &stubStore{rulePack: &domain.RulePack{Outcome: domain.RulePackResolved}}
+	h := newTestRouterWithAuthz(st, permitAll())
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/j-1/rule-pack?known_at=2026-01-02T03:04:05Z&required_codes=A,%20B,,", nil)
+	if rr := executeRequest(h, req); rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	q := st.rulePackQuery
+	if q.KnownAt == nil || !q.KnownAt.Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Fatalf("known_at not passed through, got %v", q.KnownAt)
+	}
+	if len(q.RequiredCodes) != 2 || q.RequiredCodes[0] != "A" || q.RequiredCodes[1] != "B" {
+		t.Fatalf("required_codes = %v, want [A B]", q.RequiredCodes)
+	}
+
+	st2 := &stubStore{}
+	rr := executeRequest(newTestRouterWithAuthz(st2, permitAll()), httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/j-1/rule-pack?known_at=yesterday", nil))
+	if rr.Code != http.StatusBadRequest || st2.storeCalled {
+		t.Fatalf("malformed known_at: want 400 with no store call, got %d (store called=%v)", rr.Code, st2.storeCalled)
+	}
+}

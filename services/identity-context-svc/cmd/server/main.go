@@ -35,6 +35,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/idempotency"
+	"zoiko.io/identity-context-svc/internal/mtlslistener"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/retention"
 	"zoiko.io/identity-context-svc/internal/session"
@@ -575,6 +576,22 @@ func main() {
 		}
 	}()
 
+	// Mutual-TLS listener for gateway-auth-svc and other platform callers
+	// (SEC-INV-05, S5-B1). Same router; provisioned in the background, so an
+	// unavailable mtls-management-svc never stops the plaintext listener.
+	mtlsCtx, stopMTLS := context.WithCancel(context.Background())
+	defer stopMTLS()
+	var mtlsListener *mtlslistener.Listener
+	if cfg.MTLSEnabled {
+		mtlsListener = mtlslistener.Start(mtlsCtx, mtlslistener.Options{
+			ServiceName:        "identity-context-svc",
+			Port:               cfg.MTLSPort,
+			ManagementURL:      cfg.MTLSManagementURL,
+			BootstrapTokenPath: cfg.MTLSBootstrapTokenPath,
+			AllowedClients:     cfg.MTLSAllowedClients,
+		}, r, log)
+	}
+
 	<-quit
 	log.Info("shutdown signal received — draining connections")
 
@@ -582,6 +599,12 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	if mtlsListener != nil {
+		stopMTLS()
+		if err := mtlsListener.Shutdown(shutdownCtx); err != nil {
+			log.Error("mtls listener shutdown failed", zap.Error(err))
+		}
 	}
 	log.Info("stopping event consumer")
 	stopConsumer()

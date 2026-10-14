@@ -30,7 +30,7 @@ func TestBreakGlass_Create_Success(t *testing.T) {
 		"principal_id": "` + testBGElevatedUser + `",
 		"incident_id": "INC-CRIT-991",
 		"reason": "Payment gateway failover outage remediation",
-		"requested_actions": ["payment.override", "period.reopen"],
+		"requested_actions": ["gateway.failover", "period.reopen"],
 		"duration_seconds": 1800
 	}`
 

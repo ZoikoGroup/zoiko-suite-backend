@@ -83,6 +83,8 @@ type Inner interface {
 	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string, version int64) (*domain.DelegatedAuthority, error)
 	FindDelegationCeilings(ctx context.Context, principalID, legalEntityID, tenantID, actionType string) ([]domain.DelegationCeiling, error)
 	FindEntityStatus(ctx context.Context, legalEntityID, tenantID string) (string, error)
+	FindEntityTenant(ctx context.Context, legalEntityID string) (string, error)
+	FindPrincipalTenants(ctx context.Context, principalID string) ([]string, error)
 	ProjectEntityStatus(ctx context.Context, params domain.ProjectEntityStatusParams) error
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
 	ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error)
@@ -111,6 +113,8 @@ type Inner interface {
 	FindPrivilegedSessionByID(ctx context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error)
 	ListPrivilegedSessions(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.PrivilegedSession, error)
 	RevokePrivilegedSession(ctx context.Context, sessionID, tenantID, revokedBy string) (*domain.PrivilegedSession, error)
+	DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error)
+	ReviewSession(ctx context.Context, kind, sessionID, tenantID, reviewer, outcome, notes string) error
 
 	// Break-Glass Emergency Sessions (ZS-IAM-001 §14 & §21).
 	CreateBreakGlassSession(ctx context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error)
@@ -129,10 +133,6 @@ type Inner interface {
 	CreateWorkloadBinding(ctx context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error)
 
 	// Access Reviews & Continuous Access Certification (ZS-IAM-001 §21, §24)
-	CreateAccessReview(ctx context.Context, review domain.AccessReview) (*domain.AccessReview, error)
-	GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error)
-	ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error)
-	RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error)
 }
 
 // The cache namespaces. A write invalidates whole namespaces for a tenant
@@ -178,6 +178,10 @@ type Store struct {
 	inner Inner
 	ttl   time.Duration
 	log   *zap.Logger
+
+	// entityTenants: legal entity -> owning tenant, positive answers only
+	// (see FindEntityTenant).
+	entityTenants sync.Map
 
 	mu      sync.Mutex
 	entries map[string]entry
@@ -625,6 +629,10 @@ func (s *Store) ProjectPrincipalStatus(ctx context.Context, params domain.Projec
 	if err == nil {
 		s.invalidate(nsPrincipal, params.TenantID)
 		s.invalidate(nsPrincipal, "")
+		// A delegator's standing gates the delegations they made (N-02), so
+		// the cached delegation reads go too.
+		s.invalidate(nsDelegation, params.TenantID)
+		s.invalidate(nsDelegation, "")
 	}
 	return p, err
 }
@@ -921,6 +929,27 @@ func (s *Store) ProjectEntityStatus(ctx context.Context, params domain.ProjectEn
 	return s.inner.ProjectEntityStatus(ctx, params)
 }
 
+// FindEntityTenant memoises positive answers only. An entity never changes
+// tenant, so a known owner is kept for the life of the process; an unknown
+// one is asked again every time, because the registry's entity.created can
+// arrive at any moment and must start scoping decisions when it does.
+func (s *Store) FindEntityTenant(ctx context.Context, legalEntityID string) (string, error) {
+	if v, ok := s.entityTenants.Load(legalEntityID); ok {
+		return v.(string), nil
+	}
+	tenantID, err := s.inner.FindEntityTenant(ctx, legalEntityID)
+	if err == nil && tenantID != "" {
+		s.entityTenants.Store(legalEntityID, tenantID)
+	}
+	return tenantID, err
+}
+
+// FindPrincipalTenants is not cached: it runs only for an entity the
+// projection has not heard of, and a grant made a second ago must count.
+func (s *Store) FindPrincipalTenants(ctx context.Context, principalID string) ([]string, error) {
+	return s.inner.FindPrincipalTenants(ctx, principalID)
+}
+
 // FindRoleAssignmentByID and FindPermissionBundleByID are the pre-reads behind
 // the handler's platform-scope and own-role checks. Admin reads, uncached, and
 // forwarded explicitly: the handler finds them by type assertion on THIS type,
@@ -1015,6 +1044,16 @@ func (s *Store) RevokePrivilegedSession(ctx context.Context, sessionID, tenantID
 	return s.inner.RevokePrivilegedSession(ctx, sessionID, tenantID, revokedBy)
 }
 
+// DecidePrivilegedSession and ReviewSession are uncached writes; sessions are
+// read uncached at decision time, so an approval grants from the next call.
+func (s *Store) DecidePrivilegedSession(ctx context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error) {
+	return s.inner.DecidePrivilegedSession(ctx, sessionID, tenantID, approver, approve)
+}
+
+func (s *Store) ReviewSession(ctx context.Context, kind, sessionID, tenantID, reviewer, outcome, notes string) error {
+	return s.inner.ReviewSession(ctx, kind, sessionID, tenantID, reviewer, outcome, notes)
+}
+
 func (s *Store) CreateBreakGlassSession(ctx context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error) {
 	return s.inner.CreateBreakGlassSession(ctx, params)
 }
@@ -1065,26 +1104,6 @@ func (s *Store) FindWorkloadBinding(ctx context.Context, workloadID, tenantID st
 
 func (s *Store) CreateWorkloadBinding(ctx context.Context, binding domain.WorkloadBinding) (*domain.WorkloadBinding, error) {
 	return s.inner.CreateWorkloadBinding(ctx, binding)
-}
-
-func (s *Store) CreateAccessReview(ctx context.Context, review domain.AccessReview) (*domain.AccessReview, error) {
-	return s.inner.CreateAccessReview(ctx, review)
-}
-
-func (s *Store) GetAccessReview(ctx context.Context, reviewID, tenantID string) (*domain.AccessReview, error) {
-	return s.inner.GetAccessReview(ctx, reviewID, tenantID)
-}
-
-func (s *Store) ListAccessReviews(ctx context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error) {
-	return s.inner.ListAccessReviews(ctx, tenantID, reviewerPrincipalID, status)
-}
-
-func (s *Store) RecordAccessReviewDecision(ctx context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error) {
-	rev, err := s.inner.RecordAccessReviewDecision(ctx, reviewID, tenantID, decision, decisionReason, decidedBy)
-	if err == nil && decision == domain.ReviewDecisionRevoke {
-		s.invalidateGrantSources(tenantID)
-	}
-	return rev, err
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

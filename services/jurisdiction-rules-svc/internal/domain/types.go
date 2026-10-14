@@ -49,6 +49,10 @@ type Jurisdiction struct {
 	SchemaVersion        string     `json:"schema_version"`
 	UpdatedAt            *time.Time `json:"updated_at,omitempty"`
 	UpdatedByPrincipalID *string    `json:"updated_by_principal_id,omitempty"`
+
+	// RowVersion increases on every update (000020): the aggregate version
+	// events carry and the ETag If-Match asserts.
+	RowVersion int64 `json:"row_version"`
 }
 
 // JurisdictionRule is an effective-dated applicability rule record.
@@ -100,6 +104,10 @@ type JurisdictionRule struct {
 	// (rule_domain, rule_code) at a point in time, the one with the lowest
 	// precedence_level wins. Equal precedence with overlapping periods = CONFLICTED.
 	PrecedenceLevel int `json:"precedence_level"`
+
+	// RowVersion increases on every update (000020): the aggregate version
+	// events carry and the ETag If-Match asserts.
+	RowVersion int64 `json:"row_version"`
 
 	// LegalDriftState: CURRENT, DRIFTED, UNDER_REVIEW.
 	// Current value only — full transition history is in drift_events table,
@@ -156,6 +164,10 @@ type RecordDriftParams struct {
 	Reason                *string
 	RecordedByPrincipalID string
 	CorrelationID         string
+
+	// ExpectedRowVersion, when set (If-Match), refuses the change unless the
+	// rule still has that row_version: ErrPreconditionFailed.
+	ExpectedRowVersion *int64
 }
 
 // RulePack is the resolved, runtime-ready rule set for a jurisdiction at a
@@ -189,6 +201,50 @@ type RulePack struct {
 	// found in the entire ancestor chain. Callers MUST treat this as a
 	// configuration error for governed actions requiring that rule.
 	Insufficient []string `json:"insufficient,omitempty"`
+
+	// Outcome is the resolution verdict (V-001 §11.1, §12.2): RESOLVED,
+	// CONFLICTED (Conflicts is non-empty) or INSUFFICIENT (a required rule
+	// code resolved to nothing, or nothing resolved at all). An empty pack and
+	// a complete one used to be indistinguishable — both a bare 200.
+	Outcome string `json:"outcome"`
+
+	// KnownAt is the knowledge time the pack was replayed at, when the caller
+	// asked for one ("what did the platform know at known_at about at").
+	KnownAt *time.Time `json:"known_at,omitempty"`
+
+	// PackDigest pins this exact answer: sha256 over the jurisdiction, both
+	// time axes, the chain, the outcome and every (rule id, row_version) in
+	// the pack and its conflicts. A rule's content is immutable once it leaves
+	// DRAFT (000020) and DRAFT never enters a pack, so the digest identifies
+	// the rule basis a governed action rested on (Doc 03 §8.2 evidence
+	// obligation); a caller records it with the action.
+	PackDigest string `json:"pack_digest"`
+}
+
+// Rule pack outcomes.
+const (
+	RulePackResolved     = "RESOLVED"
+	RulePackConflicted   = "CONFLICTED"
+	RulePackInsufficient = "INSUFFICIENT"
+)
+
+// RulePackQuery asks for the rule pack of a jurisdiction on two time axes.
+//
+// At is valid time: the date the rules must be in force for. KnownAt is
+// knowledge time (V-001 §8.1 decision_known_at): when set, only what the
+// platform had recorded by then counts — status and effective window are read
+// from the status-history row in force at KnownAt, and a rule recorded after
+// KnownAt does not exist. Nil keeps the original single-axis behaviour, in
+// which the status known at At decides.
+//
+// RequiredCodes are rule codes the caller needs; any that resolve to no rule
+// are listed in RulePack.Insufficient and make the outcome INSUFFICIENT.
+type RulePackQuery struct {
+	JurisdictionID string
+	RuleDomain     string
+	At             time.Time
+	KnownAt        *time.Time
+	RequiredCodes  []string
 }
 
 // RuleConflict represents a (rule_domain, rule_code) pair where multiple
@@ -266,6 +322,12 @@ var ErrOverlappingRule = errorString("rule effective period overlaps an existing
 // ErrInvalidTransition is returned when a rule status transition is illegal per state machine.
 var ErrInvalidTransition = errorString("invalid rule status transition")
 
+// ErrSelfApproval is returned when the principal who authored a rule tries to
+// activate it. ZS-JUR-001 §3 and V-001 §18.1 require an independent checker
+// before a rule governs; an approval reference supplied by the author is the
+// author approving their own work.
+var ErrSelfApproval = errorString("a rule cannot be activated by the principal who created it")
+
 // ErrConflict is returned when an idempotent creation request matches an existing record's dedup key
 // but has differing payload or attributes (409 Conflict).
 var ErrConflict = errorString("conflict: record already exists with differing attributes")
@@ -289,3 +351,22 @@ var ErrStoreUnavailable = errorString("jurisdiction rules store unavailable")
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
+
+// ErrInvalidSupersedes is returned when supersedes_rule_id does not name an
+// existing rule of the same jurisdiction, rule_domain and rule_code.
+var ErrInvalidSupersedes = errorString("supersedes_rule_id must name an earlier version of the same rule")
+
+// ErrSupersedesTaken is returned when the superseded rule already has a
+// successor: a version chain cannot fork.
+var ErrSupersedesTaken = errorString("the superseded rule already has a successor")
+
+// ErrRuleVersionMismatch is returned when a caller-supplied rule_version is
+// not the one the chain implies (1, or the superseded version + 1).
+var ErrRuleVersionMismatch = errorString("rule_version does not follow the superseded rule's version")
+
+// ErrPreconditionFailed is returned when If-Match names a row_version the
+// record no longer has.
+var ErrPreconditionFailed = errorString("the record changed since the version named in If-Match")
+
+// MaxPrecedenceLevel bounds precedence_level (lower wins).
+const MaxPrecedenceLevel = 1000

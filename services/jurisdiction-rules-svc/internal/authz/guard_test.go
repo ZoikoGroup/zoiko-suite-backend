@@ -30,7 +30,7 @@ func TestNonProductionURLsAreRefusedOutsideDevelopment(t *testing.T) {
 	}
 	for _, env := range []string{"production", "staging", "PRODUCTION"} {
 		for _, u := range refused {
-			if _, err := NewClient(env, u, zap.NewNop()); err == nil {
+			if _, err := NewClient(env, u, false, zap.NewNop()); err == nil {
 				t.Errorf("%s must refuse %q", env, u)
 			}
 		}
@@ -47,7 +47,7 @@ func TestDeployedURLsAreAcceptedInProduction(t *testing.T) {
 		"https://authz.internal.zoiko.io",
 		"http://10.0.3.7:8089",
 	} {
-		c, err := NewClient("production", u, zap.NewNop())
+		c, err := NewClient("production", u, false, zap.NewNop())
 		if err != nil {
 			t.Errorf("production must accept %q: %v", u, err)
 			continue
@@ -63,11 +63,37 @@ func TestDeployedURLsAreAcceptedInProduction(t *testing.T) {
 // and ignoring it would make local authorization testing impossible while
 // looking like it worked.
 func TestLoopbackIsARealClientInDevelopment(t *testing.T) {
-	c, err := NewClient("development", "http://localhost:8089", zap.NewNop())
+	c, err := NewClient("development", "http://localhost:8089", false, zap.NewNop())
 	if err != nil {
 		t.Fatalf("development must accept a loopback URL: %v", err)
 	}
 	if _, isStub := c.(*StubAuthZClient); isStub {
 		t.Fatal("a configured loopback URL in development is a real client, not the stub")
+	}
+}
+
+// Audit gap 2: the stub was chosen from two defaults — ENV=local and the
+// placeholder AUTHZ_SERVICE_URL — so a deployment that left ENV unset, or set
+// it to anything but exactly production/staging, permitted every admin write.
+// Without the explicit opt-in no environment gets the stub; with it, only local.
+func TestStubRequiresExplicitLocalOptIn(t *testing.T) {
+	for _, env := range []string{"local", "LOCAL", "development", "prod", "uat", "preprod", "test", ""} {
+		for _, u := range []string{"", "http://authorization-svc", "http://jurisdiction-svc:8082"} {
+			if c, err := NewClient(env, u, false, zap.NewNop()); err == nil {
+				t.Errorf("ENV=%q URL=%q without opt-in must refuse to build a client, got %T", env, u, c)
+			}
+		}
+	}
+	for _, env := range []string{"development", "prod", "uat", "preprod", ""} {
+		if c, err := NewClient(env, "http://authorization-svc", true, zap.NewNop()); err == nil {
+			t.Errorf("ENV=%q must refuse the stub even with the opt-in, got %T", env, c)
+		}
+	}
+	c, err := NewClient("local", "http://authorization-svc", true, zap.NewNop())
+	if err != nil {
+		t.Fatalf("ENV=local with the opt-in must build the stub: %v", err)
+	}
+	if _, isStub := c.(*StubAuthZClient); !isStub {
+		t.Fatalf("ENV=local with the opt-in must be the stub, got %T", c)
 	}
 }

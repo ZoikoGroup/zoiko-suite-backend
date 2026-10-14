@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -21,10 +22,30 @@ type Store interface {
 	// caller (handler) is responsible for actually issuing the new
 	// material via the CA — the store never generates cryptographic
 	// material itself, real or fake.
+	//
+	// A REVOKED record is refused with ErrCertRevoked: rotation used to set the
+	// status back to ACTIVE, so "rotate" silently un-revoked a certificate. The
+	// superseded serial is kept in PriorSerialNumbers so a later revocation
+	// still covers it.
 	ReplaceCertMaterial(ctx context.Context, tenantID, id string, serialNumber, fingerprint, certificatePEM string, validFrom, validTo time.Time) (*domain.MtlsCertificate, error)
-	RevokeCert(ctx context.Context, tenantID, id string) error
+	// RevokeCert marks the record REVOKED (idempotently) and returns it as it
+	// stands afterwards, so the caller revokes every serial it ever carried.
+	RevokeCert(ctx context.Context, tenantID, id string) (*domain.MtlsCertificate, error)
 	CreatePolicy(ctx context.Context, tenantID string, pol *domain.CommunicationPolicy) error
 	ListPolicies(ctx context.Context, tenantID string) ([]domain.CommunicationPolicy, error)
+}
+
+// ErrCertRevoked refuses an operation that would bring a revoked
+// certificate record back into use.
+var ErrCertRevoked = errors.New("certificate is revoked")
+
+// clone copies a record so callers never hold a pointer into the map: the
+// handler used to receive the stored struct itself, and a concurrent rotate
+// or revoke rewrote it underneath them.
+func clone(c *domain.MtlsCertificate) *domain.MtlsCertificate {
+	cp := *c
+	cp.PriorSerialNumbers = append([]string(nil), c.PriorSerialNumbers...)
+	return &cp
 }
 
 type MemoryStore struct {
@@ -61,7 +82,7 @@ func (m *MemoryStore) GetCertByID(ctx context.Context, tenantID, id string) (*do
 	if !ok || c.TenantID != tenantID {
 		return nil, fmt.Errorf("certificate not found")
 	}
-	return c, nil
+	return clone(c), nil
 }
 
 func (m *MemoryStore) ListCerts(ctx context.Context, tenantID, legalEntityID, status string) ([]domain.MtlsCertificate, error) {
@@ -78,7 +99,7 @@ func (m *MemoryStore) ListCerts(ctx context.Context, tenantID, legalEntityID, st
 		if status != "" && string(c.Status) != status {
 			continue
 		}
-		result = append(result, *c)
+		result = append(result, *clone(c))
 	}
 	return result, nil
 }
@@ -90,26 +111,33 @@ func (m *MemoryStore) ReplaceCertMaterial(ctx context.Context, tenantID, id stri
 	if !ok || c.TenantID != tenantID {
 		return nil, fmt.Errorf("certificate not found")
 	}
+	if c.Status == domain.CertStatusRevoked {
+		return nil, ErrCertRevoked
+	}
+	if c.SerialNumber != "" {
+		c.PriorSerialNumbers = append(c.PriorSerialNumbers, c.SerialNumber)
+	}
 	c.SerialNumber = serialNumber
 	c.Fingerprint = fingerprint
 	c.CertificatePEM = certificatePEM
 	c.ValidFrom = validFrom
 	c.ValidTo = validTo
-	c.Status = domain.CertStatusActive
 	c.UpdatedAt = time.Now()
-	return c, nil
+	return clone(c), nil
 }
 
-func (m *MemoryStore) RevokeCert(ctx context.Context, tenantID, id string) error {
+func (m *MemoryStore) RevokeCert(ctx context.Context, tenantID, id string) (*domain.MtlsCertificate, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c, ok := m.certs[id]
 	if !ok || c.TenantID != tenantID {
-		return fmt.Errorf("certificate not found")
+		return nil, fmt.Errorf("certificate not found")
 	}
-	c.Status = domain.CertStatusRevoked
-	c.UpdatedAt = time.Now()
-	return nil
+	if c.Status != domain.CertStatusRevoked {
+		c.Status = domain.CertStatusRevoked
+		c.UpdatedAt = time.Now()
+	}
+	return clone(c), nil
 }
 
 func (m *MemoryStore) CreatePolicy(ctx context.Context, tenantID string, pol *domain.CommunicationPolicy) error {

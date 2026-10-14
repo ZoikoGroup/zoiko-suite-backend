@@ -3,7 +3,10 @@ package events
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
+	svcenvelope "zoiko.io/jurisdiction-rules-svc/internal/envelope"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 	"zoiko.io/jurisdiction-rules-svc/internal/telemetry"
 )
@@ -34,17 +38,27 @@ type Publisher interface {
 	FlushPending(ctx context.Context, q store.Querier) error
 }
 
+// envelope is the event envelope every event of this service is published in.
+// classification, payload_hash and request_id are the Event Catalogue §4
+// fields the envelope lacked: what handling class the payload carries, a
+// digest a consumer can check the payload against, and the request that
+// caused the event. Tenant and entity are deliberately absent — this is
+// platform reference data.
 type envelope struct {
-	EventID        string          `json:"event_id"`
-	EventType      string          `json:"event_type"`
-	EventVersion   string          `json:"event_version"`
-	EmittedAt      time.Time       `json:"emitted_at"`
-	SchemaVersion  string          `json:"schema_version"`
-	SourceService  string          `json:"source_service"`
-	JurisdictionID string          `json:"jurisdiction_id,omitempty"`
-	ActorID        string          `json:"actor_id,omitempty"`
-	CorrelationID  string          `json:"correlation_id"`
-	Payload        json.RawMessage `json:"payload"`
+	EventID          string          `json:"event_id"`
+	EventType        string          `json:"event_type"`
+	EventVersion     string          `json:"event_version"`
+	EmittedAt        time.Time       `json:"emitted_at"`
+	SchemaVersion    string          `json:"schema_version"`
+	SourceService    string          `json:"source_service"`
+	JurisdictionID   string          `json:"jurisdiction_id,omitempty"`
+	ActorID          string          `json:"actor_id,omitempty"`
+	CorrelationID    string          `json:"correlation_id"`
+	RequestID        string          `json:"request_id,omitempty"`
+	AggregateVersion int64           `json:"aggregate_version,omitempty"`
+	Classification   string          `json:"classification"`
+	PayloadHash      string          `json:"payload_hash"`
+	Payload          json.RawMessage `json:"payload"`
 }
 
 func effectiveActor(createdBy string, updatedBy *string) string {
@@ -84,13 +98,17 @@ func partitionKey(payload map[string]any) string {
 
 // OutboxPublisher writes events to the transactional outbox table.
 // The actual Kafka publish happens asynchronously via a background worker.
+//
+// Publish* buffers an event in the batch carried by ctx (WithBatch) and
+// FlushPending writes that batch inside the caller's transaction. The buffer
+// used to be one slice on the shared publisher, so concurrent requests flushed
+// each other's events: an event could commit with another request's
+// transaction while its own rolled back, or vanish with a rollback that was
+// not its own.
 type OutboxPublisher struct {
 	log   *zap.Logger
 	store *store.PgStore
 	topic string
-	mu    sync.Mutex
-	// pending tracks events in the current transaction for testing
-	pending []OutboxPendingEvent
 }
 
 type OutboxPendingEvent struct {
@@ -100,33 +118,60 @@ type OutboxPendingEvent struct {
 	Payload      []byte
 }
 
+// ErrNoBatch is returned by Publish* when ctx carries no WithBatch batch:
+// there is no transaction for the event to commit with.
+var ErrNoBatch = errors.New("events: publish outside a WithBatch transaction scope")
+
+type batchKey struct{}
+
+type batch struct {
+	mu     sync.Mutex
+	events []OutboxPendingEvent
+}
+
+// WithBatch returns a context that buffers the events published under it
+// until FlushPending writes them. Call it once per transaction attempt.
+func WithBatch(ctx context.Context) context.Context {
+	return context.WithValue(ctx, batchKey{}, &batch{})
+}
+
+func batchFrom(ctx context.Context) *batch {
+	b, _ := ctx.Value(batchKey{}).(*batch)
+	return b
+}
+
 func NewOutboxPublisher(log *zap.Logger, store *store.PgStore, topic string) *OutboxPublisher {
 	return &OutboxPublisher{log: log, store: store, topic: topic}
 }
 
-func (p *OutboxPublisher) addPending(eventType, topic, partitionKey string, payload []byte) {
-	p.mu.Lock()
-	p.pending = append(p.pending, OutboxPendingEvent{
+func (p *OutboxPublisher) addPending(ctx context.Context, eventType, partitionKey string, payload []byte) error {
+	b := batchFrom(ctx)
+	if b == nil {
+		return fmt.Errorf("event %q: %w", eventType, ErrNoBatch)
+	}
+	b.mu.Lock()
+	b.events = append(b.events, OutboxPendingEvent{
 		EventType:    eventType,
-		Topic:        topic,
+		Topic:        p.topic,
 		PartitionKey: partitionKey,
 		Payload:      payload,
 	})
-	p.mu.Unlock()
+	b.mu.Unlock()
+	return nil
 }
 
-func (p *OutboxPublisher) takePending() []OutboxPendingEvent {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	pending := p.pending
-	p.pending = nil
-	return pending
-}
-
-// FlushPending writes all pending events to the outbox within the given transaction.
-// This must be called within the same transaction as the domain change.
+// FlushPending writes the ctx batch to the outbox within the given transaction
+// and empties it. This must be called within the same transaction as the
+// domain change.
 func (p *OutboxPublisher) FlushPending(ctx context.Context, q store.Querier) error {
-	pending := p.takePending()
+	b := batchFrom(ctx)
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	pending := b.events
+	b.events = nil
+	b.mu.Unlock()
 	for _, e := range pending {
 		if err := p.store.AddEventToOutbox(ctx, q, e.EventType, e.Topic, e.PartitionKey, e.Payload); err != nil {
 			return err
@@ -135,123 +180,82 @@ func (p *OutboxPublisher) FlushPending(ctx context.Context, q store.Querier) err
 	return nil
 }
 
+// buildEnvelope is the one place an event envelope is assembled, so the
+// envelope's event_type is always the type the event was published as.
+func buildEnvelope(ctx context.Context, eventType, jurisdictionID, actorID, correlationID, classification string, aggregateVersion int64, payload []byte) ([]byte, error) {
+	sum := sha256.Sum256(payload)
+	env := envelope{
+		EventID:          "evt-" + uuid.New().String(),
+		EventType:        eventType,
+		EventVersion:     "1.0",
+		EmittedAt:        time.Now().UTC(),
+		SchemaVersion:    "1.0",
+		SourceService:    "jurisdiction-rules-svc",
+		JurisdictionID:   jurisdictionID,
+		ActorID:          actorID,
+		CorrelationID:    correlationID,
+		Classification:   classification,
+		PayloadHash:      "sha256:" + hex.EncodeToString(sum[:]),
+		AggregateVersion: aggregateVersion,
+		Payload:          json.RawMessage(payload),
+	}
+	if reqEnv, ok := svcenvelope.FromContext(ctx); ok {
+		env.RequestID = reqEnv.RequestID
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return nil, fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
+	}
+	return data, nil
+}
+
 func (p *OutboxPublisher) emitToOutbox(ctx context.Context, q store.Querier, eventType, correlationID, jurisdictionID, actorID string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
 	}
-	env := envelope{
-		EventID:        "evt-" + uuid.New().String(),
-		EventType:      eventType,
-		EventVersion:   "1.0",
-		EmittedAt:      time.Now().UTC(),
-		SchemaVersion:  "1.0",
-		SourceService:  "jurisdiction-rules-svc",
-		JurisdictionID: jurisdictionID,
-		ActorID:        actorID,
-		CorrelationID:  correlationID,
-		Payload:        json.RawMessage(raw),
+	classification, _ := payload["data_classification"].(string)
+	if classification == "" {
+		classification = "INTERNAL"
 	}
-	data, err := json.Marshal(env)
+	data, err := buildEnvelope(ctx, eventType, jurisdictionID, actorID, correlationID, classification, 0, raw)
 	if err != nil {
-		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
+		return err
 	}
+	return p.store.AddEventToOutbox(ctx, q, eventType, p.topic, partitionKey(payload), data)
+}
 
-	pk := partitionKey(payload)
-	return p.store.AddEventToOutbox(ctx, q, eventType, p.topic, pk, data)
+func (p *OutboxPublisher) publish(ctx context.Context, eventType, partitionKey, jurisdictionID, actorID, correlationID, classification string, aggregateVersion int64, payload []byte) error {
+	data, err := buildEnvelope(ctx, eventType, jurisdictionID, actorID, correlationID, classification, aggregateVersion, payload)
+	if err != nil {
+		return err
+	}
+	return p.addPending(ctx, eventType, partitionKey, data)
 }
 
 func (p *OutboxPublisher) PublishJurisdictionCreated(ctx context.Context, j domain.Jurisdiction, correlationID string) error {
-	p.addPending(EventJurisdictionCreated, p.topic, j.JurisdictionID, p.buildJurisdictionCreatedPayload(j, correlationID))
-	return nil
+	return p.publish(ctx, EventJurisdictionCreated, j.JurisdictionID, j.JurisdictionID,
+		j.CreatedByPrincipalID, correlationID, j.DataClassification, j.RowVersion, p.marshalJurisdictionCreated(j))
 }
 
 func (p *OutboxPublisher) PublishJurisdictionDeactivated(ctx context.Context, j domain.Jurisdiction, correlationID string) error {
-	p.addPending(EventJurisdictionDeactivated, p.topic, j.JurisdictionID, p.buildJurisdictionDeactivatedPayload(j, correlationID))
-	return nil
+	return p.publish(ctx, EventJurisdictionDeactivated, j.JurisdictionID, j.JurisdictionID,
+		effectiveActor(j.CreatedByPrincipalID, j.UpdatedByPrincipalID), correlationID, j.DataClassification, j.RowVersion, p.marshalJurisdictionDeactivated(j))
 }
 
 func (p *OutboxPublisher) PublishRuleUpdated(ctx context.Context, r domain.JurisdictionRule, correlationID string) error {
-	p.addPending(EventRuleUpdated, p.topic, r.JurisdictionRuleID, p.buildRulePayload(r, correlationID))
-	return nil
+	return p.publish(ctx, EventRuleUpdated, r.JurisdictionRuleID, r.JurisdictionID,
+		effectiveActor(r.CreatedByPrincipalID, r.UpdatedByPrincipalID), correlationID, r.DataClassification, r.RowVersion, p.marshalRule(r))
 }
 
 func (p *OutboxPublisher) PublishRuleActivated(ctx context.Context, r domain.JurisdictionRule, correlationID string) error {
-	p.addPending(EventRuleActivated, p.topic, r.JurisdictionRuleID, p.buildRulePayload(r, correlationID))
-	return nil
+	return p.publish(ctx, EventRuleActivated, r.JurisdictionRuleID, r.JurisdictionID,
+		effectiveActor(r.CreatedByPrincipalID, r.UpdatedByPrincipalID), correlationID, r.DataClassification, r.RowVersion, p.marshalRule(r))
 }
 
 func (p *OutboxPublisher) PublishLegalDriftDetected(ctx context.Context, r domain.JurisdictionRule, e domain.DriftEvent, correlationID string) error {
-	p.addPending(EventLegalDriftDetected, p.topic, r.JurisdictionRuleID, p.buildDriftPayload(r, e, correlationID))
-	return nil
-}
-
-func (p *OutboxPublisher) buildJurisdictionCreatedPayload(j domain.Jurisdiction, correlationID string) []byte {
-	env := envelope{
-		EventID:        "evt-" + uuid.New().String(),
-		EventType:      EventJurisdictionCreated,
-		EventVersion:   "1.0",
-		EmittedAt:      time.Now().UTC(),
-		SchemaVersion:  "1.0",
-		SourceService:  "jurisdiction-rules-svc",
-		JurisdictionID: j.JurisdictionID,
-		ActorID:        j.CreatedByPrincipalID,
-		CorrelationID:  correlationID,
-		Payload:        json.RawMessage(p.marshalJurisdictionCreated(j)),
-	}
-	data, _ := json.Marshal(env)
-	return data
-}
-
-func (p *OutboxPublisher) buildJurisdictionDeactivatedPayload(j domain.Jurisdiction, correlationID string) []byte {
-	env := envelope{
-		EventID:        "evt-" + uuid.New().String(),
-		EventType:      EventJurisdictionDeactivated,
-		EventVersion:   "1.0",
-		EmittedAt:      time.Now().UTC(),
-		SchemaVersion:  "1.0",
-		SourceService:  "jurisdiction-rules-svc",
-		JurisdictionID: j.JurisdictionID,
-		ActorID:        effectiveActor(j.CreatedByPrincipalID, j.UpdatedByPrincipalID),
-		CorrelationID:  correlationID,
-		Payload:        json.RawMessage(p.marshalJurisdictionDeactivated(j)),
-	}
-	data, _ := json.Marshal(env)
-	return data
-}
-
-func (p *OutboxPublisher) buildRulePayload(r domain.JurisdictionRule, correlationID string) []byte {
-	env := envelope{
-		EventID:        "evt-" + uuid.New().String(),
-		EventType:      EventRuleUpdated,
-		EventVersion:   "1.0",
-		EmittedAt:      time.Now().UTC(),
-		SchemaVersion:  "1.0",
-		SourceService:  "jurisdiction-rules-svc",
-		JurisdictionID: r.JurisdictionID,
-		ActorID:        effectiveActor(r.CreatedByPrincipalID, r.UpdatedByPrincipalID),
-		CorrelationID:  correlationID,
-		Payload:        json.RawMessage(p.marshalRule(r)),
-	}
-	data, _ := json.Marshal(env)
-	return data
-}
-
-func (p *OutboxPublisher) buildDriftPayload(r domain.JurisdictionRule, e domain.DriftEvent, correlationID string) []byte {
-	env := envelope{
-		EventID:        "evt-" + uuid.New().String(),
-		EventType:      EventLegalDriftDetected,
-		EventVersion:   "1.0",
-		EmittedAt:      time.Now().UTC(),
-		SchemaVersion:  "1.0",
-		SourceService:  "jurisdiction-rules-svc",
-		JurisdictionID: r.JurisdictionID,
-		ActorID:        e.RecordedByPrincipalID,
-		CorrelationID:  correlationID,
-		Payload:        json.RawMessage(p.marshalDrift(r, e)),
-	}
-	data, _ := json.Marshal(env)
-	return data
+	return p.publish(ctx, EventLegalDriftDetected, r.JurisdictionRuleID, r.JurisdictionID,
+		e.RecordedByPrincipalID, correlationID, r.DataClassification, r.RowVersion, p.marshalDrift(r, e))
 }
 
 func (p *OutboxPublisher) marshalJurisdictionCreated(j domain.Jurisdiction) []byte {
@@ -299,6 +303,10 @@ func (p *OutboxPublisher) marshalRule(r domain.JurisdictionRule) []byte {
 		"external_feed_reference": r.ExternalFeedReference,
 		"data_classification":     r.DataClassification,
 		"schema_version":          r.SchemaVersion,
+		"precedence_level":        r.PrecedenceLevel,
+		"rule_version":            r.RuleVersion,
+		"supersedes_rule_id":      r.SupersedesRuleID,
+		"row_version":             r.RowVersion,
 	})
 	return data
 }
@@ -413,6 +421,15 @@ func (w *OutboxWorker) processBatch() {
 			}
 			if markErr := w.store.MarkOutboxEventFailed(ctx, e.OutboxID, err.Error()); markErr != nil {
 				w.log.Error("outbox: failed to mark event failed", zap.Error(markErr))
+			} else if e.PublishAttempts+1 >= store.MaxOutboxAttempts {
+				// GetPendingOutboxEvents skips it from now on, so the events
+				// behind it flow again; it stays in event_outbox for a person.
+				w.log.Error("outbox: event parked after repeated publish failures",
+					zap.String("outbox_id", e.OutboxID), zap.String("event_type", e.EventType),
+					zap.Int("attempts", store.MaxOutboxAttempts))
+				if w.metrics != nil {
+					w.metrics.OutboxParkedTotal.WithLabelValues(e.EventType).Inc()
+				}
 			}
 			// Stop processing this batch on first failure to preserve order
 			return

@@ -228,7 +228,7 @@ Confirmed fail-closed across all four services for authorization-svc unavailabil
 
 ### 8.6 Security Gaps (Domain-Wide)
 1. **🔴 Critical — `mtls-management-svc` bootstrap self-provisioning is broken**, confirmed by 3 failing tests and a dated production workaround (`docker-compose.override.yml`). This is the one path where platform-wide mTLS adoption could begin, and it currently cannot. — **✅ RESOLVED as of 2026-10-12, see §13.1** (found already fixed in the working tree; re-verified by test execution).
-2. **🟠 Medium — No certificate revocation distribution** (no CRL/OCSP) — a "revoked" certificate in `mtls-management-svc` remains cryptographically valid to any verifying peer.
+2. **🟠 Medium — No certificate revocation distribution** (no CRL/OCSP) — a "revoked" certificate in `mtls-management-svc` remains cryptographically valid to any verifying peer. — **✅ RESOLVED 2026-10-13, see §14.2 MT-1/AZ-1** (signed CRL + durable ledger; authorization-svc refuses revoked client certificates, verified live).
 3. **🟠 Medium — No maker-checker on `RevokeCert`/`DisableKey`**, the two most destructive actions in the domain.
 4. **🟠 Medium — Live third-party credentials collected with no function:** `siem-integration-svc`'s `SIEMExporter.AuthToken` is stored in plaintext in memory and never used for anything, since no outbound egress exists.
 5. **🟡 Accepted, documented residual risk:** 2 routes in `siem-integration-svc` and 1 in `carta-svc` accept tenant-header-only calls with no principal, pending a platform-wide mTLS service-identity rollout that itself is currently non-functional (see #1) — this dependency chain means the stated long-term fix for these residual risks is presently blocked by the mTLS bootstrap defect.
@@ -239,7 +239,7 @@ Confirmed fail-closed across all four services for authorization-svc unavailabil
 
 | Source Service | Target Dependency | Protocol/Port | Purpose | Failure Mode | Status |
 |---|---|---|---|---|:---:|
-| `mtls-management-svc` | `authorization-svc` | HTTP / 8089 | RBAC grant evaluation | Fails closed, `503` | ⚠️ Live-confirmed `503` — `authorization-svc` itself is platform-wide broken (missing migrations, same `principal_role_assignments.book_id` issue documented throughout this engagement) |
+| `mtls-management-svc` | `authorization-svc` | HTTP / 8089 | RBAC grant evaluation | Fails closed, `503` | ⚠️ Live-confirmed `503` — `authorization-svc` itself is platform-wide broken (missing migrations, same `principal_role_assignments.book_id` issue documented throughout this engagement) — **✅ 2026-10-13: over mTLS now, real GRANTED/DENIED verified live (§14.3); the 503 had become 12 unapplied migrations, applied (§14.4)** |
 | `mtls-management-svc` | `siem-integration-svc` | HTTP / 8141 (async client) | Security telemetry | Fail-open, fire-and-forget, bounded queue with drop-on-full | ⚠️ Implemented; target service never deployed in this environment, so live delivery was not verified |
 | `siem-integration-svc` | `authorization-svc` | HTTP / 8089 | RBAC grant evaluation (3 of 5 routes) | Fails closed, `503` | ❌ Not verified — service never deployed in this environment |
 | `siem-integration-svc` | External SIEM (Splunk/Datadog/Elastic/Sentinel) | — | **Documented but does not exist** | — | ❌ **Missing** — no outbound client found anywhere |
@@ -295,7 +295,7 @@ Confirmed fail-closed across all four services for authorization-svc unavailabil
 
 ### 11.3 Security/SoD Gaps
 1. No maker-checker/dual-approval exists anywhere in this domain for the two most destructive single-principal actions: `RevokeCert` and `DisableKey`.
-2. No CRL/OCSP revocation distribution in `mtls-management-svc` — a revoked certificate remains cryptographically valid to any peer not separately querying this service.
+2. No CRL/OCSP revocation distribution in `mtls-management-svc` — a revoked certificate remains cryptographically valid to any peer not separately querying this service. — **✅ RESOLVED 2026-10-13 (§14.2 MT-1, AZ-1).**
 3. `siem-integration-svc` stores a live third-party credential (`AuthToken`) in plaintext with no current functional use.
 4. Documented, accepted residual exposure on the deliberately-ungated routes in `siem-integration-svc` (2 routes) and `carta-svc` (1 route) — tenant-header-only callers can inject fabricated data or enumerate resource identifiers, pending the (currently broken) mTLS service-identity rollout.
 
@@ -329,6 +329,7 @@ Confirmed fail-closed across all four services for authorization-svc unavailabil
 | **siem-integration-svc** | 8141 | 5% | 55% | 20% | **27%** | **Not Ready** | No real SIEM forwarding exists despite being the service's documented, named purpose; pure in-memory, lost on restart; never deployed in this environment; frontend dead-wired |
 | **carta-svc** | 8142 | 5% | 85% | 55% | **48%** | **Not Ready** | Real, well-built, genuinely consumed by `gateway-auth-svc` — but 2 of 5 scoring inputs are placeholders and `STEP_UP_MFA` is not yet enforced downstream; never deployed in this environment; frontend dead-wired |
 | **key-management-svc** | 8143 | 5% | 55% | 20% | **27%** | **Not Ready** | Self-acknowledged metadata-only — no actual key custody for BYOK/HYOK; no maker-checker on disable; never deployed in this environment; frontend dead-wired |
+| *(2026-10-13: `mtls-management-svc` re-scored to FE 25 / BE 92 / INT 85 / **67%**, Not Ready — see §14.7; domain total recomputed there to 10 / 72 / 45 / **42%**)* | | | | | | | |
 | **Security & Trust Total** | — | ~~5%~~ **8%** | ~~69%~~ **70%** | **39%** | ~~38%~~ **39%** | **Not Ready** | See domain-wide findings below. Total recomputed 2026-10-12 after the `mtls-management-svc` remediation pass (§13); `siem-integration-svc`/`carta-svc`/`key-management-svc` rows are unchanged from the original audit. |
 
 ### Domain-Wide Observations
@@ -367,6 +368,8 @@ This section records the outcome of a dedicated "implement confirmed gaps + disc
 - **Verification:** Added `TestCreatePolicy_StoreFailure_Returns500NotFalse201` (a `failingPolicyStore` test double embedding `*store.MemoryStore`, overriding only `CreatePolicy` to force an error) — **PASS**. Full suite re-run after the fix — all tests across all 3 packages **PASS**; `go build`/`go vet` clean.
 - **Current Status:** ✅ Fixed and regression-tested. `MemoryStore.CreatePolicy` itself can never currently fail, so this has no live behavioral effect today — a defense-in-depth consistency fix, not a live-bug fix.
 
+> **2026-10-13 re-verification (§14.1):** New Gaps 2–4 below are **not present in this repository's frontend** — no commit on any branch contains them. Treated as DOC DRIFT; the read-path and KPI defects were fixed again in §14.2 MT-8, the Issue-Cert modal was not rebuilt (§14.6 FE-1).
+
 **New Gap 2 — `listMtlsPolicies` (frontend API client) could never succeed against the real backend.**
 - **Discovery Evidence:** `lib/api/security-trust.ts`'s `listMtlsPolicies` sent `tenant_id` as a query parameter and never passed `identity`, so it never sent the `X-Tenant-ID`/`X-Principal-Id` headers the real `ListPolicies` handler (`handler.go:455-463`) strictly requires (`401` if absent) — this call would have failed every time it was ever invoked.
 - **Remediation:** Changed `listMtlsPolicies` to accept and forward `identity`, exactly like the other 3 mTLS functions in the same file (`listMtlsCertificates`, `provisionMtlsCertificate`, `rotateMtlsCertificate`) already correctly do.
@@ -392,7 +395,7 @@ This section records the outcome of a dedicated "implement confirmed gaps + disc
 - **Current Status:** ✅ Fixed and regression-tested. Same as New Gap 1: `MemoryStore`'s list methods can never currently fail, so this is a defense-in-depth consistency fix with no live behavioral effect today.
 
 ### 13.3 Confirmed Still-Present, Out-of-Scope Conditions (re-verified, not modified)
-- `authorization-svc`'s migration gap is **still live**, re-confirmed in this exact pass by direct `curl` and `docker logs authorization-svc` (`ERROR: column pra.book_id does not exist (SQLSTATE 42703)`, `FindGrantedActionsScoped`, `pg_store.go:1493`). This blocks every real `GRANTED`/`DENIED` decision platform-wide, including for `mtls-management-svc`'s now-correctly-wired "Issue mTLS Cert" flow. **CROSS-SERVICE DEPENDENCY — not modified**, per this task's explicit instruction not to touch `authorization-svc`.
+- **[2026-10-13: no longer true — `book_id` exists; the remaining gap was 000020–000031, now applied, plus AZ-2 fixed by 000032. See §14.4.]** `authorization-svc`'s migration gap is **still live**, re-confirmed in this exact pass by direct `curl` and `docker logs authorization-svc` (`ERROR: column pra.book_id does not exist (SQLSTATE 42703)`, `FindGrantedActionsScoped`, `pg_store.go:1493`). This blocks every real `GRANTED`/`DENIED` decision platform-wide, including for `mtls-management-svc`'s now-correctly-wired "Issue mTLS Cert" flow. **CROSS-SERVICE DEPENDENCY — not modified**, per this task's explicit instruction not to touch `authorization-svc`.
 - Separately: the demo/test identity the console uses (`principal_id 33333333-3333-3333-3333-333333333333`, role "Console Demo Operator") holds **no permission bundle granting any mtls-management-svc action** anywhere in `authorization-svc`'s live data (confirmed by directly reading `permission_bundles`/`roles`). Even once the migration gap above is fixed, this specific demo principal would still receive `DENIED`, not `GRANTED`, for certificate provisioning. **ENVIRONMENT LIMITATION (missing RBAC seed data)** — not fabricated or worked around; creating a permission grant to force a passing demo was explicitly out of scope.
 - CRL/OCSP absence, no automated rotation, no maker-checker on `RevokeCert` — all re-confirmed still present, unchanged from the original audit, and correctly left alone as NEEDS CLARIFICATION / DOCUMENTATION DRIFT rather than invented into new features.
 
@@ -409,3 +412,184 @@ This section records the outcome of a dedicated "implement confirmed gaps + disc
 - **INT 60% unchanged:** the one live dependency (`authorization-svc`) is exactly as broken as before, for the same out-of-scope reason; the SIEM async client was already correctly implemented and is unchanged.
 
 This section does not alter any finding for `siem-integration-svc`, `carta-svc`, or `key-management-svc` — those three services were not in scope for this pass, and their sections and scores elsewhere in this document are unchanged.
+
+---
+
+## 14. Coordinated `mtls-management-svc` + `authorization-svc` Pass — 2026-10-13
+
+Scope: both services, plus the parts of their wiring they own: the mTLS bootstrap-token
+distribution in `deployments/docker-compose.yml`, and the mTLS console surface in
+`zoiko-suite-frontend-platform`. Every earlier finding was re-verified against the code, the
+compose stack and the live database before anything was changed. Nothing above this section has
+been deleted. Where an earlier statement no longer holds, it is annotated in place with a pointer
+here. The authorization-svc side is also recorded in
+`Governance Platform-audit-2026-09-28.md`, "Coordinated pass with mtls-management-svc,
+13 October 2026".
+
+All changes are **uncommitted** on `shashi-changes`.
+
+### 14.1 Re-verification of earlier findings
+
+| ID | Service | Finding | Status 13 Oct | Evidence |
+|---|---|---|---|---|
+| §13.1 | mtls | Bootstrap path refused with 401 `envelope_incomplete` | ✅ Still fixed. ⚠️ But the fix exempted the whole `/v1/mtls/certificates` path (see MT-2). | `internal/envelope/contract.go:28`. 50/50 tests. |
+| §13.2 #1, #5 | mtls | `CreatePolicy`, `ListCerts` and `ListPolicies` discarded store errors | ✅ Still fixed | `handler.go` returns 500 on a store error. The three regression tests pass. A re-grep of `handler.go` finds no discarded store result. |
+| §13.2 #2–#4 | mtls FE | `listMtlsPolicies` identity; Issue-Cert modal had no `"LE-001"`; `SecuritySummaryBar` had no `\|\| 12` | ❌ **Not present in this repository** (DOC DRIFT) | `git log --all -S"handleIssueCert"`: no commit. `SecuritySummaryBar.tsx:75` still had `\|\| certs.length \|\| 12`. `listMtlsCertificates` sent no identity and no `legal_entity_id`. The §13 FE changes were made somewhere other than this checkout. Fixed again here (MT-8); the Issue/Rotate modal was not rebuilt (§14.6). |
+| §13.3 / §11.5 #2 | authz | `column pra.book_id does not exist` blocks every decision | ✅ **No longer the cause.** The live 503 had become 12 unapplied migrations (STALE DEPLOYMENT). | `principal_role_assignments.book_id` exists on the dev database (000016). Live `/v1/authorize` answered 503 because of `relation "entity_status_projection" does not exist`; `migrate.py status` showed 19/31 applied. Fixed by the tracked runner (§14.4). |
+| §8.6 #2, §11.3 #2 | mtls | No CRL/OCSP. A revoked certificate stays valid to every peer. | ✅ **Fixed** (MT-1, AZ-1) | Signed CRL at `GET /v1/mtls/crl`. authorization-svc refuses a revoked client certificate at the handshake. Verified live. |
+| Register M-01 | mtls | Bootstrap token not bound to a service | ✅ **Fixed** (MT-3) | One token per service; service name and CN are bound to the token. Verified live. |
+| Register M-02 | PEPs | 85 PEPs send no bootstrap token | ⚠️ CROSS-SERVICE (unchanged), except for mtls-management-svc itself (MT-7) | Each PEP's own code and compose entry. |
+| Register M-03 / N-11 | both | No revocation check on authz's mTLS listener | ✅ **Fixed** (MT-1 + AZ-1) | Verified live (§14.3, probe 24). |
+| N-16 | authz | Substring classifiers (`post` matches `postcode`) | ⚠️ Partly fixed on 13 Oct: two more instances found (AZ-3) | Now fixed. |
+| N-12 / G | authz | `AUTHZ_ENTITY_REGISTRY_URL` required outside local | ✅ Present | `config.go` `Validate`; `audit_fixes_test.go`. |
+| N-14 / F | authz | 000031 purge deleted nothing under a NOSUPERUSER owner | ✅ Source fix present (`FOR ALL` policy). ✅ Proven under a NOSUPERUSER owner on scratch Postgres. | `TestFixesIT_PurgeFunctions` passes with migrations applied by `authz_owner NOSUPERUSER`. down/up/down/up clean. **A second, separate defect was found** (AZ-2). |
+| H | authz | `iam.workload.manage` missing | CROSS-SERVICE (access-control-svc permission registry), unchanged | `grep` finds it only in `authorization-svc/internal/handler/workload_bindings.go`. authz itself is correct: it denies by default. |
+| B / D / E | authz | Step-up, JIT and break-glass; tenant required; RFC 9457 | Step-up ✅, with one more fail-open fixed (AZ-4). JIT default-deny ✅. Missing tenant → 403 `tenant_required` ✅. RFC 9457: still a platform decision (B-02). | Unit tests below. |
+
+### 14.2 New gaps found and fixed in this pass
+
+**Severity, mtls-management-svc:**
+- **High:** MT-1, MT-2, MT-3, MT-4, MT-6.
+- **Medium:** MT-5, MT-7.
+- **FE:** MT-8.
+
+| ID | Service | Gap → root cause | Fix | Regression test (all mutation-checked) |
+|---|---|---|---|---|
+| MT-1 | mtls | **Revocation was invisible and volatile.** "Revoke" set a status in an in-memory map. No peer could learn of it, and a restart forgot it. | `internal/ca/revocation.go`: a durable ledger (`revocations.json` beside the CA key, write-then-rename, an unreadable ledger refuses startup) and an X.509 CRL signed by the CA (`GET /v1/mtls/crl`, unauthenticated by design, `NextUpdate` +1 h). The ledger is written before and after the store transition. | `TestRevoke_SerialPublishedOnSignedCRL`, `TestLedger_SurvivesRestart`, `TestLedger_CorruptFileRefused`, `TestRevoke_LedgerWriteFailure_500AndNotRevoked`, `TestRevokeDenied_NotOnCRL`, `TestSignCRL_CurrentAndSigned` |
+| MT-2 | mtls | **The envelope exemption swallowed human calls.** `ExemptPaths: ["/v1/mtls/certificates"]` exempted every POST and GET on that path. A human provisioning call therefore had no envelope and no idempotency key, and, because the authz client forwards the tenant from the envelope, it asked authorization-svc a **tenantless** question. | `envelopePolicy()`: only a POST that carries `X-Mtls-Bootstrap-Token` (plus the probes and the CRL) is exempt. A presented token that matches nothing is now 401 `invalid_bootstrap_token` instead of falling through. | `TestHumanProvision_RequiresEnvelope`, `TestHumanProvision_ForwardsTenantToAuthorization`, `TestProvisionCert_WrongBootstrapToken_Refused401` |
+| MT-3 | mtls | **M-01: shared bootstrap token.** Any of the 5 mounting services could mint a certificate with any CN, and authz's workload gate trusts the CN, so it could become any PEP. | `BootstrapTokens` maps a token to one service. `service_name` and `common_name` must both equal that service (403 `bootstrap_identity_mismatch`). `MTLS_BOOTSTRAP_TOKENS_DIR/<service>/token`. The legacy `MTLS_BOOTSTRAP_TOKEN_PATH` refuses startup; so do a duplicate token, a token under 32 characters, and a misnamed directory. Compose: the keygen writes one token per service, each consumer mounts only its own sub-directory (volume `subpath`) at the unchanged `/bootstrap`, and the old shared file is deleted. | `TestBootstrap_TokenProvisionsOnlyItsOwnService`, `TestReadBootstrapTokens_*`, `TestLoadBootstrapTokens_LegacySharedTokenRefused` |
+| MT-4 | mtls | **Rotation un-revoked.** `ReplaceCertMaterial` set the status back to `ACTIVE`, so rotating a revoked certificate restored it and issued new key material. | The store refuses a revoked record (`ErrCertRevoked` → 409 `certificate_revoked`). | `TestRotateRevoked_RefusedAndStaysRevoked` |
+| MT-5 | mtls | **Superseded serials became unrevocable.** Rotation overwrote the serial, but the old certificate stays valid until it expires. | `PriorSerialNumbers` is kept. Revocation lists every serial the record ever carried. | `TestRevokeAfterRotate_RevokesEverySerial` |
+| MT-6 | mtls | **The decision cache had no tenant in its key** (found live). Tenant A's GRANTED was replayed for the same principal, entity and action asked under tenant B, for up to 5 s. Live: a wrong-tenant listing answered 200. The store's tenant scoping limited this to an empty list, but the decision itself crossed tenants. | The key is `tenant\|principal\|entity\|action`. | `TestCheckAllowed_CacheIsPerTenant` |
+| MT-7 | mtls | **authz refusals reported as outages**, and mtls itself could not call authz in require mode. Every non-200 became 503 "authorization service unavailable", including authz's 403 `tenant_scope_mismatch`. Plaintext calls are refused outside local. | 403 → denied (403, not cached). 400 → 400. 401/5xx → 503. `AUTHZ_MTLS_URL`: mtls-svc self-issues a 24 h client certificate (CN `mtls-management-svc`, renewed at ⅔ of its life), trusts only its own CA, and refuses a revoked authz server certificate using its own ledger. The `GetCertByID` store now returns copies, not live map pointers. | `TestCheckAllowed_StatusMapping`, `TestCheckAllowed_RefusalNotCached_DecisionCached`, `TestAuthzRefusal403_Is403Not503`, `TestClientIdentity_MutualTLS_AndRevokedServerRefused` |
+| MT-8 | mtls FE | **The console's certificate read could never succeed and fabricated a count.** `listMtlsCertificates` sent no identity and no `legal_entity_id`, so the backend answered 401/400. The route turned that into `[]`. The panel read field names the backend never sends (`cert_id`, `expires_at`). The KPI showed `12 Active`. | The client functions take the session identity and the required `legal_entity_id`. The route passes the backend's status through. The panel maps `id`, `valid_from` and `valid_to` and shows the refusal. The KPI shows the real count or "Unavailable". KMS (`\|\| 8`) and CARTA (`\|\| 24`) are untouched: their own services' scope. | `npx tsc --noEmit`: 0 errors. ESLint on the 4 files: 5 warnings both before and after (none new). **Not run live**: the console was not running. |
+
+**authorization-svc:**
+
+| ID | Gap → root cause | Fix | Regression test |
+|---|---|---|---|
+| AZ-1 | **M-03, service-owned half.** The mTLS listener checked the chain only. | `internal/mtls/revocation.go`: fetches the CRL every `MTLS_CRL_REFRESH_SECONDS` (30), accepts it only if this listener's CA signed it, refuses a rollback (lower CRL number), and runs `VerifyConnection` on every handshake. **Fail closed:** with no current CRL, every client certificate is refused. `MTLS_REVOCATION_CHECK=require` by default; `off` only with `ENV=local` (enforced by `Validate`). | `TestRevocation_RevokedClientCertificateRefused`, `TestRevocation_NoCurrentCRL_FailsClosed`, `TestRevocation_ForgedOrRolledBackCRLRejected`, `TestRevocation_RefreshFetchesFromManagementService`, `TestMTLSRevocationCheck_DefaultAndValidation` |
+| AZ-2 | **SECURITY DEFINER grants lost on a fresh volume.** `init-db.sh` applies every migration *before* `create-app-roles.sh` creates `app_authorization`. So the guarded `GRANT EXECUTE … TO app_authorization` in 000011 and 000031 is skipped while the `REVOKE … FROM PUBLIC` lands. Live: `permission denied for function create_access_decision_log_partition` on every retention pass, so no monthly partitions were made and nothing was detached. | **000032** re-asserts the grants (idempotent). The tracked runner applies it once the roles exist. | Reproduced on a fresh cluster in init order: `TestDefinerFunctionsIT_ServiceRoleCanRunMaintenance` **failed on all 4 functions** before 000032 and passes after. Live: the runway was extended through 2027-01 and both purges ran. |
+| AZ-3 | **N-16, two more instances.** `/v1/me/capabilities` set `can_post_journals` for `ADDRESS_POSTCODE_UPDATE` and `can_export` for `SIEM_EXPORTER_READ`. The support-session export check treated `SIEM_EXPORTER_READ` as a bulk export. | Whole-token classifiers (`isExportAction`, `isReleaseAction`, `isApprovalAction`, `HasActionToken`). The step-up `reopen` check stays substring on purpose: over-matching only asks for step-up more often. | `TestCapabilities_FeatureFlagsMatchTokensNotSubstrings`, `TestSupportSession_ExportClassifiedByToken` |
+| AZ-4 | **Step-up failed open on a malformed age.** `Atoi("abc")` gave 0, marked *known*, which read as a fresh login. `"-600"` passed the same way. This is the N-07 class through a different input. | `parseAuthnAge`: anything that is not a non-negative integer is an unknown age, decided by `StepUpPolicy`. Applied on all 3 parse sites. | `TestStepUp_MalformedOrNegativeAgeIsUnknown` |
+| AZ-5 | **Duplicate `security.break_glass.ended` event.** The 000030 trigger already emits it through the outbox. The revoke handler also wrote it straight to Kafka and discarded the error, so there were two copies per revoke, the second without a tenant. | The direct publish is removed (the started event was already trigger-only). | Existing break-glass tests pass. Not mutation-tested: the fix is a removal. |
+
+**Mutation check:** all 13 mtls mutants and 9 authz mutants are killed, except one equivalent
+mtls mutant ("CN from request"; the identity check makes it identical).
+
+### 14.3 Cross-service contract, verified live
+
+```
+caller ──X-Tenant-ID/X-Principal-Id + §4 envelope──▶ mtls-management-svc (PEP)
+   mtls ──mTLS, client cert CN=mtls-management-svc (self-issued from its CA)──▶ authorization-svc :8449
+   authz: workload gate (CN on AUTHZ_PEP_ALLOWLIST) → CRL check → envelope → registry tenant check
+          → RBAC/SoD/ABAC/step-up → decision recorded (tenant, basis) → 200 {decision_outcome}
+   mtls: GRANTED → act; DENIED/403 → 403; 400 → 400; 401/5xx/timeout(5 s) → 503 (never cached)
+```
+
+**E2E pair.** Two real instances built from today's images:
+- `authz-e2e` ran with `ENV=production`, `AUTHZ_EVALUATION_MTLS=require` and allow-list
+  `mtls-management-svc`.
+- `mtls-e2e` called it over mTLS.
+- They used a scratch database. The fixtures were one role holding `MTLS_*` on entity E
+  (tenant T) for principal P, a principal Q with no grants, and an entity F owned by tenant U.
+  The fixtures exist **only in the scratch DB**; nothing was seeded into the dev database.
+- Every decision below was recorded by authz with its tenant and basis
+  (`rbac:role=E2E_MTLS_OPERATOR` / `no_grant`).
+
+**Result: 24/24.**
+
+| # | Probe | Result |
+|---|---|---|
+| 1–2 | `/healthz` on both | 200 / 200 |
+| 3 | Plaintext `/v1/authorize` in require mode | 401 `client_certificate_required` |
+| 4–5 | **ALLOW**: P provisions and lists on E | 201 / 200 (GRANTED) |
+| 6–7 | **DENY**: Q provisions and reads | 403 / 403 (DENIED `no_grant`) |
+| 8 | P lists F (tenant U) under tenant T | 403 (was 503) |
+| 9 | P lists E under tenant U | 403 (was 200 through the cache; MT-6) |
+| 10 | Read of T's certificate with tenant U | 404 |
+| 11–12 | Missing tenant / missing principal | 401 / 401 |
+| 13–15 | Rotate → revoke → rotate the revoked certificate | 200 / 200 / 409 |
+| 16–17 | Both serials (pre- and post-rotation) on the signed CRL, fetched with no identity | yes / yes |
+| 18–20 | authz's own token for itself / for `mtls-management-svc` / an unknown token | 201 / 403 / 401 |
+| 21–24 | PEP client certificate (CN `mtls-management-svc`): admitted to `/v1/authorize` over mTLS → revoked → within one CRL refresh, **refused at the handshake** | 201 / 200 / 200 / refused. authz logged `client certificate … (mtls-management-svc) is revoked`. |
+
+**Dev stack.** The real containers, recreated from fresh images:
+- mtls-management-svc → authorization-svc over mTLS (permit mode).
+- The console demo principal reading `MTLS_CERT_READ` → **403**, recorded as `DENIED no_grant`.
+  It was 503 `store_unavailable` this morning.
+- authz, identity-context, tenant-entity-registry and gateway-auth all self-provisioned with their
+  **own** per-service tokens.
+
+### 14.4 Database and migrations (authorization-svc)
+
+- **The migration issue found:** yes, but not `book_id`. The dev database was at 000019 while the
+  code needed 000031 (stale deployment). Separately, AZ-2: the definer grants were missing.
+- **Fixed:**
+  - 000020–000031 were applied with `deployments/migrate.py up --db authorization_svc`, after a
+    `pg_dump` taken beforehand.
+  - New migration **000032** was applied the same way. Status: 32/32.
+- **Fresh database:** 000001–000032 apply cleanly with a **NOSUPERUSER** schema owner. 000031
+  down/up/down/up is clean. A fresh cluster in `init-db.sh` order reproduces AZ-2, and 000032
+  repairs it.
+- **Upgrade path:** 000019 → 000032 on the live dev data. Afterwards authz runs without schema or
+  permission errors, the retention runway reaches 2027-01-31, and the purges ran.
+
+### 14.5 Regression evidence
+
+All test runs were in `golang:1.25` Linux containers, so Windows AppControl was not a factor.
+
+| Check | mtls-management-svc | authorization-svc |
+|---|---|---|
+| `go build ./...`, `go vet ./...` | clean | clean |
+| `go test -race ./... -count=1` | 50 pass, 0 fail (baseline 28) | 517 pass, 0 fail. The 67 skips are the legacy owner suite, run separately. |
+| Integration, `AUTHZ_IT_DSN` as NOBYPASSRLS `app_authorization` | n/a (no DB) | all pass, incl. purge, relay batch, session controls, 000032 |
+| Legacy owner suite (`TEST_DATABASE_URL`, throwaway DB) | n/a | 66/66 |
+| Mutants | 12/13 killed (1 equivalent) | 9/9 killed |
+| Live | healthz 200; `/readyz` **404** (no route) | healthz 200, readyz 200 |
+| Live E2E | 24/24 (§14.3) | (same run) |
+| FE | `tsc` 0 errors, lint unchanged, not run live | — |
+
+One run failed: `TestFixesIT_RelayWritesABatchAtOnce`, during a run that had the E2E authz
+instance's own outbox relay working on the same scratch database. With that instance stopped it
+passed 3/3 under `-race`. This was environment interference, not a defect.
+
+### 14.6 Remaining issues
+
+| ID | Service | Severity | Classification | Evidence | Owner | Why it is not fixed here |
+|---|---|---|---|---|---|---|
+| M-02 | the PEPs | High (it blocks `require` mode estate-wide) | CROSS-SERVICE | 85 PEP mtls clients send no token, and only ai-governance-svc presents a certificate | each PEP | Their code and compose entries. mtls-svc itself is migrated (MT-7). |
+| A-01 | gateway-auth-svc → authz | High | CROSS-SERVICE | Admin routes trust `X-Principal-Id` / `X-Tenant-Id`. **mtls-svc's routes trust the same headers.** | gateway-auth-svc (signed assertion) | Unchanged; it needs the gateway's assertion. |
+| A-03 / S-3 | gateway-auth-svc | Medium | CROSS-SERVICE | No asserted assurance before JIT or break-glass | gateway-auth-svc | Unchanged |
+| X-RBAC | access-control-svc | Medium | CROSS-SERVICE / ENVIRONMENT | `MTLS_*` (6 actions) and `iam.workload.manage` are absent from the access-control permission registry and from `seed-demo-rbac.ps1`. The demo principal is therefore DENIED (correctly). | access-control-svc (registry); deployment (seed) | Not fabricated. authz denies by default, which is correct. |
+| E-INIT | platform (`init-db.sh`) | Medium | ENVIRONMENT / platform | Migrations run before roles exist, so guarded grants are skipped on a fresh volume (AZ-2 root) | platform deployments | 000032 repairs any volume the runner touches. Fixing the order is a platform change. |
+| OVR | deployment | Medium | STALE DEPLOYMENT | `deployments/docker-compose.override.yml` (16 Sep) sets `MTLS_ENABLED=false` on authz, for a 401 fixed on 18 Sep. Plain `docker compose up` still disables the mTLS listener. | user decision (it was user-approved) | Not deleted. This pass used `-f docker-compose.yml`. |
+| MC-1 | mtls | Medium | NEEDS CLARIFICATION | No maker-checker on `RevokeCert` (§11.7 #2) | Security / product | No document requires or exempts it |
+| ROT-1 | mtls | Medium | DOC DRIFT / missing feature | `auto_rotate` is stored and never read; `EXPIRED` is never set | mtls | Feature work, not a defect fix |
+| PER-1 | mtls | Low–Med | Design (documented) | Certificate and policy records are in memory and lost on restart. **Revocations now persist** (MT-1). | mtls | Persisting records needs a DB decision (§9) |
+| FE-1 | mtls FE | Medium | Missing FE | "Issue mTLS Cert" and "Rotate" are still `alert()` stubs in `SecurityActionHeader`. §13's modal does not exist in this repository. | mtls FE | Building a new UI flow was out of this pass; the client functions now accept identity, ready for it. |
+| RDY-1 | mtls | Low | Gap | No `/readyz` route (404) | mtls | Minor |
+| BS-1 | mtls | Low | Gap | The bootstrap path records the caller-claimed `X-Tenant-ID` and `legal_entity_id` | mtls | The identity is now bound to the token, and the tenant is metadata for a platform certificate |
+| B-01 / B-02 | authz | Low | NEEDS DECISION | Session caps; RFC 9457 | Security / platform | Unchanged |
+| PUR-1 | authz | Low | Residual | The 000031 policy also admits any *other* SECURITY DEFINER function that reads `idempotency_keys` while a session has `app.idempotency_purge=on`. No such function exists today. | authz | Recorded for anyone adding definer functions |
+
+### 14.7 Updated scores
+
+| Service | FE | BE | Integration | Overall | Readiness |
+|---|---:|---:|---:|---:|---|
+| mtls-management-svc (before, §13.4) | 15% | 85% | 60% | 55% | Not Ready |
+| mtls-management-svc (after) | 25% | 92% | 85% | **67%** | **Not Ready**: the FE write actions are stubs, there is no automated rotation, and records live in memory. The backend's own controls are Ready with Minor Gaps. |
+| authorization-svc (after) | n/a (console in access-control) | 96% | 85% | **91%** | **Ready with Minor Gaps** (service-owned). Live `require` mode is gated on M-02 and A-01 (cross-service). |
+
+**Rationale:**
+- **mtls FE:** §13's 15% rested on changes that are not in this repository; the true pre-pass
+  figure was about 5%. Now the read path, the KPI and the error states are real; the write
+  modals are not.
+- **mtls BE:** revocation, binding, rotation and tenant-cache correctness are fixed. Still
+  outstanding: maker-checker, auto-rotation, persistence.
+- **INT (both services):** proved live end to end, including revocation across both services.
+  M-02 and the SIEM sink (not deployed) remain.
+
+**Security & Trust domain total:** recomputed with the other three services unchanged. FE
+(25+5+5+5)/4 = **10%**, BE (92+55+85+55)/4 = **72%**, INT (85+20+55+20)/4 = **45%**, Overall
+(67+27+48+27)/4 = **42%**. Readiness: **Not Ready**.

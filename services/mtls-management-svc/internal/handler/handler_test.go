@@ -40,7 +40,7 @@ func newRouterWithAuthz(t *testing.T, az handler.AuthzChecker) http.Handler {
 	if err != nil {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), az, zap.NewNop(), ""))
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, mustLedger(t), siem.New("", "mtls-management-svc", zap.NewNop()), az, zap.NewNop(), nil))
 }
 
 // newRouter builds a router backed by a real CA persisted under a per-test
@@ -54,13 +54,13 @@ func newRouter(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), ""))
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, mustLedger(t), siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), nil))
 }
 
 // newRouterWithBootstrapToken enables the self-provisioning bootstrap path
-// with the given shared token. Authorization DENIES by default here — the
-// whole point of these tests is to prove the bootstrap path never needs to
-// reach the authorize() call at all.
+// with token bound to "authorization-svc". Authorization DENIES by default
+// here — the whole point of these tests is to prove the bootstrap path never
+// needs to reach the authorize() call at all.
 func newRouterWithBootstrapToken(t *testing.T, token string) http.Handler {
 	t.Helper()
 	c, err := internalca.LoadOrCreate(t.TempDir())
@@ -68,12 +68,22 @@ func newRouterWithBootstrapToken(t *testing.T, token string) http.Handler {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
 	denyingAuthz := &stubAuthz{err: authzpkg.ErrAuthorizationDenied}
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), denyingAuthz, zap.NewNop(), token))
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, mustLedger(t), siem.New("", "mtls-management-svc", zap.NewNop()), denyingAuthz, zap.NewNop(), handler.BootstrapTokens{token: "authorization-svc"}))
 }
 
 // mustParsePEMCertificate fails the test if pemBytes is not a real,
 // parseable X.509 certificate — the whole point of this fix is that these
 // are no longer fabricated strings.
+// mustLedger opens a revocation ledger in a per-test directory.
+func mustLedger(t *testing.T) *internalca.Ledger {
+	t.Helper()
+	l, err := internalca.OpenLedger(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to open revocation ledger: %v", err)
+	}
+	return l
+}
+
 func mustParsePEMCertificate(t *testing.T, pemBytes string) *x509.Certificate {
 	t.Helper()
 	block, _ := pem.Decode([]byte(pemBytes))
@@ -117,7 +127,7 @@ func TestHealthCheck(t *testing.T) {
 func TestProvisionCert_BootstrapToken_SkipsAuthorization(t *testing.T) {
 	router := newRouterWithBootstrapToken(t, "shared-secret-123")
 
-	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "authorization-svc", CommonName: "authorization-svc.zoiko.internal", RotationDays: 90})
+	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "authorization-svc", CommonName: "authorization-svc", RotationDays: 90})
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Mtls-Bootstrap-Token", "shared-secret-123")
@@ -132,17 +142,20 @@ func TestProvisionCert_BootstrapToken_SkipsAuthorization(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
 		t.Fatalf("failed to decode provision response: %v", err)
 	}
-	mustParsePEMCertificate(t, result.Certificate.CertificatePEM)
+	cert := mustParsePEMCertificate(t, result.Certificate.CertificatePEM)
+	if cert.Subject.CommonName != "authorization-svc" {
+		t.Fatalf("bootstrap certificate CN = %q, want the token's service", cert.Subject.CommonName)
+	}
 }
 
-// TestProvisionCert_WrongBootstrapToken_FallsBackToDeniedAuthz proves a
-// caller presenting an INCORRECT token gets no special treatment — it
-// falls through to the normal principal/authorize path, which the test's
-// denying authz stub then rejects.
-func TestProvisionCert_WrongBootstrapToken_FallsBackToDeniedAuthz(t *testing.T) {
+// TestProvisionCert_WrongBootstrapToken_Refused401 proves a caller presenting
+// an INCORRECT token is refused outright. It used to fall through to the
+// principal path; a token-bearing POST is exempt from the envelope, so that
+// fall-through asked authorization-svc a tenantless question.
+func TestProvisionCert_WrongBootstrapToken_Refused401(t *testing.T) {
 	router := newRouterWithBootstrapToken(t, "shared-secret-123")
 
-	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "authorization-svc", CommonName: "authorization-svc.zoiko.internal", RotationDays: 90})
+	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "authorization-svc", CommonName: "authorization-svc", RotationDays: 90})
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Mtls-Bootstrap-Token", "wrong-token")
@@ -150,8 +163,8 @@ func TestProvisionCert_WrongBootstrapToken_FallsBackToDeniedAuthz(t *testing.T) 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 (denied via normal path), got %d: %s", w.Code, w.Body)
+	if w.Code != http.StatusUnauthorized || !bytes.Contains(w.Body.Bytes(), []byte("invalid_bootstrap_token")) {
+		t.Fatalf("expected 401 invalid_bootstrap_token, got %d: %s", w.Code, w.Body)
 	}
 }
 
@@ -163,6 +176,7 @@ func TestProvisionCert_NoBootstrapTokenHeader_FallsBackToDeniedAuthz(t *testing.
 
 	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "ledger-svc", CommonName: "ledger-svc.zoiko.internal", RotationDays: 90})
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
@@ -365,8 +379,8 @@ func TestCreatePolicy_StoreFailure_Returns500NotFalse201(t *testing.T) {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
 	router := handler.NewRouter(handler.New(
-		failingPolicyStore{store.NewMemoryStore()}, c,
-		siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), "",
+		failingPolicyStore{store.NewMemoryStore()}, c, mustLedger(t),
+		siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), nil,
 	))
 
 	body, _ := json.Marshal(domain.CreatePolicyRequest{PolicyName: "ledger-to-treasury", SourceService: "ledger-svc", TargetService: "treasury-svc", Action: domain.PolicyAllow, RequiresMtls: true})
@@ -405,8 +419,8 @@ func TestListCerts_StoreFailure_Returns500NotFalseEmpty200(t *testing.T) {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
 	router := handler.NewRouter(handler.New(
-		failingListStore{store.NewMemoryStore()}, c,
-		siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), "",
+		failingListStore{store.NewMemoryStore()}, c, mustLedger(t),
+		siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), nil,
 	))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates?legal_entity_id=LE-1", nil)
@@ -427,8 +441,8 @@ func TestListPolicies_StoreFailure_Returns500NotFalseEmpty200(t *testing.T) {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
 	router := handler.NewRouter(handler.New(
-		failingListStore{store.NewMemoryStore()}, c,
-		siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), "",
+		failingListStore{store.NewMemoryStore()}, c, mustLedger(t),
+		siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), nil,
 	))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/policies", nil)

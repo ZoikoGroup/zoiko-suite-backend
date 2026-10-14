@@ -33,8 +33,14 @@ type MtlsCertificate struct {
 	// encoding. Safe to store and return on every read — it's the public
 	// half. The matching private key is NEVER stored here and is only ever
 	// returned once, at issuance/rotation time — see ProvisionCertResult.
-	CertificatePEM string     `json:"certificate_pem"`
-	ValidFrom      time.Time  `json:"valid_from"`
+	CertificatePEM string `json:"certificate_pem"`
+	// PriorSerialNumbers are the serials this record carried before each
+	// rotation. Rotation does not invalidate the previous certificate (the
+	// service keeps presenting it until it adopts the new one), so a later
+	// revocation must cover every serial ever issued under this record — not
+	// only the current one, which is all the record used to remember.
+	PriorSerialNumbers []string   `json:"prior_serial_numbers,omitempty"`
+	ValidFrom          time.Time  `json:"valid_from"`
 	ValidTo        time.Time  `json:"valid_to"`
 	RotationDays   int        `json:"rotation_days"`
 	AutoRotate     bool       `json:"auto_rotate"`
@@ -63,6 +69,16 @@ type CommunicationPolicy struct {
 	Action        PolicyAction `json:"action"`
 	RequiresMtls  bool         `json:"requires_mtls"`
 	CreatedAt     time.Time    `json:"created_at"`
+}
+
+// AllSerialNumbers is the current serial plus every superseded one.
+func (c *MtlsCertificate) AllSerialNumbers() []string {
+	out := make([]string, 0, len(c.PriorSerialNumbers)+1)
+	out = append(out, c.PriorSerialNumbers...)
+	if c.SerialNumber != "" {
+		out = append(out, c.SerialNumber)
+	}
+	return out
 }
 
 type ProvisionCertRequest struct {

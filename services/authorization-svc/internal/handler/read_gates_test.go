@@ -63,19 +63,22 @@ func TestReadGates_OwnSessionsReadable(t *testing.T) {
 	}
 }
 
-// The review queue and review decisions take the reviewer from the verified
-// header only — a principal_id query parameter was enough to act as anyone.
-func TestReadGates_AccessReviewsNoImpersonation(t *testing.T) {
+// Access reviews belong to access-control-svc (N-03 / N-10). This service's
+// copy could not create a review and lost revocations on decide; it must not
+// come back unnoticed.
+func TestAccessReviewRoutesAreNotServedHere(t *testing.T) {
 	s := &stubStore{}
-	w := getAs(s, "", "/v1/iam/access-reviews?principal_id=reviewer-1&tenant_id="+govTenant)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("review list with identity only in the query: want 401, got %d", w.Code)
+	if w := getAs(s, "reviewer-1", "/v1/iam/access-reviews"); w.Code != http.StatusNotFound {
+		t.Errorf("GET /v1/iam/access-reviews: want 404 (owned by access-control-svc), got %d", w.Code)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/iam/access-reviews/rv-1/decide?principal_id=reviewer-1&tenant_id="+govTenant,
-		strings.NewReader(`{"decision":"KEEP","reason":"ok"}`))
-	w = httptest.NewRecorder()
-	newTestRouter(s).ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("deciding a review as someone else via the query: want 401, got %d", w.Code)
+	for _, path := range []string{"/v1/iam/access-reviews/rv-1/decide", "/v1/iam/access-reviews/rv-1:decide"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"decision":"REVOKE","reason":"x"}`))
+		req.Header.Set("X-Principal-Id", "reviewer-1")
+		req.Header.Set("X-Tenant-Id", govTenant)
+		w := httptest.NewRecorder()
+		newTestRouter(s).ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound && w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("POST %s: want 404/405 (owned by access-control-svc), got %d", path, w.Code)
+		}
 	}
 }

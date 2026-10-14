@@ -20,7 +20,7 @@ import (
 
 func TestNewClient_LocalEnvironment_UsesStub(t *testing.T) {
 	log := zap.NewNop()
-	client, err := authz.NewClient("local", "http://authorization-svc", log)
+	client, err := authz.NewClient("local", "http://authorization-svc", true, log)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestNewClient_LocalEnvironment_UsesStub(t *testing.T) {
 
 func TestNewClient_ProductionEnvironment_PlaceholderURL_ReturnsError(t *testing.T) {
 	log := zap.NewNop()
-	_, err := authz.NewClient("production", "http://authorization-svc", log)
+	_, err := authz.NewClient("production", "http://authorization-svc", false, log)
 	if err == nil {
 		t.Fatal("expected error when starting in production with placeholder URL, got nil")
 	}
@@ -46,7 +46,7 @@ func TestNewClient_ProductionEnvironment_PlaceholderURL_ReturnsError(t *testing.
 // back". That was harmless only while Authorize was a no-op; it must not be
 // mistaken for a wired authorization service.
 func TestNewClient_ProductionEnvironment_SelfReferentialURL_ReturnsError(t *testing.T) {
-	_, err := authz.NewClient("production", "http://jurisdiction-svc:8082", zap.NewNop())
+	_, err := authz.NewClient("production", "http://jurisdiction-svc:8082", false, zap.NewNop())
 	if err == nil {
 		t.Fatal("expected error for the self-referential placeholder URL, got nil")
 	}
@@ -54,7 +54,7 @@ func TestNewClient_ProductionEnvironment_SelfReferentialURL_ReturnsError(t *test
 
 func TestNewClient_ProductionEnvironment_ValidURL_ReturnsHTTPClient(t *testing.T) {
 	log := zap.NewNop()
-	client, err := authz.NewClient("production", "http://real-authz.zoiko.internal", log)
+	client, err := authz.NewClient("production", "http://real-authz.zoiko.internal", false, log)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -288,5 +288,37 @@ func TestActionType(t *testing.T) {
 		if got := authz.ActionType(in[0], in[1]); got != want {
 			t.Errorf("ActionType(%q, %q) = %q, want %q", in[0], in[1], got, want)
 		}
+	}
+}
+
+// Audit gap 4: a decision must name what it was taken on. The record id on the
+// context goes to authorization-svc as resource_type/resource_id, and a cached
+// grant for one record never answers for another.
+func TestHTTPClient_SendsTheTargetAndCachesPerTarget(t *testing.T) {
+	var bodies []map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var b map[string]string
+		_ = json.Unmarshal(raw, &b)
+		bodies = append(bodies, b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED","decision_basis":"rbac","access_decision_id":"d-1"}`))
+	}))
+	defer srv.Close()
+
+	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
+	for _, id := range []string{"rule-9", "rule-9", "rule-10"} {
+		if err := c.Authorize(authz.WithResourceID(context.Background(), id), "p-1", "s-1", "jurisdiction_rule", "transition", nil); err != nil {
+			t.Fatalf("authorize %s: %v", id, err)
+		}
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 live decisions (rule-9 once, rule-10 once), got %d", len(bodies))
+	}
+	if bodies[0]["resource_type"] != "jurisdiction_rule" || bodies[0]["resource_id"] != "rule-9" {
+		t.Errorf("first decision target = %q/%q, want jurisdiction_rule/rule-9", bodies[0]["resource_type"], bodies[0]["resource_id"])
+	}
+	if bodies[1]["resource_id"] != "rule-10" {
+		t.Errorf("second decision resource_id = %q, want rule-10", bodies[1]["resource_id"])
 	}
 }
