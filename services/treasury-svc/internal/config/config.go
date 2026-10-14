@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +15,10 @@ type Config struct {
 	DB DBConfig
 
 	Kafka KafkaConfig
+
+	// EventResidencyRegion is the authoritative regional data-bearing context
+	// for outbox events (ZS-EVENT-001 §4). Required at startup.
+	EventResidencyRegion string
 
 	// AuthZServiceURL is the base URL of authorization-svc.
 	AuthZServiceURL string
@@ -95,9 +100,14 @@ type KafkaConfig struct {
 
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
+	eventResidencyRegion := env("EVENT_RESIDENCY_REGION", "")
+	if eventResidencyRegion == "" {
+		return nil, fmt.Errorf("EVENT_RESIDENCY_REGION is required")
+	}
 	return &Config{
-		Env:  env("ENV", "local"),
-		Port: envInt("PORT", 8103),
+		Env:                  env("ENV", "local"),
+		Port:                 envInt("PORT", 8103),
+		EventResidencyRegion: eventResidencyRegion,
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),
@@ -120,8 +130,8 @@ func Load() (*Config, error) {
 		ARServiceURL:             env("AR_SERVICE_URL", "http://accounts-receivable-svc:8101"),
 		ObligationsServiceURL:    env("OBLIGATIONS_SERVICE_URL", "http://obligations-svc:8088"),
 		PaymentAdapterServiceURL: env("PAYMENT_ADAPTER_SERVICE_URL", "http://payment-initiation-adapter-svc:8162"),
-		IntercompanyServiceURL:      env("INTERCOMPANY_SERVICE_URL", "http://intercompany-accounting-svc:8105"),
-		BankingConnectorServiceURL:  env("BANKING_CONNECTOR_SERVICE_URL", "http://banking-connector-svc:8145"),
+		IntercompanyServiceURL:   env("INTERCOMPANY_SERVICE_URL", "http://intercompany-accounting-svc:8105"),
+		BankingConnectorServiceURL: env("BANKING_CONNECTOR_SERVICE_URL", "http://banking-connector-svc:8145"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }

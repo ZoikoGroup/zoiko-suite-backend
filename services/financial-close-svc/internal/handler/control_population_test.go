@@ -34,7 +34,7 @@ func (s *cpStore) MigrationBatchTieout(_ context.Context, q domain.MigrationBatc
 
 func cpServe(t *testing.T, st handler.Store, authzErr error, rawQuery string, tenant, principal string) *httptest.ResponseRecorder {
 	t.Helper()
-	h := handler.New(st, &stubPublisher{}, &stubAuthZ{err: authzErr}, &stubClients{}, []byte("k"), zap.NewNop())
+	h := handler.New(st, &stubAuthZ{err: authzErr}, &stubClients{}, []byte("k"), zap.NewNop())
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)

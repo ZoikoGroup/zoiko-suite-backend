@@ -10,17 +10,150 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/treasury-svc/internal/domain"
 	svcmiddleware "zoiko.io/treasury-svc/internal/middleware"
 )
 
 type PgStore struct {
-	pool *pgxpool.Pool
-	log  *zap.Logger
+	pool        *pgxpool.Pool
+	log         *zap.Logger
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
-	return &PgStore{pool: pool, log: log}
+type Option func(*PgStore)
+
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// enqueueBankAccountEvent builds and enqueues a bank-account.* event.
+func (s *PgStore) enqueueBankAccountEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.treasury.bank-account." + fact,
+		LegacyType:      legacyType,
+		Service:         "treasury-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "bank-account",
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", fact, err)
+	}
+	return outbox.Enqueue(ctx, tx, env)
+}
+
+// enqueueTreasuryTransferEvent builds and enqueues a treasury-transfer.* event.
+func (s *PgStore) enqueueTreasuryTransferEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.treasury.treasury-transfer." + fact,
+		LegacyType:      legacyType,
+		Service:         "treasury-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "treasury-transfer",
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", fact, err)
+	}
+	return outbox.Enqueue(ctx, tx, env)
+}
+
+// enqueueCashPositionEvent builds and enqueues a cash-position.* event.
+func (s *PgStore) enqueueCashPositionEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.treasury.cash-position." + fact,
+		LegacyType:      legacyType,
+		Service:         "treasury-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "cash-position",
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", fact, err)
+	}
+	return outbox.Enqueue(ctx, tx, env)
+}
+
+// enqueueFXExposureEvent builds and enqueues an fx-exposure.* event.
+func (s *PgStore) enqueueFXExposureEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.treasury.fx-exposure." + fact,
+		LegacyType:      legacyType,
+		Service:         "treasury-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "fx-exposure",
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", fact, err)
+	}
+	return outbox.Enqueue(ctx, tx, env)
+}
+
+// enqueueEffectiveCashEvent builds and enqueues effective cash / liquidity events.
+func (s *PgStore) enqueueEffectiveCashEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, legalEntityID, aggregateID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.treasury.effective-cash." + fact,
+		LegacyType:      legacyType,
+		Service:         "treasury-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   "effective-cash",
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Internal,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", fact, err)
+	}
+	return outbox.Enqueue(ctx, tx, env)
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
@@ -89,7 +222,16 @@ func (s *PgStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccoun
 			// The initial history entry — without this, GetBankAccountAsOf
 			// has no row to return for any timestamp before the first
 			// amendment, even though the account genuinely existed then.
-			return s.recordAccountHistory(ctx, tx, acct, acct.CreatedByPrincipalID)
+			if err := s.recordAccountHistory(ctx, tx, acct, acct.CreatedByPrincipalID); err != nil {
+				return err
+			}
+			// Enqueue bank_account.created event
+			return s.enqueueBankAccountEvent(ctx, tx, "created", "bank_account.created", tenantID, acct.LegalEntityID, acct.BankAccountID, acct.CreatedByPrincipalID, acct.CorrelationID, map[string]any{
+				"bank_account_id": acct.BankAccountID,
+				"tenant_id":       acct.TenantID,
+				"legal_entity_id": acct.LegalEntityID,
+				"account_status":  acct.AccountStatus,
+			})
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}

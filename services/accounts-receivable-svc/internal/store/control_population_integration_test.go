@@ -34,9 +34,19 @@ var embeddedPool *pgxpool.Pool
 
 func TestMain(m *testing.M) {
 	port := uint32(17101 + uint32(os.Getpid()%499))
+	// RuntimePath is pid-derived and private to this process, not the
+	// library's shared default (~/.embedded-postgres-go/extracted) — a
+	// second embedded-Postgres process anywhere on the machine (another
+	// service's own integration suite, a manually started scratch instance)
+	// contends for that same directory's binaries on Windows, where an
+	// in-use .dll cannot be deleted/overwritten. That contention is exactly
+	// what "unable to clean up runtime directory ... Access is denied"
+	// means, and it has nothing to do with whether this package's own tests
+	// are correct.
 	pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
 		Version(embeddedpostgres.V16).Port(port).Database("ar_ctrlpop_test").
-		Username("postgres").Password("postgres"))
+		Username("postgres").Password("postgres").
+		RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-ar-ctrlpop-%d", port))))
 	if err := pg.Start(); err != nil {
 		fmt.Printf("failed to start embedded postgres: %v\n", err)
 		os.Exit(1)

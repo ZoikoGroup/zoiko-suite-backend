@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -23,7 +24,7 @@ func strPtr(s string) *string { return &s }
 
 func TestPgStore_ACC17_CrosswalkEntryOpenItemFields_RoundTrip_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -91,7 +92,7 @@ func TestPgStore_ACC17_CrosswalkEntryOpenItemFields_RoundTrip_RealDB(t *testing.
 // documentation.
 func TestPgStore_ACC17_InvalidSourceReferenceType_RejectedByCheckConstraint(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)

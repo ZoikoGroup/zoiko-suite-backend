@@ -159,9 +159,6 @@ func (h *Handler) CreateTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 	if !created {
 		status = http.StatusOK
 	}
-	if created {
-		h.publisher.PublishTreasuryTransferCreated(r.Context(), correlationID, principalID, *transfer)
-	}
 	writeJSON(w, status, transfer)
 }
 
@@ -228,7 +225,6 @@ func (h *Handler) ApproveTreasuryTransfer(w http.ResponseWriter, r *http.Request
 		h.writeTransferErr(w, err)
 		return
 	}
-	h.publisher.PublishTreasuryTransferApproved(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -259,7 +255,6 @@ func (h *Handler) AuthorizeTreasuryTransfer(w http.ResponseWriter, r *http.Reque
 		h.writeTransferErr(w, err)
 		return
 	}
-	h.publisher.PublishTreasuryTransferAuthorized(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -281,7 +276,6 @@ func (h *Handler) RejectTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 		h.writeTransferErr(w, err)
 		return
 	}
-	h.publisher.PublishTreasuryTransferRejected(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -462,7 +456,6 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 			h.writeTransferErr(w, err)
 			return
 		}
-		h.publisher.PublishTreasuryTransferSubmitted(r.Context(), correlationID, principalID, *transfer)
 	}
 
 	if transfer.Status == domain.TransferSubmitted {
@@ -472,7 +465,6 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 				h.writeTransferErr(w, err)
 				return
 			}
-			h.publisher.PublishTreasuryTransferSettled(r.Context(), correlationID, principalID, *transfer)
 			writeJSON(w, http.StatusOK, transfer)
 			return
 		}
@@ -515,7 +507,6 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 			h.writeTransferErr(w, err)
 			return
 		}
-		h.publisher.PublishTreasuryTransferSettled(r.Context(), correlationID, principalID, *transfer)
 	}
 
 	writeJSON(w, http.StatusOK, transfer)
@@ -626,7 +617,6 @@ func (h *Handler) CancelBeforeSubmission(w http.ResponseWriter, r *http.Request)
 		h.writeTransferErr(w, err)
 		return
 	}
-	h.publisher.PublishTreasuryTransferCancelled(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -667,7 +657,6 @@ func (h *Handler) MarkTransferReturned(w http.ResponseWriter, r *http.Request) {
 		h.writeTransferErr(w, err)
 		return
 	}
-	h.publisher.PublishTreasuryTransferReturned(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -705,9 +694,6 @@ func (h *Handler) ResolveTreasuryTransfer(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		h.writeTransferErr(w, err)
 		return
-	}
-	if updated.Status == domain.TransferCancelled {
-		h.publisher.PublishTreasuryTransferCancelled(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	}
 	writeJSON(w, http.StatusOK, updated)
 }

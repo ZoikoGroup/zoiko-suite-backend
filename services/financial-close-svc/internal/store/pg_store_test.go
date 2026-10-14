@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -51,7 +52,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		fx_revaluation_items, fx_revaluation_runs,
 		migration_crosswalk_entries, migration_batches,
 		financial_snapshots,
-		lineage_edges, lineage_projection_status, lineage_trace_verifications, lineage_quarantined_gaps
+		lineage_edges, lineage_projection_status, lineage_trace_verifications, lineage_quarantined_gaps,
+		eventing_outbox
 		CASCADE;`)
 
 	// The DROP list above must be kept in sync with every CREATE TABLE the
@@ -113,7 +115,7 @@ func requireThrowawayDatabase(t *testing.T, dsn string) {
 // resolve to the original fiscal period, never a duplicate.
 func TestPgStore_CreateFiscalPeriod_Retried_IsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -170,7 +172,7 @@ func TestPgStore_CreateFiscalPeriod_Retried_IsIdempotent(t *testing.T) {
 
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()

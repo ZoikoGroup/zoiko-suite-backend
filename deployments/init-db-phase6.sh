@@ -43,6 +43,7 @@ apply_migration reporting_orchestration /migrations/reporting-orchestration/0000
 # ── Migration Integrity Service ───────────────────────────────────────────────
 create_db migration_integrity
 apply_migration migration_integrity /migrations/migration-integrity/000001_initial_schema.up.sql
+apply_migration migration_integrity /migrations/migration-integrity/000002_add_eventing_outbox.up.sql
 
 echo "=== Phase 6 databases initialised successfully ==="
 

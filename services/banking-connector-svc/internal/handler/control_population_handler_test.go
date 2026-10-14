@@ -13,7 +13,6 @@ import (
 
 	"zoiko.io/banking-connector-svc/internal/authz"
 	"zoiko.io/banking-connector-svc/internal/domain"
-	"zoiko.io/banking-connector-svc/internal/events"
 	"zoiko.io/banking-connector-svc/internal/middleware"
 	"zoiko.io/banking-connector-svc/internal/store"
 )
@@ -51,7 +50,7 @@ func authzServer(t *testing.T, outcome string, seen *map[string]string) *httptes
 }
 
 func cpRouter(t *testing.T, outcome string, f *fakeCPStore, seen *map[string]string) http.Handler {
-	h := New(store.NewMemoryStore(), events.NewMockPublisher(), authz.NewClient(authzServer(t, outcome, seen).URL), zap.NewNop())
+	h := New(store.NewMemoryStore(), authz.NewClient(authzServer(t, outcome, seen).URL), zap.NewNop())
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext)
 	RegisterControlPopulationRoutes(r, h, f)

@@ -76,7 +76,7 @@ func newStubStore() *stubStore {
 	return &stubStore{lines: map[string]*domain.StatementLine{}, byCorrelation: map[string]string{}}
 }
 
-func (s *stubStore) CreateStatementLine(_ context.Context, l *domain.StatementLine) (bool, error) {
+func (s *stubStore) CreateStatementLine(_ context.Context, l *domain.StatementLine, _ string) (bool, error) {
 	if s.createErr != nil {
 		return false, s.createErr
 	}
@@ -485,11 +485,16 @@ func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ, l *stubLedger) chi.
 // instead produce a non-nil interface wrapping a nil pointer, which
 // panics on the first method call rather than exercising the intended
 // not-configured path.
-func newRouterWithClose(s *stubStore, p *stubPublisher, a *stubAuthZ, l *stubLedger, closeClient close.Client) chi.Router {
+// p is accepted but unused — event emission moved from a handler-level
+// Publisher into the store's own transactions (ZS-EVENT-001 §6), so it is no
+// longer something a handler-level stub can observe. Kept as a parameter
+// rather than touched at every one of this file's call sites; real outbox
+// enqueue coverage now lives in internal/store's own tests.
+func newRouterWithClose(s *stubStore, _ *stubPublisher, a *stubAuthZ, l *stubLedger, closeClient close.Client) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	// Pass nil for banking client — existing tests all use journal_id path.
-	h := handler.New(s, p, a, l, nil, closeClient, zap.NewNop())
+	h := handler.New(s, a, l, nil, closeClient, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -566,7 +571,6 @@ func doRawRequest(r chi.Router, method, path, body, principalID, tenantID string
 // handler.New call site instead of here.
 var (
 	_ handler.Store       = (*stubStore)(nil)
-	_ handler.Publisher   = (*stubPublisher)(nil)
 	_ handler.AuthZClient = (*stubAuthZ)(nil)
 	_ ledger.Client       = (*stubLedger)(nil)
 )
@@ -626,9 +630,9 @@ func TestCreateStatementLine_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t 
 	if retryLine.StatementLineID != firstLine.StatementLineID {
 		t.Fatalf("retried call resolved to a different statement_line_id (%s) than the original (%s)", retryLine.StatementLineID, firstLine.StatementLineID)
 	}
-	if pub.ingested != 1 {
-		t.Fatalf("expected exactly 1 PublishStatementIngested call, got %d — replay must not re-publish", pub.ingested)
-	}
+	// The outbox-ingested event itself (exactly once, not re-enqueued on
+	// replay) is proven at the store level now — see
+	// internal/store's TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent.
 }
 
 func TestCreateStatementLine_MissingPrincipalHeader_Returns401(t *testing.T) {
@@ -680,9 +684,8 @@ func TestMatchStatementLine_LedgerVerifiedMatch_Succeeds(t *testing.T) {
 	if s.lines["l1"].Status != domain.StatementLineStatusMatched {
 		t.Fatalf("expected status MATCHED, got %s", s.lines["l1"].Status)
 	}
-	if pub.matched != 1 {
-		t.Fatalf("expected reconciliation.matched to be published once, got %d", pub.matched)
-	}
+	// reconciliation.matched's outbox enqueue is proven at the store level —
+	// see internal/store's TestPgStore_MatchStatementLine_EnqueuesMatchedEvent.
 }
 
 func TestMatchStatementLine_JournalNotFound_Returns400(t *testing.T) {
@@ -798,9 +801,8 @@ func TestFlagException_FromUnmatched_Succeeds(t *testing.T) {
 	if s.lines["l1"].Status != domain.StatementLineStatusException {
 		t.Fatalf("expected status EXCEPTION, got %s", s.lines["l1"].Status)
 	}
-	if pub.exceptionRaised != 1 {
-		t.Fatalf("expected reconciliation.exception.raised to be published once, got %d", pub.exceptionRaised)
-	}
+	// reconciliation.exception.raised's outbox enqueue is proven at the store
+	// level — see internal/store's TestPgStore_FlagException_EnqueuesExceptionRaisedEvent.
 }
 
 func TestFlagException_AlreadyMatched_Rejected(t *testing.T) {
@@ -843,9 +845,8 @@ func TestUnmatchWithReason_MatchedLine_RevertsToException(t *testing.T) {
 	if s.lines["l1"].ExceptionReason == nil || *s.lines["l1"].ExceptionReason != "matched to the wrong journal" {
 		t.Fatalf("expected the exception reason to be recorded, got %+v", s.lines["l1"].ExceptionReason)
 	}
-	if pub.exceptionRaised != 1 {
-		t.Errorf("expected PublishReconciliationExceptionRaised to be called once, got %d", pub.exceptionRaised)
-	}
+	// reconciliation.exception.raised's outbox enqueue is proven at the store
+	// level — see internal/store's TestPgStore_UnmatchWithReason_EnqueuesExceptionRaisedEvent.
 }
 
 // TestUnmatchWithReason_UnmatchedLine_Rejected is the negative control:
@@ -907,9 +908,8 @@ func TestCompleteStatement_AllResolved_Succeeds(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if pub.completed != 1 {
-		t.Fatalf("expected reconciliation.completed to be published once, got %d", pub.completed)
-	}
+	// reconciliation.completed's outbox enqueue is proven at the store level —
+	// see internal/store's TestPgStore_CertifyStatement_EnqueuesCompletedEvent.
 }
 
 func TestCompleteStatement_RequiresVerifiedTenantScope(t *testing.T) {
@@ -1090,15 +1090,8 @@ func TestReperformRun_Success_Returns201(t *testing.T) {
 		t.Error("expected reperform to return a NEW run id, not the superseded one")
 	}
 	// Wave 8c: both the OLD run's own terminal event and the NEW run's
-	// start event must be published — previously only the latter existed,
-	// so a listener had no way to learn a run had ended vs merely that
-	// another one started.
-	if pub.superseded != 1 {
-		t.Errorf("expected PublishReconciliationSuperseded to be called once, got %d", pub.superseded)
-	}
-	if pub.reperformed != 1 {
-		t.Errorf("expected PublishReconciliationReperformed to be called once, got %d", pub.reperformed)
-	}
+	// start event must be enqueued, atomically, in the same transaction —
+	// see internal/store's TestPgStore_SupersedeRun_EnqueuesBothSupersededAndReperformedEvents.
 }
 
 func TestReperformRun_AlreadySuperseded_Returns409(t *testing.T) {
@@ -1141,9 +1134,8 @@ func TestRunAutomaticMatching_VerifiedCandidate_Matches(t *testing.T) {
 	if s.lines["l1"].Status != domain.StatementLineStatusMatched {
 		t.Fatalf("expected line to be MATCHED, got %s", s.lines["l1"].Status)
 	}
-	if pub.matched != 1 {
-		t.Errorf("expected PublishReconciliationMatched to be called once, got %d", pub.matched)
-	}
+	// reconciliation.matched's outbox enqueue is proven at the store level —
+	// see internal/store's TestPgStore_MatchStatementLine_EnqueuesMatchedEvent.
 }
 
 // TestRunAutomaticMatching_UnverifiedCandidate_IsSkippedNotMatched is the

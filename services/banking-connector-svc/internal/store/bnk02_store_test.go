@@ -16,7 +16,7 @@ import (
 func TestBNK02_ConnectionLifecycle_CAS_Transitions(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-a")
 
@@ -96,7 +96,7 @@ func TestBNK02_ConnectionLifecycle_CAS_Transitions(t *testing.T) {
 func TestBNK02_ReconnectFromReconsentRequired_ForcesNewAuthorization(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-reconsent")
 
@@ -157,7 +157,7 @@ func TestBNK02_ReconnectFromReconsentRequired_ForcesNewAuthorization(t *testing.
 func TestBNK02_RevokedConnection_IsTerminal(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-b")
 	conn, _, err := s.InitiateConnection(ctx, domain.InitiateConnectionParams{
@@ -219,7 +219,7 @@ func TestBNK02_RevokedConnection_IsTerminal(t *testing.T) {
 func TestBNK02_ConnectionEvents_AreAppendOnly(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-c")
 	conn, _, err := s.InitiateConnection(ctx, domain.InitiateConnectionParams{
@@ -265,7 +265,7 @@ func TestBNK02_ConnectionEvents_AreAppendOnly(t *testing.T) {
 func TestBNK02_InitiateConnection_IdempotentOnCorrelationID(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-d")
 	params := domain.InitiateConnectionParams{
@@ -302,7 +302,7 @@ func TestBNK02_InitiateConnection_IdempotentOnCorrelationID(t *testing.T) {
 func TestBNK02_IsRegionAllowed_NoPolicyConfigured_IsUnrestricted(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-region-a")
 
@@ -322,7 +322,7 @@ func TestBNK02_IsRegionAllowed_NoPolicyConfigured_IsUnrestricted(t *testing.T) {
 func TestBNK02_IsRegionAllowed_PolicyConfigured_EnforcesAllowlist(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-region-b")
 
@@ -360,7 +360,7 @@ func TestBNK02_IsRegionAllowed_PolicyConfigured_EnforcesAllowlist(t *testing.T) 
 func TestBNK02_CreateRegionPolicy_RejectsDuplicate(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-region-c")
 

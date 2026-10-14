@@ -258,7 +258,7 @@ func newMirrorEnv(t *testing.T, o mirrorOpts) *mirrorEnv {
 	var mirror *periodmirror.Mirror
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
-	h := handler.New(store, &stubPublisher{}, authz, clients, testSigningKey, zap.NewNop()).
+	h := handler.New(store, authz, clients, testSigningKey, zap.NewNop()).
 		SetWorkflowRefs(store, []string{"accounting-period-svc"})
 	handler.RegisterRoutes(r, h)
 	fcs := httptest.NewServer(r)
@@ -390,7 +390,7 @@ func TestWorkflowRef_NoCallersConfigured_RefusesEveryone(t *testing.T) {
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	st := &mirrorStore{stubStore: newStubStore()}
-	handler.RegisterRoutes(r, handler.New(st, &stubPublisher{}, &stubAuthZ{}, &stubClients{}, testSigningKey, zap.NewNop()).SetWorkflowRefs(st, nil))
+	handler.RegisterRoutes(r, handler.New(st, &stubAuthZ{}, &stubClients{}, testSigningKey, zap.NewNop()).SetWorkflowRefs(st, nil))
 	if rr := getRef(r, "0190bbbb-0000-7000-8000-000000000001", testTenantID, "accounting-period-svc"); rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d", rr.Code)
 	}
@@ -402,7 +402,7 @@ func TestWorkflowRef_CustomAllowList(t *testing.T) {
 	st := &mirrorStore{stubStore: newStubStore()}
 	e := &mirrorEnv{store: st}
 	wr := seedRef(e, testTenantID, "APPROVED")
-	handler.RegisterRoutes(r, handler.New(st, &stubPublisher{}, &stubAuthZ{}, &stubClients{}, testSigningKey, zap.NewNop()).SetWorkflowRefs(st, []string{"a-svc", "b-svc"}))
+	handler.RegisterRoutes(r, handler.New(st, &stubAuthZ{}, &stubClients{}, testSigningKey, zap.NewNop()).SetWorkflowRefs(st, []string{"a-svc", "b-svc"}))
 	for _, w := range []string{"a-svc", "b-svc"} {
 		if rr := getRef(r, wr.RefID, testTenantID, w); rr.Code != http.StatusOK {
 			t.Errorf("%s should be allowed, got %d", w, rr.Code)
@@ -502,7 +502,7 @@ func TestLock_NoMirrorWired_Works(t *testing.T) {
 	skipREF05MirrorRebase(t)
 	s := newStubStore()
 	s.periods["fp"] = &domain.FiscalPeriod{FiscalPeriodID: "fp", TenantID: testTenantID, LegalEntityID: "le-1", PeriodName: "p", CloseStatus: "OPEN"}
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	r := newRouter(s, &stubAuthZ{}, &stubClients{})
 	if rr := doReq(r, http.MethodPost, "/v1/close/periods/fp/lock", nil, "p1"); rr.Code != http.StatusOK {
 		t.Fatalf("got %d", rr.Code)
 	}
@@ -1083,7 +1083,7 @@ func TestWorkflowRef_ThroughEnvelope_WriteStrictAdmitsREF05Callback(t *testing.T
 		r := chi.NewRouter()
 		r.Use(middleware.TenantContext())
 		r.Use(envelope.MiddlewareWithMode(envelope.ServicePolicy(), mode, nil))
-		handler.RegisterRoutes(r, handler.New(e.store, &stubPublisher{}, &stubAuthZ{}, &stubClients{}, testSigningKey, zap.NewNop()).SetWorkflowRefs(e.store, []string{"accounting-period-svc"}))
+		handler.RegisterRoutes(r, handler.New(e.store, &stubAuthZ{}, &stubClients{}, testSigningKey, zap.NewNop()).SetWorkflowRefs(e.store, []string{"accounting-period-svc"}))
 		return r
 	}
 	// REF-05 sends only X-Tenant-Id and X-Workload-Id.

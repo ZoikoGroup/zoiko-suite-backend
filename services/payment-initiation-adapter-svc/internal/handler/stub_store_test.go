@@ -39,7 +39,7 @@ func (s *stubStore) recordEvent(a *domain.PaymentInitiationAttempt, eventType, d
 	})
 }
 
-func (s *stubStore) PrepareAttempt(_ context.Context, tenantID string, req domain.PrepareAttemptRequest, principalID string) (*domain.PaymentInitiationAttempt, error) {
+func (s *stubStore) PrepareAttempt(_ context.Context, tenantID string, req domain.PrepareAttemptRequest, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error) {
 	if _, taken := s.byIdempotency[req.IdempotencyKey]; taken {
 		return nil, domain.ErrDuplicateIdempotencyKey
 	}

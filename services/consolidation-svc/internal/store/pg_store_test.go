@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 
 	"zoiko.io/consolidation-svc/internal/domain"
 	svcmiddleware "zoiko.io/consolidation-svc/internal/middleware"
@@ -41,13 +42,15 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
-		consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs
+		eventing_outbox, consolidation_adjustments, balance_contributions, balance_snapshots, consolidation_runs
 		CASCADE;`)
 
 	for _, migration := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_balance_contributions.up.sql",
 		"000003_add_consolidation_adjustments.up.sql",
+		"000004_add_eventing_outbox.up.sql",
+		"000005_eventing_outbox_relay_policy.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
 		if err != nil {
@@ -59,6 +62,10 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 
 	return pool
+}
+
+func newTestStore(pool *pgxpool.Pool) *store.PgStore {
+	return store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 }
 
 func newTestRun(tenantID, groupLegalEntityID string) *domain.ConsolidationRun {
@@ -85,7 +92,7 @@ func newTestAdjustment(tenantID, groupLegalEntityID, createdBy string) *domain.C
 
 func TestPgStore_ACC12_GroupEntityHasRun_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -98,7 +105,7 @@ func TestPgStore_ACC12_GroupEntityHasRun_RealDB(t *testing.T) {
 		t.Fatal("expected no run recorded yet")
 	}
 
-	if err := s.CreateRun(ctx, newTestRun(tenantID, "group-1")); err != nil {
+	if err := s.CreateRun(ctx, newTestRun(tenantID, "group-1"), "principal-1", "corr-1"); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	hasRun, err = s.GroupEntityHasRun(ctx, "group-1")
@@ -112,7 +119,7 @@ func TestPgStore_ACC12_GroupEntityHasRun_RealDB(t *testing.T) {
 
 func TestPgStore_ACC12_FullLifecycle_ApprovePostReverse_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -169,7 +176,7 @@ func TestPgStore_ACC12_FullLifecycle_ApprovePostReverse_RealDB(t *testing.T) {
 // UPDATE's WHERE clause against the real database.
 func TestPgStore_ACC12_ApproveFromWrongStatus_Refused(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -192,7 +199,7 @@ func TestPgStore_ACC12_ApproveFromWrongStatus_Refused(t *testing.T) {
 // migration 000003's CHECK constraints are real, not just documentation.
 func TestPgStore_ACC12_InvalidAdjustmentType_RejectedByCheckConstraint(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)

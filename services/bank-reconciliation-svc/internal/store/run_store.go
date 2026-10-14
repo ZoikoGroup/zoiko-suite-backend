@@ -130,7 +130,15 @@ func (s *PgStore) StartRun(ctx context.Context, tenantID string, req domain.Star
 			return err
 		}
 		created = true
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "run.started", "reconciliation.run.started",
+			tenantID, run.LegalEntityID, run.RunID, principalID, run.CorrelationID, map[string]any{
+				"run_id":          run.RunID,
+				"tenant_id":       run.TenantID,
+				"legal_entity_id": run.LegalEntityID,
+				"bank_account_id": run.BankAccountID,
+				"statement_date":  run.StatementDate,
+				"status":          run.Status,
+			})
 	})
 	if err != nil {
 		return nil, false, mapPgError(err)
@@ -689,7 +697,15 @@ func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, certifierPrin
 		}
 
 		created = true
-		return nil
+		return s.enqueueReconciliationEvent(ctx, tx, "run.certified", "reconciliation.run.certified",
+			tenantID, run.LegalEntityID, runID, certifierPrincipalID, correlationID, map[string]any{
+				"run_id":             runID,
+				"certificate_id":     cert.CertificateID,
+				"tenant_id":          tenantID,
+				"bank_account_id":    run.BankAccountID,
+				"statement_date":     run.StatementDate,
+				"matched_line_count": cert.MatchedLineCount,
+			})
 	})
 	if err != nil {
 		return nil, false, mapPgError(err)
@@ -744,7 +760,28 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, existingRunID, pri
 		`, newRun.RunID, existingRunID, tenantID); err != nil {
 			return err
 		}
-		return nil
+
+		// Both events describe the one atomic transition (old run ends,
+		// new run begins) — enqueued together so a listener can never see
+		// one without the other.
+		if err := s.enqueueReconciliationEvent(ctx, tx, "run.reperformed", "reconciliation.run.reperformed",
+			tenantID, newRun.LegalEntityID, newRun.RunID, principalID, correlationID, map[string]any{
+				"new_run_id":      newRun.RunID,
+				"prior_run_id":    existingRunID,
+				"tenant_id":       newRun.TenantID,
+				"bank_account_id": newRun.BankAccountID,
+				"statement_date":  newRun.StatementDate,
+			}); err != nil {
+			return err
+		}
+		return s.enqueueReconciliationEvent(ctx, tx, "run.superseded", "reconciliation.run.superseded",
+			tenantID, existing.LegalEntityID, existingRunID, existing.CreatedByPrincipalID, existing.CorrelationID, map[string]any{
+				"run_id":               existingRunID,
+				"superseded_by_run_id": newRun.RunID,
+				"tenant_id":            existing.TenantID,
+				"bank_account_id":      existing.BankAccountID,
+				"statement_date":       existing.StatementDate,
+			})
 	})
 	if err != nil {
 		return nil, mapPgError(err)

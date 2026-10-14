@@ -13,7 +13,6 @@ import (
 
 	"zoiko.io/banking-connector-svc/internal/authz"
 	"zoiko.io/banking-connector-svc/internal/domain"
-	"zoiko.io/banking-connector-svc/internal/events"
 	"zoiko.io/banking-connector-svc/internal/middleware"
 	"zoiko.io/banking-connector-svc/internal/store"
 )
@@ -30,23 +29,22 @@ func newGrantingAuthzServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func setupTestRouter(t *testing.T) (chi.Router, *events.MockPublisher) {
+func setupTestRouter(t *testing.T) chi.Router {
 	st := store.NewMemoryStore()
-	pub := events.NewMockPublisher()
 	authzSrv := newGrantingAuthzServer(t)
 	az := authz.NewClient(authzSrv.URL)
 	logger := zap.NewNop()
 
-	h := New(st, pub, az, logger)
+	h := New(st, az, logger)
 
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext)
 	RegisterRoutes(r, h)
-	return r, pub
+	return r
 }
 
 func TestBankingFlow(t *testing.T) {
-	r, _ := setupTestRouter(t)
+	r := setupTestRouter(t)
 
 	connReq := domain.CreateConnectionRequest{
 		LegalEntityID: "le-101",

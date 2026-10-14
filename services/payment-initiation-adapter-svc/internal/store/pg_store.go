@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -12,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 	"zoiko.io/payment-initiation-adapter-svc/internal/domain"
 	"zoiko.io/payment-initiation-adapter-svc/internal/middleware"
 )
@@ -40,7 +43,7 @@ func (n *nullString) Scan(src interface{}) error {
 
 // Store is the interface the handler depends on.
 type Store interface {
-	PrepareAttempt(ctx context.Context, tenantID string, req domain.PrepareAttemptRequest, principalID string) (*domain.PaymentInitiationAttempt, error)
+	PrepareAttempt(ctx context.Context, tenantID string, req domain.PrepareAttemptRequest, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error)
 	FindAttempt(ctx context.Context, attemptID string) (*domain.PaymentInitiationAttempt, error)
 	FindByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.PaymentInitiationAttempt, error)
 
@@ -55,12 +58,23 @@ type Store interface {
 }
 
 type PgStore struct {
-	pool *pgxpool.Pool
-	log  *zap.Logger
+	pool        *pgxpool.Pool
+	log         *zap.Logger
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
-	return &PgStore{pool: pool, log: log}
+type Option func(*PgStore)
+
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func NewPgStore(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
@@ -95,6 +109,39 @@ func (s *PgStore) recordEvent(ctx context.Context, tx pgx.Tx, tenantID *string, 
 	return err
 }
 
+// enqueueEvent builds and enqueues one event inside the caller's own
+// transaction — the entire point of the transactional outbox (ZS-EVENT-001
+// §6): the event and the state change it reports commit atomically, or
+// neither does. legacyType is the pre-standard event_type string existing
+// consumers filter on; always pass it explicitly — envelope.New silently
+// defaults it to the canonical type when empty, which would silently break
+// any consumer still reading the old name.
+func (s *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, canonicalType, legacyType, aggregateType, aggregateID, tenantID, legalEntityID, actorID, correlationID string, data any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            canonicalType,
+		LegacyType:      legacyType,
+		Service:         "payment-initiation-adapter-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   aggregateType,
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", canonicalType, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue %s event: %w", canonicalType, err)
+	}
+	return nil
+}
+
 const attemptColumns = `
 	attempt_id, tenant_id, legal_entity_id, source_reference, authorization_fingerprint, authorization_id, authorization_source, payer_account_ref,
 	payee_ref, amount, currency, execution_date, payment_reference, payer_account_verified, idempotency_key,
@@ -120,7 +167,7 @@ func scanAttempt(row pgx.Row) (*domain.PaymentInitiationAttempt, error) {
 // row commits before any code path is allowed to call the provider
 // adapter — see internal/domain's package doc. Relies on the migration's
 // unique index on idempotency_key to reject a duplicate.
-func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domain.PrepareAttemptRequest, principalID string) (*domain.PaymentInitiationAttempt, error) {
+func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domain.PrepareAttemptRequest, principalID, correlationID string) (*domain.PaymentInitiationAttempt, error) {
 	id := uuid.New().String()
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
@@ -169,7 +216,11 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 			return err
 		}
 		a = inserted
-		return s.recordEvent(ctx, tx, a.TenantID, id, domain.EventInitiationPrepared, "", principalID)
+		if err := s.recordEvent(ctx, tx, a.TenantID, id, domain.EventInitiationPrepared, "", principalID); err != nil {
+			return err
+		}
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payment-initiation-attempt.prepared", "PAYMENT_INITIATION_PREPARED",
+			"payment-initiation-attempt", id, tenantID, req.LegalEntityID, principalID, correlationID, a)
 	})
 	if errors.Is(err, domain.ErrUnresolvedAttemptExists) {
 		return a, domain.ErrUnresolvedAttemptExists

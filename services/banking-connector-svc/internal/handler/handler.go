@@ -11,7 +11,6 @@ import (
 
 	"zoiko.io/banking-connector-svc/internal/authz"
 	"zoiko.io/banking-connector-svc/internal/domain"
-	"zoiko.io/banking-connector-svc/internal/events"
 	"zoiko.io/banking-connector-svc/internal/middleware"
 	"zoiko.io/banking-connector-svc/internal/store"
 )
@@ -22,14 +21,13 @@ const (
 )
 
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     *authz.Client
-	logger    *zap.Logger
+	store  store.Store
+	authz  *authz.Client
+	logger *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, az *authz.Client, logger *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, logger: logger}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -136,18 +134,13 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		Status:        domain.StatusConnected,
 	}
 
-	if err := h.store.CreateConnection(r.Context(), conn); err != nil {
+	if err := h.store.CreateConnection(r.Context(), conn, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.logger.Error("failed to create bank connection", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create bank connection")
 		return
 	}
 
 	populateAliases(conn)
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "banking.connection.created", AggregateID: conn.ConnectionID, TenantID: tenantID,
-		LegalEntityID: conn.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: conn,
-	})
 	writeJSON(w, http.StatusCreated, conn)
 }
 
@@ -226,17 +219,12 @@ func (h *Handler) IngestStatement(w http.ResponseWriter, r *http.Request) {
 		ClosingBalance:  req.ClosingBalance,
 	}
 
-	if err := h.store.RecordStatement(r.Context(), stmt); err != nil {
+	if err := h.store.RecordStatement(r.Context(), stmt, conn.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.logger.Error("failed to ingest statement", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to ingest bank statement")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "banking.statement.ingested", AggregateID: stmt.StatementID, TenantID: tenantID,
-		LegalEntityID: conn.LegalEntityID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: stmt,
-	})
 	writeJSON(w, http.StatusCreated, stmt)
 }
 

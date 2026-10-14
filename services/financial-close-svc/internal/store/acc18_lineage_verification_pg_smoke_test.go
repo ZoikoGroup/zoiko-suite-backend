@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -21,7 +22,7 @@ import (
 
 func TestPgStore_ACC18_ListLineageEdgesToAsOf_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -55,7 +56,7 @@ func TestPgStore_ACC18_ListLineageEdgesToAsOf_RealDB(t *testing.T) {
 
 func TestPgStore_ACC18_TracePathVerification_RealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -81,7 +82,7 @@ func TestPgStore_ACC18_TracePathVerification_RealDB(t *testing.T) {
 
 func TestPgStore_ACC18_QuarantinedLineageGap_IdempotentAndRealDB(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)

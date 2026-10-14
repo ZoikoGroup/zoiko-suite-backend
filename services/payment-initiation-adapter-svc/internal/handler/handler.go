@@ -13,7 +13,6 @@ import (
 	authzpkg "zoiko.io/payment-initiation-adapter-svc/internal/authz"
 	"zoiko.io/payment-initiation-adapter-svc/internal/clients"
 	"zoiko.io/payment-initiation-adapter-svc/internal/domain"
-	"zoiko.io/payment-initiation-adapter-svc/internal/events"
 	svcmiddleware "zoiko.io/payment-initiation-adapter-svc/internal/middleware"
 	"zoiko.io/payment-initiation-adapter-svc/internal/provideradapter"
 	"zoiko.io/payment-initiation-adapter-svc/internal/store"
@@ -37,7 +36,6 @@ type AuthzChecker interface {
 
 type Handler struct {
 	store         store.Store
-	pub           events.Publisher
 	authz         AuthzChecker
 	provider      provideradapter.Client
 	treasury      clients.TreasuryClient
@@ -45,8 +43,8 @@ type Handler struct {
 	log           *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, provider provideradapter.Client, treasury clients.TreasuryClient, authorization clients.AuthorizationClient, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, provider: provider, treasury: treasury, authorization: authorization, log: log}
+func New(st store.Store, az AuthzChecker, provider provideradapter.Client, treasury clients.TreasuryClient, authorization clients.AuthorizationClient, log *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, provider: provider, treasury: treasury, authorization: authorization, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -204,7 +202,8 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	created, err := h.store.PrepareAttempt(r.Context(), verifiedTenant, req, principalID)
+	correlationID := r.Header.Get("X-Correlation-ID")
+	created, err := h.store.PrepareAttempt(r.Context(), verifiedTenant, req, principalID, correlationID)
 	if err != nil {
 		if errors.Is(err, domain.ErrDuplicateIdempotencyKey) {
 			existing, findErr := h.store.FindByIdempotencyKey(r.Context(), req.IdempotencyKey)
@@ -230,10 +229,6 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventInitiationPrepared, EntityID: created.AttemptID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: created,
-	})
 	writeJSON(w, http.StatusCreated, created)
 }
 

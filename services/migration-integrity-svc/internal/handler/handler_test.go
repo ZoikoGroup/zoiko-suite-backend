@@ -10,7 +10,6 @@ import (
 	"go.uber.org/zap"
 	"zoiko.io/migration-integrity-svc/internal/authz"
 	"zoiko.io/migration-integrity-svc/internal/domain"
-	"zoiko.io/migration-integrity-svc/internal/events"
 	"zoiko.io/migration-integrity-svc/internal/handler"
 	"zoiko.io/migration-integrity-svc/internal/store"
 )
@@ -30,10 +29,9 @@ func newMockAuthzServer(t *testing.T) *httptest.Server {
 func newRouter(t *testing.T) http.Handler {
 	logger := zap.NewNop()
 	s := store.NewMemoryStore()
-	p := events.NewPublisher([]string{"localhost:9092"}, "zoiko.migration-integrity.events", logger)
 	authzSrv := newMockAuthzServer(t)
 	a := authz.NewClient(authzSrv.URL, logger)
-	h := handler.NewHandler(s, p, a, logger)
+	h := handler.NewHandler(s, a, logger)
 	return handler.NewRouter(h)
 }
 
