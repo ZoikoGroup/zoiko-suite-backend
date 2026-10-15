@@ -66,7 +66,6 @@ type Store interface {
 	MarkEventProcessed(ctx context.Context, tenantID, eventID string) error
 }
 
-// Publisher is the event-publishing contract the handler depends on.
 // AuthZClient is the authorization contract the handler depends on.
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
