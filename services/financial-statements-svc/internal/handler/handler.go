@@ -34,6 +34,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/", h.ListStatementSets)
 		r.Get("/{id}", h.GetStatementSet)
 		r.Get("/{id}/facts", h.GetStatementFacts)
+		r.Get("/{id}/comparatives", h.GetComparatives)
 		// Colon-suffixed command segment, one route, dispatched by name —
 		// same convention as accounting-period-svc's {idcmd} (its own
 		// router has no clean way to combine a path param with a literal
@@ -134,6 +135,27 @@ func (h *Handler) GetStatementFacts(w http.ResponseWriter, r *http.Request) {
 		facts = []domain.StatementFact{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": facts, "count": len(facts)})
+}
+
+// GetComparatives: GET /v1/statement-sets/{id}/comparatives?prior_set_id=…
+// The prior set is named explicitly rather than resolved from a period:
+// reporting_period is a free-form label and this service has no fiscal
+// calendar to say which period is "immediately before" another.
+func (h *Handler) GetComparatives(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	view, err := h.svc.GetComparatives(r.Context(), tenantID, principalID, chi.URLParam(r, "id"), r.URL.Query().Get("prior_set_id"))
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 func (h *Handler) ExplainReportedFact(w http.ResponseWriter, r *http.Request) {

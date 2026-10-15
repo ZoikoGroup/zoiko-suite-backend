@@ -49,4 +49,7 @@ set starts its own DRAFT → ... → CERTIFIED cycle.
 - No snapshot producer exists anywhere in the platform yet — every snapshot
   used with this service today must be hand-crafted against
   `internal/domain.SnapshotContent`'s schema.
-- No disclosures, no comparative periods, no real ACC-18 lineage graph walk.
+- No disclosures, no real ACC-18 lineage graph walk. Comparatives are
+  two-period only, against an explicitly named CERTIFIED/PUBLISHED prior set
+  (`GetComparatives` 422 `SOURCE_UNVERIFIED` means the prior isn't certified;
+  `CONTEXT_INVALID` means entity/framework/currency/period don't line up).

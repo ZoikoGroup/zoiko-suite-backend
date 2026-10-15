@@ -43,6 +43,93 @@ func (s *Service) GetStatementFacts(ctx context.Context, tenantID, principalID, 
 	return s.store.GetFacts(ctx, tenantID, setID)
 }
 
+// GetComparatives pairs one statement set's facts with an explicitly named
+// prior set's (ComparativePresentation, two periods only). The prior side
+// must be CERTIFIED or PUBLISHED — an uncertified comparative is not a real
+// comparative, the same fail-closed posture CreateStatementSet takes on its
+// snapshot binding — and must describe the same legal entity, framework and
+// presentation currency, since a side-by-side of anything else is
+// meaningless. The current set may be in any state: preparing a draft
+// against last period's certified figures is the main use.
+func (s *Service) GetComparatives(ctx context.Context, tenantID, principalID, setID, priorSetID string) (*domain.ComparativeStatementView, error) {
+	if priorSetID == "" {
+		return nil, domain.Errf(domain.CodeContextInvalid, "prior_set_id is required")
+	}
+	if priorSetID == setID {
+		return nil, domain.Errf(domain.CodeContextInvalid, "prior_set_id must name a different statement set")
+	}
+	current, err := s.store.GetSet(ctx, tenantID, setID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authz.CheckAllowed(ctx, principalID, current.LegalEntityID, ActionStatementSetView); err != nil {
+		return nil, err
+	}
+	prior, err := s.store.GetSet(ctx, tenantID, priorSetID)
+	if err == domain.ErrStatementSetNotFound {
+		return nil, domain.Errf(domain.CodeNotFound, "prior statement set %q not found", priorSetID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Authorize the prior set at its own entity before reporting any
+	// mismatch, so a 422 never confirms a set exists in an entity the
+	// caller cannot view.
+	if err := s.authz.CheckAllowed(ctx, principalID, prior.LegalEntityID, ActionStatementSetView); err != nil {
+		return nil, err
+	}
+	if prior.LegalEntityID != current.LegalEntityID {
+		return nil, domain.Errf(domain.CodeContextInvalid, "prior set belongs to legal entity %q, not %q", prior.LegalEntityID, current.LegalEntityID)
+	}
+	if prior.Framework != current.Framework {
+		return nil, domain.Errf(domain.CodeContextInvalid, "prior set is reported under framework %q, not %q", prior.Framework, current.Framework)
+	}
+	if prior.PresentationCurrency != current.PresentationCurrency {
+		return nil, domain.Errf(domain.CodeContextInvalid, "prior set is presented in %q, not %q", prior.PresentationCurrency, current.PresentationCurrency)
+	}
+	if prior.MappingVersion != current.MappingVersion {
+		return nil, domain.Errf(domain.CodeContextInvalid, "prior set uses presentation mapping %q, not %q", prior.MappingVersion, current.MappingVersion)
+	}
+	if prior.ReportingPeriod == current.ReportingPeriod {
+		return nil, domain.Errf(domain.CodeContextInvalid, "prior set covers the same reporting period %q; a comparative needs a different period", prior.ReportingPeriod)
+	}
+	if prior.Status != domain.StateCertified && prior.Status != domain.StatePublished {
+		msg := "prior set is %s; a comparative must be CERTIFIED or PUBLISHED"
+		if prior.SupersededBySetID != nil {
+			return nil, domain.Errf(domain.CodeSourceUnverified, msg+" (superseded by %q)", prior.Status, *prior.SupersededBySetID)
+		}
+		return nil, domain.Errf(domain.CodeSourceUnverified, msg, prior.Status)
+	}
+
+	currentFacts, err := s.store.GetFacts(ctx, tenantID, current.StatementSetID)
+	if err != nil {
+		return nil, err
+	}
+	priorFacts, err := s.store.GetFacts(ctx, tenantID, prior.StatementSetID)
+	if err != nil {
+		return nil, err
+	}
+	if len(priorFacts) == 0 {
+		// A certified set always has facts (ValidateStatements requires
+		// them); none here means the read is wrong, not that the prior
+		// period was empty — refuse rather than show every line as new.
+		return nil, domain.Errf(domain.CodeSourceUnverified, "prior set %q has no statement facts", prior.StatementSetID)
+	}
+	statements, err := domain.BuildComparative(currentFacts, priorFacts)
+	if err != nil {
+		return nil, domain.Errf(domain.CodeValidationFailed, "cannot pair statement facts: %v", err)
+	}
+	return &domain.ComparativeStatementView{
+		LegalEntityID:        current.LegalEntityID,
+		Framework:            current.Framework,
+		PresentationCurrency: current.PresentationCurrency,
+		MappingVersion:       current.MappingVersion,
+		Current:              domain.RefFor(current),
+		Prior:                domain.RefFor(prior),
+		Statements:           statements,
+	}, nil
+}
+
 // ExplainedFact is ExplainReportedFact's response: the fact plus the
 // evidence it is traceable to. Full ACC-18 lineage-graph integration is not
 // built (see SPEC_DEVIATIONS.md) — this names the source snapshot and its
