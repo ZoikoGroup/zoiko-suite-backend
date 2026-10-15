@@ -9,16 +9,66 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 	"zoiko.io/consolidation-svc/internal/domain"
 	svcmiddleware "zoiko.io/consolidation-svc/internal/middleware"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 )
 
 type PgStore struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	log         *zap.Logger
+	eventRegion string
 }
 
-func New(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+// Option configures a PgStore.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (config EVENT_RESIDENCY_REGION).
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func New(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// enqueueRunEvent writes one consolidation-run lifecycle event to the
+// transactional outbox inside tx, the transaction that made the change it
+// reports. fact is kebab-case (envelope.New rejects underscores); legacyType
+// is the exact pre-standard event_type existing consumers still filter on.
+// The aggregate is always the run itself — never a general-ledger or
+// intercompany id the run happened to read from.
+func (s *PgStore) enqueueRunEvent(ctx context.Context, tx pgx.Tx, fact, legacyType, tenantID, groupLegalEntityID, runID, actorID, correlationID string, data map[string]any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.consolidation-run." + fact,
+		LegacyType:      legacyType,
+		Service:         "consolidation-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   groupLegalEntityID,
+		AggregateType:   "consolidation-run",
+		AggregateID:     runID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build consolidation-run.%s event: %w", fact, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue consolidation-run.%s event: %w", fact, err)
+	}
+	return nil
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
@@ -44,21 +94,30 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreateRun(ctx context.Context, run *domain.ConsolidationRun) error {
+func (s *PgStore) CreateRun(ctx context.Context, run *domain.ConsolidationRun, actorID, correlationID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO consolidation_runs (
 				consolidation_run_id, tenant_id, group_legal_entity_id, fiscal_period,
 				target_currency, status, exception_count, started_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		`, run.ConsolidationRunID, tenantID, run.GroupLegalEntityID, run.FiscalPeriod,
-			run.TargetCurrency, run.Status, run.ExceptionCount, run.StartedAt)
-		return err
+			run.TargetCurrency, run.Status, run.ExceptionCount, run.StartedAt); err != nil {
+			return err
+		}
+		return s.enqueueRunEvent(ctx, tx, "started", "consolidation.run.started", tenantID, run.GroupLegalEntityID, run.ConsolidationRunID, actorID, correlationID, map[string]any{
+			"consolidation_run_id":  run.ConsolidationRunID,
+			"tenant_id":             tenantID,
+			"group_legal_entity_id": run.GroupLegalEntityID,
+			"fiscal_period":         run.FiscalPeriod,
+			"target_currency":       run.TargetCurrency,
+			"started_at":            run.StartedAt,
+		})
 	})
 }
 
@@ -135,25 +194,56 @@ func (s *PgStore) ListRuns(ctx context.Context, groupLegalEntityID string) ([]do
 	return out, nil
 }
 
-func (s *PgStore) CompleteRun(ctx context.Context, id, status string, exceptionCount int, completedAt time.Time) error {
+// CompleteRun records a run's terminal status. Only a COMPLETED run emits
+// events — exception.detected (when exceptions is non-empty) then completed,
+// the same order and the same condition the handler used to publish them in.
+// A FAILED run has never emitted an event; that is unchanged here.
+func (s *PgStore) CompleteRun(ctx context.Context, id, status string, exceptionCount int, completedAt time.Time, actorID, correlationID string, snapshotCount int, exceptions []string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
 	}
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		res, err := tx.Exec(ctx, `
+		var groupLegalEntityID, fiscalPeriod string
+		err := tx.QueryRow(ctx, `
 			UPDATE consolidation_runs
 			SET status = $1, exception_count = $2, completed_at = $3
 			WHERE consolidation_run_id = $4 AND tenant_id = $5
-		`, status, exceptionCount, completedAt, id, tenantID)
+			RETURNING group_legal_entity_id, fiscal_period
+		`, status, exceptionCount, completedAt, id, tenantID).Scan(&groupLegalEntityID, &fiscalPeriod)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrRunNotFound
+		}
 		if err != nil {
 			return err
 		}
-		if res.RowsAffected() == 0 {
-			return domain.ErrRunNotFound
+		if status != "COMPLETED" {
+			return nil
 		}
-		return nil
+
+		if len(exceptions) > 0 {
+			if err := s.enqueueRunEvent(ctx, tx, "exception-detected", "consolidation.exception.detected", tenantID, groupLegalEntityID, id, actorID, correlationID, map[string]any{
+				"consolidation_run_id":  id,
+				"tenant_id":             tenantID,
+				"group_legal_entity_id": groupLegalEntityID,
+				"fiscal_period":         fiscalPeriod,
+				"exceptions":            exceptions,
+				"timestamp":             time.Now().UTC(),
+			}); err != nil {
+				return err
+			}
+		}
+		return s.enqueueRunEvent(ctx, tx, "completed", "consolidation.completed", tenantID, groupLegalEntityID, id, actorID, correlationID, map[string]any{
+			"consolidation_run_id":  id,
+			"tenant_id":             tenantID,
+			"group_legal_entity_id": groupLegalEntityID,
+			"fiscal_period":         fiscalPeriod,
+			"status":                status,
+			"exception_count":       exceptionCount,
+			"snapshot_count":        snapshotCount,
+			"completed_at":          completedAt,
+		})
 	})
 }
 

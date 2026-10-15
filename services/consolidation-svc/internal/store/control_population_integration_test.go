@@ -71,7 +71,7 @@ func fetchAllContrib(t *testing.T, s *store.PgStore, q domain.BalanceContributio
 
 func TestBalanceContributions_ScopeCurrencyAndExactAmounts(t *testing.T) {
 	pool := popPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 	tenant := uuid.NewString()
 	run := seedRun(t, pool, tenant, "GBP", "COMPLETED")
 	otherRun := seedRun(t, pool, tenant, "USD", "COMPLETED")
@@ -101,7 +101,7 @@ func TestBalanceContributions_ScopeCurrencyAndExactAmounts(t *testing.T) {
 
 func TestBalanceContributions_PagingAndDeclaredTotals(t *testing.T) {
 	pool := popPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 	tenant := uuid.NewString()
 	run := seedRun(t, pool, tenant, "USD", "RUNNING")
 	amounts := []string{"100.1000", "200.2000", "300.3000", "0.0001", "-75.0025"}
@@ -143,7 +143,7 @@ func TestBalanceContributions_PagingAndDeclaredTotals(t *testing.T) {
 
 func TestBalanceContributions_TenantIsolationAndUnknownRun(t *testing.T) {
 	pool := popPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 	tenantA, tenantB := uuid.NewString(), uuid.NewString()
 	run := seedRun(t, pool, tenantA, "USD", "COMPLETED")
 	seedContribution(t, pool, tenantA, run, "child-a", "1000", "10.0000")
@@ -169,7 +169,7 @@ func TestBalanceContributions_TenantIsolationAndUnknownRun(t *testing.T) {
 
 func TestBalanceContributions_EmptyForEntityWithNoContributions(t *testing.T) {
 	pool := popPool(t)
-	s := store.New(pool)
+	s := newTestStore(pool)
 	tenant := uuid.NewString()
 	run := seedRun(t, pool, tenant, "USD", "COMPLETED")
 	seedContribution(t, pool, tenant, run, "child-a", "1000", "10.0000")

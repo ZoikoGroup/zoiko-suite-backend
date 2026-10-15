@@ -20,12 +20,14 @@ const (
 
 const componentColumns = `
 	component_id, tenant_id, legal_entity_id, name, code, component_type,
-	is_taxable, default_amount, currency, description, status, created_at, updated_at`
+	is_taxable, default_amount, currency, description, status, created_at, updated_at,
+	statutory_component, tax_code, pf_contribution_type, esi_coverage, pt_applicable, is_flexible, min_value, max_value`
 
 func scanComponent(row pgx.Row, c *domain.SalaryComponent) error {
 	return row.Scan(
 		&c.ComponentID, &c.TenantID, &c.LegalEntityID, &c.Name, &c.Code, &c.ComponentType,
 		&c.IsTaxable, &c.DefaultAmount, &c.Currency, &c.Description, &c.Status, &c.CreatedAt, &c.UpdatedAt,
+		&c.StatutoryComponent, &c.TaxCode, &c.PFContributionType, &c.ESICoverage, &c.PTApplicable, &c.IsFlexible, &c.MinValue, &c.MaxValue,
 	)
 }
 
@@ -39,10 +41,12 @@ func (s *PgStore) CreateComponent(ctx context.Context, c *domain.SalaryComponent
 		_, err := tx.Exec(ctx, `
 			INSERT INTO salary_components (
 				component_id, tenant_id, legal_entity_id, name, code, component_type,
-				is_taxable, default_amount, currency, description, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				is_taxable, default_amount, currency, description, status, created_at, updated_at,
+				statutory_component, tax_code, pf_contribution_type, esi_coverage, pt_applicable, is_flexible, min_value, max_value
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		`, c.ComponentID, tenantID, c.LegalEntityID, c.Name, c.Code, c.ComponentType,
-			c.IsTaxable, c.DefaultAmount, c.Currency, c.Description, c.Status, c.CreatedAt, c.UpdatedAt)
+			c.IsTaxable, c.DefaultAmount, c.Currency, c.Description, c.Status, c.CreatedAt, c.UpdatedAt,
+			c.StatutoryComponent, c.TaxCode, c.PFContributionType, c.ESICoverage, c.PTApplicable, c.IsFlexible, c.MinValue, c.MaxValue)
 		return err
 	})
 

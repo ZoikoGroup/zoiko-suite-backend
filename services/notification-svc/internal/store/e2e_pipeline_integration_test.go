@@ -19,10 +19,10 @@ import (
 )
 
 type e2eDeliverer struct {
-	delivered    bool
-	response     string
-	lastSent     *domain.Notification
-	sendCalls    int
+	delivered bool
+	response  string
+	lastSent  *domain.Notification
+	sendCalls int
 }
 
 func (d *e2eDeliverer) Deliver(_ context.Context, n domain.Notification) domain.DeliveryOutcome {
@@ -30,10 +30,10 @@ func (d *e2eDeliverer) Deliver(_ context.Context, n domain.Notification) domain.
 	d.lastSent = &n
 	if !d.delivered {
 		return domain.DeliveryOutcome{
-			Delivered:        false,
-			Reason:           "simulated deliverer failure",
-			ProviderName:     "mock-smtp",
-			Retryable:        true,
+			Delivered:    false,
+			Reason:       "simulated deliverer failure",
+			ProviderName: "mock-smtp",
+			Retryable:    true,
 		}
 	}
 	return domain.DeliveryOutcome{
@@ -54,7 +54,7 @@ func (r *e2eResolver) ResolveEmail(_ context.Context, _, _, _ string) (string, e
 // TestE2E_DeliveryPipeline_CompleteFlow tests the full 10-step lifecycle against PostgreSQL:
 // Ingestion -> Policy Evaluation -> Render -> Dispatch -> Webhook Intake -> Ledger Outcome & Suppression.
 func TestE2E_DeliveryPipeline_CompleteFlow(t *testing.T) {
-	pool := openTestPool(t)
+	pool, admin := openTestPools(t)
 	s := store.New(pool)
 	ctx := context.Background()
 	log := zap.NewNop()
@@ -159,7 +159,7 @@ func TestE2E_DeliveryPipeline_CompleteFlow(t *testing.T) {
 
 	// Verify delivery event recorded in ledger table
 	var deliveredEventsCount int
-	err = pool.QueryRow(ctx, "SELECT count(*) FROM delivery_events WHERE tenant_id = $1 AND event_type = 'DELIVERED'", tenantID).Scan(&deliveredEventsCount)
+	err = admin.QueryRow(ctx, "SELECT count(*) FROM delivery_events WHERE tenant_id = $1 AND event_type = 'DELIVERED'", tenantID).Scan(&deliveredEventsCount)
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, deliveredEventsCount, 1, "Ledger must contain DELIVERED delivery event from webhook")
 

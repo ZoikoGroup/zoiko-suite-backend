@@ -36,6 +36,9 @@ type countingStore struct {
 	// failGrantsOnce makes the next FindGrantedActions fail and then clears
 	// itself, for the "errors are not cached" case.
 	failGrantsOnce bool
+
+	entityTenant      string
+	entityTenantCalls int
 }
 
 func (c *countingStore) FindGrantedActions(_ context.Context, _, _, _ string) ([]string, string, error) {
@@ -84,7 +87,7 @@ func (c *countingStore) RecordAccessDecision(_ context.Context, _ domain.RecordA
 func (c *countingStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
 	return &domain.Role{}, true, nil
 }
-func (c *countingStore) SetRoleActive(_ context.Context, _, _ string, _ bool) (*domain.Role, error) {
+func (c *countingStore) SetRoleActive(_ context.Context, _, _ string, _ bool, _ int64) (*domain.Role, error) {
 	return &domain.Role{}, nil
 }
 func (c *countingStore) FindRoleByID(_ context.Context, _ string) (*domain.Role, error) {
@@ -96,7 +99,7 @@ func (c *countingStore) CreatePermissionBundle(_ context.Context, _ domain.Creat
 func (c *countingStore) ListPermissionBundles(_ context.Context, _, _ string) ([]domain.PermissionBundle, error) {
 	return nil, nil
 }
-func (c *countingStore) SetPermissionBundleActive(_ context.Context, _, _ string, _ bool) (*domain.PermissionBundle, error) {
+func (c *countingStore) SetPermissionBundleActive(_ context.Context, _, _ string, _ bool, _ int64) (*domain.PermissionBundle, error) {
 	return &domain.PermissionBundle{}, nil
 }
 func (c *countingStore) CreateRoleAssignment(_ context.Context, _ domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
@@ -126,8 +129,12 @@ func (c *countingStore) RevokeDelegatedAuthority(_ context.Context, _, _ string)
 func (c *countingStore) ProjectDelegation(_ context.Context, _ domain.ProjectDelegationParams) (*domain.DelegatedAuthority, error) {
 	return &domain.DelegatedAuthority{}, nil
 }
-func (c *countingStore) RevokeProjectedDelegation(_ context.Context, _, _, _ string) (*domain.DelegatedAuthority, error) {
+func (c *countingStore) RevokeProjectedDelegation(_ context.Context, _, _, _ string, _ int64) (*domain.DelegatedAuthority, error) {
 	return &domain.DelegatedAuthority{}, nil
+}
+
+func (c *countingStore) FindDelegationCeilings(_ context.Context, _, _, _, _ string) ([]domain.DelegationCeiling, error) {
+	return nil, nil
 }
 func (c *countingStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleParams) (*domain.SoDRule, error) {
 	return &domain.SoDRule{}, nil
@@ -135,13 +142,13 @@ func (c *countingStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleP
 func (c *countingStore) ListSoDRules(_ context.Context, _ string) ([]domain.SoDRule, error) {
 	return nil, nil
 }
-func (c *countingStore) SetSoDRuleActive(_ context.Context, _, _ string, _ bool) (*domain.SoDRule, error) {
+func (c *countingStore) SetSoDRuleActive(_ context.Context, _, _ string, _ bool, _ int64) (*domain.SoDRule, error) {
 	return &domain.SoDRule{}, nil
 }
 func (c *countingStore) CreateABACRule(_ context.Context, _ domain.CreateABACRuleParams) (*domain.ABACRule, error) {
 	return &domain.ABACRule{}, nil
 }
-func (c *countingStore) SetABACRuleActive(_ context.Context, _, _ string, _ bool) (*domain.ABACRule, error) {
+func (c *countingStore) SetABACRuleActive(_ context.Context, _, _ string, _ bool, _ int64) (*domain.ABACRule, error) {
 	return &domain.ABACRule{}, nil
 }
 func (c *countingStore) ListABACRules(_ context.Context, _, _ string) ([]domain.ABACRule, error) {
@@ -191,6 +198,10 @@ func (c *countingStore) ListPrivilegedSessions(_ context.Context, _, _ string, _
 func (c *countingStore) RevokePrivilegedSession(_ context.Context, _, _, _ string) (*domain.PrivilegedSession, error) {
 	return nil, nil
 }
+func (c *countingStore) DecidePrivilegedSession(_ context.Context, _, _, _ string, _ bool) (*domain.PrivilegedSession, error) {
+	return nil, nil
+}
+func (c *countingStore) ReviewSession(_ context.Context, _, _, _, _, _, _ string) error { return nil }
 func (c *countingStore) CreateBreakGlassSession(_ context.Context, params domain.CreateBreakGlassSessionParams) (*domain.BreakGlassSession, error) {
 	return &domain.BreakGlassSession{
 		SessionID:        "bg-stub",
@@ -254,18 +265,6 @@ func (c *countingStore) FindWorkloadBinding(_ context.Context, _, _ string) (*do
 }
 func (c *countingStore) CreateWorkloadBinding(_ context.Context, wb domain.WorkloadBinding) (*domain.WorkloadBinding, error) {
 	return &wb, nil
-}
-func (c *countingStore) CreateAccessReview(_ context.Context, r domain.AccessReview) (*domain.AccessReview, error) {
-	return &r, nil
-}
-func (c *countingStore) GetAccessReview(_ context.Context, _, _ string) (*domain.AccessReview, error) {
-	return nil, nil
-}
-func (c *countingStore) ListAccessReviews(_ context.Context, _, _, _ string) ([]domain.AccessReview, error) {
-	return nil, nil
-}
-func (c *countingStore) RecordAccessReviewDecision(_ context.Context, _, _, _, _, _ string) (*domain.AccessReview, error) {
-	return nil, nil
 }
 
 const (
@@ -403,7 +402,7 @@ func TestCache_WritesInvalidate(t *testing.T) {
 		},
 		{
 			name:            "retiring a role re-reads grants AND delegations",
-			write:           func(c *cache.Store) { _, _ = c.SetRoleActive(ctx, "r-1", tenantA, false) },
+			write:           func(c *cache.Store) { _, _ = c.SetRoleActive(ctx, "r-1", tenantA, false, 0) },
 			wantGrantReread: true,
 			wantDelegReread: true,
 		},
@@ -768,5 +767,67 @@ func TestCache_DisabledCacheStillAcceptsInvalidation(t *testing.T) {
 
 	if inner.principalStatusCalls != 2 {
 		t.Fatalf("status read %d times with caching disabled, want 2", inner.principalStatusCalls)
+	}
+}
+
+// ORG-06 negative case 12: "revoked delegation still cached in authorization
+// path → revoke cache/deny". A revocation, expiry or suspension projected
+// through this process must drop the cached delegations at once, not after the
+// TTL; with a one-minute TTL here, only invalidation can make the second read
+// reach the store.
+func TestCache_RevokedDelegationIsNotServedFromCache(t *testing.T) {
+	ctx := context.Background()
+	inner := &countingStore{actions: []string{"PAYMENT_APPROVE"}, basis: "delegation:d-1"}
+	c := newCache(inner, time.Minute)
+
+	_, _, _ = c.FindDelegatedActions(ctx, "delegate-1", "e-1", tenantA)
+	_, _, _ = c.FindDelegatedActions(ctx, "delegate-1", "e-1", tenantA)
+	if inner.delegateCalls != 1 {
+		t.Fatalf("warm-up: delegations read %d times, want 1 (cached)", inner.delegateCalls)
+	}
+	if _, err := c.RevokeProjectedDelegation(ctx, "delegated-authority-svc", "d-1", tenantA, 2); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _ = c.FindDelegatedActions(ctx, "delegate-1", "e-1", tenantA)
+	if inner.delegateCalls != 2 {
+		t.Errorf("after a revocation the delegation was served from cache (store reads %d, want 2)", inner.delegateCalls)
+	}
+}
+
+
+func (c *countingStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) { return "", nil }
+func (c *countingStore) FindPrincipalTenants(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+func (c *countingStore) FindEntityTenant(_ context.Context, _ string) (string, error) {
+	c.entityTenantCalls++
+	return c.entityTenant, nil
+}
+func (c *countingStore) ProjectEntityStatus(_ context.Context, _ domain.ProjectEntityStatusParams) error {
+	return nil
+}
+
+// An entity's owner never changes, so a positive answer is memoised; an
+// unknown entity is asked again, so entity.created takes effect at once.
+func TestFindEntityTenant_MemoisesOwnerOnly(t *testing.T) {
+	inner := &countingStore{}
+	c := cache.New(inner, time.Minute, zap.NewNop())
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if got, _ := c.FindEntityTenant(ctx, "e-1"); got != "" {
+			t.Fatalf("unknown entity answered %q", got)
+		}
+	}
+	if inner.entityTenantCalls != 2 {
+		t.Fatalf("unknown entity: %d store reads, want 2 (a miss must not be memoised)", inner.entityTenantCalls)
+	}
+	inner.entityTenant = "t-1"
+	for i := 0; i < 3; i++ {
+		if got, _ := c.FindEntityTenant(ctx, "e-1"); got != "t-1" {
+			t.Fatalf("known entity answered %q", got)
+		}
+	}
+	if inner.entityTenantCalls != 3 {
+		t.Fatalf("known entity: %d store reads in total, want 3", inner.entityTenantCalls)
 	}
 }

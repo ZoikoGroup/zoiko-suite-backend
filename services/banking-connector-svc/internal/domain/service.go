@@ -106,7 +106,12 @@ type ConnectionEvent struct {
 type InitiateConnectionParams struct {
 	TenantID, LegalEntityID, BankAccountID, ProviderRef, BankName, Region string
 	RequestedScope                                                        []string
-	CreatedByPrincipalID, CorrelationID                                   string
+	// CorrelationID is the caller-supplied idempotency/dedup key (ON
+	// CONFLICT (tenant_id, correlation_id)). RequestCorrelationID is the
+	// request-tracing correlation id (X-Correlation-ID) carried on the
+	// emitted event — a distinct concern, not reused for the dedup key.
+	CreatedByPrincipalID, CorrelationID string
+	RequestCorrelationID                string
 }
 
 type CompleteConnectionAuthorizationParams struct {

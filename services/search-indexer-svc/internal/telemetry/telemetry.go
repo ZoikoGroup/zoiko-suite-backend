@@ -89,6 +89,13 @@ type Metrics struct {
 	MessagesConsumedTotal *prometheus.CounterVec
 	ProjectionsTotal      *prometheus.CounterVec
 	IndexLagSeconds       *prometheus.HistogramVec
+	// CheckpointLagSeconds is the broker-measured source-to-index lag per
+	// scope as of the last checkpoint sweep (§5.3 "Lag"), and ScopeFreshness
+	// is 1 for the scope's current freshness state and 0 for the others —
+	// §8.3's "alert by freshness class; scope marked LAGGING/STALE" needs a
+	// series that says what the scope is marked, not only how late it is.
+	CheckpointLagSeconds *prometheus.GaugeVec
+	ScopeFreshness       *prometheus.GaugeVec
 
 	// ── §13.1 Restriction lag ────────────────────────────────────────────
 	RestrictionsTotal     *prometheus.CounterVec
@@ -160,6 +167,16 @@ func NewMetrics(serviceName string) *Metrics {
 			ConstLabels: labels,
 			Buckets:     []float64{0.5, 1, 2, 5, 10, 30, 60, 120, 300, 900},
 		}),
+		CheckpointLagSeconds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name:        "search_indexer_checkpoint_lag_seconds",
+			Help:        "Broker-measured source-to-index lag at the last checkpoint, by scope (§5.3).",
+			ConstLabels: labels,
+		}, []string{"scope"}),
+		ScopeFreshness: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name:        "search_indexer_scope_freshness",
+			Help:        "1 for the scope's current freshness state (CURRENT/LAGGING/STALE/UNKNOWN), 0 otherwise.",
+			ConstLabels: labels,
+		}, []string{"scope", "state"}),
 		RestrictionBacklog: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name:        "search_indexer_restriction_backlog",
 			Help:        "Restrictions applied but not yet verified invisible, by scope.",
@@ -210,6 +227,7 @@ func NewMetrics(serviceName string) *Metrics {
 	prometheus.MustRegister(
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp,
 		m.MessagesConsumedTotal, m.ProjectionsTotal, m.IndexLagSeconds,
+		m.CheckpointLagSeconds, m.ScopeFreshness,
 		m.RestrictionsTotal, m.RestrictionLagSeconds, m.RestrictionBacklog,
 		m.RetrievalDecisionsTotal, m.AuthzDecisionsTotal,
 		m.SearchesTotal, m.SearchDurationSecs, m.SearchZeroResults, m.QueryRejectionsTotal,
@@ -257,8 +275,22 @@ func NewMetrics(serviceName string) *Metrics {
 	// A rate() over a code that has never fired evaluates against no series at
 	// all rather than against zero — silent through exactly the enumeration
 	// attempt it exists to catch.
-	for _, code := range []string{"ESR-003", "ESR-004", "ESR-005", "ESR-006", "ESR-015"} {
+	// ESR-012 / ESR-018 / ESR-019 are the server-state refusals an
+	// availability alert is written against (stale index, failing restriction
+	// lane, embedding provider down).
+	for _, code := range []string{"ESR-003", "ESR-004", "ESR-005", "ESR-006", "ESR-015",
+		"ESR-012", "ESR-018", "ESR-019"} {
 		m.QueryRejectionsTotal.WithLabelValues("bootstrap", code)
+	}
+	// Gauges too. The restriction backlog and the freshness gauges are only
+	// set per LIVE scope, so a service with none — a fresh deployment, or one
+	// whose only scope is mid-rebuild — exposed no series at all, and an alert
+	// on "backlog > 0" or "freshness STALE" had nothing to evaluate (found by
+	// scripts/audit.sh against the live stack, 30 Sep 2026).
+	m.RestrictionBacklog.WithLabelValues("bootstrap").Set(0)
+	m.CheckpointLagSeconds.WithLabelValues("bootstrap").Set(0)
+	for _, state := range []string{"CURRENT", "LAGGING", "STALE", "UNKNOWN"} {
+		m.ScopeFreshness.WithLabelValues("bootstrap", state).Set(0)
 	}
 	for _, state := range []string{"BUILDING", "VALIDATING", "READY", "ACTIVE", "FAILED", "RETIRED"} {
 		m.GenerationTransitions.WithLabelValues("bootstrap", state)
@@ -349,3 +381,16 @@ func newDiscardResponseWriter() *discardResponseWriter {
 func (d *discardResponseWriter) Header() http.Header         { return d.header }
 func (d *discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
 func (d *discardResponseWriter) WriteHeader(int)             {}
+
+// ObserveFreshness records a scope's checkpoint: its lag, and a one-hot
+// freshness state so exactly one of the four series reads 1.
+func (m *Metrics) ObserveFreshness(scope, state string, lagSeconds float64) {
+	m.CheckpointLagSeconds.WithLabelValues(scope).Set(lagSeconds)
+	for _, s := range []string{"CURRENT", "LAGGING", "STALE", "UNKNOWN"} {
+		v := 0.0
+		if s == state {
+			v = 1
+		}
+		m.ScopeFreshness.WithLabelValues(scope, s).Set(v)
+	}
+}

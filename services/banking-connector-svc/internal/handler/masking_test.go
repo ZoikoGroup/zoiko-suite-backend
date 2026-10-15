@@ -36,7 +36,7 @@ func TestMaskDigits(t *testing.T) {
 // a read API, since the caller of GetConnectionByID may be a different
 // principal in the same tenant than whoever created the connection.
 func TestGetConnectionByID_MasksAccountNumberAndIBAN(t *testing.T) {
-	r, _ := setupTestRouter(t)
+	r := setupTestRouter(t)
 
 	connID := createConnectionAs(t, r, "tenant-mask", "le-mask")
 
@@ -70,7 +70,7 @@ func TestGetConnectionByID_MasksAccountNumberAndIBAN(t *testing.T) {
 // check for the list route, including both the "connections" and
 // "accounts" response keys the route repeats the same rows under.
 func TestListConnections_MasksAccountNumberAndIBAN(t *testing.T) {
-	r, _ := setupTestRouter(t)
+	r := setupTestRouter(t)
 
 	createConnectionAs(t, r, "tenant-mask-list", "le-mask-list")
 
@@ -114,7 +114,7 @@ func TestListConnections_MasksAccountNumberAndIBAN(t *testing.T) {
 // principal who just sent it would add no security benefit while breaking
 // any client that expects to see what it sent.
 func TestCreateConnection_ResponseNotMasked(t *testing.T) {
-	r, _ := setupTestRouter(t)
+	r := setupTestRouter(t)
 
 	body, _ := json.Marshal(domain.CreateConnectionRequest{
 		LegalEntityID: "le-create-unmasked",

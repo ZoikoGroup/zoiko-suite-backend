@@ -100,7 +100,7 @@ func (h *Handler) CreateAuditEngagement(w http.ResponseWriter, r *http.Request) 
 	if h.refuseForeignTenant(w, req.TenantID, tenantID) {
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, req.LegalEntityID, actionAuditEngagementCreate); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, req.LegalEntityID, actionAuditEngagementCreate, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -137,7 +137,7 @@ func (h *Handler) GetAuditEngagement(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementRead, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -176,7 +176,7 @@ func (h *Handler) SubmitAuditEngagementAcceptance(w http.ResponseWriter, r *http
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementAccept); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementAccept, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -265,7 +265,7 @@ func (h *Handler) AmendAuditEngagementScope(w http.ResponseWriter, r *http.Reque
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -301,7 +301,7 @@ func (h *Handler) GetCompletionGates(w http.ResponseWriter, r *http.Request) {
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementRead); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementRead, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -358,7 +358,7 @@ func (h *Handler) transitionWithGate(w http.ResponseWriter, r *http.Request, sta
 		h.writeAuditEngagementErr(w, err)
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementManage); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementManage, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}
@@ -408,7 +408,7 @@ func (h *Handler) transitionAuditEngagement(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_acceptance_forbidden"})
 		return
 	}
-	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, action); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, action, ""); err != nil {
 		h.writeAuditEngagementAuthzErr(w, err)
 		return
 	}

@@ -54,9 +54,10 @@ func InitTracing(ctx context.Context, serviceName, otlpEndpoint string) (func(co
 }
 
 type Metrics struct {
-	HTTPRequestsTotal   *prometheus.CounterVec
-	HTTPRequestDuration *prometheus.HistogramVec
-	ReadinessUp         prometheus.Gauge
+	HTTPRequestsTotal      *prometheus.CounterVec
+	HTTPRequestDuration    *prometheus.HistogramVec
+	ReadinessUp            prometheus.Gauge
+	EventPublishFailures   *prometheus.CounterVec
 }
 
 func NewMetrics(serviceName string) *Metrics {
@@ -77,8 +78,13 @@ func NewMetrics(serviceName string) *Metrics {
 			Help:        "1 if the last /readyz check succeeded, 0 otherwise.",
 			ConstLabels: prometheus.Labels{"service": serviceName},
 		}),
+		EventPublishFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "event_publish_failures_total",
+			Help:        "Total event publish failures by event type.",
+			ConstLabels: prometheus.Labels{"service": serviceName},
+		}, []string{"event_type"}),
 	}
-	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp)
+	prometheus.MustRegister(m.HTTPRequestsTotal, m.HTTPRequestDuration, m.ReadinessUp, m.EventPublishFailures)
 	return m
 }
 

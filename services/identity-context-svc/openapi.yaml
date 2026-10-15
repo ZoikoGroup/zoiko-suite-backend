@@ -462,6 +462,9 @@ components:
       properties:
         support_context_id:
           type: string
+        approval_status:
+          type: string
+          enum: [PENDING_APPROVAL, APPROVED]
         expires_at:
           type: string
           format: date-time
@@ -862,17 +865,6 @@ paths:
             mode admits reads, so the guard is in the handler.
           schema:
             type: string
-        - name: X-Correlation-ID
-          in: header
-          required: true
-          description: |
-            MANDATORY on GOV-01 queries. ZS-SVC-A-001 §4 marks every query
-            "Read-only; scoped; correlation required"; a governance read that
-            cannot be traced to the story that caused it is refused 400. The
-            envelope middleware parses this header but its default write-strict
-            mode admits reads, so the guard is in the handler.
-          schema:
-            type: string
       responses:
         "200":
           description: The recorded account of the resolution
@@ -1004,11 +996,17 @@ paths:
 
   /v1/context/support:
     post:
-      summary: Attach a support context (GOV-01 AttachSupportContext, privileged)
+      summary: Request a support context (GOV-01 AttachSupportContext, privileged)
       operationId: attachSupportContext
       description: |
-        Grants a scoped, time-limited, independently-approved elevation letting
+        Requests a scoped, time-limited, independently-approved elevation letting
         a support principal operate inside a customer tenant.
+
+        **A request, not a grant (since 7 Oct 2026, gap S1-1).** It is recorded
+        `PENDING_APPROVAL` and grants nothing until the approver it names calls
+        `POST /v1/context/support/{supportContextId}/approve` themselves.
+        Naming an approver used to BE the approval: the named principal never
+        consented and need not exist. The caller may not name themselves.
 
         **This is not a role and grants no permissions.** It makes a support
         principal's session resolvable in a tenant they do not belong to, with
@@ -1022,7 +1020,7 @@ paths:
         |---|---|
         | scoped | `tenant_id`, optional `subject_principal_id` |
         | time-limited | `ttl_seconds`, refused above SUPPORT_CONTEXT_MAX_TTL_SECONDS |
-        | independently approved | `approver_principal_id` differs from grantee; GOV-04 conflict check |
+        | independently approved | the named approver's own approve call; requester and grantee refused; GOV-04 asked at request and approval |
         | fully evidenced | `reason_code`, `justification`, `ticket_ref`, returned `evidence_id` |
         | followed by review | reconciler reports expired-and-unreviewed grants |
 
@@ -1050,15 +1048,15 @@ paths:
             schema:
               $ref: "#/components/schemas/AttachSupportContextRequest"
       responses:
-        "201":
-          description: Elevation granted
+        "202":
+          description: Recorded PENDING_APPROVAL; nothing is granted until the named approver approves.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AttachSupportContextResponse"
         "400":
           description: |
-            Self-approval, a TTL above the maximum, an unrecognised reason
+            Self-approval (the grantee or the caller named as approver), a TTL above the maximum, an unrecognised reason
             code, a justification under the minimum length, or a missing
             ticket reference. error_code is BREAK_GLASS_REQUIRED.
         "401":
@@ -1142,6 +1140,61 @@ paths:
           description: Revoked, or already revoked
         "404":
           description: Not found in this tenant
+
+  /v1/context/support/{supportContextId}/approve:
+    post:
+      summary: Approve a pending support request (the approver's own act)
+      operationId: approveSupportContext
+      description: |
+        GOV-01 §1 "independently approved" (gap S1-1 / R-2). Only the approver
+        the request names may approve it; its requester or grantee is refused
+        `403 SOD_CONFLICT`, anyone else `403 AUTHORIZATION_DENIED`. GOV-04 is
+        asked again with the approver who actually acted. The window starts
+        now, so time spent waiting is not time the grant was usable, and the
+        attached event and the CRITICAL SIEM signal go out here. A request not
+        approved within the approval window (1 h) lapses.
+
+        Requires `IDENTITY_SUPPORT_CONTEXT_APPROVE` in the target tenant (its
+        own action: the right to request must not imply the right to approve).
+      parameters:
+        - name: supportContextId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          description: The TARGET tenant of the request.
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Approved; the grant is live until expires_at.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttachSupportContextResponse"
+        "403":
+          description: The requester or grantee (SOD_CONFLICT), or not the named approver (AUTHORIZATION_DENIED), or no approve grant.
+        "404":
+          description: No such request in this tenant, or revoked.
+        "409":
+          description: Already approved (BREAK_GLASS_REQUIRED), the approval window lapsed (BREAK_GLASS_EXPIRED), or a GOV-04 conflict (SOD_CONFLICT).
+        "503":
+          description: GOV-04 could not be reached; nothing was granted.
+        "501":
+          description: Support context is not configured in this deployment
 
   /v1/context/support/{supportContextId}/review:
     post:

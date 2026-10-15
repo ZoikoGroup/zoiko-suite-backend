@@ -15,6 +15,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
+	svcenvelope "zoiko.io/board-resolutions-svc/internal/envelope"
 )
 
 // Sentinel errors. Callers must fail closed: any error returned means the
@@ -91,7 +94,32 @@ func (c *Client) EvaluateSufficient(ctx context.Context, tenantID, legalEntityID
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
 	req.Header.Set("X-Correlation-ID", correlationID)
+
+	// evidence-requirements-svc validates the same canonical envelope contract
+	// this service does and answers 401 envelope_incomplete without it. A
+	// non-200 is treated as unavailable below, so an unforwarded envelope
+	// turned every pass attempt into a misleading "unavailable" refusal
+	// instead of the fixable validation error it actually was. Same defect,
+	// same fix as internal/authz.Client.checkAllowedLive.
+	evidenceRequestID := middleware.GetReqID(ctx)
+	evidenceSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.RequestID != "" {
+			evidenceRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			evidenceSourceChannel = string(env.SourceChannel)
+		}
+	}
+	req.Header.Set("X-Request-Id", evidenceRequestID)
+	req.Header.Set("X-Source-Channel", evidenceSourceChannel)
+	// One evaluation per (request, correlation): correlationID already
+	// distinguishes a genuine retry from a distinct attempt (see the caller's
+	// comment on why it is never defaulted to the resolution's own ID), so it
+	// doubles as the idempotency key here rather than minting a third value.
+	req.Header.Set("Idempotency-Key", correlationID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

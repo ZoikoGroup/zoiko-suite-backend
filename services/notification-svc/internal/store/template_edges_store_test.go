@@ -56,7 +56,7 @@ func version(t *testing.T, s *store.PgStore, ctx context.Context, stage string) 
 // F-08 / TC-02: the database refuses an illegal status change even when the SQL
 // supplies all the evidence the legal change would, so only the EDGE is at issue.
 func TestTemplateVersion_DatabaseRefusesIllegalStatusEdges(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	ctx := tenantCtx("tenant-edges")
 	bg := context.Background()
@@ -100,7 +100,7 @@ func TestTemplateVersion_DatabaseRefusesIllegalStatusEdges(t *testing.T) {
 
 // The edges the store uses all still work, including supersession and retirement.
 func TestTemplateVersion_LegalLifecycleStillWorks(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	ctx := tenantCtx("tenant-edges-ok")
 
@@ -135,7 +135,7 @@ func TestTemplateVersion_LegalLifecycleStillWorks(t *testing.T) {
 
 // F-07 / NP-07: a variable the version does not declare is refused, not ignored.
 func TestRenderPreview_RefusesUndeclaredVariables(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	ctx := tenantCtx("tenant-edges-vars")
 	v := version(t, s, ctx, "PUBLISHED")
@@ -154,7 +154,7 @@ func TestRenderPreview_RefusesUndeclaredVariables(t *testing.T) {
 }
 
 func TestMigration000017_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000017_template_version_status_edges.down.sql", "000017_template_version_status_edges.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		if err != nil {

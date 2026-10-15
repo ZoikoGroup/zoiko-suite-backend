@@ -67,7 +67,7 @@ func (a *cpAuthz) CheckAllowed(_ context.Context, _, entity, action string) erro
 func (a *cpAuthz) CheckAllowedOwnObject(_ context.Context, _, _, _, _ string) error { return a.err }
 
 func cpRouter(st *cpStore, az *cpAuthz) chi.Router {
-	h := handler.New(st, &stubPublisher{}, az, newStubParty(), zap.NewNop())
+	h := handler.New(st, az, newStubParty(), zap.NewNop())
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)

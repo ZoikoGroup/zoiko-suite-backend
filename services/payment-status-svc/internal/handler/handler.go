@@ -13,7 +13,6 @@ import (
 
 	authzpkg "zoiko.io/payment-status-svc/internal/authz"
 	"zoiko.io/payment-status-svc/internal/domain"
-	"zoiko.io/payment-status-svc/internal/events"
 	svcmiddleware "zoiko.io/payment-status-svc/internal/middleware"
 	"zoiko.io/payment-status-svc/internal/store"
 	"zoiko.io/payment-status-svc/internal/webhook"
@@ -38,14 +37,13 @@ type AuthzChecker interface {
 
 type Handler struct {
 	store         store.Store
-	pub           events.Publisher
 	authz         AuthzChecker
 	webhookSecret []byte
 	log           *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, webhookSecret string, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, webhookSecret: []byte(webhookSecret), log: log}
+func New(st store.Store, az AuthzChecker, webhookSecret string, log *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, webhookSecret: []byte(webhookSecret), log: log}
 }
 
 // RegisterRoutes registers every route directly on r. tenantMiddleware is
@@ -139,17 +137,13 @@ func (h *Handler) RecordPaymentStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
-	created, err := h.store.RecordPaymentStatus(r.Context(), verifiedTenant, req, principalID)
+	created, err := h.store.RecordPaymentStatus(r.Context(), verifiedTenant, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		h.log.Error("RecordPaymentStatus: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: "PAYMENT_EXECUTION_STATE_RECORDED", EntityID: created.PaymentID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: created,
-	})
 	writeJSON(w, http.StatusCreated, created)
 }
 
@@ -244,7 +238,7 @@ func (h *Handler) ProcessProviderCallback(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	updated, applied, err := h.store.ApplyCallbackStatus(r.Context(), payload.PaymentID, payload, eventTypeFor(payload.ReportedStatus), "PROVIDER_CALLBACK", "provider-callback")
+	updated, applied, err := h.store.ApplyCallbackStatus(r.Context(), payload.PaymentID, payload, eventTypeFor(payload.ReportedStatus), "PROVIDER_CALLBACK", "provider-callback", payload.ProviderEventRef, true)
 	if err != nil {
 		if errors.Is(err, domain.ErrPaymentNotFound) {
 			writeError(w, http.StatusNotFound, "payment execution state not found")
@@ -255,12 +249,6 @@ func (h *Handler) ProcessProviderCallback(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if applied {
-		_ = h.pub.Publish(r.Context(), events.PublishParams{
-			EventType: eventTypeFor(payload.ReportedStatus), EntityID: updated.PaymentID,
-			CorrelationID: payload.ProviderEventRef, Payload: updated,
-		})
-	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"payment": updated, "applied": applied})
 }
 
@@ -306,37 +294,11 @@ func (h *Handler) LinkStatementConfirmation(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	updated, conflict, err := h.store.LinkStatement(r.Context(), paymentID, req, principalID)
+	updated, conflict, err := h.store.LinkStatement(r.Context(), paymentID, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		h.log.Error("LinkStatementConfirmation: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
-	}
-
-	// Publish the conflict event when a new conflict is raised. bank-reconciliation-svc
-	// consumes this event to create an evidence_conflict record. The payload carries
-	// BNK-05 correlation fields so the consumer can correlate without fuzzy matching.
-	if conflict {
-		tenantID := ""
-		if updated.TenantID != nil {
-			tenantID = *updated.TenantID
-		}
-		_ = h.pub.Publish(r.Context(), events.PublishParams{
-			EventType:     domain.EventPaymentStatusConflictRaised,
-			EntityID:      paymentID,
-			TenantID:      tenantID,
-			ActorID:       principalID,
-			CorrelationID: r.Header.Get("X-Correlation-ID"),
-			Payload: map[string]interface{}{
-				"payment_id":          paymentID,
-				"statement_line_id":   req.StatementLineID,
-				"provider_request_id": updated.ProviderRequestID,
-				"bank_rec_status":     req.BankRecStatus,
-				"reported_status":     req.ReportedStatus,
-				"current_status":      updated.Status,
-				"statement_reference": req.StatementReference,
-			},
-		})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"payment": updated, "conflict_raised": conflict})
@@ -377,7 +339,7 @@ func (h *Handler) ResolveStatusConflict(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	updated, err := h.store.ResolveConflict(r.Context(), paymentID, req, principalID)
+	updated, err := h.store.ResolveConflict(r.Context(), paymentID, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "payment has no open conflict to resolve")
@@ -388,18 +350,6 @@ func (h *Handler) ResolveStatusConflict(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	tenantID := ""
-	if updated.TenantID != nil {
-		tenantID = *updated.TenantID
-	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType:     domain.EventPaymentStatusConflictResolved,
-		EntityID:      paymentID,
-		TenantID:      tenantID,
-		ActorID:       principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"),
-		Payload:       updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -450,10 +400,6 @@ func (h *Handler) RecordReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPaymentReturned, EntityID: updated.PaymentID, ActorID: principalID,
-		CorrelationID: req.ProviderEventRef, Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -481,7 +427,7 @@ func (h *Handler) CancelPaymentWhereSupported(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	updated, err := h.store.CancelPayment(r.Context(), paymentID, req, principalID)
+	updated, err := h.store.CancelPayment(r.Context(), paymentID, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "payment can no longer be cancelled")
@@ -492,14 +438,6 @@ func (h *Handler) CancelPaymentWhereSupported(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Wave 8b: previously recorded to status_events (via CancelPayment's
-	// own recordEvent call) but never published to the event bus — any
-	// consumer subscribed to this service's events topic never learned a
-	// payment was cancelled.
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPaymentCancelled, EntityID: updated.PaymentID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -546,7 +484,11 @@ func (h *Handler) PollPaymentStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, applied, err := h.store.ApplyCallbackStatus(r.Context(), paymentID, payload, eventTypeFor(payload.ReportedStatus), "MANUAL_POLL", principalID)
+	// emitEvent=false: PollPaymentStatus never published an event in the
+	// old dual-write (see ApplyCallbackStatus's own doc comment) — this
+	// fix must not silently start emitting events for a path that never
+	// did, which would be a scope expansion past the dual-write bug.
+	updated, applied, err := h.store.ApplyCallbackStatus(r.Context(), paymentID, payload, eventTypeFor(payload.ReportedStatus), "MANUAL_POLL", principalID, "", false)
 	if err != nil {
 		if errors.Is(err, domain.ErrPaymentNotFound) {
 			writeError(w, http.StatusNotFound, "payment execution state not found")

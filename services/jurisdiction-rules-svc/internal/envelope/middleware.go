@@ -1,10 +1,11 @@
 package envelope
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
 	"strings"
+
+	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 )
 
 // Mode controls what Middleware does with a request that fails §4.
@@ -110,27 +111,24 @@ func enforced(mode Mode, isWrite bool) bool {
 	}
 }
 
-// writeViolation renders the refusal in the shape the platform's error bodies
-// already use — {"error", "detail"} — with the per-field violations alongside.
+// writeViolation renders the refusal as an RFC 9457 problem (API standard §12),
+// carrying each unmet §4 obligation as an `errors[]` entry located by JSON
+// Pointer.
 //
-// The array is deliberately not folded into detail. The Next.js console's
-// readErrorDetail concatenates error/field/message/detail into one string, and
-// schema-registry-svc already showed what that costs when the structure is the
-// point: a caller cannot tell which of five headers it is missing from a folded
-// sentence. Keeping violations structured lets the console list them.
+// The per-field detail is deliberately not folded into a single sentence. The
+// Next.js console's readErrorDetail concatenates error/field/message/detail
+// into one string, and schema-registry-svc already showed what that costs when
+// the structure is the point: a caller cannot tell which of five headers it is
+// missing from a folded sentence. Keeping them structured lets the console
+// list them.
 func writeViolation(w http.ResponseWriter, err *ValidationError) {
-	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Envelope-Contract", "violated")
-	w.WriteHeader(StatusFor(err))
-	_ = json.NewEncoder(w).Encode(struct {
-		Error      string      `json:"error"`
-		Detail     string      `json:"detail"`
-		Service    string      `json:"service,omitempty"`
-		Violations []Violation `json:"violations"`
-	}{
-		Error:      "envelope_incomplete",
-		Detail:     err.Error(),
-		Service:    err.Service,
-		Violations: err.Violations,
-	})
+	p := problem.New(StatusFor(err), "envelope_incomplete", err.Error())
+	for _, v := range err.Violations {
+		p.Field("#/"+v.Field, "violation", v.Header+": "+v.Reason)
+	}
+	if err.Service != "" {
+		p.With("service", err.Service)
+	}
+	problem.Write(w, p)
 }

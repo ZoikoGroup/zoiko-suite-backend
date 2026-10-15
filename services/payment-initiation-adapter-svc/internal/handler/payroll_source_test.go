@@ -24,7 +24,7 @@ func (p *stubPayroll) VerifyInstructionFingerprint(_ context.Context, _, _, _ st
 }
 
 func newPayrollRouter(payroll clients.PayrollClient) chi.Router {
-	h := handler.New(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(), &stubTreasury{}, &stubAuthorization{}, zap.NewNop())
+	h := handler.New(newStubStore(), &stubAuthz{}, provideradapter.NewStubProviderAdapter(), &stubTreasury{}, &stubAuthorization{}, zap.NewNop())
 	if payroll != nil {
 		h.WithPayroll(payroll)
 	}

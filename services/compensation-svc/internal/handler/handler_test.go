@@ -77,8 +77,8 @@ func (s *stubStore) CreateWageRevision(_ context.Context, rev *domain.WageRevisi
 		}
 	}
 	for _, r := range s.revisions {
-		if r.EmployeeID == rev.EmployeeID && r.Status == "ACTIVE" {
-			r.Status = "SUPERSEDED"
+		if r.EmployeeID == rev.EmployeeID && r.Status == domain.WageRevisionStatusActive {
+			r.Status = domain.WageRevisionStatusSuperseded
 			r.EffectiveTo = &rev.EffectiveFrom
 		}
 	}
@@ -91,7 +91,7 @@ func (s *stubStore) CreateWageRevision(_ context.Context, rev *domain.WageRevisi
 
 func (s *stubStore) GetActiveWageRevision(_ context.Context, employeeID string) (*domain.WageRevision, error) {
 	for _, r := range s.revisions {
-		if r.EmployeeID == employeeID && r.Status == "ACTIVE" {
+		if r.EmployeeID == employeeID && r.Status == domain.WageRevisionStatusActive {
 			return r, nil
 		}
 	}
@@ -135,10 +135,10 @@ func (s *stubStore) ApproveBonusGrant(_ context.Context, grantID, approvedBy str
 	if !ok {
 		return domain.ErrBonusNotFound
 	}
-	if b.Status != "PENDING" {
+	if b.Status != domain.BonusStatusPending {
 		return domain.ErrInvalidBonusStatus
 	}
-	b.Status = "APPROVED"
+	b.Status = domain.BonusStatusApproved
 	b.ApprovedBy = &approvedBy
 	return nil
 }
@@ -149,7 +149,7 @@ func (s *stubStore) ListBonusGrants(_ context.Context, employeeID, status string
 		if employeeID != "" && b.EmployeeID != employeeID {
 			continue
 		}
-		if status != "" && b.Status != status {
+		if status != "" && b.Status != domain.BonusStatus(status) {
 			continue
 		}
 		out = append(out, *b)
@@ -303,13 +303,13 @@ func TestReviseWage_EffectiveDatedLineage(t *testing.T) {
 	if rev2.Amount != 110000.0 {
 		t.Errorf("expected amount 110000 got %f", rev2.Amount)
 	}
-	if rev2.Status != "ACTIVE" {
+	if rev2.Status != domain.WageRevisionStatusActive {
 		t.Errorf("expected v2 status ACTIVE got %q", rev2.Status)
 	}
 
 	// Verify v1 status was set to SUPERSEDED and effective_to updated
 	oldRev, _ := s.revisions[rev1.RevisionID]
-	if oldRev.Status != "SUPERSEDED" {
+	if oldRev.Status != domain.WageRevisionStatusSuperseded {
 		t.Errorf("expected v1 status SUPERSEDED got %q", oldRev.Status)
 	}
 
@@ -341,7 +341,7 @@ func TestGrantAndApproveBonus_Success(t *testing.T) {
 
 	var grant domain.BonusGrant
 	_ = json.NewDecoder(rrGrant.Body).Decode(&grant)
-	if grant.Status != "PENDING" {
+	if grant.Status != domain.BonusStatusPending {
 		t.Errorf("expected PENDING got %q", grant.Status)
 	}
 
@@ -356,7 +356,7 @@ func TestGrantAndApproveBonus_Success(t *testing.T) {
 
 	var approvedGrant domain.BonusGrant
 	_ = json.NewDecoder(rrApprove.Body).Decode(&approvedGrant)
-	if approvedGrant.Status != "APPROVED" {
+	if approvedGrant.Status != domain.BonusStatusApproved {
 		t.Errorf("expected APPROVED got %q", approvedGrant.Status)
 	}
 

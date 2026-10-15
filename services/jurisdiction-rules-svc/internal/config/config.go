@@ -21,6 +21,10 @@ type Config struct {
 	// No service self-authorizes (doctrine).
 	AuthZServiceURL string
 
+	// AuthZAllowStub opts in to the permit-all StubAuthZClient. Honoured only
+	// with ENV=local; any other ENV refuses to start with it set.
+	AuthZAllowStub bool
+
 	// AuthZPlatformScopeID is the legal_entity_id this service presents to
 	// authorization-svc when asking for a decision.
 	//
@@ -93,6 +97,11 @@ type KafkaConfig struct {
 	Brokers []string
 	GroupID string
 	Topic   string
+
+	// EntityTopic is tenant-entity-registry-svc's topic, consumed for
+	// entity.created and entity.jurisdiction.changed (Doc 03 §8.2). Empty
+	// disables the consumer.
+	EntityTopic string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -129,12 +138,14 @@ func Load() (*Config, error) {
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
 		Kafka: KafkaConfig{
-			Brokers: envList("KAFKA_BROKERS", []string{"localhost:9092"}),
-			GroupID: env("KAFKA_GROUP_ID", "jurisdiction-rules-svc"),
-			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.jurisdiction.events"),
+			Brokers:     envList("KAFKA_BROKERS", []string{"localhost:9092"}),
+			GroupID:     env("KAFKA_GROUP_ID", "jurisdiction-rules-svc"),
+			Topic:       env("KAFKA_EVENTS_TOPIC", "zoiko.jurisdiction.events"),
+			EntityTopic: env("KAFKA_ENTITY_TOPIC", "zoiko.entity.events"),
 		},
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
+		AuthZAllowStub:       env("AUTHZ_ALLOW_STUB", "false") == "true",
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
@@ -208,6 +219,10 @@ func (c *Config) validate() error {
 	// refuse to start rather than discover it at the first release.
 	if (c.PackSigningKeyRef == "") != (c.PackSigningKeyFile == "") {
 		return fmt.Errorf("PACK_SIGNING_KEY_REF and PACK_SIGNING_KEY_FILE must be set together")
+	}
+
+	if c.AuthZAllowStub && !strings.EqualFold(c.Env, "local") {
+		return fmt.Errorf("AUTHZ_ALLOW_STUB=true is only permitted with ENV=local, got ENV=%q: the stub permits every admin write", c.Env)
 	}
 
 	isProdOrStaging := strings.EqualFold(c.Env, "production") || strings.EqualFold(c.Env, "staging")

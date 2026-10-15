@@ -10,6 +10,7 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
+	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -41,8 +42,8 @@ func (h *Handler) writeCompileError(w http.ResponseWriter, err error, corr strin
 	var cf *store.CompileFailure
 	switch {
 	case errors.As(err, &cf):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-			"error": "compile_failed", "message": "the pack has errors and no artifact was produced", "report": cf.Report})
+		problem.Write(w, problem.New(http.StatusUnprocessableEntity, "compile_failed",
+			"the pack has errors and no artifact was produced").With("report", cf.Report))
 	case errors.Is(err, domain.ErrNotUnderReview):
 		writeError(w, http.StatusConflict, "not_under_review", err.Error())
 	case errors.Is(err, domain.ErrAlreadyCompiled):

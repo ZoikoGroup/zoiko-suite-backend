@@ -17,12 +17,12 @@ import (
 // Rates represent value relative to GBP base (1 unit of currency = X GBP).
 var StandardReferenceFXRates = map[string]float64{
 	"GBP": 1.0,
-	"USD": 0.78,    // 1 USD = 0.78 GBP
-	"EUR": 0.85,    // 1 EUR = 0.85 GBP
-	"CAD": 0.58,    // 1 CAD = 0.58 GBP
-	"AUD": 0.51,    // 1 AUD = 0.51 GBP
-	"JPY": 0.0052,  // 1 JPY = 0.0052 GBP
-	"CHF": 0.89,    // 1 CHF = 0.89 GBP
+	"USD": 0.78,   // 1 USD = 0.78 GBP
+	"EUR": 0.85,   // 1 EUR = 0.85 GBP
+	"CAD": 0.58,   // 1 CAD = 0.58 GBP
+	"AUD": 0.51,   // 1 AUD = 0.51 GBP
+	"JPY": 0.0052, // 1 JPY = 0.0052 GBP
+	"CHF": 0.89,   // 1 CHF = 0.89 GBP
 }
 
 // evaluateAuthorityLimits evaluates monetary limits and currency conversion for the request (Phase 3.6 & 3.7, Scenario A09).
@@ -110,7 +110,7 @@ func (h *Handler) evaluateAuthorityLimits(ctx context.Context, in evalContext, e
 	fxConversionApplied := false
 
 	if currenciesDiffer {
-		rate, rateFound := resolveFXRate(reqCurrency, limitCurrency, in.Attributes)
+		rate, rateFound := resolveFXRate(reqCurrency, limitCurrency)
 		if !rateFound {
 			// Fail-closed when no deterministic FX conversion basis exists
 			return true, "authority_limit:currency_conversion_missing",
@@ -335,20 +335,15 @@ func selectEffectiveLimit(limits []domain.AuthorityLimit) domain.AuthorityLimit 
 	return limits[bestIdx]
 }
 
-func resolveFXRate(fromCurrency, toCurrency string, attrs map[string]string) (float64, bool) {
-	if attrs != nil {
-		if rateStr := attrs["fx_rate"]; rateStr != "" {
-			if r, err := strconv.ParseFloat(rateStr, 64); err == nil && r > 0 {
-				return r, true
-			}
-		}
-		if rateStr := attrs["exchange_rate"]; rateStr != "" {
-			if r, err := strconv.ParseFloat(rateStr, 64); err == nil && r > 0 {
-				return r, true
-			}
-		}
-	}
-
+// resolveFXRate converts with the platform's reference rates ONLY.
+//
+// It used to honour an fx_rate / exchange_rate supplied in the request's
+// attributes first — by the caller whose amount is being checked. A caller
+// could send fx_rate=0.0001 and bring any amount under any limit: the limit
+// was whatever the caller said it was. A request-supplied rate is now ignored
+// (decision 5 Oct 2026); a pair the reference table cannot convert fails closed
+// in the caller, as it always did.
+func resolveFXRate(fromCurrency, toCurrency string) (float64, bool) {
 	// Look up in StandardReferenceFXRates
 	rateFrom, okFrom := StandardReferenceFXRates[fromCurrency]
 	rateTo, okTo := StandardReferenceFXRates[toCurrency]

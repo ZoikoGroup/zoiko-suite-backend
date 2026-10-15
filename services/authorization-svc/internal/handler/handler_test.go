@@ -20,6 +20,11 @@ import (
 // ── stub store ────────────────────────────────────────────────────────────────
 
 type stubStore struct {
+	// denyAdmin withholds the tenant-scoped iam.* administration permissions
+	// requirePermission checks. By default the test caller is a tenant
+	// administrator (see FindGrantedActions).
+	denyAdmin bool
+
 	role        *domain.Role
 	roleCreated bool
 	roleErr     error
@@ -32,6 +37,31 @@ type stubStore struct {
 	setActiveErr    error
 	setActiveCalls  int
 	setActiveWanted []bool
+	// gotExpectedVersion is the expected_version SetRoleActive was given.
+	gotExpectedVersion int64
+	// entityStatus is FindEntityStatus's answer ("" = nothing projected).
+	entityStatus    string
+	entityStatusErr error
+	// entityTenant is FindEntityTenant's answer ("" = registry has not spoken).
+	entityTenant    string
+	entityTenantErr error
+	// Session approval / review (000030).
+	decidedBy        string
+	decidedApprove   bool
+	sessionDecideErr error
+	reviewedKind     string
+	reviewedOutcome  string
+	reviewErr        error
+	// FindPrincipalTenants' answer, and what the handler projected after a
+	// registry confirmation.
+	principalTenants    []string
+	principalTenantsErr error
+	projectedEntities   []domain.ProjectEntityStatusParams
+	// FindDelegationSource's answer for a delegated grant.
+	delegationSourceDelegator string
+	delegationSourceID        string
+	// FindGrantingAssignments' answer for an RBAC grant.
+	granting []domain.GrantingAssignment
 
 	bundle        *domain.PermissionBundle
 	bundleCreated bool
@@ -47,11 +77,27 @@ type stubStore struct {
 	bundleActiveWant   []bool
 	bundleActiveID     string
 	bundleActiveTenant string
+	// FindPermissionBundleByID's result. Nil synthesizes a bundle on role
+	// "r-1", so reactivation tests that predate the own-role check still reach
+	// SetPermissionBundleActive.
+	findBundle    *domain.PermissionBundle
+	findBundleErr error
 
 	assignment      *domain.PrincipalRoleAssignment
 	assignmentErr   error
 	revokedAssign   *domain.PrincipalRoleAssignment
 	revokeAssignErr error
+	// FindRoleAssignmentByID's result. Nil synthesizes an entity-less
+	// assignment, so revoke tests that predate the platform-scope check still
+	// reach RevokeRoleAssignment.
+	findAssignment    *domain.PrincipalRoleAssignment
+	findAssignmentErr error
+
+	// Maker-checker.
+	gotCreateAssignment domain.CreateRoleAssignmentParams
+	gotDecision         string
+	gotDecider          string
+	decideErr           error
 
 	delegation    *domain.DelegatedAuthority
 	delegationErr error
@@ -171,6 +217,12 @@ type stubStore struct {
 	principalStatusErr       error
 	gotPrincipalStatusArgs   []string
 	principalStatusCallCount int
+	// principalStatusByID overrides principalStatus for one principal, so a
+	// test can suspend the subject without suspending the admin calling.
+	principalStatusByID map[string]string
+	// principalStatusQueried is every principal FindPrincipalStatus was asked
+	// about, in order.
+	principalStatusQueried []string
 
 	privilegedSession       *domain.PrivilegedSession
 	privilegedSessionErr    error
@@ -204,16 +256,6 @@ type stubStore struct {
 	createdWorkloadBinding   *domain.WorkloadBinding
 	createWorkloadBindingErr error
 
-	accessReview                  *domain.AccessReview
-	getAccessReviewErr            error
-	createdAccessReview           *domain.AccessReview
-	createAccessReviewErr         error
-	accessReviews                 []domain.AccessReview
-	listAccessReviewsErr          error
-	gotAccessReviewTenant         string
-	gotAccessReviewReviewer       string
-	gotAccessReviewStatus         string
-	recordAccessReviewDecisionErr error
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -222,7 +264,8 @@ func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*d
 func (s *stubStore) FindRoleByID(_ context.Context, _ string) (*domain.Role, error) {
 	return s.role, s.findRoleErr
 }
-func (s *stubStore) SetRoleActive(_ context.Context, _, _ string, active bool) (*domain.Role, error) {
+func (s *stubStore) SetRoleActive(_ context.Context, _, _ string, active bool, expectedVersion int64) (*domain.Role, error) {
+	s.gotExpectedVersion = expectedVersion
 	s.setActiveCalls++
 	s.setActiveWanted = append(s.setActiveWanted, active)
 	return s.setActiveRole, s.setActiveErr
@@ -234,14 +277,45 @@ func (s *stubStore) ListPermissionBundles(_ context.Context, roleID, tenantID st
 	s.bundlesRoleID, s.bundlesTenantID = roleID, tenantID
 	return s.bundles, s.bundlesErr
 }
-func (s *stubStore) SetPermissionBundleActive(_ context.Context, bundleID, tenantID string, active bool) (*domain.PermissionBundle, error) {
+func (s *stubStore) SetPermissionBundleActive(_ context.Context, bundleID, tenantID string, active bool, _ int64) (*domain.PermissionBundle, error) {
 	s.bundleActiveCalls++
 	s.bundleActiveWant = append(s.bundleActiveWant, active)
 	s.bundleActiveID, s.bundleActiveTenant = bundleID, tenantID
 	return s.bundleActive, s.bundleActiveErr
 }
-func (s *stubStore) CreateRoleAssignment(_ context.Context, _ domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
+func (s *stubStore) FindPermissionBundleByID(_ context.Context, bundleID, _ string) (*domain.PermissionBundle, error) {
+	if s.findBundleErr != nil {
+		return nil, s.findBundleErr
+	}
+	if s.findBundle != nil {
+		return s.findBundle, nil
+	}
+	return &domain.PermissionBundle{PermissionBundleID: bundleID, RoleID: "r-1"}, nil
+}
+func (s *stubStore) FindRoleAssignmentByID(_ context.Context, assignmentID, _ string) (*domain.PrincipalRoleAssignment, error) {
+	if s.findAssignmentErr != nil {
+		return nil, s.findAssignmentErr
+	}
+	if s.findAssignment != nil {
+		return s.findAssignment, nil
+	}
+	return &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: assignmentID, RoleID: "r-1"}, nil
+}
+func (s *stubStore) CreateRoleAssignment(_ context.Context, p domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
+	s.gotCreateAssignment = p
+	if s.assignment != nil && p.ApprovalStatus != "" {
+		a := *s.assignment
+		a.ApprovalStatus = p.ApprovalStatus
+		return &a, s.assignmentErr
+	}
 	return s.assignment, s.assignmentErr
+}
+func (s *stubStore) DecideRoleAssignment(_ context.Context, id, _, decision, decider string) (*domain.PrincipalRoleAssignment, error) {
+	s.gotDecision, s.gotDecider = decision, decider
+	if s.decideErr != nil {
+		return nil, s.decideErr
+	}
+	return &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: id, ApprovalStatus: decision}, nil
 }
 func (s *stubStore) RevokeRoleAssignment(_ context.Context, _, _ string) (*domain.PrincipalRoleAssignment, error) {
 	return s.revokedAssign, s.revokeAssignErr
@@ -267,7 +341,7 @@ func (s *stubStore) ListRoleAssignments(_ context.Context, tenantID, principalID
 	return s.listAssignments, nil
 }
 
-func (s *stubStore) SetSoDRuleActive(_ context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error) {
+func (s *stubStore) SetSoDRuleActive(_ context.Context, sodRuleID, tenantID string, active bool, _ int64) (*domain.SoDRule, error) {
 	s.gotSoDActiveID = sodRuleID
 	s.gotSoDActiveTenant = tenantID
 	s.gotSoDActiveValue = active
@@ -307,8 +381,29 @@ func (s *stubStore) ListSoDRules(_ context.Context, tenantID string) ([]domain.S
 func (s *stubStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleParams) (*domain.SoDRule, error) {
 	return s.sodRule, s.sodRuleErr
 }
-func (s *stubStore) FindGrantedActions(_ context.Context, _, _, tenantID string) ([]string, string, error) {
+
+// stubAdminActions are the administration permissions requirePermission
+// checks on the /v1/admin/* routes.
+var stubAdminActions = []string{
+	"iam.abac_rule.manage", "iam.assignment.grant", "iam.assignment.read", "iam.assignment.revoke", "iam.policy.read", "iam.break_glass.manage",
+	"iam.delegation.grant", "iam.delegation.revoke", "iam.pam.manage", "iam.permission_bundle.manage",
+	"iam.role.manage", "iam.sod_rule.manage", "iam.support.manage",
+	"iam.role.read", "iam.delegation.read", "iam.sod_rule.read",
+	// 000030 session controls: eligibility, approval, review.
+	"iam.pam.eligible", "iam.pam.approve", "iam.break_glass.eligible", "iam.session.review",
+}
+
+// FindGrantedActions returns the seeded RBAC actions. requirePermission asks
+// at TENANT scope (legal entity = tenant), and only it does — decision paths
+// always name a real entity — so on that lookup the stub also grants the
+// administration permissions unless denyAdmin is set. Those tests were written
+// before the admin routes required a permission and failed with 403 from then
+// on, unnoticed, because this package did not compile.
+func (s *stubStore) FindGrantedActions(_ context.Context, _, legalEntityID, tenantID string) ([]string, string, error) {
 	s.grantedTenantArg = tenantID
+	if s.rbacErr == nil && !s.denyAdmin && legalEntityID != "" && legalEntityID == tenantID {
+		return append(append([]string{}, s.rbacActions...), stubAdminActions...), s.rbacBasis, nil
+	}
 	return s.rbacActions, s.rbacBasis, s.rbacErr
 }
 func (s *stubStore) FindGrantedActionsScoped(_ context.Context, _, _, tenantID, bookID, orgUnitID string) ([]string, string, error) {
@@ -342,7 +437,7 @@ func (s *stubStore) CreateABACRule(_ context.Context, params domain.CreateABACRu
 	return s.abacRule, s.abacRuleErr
 }
 
-func (s *stubStore) SetABACRuleActive(_ context.Context, _, _ string, active bool) (*domain.ABACRule, error) {
+func (s *stubStore) SetABACRuleActive(_ context.Context, _, _ string, active bool, _ int64) (*domain.ABACRule, error) {
 	s.setABACActiveWant = append(s.setABACActiveWant, active)
 	return s.setABACActiveRule, s.setABACActiveErr
 }
@@ -356,12 +451,39 @@ func (s *stubStore) ListABACRules(_ context.Context, tenantID, actionType string
 	return s.listABACRules, nil
 }
 
+func (s *stubStore) FindGrantingAssignments(_ context.Context, _, _, _, _, _, _ string) ([]domain.GrantingAssignment, error) {
+	return s.granting, nil
+}
+func (s *stubStore) FindDelegationSource(_ context.Context, _, _, _, _, _, _ string) (string, string, error) {
+	return s.delegationSourceDelegator, s.delegationSourceID, nil
+}
+func (s *stubStore) FindEntityStatus(_ context.Context, _, _ string) (string, error) {
+	return s.entityStatus, s.entityStatusErr
+}
+func (s *stubStore) FindEntityTenant(_ context.Context, _ string) (string, error) {
+	return s.entityTenant, s.entityTenantErr
+}
+// FindPrincipalTenants answers principalTenants when the test set it. When it
+// did not, a principal the stub grants anything (RBAC or delegated) holds
+// authority in one tenant — the consistent world — so tests about other layers
+// are not refused by C-01's "holds nothing anywhere" rule.
+func (s *stubStore) FindPrincipalTenants(_ context.Context, _ string) ([]string, error) {
+	if s.principalTenants == nil && s.principalTenantsErr == nil && (len(s.rbacActions) > 0 || len(s.delegatedActions) > 0) {
+		return []string{"11111111-1111-4111-8111-111111111111"}, nil
+	}
+	return s.principalTenants, s.principalTenantsErr
+}
+func (s *stubStore) ProjectEntityStatus(_ context.Context, p domain.ProjectEntityStatusParams) error {
+	s.projectedEntities = append(s.projectedEntities, p)
+	return nil
+}
 func (s *stubStore) RecordAccessDecision(_ context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
 	s.recordedParams = params
 	if s.decision != nil {
 		return s.decision, s.recordErr
 	}
-	return &domain.AccessDecisionLog{AccessDecisionID: "d-1", DecisionOutcome: "GRANTED", DecisionBasis: "test"}, s.recordErr
+	return &domain.AccessDecisionLog{AccessDecisionID: "d-1", DecisionOutcome: params.Outcome, DecisionBasis: params.Basis,
+		PolicySetVersion: "cfg.42", ExpiresAt: params.ExpiresAt}, s.recordErr
 }
 func (s *stubStore) FindAccessDecisionByID(_ context.Context, _, _ string) (*domain.AccessDecisionLog, error) {
 	return s.findDecision, s.findDecisionErr
@@ -388,6 +510,10 @@ func (s *stubStore) FindPrincipalStatus(_ context.Context, principalID, tenantID
 	if s.principalStatusErr != nil {
 		return "", s.principalStatusErr
 	}
+	s.principalStatusQueried = append(s.principalStatusQueried, principalID)
+	if st, ok := s.principalStatusByID[principalID]; ok {
+		return st, nil
+	}
 	if s.principalStatus == "" {
 		return domain.PrincipalStatusActive, nil
 	}
@@ -409,11 +535,37 @@ func (s *stubStore) CreatePrivilegedSession(_ context.Context, params domain.Cre
 		RequestedActions: params.RequestedActions,
 		TicketRef:        params.TicketRef,
 		Reason:           params.Reason,
-		Status:           domain.PrivilegedSessionStatusActive,
+		Status:           privilegedStatusFor(params),
 		DurationSeconds:  params.DurationSeconds,
 		ExpiresAt:        time.Now().UTC().Add(time.Hour),
 		CreatedAt:        time.Now().UTC(),
+		RequestedBy:      &params.RequestedBy,
+		HighImpact:       params.HighImpact,
 	}, nil
+}
+
+func privilegedStatusFor(p domain.CreatePrivilegedSessionParams) string {
+	if p.HighImpact {
+		return domain.PrivilegedSessionStatusPendingApproval
+	}
+	return domain.PrivilegedSessionStatusActive
+}
+
+func (s *stubStore) DecidePrivilegedSession(_ context.Context, sessionID, tenantID, approver string, approve bool) (*domain.PrivilegedSession, error) {
+	s.decidedBy, s.decidedApprove = approver, approve
+	if s.sessionDecideErr != nil {
+		return nil, s.sessionDecideErr
+	}
+	status := domain.PrivilegedSessionStatusRejected
+	if approve {
+		status = domain.PrivilegedSessionStatusActive
+	}
+	return &domain.PrivilegedSession{SessionID: sessionID, TenantID: tenantID, Status: status, ApprovedBy: &approver}, nil
+}
+
+func (s *stubStore) ReviewSession(_ context.Context, kind, sessionID, tenantID, reviewer, outcome, notes string) error {
+	s.reviewedKind, s.reviewedOutcome = kind, outcome
+	return s.reviewErr
 }
 
 func (s *stubStore) FindPrivilegedSessionByID(_ context.Context, sessionID, tenantID string) (*domain.PrivilegedSession, error) {
@@ -598,55 +750,6 @@ func (s *stubStore) CreateWorkloadBinding(_ context.Context, binding domain.Work
 	return &binding, nil
 }
 
-func (s *stubStore) CreateAccessReview(_ context.Context, review domain.AccessReview) (*domain.AccessReview, error) {
-	s.createdAccessReview = &review
-	if s.createAccessReviewErr != nil {
-		return nil, s.createAccessReviewErr
-	}
-	return &review, nil
-}
-
-func (s *stubStore) GetAccessReview(_ context.Context, reviewID, tenantID string) (*domain.AccessReview, error) {
-	if s.getAccessReviewErr != nil {
-		return nil, s.getAccessReviewErr
-	}
-	if s.accessReview != nil {
-		return s.accessReview, nil
-	}
-	return nil, domain.ErrAccessReviewNotFound
-}
-
-func (s *stubStore) ListAccessReviews(_ context.Context, tenantID, reviewerPrincipalID, status string) ([]domain.AccessReview, error) {
-	s.gotAccessReviewTenant = tenantID
-	s.gotAccessReviewReviewer = reviewerPrincipalID
-	s.gotAccessReviewStatus = status
-	if s.listAccessReviewsErr != nil {
-		return nil, s.listAccessReviewsErr
-	}
-	return s.accessReviews, nil
-}
-
-func (s *stubStore) RecordAccessReviewDecision(_ context.Context, reviewID, tenantID, decision, decisionReason, decidedBy string) (*domain.AccessReview, error) {
-	if s.recordAccessReviewDecisionErr != nil {
-		return nil, s.recordAccessReviewDecisionErr
-	}
-	now := time.Now().UTC()
-	st := domain.ReviewStatusCompleted
-	if decision == domain.ReviewDecisionEscalate {
-		st = domain.ReviewStatusEscalated
-	}
-	return &domain.AccessReview{
-		ReviewID:            reviewID,
-		TenantID:            tenantID,
-		ReviewerPrincipalID: decidedBy,
-		Decision:            &decision,
-		DecisionReason:      &decisionReason,
-		DecidedAt:           &now,
-		DecidedBy:           &decidedBy,
-		Status:              st,
-	}, nil
-}
-
 // ── stub publisher ───────────────────────────────────────────────────────────
 
 type stubPublisher struct {
@@ -679,12 +782,6 @@ func (p *stubPublisher) PublishSupportSessionStarted(_ context.Context, _ domain
 func (p *stubPublisher) PublishSupportSessionEnded(_ context.Context, _ domain.SupportSession) error {
 	return nil
 }
-func (p *stubPublisher) PublishAccessReviewStarted(_ context.Context, _ domain.AccessReview) error {
-	return nil
-}
-func (p *stubPublisher) PublishAccessReviewCompleted(_ context.Context, _ domain.AccessReview) error {
-	return nil
-}
 func (p *stubPublisher) PublishPrivilegedSessionStarted(_ context.Context, _ domain.PrivilegedSession) error {
 	return nil
 }
@@ -713,7 +810,7 @@ func newTestRouter(s *stubStore) chi.Router {
 
 func newTestRouterFull(s *stubStore, p *stubPublisher, v *stubValidator) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, v, siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", zap.NewNop())
+	h := handler.New(s, p, v, siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", false, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -752,7 +849,9 @@ func TestAuthorize_NoGrant_Denied(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
+	// A tenant, so the question reaches the decision layers: a tenantless
+	// one from a principal holding nothing anywhere is refused (C-01).
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","tenant_id":"11111111-1111-4111-8111-111111111111"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -846,7 +945,9 @@ func TestAuthorize_StoreUnavailable_FailsClosed(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
+	// A tenant, so the question reaches the decision layers: a tenantless
+	// one from a principal holding nothing anywhere is refused (C-01).
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","tenant_id":"11111111-1111-4111-8111-111111111111"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

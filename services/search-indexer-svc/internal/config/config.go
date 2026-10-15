@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -38,6 +39,21 @@ type Config struct {
 	// validation." Without a key there is no integrity check, so this has no
 	// default outside local development and the service refuses to start.
 	CursorSigningKey []byte
+
+	// SourceCollections maps a source_type to the URL of its record
+	// collection for R2/R3 hydration, from SOURCE_SERVICE_URL_<SOURCE_TYPE>
+	// (e.g. SOURCE_SERVICE_URL_OBLIGATION=http://obligations-svc:8088/v1/obligations).
+	// The id is appended. A source type with no entry cannot be hydrated, and
+	// its R2 results are suppressed with ESR-014 rather than served from the
+	// index (NP-20).
+	SourceCollections map[string]string
+
+	// EmbeddingProviderURL is the embedding provider for semantic scopes
+	// (§10.1). OD-10 leaves the provider and model undecided, so it has no
+	// default: unset means no semantic scope can build or answer, loudly.
+	EmbeddingProviderURL   string
+	EmbeddingProviderToken string
+	EmbeddingTimeout       time.Duration
 
 	// SourceHydrationTimeout bounds an R2 hydration call. A hit whose source
 	// cannot be fetched inside it is SUPPRESSED, never served from the index
@@ -128,6 +144,10 @@ func Load() (*Config, error) {
 		MaxComplexityScore:   envInt("MAX_COMPLEXITY_SCORE", 100),
 		FacetMinCount:        envInt("FACET_MIN_COUNT", 2),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+
+		SourceCollections:      prefixedEnv("SOURCE_SERVICE_URL_"),
+		EmbeddingProviderURL:   env("EMBEDDING_PROVIDER_URL", ""),
+		EmbeddingProviderToken: os.Getenv("EMBEDDING_PROVIDER_TOKEN"),
 	}
 
 	var err error
@@ -139,6 +159,16 @@ func Load() (*Config, error) {
 	}
 	if c.CheckpointInterval, err = envDuration("CHECKPOINT_INTERVAL", 60*time.Second); err != nil {
 		return nil, err
+	}
+	if c.EmbeddingTimeout, err = envDuration("EMBEDDING_TIMEOUT", 5*time.Second); err != nil {
+		return nil, err
+	}
+	for sourceType, raw := range c.SourceCollections {
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("SOURCE_SERVICE_URL_%s must be an absolute http(s) URL, got %q",
+				strings.ToUpper(sourceType), raw)
+		}
 	}
 
 	if c.CursorSigningKey, err = loadCursorKey(c.Env); err != nil {
@@ -220,6 +250,22 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be positive, got %s", key, d)
 	}
 	return d, nil
+}
+
+// prefixedEnv collects every PREFIX<NAME>=value into name(lowercased) → value.
+func prefixedEnv(prefix string) map[string]string {
+	out := map[string]string{}
+	for _, kv := range os.Environ() {
+		key, value, _ := strings.Cut(kv, "=")
+		if !strings.HasPrefix(key, prefix) || strings.TrimSpace(value) == "" {
+			continue
+		}
+		name := strings.ToLower(strings.TrimPrefix(key, prefix))
+		if name != "" {
+			out[name] = strings.TrimSpace(value)
+		}
+	}
+	return out
 }
 
 func splitCSV(s string) []string {

@@ -17,6 +17,7 @@ import (
 	"zoiko.io/source-authority-svc/internal/domain"
 	"zoiko.io/source-authority-svc/internal/events"
 	svcmiddleware "zoiko.io/source-authority-svc/internal/middleware"
+	"zoiko.io/source-authority-svc/internal/outbox"
 	"zoiko.io/source-authority-svc/internal/store"
 )
 
@@ -121,7 +122,31 @@ func (h *Handler) CreateSourceAuthorityMap(w http.ResponseWriter, r *http.Reques
 		m.AllowedCorrectionPath = &req.AllowedCorrectionPath
 	}
 
-	created, err := h.store.CreateSourceAuthorityMap(r.Context(), m)
+	outboxEvt := outbox.Event{
+		AggregateType: "SourceAuthorityMap",
+		AggregateID:   m.SourceAuthorityMapID,
+		EventType:     "source_authority_map.created",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "source_authority_map.created",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "source-authority-svc",
+			EntityID:      m.SourceAuthorityMapID,
+			ActorID:       principalID,
+			CorrelationID: correlationID,
+			OccurredAt:    m.CreatedAt,
+			Payload:       m,
+		},
+		CorrelationID: correlationID,
+		// TenantID left nil: source authority maps are platform-wide.
+	}
+
+	// outboxEvt is inserted atomically with the domain row (same
+	// transaction) — this replaces the direct, error-swallowed
+	// h.publisher.Publish call that used to run here: a Kafka outage no
+	// longer loses the event, it is retried by the outbox relay.
+	created, err := h.store.CreateSourceAuthorityMap(r.Context(), m, outboxEvt)
 	if err != nil {
 		if errors.Is(err, domain.ErrConflict) {
 			writeError(w, http.StatusConflict, err.Error())
@@ -139,10 +164,6 @@ func (h *Handler) CreateSourceAuthorityMap(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "source_authority_map.created", EntityID: m.SourceAuthorityMapID,
-		ActorID: principalID, CorrelationID: correlationID, Payload: m,
-	})
 	writeJSON(w, http.StatusCreated, m)
 }
 
@@ -236,7 +257,41 @@ func (h *Handler) SupersedeSourceAuthorityMap(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	updated, err := h.store.SupersedeSourceAuthorityMap(r.Context(), mapID, effectiveTo, principalID)
+	correlationID := correlationIDOf(r, req.CorrelationID)
+	// The full post-update row (field_family, source_system, precedence_rank,
+	// ...) is not known here — it only exists after the store's SELECT FOR
+	// UPDATE — so the event payload is a smaller, fully handler-known
+	// projection of the business fact rather than the persisted row. A
+	// consumer needing the full entity can read GET /v1/source-authority-maps;
+	// the event's job is to say which rule changed, until when, and by whom.
+	outboxEvt := outbox.Event{
+		AggregateType: "SourceAuthorityMap",
+		AggregateID:   mapID,
+		EventType:     "source_authority_map.superseded",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "source_authority_map.superseded",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "source-authority-svc",
+			EntityID:      mapID,
+			ActorID:       principalID,
+			CorrelationID: correlationID,
+			OccurredAt:    time.Now().UTC(),
+			Payload: map[string]any{
+				"source_authority_map_id":    mapID,
+				"effective_to":               effectiveTo,
+				"superseded_by_principal_id": principalID,
+			},
+		},
+		CorrelationID: correlationID,
+		// TenantID left nil: source authority maps are platform-wide.
+	}
+
+	// outboxEvt is inserted atomically with the supersede update (same
+	// transaction) — this replaces the direct, error-swallowed
+	// h.publisher.Publish call that used to run here.
+	updated, err := h.store.SupersedeSourceAuthorityMap(r.Context(), mapID, effectiveTo, principalID, outboxEvt)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrMapNotFound):
@@ -252,10 +307,6 @@ func (h *Handler) SupersedeSourceAuthorityMap(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "source_authority_map.superseded", EntityID: updated.SourceAuthorityMapID,
-		ActorID: principalID, CorrelationID: correlationIDOf(r, req.CorrelationID), Payload: updated,
-	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -341,7 +392,32 @@ func (h *Handler) RecordFact(w http.ResponseWriter, r *http.Request) {
 		f.TransformationVersion = &req.TransformationVersion
 	}
 
-	created, err := h.store.RecordFact(r.Context(), f)
+	outboxEvt := outbox.Event{
+		AggregateType: "NormalizedFact",
+		AggregateID:   f.NormalizedFactID,
+		EventType:     "normalized_fact.recorded",
+		Payload: events.Event{
+			EventID:       "evt-" + uuid.New().String(),
+			EventType:     "normalized_fact.recorded",
+			EventVersion:  "1.0",
+			SchemaVersion: "1.0",
+			SourceService: "source-authority-svc",
+			EntityID:      f.NormalizedFactID,
+			TenantID:      tenantID,
+			ActorID:       principalID,
+			CorrelationID: correlationID,
+			OccurredAt:    f.CreatedAt,
+			Payload:       f,
+		},
+		CorrelationID: correlationID,
+		TenantID:      &tenantID,
+	}
+
+	// outboxEvt is inserted atomically with the fact row, in the same
+	// app.tenant_id-scoped transaction withTenantRLS installs — this
+	// replaces the direct, error-swallowed h.publisher.Publish call that
+	// used to run here.
+	created, err := h.store.RecordFact(r.Context(), f, outboxEvt)
 	if err != nil {
 		h.writeStoreErr(w, err, "record normalized fact")
 		return
@@ -351,10 +427,6 @@ func (h *Handler) RecordFact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "normalized_fact.recorded", EntityID: f.NormalizedFactID,
-		TenantID: tenantID, ActorID: principalID, CorrelationID: correlationID, Payload: f,
-	})
 	writeJSON(w, http.StatusCreated, f)
 }
 

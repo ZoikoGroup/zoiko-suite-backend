@@ -17,8 +17,15 @@ access groupings."
 resolves against it, and this service does not shadow that data. It is the
 authoring layer: creating a role or bundle here makes a synchronous call into
 authorization-svc's admin API, so a definition recorded here has actually been
-provisioned for enforcement. Per-principal role **assignments** are out of
-scope and are not reachable on this API at all — they stay where they are.
+provisioned for enforcement.
+
+Since 6 Oct 2026 it is also the **governance** layer (Authorization Standard
+§5, §9, §21, §24): the permission taxonomy every bundle is validated against,
+system role templates (the 21 §9.1 archetypes), governed assignment requests
+(`/v1/iam/access-assignments`) and access-review campaigns. The assignment
+itself still lives in authorization-svc; a request here is provisioned there
+(as the requester for STANDARD risk, as the independent approver otherwise)
+before it is recorded here.
 
 The consequence that shapes every incident below: **this service is useless
 without authorization-svc, and it is honest about that.** Every write calls it
@@ -164,8 +171,58 @@ docker logs access-control-svc 2>&1 | grep -i "authorization-svc admin API"
 * **`unreachable` / connection refused** — authorization-svc is down. Check its
   own health; nothing here will help.
 
+A **403 from authorization-svc is not this alert.** It is answered
+`403 provisioning_forbidden` (counted as `outcome="forbidden"` on
+`access_control_authz_admin_calls_total`), not as an outage. It means the
+caller holds `ROLE_MANAGE` here but not `iam.role.manage` /
+`iam.permission_bundle.manage` at **tenant** scope in authorization-svc, which
+gates its admin API on those since 30 Sep. The fix is a grant, not a restart.
+The response body carries authorization-svc's own reason. Until 6 Oct this
+case was reported as `503 authz_admin_unavailable`.
+
 There is no manual reconciliation step, because there is nothing to reconcile:
 the failed writes wrote nothing.
+
+### 4.2a Bundle writes refused or failing at the guards
+
+Every bundle write (create, action edit, reactivation) passes two guards before
+anything is provisioned. Both fail **closed**.
+
+| Answer | Meaning | Action |
+|---|---|---|
+| `403 protected_action` | The bundle includes an action in `protected_permissions` (the eight platform-admin names plus every `iam.*` admin action). The message names it. | None. A tenant role may not grant these. |
+| `403 sod_conflict` | authorization-svc says the role's **whole** action set (its other active bundles plus this one) is conflicted. The message names each pair. | Split the actions across roles. |
+| `503 sod_unavailable` | No verdict could be read from `POST /v1/sod/validate` (unreachable, non-200, or no `conflict_free`). | authorization-svc's health; the body says which. |
+| `503 protected_catalogue_unavailable` | `protected_permissions` is unreadable or **empty**. | `SELECT count(*) FROM protected_permissions WHERE active_flag;` and apply 000005/000007. |
+
+Before 6 Oct the SoD client sent a body authorization-svc rejects (400), and
+every error became `403 sod_conflict`, so every role and bundle create was
+refused. A wave of `sod_conflict` that names no pair is that regression.
+
+Every refusal leaves a row in `refused_escalations` (append-only since 000007):
+
+```sql
+SELECT created_at, action_type, refusal_reason, error_message
+FROM refused_escalations WHERE tenant_id = '<tenant>' ORDER BY created_at DESC LIMIT 20;
+```
+
+### 4.2b Governance commands refused
+
+| Code | Meaning | Remedy |
+|---|---|---|
+| `400 unknown_permission` | An action not in `permission_definitions` (exact spelling). | Fix the spelling. A genuinely new action is registered by migration (append to a new `0000NN_*.up.sql`, `naming` TAXONOMY for `resource.action`), never by hand on one database. |
+| `503 taxonomy_unavailable` | The registry could not be read. Fails closed. | Check the database; `SELECT count(*) FROM permission_definitions` must be > 0 (000008 applied). |
+| `409 template_managed_bundle` | Someone edited the actions of a role's `TEMPLATE` bundle. | Upgrade the role to a newer template version (`POST /v1/role-templates/{code}/upgrade`). Templates change by publishing a new `role_template_versions` row in a migration; existing versions cannot be updated (trigger). |
+| `202` on an assignment request | Not an error: HIGH/CRITICAL risk or a self-request waits for an approver. | A principal who is neither requester nor subject, holding ROLE_MANAGE here and `iam.assignment.grant` in authorization-svc, approves it. |
+| `403 self_approval` / `self_attestation` | The requester/subject tried to decide their own access. | Working as designed (§10.1 row 6). Also enforced by CHECK constraints. |
+| `403 provisioning_forbidden` on approve, revoke or a REVOKE review decision | authorization-svc refused the caller: it lacks `iam.assignment.grant` / `.revoke` at tenant scope. | Grant it in authorization-svc, or have someone who holds it act. Nothing was recorded here. |
+| `409 unresolved_high_risk` | A campaign cannot close while HIGH/CRITICAL items are open or escalated (§24). | Decide or reassign them. STANDARD items left open are recorded EXPIRED at completion. |
+| `409 IDEMPOTENCY_MISMATCH` | The same `Idempotency-Key` was sent with a different body or by a different principal. | The client must generate a new key per intent. |
+
+`access_control_governance_writes_total{operation,outcome}` counts every
+governance command; a rising `forbidden` on `approve_assignment` usually means
+approvers lack the authorization-svc grant, not that they are being refused
+here.
 
 ### 4.3 The outbox has stalled
 
@@ -324,6 +381,16 @@ docker exec -i zoiko-postgres psql -U postgres -d access_control -c \
 | `000002` | **FORCE** RLS, `WITH CHECK` on both policies, status CHECK constraint |
 | `000003` | `updated_by_principal_id` on both tables |
 | `000004` | `event_outbox` + its relay policy; unique `(tenant, role, bundle_code)`; read indexes |
+| `000005`–`000007` | Protected-action catalogue (incl. `iam.*`), append-only refusal evidence |
+| `000008` | `permission_definitions`: the §5 taxonomy (65) + grandfathered legacy names (668) |
+| `000009` | `role_templates` + append-only `role_template_versions`; the 21 §9.1 archetypes; template provenance columns |
+| `000010` | `assignment_requests` (independence CHECK); outbox CHECK admits the `iam.*` events |
+| `000011` | `access_review_campaigns` / `access_review_items` (no-self-attestation CHECK) |
+| `000012` | `idempotency_keys` (Idempotency-Key bound to caller + body) |
+
+On an existing stack prefer `python deployments/migrate.py up --db access_control`
+(tracked in `schema_migrations`). authorization-svc's `000019` seeds the §10.1
+baseline SoD rules this service's guards rely on.
 
 `000002` is load-bearing: `ENABLE` alone exempts the table **owner**, which is
 who runs migrations, so the policies never executed for anybody connecting that
@@ -359,6 +426,7 @@ go test -count=1 ./...                                   # unit
 TEST_DATABASE_URL=... go test -tags=integration ./internal/store/   # embedded Postgres + RLS
 
 ./scripts/audit.sh                                       # the whole thing, live
+./scripts/live_session_revocation_check.sh               # §19: grant / retire / revoke end sessions in identity-context-svc
 ```
 
 `scripts/audit.sh` is the re-runnable proof: static analysis, the test suites,

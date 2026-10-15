@@ -107,30 +107,80 @@ func TestSuppressionStore_Precedence_S0_T0_IgnoreUnsubscribe(t *testing.T) {
 	assert.Equal(t, string(ledger.SuppressionReasonHardBounce), reasonS0)
 }
 
-func TestSuppressionStore_RemoveAndUpsert(t *testing.T) {
-	pool := openTestPool(t)
+// A recorded suppression is never weakened, never deleted, and lifted only on
+// evidence with a second principal (§7.3, migration 000022). The upsert used to
+// overwrite the reason, so an unsubscribe arriving after a hard bounce turned
+// it into a marketing-only row and security mail resumed to a dead address.
+func TestSuppressionStore_NeverWeakenedNeverDeleted(t *testing.T) {
+	pool, admin := openTestPools(t)
 	s := store.New(pool)
 	ctx := context.Background()
 
-	tenantID := "tenant-upsert-1"
-	email := "flip@example.com"
+	tenantID := "tenant-supp-governance"
+	email := "dead@example.com"
+	add := func(reason ledger.SuppressionReason) {
+		t.Helper()
+		require.NoError(t, s.AddSuppression(ctx, &ledger.EmailSuppression{
+			TenantID: tenantID, RecipientEmail: email, Reason: reason, SourceStream: "ALL", CreatedAt: time.Now().UTC(),
+		}))
+	}
+	reasons := func() []string {
+		t.Helper()
+		rows, err := admin.Query(ctx, `SELECT reason || CASE WHEN lifted_at IS NULL THEN '' ELSE ':lifted' END
+			FROM email_suppressions WHERE tenant_id = $1 ORDER BY created_at`, tenantID)
+		require.NoError(t, err)
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var r string
+			require.NoError(t, rows.Scan(&r))
+			out = append(out, r)
+		}
+		return out
+	}
 
-	// 1. Add complaint
-	err := s.AddSuppression(ctx, &ledger.EmailSuppression{
-		SuppressionID:  uuid.NewString(),
-		TenantID:       tenantID,
-		RecipientEmail: email,
-		Reason:         ledger.SuppressionReasonComplaint,
-		SourceStream:   "MARKETING",
-		CreatedAt:      time.Now().UTC(),
-	})
+	// 1. An unsubscribe is strengthened by a later hard bounce...
+	add(ledger.SuppressionReasonUnsubscribe)
+	add(ledger.SuppressionReasonHardBounce)
+	assert.Equal(t, []string{"HARD_BOUNCE"}, reasons())
+
+	// 2. ...and a later unsubscribe or complaint cannot weaken it back.
+	add(ledger.SuppressionReasonUnsubscribe)
+	add(ledger.SuppressionReasonComplaint)
+	assert.Equal(t, []string{"HARD_BOUNCE"}, reasons())
+	blocked, _, err := s.IsEmailSuppressed(ctx, tenantID, email, ledger.StreamCritical, ledger.ClassS0)
+	require.NoError(t, err)
+	assert.True(t, blocked, "security mail must stay blocked to a hard-bounced address")
+
+	// 3. Rows are never deleted.
+	_, err = admin.Exec(ctx, `DELETE FROM email_suppressions WHERE tenant_id = $1`, tenantID)
+	require.Error(t, err, "DELETE must be refused by the database")
+
+	// 4. A lift needs evidence, and for a hard bounce a second principal.
+	_, err = admin.Exec(ctx, `UPDATE email_suppressions SET lifted_at = now(), lifted_by_principal_id = 'op'
+		WHERE tenant_id = $1`, tenantID)
+	require.Error(t, err, "a lift without evidence must be refused")
+	_, err = admin.Exec(ctx, `UPDATE email_suppressions SET lifted_at = now(), lifted_by_principal_id = 'op',
+		lift_evidence_ref = 'ticket-1' WHERE tenant_id = $1`, tenantID)
+	require.Error(t, err, "a hard-bounce lift without a second principal must be refused")
+	_, err = admin.Exec(ctx, `UPDATE email_suppressions SET lifted_at = now(), lifted_by_principal_id = 'op',
+		lift_evidence_ref = 'ticket-1', lift_approved_by_principal_id = 'op' WHERE tenant_id = $1`, tenantID)
+	require.Error(t, err, "the approver must not be the lifter")
+	_, err = admin.Exec(ctx, `UPDATE email_suppressions SET lifted_at = now(), lifted_by_principal_id = 'op',
+		lift_evidence_ref = 'ticket-1', lift_approved_by_principal_id = 'checker' WHERE tenant_id = $1`, tenantID)
 	require.NoError(t, err)
 
-	// 2. Remove suppression
-	err = s.RemoveSuppression(ctx, tenantID, email, "MARKETING")
+	blocked, _, err = s.IsEmailSuppressed(ctx, tenantID, email, ledger.StreamCritical, ledger.ClassS0)
 	require.NoError(t, err)
+	assert.False(t, blocked, "a lifted suppression no longer blocks")
 
-	supp, _, err := s.IsEmailSuppressed(ctx, tenantID, email, ledger.StreamMarketing, ledger.ClassM1)
+	// 5. A lifted row is history: it cannot change again, and a fresh bounce
+	// inserts a new active row beside it.
+	_, err = admin.Exec(ctx, `UPDATE email_suppressions SET lift_evidence_ref = 'rewritten' WHERE tenant_id = $1`, tenantID)
+	require.Error(t, err, "a lifted row must not change")
+	add(ledger.SuppressionReasonHardBounce)
+	assert.Equal(t, []string{"HARD_BOUNCE:lifted", "HARD_BOUNCE"}, reasons())
+	blocked, _, err = s.IsEmailSuppressed(ctx, tenantID, email, ledger.StreamCritical, ledger.ClassS0)
 	require.NoError(t, err)
-	assert.False(t, supp, "Email must no longer be suppressed after removal")
+	assert.True(t, blocked)
 }

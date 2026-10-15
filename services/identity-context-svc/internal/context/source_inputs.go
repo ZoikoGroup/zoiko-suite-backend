@@ -40,6 +40,18 @@ var defaultChannelByPrincipalType = map[domain.PrincipalType]svcenvelope.SourceC
 	domain.PrincipalTypeServiceAccount: svcenvelope.ChannelSystem,
 }
 
+// resolveSourceChannelForClient settles web vs mobile from the verified IdP
+// client (S1-B1). clientChannel is IDP_CLIENT_CHANNELS[azp]. A mapped channel
+// the principal's type can use wins over any assertion — a contradicting
+// assertion is not recorded — and is VERIFIED_CLIENT; otherwise the
+// principal-type rules below decide.
+func resolveSourceChannelForClient(p *domain.Principal, asserted, clientChannel string) (string, domain.SourceInputBasis) {
+	if clientChannel != "" && channelsByPrincipalType[p.PrincipalType][svcenvelope.SourceChannel(clientChannel)] {
+		return clientChannel, domain.BasisVerifiedClient
+	}
+	return resolveSourceChannel(p, asserted)
+}
+
 // resolveSourceChannel decides the source_channel recorded on the decision.
 func resolveSourceChannel(p *domain.Principal, asserted string) (string, domain.SourceInputBasis) {
 	def, hasDefault := defaultChannelByPrincipalType[p.PrincipalType]

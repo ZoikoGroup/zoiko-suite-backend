@@ -506,7 +506,7 @@ func TestPgStore_RecordEvaluation_RoundTripAndIdempotency(t *testing.T) {
 		CorrelationID:           "corr-" + uuid.New().String(),
 	}
 
-	created, err := s.RecordEvaluation(ctx, e)
+	created, err := s.RecordEvaluation(ctx, e, nil)
 	if err != nil {
 		t.Fatalf("RecordEvaluation: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestPgStore_RecordEvaluation_RoundTripAndIdempotency(t *testing.T) {
 	replay := *e
 	replay.EvaluationID = uuid.New().String()
 	replay.Outcome = domain.OutcomeMissing
-	created, err = s.RecordEvaluation(ctx, &replay)
+	created, err = s.RecordEvaluation(ctx, &replay, nil)
 	if err != nil {
 		t.Fatalf("replayed RecordEvaluation: %v", err)
 	}
@@ -569,7 +569,7 @@ func TestPgStore_GetEvaluation_OtherTenant_ReadsAsAbsent(t *testing.T) {
 		EvaluatedForPrincipalID: "buyer-1",
 		CorrelationID:           "corr-" + uuid.New().String(),
 	}
-	if _, err := s.RecordEvaluation(svcmiddleware.WithTenant(context.Background(), owner), e); err != nil {
+	if _, err := s.RecordEvaluation(svcmiddleware.WithTenant(context.Background(), owner), e, nil); err != nil {
 		t.Fatalf("RecordEvaluation: %v", err)
 	}
 

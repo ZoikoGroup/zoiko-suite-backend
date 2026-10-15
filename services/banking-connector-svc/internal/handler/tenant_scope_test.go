@@ -52,7 +52,7 @@ func createConnectionAs(t *testing.T, r http.Handler, tenantID, legalEntityID st
 // the easier request to make, which made the insecure path the path of
 // least resistance.
 func TestMissingTenantHeader_Refused(t *testing.T) {
-	r, _ := setupTestRouter(t)
+	r := setupTestRouter(t)
 
 	body, _ := json.Marshal(domain.CreateConnectionRequest{
 		LegalEntityID: "le-101",
@@ -102,7 +102,7 @@ func TestMissingTenantHeader_Refused(t *testing.T) {
 // 404 rather than 403 is deliberate: a distinct forbidden status would
 // confirm that another tenant's connection_id exists.
 func TestGetConnectionByID_ForeignTenant_NotFound(t *testing.T) {
-	r, _ := setupTestRouter(t)
+	r := setupTestRouter(t)
 
 	connID := createConnectionAs(t, r, "tenant-a", "le-a")
 
@@ -139,7 +139,7 @@ func TestGetConnectionByID_ForeignTenant_NotFound(t *testing.T) {
 // EVERY tenant's bank connections. The legal-entity dimension is
 // legitimately optional; the tenant dimension never is.
 func TestListConnections_OmittedFilter_DoesNotLeakOtherTenants(t *testing.T) {
-	r, _ := setupTestRouter(t)
+	r := setupTestRouter(t)
 
 	createConnectionAs(t, r, "tenant-a", "le-a")
 	createConnectionAs(t, r, "tenant-b", "le-b")

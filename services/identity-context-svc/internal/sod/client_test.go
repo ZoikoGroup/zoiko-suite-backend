@@ -25,6 +25,11 @@ func serving(t *testing.T, status int, body string) *httptest.Server {
 		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, "/v1/sod/evaluate", r.URL.Path)
 		assert.NotEmpty(t, r.Header.Get("X-Tenant-Id"), "the tenant scope must travel with the question")
+		// authorization-svc answers this route and refuses a request with no
+		// principal (401), which this client would read as unavailable.
+		assert.NotEmpty(t, r.Header.Get("X-Principal-Id"), "the maker must travel as the principal")
+		assert.NotEmpty(t, r.Header.Get("X-Request-Id"))
+		assert.NotEmpty(t, r.Header.Get("X-Source-Channel"))
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
 	}))

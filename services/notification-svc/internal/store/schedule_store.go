@@ -10,7 +10,7 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/events"
-	"zoiko.io/notification-svc/internal/ncd"
+	"zoiko.io/notification-svc/internal/ncdcode"
 )
 
 // ZS-SVC-Y-001 NCD-03 6.1 and 6.6: server-authoritative timing and cancellation (migration
@@ -76,7 +76,7 @@ func (s *PgStore) ExpireNotification(ctx context.Context, id, tenantID string, n
 			  AND status = 'PENDING' AND submitting_since IS NULL
 			  AND expires_at IS NOT NULL AND expires_at <= $1
 			RETURNING `+notificationColumns,
-			now, ncd.Format(ncd.DeliveryExpired)+": the communication passed its expires_at before it was submitted, so it was never sent", id, tenantID), &out)
+			now, ncdcode.Format(ncdcode.DeliveryExpired)+": the communication passed its expires_at before it was submitted, so it was never sent", id, tenantID), &out)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -91,7 +91,7 @@ func (s *PgStore) ExpireNotification(ctx context.Context, id, tenantID string, n
 		if err := enqueue(ctx, tx, tenantID, failed); err != nil {
 			return err
 		}
-		blocked, err := events.CommunicationBlocked(out.CorrelationID, out, ncd.DeliveryExpired, out.DeliveryAttempts, false, "")
+		blocked, err := events.CommunicationBlocked(out.CorrelationID, out, ncdcode.DeliveryExpired, out.DeliveryAttempts, false, "")
 		if err != nil {
 			return err
 		}

@@ -36,6 +36,11 @@ func mapPgError(err error) error {
 	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
 		return domain.ErrDelegationNotFound
 	}
+	// 23P01: the exclusion constraint refused an overlapping ACTIVE grant —
+	// the race the application pre-check cannot close on its own.
+	if errors.As(err, &pgErr) && pgErr.Code == "23P01" {
+		return domain.ErrOverlapConflict
+	}
 	return err
 }
 
@@ -67,7 +72,8 @@ const delegationColumns = `
 	action_type, effective_from, effective_to, status, created_by_principal_id, correlation_id,
 	created_at, updated_at, revoked_by_principal_id, revoked_at, expired_at,
 	authority_limit_cents, authority_limit_currency, authority_limit_quantity,
-	version
+	version, reason, approved_by_principal_id, approved_at, approval_method,
+	suspended_by_principal_id, suspended_at, suspension_reason, revocation_reason
 `
 
 // prefixedDelegationColumns qualifies every column with a table alias.
@@ -89,17 +95,30 @@ func prefixedDelegationColumns(alias string) string {
 }
 
 func scanDelegation(row pgx.Row, d *domain.DelegationGrant) error {
+	return scanDelegationPlus(row, d)
+}
+
+// scanDelegationPlus reads delegationColumns, then any extra columns. One
+// scanner for both, so the positional list cannot drift between them.
+func scanDelegationPlus(row pgx.Row, d *domain.DelegationGrant, extra ...any) error {
 	var status string
-	if err := row.Scan(
+	var reason *string
+	dest := []any{
 		&d.DelegationID, &d.TenantID, &d.LegalEntityID, &d.DelegatorPrincipalID, &d.DelegatePrincipalID,
 		&d.ActionType, &d.EffectiveFrom, &d.EffectiveTo, &status, &d.CreatedByPrincipalID, &d.CorrelationID,
 		&d.CreatedAt, &d.UpdatedAt, &d.RevokedByPrincipalID, &d.RevokedAt, &d.ExpiredAt,
 		&d.AuthorityLimitCents, &d.AuthorityLimitCurrency, &d.AuthorityLimitQuantity,
-		&d.Version,
-	); err != nil {
+		&d.Version, &reason, &d.ApprovedByPrincipalID, &d.ApprovedAt, &d.ApprovalMethod,
+		&d.SuspendedByPrincipalID, &d.SuspendedAt, &d.SuspensionReason, &d.RevocationReason,
+	}
+	if err := row.Scan(append(dest, extra...)...); err != nil {
 		return err
 	}
 	d.Status = domain.DelegationStatus(status)
+	d.Reason = ""
+	if reason != nil {
+		d.Reason = *reason
+	}
 	return nil
 }
 
@@ -119,13 +138,14 @@ func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGran
 				action_type, effective_from, effective_to, status, created_by_principal_id, correlation_id,
 				created_at, updated_at, revoked_by_principal_id, revoked_at, expired_at,
 				authority_limit_cents, authority_limit_currency, authority_limit_quantity,
-				version
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+				version, reason, approved_by_principal_id, approved_at, approval_method
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 			ON CONFLICT (tenant_id, correlation_id, created_by_principal_id, action_type, legal_entity_id, effective_from, effective_to) DO NOTHING
 		`, d.DelegationID, tenantID, d.LegalEntityID, d.DelegatorPrincipalID, d.DelegatePrincipalID,
 			d.ActionType, d.EffectiveFrom, d.EffectiveTo, string(d.Status), d.CreatedByPrincipalID, d.CorrelationID,
 			d.CreatedAt, d.UpdatedAt, d.RevokedByPrincipalID, d.RevokedAt, d.ExpiredAt,
-			d.AuthorityLimitCents, d.AuthorityLimitCurrency, d.AuthorityLimitQuantity, 1)
+			d.AuthorityLimitCents, d.AuthorityLimitCurrency, d.AuthorityLimitQuantity, 1,
+			d.Reason, d.ApprovedByPrincipalID, d.ApprovedAt, d.ApprovalMethod)
 		if err != nil {
 			return err
 		}
@@ -136,14 +156,40 @@ func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGran
 			// branch below instead and enqueues nothing, so an idempotent
 			// retry cannot emit a second authority.delegated.
 			d.TenantID = tenantID
+			d.Version = 1
+			transition := domain.TransitionActivated
+			if d.Status == domain.DelegationStatusProposed {
+				transition = domain.TransitionProposed
+			}
+			if err := recordHistory(ctx, tx, d, transition, d.CreatedByPrincipalID, d.Reason); err != nil {
+				return err
+			}
+			// A PROPOSED grant confers nothing, so nothing downstream is told
+			// until it is activated (DelegationActivated = authority.delegated).
+			if d.Status != domain.DelegationStatusActive {
+				return nil
+			}
 			return enqueue(ctx, tx, events.EventDelegated, *d)
 		}
-		// Replay: find the existing grant using the composite idempotency key
+		// Replay: find the existing grant using the composite idempotency key.
+		// It is a replay only if it is the SAME grant. ORG-06 scopes
+		// idempotency by principal + scope + validity, and the delegate is not
+		// in the unique key, so a reused correlation_id naming another
+		// delegate (or delegator, or ceiling) used to come back as a 200
+		// "replay" of a delegation the caller never asked for.
 		row := tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND correlation_id = $2 AND created_by_principal_id = $3 AND action_type = $4 AND legal_entity_id = $5 AND effective_from = $6 AND effective_to = $7", tenantID, d.CorrelationID, d.CreatedByPrincipalID, d.ActionType, d.LegalEntityID, d.EffectiveFrom, d.EffectiveTo)
-		return scanDelegation(row, d)
+		var existing domain.DelegationGrant
+		if err := scanDelegation(row, &existing); err != nil {
+			return err
+		}
+		if !sameGrant(&existing, d) {
+			return domain.ErrCorrelationReused
+		}
+		*d = existing
+		return nil
 	})
 	if err != nil {
-		return false, err
+		return false, mapPgError(err)
 	}
 	return created, nil
 }
@@ -175,8 +221,8 @@ func (s *PgStore) ExpireDue(ctx context.Context) ([]domain.DelegationGrant, erro
 		// are no longer the same column.
 		rows, err := tx.Query(ctx, `
 			UPDATE delegation_grants
-			SET status = 'EXPIRED', expired_at = effective_to, updated_at = $1
-			WHERE tenant_id = $2 AND status = 'ACTIVE' AND effective_to < $1
+			SET status = 'EXPIRED', expired_at = effective_to, updated_at = $1, version = version + 1
+			WHERE tenant_id = $2 AND status IN ('PROPOSED', 'ACTIVE', 'SUSPENDED') AND effective_to <= $1
 			RETURNING `+delegationColumns, now, tenantID)
 		if err != nil {
 			return err
@@ -203,6 +249,9 @@ func (s *PgStore) ExpireDue(ctx context.Context) ([]domain.DelegationGrant, erro
 		// this moment would lose authority.expired permanently, because the
 		// next sweep finds no ACTIVE row left to flip.
 		for _, d := range out {
+			if err := recordHistory(ctx, tx, &d, domain.TransitionExpired, "system:expiry", "window ended"); err != nil {
+				return err
+			}
 			if err := enqueue(ctx, tx, events.EventExpired, d); err != nil {
 				return err
 			}
@@ -213,49 +262,6 @@ func (s *PgStore) ExpireDue(ctx context.Context) ([]domain.DelegationGrant, erro
 		return nil, err
 	}
 	return out, nil
-}
-
-// CheckOverlap returns an error if an ACTIVE delegation already exists
-// for the same (tenant, legal_entity, delegate, action_type) with an
-// overlapping time window. This is the application-level check that runs
-// before the DB EXCLUDE constraint, providing a clear 409 error with
-// context rather than a raw DB exception.
-// correlationID is excluded from the check (for idempotent replays).
-func (s *PgStore) CheckOverlap(ctx context.Context, tenantID, legalEntityID, delegatePrincipalID, actionType string, effectiveFrom, effectiveTo time.Time, correlationID string) error {
-	if tenantID == "" {
-		return domain.ErrTenantMissing
-	}
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var exists bool
-		// Check for any ACTIVE delegation with overlapping time window
-		// for the same delegate + action_type on the same entity.
-		// Exclude the correlation_id to allow idempotent replays.
-		query := `
-			SELECT EXISTS (
-				SELECT 1 FROM delegation_grants
-				WHERE tenant_id = $1
-				  AND legal_entity_id = $2
-				  AND delegate_principal_id = $3
-				  AND action_type = $4
-				  AND status = 'ACTIVE'
-				  AND effective_from < $5
-				  AND effective_to > $6
-			)
-		`
-		args := []any{tenantID, legalEntityID, delegatePrincipalID, actionType, effectiveTo, effectiveFrom}
-		if correlationID != "" {
-			query += " AND correlation_id != $7"
-			args = append(args, correlationID)
-		}
-		err := tx.QueryRow(ctx, query, args...).Scan(&exists)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return domain.ErrOverlapConflict
-		}
-		return nil
-	})
 }
 
 func (s *PgStore) GetDelegation(ctx context.Context, delegationID string) (*domain.DelegationGrant, error) {
@@ -345,115 +351,6 @@ func (s *PgStore) ListDelegations(ctx context.Context, f domain.ListDelegationsF
 	return out, nil
 }
 
-// RevokeDelegation transitions a delegation from ACTIVE to REVOKED,
-// re-checking the current status inside the same transaction the update
-// RevokeDelegation revokes an ACTIVE delegation. If expectedVersion is
-// provided (non-zero), the revocation will fail with ErrVersionMismatch
-// if the stored version doesn't match — implementing optimistic locking.
-func (s *PgStore) RevokeDelegation(ctx context.Context, delegationID, revokedByPrincipalID string, expectedVersion int64) (*domain.DelegationGrant, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrTenantMissing
-	}
-
-	var out domain.DelegationGrant
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		var current domain.DelegationGrant
-		row := tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND delegation_id = $2 FOR UPDATE", tenantID, delegationID)
-		if err := scanDelegation(row, &current); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrDelegationNotFound
-			}
-			return err
-		}
-		if current.Status != domain.DelegationStatusActive {
-			return domain.ErrInvalidTransition
-		}
-		if expectedVersion > 0 && current.Version != expectedVersion {
-			return domain.ErrVersionMismatch
-		}
-
-		now := time.Now().UTC()
-		if _, err := tx.Exec(ctx, `
-			UPDATE delegation_grants
-			SET status = $1, revoked_by_principal_id = $2, revoked_at = $3, updated_at = $3, version = version + 1
-			WHERE tenant_id = $4 AND delegation_id = $5
-		`, string(domain.DelegationStatusRevoked), revokedByPrincipalID, now, tenantID, delegationID); err != nil {
-			return err
-		}
-
-		row = tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND delegation_id = $2", tenantID, delegationID)
-		if err := scanDelegation(row, &out); err != nil {
-			return err
-		}
-		// The event this whole mechanism was built for. identity-context-svc
-		// ends the delegate's session on authority.revoked; losing it leaves a
-		// withdrawn authority live while the register, the operator and every
-		// log agree the revocation succeeded.
-		return enqueue(ctx, tx, events.EventRevoked, out)
-	})
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &out, nil
-}
-
-// ExtendDelegation extends an ACTIVE delegation's effective_to to a later date.
-// Only allowed if the delegation is ACTIVE and the new effective_to is after
-// the current one. Returns ErrCannotExtend if validation fails.
-// If expectedVersion is provided (non-zero), the extension will fail with
-// ErrVersionMismatch if the stored version doesn't match.
-func (s *PgStore) ExtendDelegation(ctx context.Context, delegationID, extendedByPrincipalID string, newEffectiveTo time.Time, expectedVersion int64) (*domain.DelegationGrant, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrTenantMissing
-	}
-
-	var out domain.DelegationGrant
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		// Get current delegation
-		row := tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND delegation_id = $2 FOR UPDATE", tenantID, delegationID)
-		if err := scanDelegation(row, &out); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return domain.ErrDelegationNotFound
-			}
-			return err
-		}
-
-		if out.Status != domain.DelegationStatusActive {
-			return domain.ErrCannotExtend
-		}
-		if !newEffectiveTo.After(out.EffectiveTo) {
-			return domain.ErrCannotExtend
-		}
-		if expectedVersion > 0 && out.Version != expectedVersion {
-			return domain.ErrVersionMismatch
-		}
-
-		now := time.Now().UTC()
-		if _, err := tx.Exec(ctx, `
-			UPDATE delegation_grants
-			SET effective_to = $1, updated_at = $2, version = version + 1
-			WHERE tenant_id = $3 AND delegation_id = $4
-		`, newEffectiveTo, now, tenantID, delegationID); err != nil {
-			return err
-		}
-
-		out.EffectiveTo = newEffectiveTo
-		out.UpdatedAt = now
-		out.Version++
-
-		// Enqueue authority.extended event for the extension
-		return enqueue(ctx, tx, events.EventExtended, out)
-	})
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return &out, nil
-}
-
-// RecordRefusedEscalation records a refused escalation attempt for audit.
-// ORG-06 §4.2: "Every refused escalation attempt leaves durable evidence."
 func (s *PgStore) RecordRefusedEscalation(ctx context.Context, r *domain.RefusedEscalation) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -474,92 +371,13 @@ func (s *PgStore) RecordRefusedEscalation(ctx context.Context, r *domain.Refused
 	})
 }
 
-// ExplainDelegationChain returns the chain of delegations from a starting
-// principal to a target principal for a specific action_type on a legal
-// entity. Uses a recursive CTE to find all steps in the chain.
-func (s *PgStore) ExplainDelegationChain(ctx context.Context, tenantID, legalEntityID, startPrincipalID, targetPrincipalID, actionType string) ([]domain.DelegationChainStep, error) {
-	if tenantID == "" {
-		return nil, domain.ErrTenantMissing
-	}
-
-	var out []domain.DelegationChainStep
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		// Recursive CTE to find the delegation chain
-		// We start from the startPrincipalID and follow delegations forward
-		rows, err := tx.Query(ctx, `
-			WITH RECURSIVE chain AS (
-				-- Base case: delegations FROM the start principal
-				SELECT
-					dg.delegation_id,
-					dg.delegator_principal_id,
-					dg.delegate_principal_id,
-					dg.action_type,
-					dg.effective_from,
-					dg.effective_to,
-					dg.status,
-					1 as step_number
-				FROM delegation_grants dg
-				WHERE dg.tenant_id = $1
-				  AND dg.legal_entity_id = $2
-				  AND dg.delegator_principal_id = $3
-				  AND dg.action_type = $4
-				  AND dg.status = 'ACTIVE'
-				UNION ALL
-				-- Recursive case: find delegations from the previous delegate
-				SELECT
-					dg.delegation_id,
-					dg.delegator_principal_id,
-					dg.delegate_principal_id,
-					dg.action_type,
-					dg.effective_from,
-					dg.effective_to,
-					dg.status,
-					c.step_number + 1
-				FROM delegation_grants dg
-				JOIN chain c ON dg.delegator_principal_id = c.delegate_principal_id
-				WHERE dg.tenant_id = $1
-				  AND dg.legal_entity_id = $2
-				  AND dg.action_type = $4
-				  AND dg.status = 'ACTIVE'
-				  AND c.step_number < 10  -- prevent infinite recursion
-			)
-			SELECT delegation_id, delegator_principal_id, delegate_principal_id, action_type, effective_from, effective_to, status, step_number
-			FROM chain
-			WHERE delegate_principal_id = $5  -- filter to target principal
-			ORDER BY step_number
-		`, tenantID, legalEntityID, startPrincipalID, actionType, targetPrincipalID)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var step domain.DelegationChainStep
-			if err := rows.Scan(&step.DelegationID, &step.DelegatorPrincipalID, &step.DelegatePrincipalID, &step.ActionType, &step.EffectiveFrom, &step.EffectiveTo, &step.Status, &step.StepNumber); err != nil {
-				return err
-			}
-			out = append(out, step)
-		}
-		return rows.Err()
-	})
-	if err != nil {
-		return nil, mapPgError(err)
-	}
-	return out, nil
+func enqueue(ctx context.Context, tx pgx.Tx, eventType string, d domain.DelegationGrant) error {
+	return enqueueBy(ctx, tx, eventType, d, "", "")
 }
 
-// ── Transactional outbox ─────────────────────────────────────────────────────
-
-// enqueue writes one lifecycle event into the outbox, inside the caller's
-// transaction.
-//
-// It takes the tx rather than the pool for the only reason the outbox exists:
-// the event and the state change it describes must commit or roll back
-// together. Published from the handler after the commit, as this service used
-// to, a broker failure left a revoked grant whose revocation nobody was ever
-// told about — and told the operator it had succeeded.
-func enqueue(ctx context.Context, tx pgx.Tx, eventType string, d domain.DelegationGrant) error {
-	key, body, err := events.Build(eventType, d)
+// enqueueBy enqueues an event naming the principal who performed the change.
+func enqueueBy(ctx context.Context, tx pgx.Tx, eventType string, d domain.DelegationGrant, actor, reason string) error {
+	key, body, err := events.BuildFor(eventType, d, actor, reason)
 	if err != nil {
 		return err
 	}
@@ -644,13 +462,13 @@ func (s *PgStore) ExpireDueAllTenants(ctx context.Context, limit int) ([]domain.
 			WITH due AS (
 				SELECT delegation_id
 				  FROM delegation_grants
-				 WHERE status = 'ACTIVE' AND effective_to < $1
+				 WHERE status IN ('PROPOSED', 'ACTIVE', 'SUSPENDED') AND effective_to <= $1
 				 ORDER BY effective_to
 				 LIMIT $2
 				 FOR UPDATE SKIP LOCKED
 			)
 			UPDATE delegation_grants g
-			   SET status = 'EXPIRED', expired_at = g.effective_to, updated_at = $1
+			   SET status = 'EXPIRED', expired_at = g.effective_to, updated_at = $1, version = g.version + 1
 			  FROM due
 			 WHERE g.delegation_id = due.delegation_id
 			RETURNING `+prefixedDelegationColumns("g"), now, limit)
@@ -673,6 +491,9 @@ func (s *PgStore) ExpireDueAllTenants(ctx context.Context, limit int) ([]domain.
 		// happens exactly once, so an event published separately and lost could
 		// never be regenerated -- the next pass finds no ACTIVE row left.
 		for _, d := range out {
+			if err := recordHistory(ctx, tx, &d, domain.TransitionExpired, "system:expiry", "window ended"); err != nil {
+				return err
+			}
 			if err := enqueue(ctx, tx, events.EventExpired, d); err != nil {
 				return err
 			}
@@ -698,7 +519,7 @@ func (s *PgStore) DueCount(ctx context.Context) (due int64, oldestOverdue time.D
 		if err := tx.QueryRow(ctx, `
 			SELECT count(*), min(effective_to)
 			  FROM delegation_grants
-			 WHERE status = 'ACTIVE' AND effective_to < now()
+			 WHERE status IN ('PROPOSED', 'ACTIVE', 'SUSPENDED') AND effective_to <= now()
 		`).Scan(&due, &oldest); err != nil {
 			return err
 		}
@@ -831,4 +652,14 @@ func (s *PgStore) OutboxDepth(ctx context.Context) (pending int64, oldestAge tim
 		return nil
 	})
 	return pending, oldestAge, err
+}
+
+// sameGrant compares what a delegation confers: the parties and the ceiling.
+// The id, timestamps and reason may differ on a genuine retry.
+func sameGrant(a, b *domain.DelegationGrant) bool {
+	eqI := func(x, y *int64) bool { return (x == nil && y == nil) || (x != nil && y != nil && *x == *y) }
+	eqS := func(x, y *string) bool { return (x == nil && y == nil) || (x != nil && y != nil && *x == *y) }
+	return a.DelegatorPrincipalID == b.DelegatorPrincipalID && a.DelegatePrincipalID == b.DelegatePrincipalID &&
+		eqI(a.AuthorityLimitCents, b.AuthorityLimitCents) && eqS(a.AuthorityLimitCurrency, b.AuthorityLimitCurrency) &&
+		eqI(a.AuthorityLimitQuantity, b.AuthorityLimitQuantity)
 }

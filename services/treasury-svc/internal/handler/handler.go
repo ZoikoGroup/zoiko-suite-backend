@@ -79,48 +79,6 @@ type Store interface {
 	GetBankAccountAsOf(ctx context.Context, tenantID, bankAccountID string, asOf time.Time) (*domain.AccountHistoryEntry, error)
 }
 
-// Publisher defines Kafka event publication contract.
-type Publisher interface {
-	PublishCashPositionUpdated(ctx context.Context, correlationID, legalEntityID, actorID string, balance domain.CashBalance)
-	PublishEffectiveCashUpdated(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse)
-	PublishLiquidityThresholdBreached(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse)
-
-	// BNK-01 domain events — see internal/events/publisher.go's own doc
-	// comments. Previously this service published nothing at all for the
-	// bank-account lifecycle.
-	PublishBankAccountCreated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
-	PublishBankAccountOwnershipVerified(ctx context.Context, correlationID, actorID string, acct domain.BankAccount, evidence domain.OwnershipEvidence)
-	PublishBankAccountMetadataAmended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
-	PublishBankAccountOperationalUseChanged(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
-	PublishBankAccountSuspended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
-	PublishBankAccountReactivated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
-	PublishBankAccountClosed(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
-	PublishBankAccountTokenRotated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
-
-	// BNK-09 events — see internal/events/publisher.go's own doc comments.
-	// Every doc-named TreasuryTransfer* event is now covered, plus the
-	// non-doc-listed Cancelled (a documented spec-inconsistency judgment
-	// call, not a silent guess — see PublishTreasuryTransferCancelled).
-	PublishTreasuryTransferCreated(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
-	PublishTreasuryTransferApproved(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
-	PublishTreasuryTransferAuthorized(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
-	PublishTreasuryTransferSubmitted(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
-	PublishTreasuryTransferSettled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
-	PublishTreasuryTransferRejected(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
-	PublishTreasuryTransferReturned(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
-	PublishTreasuryTransferCancelled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
-
-	// BNK-08 events — see internal/events/publisher.go's own doc comments.
-	PublishCashPositionCalculated(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot)
-	PublishCashPositionPublished(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot)
-	PublishCashPositionBecameStale(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot)
-
-	// BNK-10 events — see internal/events/publisher.go's own doc comments.
-	PublishFXExposureCalculated(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot)
-	PublishFXExposurePublished(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot)
-	PublishFXExposureBecameStale(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot)
-}
-
 // AuthZClient defines authorization plane contract.
 type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
@@ -184,7 +142,6 @@ const (
 
 type Handler struct {
 	store           Store
-	publisher       Publisher
 	authz           AuthZClient
 	clients         Clients
 	transferClients TransferClients
@@ -192,10 +149,9 @@ type Handler struct {
 	log             *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, transferClients TransferClients, banking BankingConnector, log *zap.Logger) *Handler {
+func New(store Store, authz AuthZClient, clients Clients, transferClients TransferClients, banking BankingConnector, log *zap.Logger) *Handler {
 	return &Handler{
 		store:           store,
-		publisher:       publisher,
 		authz:           authz,
 		clients:         clients,
 		transferClients: transferClients,
@@ -354,7 +310,6 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = h.store.CreateCashBalance(r.Context(), bal)
 
-	h.publisher.PublishBankAccountCreated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *acct)
 	writeJSON(w, http.StatusCreated, acct)
 }
 
@@ -584,12 +539,6 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		Components:               components,
 		HasStaleComponent:        bankBalanceStale,
 	}
-
-	if details != nil && details.IsBreached {
-		h.publisher.PublishLiquidityThresholdBreached(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, resp)
-	}
-
-	h.publisher.PublishEffectiveCashUpdated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, resp)
 
 	writeJSON(w, http.StatusOK, resp)
 }

@@ -29,7 +29,7 @@ func NewMemoryStore() *MemoryStore {
 // against a fake that cannot fail, which is how the unscoped reads here
 // survived in the first place. Both implementations answer the same
 // question the same way, so a test proves something about production.
-func (m *MemoryStore) CreateConnection(ctx context.Context, c *domain.BankConnection) error {
+func (m *MemoryStore) CreateConnection(ctx context.Context, c *domain.BankConnection, _, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -81,7 +81,7 @@ func (m *MemoryStore) ListConnections(ctx context.Context, legalEntityID string)
 	return res, nil
 }
 
-func (m *MemoryStore) RecordStatement(ctx context.Context, stmt *domain.BankStatement) error {
+func (m *MemoryStore) RecordStatement(ctx context.Context, stmt *domain.BankStatement, _, _, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

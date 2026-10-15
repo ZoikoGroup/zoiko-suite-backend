@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -13,6 +14,13 @@ type Config struct {
 	DB DBConfig
 
 	Kafka KafkaConfig
+
+	// EventResidencyRegion is the residencyregion every event this service
+	// emits carries (ZS-EVENT-001 §4: required, "authoritative regional
+	// data-bearing context"). Deliberately NO default: a wrong region silently
+	// stamped on every financial event is worse than refusing to start.
+	// EVENT_RESIDENCY_REGION, a lower-case code such as "uk" or "eu-west".
+	EventResidencyRegion string
 
 	AuthZServiceURL        string
 	LedgerServiceURL       string
@@ -60,9 +68,14 @@ type KafkaConfig struct {
 }
 
 func Load() (*Config, error) {
+	region := os.Getenv("EVENT_RESIDENCY_REGION")
+	if region == "" {
+		return nil, errors.New("EVENT_RESIDENCY_REGION is required (e.g. uk, eu-west): every emitted event must carry its residency region")
+	}
 	return &Config{
-		Env:  env("ENV", "local"),
-		Port: envInt("PORT", 8106),
+		EventResidencyRegion: region,
+		Env:                  env("ENV", "local"),
+		Port:                 envInt("PORT", 8106),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),

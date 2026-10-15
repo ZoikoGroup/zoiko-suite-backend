@@ -121,6 +121,7 @@ Full request/response shapes are in `openapi.yaml`; events are in
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/v1/search` | Execute a governed search |
+| `POST` | `/v1/search/semantic` | Semantic / hybrid retrieval over a scope that pins an embedding model (§10.1) |
 | `POST` | `/v1/retrieve` | Re-authorize and hydrate named refs (max 50) |
 | `GET` | `/v1/scopes` | Search surfaces and their field capabilities |
 | `POST` | `/v1/restrictions` | Apply a priority visibility removal |
@@ -136,6 +137,8 @@ Full request/response shapes are in `openapi.yaml`; events are in
 | `POST` | `/v1/index-generations` | Plan and build a generation (platform) |
 | `GET` | `/v1/index-generations` | List generations |
 | `POST` | `/v1/index-generations/{id}/state` | BUILDING → VALIDATING → READY → ACTIVE |
+| `POST` | `/v1/index-generations/{id}/retrieval-evaluations` | recall@k certification; required before a model migration reaches READY |
+| `GET` | `/v1/index-generations/{id}/retrieval-evaluations` | The generation's latest certification |
 | `GET` | `/v1/checkpoints` | Index freshness and population |
 
 ### Reason codes
@@ -234,6 +237,10 @@ enforced somewhere specific, and each has a test that fails if it is removed.
 | `RESTRICTION_VERIFY_INTERVAL` | `30s` | §8.2 propagation verification sweep |
 | `CHECKPOINT_INTERVAL` | `60s` | §5.3 freshness and population accounting |
 | `SOURCE_HYDRATION_TIMEOUT` | `3s` | R2 hydration bound; a timeout SUPPRESSES |
+| `SOURCE_SERVICE_URL_<SOURCE_TYPE>` | *(none)* | R2/R3 hydration: the record COLLECTION URL, id appended, e.g. `SOURCE_SERVICE_URL_OBLIGATION=http://obligations-svc:8088/v1/obligations`. Hydration forwards the caller's envelope. Unset → that type's R2 results are suppressed with ESR-014 |
+| `EMBEDDING_PROVIDER_URL` | *(none)* | Semantic scopes (§10.1; provider/model are OD-10). Unset → semantic contracts cannot build a generation and `/v1/search/semantic` answers ESR-019 |
+| `EMBEDDING_PROVIDER_TOKEN` | *(none)* | Bearer token for the provider |
+| `EMBEDDING_TIMEOUT` | `5s` | Per embedding call |
 | `MAX_RESULT_WINDOW` | `100` | ESR-015 |
 | `MAX_COMPLEXITY_SCORE` | `100` | ESR-004 |
 | `FACET_MIN_COUNT` | `2` | §7.3 / NP-08. Refuses to start below 2 |
@@ -252,7 +259,9 @@ indexing.
 
 | Metric | Labels | §13.1 family |
 |---|---|---|
-| `search_indexer_index_lag_seconds` | `scope` | Freshness |
+| `search_indexer_index_lag_seconds` | `scope` | Freshness (per event, at consume time) |
+| `search_indexer_checkpoint_lag_seconds` | `scope` | Freshness — broker-measured lag at the last checkpoint |
+| `search_indexer_scope_freshness` | `scope`, `state` | Freshness — 1 for the scope's current CURRENT/LAGGING/STALE/UNKNOWN |
 | `search_indexer_restriction_lag_seconds` | — | **Restriction lag** (over-disclosure window) |
 | `search_indexer_restriction_backlog` | `scope` | Restriction safety (gauge) |
 | `search_indexer_retrieval_decisions_total` | `scope`, `outcome` | Authorization outcomes |
@@ -296,18 +305,29 @@ never evaluated as working.
 These are deliberate, not oversights. Each maps to a controlled open decision
 in §16 that is not this service's to close.
 
-- **No semantic/vector search yet** (§10, OD-10/OD-11). Wave 7. The projection
-  and restriction model already carries the lineage vectors would need, so
-  adding them is an additional index family rather than a redesign.
+- **Semantic search is built and fails closed until OD-10 closes** (§10,
+  OD-10/OD-11). Contracts pin model, version, width, preprocessing and space;
+  vectors live in the same document as the lexical projection, so tenant,
+  residency, epoch and tombstone controls apply to them structurally (INV-26,
+  NP-34); the ANN walk is filtered to the caller's eligible set (NP-33); every
+  provider answer is checked against the pin (NP-35); model migrations need a
+  passing retrieval evaluation before READY. No provider is configured, so no
+  semantic scope can build and `/v1/search/semantic` answers ESR-019. The
+  provider protocol is in `internal/embedding`.
 - **`/v1/search-exports` records authorization and population; it does not
   stream data** (OD-13). The route exists to make INV-29's boundary explicit
   and enforced. Wiring a bulk writer needs the export-maximum and
   async-threshold decision, so it answers 202 with the recorded authorization
   rather than inventing a limit.
-- **No R2 hydrator is wired** (OD-05). No scope is registered R2 yet. A scope
-  configured R2 with no hydrator answers ESR-014 rather than silently
-  downgrading to index content — a downgrade would be a freshness lie nothing
-  downstream could detect.
+- **R2 hydration is wired for `obligation` only** (OD-05 decides which scopes
+  are R2). The hydrator asks the source AS THE CALLER, with the full canonical
+  envelope. A source type with no `SOURCE_SERVICE_URL_<TYPE>` suppresses its R2
+  results with ESR-014 rather than downgrading to index content.
+- **Index freshness is enforced, not just reported.** Lag is measured at the
+  broker; STALE or UNKNOWN refuses protected (R1+) scopes with ESR-012 and
+  flags R0 answers. Past half of `max_lag_seconds` a scope is LAGGING, which is
+  surfaced but not blocked. The 50% threshold and the per-class policy are this
+  service's reading of §8.3 pending OD-03.
 - **Numeric SLOs are not set** (OD-03/OD-04). The metrics that would be
   alerted on exist and are separated correctly; the thresholds are a capacity
   decision.

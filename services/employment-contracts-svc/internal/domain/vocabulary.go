@@ -14,14 +14,18 @@ import "slices"
 // than as a 500 by the constraint. The two must agree: adding a value here
 // without adding it to 0030 turns an accepted request into a failed INSERT.
 var (
-	ContractTypes    = []string{"FULL_TIME", "PART_TIME", "FIXED_TERM", "EXECUTIVE"}
-	ContractStatuses = []string{"DRAFT", "ACTIVE", "SUPERSEDED", "TERMINATED", "EXPIRED"}
-	PayFrequencies   = []string{"MONTHLY", "BIWEEKLY", "WEEKLY"}
+	ContractTypes     = []string{"FULL_TIME", "PART_TIME", "FIXED_TERM", "EXECUTIVE", "INTERN", "PROBATION"}
+	ContractStatuses  = []string{"DRAFT", "ACTIVE", "SUPERSEDED", "TERMINATED", "EXPIRED", "PENDING"}
+	PayFrequencies    = []string{"MONTHLY", "BIWEEKLY", "WEEKLY", "SEMIMONTHLY"}
+	ShiftTypes        = []string{"DAY", "NIGHT", "ROTATIONAL"}
+	TerminationTypes  = []string{"RESIGNATION", "INVOLUNTARY", "REDUNDANCY", "RETIREMENT"}
 )
 
 func IsValidContractType(v string) bool   { return slices.Contains(ContractTypes, v) }
 func IsValidContractStatus(v string) bool { return slices.Contains(ContractStatuses, v) }
 func IsValidPayFrequency(v string) bool   { return slices.Contains(PayFrequencies, v) }
+func IsValidShiftType(v string) bool      { return slices.Contains(ShiftTypes, v) }
+func IsValidTerminationType(v string) bool { return slices.Contains(TerminationTypes, v) }
 
 // IsValidCurrency reports whether v is a three-letter uppercase ISO 4217 code,
 // which is what every consumer assumes when it renders an amount. It does not

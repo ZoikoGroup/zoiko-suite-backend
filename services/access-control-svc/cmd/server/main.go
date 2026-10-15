@@ -30,8 +30,11 @@ import (
 	"zoiko.io/access-control-svc/internal/domain"
 	svcenvelope "zoiko.io/access-control-svc/internal/envelope"
 	"zoiko.io/access-control-svc/internal/events"
+	"zoiko.io/access-control-svc/internal/expiry"
 	"zoiko.io/access-control-svc/internal/handler"
 	"zoiko.io/access-control-svc/internal/health"
+	"zoiko.io/access-control-svc/internal/hrevents"
+	"zoiko.io/access-control-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/access-control-svc/internal/middleware"
 	"zoiko.io/access-control-svc/internal/mtls"
 	"zoiko.io/access-control-svc/internal/outbox"
@@ -352,7 +355,11 @@ func main() {
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	authzAdminClient := clients.NewAuthzAdminClient(cfg.AuthZServiceURL)
 	sodClient := clients.NewSoDClient(authzBaseURL)
-	protectedActionsClient := clients.NewProtectedActionsClient(authzBaseURL)
+	// The protected-action catalogue is this service's own table, not a call:
+	// the route the old client called (GET /v1/protected-permissions) exists
+	// nowhere in the estate.
+	protectedCatalogue := store.NewProtectedCatalogue(pgStore)
+	permissionTaxonomy := store.NewPermissionCatalogue(pgStore)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -372,8 +379,19 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, authzClient, authzAdminClient, sodClient, protectedActionsClient, domainMetrics, log)
+	// After the envelope check (a write without a key is already refused
+	// there), so this only ever sees writes that carry one. See
+	// internal/idempotency for why the header is now honoured, not just
+	// required.
+	r.Use(idempotency.Middleware(pgStore, log))
+
+	h := handler.New(pgStore, authzClient, authzAdminClient, sodClient, protectedCatalogue, permissionTaxonomy, domainMetrics, log)
 	handler.RegisterRoutes(r, h)
+	gov := handler.NewGov(h, pgStore, authzAdminClient)
+	gov.SetServicePrincipal(cfg.ServicePrincipalID)
+	gov.SetGroupStore(pgStore)
+	gov.SetSubjectLinks(pgStore, cfg.EventReviewReviewer, time.Duration(cfg.EventReviewDueDays)*24*time.Hour)
+	handler.RegisterGovernanceRoutes(r, gov)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	//
@@ -400,6 +418,40 @@ func main() {
 	defer stopRelay()
 	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
 	go relay.Run(relayCtx)
+
+	// ── 6c. Assignment expiry sweep ───────────────────────────────────────────
+	//
+	// Closes governed assignments whose effective_to has passed and enqueues
+	// iam.assignment.revoked, so the sessions holding them end. Stopped with
+	// the relay; see internal/expiry.
+	go expiry.New(pgStore, domainMetrics, log).Run(relayCtx)
+
+	// ── 6d. Event-triggered reviews (S9-C2) ───────────────────────────────────
+	//
+	// HR lifecycle events open an EVENT_TRIGGERED review of the linked
+	// subject; see internal/hrevents. Off until a default reviewer is set: a
+	// review nobody is assigned to is not a control.
+	if cfg.EventReviewReviewer != "" {
+		hrReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers:     cfg.Kafka.Brokers,
+			GroupID:     cfg.HREventGroupID,
+			GroupTopics: cfg.HREventTopics,
+			StartOffset: kafka.FirstOffset,
+			// A nil ErrorLogger hides a consumer that cannot join its group
+			// behind one that looks idle.
+			ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
+				log.Warn(fmt.Sprintf("hr-events reader: "+msg, args...))
+			}),
+		})
+		defer hrReader.Close()
+		hr := hrevents.NewHandler(pgStore, gov, handler.IsTransient, log)
+		go hrevents.Run(relayCtx, hrReader, hr, log, func(outcome string) {
+			domainMetrics.HREvents.WithLabelValues(outcome).Inc()
+		})
+		log.Info("event-triggered reviews on", zap.Strings("topics", cfg.HREventTopics), zap.String("default_reviewer", cfg.EventReviewReviewer))
+	} else {
+		log.Warn("event-triggered reviews off: ACS_EVENT_REVIEW_DEFAULT_REVIEWER is not set")
+	}
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)

@@ -65,37 +65,42 @@ func TestCreateEmployee_FullHRProfile_RoundTrips(t *testing.T) {
 		t.Fatalf("decode get response: %v", err)
 	}
 
-	for _, c := range []struct {
-		field string
-		got   *string
-		want  string
-	}{
-		{"date_of_birth", got.DateOfBirth, "1992-07-19"},
-		{"gender", got.Gender, "FEMALE"},
-		{"profile_picture_url", got.ProfilePictureURL, "https://cdn.example.com/a/asha.png"},
-		{"personal_email", got.PersonalEmail, "asha@personal.example.com"},
-		{"work_email", got.WorkEmail, "a.iyer@corp.example.com"},
-		{"current_address", got.CurrentAddress, "12 Residency Road"},
-		{"permanent_address", got.PermanentAddress, "44 Hill View"},
-		{"city", got.City, "Bengaluru"},
-		{"state", got.State, "Karnataka"},
-		{"country", got.Country, "India"},
-		{"postal_code", got.PostalCode, "560025"},
-		{"company", got.Company, "Zoiko Technologies"},
-		{"business_unit", got.BusinessUnit, "Platform"},
-		{"division", got.Division, "Engineering"},
-		{"team", got.Team, "Identity"},
-		{"designation_id", got.DesignationID, "desig-sse"},
-		{"confirmation_date", got.ConfirmationDate, "2024-09-01"},
-	} {
-		if c.got == nil {
-			t.Errorf("%s: expected %q got nil", c.field, c.want)
-			continue
+	// Verify all HR profile fields round-trip correctly
+	checkPtrField := func(field string, gotVal *string, want string) {
+		if gotVal == nil {
+			t.Errorf("%s: expected %q got nil", field, want)
+			return
 		}
-		if *c.got != c.want {
-			t.Errorf("%s: expected %q got %q", c.field, c.want, *c.got)
+		if *gotVal != want {
+			t.Errorf("%s: expected %q got %q", field, want, *gotVal)
 		}
 	}
+
+	if got.DateOfBirth == nil {
+		t.Errorf("date_of_birth: expected %q got nil", "1992-07-19")
+	} else if *got.DateOfBirth != "1992-07-19" {
+		t.Errorf("date_of_birth: expected %q got %q", "1992-07-19", *got.DateOfBirth)
+	}
+
+	if string(got.Gender) != "FEMALE" {
+		t.Errorf("gender: expected %q got %q", "FEMALE", got.Gender)
+	}
+
+	checkPtrField("profile_picture_url", got.ProfilePictureURL, "https://cdn.example.com/a/asha.png")
+	checkPtrField("personal_email", got.PersonalEmail, "asha@personal.example.com")
+	checkPtrField("work_email", got.WorkEmail, "a.iyer@corp.example.com")
+	checkPtrField("current_address", got.CurrentAddress, "12 Residency Road")
+	checkPtrField("permanent_address", got.PermanentAddress, "44 Hill View")
+	checkPtrField("city", got.City, "Bengaluru")
+	checkPtrField("state", got.State, "Karnataka")
+	checkPtrField("country", got.Country, "India")
+	checkPtrField("postal_code", got.PostalCode, "560025")
+	checkPtrField("company", got.Company, "Zoiko Technologies")
+	checkPtrField("business_unit", got.BusinessUnit, "Platform")
+	checkPtrField("division", got.Division, "Engineering")
+	checkPtrField("team", got.Team, "Identity")
+	checkPtrField("designation_id", got.DesignationID, "desig-sse")
+	checkPtrField("confirmation_date", got.ConfirmationDate, "2024-09-01")
 }
 
 func TestCreateEmployee_InvalidGender_Rejected(t *testing.T) {
@@ -213,7 +218,7 @@ func TestUpdateEmployee_PatchesHRProfileFields(t *testing.T) {
 	if got.BusinessUnit == nil || *got.BusinessUnit != "Platform" {
 		t.Errorf("business_unit should be unchanged, got %v", got.BusinessUnit)
 	}
-	if got.Gender == nil || *got.Gender != "FEMALE" {
+	if string(got.Gender) != "FEMALE" {
 		t.Errorf("gender should be unchanged, got %v", got.Gender)
 	}
 }

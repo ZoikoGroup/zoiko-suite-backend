@@ -23,6 +23,7 @@ import (
 	"zoiko.io/metric-registry-svc/internal/health"
 	"zoiko.io/metric-registry-svc/internal/middleware"
 	"zoiko.io/metric-registry-svc/internal/mtls"
+	"zoiko.io/metric-registry-svc/internal/outbox"
 	"zoiko.io/metric-registry-svc/internal/store"
 	"zoiko.io/metric-registry-svc/internal/telemetry"
 )
@@ -66,6 +67,15 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
+
+	// Transactional outbox relay: drains outbox_events (written atomically
+	// with each domain row by CreateMetricDefinition/PublishNewVersion) to
+	// Kafka via publisher.PublishOutbox, replacing the direct,
+	// error-swallowed publish this service used to rely on exclusively.
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relay := outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, logger)
+	go relay.Start(relayCtx)
 
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {

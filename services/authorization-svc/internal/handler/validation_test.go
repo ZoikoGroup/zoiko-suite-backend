@@ -196,9 +196,27 @@ func TestValidateEntityScope_BatchWritesNoDecisionArtifact(t *testing.T) {
 	if len(resp.Results) != 3 {
 		t.Fatalf("results = %d, want one per requested entity", len(resp.Results))
 	}
-	if store.recordedParams.ActionType != "" {
-		t.Fatalf("a decision artifact was recorded (%+v) — this endpoint authorizes nothing and must not write to access_decision_log",
+	// The caller (p-caller) asks about somebody else (p-1), so exactly one
+	// artifact is expected: the iam.assignment.read check on the CALLER. None
+	// is written for the three entity evaluations themselves.
+	if store.recordedParams.ActionType != "iam.assignment.read" || store.recordedParams.PrincipalID != "p-caller" {
+		t.Fatalf("unexpected decision artifact (%+v) — only the caller's iam.assignment.read check may be recorded; the batch evaluation must not write to access_decision_log",
 			store.recordedParams)
+	}
+}
+
+// Asking about yourself needs no read permission, so nothing at all is recorded.
+func TestValidateEntityScope_SelfQueryWritesNoDecisionArtifact(t *testing.T) {
+	store := &stubStore{rbacActions: []string{"PAYMENT_APPROVE"}, rbacBasis: "rbac:role=FINANCE"}
+	r := newTestRouter(store)
+
+	w := postJSON(t, r, handler.EntityScopeValidatePath,
+		`{"principal_id":"p-caller","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1","11111111-1111-4111-8111-aaaaaaaaaaa2"],"action_type":"PAYMENT_APPROVE"}`, adminHeaders())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if store.recordedParams.ActionType != "" {
+		t.Fatalf("a decision artifact was recorded (%+v) for a self query", store.recordedParams)
 	}
 }
 

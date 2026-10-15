@@ -25,18 +25,23 @@ func runPayload(eventType string, r domain.PayrollRun, reason string) map[string
 			"run_id": r.RunID, "tenant_id": r.TenantID, "legal_entity_id": r.LegalEntityID, "run_number": r.RunNumber,
 			"pay_period_start": r.PayPeriodStart, "pay_period_end": r.PayPeriodEnd, "pay_date": r.PayDate,
 			"is_shadow_run": r.IsShadowRun, "status": r.Status, "initiated_at": r.CreatedAt,
+			"total_employer_contributions": r.TotalEmployerContributions, "total_employee_contributions": r.TotalEmployeeContributions, "batch_id": r.BatchID,
 		}
 	case RunCalculated:
 		return map[string]any{
 			"run_id": r.RunID, "tenant_id": r.TenantID, "legal_entity_id": r.LegalEntityID, "run_number": r.RunNumber,
 			"total_gross_pay": r.TotalGrossPay, "total_net_pay": r.TotalNetPay, "total_tax_deductions": r.TotalTaxDeductions,
 			"employee_count": r.EmployeeCount, "is_shadow_run": r.IsShadowRun, "calculated_at": r.UpdatedAt,
+			"total_employer_contributions": r.TotalEmployerContributions, "total_employee_contributions": r.TotalEmployeeContributions,
+			"total_tds": r.TotalTDS, "total_pf": r.TotalPF, "total_esi": r.TotalESI, "total_pt": r.TotalPT,
 		}
 	case RunCompleted:
 		return map[string]any{
 			"run_id": r.RunID, "tenant_id": r.TenantID, "legal_entity_id": r.LegalEntityID, "run_number": r.RunNumber,
 			"total_gross_pay": r.TotalGrossPay, "total_net_pay": r.TotalNetPay, "total_tax_deductions": r.TotalTaxDeductions,
 			"employee_count": r.EmployeeCount, "is_shadow_run": r.IsShadowRun, "finalized_at": r.FinalizedAt,
+			"total_employer_contributions": r.TotalEmployerContributions, "total_employee_contributions": r.TotalEmployeeContributions,
+			"total_tds": r.TotalTDS, "total_pf": r.TotalPF, "total_esi": r.TotalESI, "total_pt": r.TotalPT,
 		}
 	case RunBlocked:
 		return map[string]any{

@@ -173,7 +173,6 @@ func (h *Handler) ConfirmMatch(w http.ResponseWriter, r *http.Request) {
 		h.writeConfirmMatchErr(w, err)
 		return
 	}
-	h.publisher.PublishReconciliationMatched(r.Context(), *confirmed)
 	writeJSON(w, http.StatusOK, confirmed)
 }
 
@@ -222,7 +221,6 @@ func (h *Handler) RejectProposedMatch(w http.ResponseWriter, r *http.Request) {
 	l.FlaggedByPrincipalID = &principalID
 	l.ProposedJournalID = nil
 	l.ProposedByPrincipalID = nil
-	h.publisher.PublishReconciliationExceptionRaised(r.Context(), *l)
 	writeJSON(w, http.StatusOK, l)
 }
 

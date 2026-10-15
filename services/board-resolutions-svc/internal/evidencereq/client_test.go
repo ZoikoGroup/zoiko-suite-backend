@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/go-chi/chi/v5/middleware"
 )
 
 func newServer(t *testing.T, status int, body string) *httptest.Server {
@@ -100,6 +102,41 @@ func TestEvaluateSufficient_Unreachable_FailsClosed(t *testing.T) {
 		"RESOLUTION_PASS", "corr-1", "principal-1", nil)
 	if !errors.Is(err, ErrServiceUnavailable) {
 		t.Fatalf("an unreachable service returned %v, want ErrServiceUnavailable", err)
+	}
+}
+
+// evidence-requirements-svc enforces the same canonical envelope contract as
+// authorization-svc (X-Request-Id, X-Source-Channel, Idempotency-Key,
+// X-Legal-Entity-Id) and answers 401 envelope_incomplete without them — which
+// this client used to fold into the indistinguishable ErrServiceUnavailable,
+// so a fixable header gap read as a real outage. Guards against that
+// regressing silently a second time.
+func TestEvaluateSufficient_ForwardsTheEnvelopeHeaders(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"outcome":"SATISFIED"}`))
+	}))
+	defer srv.Close()
+
+	// A bare context.Background() has no chi request id, same as a real
+	// inbound request would after chi's RequestID middleware has run.
+	ctx := context.WithValue(context.Background(), middleware.RequestIDKey, "req-123")
+	c := NewClient(srv.URL)
+	if err := c.EvaluateSufficient(ctx, "tenant-a", "le-us", "FINANCIAL",
+		"RESOLUTION_PASS", "corr-1", "principal-1", []Artifact{{
+			EvidenceType: "SUPPORTING_DOCUMENT", ReferenceID: "doc-1",
+		}}); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	for _, header := range []string{"X-Request-Id", "X-Source-Channel", "Idempotency-Key", "X-Legal-Entity-Id"} {
+		if got.Get(header) == "" {
+			t.Errorf("request is missing %s — evidence-requirements-svc will answer 401 envelope_incomplete", header)
+		}
+	}
+	if got.Get("X-Legal-Entity-Id") != "le-us" {
+		t.Errorf("X-Legal-Entity-Id sent as %q, want %q", got.Get("X-Legal-Entity-Id"), "le-us")
 	}
 }
 

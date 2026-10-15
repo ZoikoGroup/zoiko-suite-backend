@@ -18,6 +18,15 @@ import (
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
 
+// Test UUID constants - valid UUID v4 format
+const (
+	testWorkflowID  = "550e8400-e29b-41d4-a716-446655440000"
+	testWorkflowID2 = "550e8400-e29b-41d4-a716-446655440001"
+	testCancelledID = "550e8400-e29b-41d4-a716-446655440002"
+	testApprovedID  = "550e8400-e29b-41d4-a716-446655440003"
+	testLegacyID    = "550e8400-e29b-41d4-a716-446655440004"
+)
+
 // ── stub store ────────────────────────────────────────────────────────────────
 
 type stubStore struct {
@@ -409,8 +418,9 @@ func (p *stubPublisher) PublishFormEvent(_ context.Context, eventType string, _ 
 
 type stubAuthz struct{ err error }
 
-func (a *stubAuthz) CheckApprovalAllowed(_ context.Context, _, _ string) error { return a.err }
-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error      { return a.err }
+func (a *stubAuthz) CheckApprovalAllowed(_ context.Context, _, _, _ string) error { return a.err }
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _, _ string) error      { return a.err }
+func (a *stubAuthz) CheckDelegation(_ context.Context, _, _, _ string) error      { return a.err }
 
 type stubDocuments struct {
 	version int
@@ -460,7 +470,7 @@ func validCreateBody() string {
 
 func TestCreateWorkflow_Created(t *testing.T) {
 	store := &stubStore{
-		instance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "PENDING"},
+		instance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING"},
 		stages:   []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}, {WorkflowStageID: "s-2", StageOrder: 2}},
 	}
 	pub := &stubPublisher{}
@@ -566,8 +576,9 @@ func TestCreateWorkflow_InitiatorAsApprover_Rejected(t *testing.T) {
 
 func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing.T) {
 	store := &stubStore{
-		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
-		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "PENDING"},
+		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage:       &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
+		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING"},
 		submitStage:        &domain.WorkflowStage{StageOrder: 1, StageStatus: "APPROVED"},
 		submitTransitioned: true,
 	}
@@ -575,7 +586,7 @@ func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing
 	r := newTestRouterFull(store, pub, &stubAuthz{})
 
 	body := `{"action":"APPROVE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/actions", bytes.NewBufferString(body)), "approver-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/actions", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -591,8 +602,9 @@ func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing
 
 func TestSubmitAction_FinalApprove_PublishesCompleted(t *testing.T) {
 	store := &stubStore{
-		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
-		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "APPROVED"},
+		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage:       &domain.WorkflowStage{StageOrder: 2, ApproverPrincipalID: "approver-2"},
+		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "APPROVED"},
 		submitStage:        &domain.WorkflowStage{StageOrder: 2, StageStatus: "APPROVED"},
 		submitTransitioned: true,
 	}
@@ -600,7 +612,7 @@ func TestSubmitAction_FinalApprove_PublishesCompleted(t *testing.T) {
 	r := newTestRouterFull(store, pub, &stubAuthz{})
 
 	body := `{"action":"APPROVE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/actions", bytes.NewBufferString(body)), "approver-2")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/actions", bytes.NewBufferString(body)), "approver-2")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -616,8 +628,9 @@ func TestSubmitAction_FinalApprove_PublishesCompleted(t *testing.T) {
 
 func TestSubmitAction_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	store := &stubStore{
-		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
-		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "PENDING"},
+		findInstance:       &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage:       &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
+		submitInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING"},
 		submitStage:        &domain.WorkflowStage{StageOrder: 1, StageStatus: "APPROVED"},
 		submitTransitioned: false,
 	}
@@ -625,7 +638,7 @@ func TestSubmitAction_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	r := newTestRouterFull(store, pub, &stubAuthz{})
 
 	body := `{"action":"APPROVE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/actions", bytes.NewBufferString(body)), "approver-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/actions", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -639,13 +652,14 @@ func TestSubmitAction_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 
 func TestSubmitAction_AuthorizationDenied_Returns403_NeverTouchesStore(t *testing.T) {
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 		submitErr:    domain.ErrWorkflowNotFound, // would only be hit if SubmitAction were called
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{err: domain.ErrAuthorizationDenied})
 
 	body := `{"action":"APPROVE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/actions", bytes.NewBufferString(body)), "approver-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/actions", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -655,11 +669,14 @@ func TestSubmitAction_AuthorizationDenied_Returns403_NeverTouchesStore(t *testin
 }
 
 func TestSubmitAction_AuthorizationServiceUnavailable_FailsClosed(t *testing.T) {
-	store := &stubStore{findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"}}
+	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
+	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{err: domain.ErrAuthorizationServiceUnavailable})
 
 	body := `{"action":"APPROVE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/actions", bytes.NewBufferString(body)), "approver-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/actions", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -670,13 +687,14 @@ func TestSubmitAction_AuthorizationServiceUnavailable_FailsClosed(t *testing.T) 
 
 func TestSubmitAction_WrongApprover(t *testing.T) {
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "le-1", WorkflowStatus: "PENDING"},
+		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 		submitErr:    domain.ErrWrongApprover,
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
 
 	body := `{"action":"APPROVE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/actions", bytes.NewBufferString(body)), "someone-else")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/actions", bytes.NewBufferString(body)), "someone-else")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -692,7 +710,8 @@ func TestSubmitAction_WrongApprover(t *testing.T) {
 // assigned approver for the current stage, they must still be rejected.
 func TestSubmitAction_InitiatorSelfApproval_Forbidden(t *testing.T) {
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "le-1", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
+		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "requester-1"},
 		submitErr:    domain.ErrWorkflowNotFound, // would only be hit if SubmitAction were called
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
@@ -700,7 +719,7 @@ func TestSubmitAction_InitiatorSelfApproval_Forbidden(t *testing.T) {
 	// requester-1 is the workflow's initiator, submitting as though they
 	// were the assigned approver for the current stage.
 	body := `{"action":"APPROVE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/actions", bytes.NewBufferString(body)), "requester-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/actions", bytes.NewBufferString(body)), "requester-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -710,11 +729,11 @@ func TestSubmitAction_InitiatorSelfApproval_Forbidden(t *testing.T) {
 }
 
 func TestSubmitAction_InvalidAction(t *testing.T) {
-	store := &stubStore{findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1"}}
+	store := &stubStore{findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, LegalEntityID: "le-1"}}
 	r := newTestRouter(store)
 
 	body := `{"action":"MAYBE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/actions", bytes.NewBufferString(body)), "approver-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/actions", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -729,15 +748,16 @@ func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
 	// Terminal state cannot be transitioned forward.
 	store := &stubStore{
 		findInstance: &domain.WorkflowInstance{
-			WorkflowInstanceID: "w-cancelled",
+			WorkflowInstanceID: testCancelledID,
 			LegalEntityID:      "le-1",
 			WorkflowStatus:     "CANCELLED",
 		},
+		currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"},
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
 
 	body := `{"action":"APPROVE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-cancelled/actions", bytes.NewBufferString(body)), "approver-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testCancelledID+"/actions", bytes.NewBufferString(body)), "approver-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -768,10 +788,18 @@ func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
 // ── Escalate / Cancel ────────────────────────────────────────────────────────
 
 func TestEscalateWorkflow_InvalidTransition(t *testing.T) {
-	store := &stubStore{escalateErr: domain.ErrInvalidTransition}
-	r := newTestRouter(store)
+	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID: testWorkflowID,
+			TenantID:           "t-1",
+			LegalEntityID:      "le-1",
+			WorkflowStatus:     "APPROVED",
+		},
+		escalateErr: domain.ErrInvalidTransition,
+	}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
 
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/escalate", nil), "admin-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/escalate", nil), "admin-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -781,11 +809,20 @@ func TestEscalateWorkflow_InvalidTransition(t *testing.T) {
 }
 
 func TestCancelWorkflow_Success(t *testing.T) {
-	store := &stubStore{cancelInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "CANCELLED"}, cancelTransitioned: true}
+	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID: testWorkflowID,
+			TenantID:           "t-1",
+			LegalEntityID:      "le-1",
+			WorkflowStatus:     "PENDING",
+		},
+		cancelInstance:     &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "CANCELLED"},
+		cancelTransitioned: true,
+	}
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubAuthz{})
 
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/cancel", nil), "admin-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/cancel", nil), "admin-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -805,7 +842,7 @@ func TestGetNextApprover_NotFound(t *testing.T) {
 	store := &stubStore{currentStageErr: domain.ErrWorkflowNotFound}
 	r := newTestRouter(store)
 
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/w-1/next-approver", nil))
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/"+testWorkflowID+"/next-approver", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -818,7 +855,7 @@ func TestGetNextApprover_Found(t *testing.T) {
 	store := &stubStore{currentStage: &domain.WorkflowStage{StageOrder: 1, ApproverPrincipalID: "approver-1"}}
 	r := newTestRouter(store)
 
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/w-1/next-approver", nil))
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/"+testWorkflowID+"/next-approver", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -830,7 +867,7 @@ func TestGetNextApprover_Found(t *testing.T) {
 func TestGetNextApprover_NoTenantScope_Refused(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/workflows/w-1/next-approver", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/workflows/"+testWorkflowID+"/next-approver", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -844,12 +881,12 @@ func TestGetNextApprover_NoTenantScope_Refused(t *testing.T) {
 
 func TestGetWorkflow_Found(t *testing.T) {
 	store := &stubStore{
-		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", WorkflowStatus: "PENDING"},
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: testWorkflowID, WorkflowStatus: "PENDING"},
 		stages:       []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}},
 	}
 	r := newTestRouter(store)
 
-	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/w-1", nil))
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/workflows/"+testWorkflowID, nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -861,7 +898,7 @@ func TestGetWorkflow_Found(t *testing.T) {
 func TestGetWorkflow_NoTenantScope_Refused(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/workflows/w-1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/workflows/"+testWorkflowID, nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -887,7 +924,7 @@ func TestCreateWorkflow_WithSubjectBinding_Success(t *testing.T) {
 
 	store := &stubStore{
 		instance: &domain.WorkflowInstance{
-			WorkflowInstanceID: "w-subj-1",
+			WorkflowInstanceID: testWorkflowID2,
 			WorkflowStatus:     domain.WorkflowStatusPending,
 			SubjectType:        &subjType,
 			SubjectID:          &subjID,
@@ -988,7 +1025,7 @@ func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
 
 	store := &stubStore{
 		invalidateInstance: &domain.WorkflowInstance{
-			WorkflowInstanceID:     "w-1",
+			WorkflowInstanceID:     testWorkflowID,
 			WorkflowStatus:         domain.WorkflowStatusInvalidated,
 			SubjectType:            &subjType,
 			SubjectID:              &subjID,
@@ -1001,7 +1038,7 @@ func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
 	r := newTestRouterFull(store, pub, &stubAuthz{})
 
 	body := `{"reason_code":"CONTROL_FAILURE","narrative":"material vendor bank account changed"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1019,7 +1056,7 @@ func TestInvalidateWorkflow_Approved_Success(t *testing.T) {
 	code := "CANCEL_CUSTOMER_REQUEST"
 	store := &stubStore{
 		invalidateInstance: &domain.WorkflowInstance{
-			WorkflowInstanceID:     "w-approved-1",
+			WorkflowInstanceID:     testApprovedID,
 			WorkflowStatus:         domain.WorkflowStatusInvalidated,
 			InvalidationReasonCode: &code,
 		},
@@ -1029,7 +1066,7 @@ func TestInvalidateWorkflow_Approved_Success(t *testing.T) {
 	r := newTestRouterFull(store, pub, &stubAuthz{})
 
 	body := `{"reason_code":"CANCEL_CUSTOMER_REQUEST"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-approved-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testApprovedID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1047,7 +1084,7 @@ func TestInvalidateWorkflow_IdempotentReplay_DoesNotRepublish(t *testing.T) {
 	code := "CONTROL_FAILURE"
 	store := &stubStore{
 		invalidateInstance: &domain.WorkflowInstance{
-			WorkflowInstanceID:     "w-1",
+			WorkflowInstanceID:     testWorkflowID,
 			WorkflowStatus:         domain.WorkflowStatusInvalidated,
 			InvalidationReasonCode: &code,
 		},
@@ -1057,7 +1094,7 @@ func TestInvalidateWorkflow_IdempotentReplay_DoesNotRepublish(t *testing.T) {
 	r := newTestRouterFull(store, pub, &stubAuthz{})
 
 	body := `{"reason_code":"CONTROL_FAILURE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1073,7 +1110,7 @@ func TestInvalidateWorkflow_InvalidReasonCode_BadRequest(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
 	body := `{"reason_code":"NON_GOVERNED_CUSTOM_REASON"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1086,7 +1123,7 @@ func TestInvalidateWorkflow_MissingReasonCode_BadRequest(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
 	body := `{"narrative":"missing reason code"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1100,7 +1137,7 @@ func TestInvalidateWorkflow_TerminalState_Conflict(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"reason_code":"CONTROL_FAILURE"}`
-	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testWorkflowID+"/invalidate", bytes.NewBufferString(body)), "admin-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1126,7 +1163,7 @@ func TestVerifyRelease_ApprovedMatching_CanRelease(t *testing.T) {
 	fp := validSubjectFingerprint()
 	store := &stubStore{
 		verifyReleaseResult: &domain.ReleaseVerificationResult{
-			WorkflowInstanceID: "w-appr-1",
+			WorkflowInstanceID: testApprovedID,
 			CanRelease:         true,
 			Status:             "VALID",
 			WorkflowStatus:     domain.WorkflowStatusApproved,
@@ -1136,7 +1173,7 @@ func TestVerifyRelease_ApprovedMatching_CanRelease(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s","expected_subject_version":1}`, fp)
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-appr-1/verify-release", bytes.NewBufferString(body)))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testApprovedID+"/verify-release", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1154,7 +1191,7 @@ func TestVerifyRelease_FingerprintMismatch_Conflict(t *testing.T) {
 	reason := domain.ErrSubjectFingerprintMismatch.Error()
 	store := &stubStore{
 		verifyReleaseResult: &domain.ReleaseVerificationResult{
-			WorkflowInstanceID: "w-appr-1",
+			WorkflowInstanceID: testApprovedID,
 			CanRelease:         false,
 			Status:             "INVALID",
 			Reason:             &reason,
@@ -1166,7 +1203,7 @@ func TestVerifyRelease_FingerprintMismatch_Conflict(t *testing.T) {
 	// Caller presents modified fingerprint
 	liveFp := validSubjectFingerprint()
 	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s"}`, liveFp)
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-appr-1/verify-release", bytes.NewBufferString(body)))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testApprovedID+"/verify-release", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1184,7 +1221,7 @@ func TestVerifyRelease_UnboundSubject_FailsSafely(t *testing.T) {
 	reason := domain.ErrWorkflowUnboundSubject.Error()
 	store := &stubStore{
 		verifyReleaseResult: &domain.ReleaseVerificationResult{
-			WorkflowInstanceID: "w-legacy-1",
+			WorkflowInstanceID: testLegacyID,
 			CanRelease:         false,
 			Status:             "INVALID",
 			Reason:             &reason,
@@ -1194,7 +1231,7 @@ func TestVerifyRelease_UnboundSubject_FailsSafely(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s"}`, validSubjectFingerprint())
-	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-legacy-1/verify-release", bytes.NewBufferString(body)))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/"+testLegacyID+"/verify-release", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
