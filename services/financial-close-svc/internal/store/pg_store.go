@@ -2058,6 +2058,59 @@ func (s *PgStore) ListSnapshotSupersession(ctx context.Context, legalEntityID, p
 	return out, nil
 }
 
+// RecordSnapshotIntegrityFailure enqueues ACC-16's SnapshotIntegrityFailed
+// event to the transactional outbox. It deliberately changes nothing on the
+// snapshot row: a failed verification is a security signal about the stored
+// content, not a lifecycle transition (the spec's degradation rule is that
+// external reporting cannot fall back to a live query, not that the row
+// moves out of SEALED/CERTIFIED). Recording it in the outbox rather than
+// only a log line means the signal survives a broker outage and log
+// retention, and does not depend on the caller verifying again.
+//
+// The recomputed signature is never put in the event: it would be a valid
+// HMAC over the tampered content, i.e. a ready-made forgery.
+func (s *PgStore) RecordSnapshotIntegrityFailure(ctx context.Context, f *domain.SnapshotIntegrityFailure, correlationID, actorID string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	env, err := envelope.New(envelope.Spec{
+		Type:            "com.zoikosuite.accounting.financial-snapshot.integrity-failed",
+		Service:         "financial-close-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      f.CheckedAt,
+		TenantID:        tenantID,
+		LegalEntityID:   f.LegalEntityID,
+		AggregateType:   "financial-snapshot",
+		AggregateID:     f.SnapshotID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data: map[string]any{
+			"snapshot_id":         f.SnapshotID,
+			"legal_entity_id":     f.LegalEntityID,
+			"purpose":             f.Purpose,
+			"snapshot_status":     f.SnapshotStatus,
+			"stored_content_hash": f.StoredContentHash,
+			"recomputed_hash":     f.RecomputedHash,
+			"hash_matched":        f.HashMatched,
+			"signature_matched":   f.SignatureMatched,
+			"checked_by":          actorID,
+			"checked_at":          f.CheckedAt,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("build financial-snapshot.integrity-failed event: %w", err)
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if err := outbox.Enqueue(ctx, tx, env); err != nil {
+			return fmt.Errorf("enqueue financial-snapshot.integrity-failed event: %w", err)
+		}
+		return nil
+	})
+}
+
 // ── ACC-18 (Source-to-Report Traceability) ───────────────────────────────────────
 
 // RecordLineageEdge inserts one permanent provenance edge. Idempotent on
