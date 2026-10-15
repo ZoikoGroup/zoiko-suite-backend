@@ -27,6 +27,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	svcenvelope "zoiko.io/notification-svc/internal/envelope"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 )
 
@@ -130,6 +131,8 @@ func (c *Client) Decide(ctx context.Context, r Request) (*Decision, error) {
 	if r.CorrelationID != "" {
 		req.Header.Set("X-Correlation-ID", r.CorrelationID)
 	}
+
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

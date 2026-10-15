@@ -35,6 +35,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	svcenvelope "zoiko.io/notification-svc/internal/envelope"
 )
 
 type Client struct {
@@ -96,6 +97,8 @@ func (c *Client) ResolveEmail(ctx context.Context, tenantID, callerPrincipalID, 
 	if cid := correlationFrom(ctx); cid != "" {
 		req.Header.Set("X-Correlation-ID", cid)
 	}
+
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
