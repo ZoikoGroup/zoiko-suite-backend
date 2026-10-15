@@ -92,13 +92,14 @@ func newClients(t *testing.T, ledgerURL string) *clients.Clients {
 // ledger semantics a second time.
 func TestCompileTrialBalance_ParsesLinesIntoMap(t *testing.T) {
 	var gotBody map[string]string
-	var gotTenant, gotPrincipal, gotRequestID, gotSourceChannel, gotCorrelationID string
+	var gotTenant, gotPrincipal, gotLegalEntity, gotRequestID, gotSourceChannel, gotCorrelationID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/trial-balance/compile" || r.Method != http.MethodPost {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
 		gotTenant = r.Header.Get("X-Tenant-Id")
 		gotPrincipal = r.Header.Get("X-Principal-Id")
+		gotLegalEntity = r.Header.Get("X-Legal-Entity-Id")
 		gotRequestID = r.Header.Get("X-Request-Id")
 		gotSourceChannel = r.Header.Get("X-Source-Channel")
 		gotCorrelationID = r.Header.Get("X-Correlation-ID")
@@ -130,6 +131,9 @@ func TestCompileTrialBalance_ParsesLinesIntoMap(t *testing.T) {
 	}
 	if gotTenant != "tenant-1" || gotPrincipal != "principal-1" {
 		t.Fatalf("expected tenant/principal forwarded, got tenant=%q principal=%q", gotTenant, gotPrincipal)
+	}
+	if gotLegalEntity != "le-1" {
+		t.Fatalf("expected X-Legal-Entity-Id forwarded, got %q", gotLegalEntity)
 	}
 	if gotRequestID == "" {
 		t.Fatalf("expected X-Request-Id forwarded, got empty")

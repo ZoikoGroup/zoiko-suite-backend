@@ -532,6 +532,7 @@ func (c *Clients) compileTrialBalance(ctx context.Context, tenantID, legalEntity
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-Id", tenantID)
 	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
 
 	// Forward canonical envelope headers so general-ledger-svc's envelope
 	// middleware (write-strict mode) accepts this write request. Mirrors
@@ -567,6 +568,9 @@ func (c *Clients) compileTrialBalance(ctx context.Context, tenantID, legalEntity
 		ledgerCorrelationID = uuid.NewString()
 	}
 	req.Header.Set("X-Correlation-ID", ledgerCorrelationID)
+
+	// Idempotency key for general-ledger-svc's material write endpoint.
+	req.Header.Set("Idempotency-Key", ledgerRequestID+":compile-trial-balance:"+fiscalPeriod)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
