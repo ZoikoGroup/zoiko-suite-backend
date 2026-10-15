@@ -60,9 +60,12 @@ lists every account behind a line.
 ## Known gaps (see SPEC_DEVIATIONS.md for the full list)
 
 - No Cash Flow Statement — only Balance Sheet and Income Statement.
-- No snapshot producer exists anywhere in the platform yet — every snapshot
-  used with this service today must be hand-crafted against
-  `internal/domain.SnapshotContent`'s schema.
+- A snapshot producer now exists: financial-close-svc's
+  `POST /v1/financial-snapshots/from-trial-balance` (commit 8083630e) compiles
+  general-ledger-svc's trial balance + chart of accounts into a Balance
+  Sheet-shaped `SnapshotContent` (one currency, no multi-book/consolidation
+  source, no REP-02…07 statement types). Snapshots from other sources still
+  must be hand-crafted against `internal/domain.SnapshotContent`'s schema.
 - No disclosures, no real ACC-18 lineage graph walk. Comparatives are
   two-period only, against an explicitly named CERTIFIED/PUBLISHED prior set
   (`GetComparatives` 422 `SOURCE_UNVERIFIED` means the prior isn't certified;
