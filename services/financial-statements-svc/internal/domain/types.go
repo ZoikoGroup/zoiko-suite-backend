@@ -12,8 +12,10 @@
 //     (MappingVersionV1), plus, from MappingVersionV2, grouping of
 //     same-category accounts by exact account_name into one line. Not a
 //     per-tenant/per-framework versioned registry, and not hierarchy-based.
-//   - DisclosureInstance (narrative disclosures) is not built: this version
-//     produces primary statements only, no notes.
+//   - DisclosureInstance is freeform notes only (title + body, added in
+//     DRAFT, frozen with the set). No mandatory-disclosure completeness check
+//     per framework/jurisdiction — that needs jurisdiction packs this service
+//     does not own.
 //   - ComparativePresentation is a two-period pairwise comparison only
 //     (BuildComparative / GetComparatives) — no N-period trend, no
 //     presentation formatting.
@@ -53,6 +55,7 @@ const (
 	CmdApprove         Command = "APPROVE_STATEMENT_SET"
 	CmdCertify         Command = "CERTIFY_STATEMENT_SET"
 	CmdPublish         Command = "PUBLISH_STATEMENT_SET"
+	CmdAddDisclosure   Command = "ADD_DISCLOSURE"
 )
 
 // MappingVersionV1 is the one fixed category -> statement-section mapping

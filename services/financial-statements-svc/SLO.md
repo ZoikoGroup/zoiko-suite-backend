@@ -8,7 +8,7 @@ RELEASE_CERTIFICATE.md).
 
 | SLI | Objective (proposed) | Notes |
 |---|---|---|
-| Availability of reads (`GET /v1/statement-sets`, `/{id}`, `/{id}/facts`, `/{id}/comparatives`) | 99.9% / 30 days | Postgres only. |
+| Availability of reads (`GET /v1/statement-sets`, `/{id}`, `/{id}/facts`, `/{id}/comparatives`, `/{id}/disclosures`) | 99.9% / 30 days | Postgres only. |
 | `ExplainReportedFact` latency | p95 < 2s | Spec's own named target for source-to-report lookup. One indexed row read per call. **Unmeasured.** |
 | Availability of `CreateStatementSet` / `:refresh-draft` | 99.5% / 30 days | Depends on financial-close-svc (ACC-16) and authorization-svc; fails closed on either being down, which bounds this below pure-Postgres availability. |
 | Availability of `:validate` / `:submit-for-review` / `:approve` / `:certify` / `:publish` | 99.9% / 30 days | Postgres + authorization-svc only; no financial-close-svc round trip once facts already exist. |

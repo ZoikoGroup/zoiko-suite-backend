@@ -39,16 +39,27 @@ type Store interface {
 	RequestChanges(ctx context.Context, tenantID, setID string, expectedVersion int64, actorID, correlationID string) error
 
 	// Approve enforces that actorID is not the preparer (see domain's SoD
-	// note) inside the same transaction that loads the row, so the check
-	// and the write can never race.
+	// note) and authored none of the set's disclosures, inside the same
+	// transaction that loads the row, so the check and the write can never
+	// race.
 	Approve(ctx context.Context, tenantID, setID string, expectedVersion int64, actorID, correlationID string) error
 
-	// Certify enforces that actorID is not the preparer (ZS-SVC-H-001 §4.1:
-	// "Preparer cannot independently certify material statutory
-	// statements").
+	// Certify enforces that actorID is not the preparer and authored none
+	// of the set's disclosures (ZS-SVC-H-001 §4.1: "Preparer cannot
+	// independently certify material statutory statements").
 	Certify(ctx context.Context, tenantID, setID string, expectedVersion int64, actorID, reason, correlationID string) error
 
 	Publish(ctx context.Context, tenantID, setID string, expectedVersion int64, actorID, correlationID string) error
+
+	// AddDisclosure appends d to setID under the set's row lock: it checks
+	// the set is DRAFT (CmdAddDisclosure), assigns the next sequence, bumps
+	// the set's version and enqueues the event, all in one transaction. A
+	// non-empty d.IdempotencyKey already used on this set returns the
+	// stored disclosure and replayed=true — checked BEFORE the state and
+	// version checks, so a retry still succeeds after the set has moved on —
+	// or CONTEXT_INVALID if the key was used for different content.
+	AddDisclosure(ctx context.Context, tenantID, setID string, expectedVersion int64, d *domain.DisclosureInstance, correlationID string) (stored *domain.DisclosureInstance, replayed bool, err error)
+	ListDisclosures(ctx context.Context, tenantID, setID string) ([]domain.DisclosureInstance, error)
 
 	// Supersede marks old SUPERSEDED and inserts newSet, in one transaction.
 	Supersede(ctx context.Context, tenantID, oldSetID string, expectedOldVersion int64, newSet *domain.FinancialStatementSet, actorID, correlationID string) error
@@ -69,6 +80,9 @@ const (
 	ActionStatementSetApprove  = "FINANCIAL_STATEMENT_SET_APPROVE"
 	ActionStatementSetCertify  = "FINANCIAL_STATEMENT_SET_CERTIFY"
 	ActionStatementSetPublish  = "FINANCIAL_STATEMENT_SET_PUBLISH"
+	// ActionStatementSetDisclosureAdd is separate from REFRESH so a tenant
+	// can let someone write notes without letting them rebuild the figures.
+	ActionStatementSetDisclosureAdd = "FINANCIAL_STATEMENT_SET_DISCLOSURE_ADD"
 )
 
 // Service is REP-01's business logic.

@@ -35,6 +35,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}", h.GetStatementSet)
 		r.Get("/{id}/facts", h.GetStatementFacts)
 		r.Get("/{id}/comparatives", h.GetComparatives)
+		r.Get("/{id}/disclosures", h.GetDisclosures)
 		// Colon-suffixed command segment, one route, dispatched by name —
 		// same convention as accounting-period-svc's {idcmd} (its own
 		// router has no clean way to combine a path param with a literal
@@ -158,6 +159,28 @@ func (h *Handler) GetComparatives(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
+// GetDisclosures: GET /v1/statement-sets/{id}/disclosures (the spec's
+// GetDisclosure), every note on the set in sequence order.
+func (h *Handler) GetDisclosures(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	disclosures, err := h.svc.GetDisclosures(r.Context(), tenantID, principalID, chi.URLParam(r, "id"))
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if disclosures == nil {
+		disclosures = []domain.DisclosureInstance{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": disclosures, "count": len(disclosures)})
+}
+
 func (h *Handler) ExplainReportedFact(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -187,7 +210,8 @@ func splitCommand(seg string) (id, cmd string, ok bool) {
 
 // StatementSetCommand dispatches every colon-suffixed command on one
 // existing set: :refresh-draft, :validate, :submit-for-review,
-// :request-changes, :approve, :certify, :publish, :supersede.
+// :request-changes, :approve, :certify, :publish, :supersede,
+// :add-disclosure.
 func (h *Handler) StatementSetCommand(w http.ResponseWriter, r *http.Request) {
 	id, cmd, ok := splitCommand(chi.URLParam(r, "idcmd"))
 	if !ok {
@@ -285,9 +309,28 @@ func (h *Handler) StatementSetCommand(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusCreated, newSet)
 
+	case "add-disclosure":
+		var body struct {
+			Title string `json:"title"`
+			Body  string `json:"body"`
+		}
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		d, replayed, err := h.svc.AddDisclosure(r.Context(), tenantID, principalID, corr, idempotencyKey(r), id, body.Title, body.Body)
+		if err != nil {
+			h.fail(w, err)
+			return
+		}
+		status := http.StatusCreated
+		if replayed {
+			status = http.StatusOK
+		}
+		writeJSON(w, status, d)
+
 	default:
 		writeError(w, http.StatusNotFound, "unknown_command",
-			"expected {id}:refresh-draft, :validate, :submit-for-review, :request-changes, :approve, :certify, :publish or :supersede")
+			"expected {id}:refresh-draft, :validate, :submit-for-review, :request-changes, :approve, :certify, :publish, :supersede or :add-disclosure")
 	}
 }
 
@@ -309,6 +352,17 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 		return "", false
 	}
 	return tenantID, true
+}
+
+// idempotencyKey reads the request's Idempotency-Key the same way
+// correlationID reads its field: the validated envelope first, then the raw
+// header. Empty means the caller sent none (the envelope middleware requires
+// one on writes in production).
+func idempotencyKey(r *http.Request) string {
+	if env, ok := svcenvelope.FromContext(r.Context()); ok && env.IdempotencyKey != "" {
+		return env.IdempotencyKey
+	}
+	return strings.TrimSpace(r.Header.Get(svcenvelope.HeaderIdempotencyKey))
 }
 
 func correlationID(r *http.Request) string {

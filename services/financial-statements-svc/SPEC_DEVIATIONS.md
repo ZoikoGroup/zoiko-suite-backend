@@ -60,8 +60,18 @@ ways. Read this before relying on anything here for a real filing.
   "Bank — current" into "Cash and cash equivalents"); that needs either the
   chart-of-accounts hierarchy or the PresentationMappingUse registry, and
   neither is available here (A3).
-- **A5. DisclosureInstance (narrative disclosures/notes) is not built.** This
-  service produces primary statements only.
+- **A5. DisclosureInstance is freeform notes only.** A preparer can attach
+  narrative notes (title + body, numbered in add order) to a DRAFT statement
+  set with `POST /v1/statement-sets/{id}:add-disclosure`, and anyone with
+  view rights can read them with `GET /v1/statement-sets/{id}/disclosures`
+  (the spec's GetDisclosure). Notes have no lifecycle of their own: they are
+  content of the set, can only be added in DRAFT (B9), and freeze with it —
+  certification freezes "report content … and disclosures". Not built: any
+  structure inside a note (tables, cross-references to StatementFacts,
+  tagging), editing or removing a note (a wrong note in DRAFT stays; a
+  correction after certification is a superseding set, which starts with no
+  notes — they are not carried across), and anything that checks *which*
+  notes a set must have — see A11.
 - **A6. ComparativePresentation is two-period, pairwise only.** A set can be
   read side by side with one explicitly named prior set (see A7 and B8). Not
   built: N-period trends (three or more columns), restated/re-presented
@@ -88,6 +98,15 @@ ways. Read this before relying on anything here for a real filing.
   tested.
 - **A10. No mTLS by default** — `AuthzMTLSEnabled` exists and is wired, off
   by default, matching every other new service's pilot posture.
+- **A11. No mandatory-disclosure completeness check.** The spec requires
+  "Mandatory disclosures/components complete for framework/jurisdiction"
+  and "missing disclosure evidence → review exception". Neither is
+  attempted: deciding which notes a framework and jurisdiction require
+  needs jurisdiction packs (ZS-JUR-001, owned by jurisdiction-rules-svc),
+  and nothing in this repository defines those rules — building a checklist
+  here would mean inventing them. `ValidateStatements` therefore checks only
+  the balance-sheet tie-out (B6); a set with zero notes validates, passes
+  review and certifies exactly as one with ten does.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -141,3 +160,25 @@ ways. Read this before relying on anything here for a real filing.
   be in any state, since preparing a draft against last period's certified
   figures is the main use. A line in only one period gets a null `change`,
   not one computed against zero: an absent line is not a zero balance.
+- **B9. Disclosures follow the facts' rules, plus three additions.**
+  - *DRAFT only.* `ADD_DISCLOSURE` is a DRAFT self-loop in the state machine,
+    like `REFRESH_DRAFT`: report content changes only in DRAFT. VALIDATED,
+    IN_REVIEW and APPROVED sets are content someone has checked or is
+    checking — adding a note under a reviewer mid-approval would approve
+    text they never saw — so the path is `REQUEST_CHANGES` back to DRAFT
+    first. (VALIDATED is refused too even though the tie-out does not read
+    notes: the set is submitted for review as validated, and the rule
+    "nothing changes after DRAFT" is simpler to audit than per-field
+    exceptions.)
+  - *Disclosure authors are preparers for SoD.* Writing a note is authoring
+    report content, so anyone who added a disclosure to a set may not
+    approve or certify it — an extension of B3/B4, re-checked under the
+    set's row lock exactly like the preparer check. Adding a note is its own
+    permission (`FINANCIAL_STATEMENT_SET_DISCLOSURE_ADD`), separate from
+    REFRESH.
+  - *Replay-safe.* Unlike every other command, an add appends rather than
+    transitions, so a retried POST would duplicate a note. The request's
+    `Idempotency-Key` is stored with the note (unique per set); a retry
+    returns the original (200, not 201) even if the set has since moved on,
+    and reusing a key for different text is refused (422
+    `CONTEXT_INVALID`).

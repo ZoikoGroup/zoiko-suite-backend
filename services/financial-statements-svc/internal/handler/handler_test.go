@@ -24,12 +24,13 @@ import (
 // JSON framing, which the service-layer tests never exercise) ─────────────
 
 type fakeStore struct {
-	sets  map[string]*domain.FinancialStatementSet
-	facts map[string][]domain.StatementFact
+	sets        map[string]*domain.FinancialStatementSet
+	facts       map[string][]domain.StatementFact
+	disclosures map[string][]domain.DisclosureInstance
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{sets: map[string]*domain.FinancialStatementSet{}, facts: map[string][]domain.StatementFact{}}
+	return &fakeStore{sets: map[string]*domain.FinancialStatementSet{}, facts: map[string][]domain.StatementFact{}, disclosures: map[string][]domain.DisclosureInstance{}}
 }
 
 func (s *fakeStore) CreateSet(ctx context.Context, tenantID string, set *domain.FinancialStatementSet, correlationID string) error {
@@ -139,7 +140,7 @@ func (s *fakeStore) RequestChanges(ctx context.Context, tenantID, setID string, 
 
 func (s *fakeStore) Approve(ctx context.Context, tenantID, setID string, expectedVersion int64, actorID, correlationID string) error {
 	set := s.sets[setID]
-	if set != nil && actorID == set.Preparer() {
+	if set != nil && (actorID == set.Preparer() || s.authoredDisclosure(setID, actorID)) {
 		return domain.Errf(domain.CodeSoDDenied, "preparer may not approve")
 	}
 	_, err := s.checkAndAdvance(setID, expectedVersion, domain.CmdApprove)
@@ -148,7 +149,7 @@ func (s *fakeStore) Approve(ctx context.Context, tenantID, setID string, expecte
 
 func (s *fakeStore) Certify(ctx context.Context, tenantID, setID string, expectedVersion int64, actorID, reason, correlationID string) error {
 	set := s.sets[setID]
-	if set != nil && actorID == set.Preparer() {
+	if set != nil && (actorID == set.Preparer() || s.authoredDisclosure(setID, actorID)) {
 		return domain.Errf(domain.CodeSoDDenied, "preparer may not certify")
 	}
 	updated, err := s.checkAndAdvance(setID, expectedVersion, domain.CmdCertify)
@@ -180,6 +181,50 @@ func (s *fakeStore) Supersede(ctx context.Context, tenantID, oldSetID string, ex
 	cp := *newSet
 	s.sets[newSet.StatementSetID] = &cp
 	return nil
+}
+
+func (s *fakeStore) AddDisclosure(ctx context.Context, tenantID, setID string, expectedVersion int64, d *domain.DisclosureInstance, correlationID string) (*domain.DisclosureInstance, bool, error) {
+	set, ok := s.sets[setID]
+	if !ok || set.TenantID != tenantID {
+		return nil, false, domain.ErrStatementSetNotFound
+	}
+	// Same order as the real store: replay first, then version, then state.
+	if d.IdempotencyKey != "" {
+		for _, prior := range s.disclosures[setID] {
+			if prior.IdempotencyKey == d.IdempotencyKey {
+				if !prior.SameContent(d.Title, d.Body) || prior.AddedByPrincipalID != d.AddedByPrincipalID {
+					return nil, false, domain.Errf(domain.CodeContextInvalid, "idempotency key reused for different content")
+				}
+				cp := prior
+				return &cp, true, nil
+			}
+		}
+	}
+	if set.Version != expectedVersion {
+		return nil, false, domain.Errf(domain.CodeVersionConflict, "version conflict")
+	}
+	if _, err := domain.Next(domain.CmdAddDisclosure, set.Status); err != nil {
+		return nil, false, err
+	}
+	d.Sequence = len(s.disclosures[setID]) + 1
+	s.disclosures[setID] = append(s.disclosures[setID], *d)
+	set.Version++
+	cp := *d
+	return &cp, false, nil
+}
+
+func (s *fakeStore) ListDisclosures(ctx context.Context, tenantID, setID string) ([]domain.DisclosureInstance, error) {
+	return s.disclosures[setID], nil
+}
+
+// authoredDisclosure mirrors the real store's lock-held SoD re-check.
+func (s *fakeStore) authoredDisclosure(setID, actorID string) bool {
+	for _, d := range s.disclosures[setID] {
+		if d.AddedByPrincipalID == actorID {
+			return true
+		}
+	}
+	return false
 }
 
 type fakeSnapshots struct{ snapshots map[string]*clients.Snapshot }
@@ -658,5 +703,160 @@ func TestExplainReportedFact_AggregatedLine_ListsAllSourcesInJSON(t *testing.T) 
 	if !body.Aggregated || len(body.SourceAccounts) != 2 || body.Fact.Amount != "500" ||
 		body.SourceAccounts[0].AccountCode != "1000" || body.SourceAccounts[1].AccountCode != "1010" {
 		t.Fatalf("expected aggregated Cash 500 from 1000 and 1010, got %+v", body)
+	}
+}
+
+// ── disclosures ──────────────────────────────────────────────────────────
+
+func seedDisclosureSet(st *fakeStore, status domain.State) {
+	st.sets["s1"] = &domain.FinancialStatementSet{
+		StatementSetID: "s1", TenantID: "tenant-1", LegalEntityID: "le-1", Framework: "IFRS",
+		ReportingPeriod: "2026-Q1", PresentationCurrency: "GBP", MappingVersion: domain.MappingVersionCurrent,
+		Status: status, CreatedByPrincipalID: "preparer-1",
+	}
+}
+
+func addDisclosureReq(r chi.Router, key string, principalID string, title, body string) *httptest.ResponseRecorder {
+	var buf bytes.Buffer
+	_ = json.NewEncoder(&buf).Encode(map[string]string{"title": title, "body": body})
+	req := httptest.NewRequest(http.MethodPost, "/v1/statement-sets/s1:add-disclosure", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	return rr
+}
+
+func TestAddDisclosure_HappyPath_Returns201AndLists(t *testing.T) {
+	st := newFakeStore()
+	seedDisclosureSet(st, domain.StateDraft)
+	r := newRouter(st, nil, "")
+
+	rr := addDisclosureReq(r, "", "preparer-1", "Basis of preparation", "Prepared under IFRS.")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var d domain.DisclosureInstance
+	_ = json.NewDecoder(rr.Body).Decode(&d)
+	if d.DisclosureID == "" || d.Sequence != 1 || d.AddedByPrincipalID != "preparer-1" {
+		t.Fatalf("unexpected disclosure: %+v", d)
+	}
+
+	list := doReq(r, http.MethodGet, "/v1/statement-sets/s1/disclosures", nil, "viewer-1")
+	if list.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", list.Code, list.Body.String())
+	}
+	var body struct {
+		Data  []domain.DisclosureInstance `json:"data"`
+		Count int                         `json:"count"`
+	}
+	_ = json.NewDecoder(list.Body).Decode(&body)
+	if body.Count != 1 || len(body.Data) != 1 || body.Data[0].Title != "Basis of preparation" {
+		t.Fatalf("unexpected list: %+v", body)
+	}
+}
+
+func TestGetDisclosures_NoneYet_ReturnsEmptyArray(t *testing.T) {
+	st := newFakeStore()
+	seedDisclosureSet(st, domain.StateDraft)
+	rr := doReq(newRouter(st, nil, ""), http.MethodGet, "/v1/statement-sets/s1/disclosures", nil, "viewer-1")
+	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"data":[]`)) {
+		t.Fatalf("expected 200 with an empty data array, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAddDisclosure_CertifiedOrPublished_Returns409(t *testing.T) {
+	for _, status := range []domain.State{domain.StateCertified, domain.StatePublished} {
+		st := newFakeStore()
+		seedDisclosureSet(st, status)
+		rr := addDisclosureReq(newRouter(st, nil, ""), "", "preparer-1", "Late note", "Text")
+		if rr.Code != http.StatusConflict {
+			t.Fatalf("%s: expected 409, got %d: %s", status, rr.Code, rr.Body.String())
+		}
+		if code := errorCodeOf(t, rr); code != string(domain.CodeInvalidTransition) {
+			t.Fatalf("%s: expected %s, got %q", status, domain.CodeInvalidTransition, code)
+		}
+	}
+}
+
+func TestAddDisclosure_DraftAcceptedValidatedRefused(t *testing.T) {
+	st := newFakeStore()
+	seedDisclosureSet(st, domain.StateDraft)
+	r := newRouter(st, nil, "")
+	if rr := addDisclosureReq(r, "", "preparer-1", "Note", "Text"); rr.Code != http.StatusCreated {
+		t.Fatalf("DRAFT: expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+	st.sets["s1"].Status = domain.StateValidated
+	if rr := addDisclosureReq(r, "", "preparer-1", "Note 2", "Text"); rr.Code != http.StatusConflict {
+		t.Fatalf("VALIDATED: expected 409, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAddDisclosure_ReplayWithIdempotencyKey_Returns200SameNote(t *testing.T) {
+	st := newFakeStore()
+	seedDisclosureSet(st, domain.StateDraft)
+	r := newRouter(st, nil, "")
+	first := addDisclosureReq(r, "idem-1", "preparer-1", "Note", "Text")
+	second := addDisclosureReq(r, "idem-1", "preparer-1", "Note", "Text")
+	if first.Code != http.StatusCreated || second.Code != http.StatusOK {
+		t.Fatalf("expected 201 then 200, got %d then %d", first.Code, second.Code)
+	}
+	var a, b domain.DisclosureInstance
+	_ = json.NewDecoder(first.Body).Decode(&a)
+	_ = json.NewDecoder(second.Body).Decode(&b)
+	if a.DisclosureID != b.DisclosureID || len(st.disclosures["s1"]) != 1 {
+		t.Fatalf("expected the replay to return the same single note, got %s / %s (%d stored)", a.DisclosureID, b.DisclosureID, len(st.disclosures["s1"]))
+	}
+}
+
+func TestAddDisclosure_MissingTitle_Returns422(t *testing.T) {
+	st := newFakeStore()
+	seedDisclosureSet(st, domain.StateDraft)
+	rr := addDisclosureReq(newRouter(st, nil, ""), "", "preparer-1", "", "Text")
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAddDisclosure_AuthorizationDenied_Returns403(t *testing.T) {
+	st := newFakeStore()
+	seedDisclosureSet(st, domain.StateDraft)
+	rr := addDisclosureReq(newRouter(st, nil, service.ActionStatementSetDisclosureAdd), "", "preparer-1", "Note", "Text")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rr.Code, rr.Body.String())
+	}
+	list := doReq(newRouter(st, nil, service.ActionStatementSetView), http.MethodGet, "/v1/statement-sets/s1/disclosures", nil, "viewer-1")
+	if list.Code != http.StatusForbidden {
+		t.Fatalf("list: expected 403, got %d: %s", list.Code, list.Body.String())
+	}
+}
+
+func TestDisclosures_MissingPrincipalOrTenant_Returns401(t *testing.T) {
+	st := newFakeStore()
+	seedDisclosureSet(st, domain.StateDraft)
+	r := newRouter(st, nil, "")
+	if rr := addDisclosureReq(r, "", "", "Note", "Text"); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("add without principal: expected 401, got %d", rr.Code)
+	}
+	if rr := doReq(r, http.MethodGet, "/v1/statement-sets/s1/disclosures", nil, ""); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("list without principal: expected 401, got %d", rr.Code)
+	}
+
+	svc := service.New(st, &fakeSnapshots{}, &fakeAuthZ{}, zap.NewNop())
+	noTenant := chi.NewRouter()
+	handler.RegisterRoutes(noTenant, handler.New(svc, zap.NewNop()))
+	if rr := addDisclosureReq(noTenant, "", "preparer-1", "Note", "Text"); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("add without tenant: expected 401, got %d", rr.Code)
+	}
+	if rr := doReq(noTenant, http.MethodGet, "/v1/statement-sets/s1/disclosures", nil, "viewer-1"); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("list without tenant: expected 401, got %d", rr.Code)
+	}
+	if len(st.disclosures["s1"]) != 0 {
+		t.Fatal("no refused request may store a disclosure")
 	}
 }
