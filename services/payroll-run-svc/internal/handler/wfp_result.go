@@ -24,6 +24,7 @@ type WFPResultStore interface {
 	GetSourceTrustProfileBySource(ctx context.Context, sourceSystemID string) (*domain.SourceTrustProfile, error)
 	GetRuleManifest(ctx context.Context, id string) (*domain.PayrollRuleManifest, error)
 	GetInputBatch(ctx context.Context, id string) (*domain.InputBatch, error)
+	GetInputBatchByRun(ctx context.Context, runID string) (*domain.InputBatch, error)
 	GetPayrollRun(ctx context.Context, id string) (*domain.PayrollRun, error)
 	GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.PaySlip, error)
 
@@ -54,6 +55,15 @@ type WFPResultHandler struct {
 	workers     ResultWorkerContexts
 	log         *zap.Logger
 	concurrency int
+	// taxEngineCertified is the operator's declaration (PAYROLL_TAX_ENGINE_CERTIFIED) that payroll-tax-svc's engine is
+	// certified; without it results computed by the engine carry TAX_ENGINE_UNCERTIFIED.
+	taxEngineCertified bool
+}
+
+// WithTaxEngineCertified records the operator's declaration about the tax engine and returns h.
+func (h *WFPResultHandler) WithTaxEngineCertified(certified bool) *WFPResultHandler {
+	h.taxEngineCertified = certified
+	return h
 }
 
 func NewWFPResult(st WFPResultStore, authz AuthZClient, workers ResultWorkerContexts, log *zap.Logger) *WFPResultHandler {
@@ -146,6 +156,12 @@ func (h *WFPResultHandler) writeErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnprocessableEntity, "CORRECTION_BASE_MISSING", err.Error())
 	case errors.Is(err, domain.ErrTooManyResultWorkers):
 		writeError(w, http.StatusUnprocessableEntity, "TOO_MANY_WORKERS", err.Error())
+	case errors.Is(err, domain.ErrManifestRuleVersionMismatch):
+		writeError(w, http.StatusUnprocessableEntity, "RULE_VERSION_MANIFEST_MISMATCH", err.Error())
+	case errors.Is(err, domain.ErrMixedTaxRuleVersions):
+		writeError(w, http.StatusUnprocessableEntity, "MIXED_TAX_RULE_VERSIONS", err.Error())
+	case errors.Is(err, domain.ErrUnmappedTaxType):
+		writeError(w, http.StatusUnprocessableEntity, "TAX_TYPE_UNMAPPED", err.Error())
 	case errors.Is(err, domain.ErrSourceUnavailable):
 		writeError(w, http.StatusServiceUnavailable, "worker_context_unavailable", err.Error())
 	case errors.Is(err, domain.ErrPayrollRunNotFound):
@@ -392,6 +408,40 @@ func (h *WFPResultHandler) FromRun(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.writeErr(w, err)
 		return
+	}
+	// A result whose tax came from the engine names exactly the rule manifest of the rule version the engine
+	// used: payroll-tax:<rule version>, registered by an operator with its evidence.
+	src := domain.TaxSourceOf(slips)
+	if len(src.RuleVersions) > 1 {
+		h.writeErr(w, domain.ErrMixedTaxRuleVersions)
+		return
+	}
+	if len(src.RuleVersions) == 1 {
+		m, err := h.store.GetRuleManifest(r.Context(), body.RuleManifestID)
+		if err != nil {
+			h.writeErr(w, err)
+			return
+		}
+		if m.ManifestVersion != domain.TaxManifestVersion(src.RuleVersions[0]) {
+			h.writeErr(w, domain.ErrManifestRuleVersionMismatch)
+			return
+		}
+	}
+	params.TaxEngineCertified = h.taxEngineCertified
+
+	// A run that consumed a FROZEN input batch computed from it: the result links that batch and is not labelled
+	// INPUT_NOT_FROZEN. A batch named only in the request body is linked (and checked by the acceptance controls) but
+	// does not make the calculation frozen-input.
+	if consumed, cerr := h.store.GetInputBatchByRun(r.Context(), run.RunID); cerr != nil {
+		h.writeErr(w, cerr)
+		return
+	} else if consumed != nil {
+		if body.InputBatchID != nil && *body.InputBatchID != "" && *body.InputBatchID != consumed.BatchID {
+			writeError(w, http.StatusConflict, "INPUT_BATCH_MISMATCH", "the run consumed a different input batch than the one named")
+			return
+		}
+		id := consumed.BatchID
+		params.InputBatchID, params.InputFrozen = &id, true
 	}
 	req, err := domain.BuildZoikoResultRequest(*run, slips, params)
 	if err != nil {

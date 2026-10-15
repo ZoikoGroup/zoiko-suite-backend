@@ -590,3 +590,23 @@ func (s *PgStore) ListLiveBonusSourceLines(ctx context.Context, legalEntityID, e
 	})
 	return out, err
 }
+
+// GetInputBatchByRun returns the input batch a payroll run consumed, or nil when it consumed none. A run
+// consumes at most one (unique link), so this is the record of "this calculation used a frozen population".
+func (s *PgStore) GetInputBatchByRun(ctx context.Context, runID string) (*domain.InputBatch, error) {
+	tenantID, err := tenantOf(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var b *domain.InputBatch
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var e error
+		b, e = scanInBatch(tx.QueryRow(ctx, `SELECT `+inBatchCols+` FROM wfp_payroll_input_batches
+			WHERE tenant_id = $1 AND payroll_run_id = $2::uuid AND state = 'CONSUMED'`, tenantID, runID))
+		if errors.Is(e, domain.ErrInputBatchNotFound) {
+			b, e = nil, nil
+		}
+		return e
+	})
+	return b, err
+}

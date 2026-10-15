@@ -41,6 +41,8 @@ import (
 	"zoiko.io/payroll-run-svc/internal/outbox"
 	"zoiko.io/payroll-run-svc/internal/paydeps"
 	"zoiko.io/payroll-run-svc/internal/paymentstatus"
+	"zoiko.io/payroll-run-svc/internal/payrolltax"
+	"zoiko.io/payroll-run-svc/internal/retention"
 	"zoiko.io/payroll-run-svc/internal/store"
 	"zoiko.io/payroll-run-svc/internal/sweeps"
 	"zoiko.io/payroll-run-svc/internal/telemetry"
@@ -352,6 +354,14 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, authzClient, empClient, ctrClient, compClient, cfg.DefaultTaxRate, log)
+	// Tax engine mode: the calculation asks payroll-tax-svc for each employee's tax and the worker financial profile
+	// for their payroll jurisdiction, and fails closed on either. "placeholder" keeps the legacy rate (results are
+	// labelled PLACEHOLDER_TAX_RATE).
+	if cfg.PayrollTaxMode != "placeholder" {
+		h.WithTaxEngine(payrolltax.NewClient(cfg.PayrollTaxURL, nil), workerctx.NewClient(cfg.EmployeeMasterURL, &http.Client{Timeout: 5 * time.Second}))
+	} else {
+		log.Warn("tax engine mode is OFF: payroll runs use the placeholder tax rate")
+	}
 	handler.RegisterRoutes(r, h)
 
 	// ZS-SVC-L-001 Wave 1: worker/run identity, source trust, rule manifests.
@@ -362,10 +372,17 @@ func main() {
 	inputPuller := inputpull.New(empClient, ctrClient, compClient,
 		benefits.NewClient(cfg.BenefitsURL, wfpHTTP),
 		workerctx.NewClient(cfg.EmployeeMasterURL, wfpHTTP), log)
-	handler.RegisterWFPInputRoutes(r, handler.NewWFPInput(pgStore, authzClient, inputPuller, pgStore, log))
+	wfpInput := handler.NewWFPInput(pgStore, authzClient, inputPuller, pgStore, log)
+	handler.RegisterWFPInputRoutes(r, wfpInput)
+	handler.RegisterWFPManualInputRoutes(r, wfpInput)
+
+	// WFP-NP-041: the disposition guard, read-only against retention-registry-svc (legal holds and retention
+	// policy). It deletes nothing and fails closed when the registry cannot answer.
+	handler.RegisterWFPDispositionRoutes(r, handler.NewWFPDisposition(retention.NewClient(cfg.RetentionRegistryURL, wfpHTTP), authzClient, log))
 
 	// WFP-04: payroll result acceptance (external submission and promotion of a Zoiko run).
-	handler.RegisterWFPResultRoutes(r, handler.NewWFPResult(pgStore, authzClient, workerctx.NewClient(cfg.EmployeeMasterURL, wfpHTTP), log))
+	handler.RegisterWFPResultRoutes(r, handler.NewWFPResult(pgStore, authzClient, workerctx.NewClient(cfg.EmployeeMasterURL, wfpHTTP), log).
+		WithTaxEngineCertified(cfg.PayrollTaxEngineCertified))
 
 	// WFP-05: payroll journal bridge. The dispatcher is the only code that talks to the
 	// ledger, and only through general-ledger-svc's posting API.

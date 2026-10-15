@@ -40,6 +40,14 @@ type Config struct {
 	GLPostingPrincipalID string
 	AccountingBook       string
 	PostingIntervalSecs  int
+	// PayrollTaxURL, PayrollTaxMode and PayrollTaxEngineCertified: in "engine" mode (the default) a calculation takes
+	// each employee's tax from payroll-tax-svc and fails closed; "placeholder" keeps the legacy rate. Certified is the
+	// operator's declaration about that engine and only removes the TAX_ENGINE_UNCERTIFIED label.
+	PayrollTaxURL             string
+	PayrollTaxMode            string
+	PayrollTaxEngineCertified bool
+	// RetentionRegistryURL is the read-only source of legal holds and retention policy for the disposition guard.
+	RetentionRegistryURL string
 	// BankingRefreshIntervalSecs and LiabilityDueSweepIntervalSecs drive the two background loops; 0 disables a loop.
 	BankingRefreshIntervalSecs    int
 	BankingRefreshPrincipalID     string
@@ -178,6 +186,10 @@ func Load() (*Config, error) {
 		PayeeBankingURL:               env("PAYEE_BANKING_URL", "http://payee-banking-identity-svc:8166"),
 		TreasuryURL:                   env("TREASURY_URL", "http://treasury-svc:8103"),
 		PolicyURL:                     env("POLICY_URL", "http://policy-svc:8085"),
+		PayrollTaxURL:                 env("PAYROLL_TAX_URL", "http://payroll-tax-svc:8113"),
+		PayrollTaxMode:                env("PAYROLL_TAX_MODE", "engine"),
+		PayrollTaxEngineCertified:     env("PAYROLL_TAX_ENGINE_CERTIFIED", "false") == "true",
+		RetentionRegistryURL:          env("RETENTION_REGISTRY_URL", "http://retention-registry-svc:8148"),
 		PaymentAdapterURL:             env("PAYMENT_INITIATION_ADAPTER_URL", "http://payment-initiation-adapter-svc:8162"),
 		HighValueSignatures:           envInt("PAYROLL_PAYMENT_HIGH_VALUE_SIGNATURES", 2),
 		GLPostingPrincipalID:          env("GL_POSTING_PRINCIPAL_ID", "payroll-run-svc"),

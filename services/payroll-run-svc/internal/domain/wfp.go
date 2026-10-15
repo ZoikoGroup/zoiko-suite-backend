@@ -369,6 +369,10 @@ const (
 	EventInputBatchCancelled    = "payroll_input_batch_cancelled"
 	EventInputBatchConsumed     = "payroll_input_batch_consumed"
 	EventInputMappingRegistered = "payroll_input_code_mapping_registered"
+	EventManualInputProposed    = "payroll_manual_input_proposed"
+	EventManualInputApproved    = "payroll_manual_input_approved"
+	EventManualInputRejected    = "payroll_manual_input_rejected"
+	EventManualInputWithdrawn   = "payroll_manual_input_withdrawn"
 
 	// Legacy payroll run lifecycle (delivered through the outbox since Wave 4).
 	EventRunInitiated  = "payroll.run.initiated"
@@ -392,6 +396,7 @@ var EventCatalogue = map[string]bool{
 	EventPayrollAccountingSubmitted: true, EventPayrollAccountingPosted: true, EventPayrollAccountingCorrected: true,
 	EventInputLineQuarantined: true, EventInputBatchRejected: true, EventInputBatchCancelled: true,
 	EventInputBatchConsumed: true, EventInputMappingRegistered: true,
+	EventManualInputProposed: true, EventManualInputApproved: true, EventManualInputRejected: true, EventManualInputWithdrawn: true,
 	EventPayrollPaymentInstrCreated: true, EventPayrollPaymentInstrCancelled: true, EventPayrollPaymentInstrSuperseded: true,
 	EventPayrollLiabilityDue: true, EventPayrollLiabilityScheduled: true, EventPayrollLiabilityAdjusted: true,
 	EventPayrollLiabilityDisputed: true, EventPayrollLiabilityReconciliationFailed: true,
