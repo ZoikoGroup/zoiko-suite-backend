@@ -8,12 +8,14 @@ ways. Read this before relying on anything here for a real filing.
 
 - **A1. ACC-16's `Content` field has no platform-wide schema.** financial-close-svc's
   `FinancialSnapshot.Content` is a free-form string; nothing in the platform
-  defines what goes inside it, and no producer (general-ledger-svc or
-  otherwise) has ever emitted a real one — the only existing test fixture is
-  the literal string `"x"`. `internal/domain.SnapshotContent` is the schema
-  *this service* requires and documents, not a platform-agreed one. Until a
-  real producer emits this shape, every statement set in this service must be
-  built from a hand-crafted snapshot.
+  defines what goes inside it. A producer now exists:
+  financial-close-svc's `POST /v1/financial-snapshots/from-trial-balance`
+  (commit 8083630e, branch satyaprakash-changes) compiles general-ledger-svc's
+  trial balance + chart of accounts into a Balance Sheet-shaped `SnapshotContent`
+  (one currency, no multi-book/consolidation source, no REP-02…07 statement
+  types). `internal/domain.SnapshotContent` is the schema *this service*
+  requires and documents, not a platform-agreed one. Until the platform agrees
+  on a schema, statement sets built from other sources remain hand-crafted.
 - **A2. Only the Balance Sheet and Income Statement are produced.** A real
   indirect-method Cash Flow Statement needs opening AND closing balances plus
   a transaction classification engine — a materially separate feature, not
