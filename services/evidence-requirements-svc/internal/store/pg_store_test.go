@@ -49,6 +49,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS outbox CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_request_receipts CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_request_notes CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS evidence_request_responses CASCADE;`)

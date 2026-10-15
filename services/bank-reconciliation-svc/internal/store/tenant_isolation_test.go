@@ -53,37 +53,44 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	dbPort := uint32(15901 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			// Version pinned explicitly — see the doc comment on
-			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
-			// main_integration_test.go for why: the unpinned default floats
-			// to whatever major the library calls "latest," and that patch
-			// build can stop resolving from the remote binary repo with no
-			// code change on our side (this is what broke PR #105's CI).
-			Version(embeddedpostgres.V16).
-			Port(dbPort).
-			Database("bankrec_isolation_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
+	ctx := context.Background()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	var pg *embeddedpostgres.EmbeddedPostgres
+
+	if dsn == "" {
+		dbPort := uint32(15901 + uint32(os.Getpid()%499))
+		pg = embeddedpostgres.NewDatabase(
+			embeddedpostgres.DefaultConfig().
+				// Version pinned explicitly — see the doc comment on
+				// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+				// main_integration_test.go for why: the unpinned default floats
+				// to whatever major the library calls "latest," and that patch
+				// build can stop resolving from the remote binary repo with no
+				// code change on our side (this is what broke PR #105's CI).
+				Version(embeddedpostgres.V16).
+				Port(dbPort).
+				Database("bankrec_isolation_test").
+				Username("postgres").
+				Password("postgres"),
+		)
+		if err := pg.Start(); err != nil {
+			fmt.Printf("failed to start embedded postgres: %v\n", err)
+			os.Exit(1)
+		}
+
+		dsn = fmt.Sprintf(
+			"host=localhost port=%d dbname=bankrec_isolation_test user=postgres password=postgres sslmode=disable",
+			dbPort,
+		)
 	}
 
-	dsn := fmt.Sprintf(
-		"host=localhost port=%d dbname=bankrec_isolation_test user=postgres password=postgres sslmode=disable",
-		dbPort,
-	)
-
-	ctx := context.Background()
 	var err error
 	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
 		fmt.Printf("failed to connect to postgres: %v\n", err)
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
 
@@ -96,9 +103,21 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		fmt.Printf("postgres did not become ready: %v\n", err)
 		testPool.Close()
-		_ = pg.Stop()
+		if pg != nil {
+			_ = pg.Stop()
+		}
 		os.Exit(1)
 	}
+
+	_, _ = testPool.Exec(ctx, `
+		DROP TABLE IF EXISTS reconciliation_evidence_conflicts CASCADE;
+		DROP TABLE IF EXISTS reconciliation_population_lines CASCADE;
+		DROP TABLE IF EXISTS reconciliation_populations CASCADE;
+		DROP TABLE IF EXISTS reconciliation_policies CASCADE;
+		DROP TABLE IF EXISTS reconciliation_runs CASCADE;
+		DROP TABLE IF EXISTS reconciliation_certificates CASCADE;
+		DROP TABLE IF EXISTS statement_lines CASCADE;
+	`)
 
 	// EVERY *.up.sql, BY GLOB, NOT A NAMED LIST.
 	//
@@ -134,13 +153,17 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			fmt.Printf("failed to read migration %s: %v\n", migration, err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
 			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(migration), err)
 			testPool.Close()
-			_ = pg.Stop()
+			if pg != nil {
+				_ = pg.Stop()
+			}
 			os.Exit(1)
 		}
 	}
@@ -150,7 +173,9 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	testPool.Close()
-	_ = pg.Stop()
+	if pg != nil {
+		_ = pg.Stop()
+	}
 	os.Exit(code)
 }
 

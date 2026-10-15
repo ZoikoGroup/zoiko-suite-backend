@@ -76,6 +76,16 @@ func (s *PgStore) CreateAction(ctx context.Context, a *domain.CorporateAction) e
 	if a.Status == "" {
 		a.Status = domain.ActionStatusProposed
 	}
+	if a.EffectiveDate == "" {
+		a.EffectiveDate = now.Format("2006-01-02")
+	}
+	if a.EffectiveFrom == "" {
+		a.EffectiveFrom = a.EffectiveDate
+	}
+	var effectiveTo *string = a.EffectiveTo
+	if effectiveTo != nil && *effectiveTo == "" {
+		effectiveTo = nil
+	}
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO corporate_actions
@@ -84,7 +94,7 @@ func (s *PgStore) CreateAction(ctx context.Context, a *domain.CorporateAction) e
 			 created_by, created_at, updated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		a.ActionID, a.TenantID, a.LegalEntityID, a.Title, string(a.ActionType), a.Description, a.ResolutionID,
-		a.EffectiveDate, string(a.Status), a.ValuationAmount, a.Currency, a.EffectiveFrom, a.EffectiveTo,
+		a.EffectiveDate, string(a.Status), a.ValuationAmount, a.Currency, a.EffectiveFrom, effectiveTo,
 		a.CreatedBy, a.CreatedAt, a.UpdatedAt,
 	)
 	if err != nil {
@@ -184,6 +194,10 @@ func (s *PgStore) UpdateAction(ctx context.Context, a *domain.CorporateAction) e
 	}
 
 	a.UpdatedAt = time.Now().UTC()
+	var effectiveTo *string = a.EffectiveTo
+	if effectiveTo != nil && *effectiveTo == "" {
+		effectiveTo = nil
+	}
 
 	_, err = tx.Exec(ctx, `
 		UPDATE corporate_actions
@@ -191,7 +205,7 @@ func (s *PgStore) UpdateAction(ctx context.Context, a *domain.CorporateAction) e
 		    status=$6, valuation_amount=$7, currency=$8, effective_to=$9, updated_at=$10
 		WHERE action_id=$11 AND tenant_id=$12`,
 		a.Title, string(a.ActionType), a.Description, a.ResolutionID, a.EffectiveDate,
-		string(a.Status), a.ValuationAmount, a.Currency, a.EffectiveTo, a.UpdatedAt, a.ActionID, middleware.GetTenantID(ctx),
+		string(a.Status), a.ValuationAmount, a.Currency, effectiveTo, a.UpdatedAt, a.ActionID, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return fmt.Errorf("update corporate action: %w", err)
