@@ -195,6 +195,9 @@ func (s *Service) Approve(ctx context.Context, tenantID, principalID, correlatio
 	if principalID == set.Preparer() {
 		return domain.Errf(domain.CodeSoDDenied, "the preparer of a statement set may not also approve it")
 	}
+	if err := s.denyDisclosureAuthor(ctx, tenantID, setID, principalID, "approve"); err != nil {
+		return err
+	}
 	return s.store.Approve(ctx, tenantID, setID, set.Version, principalID, correlationID)
 }
 
@@ -213,6 +216,9 @@ func (s *Service) Certify(ctx context.Context, tenantID, principalID, correlatio
 	}
 	if principalID == set.Preparer() {
 		return domain.Errf(domain.CodeSoDDenied, "the preparer of a statement set may not also certify it")
+	}
+	if err := s.denyDisclosureAuthor(ctx, tenantID, setID, principalID, "certify"); err != nil {
+		return err
 	}
 	return s.store.Certify(ctx, tenantID, setID, set.Version, principalID, reason, correlationID)
 }
@@ -277,4 +283,52 @@ func (s *Service) SupersedeStatementSet(ctx context.Context, tenantID, principal
 		return nil, err
 	}
 	return newSet, nil
+}
+
+// AddDisclosure attaches a freeform note to a DRAFT statement set
+// (DisclosureInstance). Report content only changes in DRAFT — see
+// domain/transition.go — so a VALIDATED or IN_REVIEW set must go back via
+// REQUEST_CHANGES first. The state check is the store's, under the row lock,
+// and comes after the idempotency replay check so a retried add still
+// returns the original note even if the set has since been validated.
+func (s *Service) AddDisclosure(ctx context.Context, tenantID, principalID, correlationID, idempotencyKey, setID, title, body string) (*domain.DisclosureInstance, bool, error) {
+	title, body, err := domain.NormalizeDisclosure(title, body)
+	if err != nil {
+		return nil, false, err
+	}
+	set, err := s.store.GetSet(ctx, tenantID, setID)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := s.authz.CheckAllowed(ctx, principalID, set.LegalEntityID, ActionStatementSetDisclosureAdd); err != nil {
+		return nil, false, err
+	}
+	d := &domain.DisclosureInstance{
+		DisclosureID:       uuid.NewString(),
+		TenantID:           tenantID,
+		StatementSetID:     setID,
+		Title:              title,
+		Body:               body,
+		AddedByPrincipalID: principalID,
+		AddedAt:            time.Now().UTC(),
+		IdempotencyKey:     idempotencyKey,
+	}
+	return s.store.AddDisclosure(ctx, tenantID, setID, set.Version, d, correlationID)
+}
+
+// denyDisclosureAuthor extends the preparer SoD rule to disclosures:
+// writing a note is authoring report content, so its author may not
+// approve or certify the set either (SPEC_DEVIATIONS B9). The store
+// re-checks this under the row lock.
+func (s *Service) denyDisclosureAuthor(ctx context.Context, tenantID, setID, principalID, action string) error {
+	disclosures, err := s.store.ListDisclosures(ctx, tenantID, setID)
+	if err != nil {
+		return err
+	}
+	for _, d := range disclosures {
+		if d.AddedByPrincipalID == principalID {
+			return domain.Errf(domain.CodeSoDDenied, "the author of a disclosure on a statement set may not also %s it", action)
+		}
+	}
+	return nil
 }

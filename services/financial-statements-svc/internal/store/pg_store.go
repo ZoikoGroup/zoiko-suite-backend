@@ -350,6 +350,11 @@ func (s *PgStore) Approve(ctx context.Context, tenantID, setID string, expectedV
 		if actorID == set.Preparer() {
 			return domain.Errf(domain.CodeSoDDenied, "the preparer of a statement set may not also approve it")
 		}
+		if authored, err := authoredDisclosure(ctx, tx, tenantID, setID, actorID); err != nil {
+			return fmt.Errorf("check disclosure authorship: %w", err)
+		} else if authored {
+			return domain.Errf(domain.CodeSoDDenied, "the author of a disclosure on a statement set may not also approve it")
+		}
 		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `
 			UPDATE financial_statement_sets
@@ -380,6 +385,11 @@ func (s *PgStore) Certify(ctx context.Context, tenantID, setID string, expectedV
 		}
 		if actorID == set.Preparer() {
 			return domain.Errf(domain.CodeSoDDenied, "the preparer of a statement set may not also certify it")
+		}
+		if authored, err := authoredDisclosure(ctx, tx, tenantID, setID, actorID); err != nil {
+			return fmt.Errorf("check disclosure authorship: %w", err)
+		} else if authored {
+			return domain.Errf(domain.CodeSoDDenied, "the author of a disclosure on a statement set may not also certify it")
 		}
 		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `
@@ -616,4 +626,107 @@ func (s *PgStore) GetFact(ctx context.Context, tenantID, factID string) (*domain
 		return nil, err
 	}
 	return &f, nil
+}
+
+// ── disclosures ──────────────────────────────────────────────────────────
+
+const disclosureColumns = `disclosure_id, tenant_id, statement_set_id, sequence, title, body, added_by_principal_id, added_at, COALESCE(idempotency_key, '')`
+
+func scanDisclosure(row pgx.Row, d *domain.DisclosureInstance) error {
+	return row.Scan(&d.DisclosureID, &d.TenantID, &d.StatementSetID, &d.Sequence, &d.Title, &d.Body, &d.AddedByPrincipalID, &d.AddedAt, &d.IdempotencyKey)
+}
+
+func (s *PgStore) AddDisclosure(ctx context.Context, tenantID, setID string, expectedVersion int64, d *domain.DisclosureInstance, correlationID string) (*domain.DisclosureInstance, bool, error) {
+	var stored *domain.DisclosureInstance
+	var replayed bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// The parent row lock serializes every add on this set with every
+		// lifecycle command, so the DRAFT check, the sequence number and the
+		// insert cannot interleave with a concurrent VALIDATE or another add.
+		set, err := loadForUpdate(ctx, tx, tenantID, setID)
+		if err != nil {
+			return err
+		}
+		if d.IdempotencyKey != "" {
+			var prior domain.DisclosureInstance
+			err := scanDisclosure(tx.QueryRow(ctx, `SELECT `+disclosureColumns+` FROM statement_disclosures
+				WHERE statement_set_id = $1 AND tenant_id = $2 AND idempotency_key = $3`, setID, tenantID, d.IdempotencyKey), &prior)
+			switch {
+			case err == nil:
+				if !prior.SameContent(d.Title, d.Body) || prior.AddedByPrincipalID != d.AddedByPrincipalID {
+					return domain.Errf(domain.CodeContextInvalid, "idempotency key %q was already used for a different disclosure on this set", d.IdempotencyKey)
+				}
+				stored, replayed = &prior, true
+				return nil
+			case !errors.Is(err, pgx.ErrNoRows):
+				return fmt.Errorf("check disclosure idempotency key: %w", err)
+			}
+		}
+		if err := checkVersion(set, expectedVersion); err != nil {
+			return err
+		}
+		if _, err := domain.Next(domain.CmdAddDisclosure, set.Status); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(sequence), 0) + 1 FROM statement_disclosures WHERE statement_set_id = $1 AND tenant_id = $2`,
+			setID, tenantID).Scan(&d.Sequence); err != nil {
+			return fmt.Errorf("next disclosure sequence: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO statement_disclosures (
+				disclosure_id, tenant_id, statement_set_id, sequence, title, body,
+				added_by_principal_id, added_at, idempotency_key
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9, ''))
+		`, d.DisclosureID, tenantID, setID, d.Sequence, d.Title, d.Body, d.AddedByPrincipalID, d.AddedAt, d.IdempotencyKey); err != nil {
+			return fmt.Errorf("insert disclosure: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE financial_statement_sets SET version = version + 1 WHERE statement_set_id = $1 AND tenant_id = $2`,
+			setID, tenantID); err != nil {
+			return fmt.Errorf("bump set version: %w", err)
+		}
+		set.Version++
+		stored = d
+		return s.enqueueEvent(ctx, tx, "disclosure-added", "FinancialStatementDisclosureAdded", d.AddedByPrincipalID, correlationID, set, map[string]any{
+			"disclosure_id": d.DisclosureID,
+			"sequence":      d.Sequence,
+			"title":         d.Title,
+		})
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return stored, replayed, nil
+}
+
+func (s *PgStore) ListDisclosures(ctx context.Context, tenantID, setID string) ([]domain.DisclosureInstance, error) {
+	var out []domain.DisclosureInstance
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT `+disclosureColumns+` FROM statement_disclosures WHERE statement_set_id = $1 AND tenant_id = $2 ORDER BY sequence`, setID, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d domain.DisclosureInstance
+			if err := scanDisclosure(rows, &d); err != nil {
+				return err
+			}
+			out = append(out, d)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// authoredDisclosure reports, inside tx, whether actorID added any
+// disclosure to setID: the lock-held half of the disclosure-author SoD
+// check (service.denyDisclosureAuthor is the early half).
+func authoredDisclosure(ctx context.Context, tx pgx.Tx, tenantID, setID, actorID string) (bool, error) {
+	var authored bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM statement_disclosures WHERE statement_set_id = $1 AND tenant_id = $2 AND added_by_principal_id = $3)`,
+		setID, tenantID, actorID).Scan(&authored)
+	return authored, err
 }

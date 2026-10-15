@@ -24,6 +24,11 @@ package domain
 // invoked explicitly from DRAFT in this version (see service.RefreshDraft);
 // the other states reach DRAFT only via REQUEST_CHANGES.
 //
+// ADD_DISCLOSURE is a DRAFT self-loop for the same reason REFRESH_DRAFT is:
+// report content — facts AND disclosures — only ever changes in DRAFT. A
+// VALIDATED, IN_REVIEW or APPROVED set is content someone has checked or is
+// checking; changing it means REQUEST_CHANGES back to DRAFT first.
+//
 // SUPERSEDE is deliberately not in this table: it is a two-aggregate
 // operation (old set -> SUPERSEDED, a brand NEW set created in DRAFT), driven
 // by CanSupersede below, not Next.
@@ -35,6 +40,7 @@ var machine = map[Command]map[State]State{
 	CmdApprove:         {StateInReview: StateApproved},
 	CmdCertify:         {StateApproved: StateCertified},
 	CmdPublish:         {StateCertified: StatePublished},
+	CmdAddDisclosure:   {StateDraft: StateDraft},
 }
 
 // Next returns the state a command leads to from `from`, or INVALID_TRANSITION.

@@ -43,6 +43,19 @@ func (s *Service) GetStatementFacts(ctx context.Context, tenantID, principalID, 
 	return s.store.GetFacts(ctx, tenantID, setID)
 }
 
+// GetDisclosures lists every disclosure on one set, in note order (the
+// spec's GetDisclosure).
+func (s *Service) GetDisclosures(ctx context.Context, tenantID, principalID, setID string) ([]domain.DisclosureInstance, error) {
+	set, err := s.store.GetSet(ctx, tenantID, setID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.authz.CheckAllowed(ctx, principalID, set.LegalEntityID, ActionStatementSetView); err != nil {
+		return nil, err
+	}
+	return s.store.ListDisclosures(ctx, tenantID, setID)
+}
+
 // GetComparatives pairs one statement set's facts with an explicitly named
 // prior set's (ComparativePresentation, two periods only). The prior side
 // must be CERTIFIED or PUBLISHED — an uncertified comparative is not a real

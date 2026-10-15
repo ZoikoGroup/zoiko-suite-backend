@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,12 +17,13 @@ import (
 // ── fakes ────────────────────────────────────────────────────────────────
 
 type fakeStore struct {
-	sets  map[string]*domain.FinancialStatementSet
-	facts map[string][]domain.StatementFact
+	sets        map[string]*domain.FinancialStatementSet
+	facts       map[string][]domain.StatementFact
+	disclosures map[string][]domain.DisclosureInstance
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{sets: map[string]*domain.FinancialStatementSet{}, facts: map[string][]domain.StatementFact{}}
+	return &fakeStore{sets: map[string]*domain.FinancialStatementSet{}, facts: map[string][]domain.StatementFact{}, disclosures: map[string][]domain.DisclosureInstance{}}
 }
 
 func (s *fakeStore) CreateSet(ctx context.Context, tenantID string, set *domain.FinancialStatementSet, correlationID string) error {
@@ -136,7 +138,7 @@ func (s *fakeStore) Approve(ctx context.Context, tenantID, setID string, expecte
 	if err != nil {
 		return err
 	}
-	if actorID == set.Preparer() {
+	if actorID == set.Preparer() || s.authoredDisclosure(setID, actorID) {
 		return domain.Errf(domain.CodeSoDDenied, "preparer may not approve")
 	}
 	set.Status = domain.StateApproved
@@ -149,7 +151,7 @@ func (s *fakeStore) Certify(ctx context.Context, tenantID, setID string, expecte
 	if err != nil {
 		return err
 	}
-	if actorID == set.Preparer() {
+	if actorID == set.Preparer() || s.authoredDisclosure(setID, actorID) {
 		return domain.Errf(domain.CodeSoDDenied, "preparer may not certify")
 	}
 	set.Status = domain.StateCertified
@@ -187,6 +189,50 @@ func (s *fakeStore) Supersede(ctx context.Context, tenantID, oldSetID string, ex
 	cp := *newSet
 	s.sets[newSet.StatementSetID] = &cp
 	return nil
+}
+
+func (s *fakeStore) AddDisclosure(ctx context.Context, tenantID, setID string, expectedVersion int64, d *domain.DisclosureInstance, correlationID string) (*domain.DisclosureInstance, bool, error) {
+	set, ok := s.sets[setID]
+	if !ok || set.TenantID != tenantID {
+		return nil, false, domain.ErrStatementSetNotFound
+	}
+	// Same order as the real store: replay first, then version, then state.
+	if d.IdempotencyKey != "" {
+		for _, prior := range s.disclosures[setID] {
+			if prior.IdempotencyKey == d.IdempotencyKey {
+				if !prior.SameContent(d.Title, d.Body) || prior.AddedByPrincipalID != d.AddedByPrincipalID {
+					return nil, false, domain.Errf(domain.CodeContextInvalid, "idempotency key reused for different content")
+				}
+				cp := prior
+				return &cp, true, nil
+			}
+		}
+	}
+	if set.Version != expectedVersion {
+		return nil, false, domain.Errf(domain.CodeVersionConflict, "version conflict")
+	}
+	if _, err := domain.Next(domain.CmdAddDisclosure, set.Status); err != nil {
+		return nil, false, err
+	}
+	d.Sequence = len(s.disclosures[setID]) + 1
+	s.disclosures[setID] = append(s.disclosures[setID], *d)
+	set.Version++
+	cp := *d
+	return &cp, false, nil
+}
+
+func (s *fakeStore) ListDisclosures(ctx context.Context, tenantID, setID string) ([]domain.DisclosureInstance, error) {
+	return s.disclosures[setID], nil
+}
+
+// authoredDisclosure mirrors the real store's lock-held SoD re-check.
+func (s *fakeStore) authoredDisclosure(setID, actorID string) bool {
+	for _, d := range s.disclosures[setID] {
+		if d.AddedByPrincipalID == actorID {
+			return true
+		}
+	}
+	return false
 }
 
 // fakeSnapshots is a canned clients.SnapshotReader.
@@ -705,4 +751,165 @@ func mustFactsV2(t *testing.T, prefix string, accounts ...domain.SnapshotContent
 		facts[i].FactID = prefix + "-" + facts[i].AccountCode
 	}
 	return facts
+}
+
+// ── disclosures (DisclosureInstance) ─────────────────────────────────────
+
+func TestAddDisclosure_HappyPath_AddsInSequenceAndLists(t *testing.T) {
+	svc, st := newService(nil, "")
+	seedSet(st, "s1", "t1", "le-1", "IFRS", "2026-Q1", domain.StateDraft)
+	ctx := context.Background()
+
+	d1, replayed, err := svc.AddDisclosure(ctx, "t1", "preparer", "c1", "", "s1", "  Basis of preparation ", " Prepared under IFRS. ")
+	if err != nil || replayed {
+		t.Fatalf("AddDisclosure: %v (replayed=%v)", err, replayed)
+	}
+	if d1.Sequence != 1 || d1.Title != "Basis of preparation" || d1.Body != "Prepared under IFRS." || d1.AddedByPrincipalID != "preparer" || d1.AddedAt.IsZero() {
+		t.Fatalf("unexpected first disclosure: %+v", d1)
+	}
+	if _, _, err := svc.AddDisclosure(ctx, "t1", "preparer", "c1", "", "s1", "Going concern", "No material uncertainty."); err != nil {
+		t.Fatalf("second AddDisclosure: %v", err)
+	}
+	list, err := svc.GetDisclosures(ctx, "t1", "viewer", "s1")
+	if err != nil {
+		t.Fatalf("GetDisclosures: %v", err)
+	}
+	if len(list) != 2 || list[0].Sequence != 1 || list[1].Sequence != 2 || list[1].Title != "Going concern" {
+		t.Fatalf("expected notes 1 and 2 in order, got %+v", list)
+	}
+	if st.sets["s1"].Version != 2 {
+		t.Errorf("each add is a content change and must bump the set version; got %d", st.sets["s1"].Version)
+	}
+}
+
+func TestAddDisclosure_OnlyInDraft(t *testing.T) {
+	// DRAFT is the only state report content may change in; every other
+	// state, including VALIDATED (the one right before review), refuses.
+	for _, status := range []domain.State{
+		domain.StateValidated, domain.StateInReview, domain.StateApproved,
+		domain.StateCertified, domain.StatePublished, domain.StateSuperseded,
+	} {
+		svc, st := newService(nil, "")
+		seedSet(st, "s1", "t1", "le-1", "IFRS", "2026-Q1", status)
+		_, _, err := svc.AddDisclosure(context.Background(), "t1", "preparer", "c1", "", "s1", "Note", "Text")
+		expectCode(t, err, domain.CodeInvalidTransition)
+		if len(st.disclosures["s1"]) != 0 {
+			t.Fatalf("%s: a refused add must store nothing", status)
+		}
+	}
+}
+
+func TestAddDisclosure_AllowedAgainAfterRequestChanges(t *testing.T) {
+	svc, st := newService(map[string]*clients.Snapshot{"snap-agg": twoCashSnapshot()}, "")
+	set := createAndRefresh(t, svc)
+	ctx := context.Background()
+	if _, err := svc.ValidateStatements(ctx, "t1", "preparer", "c1", set.StatementSetID); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if _, _, err := svc.AddDisclosure(ctx, "t1", "preparer", "c1", "", set.StatementSetID, "Note", "Text"); err == nil {
+		t.Fatal("expected VALIDATED to refuse a new disclosure")
+	}
+	if err := svc.SubmitForReview(ctx, "t1", "preparer", "c1", set.StatementSetID); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := svc.RequestChanges(ctx, "t1", "reviewer", "c1", set.StatementSetID); err != nil {
+		t.Fatalf("request changes: %v", err)
+	}
+	if _, _, err := svc.AddDisclosure(ctx, "t1", "preparer", "c1", "", set.StatementSetID, "Note", "Text"); err != nil {
+		t.Fatalf("expected DRAFT (after REQUEST_CHANGES) to accept a disclosure, got %v", err)
+	}
+	if len(st.disclosures[set.StatementSetID]) != 1 {
+		t.Fatal("expected exactly one stored disclosure")
+	}
+}
+
+func TestAddDisclosure_ValidatesText(t *testing.T) {
+	cases := map[string][2]string{
+		"empty title":    {"  ", "body"},
+		"empty body":     {"title", ""},
+		"body too long":  {"title", strings.Repeat("x", domain.MaxDisclosureBodyRunes+1)},
+		"title too long": {strings.Repeat("t", domain.MaxDisclosureTitleRunes+1), "body"},
+	}
+	for name, tc := range cases {
+		svc, st := newService(nil, "")
+		seedSet(st, "s1", "t1", "le-1", "IFRS", "2026-Q1", domain.StateDraft)
+		_, _, err := svc.AddDisclosure(context.Background(), "t1", "preparer", "c1", "", "s1", tc[0], tc[1])
+		if err == nil {
+			t.Fatalf("%s: expected an error", name)
+		}
+		expectCode(t, err, domain.CodeValidationFailed)
+	}
+}
+
+func TestAddDisclosure_IdempotentReplay(t *testing.T) {
+	svc, st := newService(nil, "")
+	seedSet(st, "s1", "t1", "le-1", "IFRS", "2026-Q1", domain.StateDraft)
+	ctx := context.Background()
+
+	first, _, err := svc.AddDisclosure(ctx, "t1", "preparer", "c1", "key-1", "s1", "Note", "Text")
+	if err != nil {
+		t.Fatalf("first add: %v", err)
+	}
+	// The set moves on before the retry arrives: the retry must still get
+	// the original note back, not INVALID_TRANSITION.
+	st.sets["s1"].Status = domain.StateValidated
+	again, replayed, err := svc.AddDisclosure(ctx, "t1", "preparer", "c1", "key-1", "s1", "Note", "Text")
+	if err != nil || !replayed || again.DisclosureID != first.DisclosureID {
+		t.Fatalf("expected a replay of %s, got %+v replayed=%v err=%v", first.DisclosureID, again, replayed, err)
+	}
+	if len(st.disclosures["s1"]) != 1 {
+		t.Fatalf("a replay must not store a second note, got %d", len(st.disclosures["s1"]))
+	}
+	_, _, err = svc.AddDisclosure(ctx, "t1", "preparer", "c1", "key-1", "s1", "Note", "Different text")
+	expectCode(t, err, domain.CodeContextInvalid)
+}
+
+func TestAddDisclosure_AuthorizationDenied(t *testing.T) {
+	_, st := newService(nil, "")
+	seedSet(st, "s1", "t1", "le-1", "IFRS", "2026-Q1", domain.StateDraft)
+	svc := service.New(st, &fakeSnapshots{}, &fakeAuthZ{denyAction: service.ActionStatementSetDisclosureAdd}, zap.NewNop())
+	_, _, err := svc.AddDisclosure(context.Background(), "t1", "preparer", "c1", "", "s1", "Note", "Text")
+	expectCode(t, err, domain.CodeForbidden)
+
+	viewDenied := service.New(st, &fakeSnapshots{}, &fakeAuthZ{denyAction: service.ActionStatementSetView}, zap.NewNop())
+	_, err = viewDenied.GetDisclosures(context.Background(), "t1", "viewer", "s1")
+	expectCode(t, err, domain.CodeForbidden)
+}
+
+func TestAddDisclosure_SetNotFound(t *testing.T) {
+	svc, _ := newService(nil, "")
+	if _, _, err := svc.AddDisclosure(context.Background(), "t1", "preparer", "c1", "", "missing", "Note", "Text"); err != domain.ErrStatementSetNotFound {
+		t.Fatalf("expected ErrStatementSetNotFound, got %v", err)
+	}
+	if _, err := svc.GetDisclosures(context.Background(), "t1", "viewer", "missing"); err != domain.ErrStatementSetNotFound {
+		t.Fatalf("expected ErrStatementSetNotFound, got %v", err)
+	}
+}
+
+func TestDisclosureAuthor_MayNotApproveOrCertify(t *testing.T) {
+	svc, _ := newService(map[string]*clients.Snapshot{"snap-agg": twoCashSnapshot()}, "")
+	set := createAndRefresh(t, svc)
+	ctx := context.Background()
+	id := set.StatementSetID
+
+	if _, _, err := svc.AddDisclosure(ctx, "t1", "writer", "c1", "", id, "Note", "Text"); err != nil {
+		t.Fatalf("AddDisclosure: %v", err)
+	}
+	if _, err := svc.ValidateStatements(ctx, "t1", "preparer", "c1", id); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if err := svc.SubmitForReview(ctx, "t1", "preparer", "c1", id); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	expectCode(t, svc.Approve(ctx, "t1", "writer", "c1", id), domain.CodeSoDDenied)
+	if err := svc.Approve(ctx, "t1", "reviewer", "c1", id); err != nil {
+		t.Fatalf("an independent reviewer must still be able to approve: %v", err)
+	}
+	expectCode(t, svc.Certify(ctx, "t1", "writer", "c1", id, "year end"), domain.CodeSoDDenied)
+	if err := svc.Certify(ctx, "t1", "cfo", "c1", id, "year end"); err != nil {
+		t.Fatalf("an independent certifier must still be able to certify: %v", err)
+	}
+	// Certified: the disclosure is now frozen with the set.
+	_, _, err := svc.AddDisclosure(ctx, "t1", "writer", "c1", "", id, "Late note", "Text")
+	expectCode(t, err, domain.CodeInvalidTransition)
 }

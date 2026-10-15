@@ -57,6 +57,24 @@ line per account forever; sets under `v2-category-map-name-aggregation`
 merge same-named, same-category accounts. `GET /v1/statement-facts/{id}/explain`
 lists every account behind a line.
 
+**Disclosure reads/adds fail with `relation "statement_disclosures" does not exist`**:
+migration `000004_statement_disclosures` has not been applied to this
+database. Same cause as 000003 above: an existing volume must have it
+applied by hand (`psql -f deployments/migrations/000004_statement_disclosures.up.sql`),
+run as the same role that ran the earlier migrations so the app role's
+default privileges grant it DML on the new table. It is additive (one new
+table) and safe to run on a live database. Until it is applied, Approve and
+Certify also fail, because both check disclosure authorship.
+
+**`:add-disclosure` returns 409 INVALID_TRANSITION**: the set is not DRAFT.
+Notes can only be added in DRAFT; send an IN_REVIEW set back with
+`:request-changes`, or supersede a CERTIFIED/PUBLISHED one.
+
+**`:approve` / `:certify` returns 403 SOD_DENIED but the caller is not the
+preparer**: they added a disclosure to this set (SPEC_DEVIATIONS B9).
+`GET /v1/statement-sets/{id}/disclosures` shows each note's
+`added_by_principal_id`.
+
 ## Known gaps (see SPEC_DEVIATIONS.md for the full list)
 
 - No Cash Flow Statement — only Balance Sheet and Income Statement.
@@ -66,7 +84,9 @@ lists every account behind a line.
   Sheet-shaped `SnapshotContent` (one currency, no multi-book/consolidation
   source, no REP-02…07 statement types). Snapshots from other sources still
   must be hand-crafted against `internal/domain.SnapshotContent`'s schema.
-- No disclosures, no real ACC-18 lineage graph walk. Comparatives are
+- Disclosures are freeform notes only, added in DRAFT: no check that a set
+  has the notes its framework/jurisdiction requires (SPEC_DEVIATIONS A11).
+- No real ACC-18 lineage graph walk. Comparatives are
   two-period only, against an explicitly named CERTIFIED/PUBLISHED prior set
   (`GetComparatives` 422 `SOURCE_UNVERIFIED` means the prior isn't certified;
   `CONTEXT_INVALID` means entity/framework/currency/period don't line up).
