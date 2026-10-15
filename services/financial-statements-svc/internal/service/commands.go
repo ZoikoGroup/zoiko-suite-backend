@@ -49,7 +49,7 @@ func (s *Service) CreateStatementSet(ctx context.Context, tenantID, principalID,
 		PresentationCurrency: req.PresentationCurrency,
 		SourceSnapshotID:     req.SourceSnapshotID,
 		SourceSnapshotHash:   snap.ContentHash,
-		MappingVersion:       domain.MappingVersionV1,
+		MappingVersion:       domain.MappingVersionCurrent,
 		Status:               domain.StateDraft,
 		Version:              1,
 		CreatedAt:            now,
@@ -92,7 +92,9 @@ func (s *Service) RefreshDraft(ctx context.Context, tenantID, principalID, corre
 	if err := json.Unmarshal([]byte(snap.Content), &content); err != nil {
 		return nil, domain.Errf(domain.CodeSourceUnverified, "snapshot %q content is not valid JSON for this service's schema: %v", set.SourceSnapshotID, err)
 	}
-	facts, err := domain.BuildFacts(content)
+	// Built under the set's OWN mapping version, never the current one: a
+	// set created under V1 keeps one line per account for its whole life.
+	facts, err := domain.BuildFacts(content, set.MappingVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +266,7 @@ func (s *Service) SupersedeStatementSet(ctx context.Context, tenantID, principal
 		PresentationCurrency: old.PresentationCurrency,
 		SourceSnapshotID:     newSnapshotID,
 		SourceSnapshotHash:   snap.ContentHash,
-		MappingVersion:       domain.MappingVersionV1,
+		MappingVersion:       domain.MappingVersionCurrent,
 		Status:               domain.StateDraft,
 		Version:              1,
 		SupersedesSetID:      &oldID,

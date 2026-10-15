@@ -43,6 +43,20 @@ correct behavior, not a bug — a different principal must perform that step.
 snapshot. The old set is marked SUPERSEDED and kept forever, unchanged; a new
 set starts its own DRAFT → ... → CERTIFIED cycle.
 
+**Fact reads fail with `column "source_accounts" does not exist`**: migration
+`000003_statement_fact_source_accounts` has not been applied to this
+database. The compose stack only runs migrations through Postgres's
+`docker-entrypoint-initdb.d` on a FRESH volume, so an existing volume must
+have it applied by hand (`psql -f deployments/migrations/000003_statement_fact_source_accounts.up.sql`).
+It is additive (one column, constant default) and safe to run on a live
+table.
+
+**Two sets show different line counts for the same snapshot**: check
+`mapping_version`. Sets created under `v1-fixed-category-map` report one
+line per account forever; sets under `v2-category-map-name-aggregation`
+merge same-named, same-category accounts. `GET /v1/statement-facts/{id}/explain`
+lists every account behind a line.
+
 ## Known gaps (see SPEC_DEVIATIONS.md for the full list)
 
 - No Cash Flow Statement — only Balance Sheet and Income Statement.

@@ -115,7 +115,7 @@ func (s *Service) GetComparatives(ctx context.Context, tenantID, principalID, se
 		// period was empty — refuse rather than show every line as new.
 		return nil, domain.Errf(domain.CodeSourceUnverified, "prior set %q has no statement facts", prior.StatementSetID)
 	}
-	statements, err := domain.BuildComparative(currentFacts, priorFacts)
+	statements, err := domain.BuildComparative(currentFacts, priorFacts, current.MappingVersion)
 	if err != nil {
 		return nil, domain.Errf(domain.CodeValidationFailed, "cannot pair statement facts: %v", err)
 	}
@@ -132,13 +132,19 @@ func (s *Service) GetComparatives(ctx context.Context, tenantID, principalID, se
 
 // ExplainedFact is ExplainReportedFact's response: the fact plus the
 // evidence it is traceable to. Full ACC-18 lineage-graph integration is not
-// built (see SPEC_DEVIATIONS.md) — this names the source snapshot and its
-// hash, which is as far as this version's traceability goes.
+// built (see SPEC_DEVIATIONS.md) — this names the source snapshot, its hash,
+// and every snapshot account summed into the fact, which is as far as this
+// version's traceability goes.
 type ExplainedFact struct {
 	Fact               domain.StatementFact `json:"fact"`
 	StatementSetID     string               `json:"statement_set_id"`
 	SourceSnapshotID   string               `json:"source_snapshot_id"`
 	SourceSnapshotHash string               `json:"source_snapshot_hash"`
+	// Aggregated is true when the fact sums more than one source account.
+	Aggregated bool `json:"aggregated"`
+	// SourceAccounts is every snapshot account behind the fact, each with
+	// its own balance — always at least one, never just the first of many.
+	SourceAccounts []domain.SnapshotContentAccount `json:"source_accounts"`
 }
 
 // ExplainReportedFact answers "where did this number come from."
@@ -154,10 +160,28 @@ func (s *Service) ExplainReportedFact(ctx context.Context, tenantID, principalID
 	if err := s.authz.CheckAllowed(ctx, principalID, set.LegalEntityID, ActionStatementSetView); err != nil {
 		return nil, err
 	}
+	sources := fact.Sources()
+	// The provenance claim is "these accounts make up this number". Check
+	// it rather than assert it: a stored fact whose sources do not sum to
+	// its amount is refused, not explained.
+	balances := make([]string, len(sources))
+	for i, a := range sources {
+		balances[i] = a.Balance
+	}
+	sum, err := domain.SumAmounts(balances)
+	if err != nil {
+		return nil, domain.Errf(domain.CodeValidationFailed, "fact %q has an unparseable source balance: %v", factID, err)
+	}
+	amount, err := domain.ParseAmount(fact.Amount)
+	if err != nil || sum.Cmp(amount) != 0 {
+		return nil, domain.Errf(domain.CodeValidationFailed, "fact %q amount %s does not equal the sum of its source accounts %s", factID, fact.Amount, domain.CanonicalAmount(sum))
+	}
 	return &ExplainedFact{
 		Fact:               *fact,
 		StatementSetID:     set.StatementSetID,
 		SourceSnapshotID:   set.SourceSnapshotID,
 		SourceSnapshotHash: set.SourceSnapshotHash,
+		Aggregated:         len(sources) > 1,
+		SourceAccounts:     sources,
 	}, nil
 }

@@ -9,7 +9,9 @@
 //     plus a classification engine; it is a materially separate feature, not
 //     built in this pass.
 //   - PresentationMappingUse is one fixed category -> statement-section map
-//     (MappingVersionV1), not a per-tenant/per-framework versioned registry.
+//     (MappingVersionV1), plus, from MappingVersionV2, grouping of
+//     same-category accounts by exact account_name into one line. Not a
+//     per-tenant/per-framework versioned registry, and not hierarchy-based.
 //   - DisclosureInstance (narrative disclosures) is not built: this version
 //     produces primary statements only, no notes.
 //   - ComparativePresentation is a two-period pairwise comparison only
@@ -57,6 +59,20 @@ const (
 // this version ships. A real PresentationMappingUse (versioned per tenant,
 // framework and jurisdiction) is not built — see the package doc comment.
 const MappingVersionV1 = "v1-fixed-category-map"
+
+// MappingVersionV2 is MappingVersionV1's category -> statement map plus one
+// grouping rule: accounts on the same statement, in the same category and
+// with exactly the same non-empty account_name are reported as ONE line,
+// their balances summed (SPEC_DEVIATIONS A3/A4). It is still not a real
+// PresentationMappingUse — the snapshot carries no account hierarchy, so a
+// shared name is the only grouping signal this service receives.
+const MappingVersionV2 = "v2-category-map-name-aggregation"
+
+// MappingVersionCurrent is the mapping new statement sets are built with.
+// A set keeps the version it was created with for its whole life, so a
+// draft or certified set is never re-presented under a mapping it was not
+// built with.
+const MappingVersionCurrent = MappingVersionV2
 
 // AccountCategory is the account classification carried in a snapshot's
 // content (see SnapshotContent). Deliberately the same five values
@@ -148,8 +164,9 @@ type FinancialStatementSet struct {
 	SupersededAt *time.Time `json:"superseded_at,omitempty"`
 }
 
-// StatementFact is one reported line in one statement set — one fact per
-// source account (see the package doc comment on aggregation).
+// StatementFact is one reported line in one statement set: one source
+// account under MappingVersionV1, or every same-category account sharing an
+// exact account_name under MappingVersionV2 (see SourceAccounts).
 type StatementFact struct {
 	FactID         string          `json:"fact_id"`
 	TenantID       string          `json:"tenant_id"`
@@ -160,22 +177,47 @@ type StatementFact struct {
 	AccountName    string          `json:"account_name"`
 	// Amount is an exact decimal string (ZS-DATA-001 D06: binary floating
 	// point is prohibited for monetary values) — never a Go float.
-	Amount    string    `json:"amount"`
-	CreatedAt time.Time `json:"created_at"`
+	Amount string `json:"amount"`
+	// SourceAccounts lists every snapshot account summed into this line,
+	// with each one's own balance exactly as the snapshot stated it. Empty
+	// for facts built before aggregation existed (and for MappingVersionV1,
+	// where a line IS its one account) — use Sources(), never this field
+	// directly, to answer "which accounts make up this number".
+	SourceAccounts []SnapshotContentAccount `json:"source_accounts,omitempty"`
+	CreatedAt      time.Time                `json:"created_at"`
 }
 
-// ComparativeFact pairs one account's reported line across two periods.
-// A side is nil when the account appears in only one period's facts — a
-// new or discontinued account is reported with an explicit gap, never
-// silently dropped.
+// Sources reports the source accounts behind a fact: SourceAccounts when
+// recorded, otherwise the fact's own single account.
+func (f StatementFact) Sources() []SnapshotContentAccount {
+	if len(f.SourceAccounts) > 0 {
+		return f.SourceAccounts
+	}
+	return []SnapshotContentAccount{{AccountCode: f.AccountCode, AccountName: f.AccountName, Category: f.Category, Balance: f.Amount}}
+}
+
+// ComparativeFact pairs one reported line across two periods. Under
+// MappingVersionV1 a line is one account; under MappingVersionV2 it is
+// every same-category account sharing one account_name. A side is nil when
+// the line appears in only one period's facts — a new or discontinued line
+// is reported with an explicit gap, never silently dropped.
 type ComparativeFact struct {
+	// AccountCode is the line's representative code (under V2, its lowest
+	// source account code; the current period's when both sides exist).
 	AccountCode string          `json:"account_code"`
 	AccountName string          `json:"account_name"`
 	Category    AccountCategory `json:"category"`
-	// PriorCategory is set only when the account was classified differently
+	// PriorCategory is set only when the line was classified differently
 	// in the prior period (a reclassification within the same statement), so
 	// that change is visible rather than hidden behind one category value.
 	PriorCategory *AccountCategory `json:"prior_category,omitempty"`
+
+	// Current/PriorSourceAccountCodes name the accounts summed into each
+	// side. Under V2 a line's composition can change between periods (an
+	// account added to "Cash"), which moves the number without any balance
+	// changing — so the composition is shown, not just the totals.
+	CurrentSourceAccountCodes []string `json:"current_source_account_codes,omitempty"`
+	PriorSourceAccountCodes   []string `json:"prior_source_account_codes,omitempty"`
 
 	CurrentFactID *string `json:"current_fact_id"`
 	PriorFactID   *string `json:"prior_fact_id"`
@@ -189,7 +231,7 @@ type ComparativeFact struct {
 }
 
 // ComparativeStatement is one primary statement's paired lines, ordered by
-// account code.
+// representative account code.
 type ComparativeStatement struct {
 	StatementType StatementType     `json:"statement_type"`
 	Lines         []ComparativeFact `json:"lines"`

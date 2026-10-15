@@ -17,7 +17,7 @@ func TestBuildComparative_PairsOverlappingAndKeepsOneSidedLines(t *testing.T) {
 		fact("p2", StatementBalanceSheet, CategoryLiability, "2000", "100"), // discontinued
 		fact("p3", StatementIncomeStatement, CategoryRevenue, "4000", "1000.10"),
 	}
-	got, err := BuildComparative(current, prior)
+	got, err := BuildComparative(current, prior, MappingVersionV1)
 	if err != nil {
 		t.Fatalf("BuildComparative: %v", err)
 	}
@@ -50,6 +50,7 @@ func TestBuildComparative_ReclassificationIsVisible(t *testing.T) {
 	got, err := BuildComparative(
 		[]StatementFact{fact("c1", StatementBalanceSheet, CategoryLiability, "2500", "10")},
 		[]StatementFact{fact("p1", StatementBalanceSheet, CategoryAsset, "2500", "10")},
+		MappingVersionV1,
 	)
 	if err != nil {
 		t.Fatalf("BuildComparative: %v", err)
@@ -63,6 +64,7 @@ func TestBuildComparative_ReclassificationIsVisible(t *testing.T) {
 	got, err = BuildComparative(
 		[]StatementFact{fact("c1", StatementIncomeStatement, CategoryExpense, "5000", "10")},
 		[]StatementFact{fact("p1", StatementBalanceSheet, CategoryAsset, "5000", "10")},
+		MappingVersionV1,
 	)
 	if err != nil {
 		t.Fatalf("BuildComparative: %v", err)
@@ -77,11 +79,11 @@ func TestBuildComparative_FailsClosedOnBadInput(t *testing.T) {
 		fact("a", StatementBalanceSheet, CategoryAsset, "1000", "1"),
 		fact("b", StatementBalanceSheet, CategoryAsset, "1000", "2"),
 	}
-	if _, err := BuildComparative(dup, nil); err == nil {
+	if _, err := BuildComparative(dup, nil, MappingVersionV1); err == nil {
 		t.Error("expected a duplicate account code in one period to be refused")
 	}
 	notNum := []StatementFact{fact("a", StatementBalanceSheet, CategoryAsset, "1000", "abc")}
-	if _, err := BuildComparative(notNum, nil); err == nil {
+	if _, err := BuildComparative(notNum, nil, MappingVersionV1); err == nil {
 		t.Error("expected an unparseable amount to be refused")
 	}
 }

@@ -538,3 +538,171 @@ func TestGetComparatives_PriorInAnotherTenant_NotFound(t *testing.T) {
 	_, err := svc.GetComparatives(context.Background(), "t1", "viewer", "cur", "pri")
 	expectCode(t, err, domain.CodeNotFound)
 }
+
+// ── statement line aggregation (MappingVersionV2) ───────────────────────
+
+func snapshotWith(legalEntityID string, accounts ...domain.SnapshotContentAccount) *clients.Snapshot {
+	raw, _ := json.Marshal(domain.SnapshotContent{Currency: "GBP", Accounts: accounts})
+	return &clients.Snapshot{SnapshotID: "snap-agg", LegalEntityID: legalEntityID, Content: string(raw), ContentHash: "sha256:agg", Status: "CERTIFIED"}
+}
+
+func twoCashSnapshot() *clients.Snapshot {
+	return snapshotWith("le-1",
+		domain.SnapshotContentAccount{AccountCode: "1000", AccountName: "Cash", Category: domain.CategoryAsset, Balance: "300.00"},
+		domain.SnapshotContentAccount{AccountCode: "1010", AccountName: "Cash", Category: domain.CategoryAsset, Balance: "200.00"},
+		domain.SnapshotContentAccount{AccountCode: "2000", AccountName: "Payables", Category: domain.CategoryLiability, Balance: "100.00"},
+		domain.SnapshotContentAccount{AccountCode: "3000", AccountName: "Equity", Category: domain.CategoryEquity, Balance: "400.00"},
+	)
+}
+
+func createAndRefresh(t *testing.T, svc *service.Service) *domain.FinancialStatementSet {
+	t.Helper()
+	ctx := context.Background()
+	set, err := svc.CreateStatementSet(ctx, "t1", "preparer", "c1", service.CreateSetRequest{
+		LegalEntityID: "le-1", ReportingPeriod: "2026-Q1", Framework: "IFRS", PresentationCurrency: "GBP", SourceSnapshotID: "snap-agg",
+	})
+	if err != nil {
+		t.Fatalf("CreateStatementSet: %v", err)
+	}
+	if _, err := svc.RefreshDraft(ctx, "t1", "preparer", "c1", set.StatementSetID); err != nil {
+		t.Fatalf("RefreshDraft: %v", err)
+	}
+	return set
+}
+
+func TestNewSet_UsesCurrentMappingAndAggregatesSameNamedAccounts(t *testing.T) {
+	svc, st := newService(map[string]*clients.Snapshot{"snap-agg": twoCashSnapshot()}, "")
+	set := createAndRefresh(t, svc)
+	if set.MappingVersion != domain.MappingVersionV2 {
+		t.Fatalf("expected new sets under %s, got %s", domain.MappingVersionV2, set.MappingVersion)
+	}
+	facts := st.facts[set.StatementSetID]
+	if len(facts) != 3 {
+		t.Fatalf("expected Cash (1000+1010), Payables, Equity; got %d facts: %+v", len(facts), facts)
+	}
+	// Aggregation regroups lines; the tie-out over them is unchanged.
+	res, err := svc.ValidateStatements(context.Background(), "t1", "preparer", "c1", set.StatementSetID)
+	if err != nil || len(res.Errors) != 0 {
+		t.Fatalf("expected the aggregated set to tie out, got %v / %v", res, err)
+	}
+}
+
+func TestExplainReportedFact_ListsEverySourceAccountOfAnAggregatedLine(t *testing.T) {
+	svc, st := newService(map[string]*clients.Snapshot{"snap-agg": twoCashSnapshot()}, "")
+	set := createAndRefresh(t, svc)
+
+	var cashID, payID string
+	for _, f := range st.facts[set.StatementSetID] {
+		switch f.AccountName {
+		case "Cash":
+			cashID = f.FactID
+		case "Payables":
+			payID = f.FactID
+		}
+	}
+
+	ex, err := svc.ExplainReportedFact(context.Background(), "t1", "viewer", cashID)
+	if err != nil {
+		t.Fatalf("ExplainReportedFact: %v", err)
+	}
+	if !ex.Aggregated || len(ex.SourceAccounts) != 2 {
+		t.Fatalf("expected an aggregated fact with 2 source accounts, got %+v", ex)
+	}
+	if ex.SourceAccounts[0].AccountCode != "1000" || ex.SourceAccounts[0].Balance != "300.00" ||
+		ex.SourceAccounts[1].AccountCode != "1010" || ex.SourceAccounts[1].Balance != "200.00" {
+		t.Errorf("expected 1000 (300.00) and 1010 (200.00), got %+v", ex.SourceAccounts)
+	}
+	if ex.Fact.Amount != "500" || ex.SourceSnapshotHash != "sha256:agg" {
+		t.Errorf("unexpected fact/provenance: %+v", ex)
+	}
+
+	single, err := svc.ExplainReportedFact(context.Background(), "t1", "viewer", payID)
+	if err != nil {
+		t.Fatalf("ExplainReportedFact (single): %v", err)
+	}
+	if single.Aggregated || len(single.SourceAccounts) != 1 || single.SourceAccounts[0].AccountCode != "2000" {
+		t.Errorf("expected a single-source, non-aggregated fact, got %+v", single)
+	}
+}
+
+func TestExplainReportedFact_PreAggregationFactExplainsItself(t *testing.T) {
+	// A fact stored before source_accounts existed has none recorded.
+	svc, st := newService(nil, "")
+	seedSet(st, "old", "t1", "le-1", "IFRS", "2025-Q4", domain.StateCertified, bsFact("f-old", "1000", "42"))
+	ex, err := svc.ExplainReportedFact(context.Background(), "t1", "viewer", "f-old")
+	if err != nil {
+		t.Fatalf("ExplainReportedFact: %v", err)
+	}
+	if ex.Aggregated || len(ex.SourceAccounts) != 1 || ex.SourceAccounts[0].AccountCode != "1000" || ex.SourceAccounts[0].Balance != "42" {
+		t.Fatalf("expected the fact itself as its single source, got %+v", ex)
+	}
+}
+
+func TestExplainReportedFact_SourcesNotSummingToAmount_Refused(t *testing.T) {
+	svc, st := newService(map[string]*clients.Snapshot{"snap-agg": twoCashSnapshot()}, "")
+	set := createAndRefresh(t, svc)
+	var cashID string
+	for i, f := range st.facts[set.StatementSetID] {
+		if f.AccountName == "Cash" {
+			cashID = f.FactID
+			st.facts[set.StatementSetID][i].Amount = "501" // tampered total
+		}
+	}
+	_, err := svc.ExplainReportedFact(context.Background(), "t1", "viewer", cashID)
+	expectCode(t, err, domain.CodeValidationFailed)
+}
+
+func TestRefreshDraft_V1SetKeepsOneFactPerAccount(t *testing.T) {
+	// A set created before aggregation keeps the mapping it recorded.
+	svc, st := newService(map[string]*clients.Snapshot{"snap-agg": twoCashSnapshot()}, "")
+	set := createAndRefresh(t, svc)
+	st.sets[set.StatementSetID].MappingVersion = domain.MappingVersionV1
+	if _, err := svc.RefreshDraft(context.Background(), "t1", "preparer", "c1", set.StatementSetID); err != nil {
+		t.Fatalf("RefreshDraft: %v", err)
+	}
+	if n := len(st.facts[set.StatementSetID]); n != 4 {
+		t.Fatalf("expected V1 to keep 4 per-account facts, got %d", n)
+	}
+}
+
+func TestGetComparatives_V2SetsPairAggregatedLines(t *testing.T) {
+	svc, st := newService(nil, "")
+	cur := mustFactsV2(t, "cur",
+		domain.SnapshotContentAccount{AccountCode: "1000", AccountName: "Cash", Category: domain.CategoryAsset, Balance: "70"},
+		domain.SnapshotContentAccount{AccountCode: "1010", AccountName: "Cash", Category: domain.CategoryAsset, Balance: "30"})
+	pri := mustFactsV2(t, "pri",
+		domain.SnapshotContentAccount{AccountCode: "1000", AccountName: "Cash", Category: domain.CategoryAsset, Balance: "75"})
+	seedSet(st, "cur", "t1", "le-1", "IFRS", "2026-Q2", domain.StateDraft, cur...)
+	seedSet(st, "pri", "t1", "le-1", "IFRS", "2026-Q1", domain.StateCertified, pri...)
+	st.sets["cur"].MappingVersion, st.sets["pri"].MappingVersion = domain.MappingVersionV2, domain.MappingVersionV2
+
+	view, err := svc.GetComparatives(context.Background(), "t1", "viewer", "cur", "pri")
+	if err != nil {
+		t.Fatalf("GetComparatives: %v", err)
+	}
+	lines := view.Statements[0].Lines
+	if len(lines) != 1 || *lines[0].Change != "25" || len(lines[0].CurrentSourceAccountCodes) != 2 || len(lines[0].PriorSourceAccountCodes) != 1 {
+		t.Fatalf("expected one Cash line 100 vs 75 with composition 2 vs 1, got %+v", lines)
+	}
+}
+
+func TestGetComparatives_V1AgainstV2_Refused(t *testing.T) {
+	// Different granularities are never paired (B8): a per-account V1 set
+	// cannot be compared line-for-line with an aggregated V2 set.
+	svc, st := comparativeFixture(domain.StateCertified)
+	st.sets["cur"].MappingVersion = domain.MappingVersionV2
+	_, err := svc.GetComparatives(context.Background(), "t1", "viewer", "cur", "pri")
+	expectCode(t, err, domain.CodeContextInvalid)
+}
+
+func mustFactsV2(t *testing.T, prefix string, accounts ...domain.SnapshotContentAccount) []domain.StatementFact {
+	t.Helper()
+	facts, err := domain.BuildFacts(domain.SnapshotContent{Currency: "GBP", Accounts: accounts}, domain.MappingVersionV2)
+	if err != nil {
+		t.Fatalf("BuildFacts: %v", err)
+	}
+	for i := range facts {
+		facts[i].FactID = prefix + "-" + facts[i].AccountCode
+	}
+	return facts
+}

@@ -224,13 +224,17 @@ func (s *PgStore) RefreshFacts(ctx context.Context, tenantID, setID string, expe
 			return fmt.Errorf("clear prior facts: %w", err)
 		}
 		for _, f := range facts {
+			sources, err := marshalSourceAccounts(f.SourceAccounts)
+			if err != nil {
+				return fmt.Errorf("encode source accounts for fact %s: %w", f.AccountCode, err)
+			}
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO statement_facts (
 					fact_id, tenant_id, statement_set_id, statement_type, category,
-					account_code, account_name, amount, created_at
-				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::numeric,$9)
+					account_code, account_name, amount, source_accounts, created_at
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::numeric,$9::jsonb,$10)
 			`, f.FactID, tenantID, setID, string(f.StatementType), string(f.Category),
-				f.AccountCode, f.AccountName, f.Amount, f.CreatedAt); err != nil {
+				f.AccountCode, f.AccountName, f.Amount, sources, f.CreatedAt); err != nil {
 				return fmt.Errorf("insert fact %s: %w", f.AccountCode, err)
 			}
 		}
@@ -547,10 +551,33 @@ func (s *PgStore) ListSets(ctx context.Context, tenantID, legalEntityID, status 
 	return out, nil
 }
 
-const factColumns = `fact_id, tenant_id, statement_set_id, statement_type, category, account_code, account_name, amount, created_at`
+const factColumns = `fact_id, tenant_id, statement_set_id, statement_type, category, account_code, account_name, amount, source_accounts, created_at`
 
 func scanFact(row pgx.Row, f *domain.StatementFact) error {
-	return row.Scan(&f.FactID, &f.TenantID, &f.StatementSetID, &f.StatementType, &f.Category, &f.AccountCode, &f.AccountName, &f.Amount, &f.CreatedAt)
+	var sources []byte
+	if err := row.Scan(&f.FactID, &f.TenantID, &f.StatementSetID, &f.StatementType, &f.Category, &f.AccountCode, &f.AccountName, &f.Amount, &sources, &f.CreatedAt); err != nil {
+		return err
+	}
+	f.SourceAccounts = nil
+	if len(sources) > 0 {
+		if err := json.Unmarshal(sources, &f.SourceAccounts); err != nil {
+			return fmt.Errorf("decode source_accounts for fact %s: %w", f.FactID, err)
+		}
+	}
+	if len(f.SourceAccounts) == 0 {
+		f.SourceAccounts = nil
+	}
+	return nil
+}
+
+// marshalSourceAccounts encodes a fact's source accounts for the JSONB
+// column; nil (a per-account fact) is stored as '[]', never NULL.
+func marshalSourceAccounts(sources []domain.SnapshotContentAccount) (string, error) {
+	if len(sources) == 0 {
+		return "[]", nil
+	}
+	b, err := json.Marshal(sources)
+	return string(b), err
 }
 
 func (s *PgStore) GetFacts(ctx context.Context, tenantID, setID string) ([]domain.StatementFact, error) {
