@@ -519,6 +519,44 @@ func TestTerminateContract_DraftIsRefused(t *testing.T) {
 	}
 }
 
+func TestContract_ReadEndpoints_RequirePrincipal(t *testing.T) {
+	store := newStubStore()
+	store.contracts["ctr-001"] = &domain.Contract{
+		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Status: domain.ContractStatusDraft,
+	}
+	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, zap.NewNop())
+	router := newChiRouter(h)
+
+	// GET /v1/contracts without principal
+	r1 := httptest.NewRequest(http.MethodGet, "/v1/contracts", nil)
+	r1.Header.Set("X-Tenant-Id", "tenant-test-01")
+	w1 := httptest.NewRecorder()
+	router.ServeHTTP(w1, r1)
+	if w1.Code != http.StatusUnauthorized {
+		t.Errorf("ListContracts: expected 401 without X-Principal-Id, got %d", w1.Code)
+	}
+
+	// GET /v1/contracts/ctr-001 without principal
+	r2 := httptest.NewRequest(http.MethodGet, "/v1/contracts/ctr-001", nil)
+	r2.Header.Set("X-Tenant-Id", "tenant-test-01")
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusUnauthorized {
+		t.Errorf("GetContract: expected 401 without X-Principal-Id, got %d", w2.Code)
+	}
+
+	// GET /v1/contracts/ctr-001/versions without principal
+	r3 := httptest.NewRequest(http.MethodGet, "/v1/contracts/ctr-001/versions", nil)
+	r3.Header.Set("X-Tenant-Id", "tenant-test-01")
+	w3 := httptest.NewRecorder()
+	router.ServeHTTP(w3, r3)
+	if w3.Code != http.StatusUnauthorized {
+		t.Errorf("ListContractVersions: expected 401 without X-Principal-Id, got %d", w3.Code)
+	}
+}
+
+
 func newTestRouter(h *Handler) http.Handler {
 	// Import chi inline for tests
 	mux := http.NewServeMux()

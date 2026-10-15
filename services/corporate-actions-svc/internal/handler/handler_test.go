@@ -123,7 +123,8 @@ func TestCreateAction(t *testing.T) {
 		ValuationAmount: 10000000,
 		Currency:        "USD",
 		EffectiveFrom:   "2026-01-01",
-		CreatedBy:       "cfo-001",
+		// CreatedBy is intentionally absent: attribution should be pinned to
+		// the X-Principal-Id header, not supplied by the body.
 	}
 	w := httptest.NewRecorder()
 	h.CreateAction(w, buildRequest(http.MethodPost, "/v1/corporate-actions", body))
@@ -140,6 +141,64 @@ func TestCreateAction(t *testing.T) {
 	if resp.Status != domain.ActionStatusProposed {
 		t.Errorf("expected PROPOSED, got %s", resp.Status)
 	}
+	// created_by must be the authenticated principal, not an empty string.
+	if resp.CreatedBy != "principal-test-01" {
+		t.Errorf("expected created_by=principal-test-01 (pinned to X-Principal-Id), got %q", resp.CreatedBy)
+	}
+}
+
+// TestCreateAction_SelfAttributionMismatch verifies that supplying a
+// created_by in the request body that does not match X-Principal-Id is
+// rejected 400 — the fix for the SoD bypass described in the audit.
+func TestCreateAction_SelfAttributionMismatch(t *testing.T) {
+	h := newTestHandler()
+	body := domain.CreateCorporateActionRequest{
+		LegalEntityID: "le-001",
+		Title:         "Fake Attribution Test",
+		ActionType:    domain.ActionTypeMerger,
+		EffectiveDate: "2026-06-01",
+		CreatedBy:     "some-other-principal", // differs from X-Principal-Id
+	}
+	w := httptest.NewRecorder()
+	req := buildRequest(http.MethodPost, "/v1/corporate-actions", body)
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	h.CreateAction(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for self-attribution mismatch, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+// TestGetAction_RequiresPrincipal verifies that GET /v1/corporate-actions/{id}
+// now returns 401 when X-Principal-Id is absent (previously unguarded).
+func TestGetAction_RequiresPrincipal(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/corporate-actions/any-id", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-test-01")
+	// deliberately no X-Principal-Id
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when X-Principal-Id absent, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+// TestListActions_RequiresPrincipal verifies that GET /v1/corporate-actions
+// now returns 401 when X-Principal-Id is absent.
+func TestListActions_RequiresPrincipal(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/corporate-actions", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-test-01")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when X-Principal-Id absent, got %d — %s", w.Code, w.Body.String())
+	}
 }
 
 func TestExecuteAction(t *testing.T) {
@@ -147,25 +206,27 @@ func TestExecuteAction(t *testing.T) {
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 
-	// First create an action
+	// Create as principal-test-01 (matches X-Principal-Id in buildRequest)
 	body := domain.CreateCorporateActionRequest{
 		LegalEntityID: "le-001",
 		Title:         "Subsidiary Restructure",
 		ActionType:    domain.ActionTypeRestructure,
 		EffectiveDate: "2026-05-01",
-		CreatedBy:     "ceo-001",
+		// CreatedBy deliberately omitted — pinned to X-Principal-Id
 	}
 	wCreate := httptest.NewRecorder()
 	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/corporate-actions", body))
 	var created domain.CorporateAction
 	_ = json.NewDecoder(wCreate.Body).Decode(&created)
 
-	// Execute it
+	// Execute as a different principal (not the creator) — SoD satisfied
 	execBody := domain.ExecuteCorporateActionRequest{
-		ExecutedBy: "ceo-001",
+		ExecutedBy: "another-principal",
 	}
+	execReq := buildRequest(http.MethodPost, "/v1/corporate-actions/"+created.ActionID+"/execute", execBody)
+	execReq.Header.Set("X-Principal-Id", "another-principal")
 	wExec := httptest.NewRecorder()
-	r.ServeHTTP(wExec, buildRequest(http.MethodPost, "/v1/corporate-actions/"+created.ActionID+"/execute", execBody))
+	r.ServeHTTP(wExec, execReq)
 	if wExec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d — %s", wExec.Code, wExec.Body.String())
 	}
@@ -182,18 +243,23 @@ func TestExecuteAction_EvidenceMissing_Returns422(t *testing.T) {
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 
+	// CreatedBy omitted — pinned to X-Principal-Id (principal-test-01)
 	body := domain.CreateCorporateActionRequest{
 		LegalEntityID: "le-001", Title: "Merger with Acme", ActionType: domain.ActionTypeMerger,
-		EffectiveDate: "2026-05-01", CreatedBy: "ceo-001",
+		EffectiveDate: "2026-05-01",
 	}
 	wCreate := httptest.NewRecorder()
 	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/corporate-actions", body))
 	var created domain.CorporateAction
 	_ = json.NewDecoder(wCreate.Body).Decode(&created)
 
-	execBody := domain.ExecuteCorporateActionRequest{ExecutedBy: "ceo-001"}
+	// Execute as a different principal so SoD is satisfied; the evidence gate
+	// is what should reject this.
+	execBody := domain.ExecuteCorporateActionRequest{ExecutedBy: "another-principal"}
+	execReq := buildRequest(http.MethodPost, "/v1/corporate-actions/"+created.ActionID+"/execute", execBody)
+	execReq.Header.Set("X-Principal-Id", "another-principal")
 	wExec := httptest.NewRecorder()
-	r.ServeHTTP(wExec, buildRequest(http.MethodPost, "/v1/corporate-actions/"+created.ActionID+"/execute", execBody))
+	r.ServeHTTP(wExec, execReq)
 	if wExec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 when required evidence is missing, got %d — %s", wExec.Code, wExec.Body.String())
 	}
@@ -205,18 +271,21 @@ func TestExecuteAction_EvidenceServiceUnavailable_Returns503(t *testing.T) {
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 
+	// CreatedBy omitted — pinned to X-Principal-Id (principal-test-01)
 	body := domain.CreateCorporateActionRequest{
 		LegalEntityID: "le-001", Title: "Merger with Acme", ActionType: domain.ActionTypeMerger,
-		EffectiveDate: "2026-05-01", CreatedBy: "ceo-001",
+		EffectiveDate: "2026-05-01",
 	}
 	wCreate := httptest.NewRecorder()
 	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/corporate-actions", body))
 	var created domain.CorporateAction
 	_ = json.NewDecoder(wCreate.Body).Decode(&created)
 
-	execBody := domain.ExecuteCorporateActionRequest{ExecutedBy: "ceo-001"}
+	execBody := domain.ExecuteCorporateActionRequest{ExecutedBy: "another-principal"}
+	execReq := buildRequest(http.MethodPost, "/v1/corporate-actions/"+created.ActionID+"/execute", execBody)
+	execReq.Header.Set("X-Principal-Id", "another-principal")
 	wExec := httptest.NewRecorder()
-	r.ServeHTTP(wExec, buildRequest(http.MethodPost, "/v1/corporate-actions/"+created.ActionID+"/execute", execBody))
+	r.ServeHTTP(wExec, execReq)
 	if wExec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when evidence-requirements-svc is unavailable, got %d — %s", wExec.Code, wExec.Body.String())
 	}
@@ -232,13 +301,14 @@ func TestExecuteAction_SelfApprovalForbidden(t *testing.T) {
 
 	const creator = "board-member-001"
 
-	// Create the action as `creator`.
+	// Create the action as `creator` — body CreatedBy matches the header so
+	// the self-attribution check passes, and created_by is pinned to `creator`.
 	createBody := domain.CreateCorporateActionRequest{
 		LegalEntityID: "le-001",
 		Title:         "Subsidiary Restructure",
 		ActionType:    domain.ActionTypeRestructure,
 		EffectiveDate: "2026-05-01",
-		CreatedBy:     creator,
+		// CreatedBy omitted — will be pinned to X-Principal-Id = creator
 	}
 	createReq := buildRequest(http.MethodPost, "/v1/corporate-actions", createBody)
 	createReq.Header.Set("X-Principal-Id", creator)
@@ -258,5 +328,36 @@ func TestExecuteAction_SelfApprovalForbidden(t *testing.T) {
 
 	if wExec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 self-approval rejection, got %d — %s", wExec.Code, wExec.Body.String())
+	}
+}
+
+// TestUpdateAction_StatusGuard verifies that only PROPOSED actions can be
+// updated — the fix for the missing lifecycle status guard in UpdateAction.
+func TestUpdateAction_StatusGuard(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	// Insert an EXECUTED action directly into the store stub.
+	executedAction := &domain.CorporateAction{
+		ActionID:      "act-executed-001",
+		LegalEntityID: "le-001",
+		Title:         "Already Executed",
+		ActionType:    domain.ActionTypeMerger,
+		EffectiveDate: "2026-01-01",
+		Status:        domain.ActionStatusExecuted,
+		CreatedBy:     "principal-test-01",
+	}
+	h.store.(*stubStore).actions[executedAction.ActionID] = executedAction
+
+	updateBody := domain.UpdateCorporateActionRequest{
+		Title: "Attempting to overwrite EXECUTED record",
+	}
+	updReq := buildRequest(http.MethodPut, "/v1/corporate-actions/act-executed-001", updateBody)
+	wUpd := httptest.NewRecorder()
+	r.ServeHTTP(wUpd, updReq)
+
+	if wUpd.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for EXECUTED record update, got %d — %s", wUpd.Code, wUpd.Body.String())
 	}
 }
