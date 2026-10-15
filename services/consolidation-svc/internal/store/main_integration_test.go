@@ -78,6 +78,13 @@ func TestMain(m *testing.M) {
 			fmt.Printf("embedded postgres not ready: %v\n", err)
 			return 1
 		}
+		_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
+			eventing_outbox,
+			consolidation_adjustments,
+			balance_contributions,
+			balance_snapshots,
+			consolidation_runs
+			CASCADE;`)
 		files, _ := filepath.Glob("../../deployments/migrations/*.up.sql")
 		sort.Strings(files)
 		for _, f := range files {
