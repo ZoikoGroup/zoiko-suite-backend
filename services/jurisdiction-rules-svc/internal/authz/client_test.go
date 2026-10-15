@@ -13,13 +13,14 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
+	"zoiko.io/jurisdiction-rules-svc/internal/envelope"
 )
 
 // ── client selection ─────────────────────────────────────────────────────────
 
 func TestNewClient_LocalEnvironment_UsesStub(t *testing.T) {
 	log := zap.NewNop()
-	client, err := authz.NewClient("local", "http://authorization-svc", log)
+	client, err := authz.NewClient("local", "http://authorization-svc", true, log)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -33,7 +34,7 @@ func TestNewClient_LocalEnvironment_UsesStub(t *testing.T) {
 
 func TestNewClient_ProductionEnvironment_PlaceholderURL_ReturnsError(t *testing.T) {
 	log := zap.NewNop()
-	_, err := authz.NewClient("production", "http://authorization-svc", log)
+	_, err := authz.NewClient("production", "http://authorization-svc", false, log)
 	if err == nil {
 		t.Fatal("expected error when starting in production with placeholder URL, got nil")
 	}
@@ -45,7 +46,7 @@ func TestNewClient_ProductionEnvironment_PlaceholderURL_ReturnsError(t *testing.
 // back". That was harmless only while Authorize was a no-op; it must not be
 // mistaken for a wired authorization service.
 func TestNewClient_ProductionEnvironment_SelfReferentialURL_ReturnsError(t *testing.T) {
-	_, err := authz.NewClient("production", "http://jurisdiction-svc:8082", zap.NewNop())
+	_, err := authz.NewClient("production", "http://jurisdiction-svc:8082", false, zap.NewNop())
 	if err == nil {
 		t.Fatal("expected error for the self-referential placeholder URL, got nil")
 	}
@@ -53,7 +54,7 @@ func TestNewClient_ProductionEnvironment_SelfReferentialURL_ReturnsError(t *test
 
 func TestNewClient_ProductionEnvironment_ValidURL_ReturnsHTTPClient(t *testing.T) {
 	log := zap.NewNop()
-	client, err := authz.NewClient("production", "http://real-authz.zoiko.internal", log)
+	client, err := authz.NewClient("production", "http://real-authz.zoiko.internal", false, log)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -95,6 +96,68 @@ func TestHTTPClient_Granted(t *testing.T) {
 	}
 	if gotBody["action_type"] != "JURISDICTION_RULE_TRANSITION" {
 		t.Errorf("action_type = %q, want JURISDICTION_RULE_TRANSITION", gotBody["action_type"])
+	}
+}
+
+// TestHTTPClient_ForwardsRequestContextHeaders — audit X6 attribution: the
+// outbound authorize call must carry the caller's tenant, principal,
+// correlation, request and channel as headers (not only inside the JSON body)
+// so authorization-svc's middleware and decision log attribute it the same way.
+func TestHTTPClient_ForwardsRequestContextHeaders(t *testing.T) {
+	gotHeaders := make(http.Header)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED","decision_basis":"rbac","access_decision_id":"d-1"}`))
+	}))
+	defer srv.Close()
+
+	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
+	env := &envelope.Envelope{
+		TenantID:       "t-1",
+		ActorSubjectID: "p-1",
+		CorrelationID:  "c-1",
+		RequestID:      "r-1",
+		SourceChannel:  envelope.ChannelAPI,
+	}
+	err := c.Authorize(context.Background(), "p-1", "scope-1", "jurisdiction", "create", env)
+	if err != nil {
+		t.Fatalf("expected permit, got %v", err)
+	}
+
+	want := map[string]string{
+		"X-Tenant-Id":      "t-1",
+		"X-Principal-Id":   "p-1",
+		"X-Correlation-ID": "c-1",
+		"X-Request-Id":     "r-1",
+		"X-Source-Channel": "api",
+	}
+	for h, expected := range want {
+		if got := gotHeaders.Get(h); got != expected {
+			t.Errorf("%s header = %q, want %q", h, got, expected)
+		}
+	}
+}
+
+// TestHTTPClient_AlwaysSendsPrincipalHeader — even without an envelope (an
+// internal/legacy call), the acting principal must be attributed out-of-band.
+func TestHTTPClient_AlwaysSendsPrincipalHeader(t *testing.T) {
+	var principalHeader string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principalHeader = r.Header.Get("X-Principal-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED","decision_basis":"rbac","access_decision_id":"d-1"}`))
+	}))
+	defer srv.Close()
+
+	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
+	if err := c.Authorize(context.Background(), "principal-legacy", "scope-1", "jurisdiction", "create", nil); err != nil {
+		t.Fatalf("expected permit, got %v", err)
+	}
+	if principalHeader != "principal-legacy" {
+		t.Errorf("X-Principal-Id header = %q, want principal-legacy", principalHeader)
 	}
 }
 
@@ -225,5 +288,37 @@ func TestActionType(t *testing.T) {
 		if got := authz.ActionType(in[0], in[1]); got != want {
 			t.Errorf("ActionType(%q, %q) = %q, want %q", in[0], in[1], got, want)
 		}
+	}
+}
+
+// Audit gap 4: a decision must name what it was taken on. The record id on the
+// context goes to authorization-svc as resource_type/resource_id, and a cached
+// grant for one record never answers for another.
+func TestHTTPClient_SendsTheTargetAndCachesPerTarget(t *testing.T) {
+	var bodies []map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var b map[string]string
+		_ = json.Unmarshal(raw, &b)
+		bodies = append(bodies, b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"decision_outcome":"GRANTED","decision_basis":"rbac","access_decision_id":"d-1"}`))
+	}))
+	defer srv.Close()
+
+	c := authz.NewHTTPAuthZClient(srv.URL, zap.NewNop())
+	for _, id := range []string{"rule-9", "rule-9", "rule-10"} {
+		if err := c.Authorize(authz.WithResourceID(context.Background(), id), "p-1", "s-1", "jurisdiction_rule", "transition", nil); err != nil {
+			t.Fatalf("authorize %s: %v", id, err)
+		}
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 live decisions (rule-9 once, rule-10 once), got %d", len(bodies))
+	}
+	if bodies[0]["resource_type"] != "jurisdiction_rule" || bodies[0]["resource_id"] != "rule-9" {
+		t.Errorf("first decision target = %q/%q, want jurisdiction_rule/rule-9", bodies[0]["resource_type"], bodies[0]["resource_id"])
+	}
+	if bodies[1]["resource_id"] != "rule-10" {
+		t.Errorf("second decision resource_id = %q, want rule-10", bodies[1]["resource_id"])
 	}
 }

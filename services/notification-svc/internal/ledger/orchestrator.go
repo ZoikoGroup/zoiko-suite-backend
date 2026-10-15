@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 	"time"
 
@@ -22,7 +21,16 @@ var (
 	ErrMissingTenantContext     = errors.New("missing or unauthenticated tenant context")
 	ErrInvalidIngestRequest     = errors.New("invalid event ingest request parameters")
 	ErrRecipientEmailUnresolved = errors.New("recipient email could not be resolved")
+	// ErrUnsubscribeUnavailable refuses a marketing send that could not carry a
+	// working one-click unsubscribe link (ZS-SVC-Y-001 §11.4, INV-25).
+	ErrUnsubscribeUnavailable = errors.New("marketing mail refused: no one-click unsubscribe link can be issued")
 )
+
+// UnsubscribeLinker issues the RFC 8058 List-Unsubscribe headers for one
+// recipient (internal/unsubscribe.Codec).
+type UnsubscribeLinker interface {
+	Headers(tenantID, email string) (map[string]string, error)
+}
 
 // LedgerStore specifies the persistence methods required by the Orchestrator.
 type LedgerStore interface {
@@ -79,8 +87,11 @@ type Orchestrator struct {
 	deliverer  Deliverer
 	recipient  RecipientResolver
 	metrics    MetricsRecorder
-	register   CommunicationRegister
-	log        *zap.Logger
+	// unsubscribe issues marketing mail's one-click unsubscribe link. Nil
+	// means none can be issued, and marketing sends are then refused.
+	unsubscribe UnsubscribeLinker
+	register    CommunicationRegister
+	log         *zap.Logger
 }
 
 // WithRegister makes every delivery also a register row linked to its intent
@@ -115,6 +126,12 @@ func NewOrchestrator(
 // WithPolicyResolver attaches a policy precedence and suppression resolver.
 func (o *Orchestrator) WithPolicyResolver(pr PolicyResolver) *Orchestrator {
 	o.policy = pr
+	return o
+}
+
+// WithUnsubscribe attaches the issuer of one-click unsubscribe links.
+func (o *Orchestrator) WithUnsubscribe(u UnsubscribeLinker) *Orchestrator {
+	o.unsubscribe = u
 	return o
 }
 
@@ -366,9 +383,27 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 
 	headers := make(map[string]string)
 	if tmplDef.SenderStream == StreamMarketing {
-		// RFC 8058 One-Click List-Unsubscribe
-		headers["List-Unsubscribe"] = fmt.Sprintf("<https://notify.zoiko.com/v1/notifications/unsubscribe?tenant_id=%s&email=%s>, <mailto:unsubscribe@news.zoikosuite.com?subject=unsubscribe>", tenantID, url.QueryEscape(recipientEmail))
-		headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+		// RFC 8058 one-click unsubscribe. The link carries a sealed token, not
+		// the tenant and address in clear: the receiver believes nothing else,
+		// and the address stays out of URLs (§11.2). Marketing mail that cannot
+		// carry a working link is not sent at all (§11.4, INV-25).
+		var unsub map[string]string
+		err := ErrUnsubscribeUnavailable
+		if o.unsubscribe != nil {
+			if unsub, err = o.unsubscribe.Headers(tenantID, recipientEmail); err != nil {
+				err = fmt.Errorf("%w: %v", ErrUnsubscribeUnavailable, err)
+			}
+		}
+		if err != nil {
+			failMsg := err.Error()
+			if upErr := o.store.UpdateIntentStatus(ctx, tenantID, intent.MessageIntentID, IntentStatusFailed, &failMsg); upErr != nil {
+				o.log.Error("failed to update intent status to FAILED", zap.String("intent_id", intent.MessageIntentID), zap.Error(upErr))
+			}
+			return nil, err
+		}
+		for k, v := range unsub {
+			headers[k] = v
+		}
 	}
 
 	notificationForDeliverer := domain.Notification{

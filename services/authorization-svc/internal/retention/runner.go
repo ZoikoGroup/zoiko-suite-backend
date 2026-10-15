@@ -67,9 +67,22 @@ type Store interface {
 }
 
 // Runner sweeps on an interval.
+// Purger is the optional purge capability (000031; Governance audit N-14):
+// published outbox rows and old Idempotency-Key records. A store without it
+// is simply not purged.
+type Purger interface {
+	PurgePublishedOutbox(ctx context.Context, olderThan time.Duration) (int64, error)
+	PurgeIdempotencyKeys(ctx context.Context, olderThan time.Duration) (int64, error)
+}
+
 type Runner struct {
 	store Store
 	log   *zap.Logger
+
+	// outboxRetention / idempotencyRetention: how long a published outbox row
+	// and an Idempotency-Key record are kept; 0 keeps them (see SetPurge).
+	outboxRetention      time.Duration
+	idempotencyRetention time.Duration
 
 	interval        time.Duration
 	monthsAhead     int
@@ -112,6 +125,13 @@ func New(store Store, log *zap.Logger, interval time.Duration, monthsAhead, rete
 // a long outage, or a fresh deployment whose migrations created only the months
 // current at migration time, needs the runway extended now rather than at the
 // next tick.
+// SetPurge turns on the purge of published outbox rows and Idempotency-Key
+// records older than the given windows. Zero leaves that table alone.
+func (r *Runner) SetPurge(outboxRetention, idempotencyRetention time.Duration) {
+	r.outboxRetention = outboxRetention
+	r.idempotencyRetention = idempotencyRetention
+}
+
 func (r *Runner) Run(ctx context.Context) {
 	r.log.Info("retention sweeper started",
 		zap.Duration("interval", r.interval),
@@ -165,6 +185,31 @@ func (r *Runner) Sweep(ctx context.Context) {
 
 	r.extendRunway(ctx)
 	r.detachAged(ctx)
+	r.purge(ctx)
+}
+
+// purge deletes what has outlived its use: published outbox rows (the event is
+// in Kafka) and Idempotency-Key records past their replay window. Failures are
+// logged and the next sweep retries; nothing here affects a decision.
+func (r *Runner) purge(ctx context.Context) {
+	p, ok := r.store.(Purger)
+	if !ok {
+		return
+	}
+	if r.outboxRetention > 0 {
+		if n, err := p.PurgePublishedOutbox(ctx, r.outboxRetention); err != nil {
+			r.log.Error("retention: outbox purge failed", zap.Error(err))
+		} else {
+			r.log.Info("retention: published outbox rows purged", zap.Int64("rows", n), zap.Duration("older_than", r.outboxRetention))
+		}
+	}
+	if r.idempotencyRetention > 0 {
+		if n, err := p.PurgeIdempotencyKeys(ctx, r.idempotencyRetention); err != nil {
+			r.log.Error("retention: idempotency key purge failed", zap.Error(err))
+		} else {
+			r.log.Info("retention: idempotency keys purged", zap.Int64("rows", n), zap.Duration("older_than", r.idempotencyRetention))
+		}
+	}
 }
 
 // extendRunway creates this month's partition and the next monthsAhead.

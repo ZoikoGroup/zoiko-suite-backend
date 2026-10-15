@@ -13,26 +13,10 @@ import (
 
 	authzpkg "zoiko.io/payment-status-svc/internal/authz"
 	"zoiko.io/payment-status-svc/internal/domain"
-	"zoiko.io/payment-status-svc/internal/events"
 	"zoiko.io/payment-status-svc/internal/handler"
 	"zoiko.io/payment-status-svc/internal/middleware"
 	"zoiko.io/payment-status-svc/internal/webhook"
 )
-
-// ── stub publisher ───────────────────────────────────────────────────────────
-
-type stubPublisher struct {
-	calls     int
-	published []events.PublishParams
-}
-
-func (p *stubPublisher) Publish(_ context.Context, params events.PublishParams) error {
-	p.calls++
-	p.published = append(p.published, params)
-	return nil
-}
-
-var _ events.Publisher = (*stubPublisher)(nil)
 
 // ── stub authz ───────────────────────────────────────────────────────────────
 
@@ -51,9 +35,9 @@ const testTenant = "tenant-bnk07-1"
 const testLegalEntity = "le-bnk07-1"
 const testSecret = "test-webhook-shared-secret"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz) chi.Router {
+func newTestRouter(st *stubStore, az *stubAuthz) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, testSecret, logger)
+	h := handler.New(st, az, testSecret, logger)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h, middleware.TenantContext())
 	return r
@@ -111,7 +95,7 @@ func recordPayment(t *testing.T, r http.Handler) *domain.PaymentExecutionState {
 // ── tests ────────────────────────────────────────────────────────────────────
 
 func TestRecordPaymentStatus_Prepared(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 	if p.Status != domain.StatusPrepared {
 		t.Fatalf("expected PREPARED, got %s", p.Status)
@@ -119,7 +103,7 @@ func TestRecordPaymentStatus_Prepared(t *testing.T) {
 }
 
 func TestProcessProviderCallback_ValidSignature_Applied(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 
 	w := postWebhook(r, domain.ProviderCallbackPayload{
@@ -140,7 +124,7 @@ func TestProcessProviderCallback_ValidSignature_Applied(t *testing.T) {
 
 // TestProcessProviderCallback_InvalidSignature_Rejected is negative-path #1.
 func TestProcessProviderCallback_InvalidSignature_Rejected(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 
 	w := postWebhook(r, domain.ProviderCallbackPayload{
@@ -154,7 +138,7 @@ func TestProcessProviderCallback_InvalidSignature_Rejected(t *testing.T) {
 // TestProcessProviderCallback_Duplicate_NotDoubleApplied is negative-path
 // #3.
 func TestProcessProviderCallback_Duplicate_NotDoubleApplied(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 
 	callback := domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-dup", ReportedStatus: domain.StatusAccepted}
@@ -175,7 +159,7 @@ func TestProcessProviderCallback_Duplicate_NotDoubleApplied(t *testing.T) {
 
 // TestProcessProviderCallback_RegressionBlocked is negative-path #2.
 func TestProcessProviderCallback_RegressionBlocked(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 	postWebhook(r, domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-settle", ReportedStatus: domain.StatusSettled}, testSecret)
 
@@ -195,7 +179,7 @@ func TestProcessProviderCallback_RegressionBlocked(t *testing.T) {
 
 // TestLinkStatementConfirmation_Conflict is negative-path #4.
 func TestLinkStatementConfirmation_Conflict(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 	postWebhook(r, domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-settle-2", ReportedStatus: domain.StatusSettled}, testSecret)
 
@@ -215,7 +199,7 @@ func TestLinkStatementConfirmation_Conflict(t *testing.T) {
 }
 
 func TestResolveStatusConflict(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 	postWebhook(r, domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-settle-3", ReportedStatus: domain.StatusSettled}, testSecret)
 	doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/link-statement",
@@ -240,7 +224,7 @@ func TestResolveStatusConflict(t *testing.T) {
 // proof of the SoD rule: the principal who created the payment cannot
 // also resolve its own conflict, even holding PAYMENT_FINALITY_CONFIRM.
 func TestResolveStatusConflict_SamePrincipalAsCreator_Forbidden(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r) // created as "principal-operator"
 	postWebhook(r, domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-settle-3b", ReportedStatus: domain.StatusSettled}, testSecret)
 	doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/link-statement",
@@ -260,7 +244,7 @@ func TestResolveStatusConflict_SamePrincipalAsCreator_Forbidden(t *testing.T) {
 // command exists), so it must be gated the same way
 // ResolveStatusConflict/RecordReturn already are.
 func TestPollPaymentStatus_SamePrincipalAsCreator_AssertingSettled_Forbidden(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r) // created as "principal-operator"
 
 	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
@@ -274,7 +258,7 @@ func TestPollPaymentStatus_SamePrincipalAsCreator_AssertingSettled_Forbidden(t *
 // proves the same guard covers REJECTED, the other governed-final status
 // PollPaymentStatus can assert — not just SETTLED specifically.
 func TestPollPaymentStatus_SamePrincipalAsCreator_AssertingRejected_Forbidden(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 
 	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
@@ -290,7 +274,7 @@ func TestPollPaymentStatus_SamePrincipalAsCreator_AssertingRejected_Forbidden(t 
 // settlement" and remains unrestricted, same scoping as the doc's own
 // SoD language.
 func TestPollPaymentStatus_SamePrincipalAsCreator_IntermediateStatus_Allowed(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 
 	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
@@ -303,7 +287,7 @@ func TestPollPaymentStatus_SamePrincipalAsCreator_IntermediateStatus_Allowed(t *
 // TestPollPaymentStatus_DifferentPrincipal_AssertingSettled_Succeeds is
 // the positive control.
 func TestPollPaymentStatus_DifferentPrincipal_AssertingSettled_Succeeds(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 
 	w := doRequestAs(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
@@ -314,7 +298,7 @@ func TestPollPaymentStatus_DifferentPrincipal_AssertingSettled_Succeeds(t *testi
 }
 
 func TestRecordReturn_FromSettled(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 	postWebhook(r, domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-settle-4", ReportedStatus: domain.StatusSettled}, testSecret)
 
@@ -333,7 +317,7 @@ func TestRecordReturn_FromSettled(t *testing.T) {
 // TestRecordReturn_SamePrincipalAsCreator_Forbidden mirrors the conflict
 // SoD check for the return path.
 func TestRecordReturn_SamePrincipalAsCreator_Forbidden(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r) // created as "principal-operator"
 	postWebhook(r, domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-settle-4b", ReportedStatus: domain.StatusSettled}, testSecret)
 
@@ -345,7 +329,7 @@ func TestRecordReturn_SamePrincipalAsCreator_Forbidden(t *testing.T) {
 }
 
 func TestRecordReturn_NotSettled_Rejected(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 
 	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/return",
@@ -356,8 +340,7 @@ func TestRecordReturn_NotSettled_Rejected(t *testing.T) {
 }
 
 func TestCancelPaymentWhereSupported(t *testing.T) {
-	pub := &stubPublisher{}
-	r := newTestRouter(newStubStore(), pub, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	p := recordPayment(t, r)
 
 	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/cancel", domain.CancelRequest{Reason: "duplicate record"}, testTenant)
@@ -365,21 +348,16 @@ func TestCancelPaymentWhereSupported(t *testing.T) {
 		t.Fatalf("expected 200 cancelling, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Wave 8b: PaymentCancelled was recorded to status_events but never
-	// published to the event bus — this is the real proof it now is.
-	found := false
-	for _, ev := range pub.published {
-		if ev.EventType == domain.EventPaymentCancelled {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("expected a PAYMENT_CANCELLED event to be published, got %+v", pub.published)
-	}
+	// Wave 8b fixed PaymentCancelled never reaching the event bus; this
+	// session moved that publish into the store's own transaction (the
+	// outbox). The real proof now lives at the store layer —
+	// TestPgStore_Outbox_CancelPayment_EnqueuesCancelledEvent in
+	// internal/store/outbox_events_test.go — since the stub store used
+	// here has no outbox to assert against.
 }
 
 func TestGetPaymentStatus_NotFound(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	r := newTestRouter(newStubStore(), &stubAuthz{})
 	w := doRequest(r, http.MethodGet, "/bnk07/payments/does-not-exist", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())

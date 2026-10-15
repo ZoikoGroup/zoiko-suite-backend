@@ -1,0 +1,12 @@
+DROP TRIGGER IF EXISTS trg_ctp_guard ON calendar_transition_plans;
+DROP TRIGGER IF EXISTS trg_fcv_guard ON fiscal_calendar_versions;
+DROP TRIGGER IF EXISTS trg_fiscal_calendars_guard ON fiscal_calendars;
+DROP TRIGGER IF EXISTS trg_ctp_no_delete ON calendar_transition_plans;
+DROP TRIGGER IF EXISTS trg_fcv_no_delete ON fiscal_calendar_versions;
+DROP TRIGGER IF EXISTS trg_fiscal_calendars_no_delete ON fiscal_calendars;
+DROP TRIGGER IF EXISTS trg_fcsh_append_only ON fiscal_calendar_status_history;
+DROP FUNCTION IF EXISTS calendar_transition_plans_guard();
+DROP FUNCTION IF EXISTS fiscal_calendar_versions_guard();
+DROP FUNCTION IF EXISTS fiscal_calendars_guard();
+DROP FUNCTION IF EXISTS fiscal_calendar_forbid_delete();
+DROP FUNCTION IF EXISTS fiscal_calendar_forbid_mutation();

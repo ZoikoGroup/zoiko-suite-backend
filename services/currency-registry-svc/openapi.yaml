@@ -1,0 +1,499 @@
+openapi: 3.0.3
+
+# currency-registry-svc (spec REF-02) - the Currency Registry.
+#
+# Owns: Currency, CurrencyLifecycle, MinorUnitMetadata, PlatformSupportStatus.
+# Does NOT own: FX rates, accounting functional-currency assignment, monetary
+# amounts. This service does no arithmetic and uses no floating point.
+#
+# THINGS A CLIENT CANNOT GUESS FROM THE PATHS
+#
+#  1. CURRENCIES ARE GLOBAL. There is no tenant_id on a currency. What is
+#     per-tenant is the OVERLAY (tenant_currency_support): a tenant may enable a
+#     currency only while it is globally SUPPORTED.
+#
+#  2. NO CURRENCY IS BUILT IN. The registry is empty until an import populates
+#     it. An empty registry answers every :validate with supported=false.
+#
+#  3. :validate IS THE CALL OTHER SERVICES MAKE to satisfy "unknown currency
+#     blocks financial command". It never guesses: unknown, KNOWN (not yet
+#     activated), RESTRICTED, RETIRED and not-yet-effective currencies are all
+#     supported=false for operation=post, with a machine-readable reason.
+#     minor_unit is null for an unknown currency (never a default of 0).
+#     operation=read is true for any currency that ever existed (history).
+#     Codes are matched exactly and case-sensitively; "usd" is unknown.
+#
+#  4. RETIRED CURRENCIES REMAIN READABLE. GET /v1/currencies/{code} returns 200
+#     with status RETIRED; only a code that never existed is 404 NOT_FOUND.
+#     as_of resolves the record and the minor-unit version in force at that
+#     valid-time instant; a minor-unit change never alters history.
+#
+#  5. ERRORS. Every failure body is {"code": "...", "message": "..."}. Codes are
+#     the shared contract set (CONTEXT_INVALID, VERSION_CONFLICT,
+#     DUPLICATE_CANDIDATE, INVALID_TRANSITION, SOURCE_UNVERIFIED, SOD_DENIED,
+#     REFERENCE_RETIRED, DEPENDENCY_UNAVAILABLE; RULE_AMBIGUOUS is part of the
+#     contract but never raised here) plus NOT_FOUND and FORBIDDEN.
+#     400 = malformed request / missing mandatory header or field.
+#     422 = well-formed but semantically invalid context (CONTEXT_INVALID raised
+#           by the service, SOURCE_UNVERIFIED).
+#
+#  6. COMMANDS need Idempotency-Key, a `reason`, and (on an existing object)
+#     `expected_version`. A replay with the same key and body returns the
+#     ORIGINAL result with header Idempotent-Replay: true; the same key with a
+#     different body is 422 CONTEXT_INVALID.
+#
+#  7. IMPORTS ARE SYNCHRONOUS here (the spec's "async operation" is documented
+#     as a deviation). A quarantined import is a stored, successful 201 whose
+#     body says status=QUARANTINED; nothing in it was applied.
+
+info:
+  title: currency-registry-svc
+  version: "0.1.0"
+  description: REF-02 Currency Registry - global ISO 4217 reference data, versioned minor-unit metadata and platform support lifecycle.
+
+servers:
+  - url: http://localhost:8172
+
+tags:
+  - name: commands
+  - name: queries
+  - name: tenant-overlay
+
+paths:
+  /v1/currency-imports:
+    post:
+      tags: [commands]
+      operationId: importCurrencyUpdate
+      summary: ImportCurrencyUpdate (authz action CURRENCY_IMPORT)
+      description: |
+        Verifies the manifest hash, validates every row, and applies the whole
+        file or none of it. The server RECOMPUTES the hash:
+
+            sha256( "zoiko.currency-manifest.v1\n" + sorted lines )
+            line = alpha_code|numeric_code|<Go-quoted name>|minor_unit|<true|false>
+
+        Row order is irrelevant (lines are sorted). Mismatch -> 422
+        SOURCE_UNVERIFIED and nothing is stored. Idempotent on
+        (source_name, source_version, manifest_hash): a re-submission returns the
+        ORIGINAL import (200). The same (source_name, source_version) with a
+        different manifest is 409 DUPLICATE_CANDIDATE.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportRequest' }
+      responses:
+        '201':
+          description: Import stored. status is APPLIED or QUARANTINED.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Import' }
+        '200':
+          description: Replay - the original import, nothing re-applied.
+          headers:
+            Idempotent-Replay: { schema: { type: string, enum: ['true'] } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Import' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [queries]
+      operationId: getImport
+      summary: Evidence record of an import, by source name and version
+      parameters:
+        - { name: source_name, in: query, required: true, schema: { type: string } }
+        - { name: source_version, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The import
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Import' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/currencies/{idCommand}:
+    post:
+      tags: [commands]
+      operationId: currencyCommand
+      summary: |
+        POST /v1/currencies/{currency_id}:activate | :restrict | :retire
+      description: |
+        The path segment is `{currency_id}:{command}`.
+
+        | command  | authz action       | transition                          |
+        |----------|--------------------|-------------------------------------|
+        | activate | CURRENCY_ACTIVATE  | KNOWN/RESTRICTED -> SUPPORTED       |
+        | restrict | CURRENCY_RESTRICT  | KNOWN/SUPPORTED -> RESTRICTED       |
+        | retire   | CURRENCY_RETIRE    | SUPPORTED/RESTRICTED -> RETIRED     |
+
+        Any other move is 409 INVALID_TRANSITION; RETIRED is terminal. Check
+        order: context, existence, expected_version (409 VERSION_CONFLICT),
+        lifecycle, then SoD. SoD: the actor who applied the import that
+        introduced or last changed the currency may not activate it (403
+        SOD_DENIED).
+      parameters:
+        - { name: idCommand, in: path, required: true, schema: { type: string }, example: "0190f2c4-...:activate" }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommandRequest' }
+      responses:
+        '200':
+          description: Currency after the transition (or the original result on replay).
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Currency' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /v1/currencies:
+    get:
+      tags: [queries]
+      operationId: listCurrencies
+      summary: ListSupportedCurrencies (optionally any status)
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [KNOWN, SUPPORTED, RESTRICTED, RETIRED] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        '200':
+          description: Currencies with the minor-unit version in force now.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Currency' } }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        '400': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /v1/currencies/{code}:
+    get:
+      tags: [queries]
+      operationId: getCurrency
+      summary: GetCurrency / GetCurrencyAsOf
+      description: |
+        Resolves by alpha code. With `as_of` (RFC3339) returns the record valid
+        then and the minor-unit version in force then. Retired currencies are
+        returned normally. A code that never existed (or did not yet exist at
+        as_of) is 404 NOT_FOUND. Responds `Cache-Control: no-cache` with an ETag
+        (currency id + version) so caches must revalidate and a restrict/retire
+        is never served stale; If-None-Match -> 304.
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string } }
+        - { name: as_of, in: query, schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: The currency
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Currency' }
+        '304': { description: Not modified }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/currencies/{code}/minor-unit-versions:
+    get:
+      tags: [queries]
+      operationId: listMinorUnitVersions
+      summary: Append-only minor-unit history, with derived valid_to
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Versions, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currency_id: { type: string }
+                  alpha_code: { type: string }
+                  versions: { type: array, items: { $ref: '#/components/schemas/MinorUnitVersion' } }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/currencies:resolve-numeric:
+    get:
+      tags: [queries]
+      operationId: resolveNumericCurrencyCode
+      summary: ResolveNumericCurrencyCode
+      parameters:
+        - { name: code, in: query, required: true, schema: { type: string, pattern: '^[0-9]{3}$' } }
+      responses:
+        '200':
+          description: The current currency with that numeric code
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Currency' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v1/currencies:validate:
+    get:
+      tags: [queries]
+      operationId: validateCurrency
+      summary: May this currency be used for this operation? (never guesses)
+      description: |
+        Always 200 for a well-formed query. See the file header for semantics.
+        With tenant_scoped=true a post additionally requires the caller's tenant
+        to have enabled the currency (reason NOT_ENABLED_FOR_TENANT otherwise).
+        Responds Cache-Control: no-store.
+      parameters:
+        - { name: code, in: query, required: true, schema: { type: string } }
+        - { name: operation, in: query, schema: { type: string, enum: [post, read], default: post } }
+        - { name: tenant_scoped, in: query, schema: { type: boolean, default: false } }
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '200':
+          description: Verdict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidateResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /v1/tenants/{tenant}/currency-support:
+    get:
+      tags: [tenant-overlay]
+      operationId: listTenantCurrencySupport
+      summary: The caller's own tenant overlay
+      description: "{tenant} must equal the trusted X-Tenant-Id, else 403 CONTEXT_INVALID."
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/TenantId'
+      responses:
+        '200':
+          description: Overlay rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/TenantSupport' } }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+
+  /v1/tenants/{tenant}/currency-support/{codeCommand}:
+    post:
+      tags: [tenant-overlay]
+      operationId: tenantCurrencySupportCommand
+      summary: POST .../currency-support/{alpha_code}:enable | :disable
+      description: |
+        authz actions CURRENCY_TENANT_ENABLE / CURRENCY_TENANT_DISABLE.
+        expected_version is the OVERLAY row's version (0 when none exists yet).
+        enable requires the currency to be globally SUPPORTED (RETIRED ->
+        409 REFERENCE_RETIRED; KNOWN/RESTRICTED -> 422 CONTEXT_INVALID; unknown
+        -> 404). Enabling an enabled currency / disabling a non-enabled one is
+        409 INVALID_TRANSITION. Disabling is allowed whatever the global status.
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { type: string } }
+        - { name: codeCommand, in: path, required: true, schema: { type: string }, example: "AAA:enable" }
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OverlayRequest' }
+      responses:
+        '200':
+          description: The overlay row after the change (or the original on replay)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantSupport' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      description: Trusted tenant context (set by the gateway). Global reads do not need it.
+      schema: { type: string }
+    PrincipalId:
+      name: X-Principal-Id
+      in: header
+      required: true
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: Typed error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [CONTEXT_INVALID, VERSION_CONFLICT, DUPLICATE_CANDIDATE, INVALID_TRANSITION, RULE_AMBIGUOUS,
+                 SOURCE_UNVERIFIED, SOD_DENIED, REFERENCE_RETIRED, DEPENDENCY_UNAVAILABLE, NOT_FOUND, FORBIDDEN]
+        message: { type: string }
+
+    ImportRow:
+      type: object
+      required: [alpha_code, numeric_code, name, minor_unit]
+      properties:
+        alpha_code: { type: string, description: "exactly 3 uppercase letters" }
+        numeric_code: { type: string, description: "exactly 3 digits" }
+        name: { type: string, minLength: 1, maxLength: 200 }
+        minor_unit: { type: integer, minimum: 0, maximum: 6, description: "integer exponent; fractional values quarantine the import" }
+        fund_or_metal_flag: { type: boolean, default: false }
+
+    ImportRequest:
+      type: object
+      required: [source_name, source_version, manifest_hash, reason, rows]
+      properties:
+        source_name: { type: string }
+        source_version: { type: string }
+        manifest_hash: { type: string, description: "lowercase hex sha256 (optional sha256: prefix) of the canonical rows - see operation description" }
+        effective_at: { type: string, format: date-time, description: "defaults to now; a minor-unit change must be after the current version's valid_from" }
+        reason: { type: string }
+        rows: { type: array, minItems: 1, maxItems: 5000, items: { $ref: '#/components/schemas/ImportRow' } }
+
+    Import:
+      type: object
+      properties:
+        import_id: { type: string }
+        source_name: { type: string }
+        source_version: { type: string }
+        manifest_hash: { type: string }
+        status: { type: string, enum: [RECEIVED, VALIDATED, APPLIED, QUARANTINED], description: "only APPLIED and QUARANTINED are produced today" }
+        row_count: { type: integer }
+        quarantine_reason: { type: string }
+        row_errors:
+          type: array
+          items:
+            type: object
+            properties:
+              row: { type: integer, description: "0-based index; -1 = file level" }
+              message: { type: string }
+        summary:
+          type: object
+          properties:
+            created: { type: integer }
+            minor_unit_changed: { type: integer }
+            attributes_changed: { type: integer }
+            unchanged: { type: integer }
+        effective_at: { type: string, format: date-time }
+        actor: { type: string }
+        actor_tenant_id: { type: string }
+        reason: { type: string }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+
+    CommandRequest:
+      type: object
+      required: [reason]
+      properties:
+        expected_version: { type: integer, minimum: 1, description: "required; body field or X-Expected-Version header" }
+        reason: { type: string }
+        effective_at: { type: string, format: date-time, description: "retire only: becomes valid_to; within [valid_from, now]" }
+        approver_id: { type: string, description: "asserted approver, recorded as evidence; not verified by this service" }
+
+    OverlayRequest:
+      type: object
+      required: [reason, expected_version]
+      properties:
+        expected_version: { type: integer, minimum: 0 }
+        reason: { type: string }
+
+    MinorUnitVersion:
+      type: object
+      properties:
+        currency_id: { type: string }
+        minor_unit: { type: integer, minimum: 0, maximum: 6 }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time, description: "derived: next version's valid_from, or the currency's valid_to" }
+        source_version: { type: string }
+        import_id: { type: string }
+        evidence_ref: { type: string }
+        recorded_at: { type: string, format: date-time }
+
+    Currency:
+      type: object
+      properties:
+        currency_id: { type: string, description: UUIDv7 }
+        alpha_code: { type: string }
+        numeric_code: { type: string }
+        name: { type: string }
+        fund_or_metal_flag: { type: boolean }
+        status: { type: string, enum: [KNOWN, SUPPORTED, RESTRICTED, RETIRED] }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time }
+        version: { type: integer }
+        last_import_id: { type: string }
+        last_import_actor: { type: string }
+        created_at: { type: string, format: date-time }
+        recorded_at: { type: string, format: date-time }
+        minor_unit: { $ref: '#/components/schemas/MinorUnitVersion' }
+
+    TenantSupport:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        currency_id: { type: string }
+        alpha_code: { type: string }
+        enabled: { type: boolean }
+        version: { type: integer }
+        reason: { type: string }
+        actor: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ValidateResult:
+      type: object
+      required: [code, operation, supported, minor_unit, reason]
+      properties:
+        code: { type: string }
+        operation: { type: string }
+        supported: { type: boolean }
+        minor_unit: { type: integer, nullable: true, description: "null when the currency is unknown - never a guessed default" }
+        reason:
+          type: string
+          enum: [OK, UNKNOWN_CURRENCY, STATUS_KNOWN, STATUS_RESTRICTED, STATUS_RETIRED, NOT_YET_EFFECTIVE, NOT_ENABLED_FOR_TENANT]
+        currency_id: { type: string }
+        currency_version: { type: integer, description: "pin this when persisting the applied precision" }
+        status: { type: string }
+        minor_unit_valid_from: { type: string, format: date-time }

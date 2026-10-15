@@ -88,3 +88,19 @@ func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) erro
 	}
 	return nil
 }
+
+// PublishOutbox publishes an event from the transactional outbox relay, keeping
+// the stable outbox event id as the X-Event-ID Kafka header across retries.
+// Unlike Publish it returns the Kafka error so the relay retries the row.
+func (p *KafkaPublisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:     []byte(aggregateID),
+		Value:   payload,
+		Headers: []kafka.Header{{Key: "X-Event-ID", Value: []byte(outboxEventID)}},
+	})
+	if err != nil {
+		p.logger.Warn("outbox kafka write failed", zap.String("outbox_event_id", outboxEventID), zap.Error(err))
+		return err
+	}
+	return nil
+}

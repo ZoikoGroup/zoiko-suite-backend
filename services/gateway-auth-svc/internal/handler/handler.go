@@ -110,8 +110,41 @@ type envelopeClaims struct {
 	TenantID      string `json:"tenant_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	CorrelationID string `json:"correlation_id"`
+
+	// SourceChannel is GOV-01 §4's server-resolved channel, set by
+	// identity-context-svc when it could establish it (a verified client
+	// mapping or the principal's own type) and empty when only an assertion
+	// was available. Stamped as X-Source-Channel (S1-B1).
+	SourceChannel string `json:"source_channel"`
+
+	// SupportContextID is present only on a session identity-context-svc
+	// issued under a VERIFIED support elevation.
+	SupportContextID string `json:"support_context_id"`
+
+	// SessionTrustPosture.MFAVerified is the authentication assurance the
+	// session was issued with. A pointer so an envelope without the claim
+	// asserts nothing, rather than "single factor".
+	SessionTrustPosture struct {
+		MFAVerified *bool `json:"mfa_verified"`
+	} `json:"session_trust_posture"`
+
 	jwt.RegisteredClaims
 }
+
+// Source-channel provenance, on X-Source-Channel-Basis.
+const (
+	// channelVerified: X-Source-Channel came from the signed envelope.
+	channelVerified = "verified"
+	// channelAsserted: the envelope named no channel, so the caller's own
+	// X-Source-Channel is passed on, labelled as the assertion it is.
+	channelAsserted = "asserted"
+)
+
+// Assurance levels, on X-Assurance-Level.
+const (
+	assuranceMFA          = "MFA"
+	assuranceSingleFactor = "SINGLE_FACTOR"
+)
 
 // Verify is called by Traefik's ForwardAuth middleware on every gated
 // request. A 2xx response grants access and its headers are copied into the
@@ -251,17 +284,17 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			severityFor(assessment.Decision),
 			"CARTA flagged principal "+claims.Principal.PrincipalID+": "+string(assessment.Decision))
 
-		// ISOLATE/DENY/STEP_UP_MFA are hard-blocked: they represent risk high
-		// enough that this platform has no automated remediation for them.
-		// STEP_UP_MFA was previously allowed through because there was no
-		// step-up challenge flow downstream, but letting it pass silently
-		// defeats the risk engine's intent — a request that needs step-up
-		// must not proceed as if it were ALLOW.
-		if assessment.Decision == carta.DecisionIsolate || assessment.Decision == carta.DecisionDeny || assessment.Decision == carta.DecisionStepUpMFA {
-			h.metrics.VerifyDecision(outcomeCartaBlocked)
-			h.denyCarta(w, "access denied by continuous risk assessment", string(assessment.Decision))
-			return
-		}
+		// Every answer except ALLOW blocks. STEP_UP_MFA blocks because no
+		// step-up factor exists anywhere in the estate to satisfy it, and
+		// letting it pass answers the risk engine's "not like this" with yes.
+		// The test is "not ALLOW" rather than a list of the blocking values
+		// on purpose: a list lets through any decision it does not name — a
+		// value carta-svc adds later, or an empty one from a reply that
+		// parsed but carried no decision — and CARTA having answered is not
+		// the unreachable case that Evaluate deliberately fails open on.
+		h.metrics.VerifyDecision(outcomeCartaBlocked)
+		h.denyCarta(w, "access denied by continuous risk assessment", string(assessment.Decision))
+		return
 	}
 
 	// GOV-01 (ZS-SVC-A-001 §4): resolve the authoritative tenant and operating
@@ -283,6 +316,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	if claims.CorrelationID != "" {
 		w.Header().Set("X-Correlation-Id", claims.CorrelationID)
 	}
+	setSessionContext(w, r, claims)
 
 	// Server-resolved context, forwarded so backends read authoritative values
 	// instead of the caller's assertions (§5 provenance class S: "client may
@@ -317,6 +351,47 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 
 	h.metrics.VerifyDecision(outcomeAllowed)
 	w.WriteHeader(http.StatusOK)
+}
+
+// setSessionContext forwards the session facts the signed envelope carries, in
+// place of anything the caller wrote under the same names. Every header here
+// is in authResponseHeaders, so Traefik deletes the client's copy and keeps
+// only what this sets.
+//
+//   - X-Source-Channel (S1-B1, GOV-01 §4 "server-resolved source channel"):
+//     identity-context-svc puts the verified channel on the envelope, and it
+//     used to stop there — the edge passed the client's header through, so any
+//     caller could claim "system" or "scheduled_job". The verified value now
+//     wins. When the envelope names none, the caller's value is passed on, and
+//     X-Source-Channel-Basis says which of the two a backend is reading.
+//   - X-Assurance-Level: MFA or SINGLE_FACTOR, from the session's
+//     mfa_verified. authorization-svc's step-up reads this header; through the
+//     edge it was whatever the client sent.
+//   - X-Support-Context-Id: only a support elevation identity-context-svc
+//     verified at resolve time. Before, the edge stripped it outright, so no
+//     backend could see that a request ran under one.
+//
+// Nothing here can state how recently the user authenticated: the envelope's
+// iat is when the envelope was minted, not when the user logged in, and no
+// auth_time claim exists. X-Authn-Age-Seconds is therefore stripped and never
+// set (see the edge lists) rather than derived from a value that would
+// overstate freshness.
+func setSessionContext(w http.ResponseWriter, r *http.Request, claims *envelopeClaims) {
+	if ch := strings.TrimSpace(claims.SourceChannel); ch != "" {
+		w.Header().Set("X-Source-Channel", ch)
+		w.Header().Set("X-Source-Channel-Basis", channelVerified)
+	} else if asserted := strings.TrimSpace(r.Header.Get("X-Source-Channel")); asserted != "" {
+		w.Header().Set("X-Source-Channel", asserted)
+		w.Header().Set("X-Source-Channel-Basis", channelAsserted)
+	}
+	if mfa := claims.SessionTrustPosture.MFAVerified; mfa != nil {
+		if *mfa {
+			w.Header().Set("X-Assurance-Level", assuranceMFA)
+		} else {
+			w.Header().Set("X-Assurance-Level", assuranceSingleFactor)
+		}
+	}
+	setIfPresent(w, "X-Support-Context-Id", strings.TrimSpace(claims.SupportContextID))
 }
 
 func setIfPresent(w http.ResponseWriter, header, value string) {
@@ -409,9 +484,18 @@ func severityFor(d carta.Decision) siem.Severity {
 
 // clientIP prefers the value Traefik sets over the raw socket address, which
 // would otherwise always be the gateway container's own address.
+// clientIP is the address CARTA scores. It is the RIGHTMOST X-Forwarded-For
+// entry: the one appended by the proxy directly in front of this service,
+// which no client can write. The leftmost entry is whatever the client sent,
+// so taking it let any caller choose the IP its risk was assessed on. With
+// ForwardAuth's trustForwardHeader off, Traefik sends a single entry (its
+// peer), so rightmost and only are the same.
 func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.TrimSpace(strings.Split(fwd, ",")[0])
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		if hop := strings.TrimSpace(hops[i]); hop != "" {
+			return hop
+		}
 	}
 	return r.RemoteAddr
 }

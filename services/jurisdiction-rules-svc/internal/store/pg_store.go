@@ -8,10 +8,13 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -101,11 +104,16 @@ type Store interface {
 	// ancestors at a point in time — one winning rule per (domain, code).
 	FindRulePack(ctx context.Context, jurisdictionID, ruleDomain string, at time.Time) (*domain.RulePack, error)
 
+	// ResolveRulePack is FindRulePack on two time axes with required codes.
+	ResolveRulePack(ctx context.Context, q domain.RulePackQuery) (*domain.RulePack, error)
+
 	// CreateJurisdiction inserts a new jurisdiction idempotently.
 	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
 
 	// DeactivateJurisdiction sets active_flag=false and end-dates the record.
-	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error)
+	// The bool reports whether the row actually changed (false on an
+	// idempotent replay of an already-deactivated jurisdiction).
+	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error)
 
 	// FindRuleByID looks up a rule by ID.
 	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
@@ -124,6 +132,19 @@ type Store interface {
 
 	// FindDriftEvents returns the append-only drift history for a rule, newest first.
 	FindDriftEvents(ctx context.Context, ruleID string, limit, offset int) ([]*domain.DriftEvent, error)
+
+	// AddEventToOutbox writes an event to the transactional outbox.
+	// Called within the same transaction as the domain change.
+	AddEventToOutbox(ctx context.Context, q querier, eventType, topic, partitionKey string, payload []byte) error
+
+	// GetPendingOutboxEvents returns unpublished events for the background publisher.
+	GetPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error)
+
+	// MarkOutboxEventPublished marks an outbox event as successfully published.
+	MarkOutboxEventPublished(ctx context.Context, outboxID string) error
+
+	// MarkOutboxEventFailed increments the attempt count and records the error.
+	MarkOutboxEventFailed(ctx context.Context, outboxID, errMsg string) error
 }
 
 // TransitionParams holds the inputs for a rule_status transition.
@@ -146,6 +167,19 @@ type TransitionParams struct {
 	EffectiveTo *time.Time
 
 	ActorID string
+
+	// RequireIndependentActor refuses the transition when ActorID created the
+	// rule (maker-checker; set for activation).
+	RequireIndependentActor bool
+
+	// ApprovalReference is the approval evidence the transition rests on. It
+	// is written to the change_reason of the status-history row the
+	// transition opens, so the basis of an activation can be read back.
+	ApprovalReference string
+
+	// ExpectedRowVersion, when set (If-Match), refuses the transition unless
+	// the rule still has that row_version: ErrPreconditionFailed.
+	ExpectedRowVersion *int64
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -159,6 +193,29 @@ func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
+// WithTransaction executes fn within a database transaction. If fn returns an
+// error, the transaction is rolled back; otherwise it is committed. The
+// provided querier (a *pgx.Tx) can be used for all database operations within
+// the transaction, including writing to the event outbox.
+func (s *PgStore) WithTransaction(ctx context.Context, fn func(q Querier) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		s.log.Error("pg WithTransaction: begin failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		s.log.Error("pg WithTransaction: commit failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
 // querier is the subset of pgxpool.Pool that pgx.Tx also satisfies, so the
 // shared helpers below work inside and outside a transaction.
 type querier interface {
@@ -166,6 +223,13 @@ type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
+
+// Querier is the public alias for querier used by other packages (e.g., events).
+type Querier = querier
+
+// Pool returns the store's pool as a Querier, for writes that run outside a
+// caller-managed transaction (e.g. registry events written to the outbox).
+func (s *PgStore) Pool() Querier { return s.pool }
 
 // ── error classification ─────────────────────────────────────────────────────
 
@@ -187,6 +251,31 @@ func isForeignKeyViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23503"
 }
+
+// isExclusionViolation reports whether err is SQLSTATE 23P01 (exclusion constraint violation).
+// This is raised when the excl_no_overlapping_live_rules constraint is violated.
+func isExclusionViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23P01"
+}
+
+// isStringDataRightTruncation reports whether err is SQLSTATE 22001 (string
+// data too long for the column). It is what a non-UUID, over-length code in
+// the body produces when a handler does not bound its own text fields — e.g.
+// jurisdiction_code VARCHAR(32). Without this every over-length create died
+// in the pgx driver and surfaced as 503 store_unavailable: a client mistake
+// reading as a platform outage, exactly the class of error 22P02 already
+// maps to 404. The client's input is the problem, so handlers reject it and
+// the WriteError net below keeps any missed path a 400 too.
+func isStringDataRightTruncation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "22001"
+}
+
+// IsInputTooLong reports whether err (or anything it wraps) is a Postgres
+// string-data-too-long error. Exported so the handler layer can classify
+// store failures without importing the pgx driver itself.
+func IsInputTooLong(err error) bool { return isStringDataRightTruncation(err) }
 
 // notFoundOr maps a scan error onto notFound for both "no rows" and
 // "the id could never match a row", and to ErrStoreUnavailable otherwise.
@@ -220,6 +309,7 @@ var jurisdictionColumnNames = []string{
 	"schema_version",
 	"updated_at",
 	"updated_by_principal_id",
+	"row_version",
 }
 
 var (
@@ -244,6 +334,7 @@ func jurisdictionScanTargets(j *domain.Jurisdiction) []any {
 		&j.SchemaVersion,
 		&j.UpdatedAt,
 		&j.UpdatedByPrincipalID,
+		&j.RowVersion,
 	}
 }
 
@@ -261,6 +352,9 @@ var ruleColumnNames = []string{
 	"source_reference",
 	"external_feed_reference",
 	"rule_status",
+	"rule_version",
+	"supersedes_rule_id",
+	"precedence_level",
 	"legal_drift_state",
 	"data_classification",
 	"created_at",
@@ -268,6 +362,7 @@ var ruleColumnNames = []string{
 	"schema_version",
 	"updated_at",
 	"updated_by_principal_id",
+	"row_version",
 }
 
 var (
@@ -288,6 +383,9 @@ func ruleScanTargets(r *domain.JurisdictionRule) []any {
 		&r.SourceReference,
 		&r.ExternalFeedReference,
 		&r.RuleStatus,
+		&r.RuleVersion,
+		&r.SupersedesRuleID,
+		&r.PrecedenceLevel,
 		&r.LegalDriftState,
 		&r.DataClassification,
 		&r.CreatedAt,
@@ -295,6 +393,7 @@ func ruleScanTargets(r *domain.JurisdictionRule) []any {
 		&r.SchemaVersion,
 		&r.UpdatedAt,
 		&r.UpdatedByPrincipalID,
+		&r.RowVersion,
 	}
 }
 
@@ -324,6 +423,41 @@ func driftEventScanTargets(e *domain.DriftEvent) []any {
 		&e.CorrelationID,
 		&e.SchemaVersion,
 	}
+}
+
+var ruleStatusHistoryColumnNames = []string{
+	"history_id",
+	"jurisdiction_rule_id",
+	"rule_status",
+	"effective_from",
+	"effective_to",
+	"known_from",
+	"known_to",
+	"changed_by_principal_id",
+	"change_reason",
+	"schema_version",
+}
+
+var ruleStatusHistoryColumns = strings.Join(ruleStatusHistoryColumnNames, ", ")
+
+func ruleStatusHistoryScanTargets(h *domain.RuleStatusHistory) []any {
+	return []any{
+		&h.HistoryID,
+		&h.JurisdictionRuleID,
+		&h.RuleStatus,
+		&h.EffectiveFrom,
+		&h.EffectiveTo,
+		&h.KnownFrom,
+		&h.KnownTo,
+		&h.ChangedByPrincipalID,
+		&h.ChangeReason,
+		&h.SchemaVersion,
+	}
+}
+
+func scanRuleStatusHistory(row pgx.Row) (*domain.RuleStatusHistory, error) {
+	h := &domain.RuleStatusHistory{}
+	return h, row.Scan(ruleStatusHistoryScanTargets(h)...)
 }
 
 // qualify prefixes every column with a table alias, for queries that join and
@@ -551,6 +685,11 @@ func (s *PgStore) FindAncestors(ctx context.Context, jurisdictionID string) ([]*
 
 // CreateJurisdiction inserts a new jurisdiction or returns existing on dedup match.
 func (s *PgStore) CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error) {
+	return s.CreateJurisdictionWithQuerier(ctx, s.pool, params)
+}
+
+// CreateJurisdictionWithQuerier is the same as CreateJurisdiction but uses the provided querier (transaction).
+func (s *PgStore) CreateJurisdictionWithQuerier(ctx context.Context, q Querier, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error) {
 	if params.JurisdictionID == "" {
 		params.JurisdictionID = uuid.New().String()
 	}
@@ -588,7 +727,7 @@ func (s *PgStore) CreateJurisdiction(ctx context.Context, params domain.CreateJu
 		DO NOTHING
 		RETURNING ` + jurisdictionColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query,
+	row := q.QueryRow(ctx, query,
 		params.JurisdictionID, params.JurisdictionCode, params.JurisdictionName, params.JurisdictionType,
 		params.ParentJurisdictionID, params.AuthorityType, params.EffectiveFrom, params.EffectiveTo,
 		params.ActiveFlag, params.DataClassification, params.CreatedByPrincipalID, params.SchemaVersion,
@@ -600,6 +739,12 @@ func (s *PgStore) CreateJurisdiction(ctx context.Context, params domain.CreateJu
 	}
 	if isForeignKeyViolation(err) {
 		return nil, false, domain.ErrParentNotFound
+	}
+	if isStringDataRightTruncation(err) {
+		// An over-length code/type is the client's mistake, not an outage
+		// (SQLSTATE 22001). Handlers bound these fields too; this is the net
+		// for any constrained column they miss.
+		return nil, false, domain.ErrInputTooLong
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		s.log.Error("pg CreateJurisdiction failed", zap.Error(err))
@@ -640,7 +785,16 @@ func (s *PgStore) CreateJurisdiction(ctx context.Context, params domain.CreateJu
 // deactivated jurisdiction still had an open-ended effective period and kept
 // satisfying every effective_to-based query in this service and in callers
 // that read the record directly.
-func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error) {
+func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error) {
+	return s.DeactivateJurisdictionWithQuerier(ctx, s.pool, jurisdictionID, actorID)
+}
+
+// DeactivateJurisdictionWithQuerier is the same as DeactivateJurisdiction but uses the provided querier (transaction).
+// The bool is true when the jurisdiction transitioned active → deactivated, and
+// false when it was already deactivated (the trg_prevent_duplicate_deactivation
+// trigger skips the UPDATE, so no row is returned): an idempotent replay that a
+// caller must not re-announce.
+func (s *PgStore) DeactivateJurisdictionWithQuerier(ctx context.Context, q Querier, jurisdictionID, actorID string) (*domain.Jurisdiction, bool, error) {
 	query := `
 		UPDATE jurisdictions
 		SET active_flag             = FALSE,
@@ -650,14 +804,23 @@ func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, ac
 		WHERE jurisdiction_id = $1
 		RETURNING ` + jurisdictionColumns + `;`
 
-	j, err := scanJurisdiction(s.pool.QueryRow(ctx, query, jurisdictionID, actorID))
+	j, err := scanJurisdiction(q.QueryRow(ctx, query, jurisdictionID, actorID))
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) && !isInvalidTextRepresentation(err) {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Trigger skipped the update because already deactivated.
+			// Fetch the existing jurisdiction; nothing changed.
+			existing, findErr := s.FindByIDAny(ctx, jurisdictionID)
+			if findErr != nil {
+				return nil, false, findErr
+			}
+			return existing, false, nil
+		}
+		if !isInvalidTextRepresentation(err) {
 			s.log.Error("pg DeactivateJurisdiction failed", zap.String("id", jurisdictionID), zap.Error(err))
 		}
-		return nil, notFoundOr(err, domain.ErrJurisdictionNotFound)
+		return nil, false, notFoundOr(err, domain.ErrJurisdictionNotFound)
 	}
-	return j, nil
+	return j, true, nil
 }
 
 // ── rules: reads ─────────────────────────────────────────────────────────────
@@ -741,29 +904,106 @@ func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*dom
 
 // FindRulePack resolves the runtime rule pack for a jurisdiction at a point in
 // time — the "resolve jurisdiction set" + "fetch runtime rule pack" inbound
-// APIs of 03-microservices.md §8.2.
+// APIs of 03-microservices.md §8.2. It fails closed (ErrJurisdictionNotFound)
+// when the requested `at` falls outside the jurisdiction's own effectiveness
+// window, and windows every rule by its owning jurisdiction's effective period,
+// so a since-deactivated jurisdiction (or retired ancestor) still replays the
+// pack that was in force at a historical `at`.
 //
 // Callers previously had to fetch the ancestor chain and then issue one
 // /rules request per generation, and merge the results themselves — which
 // meant every consumer reimplemented (and could disagree about) which rule
 // wins when a country and one of its states both define the same rule_code.
-// Resolution happens here, once: nearest jurisdiction wins, ties broken by
-// the later effective_from. DRAFT and RETIRED rules never enter a pack.
+// Resolution happens here, once: explicit precedence_level wins, ties broken
+// by nearest jurisdiction (depth), then by later effective_from.
+// CONFLICTED: equal precedence_level with overlapping periods.
+// INSUFFICIENT: no rule found in entire ancestor chain for a given domain/code.
 func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain string, at time.Time) (*domain.RulePack, error) {
+	return s.ResolveRulePack(ctx, domain.RulePackQuery{JurisdictionID: jurisdictionID, RuleDomain: ruleDomain, At: at})
+}
+
+// singleAxisRulePredicate is FindRulePack's original filter: the status KNOWN
+// to the platform at `at` ($4) decides, the effective window is the stored one.
+//
+// Status is bitemporal: a rule is in a historical pack when the status known
+// at the queried point-in-time was live, not when its CURRENT status is live.
+// The latter would drop a since-RETIRED rule from every earlier pack and make
+// a since-activated rule answer for dates on which it was still DRAFT. Where
+// the history does not cover the point-in-time -- rules created before 000007,
+// or a query before the rule was created -- the stored status governs.
+const singleAxisRulePredicate = `
+	  AND  (
+	      ( NOT EXISTS (
+	            SELECT 1 FROM rule_status_history h
+	            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+	              AND  h.known_from <= $4
+	              AND  (h.known_to IS NULL OR h.known_to > $4)
+	        )
+	        AND  r.rule_status NOT IN ('DRAFT', 'RETIRED') )
+	      OR EXISTS (
+	            SELECT 1 FROM rule_status_history h
+	            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+	              AND  h.known_from <= $4
+	              AND  (h.known_to IS NULL OR h.known_to > $4)
+	              AND  h.rule_status NOT IN ('DRAFT', 'RETIRED')
+	        )
+	  )
+	  AND  r.effective_from <= $4
+	  AND  (r.effective_to IS NULL OR r.effective_to > $4)`
+
+// bitemporalRulePredicate answers "what did the platform know at known_at
+// ($5) about valid time at ($4)". Status AND effective window come from the
+// history row in force at known_at: a later end-dating (supersede, retire) or
+// activation is not visible, and a rule recorded after known_at does not
+// exist. A rule with no history at all (created before 000007) falls back to
+// its stored row, but only if it was created by known_at.
+const bitemporalRulePredicate = `
+	  AND  (
+	      EXISTS (
+	            SELECT 1 FROM rule_status_history h
+	            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+	              AND  h.known_from <= $5
+	              AND  (h.known_to IS NULL OR h.known_to > $5)
+	              AND  h.rule_status NOT IN ('DRAFT', 'RETIRED')
+	              AND  h.effective_from <= $4
+	              AND  (h.effective_to IS NULL OR h.effective_to > $4)
+	        )
+	      OR ( NOT EXISTS (
+	            SELECT 1 FROM rule_status_history h
+	            WHERE  h.jurisdiction_rule_id = r.jurisdiction_rule_id
+	        )
+	        AND  r.created_at <= $5
+	        AND  r.rule_status NOT IN ('DRAFT', 'RETIRED')
+	        AND  r.effective_from <= $4
+	        AND  (r.effective_to IS NULL OR r.effective_to > $4) )
+	  )`
+
+// ResolveRulePack is FindRulePack with a knowledge-time axis and the caller's
+// required rule codes; see domain.RulePackQuery.
+func (s *PgStore) ResolveRulePack(ctx context.Context, rq domain.RulePackQuery) (*domain.RulePack, error) {
+	jurisdictionID, ruleDomain, at := rq.JurisdictionID, rq.RuleDomain, rq.At
 	chain, err := s.findChain(ctx, jurisdictionID)
 	if err != nil {
 		return nil, err
 	}
 
-	// The pack is a runtime artifact — an inactive or expired jurisdiction
-	// has no runtime rules. Fail closed rather than serve a stale pack.
-	self := chain[0]
-	if !self.ActiveFlag || (self.EffectiveTo != nil && !self.EffectiveTo.After(time.Now().UTC())) {
-		return nil, domain.ErrJurisdictionNotFound
-	}
-
 	if at.IsZero() {
 		at = time.Now().UTC()
+	}
+
+	// The pack is a runtime artifact. A jurisdiction with an end date only has
+	// runtime rules for `at` inside its own effectiveness window: demanding a
+	// pack for a moment after deactivation fails closed (404) rather than
+	// serving a stale pack. The check is keyed off `at`, not the clock, so a
+	// historical query against a since-deactivated jurisdiction still answers —
+	// "historical actions must always be explainable against the rule set
+	// active at the time of execution" (03-microservices.md §8.2).
+	self := chain[0]
+	if !self.EffectiveFrom.IsZero() && at.Before(self.EffectiveFrom) {
+		return nil, domain.ErrJurisdictionNotFound
+	}
+	if self.EffectiveTo != nil && !at.Before(*self.EffectiveTo) {
+		return nil, domain.ErrJurisdictionNotFound
 	}
 
 	resolvedFrom := make([]string, 0, len(chain))
@@ -771,6 +1011,14 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 		resolvedFrom = append(resolvedFrom, j.JurisdictionID)
 	}
 
+	predicate := singleAxisRulePredicate
+	args := []any{jurisdictionID, maxAncestorDepth, ruleDomain, at}
+	if rq.KnownAt != nil {
+		predicate = bitemporalRulePredicate
+		args = append(args, *rq.KnownAt)
+	}
+
+	// First, get all matching rules with their precedence and depth
 	query := fmt.Sprintf(`
 		WITH RECURSIVE chain AS (
 		        SELECT jurisdiction_id, parent_jurisdiction_id, 0 AS depth,
@@ -785,18 +1033,19 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 		        WHERE  c.depth < $2
 		          AND  NOT p.jurisdiction_id = ANY(c.seen)
 		)
-		SELECT DISTINCT ON (r.rule_domain, r.rule_code) %s
+		SELECT %s, c.depth
 		FROM   jurisdiction_rules r
 		JOIN   chain c ON c.jurisdiction_id = r.jurisdiction_id
+		JOIN   jurisdictions jj ON jj.jurisdiction_id = c.jurisdiction_id
 		WHERE  ($3 = '' OR r.rule_domain = $3)
-		  AND  r.rule_status NOT IN ('DRAFT', 'RETIRED')
-		  AND  r.effective_from <= $4
-		  AND  (r.effective_to IS NULL OR r.effective_to > $4)
-		ORDER BY r.rule_domain ASC, r.rule_code ASC, c.depth ASC, r.effective_from DESC`,
-		ruleColumnsR,
+		  %s
+		  AND  (jj.effective_from IS NULL OR jj.effective_from <= $4)
+		  AND  (jj.effective_to IS NULL OR jj.effective_to > $4)
+		ORDER BY r.rule_domain ASC, r.rule_code ASC, r.precedence_level ASC, c.depth ASC, r.effective_from DESC`,
+		ruleColumnsR, predicate,
 	)
 
-	rows, err := s.pool.Query(ctx, query, jurisdictionID, maxAncestorDepth, ruleDomain, at)
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		s.log.Error("pg FindRulePack failed",
 			zap.String("jurisdiction_id", jurisdictionID),
@@ -806,31 +1055,184 @@ func (s *PgStore) FindRulePack(ctx context.Context, jurisdictionID, ruleDomain s
 	}
 	defer rows.Close()
 
-	pack := &domain.RulePack{
-		JurisdictionID: jurisdictionID,
-		EffectiveAt:    at,
-		ResolvedFrom:   resolvedFrom,
-		Rules:          []*domain.JurisdictionRule{},
+	// Collect all rules grouped by (rule_domain, rule_code)
+	type ruleCandidate struct {
+		rule  *domain.JurisdictionRule
+		depth int
 	}
+	candidates := make(map[string][]ruleCandidate) // key: rule_domain|rule_code
+
 	for rows.Next() {
-		rule, scanErr := scanJurisdictionRule(rows)
-		if scanErr != nil {
-			s.log.Error("pg FindRulePack scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		rule := &domain.JurisdictionRule{}
+		var depth int
+		if err := rows.Scan(append(ruleScanTargets(rule), &depth)...); err != nil {
+			s.log.Error("pg FindRulePack scan failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
-		pack.Rules = append(pack.Rules, rule)
+		key := rule.RuleDomain + "|" + rule.RuleCode
+		candidates[key] = append(candidates[key], ruleCandidate{rule: rule, depth: depth})
 	}
 	if err := rows.Err(); err != nil {
 		s.log.Error("pg FindRulePack rows error", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
+
+	// Now resolve: pick winner per (rule_domain, rule_code) by precedence, then depth
+	// Detect conflicts: multiple candidates with same precedence and overlapping periods
+	pack := &domain.RulePack{
+		JurisdictionID: jurisdictionID,
+		EffectiveAt:    at,
+		ResolvedFrom:   resolvedFrom,
+		Rules:          []*domain.JurisdictionRule{},
+		Conflicts:      []domain.RuleConflict{},
+		Insufficient:   []string{},
+	}
+
+	for _, cands := range candidates {
+		if len(cands) == 0 {
+			continue
+		}
+
+		// Sort by precedence_level ASC, depth ASC, effective_from DESC
+		sort.Slice(cands, func(i, j int) bool {
+			if cands[i].rule.PrecedenceLevel != cands[j].rule.PrecedenceLevel {
+				return cands[i].rule.PrecedenceLevel < cands[j].rule.PrecedenceLevel
+			}
+			if cands[i].depth != cands[j].depth {
+				return cands[i].depth < cands[j].depth
+			}
+			return cands[i].rule.EffectiveFrom.After(cands[j].rule.EffectiveFrom)
+		})
+
+		winner := cands[0].rule
+
+		// Check for conflicts: same precedence_level at the SAME depth and
+		// overlapping periods. A candidate from a farther ancestor is an
+		// override, not a conflict — the pack resolves it by nearest
+		// jurisdiction (the sort above already picked the nearest winner).
+		var conflictIDs []string
+		for _, c := range cands[1:] {
+			if c.rule.PrecedenceLevel == winner.PrecedenceLevel && c.depth == cands[0].depth {
+				// Check if periods overlap
+				if periodsOverlap(winner.EffectiveFrom, winner.EffectiveTo, c.rule.EffectiveFrom, c.rule.EffectiveTo) {
+					conflictIDs = append(conflictIDs, c.rule.JurisdictionRuleID)
+				}
+			}
+		}
+
+		if len(conflictIDs) > 0 {
+			conflictIDs = append([]string{winner.JurisdictionRuleID}, conflictIDs...)
+			pack.Conflicts = append(pack.Conflicts, domain.RuleConflict{
+				RuleDomain: winner.RuleDomain,
+				RuleCode:   winner.RuleCode,
+				RuleIDs:    conflictIDs,
+			})
+		} else {
+			pack.Rules = append(pack.Rules, winner)
+		}
+	}
+
+	// Map iteration order is random; a pack is evidence and must be stable.
+	sort.Slice(pack.Rules, func(i, j int) bool {
+		if pack.Rules[i].RuleDomain != pack.Rules[j].RuleDomain {
+			return pack.Rules[i].RuleDomain < pack.Rules[j].RuleDomain
+		}
+		return pack.Rules[i].RuleCode < pack.Rules[j].RuleCode
+	})
+
+	// INSUFFICIENT: a code the caller requires resolved to nothing. A code
+	// in conflict did resolve to something, so it is CONFLICTED, not missing.
+	present := make(map[string]bool, len(pack.Rules)+len(pack.Conflicts))
+	for _, r := range pack.Rules {
+		present[r.RuleCode] = true
+	}
+	for _, c := range pack.Conflicts {
+		present[c.RuleCode] = true
+	}
+	for _, code := range rq.RequiredCodes {
+		if !present[code] {
+			pack.Insufficient = append(pack.Insufficient, code)
+		}
+	}
+
+	if rq.KnownAt != nil {
+		known := rq.KnownAt.UTC()
+		pack.KnownAt = &known
+	}
+	switch {
+	case len(pack.Conflicts) > 0:
+		pack.Outcome = domain.RulePackConflicted
+	case len(pack.Insufficient) > 0, len(pack.Rules) == 0:
+		pack.Outcome = domain.RulePackInsufficient
+	default:
+		pack.Outcome = domain.RulePackResolved
+	}
+	pack.PackDigest = rulePackDigest(pack)
 	return pack, nil
+}
+
+// rulePackDigest canonicalises the pack's identity and hashes it. Rules are
+// already sorted; conflict ids keep their resolution order.
+func rulePackDigest(p *domain.RulePack) string {
+	type ruleRef struct {
+		ID         string `json:"id"`
+		RowVersion int64  `json:"row_version"`
+	}
+	refs := make([]ruleRef, 0, len(p.Rules))
+	for _, r := range p.Rules {
+		refs = append(refs, ruleRef{r.JurisdictionRuleID, r.RowVersion})
+	}
+	canon, _ := json.Marshal(struct {
+		JurisdictionID string                `json:"jurisdiction_id"`
+		EffectiveAt    string                `json:"effective_at"`
+		KnownAt        string                `json:"known_at,omitempty"`
+		ResolvedFrom   []string              `json:"resolved_from"`
+		Outcome        string                `json:"outcome"`
+		Rules          []ruleRef             `json:"rules"`
+		Conflicts      []domain.RuleConflict `json:"conflicts"`
+		Insufficient   []string              `json:"insufficient"`
+	}{
+		JurisdictionID: p.JurisdictionID,
+		EffectiveAt:    p.EffectiveAt.UTC().Format(time.RFC3339Nano),
+		KnownAt: func() string {
+			if p.KnownAt == nil {
+				return ""
+			}
+			return p.KnownAt.UTC().Format(time.RFC3339Nano)
+		}(),
+		ResolvedFrom: p.ResolvedFrom,
+		Outcome:      p.Outcome,
+		Rules:        refs,
+		Conflicts:    p.Conflicts,
+		Insufficient: p.Insufficient,
+	})
+	sum := sha256.Sum256(canon)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// periodsOverlap checks if two half-open intervals [from1, to1) and [from2, to2)
+// overlap. A nil to is an open end (the rule is still in force) — a pointer
+// here cannot be dereferenced without a nil guard, since effective_to is
+// NULL for rules with no end date.
+func periodsOverlap(from1 time.Time, to1 *time.Time, from2 time.Time, to2 *time.Time) bool {
+	if to1 != nil && to1.Before(from2) {
+		return false
+	}
+	if to2 != nil && to2.Before(from1) {
+		return false
+	}
+	return true
 }
 
 // ── rules: writes ────────────────────────────────────────────────────────────
 
 // CreateRule inserts a new rule idempotently.
 func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error) {
+	return s.CreateRuleWithQuerier(ctx, s.pool, params)
+}
+
+// CreateRuleWithQuerier is the same as CreateRule but uses the provided querier (transaction).
+func (s *PgStore) CreateRuleWithQuerier(ctx context.Context, q Querier, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error) {
 	if params.JurisdictionRuleID == "" {
 		params.JurisdictionRuleID = uuid.New().String()
 	}
@@ -853,12 +1255,41 @@ func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams
 		return nil, false, err
 	}
 
+	// rule_version follows the version chain: 1 for a new rule, the
+	// superseded version + 1 for a successor. It is never the caller's to
+	// choose; a caller that states one must state the right one. (The create
+	// path used to insert params.RuleVersion as given — 0, since nothing set
+	// it.)
+	version := 1
+	if params.SupersedesRuleID != nil {
+		var predJur, predDomain, predCode string
+		var predVersion int
+		err := q.QueryRow(ctx, `
+			SELECT jurisdiction_id::text, rule_domain, rule_code, rule_version
+			FROM jurisdiction_rules WHERE jurisdiction_rule_id::text = $1`, *params.SupersedesRuleID).
+			Scan(&predJur, &predDomain, &predCode, &predVersion)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, domain.ErrInvalidSupersedes
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if predJur != params.JurisdictionID || predDomain != params.RuleDomain || predCode != params.RuleCode {
+			return nil, false, domain.ErrInvalidSupersedes
+		}
+		version = max(predVersion, 1) + 1
+	}
+	if params.RuleVersion != 0 && params.RuleVersion != version {
+		return nil, false, domain.ErrRuleVersionMismatch
+	}
+	params.RuleVersion = version
+
 	// Two live rules with the same code and overlapping periods make "the
 	// effective rule at date X" ambiguous. DRAFT rules are exempt so a
 	// replacement can be drafted while the incumbent is still in force; the
 	// same check runs again on the transition into ACTIVE.
 	if isLiveRuleStatus(params.RuleStatus) {
-		overlaps, err := s.hasOverlappingRule(ctx, s.pool, params.JurisdictionID, params.RuleDomain, params.RuleCode, params.EffectiveFrom, params.EffectiveTo)
+		overlaps, err := s.hasOverlappingRule(ctx, q, params.JurisdictionID, params.RuleDomain, params.RuleCode, params.EffectiveFrom, params.EffectiveTo)
 		if err != nil {
 			return nil, false, err
 		}
@@ -871,16 +1302,18 @@ func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams
 		INSERT INTO jurisdiction_rules (
 			jurisdiction_rule_id, jurisdiction_id, rule_domain, rule_code, rule_name,
 			effective_from, effective_to, rule_payload, source_reference, rule_status,
+			rule_version, supersedes_rule_id, precedence_level,
 			external_feed_reference, legal_drift_state, data_classification,
 			created_by_principal_id, schema_version
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		ON CONFLICT (jurisdiction_id, rule_code, effective_from)
 		DO NOTHING
 		RETURNING ` + ruleColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query,
+	row := q.QueryRow(ctx, query,
 		params.JurisdictionRuleID, params.JurisdictionID, params.RuleDomain, params.RuleCode, params.RuleName,
 		params.EffectiveFrom, params.EffectiveTo, params.RulePayload, params.SourceReference, params.RuleStatus,
+		params.RuleVersion, params.SupersedesRuleID, params.PrecedenceLevel,
 		params.ExternalFeedReference, params.LegalDriftState, params.DataClassification,
 		params.CreatedByPrincipalID, params.SchemaVersion,
 	)
@@ -891,6 +1324,15 @@ func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams
 	}
 	if isForeignKeyViolation(err) {
 		return nil, false, domain.ErrJurisdictionNotFound
+	}
+	if isExclusionViolation(err) {
+		return nil, false, domain.ErrOverlappingRule
+	}
+	if isStringDataRightTruncation(err) {
+		return nil, false, domain.ErrInputTooLong
+	}
+	if isUniqueViolation(err, "uq_jurisdiction_rules_single_successor") {
+		return nil, false, domain.ErrSupersedesTaken
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		s.log.Error("pg CreateRule failed", zap.Error(err))
@@ -905,14 +1347,17 @@ func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams
 		  AND rule_code = $2
 		  AND effective_from = $3;`
 
-	row = s.pool.QueryRow(ctx, lookupQuery, params.JurisdictionID, params.RuleCode, params.EffectiveFrom)
+	row = q.QueryRow(ctx, lookupQuery, params.JurisdictionID, params.RuleCode, params.EffectiveFrom)
 	r, err = scanJurisdictionRule(row)
 	if err != nil {
 		s.log.Error("pg CreateRule lookup existing failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	if !jsonEquivalent(r.RulePayload, params.RulePayload) || r.RuleName != params.RuleName {
+	// A replay must be the same rule: precedence and version-chain position
+	// are part of what a rule says, not incidental attributes.
+	if !jsonEquivalent(r.RulePayload, params.RulePayload) || r.RuleName != params.RuleName ||
+		r.PrecedenceLevel != params.PrecedenceLevel || !equalStrPtr(r.SupersedesRuleID, params.SupersedesRuleID) {
 		s.log.Warn("rule dedup match but payload/name mismatch (409 conflict)",
 			zap.String("existing_id", r.JurisdictionRuleID),
 			zap.String("req_id", params.JurisdictionRuleID),
@@ -934,6 +1379,11 @@ func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams
 //     (params.EndDate). Without that a superseded rule keeps matching every
 //     point-in-time query forever, side by side with its own replacement.
 func (s *PgStore) TransitionRuleStatus(ctx context.Context, params TransitionParams) (*domain.JurisdictionRule, bool, error) {
+	return s.TransitionRuleStatusWithQuerier(ctx, s.pool, params)
+}
+
+// TransitionRuleStatusWithQuerier is the same as TransitionRuleStatus but uses the provided querier (transaction).
+func (s *PgStore) TransitionRuleStatusWithQuerier(ctx context.Context, q Querier, params TransitionParams) (*domain.JurisdictionRule, bool, error) {
 	current, err := s.FindRuleByID(ctx, params.RuleID)
 	if err != nil {
 		return nil, false, err
@@ -946,11 +1396,21 @@ func (s *PgStore) TransitionRuleStatus(ctx context.Context, params TransitionPar
 		return current, false, nil
 	}
 
+	// created_by never changes after insert, so this read outside the
+	// transaction cannot race the UPDATE below.
+	if params.ExpectedRowVersion != nil && current.RowVersion != *params.ExpectedRowVersion {
+		return nil, false, domain.ErrPreconditionFailed
+	}
+
+	if params.RequireIndependentActor && current.CreatedByPrincipalID == params.ActorID {
+		return nil, false, domain.ErrSelfApproval
+	}
+
 	// Activating a rule whose period overlaps another live rule with the same
 	// code would create the ambiguity CreateRule deliberately let through for
 	// DRAFT records. This is where that debt comes due.
 	if isLiveRuleStatus(params.NewStatus) {
-		overlaps, overlapErr := s.hasOverlappingRule(ctx, s.pool, current.JurisdictionID, current.RuleDomain, current.RuleCode, current.EffectiveFrom, current.EffectiveTo)
+		overlaps, overlapErr := s.hasOverlappingRule(ctx, q, current.JurisdictionID, current.RuleDomain, current.RuleCode, current.EffectiveFrom, current.EffectiveTo)
 		if overlapErr != nil {
 			return nil, false, overlapErr
 		}
@@ -979,15 +1439,40 @@ func (s *PgStore) TransitionRuleStatus(ctx context.Context, params TransitionPar
 		    updated_at              = NOW(),
 		    updated_by_principal_id = $2
 		WHERE jurisdiction_rule_id = $3 AND rule_status = ANY($4::text[])
+		  AND ($6::bigint IS NULL OR row_version = $6)
 		RETURNING ` + ruleColumns + `;`
 
-	r, err := scanJurisdictionRule(s.pool.QueryRow(ctx, query, params.NewStatus, params.ActorID, params.RuleID, params.AllowedPriors, endDate))
+	r, err := scanJurisdictionRule(q.QueryRow(ctx, query, params.NewStatus, params.ActorID, params.RuleID, params.AllowedPriors, endDate, params.ExpectedRowVersion))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// Lost a race since the pre-read: if the row moved past the
+			// version the caller asserted, that is the answer, not the state
+			// machine.
+			if params.ExpectedRowVersion != nil {
+				var now int64
+				if qerr := q.QueryRow(ctx, `SELECT row_version FROM jurisdiction_rules WHERE jurisdiction_rule_id = $1`, params.RuleID).Scan(&now); qerr == nil && now != *params.ExpectedRowVersion {
+					return nil, false, domain.ErrPreconditionFailed
+				}
+			}
 			return nil, false, domain.ErrInvalidTransition
+		}
+		if isExclusionViolation(err) {
+			return nil, false, domain.ErrOverlappingRule
 		}
 		s.log.Error("pg TransitionRuleStatus failed", zap.String("id", params.RuleID), zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	// The UPDATE above fired trg_record_rule_status_change, which opened the
+	// history row for the new status with change_reason NULL.
+	if params.ApprovalReference != "" {
+		if _, err := q.Exec(ctx, `
+			UPDATE rule_status_history SET change_reason = $1
+			WHERE jurisdiction_rule_id = $2 AND known_to IS NULL`,
+			params.ApprovalReference, params.RuleID); err != nil {
+			s.log.Error("pg TransitionRuleStatus: approval reference write failed", zap.String("id", params.RuleID), zap.Error(err))
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 	}
 	return r, true, nil
 }
@@ -1000,12 +1485,30 @@ func (s *PgStore) TransitionRuleStatus(ctx context.Context, params TransitionPar
 // it, despite "legal drift indicators" being owned by this service and
 // legal.drift.detected being one of its published events.
 func (s *PgStore) RecordDrift(ctx context.Context, params domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		s.log.Error("pg RecordDrift: begin failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	return s.RecordDriftWithQuerier(ctx, s.pool, params)
+}
+
+// RecordDriftWithQuerier is the same as RecordDrift but uses the provided querier.
+// If the querier is a *pgx.Tx, the caller manages the transaction; otherwise a new transaction is started.
+func (s *PgStore) RecordDriftWithQuerier(ctx context.Context, q Querier, params domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error) {
+	// If q is the pool (not a transaction), start a new transaction
+	var tx pgx.Tx
+	var ownsTx bool
+	if q == s.pool {
+		var err error
+		tx, err = s.pool.Begin(ctx)
+		if err != nil {
+			s.log.Error("pg RecordDrift: begin failed", zap.Error(err))
+			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		ownsTx = true
+		defer func() {
+			if ownsTx {
+				_ = tx.Rollback(ctx)
+			}
+		}()
+		q = tx
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
 
 	lockQuery := `
 		SELECT ` + ruleColumns + `
@@ -1013,7 +1516,7 @@ func (s *PgStore) RecordDrift(ctx context.Context, params domain.RecordDriftPara
 		WHERE jurisdiction_rule_id = $1
 		FOR UPDATE;`
 
-	current, err := scanJurisdictionRule(tx.QueryRow(ctx, lockQuery, params.JurisdictionRuleID))
+	current, err := scanJurisdictionRule(q.QueryRow(ctx, lockQuery, params.JurisdictionRuleID))
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) && !isInvalidTextRepresentation(err) {
 			s.log.Error("pg RecordDrift: lock read failed", zap.Error(err))
@@ -1022,12 +1525,18 @@ func (s *PgStore) RecordDrift(ctx context.Context, params domain.RecordDriftPara
 	}
 
 	if current.LegalDriftState == params.ToState {
-		// Idempotent replay. Committing an empty transaction is cheaper than
-		// rolling back and re-reading, and leaves no history entry behind.
-		if err := tx.Commit(ctx); err != nil {
-			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		// Idempotent replay.
+		if ownsTx {
+			if err := tx.Commit(ctx); err != nil {
+				return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			}
 		}
 		return current, nil, false, nil
+	}
+
+	// The row is locked FOR UPDATE, so this check cannot race the UPDATE.
+	if params.ExpectedRowVersion != nil && current.RowVersion != *params.ExpectedRowVersion {
+		return nil, nil, false, domain.ErrPreconditionFailed
 	}
 
 	updateQuery := `
@@ -1038,7 +1547,7 @@ func (s *PgStore) RecordDrift(ctx context.Context, params domain.RecordDriftPara
 		WHERE jurisdiction_rule_id = $3
 		RETURNING ` + ruleColumns + `;`
 
-	updated, err := scanJurisdictionRule(tx.QueryRow(ctx, updateQuery, params.ToState, params.RecordedByPrincipalID, params.JurisdictionRuleID))
+	updated, err := scanJurisdictionRule(q.QueryRow(ctx, updateQuery, params.ToState, params.RecordedByPrincipalID, params.JurisdictionRuleID))
 	if err != nil {
 		s.log.Error("pg RecordDrift: update failed", zap.Error(err))
 		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -1056,7 +1565,7 @@ func (s *PgStore) RecordDrift(ctx context.Context, params domain.RecordDriftPara
 		correlationID = &params.CorrelationID
 	}
 
-	event, err := scanDriftEvent(tx.QueryRow(ctx, insertQuery,
+	event, err := scanDriftEvent(q.QueryRow(ctx, insertQuery,
 		params.JurisdictionRuleID, current.LegalDriftState, params.ToState, params.Reason,
 		params.RecordedByPrincipalID, correlationID,
 	))
@@ -1065,9 +1574,11 @@ func (s *PgStore) RecordDrift(ctx context.Context, params domain.RecordDriftPara
 		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		s.log.Error("pg RecordDrift: commit failed", zap.Error(err))
-		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	if ownsTx {
+		if err := tx.Commit(ctx); err != nil {
+			s.log.Error("pg RecordDrift: commit failed", zap.Error(err))
+			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
 	}
 	return updated, event, true, nil
 }
@@ -1108,6 +1619,49 @@ func (s *PgStore) FindDriftEvents(ctx context.Context, ruleID string, limit, off
 	}
 	if err := rows.Err(); err != nil {
 		s.log.Error("pg FindDriftEvents rows error", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return results, nil
+}
+
+// FindRuleStatusHistory returns the bitemporal status history for a rule,
+// newest known_from first. This enables "what did the platform know on date X"
+// queries per V-001 §8.1.
+func (s *PgStore) FindRuleStatusHistory(ctx context.Context, ruleID string, limit, offset int) ([]*domain.RuleStatusHistory, error) {
+	if _, err := s.FindRuleByID(ctx, ruleID); err != nil {
+		return nil, err
+	}
+
+	limit = clampLimit(limit, 50, 200)
+	if offset < 0 {
+		offset = 0
+	}
+
+	query := `
+		SELECT ` + ruleStatusHistoryColumns + `
+		FROM   rule_status_history
+		WHERE  jurisdiction_rule_id = $1
+		ORDER BY known_from DESC, history_id DESC
+		LIMIT  $2 OFFSET $3;`
+
+	rows, err := s.pool.Query(ctx, query, ruleID, limit, offset)
+	if err != nil {
+		s.log.Error("pg FindRuleStatusHistory failed", zap.String("rule_id", ruleID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+
+	var results []*domain.RuleStatusHistory
+	for rows.Next() {
+		h, scanErr := scanRuleStatusHistory(rows)
+		if scanErr != nil {
+			s.log.Error("pg FindRuleStatusHistory scan failed", zap.Error(scanErr))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+		results = append(results, h)
+	}
+	if err := rows.Err(); err != nil {
+		s.log.Error("pg FindRuleStatusHistory rows error", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
@@ -1187,3 +1741,121 @@ func clampLimit(limit, def, max int) int {
 	}
 	return limit
 }
+
+// OutboxEvent represents an event in the transactional outbox.
+type OutboxEvent struct {
+	OutboxID        string
+	EventType       string
+	EventPayload    []byte
+	Topic           string
+	PartitionKey    *string
+	CreatedAt       time.Time
+	PublishAttempts int
+}
+
+// AddEventToOutbox writes an event to the transactional outbox within the
+// given querier (transaction or pool). Called in the same transaction as the
+// domain change to guarantee at-least-once delivery.
+func (s *PgStore) AddEventToOutbox(ctx context.Context, q querier, eventType, topic, partitionKey string, payload []byte) error {
+	query := `
+		INSERT INTO event_outbox (event_type, event_payload, topic, partition_key)
+		VALUES ($1, $2, $3, $4);`
+
+	var pk *string
+	if partitionKey != "" {
+		pk = &partitionKey
+	}
+
+	_, err := q.Exec(ctx, query, eventType, payload, topic, pk)
+	if err != nil {
+		s.log.Error("pg AddEventToOutbox failed",
+			zap.String("event_type", eventType),
+			zap.Error(err),
+		)
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+// GetPendingOutboxEvents returns unpublished events for the background publisher.
+func (s *PgStore) GetPendingOutboxEvents(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	query := `
+		SELECT outbox_id, event_type, event_payload, topic, partition_key, created_at, publish_attempts
+		FROM event_outbox
+		WHERE published_at IS NULL
+		  -- A message the broker keeps refusing (e.g. too large) is parked after
+		  -- MaxOutboxAttempts instead of blocking every event behind it; it stays
+		  -- in the table (published_at NULL) for an operator to inspect.
+		  AND publish_attempts < $2
+		ORDER BY created_at ASC
+		LIMIT $1;`
+
+	rows, err := s.pool.Query(ctx, query, limit, MaxOutboxAttempts)
+	if err != nil {
+		s.log.Error("pg GetPendingOutboxEvents failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+
+	var events []OutboxEvent
+	for rows.Next() {
+		var e OutboxEvent
+		if err := rows.Scan(&e.OutboxID, &e.EventType, &e.EventPayload, &e.Topic, &e.PartitionKey, &e.CreatedAt, &e.PublishAttempts); err != nil {
+			s.log.Error("pg GetPendingOutboxEvents scan failed", zap.Error(err))
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
+// MarkOutboxEventPublished marks an outbox event as successfully published.
+func (s *PgStore) MarkOutboxEventPublished(ctx context.Context, outboxID string) error {
+	query := `
+		UPDATE event_outbox
+		SET published_at = NOW()
+		WHERE outbox_id = $1;`
+
+	_, err := s.pool.Exec(ctx, query, outboxID)
+	if err != nil {
+		s.log.Error("pg MarkOutboxEventPublished failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+// MarkOutboxEventFailed increments the attempt count and records the error.
+func (s *PgStore) MarkOutboxEventFailed(ctx context.Context, outboxID, errMsg string) error {
+	query := `
+		UPDATE event_outbox
+		SET publish_attempts = publish_attempts + 1,
+		    last_error = $2
+		WHERE outbox_id = $1;`
+
+	_, err := s.pool.Exec(ctx, query, outboxID, errMsg)
+	if err != nil {
+		s.log.Error("pg MarkOutboxEventFailed failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+// isUniqueViolation reports whether err is SQLSTATE 23505 on the named constraint.
+func isUniqueViolation(err error, constraint string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == constraint
+}
+
+func equalStrPtr(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// MaxOutboxAttempts is how many failed publishes an outbox event gets before
+// the worker parks it.
+const MaxOutboxAttempts = 10

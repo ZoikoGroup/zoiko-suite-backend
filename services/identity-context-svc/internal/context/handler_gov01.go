@@ -260,8 +260,51 @@ func (h *Handler) AttachSupportContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, domain.AttachSupportContextResponse{
+	// 202: a request, not a grant. It is live only once the named approver
+	// approves it (POST /v1/context/support/{id}/approve).
+	writeJSON(w, http.StatusAccepted, domain.AttachSupportContextResponse{
 		SupportContextID: sc.SupportContextID,
+		ApprovalStatus:   sc.ApprovalStatus,
+		ExpiresAt:        sc.ExpiresAt,
+		EvidenceID:       sc.EvidenceID,
+	})
+}
+
+// ActionApproveSupportContext guards approving a support request. Its own
+// action: holding the right to REQUEST an elevation must not imply the right
+// to APPROVE one, or one grant would make a principal both halves of the
+// maker-checker pair.
+const ActionApproveSupportContext = "IDENTITY_SUPPORT_CONTEXT_APPROVE"
+
+// ApproveSupportContext is the approver's own call (S1-1 / R-2). Scoped to the
+// TARGET tenant, like attach; the caller must be the approver the request
+// names, and never its requester or grantee.
+func (h *Handler) ApproveSupportContext(w http.ResponseWriter, r *http.Request) {
+	if h.support == nil {
+		writeCoded(w, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
+			"support context is not configured in this deployment")
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	callerPrincipalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, callerPrincipalID, tenantID, ActionApproveSupportContext) {
+		return
+	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+	sc, err := h.support.Approve(r.Context(), chi.URLParam(r, "supportContextID"), tenantID, callerPrincipalID, correlationID)
+	if err != nil {
+		h.writeSupportError(w, err, correlationID)
+		return
+	}
+	writeJSON(w, http.StatusOK, domain.AttachSupportContextResponse{
+		SupportContextID: sc.SupportContextID,
+		ApprovalStatus:   sc.ApprovalStatus,
 		ExpiresAt:        sc.ExpiresAt,
 		EvidenceID:       sc.EvidenceID,
 	})
@@ -410,10 +453,41 @@ func (h *Handler) ReviewSupportContext(w http.ResponseWriter, r *http.Request) {
 // to be indistinguishable message strings.
 func (h *Handler) writeSupportError(w http.ResponseWriter, err error, correlationID string) {
 	switch {
+	case errors.Is(err, sod.ErrConflict) && errors.Is(err, domain.ErrSupportSelfApproval):
+		// The requester or the grantee approving their own request.
+		writeJSON(w, http.StatusForbidden, errorResponse{
+			Error:         err.Error(),
+			ErrorCode:     domain.ErrCodeSoDConflict,
+			CorrelationID: correlationID,
+		})
 	case errors.Is(err, sod.ErrConflict):
 		writeJSON(w, http.StatusConflict, errorResponse{
 			Error:         err.Error(),
 			ErrorCode:     domain.ErrCodeSoDConflict,
+			CorrelationID: correlationID,
+		})
+	case errors.Is(err, domain.ErrSupportNotApprover):
+		writeJSON(w, http.StatusForbidden, errorResponse{
+			Error:         err.Error(),
+			ErrorCode:     domain.ErrCodeAuthorizationDenied,
+			CorrelationID: correlationID,
+		})
+	case errors.Is(err, domain.ErrSupportNotPending):
+		writeJSON(w, http.StatusConflict, errorResponse{
+			Error:         err.Error(),
+			ErrorCode:     domain.ErrCodeBreakGlassRequired,
+			CorrelationID: correlationID,
+		})
+	case errors.Is(err, domain.ErrSupportApprovalLapsed):
+		writeJSON(w, http.StatusConflict, errorResponse{
+			Error:         err.Error(),
+			ErrorCode:     domain.ErrCodeBreakGlassExpired,
+			CorrelationID: correlationID,
+		})
+	case errors.Is(err, domain.ErrSupportContextNotFound):
+		writeJSON(w, http.StatusNotFound, errorResponse{
+			Error:         err.Error(),
+			ErrorCode:     domain.ErrCodeBreakGlassRequired,
 			CorrelationID: correlationID,
 		})
 	case errors.Is(err, sod.ErrUnavailable):

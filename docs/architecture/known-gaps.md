@@ -224,16 +224,19 @@ caller-supplied path parameter is not an isolation boundary however correct
 its WHERE clause.
 
 
-## Open: jurisdiction-rules-svc owns no compliance calendar
-03-microservices.md §8.2 lists "compliance calendar logic" among this
-service's holdings and jurisdiction.calendar.changed among its published
-events. Neither exists: there is no calendar entity in its schema, and the
-event name is deliberately absent from internal/events rather than declared
-for a signal that could never fire. Filing due dates and filing_requirements
-currently live in obligations-svc, so the boundary question — does the
-calendar belong here, there, or split — has to be settled before the entity
-is built. The other three §8.2 events (jurisdiction.rule.updated,
-jurisdiction.rule.activated, legal.drift.detected) are published.
+## Resolved: jurisdiction-rules-svc owns no compliance calendar
+Closed by the ZS-JUR-001 Wave 4 (calendar half) work. The service now owns
+`regulatory_calendars`, `regulatory_calendar_versions`,
+`calendar_version_sources` and `pack_version_calendars`
+(`000010_calendars_and_obligations.up.sql`), obligation rules and a publish
+lifecycle. `jurisdiction.calendar.changed` is declared in `internal/events`
+and emitted by `PublishCalendarVersion` (`internal/handler/calendar.go`);
+`calendar_integration_test.go` asserts it fires per published version. All
+four §8.2 events are now published (jurisdiction.rule.updated,
+jurisdiction.rule.activated, jurisdiction.calendar.changed,
+legal.drift.detected). The obligations ownership boundary across
+obligations-svc / obligation-tracking-svc / filing-tracker-svc is a separate
+Doc 04 §2.1 single-owner issue, tracked at backend-completion-tracker row 78.
 
 ## Resolved: authorization scope for platform-wide reference data
 Jurisdiction data has no tenant_id and no owning legal entity, but
@@ -268,7 +271,14 @@ they pass a real uuid, which is still evaluated exactly as before. Migrating
 one to the sentinel is worth doing only when its synthetic id turns out to
 disagree with the platform one.
 
-Still open: seed-demo-rbac.ps1 does not grant the JURISDICTION_* actions.
+Also closed: seed-demo-rbac.ps1 now grants a `JURISDICTION_FULL` bundle
+(`JURISDICTION_CREATE`, `JURISDICTION_DEACTIVATE`, `JURISDICTION_RULE_CREATE`,
+`JURISDICTION_RULE_TRANSITION`, `JURISDICTION_RULE_RECORD_DRIFT`) plus
+`JURISDICTION_RESOLVER_CALLER` and `JURISDICTION_PACK_REGISTRY_FULL` bundles
+covering the resolver, registry, pack, calendar, rollout and submission
+surfaces. The file's inline comment that the service "gates all five of its
+admin routes" now understates the surface: the service authorizes its ~57 POST
++ 6 PUT routes through the same shared helper.
 
 ## Resolved: jurisdiction-rules-svc authorized nothing
 HTTPAuthZClient.Authorize was a TODO that logged a warning and returned nil,

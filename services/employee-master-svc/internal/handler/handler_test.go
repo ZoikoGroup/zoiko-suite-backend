@@ -68,10 +68,10 @@ func (s *stubStore) ListEmployees(_ context.Context, f domain.EmployeeFilter) ([
 		if f.LegalEntityID != "" && emp.LegalEntityID != f.LegalEntityID {
 			continue
 		}
-		if f.Status != "" && emp.Status != f.Status {
+		if f.Status != "" && string(emp.Status) != f.Status {
 			continue
 		}
-		if f.WorkerType != "" && emp.WorkerType != f.WorkerType {
+		if f.WorkerType != "" && string(emp.WorkerType) != f.WorkerType {
 			continue
 		}
 		if !matches(f.DepartmentID, emp.DepartmentID) ||
@@ -87,7 +87,7 @@ func (s *stubStore) ListEmployees(_ context.Context, f domain.EmployeeFilter) ([
 		// the projection leaks in production.
 		projected := *emp
 		projected.DateOfBirth = nil
-		projected.Gender = nil
+		projected.Gender = ""
 		projected.ProfilePictureURL = nil
 		projected.PersonalEmail = nil
 		projected.CurrentAddress = nil
@@ -116,7 +116,7 @@ func (s *stubStore) UpdateStatus(_ context.Context, id, newStatus string, termin
 	if !ok {
 		return domain.ErrEmployeeNotFound
 	}
-	emp.Status = newStatus
+	emp.Status = domain.EmployeeStatus(newStatus)
 	emp.TerminationDate = terminationDate
 	emp.UpdatedAt = time.Now().UTC()
 	return nil

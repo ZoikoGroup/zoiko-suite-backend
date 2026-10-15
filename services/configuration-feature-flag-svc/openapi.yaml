@@ -599,6 +599,13 @@ paths:
         approval keeps the change `PROPOSED` — there is no REJECTED state —
         and the approver remains the verified principal: there is no
         body-supplied approver field.
+
+        Only a `PROPOSED` or `VALIDATED` change can be decided
+        (`409 change_not_approvable` otherwise: an approved, activated or
+        verified change is never sent back). A C2 / C3 change is never
+        approved by its proposer (`403 change_self_approval`; AA-001 §8.1
+        segregated approval). `approved_at` is set by the server; a body value
+        is ignored.
       parameters:
         - name: change_id
           in: path
@@ -626,7 +633,16 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403':
+          description: '`change_self_approval` — the proposer of a C2/C3 change approving it; or no grant.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`change_not_approvable` — the change is no longer awaiting a decision.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '413': { $ref: '#/components/responses/TooLarge' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
@@ -1529,7 +1545,7 @@ components:
       type: object
       properties:
         approved: { type: boolean, default: true }
-        approved_at: { type: string, format: date-time }
+        approved_at: { type: string, format: date-time, description: Ignored; the server records the approval time. }
         wfc_reference: { type: string }
       additionalProperties: false
 

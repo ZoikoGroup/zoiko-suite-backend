@@ -32,7 +32,7 @@ func seedIntent(t *testing.T, s *store.PgStore, tenant string) string {
 // Migration 000016 / INV-02: the two halves of a communication are joined on both
 // sides in one step, and can be read from either end.
 func TestLink_JoinsIntentAndNotificationBothWays(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	ctx := tenantCtx("tenant-link")
 	intent := seedIntent(t, s, "tenant-link")
 	n := seedNotification(t, s, "tenant-link", "corr-link-1")
@@ -56,7 +56,7 @@ func TestLink_JoinsIntentAndNotificationBothWays(t *testing.T) {
 }
 
 func TestLink_IsOneToOneAndNeverRepointed(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	ctx := tenantCtx("tenant-link")
 	i1, i2 := seedIntent(t, s, "tenant-link"), seedIntent(t, s, "tenant-link")
 	n1, n2 := seedNotification(t, s, "tenant-link", "corr-link-2a"), seedNotification(t, s, "tenant-link", "corr-link-2b")
@@ -81,7 +81,7 @@ func TestLink_IsOneToOneAndNeverRepointed(t *testing.T) {
 }
 
 func TestLink_RefusesMissingAndCrossTenantTargets(t *testing.T) {
-	s := store.New(openTestPool(t))
+	s := store.New(openAdminTestPool(t))
 	intent := seedIntent(t, s, "tenant-link-a")
 	n := seedNotification(t, s, "tenant-link-b", "corr-link-3")
 
@@ -102,7 +102,7 @@ func TestLink_RefusesMissingAndCrossTenantTargets(t *testing.T) {
 
 // The database enforces the same rules without the store.
 func TestLink_DatabaseRefusesWhatTheStoreWouldRefuse(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	ctx := context.Background()
 	intentA := seedIntent(t, s, "tenant-db-a")
@@ -126,8 +126,12 @@ func TestLink_DatabaseRefusesWhatTheStoreWouldRefuse(t *testing.T) {
 
 // Housekeeping purges stale intents; that must not be blocked by, or damage, the
 // notification that points at the intent.
+// Delivery evidence is never deleted (ZS-SVC-Y-001 INV-28, migration 000023:
+// retention belongs to DRC), so a purge of the ledger intent is refused by the
+// database. What this test guards still holds, and more strongly: the
+// notification and its link to the intent both survive.
 func TestLink_PurgingTheIntentLeavesTheNotification(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	s := store.New(pool)
 	ctx := tenantCtx("tenant-link-purge")
 	intent := seedIntent(t, s, "tenant-link-purge")
@@ -135,20 +139,20 @@ func TestLink_PurgingTheIntentLeavesTheNotification(t *testing.T) {
 	if err := s.LinkIntentToNotification(ctx, intent, n.NotificationID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(context.Background(), `DELETE FROM message_intents WHERE message_intent_id=$1::uuid`, intent); err != nil {
-		t.Fatalf("the purge was blocked by the link: %v", err)
+	if _, err := pool.Exec(context.Background(), `DELETE FROM message_intents WHERE message_intent_id=$1::uuid`, intent); err == nil {
+		t.Fatal("deleting a ledger intent must be refused: it is delivery evidence (INV-28)")
 	}
 	got, err := s.GetNotification(ctx, n.NotificationID)
 	if err != nil || got == nil {
 		t.Fatalf("the notification must survive: %v", err)
 	}
-	if id, _ := s.IntentIDForNotification(ctx, n.NotificationID); id != "" {
-		t.Errorf("the dangling link should have been cleared, got %q", id)
+	if id, _ := s.IntentIDForNotification(ctx, n.NotificationID); id != intent {
+		t.Errorf("the link must survive a refused purge, got %q want %q", id, intent)
 	}
 }
 
 func TestMigration000016_DownThenUp(t *testing.T) {
-	pool := openTestPool(t)
+	pool := openAdminTestPool(t)
 	for _, f := range []string{"000016_intent_notification_link.down.sql", "000016_intent_notification_link.up.sql"} {
 		b, err := os.ReadFile("../../deployments/migrations/" + f)
 		if err != nil {

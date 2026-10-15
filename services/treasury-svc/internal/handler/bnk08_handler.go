@@ -220,7 +220,6 @@ func (h *Handler) PublishCashPositionSnapshot(w http.ResponseWriter, r *http.Req
 		h.writeCashPositionErr(w, err)
 		return
 	}
-	h.publisher.PublishCashPositionPublished(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -232,10 +231,8 @@ func (h *Handler) PublishCashPositionSnapshot(w http.ResponseWriter, r *http.Req
 // so this is the mechanical, already-computed trigger for that event
 // rather than a fabricated new staleness-detection mechanism.
 func (h *Handler) publishCashPositionCalculated(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot) {
-	h.publisher.PublishCashPositionCalculated(ctx, correlationID, actorID, snap)
-	if snap.HasStaleComponent {
-		h.publisher.PublishCashPositionBecameStale(ctx, correlationID, actorID, snap)
-	}
+	// Events are now enqueued in the store layer (CreateCashPositionSnapshot)
+	// via the transactional outbox pattern.
 }
 
 type supersedeCashPositionRequest struct {

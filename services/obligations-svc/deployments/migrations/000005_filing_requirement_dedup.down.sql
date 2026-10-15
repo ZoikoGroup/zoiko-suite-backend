@@ -1,0 +1,3 @@
+-- 000005_filing_requirement_dedup.down.sql
+
+DROP INDEX IF EXISTS idx_filing_requirements_tenant_obligation_type_authority_channel;

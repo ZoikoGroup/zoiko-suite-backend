@@ -22,10 +22,12 @@ import (
 )
 
 type Store interface {
-	CreateRun(ctx context.Context, run *domain.ConsolidationRun) error
+	CreateRun(ctx context.Context, run *domain.ConsolidationRun, actorID, correlationID string) error
 	GetRun(ctx context.Context, id string) (*domain.ConsolidationRun, error)
 	ListRuns(ctx context.Context, groupLegalEntityID string) ([]domain.ConsolidationRun, error)
-	CompleteRun(ctx context.Context, id, status string, exceptionCount int, completedAt time.Time) error
+	// CompleteRun enqueues the run's completion events (only for status
+	// COMPLETED) in the same transaction as the status change.
+	CompleteRun(ctx context.Context, id, status string, exceptionCount int, completedAt time.Time, actorID, correlationID string, snapshotCount int, exceptions []string) error
 	CreateBalanceSnapshots(ctx context.Context, snapshots []domain.BalanceSnapshot) error
 	ListSnapshotsByRun(ctx context.Context, runID string) ([]domain.BalanceSnapshot, error)
 	CreateBalanceContributions(ctx context.Context, contributions []domain.BalanceContribution) error
@@ -44,12 +46,6 @@ type Store interface {
 	ApproveAdjustment(ctx context.Context, id, principalID string) error
 	MarkAdjustmentPosted(ctx context.Context, id, principalID, journalID string) error
 	ReverseAdjustment(ctx context.Context, id, principalID, reason string, supersededBy *string) error
-}
-
-type Publisher interface {
-	PublishRunStarted(ctx context.Context, correlationID, actorID string, run domain.ConsolidationRun)
-	PublishCompleted(ctx context.Context, correlationID, actorID string, run domain.ConsolidationRun, snapshotCount int)
-	PublishExceptionDetected(ctx context.Context, correlationID, actorID string, run domain.ConsolidationRun, exceptions []string)
 }
 
 type AuthZClient interface {
@@ -85,20 +81,18 @@ const (
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	clients   DomainClients
-	log       *zap.Logger
+	store   Store
+	authz   AuthZClient
+	clients DomainClients
+	log     *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, clients DomainClients, log *zap.Logger) *Handler {
+func New(store Store, authz AuthZClient, clients DomainClients, log *zap.Logger) *Handler {
 	return &Handler{
-		store:     store,
-		publisher: publisher,
-		authz:     authz,
-		clients:   clients,
-		log:       log,
+		store:   store,
+		authz:   authz,
+		clients: clients,
+		log:     log,
 	}
 }
 
@@ -164,13 +158,11 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		StartedAt:          now,
 	}
 
-	if err := h.store.CreateRun(r.Context(), run); err != nil {
+	if err := h.store.CreateRun(r.Context(), run, principalID, correlationID); err != nil {
 		h.log.Error("failed to create consolidation run", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
-
-	h.publisher.PublishRunStarted(r.Context(), correlationID, principalID, *run)
 
 	// Step 1: Query GL Trial Balances across all child legal entities.
 	// Each child's own contribution to each account is recorded (ACC-13
@@ -183,7 +175,7 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		bal, err := h.clients.FetchTrialBalance(r.Context(), tenantID, childID, req.FiscalPeriod)
 		if err != nil {
 			h.log.Error("failed to fetch trial balance for child entity", zap.String("child_id", childID), zap.Error(err))
-			_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC())
+			_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC(), principalID, correlationID, 0, nil)
 			writeError(w, http.StatusServiceUnavailable, "gl_fetch_failed", fmt.Sprintf("failed to fetch trial balance for entity %s: %s", childID, err.Error()))
 			return
 		}
@@ -205,7 +197,7 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		// completes without it recorded would silently repeat the same
 		// "claimed but not actually done" shape §3.29 already fixed once.
 		h.log.Error("failed to record balance contributions", zap.Error(err))
-		_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC())
+		_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC(), principalID, correlationID, 0, nil)
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "failed to record entity-to-group provenance: "+err.Error())
 		return
 	}
@@ -270,30 +262,16 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.store.CreateBalanceSnapshots(r.Context(), snapshots); err != nil {
 		h.log.Error("failed to store balance snapshots", zap.Error(err))
-		_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC())
+		_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC(), principalID, correlationID, 0, nil)
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	completedAt := time.Now().UTC()
 	exceptionCount := len(eliminationExceptions)
-	if err := h.store.CompleteRun(r.Context(), runID, "COMPLETED", exceptionCount, completedAt); err != nil {
+	if err := h.store.CompleteRun(r.Context(), runID, "COMPLETED", exceptionCount, completedAt, principalID, correlationID, len(snapshots), eliminationExceptions); err != nil {
 		h.log.Error("failed to mark consolidation run completed", zap.Error(err))
 	}
-
-	run.Status = "COMPLETED"
-	run.CompletedAt = &completedAt
-	run.ExceptionCount = exceptionCount
-
-	if exceptionCount > 0 {
-		// Visible, not silent: a run whose elimination step partially or
-		// fully failed still completes (the balances it DID compute are
-		// real), but callers must be able to see that some intercompany
-		// legs were not eliminated, not infer it from a suspiciously round
-		// group total.
-		h.publisher.PublishExceptionDetected(r.Context(), correlationID, principalID, *run, eliminationExceptions)
-	}
-	h.publisher.PublishCompleted(r.Context(), correlationID, principalID, *run, len(snapshots))
 
 	writeJSON(w, http.StatusCreated, domain.ConsolidationRunResponse{
 		ConsolidationRunID: runID,

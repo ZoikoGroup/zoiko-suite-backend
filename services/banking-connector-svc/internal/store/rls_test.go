@@ -41,7 +41,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS mapping_exceptions, bank_transaction_mappings, bank_region_policies, bank_transactions_canonical, bank_statement_lines, bank_statements, bank_connection_events, bank_connections CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS mapping_exceptions, bank_transaction_mappings, bank_region_policies, bank_transactions_canonical, bank_statement_lines, bank_statements, bank_connection_events, bank_connections, eventing_outbox CASCADE;`)
 
 	// Every migration in filename order, never one hardcoded name — a
 	// suite that names migrations individually silently skips new ones,
@@ -148,7 +148,7 @@ func TestRLS_EnabledAndForced(t *testing.T) {
 func TestRLS_PgStore_TenantIsolation(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)
-	s := store.NewPgStore(appPool)
+	s := store.NewPgStore(appPool, store.WithEventRegion("uk"))
 
 	ctxA := middleware.WithTenant(context.Background(), "tenant-a")
 	ctxB := middleware.WithTenant(context.Background(), "tenant-b")
@@ -157,7 +157,7 @@ func TestRLS_PgStore_TenantIsolation(t *testing.T) {
 		LegalEntityID: "le-a", BankName: "Test Bank", BIC: "TESTUS33XXX",
 		AccountNumber: "GB00TEST1234567890", Currency: "USD", Status: "CONNECTED",
 	}
-	if err := s.CreateConnection(ctxA, conn); err != nil {
+	if err := s.CreateConnection(ctxA, conn, "actor-a", "corr-a"); err != nil {
 		t.Fatalf("create tenant A's connection: %v", err)
 	}
 

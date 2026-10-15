@@ -943,6 +943,13 @@ This is the runtime rules foundation of ZoikoSuite.
 
 - decision_timestamp
 
+*Physical names (recorded 12 Oct 2026; governance-decision-log-svc wire and column names, which every caller already uses):*
+`governance_decision_id` → `decision_id` (unique per tenant: key `(tenant_id, decision_id)`) ·
+`principal_id` → `actor_id` (always the authenticated caller) ·
+`jurisdiction_rule_basis` → `rule_basis` + `jurisdiction_context` ·
+`authorization_outcome` → `outcome` ·
+`decision_timestamp` → `decided_at` (upstream decision time) plus server-assigned `recorded_at`.
+
 ### **EvidenceRequirement**
 
 - evidence_requirement_id

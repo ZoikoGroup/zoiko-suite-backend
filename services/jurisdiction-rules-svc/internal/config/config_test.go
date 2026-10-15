@@ -21,8 +21,8 @@ func withEnv(t *testing.T, vars map[string]string) {
 	// backbone", absent means "use the default".
 	for _, k := range []string{
 		"ENV", "PORT", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_SSLMODE",
-		"KAFKA_BROKERS", "KAFKA_GROUP_ID", "KAFKA_EVENTS_TOPIC",
-		"AUTHZ_SERVICE_URL", "AUTHZ_PLATFORM_SCOPE_ID", "OTEL_EXPORTER_OTLP_ENDPOINT",
+		"KAFKA_BROKERS", "KAFKA_GROUP_ID", "KAFKA_EVENTS_TOPIC", "KAFKA_ENTITY_TOPIC",
+		"AUTHZ_SERVICE_URL", "AUTHZ_PLATFORM_SCOPE_ID", "AUTHZ_ALLOW_STUB", "OTEL_EXPORTER_OTLP_ENDPOINT",
 		"PACK_SIGNING_KEY_REF", "PACK_SIGNING_KEY_FILE", "PACK_CERT_MIN_REVIEWS",
 		"RESOLVER_ELIGIBLE_STATUSES", "RESOLVER_CACHE_TTL_SECONDS",
 		"RESOLVER_ENABLED", "RESOLVER_RING", "RESOLVER_REGION", "HOTFIX_RETRO_SLA_HOURS", "PACK_CERT_AGE_WARN_DAYS",
@@ -333,5 +333,28 @@ func TestLoad_OperationsPolicyDefaultsAndBounds(t *testing.T) {
 		if _, err = config.Load(); err == nil {
 			t.Fatalf("%s=0 must be rejected", k)
 		}
+	}
+}
+
+// AUTHZ_ALLOW_STUB opts in to the permit-all authorization stub. Anywhere but
+// ENV=local it must refuse to start rather than quietly permit every write.
+func TestLoad_AuthZAllowStubIsLocalOnly(t *testing.T) {
+	for _, env := range []string{"development", "prod", "uat", "preprod", "staging", "production"} {
+		withEnv(t, map[string]string{"ENV": env, "AUTHZ_ALLOW_STUB": "true", "DB_PASSWORD": "x", "AUTHZ_PLATFORM_SCOPE_ID": "s"})
+		if _, err := config.Load(); err == nil || !strings.Contains(err.Error(), "AUTHZ_ALLOW_STUB") {
+			t.Errorf("ENV=%s with AUTHZ_ALLOW_STUB=true must refuse to start, got %v", env, err)
+		}
+	}
+	withEnv(t, map[string]string{"AUTHZ_ALLOW_STUB": "true"})
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("default ENV (local) with AUTHZ_ALLOW_STUB=true must load: %v", err)
+	}
+	if !cfg.AuthZAllowStub {
+		t.Fatal("AUTHZ_ALLOW_STUB=true was not read")
+	}
+	withEnv(t, nil)
+	if cfg, _ := config.Load(); cfg == nil || cfg.AuthZAllowStub {
+		t.Fatal("the stub must be off unless AUTHZ_ALLOW_STUB=true is set")
 	}
 }

@@ -13,7 +13,6 @@ import (
 	authzpkg "zoiko.io/payee-banking-identity-svc/internal/authz"
 	"zoiko.io/payee-banking-identity-svc/internal/counterparty"
 	"zoiko.io/payee-banking-identity-svc/internal/domain"
-	"zoiko.io/payee-banking-identity-svc/internal/events"
 	svcmiddleware "zoiko.io/payee-banking-identity-svc/internal/middleware"
 	"zoiko.io/payee-banking-identity-svc/internal/store"
 )
@@ -38,14 +37,13 @@ type AuthzChecker interface {
 
 type Handler struct {
 	store store.Store
-	pub   events.Publisher
 	authz AuthzChecker
 	party counterparty.Client
 	log   *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, party counterparty.Client, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, party: party, log: log}
+func New(st store.Store, az AuthzChecker, party counterparty.Client, log *zap.Logger) *Handler {
+	return &Handler{store: st, authz: az, party: party, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -176,7 +174,7 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	created, err := h.store.ProposeDestination(r.Context(), verifiedTenant, req, principalID)
+	created, err := h.store.ProposeDestination(r.Context(), verifiedTenant, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		if errors.Is(err, domain.ErrDuplicateDestination) {
 			writeError(w, http.StatusConflict, domain.ErrDuplicateDestination.Error())
@@ -187,10 +185,9 @@ func (h *Handler) ProposePayeeDestination(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationProposed, EntityID: created.DestinationID, TenantID: verifiedTenant,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: created,
-	})
+	// com.zoikosuite.banking.payee-destination.proposed is enqueued inside
+	// ProposeDestination's own transaction (the transactional outbox), not
+	// published here after the fact — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, req.LegalEntityID, created)
 	writeJSON(w, http.StatusCreated, created)
 }
@@ -338,7 +335,7 @@ func (h *Handler) ApprovePayeeDestination(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	updated, err := h.store.ApproveDestination(r.Context(), destinationID, principalID)
+	updated, err := h.store.ApproveDestination(r.Context(), destinationID, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "destination must be VERIFIED to approve")
@@ -348,10 +345,8 @@ func (h *Handler) ApprovePayeeDestination(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationApproved, EntityID: updated.DestinationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
+	// com.zoikosuite.banking.payee-destination.approved is enqueued inside
+	// ApproveDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -375,7 +370,7 @@ func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.ActivateDestination(r.Context(), destinationID, principalID)
+	updated, err := h.store.ActivateDestination(r.Context(), destinationID, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "destination must be APPROVAL_PENDING to activate")
@@ -385,10 +380,8 @@ func (h *Handler) ActivateDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationActivated, EntityID: updated.DestinationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
+	// com.zoikosuite.banking.payee-destination.activated is enqueued inside
+	// ActivateDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -416,7 +409,7 @@ func (h *Handler) SuspendDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.SuspendDestination(r.Context(), destinationID, req, principalID)
+	updated, err := h.store.SuspendDestination(r.Context(), destinationID, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "destination must be ACTIVE to suspend")
@@ -426,10 +419,8 @@ func (h *Handler) SuspendDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationSuspended, EntityID: updated.DestinationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
+	// com.zoikosuite.banking.payee-destination.suspended is enqueued inside
+	// SuspendDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -457,7 +448,7 @@ func (h *Handler) SupersedeDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.SupersedeDestination(r.Context(), destinationID, req, principalID)
+	updated, err := h.store.SupersedeDestination(r.Context(), destinationID, req, principalID, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		if errors.Is(err, domain.ErrInvalidTransition) {
 			writeError(w, http.StatusConflict, "destination is not in a state that can be superseded")
@@ -467,10 +458,8 @@ func (h *Handler) SupersedeDestination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventPayeeDestinationSuperseded, EntityID: updated.DestinationID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
+	// com.zoikosuite.banking.payee-destination.superseded is enqueued inside
+	// SupersedeDestination's own transaction — see pg_store.go.
 	h.maskIfNotPrivileged(r, principalID, updated.LegalEntityID, updated)
 	writeJSON(w, http.StatusOK, updated)
 }

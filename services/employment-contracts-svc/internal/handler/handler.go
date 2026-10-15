@@ -118,6 +118,12 @@ func (h *Handler) IssueContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate monolith-aligned fields
+	if req.ShiftType != nil && *req.ShiftType != "" && !domain.IsValidShiftType(*req.ShiftType) {
+		writeError(w, http.StatusBadRequest, "invalid_shift_type", domain.ErrInvalidShiftType.Error())
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -153,24 +159,35 @@ func (h *Handler) IssueContract(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	contract := &domain.EmploymentContract{
-		ContractID:       uuid.NewString(),
-		TenantID:         tenantID,
-		LegalEntityID:    req.LegalEntityID,
-		EmployeeID:       req.EmployeeID,
-		ContractNumber:   contractNum,
-		Version:          1,
-		ContractType:     req.ContractType,
-		Status:           "ACTIVE",
-		Title:            req.Title,
-		BaseSalaryAmount: req.BaseSalaryAmount,
-		Currency:         req.Currency,
-		PayFrequency:     req.PayFrequency,
-		EffectiveFrom:    req.EffectiveFrom,
-		EffectiveTo:      req.EffectiveTo,
-		DocumentVaultRef: req.DocumentVaultRef,
-		CorrelationID:    req.CorrelationID,
-		CreatedAt:        now,
-		UpdatedAt:        now,
+		ContractID:         uuid.NewString(),
+		TenantID:           tenantID,
+		LegalEntityID:      req.LegalEntityID,
+		EmployeeID:         req.EmployeeID,
+		ContractNumber:     contractNum,
+		Version:            1,
+		ContractType:       domain.ContractType(req.ContractType),
+		Status:             domain.ContractStatusActive,
+		Title:              req.Title,
+		BaseSalaryAmount:   req.BaseSalaryAmount,
+		Currency:           req.Currency,
+		PayFrequency:       domain.PayFrequency(req.PayFrequency),
+		EffectiveFrom:      req.EffectiveFrom,
+		EffectiveTo:        req.EffectiveTo,
+		DocumentVaultRef:   req.DocumentVaultRef,
+		CorrelationID:      req.CorrelationID,
+		CTC:                req.CTC,
+		BasicSalary:        req.BasicSalary,
+		HRA:                req.HRA,
+		SpecialAllowance:   req.SpecialAllowance,
+		ConveyanceAllowance: req.ConveyanceAllowance,
+		MedicalAllowance:   req.MedicalAllowance,
+		LTA:                req.LTA,
+		ProbationPeriodDays: req.ProbationPeriodDays,
+		NoticePeriodDays:   req.NoticePeriodDays,
+		WorkingHoursPerWeek: req.WorkingHoursPerWeek,
+		ShiftType:          req.ShiftType,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 
 	created, err := h.store.IssueContract(r.Context(), contract)
@@ -323,7 +340,7 @@ func (h *Handler) AmendContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if oldContract.Status != "ACTIVE" {
+	if oldContract.Status != domain.ContractStatusActive {
 		writeError(w, http.StatusConflict, "contract_not_active", "only ACTIVE contracts can be amended")
 		return
 	}
@@ -342,59 +359,73 @@ func (h *Handler) AmendContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate monolith-aligned fields
+	if req.Currency != nil && *req.Currency != "" && !domain.IsValidCurrency(*req.Currency) {
+		writeError(w, http.StatusBadRequest, "invalid_currency", domain.ErrInvalidCurrency.Error())
+		return
+	}
+	if req.PayFrequency != nil && *req.PayFrequency != "" && !domain.IsValidPayFrequency(*req.PayFrequency) {
+		writeError(w, http.StatusBadRequest, "unknown_pay_frequency", domain.ErrUnknownPayFrequency.Error())
+		return
+	}
+	if req.BaseSalaryAmount != nil && *req.BaseSalaryAmount <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_salary", domain.ErrInvalidSalary.Error())
+		return
+	}
+	if req.ShiftType != nil && *req.ShiftType != "" && !domain.IsValidShiftType(*req.ShiftType) {
+		writeError(w, http.StatusBadRequest, "invalid_shift_type", domain.ErrInvalidShiftType.Error())
+		return
+	}
+
 	title := oldContract.Title
 	if req.Title != nil {
 		title = *req.Title
 	}
 
-	// The amend path takes each of these as an optional override and, unlike
-	// the issue path, never checked any of them. A negative salary or an
-	// unknown pay frequency could only ever arrive this way.
 	salary := oldContract.BaseSalaryAmount
 	if req.BaseSalaryAmount != nil {
-		if *req.BaseSalaryAmount <= 0 {
-			writeError(w, http.StatusBadRequest, "invalid_salary", domain.ErrInvalidSalary.Error())
-			return
-		}
 		salary = *req.BaseSalaryAmount
 	}
 
 	currency := oldContract.Currency
 	if req.Currency != nil {
-		if !domain.IsValidCurrency(*req.Currency) {
-			writeError(w, http.StatusBadRequest, "invalid_currency", domain.ErrInvalidCurrency.Error())
-			return
-		}
 		currency = *req.Currency
 	}
 
 	freq := oldContract.PayFrequency
 	if req.PayFrequency != nil {
-		if !domain.IsValidPayFrequency(*req.PayFrequency) {
-			writeError(w, http.StatusBadRequest, "unknown_pay_frequency", domain.ErrUnknownPayFrequency.Error())
-			return
-		}
-		freq = *req.PayFrequency
+		freq = domain.PayFrequency(*req.PayFrequency)
 	}
 
 	now := time.Now().UTC()
 	newContract := &domain.EmploymentContract{
-		ContractID:       uuid.NewString(),
-		TenantID:         oldContract.TenantID,
-		LegalEntityID:    oldContract.LegalEntityID,
-		EmployeeID:       oldContract.EmployeeID,
-		ContractNumber:   oldContract.ContractNumber,
-		Version:          oldContract.Version + 1,
-		ContractType:     oldContract.ContractType,
-		Status:           "ACTIVE",
-		Title:            title,
-		BaseSalaryAmount: salary,
-		Currency:         currency,
-		PayFrequency:     freq,
-		EffectiveFrom:    req.EffectiveFrom,
-		DocumentVaultRef: oldContract.DocumentVaultRef,
-		CreatedAt:        now,
-		UpdatedAt:        now,
+		ContractID:            uuid.NewString(),
+		TenantID:              oldContract.TenantID,
+		LegalEntityID:         oldContract.LegalEntityID,
+		EmployeeID:            oldContract.EmployeeID,
+		ContractNumber:        oldContract.ContractNumber,
+		Version:               oldContract.Version + 1,
+		ContractType:          oldContract.ContractType,
+		Status:                domain.ContractStatusActive,
+		Title:                 title,
+		BaseSalaryAmount:      salary,
+		Currency:              currency,
+		PayFrequency:          freq,
+		EffectiveFrom:         req.EffectiveFrom,
+		DocumentVaultRef:      oldContract.DocumentVaultRef,
+		CTC:                   req.CTC,
+		BasicSalary:           req.BasicSalary,
+		HRA:                   req.HRA,
+		SpecialAllowance:      req.SpecialAllowance,
+		ConveyanceAllowance:   req.ConveyanceAllowance,
+		MedicalAllowance:      req.MedicalAllowance,
+		LTA:                   req.LTA,
+		ProbationPeriodDays:   req.ProbationPeriodDays,
+		NoticePeriodDays:      req.NoticePeriodDays,
+		WorkingHoursPerWeek:   req.WorkingHoursPerWeek,
+		ShiftType:             req.ShiftType,
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 
 	amendment := &domain.ContractAmendment{
@@ -455,6 +486,11 @@ func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.TerminationType != nil && *req.TerminationType != "" {
+		// Termination type validation would be added if we had a vocabulary function
+		// For now, just accept it
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -482,7 +518,7 @@ func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oldContract.Status = "TERMINATED"
+	oldContract.Status = domain.ContractStatusTerminated
 	oldContract.EffectiveTo = &req.TerminationDate
 	oldContract.UpdatedAt = time.Now().UTC()
 

@@ -37,8 +37,12 @@ import (
 	"zoiko.io/authorization-svc/internal/events"
 	"zoiko.io/authorization-svc/internal/handler"
 	"zoiko.io/authorization-svc/internal/health"
+	"zoiko.io/authorization-svc/internal/idempotency"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
+	"zoiko.io/authorization-svc/internal/outbox"
+	"zoiko.io/authorization-svc/internal/registry"
 	"zoiko.io/authorization-svc/internal/mtls"
+	"zoiko.io/authorization-svc/internal/workload"
 	"zoiko.io/authorization-svc/internal/retention"
 	"zoiko.io/authorization-svc/internal/siem"
 	"zoiko.io/authorization-svc/internal/store"
@@ -74,6 +78,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() { _ = log.Sync() }()
+
+	if err := cfg.Validate(); err != nil {
+		log.Fatal("invalid configuration", zap.Error(err))
+	}
 
 	log.Info("authorization-svc starting",
 		zap.Int("port", cfg.Port),
@@ -129,6 +137,13 @@ func main() {
 	// see internal/cache's package comment, which is the part worth reading
 	// before changing this line.
 	authzStore := cache.New(pgStore, cfg.CacheTTL, log)
+	// The assignment / policy version watermark in every cache key (000028):
+	// writes on any replica retire cached entries within a second.
+	watermarkCtx, stopWatermark := context.WithCancel(context.Background())
+	defer stopWatermark()
+	if authzStore.Enabled() {
+		go authzStore.RunWatermark(watermarkCtx, pgStore.VersionWatermark, time.Second)
+	}
 	if authzStore.Enabled() {
 		log.Info("authorization read cache enabled", zap.Duration("ttl", cfg.CacheTTL))
 	} else {
@@ -141,10 +156,20 @@ func main() {
 	// metadata request, so every write to a not-yet-existing topic fails
 	// with "Unknown Topic Or Partition" regardless of the broker-side
 	// setting.
+	//
+	// BatchTimeout: kafka-go holds an incomplete batch for up to a second by
+	// default, so every single-message write waited that long — the outbox
+	// relay drained about one event per second (Governance audit N-04). 10ms
+	// keeps batching for bursts without a per-write second.
+	//
+	// Hash, not LeastBytes: LeastBytes ignores the message key, so successive
+	// events about the same subject could land on different partitions and be
+	// consumed out of order. Hashing the key keeps one key on one partition.
 	kafkaWriter := &kafka.Writer{
 		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
 		Topic:                  cfg.Kafka.Topic,
-		Balancer:               &kafka.LeastBytes{},
+		Balancer:               &kafka.Hash{},
+		BatchTimeout:           10 * time.Millisecond,
 		AllowAutoTopicCreation: true,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
@@ -161,6 +186,15 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
+	// Which SERVICE may ask for a decision (register A-02). Both listeners
+	// share this router; on the plaintext one r.TLS is nil, so in require
+	// mode every evaluation call there is refused 401. Ahead of the envelope
+	// so the actor it resolves is the certificate's name, not a header.
+	workloadGate := workload.New(workload.Mode(cfg.EvaluationMTLS), cfg.PEPAllowList, log)
+	r.Use(workloadGate.Middleware)
+	log.Info("evaluation workload gate configured",
+		zap.String("mode", string(workloadGate.Mode())), zap.Strings("registered_peps", workloadGate.Registered()))
+
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
 	// Recoverer and telemetry so a refusal is still traced, and ahead of every
 	// handler so no request reaches business logic without a resolved tenant,
@@ -171,14 +205,51 @@ func main() {
 	// policy classifies POST /v1/authorize as a material write, which refused
 	// almost every caller of the evaluation endpoint. See handler.MaterialWrite.
 	r.Use(svcenvelope.Middleware(handler.EnvelopePolicy(), svcenvelope.DefaultReporter()))
+	// Idempotency-Key honoured on material writes (migration 000021): a retry
+	// is answered from the first response instead of creating a second grant
+	// or rule. After the envelope, so a refused request claims no key.
+	r.Use(idempotency.Middleware(pgStore, handler.MaterialWrite, log))
 
 	siemClient := siem.New(cfg.SIEMServiceURL, "authorization-svc", log)
 	// Drains the SIEM queue on shutdown. Streaming is fire-and-forget, so
 	// without this a SIGTERM would discard security events already accepted
 	// from a request that has long since been answered.
 	defer siemClient.Close()
-	h := handler.New(authzStore, publisher, jurisdictionValidator, siemClient, cfg.PlatformScopeEntityID, log)
+	h := handler.New(authzStore, publisher, jurisdictionValidator, siemClient, cfg.PlatformScopeEntityID, cfg.EnforceTenantOnAuthorize, log)
+	// Decision events go through the transactional outbox (migration 000020):
+	// written with the decision, published by the relay below, so a Kafka
+	// outage delays authorization.denied and sod.violation.detected rather than
+	// losing them.
+	h.UseOutbox(events.DecisionEvents)
+	if cfg.CommandContractEnforce {
+		h.SetCommandContract(handler.CommandContractEnforce)
+	} else {
+		log.Warn("AUTHZ_COMMAND_CONTRACT=warn — admin commands without reason_code are admitted and marked; set enforce once callers send it")
+	}
+	h.SetStepUpPolicy(handler.StepUpPolicy{
+		Actions:            cfg.StepUpActions,
+		MaxAuthnAgeSeconds: cfg.StepUpMaxAuthnAgeSeconds,
+		UnknownAgeStepsUp:  cfg.StepUpUnknownAge != "permit",
+	})
+	if cfg.StepUpUnknownAge == "permit" {
+		log.Warn("AUTHZ_STEP_UP_UNKNOWN_AGE=permit — a step-up action with no stated authentication age is treated as recent; set step_up once PEPs forward X-Authn-Age-Seconds")
+	}
+	if cfg.EntityRegistryURL != "" {
+		h.SetEntityRegistry(registry.NewHTTPClient(cfg.EntityRegistryURL, log))
+		log.Info("entity registry check wired", zap.String("url", cfg.EntityRegistryURL))
+	} else {
+		log.Warn("AUTHZ_ENTITY_REGISTRY_URL unset — tenants of unprojected entities are not verified; tenantless questions about them are evaluated across tenants")
+	}
 	handler.RegisterRoutes(r, h)
+
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	go outbox.NewRelay(pool, kafkaWriter, time.Second, 100, log).Run(relayCtx)
+	// Records what has run out: GOV-04 exceptions past expiry
+	// (sod.exception.expired) and privileged assignments whose approval
+	// window passed. Decisions already ignore both from the instant they
+	// expire; this makes the state and the event say so.
+	go pgStore.RunExpirySweeper(relayCtx)
 
 	if cfg.PlatformScopeEntityID == "" {
 		// Not fatal, but worth one loud line at boot: without it every
@@ -216,15 +287,40 @@ func main() {
 	// every caller still on the plain port above keeps working unchanged.
 	var mtlsSrv *http.Server
 	if cfg.MTLSEnabled {
-		bootstrapToken := loadMTLSBootstrapToken(cfg.MTLSBootstrapTokenPath, log)
-		identity, err := mtls.ProvisionServerIdentity(context.Background(), cfg.MTLSManagementServiceURL, "authorization-svc", platformScopeID, bootstrapToken)
+		// The token file is re-read on every provisioning, so a rotated
+		// bootstrap token is picked up by the next renewal.
+		provision := func(ctx context.Context) (*mtls.ServerIdentity, error) {
+			return mtls.ProvisionServerIdentity(ctx, cfg.MTLSManagementServiceURL, "authorization-svc", platformScopeID,
+				loadMTLSBootstrapToken(cfg.MTLSBootstrapTokenPath, log))
+		}
+		first, err := provision(context.Background())
 		if err != nil {
 			log.Fatal("mtls: failed to provision server identity", zap.Error(err))
 		}
-		tlsConfig, err := mtls.ServerTLSConfig(identity)
+		identity, err := mtls.NewRotatingIdentity(first)
 		if err != nil {
 			log.Fatal("mtls: failed to build server tls config", zap.Error(err))
 		}
+		// Renewed before it expires (Governance audit N-11): the 90-day
+		// certificate used to be frozen at boot, so the listener refused every
+		// handshake from day 91 until a restart.
+		go identity.Run(relayCtx, provision, log)
+		log.Info("mtls: server identity provisioned", zap.Time("not_after", identity.NotAfter()), zap.Time("renew_at", identity.RenewAt()))
+		// Revocation (register M-03): client certificates on
+		// mtls-management-svc's CRL are refused at the handshake, and so is
+		// every client certificate while no current CRL is held.
+		if cfg.MTLSRevocationCheck != "off" {
+			revocation := mtls.NewRevocationChecker(cfg.MTLSCRLURL, identity.CACertificates)
+			if err := revocation.Refresh(context.Background()); err != nil {
+				log.Warn("mtls: initial CRL fetch failed — client certificates are refused until one is fetched", zap.Error(err))
+			}
+			identity.SetPeerVerifier(revocation.VerifyConnection)
+			go revocation.Run(relayCtx, time.Duration(cfg.MTLSCRLRefreshSeconds)*time.Second, log)
+			log.Info("mtls: client certificate revocation check on", zap.String("crl_url", cfg.MTLSCRLURL))
+		} else {
+			log.Warn("mtls: MTLS_REVOCATION_CHECK=off — a revoked client certificate is admitted until it expires (ENV=local only)")
+		}
+		tlsConfig := identity.TLSConfig()
 		mtlsAddr := ":" + strconv.Itoa(cfg.MTLSPort)
 		mtlsSrv = &http.Server{
 			Addr:         mtlsAddr,
@@ -366,6 +462,41 @@ func main() {
 		lifecycleConsumer := events.NewLifecycleConsumer(log, authzStore)
 		go lifecycleConsumer.Run(consumerCtx, lifecycleReader)
 		log.Info("lifecycle consumer wired", zap.Strings("topics", cfg.Kafka.LifecycleTopics))
+
+		// Cross-replica cache invalidation. Its own consumer group PER
+		// REPLICA, so every replica sees every message (a broadcast); the
+		// lifecycle consumer's shared group hands each message to one replica
+		// only, which left every other replica serving a revoked grant until
+		// its TTL. Starts at the latest offset: a new replica has nothing
+		// cached to invalidate.
+		//
+		// The group is named after the replica. AUTHZ_REPLICA_ID gives it a
+		// stable name (a StatefulSet ordinal, a slot number) so a restart
+		// rejoins its own group; the hostname fallback is a new group per pod
+		// on a Deployment, and every restart then leaves one behind on the
+		// broker until its offsets expire (Governance audit N-15).
+		host := cfg.ReplicaID
+		if host == "" {
+			host, _ = os.Hostname()
+		}
+		invalidationTopics := append(append([]string{}, cfg.Kafka.LifecycleTopics...), cfg.Kafka.Topic)
+		if cfg.Kafka.DelegationTopic != "" {
+			invalidationTopics = append(invalidationTopics, cfg.Kafka.DelegationTopic)
+		}
+		invalidationReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers:                cfg.Kafka.Brokers,
+			GroupID:                cfg.Kafka.LifecycleGroupID + "-invalidate-" + host,
+			GroupTopics:            invalidationTopics,
+			StartOffset:            kafka.LastOffset,
+			MinBytes:               1,
+			MaxBytes:               10e6,
+			MaxWait:                500 * time.Millisecond,
+			ErrorLogger:            kafkaErrorLogger(log, strings.Join(invalidationTopics, ",")),
+			WatchPartitionChanges:  true,
+			PartitionWatchInterval: partitionWatchInterval,
+		})
+		go events.NewCacheInvalidator(log, authzStore).Run(consumerCtx, invalidationReader)
+		log.Info("cache invalidator wired", zap.Strings("topics", invalidationTopics))
 	}
 
 	// ── access_decision_log retention ──────────────────────────────────────
@@ -387,6 +518,7 @@ func main() {
 		defer stopRetention()
 		sweeper := retention.New(pgStore, log, cfg.RetentionSweepInterval,
 			cfg.PartitionMonthsAhead, cfg.AccessDecisionRetentionMonths)
+		sweeper.SetPurge(cfg.OutboxRetention, cfg.IdempotencyRetention)
 		go sweeper.Run(retentionCtx)
 	}
 

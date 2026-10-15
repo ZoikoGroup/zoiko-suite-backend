@@ -31,6 +31,9 @@ type lifecycleStub struct {
 	projectErr error
 
 	invalidatedTenants []string
+
+	entities  []domain.ProjectEntityStatusParams
+	entityErr error
 }
 
 func (s *lifecycleStub) ProjectPrincipalStatus(_ context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error) {
@@ -43,6 +46,14 @@ func (s *lifecycleStub) ProjectPrincipalStatus(_ context.Context, params domain.
 		TenantID:    params.TenantID,
 		Status:      params.Status,
 	}, nil
+}
+
+func (s *lifecycleStub) ProjectEntityStatus(_ context.Context, p domain.ProjectEntityStatusParams) error {
+	if s.entityErr != nil {
+		return s.entityErr
+	}
+	s.entities = append(s.entities, p)
+	return nil
 }
 
 func (s *lifecycleStub) InvalidateGrantSourcesForTenant(tenantID string) {
@@ -471,9 +482,9 @@ func TestLifecycle_AbsentStatusChangedAtIsNilNotZeroTime(t *testing.T) {
 	if len(store.projected) != 1 {
 		t.Fatalf("projected %d rows, want 1", len(store.projected))
 	}
-	// nil, not the zero time. A zero time would order BEFORE every stored
-	// value, so the store's staleness check would refuse every event from a
-	// producer that does not send the field — which is the current producer.
+	// nil, not the zero time, when neither the payload nor the envelope
+	// (emitted_at, N-05) says when. A zero time would order BEFORE every stored
+	// value, so the store's staleness check would refuse every such event.
 	if store.projected[0].StatusChangedAt != nil {
 		t.Fatalf("status_changed_at = %v, want nil — the zero time would make every event from the current producer look stale",
 			store.projected[0].StatusChangedAt)

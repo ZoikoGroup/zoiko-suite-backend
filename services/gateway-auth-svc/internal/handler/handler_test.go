@@ -308,6 +308,24 @@ func TestVerify_CartaDeny_Returns403(t *testing.T) {
 	assert.Equal(t, "DENY", rec.Header().Get("X-Carta-Decision"))
 }
 
+// A decision the gateway does not recognise must block, not pass. The block
+// used to be a list of named decisions, so a value carta-svc added later, or
+// a casing drift of an existing one, walked through as if ALLOW. ("" is not
+// tested here: newTestEnvWith reads it as "no carta-svc at all".)
+func TestVerify_CartaUnrecognisedDecision_Returns403(t *testing.T) {
+	for _, decision := range []string{"REVIEW", "step_up_mfa"} {
+		h, key, _ := newTestEnvWithCartaDecision(t, decision)
+		req := httptest.NewRequest(http.MethodGet, "/verify", nil)
+		req.Header.Set("Authorization", "Bearer "+mintEnvelope(t, key, testKid, validClaims()))
+		rec := httptest.NewRecorder()
+
+		h.Verify(rec, req)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, "decision %q", decision)
+		assert.Empty(t, rec.Header().Get("X-Principal-Id"), "decision %q must not forward identity", decision)
+	}
+}
+
 // TestVerify_ResolvedTenantMismatch_Returns403 proves acceptance test O:
 // a validly-signed token claiming tenant-abc, presented against a request
 // GTRM's per-tenant routing already resolved to a DIFFERENT tenant, must be

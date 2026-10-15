@@ -232,8 +232,16 @@ type SupportContext struct {
 	Justification       string    `json:"justification"`
 	TicketRef           string    `json:"ticket_ref"`
 	ApproverPrincipalID string    `json:"approver_principal_id"`
-	GrantedAt           time.Time `json:"granted_at"`
-	ExpiresAt           time.Time `json:"expires_at"`
+	// RequestedByPrincipalID made the request; ApprovalStatus is
+	// PENDING_APPROVAL until the named approver approves it with their own
+	// call (S1-1 / R-2). A pending request grants nothing: GrantedAt and
+	// ExpiresAt are restarted at approval.
+	RequestedByPrincipalID string     `json:"requested_by_principal_id,omitempty"`
+	ApprovalStatus         string     `json:"approval_status"`
+	ApprovedAt             *time.Time `json:"approved_at,omitempty"`
+	RequestedTTLSeconds    int        `json:"requested_ttl_seconds,omitempty"`
+	GrantedAt              time.Time  `json:"granted_at"`
+	ExpiresAt              time.Time  `json:"expires_at"`
 	// RevokedAt and RevocationReason are append-only, set at most once.
 	RevokedAt        *time.Time `json:"revoked_at"`
 	RevocationReason *string    `json:"revocation_reason"`
@@ -254,6 +262,10 @@ func (s *SupportContext) Live(t time.Time) bool {
 		return false
 	}
 	if s.RevokedAt != nil {
+		return false
+	}
+	// A request the approver has not approved grants nothing.
+	if s.ApprovalStatus == SupportPendingApproval {
 		return false
 	}
 	if !t.Before(s.ExpiresAt) {
@@ -324,6 +336,23 @@ var (
 	// silently clamped: clamping would issue a grant nobody asked for and
 	// nobody reviewed.
 	ErrSupportTTLExceeded = errors.New("requested support window exceeds the maximum permitted TTL")
+
+	// ErrSupportNotApprover: only the approver the request names may approve
+	// it. Naming someone is a request for their approval, never the approval.
+	ErrSupportNotApprover = errors.New("only the approver named on the support request may approve it")
+
+	// ErrSupportNotPending: the request was already approved or revoked.
+	ErrSupportNotPending = errors.New("the support request is not awaiting approval")
+
+	// ErrSupportApprovalLapsed: the request was not approved within the
+	// approval window; a new request is needed.
+	ErrSupportApprovalLapsed = errors.New("the support request was not approved in time; make a new request")
+)
+
+// Support request approval states (migration 000011).
+const (
+	SupportPendingApproval = "PENDING_APPROVAL"
+	SupportApproved        = "APPROVED"
 )
 
 // ---------------------------------------------------------------------------
@@ -537,6 +566,7 @@ type AttachSupportContextRequest struct {
 // AttachSupportContextResponse returns the grant and its evidence.
 type AttachSupportContextResponse struct {
 	SupportContextID string    `json:"support_context_id"`
+	ApprovalStatus   string    `json:"approval_status"`
 	ExpiresAt        time.Time `json:"expires_at"`
 	EvidenceID       string    `json:"evidence_id"`
 }

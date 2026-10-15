@@ -11,6 +11,9 @@ type Config struct {
 	KafkaBrokers     string
 	KafkaEventsTopic string
 	AuthzServiceURL  string
+	// PaymentStatusServiceURL is BNK-07, consulted before a payment is
+	// applied to a payable.
+	PaymentStatusServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -28,6 +31,7 @@ func Load() (*Config, error) {
 		KafkaBrokers:     getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
 		KafkaEventsTopic: getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.payable-open-item.events"),
 		AuthzServiceURL:  getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		PaymentStatusServiceURL: getEnvOrDefault("PAYMENT_STATUS_SERVICE_URL", "http://payment-status-svc:8163"),
 	}, nil
 }
 

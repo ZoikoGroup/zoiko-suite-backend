@@ -4,7 +4,7 @@
 //  1. Load config from environment
 //  2. Initialise structured logger (zap)
 //  3. Connect to PostgreSQL pool (pgxpool) — Tier 0 pool sizing
-//  4. Construct PgStore, Kafka producer, jurisdiction-rules-svc validator
+//  4. Construct PgStore, Kafka producer (outbox relay), idempotency middleware, spend-controls/purchase-order clients
 //  5. Construct HTTP handler + mount routes on chi router
 //  6. Mount health probes (/healthz, /readyz)
 //  7. Start HTTP server with graceful shutdown
@@ -35,8 +35,12 @@ import (
 	"zoiko.io/purchase-request-svc/internal/events"
 	"zoiko.io/purchase-request-svc/internal/handler"
 	"zoiko.io/purchase-request-svc/internal/health"
+	"zoiko.io/purchase-request-svc/internal/idempotency"
 	svcmiddleware "zoiko.io/purchase-request-svc/internal/middleware"
 	"zoiko.io/purchase-request-svc/internal/mtls"
+	"zoiko.io/purchase-request-svc/internal/outbox"
+	"zoiko.io/purchase-request-svc/internal/purchaseorder"
+	"zoiko.io/purchase-request-svc/internal/spendcontrols"
 	"zoiko.io/purchase-request-svc/internal/store"
 	"zoiko.io/purchase-request-svc/internal/telemetry"
 )
@@ -175,7 +179,46 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	// Idempotency-Key replay (spec §16) runs after the envelope has validated
+	// the headers and the tenant is known, and before any handler.
+	r.Use(idempotency.Middleware(idempotency.NewPgStore(pool), idempotency.Options{
+		TenantFromContext: svcmiddleware.TenantFromContext,
+		Log:               log,
+	}))
+
+	// Transactional outbox relay: delivers the events written in the same
+	// transaction as each state change.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	go outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, log).Start(relayCtx)
+
+	// Expiry sweep: PENDING_APPROVAL/APPROVED requisitions past expires_at.
+	go func() {
+		t := time.NewTicker(cfg.ExpirySweepInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-relayCtx.Done():
+				return
+			case <-t.C:
+				if n, err := pgStore.ExpireDue(relayCtx, time.Now().UTC()); err != nil {
+					log.Error("requisition expiry sweep failed", zap.Error(err))
+				} else if n > 0 {
+					log.Info("requisitions expired", zap.Int("count", n))
+				}
+			}
+		}
+	}()
+
+	var spendClient spendcontrols.Client
+	if cfg.SpendControlsURL != "" {
+		spendClient = spendcontrols.NewHTTPClient(cfg.SpendControlsURL)
+	}
+	h := handler.New(pgStore, authzClient, spendClient, purchaseorder.NewHTTPClient(cfg.PurchaseOrderURL), handler.Config{
+		ControlledCategories: cfg.ControlledCategories,
+		ApprovalThreshold:    cfg.RequisitionApprovalThreshold,
+		MakerChecker:         cfg.MakerChecker,
+	}, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

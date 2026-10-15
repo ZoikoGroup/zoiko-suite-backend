@@ -32,6 +32,8 @@ func NewJWTVerifier(cfg *config.Config) *JWTVerifier {
 type idpClaims struct {
 	TenantID string `json:"tenant_id"`
 	MFADone  bool   `json:"mfa_done"`
+	// AuthorizedParty is the OIDC azp: the client the token was issued to.
+	AuthorizedParty string `json:"azp"`
 	jwt.RegisteredClaims
 }
 
@@ -71,6 +73,7 @@ func (v *JWTVerifier) VerifyBearer(_ context.Context, token string) (*domain.Ver
 		Subject:  claims.Subject,
 		TenantID: claims.TenantID,
 		MFADone:  claims.MFADone,
+		ClientID: claims.AuthorizedParty,
 	}, nil
 }
 

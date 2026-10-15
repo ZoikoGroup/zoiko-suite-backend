@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
@@ -14,7 +15,7 @@ import (
 
 func TestCloseEvidence_RelianceManifestRoundTripsExactly(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, zap.NewNop(), store.WithEventRegion("uk"))
 	tenantID := uuid.NewString()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 	fp := &domain.FiscalPeriod{FiscalPeriodID: uuid.NewString(), TenantID: tenantID, LegalEntityID: "le-1",
@@ -33,7 +34,7 @@ func TestCloseEvidence_RelianceManifestRoundTripsExactly(t *testing.T) {
 		TrialBalanceHash: "tb-2", Signature: "sig-2", GeneratedAt: time.Now().UTC(),
 		RelianceManifest: manifest, RelianceHash: "abc", RelianceSignature: "def"}
 	for _, ev := range []*domain.CloseEvidence{legacy, pinned} {
-		if err := s.CreateCloseEvidence(ctx, ev); err != nil {
+		if err := s.CreateCloseEvidence(ctx, ev, "corr-1", "actor-1", "2026-10", "le-1"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -51,7 +52,7 @@ func TestCloseEvidence_RelianceManifestRoundTripsExactly(t *testing.T) {
 
 	half := &domain.CloseEvidence{EvidenceID: uuid.NewString(), TenantID: tenantID, FiscalPeriodID: fp.FiscalPeriodID,
 		TrialBalanceHash: "tb-3", Signature: "sig-3", GeneratedAt: time.Now().UTC(), RelianceManifest: manifest}
-	if err := s.CreateCloseEvidence(ctx, half); err == nil {
+	if err := s.CreateCloseEvidence(ctx, half, "corr-1", "actor-1", "2026-10", "le-1"); err == nil {
 		t.Fatal("a manifest without its hash and signature was stored")
 	}
 

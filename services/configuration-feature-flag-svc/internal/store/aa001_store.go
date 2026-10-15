@@ -2009,6 +2009,25 @@ func (s *PgStore) ApproveChange(ctx context.Context, changeID string, approval d
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 
+		// A tenant-owned change is decided only from its own tenant. Answered
+		// as not-found, the same as an id that does not exist.
+		if change.TenantID != nil && *change.TenantID != callerTenantID {
+			return domain.ErrChangeNotFound
+		}
+		// S3-2 / R-5: only a change awaiting a decision can take one. With no
+		// guard here a rejection sent a VERIFIED change back to PROPOSED and a
+		// re-approval to APPROVED, which made it activatable again.
+		if change.Status != domain.ChangeStatusProposed && change.Status != domain.ChangeStatusValidated {
+			return domain.ErrChangeNotApprovable
+		}
+		// S3-1 / R-4: C2 / C3 need an approval by somebody other than the
+		// proposer (AA-001 §8.1). Rejecting one's own change is allowed: it
+		// only withholds.
+		if approval.Approved && approval.ByPrincipalID == change.CreatedByPrincipalID &&
+			(change.ChangeClass == domain.ChangeClassC2 || change.ChangeClass == domain.ChangeClassC3) {
+			return domain.ErrChangeSelfApproval
+		}
+
 		// The approval record lives in config_changes.approval as {approved,
 		// by_principal_id, approved_at, wfc_reference?} (000006) — not in a
 		// separate approval table. A rejected approval keeps the change's
@@ -2026,11 +2045,15 @@ func (s *PgStore) ApproveChange(ctx context.Context, changeID string, approval d
 		if approval.Approved {
 			status = domain.ChangeStatusApproved
 		}
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE config_changes
 			SET status = $2, approval = $3, updated_at = NOW()
-			WHERE change_id = $1`, changeID, status, approvalJSON); err != nil {
+			WHERE change_id = $1 AND status IN ('PROPOSED', 'VALIDATED')`, changeID, status, approvalJSON)
+		if err != nil {
 			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		if tag.RowsAffected() != 1 {
+			return domain.ErrChangeNotApprovable
 		}
 
 		change.Status = status

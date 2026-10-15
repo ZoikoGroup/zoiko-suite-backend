@@ -31,6 +31,18 @@ type Policy struct {
 	// types it actually implements (v1: APPROVAL_THRESHOLD only).
 	PolicyType string `json:"policy_type"`
 
+	// TenantID: nullable, NULL means platform-wide policy family (not tenant-owned).
+	// Per 04-data-model.md §7.1: Policy is tenant-owned, but platform-wide policies exist.
+	TenantID *string `json:"tenant_id,omitempty"`
+
+	// PolicyStatus: DRAFT | ACTIVE | RETIRED (policy-level lifecycle, not version-level).
+	// Per 04-data-model.md §7.1: policy_status tracks the policy family's lifecycle.
+	PolicyStatus string `json:"policy_status"`
+
+	// VersioningMode: SIMPLE | BRANCHED | FORMAL — controls how versions are created/managed.
+	// Per 04-data-model.md §7.1: versioning_mode controls the versioning strategy.
+	VersioningMode string `json:"versioning_mode"`
+
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }
@@ -71,6 +83,26 @@ type PolicyVersion struct {
 
 	// VersionStatus: DRAFT | ACTIVE | SUPERSEDED | RETIRED — VARCHAR, not enum.
 	VersionStatus string `json:"version_status"`
+
+	// VersionNumber: sequential integer per policy, for human readability.
+	// Per 04-data-model.md §7.1.
+	VersionNumber int `json:"version_number"`
+
+	// Source: where this version originated (e.g. "internal", "imported", "migrated").
+	// Per GCP §18 / V-001 §7.
+	Source string `json:"source"`
+
+	// Rationale: human-readable explanation for why this version was created.
+	// Per GCP §18 / V-001 §7.
+	Rationale string `json:"rationale"`
+
+	// ArtifactDigest: SHA256 of the rule_payload for integrity verification.
+	// Per GCP §18 / V-001 §8.1.
+	ArtifactDigest string `json:"artifact_digest"`
+
+	// KnownFrom: when this version became known to the platform (decision_as_of / known_at).
+	// Per V-001 §8.1.
+	KnownFrom time.Time `json:"known_from"`
 
 	// ActivatedByPrincipalID is the principal who performed this version's
 	// DRAFT->ACTIVE transition. Nil until the version is activated for the

@@ -14,6 +14,16 @@ import (
 type Config struct {
 	Port int
 
+	// MTLS* enable the mutual-TLS listener gateway-auth-svc's mTLS client
+	// calls (SEC-INV-05; Group 1 register S5-B1). Off unless MTLS_ENABLED.
+	MTLSEnabled            bool
+	MTLSPort               int
+	MTLSManagementURL      string
+	MTLSBootstrapTokenPath string
+	// MTLSAllowedClients lists the client certificate CNs admitted on the
+	// mTLS listener; empty admits any certificate the platform CA issued.
+	MTLSAllowedClients []string
+
 	// JWT envelope signing (Q2 — signed short-lived JWT)
 	// Production: RS256 via KMS-backed keypair through Secret Vault Integration Service.
 	JWTSigningPrivateKeyPath string
@@ -54,6 +64,17 @@ type Config struct {
 	// Upstream Tier 0 service base URLs (read-only calls only)
 	TenantRegistryURL string
 	AccessControlURL  string
+
+	// CommercialAccountURL is COM-03 Entitlement (commercial-account-svc), the
+	// "commercial entitlement read model" §4 names for the entitlement context
+	// reference. Empty leaves it UPSTREAM_NOT_CONFIGURED. ServicePrincipalID is
+	// this service's identity there (platform COMMERCIAL_RESTRICTION_READ).
+	CommercialAccountURL string
+	ServicePrincipalID   string
+
+	// IDPClientChannels maps a verified IdP client id (azp) to its §4 source
+	// channel: IDP_CLIENT_CHANNELS="zoiko-console=web,zoiko-mobile=mobile".
+	IDPClientChannels map[string]string
 
 	// Authorization Service URL for admin mutation authorization checks.
 	// Must be set in production/staging; a placeholder is allowed only in local development.
@@ -335,6 +356,9 @@ func Load() (*Config, error) {
 		},
 		TenantRegistryURL:    env("TENANT_REGISTRY_URL", "http://tenant-registry-svc"),
 		AccessControlURL:     env("ACCESS_CONTROL_URL", "http://access-control-svc"),
+		CommercialAccountURL: env("COMMERCIAL_ACCOUNT_URL", ""),
+		ServicePrincipalID:   env("IDENTITY_SERVICE_PRINCIPAL_ID", "svc-identity-context"),
+		IDPClientChannels:    envPairs("IDP_CLIENT_CHANNELS"),
 		AuthzServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthzEnv:             env("AUTHZ_ENV", ""), // derived below; never defaulted here
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
@@ -448,6 +472,19 @@ func Load() (*Config, error) {
 		cfg.Kafka.ConsumeTopics = append([]string(nil), DefaultConsumeTopics...)
 	}
 
+	cfg.MTLSEnabled = envBool("MTLS_ENABLED", false)
+	cfg.MTLSPort = envInt("MTLS_PORT", 8449)
+	cfg.MTLSManagementURL = env("MTLS_MANAGEMENT_SERVICE_URL", "")
+	cfg.MTLSBootstrapTokenPath = env("MTLS_BOOTSTRAP_TOKEN_PATH", "")
+	for _, s := range strings.Split(env("MTLS_ALLOWED_CLIENTS", ""), ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			cfg.MTLSAllowedClients = append(cfg.MTLSAllowedClients, s)
+		}
+	}
+	if cfg.MTLSEnabled && cfg.MTLSManagementURL == "" {
+		return nil, fmt.Errorf("MTLS_ENABLED=true needs MTLS_MANAGEMENT_SERVICE_URL: the listener's certificate comes from mtls-management-svc")
+	}
+
 	return cfg, nil
 }
 
@@ -504,4 +541,16 @@ func envBool(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// envPairs parses "a=b,c=d" into a map; blanks and malformed pairs are skipped.
+func envPairs(key string) map[string]string {
+	out := map[string]string{}
+	for _, part := range strings.Split(os.Getenv(key), ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.TrimSpace(k) != "" && strings.TrimSpace(v) != "" {
+			out[strings.TrimSpace(k)] = strings.ToLower(strings.TrimSpace(v))
+		}
+	}
+	return out
 }

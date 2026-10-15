@@ -7,6 +7,7 @@ import (
 )
 
 type tenantCtxKey struct{}
+type correlationCtxKey struct{}
 
 func WithTenant(ctx context.Context, tenantID string) context.Context {
 	return context.WithValue(ctx, tenantCtxKey{}, tenantID)
@@ -17,13 +18,28 @@ func TenantFromContext(ctx context.Context) string {
 	return v
 }
 
+func WithCorrelation(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, correlationCtxKey{}, id)
+}
+
+// CorrelationFromContext is the caller's X-Correlation-ID, carried into the
+// outbox rows written by the store.
+func CorrelationFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(correlationCtxKey{}).(string)
+	return v
+}
+
 func TenantContext() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := r.Context()
 			if tenantID := r.Header.Get("X-Tenant-Id"); tenantID != "" {
-				r = r.WithContext(WithTenant(r.Context(), tenantID))
+				ctx = WithTenant(ctx, tenantID)
 			}
-			next.ServeHTTP(w, r)
+			if corr := r.Header.Get("X-Correlation-ID"); corr != "" {
+				ctx = WithCorrelation(ctx, corr)
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }

@@ -69,18 +69,67 @@ var untrustedInboundHeaders = []string{
 	"X-Zoiko-GTRM-State",
 	"X-Zoiko-GTRM-Map-Version",
 
-	// Governance envelope headers (§4 conditional fields, §5 class S server-resolved)
-	// These must be stripped so clients cannot self-assert authoritative context.
+	// Identity-class envelope headers. Nothing a client writes can establish a
+	// workload identity or a support session, so they are stripped here and
+	// again by ForwardAuth (see gatewayAuthResponseHeaders).
 	"X-Workload-Id",
 	"X-Support-Context-Id",
-	"X-Purpose-Context",
-	"X-Causation-Id",
-	"X-Approval-Reference",
-	"X-Workflow-Instance-Id",
-	"X-Evidence-Refs",
-	"X-Book-Id",
+
+	// Assurance- and subject-class headers authorization-svc reads (13 Oct
+	// 2026). A client wrote them straight through the edge: a forged
+	// X-Authn-Age-Seconds passed step-up, a forged audience passed the workload
+	// audience check, a forged on-behalf-of named the initiating subject.
+	// gateway-auth-svc sets X-Assurance-Level and X-Source-Channel-Basis from
+	// the signed envelope; the rest have no verified source yet, so they are
+	// only ever stripped.
+	"X-Assurance-Level",
+	"X-Authn-Age-Seconds",
+	"X-Audience",
+	"X-Token-Audience",
+	"X-Initiating-Subject-Id",
+	"X-On-Behalf-Of",
+	"X-Source-Channel-Basis",
+
+	// NOT stripped, deliberately: X-Purpose-Context, X-Approval-Reference,
+	// X-Evidence-Refs, X-Causation-Id, X-Workflow-Instance-Id, X-Book-Id,
+	// X-Expected-Version. The §4 envelope contract makes these caller-written
+	// assertions that the owning service validates. Stripping them failed
+	// every service that requires purpose or book with 400
+	// envelope_incomplete, and silently disabled optimistic concurrency.
+	//
+	// X-Source-Channel is not stripped HERE either: ForwardAuth must still see
+	// the caller's value, which gateway-auth-svc passes on (labelled
+	// "asserted") only when the signed envelope names no channel. It is in
+	// gatewayAuthResponseHeaders, so whatever reaches the backend is the
+	// gateway's answer (S1-B1).
+}
+
+// gatewayAuthResponseHeaders is the ForwardAuth authResponseHeaders list.
+// Traefik deletes each name from the forwarded request and then copies the
+// gateway's value, if it set one, so the list does two jobs: it makes every
+// header gateway-auth-svc's Verify sets authoritative, and it strips the ones
+// the gateway never sets. A header the handler sets and this list omits
+// passes the client's copy through untouched. It must match the compose
+// "gateway-auth" middleware; gateway-auth-svc's edge-contract test checks both.
+var gatewayAuthResponseHeaders = []string{
+	"X-Principal-Id",
+	"X-Tenant-Id",
+	"X-Legal-Entity-Id",
+	"X-Correlation-Id",
+	"X-Jurisdiction-Context",
+	"X-Timezone",
+	"X-Residency-Policy-Id",
+	"X-Tenant-Context-Stale",
+	"X-Workload-Id",
+	"X-Support-Context-Id",
 	"X-Source-Channel",
-	"X-Expected-Version",
+	"X-Source-Channel-Basis",
+	"X-Assurance-Level",
+	"X-Authn-Age-Seconds",
+	"X-Audience",
+	"X-Token-Audience",
+	"X-Initiating-Subject-Id",
+	"X-On-Behalf-Of",
 }
 
 const (
@@ -120,11 +169,16 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 	// gateway-auth ForwardAuth middleware: calls gateway-auth-svc /verify
 	// to validate every request's identity envelope. Configured once and
 	// shared by all tenant routers.
+	//
+	// trustForwardHeader stays off. With it on, Traefik passes the incoming
+	// X-Forwarded-Method/-Uri/-For to /verify instead of setting them from
+	// the real request, so behind any proxy the entrypoint trusts (the GCP
+	// L7 load balancer in production), a client's own "X-Forwarded-Method:
+	// GET" on a POST made the gateway score a write as a read.
 	cfg.HTTP.Middlewares[authMW] = traefikMiddleware{
 		ForwardAuth: &traefikForwardAuth{
-			Address:            "http://gateway-auth-svc:8092/verify",
-			TrustForwardHeader: true,
-			AuthResponseHeaders: []string{"X-Principal-Id", "X-Tenant-Id", "X-Workload-Id", "X-Carta-Decision"},
+			Address:             "http://gateway-auth-svc:8092/verify",
+			AuthResponseHeaders: gatewayAuthResponseHeaders,
 		},
 	}
 
@@ -182,7 +236,12 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 		cfg.HTTP.Routers[routerName] = traefikRouter{
 			Rule:        fmt.Sprintf("Host(`%s.%s`)", slug, m.EnvDomain),
 			Service:     svcName,
-			Middlewares: []string{edgeStripMW, authMW, ctxMW},
+			// ctx BEFORE auth. Traefik runs these in order, and ForwardAuth
+			// sends /verify the request as it stands at that point. With auth
+			// second, the edge had just deleted X-Zoiko-Resolved-Tenant-Id and
+			// ctx had not yet set it, so the token/hostname tenant check
+			// (acceptance test O) saw no header and never compared anything.
+			Middlewares: []string{edgeStripMW, ctxMW, authMW},
 			Priority:    primaryPriority,
 			EntryPoints: []string{"web", "websecure"},
 		}

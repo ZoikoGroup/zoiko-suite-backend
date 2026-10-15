@@ -34,17 +34,21 @@ type Store interface {
 	// ApplyPeriodTransition moves a period to u.To from one of allowedFrom,
 	// recording the transition atomically; ErrInvalidPeriodTransition (with
 	// the current period) when its state no longer allows it.
-	ApplyPeriodTransition(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate) (*domain.FiscalPeriod, error)
-	CreateReopenRequest(ctx context.Context, req *domain.ReopenRequest) error
+	// If fact is non-empty, a period lifecycle event is enqueued to the
+	// transactional outbox in the same transaction (e.g. "soft_closed",
+	// "close_review_started", "reopened", "reclosed").
+	ApplyPeriodTransition(ctx context.Context, id string, allowedFrom []string, u domain.PeriodUpdate, fact, legacyType, correlationID, actorID string) (*domain.FiscalPeriod, error)
+	CreateReopenRequest(ctx context.Context, req *domain.ReopenRequest, correlationID, actorID string) error
 	GetReopenRequest(ctx context.Context, requestID string) (*domain.ReopenRequest, error)
-	ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time) (*domain.ReopenRequest, *domain.FiscalPeriod, error)
-	RejectReopenRequest(ctx context.Context, requestID, deciderID, reason string, at time.Time) (*domain.ReopenRequest, error)
+	ApproveReopenRequest(ctx context.Context, requestID, approverID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, *domain.FiscalPeriod, error)
+	RejectReopenRequest(ctx context.Context, requestID, deciderID, reason string, at time.Time, correlationID, actorID string) (*domain.ReopenRequest, error)
 	GetCloseHistory(ctx context.Context, fiscalPeriodID string) (*domain.CloseHistory, error)
-	CreateCloseEvidence(ctx context.Context, evidence *domain.CloseEvidence) error
+	CreateCloseEvidence(ctx context.Context, evidence *domain.CloseEvidence, correlationID, actorID string, periodName, legalEntityID string) error
 	ListCloseEvidence(ctx context.Context, fiscalPeriodID string) ([]domain.CloseEvidence, error)
 	// CreateControlRun persists one ACC-06 subledger-to-GL reconciliation
 	// result — append-only, see migration 000004's doc comment.
-	CreateControlRun(ctx context.Context, run *domain.SubledgerControlRun) error
+	// If the run's status is EXCEPTION, enqueues a period.subledger_control_exception event.
+	CreateControlRun(ctx context.Context, run *domain.SubledgerControlRun, correlationID, actorID string) error
 	ListControlRuns(ctx context.Context, legalEntityID, fiscalPeriod string) ([]domain.SubledgerControlRun, error)
 
 	// ACC-07 (Accruals) — see internal/domain's AccrualSchedule doc comment
@@ -142,18 +146,6 @@ type Store interface {
 	ListPostedJournalRefs(ctx context.Context, legalEntityID string) ([]domain.PostedJournalRef, error)
 	GetLineageProjectionStatus(ctx context.Context, legalEntityID string) (*domain.LineageProjectionStatus, error)
 	UpsertLineageProjectionStatus(ctx context.Context, legalEntityID, status string, degradedReason *string, at *time.Time) error
-}
-
-type Publisher interface {
-	PublishCloseStarted(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod)
-	PublishCloseBlocked(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod, reasons []string)
-	PublishClosed(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod, evidenceID string)
-	PublishReopened(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod, reason string)
-	// PublishPeriodTransition announces a close state change that has no
-	// dedicated event: period.soft_closed, period.close_review_started,
-	// period.reopen_requested, period.reopen_rejected, period.reclosed.
-	PublishPeriodTransition(ctx context.Context, eventType, correlationID, actorID string, fp domain.FiscalPeriod, details map[string]any)
-	PublishSubledgerControlException(ctx context.Context, correlationID, actorID string, run domain.SubledgerControlRun)
 }
 
 type AuthZClient interface {
@@ -335,10 +327,9 @@ const (
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	clients   Clients
+	store   Store
+	authz   AuthZClient
+	clients Clients
 	// signingKey is the HMAC secret for close evidence. See signEvidence.
 	signingKey []byte
 	log        *zap.Logger
@@ -356,6 +347,13 @@ type Handler struct {
 	// bankReconCutoffDays — see config.BankReconCutoffDays. Zero means the
 	// statement must be dated on the period's last day itself.
 	bankReconCutoffDays int
+
+
+	// REF-05 cutover phase 1 (see period_mirror.go). All nil/empty by default,
+	// which means: no mirroring, and the workflow-ref endpoint refuses everyone.
+	mirror             PeriodMirror
+	workflowRefs       WorkflowRefReader
+	workflowRefCallers map[string]struct{}
 }
 
 // SetCloseGateEnforced turns the financial-control-svc close-gate dependency
@@ -386,10 +384,9 @@ func (h *Handler) SetBankReconciliationGate(enforce bool, cutoffDays int) *Handl
 // without SetBankReconciliationGate (tests, and any future constructor).
 const defaultBankReconCutoffDays = 4
 
-func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, signingKey []byte, log *zap.Logger) *Handler {
+func New(store Store, authz AuthZClient, clients Clients, signingKey []byte, log *zap.Logger) *Handler {
 	return &Handler{
 		store:               store,
-		publisher:           publisher,
 		authz:               authz,
 		clients:             clients,
 		signingKey:          signingKey,
@@ -409,6 +406,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/remove", h.RemoveCloseRequirement)
 	})
 	r.Get("/v1/control-populations/migration-batch-tieout", h.GetMigrationBatchTieoutPopulation)
+	r.Get("/v1/close/workflow-refs/{ref}", h.GetWorkflowRef)
+	r.Get("/v1/close/workflow-refs/{ref}", h.GetWorkflowRef)
 	r.Route("/v1/close/periods", func(r chi.Router) {
 		r.Post("/", h.CreateFiscalPeriod)
 		r.Get("/", h.ListFiscalPeriods)
@@ -426,6 +425,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/reopen", h.RetiredReopen)
 		r.Get("/{id}/history", h.GetCloseHistory)
 		r.Get("/{id}/available-actions", h.GetAvailableCloseActions)
+		r.Post("/{id}:mirror-to-period-service", h.MirrorPeriodToPeriodService)
 	})
 	r.Route("/v1/subledger-control/runs", func(r chi.Router) {
 		r.Post("/", h.RunSubledgerControl)
@@ -944,8 +944,6 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 		return
 	}
 
-	h.publisher.PublishCloseStarted(r.Context(), correlationID, principalID, *fp)
-
 	var notBefore *time.Time
 	if mode.reperform {
 		notBefore = fp.ReopenedAt
@@ -959,7 +957,6 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 	}
 
 	if len(blockingIssues) > 0 {
-		h.publisher.PublishCloseBlocked(r.Context(), correlationID, principalID, *fp, blockingIssues)
 		h.log.Warn("period close blocked by outstanding items", zap.String("period_id", id), zap.Strings("reasons", blockingIssues))
 		writeJSON(w, http.StatusUnprocessableEntity, domain.ReadinessCheckResponse{
 			IsReady:        false,
@@ -1010,10 +1007,12 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 	// row lock, so a concurrent transition between the check above and here
 	// is refused rather than overwritten.
 	lockedAt, evidenceDoc := now, docID
+	// The period.closed/period.reclosed event is enqueued in CreateCloseEvidence
+	// in the same transaction as the evidence row.
 	if current, err := h.store.ApplyPeriodTransition(r.Context(), id, []string{mode.from}, domain.PeriodUpdate{
 		To: mode.to, PrincipalID: principalID, At: now, LockedAt: &lockedAt, EvidenceDocID: &evidenceDoc,
 		ClearReopen: mode.reperform,
-	}); err != nil {
+	}, "", "", correlationID, principalID); err != nil {
 		if errors.Is(err, domain.ErrInvalidPeriodTransition) && current != nil && current.CloseStatus != mode.to {
 			// Moved by someone else between the check above and now: refused,
 			// not reported as this command's success.
@@ -1070,7 +1069,7 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 	evidence.RelianceManifest = string(manifest)
 	evidence.RelianceHash = hex.EncodeToString(manifestHash[:])
 	evidence.RelianceSignature = h.signEvidence(manifestHash[:])
-	if err := h.store.CreateCloseEvidence(r.Context(), evidence); err != nil {
+	if err := h.store.CreateCloseEvidence(r.Context(), evidence, correlationID, principalID, fp.PeriodName, fp.LegalEntityID); err != nil {
 		h.log.Error("period locked but close evidence could not be recorded",
 			zap.String("period_id", id), zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "evidence_not_recorded",
@@ -1080,12 +1079,13 @@ func (h *Handler) closeWithEvidence(w http.ResponseWriter, r *http.Request, mode
 		return
 	}
 
-	if mode.reperform {
-		h.publisher.PublishPeriodTransition(r.Context(), "period.reclosed", correlationID, principalID, *fp,
-			map[string]any{"evidence_document_id": docID})
-	} else {
-		h.publisher.PublishClosed(r.Context(), correlationID, principalID, *fp, docID)
-	}
+	// period.closed/period.reclosed is enqueued inside CreateCloseEvidence's
+	// own transaction (the transactional outbox) rather than published here
+	// after the fact — see pg_store.go's CreateCloseEvidence doc comment.
+	//
+	// REF-05 phase 1: best-effort mirror. Runs only when PERIOD_SERVICE_MIRROR=on,
+	// is bounded by a short deadline, and can neither fail nor change this response.
+	h.mirrorLock(r.Context(), tenantID, correlationID, principalID, fp, docID, blockingIssues)
 
 	writeJSON(w, http.StatusOK, domain.PeriodLockResponse{
 		FiscalPeriodID:     id,
@@ -1307,14 +1307,10 @@ func (h *Handler) recordAndRespondControlRun(w http.ResponseWriter, r *http.Requ
 		RunByPrincipalID:       principalID,
 	}
 
-	if err := h.store.CreateControlRun(r.Context(), run); err != nil {
+	if err := h.store.CreateControlRun(r.Context(), run, correlationID, principalID); err != nil {
 		h.log.Error("failed to record subledger control run", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
-	}
-
-	if status == "EXCEPTION" {
-		h.publisher.PublishSubledgerControlException(r.Context(), correlationID, principalID, *run)
 	}
 
 	writeJSON(w, http.StatusCreated, run)

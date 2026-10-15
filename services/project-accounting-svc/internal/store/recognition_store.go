@@ -290,6 +290,14 @@ func (s *PgStore) FreezeAndCalculate(ctx context.Context, runID string, at time.
 			return domain.ErrContractValueRequired
 		}
 
+		method, err := currentRecognitionMethod(ctx, tx, tenantID, projectID)
+		if err != nil {
+			return err
+		}
+		if method == domain.RecognitionMethodMilestone {
+			return freezeMilestoneRun(ctx, tx, tenantID, runID, projectID, *contractValue, billedToDate, at)
+		}
+
 		var estimateToComplete float64
 		err = tx.QueryRow(ctx, `
 			SELECT estimate_to_complete FROM project_recognition_estimates

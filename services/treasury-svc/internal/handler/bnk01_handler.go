@@ -91,7 +91,6 @@ func (h *Handler) VerifyBankAccountOwnership(w http.ResponseWriter, r *http.Requ
 		h.writeBankAccountErr(w, err)
 		return
 	}
-	h.publisher.PublishBankAccountOwnershipVerified(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *acct, *evidence)
 	writeJSON(w, http.StatusOK, evidence)
 }
 
@@ -374,7 +373,6 @@ func (h *Handler) AmendBankAccountMetadata(w http.ResponseWriter, r *http.Reques
 		h.writeBankAccountErr(w, err)
 		return
 	}
-	h.publisher.PublishBankAccountMetadataAmended(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -413,7 +411,6 @@ func (h *Handler) ChangeOperationalUse(w http.ResponseWriter, r *http.Request) {
 		h.writeBankAccountErr(w, err)
 		return
 	}
-	h.publisher.PublishBankAccountOperationalUseChanged(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -447,7 +444,6 @@ func (h *Handler) SuspendBankAccount(w http.ResponseWriter, r *http.Request) {
 		h.writeBankAccountErr(w, err)
 		return
 	}
-	h.publisher.PublishBankAccountSuspended(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -475,7 +471,6 @@ func (h *Handler) ReactivateBankAccount(w http.ResponseWriter, r *http.Request) 
 		h.writeBankAccountErr(w, err)
 		return
 	}
-	h.publisher.PublishBankAccountReactivated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -505,7 +500,6 @@ func (h *Handler) CloseBankAccount(w http.ResponseWriter, r *http.Request) {
 		h.writeBankAccountErr(w, err)
 		return
 	}
-	h.publisher.PublishBankAccountClosed(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -554,6 +548,5 @@ func (h *Handler) RotateAccountIdentifierToken(w http.ResponseWriter, r *http.Re
 		h.writeBankAccountErr(w, err)
 		return
 	}
-	h.publisher.PublishBankAccountTokenRotated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }

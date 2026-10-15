@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -42,11 +43,23 @@ type evalContext struct {
 	SupportSessionID    string
 	CorrelationID       string
 	InitiatingSubjectID string
+	ResourceVersion     string
+
+	// SkipAvailable: evaluate the one requested action only. /v1/authorize and
+	// the per-action evaluations computeAvailableActions makes set it.
+	SkipAvailable bool
+}
+
+// boundWorkloadFinder is the store capability that says whether a principal
+// is a bound workload anywhere (N-09). Optional: without it only a declared
+// workload is evaluated as one.
+type boundWorkloadFinder interface {
+	IsBoundWorkload(ctx context.Context, principalID string) (bool, error)
 }
 
 type evalResult struct {
-	Decision         string // ALLOW, DENY, STEP_UP
-	Outcome          string // GRANTED, DENIED, STEP_UP
+	Decision         string // PERMIT, DENY, STEP_UP, REQUIRE_APPROVAL (ZS-IAM-001 §7 stage 9)
+	Outcome          string // GRANTED, DENIED, STEP_UP — the /v1/authorize decision_outcome vocabulary
 	Basis            string
 	Reason           string
 	ReasonCodes      []string
@@ -63,7 +76,28 @@ type evalResult struct {
 // evaluateCore is the central authorization evaluation engine shared by
 // Authorize (/v1/authorize), Canonical Decisions (POST /internal/authorization/decisions),
 // and Available Actions (GET /v1/{resource}/{id}/available-actions).
+//
+// ONE engine for all three, deliberately. /v1/authorize used to carry its own
+// inline copy of the pipeline and the two had drifted (session-store errors
+// were a 503 in one and silently ignored in the other), and the available
+// actions were computed without SoD, ABAC or authority limits — so the UI
+// could be offered actions /v1/authorize then refused (GOV-03 negative path
+// #4: "AvailableActions equals backend-authorized actions").
 func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEntityID string) (*evalResult, error) {
+	res, err := h.evaluateDecision(ctx, in, evaluationEntityID)
+	if err != nil {
+		return nil, err
+	}
+	if !in.SkipAvailable {
+		if err := h.computeAvailableActions(ctx, in, evaluationEntityID, res); err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
+}
+
+// evaluateDecision runs the decision pipeline for in.ActionType alone.
+func (h *Handler) evaluateDecision(ctx context.Context, in evalContext, evaluationEntityID string) (*evalResult, error) {
 	res := &evalResult{
 		MatchedGrants:    make([]string, 0),
 		NegativeControls: make([]string, 0),
@@ -79,6 +113,19 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 	isWorkload := strings.EqualFold(in.PrincipalType, "WORKLOAD") ||
 		(in.Attributes != nil && strings.EqualFold(in.Attributes["principal_type"], "WORKLOAD")) ||
 		(in.Attributes != nil && in.Attributes["workload_id"] != "")
+	// Not opt-in (Governance audit N-09): a principal that IS a bound
+	// workload in some tenant is evaluated as one whether or not the request
+	// says so. Before, omitting principal_type stepped a workload outside its
+	// binding and into whatever RBAC grants its id held.
+	if !isWorkload {
+		if f, ok := h.store.(boundWorkloadFinder); ok {
+			bound, err := f.IsBoundWorkload(ctx, in.PrincipalID)
+			if err != nil {
+				return nil, fmt.Errorf("workload lookup: %w", err)
+			}
+			isWorkload = bound
+		}
+	}
 
 	if isWorkload {
 		workloadID := in.PrincipalID
@@ -131,6 +178,20 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 				return res, nil
 			}
 		}
+
+		// The binding's actions bound what the workload may do in this
+		// tenant (N-09: allowed_actions was stored and never read). An
+		// action outside them is denied whatever RBAC would say; one inside
+		// still needs its grant below — the binding narrows, never grants.
+		if !contains(binding.AllowedActions, in.ActionType) {
+			res.Decision = domain.CanonicalDecisionDeny
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = "workload:action_not_bound"
+			res.Reason = "WORKLOAD_ACTION_NOT_BOUND"
+			res.ReasonCodes = []string{"WORKLOAD_ACTION_NOT_BOUND"}
+			res.NegativeControls = []string{"workload:action_not_bound"}
+			return res, nil
+		}
 	}
 
 	// ── Layer 0: Principal Status ─────────────────────────────────────────────
@@ -145,6 +206,29 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		res.Reason = "Principal account is " + principalStatus
 		res.ReasonCodes = []string{"PRINCIPAL_SUSPENDED"}
 		res.NegativeControls = []string{principalStatusBasisPrefix + principalStatus}
+		return res, nil
+	}
+
+	// ── Layer 0.1: Legal entity standing (Doc 03 §8.3 entity.scope.updated) ──
+	// A SUSPENDED or DISSOLVED entity can be acted in by nobody: the negative
+	// control layer overrides grants (ZS-IAM-001 §7 stage 6). DORMANT is not a
+	// denial — a dormant company still files dormant accounts — so it permits
+	// with an obligation the PEP must honour. No projected status means the
+	// registry has said nothing about this entity, which changes nothing.
+	entityStatus := ""
+	if !h.isPlatformScopeEntity(evaluationEntityID) {
+		entityStatus, err = h.store.FindEntityStatus(ctx, evaluationEntityID, in.TenantID)
+		if err != nil {
+			return nil, fmt.Errorf("entity status lookup: %w", err)
+		}
+	}
+	if entityStatus == domain.EntityStatusSuspended || entityStatus == domain.EntityStatusDissolved {
+		res.Decision = domain.CanonicalDecisionDeny
+		res.Outcome = domain.OutcomeDenied
+		res.Basis = entityStatusBasisPrefix + entityStatus
+		res.Reason = "Legal entity is " + entityStatus
+		res.ReasonCodes = []string{"ENTITY_NOT_OPERATIONAL"}
+		res.NegativeControls = []string{entityStatusBasisPrefix + entityStatus}
 		return res, nil
 	}
 
@@ -167,19 +251,24 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		return nil, fmt.Errorf("delegation lookup: %w", err)
 	}
 	allHeldActions = append(allHeldActions, delegatedActions...)
+	grantedViaDelegation := false
 	if !granted && contains(delegatedActions, in.ActionType) {
 		granted = true
 		basis = delegatedBasis
+		grantedViaDelegation = true
 		res.MatchedGrants = append(res.MatchedGrants, delegatedBasis)
 	}
 
 	// ── Layer 3: Privileged Access Management (JIT Elevation) ─────────────────
 	if in.PrivilegedSessionID != "" {
 		ps, err := h.store.FindPrivilegedSessionByID(ctx, in.PrivilegedSessionID, in.TenantID)
+		if err != nil && !errors.Is(err, domain.ErrPrivilegedSessionNotFound) {
+			return nil, fmt.Errorf("privileged session lookup: %w", err)
+		}
 		if err == nil && ps != nil {
 			if ps.PrincipalID == in.PrincipalID && ps.Status == domain.PrivilegedSessionStatusActive && time.Now().UTC().Before(ps.ExpiresAt) {
 				allHeldActions = append(allHeldActions, ps.RequestedActions...)
-				if !granted && (contains(ps.RequestedActions, in.ActionType) || contains(ps.RequestedActions, "*")) {
+				if !granted && contains(ps.RequestedActions, in.ActionType) {
 					granted = true
 					basis = fmt.Sprintf("pam:session=%s:ticket=%s", ps.SessionID, ps.TicketRef)
 					res.MatchedGrants = append(res.MatchedGrants, basis)
@@ -191,10 +280,13 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 	// ── Layer 3.1: Break-Glass Emergency Session ──────────────────────────────
 	if in.BreakGlassSessionID != "" {
 		bg, err := h.store.FindBreakGlassSessionByID(ctx, in.BreakGlassSessionID, in.TenantID)
+		if err != nil && !errors.Is(err, domain.ErrBreakGlassSessionNotFound) {
+			return nil, fmt.Errorf("break-glass session lookup: %w", err)
+		}
 		if err == nil && bg != nil {
 			if bg.PrincipalID == in.PrincipalID && bg.IncidentID != "" && bg.Status == domain.BreakGlassSessionStatusActive && time.Now().UTC().Before(bg.ExpiresAt) {
 				allHeldActions = append(allHeldActions, bg.RequestedActions...)
-				if !granted && (contains(bg.RequestedActions, in.ActionType) || contains(bg.RequestedActions, "*")) {
+				if !granted && contains(bg.RequestedActions, in.ActionType) {
 					granted = true
 					basis = fmt.Sprintf("break_glass:session=%s:incident=%s", bg.SessionID, bg.IncidentID)
 					res.MatchedGrants = append(res.MatchedGrants, basis)
@@ -206,12 +298,30 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 	// ── Layer 3.2: Support Session ────────────────────────────────────────────
 	if in.SupportSessionID != "" {
 		ss, err := h.store.FindSupportSessionByID(ctx, in.SupportSessionID, in.TenantID)
+		if err != nil && !errors.Is(err, domain.ErrSupportSessionNotFound) {
+			return nil, fmt.Errorf("support session lookup: %w", err)
+		}
 		if err == nil && ss != nil {
 			if ss.SupportOperatorID == in.PrincipalID && ss.Status == domain.SupportSessionStatusActive && time.Now().UTC().Before(ss.ExpiresAt) {
-				isExportAction := strings.HasSuffix(in.ActionType, ".export") || in.ActionType == "export" || strings.Contains(in.ActionType, "export")
-				isMutationAction := strings.HasSuffix(in.ActionType, ".create") || strings.HasSuffix(in.ActionType, ".edit") || strings.HasSuffix(in.ActionType, ".post") || strings.HasSuffix(in.ActionType, ".delete") || strings.HasSuffix(in.ActionType, ".release") || strings.HasSuffix(in.ActionType, ".revoke")
+				// §15: consent stated, export off by default, read-only by
+				// default, and writes only when named. "Write" is anything that
+				// is not a read verb — so a legacy name like PAYMENT_RELEASE is
+				// a write, which the old suffix list (.create, .post, ...) missed.
+				if !ss.TenantConsentObtained {
+					res.Decision = domain.CanonicalDecisionDeny
+					res.Outcome = domain.OutcomeDenied
+					res.Basis = "support:consent_not_obtained"
+					res.Reason = "Support session has no tenant consent or support agreement on record"
+					res.ReasonCodes = []string{"SUPPORT_CONSENT_NOT_OBTAINED"}
+					res.NegativeControls = []string{"support:consent_not_obtained"}
+					return res, nil
+				}
+				// Whole tokens (N-16): "export" is in SIEM_EXPORTER_READ, which
+				// names an exporter and moves no data.
+				exporting := isExportAction(in.ActionType)
+				isMutationAction := !domain.IsReadAction(in.ActionType)
 
-				if isExportAction && !ss.AllowBulkExport && !contains(ss.AllowedActions, in.ActionType) {
+				if exporting && !ss.AllowBulkExport && !contains(ss.AllowedActions, in.ActionType) {
 					res.Decision = domain.CanonicalDecisionDeny
 					res.Outcome = domain.OutcomeDenied
 					res.Basis = "support:bulk_export_prohibited"
@@ -221,7 +331,7 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 					return res, nil
 				}
 
-				if ss.ReadOnly && isMutationAction && !contains(ss.AllowedActions, in.ActionType) {
+				if isMutationAction && (ss.ReadOnly || !contains(ss.AllowedActions, in.ActionType)) {
 					res.Decision = domain.CanonicalDecisionDeny
 					res.Outcome = domain.OutcomeDenied
 					res.Basis = "support:read_only_session"
@@ -231,7 +341,7 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 					return res, nil
 				}
 
-				if contains(ss.AllowedActions, in.ActionType) || contains(ss.AllowedActions, "*") || (!ss.ReadOnly && len(ss.AllowedActions) == 0) || (ss.ReadOnly && !isMutationAction) {
+				if !isMutationAction || contains(ss.AllowedActions, in.ActionType) {
 					granted = true
 					basis = fmt.Sprintf("support:session=%s:operator=%s:ticket=%s", ss.SessionID, ss.SupportOperatorID, ss.TicketRef)
 					res.MatchedGrants = append(res.MatchedGrants, basis)
@@ -252,15 +362,38 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		res.NegativeControls = []string{"no_grant"}
 
 		// Compute available actions from other held actions
-		h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 		return res, nil
 	}
 
 	// ── Layer 4: Static SoD Conflicts ─────────────────────────────────────────
+	// A conflict covered by an active GOV-04 compensating-control exception
+	// for this principal and pair does not deny; the next conflicting pair, if
+	// any, is then checked, so an exception for one pair never hides another.
 	others := removeAll(allHeldActions, in.ActionType)
-	conflicting, hasConflict, err := h.store.CheckSoDConflict(ctx, others, in.ActionType, in.TenantID)
-	if err != nil {
-		return nil, fmt.Errorf("sod check: %w", err)
+	var excepted []*domain.SoDException
+	conflicting, hasConflict := "", false
+	for {
+		var err error
+		conflicting, hasConflict, err = h.store.CheckSoDConflict(ctx, others, in.ActionType, in.TenantID)
+		if err != nil {
+			return nil, fmt.Errorf("sod check: %w", err)
+		}
+		if !hasConflict {
+			break
+		}
+		finder, ok := h.store.(sodExceptionFinder)
+		if !ok {
+			break
+		}
+		exc, err := finder.FindActiveSoDException(ctx, in.PrincipalID, in.TenantID, in.ActionType, conflicting)
+		if err != nil {
+			return nil, fmt.Errorf("sod exception lookup: %w", err)
+		}
+		if exc == nil {
+			break
+		}
+		excepted = append(excepted, exc)
+		others = removeAll(others, conflicting)
 	}
 	if hasConflict {
 		res.Decision = domain.CanonicalDecisionDeny
@@ -270,7 +403,6 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		res.ReasonCodes = []string{"SOD_STATIC_CONFLICT"}
 		res.NegativeControls = []string{"sod:conflict_with=" + conflicting}
 
-		h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 		return res, nil
 	}
 
@@ -290,7 +422,31 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 			res.ReasonCodes = []string{"SOD_DYNAMIC_CONFLICT", "OWN_OBJECT_FORBIDDEN"}
 			res.NegativeControls = []string{"dynamic_sod:own_object_forbidden"}
 
-			h.computeAvailableActions(ctx, in, evaluationEntityID, res)
+			return res, nil
+		}
+	}
+
+	// ── Layer 4.1b: Dynamic SoD with unknown participation (GOV-04) ─────────
+	// An own-object rule exists for this action but the caller did not say who
+	// prepared the object. GOV-04: "Unknown participation/history on material
+	// action => block or require independent review; never silently assume no
+	// conflict." Before this the check was simply skipped, so a PEP that omitted
+	// the preparer passed every own-object rule.
+	ownerKnown := in.ResourceOwnerID != "" ||
+		(in.Attributes != nil && (in.Attributes["preparer_id"] != "" || in.Attributes["created_by"] != ""))
+	if !ownerKnown {
+		ownObjectRuled, err := h.store.CheckOwnObjectSoD(ctx, in.ActionType, in.TenantID)
+		if err != nil {
+			return nil, fmt.Errorf("own-object sod check: %w", err)
+		}
+		if ownObjectRuled {
+			res.Decision = domain.CanonicalDecisionRequireApproval
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = "sod:participation_unknown"
+			res.Reason = "An own-object SoD rule applies and the object's preparer was not supplied"
+			res.ReasonCodes = []string{"SOD_PARTICIPATION_UNKNOWN", "APPROVAL_REQUIRED"}
+			res.NegativeControls = []string{"dynamic_sod:participation_unknown"}
+			res.Obligations = []string{"REQUIRE_INDEPENDENT_REVIEW"}
 			return res, nil
 		}
 	}
@@ -321,7 +477,6 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 			res.ReasonCodes = []string{"SOD_DYNAMIC_CONFLICT", "COOLING_WINDOW_CONFLICT"}
 			res.NegativeControls = []string{"dynamic_sod:cooling_window_conflict"}
 
-			h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 			return res, nil
 		}
 	}
@@ -340,7 +495,6 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 			res.ReasonCodes = []string{"SOD_DYNAMIC_CONFLICT", "REQUESTOR_SELF_APPROVAL"}
 			res.NegativeControls = []string{"dynamic_sod:requestor_self_approval"}
 
-			h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 			return res, nil
 		}
 	}
@@ -359,7 +513,6 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 			res.ReasonCodes = []string{"SOD_DYNAMIC_CONFLICT", "OWN_ACCESS_ELEVATION"}
 			res.NegativeControls = []string{"dynamic_sod:own_access_elevation"}
 
-			h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 			return res, nil
 		}
 	}
@@ -379,7 +532,6 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 			res.ReasonCodes = []string{"SOD_DYNAMIC_CONFLICT", "PRIOR_REJECTED_REVIEWER_CONFLICT"}
 			res.NegativeControls = []string{"dynamic_sod:prior_rejected_reviewer"}
 
-			h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 			return res, nil
 		}
 	}
@@ -400,7 +552,6 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 			res.ReasonCodes = []string{"SOD_DYNAMIC_CONFLICT", "RELATED_PARTY_CONFLICT"}
 			res.NegativeControls = []string{"dynamic_sod:related_party_conflict"}
 
-			h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 			return res, nil
 		}
 	}
@@ -418,8 +569,24 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		res.ReasonCodes = []string{"ABAC_RULE_VIOLATION"}
 		res.NegativeControls = []string{denial.Basis()}
 
-		h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 		return res, nil
+	}
+
+	// ── Layer 5.9: the ceiling of the delegation the grant rests on (ORG-06) ──
+	if grantedViaDelegation {
+		ceilingDenied, ceilingBasis, ceilingReason, err := h.evaluateDelegationCeiling(ctx, in, evaluationEntityID)
+		if err != nil {
+			return nil, fmt.Errorf("delegation ceiling evaluation: %w", err)
+		}
+		if ceilingDenied {
+			res.Decision = domain.CanonicalDecisionDeny
+			res.Outcome = domain.OutcomeDenied
+			res.Basis = ceilingBasis
+			res.Reason = ceilingReason
+			res.ReasonCodes = []string{"DELEGATION_LIMIT_EXCEEDED"}
+			res.NegativeControls = []string{ceilingBasis}
+			return res, nil
+		}
 	}
 
 	// ── Layer 6.0: Monetary Authority Limits & FX Basis (Phase 3.6 & 3.7, Scenario A09) ──
@@ -435,7 +602,6 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		res.ReasonCodes = limitReasonCodes
 		res.NegativeControls = limitNC
 
-		h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 		return res, nil
 	}
 
@@ -449,7 +615,6 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		res.ReasonCodes = qReasonCodes
 		res.NegativeControls = qNC
 
-		h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 		return res, nil
 	}
 
@@ -463,13 +628,12 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		res.ReasonCodes = rReasonCodes
 		res.NegativeControls = rNC
 
-		h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 		return res, nil
 	}
 
 	// ── Layer 7: Stage 7 Assurance / Step-Up Handling (Scenario A26, §7, §8.2) ─
 	// Scenario A26: Session authentication too old for period reopen -> STEP_UP
-	if isStepUpRequired(in.ActionType, in.Attributes, in.Environment) {
+	if h.isStepUpRequired(in.ActionType, in.Attributes, in.Environment) {
 		res.Decision = domain.CanonicalDecisionStepUp
 		res.Outcome = domain.OutcomeStepUp
 		res.Basis = "assurance:recent_authn_required"
@@ -478,11 +642,10 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 		res.Obligations = []string{"REQUIRE_RECENT_AUTHN"}
 		res.StepUp = &domain.StepUpRequirement{
 			RequiredAssurance:  "PHISHING_RESISTANT",
-			MaxAuthnAgeSeconds: DefaultMaxAuthnAgeSecs,
+			MaxAuthnAgeSeconds: h.stepUpPolicy().MaxAuthnAgeSeconds,
 			Reason:             "PERIOD_REOPEN_REQUIRES_RECENT_AUTHN",
 		}
 
-		h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 		return res, nil
 	}
 
@@ -497,135 +660,81 @@ func (h *Handler) evaluateCore(ctx context.Context, in evalContext, evaluationEn
 			res.ReasonCodes = []string{"RESOURCE_STATE_CONFLICT"}
 			res.NegativeControls = []string{"state:terminal_status=" + status}
 
-			h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 			return res, nil
 		}
 	}
 
 	// ── Final ALLOW Decision ──────────────────────────────────────────────────
-	res.Decision = domain.CanonicalDecisionAllow
+	res.Decision = domain.CanonicalDecisionPermit
 	res.Outcome = domain.OutcomeGranted
 	res.Basis = basis
 	res.Reason = "Access permitted per active policy and scope"
 	res.ReasonCodes = []string{"PERMISSION_GRANTED", "SOD_CLEAR", "AUTHORITY_WITHIN_LIMIT"}
+	if grantedViaDelegation {
+		res.ReasonCodes = append(res.ReasonCodes, "DELEGATED_AUTHORITY")
+	}
+	if entityStatus == domain.EntityStatusDormant {
+		res.ReasonCodes = append(res.ReasonCodes, "ENTITY_DORMANT")
+		res.Obligations = append(res.Obligations, "ENTITY_DORMANT_REVIEW")
+	}
+	if len(excepted) > 0 {
+		// The conflict was not clear: it was excepted. Say so, and hand the PEP
+		// the compensating control it must apply.
+		res.ReasonCodes[1] = "SOD_EXCEPTION_APPLIED"
+		for _, e := range excepted {
+			res.Obligations = append(res.Obligations, "COMPENSATING_CONTROL:"+e.CompensatingControl)
+			res.MatchedGrants = append(res.MatchedGrants, "sod_exception:"+e.SoDExceptionID)
+		}
+	}
 
 	// High risk obligation per §8.2
 	if in.Environment.Risk == "HIGH" || strings.ToLower(in.Attributes["risk"]) == "high" {
 		res.Obligations = append(res.Obligations, "RECORD_HIGH_RISK_EVIDENCE")
 	}
 
-	h.computeAvailableActions(ctx, in, evaluationEntityID, res)
 	return res, nil
 }
 
-// computeAvailableActions populates available_actions, denied_actions, and step_up_actions
-// for the subject in this resource/scope context.
-func (h *Handler) computeAvailableActions(ctx context.Context, in evalContext, evaluationEntityID string, res *evalResult) {
-	for _, act := range res.AllHeldActions {
-		if act == in.ActionType {
-			if res.Decision == domain.CanonicalDecisionAllow {
-				res.AvailableActions = append(res.AvailableActions, act)
-			} else if res.Decision == domain.CanonicalDecisionStepUp {
-				res.StepUpActions = append(res.StepUpActions, domain.StepUpActionInfo{
-					Action:             act,
-					RequiredAssurance:  "PHISHING_RESISTANT",
-					MaxAuthnAgeSeconds: DefaultMaxAuthnAgeSecs,
-					Reason:             res.Reason,
-				})
-			} else {
-				res.DeniedActions = append(res.DeniedActions, domain.DeniedActionInfo{
-					Action:     act,
-					ReasonCode: firstReasonCode(res.ReasonCodes),
-					Basis:      res.Basis,
-				})
-			}
-			continue
-		}
-
-		// Candidate check for other held actions
-		if isReleaseAction(act) && in.Attributes != nil {
-			bankChangedBy := in.Attributes["supplier_bank_changed_by"]
-			if bankChangedBy == "" {
-				bankChangedBy = in.Attributes["bank_account_changed_by"]
-			}
-			coolingViolation := in.Attributes["cooling_window_violation"] == "true" ||
-				in.Attributes["supplier_bank_cooling_window_active"] == "true" ||
-				in.Attributes["cooling_window_conflict"] == "true" ||
-				in.Attributes["supplier_bank_cooling_active"] == "true" ||
-				in.Attributes["cooling_window_active"] == "true"
-
-			if (bankChangedBy == in.PrincipalID && coolingViolation) || in.Attributes["cooling_window_conflict"] == "true" {
-				res.DeniedActions = append(res.DeniedActions, domain.DeniedActionInfo{
-					Action:     act,
-					ReasonCode: "SOD_DYNAMIC_CONFLICT",
-					Basis:      "sod:cooling_window_conflict",
-				})
-				continue
+// computeAvailableActions populates available_actions, denied_actions and
+// step_up_actions for the subject in this resource/scope context.
+//
+// Every held action is classified by the SAME pipeline /v1/authorize runs —
+// static and dynamic SoD, ABAC, authority limits, assurance, domain guards —
+// not by a partial re-implementation of some of them. That is what makes the
+// list equal to what the backend would authorize (GOV-03 negative path #4).
+func (h *Handler) computeAvailableActions(ctx context.Context, in evalContext, evaluationEntityID string, res *evalResult) error {
+	for _, act := range deduplicate(res.AllHeldActions) {
+		r := res
+		if act != in.ActionType {
+			sub := in
+			sub.ActionType = act
+			sub.SkipAvailable = true
+			var err error
+			r, err = h.evaluateDecision(ctx, sub, evaluationEntityID)
+			if err != nil {
+				return err
 			}
 		}
-
-		// Dynamic SoD — Prior rejected reviewer (§10.2 Pattern 5)
-		if isApprovalAction(act) && in.Attributes != nil {
-			priorRejectedBy := in.Attributes["prior_rejected_by"]
-			if priorRejectedBy == "" {
-				priorRejectedBy = in.Attributes["rejected_by"]
-			}
-			isResubmission := in.Attributes["is_resubmission"] == "true" || in.Attributes["resubmitted"] == "true" || priorRejectedBy != ""
-			if priorRejectedBy != "" && priorRejectedBy == in.PrincipalID && isResubmission {
-				res.DeniedActions = append(res.DeniedActions, domain.DeniedActionInfo{
-					Action:     act,
-					ReasonCode: "PRIOR_REJECTED_REVIEWER_CONFLICT",
-					Basis:      "sod:prior_rejected_reviewer",
-				})
-				continue
-			}
-		}
-
-		// Dynamic SoD — Related-party conflict (§10.2 Pattern 6)
-		if in.Attributes != nil {
-			relatedPartySubject := in.Attributes["related_party_subject_id"]
-			if relatedPartySubject == "" {
-				relatedPartySubject = in.Attributes["vendor_related_party_subject_id"]
-			}
-			isRelatedParty := in.Attributes["is_related_party"] == "true" || in.Attributes["related_party_conflict"] == "true" ||
-				(relatedPartySubject != "" && relatedPartySubject == in.PrincipalID)
-			if isRelatedParty {
-				res.DeniedActions = append(res.DeniedActions, domain.DeniedActionInfo{
-					Action:     act,
-					ReasonCode: "RELATED_PARTY_CONFLICT",
-					Basis:      "sod:related_party_conflict",
-				})
-				continue
-			}
-		}
-
-		// Domain Guards — Resource Lifecycle State (ZS-STATE-001)
-		if in.Attributes != nil {
-			status := getResourceLifecycleStatus(in.Attributes)
-			if isTerminalLifecycleState(status) && isMutationOrApprovalAction(act) {
-				res.DeniedActions = append(res.DeniedActions, domain.DeniedActionInfo{
-					Action:     act,
-					ReasonCode: "RESOURCE_STATE_CONFLICT",
-					Basis:      "state:terminal_status=" + status,
-				})
-				continue
-			}
-		}
-
-		if isStepUpRequired(act, in.Attributes, in.Environment) {
+		switch r.Decision {
+		case domain.CanonicalDecisionPermit:
+			res.AvailableActions = append(res.AvailableActions, act)
+		case domain.CanonicalDecisionStepUp:
 			res.StepUpActions = append(res.StepUpActions, domain.StepUpActionInfo{
 				Action:             act,
 				RequiredAssurance:  "PHISHING_RESISTANT",
-				MaxAuthnAgeSeconds: DefaultMaxAuthnAgeSecs,
-				Reason:             "Action requires high assurance or recent authentication",
+				MaxAuthnAgeSeconds: h.stepUpPolicy().MaxAuthnAgeSeconds,
+				Reason:             r.Reason,
 			})
-			continue
+		default:
+			res.DeniedActions = append(res.DeniedActions, domain.DeniedActionInfo{
+				Action:     act,
+				ReasonCode: firstReasonCode(r.ReasonCodes),
+				Basis:      r.Basis,
+			})
 		}
-
-		res.AvailableActions = append(res.AvailableActions, act)
 	}
-
 	res.AvailableActions = deduplicate(res.AvailableActions)
+	return nil
 }
 
 // HandleCanonicalDecision handles POST /internal/authorization/decisions (ZS-IAM-001 §8.1 & §8.2).
@@ -684,7 +793,7 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	tenantScope, ok := h.resolveTenantScope(w, r, req.TenantID)
+	tenantScope, ok := h.resolveTenantScope(w, r, subjectID, req.TenantID, evaluationEntityID)
 	if !ok {
 		return
 	}
@@ -753,7 +862,9 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 		ResourceOwnerID:     resourceOwnerID,
 		Attributes:          req.ResourceAttributes,
 		Environment:         req.Environment,
-		PrivilegedSessionID:  req.SessionID,
+		PrivilegedSessionID: req.SessionID,
+		BreakGlassSessionID: req.BreakGlassSessionID,
+		SupportSessionID:    req.SupportSessionID,
 		CorrelationID:       correlationID,
 		InitiatingSubjectID: initiatingSubjectID,
 	}
@@ -765,31 +876,29 @@ func (h *Handler) HandleCanonicalDecision(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Persist the decision artifact in access_decision_log
-	decision, err := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
-		PrincipalID:   subjectID,
-		LegalEntityID: evaluationEntityID,
-		ActionType:    req.Action,
-		Outcome:       evalRes.Outcome,
-		Basis:         evalRes.Basis,
-		CorrelationID: correlationID,
-		TenantID:      tenantScope,
-	})
-	if err != nil {
-		h.log.Error("CanonicalDecision: failed to record access decision", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	// Persist the decision artifact with its full evidence.
+	if req.ResourceVersion != 0 {
+		in.ResourceVersion = strconv.Itoa(req.ResourceVersion)
+	}
+	decision, ok := h.recordDecision(w, r, in, evaluationEntityID, evalRes)
+	if !ok {
 		return
 	}
 
 	// Publish domain events & SIEM telemetry
 	h.emitDecisionTelemetry(r.Context(), req.Action, subjectID, evaluationEntityID, tenantScope, correlationID, evalRes, decision)
 
-	expiresAt := time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339)
+	expiresAt := ""
+	if decision.ExpiresAt != nil {
+		expiresAt = decision.ExpiresAt.UTC().Format(time.RFC3339)
+	}
 
 	resp := domain.CanonicalDecisionResponse{
 		Decision:         evalRes.Decision,
 		DecisionID:       decision.AccessDecisionID,
-		PolicySetVersion: DefaultPolicySetVersion,
+		// The configuration watermark actually in force, recorded with the
+		// decision — not the constant this used to report for every decision.
+		PolicySetVersion: decision.PolicySetVersion,
 		MatchedGrants:    evalRes.MatchedGrants,
 		NegativeControls: evalRes.NegativeControls,
 		Obligations:      evalRes.Obligations,
@@ -835,28 +944,25 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 		resourceID = chi.URLParam(r, "resource_id")
 	}
 
-	principalID := r.Header.Get("X-Principal-Id")
-	if principalID == "" {
-		principalID = r.URL.Query().Get("principal_id")
-	}
-	if principalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_principal",
-			"message": "X-Principal-Id header or principal_id query parameter is required",
-		})
+	// The caller and tenant are the verified headers. Both used to fall back
+	// to query parameters, so anyone could ask for anyone's actions in any
+	// tenant (GOV invariant #2; ZS-IAM-001 §32 "client-supplied tenant").
+	callerPrincipal, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-
-	tenantScope := r.Header.Get("X-Tenant-Id")
-	if tenantScope == "" {
-		tenantScope = r.URL.Query().Get("tenant_id")
-	}
-	if tenantScope == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_tenant_scope",
-			"message": "X-Tenant-Id header or tenant_id query parameter is required",
-		})
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
 		return
+	}
+	principalID := callerPrincipal
+	if q := strings.TrimSpace(r.URL.Query().Get("principal_id")); q != "" && q != callerPrincipal {
+		// Another principal's actions are their grant map: iam.assignment.read,
+		// as on /v1/entity-scope/validate.
+		if !h.requirePermission(w, r, callerPrincipal, tenantScope, "iam.assignment.read") {
+			return
+		}
+		principalID = q
 	}
 
 	legalEntityID := r.Header.Get("X-Legal-Entity-Id")
@@ -870,6 +976,14 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	evaluationEntityID, ok := h.resolvePlatformScope(w, legalEntityID, correlationID)
 	if !ok {
+		return
+	}
+	// The entity must be in the caller's tenant, as on /v1/authorize
+	// (Governance audit N-06). Without this, tenant A's tenant-wide grants
+	// were listed as usable on tenant B's entity: the UI offered actions
+	// /v1/authorize then refused (GOV-03 negative path #4), and a foreign
+	// entity id could be probed for what it would allow.
+	if _, ok := h.resolveTenantScope(w, r, principalID, "", evaluationEntityID); !ok {
 		return
 	}
 
@@ -889,13 +1003,14 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	authnAge := 0
+	authnAge, authnAgeKnown := 0, false
 	if rawAge := r.URL.Query().Get("authn_age_seconds"); rawAge != "" {
-		authnAge, _ = strconv.Atoi(rawAge)
+		authnAge, authnAgeKnown = parseAuthnAge(rawAge)
 	}
 
 	env := domain.EnvironmentContext{
 		AuthnAgeSeconds: authnAge,
+		AuthnAgeKnown:   authnAgeKnown,
 		Assurance:       r.URL.Query().Get("assurance"),
 		Risk:            r.URL.Query().Get("risk"),
 	}
@@ -935,7 +1050,11 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res.AllHeldActions = deduplicate(append(rbacActions, delegatedActions...))
-	h.computeAvailableActions(r.Context(), in, evaluationEntityID, res)
+	if err := h.computeAvailableActions(r.Context(), in, evaluationEntityID, res); err != nil {
+		h.log.Error("GetAvailableActions: evaluation failed", zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
 
 	resp := domain.AvailableActionsResponse{
 		ResourceType:     resourceType,
@@ -955,13 +1074,19 @@ func (h *Handler) emitDecisionTelemetry(
 	evalRes *evalResult,
 	decision *domain.AccessDecisionLog,
 ) {
+	// With the outbox on, these events were committed with the decision.
+	direct := h.decisionEvents == nil
 	if evalRes.Outcome == domain.OutcomeGranted {
-		if pubErr := h.publisher.PublishAuthorizationGranted(ctx, *decision); pubErr != nil {
-			h.log.Error("emitTelemetry: failed to publish authorization.granted", zap.Error(pubErr))
+		if direct {
+			if pubErr := h.publisher.PublishAuthorizationGranted(ctx, *decision); pubErr != nil {
+				h.log.Error("emitTelemetry: failed to publish authorization.granted", zap.Error(pubErr))
+			}
 		}
 	} else {
-		if pubErr := h.publisher.PublishAuthorizationDenied(ctx, *decision); pubErr != nil {
-			h.log.Error("emitTelemetry: failed to publish authorization.denied", zap.Error(pubErr))
+		if direct {
+			if pubErr := h.publisher.PublishAuthorizationDenied(ctx, *decision); pubErr != nil {
+				h.log.Error("emitTelemetry: failed to publish authorization.denied", zap.Error(pubErr))
+			}
 		}
 
 		severity := siem.SeverityMedium
@@ -976,12 +1101,8 @@ func (h *Handler) emitDecisionTelemetry(
 
 		h.siem.Stream(ctx, tenantScope, "authorization.denied", severity,
 			fmt.Sprintf("Authorization decision for principal %s, action %s: %s (%s)", principalID, actionType, evalRes.Outcome, evalRes.Basis))
-		if isWorkloadUnbound {
-			h.siem.Stream(ctx, tenantScope, "security.workload.unbound_tenant", siem.SeverityHigh,
-				fmt.Sprintf("Workload %s attempted access with unbound tenant %s", principalID, tenantScope))
-		}
 
-		if isSoD {
+		if isSoD && direct {
 			conflictingAction := actionType
 			if strings.HasPrefix(evalRes.Basis, "sod:conflict_with=") {
 				conflictingAction = evalRes.Basis[len("sod:conflict_with="):]
@@ -995,14 +1116,20 @@ func (h *Handler) emitDecisionTelemetry(
 
 // ── Helper Predicates ────────────────────────────────────────────────────────
 
+// The verb classifiers match whole tokens of the action name (split on "." and
+// "_"), not substrings (Governance audit N-16): "release" is in "prerelease",
+// "post" in "postcode".
+
 func isApprovalAction(action string) bool {
-	lower := strings.ToLower(action)
-	return strings.HasSuffix(lower, ".approve") || lower == "approve" || strings.Contains(lower, "approve")
+	return domain.HasActionToken(action, "APPROVE", "APPROVAL")
 }
 
 func isReleaseAction(action string) bool {
-	lower := strings.ToLower(action)
-	return strings.HasSuffix(lower, ".release") || lower == "release" || strings.Contains(lower, "release")
+	return domain.HasActionToken(action, "RELEASE")
+}
+
+func isExportAction(action string) bool {
+	return domain.HasActionToken(action, "EXPORT", "EXPORTS")
 }
 
 func isGrantAction(action string) bool {
@@ -1010,24 +1137,91 @@ func isGrantAction(action string) bool {
 	return strings.HasSuffix(lower, ".grant") || strings.HasSuffix(lower, ".assign") || strings.Contains(lower, "access_assign")
 }
 
-func isStepUpRequired(action string, attrs map[string]string, env domain.EnvironmentContext) bool {
-	lower := strings.ToLower(action)
-	isPeriodReopen := strings.Contains(lower, "period.reopen") || strings.Contains(lower, "period_reopen") || strings.Contains(lower, "reopen")
-	explicitRequire := attrs != nil && (attrs["requires_recent_authn"] == "true" || attrs["step_up_required"] == "true")
+// StepUpPolicy is the server's own step-up rule (ZS-IAM-001 §7 stage 7,
+// Scenario A26; Governance audit N-07).
+//
+// It used to live in the request: the PEP could raise max_authn_age_seconds to
+// any value, and an absent authentication age read as a login zero seconds
+// old, so a caller that sent nothing always passed. Now:
+//   - which actions need step-up is the server's: any "reopen" action plus
+//     Actions (exact names, case-insensitive). A caller may ADD the
+//     requirement (step_up_required / requires_recent_authn) but not remove it;
+//   - the maximum age is MaxAuthnAgeSeconds. A caller may only tighten it;
+//   - an age the caller did not state is unknown, and UnknownAgeStepsUp
+//     decides it: true (the default) answers STEP_UP. False keeps the old
+//     reading, for a deployment whose PEPs cannot yet forward an age —
+//     gateway-auth-svc does not assert one (register A-03).
+type StepUpPolicy struct {
+	Actions            []string
+	MaxAuthnAgeSeconds int
+	UnknownAgeStepsUp  bool
+}
 
-	if isPeriodReopen || explicitRequire {
-		maxAge := DefaultMaxAuthnAgeSecs
-		if attrs != nil && attrs["max_authn_age_seconds"] != "" {
-			if parsed, err := strconv.Atoi(attrs["max_authn_age_seconds"]); err == nil && parsed > 0 {
-				maxAge = parsed
-			}
-		}
-		// If authn age exceeds threshold or is not recent (Scenario A26)
-		if env.AuthnAgeSeconds > maxAge || env.Assurance == "NONE" {
-			return true
+// DefaultStepUpPolicy: five minutes, and an unknown age steps up.
+func DefaultStepUpPolicy() StepUpPolicy {
+	return StepUpPolicy{MaxAuthnAgeSeconds: DefaultMaxAuthnAgeSecs, UnknownAgeStepsUp: true}
+}
+
+// SetStepUpPolicy replaces the step-up policy. A non-positive age keeps the
+// default.
+func (h *Handler) SetStepUpPolicy(p StepUpPolicy) {
+	if p.MaxAuthnAgeSeconds <= 0 {
+		p.MaxAuthnAgeSeconds = DefaultMaxAuthnAgeSecs
+	}
+	h.stepUp = &p
+}
+
+func (h *Handler) stepUpPolicy() StepUpPolicy {
+	if h.stepUp == nil {
+		return DefaultStepUpPolicy()
+	}
+	return *h.stepUp
+}
+
+func (h *Handler) isStepUpRequired(action string, attrs map[string]string, env domain.EnvironmentContext) bool {
+	p := h.stepUpPolicy()
+	required := strings.Contains(strings.ToLower(action), "reopen")
+	for _, a := range p.Actions {
+		if strings.EqualFold(strings.TrimSpace(a), action) {
+			required = true
 		}
 	}
-	return false
+	if attrs != nil && (attrs["requires_recent_authn"] == "true" || attrs["step_up_required"] == "true") {
+		required = true
+	}
+	if !required {
+		return false
+	}
+
+	maxAge := p.MaxAuthnAgeSeconds
+	if attrs != nil && attrs["max_authn_age_seconds"] != "" {
+		// Tighten only: a caller asking for a fresher login is honoured, one
+		// asking to accept an older login is not.
+		if parsed, err := strconv.Atoi(attrs["max_authn_age_seconds"]); err == nil && parsed > 0 && parsed < maxAge {
+			maxAge = parsed
+		}
+	}
+	if env.Assurance == "NONE" {
+		return true
+	}
+	if !env.AuthnAgeKnown {
+		return p.UnknownAgeStepsUp
+	}
+	return env.AuthnAgeSeconds > maxAge
+}
+
+// parseAuthnAge reads a stated authentication age. Anything that is not a
+// non-negative whole number of seconds is NOT a known age (second-pass scan,
+// 13 Oct 2026): "abc" used to parse as 0 and count as a login zero seconds
+// old, and "-600" as one younger than now — both passed step-up, the same
+// fail-open N-07 closed for an absent age. An unknown age is decided by
+// StepUpPolicy.UnknownAgeStepsUp.
+func parseAuthnAge(raw string) (int, bool) {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 func checkCoolingWindowActive(changedAtStr string) bool {
@@ -1084,38 +1278,21 @@ func isTerminalLifecycleState(status string) bool {
 }
 
 func isMutationOrApprovalAction(action string) bool {
-	lower := strings.ToLower(action)
-	return strings.HasSuffix(lower, ".edit") || strings.HasSuffix(lower, ".modify") ||
-		strings.HasSuffix(lower, ".update") || strings.HasSuffix(lower, ".approve") ||
-		strings.HasSuffix(lower, ".release") || strings.HasSuffix(lower, ".post") ||
-		strings.HasSuffix(lower, ".cancel") || strings.HasSuffix(lower, ".void") ||
-		strings.HasSuffix(lower, ".reopen") || strings.Contains(lower, "approve") ||
-		strings.Contains(lower, "release") || strings.Contains(lower, "post")
+	return domain.HasActionToken(action, "EDIT", "MODIFY", "UPDATE", "APPROVE", "APPROVAL", "RELEASE",
+		"POST", "POSTING", "CANCEL", "VOID", "REOPEN")
 }
 
 // GetMyCapabilities handles GET /v1/me/capabilities (ZS-IAM-001 §21).
 func (h *Handler) GetMyCapabilities(w http.ResponseWriter, r *http.Request) {
-	principalID := r.Header.Get("X-Principal-Id")
-	if principalID == "" {
-		principalID = r.URL.Query().Get("principal_id")
-	}
-	if principalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "missing_principal",
-			"message": "X-Principal-Id header or principal_id query parameter is required",
-		})
+	// "me": the verified caller only (§21 "for current user"). The
+	// principal_id / tenant_id query fallbacks let anyone read anyone's
+	// capabilities in any tenant.
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-
-	tenantScope := r.Header.Get("X-Tenant-Id")
-	if tenantScope == "" {
-		tenantScope = r.URL.Query().Get("tenant_id")
-	}
-	if tenantScope == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "missing_tenant_scope",
-			"message": "X-Tenant-Id header or tenant_id query parameter is required",
-		})
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 
@@ -1130,6 +1307,14 @@ func (h *Handler) GetMyCapabilities(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	evaluationEntityID, ok := h.resolvePlatformScope(w, legalEntityID, correlationID)
 	if !ok {
+		return
+	}
+	// The entity must be in the caller's tenant, as on /v1/authorize
+	// (Governance audit N-06). Without this, tenant A's tenant-wide grants
+	// were listed as usable on tenant B's entity: the UI offered actions
+	// /v1/authorize then refused (GOV-03 negative path #4), and a foreign
+	// entity id could be probed for what it would allow.
+	if _, ok := h.resolveTenantScope(w, r, principalID, "", evaluationEntityID); !ok {
 		return
 	}
 
@@ -1184,17 +1369,20 @@ func (h *Handler) GetMyCapabilities(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		lower := strings.ToLower(perm)
-		if strings.Contains(lower, "release") {
+		// Whole tokens, like every other classifier here (N-16). These used
+		// substrings, so ADDRESS_POSTCODE_UPDATE advertised can_post_journals
+		// and SIEM_EXPORTER_READ can_export — the console then offered actions
+		// /v1/authorize refuses.
+		if isReleaseAction(perm) {
 			features["can_release_payments"] = true
 		}
-		if strings.Contains(lower, "approve") {
+		if isApprovalAction(perm) {
 			features["can_approve"] = true
 		}
-		if strings.Contains(lower, "post") {
+		if domain.HasActionToken(perm, "POST", "POSTING") {
 			features["can_post_journals"] = true
 		}
-		if strings.Contains(lower, "export") {
+		if isExportAction(perm) {
 			features["can_export"] = true
 		}
 	}
@@ -1217,4 +1405,3 @@ func (h *Handler) GetMyCapabilities(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, resp)
 }
-

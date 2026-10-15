@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for governance-decision-log-svc.
@@ -44,6 +45,22 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// ReadAuthzMode is how GET /v1/decisions* answers a caller that is not
+	// authorized to read the ledger: "enforce" (default) refuses it; "warn"
+	// logs the refusal it would have made and serves the read.
+	//
+	// warn exists only as a migration path. Reads gained authorization after
+	// three callers were built, and two of them (contract-lifecycle-svc,
+	// decision-support-svc) send no X-Principal-Id, so enforcing on the stack
+	// today would break contract activation. Switch to enforce once they
+	// forward the caller's principal.
+	ReadAuthzMode string
+
+	// OutboxRetention is how long a PUBLISHED outbox row is kept before the
+	// relay removes it (OUTBOX_RETENTION, a Go duration; default 168h, 0 keeps
+	// rows forever). Unpublished rows are never removed.
+	OutboxRetention time.Duration
 }
 
 // KafkaConfig holds event-backbone connection parameters. Every governance
@@ -155,6 +172,8 @@ func Load() (*Config, error) {
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		PolicyServiceURL:         env("POLICY_SERVICE_URL", "http://policy-svc:8085"),
+		ReadAuthzMode:            env("DECISION_LOG_READ_AUTHZ", "enforce"),
+		OutboxRetention:          envDuration("OUTBOX_RETENTION", 168*time.Hour),
 		Kafka: KafkaConfig{
 			Brokers: envList("KAFKA_BROKERS", []string{"localhost:9092"}),
 			GroupID: env("KAFKA_GROUP_ID", "governance-decision-log-svc"),
@@ -201,6 +220,20 @@ func envList(key string, def []string) []string {
 		}
 	}
 	return out
+}
+
+// envDuration reads a Go duration ("168h", "30m"). A malformed or negative
+// value falls back to the default rather than silently disabling retention.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return def
+	}
+	return d
 }
 
 func envInt(key string, def int) int {

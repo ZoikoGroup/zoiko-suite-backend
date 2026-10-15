@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "ZoikoSuite - Authorization Service (8089)",
-    "description": "Every endpoint on authorization-svc (:8089), ordered as a runnable flow.\n\nRun the folders top to bottom with the Collection Runner. Ids are captured by\ntest scripts, so nothing needs pasting by hand.\n\nTHE ENVELOPE IS SET FOR YOU\nA collection-level pre-request script adds the canonical input contract\n(ZS-ARCH-SVC-001 section 4) to every request: X-Tenant-Id, X-Principal-Id,\nX-Legal-Entity-Id, X-Request-Id, X-Correlation-ID, X-Source-Channel and, on\nmaterial writes only, Idempotency-Key. Without it every /v1/admin/* write here\nanswers 401 envelope_incomplete, because the service enforces write-strict by\ndefault. Open the collection's Pre-request Script tab to see it.\n\nKEY FACTS\n- /v1/authorize returns HTTP 200 for BOTH grant and deny. The verdict is in\n  decision_outcome, not the status code. 200 means the evaluation succeeded.\n- Evaluation order: principal status (layer 0), RBAC, delegated authority,\n  static SoD, own-object SoD, then attribute conditions. Every layer after the\n  first can only ever REMOVE access the earlier ones conferred.\n- Every evaluation is written to access_decision_log before responding. The\n  three pre-flight routes in folder 10 write nothing at all, which is what\n  makes them safe to call while somebody is still deciding.\n- legal_entity_id and tenant_id MUST be UUIDs — they are uuid columns. A\n  malformed one now answers 400 invalid_scope naming the field. It used to\n  answer 503 store_unavailable, which read to a caller as this service being\n  down; that is fixed, and this collection no longer documents it as a defect\n  you have to live with.\n- principal_id is free text and deliberately NOT validated: it is TEXT in every\n  table, and service-account ids are not UUIDs.\n- legal_entity_id accepts the literal PLATFORM for an act that belongs to no\n  single legal entity. It resolves to AUTHZ_PLATFORM_SCOPE_ENTITY_ID.\n- Purchase actions consumed by purchase-order-svc: PO_ISSUE, PO_AMEND, PO_CLOSE.\n\nNOT REACHABLE FROM HERE, BY DESIGN\nLayer 0 (principal status) has no HTTP route. identity-context-svc is\nauthoritative for whether an account is active, and this service consumes\nprincipal.status.changed from zoiko.identity.events into a read-model. An admin\nroute that could override it would let two services disagree about who is\nsuspended. Folder 11 explains how to exercise it.",
+    "description": "Every endpoint on authorization-svc (:8089), ordered as a runnable flow.\n\nRun the folders top to bottom with the Collection Runner. Ids are captured by\ntest scripts, so nothing needs pasting by hand.\n\nTHE ENVELOPE IS SET FOR YOU\nA collection-level pre-request script adds the canonical input contract\n(ZS-ARCH-SVC-001 section 4) to every request: X-Tenant-Id, X-Principal-Id,\nX-Legal-Entity-Id, X-Request-Id, X-Correlation-ID, X-Source-Channel and, on\nmaterial writes only, Idempotency-Key. Without it every /v1/admin/* write here\nanswers 401 envelope_incomplete, because the service enforces write-strict by\ndefault. Open the collection's Pre-request Script tab to see it.\n\nKEY FACTS\n- /v1/authorize returns HTTP 200 for BOTH grant and deny. The verdict is in\n  decision_outcome, not the status code. 200 means the evaluation succeeded.\n- Evaluation order: principal status (layer 0), RBAC, delegated authority,\n  static SoD, own-object SoD, then attribute conditions. Every layer after the\n  first can only ever REMOVE access the earlier ones conferred.\n- Every evaluation is written to access_decision_log before responding. The\n  three pre-flight routes in folder 10 write nothing at all, which is what\n  makes them safe to call while somebody is still deciding.\n- legal_entity_id and tenant_id MUST be UUIDs \u2014 they are uuid columns. A\n  malformed one now answers 400 invalid_scope naming the field. It used to\n  answer 503 store_unavailable, which read to a caller as this service being\n  down; that is fixed, and this collection no longer documents it as a defect\n  you have to live with.\n- principal_id is free text and deliberately NOT validated: it is TEXT in every\n  table, and service-account ids are not UUIDs.\n- legal_entity_id accepts the literal PLATFORM for an act that belongs to no\n  single legal entity. It resolves to AUTHZ_PLATFORM_SCOPE_ENTITY_ID.\n- Purchase actions consumed by purchase-order-svc: PO_ISSUE, PO_AMEND, PO_CLOSE.\n\nNOT REACHABLE FROM HERE, BY DESIGN\nLayer 0 (principal status) has no HTTP route. identity-context-svc is\nauthoritative for whether an account is active, and this service consumes\nprincipal.status.changed from zoiko.identity.events into a read-model. An admin\nroute that could override it would let two services disagree about who is\nsuspended. Folder 11 explains how to exercise it.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -71,6 +71,30 @@
     },
     {
       "key": "decisionCursor",
+      "value": ""
+    },
+    {
+      "key": "approverPrincipal",
+      "value": "pm-approver"
+    },
+    {
+      "key": "subjectPrincipal",
+      "value": "pm-oncall"
+    },
+    {
+      "key": "jitSessionId",
+      "value": ""
+    },
+    {
+      "key": "jitReadSessionId",
+      "value": ""
+    },
+    {
+      "key": "bgSessionId",
+      "value": ""
+    },
+    {
+      "key": "supportSessionId",
       "value": ""
     }
   ],
@@ -826,7 +850,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{}"
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Revoke delegation\"\n}"
             },
             "url": {
               "raw": "{{authzUrl}}/v1/admin/delegated-authorities/{{delegationId}}/revoke",
@@ -914,7 +938,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{}"
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Revoke role assignment\"\n}"
             },
             "url": {
               "raw": "{{authzUrl}}/v1/admin/role-assignments/{{assignmentId}}/revoke",
@@ -1008,7 +1032,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{}"
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Revoke delegation twice -> 409 already_revoked\"\n}"
             },
             "url": {
               "raw": "{{authzUrl}}/v1/admin/delegated-authorities/{{delegationId}}/revoke",
@@ -1250,7 +1274,7 @@
     },
     {
       "name": "06 - Attribute conditions (ABAC, layer 5)",
-      "description": "The deny-only attribute layer. abac_rules SHIPS EMPTY, so this layer changes no outcome until somebody declares a rule — which is why creating one here immediately starts refusing an action that was allowed a moment ago.\n\nREQUIRE means the condition must hold or the action is denied, and an attribute the rule names that the caller did NOT send counts as not held. That is deliberate: otherwise any caller could evade a required condition by omitting a JSON field.",
+      "description": "The deny-only attribute layer. abac_rules SHIPS EMPTY, so this layer changes no outcome until somebody declares a rule \u2014 which is why creating one here immediately starts refusing an action that was allowed a moment ago.\n\nREQUIRE means the condition must hold or the action is denied, and an attribute the rule names that the caller did NOT send counts as not held. That is deliberate: otherwise any caller could evade a required condition by omitting a JSON field.",
       "item": [
         {
           "name": "Grant DOC_PUBLISH via a role (setup)",
@@ -1546,7 +1570,7 @@
                 "abac-rules"
               ]
             },
-            "description": "Includes platform-wide rules (tenant_id null) alongside the tenant's own — both deny identically, and hiding the ones a tenant operator cannot edit would make a denial unexplainable."
+            "description": "Includes platform-wide rules (tenant_id null) alongside the tenant's own \u2014 both deny identically, and hiding the ones a tenant operator cannot edit would make a denial unexplainable."
           },
           "event": [
             {
@@ -1564,7 +1588,12 @@
           "name": "Retire the condition",
           "request": {
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{authzUrl}}/v1/admin/abac-rules/{{abacRuleId}}/retire",
               "host": [
@@ -1578,7 +1607,11 @@
                 "retire"
               ]
             },
-            "description": "The off switch. active_flag is in the evaluation predicate, and until this route existed nothing could reach it."
+            "description": "The off switch. active_flag is in the evaluation predicate, and until this route existed nothing could reach it.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Retire the condition\"\n}"
+            }
           },
           "event": [
             {
@@ -1634,7 +1667,12 @@
           "name": "Reactivate it",
           "request": {
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{authzUrl}}/v1/admin/abac-rules/{{abacRuleId}}/reactivate",
               "host": [
@@ -1648,7 +1686,11 @@
                 "reactivate"
               ]
             },
-            "description": ""
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Reactivate it\"\n}"
+            }
           },
           "event": [
             {
@@ -1705,7 +1747,7 @@
     },
     {
       "name": "07 - The registers (every admin read)",
-      "description": "All five admin reads. Each is authenticated and tenant-scoped: an assignment names a principal and the role they hold, and a SoD rule names where the segregation tripwires are.\n\nThe tenant comes from the VERIFIED X-Tenant-Id header, never from a query parameter — so no filter here can widen the scope.",
+      "description": "All five admin reads. Each is authenticated and tenant-scoped: an assignment names a principal and the role they hold, and a SoD rule names where the segregation tripwires are.\n\nThe tenant comes from the VERIFIED X-Tenant-Id header, never from a query parameter \u2014 so no filter here can widen the scope.",
       "item": [
         {
           "name": "Roles in this tenant",
@@ -1755,7 +1797,7 @@
                 "permission-bundles"
               ]
             },
-            "description": "permitted_actions was write-only until this route existed — a role could be created and there was no way to read what it granted."
+            "description": "permitted_actions was write-only until this route existed \u2014 a role could be created and there was no way to read what it granted."
           },
           "event": [
             {
@@ -1929,7 +1971,7 @@
                 "roles"
               ]
             },
-            "description": "tenant_id is a uuid column and withRLS installs the raw value into app.tenant_id, where the POLICY casts it — so a malformed tenant used to fail inside row security and surface as 503 store_unavailable, which reads to a caller as this service being down. Now a 400 naming the header."
+            "description": "tenant_id is a uuid column and withRLS installs the raw value into app.tenant_id, where the POLICY casts it \u2014 so a malformed tenant used to fail inside row security and surface as 503 store_unavailable, which reads to a caller as this service being down. Now a 400 naming the header."
           },
           "event": [
             {
@@ -1954,7 +1996,12 @@
           "name": "Retire the buyer role",
           "request": {
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{authzUrl}}/v1/admin/roles/{{roleId}}/retire",
               "host": [
@@ -1968,7 +2015,11 @@
                 "retire"
               ]
             },
-            "description": "Suspends the role for every holder. Not a delete — assignments referencing it must stay resolvable for audit history."
+            "description": "Suspends the role for every holder. Not a delete \u2014 assignments referencing it must stay resolvable for audit history.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Retire the buyer role\"\n}"
+            }
           },
           "event": [
             {
@@ -2025,7 +2076,12 @@
           "name": "Reactivate it",
           "request": {
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{authzUrl}}/v1/admin/roles/{{roleId}}/reactivate",
               "host": [
@@ -2039,7 +2095,11 @@
                 "reactivate"
               ]
             },
-            "description": ""
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Reactivate it\"\n}"
+            }
           },
           "event": [
             {
@@ -2095,7 +2155,12 @@
           "name": "Withdraw one permission bundle",
           "request": {
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{authzUrl}}/v1/admin/permission-bundles/{{bundleId}}/retire",
               "host": [
@@ -2109,7 +2174,11 @@
                 "retire"
               ]
             },
-            "description": "Narrower than retiring the role. Needs bundleId — folder 07's bundle read captures it."
+            "description": "Narrower than retiring the role. Needs bundleId \u2014 folder 07's bundle read captures it.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Withdraw one permission bundle\"\n}"
+            }
           },
           "event": [
             {
@@ -2127,7 +2196,12 @@
           "name": "Restore it",
           "request": {
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{authzUrl}}/v1/admin/permission-bundles/{{bundleId}}/reactivate",
               "host": [
@@ -2141,7 +2215,11 @@
                 "reactivate"
               ]
             },
-            "description": ""
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Restore it\"\n}"
+            }
           },
           "event": [
             {
@@ -2159,7 +2237,12 @@
           "name": "Retire the SoD rule",
           "request": {
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{authzUrl}}/v1/admin/sod-rules/{{sodRuleId}}/retire",
               "host": [
@@ -2173,7 +2256,11 @@
                 "retire"
               ]
             },
-            "description": "Stops the conflict being enforced. Withdrawing a segregation-of-duties control should be a decision somebody has taken, not a way to unblock a grant."
+            "description": "Stops the conflict being enforced. Withdrawing a segregation-of-duties control should be a decision somebody has taken, not a way to unblock a grant.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Retire the SoD rule\"\n}"
+            }
           },
           "event": [
             {
@@ -2191,7 +2278,12 @@
           "name": "Reactivate the SoD rule",
           "request": {
             "method": "POST",
-            "header": [],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "url": {
               "raw": "{{authzUrl}}/v1/admin/sod-rules/{{sodRuleId}}/reactivate",
               "host": [
@@ -2205,7 +2297,11 @@
                 "reactivate"
               ]
             },
-            "description": ""
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough of Reactivate the SoD rule\"\n}"
+            }
           },
           "event": [
             {
@@ -2223,7 +2319,7 @@
     },
     {
       "name": "09 - The decision history (searchable)",
-      "description": "Doc 03 section 8.3 sets two evidence obligations: every decision logged with actor, action, basis and outcome, and separately, denials must be EVIDENTIALLY RETRIEVABLE.\n\nThe first held from the first migration. The second did not, because GET /v1/access-decisions/{id} was the only read — and retrieval by primary key only serves somebody who already holds the key. A denial's key exists in exactly one place: the response handed to the service that was refused. So auditing a denial began by reading the CALLING service's logs.\n\nNewest first, keyset-paginated. OFFSET would be wrong here: the log takes a row for every permission check on the platform, so a row inserted while somebody is paging would shift every later page and silently drop one decision while repeating another.",
+      "description": "Doc 03 section 8.3 sets two evidence obligations: every decision logged with actor, action, basis and outcome, and separately, denials must be EVIDENTIALLY RETRIEVABLE.\n\nThe first held from the first migration. The second did not, because GET /v1/access-decisions/{id} was the only read \u2014 and retrieval by primary key only serves somebody who already holds the key. A denial's key exists in exactly one place: the response handed to the service that was refused. So auditing a denial began by reading the CALLING service's logs.\n\nNewest first, keyset-paginated. OFFSET would be wrong here: the log takes a row for every permission check on the platform, so a row inserted while somebody is paging would shift every later page and silently drop one decision while repeating another.",
       "item": [
         {
           "name": "Every recorded check, newest first",
@@ -2246,7 +2342,7 @@
                 }
               ]
             },
-            "description": "Decisions recorded with NO tenant are invisible here — the callers that do not yet forward an envelope. They cannot be attributed to an organisation, so serving them to one would be a guess."
+            "description": "Decisions recorded with NO tenant are invisible here \u2014 the callers that do not yet forward an envelope. They cannot be attributed to an organisation, so serving them to one would be a guess."
           },
           "event": [
             {
@@ -2404,7 +2500,7 @@
                 }
               ]
             },
-            "description": "Refused rather than matched against nothing. On an AUDIT read, 'this organisation refused nobody' and 'your filter was a typo' must not be the same answer — somebody could close an investigation on the difference."
+            "description": "Refused rather than matched against nothing. On an AUDIT read, 'this organisation refused nobody' and 'your filter was a typo' must not be the same answer \u2014 somebody could close an investigation on the difference."
           },
           "event": [
             {
@@ -2440,7 +2536,7 @@
                 }
               ]
             },
-            "description": "A token this service did not issue is refused, not silently reset to page one — that would hand an auditor the newest page while they believed they were continuing through the oldest."
+            "description": "A token this service did not issue is refused, not silently reset to page one \u2014 that would hand an auditor the newest page while they believed they were continuing through the oldest."
           },
           "event": [
             {
@@ -2514,7 +2610,7 @@
                 }
               ]
             },
-            "description": "Returns nothing, and nothing is a legitimate answer to a well-formed question — so it is refused instead."
+            "description": "Returns nothing, and nothing is a legitimate answer to a well-formed question \u2014 so it is refused instead."
           },
           "event": [
             {
@@ -2570,7 +2666,7 @@
     },
     {
       "name": "10 - Pre-flight checks (the other three section 8.3 APIs)",
-      "description": "Doc 03 section 8.3 lists five inbound APIs. Three of them — validate entity scope, validate SoD conflicts, evaluate delegated access — were folded into /v1/authorize as internal layers and had no HTTP surface, which left three questions unanswerable.\n\nNONE OF THESE RECORDS A DECISION ARTIFACT. The decision log means 'one row per authorization of a material act', and these answer questions ABOUT the grant graph rather than authorizing anything — rows from them would make that meaning false, and that meaning is what an auditor reads it for. So they are safe to call repeatedly while somebody is still deciding, unlike /v1/authorize.\n\nAll three are POSTs because each takes a body, and all three are classified as NON-WRITES, so no Idempotency-Key is sent or required.",
+      "description": "Doc 03 section 8.3 lists five inbound APIs. Three of them \u2014 validate entity scope, validate SoD conflicts, evaluate delegated access \u2014 were folded into /v1/authorize as internal layers and had no HTTP surface, which left three questions unanswerable.\n\nNONE OF THESE RECORDS A DECISION ARTIFACT. The decision log means 'one row per authorization of a material act', and these answer questions ABOUT the grant graph rather than authorizing anything \u2014 rows from them would make that meaning false, and that meaning is what an auditor reads it for. So they are safe to call repeatedly while somebody is still deciding, unlike /v1/authorize.\n\nAll three are POSTs because each takes a body, and all three are classified as NON-WRITES, so no Idempotency-Key is sent or required.",
       "item": [
         {
           "name": "Which companies may this person act in?",
@@ -2593,7 +2689,7 @@
                 "validate"
               ]
             },
-            "description": "One call for a whole list. The same question through /v1/authorize is one call per company AND one decision-log row per company — twelve audit records written to grey out four buttons.\n\nOmitting action_type asks the broad question and returns everything they hold in each company. Delegated authority counts as in scope.",
+            "description": "One call for a whole list. The same question through /v1/authorize is one call per company AND one decision-log row per company \u2014 twelve audit records written to grey out four buttons.\n\nOmitting action_type asks the broad question and returns everything they hold in each company. Delegated authority counts as in scope.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_ids\": [\n    \"{{entityId}}\",\n    \"33330000-0000-4000-8000-000000000009\",\n    \"PLATFORM\"\n  ]\n}"
@@ -2676,7 +2772,7 @@
                 "validate"
               ]
             },
-            "description": "The question /v1/authorize structurally cannot answer. A breach is a COMBINATION, so it only becomes visible once the combination exists — which meant the only way to discover a role must not be granted was to grant it and watch every use of it be refused.\n\nNo principal named, so this asks whether the SET conflicts with ITSELF. Folder 03 created the PO_ISSUE/PO_APPROVE rule, so expect a conflict with source 'candidate' — the bundle has to be split.",
+            "description": "The question /v1/authorize structurally cannot answer. A breach is a COMBINATION, so it only becomes visible once the combination exists \u2014 which meant the only way to discover a role must not be granted was to grant it and watch every use of it be refused.\n\nNo principal named, so this asks whether the SET conflicts with ITSELF. Folder 03 created the PO_ISSUE/PO_APPROVE rule, so expect a conflict with source 'candidate' \u2014 the bundle has to be split.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"candidate_actions\": [\"PO_ISSUE\", \"PO_APPROVE\"]\n}"
@@ -2718,7 +2814,7 @@
                 "validate"
               ]
             },
-            "description": "With a principal AND a company, the candidates are checked against what they already hold — including anything lent by a delegation, which conflicts just as hard. Excluding delegations here would clear a grant the evaluation engine then refuses.",
+            "description": "With a principal AND a company, the candidates are checked against what they already hold \u2014 including anything lent by a delegation, which conflicts just as hard. Excluding delegations here would clear a grant the evaluation engine then refuses.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"candidate_actions\": [\"PO_APPROVE\"]\n}"
@@ -2758,7 +2854,7 @@
                 "validate"
               ]
             },
-            "description": "Refused rather than downgraded to the bundle-only question. Grants are entity-scoped, so answering the narrower question instead would return conflict_free:true for somebody who DOES conflict — a false all-clear on a control.",
+            "description": "Refused rather than downgraded to the bundle-only question. Grants are entity-scoped, so answering the narrower question instead would return conflict_free:true for somebody who DOES conflict \u2014 a false all-clear on a control.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"candidate_actions\": [\"PO_APPROVE\"]\n}"
@@ -2798,7 +2894,7 @@
                 "evaluate"
               ]
             },
-            "description": "held_directly is the field that makes this route worth having. /v1/authorize returns one GRANTED for both paths and names RBAC as the basis when both apply — so somebody holding an action directly AND by delegation reads as ordinary role-based access. For a four-eyes step that has to know whether the delegate or the delegator satisfied it, that is the whole question.",
+            "description": "held_directly is the field that makes this route worth having. /v1/authorize returns one GRANTED for both paths and names RBAC as the basis when both apply \u2014 so somebody holding an action directly AND by delegation reads as ordinary role-based access. For a four-eyes step that has to know whether the delegate or the delegator satisfied it, that is the whole question.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"principal_id\": \"{{delegatePrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_APPROVE\"\n}"
@@ -2902,7 +2998,7 @@
     },
     {
       "name": "11 - Layer 0: principal status (event-driven, no HTTP route)",
-      "description": "A principal that identity-context-svc has SUSPENDED or DISABLED may execute NOTHING — refused before any grant is even looked up, with decision_basis principal_status:SUSPENDED.\n\nThis closes a hole session eviction does not. identity-context-svc evicts SESSIONS on principal.status.changed, so a suspended human cannot log in — but /v1/authorize is called east-west by 111 services on envelopes resolved BEFORE the suspension, and by scheduled and queued work that carries a principal and no session at all.\n\nTHERE IS DELIBERATELY NO ROUTE TO SET IT. identity-context-svc is authoritative for whether an account is active; an admin route here would let two services disagree about who is suspended. This service consumes principal.status.changed from zoiko.identity.events into a read-model.\n\nTO EXERCISE IT BY HAND, publish to the topic:\n\n  docker exec -i zoiko-kafka /opt/kafka/bin/kafka-console-producer.sh \\\n    --bootstrap-server localhost:9094 --topic zoiko.identity.events\n\nthen paste one line:\n\n  {\"event_id\":\"m-1\",\"event_type\":\"principal.status.changed\",\n   \"tenant_id\":\"<tenantId>\",\"payload\":{\"principal_id\":\"buyer-alice\",\n   \"tenant_id\":\"<tenantId>\",\"new_status\":\"SUSPENDED\"}}\n\nSend new_status ACTIVE to reinstate. The role assignments are never touched — that is why this is a projection and not a revocation: SUSPENDED is reversible and effective_to is not.\n\nNO ROW MEANS ACTIVE, so on a stack that has seen no status event this layer changes no outcome at all.",
+      "description": "A principal that identity-context-svc has SUSPENDED or DISABLED may execute NOTHING \u2014 refused before any grant is even looked up, with decision_basis principal_status:SUSPENDED.\n\nThis closes a hole session eviction does not. identity-context-svc evicts SESSIONS on principal.status.changed, so a suspended human cannot log in \u2014 but /v1/authorize is called east-west by 111 services on envelopes resolved BEFORE the suspension, and by scheduled and queued work that carries a principal and no session at all.\n\nTHERE IS DELIBERATELY NO ROUTE TO SET IT. identity-context-svc is authoritative for whether an account is active; an admin route here would let two services disagree about who is suspended. This service consumes principal.status.changed from zoiko.identity.events into a read-model.\n\nTO EXERCISE IT BY HAND, publish to the topic:\n\n  docker exec -i zoiko-kafka /opt/kafka/bin/kafka-console-producer.sh \\\n    --bootstrap-server localhost:9094 --topic zoiko.identity.events\n\nthen paste one line:\n\n  {\"event_id\":\"m-1\",\"event_type\":\"principal.status.changed\",\n   \"tenant_id\":\"<tenantId>\",\"payload\":{\"principal_id\":\"buyer-alice\",\n   \"tenant_id\":\"<tenantId>\",\"new_status\":\"SUSPENDED\"}}\n\nSend new_status ACTIVE to reinstate. The role assignments are never touched \u2014 that is why this is a projection and not a revocation: SUSPENDED is reversible and effective_to is not.\n\nNO ROW MEANS ACTIVE, so on a stack that has seen no status event this layer changes no outcome at all.",
       "item": [
         {
           "name": "Check the gate (run after publishing SUSPENDED)",
@@ -2941,7 +3037,7 @@
                   "if (b.decision_basis && b.decision_basis.indexOf(\"principal_status:\") === 0) {",
                   "  pm.test(\"denied by layer 0\", () => pm.expect(b.decision_outcome).to.eql(\"DENIED\"));",
                   "} else {",
-                  "  console.log(\"No status projected for this principal — layer 0 is inert, which is the default. Basis: \" + b.decision_basis);",
+                  "  console.log(\"No status projected for this principal \u2014 layer 0 is inert, which is the default. Basis: \" + b.decision_basis);",
                   "}"
                 ]
               }
@@ -2995,7 +3091,7 @@
     },
     {
       "name": "12 - Scope validation (a typo is a 400, not an outage)",
-      "description": "legal_entity_id and tenant_id are UUID in every table this service compares them against, and passing a non-UUID to a uuid comparison is a DRIVER error — which the store wraps as ErrStoreUnavailable and every handler answers 503 for.\n\nFrom a calling service that 503 is indistinguishable from authorization-svc being down, so a caller that mistyped an entity id was told the platform's authorization plane had failed. known-gaps.md recorded it and put the remedy on the CALLERS — 'callers must validate the scope themselves before asking' — which is the wrong place: the workaround has to be written 111 times and any caller that forgets reports an outage instead of a typo.\n\nprincipal_id is deliberately NOT validated. It is TEXT in every table and compared as text, so a malformed one is a valid comparison that matches nothing — and refusing it would break every service account, whose ids are not UUIDs.",
+      "description": "legal_entity_id and tenant_id are UUID in every table this service compares them against, and passing a non-UUID to a uuid comparison is a DRIVER error \u2014 which the store wraps as ErrStoreUnavailable and every handler answers 503 for.\n\nFrom a calling service that 503 is indistinguishable from authorization-svc being down, so a caller that mistyped an entity id was told the platform's authorization plane had failed. known-gaps.md recorded it and put the remedy on the CALLERS \u2014 'callers must validate the scope themselves before asking' \u2014 which is the wrong place: the workaround has to be written 111 times and any caller that forgets reports an outage instead of a typo.\n\nprincipal_id is deliberately NOT validated. It is TEXT in every table and compared as text, so a malformed one is a valid comparison that matches nothing \u2014 and refusing it would break every service account, whose ids are not UUIDs.",
       "item": [
         {
           "name": "Malformed legal_entity_id -> 400 invalid_scope",
@@ -3097,7 +3193,7 @@
                 "authorize"
               ]
             },
-            "description": "The other half, and the one it would be wrong to get wrong. Expect 200 with DENIED no_grant — evaluated properly, just holding nothing.",
+            "description": "The other half, and the one it would be wrong to get wrong. Expect 200 with DENIED no_grant \u2014 evaluated properly, just holding nothing.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"principal_id\": \"svc-accounts-payable\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"{{tenantId}}\"\n}"
@@ -3136,7 +3232,7 @@
                 "authorize"
               ]
             },
-            "description": "The sentinel is not a UUID and must not be rejected as one — a platform-wide act needs somewhere to put itself. Resolves to AUTHZ_PLATFORM_SCOPE_ENTITY_ID; a deployment without it answers 400 platform_scope_not_configured rather than inventing an id.",
+            "description": "The sentinel is not a UUID and must not be rejected as one \u2014 a platform-wide act needs somewhere to put itself. Resolves to AUTHZ_PLATFORM_SCOPE_ENTITY_ID; a deployment without it answers 400 platform_scope_not_configured rather than inventing an id.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"PLATFORM\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"{{tenantId}}\"\n}"
@@ -3199,6 +3295,664 @@
           ]
         }
       ]
+    },
+    {
+      "name": "13 - Session controls (JIT, break-glass, support; ZS-IAM-001 \u00a713-15)",
+      "description": "Prerequisites (granted through access-control-svc or seed-demo-rbac): {{adminPrincipal}} holds iam.pam.manage, iam.break_glass.manage and iam.support.manage; {{approverPrincipal}} holds iam.pam.approve and iam.session.review; {{subjectPrincipal}} holds iam.pam.eligible and iam.break_glass.eligible. A JIT session for anything but reads waits for an independent approver (202); wildcards are refused; every revoke carries a reason.",
+      "item": [
+        {
+          "name": "JIT, read-only: active at once (201)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/privileged-sessions",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "privileged-sessions"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{subjectPrincipal}}\",\n  \"requested_actions\": [\n    \"ledger.view\"\n  ],\n  \"ticket_ref\": \"PM-1\",\n  \"reason\": \"Investigate a ledger question\",\n  \"duration_seconds\": 1800,\n  \"resource_scope\": \"ledger/2026-10\",\n  \"target_environment\": \"production\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "if (pm.response.code === 201) { pm.collectionVariables.set(\"jitReadSessionId\", pm.response.json().session_id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "JIT, a write: waits for approval (202)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/privileged-sessions",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "privileged-sessions"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{subjectPrincipal}}\",\n  \"requested_actions\": [\n    \"PO_APPROVE\"\n  ],\n  \"ticket_ref\": \"PM-2\",\n  \"reason\": \"Cover approvals during an outage\",\n  \"duration_seconds\": 1800,\n  \"resource_scope\": \"purchase-orders\",\n  \"target_environment\": \"production\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 202\", () => pm.response.to.have.status(202));",
+                  "if (pm.response.code === 202) { pm.collectionVariables.set(\"jitSessionId\", pm.response.json().session_id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "JIT with a wildcard: refused (400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/privileged-sessions",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "privileged-sessions"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{subjectPrincipal}}\",\n  \"requested_actions\": [\n    \"*\"\n  ],\n  \"ticket_ref\": \"PM-3\",\n  \"reason\": \"x\",\n  \"duration_seconds\": 600,\n  \"resource_scope\": \"x\",\n  \"target_environment\": \"production\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Approve by the requester: refused (403)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/privileged-sessions/{{jitSessionId}}/approve",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "privileged-sessions",
+                "{{jitSessionId}}",
+                "approve"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 403\", () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Approve by an independent approver (200)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{approverPrincipal}}"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/privileged-sessions/{{jitSessionId}}/approve",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "privileged-sessions",
+                "{{jitSessionId}}",
+                "approve"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Revoke the JIT session, with a reason (200)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/privileged-sessions/{{jitSessionId}}/revoke",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "privileged-sessions",
+                "{{jitSessionId}}",
+                "revoke"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Review the ended session (200)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Principal-Id",
+                "value": "{{approverPrincipal}}"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/privileged-sessions/{{jitSessionId}}/review",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "privileged-sessions",
+                "{{jitSessionId}}",
+                "review"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"outcome\": \"ATTESTED\",\n  \"notes\": \"actions matched the ticket\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Break-glass (201)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/break-glass-sessions",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "break-glass-sessions"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{subjectPrincipal}}\",\n  \"incident_id\": \"INC-PM-1\",\n  \"reason\": \"Production incident\",\n  \"requested_actions\": [\n    \"ledger.view\"\n  ],\n  \"duration_seconds\": 1800\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "if (pm.response.code === 201) { pm.collectionVariables.set(\"bgSessionId\", pm.response.json().session_id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Revoke break-glass, with a reason (200)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/break-glass-sessions/{{bgSessionId}}/revoke",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "break-glass-sessions",
+                "{{bgSessionId}}",
+                "revoke"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Support session, read-only, consent stated (201)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/support/sessions",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "support",
+                "sessions"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"support_operator_id\": \"{{subjectPrincipal}}\",\n  \"ticket_ref\": \"SUP-PM-1\",\n  \"purpose\": \"Customer ticket\",\n  \"read_only\": true,\n  \"tenant_consent_obtained\": true,\n  \"duration_seconds\": 1800\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "if (pm.response.code === 201) { pm.collectionVariables.set(\"supportSessionId\", pm.response.json().session_id); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Revoke the support session, with a reason (200)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/support/sessions/{{supportSessionId}}/revoke",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "support",
+                "sessions",
+                "{{supportSessionId}}",
+                "revoke"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"POSTMAN_WALKTHROUGH\",\n  \"purpose\": \"Postman walkthrough\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "14 - Workload bindings (ZS-IAM-001 \u00a716)",
+      "description": "Prerequisite: {{adminPrincipal}} holds iam.workload.manage (not yet in access-control-svc's registry; grant it through this service's admin API). A bound workload may take only the actions its binding lists, and is evaluated as a workload whether or not the request says so.",
+      "item": [
+        {
+          "name": "Bind a workload (200)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/workload-bindings",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "workload-bindings"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"workload_id\": \"ledger-sync\",\n  \"allowed_audience\": \"ledger-api\",\n  \"allowed_actions\": [\n    \"GL_JOURNAL_READ\"\n  ],\n  \"reason_code\": \"ONBOARD\",\n  \"purpose\": \"nightly ledger sync\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Wildcard audience: refused (400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/workload-bindings",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "workload-bindings"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"workload_id\": \"ledger-sync\",\n  \"allowed_audience\": \"*\",\n  \"allowed_actions\": [\n    \"GL_JOURNAL_READ\"\n  ],\n  \"reason_code\": \"ONBOARD\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List the tenant's bindings (200)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/workload-bindings",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "workload-bindings"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Action outside the binding: DENIED workload:action_not_bound",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"ledger-sync\",\n  \"principal_type\": \"WORKLOAD\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"GL_POST\",\n  \"audience\": \"ledger-api\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"outside the binding\", () => pm.expect(pm.response.json().decision_basis).to.eql(\"workload:action_not_bound\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Deactivate the binding, with a reason (200)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/workload-bindings/ledger-sync/deactivate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "workload-bindings",
+                "ledger-sync",
+                "deactivate"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason_code\": \"COMPROMISED\",\n  \"purpose\": \"credential leaked\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
     }
   ],
   "event": [
@@ -3217,7 +3971,7 @@
           "// refused and the 'runnable flow' in the description was not runnable.",
           "//",
           "// Set here rather than on each of ~50 items: one definition, and a request",
-          "// added later inherits it. Nothing is overwritten — an item that sets its own",
+          "// added later inherits it. Nothing is overwritten \u2014 an item that sets its own",
           "// X-Correlation-ID keeps it, which is how the per-step pm-N values survive.",
           "const need = (k, v) => {",
           "  if (v && !pm.request.headers.has(k)) {",
@@ -3240,7 +3994,7 @@
           "// internal/handler/envelope_policy.go) because they change no business",
           "// state: /v1/authorize writes only the audit record OF the question, and the",
           "// three pre-flight routes write nothing at all. Sending a key there would",
-          "// imply replay protection on a question, which is backwards — two identical",
+          "// imply replay protection on a question, which is backwards \u2014 two identical",
           "// questions must produce two log rows.",
           "const NON_WRITES = /\\/v1\\/(authorize|entity-scope\\/validate|sod\\/validate|delegated-access\\/evaluate)$/;",
           "const path = '/' + pm.request.url.getPath().replace(/^\\/+/, '');",

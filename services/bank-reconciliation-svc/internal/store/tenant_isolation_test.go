@@ -168,7 +168,7 @@ func TestMain(m *testing.M) {
 		}
 	}
 
-	testStore = store.New(testPool, zap.NewNop())
+	testStore = store.New(testPool, zap.NewNop(), store.WithEventRegion("uk"))
 
 	code := m.Run()
 
@@ -210,7 +210,7 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) lineFixture {
 		BankReference:   "ACH-" + tenantLabel,
 		Status:          domain.StatementLineStatusUnmatched,
 		CorrelationID:   "corr-" + tenantLabel + "-" + f.statementLineID,
-	})
+	}, "ingest-fixture")
 	require.NoError(t, err)
 
 	return f
@@ -236,7 +236,7 @@ func TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent(t *testin
 		Status:          domain.StatementLineStatusUnmatched,
 		CorrelationID:   "corr-retry-1",
 	}
-	created1, err := testStore.CreateStatementLine(ctx, line1)
+	created1, err := testStore.CreateStatementLine(ctx, line1, "ingest-actor")
 	require.NoError(t, err)
 	assert.True(t, created1, "expected created=true on the first call")
 
@@ -252,7 +252,7 @@ func TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent(t *testin
 		Status:          domain.StatementLineStatusUnmatched,
 		CorrelationID:   "corr-retry-1",
 	}
-	created2, err := testStore.CreateStatementLine(ctx, line2)
+	created2, err := testStore.CreateStatementLine(ctx, line2, "ingest-actor")
 	require.NoError(t, err)
 	assert.False(t, created2, "expected created=false on the retried call — this is a duplicate-line bug if it's true")
 	assert.Equal(t, line1.StatementLineID, line2.StatementLineID, "retried call must resolve to the original statement_line_id")
@@ -261,6 +261,15 @@ func TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent(t *testin
 	require.NoError(t, testPool.QueryRow(ctx, `SELECT COUNT(*) FROM statement_lines WHERE tenant_id = $1 AND correlation_id = $2`,
 		tenantID, "corr-retry-1").Scan(&count))
 	assert.Equal(t, 1, count, "DUPLICATE LINE: expected exactly 1 statement_lines row for this correlation_id")
+
+	// TestPgStore_CreateStatementLine_RetriedCorrelationID_DoesNotReenqueue:
+	// the replay branch must not call enqueueReconciliationEvent a second
+	// time — a retried ingest must never re-announce the fact to the outbox.
+	var outboxCount int
+	require.NoError(t, testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM eventing_outbox WHERE tenant_id = $1 AND aggregate_id = $2 AND event_type LIKE '%reconciliation.ingested'`,
+		tenantID, line1.StatementLineID).Scan(&outboxCount))
+	assert.Equal(t, 1, outboxCount, "expected exactly 1 outbox row for this ingestion — a retry must not re-enqueue the event")
 }
 
 // TestPgStore_CreateStatementLine_WritesContextTenantNotStructTenant proves
@@ -289,7 +298,7 @@ func TestPgStore_CreateStatementLine_WritesContextTenantNotStructTenant(t *testi
 		BankReference:   "ACH-crosstenant",
 		Status:          domain.StatementLineStatusUnmatched,
 		CorrelationID:   "corr-crosstenant-" + lineID,
-	})
+	}, "ingest-actor")
 	require.NoError(t, err)
 
 	var stored string
@@ -362,7 +371,7 @@ func TestPgStore_ListStatementLines_IsBounded(t *testing.T) {
 			BankReference:   "ACH-bounded",
 			Status:          domain.StatementLineStatusUnmatched,
 			CorrelationID:   "corr-bounded-" + id,
-		})
+		}, "ingest-actor")
 		require.NoError(t, err)
 	}
 

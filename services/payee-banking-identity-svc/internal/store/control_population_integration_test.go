@@ -33,7 +33,7 @@ func openPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS payee_destination_events, payee_destinations CASCADE`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS payee_destination_events, payee_destinations, eventing_outbox CASCADE`); err != nil {
 		t.Fatalf("drop: %v", err)
 	}
 	_, file, _, _ := runtime.Caller(0)
@@ -63,7 +63,7 @@ type fixture struct {
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	pool := openPool(t)
-	return &fixture{pool: pool, s: store.NewPgStore(pool, zap.NewNop()), tenant: uuid.New().String(), entity: "le-1"}
+	return &fixture{pool: pool, s: store.NewPgStore(pool, zap.NewNop(), store.WithEventRegion("uk")), tenant: uuid.New().String(), entity: "le-1"}
 }
 
 const (

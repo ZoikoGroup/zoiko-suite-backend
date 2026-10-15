@@ -74,6 +74,8 @@ type Store interface {
 	ValidateAssetEvent(ctx context.Context, eventID string, at time.Time) error
 	ApproveAssetEvent(ctx context.Context, eventID, principalID string, at time.Time) error
 	ApplyAssetEvent(ctx context.Context, eventID string, at time.Time, journalID *string) error
+	// PreflightApplyAssetEvent dry-runs ApplyAssetEvent (rolled back) so refusals surface before the GL journal is posted.
+	PreflightApplyAssetEvent(ctx context.Context, eventID string, at time.Time) error
 	ReverseAssetEvent(ctx context.Context, eventID, principalID, reason string, at time.Time) error
 	SupersedeAssetEvent(ctx context.Context, eventID, principalID, reason string, at time.Time) error
 }

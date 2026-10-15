@@ -21,6 +21,9 @@ type Config struct {
 	// AuthorizationSourcePaymentAuthorization fingerprint rather than
 	// trusting the caller-supplied value (Wave 11a).
 	AuthorizationServiceURL string
+	// EventResidencyRegion is the residency region carried by emitted
+	// events (ZS-EVENT-001 §4). Empty default — deployments must set it.
+	EventResidencyRegion string
 }
 
 func Load() (*Config, error) {
@@ -40,6 +43,7 @@ func Load() (*Config, error) {
 		AuthzServiceURL:         getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		TreasuryServiceURL:      getEnvOrDefault("TREASURY_SERVICE_URL", "http://treasury-svc:8103"),
 		AuthorizationServiceURL: getEnvOrDefault("AUTHORIZATION_SERVICE_URL", "http://payment-authorization-svc:8160"),
+		EventResidencyRegion:    os.Getenv("EVENT_RESIDENCY_REGION"),
 	}, nil
 }
 

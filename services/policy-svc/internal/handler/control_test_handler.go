@@ -122,12 +122,25 @@ func (h *Handler) CreateControlTestDefinition(w http.ResponseWriter, r *http.Req
 // GetControlTestDefinition handles GET /v1/control-test-definitions/{id}.
 func (h *Handler) GetControlTestDefinition(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// Control test definitions are global (not tenant-scoped), so authorize
+	// against the platform scope.
+	if !h.authorize(w, r, principalID, authz.ActionControlTestDefinitionRead, nil) {
+		return
+	}
+
 	d, err := h.store.FindControlTestDefinitionByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrControlTestDefinitionNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "control_test_definition_not_found"})
 			return
 		}
+		h.log.Error("GetControlTestDefinition: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
@@ -232,8 +245,19 @@ func (h *Handler) CreateControlTestExecution(w http.ResponseWriter, r *http.Requ
 // GET /v1/control-test-definitions/{id}/executions.
 func (h *Handler) ListControlTestExecutions(w http.ResponseWriter, r *http.Request) {
 	definitionID := chi.URLParam(r, "id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, authz.ActionControlTestExecutionRead, nil) {
+		return
+	}
+
 	results, err := h.store.ListControlTestExecutions(r.Context(), definitionID)
 	if err != nil {
+		h.log.Error("ListControlTestExecutions: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
@@ -245,14 +269,25 @@ func (h *Handler) ListControlTestExecutions(w http.ResponseWriter, r *http.Reque
 
 // GetControlEffectiveness handles GET /v1/controls/{control_ref}/effectiveness
 // — the doc7 §E3 answer endpoint: DESIGN_STATUS and OPERATING_EFFECTIVENESS
-// composed as two independent fields, never one collapsed status. No authz
-// gate — a read of a compliance signal every consuming service needs to
-// check cheaply and often, same posture as capability-registry-svc's
-// resolution endpoint.
+// composed as two independent fields, never one collapsed status.
+//
+// Requires authentication and authorization. Control effectiveness is a
+// global (cross-tenant) signal, so authorization uses the platform scope.
 func (h *Handler) GetControlEffectiveness(w http.ResponseWriter, r *http.Request) {
 	controlRef := chi.URLParam(r, "control_ref")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, authz.ActionControlEffectivenessRead, nil) {
+		return
+	}
+
 	result, err := h.store.ResolveControlEffectiveness(r.Context(), controlRef)
 	if err != nil {
+		h.log.Error("GetControlEffectiveness: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
@@ -351,12 +386,23 @@ func (h *Handler) CreateAttestation(w http.ResponseWriter, r *http.Request) {
 // GetAttestation handles GET /v1/attestations/{id}.
 func (h *Handler) GetAttestation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, authz.ActionAttestationRead, nil) {
+		return
+	}
+
 	a, err := h.store.FindAttestationByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrAttestationNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "attestation_not_found"})
 			return
 		}
+		h.log.Error("GetAttestation: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}

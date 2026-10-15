@@ -21,9 +21,11 @@ type Engine interface {
 
 	// ── ESR-02: projections and tombstones ───────────────────────────────
 	IndexProjection(ctx context.Context, physicalIndex string, p Projection) error
+	CreateProjection(ctx context.Context, physicalIndex string, p Projection) error
 	DeleteProjection(ctx context.Context, physicalIndex, docID string) error
 	GetProjection(ctx context.Context, physicalIndex, docID string) (map[string]any, bool, error)
 	CountProjections(ctx context.Context, physicalIndex string, terms map[string]string) (int64, error)
+	CountMissing(ctx context.Context, physicalIndex, field string) (int64, error)
 
 	// ── ESR-03: compiled query execution ─────────────────────────────────
 	ExecutePlan(ctx context.Context, target string, plan ExecutionPlan) (Result, error)

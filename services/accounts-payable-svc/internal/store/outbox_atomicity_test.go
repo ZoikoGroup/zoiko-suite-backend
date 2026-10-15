@@ -40,12 +40,12 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 			invoice_id, tenant_id, legal_entity_id, vendor_id, invoice_number,
 			amount, currency_code, due_date, status, created_by_principal_id,
 			correlation_id, invoice_date, supply_date, net_amount, tax_amount,
-			created_at
+			created_at, source_hash, source_channel, invoice_number_normalized
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
 			$11, $12, $13, $14, $15,
-			now()
+			now(), repeat('0',64), 'test', lower($5::varchar)
 		)
 	`
 	_, err = tx.Exec(ctx, insertInvoiceSQL,

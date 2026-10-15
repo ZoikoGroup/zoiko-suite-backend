@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -15,6 +16,8 @@ import (
 
 	"zoiko.io/payee-banking-identity-svc/internal/domain"
 	"zoiko.io/payee-banking-identity-svc/internal/middleware"
+	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/outbox"
 )
 
 func isInvalidUUID(err error) bool {
@@ -28,16 +31,16 @@ func isUniqueViolation(err error) bool {
 }
 
 type Store interface {
-	ProposeDestination(ctx context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID string) (*domain.PayeeDestination, error)
+	ProposeDestination(ctx context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error)
 	FindDestination(ctx context.Context, destinationID string) (*domain.PayeeDestination, error)
 	ListVersions(ctx context.Context, partyRef string) ([]domain.PayeeDestination, error)
 	FindActiveDestination(ctx context.Context, partyRef, scope string) (*domain.PayeeDestination, error)
 
 	VerifyDestination(ctx context.Context, destinationID string, req domain.VerifyDestinationRequest, principalID string) (*domain.PayeeDestination, error)
-	ApproveDestination(ctx context.Context, destinationID, principalID string) (*domain.PayeeDestination, error)
-	ActivateDestination(ctx context.Context, destinationID, principalID string) (*domain.PayeeDestination, error)
-	SuspendDestination(ctx context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID string) (*domain.PayeeDestination, error)
-	SupersedeDestination(ctx context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID string) (*domain.PayeeDestination, error)
+	ApproveDestination(ctx context.Context, destinationID, principalID, correlationID string) (*domain.PayeeDestination, error)
+	ActivateDestination(ctx context.Context, destinationID, principalID, correlationID string) (*domain.PayeeDestination, error)
+	SuspendDestination(ctx context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error)
+	SupersedeDestination(ctx context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error)
 
 	ListEvents(ctx context.Context, destinationID string) ([]domain.ChangeEvent, error)
 
@@ -46,12 +49,69 @@ type Store interface {
 }
 
 type PgStore struct {
-	pool *pgxpool.Pool
-	log  *zap.Logger
+	pool        *pgxpool.Pool
+	log         *zap.Logger
+	eventRegion string
 }
 
-func NewPgStore(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
-	return &PgStore{pool: pool, log: log}
+// Option configures a PgStore at construction.
+type Option func(*PgStore)
+
+// WithEventRegion sets the residency region carried by emitted events
+// (ZS-EVENT-001 §4, envelope.Spec.ResidencyRegion — required, a controlled
+// lower-case code such as "uk" or "eu-west").
+func WithEventRegion(region string) Option {
+	return func(s *PgStore) { s.eventRegion = region }
+}
+
+func NewPgStore(pool *pgxpool.Pool, log *zap.Logger, opts ...Option) *PgStore {
+	s := &PgStore{pool: pool, log: log}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// enqueueEvent builds and enqueues one event inside the caller's own
+// transaction — the entire point of the transactional outbox (ZS-EVENT-001
+// §6): the event and the state change it reports commit atomically, or
+// neither does. legacyType is the pre-standard event_type string existing
+// consumers filter on; always pass it explicitly — envelope.New silently
+// defaults it to the canonical type when empty, which would silently break
+// any consumer still reading the old name.
+func (s *PgStore) enqueueEvent(ctx context.Context, tx pgx.Tx, canonicalType, legacyType, aggregateType, aggregateID, tenantID, legalEntityID, actorID, correlationID string, data any) error {
+	env, err := envelope.New(envelope.Spec{
+		Type:            canonicalType,
+		LegacyType:      legacyType,
+		Service:         "payee-banking-identity-svc",
+		SchemaVersion:   "1.0.0",
+		OccurredAt:      time.Now().UTC(),
+		TenantID:        tenantID,
+		LegalEntityID:   legalEntityID,
+		AggregateType:   aggregateType,
+		AggregateID:     aggregateID,
+		CorrelationID:   correlationID,
+		ActorID:         actorID,
+		ResidencyRegion: s.eventRegion,
+		Classification:  envelope.Confidential,
+		Data:            data,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s event: %w", canonicalType, err)
+	}
+	if err := outbox.Enqueue(ctx, tx, env); err != nil {
+		return fmt.Errorf("enqueue %s event: %w", canonicalType, err)
+	}
+	return nil
+}
+
+// strOrEmpty dereferences a nullable tenant_id for use as a plain string in
+// an event envelope, which requires a non-empty TenantID.
+func strOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
@@ -110,7 +170,7 @@ func (s *PgStore) recordEvent(ctx context.Context, tx pgx.Tx, tenantID *string, 
 	return err
 }
 
-func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req domain.ProposeDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error) {
 	destinationID := uuid.New().String()
 	fingerprint := domain.Fingerprint(req.FinancialInstitution, req.AccountIdentifier, req.Currency)
 	last4 := domain.Last4(req.AccountIdentifier)
@@ -133,7 +193,16 @@ func (s *PgStore) ProposeDestination(ctx context.Context, tenantID string, req d
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationProposed, "", principalID)
+		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationProposed, "", principalID); err != nil {
+			return err
+		}
+		// The safe projection, never the full PayeeDestination (which carries
+		// the unmasked AccountIdentifier) — same doctrine as maskIfNotPrivileged
+		// at the HTTP layer, applied here because this is the one place the
+		// full account identifier could otherwise leak into Kafka.
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.proposed", domain.EventPayeeDestinationProposed,
+			"payee-destination", destinationID, tenantID, req.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, tenantID))
 	})
 	if isUniqueViolation(err) {
 		return nil, domain.ErrDuplicateDestination
@@ -229,7 +298,7 @@ func (s *PgStore) VerifyDestination(ctx context.Context, destinationID string, r
 	return d, nil
 }
 
-func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, principalID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, principalID, correlationID string) (*domain.PayeeDestination, error) {
 	var d *domain.PayeeDestination
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
@@ -242,7 +311,13 @@ func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, princip
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationApproved, "", principalID)
+		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationApproved, "", principalID); err != nil {
+			return err
+		}
+		// Safe projection — see ProposeDestination's enqueueEvent call for why.
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.approved", domain.EventPayeeDestinationApproved,
+			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -259,7 +334,7 @@ func (s *PgStore) ApproveDestination(ctx context.Context, destinationID, princip
 // transaction, supersedes whatever destination (if any) is currently
 // ACTIVE for the same party/scope — the database's own partial unique
 // index is the second, structural layer of the same guarantee.
-func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, principalID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, principalID, correlationID string) (*domain.PayeeDestination, error) {
 	var d *domain.PayeeDestination
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var partyRef, scope string
@@ -295,7 +370,18 @@ func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, princi
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationActivated, "", principalID)
+		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationActivated, "", principalID); err != nil {
+			return err
+		}
+		// The old destination auto-superseded above (if any) is recorded
+		// to the internal audit log (recordEvent) but was never published
+		// by the old dual-write — only the newly-activated destination's
+		// own event was. Not expanding scope here: only the activated
+		// event is enqueued, matching the exact prior behavior.
+		// Safe projection — see ProposeDestination's enqueueEvent call for why.
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.activated", domain.EventPayeeDestinationActivated,
+			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
 	})
 	if errors.Is(err, domain.ErrInvalidTransition) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -310,7 +396,7 @@ func (s *PgStore) ActivateDestination(ctx context.Context, destinationID, princi
 	return d, nil
 }
 
-func (s *PgStore) SuspendDestination(ctx context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) SuspendDestination(ctx context.Context, destinationID string, req domain.SuspendDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error) {
 	var d *domain.PayeeDestination
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
@@ -323,7 +409,13 @@ func (s *PgStore) SuspendDestination(ctx context.Context, destinationID string, 
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationSuspended, req.Reason, principalID)
+		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationSuspended, req.Reason, principalID); err != nil {
+			return err
+		}
+		// Safe projection — see ProposeDestination's enqueueEvent call for why.
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.suspended", domain.EventPayeeDestinationSuspended,
+			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition
@@ -335,7 +427,7 @@ func (s *PgStore) SuspendDestination(ctx context.Context, destinationID string, 
 	return d, nil
 }
 
-func (s *PgStore) SupersedeDestination(ctx context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID string) (*domain.PayeeDestination, error) {
+func (s *PgStore) SupersedeDestination(ctx context.Context, destinationID string, req domain.SupersedeDestinationRequest, principalID, correlationID string) (*domain.PayeeDestination, error) {
 	var d *domain.PayeeDestination
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var err error
@@ -348,7 +440,13 @@ func (s *PgStore) SupersedeDestination(ctx context.Context, destinationID string
 		if err != nil {
 			return err
 		}
-		return s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationSuperseded, req.Reason, principalID)
+		if err := s.recordEvent(ctx, tx, d.TenantID, destinationID, domain.EventPayeeDestinationSuperseded, req.Reason, principalID); err != nil {
+			return err
+		}
+		// Safe projection — see ProposeDestination's enqueueEvent call for why.
+		return s.enqueueEvent(ctx, tx, "com.zoikosuite.banking.payee-destination.superseded", domain.EventPayeeDestinationSuperseded,
+			"payee-destination", destinationID, strOrEmpty(d.TenantID), d.LegalEntityID, principalID, correlationID,
+			domain.NewDestinationEventPayload(d, strOrEmpty(d.TenantID)))
 	})
 	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidTransition

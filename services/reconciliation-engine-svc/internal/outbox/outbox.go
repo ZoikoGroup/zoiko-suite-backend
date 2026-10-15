@@ -87,6 +87,7 @@ type Relay struct {
 type PgxPool interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
 func NewRelay(pool PgxPool, publisher Publisher, interval time.Duration, batchSize int, log *zap.Logger) *Relay {
@@ -114,13 +115,35 @@ func (r *Relay) Start(ctx context.Context) {
 	}
 }
 
+// relayOnce runs the whole poll-publish-mark cycle inside one transaction.
+// Two things require that: (1) outbox_events carries RLS forced for every
+// role, and the policy admits either the caller's own tenant_id or the
+// relay's app.outbox_relay marker (000002_outbox_events_relay_policy) — that
+// marker is a transaction-local GUC (set_config's third argument, is_local =
+// true), so it must be set on the same transaction that then polls and
+// updates the table, not a bare pool call, or a non-BYPASSRLS role sees zero
+// rows. (2) FOR UPDATE SKIP LOCKED needs a transaction to hold the row locks
+// across multiple relay replicas.
 func (r *Relay) relayOnce(ctx context.Context) {
-	rows, err := r.pool.Query(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		r.log.Error("outbox relay: begin tx failed", zap.Error(err))
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.outbox_relay', 'true', true)`); err != nil {
+		r.log.Error("outbox relay: set relay GUC failed", zap.Error(err))
+		return
+	}
+
+	rows, err := tx.Query(ctx, `
 		SELECT outbox_event_id, event_type, aggregate_id, tenant_id, payload, publish_attempts
 		FROM outbox_events
 		WHERE published_at IS NULL
 		ORDER BY created_at ASC
 		LIMIT $1
+		FOR UPDATE SKIP LOCKED
 	`, r.batchSize)
 	if err != nil {
 		r.log.Error("outbox relay: poll failed", zap.Error(err))
@@ -149,22 +172,26 @@ func (r *Relay) relayOnce(ctx context.Context) {
 		_ = json.Unmarshal(e.Payload, &payload)
 
 		if pubErr := r.publisher.PublishForOutbox(ctx, e.EventType, e.AggregateID, tenantID, payload); pubErr != nil {
-			r.markFailed(ctx, e.OutboxEventID, pubErr)
+			r.markFailed(ctx, tx, e.OutboxEventID, pubErr)
 			continue
 		}
-		r.markPublished(ctx, e.OutboxEventID)
+		r.markPublished(ctx, tx, e.OutboxEventID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		r.log.Error("outbox relay: commit failed", zap.Error(err))
 	}
 }
 
-func (r *Relay) markPublished(ctx context.Context, outboxEventID string) {
-	_, err := r.pool.Exec(ctx, `UPDATE outbox_events SET published_at = NOW() WHERE outbox_event_id = $1`, outboxEventID)
+func (r *Relay) markPublished(ctx context.Context, tx pgx.Tx, outboxEventID string) {
+	_, err := tx.Exec(ctx, `UPDATE outbox_events SET published_at = NOW() WHERE outbox_event_id = $1`, outboxEventID)
 	if err != nil {
 		r.log.Error("outbox relay: failed to mark published", zap.String("outbox_event_id", outboxEventID), zap.Error(err))
 	}
 }
 
-func (r *Relay) markFailed(ctx context.Context, outboxEventID string, publishErr error) {
-	_, err := r.pool.Exec(ctx, `
+func (r *Relay) markFailed(ctx context.Context, tx pgx.Tx, outboxEventID string, publishErr error) {
+	_, err := tx.Exec(ctx, `
 		UPDATE outbox_events SET publish_attempts = publish_attempts + 1, last_error = $2
 		WHERE outbox_event_id = $1
 	`, outboxEventID, publishErr.Error())

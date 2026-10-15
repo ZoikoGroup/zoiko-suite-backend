@@ -108,6 +108,18 @@ type Store interface {
 	LinkCountLineAdjustment(ctx context.Context, lineID, movementID string) error
 	MarkCountAdjustmentsGenerated(ctx context.Context, countID string) error
 	CertifyStockCount(ctx context.Context, countID, principalID string, at time.Time) error
+
+	// INV-04 AllocateLandedCost (migration 000009).
+	AllocateLandedCost(ctx context.Context, a *domain.LandedCostAllocation) (created bool, err error)
+	MarkLandedCostEmitted(ctx context.Context, allocationID, journalID string, at time.Time) error
+	GetLandedCostAllocation(ctx context.Context, allocationID string) (*domain.LandedCostAllocation, error)
+	// INV-04 RecalculateValuation (read-only) / RebuildCostLayersControlled (migration 000010).
+	RecalculateValuation(ctx context.Context, itemID, locationID string) (*domain.ValuationRecalculation, error)
+	RebuildCostLayers(ctx context.Context, itemID, locationID, reason, principalID string, at time.Time) (*domain.CostLayerRebuildResult, error)
+
+	// AP-03 receipt linkage for the inbound GRNI reclass (migration 000008).
+	LinkMovementReceipt(ctx context.Context, movementID, apReceiptID, principalID string, at time.Time) error
+	GetRunInboundValue(ctx context.Context, runID string) (domain.RunInboundValue, error)
 	// GetUnapprovedVarianceCount backs GET
 	// /v1/stock-counts/unapproved-variance-count — see
 	// internal/store/stock_count_store.go's own doc comment. Serves the
@@ -291,10 +303,28 @@ type Handler struct {
 	periodChecker PeriodChecker
 	ledger        InventoryLedgerClient
 	log           *zap.Logger
+
+	// grniReclassMappingKey is the ACC-02 mapping key AP-03 debits when it
+	// accrues a receipt (goods-service-receipt-svc's AP_GRNI_EXPENSE).
+	// INV-04 credits it when it reclasses that cost into inventory.
+	grniReclassMappingKey string
 }
 
+// DefaultGRNIReclassMappingKey matches goods-service-receipt-svc's default
+// GRNI debit key (GRNI_DEBIT_MAPPING_KEY).
+const DefaultGRNIReclassMappingKey = "AP_GRNI_EXPENSE"
+
 func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, log: log}
+	return &Handler{store: store, publisher: publisher, authz: authz, log: log, grniReclassMappingKey: DefaultGRNIReclassMappingKey}
+}
+
+// WithGRNIReclassMappingKey overrides the mapping key credited by the
+// inbound reclass; it must equal the key AP-03 debits.
+func (h *Handler) WithGRNIReclassMappingKey(key string) *Handler {
+	if key != "" {
+		h.grniReclassMappingKey = key
+	}
+	return h
 }
 
 // WithLedgerClient sets INV-04's own real dependency on general-ledger-svc.
@@ -376,12 +406,18 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/inventory-value-total", h.GetInventoryValueTotal)
 		r.Get("/inventory-value-as-of", h.GetInventoryValueAsOf)
 		r.Get("/cost-layers", h.GetCostLayers)
+		r.Post("/recalculate", h.RecalculateValuation)
+		r.Post("/cost-layers/rebuild", h.RebuildCostLayersControlled)
 		r.Route("/runs", func(r chi.Router) {
 			r.Post("/", h.CreateValuationRun)
 			r.Get("/{id}", h.GetValuationRun)
 			r.Post("/{id}/emit", h.EmitInventoryAccountingEvent)
 		})
-		r.Route("/write-downs", func(r chi.Router) {
+		r.Route("/landed-costs", func(r chi.Router) {
+				r.Post("/", h.AllocateLandedCost)
+				r.Get("/{id}", h.GetLandedCostAllocation)
+			})
+			r.Route("/write-downs", func(r chi.Router) {
 			r.Post("/", h.RecordInventoryWriteDown)
 			r.Get("/{id}", h.GetWriteDown)
 			r.Post("/{id}/reverse", h.ReverseWriteDown)

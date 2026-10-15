@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/source-authority-svc/internal/domain"
+	"zoiko.io/source-authority-svc/internal/outbox"
 )
 
 func isUniqueViolation(err error) bool {
@@ -46,17 +47,19 @@ func mapPgError(err error) error {
 type Store interface {
 	// CreateSourceAuthorityMap is idempotent on correlation_id: created is
 	// false when the call replayed an existing rule, and m is overwritten with
-	// the stored one.
-	CreateSourceAuthorityMap(ctx context.Context, m *domain.SourceAuthorityMap) (created bool, err error)
+	// the stored one. outboxEvt is inserted atomically with the new row (same
+	// transaction) when created is true — never on a replay.
+	CreateSourceAuthorityMap(ctx context.Context, m *domain.SourceAuthorityMap, outboxEvt outbox.Event) (created bool, err error)
 	GetSourceAuthorityMap(ctx context.Context, mapID string) (*domain.SourceAuthorityMap, error)
 	ListSourceAuthorityMaps(ctx context.Context, f domain.ListSourceAuthorityMapsFilter) ([]domain.SourceAuthorityMap, error)
 	// SupersedeSourceAuthorityMap end-dates a rule. The only UPDATE this
 	// service performs, and it touches effective_to and the supersession
-	// evidence columns only.
-	SupersedeSourceAuthorityMap(ctx context.Context, mapID string, effectiveTo time.Time, principalID string) (*domain.SourceAuthorityMap, error)
+	// evidence columns only. outboxEvt is inserted atomically with the update.
+	SupersedeSourceAuthorityMap(ctx context.Context, mapID string, effectiveTo time.Time, principalID string, outboxEvt outbox.Event) (*domain.SourceAuthorityMap, error)
 
-	// RecordFact is idempotent on (tenant_id, correlation_id).
-	RecordFact(ctx context.Context, f *domain.NormalizedFact) (created bool, err error)
+	// RecordFact is idempotent on (tenant_id, correlation_id). outboxEvt is
+	// inserted atomically with the new row — never on a replay.
+	RecordFact(ctx context.Context, f *domain.NormalizedFact, outboxEvt outbox.Event) (created bool, err error)
 	ListNormalizedFacts(ctx context.Context, f domain.ListNormalizedFactsFilter) ([]domain.NormalizedFact, error)
 	// ResolveAuthoritativeFact composes precedence with conflict detection
 	// for a (tenant, field_family, entity_ref) triple — see package doc comment.
@@ -123,8 +126,14 @@ func scanMap(row pgx.Row) (*domain.SourceAuthorityMap, error) {
 // trips that second index and is told its rule conflicts with itself, which is
 // both wrong and unactionable: the operator is looking at a 409 naming a rule
 // they successfully created a moment ago.
-func (s *PgStore) CreateSourceAuthorityMap(ctx context.Context, m *domain.SourceAuthorityMap) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `
+func (s *PgStore) CreateSourceAuthorityMap(ctx context.Context, m *domain.SourceAuthorityMap, outboxEvt outbox.Event) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO source_authority_maps (
 			source_authority_map_id, field_family, source_system, precedence_rank,
 			conflict_route, allowed_correction_path, effective_from, created_by_principal_id,
@@ -144,11 +153,22 @@ func (s *PgStore) CreateSourceAuthorityMap(ctx context.Context, m *domain.Source
 		return false, fmt.Errorf("insert source authority map: %w", err)
 	}
 	if tag.RowsAffected() == 1 {
+		// outboxEvt is inserted atomically with the domain row — this
+		// replaces the direct, error-swallowed h.publisher.Publish call that
+		// used to run here: a Kafka outage no longer loses the event, it is
+		// retried by the outbox relay. Never inserted on a replay (below).
+		if err := outbox.Insert(ctx, tx, outboxEvt); err != nil {
+			return false, fmt.Errorf("insert outbox event: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit transaction: %w", err)
+		}
 		return true, nil
 	}
 
-	// Replay: return the rule this correlation_id already created.
-	row := s.pool.QueryRow(ctx, "SELECT "+mapColumns+" FROM source_authority_maps WHERE correlation_id = $1", m.CorrelationID)
+	// Replay: return the rule this correlation_id already created. Nothing
+	// was written, so the transaction is simply left to roll back.
+	row := tx.QueryRow(ctx, "SELECT "+mapColumns+" FROM source_authority_maps WHERE correlation_id = $1", m.CorrelationID)
 	stored, err := scanMap(row)
 	if err != nil {
 		return false, fmt.Errorf("read replayed source authority map: %w", err)
@@ -224,7 +244,7 @@ func (s *PgStore) ListSourceAuthorityMaps(ctx context.Context, f domain.ListSour
 // Re-reads the row FOR UPDATE inside the same transaction as the write, so two
 // concurrent supersessions cannot both observe an open window and both claim
 // to have closed it.
-func (s *PgStore) SupersedeSourceAuthorityMap(ctx context.Context, mapID string, effectiveTo time.Time, principalID string) (*domain.SourceAuthorityMap, error) {
+func (s *PgStore) SupersedeSourceAuthorityMap(ctx context.Context, mapID string, effectiveTo time.Time, principalID string, outboxEvt outbox.Event) (*domain.SourceAuthorityMap, error) {
 	var out domain.SourceAuthorityMap
 
 	tx, err := s.pool.Begin(ctx)
@@ -262,6 +282,11 @@ func (s *PgStore) SupersedeSourceAuthorityMap(ctx context.Context, mapID string,
 	if err != nil {
 		return nil, fmt.Errorf("read superseded source authority map: %w", err)
 	}
+
+	if err := outbox.Insert(ctx, tx, outboxEvt); err != nil {
+		return nil, fmt.Errorf("insert outbox event: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
@@ -299,7 +324,8 @@ func scanFact(row pgx.Row, f *domain.NormalizedFact) error {
 }
 
 // RecordFact appends one observation, idempotent on (tenant_id, correlation_id).
-func (s *PgStore) RecordFact(ctx context.Context, f *domain.NormalizedFact) (bool, error) {
+// outboxEvt is inserted atomically with the new row — never on a replay.
+func (s *PgStore) RecordFact(ctx context.Context, f *domain.NormalizedFact, outboxEvt outbox.Event) (bool, error) {
 	var created bool
 	err := s.withTenantRLS(ctx, f.TenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
@@ -318,7 +344,11 @@ func (s *PgStore) RecordFact(ctx context.Context, f *domain.NormalizedFact) (boo
 		}
 		if tag.RowsAffected() == 1 {
 			created = true
-			return nil
+			// Same transaction as the fact row, and inside the same
+			// app.tenant_id-scoped tx withTenantRLS installed — the outbox
+			// write succeeds or rolls back together with the fact it
+			// describes.
+			return outbox.Insert(ctx, tx, outboxEvt)
 		}
 		row := tx.QueryRow(ctx,
 			"SELECT "+factColumns+" FROM normalized_facts WHERE tenant_id = $1 AND correlation_id = $2",
