@@ -3,6 +3,7 @@ package bankingrefresh
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,13 +104,34 @@ func TestObserveTrustsALinkedPaymentOverTheAttemptButOnlyForTheSameInstruction(t
 }
 
 type fakeSource struct {
+	mu      sync.Mutex
 	limit   int
 	called  int
 	returns int
 	err     error
 }
 
+func (f *fakeSource) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.called
+}
+
+func (f *fakeSource) lastLimit() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.limit
+}
+
+func (f *fakeSource) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
 func (f *fakeSource) RefreshBankingOutcomes(_ context.Context, limit int, _ store.ObserveFunc, mk store.ReconEventBuilder) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.called++
 	f.limit = limit
 	if mk == nil {
@@ -122,13 +144,13 @@ func TestRunOnceUsesTheConfiguredBatchAndSurvivesErrors(t *testing.T) {
 	src := &fakeSource{returns: 3}
 	r := New(src, &fakeAttempts{}, &fakePayments{}, "", 0, 0, zap.NewNop())
 	assert.Equal(t, 3, r.RunOnce(context.Background()))
-	assert.Equal(t, 10, src.limit, "default batch")
+	assert.Equal(t, 10, src.lastLimit(), "default batch")
 	assert.Equal(t, 30*time.Second, r.interval, "default interval")
 	assert.Equal(t, "payroll-run-svc", r.principal, "default principal")
 
-	src.err = errors.New("db down")
+	src.setErr(errors.New("db down"))
 	assert.Equal(t, 3, r.RunOnce(context.Background()), "an error is logged, not fatal")
-	assert.Equal(t, 2, src.called)
+	assert.Equal(t, 2, src.calls())
 }
 
 func TestStartStopsWithItsContext(t *testing.T) {
@@ -137,7 +159,7 @@ func TestStartStopsWithItsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { r.Start(ctx); close(done) }()
-	require.Eventually(t, func() bool { return src.called >= 2 }, 2*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return src.calls() >= 2 }, 2*time.Second, 5*time.Millisecond)
 	cancel()
 	select {
 	case <-done:
