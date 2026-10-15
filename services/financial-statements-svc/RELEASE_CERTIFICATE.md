@@ -26,8 +26,8 @@ Snapshot, through a Draft → Validated → InReview → Approved → Certified 
 Published lifecycle, with segregation-of-duties (a preparer may not approve
 or certify their own work) and a supersession path for corrections. See
 SPEC_DEVIATIONS.md for the full, honest list of what the spec asks for that
-this version does not build (Cash Flow Statement, disclosures, comparative
-periods, a real presentation-mapping registry, full ACC-18 lineage-graph
+this version does not build (Cash Flow Statement, disclosures, N-period
+comparatives, a real presentation-mapping registry, full ACC-18 lineage-graph
 integration).
 
 ## Verification performed
@@ -151,7 +151,7 @@ reasoning, and the still-passing `TestPgStore_Supersede_MarksOldAndCreatesNew`.
 
 See SPEC_DEVIATIONS.md (B-section additions and A-section gaps). Most
 relevant to a certification decision: no Cash Flow Statement (A2); no
-disclosures (A5); no comparative periods (A6); no real presentation-mapping
+disclosures (A5); comparatives are two-period only (A6/A7); no real presentation-mapping
 registry (A3); no real ACC-18 lineage-graph walk (A8); ACC-16's content
 schema is this service's own invention, not a platform agreement (A1).
 
@@ -161,6 +161,7 @@ schema is this service's own invention, not a platform agreement (A1).
 - `GET /v1/statement-sets` — ListStatementSets (`legal_entity_id` required, `status` optional)
 - `GET /v1/statement-sets/{id}` — GetStatementSet
 - `GET /v1/statement-sets/{id}/facts` — GetStatementFacts
+- `GET /v1/statement-sets/{id}/comparatives?prior_set_id=` — GetComparatives (two-period; prior must be CERTIFIED/PUBLISHED)
 - `POST /v1/statement-sets/{id}:refresh-draft` / `:validate` / `:submit-for-review` /
   `:request-changes` / `:approve` / `:certify` / `:publish` / `:supersede`
 - `GET /v1/statement-facts/{id}/explain` — ExplainReportedFact

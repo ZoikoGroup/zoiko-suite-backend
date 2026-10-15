@@ -12,7 +12,9 @@
 //     (MappingVersionV1), not a per-tenant/per-framework versioned registry.
 //   - DisclosureInstance (narrative disclosures) is not built: this version
 //     produces primary statements only, no notes.
-//   - ComparativePresentation (prior-period columns) is not built.
+//   - ComparativePresentation is a two-period pairwise comparison only
+//     (BuildComparative / GetComparatives) — no N-period trend, no
+//     presentation formatting.
 package domain
 
 import "time"
@@ -160,6 +162,69 @@ type StatementFact struct {
 	// point is prohibited for monetary values) — never a Go float.
 	Amount    string    `json:"amount"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// ComparativeFact pairs one account's reported line across two periods.
+// A side is nil when the account appears in only one period's facts — a
+// new or discontinued account is reported with an explicit gap, never
+// silently dropped.
+type ComparativeFact struct {
+	AccountCode string          `json:"account_code"`
+	AccountName string          `json:"account_name"`
+	Category    AccountCategory `json:"category"`
+	// PriorCategory is set only when the account was classified differently
+	// in the prior period (a reclassification within the same statement), so
+	// that change is visible rather than hidden behind one category value.
+	PriorCategory *AccountCategory `json:"prior_category,omitempty"`
+
+	CurrentFactID *string `json:"current_fact_id"`
+	PriorFactID   *string `json:"prior_fact_id"`
+	// Amounts are exact decimal strings (ZS-DATA-001 D06), never floats.
+	CurrentAmount *string `json:"current_amount"`
+	PriorAmount   *string `json:"prior_amount"`
+	// Change is CurrentAmount - PriorAmount, computed with big.Rat. It is
+	// nil when either side is missing: an absent line is not the same thing
+	// as a zero balance, so no change is invented for it.
+	Change *string `json:"change"`
+}
+
+// ComparativeStatement is one primary statement's paired lines, ordered by
+// account code.
+type ComparativeStatement struct {
+	StatementType StatementType     `json:"statement_type"`
+	Lines         []ComparativeFact `json:"lines"`
+}
+
+// ComparativeSetRef identifies one side of a comparison.
+type ComparativeSetRef struct {
+	StatementSetID     string `json:"statement_set_id"`
+	ReportingPeriod    string `json:"reporting_period"`
+	Status             State  `json:"status"`
+	SourceSnapshotID   string `json:"source_snapshot_id"`
+	SourceSnapshotHash string `json:"source_snapshot_hash"`
+}
+
+// ComparativeStatementView is GetComparatives's response: a two-period
+// pairwise comparison of one set against a certified prior set.
+type ComparativeStatementView struct {
+	LegalEntityID        string                 `json:"legal_entity_id"`
+	Framework            string                 `json:"framework"`
+	PresentationCurrency string                 `json:"presentation_currency"`
+	MappingVersion       string                 `json:"mapping_version"`
+	Current              ComparativeSetRef      `json:"current"`
+	Prior                ComparativeSetRef      `json:"prior"`
+	Statements           []ComparativeStatement `json:"statements"`
+}
+
+// RefFor builds a ComparativeSetRef from a set.
+func RefFor(s *FinancialStatementSet) ComparativeSetRef {
+	return ComparativeSetRef{
+		StatementSetID:     s.StatementSetID,
+		ReportingPeriod:    s.ReportingPeriod,
+		Status:             s.Status,
+		SourceSnapshotID:   s.SourceSnapshotID,
+		SourceSnapshotHash: s.SourceSnapshotHash,
+	}
 }
 
 // SnapshotContent is the JSON schema this service requires inside an ACC-16

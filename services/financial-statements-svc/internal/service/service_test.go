@@ -429,3 +429,112 @@ func TestAuthorizationDenied_PropagatesAsForbidden(t *testing.T) {
 		t.Fatalf("expected CodeForbidden, got %v", err)
 	}
 }
+
+// ── GetComparatives ──────────────────────────────────────────────────────
+
+func seedSet(st *fakeStore, id, tenantID, legalEntityID, framework, period string, status domain.State, facts ...domain.StatementFact) {
+	st.sets[id] = &domain.FinancialStatementSet{
+		StatementSetID: id, TenantID: tenantID, LegalEntityID: legalEntityID, Framework: framework,
+		ReportingPeriod: period, PresentationCurrency: "GBP", MappingVersion: domain.MappingVersionV1, Status: status,
+	}
+	for i := range facts {
+		facts[i].StatementSetID = id
+	}
+	st.facts[id] = facts
+}
+
+func bsFact(id, code, amount string) domain.StatementFact {
+	return domain.StatementFact{FactID: id, StatementType: domain.StatementBalanceSheet, Category: domain.CategoryAsset, AccountCode: code, Amount: amount}
+}
+
+func comparativeFixture(priorStatus domain.State) (*service.Service, *fakeStore) {
+	svc, st := newService(nil, "")
+	seedSet(st, "cur", "t1", "le-1", "IFRS", "2026-Q2", domain.StateDraft, bsFact("c1", "1000", "600"), bsFact("c2", "1100", "40"))
+	seedSet(st, "pri", "t1", "le-1", "IFRS", "2026-Q1", priorStatus, bsFact("p1", "1000", "500"), bsFact("p2", "2000", "75"))
+	return svc, st
+}
+
+func expectCode(t *testing.T, err error, want domain.Code) {
+	t.Helper()
+	de, ok := domain.AsError(err)
+	if !ok || de.Code != want {
+		t.Fatalf("expected %s, got %v", want, err)
+	}
+}
+
+func TestGetComparatives_PairsCertifiedPriorIncludingOneSidedLines(t *testing.T) {
+	for _, status := range []domain.State{domain.StateCertified, domain.StatePublished} {
+		svc, _ := comparativeFixture(status)
+		view, err := svc.GetComparatives(context.Background(), "t1", "viewer", "cur", "pri")
+		if err != nil {
+			t.Fatalf("%s prior: GetComparatives: %v", status, err)
+		}
+		if view.Current.StatementSetID != "cur" || view.Prior.StatementSetID != "pri" || view.Prior.ReportingPeriod != "2026-Q1" {
+			t.Fatalf("unexpected set refs: %+v / %+v", view.Current, view.Prior)
+		}
+		lines := view.Statements[0].Lines
+		if len(lines) != 3 {
+			t.Fatalf("expected 1000 (both), 1100 (current only), 2000 (prior only); got %+v", lines)
+		}
+		if *lines[0].Change != "100" || lines[1].PriorAmount != nil || lines[2].CurrentAmount != nil {
+			t.Fatalf("unexpected pairing: %+v", lines)
+		}
+	}
+}
+
+func TestGetComparatives_PriorNotCertified_SourceUnverified(t *testing.T) {
+	for _, status := range []domain.State{domain.StateDraft, domain.StateApproved, domain.StateSuperseded} {
+		svc, _ := comparativeFixture(status)
+		_, err := svc.GetComparatives(context.Background(), "t1", "viewer", "cur", "pri")
+		expectCode(t, err, domain.CodeSourceUnverified)
+	}
+}
+
+func TestGetComparatives_PriorContextMismatch_ContextInvalid(t *testing.T) {
+	cases := map[string]func(*domain.FinancialStatementSet){
+		"legal entity": func(s *domain.FinancialStatementSet) { s.LegalEntityID = "le-2" },
+		"framework":    func(s *domain.FinancialStatementSet) { s.Framework = "US_GAAP" },
+		"currency":     func(s *domain.FinancialStatementSet) { s.PresentationCurrency = "USD" },
+		"same period":  func(s *domain.FinancialStatementSet) { s.ReportingPeriod = "2026-Q2" },
+	}
+	for name, mutate := range cases {
+		svc, st := comparativeFixture(domain.StateCertified)
+		mutate(st.sets["pri"])
+		_, err := svc.GetComparatives(context.Background(), "t1", "viewer", "cur", "pri")
+		if err == nil {
+			t.Fatalf("%s mismatch: expected an error", name)
+		}
+		expectCode(t, err, domain.CodeContextInvalid)
+	}
+}
+
+func TestGetComparatives_NotFoundAndMissingParam(t *testing.T) {
+	svc, _ := comparativeFixture(domain.StateCertified)
+	ctx := context.Background()
+
+	if _, err := svc.GetComparatives(ctx, "t1", "viewer", "nope", "pri"); err != domain.ErrStatementSetNotFound {
+		t.Errorf("current missing: expected ErrStatementSetNotFound, got %v", err)
+	}
+	_, err := svc.GetComparatives(ctx, "t1", "viewer", "cur", "nope")
+	expectCode(t, err, domain.CodeNotFound)
+	_, err = svc.GetComparatives(ctx, "t1", "viewer", "cur", "")
+	expectCode(t, err, domain.CodeContextInvalid)
+	_, err = svc.GetComparatives(ctx, "t1", "viewer", "cur", "cur")
+	expectCode(t, err, domain.CodeContextInvalid)
+}
+
+func TestGetComparatives_AuthorizationDenied_Forbidden(t *testing.T) {
+	_, st := comparativeFixture(domain.StateCertified)
+	svc := service.New(st, &fakeSnapshots{}, &fakeAuthZ{denyAction: service.ActionStatementSetView}, zap.NewNop())
+	_, err := svc.GetComparatives(context.Background(), "t1", "viewer", "cur", "pri")
+	expectCode(t, err, domain.CodeForbidden)
+}
+
+func TestGetComparatives_PriorInAnotherTenant_NotFound(t *testing.T) {
+	// Another tenant's set is invisible — reported as not found, never as
+	// a legal-entity mismatch that would confirm it exists.
+	svc, st := comparativeFixture(domain.StateCertified)
+	st.sets["pri"].TenantID = "t-other"
+	_, err := svc.GetComparatives(context.Background(), "t1", "viewer", "cur", "pri")
+	expectCode(t, err, domain.CodeNotFound)
+}

@@ -471,3 +471,148 @@ func TestListStatementSets_FiltersByLegalEntityAndStatus(t *testing.T) {
 		t.Fatalf("expected 0 sets for an unrelated legal entity, got %d", res.Count)
 	}
 }
+
+// ── GetComparatives ──────────────────────────────────────────────────────
+
+func seedComparativeSets(st *fakeStore, priorStatus domain.State) {
+	mk := func(id, period string, status domain.State) {
+		st.sets[id] = &domain.FinancialStatementSet{
+			StatementSetID: id, TenantID: "tenant-1", LegalEntityID: "le-1", Framework: "IFRS",
+			ReportingPeriod: period, PresentationCurrency: "GBP", MappingVersion: domain.MappingVersionV1, Status: status,
+		}
+	}
+	mk("cur", "2026-Q2", domain.StateDraft)
+	mk("pri", "2026-Q1", priorStatus)
+	st.facts["cur"] = []domain.StatementFact{
+		{FactID: "c1", StatementSetID: "cur", StatementType: domain.StatementBalanceSheet, Category: domain.CategoryAsset, AccountCode: "1000", Amount: "600.50"},
+		{FactID: "c2", StatementSetID: "cur", StatementType: domain.StatementIncomeStatement, Category: domain.CategoryRevenue, AccountCode: "4000", Amount: "900"},
+	}
+	st.facts["pri"] = []domain.StatementFact{
+		{FactID: "p1", StatementSetID: "pri", StatementType: domain.StatementBalanceSheet, Category: domain.CategoryAsset, AccountCode: "1000", Amount: "500"},
+		{FactID: "p2", StatementSetID: "pri", StatementType: domain.StatementBalanceSheet, Category: domain.CategoryLiability, AccountCode: "2000", Amount: "75"},
+	}
+}
+
+func errorCodeOf(t *testing.T, rr *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body map[string]string
+	_ = json.NewDecoder(rr.Body).Decode(&body)
+	return body["error_code"]
+}
+
+func TestGetComparatives_HappyPath_Returns200WithPairedLines(t *testing.T) {
+	st := newFakeStore()
+	seedComparativeSets(st, domain.StateCertified)
+	r := newRouter(st, nil, "")
+
+	rr := doReq(r, http.MethodGet, "/v1/statement-sets/cur/comparatives?prior_set_id=pri", nil, "viewer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// Decode generically too: one-sided lines must carry an explicit JSON
+	// null, not an omitted field a client could mistake for "unchanged".
+	raw := rr.Body.Bytes()
+	var view domain.ComparativeStatementView
+	if err := json.Unmarshal(raw, &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(view.Statements) != 2 || view.Statements[0].StatementType != domain.StatementBalanceSheet {
+		t.Fatalf("expected balance sheet then income statement, got %+v", view.Statements)
+	}
+	bs := view.Statements[0].Lines
+	if len(bs) != 2 || bs[0].AccountCode != "1000" || *bs[0].Change != "100.5" || bs[1].AccountCode != "2000" || bs[1].CurrentAmount != nil {
+		t.Fatalf("unexpected balance sheet lines: %+v", bs)
+	}
+	is := view.Statements[1].Lines
+	if len(is) != 1 || is[0].PriorAmount != nil || *is[0].CurrentAmount != "900" {
+		t.Fatalf("unexpected income statement lines: %+v", is)
+	}
+	if !bytes.Contains(raw, []byte(`"current_amount":null`)) || !bytes.Contains(raw, []byte(`"prior_amount":null`)) {
+		t.Errorf("expected explicit nulls for one-sided lines, got %s", raw)
+	}
+}
+
+func TestGetComparatives_PriorNotCertified_Returns422(t *testing.T) {
+	st := newFakeStore()
+	seedComparativeSets(st, domain.StateApproved)
+	rr := doReq(newRouter(st, nil, ""), http.MethodGet, "/v1/statement-sets/cur/comparatives?prior_set_id=pri", nil, "viewer-1")
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if code := errorCodeOf(t, rr); code != string(domain.CodeSourceUnverified) {
+		t.Fatalf("expected %s, got %q", domain.CodeSourceUnverified, code)
+	}
+}
+
+func TestGetComparatives_PriorWrongEntityOrFramework_Returns422(t *testing.T) {
+	for name, mutate := range map[string]func(*domain.FinancialStatementSet){
+		"legal entity": func(s *domain.FinancialStatementSet) { s.LegalEntityID = "le-2" },
+		"framework":    func(s *domain.FinancialStatementSet) { s.Framework = "US_GAAP" },
+	} {
+		st := newFakeStore()
+		seedComparativeSets(st, domain.StateCertified)
+		mutate(st.sets["pri"])
+		rr := doReq(newRouter(st, nil, ""), http.MethodGet, "/v1/statement-sets/cur/comparatives?prior_set_id=pri", nil, "viewer-1")
+		if rr.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("%s: expected 422, got %d: %s", name, rr.Code, rr.Body.String())
+		}
+		if code := errorCodeOf(t, rr); code != string(domain.CodeContextInvalid) {
+			t.Fatalf("%s: expected %s, got %q", name, domain.CodeContextInvalid, code)
+		}
+	}
+}
+
+func TestGetComparatives_MissingPriorSetID_Returns422(t *testing.T) {
+	st := newFakeStore()
+	seedComparativeSets(st, domain.StateCertified)
+	rr := doReq(newRouter(st, nil, ""), http.MethodGet, "/v1/statement-sets/cur/comparatives", nil, "viewer-1")
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetComparatives_PriorNotFound_Returns404(t *testing.T) {
+	st := newFakeStore()
+	seedComparativeSets(st, domain.StateCertified)
+	rr := doReq(newRouter(st, nil, ""), http.MethodGet, "/v1/statement-sets/cur/comparatives?prior_set_id=missing", nil, "viewer-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetComparatives_CurrentNotFound_Returns404(t *testing.T) {
+	st := newFakeStore()
+	seedComparativeSets(st, domain.StateCertified)
+	rr := doReq(newRouter(st, nil, ""), http.MethodGet, "/v1/statement-sets/missing/comparatives?prior_set_id=pri", nil, "viewer-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetComparatives_AuthorizationDenied_Returns403(t *testing.T) {
+	st := newFakeStore()
+	seedComparativeSets(st, domain.StateCertified)
+	rr := doReq(newRouter(st, nil, service.ActionStatementSetView), http.MethodGet, "/v1/statement-sets/cur/comparatives?prior_set_id=pri", nil, "viewer-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetComparatives_MissingPrincipalOrTenant_Returns401(t *testing.T) {
+	st := newFakeStore()
+	seedComparativeSets(st, domain.StateCertified)
+
+	rr := doReq(newRouter(st, nil, ""), http.MethodGet, "/v1/statement-sets/cur/comparatives?prior_set_id=pri", nil, "")
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("no principal: expected 401, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// A router with no tenant middleware: the request carries no tenant scope.
+	svc := service.New(st, &fakeSnapshots{}, &fakeAuthZ{}, zap.NewNop())
+	noTenant := chi.NewRouter()
+	handler.RegisterRoutes(noTenant, handler.New(svc, zap.NewNop()))
+	rr = doReq(noTenant, http.MethodGet, "/v1/statement-sets/cur/comparatives?prior_set_id=pri", nil, "viewer-1")
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("no tenant: expected 401, got %d: %s", rr.Code, rr.Body.String())
+	}
+}

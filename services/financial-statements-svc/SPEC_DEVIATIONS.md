@@ -31,9 +31,21 @@ ways. Read this before relying on anything here for a real filing.
   every account individually.
 - **A5. DisclosureInstance (narrative disclosures/notes) is not built.** This
   service produces primary statements only.
-- **A6. ComparativePresentation (prior-period columns) is not built.** Every
-  statement set stands alone; there is no "vs last period" view.
-- **A7. No `GetComparatives` query**, for the same reason as A6.
+- **A6. ComparativePresentation is two-period, pairwise only.** A set can be
+  read side by side with one explicitly named prior set (see A7 and B8). Not
+  built: N-period trends (three or more columns), restated/re-presented
+  prior-period figures, any presentation formatting or export (PDF, XBRL,
+  spreadsheet), and comparatives stored as part of a set — a comparative is
+  computed on read and never certified or published itself.
+- **A7. `GetComparatives` exists, with limits.**
+  `GET /v1/statement-sets/{id}/comparatives?prior_set_id=<id>` pairs both
+  sets' facts per (statement type, account code), with explicit nulls for an
+  account present in only one period, and an exact-decimal `change`
+  (current − prior, `big.Rat`) only when both sides exist. The caller must
+  name the prior set: the service does not find "the previous period"
+  itself, because `reporting_period` is a free-form label and this service
+  has no fiscal calendar to order periods by. Because of A4, lines pair per
+  source account, not per aggregated reported line.
 - **A8. ACC-18 (source-to-report lineage) is not integrated as a graph.**
   `ExplainReportedFact` names the source snapshot ID and its content hash —
   real, verifiable provenance — but does not walk an actual lineage graph
@@ -81,3 +93,12 @@ ways. Read this before relying on anything here for a real filing.
   **`float64`** — ZS-DATA-001 D06 (binary floating point prohibited for
   monetary values), the same rule this platform's other accounting services
   (e.g. financial-control-svc) already follow.
+- **B8. `GetComparatives` refuses comparisons it cannot stand behind.** The
+  prior set must be CERTIFIED or PUBLISHED (422 `SOURCE_UNVERIFIED`; a
+  SUPERSEDED prior is refused too, naming its replacement) — the same
+  fail-closed posture as B1. It must match the current set's legal entity,
+  framework, presentation currency and mapping version, and cover a
+  different reporting period (422 `CONTEXT_INVALID`). The *current* set may
+  be in any state, since preparing a draft against last period's certified
+  figures is the main use. A line in only one period gets a null `change`,
+  not one computed against zero: an absent line is not a zero balance.
