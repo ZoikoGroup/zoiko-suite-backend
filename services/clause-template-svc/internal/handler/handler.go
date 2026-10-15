@@ -141,6 +141,9 @@ func (h *Handler) CreateClause(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetClause(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	c, err := h.store.GetClause(r.Context(), id)
 	if err != nil {
@@ -151,6 +154,9 @@ func (h *Handler) GetClause(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListClauses(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	category := r.URL.Query().Get("category")
 	clauses, err := h.store.ListClauses(r.Context(), legalEntityID, category)
@@ -391,6 +397,9 @@ func (h *Handler) SupersedeClause(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListClauseVersions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	versions, err := h.store.ListClauseVersions(r.Context(), id)
 	if err != nil {
@@ -454,6 +463,9 @@ func (h *Handler) CreateDeviationRule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetDeviationRule(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	d, err := h.store.GetDeviationRule(r.Context(), id)
 	if err != nil {
@@ -466,6 +478,9 @@ func (h *Handler) GetDeviationRule(w http.ResponseWriter, r *http.Request) {
 // ListDeviationRules is LEG-06's named GetPlaybook read surface: the set of
 // deviation rules for a jurisdiction, optionally narrowed to APPROVED only.
 func (h *Handler) ListDeviationRules(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	jurisdictionID := r.URL.Query().Get("jurisdiction_id")
 	status := r.URL.Query().Get("status")
@@ -570,6 +585,9 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	t, err := h.store.GetTemplate(r.Context(), id)
 	if err != nil {
@@ -580,6 +598,9 @@ func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	contractType := r.URL.Query().Get("contract_type")
 	templates, err := h.store.ListTemplates(r.Context(), legalEntityID, contractType)

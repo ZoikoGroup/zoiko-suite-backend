@@ -59,9 +59,6 @@ func (s *PgStore) Create(ctx context.Context, o *domain.WithholdingTaxObligation
 	if o.Status == "" {
 		o.Status = domain.StatusPendingRemittance
 	}
-	if o.Currency == "" {
-		o.Currency = "USD"
-	}
 	if o.PaymentType == "" {
 		o.PaymentType = "SERVICES"
 	}

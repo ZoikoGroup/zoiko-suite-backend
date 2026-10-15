@@ -112,7 +112,7 @@ func TestCreateCounterparty(t *testing.T) {
 		JurisdictionID:     "us-delaware",
 		ContactEmail:       "contact@acme.com",
 		EffectiveFrom:      "2026-01-01",
-		CreatedBy:          "user-001",
+		// CreatedBy intentionally absent — must be pinned to X-Principal-Id
 	}
 	w := httptest.NewRecorder()
 	h.CreateCounterparty(w, buildRequest(http.MethodPost, "/v1/counterparties", body))
@@ -129,6 +129,56 @@ func TestCreateCounterparty(t *testing.T) {
 	if resp.Status != domain.StatusOnboarding {
 		t.Errorf("expected ONBOARDING, got %s", resp.Status)
 	}
+	// created_by must be pinned to the authenticated principal, not the body.
+	if resp.CreatedBy != "principal-test-01" {
+		t.Errorf("expected created_by=principal-test-01, got %q", resp.CreatedBy)
+	}
+}
+
+// TestCreateCounterparty_SelfAttributionMismatch verifies that a body-supplied
+// created_by that differs from X-Principal-Id is rejected 400.
+func TestCreateCounterparty_SelfAttributionMismatch(t *testing.T) {
+	h := newTestHandler()
+	body := domain.CreateCounterpartyRequest{
+		LegalEntityID:    "le-001",
+		Name:             "Fake Corp",
+		CounterpartyType: domain.TypeVendor,
+		JurisdictionID:   "us-delaware",
+		CreatedBy:        "some-other-user", // differs from X-Principal-Id
+	}
+	w := httptest.NewRecorder()
+	h.CreateCounterparty(w, buildRequest(http.MethodPost, "/v1/counterparties", body))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for attribution mismatch, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+// TestGetCounterparty_RequiresPrincipal verifies the GET route now enforces auth.
+func TestGetCounterparty_RequiresPrincipal(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+	req := httptest.NewRequest(http.MethodGet, "/v1/counterparties/any-id", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-test-01")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when X-Principal-Id absent, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+// TestListCounterparties_RequiresPrincipal verifies the LIST route now enforces auth.
+func TestListCounterparties_RequiresPrincipal(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+	req := httptest.NewRequest(http.MethodGet, "/v1/counterparties", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-test-01")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when X-Principal-Id absent, got %d — %s", w.Code, w.Body.String())
+	}
 }
 
 func TestUpdateComplianceStatus(t *testing.T) {
@@ -136,13 +186,12 @@ func TestUpdateComplianceStatus(t *testing.T) {
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 
-	// First create a counterparty
+	// Create with no CreatedBy in body — pinned to X-Principal-Id
 	body := domain.CreateCounterpartyRequest{
 		LegalEntityID:    "le-001",
 		Name:             "Global Logistics Ltd",
 		CounterpartyType: domain.TypeVendor,
 		JurisdictionID:   "uk-england",
-		CreatedBy:        "compliance-001",
 	}
 	wCreate := httptest.NewRecorder()
 	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/counterparties", body))

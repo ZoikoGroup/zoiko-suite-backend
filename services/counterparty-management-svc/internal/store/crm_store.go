@@ -287,9 +287,6 @@ func (s *PgStore) CreateOpportunity(ctx context.Context, p domain.CreateOpportun
 		return nil, domain.ErrRelationshipNotFound
 	}
 	currency := p.Currency
-	if currency == "" {
-		currency = "USD"
-	}
 	opportunityID := "opp-" + uuid.New().String()
 	row := tx.QueryRow(ctx, `INSERT INTO opportunities (
 			opportunity_id, relationship_id, tenant_id, legal_entity_id, name, value, currency, owner_principal_id, created_by

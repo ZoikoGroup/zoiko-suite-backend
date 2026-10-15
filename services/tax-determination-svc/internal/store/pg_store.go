@@ -95,9 +95,6 @@ func (s *PgStore) CreateDetermination(ctx context.Context, d *domain.TaxDetermin
 	if d.Status == "" {
 		d.Status = domain.StatusCalculated
 	}
-	if d.Currency == "" {
-		d.Currency = "USD"
-	}
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO tax_determinations

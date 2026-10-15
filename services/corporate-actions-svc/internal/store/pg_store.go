@@ -76,9 +76,6 @@ func (s *PgStore) CreateAction(ctx context.Context, a *domain.CorporateAction) e
 	if a.Status == "" {
 		a.Status = domain.ActionStatusProposed
 	}
-	if a.Currency == "" {
-		a.Currency = "USD"
-	}
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO corporate_actions
@@ -113,7 +110,7 @@ func (s *PgStore) GetAction(ctx context.Context, id string) (*domain.CorporateAc
 		SELECT action_id, tenant_id, legal_entity_id, title, action_type, COALESCE(description,''), COALESCE(resolution_id,''),
 		       `+effectiveDateColumn+`, status, valuation_amount, currency, executed_at, executed_by, document_vault_id,
 		       `+effectiveDateColumns+`, created_by, created_at, updated_at
-		FROM corporate_actions WHERE action_id = $1`, id,
+		FROM corporate_actions WHERE action_id = $1 AND tenant_id = $2`, id, middleware.GetTenantID(ctx),
 	).Scan(
 		&a.ActionID, &a.TenantID, &a.LegalEntityID, &a.Title, &atype, &a.Description, &a.ResolutionID,
 		&a.EffectiveDate, &status, &a.ValuationAmount, &a.Currency, &a.ExecutedAt, &a.ExecutedBy, &a.DocumentVaultID,
@@ -146,10 +143,11 @@ func (s *PgStore) ListActions(ctx context.Context, legalEntityID, actionType, st
 		       `+effectiveDateColumn+`, status, valuation_amount, currency, executed_at, executed_by, document_vault_id,
 		       `+effectiveDateColumns+`, created_by, created_at, updated_at
 		FROM corporate_actions
-		WHERE ($1 = '' OR legal_entity_id = $1)
+		WHERE tenant_id = $4
+		  AND ($1 = '' OR legal_entity_id = $1)
 		  AND ($2 = '' OR action_type = $2)
 		  AND ($3 = '' OR status = $3)
-		ORDER BY created_at DESC`, legalEntityID, actionType, status,
+		ORDER BY created_at DESC`, legalEntityID, actionType, status, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return nil, err
@@ -191,9 +189,9 @@ func (s *PgStore) UpdateAction(ctx context.Context, a *domain.CorporateAction) e
 		UPDATE corporate_actions
 		SET title=$1, action_type=$2, description=$3, resolution_id=$4, effective_date=$5,
 		    status=$6, valuation_amount=$7, currency=$8, effective_to=$9, updated_at=$10
-		WHERE action_id=$11`,
+		WHERE action_id=$11 AND tenant_id=$12`,
 		a.Title, string(a.ActionType), a.Description, a.ResolutionID, a.EffectiveDate,
-		string(a.Status), a.ValuationAmount, a.Currency, a.EffectiveTo, a.UpdatedAt, a.ActionID,
+		string(a.Status), a.ValuationAmount, a.Currency, a.EffectiveTo, a.UpdatedAt, a.ActionID, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return fmt.Errorf("update corporate action: %w", err)
@@ -202,15 +200,13 @@ func (s *PgStore) UpdateAction(ctx context.Context, a *domain.CorporateAction) e
 	return tx.Commit(ctx)
 }
 
+// ExecuteAction moves PROPOSED/BOARD_APPROVED -> EXECUTED inside a single
+// transaction with a FOR UPDATE row lock, eliminating the TOCTOU race the
+// previous two-transaction design allowed (GetAction in txn-1, write in
+// txn-2 — another caller could execute between them). The explicit
+// tenant_id predicate is the same belt-and-braces already present in
+// contract-lifecycle-svc and board-resolutions-svc.
 func (s *PgStore) ExecuteAction(ctx context.Context, id string, req *domain.ExecuteCorporateActionRequest) (*domain.CorporateAction, error) {
-	a, err := s.GetAction(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if a.Status == domain.ActionStatusExecuted {
-		return nil, domain.ErrActionAlreadyExecuted
-	}
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -218,6 +214,34 @@ func (s *PgStore) ExecuteAction(ctx context.Context, id string, req *domain.Exec
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.setRLS(ctx, tx); err != nil {
 		return nil, err
+	}
+
+	// Lock the row inside this transaction — the status check and the write
+	// must be atomic to prevent concurrent double-execution.
+	var a domain.CorporateAction
+	var atype, status string
+	err = tx.QueryRow(ctx, `
+		SELECT action_id, tenant_id, legal_entity_id, title, action_type, COALESCE(description,''), COALESCE(resolution_id,''),
+		       `+effectiveDateColumn+`, status, valuation_amount, currency, executed_at, executed_by, document_vault_id,
+		       `+effectiveDateColumns+`, created_by, created_at, updated_at
+		FROM corporate_actions WHERE action_id = $1 AND tenant_id = $2 FOR UPDATE`,
+		id, middleware.GetTenantID(ctx),
+	).Scan(
+		&a.ActionID, &a.TenantID, &a.LegalEntityID, &a.Title, &atype, &a.Description, &a.ResolutionID,
+		&a.EffectiveDate, &status, &a.ValuationAmount, &a.Currency, &a.ExecutedAt, &a.ExecutedBy, &a.DocumentVaultID,
+		&a.EffectiveFrom, &a.EffectiveTo, &a.CreatedBy, &a.CreatedAt, &a.UpdatedAt,
+	)
+	if err != nil {
+		if errorsIs(err, pgx.ErrNoRows) {
+			return nil, domain.ErrCorporateActionNotFound
+		}
+		return nil, err
+	}
+	a.ActionType = domain.ActionType(atype)
+	a.Status = domain.ActionStatus(status)
+
+	if a.Status == domain.ActionStatusExecuted {
+		return nil, domain.ErrActionAlreadyExecuted
 	}
 
 	now := time.Now().UTC()
@@ -230,8 +254,8 @@ func (s *PgStore) ExecuteAction(ctx context.Context, id string, req *domain.Exec
 	_, err = tx.Exec(ctx, `
 		UPDATE corporate_actions
 		SET status=$1, executed_by=$2, executed_at=$3, document_vault_id=$4, updated_at=$5
-		WHERE action_id=$6`,
-		string(a.Status), a.ExecutedBy, a.ExecutedAt, a.DocumentVaultID, a.UpdatedAt, id,
+		WHERE action_id=$6 AND tenant_id=$7`,
+		string(a.Status), a.ExecutedBy, a.ExecutedAt, a.DocumentVaultID, a.UpdatedAt, id, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return nil, err
@@ -240,7 +264,7 @@ func (s *PgStore) ExecuteAction(ctx context.Context, id string, req *domain.Exec
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return a, nil
+	return &a, nil
 }
 
 func errorsIs(err, target error) bool {

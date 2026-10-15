@@ -162,6 +162,10 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetObligation(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Read routes require an authenticated principal — previously unguarded.
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	o, err := h.store.GetObligation(r.Context(), id)
 	if err != nil {
 		h.writeLifecycleErr(w, "failed to get obligation", err)
@@ -171,6 +175,10 @@ func (h *Handler) GetObligation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListObligations(w http.ResponseWriter, r *http.Request) {
+	// Read routes require an authenticated principal — previously unguarded.
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	status := r.URL.Query().Get("status")
 	sourceType := r.URL.Query().Get("source_type")
