@@ -14,6 +14,11 @@ var ErrPopulationTooLarge = errorString("control population exceeds the 200000 r
 const (
 	PopulationPaySlips    = "pay-slips"
 	PopulationPayrollRuns = "payroll-runs"
+
+	// WFP populations: one record per ACCEPTED payroll result on each side, paired by the result id.
+	PopulationWFPResults         = "wfp-results"
+	PopulationWFPJournals        = "wfp-journals"
+	PopulationWFPNetInstructions = "wfp-net-instructions"
 )
 
 // Control population measures: which pay figure `amount` carries.
@@ -21,6 +26,15 @@ const (
 	MeasureGross = "gross"
 	MeasureNet   = "net"
 )
+
+// IsControlPopulation is whether this service serves the named population.
+func IsControlPopulation(name string) bool {
+	switch name {
+	case PopulationPaySlips, PopulationPayrollRuns, PopulationWFPResults, PopulationWFPJournals, PopulationWFPNetInstructions:
+		return true
+	}
+	return false
+}
 
 // ControlPopulationQuery selects one page of a payroll control population.
 type ControlPopulationQuery struct {

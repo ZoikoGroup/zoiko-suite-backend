@@ -396,6 +396,8 @@ var EventCatalogue = map[string]bool{
 	EventPayrollLiabilityDue: true, EventPayrollLiabilityScheduled: true, EventPayrollLiabilityAdjusted: true,
 	EventPayrollLiabilityDisputed: true, EventPayrollLiabilityReconciliationFailed: true,
 	EventRunInitiated: true, EventRunCalculated: true, EventRunCompleted: true, EventRunBlocked: true,
+	EventPayrollReconRunCompleted: true, EventPayrollReconRunCertified: true, EventPayrollReconExceptionResolved: true,
+	EventPayrollReconExceptionWaived: true, EventPayrollBankingOutcomeObserved: true, EventPayrollPaymentInstrReturned: true,
 }
 
 // OutboxEvent is one event to be written in the caller's transaction.

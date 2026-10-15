@@ -23,6 +23,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/payroll-run-svc/internal/accounting"
+	"zoiko.io/payroll-run-svc/internal/bankingrefresh"
 	"zoiko.io/payroll-run-svc/internal/benefits"
 	"zoiko.io/payroll-run-svc/internal/compensation"
 	"zoiko.io/payroll-run-svc/internal/config"
@@ -41,6 +42,7 @@ import (
 	"zoiko.io/payroll-run-svc/internal/paydeps"
 	"zoiko.io/payroll-run-svc/internal/paymentstatus"
 	"zoiko.io/payroll-run-svc/internal/store"
+	"zoiko.io/payroll-run-svc/internal/sweeps"
 	"zoiko.io/payroll-run-svc/internal/telemetry"
 	"zoiko.io/payroll-run-svc/internal/workerctx"
 )
@@ -383,6 +385,14 @@ func main() {
 		Banking: paydeps.NewBankingHandoff(cfg.PaymentAdapterURL, &http.Client{Timeout: 15 * time.Second}), HighValueSi: cfg.HighValueSignatures,
 	}, log))
 
+	// Wave 8: reconciliation, exceptions, the close gate, Banking outcome evidence and the correction
+	// chain. Banking is asked through the same clients as WFP-06/07; nothing it says reopens anything.
+	bankingClient := paydeps.NewBankingHandoff(cfg.PaymentAdapterURL, &http.Client{Timeout: 10 * time.Second})
+	paymentLookup := paymentstatus.NewClient(cfg.PaymentStatusURL, wfpHTTP)
+	refresher := bankingrefresh.New(pgStore, bankingClient, paymentLookup, cfg.BankingRefreshPrincipalID,
+		time.Duration(cfg.BankingRefreshIntervalSecs)*time.Second, 10, log)
+	handler.RegisterWFPReconRoutes(r, handler.NewWFPRecon(pgStore, authzClient, paymentLookup, refresher, log))
+
 	// WFP events are written to wfp_outbox in the transaction that changes state
 	// and delivered here, so a broker outage delays them and never loses them.
 	relayCtx, stopRelay := context.WithCancel(context.Background())
@@ -394,6 +404,15 @@ func main() {
 
 	// The WFP-05 dispatcher stops with the relay (the same context).
 	go accounting.New(pgStore, ledgerClient, time.Duration(cfg.PostingIntervalSecs)*time.Second, 10, log).Start(relayCtx)
+
+	// Wave 8 loops: Banking outcome refresh and the liability DUE sweep. Both claim work with
+	// FOR UPDATE SKIP LOCKED / idempotent updates, so replicas never double-process.
+	if cfg.BankingRefreshIntervalSecs > 0 {
+		go refresher.Start(relayCtx)
+	}
+	if cfg.LiabilityDueSweepIntervalSecs > 0 {
+		go sweeps.NewDueSweeper(pgStore, time.Duration(cfg.LiabilityDueSweepIntervalSecs)*time.Second, log).Start(relayCtx)
+	}
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

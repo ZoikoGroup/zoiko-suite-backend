@@ -52,7 +52,7 @@ func (h *Handler) GetControlPopulation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	population := chi.URLParam(r, "population")
-	if population != domain.PopulationPaySlips && population != domain.PopulationPayrollRuns {
+	if !domain.IsControlPopulation(population) {
 		writeError(w, http.StatusNotFound, "population_not_found", "")
 		return
 	}
@@ -80,6 +80,10 @@ func (h *Handler) GetControlPopulation(w http.ResponseWriter, r *http.Request) {
 	measure := q.Get("measure")
 	if measure != domain.MeasureGross && measure != domain.MeasureNet {
 		writeError(w, http.StatusBadRequest, "invalid_field", "measure is required and must be gross or net")
+		return
+	}
+	if population == domain.PopulationWFPNetInstructions && measure != domain.MeasureNet {
+		writeError(w, http.StatusBadRequest, "invalid_field", "wfp-net-instructions is a net-pay population: measure must be net")
 		return
 	}
 
