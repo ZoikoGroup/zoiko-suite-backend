@@ -135,7 +135,7 @@ func (s *PgStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (c
 			return nil
 		}
 		created = true
-		return nil
+		return enqueueRunEvent(ctx, tx, tenantID, r.RunID)
 	})
 	return created, err
 }
@@ -343,7 +343,10 @@ func (s *PgStore) SaveCalculatedResults(ctx context.Context, runID string, total
 			    updated_at = $6
 			WHERE run_id = $7 AND tenant_id = $8
 		`, totalGross, totalNet, totalTax, totalDeductions, len(slips), time.Now().UTC(), runID, tenantID)
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueRunEvent(ctx, tx, tenantID, runID)
 	})
 }
 
@@ -526,6 +529,9 @@ func (s *PgStore) FinalizePayrollRun(ctx context.Context, runID string, governan
 			    snapshot_hash = $4
 			WHERE run_id = $5 AND tenant_id = $6
 		`, now, now, governanceDecisionID, snapshotHash, runID, tenantID)
-		return err
+		if err != nil {
+			return err
+		}
+		return enqueueRunEvent(ctx, tx, tenantID, runID)
 	})
 }

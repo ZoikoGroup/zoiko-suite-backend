@@ -22,19 +22,27 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/payroll-run-svc/internal/accounting"
+	"zoiko.io/payroll-run-svc/internal/benefits"
 	"zoiko.io/payroll-run-svc/internal/compensation"
 	"zoiko.io/payroll-run-svc/internal/config"
 	"zoiko.io/payroll-run-svc/internal/contract"
+	"zoiko.io/payroll-run-svc/internal/counterparty"
 	"zoiko.io/payroll-run-svc/internal/domain"
 	"zoiko.io/payroll-run-svc/internal/employee"
 	svcenvelope "zoiko.io/payroll-run-svc/internal/envelope"
-	"zoiko.io/payroll-run-svc/internal/events"
 	"zoiko.io/payroll-run-svc/internal/handler"
 	"zoiko.io/payroll-run-svc/internal/health"
+	"zoiko.io/payroll-run-svc/internal/inputpull"
+	"zoiko.io/payroll-run-svc/internal/ledger"
 	svcmiddleware "zoiko.io/payroll-run-svc/internal/middleware"
 	"zoiko.io/payroll-run-svc/internal/mtls"
+	"zoiko.io/payroll-run-svc/internal/outbox"
+	"zoiko.io/payroll-run-svc/internal/paydeps"
+	"zoiko.io/payroll-run-svc/internal/paymentstatus"
 	"zoiko.io/payroll-run-svc/internal/store"
 	"zoiko.io/payroll-run-svc/internal/telemetry"
+	"zoiko.io/payroll-run-svc/internal/workerctx"
 )
 
 // platformScopeID mirrors authorization-svc's own constant of the same
@@ -305,8 +313,6 @@ func main() {
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-
 	var httpClientForAuthz *http.Client
 	authzBaseURL := cfg.AuthZServiceURL
 	if cfg.AuthzMTLSEnabled {
@@ -343,8 +349,51 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, empClient, ctrClient, compClient, cfg.DefaultTaxRate, log)
+	h := handler.New(pgStore, authzClient, empClient, ctrClient, compClient, cfg.DefaultTaxRate, log)
 	handler.RegisterRoutes(r, h)
+
+	// ZS-SVC-L-001 Wave 1: worker/run identity, source trust, rule manifests.
+	handler.RegisterWFPRoutes(r, handler.NewWFP(pgStore, authzClient, log))
+
+	// WFP-03: payroll input batches, pulled from contract, compensation and benefits.
+	wfpHTTP := &http.Client{Timeout: 5 * time.Second}
+	inputPuller := inputpull.New(empClient, ctrClient, compClient,
+		benefits.NewClient(cfg.BenefitsURL, wfpHTTP),
+		workerctx.NewClient(cfg.EmployeeMasterURL, wfpHTTP), log)
+	handler.RegisterWFPInputRoutes(r, handler.NewWFPInput(pgStore, authzClient, inputPuller, pgStore, log))
+
+	// WFP-04: payroll result acceptance (external submission and promotion of a Zoiko run).
+	handler.RegisterWFPResultRoutes(r, handler.NewWFPResult(pgStore, authzClient, workerctx.NewClient(cfg.EmployeeMasterURL, wfpHTTP), log))
+
+	// WFP-05: payroll journal bridge. The dispatcher is the only code that talks to the
+	// ledger, and only through general-ledger-svc's posting API.
+	ledgerClient := ledger.New(cfg.LedgerServiceURL, cfg.GLPostingPrincipalID, nil, log)
+	handler.RegisterWFPAccountingRoutes(r, handler.NewWFPAccounting(pgStore, authzClient, ledgerClient, cfg.AccountingBook, log))
+
+	// WFP-06: payroll liabilities. Authorities are validated against counterparty-management-svc and
+	// settlement is evidenced only by payment-status-svc; both fail closed.
+	handler.RegisterWFPLiabilityRoutes(r, handler.NewWFPLiability(pgStore, authzClient,
+		counterparty.NewClient(cfg.CounterpartyURL, wfpHTTP), paymentstatus.NewClient(cfg.PaymentStatusURL, wfpHTTP), log))
+
+	// WFP-07: payroll payment instructions. The beneficiary, paying account, approval threshold and
+	// Banking handoff are all resolved from their authorities and fail closed.
+	handler.RegisterWFPPaymentRoutes(r, handler.NewWFPPayment(pgStore, authzClient, handler.PaymentDeps{
+		Payees: paydeps.NewPayeeMaster(cfg.PayeeBankingURL, wfpHTTP), Workers: paydeps.NewWorkerPayee(cfg.EmployeeMasterURL, wfpHTTP),
+		Payers: paydeps.NewPayerAccounts(cfg.TreasuryURL, wfpHTTP), Policy: paydeps.NewApprovalPolicy(cfg.PolicyURL, wfpHTTP),
+		Banking: paydeps.NewBankingHandoff(cfg.PaymentAdapterURL, &http.Client{Timeout: 15 * time.Second}), HighValueSi: cfg.HighValueSignatures,
+	}, log))
+
+	// WFP events are written to wfp_outbox in the transaction that changes state
+	// and delivered here, so a broker outage delays them and never loses them.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		outbox.NewRelay(pgStore, kafkaWriter, log).Run(relayCtx)
+	}()
+
+	// The WFP-05 dispatcher stops with the relay (the same context).
+	go accounting.New(pgStore, ledgerClient, time.Duration(cfg.PostingIntervalSecs)*time.Second, 10, log).Start(relayCtx)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
@@ -383,6 +432,12 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	stopRelay()
+	select {
+	case <-relayDone:
+	case <-time.After(10 * time.Second):
+		log.Warn("outbox relay did not stop within 10s; undelivered events remain queued and will drain at next start")
 	}
 	log.Info("server stopped")
 }
