@@ -131,6 +131,9 @@ type Store interface {
 	CertifyFinancialSnapshot(ctx context.Context, snapshotID, principalID, reason string, at time.Time) error
 	SupersedeFinancialSnapshot(ctx context.Context, snapshotID, fromStatus, newSnapshotID string, at time.Time) error
 	ListSnapshotSupersession(ctx context.Context, legalEntityID, purpose string) ([]domain.FinancialSnapshot, error)
+	// RecordSnapshotIntegrityFailure enqueues SnapshotIntegrityFailed to the
+	// outbox; it never changes the snapshot row itself.
+	RecordSnapshotIntegrityFailure(ctx context.Context, f *domain.SnapshotIntegrityFailure, correlationID, actorID string) error
 
 	// ACC-18 (Source-to-Report Traceability) — see domain.LineageEdge's
 	// doc comment for the authority boundary these implement.
@@ -314,6 +317,7 @@ const (
 	actionSnapshotCertify   = "SNAPSHOT_CERTIFY"
 	actionSnapshotSupersede = "SNAPSHOT_SUPERSEDE"
 	actionSnapshotView      = "SNAPSHOT_VIEW"
+	actionSnapshotVerify    = "SNAPSHOT_VERIFY"
 
 	// ACC-18 (Source-to-Report Traceability) actions. Rebuilding the
 	// projection is a heavier operation than reading it, so it gets its
@@ -492,6 +496,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/from-trial-balance", h.CreateFinancialSnapshotFromTrialBalance)
 		r.Get("/supersession", h.ListSnapshotSupersession)
 		r.Get("/{id}", h.GetFinancialSnapshotHandler)
+		// The spec lists VerifySnapshotIntegrity as "GET/POST"; it is a
+		// read either way, so both verbs reach the same handler.
+		r.Get("/{id}/verify", h.VerifySnapshotIntegrity)
+		r.Post("/{id}/verify", h.VerifySnapshotIntegrity)
 		r.Post("/{id}/seal", h.SealSnapshot)
 		r.Post("/{id}/certify", h.CertifySnapshot)
 		r.Post("/{id}/supersede", h.SupersedeSnapshot)
@@ -4126,6 +4134,88 @@ func (h *Handler) GetFinancialSnapshotHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
+}
+
+// VerifySnapshotIntegrity recomputes a sealed snapshot's content hash and
+// HMAC signature exactly as SealSnapshot produced them and compares both
+// against what is stored. Spec: "Hash/signature mismatch fails
+// verification." A mismatch is reported as verified=false (200 — the
+// check ran) AND recorded as a SnapshotIntegrityFailed outbox event, so
+// the security signal does not depend on log retention or on the caller
+// checking again. If that event cannot be recorded the request fails with
+// 503 rather than returning a report whose signal was lost.
+func (h *Handler) VerifySnapshotIntegrity(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	snap, err := h.store.GetFinancialSnapshot(r.Context(), id)
+	if err != nil {
+		h.writeSnapshotErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, snap.LegalEntityID, actionSnapshotVerify); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if snap.ContentHash == nil || snap.Signature == nil {
+		writeError(w, http.StatusUnprocessableEntity, "snapshot_not_sealed", string(domain.ErrSnapshotNotSealed))
+		return
+	}
+	// Without the real key every signature would "mismatch" — refuse
+	// rather than raise a false integrity failure.
+	if len(h.signingKey) == 0 {
+		writeError(w, http.StatusServiceUnavailable, "signing_key_unavailable", "no signing key is available to verify this snapshot")
+		return
+	}
+
+	manifest := snap.Purpose + "|" + snap.Content + "|" + snap.SourceReferences
+	hashBytes := sha256.Sum256([]byte(manifest))
+	recomputedHash := hex.EncodeToString(hashBytes[:])
+	recomputedSignature := h.signEvidence(hashBytes[:])
+
+	hashMatched := hmac.Equal([]byte(recomputedHash), []byte(*snap.ContentHash))
+	signatureMatched := hmac.Equal([]byte(recomputedSignature), []byte(*snap.Signature))
+	result := domain.SnapshotIntegrityResult{
+		Verified:   hashMatched && signatureMatched,
+		SnapshotID: snap.SnapshotID,
+		CheckedAt:  time.Now().UTC(),
+	}
+	if result.Verified {
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+
+	h.log.Error("financial snapshot integrity verification FAILED",
+		zap.String("snapshot_id", snap.SnapshotID), zap.String("legal_entity_id", snap.LegalEntityID),
+		zap.String("status", snap.Status), zap.Bool("hash_matched", hashMatched),
+		zap.Bool("signature_matched", signatureMatched), zap.String("principal_id", principalID))
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	if err := h.store.RecordSnapshotIntegrityFailure(r.Context(), &domain.SnapshotIntegrityFailure{
+		SnapshotID:        snap.SnapshotID,
+		LegalEntityID:     snap.LegalEntityID,
+		Purpose:           snap.Purpose,
+		SnapshotStatus:    snap.Status,
+		StoredContentHash: *snap.ContentHash,
+		RecomputedHash:    recomputedHash,
+		HashMatched:       hashMatched,
+		SignatureMatched:  signatureMatched,
+		CheckedAt:         result.CheckedAt,
+	}, correlationID, principalID); err != nil {
+		h.log.Error("snapshot integrity failure could not be recorded", zap.String("snapshot_id", snap.SnapshotID), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "integrity_failure_not_recorded",
+			"snapshot integrity verification FAILED, but the failure event could not be recorded; retry")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) ListSnapshotSupersession(w http.ResponseWriter, r *http.Request) {

@@ -86,6 +86,10 @@ type stubStore struct {
 	snapshots             map[string]*domain.FinancialSnapshot
 	createSnapshotErr     error
 	transitionSnapshotErr error
+	// integrityFailures is every SnapshotIntegrityFailed event "enqueued";
+	// recordIntegrityFailureErr makes that enqueue fail.
+	integrityFailures         []domain.SnapshotIntegrityFailure
+	recordIntegrityFailureErr error
 
 	lineageEdges           []domain.LineageEdge
 	tracePathVerifications []domain.TracePathVerification
@@ -1045,6 +1049,14 @@ func (s *stubStore) ListSnapshotSupersession(_ context.Context, legalEntityID, p
 		}
 	}
 	return out, nil
+}
+
+func (s *stubStore) RecordSnapshotIntegrityFailure(_ context.Context, f *domain.SnapshotIntegrityFailure, _, _ string) error {
+	if s.recordIntegrityFailureErr != nil {
+		return s.recordIntegrityFailureErr
+	}
+	s.integrityFailures = append(s.integrityFailures, *f)
+	return nil
 }
 
 func (s *stubStore) RecordLineageEdge(_ context.Context, edge *domain.LineageEdge) error {

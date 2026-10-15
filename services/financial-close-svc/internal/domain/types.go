@@ -613,6 +613,29 @@ type FinancialSnapshot struct {
 	SupersededAt            *time.Time `json:"superseded_at,omitempty"`
 }
 
+// SnapshotIntegrityResult is VerifySnapshotIntegrity's response. A
+// mismatch is still a 200: the verification ran and this is its report.
+type SnapshotIntegrityResult struct {
+	Verified   bool      `json:"verified"`
+	SnapshotID string    `json:"snapshot_id"`
+	CheckedAt  time.Time `json:"checked_at"`
+}
+
+// SnapshotIntegrityFailure is what a failed VerifySnapshotIntegrity
+// records as ACC-16's SnapshotIntegrityFailed event. It intentionally has
+// no recomputed-signature field — see PgStore.RecordSnapshotIntegrityFailure.
+type SnapshotIntegrityFailure struct {
+	SnapshotID        string
+	LegalEntityID     string
+	Purpose           string
+	SnapshotStatus    string
+	StoredContentHash string
+	RecomputedHash    string
+	HashMatched       bool
+	SignatureMatched  bool
+	CheckedAt         time.Time
+}
+
 type CreateFinancialSnapshotRequest struct {
 	LegalEntityID           string `json:"legal_entity_id"`
 	Purpose                 string `json:"purpose"`
@@ -664,6 +687,10 @@ var (
 	ErrFinancialSnapshotNotFound = errorString("financial snapshot not found")
 	ErrInvalidSnapshotTransition = errorString("financial snapshot is not in a status that allows this action")
 	ErrSigningKeyUnavailable     = errorString("no valid signing key is available to seal this snapshot")
+	// ErrSnapshotNotSealed is returned by VerifySnapshotIntegrity for a
+	// snapshot that has no content hash / signature yet — there is nothing
+	// to verify against, so this is neither a pass nor a failure.
+	ErrSnapshotNotSealed = errorString("financial snapshot has not been sealed; there is no hash or signature to verify")
 	// ErrCertifyWithUnresolvedException is returned when CertifySnapshot
 	// is called on a snapshot whose has_unresolved_exceptions flag is
 	// still true — the spec's own negative path, "Certify snapshot with
