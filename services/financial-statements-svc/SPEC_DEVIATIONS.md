@@ -22,15 +22,44 @@ ways. Read this before relying on anything here for a real filing.
   attempted here (the spec's own "Mandatory engineering control" that "cash
   flow construction method and mapping are versioned" is therefore
   unaddressed).
-- **A3. PresentationMappingUse is one fixed category → statement-section map**
-  (`domain.MappingVersionV1`), not a per-tenant/per-framework/per-jurisdiction
-  versioned registry. Every account's statement placement is derived solely
-  from its `category` (ASSET/LIABILITY/EQUITY/REVENUE/EXPENSE); there is no
-  way to override where one specific account line is reported.
-- **A4. No aggregation.** One StatementFact per source account. A real
-  statement groups many accounts into one reported line (e.g. all cash
-  accounts summed into "Cash and cash equivalents"); this version reports
-  every account individually.
+- **A3. PresentationMappingUse is a fixed, code-defined mapping, not the**
+  **spec's registry.** The spec names PresentationMappingUse as the entity
+  that maps accounts to report lines but defines no grouping rule; this
+  service ships two hard-coded versions instead of a
+  per-tenant/per-framework/per-jurisdiction versioned registry:
+  - `v1-fixed-category-map` (`MappingVersionV1`): statement placement from
+    `category` alone (ASSET/LIABILITY/EQUITY/REVENUE/EXPENSE), one line per
+    source account.
+  - `v2-category-map-name-aggregation` (`MappingVersionV2`, used for every
+    set created from now on): the same placement, plus accounts on the same
+    statement, in the same category, with **exactly** the same non-empty
+    `account_name` become one line whose amount is their exact `big.Rat`
+    sum. Category is part of the key so a balance can never move between
+    tie-out buckets (B6 is unaffected); unnamed accounts never merge; names
+    are compared byte-for-byte (`"Cash"`, `"Cash "` and `"cash"` are three
+    lines). This is a placeholder step toward the real entity, not it:
+    grouping by name is the only signal available, because the ACC-16
+    snapshot carries no account hierarchy. general-ledger-svc's chart of
+    accounts *does* have one (`ParentAccountID`), but threading it through
+    financial-close-svc's snapshot producer into here is a three-service
+    change not attempted. There is still no way to override where one
+    specific account is reported, or to give a line a presentation label
+    other than its accounts' shared name.
+
+  A set records the mapping version it was created with and is built with
+  that version for its whole life: sets created before v2 (including
+  certified ones) keep one line per account on every refresh.
+  Each aggregated fact stores every source account with its own balance
+  (`source_accounts`, migration 000003); `ExplainReportedFact` returns all
+  of them, flags `aggregated`, and refuses (422 `VALIDATION_FAILED`) a fact
+  whose stored sources do not sum to its amount.
+- **A4. Aggregation is name-based only — part of A3.** Since
+  `MappingVersionV2`, same-named, same-category accounts are reported as one
+  line (see A3 for the exact rule and its limits). A real statement groups
+  *differently named* accounts into a labelled line (e.g. "Petty cash" and
+  "Bank — current" into "Cash and cash equivalents"); that needs either the
+  chart-of-accounts hierarchy or the PresentationMappingUse registry, and
+  neither is available here (A3).
 - **A5. DisclosureInstance (narrative disclosures/notes) is not built.** This
   service produces primary statements only.
 - **A6. ComparativePresentation is two-period, pairwise only.** A set can be
@@ -46,8 +75,11 @@ ways. Read this before relying on anything here for a real filing.
   (current − prior, `big.Rat`) only when both sides exist. The caller must
   name the prior set: the service does not find "the previous period"
   itself, because `reporting_period` is a free-form label and this service
-  has no fiscal calendar to order periods by. Because of A4, lines pair per
-  source account, not per aggregated reported line.
+  has no fiscal calendar to order periods by. Lines pair at the sets' own
+  mapping granularity: by account code under v1; by exact account name under
+  v2 (same category first, then one leftover line per side as a
+  reclassification), with each side's `*_source_account_codes` shown so a
+  change in a line's composition is visible, not just its total.
 - **A8. ACC-18 (source-to-report lineage) is not integrated as a graph.**
   `ExplainReportedFact` names the source snapshot ID and its content hash —
   real, verifiable provenance — but does not walk an actual lineage graph
@@ -100,7 +132,12 @@ ways. Read this before relying on anything here for a real filing.
   SUPERSEDED prior is refused too, naming its replacement) — the same
   fail-closed posture as B1. It must match the current set's legal entity,
   framework, presentation currency and mapping version, and cover a
-  different reporting period (422 `CONTEXT_INVALID`). The *current* set may
+  different reporting period (422 `CONTEXT_INVALID`). The mapping-version
+  rule means a v2 set cannot be compared with a v1 prior: per-account and
+  aggregated lines are different granularities, and re-presenting a
+  certified v1 set's figures under v2 on the fly is not done. The first v2
+  period therefore has no comparative until the prior period is itself
+  superseded under v2. The *current* set may
   be in any state, since preparing a draft against last period's certified
   figures is the main use. A line in only one period gets a null `change`,
   not one computed against zero: an absent line is not a zero balance.

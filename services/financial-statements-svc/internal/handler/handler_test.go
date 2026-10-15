@@ -616,3 +616,47 @@ func TestGetComparatives_MissingPrincipalOrTenant_Returns401(t *testing.T) {
 		t.Fatalf("no tenant: expected 401, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
+
+func TestExplainReportedFact_AggregatedLine_ListsAllSourcesInJSON(t *testing.T) {
+	content := domain.SnapshotContent{Currency: "GBP", Accounts: []domain.SnapshotContentAccount{
+		{AccountCode: "1000", AccountName: "Cash", Category: domain.CategoryAsset, Balance: "300"},
+		{AccountCode: "1010", AccountName: "Cash", Category: domain.CategoryAsset, Balance: "200"},
+		{AccountCode: "3000", AccountName: "Equity", Category: domain.CategoryEquity, Balance: "500"},
+	}}
+	raw, _ := json.Marshal(content)
+	snap := &clients.Snapshot{SnapshotID: "snap-1", LegalEntityID: "le-1", Content: string(raw), ContentHash: "sha256:x", Status: "CERTIFIED"}
+	st := newFakeStore()
+	r := newRouter(st, map[string]*clients.Snapshot{"snap-1": snap}, "")
+	set := createViaAPI(t, r)
+	if rr := doReq(r, http.MethodPost, "/v1/statement-sets/"+set.StatementSetID+":refresh-draft", nil, "preparer-1"); rr.Code != http.StatusOK {
+		t.Fatalf("refresh-draft: %d %s", rr.Code, rr.Body.String())
+	}
+	var cashID string
+	for _, f := range st.facts[set.StatementSetID] {
+		if f.AccountName == "Cash" {
+			cashID = f.FactID
+		}
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/statement-facts/"+cashID+"/explain", nil, "viewer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Aggregated     bool `json:"aggregated"`
+		SourceAccounts []struct {
+			AccountCode string `json:"account_code"`
+			Balance     string `json:"balance"`
+		} `json:"source_accounts"`
+		Fact struct {
+			Amount string `json:"amount"`
+		} `json:"fact"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body.Aggregated || len(body.SourceAccounts) != 2 || body.Fact.Amount != "500" ||
+		body.SourceAccounts[0].AccountCode != "1000" || body.SourceAccounts[1].AccountCode != "1010" {
+		t.Fatalf("expected aggregated Cash 500 from 1000 and 1010, got %+v", body)
+	}
+}

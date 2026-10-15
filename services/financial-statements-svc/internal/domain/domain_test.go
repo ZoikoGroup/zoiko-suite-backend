@@ -112,27 +112,31 @@ func TestBuildFacts_MapsCategoriesToStatements(t *testing.T) {
 			{AccountCode: "5000", AccountName: "COGS", Category: CategoryExpense, Balance: "600.00"},
 		},
 	}
-	facts, err := BuildFacts(content)
-	if err != nil {
-		t.Fatalf("BuildFacts: %v", err)
-	}
-	if len(facts) != 5 {
-		t.Fatalf("expected 5 facts, got %d", len(facts))
-	}
-	byCode := make(map[string]StatementFact, len(facts))
-	for _, f := range facts {
-		byCode[f.AccountCode] = f
-	}
-	if byCode["1000"].StatementType != StatementBalanceSheet {
-		t.Errorf("asset account should map to balance sheet")
-	}
-	if byCode["4000"].StatementType != StatementIncomeStatement {
-		t.Errorf("revenue account should map to income statement")
+	// Every name is distinct, so both mapping versions produce one fact per
+	// account here; only the statement placement is under test.
+	for _, version := range []string{MappingVersionV1, MappingVersionV2} {
+		facts, err := BuildFacts(content, version)
+		if err != nil {
+			t.Fatalf("%s: BuildFacts: %v", version, err)
+		}
+		if len(facts) != 5 {
+			t.Fatalf("%s: expected 5 facts, got %d", version, len(facts))
+		}
+		byCode := make(map[string]StatementFact, len(facts))
+		for _, f := range facts {
+			byCode[f.AccountCode] = f
+		}
+		if byCode["1000"].StatementType != StatementBalanceSheet {
+			t.Errorf("%s: asset account should map to balance sheet", version)
+		}
+		if byCode["4000"].StatementType != StatementIncomeStatement {
+			t.Errorf("%s: revenue account should map to income statement", version)
+		}
 	}
 }
 
 func TestBuildFacts_RejectsInvalidContent(t *testing.T) {
-	if _, err := BuildFacts(SnapshotContent{}); err == nil {
+	if _, err := BuildFacts(SnapshotContent{}, MappingVersionCurrent); err == nil {
 		t.Fatal("expected an error for empty content")
 	}
 }
