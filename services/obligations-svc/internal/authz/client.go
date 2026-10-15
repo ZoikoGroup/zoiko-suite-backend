@@ -185,6 +185,9 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 	req.Header.Set("X-Source-Channel", authzSourceChannel)
 	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+
 	// Execute with circuit breaker
 	err = c.breaker.Execute(ctx, func() error {
 		resp, err := c.http.Do(req)

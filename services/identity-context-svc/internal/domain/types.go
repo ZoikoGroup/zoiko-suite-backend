@@ -92,6 +92,10 @@ type SessionContext struct {
 	RiskSignalSource  string `json:"risk_signal_source"`
 	// EnvelopeJWTJTI is the JWT ID of the issued IdentityContextEnvelope.
 	EnvelopeJWTJTI string    `json:"envelope_jwt_jti"`
+	// AuthSessionID is the login session (OIDC sid) this session was
+	// resolved under; ending it ends this session (AU-01). Empty for a
+	// session resolved from a token minted before login sessions existed.
+	AuthSessionID string `json:"auth_session_id,omitempty"`
 	IssuedAt       time.Time `json:"issued_at"`
 	ExpiresAt      time.Time `json:"expires_at"`
 	// InvalidatedAt is append-only. This record is NEVER deleted.
@@ -284,6 +288,19 @@ type IdentityContextEnvelope struct {
 	// (OIDC azp). Carried so a step-up re-issue keeps the verified channel.
 	AuthorizedParty string `json:"azp,omitempty"`
 
+	// SID is the login session this envelope descends from (OIDC sid). A
+	// relying party's revocation check (POST /v1/context/session/introspect)
+	// answers inactive once it ends (AU-01).
+	SID string `json:"sid,omitempty"`
+
+	// Cnf binds the envelope to a DPoP key or a client certificate (RFC 7800 /
+	// 9449 / 8705, AU-27). A relying party refuses it without the proof.
+	Cnf *Confirmation `json:"cnf,omitempty"`
+
+	// Act names the workload that exchanged this envelope for a narrower
+	// audience on the person's behalf (RFC 8693, AU-12).
+	Act *Actor `json:"act,omitempty"`
+
 	// Propagation
 	CorrelationID string `json:"correlation_id"`
 	SchemaVersion string `json:"schema_version"`
@@ -320,7 +337,29 @@ type SessionTrustClaims struct {
 	MFAVerified       bool         `json:"mfa_verified"`
 	AdaptiveRiskScore int          `json:"adaptive_risk_score"`
 	SessionContextID  string       `json:"session_context_id"`
+	// AssuranceLevel is the session's authentication assurance (IAM §31
+	// taxonomy): SINGLE_FACTOR, MFA, or PHISHING_RESISTANT after a WebAuthn
+	// factor (AU-11).
+	AssuranceLevel string `json:"assurance_level,omitempty"`
 }
+
+// Confirmation is the RFC 7800 cnf claim.
+type Confirmation struct {
+	JKT     string `json:"jkt,omitempty"`
+	X5TS256 string `json:"x5t#S256,omitempty"`
+}
+
+// Actor is the RFC 8693 act claim.
+type Actor struct {
+	Subject string `json:"sub"`
+}
+
+// Assurance levels (IAM §3 / §31 session assurance taxonomy).
+const (
+	AssuranceSingleFactor      = "SINGLE_FACTOR"
+	AssuranceMFA               = "MFA"
+	AssurancePhishingResistant = "PHISHING_RESISTANT"
+)
 
 // ---------------------------------------------------------------------------
 // Wire types (request/response)
@@ -377,6 +416,10 @@ type ResolveRequest struct {
 	// WorkloadID is the calling workload identity where one was presented.
 	// Empty for ordinary user traffic.
 	WorkloadID string `json:"-"`
+
+	// DPoPJKT is the thumbprint of a DPoP proof the handler verified on this
+	// request (RFC 9449); a DPoP-bound access token resolves only with it.
+	DPoPJKT string `json:"-"`
 
 	// CausationID names the event or command that caused this one. Distinct
 	// from CorrelationID: correlation groups a story, causation is the edge
@@ -486,6 +529,14 @@ type TokenGrant struct {
 	// ClientID is the VERIFIED OAuth client (azp). Empty when none
 	// authenticated.
 	ClientID string
+	// SID is the login session (auth_sessions) the token belongs to.
+	SID string
+	// CnfJKT binds the token to a DPoP key; "" for a bearer token.
+	CnfJKT string
+	// Scope is the granted OAuth scope (space-separated).
+	Scope string
+	// AssuranceLevel is SINGLE_FACTOR, MFA or PHISHING_RESISTANT.
+	AssuranceLevel string
 }
 
 // StepUpRequest is POST /v1/authenticate/step-up: the current session's
@@ -595,7 +646,29 @@ const CredentialStatusPending = "PENDING"
 const (
 	AMRPassword = "pwd"
 	AMROTP      = "otp"
+	// AMRHardwareKey is a WebAuthn/passkey assertion (RFC 8176 "hwk").
+	AMRHardwareKey = "hwk"
+	// AMRFederated is a login delegated to an enterprise IdP (OIDC or SAML).
+	AMRFederated = "fed"
+	// AMRMFA marks that more than one factor was used (RFC 8176 "mfa").
+	AMRMFA = "mfa"
 )
+
+// AssuranceFor derives the assurance level from authentication methods.
+func AssuranceFor(amr []string) string {
+	has := map[string]bool{}
+	for _, m := range amr {
+		has[m] = true
+	}
+	switch {
+	case has[AMRHardwareKey]:
+		return AssurancePhishingResistant
+	case has[AMROTP] || has[AMRMFA]:
+		return AssuranceMFA
+	default:
+		return AssuranceSingleFactor
+	}
+}
 
 // ErrPrincipalNotFound is returned when a principal does not exist in the caller's tenant scope.
 var ErrPrincipalNotFound = errors.New("principal not found")
@@ -643,6 +716,19 @@ type VerifiedClaims struct {
 	// through (the web console, the mobile app). Verified with the token, so
 	// the channel derived from it is a fact, not an assertion.
 	ClientID string
+	// SID is the login session the token belongs to (OIDC sid). Ending it
+	// (logout, refresh-token reuse, deprovisioning) ends every envelope
+	// resolved from it.
+	SID string
+	// CnfJKT is the DPoP key the token is bound to (RFC 9449 §6), "" for a
+	// bearer token. The envelope resolved from it carries the same binding.
+	CnfJKT string
+	// AssuranceLevel is SINGLE_FACTOR, MFA or PHISHING_RESISTANT.
+	AssuranceLevel string
+	JTI            string
+	ExpiresAt      time.Time
+	// Scope is the OAuth scope the token was granted.
+	Scope string
 }
 
 // ErrAuthorizationDenied is returned when the caller is not authorized for the requested action.

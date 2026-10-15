@@ -1,11 +1,10 @@
 package envelope
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"strings"
-
-	"zoiko.io/jurisdiction-rules-svc/internal/problem"
 )
 
 // Mode controls what Middleware does with a request that fails §4.
@@ -111,24 +110,42 @@ func enforced(mode Mode, isWrite bool) bool {
 	}
 }
 
-// writeViolation renders the refusal as an RFC 9457 problem (API standard §12),
-// carrying each unmet §4 obligation as an `errors[]` entry located by JSON
-// Pointer.
-//
-// The per-field detail is deliberately not folded into a single sentence. The
-// Next.js console's readErrorDetail concatenates error/field/message/detail
-// into one string, and schema-registry-svc already showed what that costs when
-// the structure is the point: a caller cannot tell which of five headers it is
-// missing from a folded sentence. Keeping them structured lets the console
-// list them.
+// writeViolation renders the refusal as an RFC 9457 problem+json with the
+// per-field violations. The structure matches the platform's standard problem
+// detail format (API standard §12) so that clients can programmatically
+// inspect the violations.
 func writeViolation(w http.ResponseWriter, err *ValidationError) {
+	w.Header().Set("Content-Type", "application/problem+json")
 	w.Header().Set("X-Envelope-Contract", "violated")
-	p := problem.New(StatusFor(err), "envelope_incomplete", err.Error())
-	for _, v := range err.Violations {
-		p.Field("#/"+v.Field, "violation", v.Header+": "+v.Reason)
+	w.WriteHeader(StatusFor(err))
+
+	// Build RFC 9457 problem detail with per-field violations
+	type problemDetail struct {
+		Type       string      `json:"type"`
+		Title      string      `json:"title"`
+		Status     int         `json:"status"`
+		Detail     string      `json:"detail"`
+		Code       string      `json:"code"`
+		Error      string      `json:"error"`
+		Violations []Violation `json:"errors"`
 	}
-	if err.Service != "" {
-		p.With("service", err.Service)
+
+	pd := struct {
+		Type       string      `json:"type"`
+		Title      string      `json:"title"`
+		Status     int         `json:"status"`
+		Detail     string      `json:"detail"`
+		Code       string      `json:"code"`
+		Error      string      `json:"error"`
+		Violations []Violation `json:"errors"`
+	}{
+		Type:       "https://api.zoikosuite.com/problems/authorization-denied",
+		Title:      "Authorization Denied",
+		Status:     StatusFor(err),
+		Detail:     err.Error(),
+		Code:       "envelope_incomplete",
+		Error:      "envelope_incomplete",
+		Violations: err.Violations,
 	}
-	problem.Write(w, p)
+	_ = json.NewEncoder(w).Encode(pd)
 }

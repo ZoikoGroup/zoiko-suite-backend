@@ -91,6 +91,39 @@ const (
 	// contract names DispositionFailed; a legal hold is not a failure, so this
 	// is a distinct name rather than a misuse of that one.
 	EventDispositionBlocked = "identity.retention.disposition_blocked"
+
+	// ── ZS-IAM-001 §23 canonical names (AU-25) ───────────────────────────────
+	//
+	// §23 names identity.session.revoked / identity.subject.*, while this
+	// service has published session.invalidated / principal.status.changed
+	// since before the standard, and authorization-svc and the gateway
+	// consume those. Both are now emitted: the legacy name for existing
+	// consumers, the canonical one for every new consumer. The legacy names
+	// retire when the consumer register shows no subscriber.
+	EventSessionRevoked    = "identity.session.revoked"
+	EventSubjectCreated    = "identity.subject.created"
+	EventSubjectDisabled   = "identity.subject.disabled"
+	EventSubjectEnabled    = "identity.subject.enabled"
+	EventSCIMSyncCompleted = "identity.scim_sync.completed"
+
+	// ── Auth plane closure (15 Oct 2026) ─────────────────────────────────────
+	EventLoginSessionStarted   = "identity.login_session.started"
+	EventLoginSessionEnded     = "identity.login_session.ended"
+	EventRefreshReuseDetected  = "identity.refresh_token.reuse_detected"
+	EventAuthCodeReplayed      = "identity.authorization_code.replayed"
+	EventLoginThrottled        = "identity.authentication.throttled"
+	EventPasswordChanged       = "identity.password.changed"
+	EventPasswordResetRequest  = "identity.password_reset.requested"
+	EventPasswordResetDecided  = "identity.password_reset.decided"
+	EventSubjectInvited        = "identity.subject.invited"
+	EventIdPRegistered         = "identity.idp.registered"
+	EventIdPStatusChanged      = "identity.idp.status_changed"
+	EventFederatedLogin        = "identity.federation.login"
+	EventGroupMappingProposed  = "identity.group_role_mapping.proposed"
+	EventGroupMappingDecided   = "identity.group_role_mapping.decided"
+	EventGroupMembershipChange = "identity.group.membership_changed"
+	EventSCIMConnectionCreated = "identity.scim_connection.created"
+	EventTokenExchanged        = "identity.token.exchanged"
 )
 
 // SourceServiceName is stamped on every envelope this service emits, and is
@@ -230,12 +263,22 @@ func (p *Publisher) PublishSessionInvalidated(
 	reason domain.InvalidationReason,
 	correlationID string,
 ) error {
-	return p.emit(ctx, EventSessionInvalidated, "", "", principalID, correlationID, sessionContextID, map[string]any{
+	payload := map[string]any{
 		"session_context_id":  sessionContextID,
 		"principal_id":        principalID,
 		"invalidation_reason": reason,
 		"correlation_id":      correlationID,
-	})
+	}
+	if err := p.emit(ctx, EventSessionInvalidated, "", "", principalID, correlationID, sessionContextID, payload); err != nil {
+		return err
+	}
+	return p.emit(ctx, EventSessionRevoked, "", "", principalID, correlationID, sessionContextID, payload)
+}
+
+// Emit renders and enqueues any event (the auth-plane services use it for
+// events that have no dedicated method).
+func (p *Publisher) Emit(ctx context.Context, eventType, tenantID, actorID, correlationID, key string, payload map[string]any) error {
+	return p.emit(ctx, eventType, tenantID, "", actorID, correlationID, key, payload)
 }
 
 // PublishRiskSignalUnavailable raises the alarm that the risk cache had no
@@ -260,13 +303,23 @@ func (p *Publisher) PublishPrincipalStatusChanged(
 	newStatus domain.PrincipalStatus,
 	actorID, correlationID string,
 ) error {
-	return p.emit(ctx, EventPrincipalStatusChanged, tenantID, "", actorID, correlationID, principalID, map[string]any{
+	payload := map[string]any{
 		"principal_id":   principalID,
 		"tenant_id":      tenantID,
 		"new_status":     string(newStatus),
 		"actor":          actorID,
 		"correlation_id": correlationID,
-	})
+	}
+	if err := p.emit(ctx, EventPrincipalStatusChanged, tenantID, "", actorID, correlationID, principalID, payload); err != nil {
+		return err
+	}
+	switch newStatus {
+	case domain.PrincipalStatusDisabled, domain.PrincipalStatusSuspended:
+		return p.emit(ctx, EventSubjectDisabled, tenantID, "", actorID, correlationID, principalID, payload)
+	case domain.PrincipalStatusActive:
+		return p.emit(ctx, EventSubjectEnabled, tenantID, "", actorID, correlationID, principalID, payload)
+	}
+	return nil
 }
 
 // PublishAuthenticationSucceeded records that a human proved possession of a

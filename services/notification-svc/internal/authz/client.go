@@ -237,6 +237,9 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 	// request alone would make the second look like a replay of the first.
 	req.Header.Set("Idempotency-Key", requestID+":"+actionType)
 
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
+
 	resp, err := c.client.Do(req)
 	if err != nil {
 		c.log.Error("failed to call authorization-svc", zap.Error(err))

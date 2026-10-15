@@ -88,7 +88,7 @@ func (s *PgStore) withTenantTx(ctx context.Context, fn func(tx pgx.Tx, tenantID 
 // CheckIdempotencyKey checks if an idempotency key has been processed before.
 // Returns (alreadyProcessed bool, existingResourceID string, existingResourceType string, err error).
 // If alreadyProcessed is true, the caller can return the existing resource.
-// Note: Request hash verification is not implemented in this version.
+// Verifies that the request hash matches to detect IDEMPOTENCY_MISMATCH.
 func (s *PgStore) CheckIdempotencyKey(ctx context.Context, idempotencyKey, requestHash string) (bool, string, string, error) {
 	tenantID, err := tenantOf(ctx)
 	if err != nil {
@@ -96,12 +96,12 @@ func (s *PgStore) CheckIdempotencyKey(ctx context.Context, idempotencyKey, reque
 	}
 
 	const query = `
-		SELECT resource_id, resource_type
+		SELECT resource_id, resource_type, request_hash
 		FROM idempotency_keys
 		WHERE tenant_id = $1 AND idempotency_key = $2;`
 
-	var existingResourceID, existingResourceType string
-	err = s.pool.QueryRow(ctx, query, tenantID, idempotencyKey).Scan(&existingResourceID, &existingResourceType)
+	var existingResourceID, existingResourceType, existingRequestHash string
+	err = s.pool.QueryRow(ctx, query, tenantID, idempotencyKey).Scan(&existingResourceID, &existingResourceType, &existingRequestHash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, "", "", nil
@@ -109,8 +109,11 @@ func (s *PgStore) CheckIdempotencyKey(ctx context.Context, idempotencyKey, reque
 		return false, "", "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	// For now, we don't verify the request hash matches since we're not storing it in this simplified version.
-	// A full implementation would store and verify the request hash.
+	// Verify the request hash matches to detect IDEMPOTENCY_MISMATCH (API standard L381).
+	if existingRequestHash != requestHash {
+		return false, "", "", domain.ErrIdempotencyMismatch
+	}
+
 	return true, existingResourceID, existingResourceType, nil
 }
 

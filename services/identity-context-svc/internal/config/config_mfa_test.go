@@ -18,6 +18,7 @@ func mfaBaseEnv(t *testing.T) {
 	t.Setenv("IDP_CLIENT_AUTH", "")
 	t.Setenv("IDP_CLIENT_SECRETS_FILE", "")
 	t.Setenv("MFA_TOTP_SKEW_STEPS", "")
+	t.Setenv("OIDC_ISSUER", "https://auth.example.com")
 }
 
 func TestMFAKey_RequiredInProtectedTiers(t *testing.T) {

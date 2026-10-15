@@ -35,6 +35,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/idempotency"
+	"zoiko.io/identity-context-svc/internal/keys"
 	"zoiko.io/identity-context-svc/internal/mfa"
 	"zoiko.io/identity-context-svc/internal/mtlslistener"
 	"zoiko.io/identity-context-svc/internal/outbox"
@@ -264,12 +265,21 @@ func main() {
 	// replaced, which is exactly the case worth alerting on.
 	go telemetry.SampleOutbox(relayCtx, relay, govMetrics, 30*time.Second, log)
 
-	verifier := auth.NewJWTVerifier(cfg)
-	signer, err := auth.NewJWTSigner(cfg)
-
+	// ── Signing keyring (AU-05) ──────────────────────────────────────────────
+	// Load the active signing key and any verify-only keys from config/env.
+	// The keyring is shared by JWTVerifier, JWTSigner, IdPTokenIssuer and JWKSHandler.
+	keyring, err := keys.Load(keys.Options{
+		Signing: []keys.Spec{
+			{Kid: cfg.JWTKeyID, Source: cfg.JWTSigningPrivateKeyPath},
+		},
+		ActiveKid: cfg.JWTKeyID,
+	})
 	if err != nil {
-		log.Fatal("failed to initialise JWT signer", zap.Error(err))
+		log.Fatal("failed to load signing keyring", zap.Error(err))
 	}
+
+	verifier := auth.NewJWTVerifier(cfg, keyring)
+	signer := auth.NewJWTSigner(keyring)
 
 	// ── Password hashing ───────────────────────────────────────────────────
 	// Built before the server starts listening: NewHasher performs one
@@ -293,7 +303,7 @@ func main() {
 		zap.Int("peak_memory_mib", (cfg.ArgonMemoryKiB*cfg.ArgonMaxConcurrent)/1024),
 	)
 
-	idpIssuer, err := auth.NewIdPTokenIssuer(cfg)
+	idpIssuer, err := auth.NewIdPTokenIssuer(cfg, keyring)
 	if err != nil {
 		log.Fatal("failed to initialise IdP token issuer", zap.Error(err))
 	}
@@ -403,7 +413,7 @@ func main() {
 		log.Warn("MFA_SECRET_KEY unset: TOTP enrolment and step-up are unavailable, so no privileged session can be issued")
 	}
 	mfaService := identityctx.NewMFAService(log, principalRepo, mfaKeys,
-		auth.NewEnvelopeVerifier(signer.PublicKey(), cfg.JWTIssuer, cfg.JWTAudienceInternal),
+		auth.NewEnvelopeVerifier(keyring, cfg.JWTIssuer, cfg.JWTAudienceInternal),
 		idpIssuer, publisher, siemClient,
 		identityctx.MFAPolicy{
 			MaxFailedAttempts: cfg.MFAMaxFailedAttempts,
@@ -504,7 +514,7 @@ func main() {
 	))
 	r.Handle("/metrics", promhttp.Handler())
 
-	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(signer.PublicKey(), cfg.JWTKeyID))
+	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(keyring))
 
 	// ── GOV-01 command services ───────────────────────────────────────────
 	supportService := identityctx.NewSupportService(

@@ -43,22 +43,22 @@ const (
 	ReasonCancelPreIssueError        ReasonCode = "PRE_ISSUE_ERROR"
 
 	// Family: RETURN
-	ReasonReturnMissingEvidence   ReasonCode = "MISSING_EVIDENCE"
-	ReasonReturnDataCorrectionReq ReasonCode = "DATA_CORRECTION_REQUIRED"
-	ReasonReturnPolicyException   ReasonCode = "POLICY_EXCEPTION"
-	ReasonReturnReviewNotes       ReasonCode = "REVIEW_NOTES"
+	ReasonReturnMissingEvidence       ReasonCode = "MISSING_EVIDENCE"
+	ReasonReturnDataCorrectionReq     ReasonCode = "DATA_CORRECTION_REQUIRED"
+	ReasonReturnPolicyException       ReasonCode = "POLICY_EXCEPTION"
+	ReasonReturnReviewNotes           ReasonCode = "REVIEW_NOTES"
 
 	// Family: REJECT
-	ReasonRejectAuthorityDenied    ReasonCode = "AUTHORITY_DENIED"
-	ReasonRejectControlFailure     ReasonCode = "CONTROL_FAILURE"
-	ReasonRejectPolicyNotMet       ReasonCode = "POLICY_NOT_MET"
-	ReasonRejectCounterpartyReject ReasonCode = "COUNTERPARTY_REJECTED"
+	ReasonRejectAuthorityDenied     ReasonCode = "AUTHORITY_DENIED"
+	ReasonRejectControlFailure      ReasonCode = "CONTROL_FAILURE"
+	ReasonRejectPolicyNotMet        ReasonCode = "POLICY_NOT_MET"
+	ReasonRejectCounterpartyReject  ReasonCode = "COUNTERPARTY_REJECTED"
 
 	// Family: REVERSE
-	ReasonReversePostingError  ReasonCode = "POSTING_ERROR"
-	ReasonReverseWrongPeriod   ReasonCode = "WRONG_PERIOD"
-	ReasonReverseWrongAccount  ReasonCode = "WRONG_ACCOUNT"
-	ReasonReverseDuplicatePost ReasonCode = "DUPLICATE_POSTING"
+	ReasonReversePostingError   ReasonCode = "POSTING_ERROR"
+	ReasonReverseWrongPeriod    ReasonCode = "WRONG_PERIOD"
+	ReasonReverseWrongAccount   ReasonCode = "WRONG_ACCOUNT"
+	ReasonReverseDuplicatePost  ReasonCode = "DUPLICATE_POSTING"
 
 	// Family: REOPEN
 	ReasonReopenPostCloseError       ReasonCode = "POST_CLOSE_ERROR"
@@ -80,9 +80,9 @@ const (
 	ReasonTerminateEndOfService    ReasonCode = "END_OF_SERVICE"
 
 	// Family: OVERRIDE
-	ReasonOverrideControlOwner  ReasonCode = "CONTROL_OWNER_OVERRIDE"
-	ReasonOverrideEmergencyOp   ReasonCode = "EMERGENCY_OPERATION"
-	ReasonOverrideAuthorizedExc ReasonCode = "AUTHORIZED_EXCEPTION"
+	ReasonOverrideControlOwner   ReasonCode = "CONTROL_OWNER_OVERRIDE"
+	ReasonOverrideEmergencyOp    ReasonCode = "EMERGENCY_OPERATION"
+	ReasonOverrideAuthorizedExc  ReasonCode = "AUTHORIZED_EXCEPTION"
 
 	// Family: EXTERNAL
 	ReasonExternalProviderRejected  ReasonCode = "PROVIDER_REJECTED"

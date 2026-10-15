@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	svcenvelope "zoiko.io/policy-svc/internal/envelope"
 )
 
 // PurposeContext is sent as X-Purpose-Context. governance-decision-log-svc's
@@ -133,6 +135,9 @@ func (c *HTTPClient) RecordDecision(ctx context.Context, rec Record) error {
 	if rec.CausationID != "" {
 		h.Set("X-Causation-Id", rec.CausationID)
 	}
+
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

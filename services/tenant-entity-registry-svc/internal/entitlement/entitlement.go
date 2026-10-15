@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	svcenvelope "zoiko.io/tenant-entity-registry-svc/internal/envelope"
 )
 
 var (
@@ -56,6 +58,9 @@ func (c *HTTPChecker) CheckProvisioning(ctx context.Context, subscriptionID, pri
 	}
 	req.Header.Set("X-Principal-Id", principalID)
 	req.Header.Set("X-Source-Channel", "system")
+	// Forward the caller's canonical envelope for §4 contract propagation
+	svcenvelope.ForwardTo(ctx, req)
+
 	resp, err := c.client.Do(req)
 	if err != nil {
 		c.log.Error("commercial-account-svc unreachable — refusing provisioning (fail-closed)", zap.Error(err))

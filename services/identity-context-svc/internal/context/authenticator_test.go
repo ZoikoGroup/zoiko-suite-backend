@@ -1,6 +1,11 @@
 package context_test
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+
 	"context"
 	"errors"
 	"testing"
@@ -14,6 +19,7 @@ import (
 	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/credential"
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/keys"
 )
 
 // ── Test doubles ─────────────────────────────────────────────────────────────
@@ -576,11 +582,16 @@ func TestSetPassword_RejectsEmptyInputs(t *testing.T) {
 // every login succeeds and then 401s at /v1/context/resolve.
 func TestIssuedToken_IsAcceptedByTheResolvePath(t *testing.T) {
 	cfg := &config.Config{
-		JWTSigningSecret:   "local-dev-jwt-signing-secret-key-32-chars-long",
 		JWTIssuer:          "identity-context-svc",
 		IdPTokenTTLSeconds: 300,
 	}
-	issuer, err := authpkg.NewIdPTokenIssuer(cfg)
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	signer, err := keys.NewPEMSigner("k1", pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rsaKey)}))
+	require.NoError(t, err)
+	ring, err := keys.NewKeyring(signer)
+	require.NoError(t, err)
+	issuer, err := authpkg.NewIdPTokenIssuer(cfg, ring)
 	require.NoError(t, err)
 
 	h := testHasher(t)
@@ -591,7 +602,7 @@ func TestIssuedToken_IsAcceptedByTheResolvePath(t *testing.T) {
 	resp, err := authenticator.Authenticate(context.Background(), request())
 	require.NoError(t, err)
 
-	claims, err := authpkg.NewJWTVerifier(cfg).VerifyBearer(context.Background(), resp.AccessToken)
+	claims, err := authpkg.NewJWTVerifier(cfg, ring).VerifyBearer(context.Background(), resp.AccessToken)
 	require.NoError(t, err, "the resolve path must accept the token authentication mints")
 	require.Equal(t, testSubject, claims.Subject,
 		"sub must be the IdP subject FindByIDPSubject queries on")

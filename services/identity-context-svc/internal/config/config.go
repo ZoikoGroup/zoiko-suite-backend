@@ -30,7 +30,9 @@ type Config struct {
 	JWTSigningPrivateKeyPath string
 	JWTKeyID                 string
 
-	// TODO: replace JWTSigningSecret with KMS key reference before Phase 1 production cutover.
+	// JWTSigningSecret is DEPRECATED and ignored: the access token is signed
+	// by the keyring like every other token (AU-05). Still read so a
+	// deployment that sets it gets a warning rather than a silent no-op.
 	JWTSigningSecret      string
 	JWTIssuer             string
 	JWTAudienceInternal   string
@@ -105,6 +107,10 @@ type Config struct {
 	MFATOTPSkewSteps int
 	// MFAIssuerLabel is the issuer an authenticator app shows.
 	MFAIssuerLabel string
+
+	// AuthPlane is the 15 Oct 2026 auth closure's settings (keys, OIDC,
+	// throttling, lifecycle, federation, WebAuthn). See config_authplane.go.
+	AuthPlane AuthPlaneConfig
 
 	// Authorization Service URL for admin mutation authorization checks.
 	// Must be set in production/staging; a placeholder is allowed only in local development.
@@ -421,14 +427,6 @@ func Load() (*Config, error) {
 		IngressBindingTTLSeconds:      envInt("INGRESS_BINDING_TTL_SECONDS", 24*60*60),
 	}
 
-	// JWT_SIGNING_SECRET is mandatory and must be at least 32 bytes for HS256.
-	if cfg.JWTSigningSecret == "" {
-		return nil, errors.New("JWT_SIGNING_SECRET is required")
-	}
-	if len(cfg.JWTSigningSecret) < 32 {
-		return nil, errors.New("JWT_SIGNING_SECRET must be at least 32 bytes")
-	}
-
 	// Lockout must actually bound guessing. A zero or negative threshold would
 	// read as "lock immediately" or "never lock" depending on the comparison,
 	// and neither is a setting anyone means to choose.
@@ -561,6 +559,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("MTLS_ENABLED=true needs MTLS_MANAGEMENT_SERVICE_URL: the listener's certificate comes from mtls-management-svc")
 	}
 
+	if err := loadAuthPlane(cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 

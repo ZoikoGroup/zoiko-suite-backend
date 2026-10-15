@@ -245,79 +245,73 @@ func MustFromContext(ctx context.Context) Envelope {
 	return e
 }
 
-// ApplyTo writes this envelope onto an OUTBOUND request, so a service calling a
-// peer forwards the caller's envelope instead of dropping it.
-//
-// WHY THIS EXISTS. Every authz client in this estate built its outbound call to
-// authorization-svc with one header:
-//
-//	req.Header.Set("Content-Type", "application/json")
-//
-// authorization-svc enforces the same canonical contract on POST /v1/authorize
-// that every other service enforces on a write, so it answered 401
-// envelope_incomplete naming six missing fields. The caller treats any non-2xx
-// as "authorization service unavailable" and fails closed, so the symptom was
-// 503 authz_unavailable on every authorized write in the platform -- with
-// authorization-svc healthy, reachable, and answering correctly the whole time.
-//
-// It is the exact inverse of Parse, and deliberately in this file next to it:
-// the two must not drift, because a header Parse reads and ApplyTo omits becomes
-// a field that silently disappears on every internal hop.
-//
-// THE ENVELOPE IS FORWARDED VERBATIM, including the idempotency key. That is the
-// doctrinal reading: the envelope identifies a business OPERATION, and an
-// authorization check made while serving that operation belongs to it rather
-// than being a new one. Minting a fresh key here would break the link between a
-// decision and the write it authorised.
-//
-// Empty fields are omitted rather than set blank. Header.Get returns "" for both
-// so a peer cannot tell them apart, but sending empty headers makes a request
-// dump unreadable and invites a peer to treat "" as a real value.
+// ApplyTo copies the envelope onto an outbound request's headers.
 func (e Envelope) ApplyTo(r *http.Request) {
-	set := func(header, value string) {
-		if value != "" {
-			r.Header.Set(header, value)
-		}
+	if e.TenantID != "" {
+		r.Header.Set(HeaderTenantID, e.TenantID)
 	}
-
-	set(HeaderTenantID, e.TenantID)
-	set(HeaderActorSubjectID, e.ActorSubjectID)
-	set(HeaderWorkloadID, e.WorkloadID)
-	set(HeaderLegalEntityID, e.LegalEntityID)
-	set(HeaderBookID, e.BookID)
-	set(HeaderReportingBasis, e.ReportingBasis)
-	set(HeaderOperation, e.Operation)
-	set(HeaderRequestID, e.RequestID)
-	set(HeaderCorrelationID, e.CorrelationID)
-	set(HeaderCausationID, e.CausationID)
-	set(HeaderIdempotencyKey, e.IdempotencyKey)
-	set(HeaderSourceSystem, e.SourceSystem)
-	set(HeaderExternalReference, e.ExternalReference)
-	set(HeaderTimezone, e.Timezone)
-	set(HeaderJurisdictionContext, e.JurisdictionContext)
-	set(HeaderPurposeContext, e.PurposeContext)
-	set(HeaderExpectedVersion, e.ExpectedVersion)
-	set(HeaderWorkflowInstanceID, e.WorkflowInstanceID)
-	set(HeaderApprovalReference, e.ApprovalReference)
-
-	// source_channel is mandatory downstream and has a closed vocabulary, so an
-	// absent or unrecognised one cannot simply be passed along. A service-to-
-	// service hop with no channel of its own genuinely IS a system call, which
-	// is what ChannelSystem means -- this does not coerce a caller's real
-	// channel, it only fills a gap that would otherwise be a 401.
-	channel := e.SourceChannel
-	if !channel.Valid() {
-		channel = ChannelSystem
+	if e.ActorSubjectID != "" {
+		r.Header.Set(HeaderActorSubjectID, e.ActorSubjectID)
 	}
-	r.Header.Set(HeaderSourceChannel, string(channel))
-
-	// RFC3339 because that is the only format Parse accepts. Anything else
-	// arrives at the peer as a badTimes entry and is refused.
+	if e.WorkloadID != "" {
+		r.Header.Set(HeaderWorkloadID, e.WorkloadID)
+	}
+	if e.LegalEntityID != "" {
+		r.Header.Set(HeaderLegalEntityID, e.LegalEntityID)
+	}
+	if e.BookID != "" {
+		r.Header.Set(HeaderBookID, e.BookID)
+	}
+	if e.ReportingBasis != "" {
+		r.Header.Set(HeaderReportingBasis, e.ReportingBasis)
+	}
+	if e.Operation != "" {
+		r.Header.Set(HeaderOperation, e.Operation)
+	}
+	if e.RequestID != "" {
+		r.Header.Set(HeaderRequestID, e.RequestID)
+	}
+	if e.CorrelationID != "" {
+		r.Header.Set(HeaderCorrelationID, e.CorrelationID)
+	}
+	if e.CausationID != "" {
+		r.Header.Set(HeaderCausationID, e.CausationID)
+	}
+	if e.IdempotencyKey != "" {
+		r.Header.Set(HeaderIdempotencyKey, e.IdempotencyKey)
+	}
+	if e.SourceChannel != "" {
+		r.Header.Set(HeaderSourceChannel, string(e.SourceChannel))
+	}
+	if e.SourceSystem != "" {
+		r.Header.Set(HeaderSourceSystem, e.SourceSystem)
+	}
+	if e.ExternalReference != "" {
+		r.Header.Set(HeaderExternalReference, e.ExternalReference)
+	}
 	if e.OccurredAt != nil {
 		r.Header.Set(HeaderOccurredAt, e.OccurredAt.Format(time.RFC3339))
 	}
 	if e.EffectiveAt != nil {
 		r.Header.Set(HeaderEffectiveAt, e.EffectiveAt.Format(time.RFC3339))
+	}
+	if e.Timezone != "" {
+		r.Header.Set(HeaderTimezone, e.Timezone)
+	}
+	if e.JurisdictionContext != "" {
+		r.Header.Set(HeaderJurisdictionContext, e.JurisdictionContext)
+	}
+	if e.PurposeContext != "" {
+		r.Header.Set(HeaderPurposeContext, e.PurposeContext)
+	}
+	if e.ExpectedVersion != "" {
+		r.Header.Set(HeaderExpectedVersion, e.ExpectedVersion)
+	}
+	if e.WorkflowInstanceID != "" {
+		r.Header.Set(HeaderWorkflowInstanceID, e.WorkflowInstanceID)
+	}
+	if e.ApprovalReference != "" {
+		r.Header.Set(HeaderApprovalReference, e.ApprovalReference)
 	}
 	if len(e.EvidenceRefs) > 0 {
 		r.Header.Set(HeaderEvidenceRefs, strings.Join(e.EvidenceRefs, ","))

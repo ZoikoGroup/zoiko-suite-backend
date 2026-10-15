@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	svcenvelope "zoiko.io/policy-svc/internal/envelope"
 )
 
 type key struct {
@@ -123,6 +125,8 @@ func (c *KeySet) refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Forward the canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("fetch jwks: %w", err)

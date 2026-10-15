@@ -68,6 +68,8 @@ const (
 	ActionMFAStepUp   = "MFA_STEP_UP"
 	ActionMFARevoke   = "MFA_REVOKE"
 	ActionMFAReset    = "MFA_RESET"
+	// ActionMFALogin is the second factor presented at the hosted login.
+	ActionMFALogin = "MFA_LOGIN"
 )
 
 // MFAStore is the MFA service's slice of the store.
@@ -363,14 +365,22 @@ func (s *MFAService) StepUp(ctx context.Context, c *MFACaller, code, correlation
 	}
 
 	authTime := s.now()
-	token, err := s.issuer.IssueGrant(domain.TokenGrant{
+	// The step-up keeps the login session (sid) and the DPoP binding: it is
+	// a stronger assurance for the SAME session, so logging out still ends
+	// it and a stolen step-up token is as bound as the original.
+	grant := domain.TokenGrant{
 		Subject:  c.Principal.IdentityProviderSubject,
 		TenantID: c.Principal.TenantID,
 		MFADone:  true,
 		AuthTime: authTime,
 		AMR:      amr,
 		ClientID: c.Envelope.AuthorizedParty,
-	})
+		SID:      c.Envelope.SID,
+	}
+	if c.Envelope.Cnf != nil {
+		grant.CnfJKT = c.Envelope.Cnf.JKT
+	}
+	token, err := s.issuer.IssueGrant(grant)
 	if err != nil {
 		return nil, fmt.Errorf("%w: token issuance: %v", ErrAuthUnavailable, err)
 	}
@@ -388,6 +398,47 @@ func (s *MFAService) StepUp(ctx context.Context, c *MFACaller, code, correlation
 		AuthTime:    authTime.Unix(),
 		AMR:         amr,
 	}, nil
+}
+
+// VerifyLoginTOTP checks a TOTP code presented at the hosted login (after
+// the password) for p, with the same lockout, replay protection and evidence
+// as a step-up. ErrMFANotEnrolled when p has no active factor.
+func (s *MFAService) VerifyLoginTOTP(ctx context.Context, p *domain.Principal, code, correlationID string) error {
+	if !s.Configured() {
+		return ErrMFAUnavailable
+	}
+	c := &MFACaller{Principal: p}
+	var err error
+	code, err = mfa.NormalizeCode(code)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrRequestInvalid, err)
+	}
+	f, err := s.store.FindActiveTOTP(ctx, p.PrincipalID, p.TenantID)
+	switch {
+	case errors.Is(err, domain.ErrCredentialNotFound):
+		return ErrMFANotEnrolled
+	case err != nil:
+		return fmt.Errorf("%w: factor lookup: %v", ErrAuthUnavailable, err)
+	}
+	rec, err := events.Render(events.EventStepUpSucceeded, p.TenantID, "", p.PrincipalID, correlationID, p.PrincipalID,
+		map[string]any{"principal_id": p.PrincipalID, "tenant_id": p.TenantID, "factor_id": f.FactorID,
+			"context": "login", "amr": []string{domain.AMRPassword, domain.AMROTP}, "correlation_id": correlationID})
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrAuthUnavailable, err)
+	}
+	return s.verifyCode(ctx, c, f, code, ActionMFALogin, false, correlationID, rec)
+}
+
+// HasActiveTOTP reports whether p holds an active TOTP factor.
+func (s *MFAService) HasActiveTOTP(ctx context.Context, principalID, tenantID string) (bool, error) {
+	if !s.Configured() {
+		return false, nil
+	}
+	_, err := s.store.FindActiveTOTP(ctx, principalID, tenantID)
+	if errors.Is(err, domain.ErrCredentialNotFound) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // List returns the caller's own factors.

@@ -121,6 +121,10 @@ func noStore(w http.ResponseWriter) {
 // mfa_verified=true. 401 invalid_code / session_invalid, 409 mfa_not_enrolled,
 // 503 when no factor can be checked.
 func (h *Handler) StepUp(w http.ResponseWriter, r *http.Request) {
+	ip, ok := h.throttle(w, r, "step-up", "")
+	if !ok {
+		return
+	}
 	c, ok := h.mfaCaller(w, r)
 	if !ok {
 		return
@@ -131,6 +135,9 @@ func (h *Handler) StepUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := h.mfa.StepUp(r.Context(), c, req.Code, mfaCorrelation(r, req.CorrelationID))
+	if err != nil && h.limiter != nil && errors.Is(err, ErrInvalidCode) {
+		h.limiter.Failure(r.Context(), ip, c.Principal.TenantID)
+	}
 	if err != nil {
 		h.writeMFAError(w, err)
 		return

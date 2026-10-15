@@ -1,44 +1,26 @@
 package auth
 
 import (
-	"crypto/rsa"
-	"encoding/base64"
 	"encoding/json"
-	"math/big"
 	"net/http"
+
+	"zoiko.io/identity-context-svc/internal/keys"
 )
 
-type jwk struct {
-	Kty string `json:"kty"`
-	Use string `json:"use"`
-	Kid string `json:"kid"`
-	Alg string `json:"alg"`
-	N   string `json:"n"`
-	E   string `json:"e"`
-}
-
-type jwksResponse struct {
-	Keys []jwk `json:"keys"`
-}
-
-// NewJWKSHandler exposes the signer's public key in standard JWKS format
-// so any service can verify envelopes independently, without ever holding
-// the private key.
-func NewJWKSHandler(pub *rsa.PublicKey, kid string) http.HandlerFunc {
-	eBytes := big.NewInt(int64(pub.E)).Bytes()
-	resp := jwksResponse{Keys: []jwk{{
-		Kty: "RSA",
-		Use: "sig",
-		Kid: kid,
-		Alg: "RS256",
-		N:   base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
-		E:   base64.RawURLEncoding.EncodeToString(eBytes),
-	}}}
+// NewJWKSHandler publishes every key in the ring (the active one and any
+// being rotated in or out), so a relying party can verify every live token
+// through a rotation without a restart (AU-05).
+func NewJWKSHandler(ring *keys.Keyring) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		set, err := ring.JWKS()
+		if err != nil {
+			http.Error(w, "key set unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/jwk-set+json")
+		// Relying parties cache by kid and refetch on an unknown one; a short
+		// public max-age keeps intermediaries from pinning a stale set.
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": set})
 	}
-}
-func (s *JWTSigner) PublicKey() *rsa.PublicKey {
-	return &s.privateKey.PublicKey
 }

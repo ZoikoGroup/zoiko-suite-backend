@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"go.uber.org/zap"
 )
 
@@ -77,6 +78,9 @@ func (c *HTTPClient) RecordDecision(ctx context.Context, params RecordDecisionPa
 	if params.CausationID != nil {
 		req.Header.Set("X-Causation-Id", *params.CausationID)
 	}
+
+	// Forward the caller's canonical envelope for downstream traceability
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

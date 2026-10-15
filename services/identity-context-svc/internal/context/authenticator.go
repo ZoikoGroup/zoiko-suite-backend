@@ -158,6 +158,8 @@ type Authenticator struct {
 	// clients verifies the login client (R-1). Nil accepts only logins that
 	// present no client, which is the behaviour before clients existed.
 	clients ClientAuthenticator
+	// startSession records the login session (sid) a token belongs to.
+	startSession func(ctx context.Context, p *domain.Principal, clientID string, amr []string, authTime time.Time) (string, error)
 	// mfa answers mfa_enrolled. Nil reports false.
 	mfa MFAStatusReader
 
@@ -173,6 +175,12 @@ func (a *Authenticator) WithClients(c ClientAuthenticator) *Authenticator {
 }
 
 // WithMFAStatus lets the login response say whether a factor is enrolled.
+// WithLoginSessions makes every login record an auth session (AU-01).
+func (a *Authenticator) WithLoginSessions(start func(ctx context.Context, p *domain.Principal, clientID string, amr []string, authTime time.Time) (string, error)) *Authenticator {
+	a.startSession = start
+	return a
+}
+
 func (a *Authenticator) WithMFAStatus(m MFAStatusReader) *Authenticator {
 	a.mfa = m
 	return a
@@ -242,6 +250,80 @@ func (a *Authenticator) Authenticate(ctx context.Context, req domain.Authenticat
 		a.reject(ctx, email, "", req.TenantID, req.CorrelationID, "invalid_client", siem.SeverityMedium)
 		return nil, err
 	}
+
+	principal, err := a.VerifyPassword(ctx, req.TenantID, email, req.Password, req.CorrelationID)
+	if err != nil {
+		return nil, err
+	}
+
+	// The token asserts the IdP subject, not the principal ID: VerifyBearer
+	// hands its sub claim to FindByIDPSubject. MFADone is false: a password
+	// is one factor; the second is proven by POST /v1/authenticate/step-up.
+	authTime := time.Now().UTC()
+	amr := []string{domain.AMRPassword}
+	grant := domain.TokenGrant{
+		Subject:  principal.IdentityProviderSubject,
+		TenantID: principal.TenantID,
+		MFADone:  false,
+		AuthTime: authTime,
+		AMR:      amr,
+		ClientID: clientID,
+	}
+	// Every login is a session that logout can end (AU-01): the internal
+	// route records one too, so its envelopes carry a sid like the OAuth
+	// flow's do.
+	if a.startSession != nil {
+		sid, err := a.startSession(ctx, principal, clientID, amr, authTime)
+		if err != nil {
+			return nil, fmt.Errorf("%w: login session: %v", ErrAuthUnavailable, err)
+		}
+		grant.SID = sid
+	}
+	token, err := a.issuer.IssueGrant(grant)
+	if err != nil {
+		a.log.Error("failed to mint bearer token after successful verification",
+			zap.String("principal_id", principal.PrincipalID),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("%w: token issuance: %v", ErrAuthUnavailable, err)
+	}
+
+	// MFARequired stays false: login is password-baseline, and the second
+	// factor is demanded at step-up, before a privileged session. MFAEnrolled
+	// tells the client which of step-up or enrolment to offer. A failed lookup
+	// reports false rather than failing a login that already succeeded.
+	enrolled := false
+	if a.mfa != nil {
+		has, mfaErr := a.mfa.HasActiveTOTP(ctx, principal.PrincipalID, principal.TenantID)
+		if mfaErr != nil {
+			a.log.Warn("could not read mfa enrolment for login response",
+				zap.String("principal_id", principal.PrincipalID), zap.Error(mfaErr))
+		}
+		enrolled = has
+	}
+	return &domain.AuthenticateResponse{
+		AccessToken: token,
+		TokenType:   "Bearer",
+		ExpiresIn:   a.issuer.TTLSeconds(),
+		PrincipalID: principal.PrincipalID,
+		TenantID:    principal.TenantID,
+		MFARequired: false,
+		MFAEnrolled: enrolled,
+		AuthTime:    authTime.Unix(),
+		AMR:         amr,
+	}, nil
+}
+
+// VerifyPassword checks a password for (tenant, email) with the lockout,
+// evidence, events and timing equalisation Authenticate always had, and
+// returns the principal. It mints nothing: the hosted login (internal/oidc)
+// and Authenticate each decide what a verified password leads to.
+func (a *Authenticator) VerifyPassword(ctx context.Context, tenantID, email, password, correlationID string) (*domain.Principal, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if tenantID == "" || email == "" || password == "" {
+		return nil, ErrAuthRequestInvalid
+	}
+	req := domain.AuthenticateRequest{TenantID: tenantID, Email: email, Password: password, CorrelationID: correlationID}
 
 	principal, cred, err := a.credentials.FindActiveCredentialByEmail(ctx, email, req.TenantID)
 	switch {
@@ -369,34 +451,6 @@ func (a *Authenticator) Authenticate(ctx context.Context, req domain.Authenticat
 		return nil, fmt.Errorf("%w: evidence write: %v", ErrAuthUnavailable, err)
 	}
 
-	// The token asserts the IdP subject, not the principal ID: VerifyBearer
-	// hands its sub claim to FindByIDPSubject, which looks up
-	// identity_provider_subject. Sending principal_id here would resolve to
-	// nothing and every login would 401 one step later.
-	//
-	// MFADone is false: a password is one factor. The second is proven
-	// separately, by POST /v1/authenticate/step-up, which mints a new token
-	// with MFADone and a fresh auth_time. auth_time here is the moment the
-	// password verified; it travels to the envelope so relying parties can
-	// tell how recently the person authenticated, which iat cannot say.
-	authTime := time.Now().UTC()
-	amr := []string{domain.AMRPassword}
-	token, err := a.issuer.IssueGrant(domain.TokenGrant{
-		Subject:  principal.IdentityProviderSubject,
-		TenantID: principal.TenantID,
-		MFADone:  false,
-		AuthTime: authTime,
-		AMR:      amr,
-		ClientID: clientID,
-	})
-	if err != nil {
-		a.log.Error("failed to mint bearer token after successful verification",
-			zap.String("principal_id", principal.PrincipalID),
-			zap.Error(err),
-		)
-		return nil, fmt.Errorf("%w: token issuance: %v", ErrAuthUnavailable, err)
-	}
-
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
@@ -418,30 +472,7 @@ func (a *Authenticator) Authenticate(ctx context.Context, req domain.Authenticat
 		zap.String("correlation_id", req.CorrelationID),
 	)
 
-	// MFARequired stays false: login is password-baseline, and the second
-	// factor is demanded at step-up, before a privileged session. MFAEnrolled
-	// tells the client which of step-up or enrolment to offer. A failed lookup
-	// reports false rather than failing a login that already succeeded.
-	enrolled := false
-	if a.mfa != nil {
-		has, mfaErr := a.mfa.HasActiveTOTP(ctx, principal.PrincipalID, principal.TenantID)
-		if mfaErr != nil {
-			a.log.Warn("could not read mfa enrolment for login response",
-				zap.String("principal_id", principal.PrincipalID), zap.Error(mfaErr))
-		}
-		enrolled = has
-	}
-	return &domain.AuthenticateResponse{
-		AccessToken: token,
-		TokenType:   "Bearer",
-		ExpiresIn:   a.issuer.TTLSeconds(),
-		PrincipalID: principal.PrincipalID,
-		TenantID:    principal.TenantID,
-		MFARequired: false,
-		MFAEnrolled: enrolled,
-		AuthTime:    authTime.Unix(),
-		AMR:         amr,
-	}, nil
+	return principal, nil
 }
 
 // SetPassword hashes and stores a password for a principal.

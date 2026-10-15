@@ -30,6 +30,7 @@ func baseEnv(t *testing.T) {
 	t.Setenv("SOD_SERVICE_URL", "http://sod-svc:8090")
 	// Required in staging and production since 000012 (the TOTP factor).
 	t.Setenv("MFA_SECRET_KEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
+	t.Setenv("OIDC_ISSUER", "https://auth.example.com")
 }
 
 func TestAuthzEnvDefaultsToTheDeploymentEnvironment(t *testing.T) {
