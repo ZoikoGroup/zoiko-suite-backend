@@ -20,18 +20,42 @@ policies a run pins.
 
 - **A1. A certification cannot be revoked.** `CertRevoked` and the
   `CERTIFIED → REVOKED` edge exist in `internal/domain/state.go`, but no command
-  reaches them. §7 lists Revoked as a certification state; §27 requires a
-  restricted reopen command ("reason, evidence, prior certification retained");
-  scenario 12 says a certified run later found erroneous needs a controlled
-  supersede/reopen workflow. Today the only way out of CERTIFIED is a new run
-  with `prior_run_id` for the same entity and period, which supersedes it.
-  That covers "replace with a better result" but not "this result is wrong and
-  nothing replaces it yet". Scope for a task: `POST /controls/v1/runs/{id}/revoke-certification`
-  with mandatory reason and authority reference, `If-Match`, `Idempotency-Key`,
-  its own action (e.g. `FINCTRL_REVOKE`, not `FINCTRL_CERTIFY`), event
-  `control.run.certification_revoked`. The close gate already reads each
-  control's latest run, so a revoked run must make the gate report closed
-  again — that needs a test.
+  reaches them. Today the only way out of CERTIFIED is a new run with
+  `prior_run_id` for the same entity and period, which supersedes it. That
+  covers "replace with a better result" but not "this result is wrong and
+  nothing replaces it yet".
+
+  *What the specification does say* (checked against the source text):
+  ZS-CONTROL-001 §7 names Revoked as a certification state (it is not a
+  lifecycle state); §27 "Reopen/supersede certified run — restricted command,
+  reason, evidence, prior certification retained"; §25 requires a reason for
+  reopen and idempotency, `If-Match` and re-authorization on material commands;
+  Invariant 2 "corrections create a new run, superseding certification or
+  documented reopen workflow"; scenario 12 "certified run later found erroneous
+  — original certification retained; controlled superseding/reopen workflow
+  required". ZS-SVC-Z-001 (the data-quality certification analogue) adds "new
+  material evidence may revoke certification prospectively; prior
+  certification history remains", runbook RB-05 "revoke affected certification
+  prospectively, preserve prior evidence, assess blast radius", NP-47
+  "certification revoked with no reason/evidence" must fail safe, and an event
+  carrying prior certification id, reason and effective time. Not relevant
+  here: scenario 11 ("certification authority revoked before sign-off") is the
+  *certifier's IAM authority* being withdrawn; `CertifyRun` already re-checks
+  authorization when it is called.
+
+  *Why it was not built* (2026-10-16): the specification does not say
+  (a) which **lifecycle** state a run takes when its certification is revoked
+  — §7 has no lifecycle Revoked, the only edge out of lifecycle CERTIFIED is
+  SUPERSEDED, and the `control_runs` CHECK forbids lifecycle CERTIFIED with any
+  other certification state, so a choice has to be made and the constraint
+  migrated; (b) what happens **downstream** (A11); (c) **who** may revoke —
+  "restricted command" names no role. Once those are decided, the command is
+  small: `POST /controls/v1/runs/{id}/revoke-certification` with mandatory
+  reason and evidence reference (NP-47), `If-Match`, `Idempotency-Key`, its own
+  action (not `FINCTRL_CERTIFY`), the original certification transition kept,
+  event `control.run.certification_revoked` (prior state, reason, effective
+  time), and a test that the close gate reports closed for that control
+  afterwards (the gate reads the latest run's states).
 - **A2. No ControlCertification record (§6, Invariant 9).** Certifying changes
   the run's states and appends a transition row (actor, reason, time). Invariant
   9 requires the certified result to identify the certifier, *certification
@@ -99,6 +123,22 @@ policies a run pins.
 - **A10. 25 catalogue controls are blocked or partial.** See
   `financial-control-closure.md` §7 and `GET /controls/v1/catalogue/status`;
   not repeated here.
+- **A11. Downstream effect of a revoked (or superseded) certification is
+  unspecified.** A certification is consumed elsewhere: financial-close-svc's
+  readiness check calls `GET /controls/v1/close-gate` before a period is
+  closed, and reporting is released from that closed period (ZS-CONTROL-001
+  §22, Invariants 10 and 17). Neither ZS-CONTROL-001 nor ZS-SVC-Z-001 says
+  what happens when a certification that a period was **already** closed on is
+  revoked: whether the period must be reopened, whether released reports are
+  marked or withdrawn, or whether consumers are only notified. ZS-SVC-Z-001
+  RB-05 says only "assess blast radius", and its revocation is "prospective".
+  The close gate in this service would report the gate closed for future
+  readiness checks, but nothing tells financial-close-svc or reporting that a
+  past decision rested on a revoked certification. This needs an owner's
+  decision (Finance Controls / close governance) before A1 is built, and
+  probably a consumer of `control.run.certification_revoked` in
+  financial-close-svc. The same question applies today to a certified run that
+  is superseded by a failing one after its period closed.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
