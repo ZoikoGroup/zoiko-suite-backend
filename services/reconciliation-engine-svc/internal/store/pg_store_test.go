@@ -273,3 +273,110 @@ func TestReconciliation_TenantIsolation(t *testing.T) {
 		t.Fatalf("cross-tenant read leaked population snapshots: %+v", snapshots)
 	}
 }
+
+// An empty population is still a side: every item on the other side must
+// surface as an exception, so the run cannot certify with nothing matched
+// (ZS-SVC-Z-001 NP-27 — a missing source is never coerced to agreement).
+func TestReconciliation_EmptySide_SurfacesExceptionsAndBlocksCertify(t *testing.T) {
+	f := newFixture(t)
+	def := f.defineReconciliation(orgA, "empty-side", 0)
+	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("REF-1", 100), item("REF-2", 200)}},
+		{Side: "Ledger", SourceSystem: "GL"},
+	})
+	matched, err := f.s.Match(f.ctx, orgA, run.RunID, domain.MatchRequest{}, "test-operator", f.claim("Match", run.RunID))
+	if err != nil {
+		t.Fatalf("match: %v", err)
+	}
+	if matched.Status != domain.RunExceptionsOpen {
+		t.Fatalf("status with an empty side = %s, want ExceptionsOpen", matched.Status)
+	}
+	exceptions, err := f.s.GetExceptions(f.ctx, orgA, run.RunID)
+	if err != nil || len(exceptions) != 2 {
+		t.Fatalf("expected 2 exceptions for the unmatched Bank items, got %d (err=%v)", len(exceptions), err)
+	}
+	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
+		t.Fatalf("certify with an empty side: %v, want ErrOpenExceptionsRemain", err)
+	}
+}
+
+// Scenario 06: a manual match cannot hide an amount difference beyond the
+// run's pinned tolerance, and cannot pair two items from the same side.
+func TestReconciliation_ManualMatchCannotHideAmountDifference(t *testing.T) {
+	f := newFixture(t)
+	def := f.defineReconciliation(orgA, "manual-match-tolerance", 0)
+	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("BANK-REF", 10000), item("BANK-REF-2", 500)}},
+		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("GL-REF", 9000)}},
+	})
+	if _, err := f.s.Match(f.ctx, orgA, run.RunID, domain.MatchRequest{}, "test-operator", f.claim("Match-1", run.RunID)); err != nil {
+		t.Fatalf("auto match pass: %v", err)
+	}
+	exceptions, err := f.s.GetExceptions(f.ctx, orgA, run.RunID)
+	if err != nil {
+		t.Fatalf("get exceptions: %v", err)
+	}
+	var bank, bank2, ledger string
+	for _, e := range exceptions {
+		switch e.RefID {
+		case "BANK-REF":
+			bank = e.ItemID
+		case "BANK-REF-2":
+			bank2 = e.ItemID
+		case "GL-REF":
+			ledger = e.ItemID
+		}
+	}
+
+	_, err = f.s.Match(f.ctx, orgA, run.RunID, domain.MatchRequest{
+		ManualMatches: []domain.ManualMatchInput{{ItemAID: bank, ItemBID: ledger, Reason: "reviewer says these are the same"}},
+	}, "reviewer-alice", f.claim("Match-2", run.RunID))
+	if !errors.Is(err, domain.ErrManualMatchOutsideTolerance) {
+		t.Fatalf("manual match across a 1000 difference: %v, want ErrManualMatchOutsideTolerance", err)
+	}
+	_, err = f.s.Match(f.ctx, orgA, run.RunID, domain.MatchRequest{
+		ManualMatches: []domain.ManualMatchInput{{ItemAID: bank, ItemBID: bank2, Reason: "same side"}},
+	}, "reviewer-alice", f.claim("Match-3", run.RunID))
+	if !errors.Is(err, domain.ErrManualMatchSameSide) {
+		t.Fatalf("manual match within one side: %v, want ErrManualMatchSameSide", err)
+	}
+
+	after, err := f.s.GetExceptions(f.ctx, orgA, run.RunID)
+	if err != nil {
+		t.Fatalf("get exceptions after refused matches: %v", err)
+	}
+	for _, e := range after {
+		if e.Status != domain.ExceptionOpen {
+			t.Fatalf("a refused manual match resolved an exception: %+v", e)
+		}
+	}
+}
+
+// Changing a definition's rules is a new version, so runs and certifications
+// that pin definition_version identify the rules that actually applied.
+func TestReconciliation_RedefiningRulesBumpsVersion(t *testing.T) {
+	f := newFixture(t)
+	first := f.defineReconciliation(orgA, "versioned", 0)
+	same := f.defineReconciliation(orgA, "versioned", 0)
+	if same.Version != first.Version {
+		t.Fatalf("re-posting identical rules changed the version: %d -> %d", first.Version, same.Version)
+	}
+	widened := f.defineReconciliation(orgA, "versioned", 500)
+	if widened.Version != first.Version+1 {
+		t.Fatalf("tolerance change: version %d, want %d", widened.Version, first.Version+1)
+	}
+}
+
+func TestReconciliation_RunCannotSupersedeItself(t *testing.T) {
+	f := newFixture(t)
+	def := f.defineReconciliation(orgA, "self-supersede", 0)
+	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
+		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
+	})
+	_, err := f.s.SupersedeRun(f.ctx, orgA, run.RunID, domain.SupersedeRunRequest{NewRunID: run.RunID, Reason: "loop"},
+		"test-operator", f.claim("Supersede", run.RunID))
+	if !errors.Is(err, domain.ErrSupersedeSelf) {
+		t.Fatalf("self-supersede: %v, want ErrSupersedeSelf", err)
+	}
+}
