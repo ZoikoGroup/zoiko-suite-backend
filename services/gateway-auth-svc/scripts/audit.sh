@@ -210,7 +210,8 @@ if [ "${MISMATCH%%.*}" -ge 1 ] 2>/dev/null; then ok "  spoofing attempts counted
 # written for.
 MISSING=0
 for o in allowed no_token invalid_token incomplete_claims tenant_hostname_mismatch \
-         carta_blocked tenant_context_denied tenant_context_unresolved; do
+         carta_blocked tenant_context_denied tenant_context_unresolved \
+         rate_limited overloaded request_too_large request_encoding_refused malformed_request version_unsupported; do
   echo "$M" | grep -q "outcome=\"$o\"" || { MISSING=$((MISSING+1)); echo "        missing series: $o"; }
 done
 chk "outcome series absent before first occurrence" "$MISSING" "0"

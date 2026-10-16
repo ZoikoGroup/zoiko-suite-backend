@@ -119,4 +119,14 @@ func TestRouter_ExposesMetrics(t *testing.T) {
 	}
 	assert.Contains(t, body, `outcome="tenant_hostname_mismatch"`,
 		"the spoofing outcome must exist as a series before it ever fires")
+
+	// The admission outcomes (INT-01) exist from startup too: an alert on a
+	// rate-limit or overload surge must evaluate against zero, not against
+	// nothing, until the first one happens.
+	for _, outcome := range []string{
+		"rate_limited", "overloaded", "request_too_large", "request_encoding_refused",
+		"malformed_request", "version_unsupported",
+	} {
+		assert.Contains(t, body, `outcome="`+outcome+`"`, "admission outcome %q must exist as a series before it fires", outcome)
+	}
 }

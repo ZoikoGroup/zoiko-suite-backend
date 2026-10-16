@@ -40,6 +40,8 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/eventing/envelope"
+	"zoiko.io/eventing/integration"
+	"zoiko.io/eventing/repair"
 )
 
 // publish_state values (ZS-EVENT-001 §6).
@@ -58,6 +60,8 @@ const (
 	CodePublishFailed     = "PUBLISH_FAILED"
 	CodePermanent         = "PERMANENT_PUBLISH_ERROR"
 	CodeInvalidStored     = "INVALID_STORED_ENVELOPE"
+	CodeSchemaRejected    = "SCHEMA_REJECTED"
+	CodeGateUnavailable   = "GATE_UNAVAILABLE"
 )
 
 // EventIDHeader carries the event id as a Kafka header as well as in the body.
@@ -219,6 +223,8 @@ type Relay struct {
 	writer Writer
 	cfg    Config
 	log    *zap.Logger
+	gate   Gate
+	region string
 
 	// outagePasses counts consecutive passes that found the broker down, to
 	// back off the whole relay rather than any one event.
@@ -314,6 +320,8 @@ func (r *Relay) DrainOnce(ctx context.Context) (PassResult, error) {
 
 	msgs := make([]Message, 0, len(batch))
 	ready := make([]claimed, 0, len(batch))
+	var held []claimed
+	var heldCause error
 	for _, rec := range batch {
 		value, err := envelope.WithPublishedAt(rec.payload, rec.dispatchedAt)
 		if err != nil {
@@ -322,8 +330,23 @@ func (r *Relay) DrainOnce(ctx context.Context) (PassResult, error) {
 			r.recordFailure(ctx, rec, true, CodeInvalidStored, err, &res)
 			continue
 		}
+		if r.gate != nil {
+			if gerr := r.gate.Check(ctx, rec.eventType, rec.payload); gerr != nil {
+				if errors.Is(gerr, integration.ErrRegistryUnavailable) {
+					// Could not check: do not publish, do not blame the event.
+					held = append(held, rec)
+					heldCause = gerr
+				} else {
+					r.recordFailure(ctx, rec, true, CodeSchemaRejected, gerr, &res)
+				}
+				continue
+			}
+		}
 		msgs = append(msgs, message(rec, value))
 		ready = append(ready, rec)
+	}
+	if len(held) > 0 {
+		r.release(ctx, held, CodeGateUnavailable, heldCause, &res)
 	}
 	if len(ready) == 0 {
 		return res, nil
@@ -339,7 +362,7 @@ func (r *Relay) DrainOnce(ctx context.Context) (PassResult, error) {
 		return res, nil
 	}
 	if err := r.writer.Probe(ctx); err != nil {
-		r.release(ctx, ready, fmt.Errorf("%w (broker probe: %v)", batchErr, err), &res)
+		r.release(ctx, ready, CodeBrokerUnavailable, fmt.Errorf("%w (broker probe: %v)", batchErr, err), &res)
 		return res, nil
 	}
 	r.outagePasses = 0
@@ -362,7 +385,7 @@ func (r *Relay) DrainOnce(ctx context.Context) (PassResult, error) {
 		if consecutive >= 2 {
 			if probeErr := r.writer.Probe(ctx); probeErr != nil {
 				// Went down mid-pass: neither this event nor the rest is to blame.
-				r.release(ctx, ready[i:], fmt.Errorf("%w (broker probe: %v)", err, probeErr), &res)
+				r.release(ctx, ready[i:], CodeBrokerUnavailable, fmt.Errorf("%w (broker probe: %v)", err, probeErr), &res)
 				return res, nil
 			}
 		}
@@ -505,7 +528,7 @@ func (r *Relay) recordFailure(ctx context.Context, rec claimed, permanent bool, 
 
 // release returns rows uncounted after the broker looked down, scheduling
 // them behind a relay-wide backoff.
-func (r *Relay) release(ctx context.Context, recs []claimed, cause error, res *PassResult) {
+func (r *Relay) release(ctx context.Context, recs []claimed, code string, cause error, res *PassResult) {
 	if len(recs) == 0 {
 		return
 	}
@@ -524,7 +547,7 @@ func (r *Relay) release(ctx context.Context, recs []claimed, cause error, res *P
 			       last_error_code = $3,
 			       last_error = $4
 			 WHERE outbox_id = ANY($1::uuid[]) AND publish_state = 'claimed'`,
-			ids, retryIn.Seconds(), CodeBrokerUnavailable, errText(cause))
+			ids, retryIn.Seconds(), code, errText(cause))
 		return err
 	})
 	if err != nil {
@@ -619,19 +642,278 @@ func (r *Relay) ReadStats(ctx context.Context) (Stats, error) {
 // cause (§11.1 disposition "fix-and-replay"). The event id is unchanged — it is
 // a redelivery of the same fact, not a new one — and its attempt budget is
 // reset. Reports false if the event is not quarantined.
-func (r *Relay) Requeue(ctx context.Context, eventID string) (bool, error) {
-	var n int64
+//
+// It is a privileged repair (ZS-SVC-M-001 §4.3): auth must name an operator, a
+// different approver, an approval reference and a reason, and the repair is
+// logged in the same transaction. Only publish state changes; the payload is
+// never touched (see HardeningSQL, which makes that a database guarantee).
+// The repair log table (repair.SchemaSQL) must exist in the service's schema.
+func (r *Relay) Requeue(ctx context.Context, eventID string, auth repair.Authorization) (bool, error) {
+	if err := auth.Validate(); err != nil {
+		return false, err
+	}
+	var requeued bool
 	err := r.inRelayTx(ctx, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
+		var tenant, region, state string
+		err := tx.QueryRow(ctx, `
+			SELECT tenant_id, region, publish_state FROM eventing_outbox
+			 WHERE event_id = $1 FOR UPDATE`, eventID).Scan(&tenant, &region, &state)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if state != StateQuarantined {
+			return nil
+		}
+		if err := r.regionAllowed(region); err != nil {
+			return err
+		}
+		if err := repair.Record(ctx, tx, repair.Entry{Kind: "outbox", TenantID: tenant,
+			EventID: eventID, Action: "requeue", PriorState: state, Auth: auth}); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
 			UPDATE eventing_outbox
 			   SET publish_state = 'pending', attempt_count = 0, next_attempt_at = now(),
 			       last_error_code = NULL, last_error = NULL
-			 WHERE event_id = $1 AND publish_state = 'quarantined'`, eventID)
-		n = tag.RowsAffected()
+			 WHERE event_id = $1`, eventID)
+		requeued = err == nil
 		return err
 	})
 	if err != nil {
 		return false, fmt.Errorf("outbox: requeue %s: %w", eventID, err)
 	}
-	return n == 1, nil
+	return requeued, nil
+}
+
+// MaxReplayBatch bounds one replay request: a controlled replay is a deliberate
+// act on named events, not a bulk reset.
+const MaxReplayBatch = 500
+
+// Replay re-publishes already-published events under their ORIGINAL event ids
+// (ReplayControlled). Consumers' inbox/dedupe absorbs the redelivery
+// (INT-NP-010); a consumer that never applied the event applies it now.
+//
+// It is all-or-nothing: if any named event is unknown, not yet published, or
+// outside this relay's region (INT-NP-045), nothing is replayed. Each event is
+// recorded in the repair log. It returns the number of events queued.
+func (r *Relay) Replay(ctx context.Context, eventIDs []string, auth repair.Authorization) (int, error) {
+	if err := auth.Validate(); err != nil {
+		return 0, err
+	}
+	if len(eventIDs) == 0 || len(eventIDs) > MaxReplayBatch {
+		return 0, fmt.Errorf("outbox: a replay names between 1 and %d events", MaxReplayBatch)
+	}
+	var n int
+	err := r.inRelayTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT event_id, tenant_id, region, publish_state FROM eventing_outbox
+			 WHERE event_id = ANY($1) FOR UPDATE`, eventIDs)
+		if err != nil {
+			return err
+		}
+		type row struct{ id, tenant, region, state string }
+		var found []row
+		for rows.Next() {
+			var x row
+			if err := rows.Scan(&x.id, &x.tenant, &x.region, &x.state); err != nil {
+				rows.Close()
+				return err
+			}
+			found = append(found, x)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(found) != len(uniqueStrings(eventIDs)) {
+			return errors.New("an event named for replay does not exist")
+		}
+		for _, x := range found {
+			if x.state != StatePublished {
+				return fmt.Errorf("event %s is %s; only published events are replayed", x.id, x.state)
+			}
+			if err := r.regionAllowed(x.region); err != nil {
+				return err
+			}
+		}
+		for _, x := range found {
+			if err := repair.Record(ctx, tx, repair.Entry{Kind: "outbox", TenantID: x.tenant,
+				EventID: x.id, Action: "replay", PriorState: x.state, Auth: auth}); err != nil {
+				return err
+			}
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE eventing_outbox
+			   SET publish_state = 'pending', attempt_count = 0, next_attempt_at = now(),
+			       published_at = NULL, dispatched_at = NULL, claimed_until = NULL,
+			       last_error_code = NULL, last_error = NULL
+			 WHERE event_id = ANY($1) AND publish_state = 'published'`, eventIDs)
+		n = int(tag.RowsAffected())
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("outbox: replay: %w", err)
+	}
+	return n, nil
+}
+
+func uniqueStrings(in []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(in))
+	for _, s := range in {
+		m[s] = struct{}{}
+	}
+	return m
+}
+
+// SetRegion pins the relay to a residency region. Requeue and Replay then
+// refuse events whose residency region differs: a repair must not move an
+// event out of, or into, a region it does not belong to (INT-REG-002,
+// INT-NP-045). Unset means no region check.
+func (r *Relay) SetRegion(region string) { r.region = region }
+
+func (r *Relay) regionAllowed(eventRegion string) error {
+	if r.region == "" || r.region == eventRegion {
+		return nil
+	}
+	return integration.Newf(integration.CodeResidencyDenied,
+		"event residency region %q does not match this relay's region", eventRegion)
+}
+
+// Gate checks an event before it leaves the outbox (INT-CTRL-005). rendered is
+// the envelope exactly as stored. Return nil to publish; an error wrapping
+// integration.ErrRegistryUnavailable to hold the event for a later pass without
+// spending its retry budget (fail closed: "could not check" never publishes);
+// any other error to quarantine it before any consumer sees it (INT-NP-006).
+type Gate interface {
+	Check(ctx context.Context, eventType string, rendered []byte) error
+}
+
+// SetGate installs a gate. Call before Run.
+func (r *Relay) SetGate(g Gate) { r.gate = g }
+
+// Thresholds are the alerting limits for the producer signals.
+type Thresholds struct {
+	MaxBacklog    int           // 0 = unchecked
+	MaxBacklogAge time.Duration // 0 = unchecked
+}
+
+// Alert is a canonical integration event the service should emit.
+type Alert struct {
+	Event  string // ZS-SVC-M-001 §10 event name
+	Detail string
+}
+
+// Evaluate turns Stats into the §10 alerts: outbox_publish_delayed when the
+// backlog is too old or too large, outbox_quarantined whenever anything is
+// quarantined (quarantine always needs an owner).
+func Evaluate(s Stats, t Thresholds) []Alert {
+	var out []Alert
+	if t.MaxBacklogAge > 0 && s.OldestBacklogAge > t.MaxBacklogAge {
+		out = append(out, Alert{"outbox_publish_delayed",
+			fmt.Sprintf("oldest unpublished event is %s old", s.OldestBacklogAge.Round(time.Second))})
+	} else if t.MaxBacklog > 0 && s.Backlog > t.MaxBacklog {
+		out = append(out, Alert{"outbox_publish_delayed",
+			fmt.Sprintf("%d events are waiting to publish", s.Backlog)})
+	}
+	if s.Quarantined > 0 {
+		out = append(out, Alert{"outbox_quarantined", fmt.Sprintf("%d events are quarantined", s.Quarantined)})
+	}
+	return out
+}
+
+// HardeningSQL makes the payload immutable at the database. Services that
+// adopted the outbox before this existed append it in their next migration;
+// new adopters append it after SchemaSQL. Without it, "repair tooling cannot
+// mutate event payload" is only a promise of this package's code.
+const HardeningSQL = `
+CREATE FUNCTION eventing_outbox_payload_immutable() RETURNS trigger AS $$
+BEGIN
+    IF NEW.event_id IS DISTINCT FROM OLD.event_id
+       OR NEW.event_type IS DISTINCT FROM OLD.event_type
+       OR NEW.schema_version IS DISTINCT FROM OLD.schema_version
+       OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
+       OR NEW.region IS DISTINCT FROM OLD.region
+       OR NEW.partition_key IS DISTINCT FROM OLD.partition_key
+       OR NEW.payload IS DISTINCT FROM OLD.payload
+       OR NEW.payload_hash IS DISTINCT FROM OLD.payload_hash
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'eventing_outbox event content is immutable'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER eventing_outbox_content_immutable
+    BEFORE UPDATE ON eventing_outbox
+    FOR EACH ROW EXECUTE FUNCTION eventing_outbox_payload_immutable();
+`
+
+// PartitionViolation is one breach of the partition-key policy.
+type PartitionViolation struct {
+	Kind     string // "mixed-keys" or "malformed-key"
+	TenantID string
+	Subject  string // aggregate subject URN, when known
+	Detail   string
+}
+
+// VerifyPartitioning certifies the ordering policy (INT-CTRL-006, INT-NP-009)
+// over events enqueued since `since`: every event for one aggregate must carry
+// the same partition key, and every key must be the opaque hash the envelope
+// derives. A producer that builds its own key breaks per-aggregate ordering
+// silently; this finds it. Run it in the producer's CI against a populated
+// outbox and as a periodic production check.
+func (r *Relay) VerifyPartitioning(ctx context.Context, since time.Time) ([]PartitionViolation, error) {
+	var out []PartitionViolation
+	err := r.inRelayTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT tenant_id, COALESCE(convert_from(payload, 'UTF8')::jsonb ->> 'subject', ''),
+			       count(DISTINCT partition_key)
+			  FROM eventing_outbox
+			 WHERE aggregate_id IS NOT NULL AND created_at >= $1
+			 GROUP BY 1, 2
+			HAVING count(DISTINCT partition_key) > 1`, since)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			v := PartitionViolation{Kind: "mixed-keys"}
+			var n int
+			if err := rows.Scan(&v.TenantID, &v.Subject, &n); err != nil {
+				rows.Close()
+				return err
+			}
+			v.Detail = fmt.Sprintf("%d different partition keys for one aggregate", n)
+			out = append(out, v)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		bad, err := tx.Query(ctx, `
+			SELECT tenant_id, count(*) FROM eventing_outbox
+			 WHERE created_at >= $1 AND partition_key !~ '^[0-9a-f]{64}$'
+			 GROUP BY tenant_id`, since)
+		if err != nil {
+			return err
+		}
+		defer bad.Close()
+		for bad.Next() {
+			v := PartitionViolation{Kind: "malformed-key"}
+			var n int
+			if err := bad.Scan(&v.TenantID, &n); err != nil {
+				return err
+			}
+			v.Detail = fmt.Sprintf("%d events carry a partition key that is not the envelope's opaque hash", n)
+			out = append(out, v)
+		}
+		return bad.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("outbox: verify partitioning: %w", err)
+	}
+	return out, nil
 }
