@@ -161,6 +161,20 @@ func Middleware(s Store, log *zap.Logger) func(http.Handler) http.Handler {
 				}
 				return
 			}
+
+			// A response that cannot be stored would strand the claim: the
+			// jsonb column rejects non-JSON bodies, and chi's router-generated
+			// 404/405 answers ARE plain text. Completing used to fail silently
+			// (logged only) and leave the claim at status 0, so every retry of
+			// the same path got IDEMPOTENCY_IN_FLIGHT until the lease expired
+			// and the cycle repeated. A router refusal is not a command
+			// outcome; release the claim and let the router answer the retry.
+			if !storableBody(rw.body.Bytes()) {
+				if err := s.ReleaseIdempotencyKey(r.Context(), tenantID, endpoint, key); err != nil {
+					log.Error("idempotency release after non-JSON response failed", zap.Error(err), zap.String("endpoint", endpoint))
+				}
+				return
+			}
 			if err := s.CompleteIdempotencyKey(r.Context(), tenantID, endpoint, key, rw.status, rw.body.Bytes()); err != nil {
 				// The command DID run. Logging is all that is left — failing
 				// the response now would tell the caller nothing happened when
@@ -188,6 +202,15 @@ func Middleware(s Store, log *zap.Logger) func(http.Handler) http.Handler {
 func fingerprintOf(principalID, body string) string {
 	sum := sha256.Sum256([]byte(principalID + "\x00" + body))
 	return hex.EncodeToString(sum[:])
+}
+
+// storableBody reports whether a response body can be stored in the
+// idempotency table's jsonb response_body column. An empty body is stored as
+// JSON null (a 204 has none); anything non-empty must be valid JSON. Every
+// handler in this service writes JSON via writeJSON/writeError — only chi's
+// router-generated 404/405 answers are plain text.
+func storableBody(body []byte) bool {
+	return len(body) == 0 || json.Valid(body)
 }
 
 // materialWrite mirrors the envelope contract's own definition, including PUT

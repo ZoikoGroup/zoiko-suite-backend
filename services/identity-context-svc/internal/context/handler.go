@@ -15,8 +15,8 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
-	"zoiko.io/identity-context-svc/internal/ratelimit"
 	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
+	"zoiko.io/identity-context-svc/internal/ratelimit"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
 	idenv "zoiko.io/identity-envelope"
@@ -24,9 +24,11 @@ import (
 
 // Action constants passed to authorization-svc as action_type.
 //
-// Scoped at the tenant: domain.Principal and domain.SessionContext carry
-// TenantID and no legal entity, so there is no finer scope to pass. Naming
-// the real one is better than inventing a legal entity that does not exist.
+// Every authorize call carries the caller's verified tenant AND the legal
+// entity the verified envelope names. authorization-svc resolves an entity's
+// owning tenant from the entity registry and refuses a question whose entity
+// and tenant disagree (tenant_scope_mismatch), so the entity position must
+// hold the real legal entity — never the tenant id standing in for it.
 const (
 	IdentitySessionRead       = "IDENTITY_SESSION_READ"
 	IdentitySessionInvalidate = "IDENTITY_SESSION_INVALIDATE"
@@ -36,10 +38,15 @@ const (
 
 // AuthzChecker is the authorization-svc contract this handler depends on.
 type AuthzChecker interface {
-	// tenantID is the caller's gateway-verified tenant scope, forwarded to
-	// authorization-svc as X-Tenant-Id. Without it /v1/authorize answers 400
-	// envelope_incomplete and this client fails closed, so every guarded route
-	// below reports an outage instead of a decision.
+	// legalEntityID is the legal entity from the caller's verified envelope
+	// (X-Legal-Entity-Id). It must be a legal entity, NOT the tenant: the
+	// authorization service resolves the entity's owning tenant from the
+	// registry and answers 403 tenant_scope_mismatch when the value is a
+	// tenant id. tenantID is the caller's gateway-verified tenant scope,
+	// forwarded to authorization-svc as X-Tenant-Id. Without the tenant
+	// /v1/authorize answers 400 envelope_incomplete and this client fails
+	// closed, so every guarded route below reports an outage instead of a
+	// decision.
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error
 }
 
@@ -278,9 +285,20 @@ func (h *Handler) authorizeUnlessSelf(w http.ResponseWriter, r *http.Request, ca
 }
 
 // authorize asks authorization-svc whether this principal may perform
-// action within tenantID, and fails CLOSED.
+// action within tenantID at the legal entity the verified envelope carries,
+// and fails CLOSED.
+//
+// The legal entity is load-bearing, not decoration. authorization-svc
+// resolves which tenant owns the entity, and refuses a question whose entity
+// and tenant disagree. This call passed the TENANT id in the entity position
+// (a merge artifact carried over from a 3-argument client whose slot meant
+// "scope"), so every guarded command answered 503 Service Unavailable once
+// the authorization service began enforcing entity scope: it replied 403
+// tenant_scope_mismatch and this client failed closed. The grant seeded for
+// the old convention (an assignment keyed at legal_entity_id = tenant id)
+// could never be reached; grants are matched at the real entity.
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, action string) bool {
-	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, action, tenantID); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityOf(r), action, tenantID); err != nil {
 		if errors.Is(err, domain.ErrAuthorizationDenied) {
 			writeError(w, http.StatusForbidden, "not authorized to perform this action")
 			return false
@@ -290,6 +308,17 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 		return false
 	}
 	return true
+}
+
+// legalEntityOf returns the legal entity the request is acting within, from
+// the envelope middleware's parsed envelope when present (the production
+// path) and from the raw header otherwise (handler unit tests drive handlers
+// without the middleware mounted).
+func legalEntityOf(r *http.Request) string {
+	if e, ok := svcenvelope.FromContext(r.Context()); ok {
+		return e.LegalEntityID
+	}
+	return strings.TrimSpace(r.Header.Get(svcenvelope.HeaderLegalEntityID))
 }
 
 // RegisterRoutes mounts all endpoints under a chi Router.
