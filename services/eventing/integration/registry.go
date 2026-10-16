@@ -18,6 +18,11 @@ import (
 // "compatible" (INT-CTRL-005).
 var ErrRegistryUnavailable = errors.New("contract registry unavailable")
 
+// ErrNoContract means the registry has no contract of that name (or version).
+// It is distinct from a mismatch so a gate can apply an explicit policy to
+// events whose contract was never registered.
+var ErrNoContract = errors.New("no registered contract")
+
 // maxSchemaBytes bounds what the client will read from the registry.
 const maxSchemaBytes = 1 << 20
 
@@ -92,7 +97,7 @@ func (r *HTTPRegistry) Schema(ctx context.Context, eventName string, version int
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
-		return nil, Newf(CodeSchemaMismatch, "no registered contract %s (version %s)", eventName, versionLabel(version))
+		return nil, Wrap(CodeSchemaMismatch, fmt.Sprintf("no registered contract %s (version %s)", eventName, versionLabel(version)), ErrNoContract)
 	default:
 		return nil, fmt.Errorf("%w: status %d", ErrRegistryUnavailable, resp.StatusCode)
 	}
