@@ -12,7 +12,7 @@ import (
 	"zoiko.io/gateway-auth-svc/internal/admission"
 )
 
-const token = "0123456789abcdef0123456789abcdef"
+const token = "0123456789abcdef0123456789abcdef" // gitleaks:allow -- throwaway test token for an in-memory test server, not a credential
 
 func fixture(t *testing.T) (http.Handler, *admission.Recorder, *admission.Limiter) {
 	t.Helper()

@@ -452,7 +452,7 @@ func TestRedactNestedSecrets(t *testing.T) {
 }
 
 func TestScrubStringPrivateKeyAndKeyValue(t *testing.T) {
-	pem := "x -----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY----- y"
+	pem := "x -----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY----- y" // gitleaks:allow -- truncated sample PEM header: the test proves private keys are scrubbed from telemetry
 	if got := ScrubString(pem); strings.Contains(got, "MIIabc") {
 		t.Errorf("private key leaked: %q", got)
 	}

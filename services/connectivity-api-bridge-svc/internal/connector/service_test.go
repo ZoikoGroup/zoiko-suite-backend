@@ -215,7 +215,7 @@ func TestCreateRefusesAnythingThatCouldBeASecret_INT_NP_019(t *testing.T) {
 		"userinfo in the url":    func(c *CreateInput) { c.EndpointURL = "https://user:hunter2@api.bank-x.example/x" },
 		"api key in the query":   func(c *CreateInput) { c.EndpointURL = "https://api.bank-x.example/x?api_key=sk_live_123" },
 		"token in the query":     func(c *CreateInput) { c.EndpointURL = "https://api.bank-x.example/x?access_token=abc" },
-		"secret as credential":   func(c *CreateInput) { c.CredentialRef = "sk_live_REALSECRET" },
+		"secret as credential":   func(c *CreateInput) { c.CredentialRef = "sk_live_REALSECRET" }, // gitleaks:allow -- deliberately fake secret: the test proves a credential-shaped value is REFUSED as a credential_ref
 		"password as credential": func(c *CreateInput) { c.CredentialRef = "hunter2" },
 		"bearer as credential":   func(c *CreateInput) { c.CredentialRef = "Bearer abcdef" },
 	} {

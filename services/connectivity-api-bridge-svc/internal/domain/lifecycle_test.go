@@ -137,7 +137,7 @@ func TestEndpointSyntaxRefusesCredentials_INT_NP_019(t *testing.T) {
 func TestSyntaxMessagesNeverEchoValues(t *testing.T) {
 	c := draft().Protected()
 	c.EndpointURL = "https://user:SUPERSECRET@api.example.com/x"
-	c.CredentialRef = "sk_live_REALSECRETVALUE"
+	c.CredentialRef = "sk_live_REALSECRETVALUE" // gitleaks:allow -- deliberately fake secret: the test proves the refusal message never echoes it
 	for _, msg := range c.ValidateSyntax() {
 		if strings.Contains(msg, "SUPERSECRET") || strings.Contains(msg, "REALSECRET") {
 			t.Fatalf("message echoes a value: %q", msg)
