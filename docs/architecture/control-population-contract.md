@@ -18,16 +18,16 @@ Headers forwarded from the verified caller: X-Tenant-Id, X-Principal-Id,
   ],
   "next_cursor": "",            // empty on the last page
   "watermark": "…",             // REQUIRED, identical on every page of one extraction
-  "declared_totals": {          // REQUIRED for Wave 2 sources
+  "declared_totals": {          // REQUIRED from every source, identical on every page
     "row_count": 1234,
     "totals": { "USD": "98765.43" }
   }
 }
 ```
 
-A *population name* is `a-z 0-9 _ -`. A control definition references it as
+A *population name* is 1–64 characters of `a-z 0-9 _ -`, starting with a letter or digit. A control definition references it as
 `{"system": "<registered name>", "population": "<name>", "params": {"k": "v"}}` in
-`source_spec` (side A) and `target_spec` (side B). `params` keys are `a-z_` (max 32 chars),
+`source_spec` (side A) and `target_spec` (side B). At most 8 `params`; keys are `a-z_` (max 32 chars),
 values max 512 chars; the reserved names `legal_entity_id`, `period_id`, `limit`, `cursor`
 cannot be used. **A source must reject (400) any query parameter it does not define** —
 a misspelt filter must never silently widen or narrow a population.
@@ -54,7 +54,7 @@ a misspelt filter must never silently widen or narrow a population.
 The control **fails closed**. Any of the following ends the run `FAILED` with result
 `INDETERMINATE` — never `PASS`: source unreachable / non-200 / unreadable body; system not
 registered in `SOURCE_ENDPOINTS`; no `watermark` or one that changed between pages;
-`declared_totals` not tying to the received records; an invalid record; more than 200,000
+no `declared_totals`, or ones that differ between pages or do not tie to the received records; an invalid record; more than 200,000
 records.
 
 ## Wave 2 population definitions
