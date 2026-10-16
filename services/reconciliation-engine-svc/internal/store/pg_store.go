@@ -155,7 +155,16 @@ func (s *PgStore) DefineReconciliation(ctx context.Context, tenantID string, req
 			ON CONFLICT (tenant_id, name) DO UPDATE SET
 				match_key_fields = EXCLUDED.match_key_fields,
 				tolerance_amount_minor_units = EXCLUDED.tolerance_amount_minor_units,
-				materiality_amount_minor_units = EXCLUDED.materiality_amount_minor_units
+				materiality_amount_minor_units = EXCLUDED.materiality_amount_minor_units,
+				-- A rule change is a new version: runs and certifications pin
+				-- definition_version, so it must identify the rules that applied.
+				version = reconciliation_definitions.version + CASE
+					WHEN (reconciliation_definitions.match_key_fields, reconciliation_definitions.tolerance_amount_minor_units,
+					      reconciliation_definitions.materiality_amount_minor_units)
+					  IS DISTINCT FROM (EXCLUDED.match_key_fields, EXCLUDED.tolerance_amount_minor_units,
+					      EXCLUDED.materiality_amount_minor_units)
+					THEN 1 ELSE 0 END,
+				updated_at = NOW()
 			RETURNING `+definitionColumns,
 			id, tenantID, req.Name, req.MatchKeyFields, req.ToleranceAmountMinorUnits, req.MaterialityAmountMinorUnits, actor))
 		if err != nil {
@@ -343,13 +352,30 @@ func runAutoMatch(ctx context.Context, tx pgx.Tx, tenantID, runID, actor string,
 	}
 	rows.Close()
 
-	sides := make([]string, 0, len(bySide))
-	for side := range bySide {
+	// Sides come from the frozen snapshots, not from the unprocessed items: an
+	// EMPTY population is still a side, so every item on the other side surfaces
+	// as "no matching reference" instead of the run passing with nothing matched
+	// (ZS-SVC-Z-001 NP-27 — a missing source is never coerced to agreement).
+	sideRows, err := tx.Query(ctx, `SELECT side FROM population_snapshots WHERE run_id = $1 ORDER BY side`, runID)
+	if err != nil {
+		return 0, fmt.Errorf("load population sides: %w", err)
+	}
+	var sides []string
+	for sideRows.Next() {
+		var side string
+		if err := sideRows.Scan(&side); err != nil {
+			sideRows.Close()
+			return 0, err
+		}
 		sides = append(sides, side)
 	}
+	if err := sideRows.Err(); err != nil {
+		return 0, err
+	}
+	sideRows.Close()
 	sort.Strings(sides)
-	if len(sides) < 2 {
-		return 0, nil
+	if len(sides) != 2 {
+		return 0, fmt.Errorf("reconciliation run %s has %d populations; exactly two are required", runID, len(sides))
 	}
 	sideA, sideB := sides[0], sides[1]
 
@@ -459,7 +485,7 @@ func (s *PgStore) Match(ctx context.Context, tenantID, runID string, req domain.
 		}
 
 		for _, m := range req.ManualMatches {
-			if err := applyManualMatch(ctx, tx, tenantID, runID, actor, m); err != nil {
+			if err := applyManualMatch(ctx, tx, tenantID, runID, actor, run.ToleranceAmountMinorUnits, m); err != nil {
 				return err
 			}
 		}
@@ -486,17 +512,23 @@ func (s *PgStore) Match(ctx context.Context, tenantID, runID string, req domain.
 	return out, err
 }
 
-func applyManualMatch(ctx context.Context, tx pgx.Tx, tenantID, runID, actor string, m domain.ManualMatchInput) error {
-	for _, itemID := range []string{m.ItemAID, m.ItemBID} {
-		var exists bool
-		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS(SELECT 1 FROM population_items pi JOIN population_snapshots ps ON ps.snapshot_id = pi.snapshot_id
-				WHERE ps.run_id = $1 AND pi.item_id = $2)`, runID, itemID).Scan(&exists); err != nil {
-			return fmt.Errorf("check manual match item: %w", err)
-		}
-		if !exists {
+func applyManualMatch(ctx context.Context, tx pgx.Tx, tenantID, runID, actor string, tolerance int64, m domain.ManualMatchInput) error {
+	var sides [2]string
+	var amounts [2]int64
+	for i, itemID := range []string{m.ItemAID, m.ItemBID} {
+		err := tx.QueryRow(ctx, `
+			SELECT ps.side, pi.amount_minor_units FROM population_items pi
+			JOIN population_snapshots ps ON ps.snapshot_id = pi.snapshot_id
+			WHERE ps.run_id = $1 AND pi.item_id = $2`, runID, itemID).Scan(&sides[i], &amounts[i])
+		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrItemNotFound
 		}
+		if err != nil {
+			return fmt.Errorf("check manual match item: %w", err)
+		}
+	}
+	if err := domain.ValidateManualMatch(sides[0], sides[1], amounts[0], amounts[1], tolerance); err != nil {
+		return err
 	}
 	var alreadyMatched bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM match_results WHERE item_a_id IN ($1, $2) OR item_b_id IN ($1, $2))`,
@@ -785,6 +817,9 @@ func (s *PgStore) GetCertification(ctx context.Context, tenantID, runID string) 
 func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req domain.SupersedeRunRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
 	if err := req.Validate(); err != nil {
 		return nil, err
+	}
+	if req.NewRunID == runID {
+		return nil, domain.ErrSupersedeSelf
 	}
 	var out *domain.ReconciliationRun
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {

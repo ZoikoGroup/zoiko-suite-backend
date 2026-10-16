@@ -176,8 +176,11 @@ func (r StartRunRequest) Validate() error {
 	if r.DefinitionID == "" {
 		return fmt.Errorf("definition_id is required")
 	}
-	if len(r.Populations) < 2 {
-		return fmt.Errorf("at least two populations are required")
+	// The matcher compares exactly two sides. A third population would be frozen
+	// but never matched or excepted, so the run could certify with that side
+	// entirely unreconciled (ZS-SVC-Z-001 INV-26) — refuse it instead.
+	if len(r.Populations) != 2 {
+		return fmt.Errorf("exactly two populations are required")
 	}
 	sides := map[string]bool{}
 	for _, p := range r.Populations {
@@ -237,6 +240,26 @@ func (r MatchRequest) Validate() error {
 		if m.Reason == "" {
 			return fmt.Errorf("manual match requires a reason")
 		}
+	}
+	return nil
+}
+
+// ValidateManualMatch checks a manual pairing against the run's frozen rules.
+// The two items must come from different populations, and their amounts must
+// agree within the run's pinned tolerance: a manual match records a reason and
+// an authority, but it can never hide an amount difference (ZS-CONTROL-001 §10,
+// scenario 06 — "narrative alone cannot force pass"). An out-of-tolerance pair
+// stays an exception.
+func ValidateManualMatch(sideA, sideB string, amountA, amountB, toleranceMinor int64) error {
+	if sideA == sideB {
+		return ErrManualMatchSameSide
+	}
+	diff := amountA - amountB
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > toleranceMinor {
+		return fmt.Errorf("%w: difference %d exceeds tolerance %d", ErrManualMatchOutsideTolerance, diff, toleranceMinor)
 	}
 	return nil
 }
@@ -329,4 +352,8 @@ var (
 	ErrRunImmutable           = errorString("reconciliation run is certified and immutable")
 	ErrExceptionAlreadyClosed = errorString("exception is already resolved")
 	ErrIdempotencyKeyReused   = errorString("idempotency key was already used for a different request")
+
+	ErrManualMatchSameSide         = errorString("manual match must pair items from different populations")
+	ErrManualMatchOutsideTolerance = errorString("manual match amounts differ by more than the run's tolerance")
+	ErrSupersedeSelf               = errorString("a run cannot supersede itself")
 )
