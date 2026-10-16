@@ -103,3 +103,42 @@ func TestPerformIntelligentReconciliation_MissingReference_LargerAmount_ManualRe
 // behavioral test (the machine rationale must survive an empty-note human
 // approval) is in internal/handler, exercised end-to-end through
 // ApplyResolution rather than as a unit test on the helper directly.
+
+// A missing-reference credit is judged by its magnitude: a large negative
+// amount is never a "small amount" write-off.
+func TestPerformIntelligentReconciliation_MissingReference_NegativeAmountUsesMagnitude(t *testing.T) {
+	req := reqWith([]TransactionItem{{RefID: "credit", Amount: -50000.00}, {RefID: "small", Amount: -4.00}}, nil)
+	_, _, _, items := PerformIntelligentReconciliation(req, "job-1", "tenant-1", testAmountMismatchTolerance, testMissingReferenceTolerance)
+	if len(items) != 2 {
+		t.Fatalf("expected 2 unmatched items, got %d", len(items))
+	}
+	if items[0].Recommendation != RecommendationManualReview || items[0].DiscrepancyAmount != 50000.00 {
+		t.Fatalf("-50000 credit: got %s with discrepancy %.2f, want MANUAL_REVIEW / 50000.00",
+			items[0].Recommendation, items[0].DiscrepancyAmount)
+	}
+	if items[1].Recommendation != RecommendationWriteOff || items[1].DiscrepancyAmount != 4.00 {
+		t.Fatalf("-4 credit: got %s with discrepancy %.2f, want WRITE_OFF / 4.00",
+			items[1].Recommendation, items[1].DiscrepancyAmount)
+	}
+}
+
+func TestValidateResolutionTransition(t *testing.T) {
+	allowed := [][2]ResolutionStatus{
+		{StatusRecommended, StatusApproved}, {StatusRecommended, StatusRejected}, {StatusApproved, StatusExecuted},
+	}
+	for _, e := range allowed {
+		if err := ValidateResolutionTransition(e[0], e[1]); err != nil {
+			t.Fatalf("%s -> %s should be allowed: %v", e[0], e[1], err)
+		}
+	}
+	refused := [][2]ResolutionStatus{
+		{StatusRecommended, StatusExecuted}, {StatusApproved, StatusRejected}, {StatusApproved, StatusApproved},
+		{StatusRejected, StatusApproved}, {StatusRejected, StatusExecuted}, {StatusExecuted, StatusRejected},
+		{StatusRecommended, StatusRecommended}, {StatusRecommended, "BOGUS"},
+	}
+	for _, e := range refused {
+		if err := ValidateResolutionTransition(e[0], e[1]); err == nil {
+			t.Fatalf("%s -> %s should be refused", e[0], e[1])
+		}
+	}
+}
