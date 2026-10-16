@@ -35,6 +35,7 @@ type WFPInputStore interface {
 	ListInputLines(ctx context.Context, batchID, state, workerID string) ([]domain.InputLine, error)
 	ListInputControlTotals(ctx context.Context, batchID string) ([]domain.InputControlTotal, error)
 	ListLiveBonusSourceLines(ctx context.Context, legalEntityID, excludePeriodID string) (map[string]bool, error)
+	ManualInputStore
 }
 
 // InputPuller gathers the source facts for a batch (read-only, fail closed).
@@ -191,7 +192,11 @@ func (h *WFPInputHandler) buildFresh(r *http.Request, principal, tenant, entity,
 	if err != nil {
 		return nil, err
 	}
-	return domain.BuildInputLines(sources, mappings, end), nil
+	manuals, err := h.store.ListApprovedManualInputs(r.Context(), entity, periodID)
+	if err != nil {
+		return nil, err
+	}
+	return domain.BuildInputLines(manualSources(manuals, sources), mappings, end), nil
 }
 
 func quarantinedInput(lines []domain.InputLine) []domain.InputLine {
@@ -206,7 +211,7 @@ func quarantinedInput(lines []domain.InputLine) []domain.InputLine {
 
 // inputEvents turns a committed change into events. No amounts and no personal
 // data travel; worker ids are opaque references.
-func (h *WFPInputHandler) inputEvents(r *http.Request, actor, tenant string) store.InputEventBuilder {
+func inputEventBuilder(r *http.Request, actor, tenant string) store.InputEventBuilder {
 	return func(ch store.InputChange) ([]domain.OutboxEvent, error) {
 		corr, cause := getCorrelationID(r), r.Header.Get("X-Causation-Id")
 		var out []domain.OutboxEvent
@@ -679,4 +684,9 @@ func (h *WFPInputHandler) WorkerInputs(w http.ResponseWriter, r *http.Request) {
 		lines = []domain.InputLine{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"batch_id": b.BatchID, "worker_id": workerID, "lines": lines})
+}
+
+// inputEvents is the handler's own builder (the package function is shared with the payroll calculation).
+func (h *WFPInputHandler) inputEvents(r *http.Request, actor, tenant string) store.InputEventBuilder {
+	return inputEventBuilder(r, actor, tenant)
 }

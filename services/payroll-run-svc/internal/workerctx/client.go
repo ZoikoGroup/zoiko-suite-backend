@@ -55,14 +55,15 @@ func (c *Client) Validate(ctx context.Context, caller Caller, workerID, legalEnt
 		return domain.WorkerContext{}, domain.ErrSourceUnavailable
 	}
 	var body struct {
-		Valid         bool     `json:"valid"`
-		Reasons       []string `json:"reasons"`
-		PayCurrencies []string `json:"pay_currencies"`
+		Valid                bool     `json:"valid"`
+		Reasons              []string `json:"reasons"`
+		PayCurrencies        []string `json:"pay_currencies"`
+		PayrollJurisdictions []string `json:"payroll_jurisdictions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return domain.WorkerContext{}, domain.ErrSourceUnavailable
 	}
-	out := domain.WorkerContext{Valid: body.Valid, PayCurrencies: body.PayCurrencies}
+	out := domain.WorkerContext{Valid: body.Valid, PayCurrencies: body.PayCurrencies, PayrollJurisdictions: body.PayrollJurisdictions}
 	if !body.Valid {
 		out.Reason = domain.InReasonWorkerContext
 		if len(body.Reasons) > 0 {

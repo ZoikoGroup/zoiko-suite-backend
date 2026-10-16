@@ -29,6 +29,7 @@ type stubInputStore struct {
 	batch    *domain.InputBatch
 	stored   []domain.InputLine
 	liveBon  map[string]bool
+	memManual
 
 	mappingResolvedAsOf string
 	created             []domain.InputLine

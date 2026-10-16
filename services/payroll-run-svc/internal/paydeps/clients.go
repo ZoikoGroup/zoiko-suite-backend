@@ -356,3 +356,20 @@ func (b *BankingHandoff) Handoff(ctx context.Context, r HandoffRequest) (*Attemp
 	}
 	return &a, nil
 }
+
+// AttemptStatus reads the adapter's status of an attempt (BNK-06): PREPARED, SUBMITTED,
+// PENDING_UNKNOWN, REJECTED_BEFORE_SUBMISSION, CANCELLED, QUARANTINED. Unreachable or any
+// non-200 answer is domain.ErrHandoffUnavailable: an unknown is never reported as a status.
+func (b *BankingHandoff) AttemptStatus(ctx context.Context, tenantID, principalID, legalEntityID, attemptID string) (string, error) {
+	status, body, err := b.do(ctx, http.MethodGet, "/bnk06/attempts/"+url.PathEscape(attemptID), HandoffRequest{
+		TenantID: tenantID, PrincipalID: principalID, LegalEntityID: legalEntityID, CorrelationID: uuid.NewString(),
+	}, nil)
+	if err != nil || status != http.StatusOK {
+		return "", domain.ErrHandoffUnavailable
+	}
+	var a Attempt
+	if err := json.Unmarshal(body, &a); err != nil || a.Status == "" {
+		return "", domain.ErrHandoffUnavailable
+	}
+	return a.Status, nil
+}

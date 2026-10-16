@@ -87,3 +87,45 @@ func (c *Client) VerifySettled(ctx context.Context, tenantID, legalEntityID, pay
 	}
 	return &Evidence{Status: st.Status, FinalitySource: st.FinalitySource, SourceReference: st.SourceReference}, nil
 }
+
+// Snapshot is what Banking says about a payment, whatever its state. WFP's reconciliation and
+// payment linking use it; settlement still goes through VerifySettled.
+type Snapshot struct {
+	PaymentID       string
+	LegalEntityID   string
+	Status          string
+	SourceReference string
+	HasOpenConflict bool
+}
+
+// Snapshot reads a payment's execution state. Unreachable is ErrBankingUnavailable; an unknown
+// payment is ErrPaymentNotFound. It judges nothing: the caller decides what the status means.
+func (c *Client) Snapshot(ctx context.Context, tenantID, legalEntityID, paymentID string) (*Snapshot, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/bnk07/payments/"+url.PathEscape(paymentID), nil)
+	if err != nil {
+		return nil, domain.ErrBankingUnavailable
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", "payroll-run-svc")
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Correlation-ID", uuid.NewString())
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, domain.ErrBankingUnavailable
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, domain.ErrPaymentNotFound
+	case resp.StatusCode != http.StatusOK:
+		return nil, domain.ErrBankingUnavailable
+	}
+	var st executionState
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		return nil, domain.ErrBankingUnavailable
+	}
+	if st.PaymentID != paymentID {
+		return nil, domain.ErrPaymentNotFound
+	}
+	return &Snapshot{PaymentID: st.PaymentID, LegalEntityID: st.LegalEntityID, Status: st.Status, SourceReference: st.SourceReference, HasOpenConflict: st.HasOpenConflict}, nil
+}
