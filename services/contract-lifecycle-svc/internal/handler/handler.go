@@ -129,6 +129,9 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetContract(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	c, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
@@ -139,6 +142,9 @@ func (h *Handler) GetContract(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListContracts(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	contracts, err := h.store.ListContracts(r.Context(), legalEntityID)
 	if err != nil {
@@ -501,6 +507,9 @@ func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListContractVersions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	versions, err := h.store.ListContractVersions(r.Context(), id)
 	if err != nil {

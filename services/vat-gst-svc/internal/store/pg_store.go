@@ -59,9 +59,6 @@ func (s *PgStore) CreateVATReturn(ctx context.Context, r *domain.VATReturn) erro
 	if r.Status == "" {
 		r.Status = domain.StatusDraft
 	}
-	if r.Currency == "" {
-		r.Currency = "USD"
-	}
 	r.NetTaxPayable = r.OutputTaxAmount - r.InputTaxAmount
 
 	_, err = tx.Exec(ctx, `

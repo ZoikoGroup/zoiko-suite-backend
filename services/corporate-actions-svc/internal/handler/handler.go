@@ -107,6 +107,17 @@ func (h *Handler) CreateAction(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+
+	// Attribution is pinned to the authenticated caller, not to whatever the
+	// body says. created_by used to be stored verbatim from the request body,
+	// which let a caller file under someone else's name and then execute their
+	// own submission — defeating the SoD check that compares created_by against
+	// the executing principal (Doc1 §12.3, ZoikoSuite build doctrine).
+	if req.CreatedBy != "" && req.CreatedBy != principalID {
+		writeError(w, http.StatusBadRequest, domain.ErrSelfAttributionMismatch.Error())
+		return
+	}
+
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionCorporateActionCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -123,7 +134,7 @@ func (h *Handler) CreateAction(w http.ResponseWriter, r *http.Request) {
 		ValuationAmount: req.ValuationAmount,
 		Currency:        req.Currency,
 		EffectiveFrom:   req.EffectiveFrom,
-		CreatedBy:       req.CreatedBy,
+		CreatedBy:       principalID, // always the authenticated caller, never the body value
 	}
 
 	if err := h.store.CreateAction(r.Context(), a); err != nil {
@@ -141,6 +152,11 @@ func (h *Handler) CreateAction(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetAction(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Read routes require a principal: an unauthenticated caller must not
+	// retrieve corporate-action records (previously unguarded).
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	a, err := h.store.GetAction(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrCorporateActionNotFound) {
@@ -154,6 +170,10 @@ func (h *Handler) GetAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListActions(w http.ResponseWriter, r *http.Request) {
+	// Read routes require a principal — previously unguarded.
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	actionType := r.URL.Query().Get("action_type")
 	status := r.URL.Query().Get("status")
@@ -179,6 +199,15 @@ func (h *Handler) UpdateAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch corporate action")
+		return
+	}
+
+	// Lifecycle status guard: only PROPOSED actions are mutable. A record that
+	// has been board-approved, executed, or cancelled is immutable — mutating
+	// it would corrupt the audit trail. Previously, UpdateAction had no status
+	// check at all, so EXECUTED records could be overwritten.
+	if existing.Status != domain.ActionStatusProposed {
+		writeError(w, http.StatusConflict, domain.ErrWrongLifecycleStatus.Error())
 		return
 	}
 
@@ -212,9 +241,10 @@ func (h *Handler) UpdateAction(w http.ResponseWriter, r *http.Request) {
 	if req.EffectiveDate != "" {
 		existing.EffectiveDate = req.EffectiveDate
 	}
-	if req.Status != "" {
-		existing.Status = req.Status
-	}
+	// Status is deliberately NOT accepted here: a caller must not be able to
+	// set status to EXECUTED/BOARD_APPROVED via a plain PUT — that bypasses
+	// ExecuteAction's SoD and evidence gates. Status transitions go through
+	// their dedicated endpoints.
 	if req.ValuationAmount > 0 {
 		existing.ValuationAmount = req.ValuationAmount
 	}

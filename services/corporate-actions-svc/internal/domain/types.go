@@ -18,7 +18,19 @@ var (
 	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
 	// unauthenticated request, not an empty tenant named "default".
 	ErrTenantMissing = errors.New("tenant scope missing")
+
+	// ErrWrongLifecycleStatus is returned when a caller attempts to mutate a
+	// corporate action that is no longer in a mutable state. Only PROPOSED
+	// actions may be updated — once board-approved, executed, or cancelled the
+	// record is immutable.
+	ErrWrongLifecycleStatus = errors.New("corporate action is not in a mutable state: only PROPOSED actions can be updated")
+
+	// ErrSelfAttributionMismatch is returned when the request body's
+	// created_by field names a principal other than the authenticated caller.
+	// Attribution is pinned to X-Principal-Id, not to whatever the body says.
+	ErrSelfAttributionMismatch = errors.New("created_by must match the authenticated principal (X-Principal-Id)")
 )
+
 
 type ActionType string
 

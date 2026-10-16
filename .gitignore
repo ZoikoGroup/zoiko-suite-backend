@@ -51,3 +51,4 @@ docs/original_doc/*.docx
 # Control intermittently blocks a freshly linked test binary there — a scan
 # race, not a test failure.
 .gotmp/
+scratch/
