@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"zoiko.io/reconciliation-engine-svc/internal/domain"
@@ -123,9 +124,10 @@ func TestReconciliation_ToleranceCannotBeWidenedOnCertifiedRun(t *testing.T) {
 	if _, err := tx.Exec(f.ctx, "SELECT set_config('app.tenant_id', $1, true)", orgA); err != nil {
 		t.Fatalf("set tenant: %v", err)
 	}
-	_, err = tx.Exec(f.ctx, `UPDATE reconciliation_runs SET tolerance_amount_minor_units = 999999 WHERE run_id = $1`, run.RunID)
-	if err == nil {
-		t.Fatalf("widening tolerance on a certified run should have been rejected")
+	_, err = tx.Exec(f.ctx, `UPDATE reconciliation_runs SET tolerance_policy = '{"currencies":{"USD":{"absolute_minor_units":999999}}}'
+		WHERE run_id = $1`, run.RunID)
+	if err == nil || !strings.Contains(err.Error(), "pinned scope or rules") {
+		t.Fatalf("widening tolerance on a certified run: %v, want the lifecycle trigger to refuse it", err)
 	}
 }
 
@@ -318,8 +320,20 @@ func TestReconciliation_EmptySide_SurfacesExceptionsAndBlocksCertify(t *testing.
 		t.Fatalf("status with an empty side = %s, want ExceptionsOpen", matched.Status)
 	}
 	exceptions, err := f.s.GetExceptions(f.ctx, orgA, run.RunID)
-	if err != nil || len(exceptions) != 2 {
-		t.Fatalf("expected 2 exceptions for the unmatched Bank items, got %d (err=%v)", len(exceptions), err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var items, balances int
+	for _, e := range exceptions {
+		if e.Kind == domain.ExceptionKindBalance {
+			balances++
+		} else {
+			items++
+		}
+	}
+	// One exception per unmatched Bank item, and the USD total (300 vs 0) out of balance.
+	if items != 2 || balances != 1 {
+		t.Fatalf("expected 2 item exceptions and 1 balance exception, got %d and %d: %+v", items, balances, exceptions)
 	}
 	if _, err := f.s.Certify(f.ctx, orgA, run.RunID, "test-operator", f.claim("Certify", run.RunID)); !errors.Is(err, domain.ErrOpenExceptionsRemain) {
 		t.Fatalf("certify with an empty side: %v, want ErrOpenExceptionsRemain", err)

@@ -18,35 +18,31 @@ Overall: every named command and read surface exists and the non-ownership
 line holds (the service writes only its own tables). Populations are now read
 from their owning services through the control population contract, with
 watermarks, declared totals and hashes pinned on the frozen snapshot (B7), and
-definitions and runs carry a legal entity (B9). What a run proves about those
-populations is still weaker than the specs require: matching ignores the
-declared key fields, currency and dimensions (A2, A3), tolerance is absolute
-only (A5), and there is no result dimension or exception governance (A6, A7).
-Defects fixed: B1–B4; Stage 1 closed A1, A10, A13 and A14 (B7–B12).
+definitions and runs carry a legal entity (B9). Matching honours the declared
+composite key, compares currency and dates, and checks per-currency balance
+for the population and every declared dimension (B13–B15). Still missing:
+a result dimension and exception governance (A6, A7), materiality (A4),
+rounding and business-day tolerance (A5). Defects fixed: B1–B4; Stage 1
+closed A1, A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
+(B13–B17).
 
 ## A. Not implemented / weaker than the spec
 
 - **A1. Closed** — populations are read from their owning services; see B7.
-- **A2. Currency is stored but not used.** Since B7, every item carries the
-  currency its source delivered and every snapshot has per-currency control
-  totals. Matching, tolerance and the certification total still ignore it:
-  two items in different currencies with the same reference and amount match,
-  and `total_amount_minor_units` (snapshot) and `total_asserted_minor_units`
-  (certification) still add different currencies together (ZS-SVC-Z-001
-  INV-10, NP-22). Scope: a currency-mismatch exception, tolerance per currency,
-  no cross-currency total anywhere.
-- **A3. `match_key_fields` is stored but ignored.** Matching pairs items on
-  `ref_id` only; the definition's declared key fields and item `dimensions`
-  are never used. A reader of a definition is told something about the rule
-  that is not true. Composite-key matching (ZS-CONTROL-001 §10 "composite
-  deterministic match") and dimensional balance (DQC-03 "no aggregate-only
-  pass when a material sub-dimension is out of balance", INV-08) are absent.
+- **A2. Closed** — currency is compared and never summed across; see B14.
+- **A3. Closed** — composite-key matching and dimensional balance; see B13.
 - **A4. Materiality is stored but never used.** It is copied onto runs and the
   certification manifest, and nothing reads it: no severity, no aggregate
   assessment (ZS-CONTROL-001 §11 aggregation, scenario 25).
-- **A5. Only absolute tolerance.** No percentage, date or rounding tolerance
-  (§11); `occurred_at` is never compared, so timing differences are invisible
-  and there is no expected-clearing-date reconciling item (§10).
+- **A5. Rounding and business-day tolerance are missing** (absolute,
+  percentage and calendar-day date tolerance exist: B15). §11 also names a
+  *rounding tolerance* "bound to known rounding rules, currencies and
+  tax/accounting calculations", and allows date tolerance in *business* days.
+  Both need inputs this service does not have — the applicable rounding rule
+  and a business-day calendar — which the platform keeps in the jurisdiction
+  and tax services; they are not to be hardcoded here. §10's "expected clearing
+  date" for a timing difference needs a reconciling-item state on the
+  exception, which belongs with A7.
 - **A6. No result dimension.** DQC-03 defines MATCH / VARIANCE /
   INDETERMINATE / PARTIAL / SUPERSEDED; ZS-CONTROL-001 §7 separates lifecycle,
   result, exception and certification. Here a single `status` carries
@@ -89,6 +85,19 @@ Defects fixed: B1–B4; Stage 1 closed A1, A10, A13 and A14 (B7–B12).
   evidence"; ZS-CONTROL-001 Invariant 9). No revocation.
 - **A13. Closed** — supersession is constrained and records its actor; see B10.
 - **A14. Closed** — population totals are overflow-checked; see B11.
+- **A15. How an absolute and a percentage tolerance combine is unspecified.**
+  Text checked: ZS-CONTROL-001 §11 "Absolute tolerance — Value in relevant
+  currency/unit; versioned by control and scope" and "Percentage tolerance —
+  Permitted only where economically meaningful; base must be explicit";
+  ZS-SVC-Z-001 DQC-01 "Explicit numeric or percentage tolerance, scale/rounding
+  semantics and population definition" and INV-09. Each describes one kind of
+  tolerance; none says whether a comparison that declares both passes when it
+  is within *either* threshold (the common "5 cents or 0.1%") or only when
+  within *both*. The two readings disagree on real items, and choosing one is a
+  control-design decision for the definition owner, not an implementation
+  detail. Until it is decided, a currency declares exactly one kind (B15);
+  declaring both is refused. Once decided, the change is a `combine` field on
+  the currency tolerance (`EITHER` / `BOTH`), versioned with the policy.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -246,3 +255,73 @@ Defects fixed: B1–B4; Stage 1 closed A1, A10, A13 and A14 (B7–B12).
   CHECK, overflow leaving no run behind, entity scoping and immutability,
   versioning of populations and scale, and every supersession rule. Migration
   000004 was round-tripped down and up.
+- **B13. Composite-key matching and dimensional balance (closes A3).**
+  `match_key_fields` is validated against what an item has — `ref_id`,
+  `currency`, `occurred_at`, `amount_minor_units`, `dimensions.<name>` — and
+  is now pinned on the run (before, a run did not pin its match key at all).
+  Items pair on the composite key; an item lacking a key field is an
+  exception (MISSING_KEY_FIELD) rather than pairing on an empty value.
+  Pairing is deterministic (source record id order; for each side-A item the
+  first same-key candidate that reconciles, otherwise the first candidate,
+  and both become exceptions); before this change the order fell back to
+  random item ids. After item matching, side totals are compared per
+  currency for the whole population and for every value of every declared
+  `balance_dimensions` attribute, and any bucket outside the currency's
+  tolerance raises a BALANCE exception (no item; signed difference A − B;
+  both totals and the threshold in `detail`), once per run and bucket however
+  often matching re-runs. This is DQC-03 "no aggregate-only pass when a
+  material sub-dimension is out of balance", INV-08, NP-21. Two reader notes:
+  (a) every out-of-tolerance bucket is flagged — whether it is *material* is
+  graded only once A4 exists, so this is the stricter reading; (b) a BALANCE
+  exception cannot be resolved by a manual match (matching does not change
+  frozen totals), so until A7's waiver path it can only be cleared by
+  superseding the run. Items without the attribute form their own bucket.
+- **B14. Currency is compared, never summed across (closes A2).** A
+  key-matched pair in different currencies is a CURRENCY_MISMATCH exception
+  for both items, whatever the amounts and tolerance; amounts in different
+  currencies are never compared. ZS-CONTROL-001 §10 permits cross-currency
+  matching only "using approved FX basis", and no FX basis is available to
+  this service, so none is attempted. Snapshots stop writing the single
+  `total_amount_minor_units` and certifications stop writing
+  `total_asserted_minor_units` (both added currencies together; NOT VALID
+  CHECKs keep new rows from writing them); certifications seal per-side,
+  per-currency `control_totals`, and the manifest also pins the tolerance
+  policy, match key and balance dimensions. Exceptions carry a currency.
+  Manual matches (B1) now use the same comparison as automatic ones, so a
+  manual match also cannot cross currencies or hide a timing difference.
+- **B15. Per-currency tolerance policy (A2, A5).** `tolerance` replaces
+  `tolerance_amount_minor_units`:
+  `{"currencies": {"USD": {"absolute_minor_units": 5}, "EUR": {"percentage_bps": 10}},
+  "percentage_base_side": "Ledger", "date_days": 3}`. Each currency declares
+  one kind (A15). A percentage needs `percentage_base_side` naming one of the
+  populations (§11 "base must be explicit"); it is applied to that side's
+  amount (or sub-total, for balance) and floored, so it never rounds in the
+  preparer's favour. A currency with no entry must match exactly: missing
+  configuration can only make the check stricter. `date_days` is a
+  calendar-day tolerance on `occurred_at` (DATE_OUTSIDE_TOLERANCE); absent, dates are not
+  compared, and the absence is visible on the pinned policy rather than
+  implied. The define endpoint now refuses unknown JSON fields, so a client
+  still sending `tolerance_amount_minor_units` is told so instead of silently
+  getting exact matching.
+- **B16. Rules are pinned from run start, with evidence.** Migration 000005's
+  lifecycle trigger fixes the tolerance policy, match key, balance
+  dimensions, materiality and definition version from the moment a run is
+  created, not only once it is certified (the doc-named "tolerance cannot be
+  widened during a certified run" test now targets `tolerance_policy`). Every
+  exception stores `detail`: the rule that fired, the observed values and the
+  threshold applied (ZS-SVC-Z-001 TC-03). The 000005 down migration refuses to
+  run while BALANCE exceptions exist (they have no 000004 shape and exceptions
+  cannot be deleted), and backfills the strictest single tolerance (0) for
+  rows that never had one.
+- **B17. Verification of B13–B16.** Unit tests in `internal/domain` for key
+  validation, composite keys, missing key fields, currency mismatch,
+  absolute/percentage/date tolerance, flooring, overflow at the int64 limits,
+  per-currency and per-dimension balance; a handler test for the refused
+  legacy field; integration tests for the composite key, an unbalanced
+  sub-dimension behind a balanced aggregate (and no duplicate on reperform),
+  currency mismatch (including a refused manual match), percentage and date
+  tolerance end to end, per-currency certification totals, rules pinned on an
+  open run, and versioning of the new rule columns. Two existing tests changed
+  expectations because the behaviour is now stricter: an empty side now also
+  raises a population-level BALANCE exception. Migrations 000004–000005 were
+  round-tripped, and the 000005 down refusal was exercised.

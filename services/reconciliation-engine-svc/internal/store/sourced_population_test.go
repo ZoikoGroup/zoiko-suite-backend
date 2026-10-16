@@ -107,8 +107,8 @@ func TestStartRun_RefusesPopulationWithoutEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = tx.Exec(f.ctx, `
-		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, source_system, item_count, total_amount_minor_units, content_hash)
-		VALUES ('rps_00000000-0000-0000-0000-000000000001', $1, $2, 'Third', 'X', 0, 0, repeat('0', 64))`, orgA, run.RunID)
+		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, source_system, item_count, content_hash)
+		VALUES ('rps_00000000-0000-0000-0000-000000000001', $1, $2, 'Third', 'X', 0, repeat('0', 64))`, orgA, run.RunID)
 	if err == nil || !strings.Contains(err.Error(), "population_snapshots_sourced_check") {
 		t.Fatalf("a snapshot without watermark/declared totals: %v, want population_snapshots_sourced_check", err)
 	}
@@ -170,13 +170,15 @@ func TestLegalEntity_ScopesDefinitionsAndRuns(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tx.Exec(f.ctx, "SELECT set_config('app.tenant_id', $1, true)", orgA); err != nil {
-			t.Fatal(err)
+		_, setErr := tx.Exec(f.ctx, "SELECT set_config('app.tenant_id', $1, true)", orgA)
+		_, err = tx.Exec(f.ctx, stmt)
+		_ = tx.Rollback(f.ctx) // before any Fatal: a leaked transaction blocks the pool's Close
+		if setErr != nil {
+			t.Fatal(setErr)
 		}
-		if _, err := tx.Exec(f.ctx, stmt); err == nil || !strings.Contains(err.Error(), "legal_entity_id") && !strings.Contains(err.Error(), "legal entity") {
+		if err == nil || !strings.Contains(err.Error(), "legal_entity_id") && !strings.Contains(err.Error(), "pinned scope") {
 			t.Fatalf("%s legal_entity_id change: %v, want the immutability trigger to refuse it", name, err)
 		}
-		_ = tx.Rollback(f.ctx)
 	}
 }
 

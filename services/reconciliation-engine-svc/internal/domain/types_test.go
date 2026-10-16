@@ -55,23 +55,29 @@ func TestDefineRequest_RequiresEntityAndScale(t *testing.T) {
 }
 
 // Scenario 06: a manual match with an amount difference beyond the pinned
-// tolerance stays an exception; the reason text cannot force it through.
+// tolerance stays an exception; the reason text cannot force it through. The
+// same holds for a currency difference.
 func TestValidateManualMatch(t *testing.T) {
+	usd := func(side string, amt int64) MatchItem { return MatchItem{Side: side, Amount: amt, Currency: "USD"} }
+	eur := func(side string, amt int64) MatchItem { return MatchItem{Side: side, Amount: amt, Currency: "EUR"} }
 	cases := []struct {
-		name         string
-		sideA, sideB string
-		a, b, tol    int64
-		want         error
+		name string
+		a, b MatchItem
+		tol  int64
+		want error
 	}{
-		{"equal amounts", "Bank", "Ledger", 10000, 10000, 0, nil},
-		{"within tolerance", "Bank", "Ledger", 10000, 10050, 50, nil},
-		{"negative difference within tolerance", "Bank", "Ledger", 10050, 10000, 50, nil},
-		{"outside tolerance", "Bank", "Ledger", 10000, 10051, 50, ErrManualMatchOutsideTolerance},
-		{"outside zero tolerance", "Bank", "Ledger", 10000, 9999, 0, ErrManualMatchOutsideTolerance},
-		{"same side", "Bank", "Bank", 10000, 10000, 0, ErrManualMatchSameSide},
+		{"equal amounts", usd("Bank", 10000), usd("Ledger", 10000), 0, nil},
+		{"within tolerance", usd("Bank", 10000), usd("Ledger", 10050), 50, nil},
+		{"negative difference within tolerance", usd("Bank", 10050), usd("Ledger", 10000), 50, nil},
+		{"outside tolerance", usd("Bank", 10000), usd("Ledger", 10051), 50, ErrManualMatchOutsideTolerance},
+		{"outside zero tolerance", usd("Bank", 10000), usd("Ledger", 9999), 0, ErrManualMatchOutsideTolerance},
+		{"same side", usd("Bank", 10000), usd("Bank", 10000), 0, ErrManualMatchSameSide},
+		{"different currencies", usd("Bank", 10000), eur("Ledger", 10000), 50, ErrManualMatchOutsideTolerance},
 	}
 	for _, c := range cases {
-		err := ValidateManualMatch(c.sideA, c.sideB, c.a, c.b, c.tol)
+		tol := c.tol
+		p := TolerancePolicy{Currencies: map[string]CurrencyTolerance{"USD": {AbsoluteMinorUnits: &tol}}}
+		err := ValidateManualMatch(c.a, c.b, p)
 		if c.want == nil && err != nil {
 			t.Fatalf("%s: unexpected error %v", c.name, err)
 		}

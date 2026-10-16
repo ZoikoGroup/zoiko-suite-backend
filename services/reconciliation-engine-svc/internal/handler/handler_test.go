@@ -157,3 +157,15 @@ func TestDefine_RefusesNonEntityBeforeAuthorization(t *testing.T) {
 		t.Fatalf("define with a non-UUID entity: %d %s, authz calls %v", w.Code, w.Body, az.entities)
 	}
 }
+
+// The pre-000005 tolerance_amount_minor_units is refused rather than silently
+// dropped: dropping it would give the caller exact matching without saying so.
+func TestDefine_RefusesUnknownFields(t *testing.T) {
+	az := &recordingAuthz{}
+	h := NewHandler(&fakeStore{}, az, failingFetcher{}, zap.NewNop())
+	w := serve(h, http.MethodPost, "/v1/reconciliation/definitions",
+		`{"legal_entity_id":"`+entityA+`","name":"n","tolerance_amount_minor_units":5}`)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "tolerance_amount_minor_units") || len(az.entities) != 0 {
+		t.Fatalf("legacy tolerance field: %d %s, authz calls %v", w.Code, w.Body, az.entities)
+	}
+}
