@@ -71,7 +71,7 @@ func main() {
 	treasuryClient := clients.NewTreasuryHTTPClient(cfg.TreasuryServiceURL)
 	authorizationClient := clients.NewAuthorizationHTTPClient(cfg.AuthorizationServiceURL)
 
-	h := handler.New(pgStore, authzClient, provider, treasuryClient, authorizationClient, logger)
+	h := handler.New(pgStore, authzClient, provider, treasuryClient, authorizationClient, logger).WithPayroll(clients.NewPayrollHTTPClient(cfg.PayrollRunServiceURL))
 
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	writer, err := kafkaout.New(kafkaout.Config{Brokers: brokers, Topic: cfg.KafkaEventsTopic})

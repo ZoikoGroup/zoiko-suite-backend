@@ -33,9 +33,6 @@ func (s *stubStore) Create(_ context.Context, r *domain.TaxReturn) error {
 	if r.Status == "" {
 		r.Status = domain.StatusDraft
 	}
-	if r.Currency == "" {
-		r.Currency = "USD"
-	}
 	r.Compute()
 	s.returns[r.ReturnID] = r
 	return nil

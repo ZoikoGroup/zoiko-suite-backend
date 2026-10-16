@@ -44,7 +44,7 @@ func cpRouter(s *stubStore, authz *stubAuthZ, withTenant bool) chi.Router {
 			})
 		})
 	}
-	h := handler.New(s, &stubPublisher{}, authz, nil, nil, nil, testTaxRate, zap.NewNop())
+	h := handler.New(s, authz, nil, nil, nil, testTaxRate, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -145,7 +145,7 @@ func TestControlPopulation_AuthorizesAgainstEntityWithReadAction(t *testing.T) {
 			next.ServeHTTP(w, req.WithContext(middleware.WithTenant(req.Context(), "tenant-abc")))
 		})
 	})
-	handler.RegisterRoutes(r, handler.New(s, &stubPublisher{}, az, nil, nil, nil, testTaxRate, zap.NewNop()))
+	handler.RegisterRoutes(r, handler.New(s, az, nil, nil, nil, testTaxRate, zap.NewNop()))
 	rr := cpGet(r, cpBaseURL+"pay-slips"+okQuery("period_id=2026-09&limit=7"), "principal-9")
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Equal(t, "principal-9", az.principal)

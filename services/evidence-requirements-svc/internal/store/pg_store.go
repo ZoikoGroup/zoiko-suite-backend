@@ -127,6 +127,14 @@ func (s *PgStore) CreateRequirement(ctx context.Context, r *domain.EvidenceRequi
 		payload = json.RawMessage(`{}`)
 	}
 
+	if r.IdempotencyKey == "" {
+		if r.CorrelationID != "" {
+			r.IdempotencyKey = r.CorrelationID
+		} else {
+			r.IdempotencyKey = r.EvidenceRequirementID
+		}
+	}
+
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
 		tag, err := tx.Exec(ctx, `
@@ -346,6 +354,14 @@ func (s *PgStore) RecordEvaluation(ctx context.Context, e *domain.EvidenceEvalua
 	reqIDs := e.RequirementIDs
 	if reqIDs == nil {
 		reqIDs = []string{}
+	}
+
+	if e.IdempotencyKey == "" {
+		if e.CorrelationID != "" {
+			e.IdempotencyKey = e.CorrelationID
+		} else {
+			e.IdempotencyKey = e.EvaluationID
+		}
 	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {

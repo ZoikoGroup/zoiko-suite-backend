@@ -1,0 +1,6 @@
+BEGIN;
+
+ALTER TABLE opportunities
+  ALTER COLUMN currency DROP DEFAULT;
+
+COMMIT;

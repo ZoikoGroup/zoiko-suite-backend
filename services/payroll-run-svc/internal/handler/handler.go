@@ -18,7 +18,9 @@ import (
 	"zoiko.io/payroll-run-svc/internal/contract"
 	"zoiko.io/payroll-run-svc/internal/domain"
 	"zoiko.io/payroll-run-svc/internal/employee"
+	"zoiko.io/payroll-run-svc/internal/events"
 	svcmiddleware "zoiko.io/payroll-run-svc/internal/middleware"
+	"zoiko.io/payroll-run-svc/internal/store"
 )
 
 type Store interface {
@@ -29,19 +31,10 @@ type Store interface {
 	GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.PaySlip, error)
 	GetShadowComparisonsByRun(ctx context.Context, runID string) ([]domain.ShadowComparison, error)
 	FinalizePayrollRun(ctx context.Context, runID string, governanceDecisionID *string) error
+	// EnqueueRunEvent writes a run event that has no state change of its own.
+	EnqueueRunEvent(ctx context.Context, run domain.PayrollRun, fn store.RunEventFunc) error
 	// ControlPopulation serves the control-population contract (pay-slips, payroll-runs).
 	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
-}
-
-// actorID on every method is the already-authorized principal from that
-// request's requirePrincipal() call — domain.PayrollRun carries no actor
-// field of its own (no InitiatedBy/CalculatedBy/etc.), so this is the only
-// real source for the event envelope's actor_id (Doc 03 §19).
-type Publisher interface {
-	PublishRunInitiated(ctx context.Context, correlationID, actorID string, r domain.PayrollRun)
-	PublishRunCalculated(ctx context.Context, correlationID, actorID string, r domain.PayrollRun)
-	PublishRunCompleted(ctx context.Context, correlationID, actorID string, r domain.PayrollRun)
-	PublishRunBlocked(ctx context.Context, correlationID, actorID string, r domain.PayrollRun, reason string)
 }
 
 type AuthZClient interface {
@@ -72,7 +65,6 @@ const (
 
 type Handler struct {
 	store      Store
-	publisher  Publisher
 	authz      AuthZClient
 	empClient  EmployeeClient
 	ctrClient  ContractClient
@@ -88,10 +80,9 @@ type Handler struct {
 	log            *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, empClient EmployeeClient, ctrClient ContractClient, compClient CompensationClient, defaultTaxRate float64, log *zap.Logger) *Handler {
+func New(st Store, authz AuthZClient, empClient EmployeeClient, ctrClient ContractClient, compClient CompensationClient, defaultTaxRate float64, log *zap.Logger) *Handler {
 	return &Handler{
-		store:          store,
-		publisher:      publisher,
+		store:          st,
 		authz:          authz,
 		empClient:      empClient,
 		ctrClient:      ctrClient,
@@ -164,7 +155,8 @@ func (h *Handler) InitiateRun(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:      now,
 	}
 
-	created, err := h.store.CreatePayrollRun(r.Context(), payrollRun)
+	// The initiated event is written in the same transaction as the run (outbox).
+	created, err := h.store.CreatePayrollRun(store.WithRunEvent(r.Context(), h.runEvent(events.RunInitiated, getCorrelationID(r), principalID, "")), payrollRun)
 	if err != nil {
 		h.log.Error("failed to create payroll run", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -176,9 +168,6 @@ func (h *Handler) InitiateRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, payrollRun)
 		return
 	}
-
-	correlationID := getCorrelationID(r)
-	h.publisher.PublishRunInitiated(r.Context(), correlationID, principalID, *payrollRun)
 
 	writeJSON(w, http.StatusCreated, payrollRun)
 }
@@ -275,7 +264,7 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 			contracts[emp.EmployeeID] = ctr
 		}
 		if len(missingContracts) > 0 {
-			h.publisher.PublishRunBlocked(r.Context(), getCorrelationID(r), principalID, *run, domain.ErrContractLookupFailed.Error())
+			h.enqueueBlocked(r, principalID, *run, domain.ErrContractLookupFailed.Error())
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 				"error_code":         "contract_lookup_failed",
 				"error_message":      domain.ErrContractLookupFailed.Error(),
@@ -303,7 +292,7 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				h.log.Error("failed to resolve compensation breakdown",
 					zap.String("employee_id", emp.EmployeeID), zap.Error(err))
-				h.publisher.PublishRunBlocked(r.Context(), getCorrelationID(r), principalID, *run, domain.ErrCompensationLookupFailed.Error())
+				h.enqueueBlocked(r, principalID, *run, domain.ErrCompensationLookupFailed.Error())
 				writeError(w, http.StatusServiceUnavailable, "compensation_lookup_failed", string(domain.ErrCompensationLookupFailed))
 				return
 			}
@@ -447,15 +436,13 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.SaveCalculatedResults(r.Context(), id, totalGross, totalNet, totalTax, totalDeductions, slips, shadowComps); err != nil {
+	if err := h.store.SaveCalculatedResults(store.WithRunEvent(r.Context(), h.runEvent(events.RunCalculated, getCorrelationID(r), principalID, "")), id, totalGross, totalNet, totalTax, totalDeductions, slips, shadowComps); err != nil {
 		h.log.Error("failed to save calculated payroll results", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	updatedRun, _ := h.store.GetPayrollRun(r.Context(), id)
-	correlationID := getCorrelationID(r)
-	h.publisher.PublishRunCalculated(r.Context(), correlationID, principalID, *updatedRun)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"run":                updatedRun,
@@ -658,7 +645,7 @@ func (h *Handler) FinalizeRun(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
 
-	if err := h.store.FinalizePayrollRun(r.Context(), id, req.GovernanceDecisionID); err != nil {
+	if err := h.store.FinalizePayrollRun(store.WithRunEvent(r.Context(), h.runEvent(events.RunCompleted, getCorrelationID(r), principalID, "")), id, req.GovernanceDecisionID); err != nil {
 		if errors.Is(err, domain.ErrRunAlreadyFinalized) {
 			writeError(w, http.StatusConflict, "already_finalized", err.Error())
 			return
@@ -673,9 +660,6 @@ func (h *Handler) FinalizeRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	finalizedRun, _ := h.store.GetPayrollRun(r.Context(), id)
-	correlationID := getCorrelationID(r)
-	h.publisher.PublishRunCompleted(r.Context(), correlationID, principalID, *finalizedRun)
-
 	writeJSON(w, http.StatusOK, finalizedRun)
 }
 
@@ -719,4 +703,21 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// runEvent builds the outbox event for a run lifecycle change. The actor is the
+// already-authorized principal: domain.PayrollRun carries no actor of its own.
+func (h *Handler) runEvent(eventType, correlationID, actorID, reason string) store.RunEventFunc {
+	return func(run domain.PayrollRun) (domain.OutboxEvent, error) {
+		body, err := events.BuildRunEnvelope(eventType, correlationID, actorID, run, reason)
+		return domain.OutboxEvent{TenantID: run.TenantID, ObjectID: run.RunID, EventType: eventType, Payload: body}, err
+	}
+}
+
+// enqueueBlocked records that a run was blocked before it could be calculated. A
+// failure to record is logged, not allowed to change the answer the caller gets.
+func (h *Handler) enqueueBlocked(r *http.Request, principalID string, run domain.PayrollRun, reason string) {
+	if err := h.store.EnqueueRunEvent(r.Context(), run, h.runEvent(events.RunBlocked, getCorrelationID(r), principalID, reason)); err != nil {
+		h.log.Error("failed to record payroll.run.blocked", zap.String("run_id", run.RunID), zap.Error(err))
+	}
 }

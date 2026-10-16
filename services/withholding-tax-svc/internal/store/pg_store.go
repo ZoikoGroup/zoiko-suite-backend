@@ -35,7 +35,7 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	if tenantID == "" {
 		return domain.ErrTenantMissing
 	}
-	_, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID)
+	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }
 
@@ -58,9 +58,6 @@ func (s *PgStore) Create(ctx context.Context, o *domain.WithholdingTaxObligation
 	o.UpdatedAt = now
 	if o.Status == "" {
 		o.Status = domain.StatusPendingRemittance
-	}
-	if o.Currency == "" {
-		o.Currency = "USD"
 	}
 	if o.PaymentType == "" {
 		o.PaymentType = "SERVICES"

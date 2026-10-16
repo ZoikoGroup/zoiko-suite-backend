@@ -156,7 +156,8 @@ func withTAX03(req domain.DetermineTaxRequest) domain.DetermineTaxRequest {
 		req.SupplyType = domain.SupplyTypeB2C
 	}
 	if req.Currency == "" {
-		req.Currency = "GBP"
+		testCurr := "GBP"
+		req.Currency = testCurr
 	}
 	return req
 }

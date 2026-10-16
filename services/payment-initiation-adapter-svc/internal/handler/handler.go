@@ -40,7 +40,16 @@ type Handler struct {
 	provider      provideradapter.Client
 	treasury      clients.TreasuryClient
 	authorization clients.AuthorizationClient
-	log           *zap.Logger
+	// payroll verifies AuthorizationSourcePayroll attempts (WFP-07). Nil means that source is not
+	// accepted: it is refused, never trusted.
+	payroll clients.PayrollClient
+	log     *zap.Logger
+}
+
+// WithPayroll enables the PAYROLL_RUN_SVC authorization source.
+func (h *Handler) WithPayroll(p clients.PayrollClient) *Handler {
+	h.payroll = p
+	return h
 }
 
 func New(st store.Store, az AuthzChecker, provider provideradapter.Client, treasury clients.TreasuryClient, authorization clients.AuthorizationClient, log *zap.Logger) *Handler {
@@ -177,6 +186,24 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 			}
 			h.log.Error("PrepareAttempt: treasury-svc transfer fingerprint verification failed — failing closed", zap.Error(err))
 			writeError(w, http.StatusServiceUnavailable, "treasury service unavailable")
+			return
+		}
+	case domain.AuthorizationSourcePayroll:
+		if h.payroll == nil {
+			writeError(w, http.StatusBadRequest, domain.ErrUnrecognizedAuthorizationSource.Error())
+			return
+		}
+		if req.AuthorizationFingerprint == "" || req.AuthorizationID == "" {
+			writeError(w, http.StatusBadRequest, domain.ErrAuthorizationFingerprintRequired.Error())
+			return
+		}
+		if err := h.payroll.VerifyInstructionFingerprint(r.Context(), verifiedTenant, req.AuthorizationID, req.AuthorizationFingerprint); err != nil {
+			if errors.Is(err, domain.ErrPayrollFingerprintMismatch) {
+				writeError(w, http.StatusUnprocessableEntity, domain.ErrPayrollFingerprintMismatch.Error())
+				return
+			}
+			h.log.Error("PrepareAttempt: payroll-run-svc instruction fingerprint verification failed — failing closed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "payroll service unavailable")
 			return
 		}
 	case "":

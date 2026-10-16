@@ -16,6 +16,9 @@ type Config struct {
 	// account_status + is_ownership_verified) instead of trusting the
 	// caller-supplied PayerAccountVerified flag alone.
 	TreasuryServiceURL string
+
+	// PayrollRunServiceURL is payroll-run-svc, which verifies WFP-07 payroll payment instructions.
+	PayrollRunServiceURL string
 	// AuthorizationServiceURL is the base URL of payment-authorization-svc
 	// (AP-10), used by PrepareAttempt to independently re-verify an
 	// AuthorizationSourcePaymentAuthorization fingerprint rather than
@@ -36,12 +39,13 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
 	return &Config{
-		Port:             port,
-		DatabaseURL:      dbURL,
-		KafkaBrokers:     getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
-		KafkaEventsTopic: getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.payment-initiation.events"),
+		Port:                    port,
+		DatabaseURL:             dbURL,
+		KafkaBrokers:            getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
+		KafkaEventsTopic:        getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.payment-initiation.events"),
 		AuthzServiceURL:         getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		TreasuryServiceURL:      getEnvOrDefault("TREASURY_SERVICE_URL", "http://treasury-svc:8103"),
+		PayrollRunServiceURL:    getEnvOrDefault("PAYROLL_RUN_SERVICE_URL", "http://payroll-run-svc:8110"),
 		AuthorizationServiceURL: getEnvOrDefault("AUTHORIZATION_SERVICE_URL", "http://payment-authorization-svc:8160"),
 		EventResidencyRegion:    os.Getenv("EVENT_RESIDENCY_REGION"),
 	}, nil
