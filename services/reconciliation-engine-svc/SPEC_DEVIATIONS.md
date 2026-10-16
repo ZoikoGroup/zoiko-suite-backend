@@ -84,7 +84,7 @@ faithfully. Four defects were fixed in this pass (B1–B4).
   authorization is checked with the tenant id passed as the entity
   (`h.authorize(…, tenantID, …)`). Entity-scoped grants cannot be expressed.
 - **A11. Definitions are upserted in place, without history or approval.**
-  Re-posting a name overwrites its rules (the version now increments — B3 —
+  Re-posting a name overwrites its rules (the version increments on a rule change — B4 —
   but the previous rules are not kept, so a run's `definition_version` can be
   matched only against the copy frozen on the run itself). No approval step,
   no effective dating (ZS-SVC-Z-001 INV-01/22, ZS-CONTROL-001 Invariant 4).
@@ -125,17 +125,20 @@ faithfully. Four defects were fixed in this pass (B1–B4).
   the matcher refuses a run that does not have two. N-way reconciliation is
   not implemented. Runs created earlier with three or more sides will now
   fail `Match`/`Reperform` with an error instead of certifying partially.
-- **B4. Redefining rules bumps the version; a run cannot supersede itself**
-  (fixed). The upsert used to overwrite tolerance/materiality/keys without
-  touching `version`, so every run and certification reported
-  `definition_version: 1` whatever rules applied. The version now increments
-  when the rules actually change (re-posting identical rules leaves it alone).
-  `SupersedeRun` with `new_run_id` equal to the run id is refused.
-- **B5. Verification of B2–B4.** The new rules in B1 and B3 are covered by
-  unit tests in `internal/domain`. The SQL changes (sides from snapshots, the
-  conditional version bump, the supersede guard) are covered by new
-  integration tests in `internal/store/pg_store_test.go`, which need
-  `TEST_DATABASE_URL` and were **not run** in this pass (skipped locally).
+- **B4. The version changes only when the rules change; a run cannot
+  supersede itself** (fixed). `trigger_definition_versioning` (migration
+  000001) bumped `version` on every update, so re-posting identical rules
+  produced a new version that meant nothing. Migration 000003 makes the
+  trigger bump `version` and `updated_at` only when `match_key_fields`,
+  tolerance or materiality change; the trigger is the single owner of both
+  columns. (A first attempt put this condition in the upsert's SQL; the
+  trigger overrode it, which the integration test caught.) `SupersedeRun`
+  with `new_run_id` equal to the run id is refused.
+- **B5. Verification of B1–B4.** B1 and B3 have unit tests in
+  `internal/domain`; the SQL behaviour (sides from snapshots, conditional
+  versioning, the supersede guard, manual-match refusal) has integration tests
+  in `internal/store/pg_store_test.go`, run against Postgres 16 with
+  `TEST_DATABASE_URL`.
 - **B6. Refused requests answer 400.** The new errors fall through the
   handler's existing default branch (400), like the service's other
   validation errors.
