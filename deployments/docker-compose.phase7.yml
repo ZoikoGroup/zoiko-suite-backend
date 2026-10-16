@@ -64,8 +64,9 @@ services:
   # ─── Connectivity & API Bridge (8144) ───────────────────────────────────────
   connectivity-api-bridge-svc:
     build:
-      context: ../services/connectivity-api-bridge-svc
-      dockerfile: Dockerfile
+      # services/, so the build can reach ../eventing - see the Dockerfile.
+      context: ../services
+      dockerfile: connectivity-api-bridge-svc/Dockerfile
     networks: [zoiko-p7]
     depends_on:
       postgres-p7:
@@ -78,6 +79,12 @@ services:
       KAFKA_BROKERS: "kafka-p7:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.connectivity.api.bridge.events"
       AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
+      # Connector governance (INT-05). EGRESS_ALLOWED_REGIONS is the allowlist of
+      # regions connectors may send data to; EMPTY MEANS NONE, so a connector
+      # cannot be submitted until a region is listed here.
+      EVENT_RESIDENCY_REGION: "uk"
+      EGRESS_ALLOWED_REGIONS: "uk"
+      SECRET_VAULT_URL: "http://host.docker.internal:8087"
     ports:
       - "8144:8144"
     healthcheck:
