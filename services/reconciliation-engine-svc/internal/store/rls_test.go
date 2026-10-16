@@ -45,6 +45,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS reconciliation_exception_transitions CASCADE;
 		DROP TABLE IF EXISTS reconciliation_run_transitions CASCADE;
 		DROP TABLE IF EXISTS outbox_events CASCADE;
 		DROP TABLE IF EXISTS idempotency_keys CASCADE;
@@ -59,6 +60,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP FUNCTION IF EXISTS reject_immutable_row() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_run_lifecycle() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_run_creation() CASCADE;
+		DROP FUNCTION IF EXISTS enforce_run_governance_pinned() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_definition_versioning() CASCADE;`)
 
 	_, thisFile, _, _ := runtime.Caller(0)
@@ -172,7 +174,9 @@ func defineRequest(name string, toleranceMinor int64) domain.DefineReconciliatio
 	scale := 2
 	return domain.DefineReconciliationRequest{
 		LegalEntityID: entityA, Name: name, Populations: testSpecs(), MatchKeyFields: []string{"ref_id"},
-		AmountScale: &scale, MaterialityAmountMinorUnits: 100000,
+		AmountScale: &scale, Materiality: domain.MaterialityPolicy{Currencies: map[string]int64{"USD": 100000}},
+		ExceptionPolicy: &domain.ExceptionPolicy{OwnerRole: "recon-owner",
+			SLADays: map[domain.Severity]int{domain.SeverityBlocker: 1, domain.SeverityError: 3, domain.SeverityWarning: 10}},
 		Tolerance: domain.TolerancePolicy{Currencies: map[string]domain.CurrencyTolerance{"USD": {AbsoluteMinorUnits: &toleranceMinor}}},
 	}
 }

@@ -23,20 +23,30 @@ composite key, compares currency and dates, and checks per-currency balance
 for the population and every declared dimension (B13–B15). A run carries
 three state dimensions — lifecycle, result and certification — with an
 append-only history, and a run that cannot prove its populations is recorded
-Failed / INDETERMINATE (B18–B19). Still missing: exception governance (A7),
-materiality (A4), rounding and business-day tolerance (A5), and any defined
-meaning for a PARTIAL result (A16). Defects fixed: B1–B4; Stage 1 closed A1,
-A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
-(B13–B17); Stage 3a closed A6 (B18–B20).
+Failed / INDETERMINATE (B18–B19). Exceptions are owned, classified,
+severity-graded against a per-currency materiality, due by an SLA and follow
+a governed lifecycle; accepted risk is a separate, authorized path that keeps
+the result VARIANCE, and unresolved exposure is assessed in aggregate
+(B21–B24). Still missing: rounding and business-day tolerance and reconciling
+items (A5), maker-checker beyond accepting risk (A9), recurrence and
+qualitative materiality (A4 remainder), and any defined meaning for a PARTIAL
+result (A16). Defects fixed: B1–B4; Stage 1 closed A1, A10, A13 and A14
+(B7–B12); Stage 2 closed A2 and A3 and most of A5 (B13–B17); Stage 3 closed
+A6 (B18–B20) and A7 and most of A4 (B21–B25).
 
 ## A. Not implemented / weaker than the spec
 
 - **A1. Closed** — populations are read from their owning services; see B7.
 - **A2. Closed** — currency is compared and never summed across; see B14.
 - **A3. Closed** — composite-key matching and dimensional balance; see B13.
-- **A4. Materiality is stored but never used.** It is copied onto runs and the
-  certification manifest, and nothing reads it: no severity, no aggregate
-  assessment (ZS-CONTROL-001 §11 aggregation, scenario 25).
+- **A4. Mostly closed** — per-currency materiality grades every exception and
+  the aggregate is assessed (B23). Still missing: *recurrence* ("repeated
+  small items may be material by pattern", §11; §21 "Recurrence") needs
+  exception history across runs of a definition, and *qualitative* triggers
+  ("quantitative and qualitative criteria") need a criteria list nobody has
+  defined; neither raises severity today. Close impact (scenario 25
+  "reassesses close impact") belongs to the close service, which can read
+  the run's assessment.
 - **A5. Rounding and business-day tolerance are missing** (absolute,
   percentage and calendar-day date tolerance exist: B15). §11 also names a
   *rounding tolerance* "bound to known rounding rules, currencies and
@@ -44,22 +54,18 @@ A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   Both need inputs this service does not have — the applicable rounding rule
   and a business-day calendar — which the platform keeps in the jurisdiction
   and tax services; they are not to be hardcoded here. §10's "expected clearing
-  date" for a timing difference needs a reconciling-item state on the
-  exception, which belongs with A7.
+  date" for a timing difference — a reconciling item that is expected to
+  clear rather than an error — is also not modelled: a DATE_OUTSIDE_TOLERANCE
+  exception is an ordinary exception with the TIMING category, due by the SLA
+  rather than by its clearing date.
 - **A6. Closed** — three state dimensions, transition history, reachable
   Failed / INDETERMINATE; see B18–B19.
-- **A7. Exceptions have no governance fields or lifecycle.** An exception has
-  free-text `reason`, `amount`, `Open/Resolved`. Missing per ZS-CONTROL-001
-  Invariant 7 and §21: owner, severity, category/assertion, due date/SLA,
-  aging, root cause. The only way to resolve one is a manual match that
-  consumes its item; there is no waiver/accepted-risk path (DQC-05 "accepted
-  risk never changes a FAIL into PASS"). An item that is genuinely unmatched
-  because the source is wrong can therefore never be closed in its run: the
-  run can only be superseded. The same holds for a BALANCE exception (B13)
-  and for an exception raised by `RaiseException` on an item that was already
-  matched — the only items it accepts, since an unmatched item already has an
-  automatic exception: a manual match cannot resolve it, because the item is
-  matched.
+- **A7. Closed** — governed exception lifecycle, owner, classification,
+  severity, SLA, aging and an authorized accepted-risk path; see B21–B22.
+  Not built: ZS-CONTROL-001's *carried forward under authority* (it is not in
+  ZS-SVC-Z-001's exception vocabulary, which this service follows, and needs
+  a next-period run to carry into) and an escalation chain beyond the owner
+  role (§21 "Owner / reviewer — authorized owner and escalation chain").
 - **A8. Reperform does nothing useful.** `Reperform` re-runs auto-matching on
   items with neither a match nor an exception — after the first `Match` there
   are none, so it only changes the status to `Reperformed`. Because
@@ -67,8 +73,9 @@ A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   domain, a meaningful reperformance is a new run over new populations,
   linked to this one. Scope: define reperformance as "start a linked run and
   supersede on certification", or remove the command.
-- **A9. No maker-checker or separated permissions.** Every command uses one
-  action, `RECONCILIATION_MANAGE`, so the same principal can define the
+- **A9. No maker-checker or separated permissions** (except accepting risk,
+  which has its own action and independence rule — B22). Every other command
+  uses one action, `RECONCILIATION_MANAGE`, so the same principal can define the
   rules, start the run, manually match, and certify it (ZS-CONTROL-001
   Invariant 12, §27; DATA-07 "configuration/rule publication separated from
   evaluation/release approval"). Scope: separate actions (define, run, manual
@@ -83,7 +90,8 @@ A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   no effective dating (ZS-SVC-Z-001 INV-01/22, ZS-CONTROL-001 Invariant 4).
   There is also no read endpoint for definitions.
 - **A12. Certification is thin.** The sealed manifest records counts, the
-  pinned tolerance/materiality and the definition version — not the
+  pinned tolerance/materiality, the definition version and (since B22) the
+  result and the assessment with every accepted risk — not the
   population hashes, the manual matches with their reasons, or the certifier's
   authority (ZS-SVC-Z-001 INV-21, DQC-05 "certification binds exact
   evidence"; ZS-CONTROL-001 Invariant 9). No revocation.
@@ -363,7 +371,9 @@ A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   exception and VARIANCE otherwise, re-evaluated in the same transaction as
   every match, manual match, raised exception and reperformance; ELIGIBLE
   exactly while the result is MATCH; Certify requires ELIGIBLE (so a VARIANCE,
-  INDETERMINATE or PARTIAL can never be certified — INV-05, INV-26); Certified
+  INDETERMINATE or PARTIAL can never be certified — INV-05, INV-26; Stage 3b
+  refines this for a VARIANCE that is only permitted, immaterial accepted
+  risk, which may be certified *as a VARIANCE* — B22); Certified
   ⇔ CERTIFIED; ExceptionsOpen ⇒ VARIANCE; INDETERMINATE can only become
   SUPERSEDED (INV-05); a result is never reset to NOT_RUN; supersession sets
   the result (and a certification) to SUPERSEDED. Every change to any
@@ -426,3 +436,110 @@ A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   Reperformed and ExceptionsOpen with an open exception → VARIANCE /
   UNCERTIFIED, Certified, Superseded, Planned), and both refusals exercised
   (down with live history; up with a hand-made Failed row).
+- **B21. Governed exception lifecycle (closes A7).** States are ZS-SVC-Z-001's
+  exception dimension — OPEN / INVESTIGATING / REMEDIATED / ACCEPTED_RISK /
+  CLOSED (existing `Open` / `Resolved` rows were renamed OPEN / CLOSED). Edges
+  (domain and trigger): OPEN → INVESTIGATING | ACCEPTED_RISK | CLOSED;
+  INVESTIGATING → REMEDIATED | ACCEPTED_RISK | CLOSED; REMEDIATED →
+  INVESTIGATING | CLOSED; ACCEPTED_RISK and CLOSED are final. CLOSED is
+  reached only through a manual match (B1): §21 "clearing requires
+  authoritative correction … not manual status-only closure". REMEDIATED
+  records the correction made in the owning domain (`evidence_ref`, required)
+  and leaves the exception unresolved, because this run's populations are
+  frozen; a new run re-tests it (DQC-05 "Re-test"; A8). Working an exception
+  (INVESTIGATING, REMEDIATED) is the assigned owner's job
+  (`:assign` names the owner). Every exception is raised with an owner role
+  (`exception_policy.owner_role`, pinned on the run — Invariant 7, never
+  ownerless), a category and assertion from §21's lists (fixed per matching
+  rule for automatic exceptions; named by the raiser for `RaiseException`), a
+  severity and materiality (B23), an exposure, and `due_at` = raised + the
+  pinned SLA for its severity (`exception_policy.sla_days`). Identity,
+  classification, severity and due date are immutable (DQC "severity cannot
+  be edited retroactively"); aging (`age_days`) and attention signals
+  (OVERDUE, SLA_BREACH, MATERIAL, UNASSIGNED) are derived on read and never
+  stored. A root cause (code + note) is required to remediate or accept a
+  BLOCKER. Every move, assignment and manual-match closure is appended to
+  `reconciliation_exception_transitions`. New endpoints: `GET
+  /exceptions/{id}`, `GET /exceptions/{id}/transitions`, `POST
+  /exceptions/{id}:assign`, `POST /exceptions/{id}:transition`, `GET
+  /runs/{id}/assessment`. Two consequences: `RaiseException` now requires
+  `category` and `assertion`; an item whose exception was accepted as risk can
+  no longer be manually matched (acceptance is final).
+- **B22. Accepted risk never turns VARIANCE into MATCH; certifying over it is
+  opt-in and recorded.** ACCEPTED_RISK needs a named authority
+  (`authority_ref`), the separate action `RECONCILIATION_ACCEPT_RISK`
+  (scenario 24 "waived without authority — command rejected"), and an
+  acceptor who is neither the exception's owner nor its raiser
+  (financial-control-svc's waiver independence). An accepted exception stays
+  unresolved, so the run's result stays VARIANCE (INV-19, NP-44); the run is
+  no longer ExceptionsOpen (nothing is being worked) but it is not a MATCH.
+  The run read (`assessment`) lists every accepted risk. Whether such a run
+  can be certified is answered by DQC-05's open-blocker rule — "no unresolved
+  BLOCKER exception unless certification profile explicitly permits and
+  records governed risk acceptance" — read strictly: a definition's versioned
+  `certification_profile.permit_accepted_risk` (default false, pinned on the
+  run) must permit it, for any severity, not only BLOCKER; every unresolved
+  exception must be accepted risk; and the accepted exposure must be
+  IMMATERIAL in aggregate in every currency. A material or unassessable
+  accepted risk is never certifiable here: accepting a material risk would
+  need an authority tier above the acceptor (A9), so it needs a correction and
+  a new run instead. When certified, the run is Certified / VARIANCE /
+  CERTIFIED (never relabeled MATCH); the certification row stores
+  `result_state` VARIANCE and the full assessment, and both are in the
+  manifest hash (Invariant 9: "unresolved exceptions and impact assessment").
+  This is the decision a reviewer is most likely to want to revisit: the
+  reference service (financial-control-svc) certifies PASS_WITH_APPROVED_
+  EXCEPTIONS over waivers without a profile switch; DQC-03 has no such result,
+  and this service keeps VARIANCE and requires the switch.
+- **B23. Materiality grades exceptions and is assessed in aggregate (A4).**
+  `materiality` is per currency, in minor units at the amount scale
+  (`{"currencies": {"USD": 100000}}`), replacing the currency-less
+  `materiality_amount_minor_units` (which no new row writes); a currency
+  without a threshold is UNASSESSED, never assumed immaterial. Severity is
+  derived, never supplied, on DQC's scale, with financial-control-svc's bands:
+  exposure ≥ threshold → BLOCKER (MATERIAL); ≥ threshold/10 → ERROR;
+  otherwise WARNING; unassessed → ERROR. INFO is never derived. Exposure is the
+  difference for an amount outside tolerance or a balance variance, and the
+  whole item otherwise (|MinInt64| saturates). The aggregate (§11
+  "individually and in aggregate", scenario 25) is per currency over
+  unresolved exceptions: item exposures summed with a key-matched pair counted
+  once, and a balance variance — itself an aggregate of those items —
+  compared rather than added (the larger counts). It is computed on read from
+  the exceptions (no stored copy to drift) and sealed into any certification.
+  The bands and the aggregation basis are policy constants a reviewer may
+  want on the definition instead.
+- **B24. Governance is pinned, versioned and required.** `materiality`,
+  `exception_policy` (owner role and SLA days for BLOCKER / ERROR / WARNING,
+  1–365, all required) and `certification_profile` are definition rules:
+  changing one bumps the version (B4), and each is copied onto the run and
+  pinned from creation (trigger). Definitions and runs written before
+  migration 000007 have none of them; such a definition cannot start a run and
+  such a run cannot be matched or have exceptions raised (409, as for B9
+  legacy records), because their exceptions could be neither owned nor graded.
+  Migration 000007 renames exception statuses, adds the columns as NOT VALID
+  requirements for new rows, and its down migration refuses while governed
+  exception state, exception history or a certification over accepted risk
+  exists.
+- **B25. Verification of B21–B24.** Unit tests in `internal/domain` for every
+  exception edge, the severity bands and the unassessed case, policy and
+  request validation, root-cause and independence rules, the scenario-25
+  aggregate with pair de-duplication, and the certification gate (no profile,
+  material, unassessable, working, permitted-immaterial; VARIANCE certified
+  only when the assessment allows); a handler test that accepting risk is
+  checked against `RECONCILIATION_ACCEPT_RISK` on the run's entity and that a
+  denial changes nothing. Integration tests: exceptions raised with
+  classification, severity, materiality, exposure, owner role, SLA due date and
+  derived attention (including a BLOCKER and an unassessed EUR item); the
+  worked lifecycle with owner-only moves and evidence-required remediation
+  that stays unresolved; accepted risk refused to the owner and the raiser,
+  final, kept as VARIANCE, listed on the run, blocking certification without
+  a profile and blocking a manual match; certification over permitted
+  immaterial risk sealed as VARIANCE with every accepted exception; scenario
+  25 blocking certification; a BLOCKER needing a root cause; manual-match
+  closure recorded; direct SQL refused for rewriting severity or due date,
+  undoing an acceptance, closing without a match, waiving without authority,
+  making a VARIANCE eligible without the profile, widening a run's profile and
+  rewriting exception history; and a profile change versioning the
+  definition. Migration 000007 was round-tripped on a database holding
+  exceptions, with the down refusal exercised and the status renames checked
+  both ways.

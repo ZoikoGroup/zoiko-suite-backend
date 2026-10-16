@@ -183,7 +183,7 @@ func TestRunState_RaiseExceptionBeforeMatchIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.s.RaiseException(f.ctx, orgA, run.RunID, domain.RaiseExceptionRequest{ItemID: itemID, Reason: "looks wrong"},
+	_, err = f.s.RaiseException(f.ctx, orgA, run.RunID, domain.RaiseExceptionRequest{ItemID: itemID, Reason: "looks wrong", Category: "MISMATCH", Assertion: "ACCURACY"},
 		"test-operator", f.claim("RaiseException", run.RunID))
 	if !errors.Is(err, domain.ErrRunNotEvaluated) {
 		t.Fatalf("raise exception on a Planned run: %v, want ErrRunNotEvaluated", err)
@@ -197,7 +197,7 @@ func TestRunState_RaiseExceptionBeforeMatchIsRefused(t *testing.T) {
 	// After matching, raising an exception turns the MATCH into a VARIANCE and
 	// withdraws eligibility.
 	f.match(run.RunID)
-	if _, err := f.s.RaiseException(f.ctx, orgA, run.RunID, domain.RaiseExceptionRequest{ItemID: itemID, Reason: "looks wrong"},
+	if _, err := f.s.RaiseException(f.ctx, orgA, run.RunID, domain.RaiseExceptionRequest{ItemID: itemID, Reason: "looks wrong", Category: "MISMATCH", Assertion: "ACCURACY"},
 		"test-operator", f.claim("RaiseException", run.RunID)); err != nil {
 		t.Fatalf("raise exception after match: %v", err)
 	}

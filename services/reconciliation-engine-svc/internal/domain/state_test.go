@@ -22,7 +22,7 @@ func TestLifecycle_EdgesAreClosed(t *testing.T) {
 		{RunFailed, RunSuperseded, ResultSuperseded, CertUncertified},
 	}
 	for _, c := range legal {
-		if err := ValidateLifecycleTransition(c.from, c.to, c.result, c.cert); err != nil {
+		if err := ValidateLifecycleTransition(c.from, c.to, c.result, c.cert, false); err != nil {
 			t.Errorf("%s -> %s (%s/%s) refused: %v", c.from, c.to, c.result, c.cert, err)
 		}
 	}
@@ -46,7 +46,7 @@ func TestLifecycle_EdgesAreClosed(t *testing.T) {
 		{"superseded result on an open run", RunRunning, RunRunning, ResultSuperseded, CertUncertified},
 	}
 	for _, c := range illegal {
-		if err := ValidateLifecycleTransition(c.from, c.to, c.result, c.cert); !errors.Is(err, ErrInvalidTransition) {
+		if err := ValidateLifecycleTransition(c.from, c.to, c.result, c.cert, false); !errors.Is(err, ErrInvalidTransition) {
 			t.Errorf("%s: %v, want ErrInvalidTransition", c.name, err)
 		}
 	}
@@ -101,16 +101,11 @@ func TestCertification_Transitions(t *testing.T) {
 }
 
 func TestEvaluatedResult(t *testing.T) {
-	if EvaluatedResult(0) != ResultMatch || CertificationFor(ResultMatch) != CertEligible {
+	if EvaluatedResult(0) != ResultMatch || CertificationFor(RunAssessment{Certifiable: true}) != CertEligible {
 		t.Fatal("no open exceptions must be MATCH / ELIGIBLE")
 	}
-	if EvaluatedResult(1) != ResultVariance || CertificationFor(ResultVariance) != CertUncertified {
+	if EvaluatedResult(1) != ResultVariance || CertificationFor(RunAssessment{}) != CertUncertified {
 		t.Fatal("an open exception must be VARIANCE / UNCERTIFIED")
-	}
-	for _, r := range []ResultState{ResultIndeterminate, ResultPartial, ResultNotRun, ResultSuperseded} {
-		if CertificationFor(r) != CertUncertified {
-			t.Fatalf("%s must never be eligible", r)
-		}
 	}
 }
 
