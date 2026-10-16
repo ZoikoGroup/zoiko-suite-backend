@@ -49,38 +49,68 @@ const SellerScope = "seller"
 // ── ReconciliationDefinition ────────────────────────────────────────────────
 
 // ReconciliationDefinition is the versioned, seller-managed rule set a
-// run is executed against — match keys, tolerance and materiality.
-// Mutable in place like commercial_currencies/meter_definitions
-// elsewhere in the platform: a new StartRun always copies the
-// definition's CURRENT values onto the run itself (frozen there), so
-// editing a definition never reaches back into a run already started
-// against an earlier version.
+// run is executed against — which two populations are compared (and where
+// they are read from), match keys, the fixed-point amount scale, tolerance
+// and materiality. A new StartRun copies the definition's CURRENT values
+// onto the run itself (frozen there), so editing a definition never reaches
+// back into a run already started against an earlier version.
+//
+// LegalEntityID is the entity the definition and every run of it belong to;
+// authorization is evaluated against it (A10). It is fixed for the life of
+// the definition.
 type ReconciliationDefinition struct {
-	DefinitionID                string    `json:"definition_id"`
-	TenantID                    string    `json:"tenant_id"`
-	Name                        string    `json:"name"`
-	MatchKeyFields              []string  `json:"match_key_fields"`
-	ToleranceAmountMinorUnits   int64     `json:"tolerance_amount_minor_units"`
-	MaterialityAmountMinorUnits int64     `json:"materiality_amount_minor_units"`
-	Version                     int64     `json:"version"`
-	CreatedAt                   time.Time `json:"created_at"`
-	CreatedBy                   string    `json:"created_by"`
-	UpdatedAt                   time.Time `json:"updated_at"`
+	DefinitionID                string           `json:"definition_id"`
+	TenantID                    string           `json:"tenant_id"`
+	LegalEntityID               string           `json:"legal_entity_id"`
+	Name                        string           `json:"name"`
+	Populations                 []PopulationSpec `json:"populations"`
+	MatchKeyFields              []string         `json:"match_key_fields"`
+	AmountScale                 int              `json:"amount_scale"`
+	ToleranceAmountMinorUnits   int64            `json:"tolerance_amount_minor_units"`
+	MaterialityAmountMinorUnits int64            `json:"materiality_amount_minor_units"`
+	Version                     int64            `json:"version"`
+	CreatedAt                   time.Time        `json:"created_at"`
+	CreatedBy                   string           `json:"created_by"`
+	UpdatedAt                   time.Time        `json:"updated_at"`
 }
 
+// Legacy reports a definition created before migration 000004: it has no
+// legal entity and no population sources, so it can be neither authorized
+// against an entity nor run.
+func (d ReconciliationDefinition) Legacy() bool { return d.LegalEntityID == "" }
+
+// DefineReconciliationRequest. Amounts (tolerance, materiality and every
+// population amount) are integers in units of 10^-amount_scale.
+// amount_scale is required, with no default, because the scale is part of
+// what "balanced" means (ZS-SVC-Z-001 INV-09, TC-05).
 type DefineReconciliationRequest struct {
-	Name                        string   `json:"name"`
-	MatchKeyFields              []string `json:"match_key_fields"`
-	ToleranceAmountMinorUnits   int64    `json:"tolerance_amount_minor_units"`
-	MaterialityAmountMinorUnits int64    `json:"materiality_amount_minor_units"`
+	LegalEntityID               string           `json:"legal_entity_id"`
+	Name                        string           `json:"name"`
+	Populations                 []PopulationSpec `json:"populations"`
+	MatchKeyFields              []string         `json:"match_key_fields"`
+	AmountScale                 *int             `json:"amount_scale"`
+	ToleranceAmountMinorUnits   int64            `json:"tolerance_amount_minor_units"`
+	MaterialityAmountMinorUnits int64            `json:"materiality_amount_minor_units"`
 }
 
 func (r DefineReconciliationRequest) Validate() error {
+	if !ValidUUID(r.LegalEntityID) {
+		return fmt.Errorf("%w: legal_entity_id must be a UUID", ErrInvalidArgument)
+	}
 	if r.Name == "" {
 		return fmt.Errorf("name is required")
 	}
+	if err := ValidatePopulationSpecs(r.Populations); err != nil {
+		return err
+	}
 	if len(r.MatchKeyFields) == 0 {
 		return fmt.Errorf("match_key_fields is required")
+	}
+	if r.AmountScale == nil {
+		return fmt.Errorf("%w: amount_scale is required", ErrInvalidArgument)
+	}
+	if *r.AmountScale < 0 || *r.AmountScale > MaxAmountScale {
+		return fmt.Errorf("%w: amount_scale must be between 0 and %d", ErrInvalidArgument, MaxAmountScale)
 	}
 	if r.ToleranceAmountMinorUnits < 0 {
 		return fmt.Errorf("tolerance_amount_minor_units cannot be negative")
@@ -114,14 +144,20 @@ const (
 type ReconciliationRun struct {
 	RunID                       string     `json:"run_id"`
 	TenantID                    string     `json:"tenant_id"`
-	DefinitionID                string     `json:"definition_id"`
-	DefinitionVersion           int64      `json:"definition_version"`
-	Status                      RunStatus  `json:"status"`
-	ToleranceAmountMinorUnits   int64      `json:"tolerance_amount_minor_units"`
-	MaterialityAmountMinorUnits int64      `json:"materiality_amount_minor_units"`
-	SupersedesRunID             *string    `json:"supersedes_run_id,omitempty"`
-	SupersededByRunID           *string    `json:"superseded_by_run_id,omitempty"`
-	SupersededReason            *string    `json:"superseded_reason,omitempty"`
+	LegalEntityID               string            `json:"legal_entity_id"`
+	DefinitionID                string            `json:"definition_id"`
+	DefinitionVersion           int64             `json:"definition_version"`
+	Status                      RunStatus         `json:"status"`
+	PeriodID                    string            `json:"period_id,omitempty"`
+	Scope                       map[string]string `json:"scope,omitempty"`
+	AmountScale                 int               `json:"amount_scale"`
+	ToleranceAmountMinorUnits   int64             `json:"tolerance_amount_minor_units"`
+	MaterialityAmountMinorUnits int64             `json:"materiality_amount_minor_units"`
+	SupersedesRunID             *string           `json:"supersedes_run_id,omitempty"`
+	SupersededByRunID           *string           `json:"superseded_by_run_id,omitempty"`
+	SupersededReason            *string           `json:"superseded_reason,omitempty"`
+	SupersededBy                *string           `json:"superseded_by,omitempty"`
+	SupersededAt                *time.Time        `json:"superseded_at,omitempty"`
 	StartedAt                   time.Time  `json:"started_at"`
 	StartedBy                   string     `json:"started_by"`
 	CertifiedAt                 *time.Time `json:"certified_at,omitempty"`
@@ -129,76 +165,69 @@ type ReconciliationRun struct {
 }
 
 // PopulationSnapshot is one frozen side of a run's comparison (e.g.
-// "Ledger" vs "Bank"). Immutable from the moment StartRun creates it —
-// this is the "frozen populations" core control the doc names; this
-// service never edits the source records a snapshot's items were
-// copied from.
+// "Ledger" vs "Bank"), read from its owning service through the control
+// population contract. Immutable from the moment StartRun creates it. It pins
+// what ZS-CONTROL-001 names for a snapshot (side, source, query/spec,
+// watermark, row count, per-currency control totals, hash) plus the source's
+// own declared totals it was verified against. The optional fields are empty
+// only on snapshots frozen before migration 000004.
 type PopulationSnapshot struct {
-	SnapshotID            string    `json:"snapshot_id"`
-	TenantID              string    `json:"tenant_id"`
-	RunID                 string    `json:"run_id"`
-	Side                  string    `json:"side"`
-	SourceSystem          string    `json:"source_system"`
-	ItemCount             int64     `json:"item_count"`
-	TotalAmountMinorUnits int64     `json:"total_amount_minor_units"`
-	ContentHash           string    `json:"content_hash"`
-	CreatedAt             time.Time `json:"created_at"`
+	SnapshotID            string            `json:"snapshot_id"`
+	TenantID              string            `json:"tenant_id"`
+	RunID                 string            `json:"run_id"`
+	Side                  string            `json:"side"`
+	SourceSystem          string            `json:"source_system"`
+	SpecRef               string            `json:"spec_ref,omitempty"`
+	SourceWatermark       string            `json:"source_watermark,omitempty"`
+	ItemCount             int64             `json:"item_count"`
+	AmountScale           *int              `json:"amount_scale,omitempty"`
+	TotalAmountMinorUnits int64             `json:"total_amount_minor_units"`
+	ControlTotals         []CurrencyTotal   `json:"control_totals,omitempty"`
+	DeclaredRowCount      *int64            `json:"declared_row_count,omitempty"`
+	DeclaredTotals        map[string]string `json:"declared_totals,omitempty"`
+	ContentHash           string            `json:"content_hash"`
+	CreatedAt             time.Time         `json:"created_at"`
 }
 
 type PopulationItem struct {
 	ItemID           string            `json:"item_id"`
 	SnapshotID       string            `json:"snapshot_id"`
+	SourceRecordID   string            `json:"source_record_id,omitempty"`
 	RefID            string            `json:"ref_id"`
 	AmountMinorUnits int64             `json:"amount_minor_units"`
+	Currency         string            `json:"currency,omitempty"`
 	OccurredAt       time.Time         `json:"occurred_at"`
 	Dimensions       map[string]string `json:"dimensions,omitempty"`
 }
 
-type PopulationInput struct {
-	Side         string                `json:"side"`
-	SourceSystem string                `json:"source_system"`
-	Items        []PopulationItemInput `json:"items"`
-}
-
+// PopulationItemInput is one item to freeze, converted from a source record.
 type PopulationItemInput struct {
-	RefID            string            `json:"ref_id"`
-	AmountMinorUnits int64             `json:"amount_minor_units"`
-	OccurredAt       time.Time         `json:"occurred_at"`
-	Dimensions       map[string]string `json:"dimensions,omitempty"`
+	SourceRecordID   string
+	RefID            string
+	AmountMinorUnits int64
+	Currency         string
+	OccurredAt       time.Time
+	Dimensions       map[string]string
 }
 
+// StartRunRequest names the definition to run and the run's own scope. The
+// populations are NOT in the request: they are read from the sources the
+// definition names, for the definition's legal entity and this period (A1).
 type StartRunRequest struct {
 	DefinitionID string            `json:"definition_id"`
-	Populations  []PopulationInput `json:"populations"`
+	PeriodID     string            `json:"period_id,omitempty"`
+	Scope        map[string]string `json:"scope,omitempty"`
 }
 
 func (r StartRunRequest) Validate() error {
 	if r.DefinitionID == "" {
 		return fmt.Errorf("definition_id is required")
 	}
-	// The matcher compares exactly two sides. A third population would be frozen
-	// but never matched or excepted, so the run could certify with that side
-	// entirely unreconciled (ZS-SVC-Z-001 INV-26) — refuse it instead.
-	if len(r.Populations) != 2 {
-		return fmt.Errorf("exactly two populations are required")
+	if r.PeriodID != "" && !periodRe.MatchString(r.PeriodID) {
+		return fmt.Errorf("%w: period_id must be YYYY-MM", ErrInvalidArgument)
 	}
-	sides := map[string]bool{}
-	for _, p := range r.Populations {
-		if p.Side == "" {
-			return fmt.Errorf("population side is required")
-		}
-		if sides[p.Side] {
-			return fmt.Errorf("duplicate population side %q", p.Side)
-		}
-		sides[p.Side] = true
-		for _, it := range p.Items {
-			if it.RefID == "" {
-				return fmt.Errorf("population item ref_id is required")
-			}
-			if it.OccurredAt.IsZero() {
-				return fmt.Errorf("population item occurred_at is required")
-			}
-		}
+	if err := ValidateParams(r.Scope); err != nil {
+		return fmt.Errorf("scope: %w", err)
 	}
 	return nil
 }
@@ -356,4 +385,13 @@ var (
 	ErrManualMatchSameSide         = errorString("manual match must pair items from different populations")
 	ErrManualMatchOutsideTolerance = errorString("manual match amounts differ by more than the run's tolerance")
 	ErrSupersedeSelf               = errorString("a run cannot supersede itself")
+
+	ErrInvalidArgument              = errorString("invalid argument")
+	ErrAmountNotRepresentable       = errorString("amount is not exactly representable at the definition's amount_scale")
+	ErrAmountOverflow               = errorString("amount or total exceeds the representable range")
+	ErrDefinitionChanged            = errorString("the definition changed while its populations were being read; start the run again")
+	ErrLegacyRecord                 = errorString("record predates legal-entity scoping (migration 000004) and cannot be authorized or run")
+	ErrSupersedeDifferentDefinition = errorString("a replacement run must use the same definition as the run it supersedes")
+	ErrReplacementNotTerminal       = errorString("a replacement run must be Certified or Failed before it can supersede another run")
+	ErrReplacementAlreadyUsed       = errorString("the replacement run already supersedes another run")
 )

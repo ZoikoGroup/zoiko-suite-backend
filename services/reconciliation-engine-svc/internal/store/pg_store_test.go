@@ -15,7 +15,7 @@ import (
 func TestReconciliation_HappyPath_MatchAndCertify(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "ledger-vs-bank", 0)
-	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+	run := f.startRun(orgA, def, []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("REF-1", 10000), item("REF-2", 5000)}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("REF-1", 10000), item("REF-2", 5000)}},
 	})
@@ -64,7 +64,7 @@ func TestReconciliation_HappyPath_MatchAndCertify(t *testing.T) {
 func TestReconciliation_EqualTotalsDifferentComposition_SurfacesExceptions(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "composition-check", 0)
-	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+	run := f.startRun(orgA, def, []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("X", 10000), item("Y", 5000)}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("Z", 9000), item("W", 6000)}},
 	})
@@ -104,7 +104,7 @@ func TestReconciliation_EqualTotalsDifferentComposition_SurfacesExceptions(t *te
 func TestReconciliation_ToleranceCannotBeWidenedOnCertifiedRun(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "tolerance-lock", 0)
-	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+	run := f.startRun(orgA, def, []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("REF-1", 10000)}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("REF-1", 10000)}},
 	})
@@ -134,7 +134,7 @@ func TestReconciliation_ToleranceCannotBeWidenedOnCertifiedRun(t *testing.T) {
 func TestReconciliation_ManualMatchRequiresReasonAndIsAuditable(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "manual-match", 0)
-	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+	run := f.startRun(orgA, def, []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("BANK-REF", 10000)}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("GL-REF", 10000)}},
 	})
@@ -198,49 +198,75 @@ func TestReconciliation_ManualMatchRequiresReasonAndIsAuditable(t *testing.T) {
 func TestReconciliation_StartRun_IdempotentReplay(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "replay-check", 0)
-	req := domain.StartRunRequest{DefinitionID: def.DefinitionID, Populations: []domain.PopulationInput{
+	req := domain.StartRunRequest{DefinitionID: def.DefinitionID}
+	pops := frozenAll([]testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
-	}}
+	})
 	claim := f.claim("StartRun", "replay-check")
-	first, err := f.s.StartRun(f.ctx, orgA, req, "test-operator", claim)
+	if err := f.s.CheckIdempotency(f.ctx, orgA, claim); err != nil {
+		t.Fatalf("pre-check of an unused key: %v", err)
+	}
+	first, err := f.s.StartRun(f.ctx, orgA, req, def.Version, pops, "test-operator", claim)
 	if err != nil {
 		t.Fatalf("first start run: %v", err)
 	}
-	_, err = f.s.StartRun(f.ctx, orgA, req, "test-operator", claim)
+	_, err = f.s.StartRun(f.ctx, orgA, req, def.Version, pops, "test-operator", claim)
 	var replay *domain.IdempotentReplayError
 	if !errors.As(err, &replay) || replay.ResourceID != first.RunID {
 		t.Fatalf("replay of StartRun: %v", err)
 	}
+	// The pre-check the handler runs before reading any source replays too, so a
+	// retry never re-reads populations that may since have moved.
+	if err := f.s.CheckIdempotency(f.ctx, orgA, claim); !errors.As(err, &replay) || replay.ResourceID != first.RunID {
+		t.Fatalf("pre-check of a used key: %v", err)
+	}
+	reused := claim
+	reused.RequestSHA256 = "different"
+	if err := f.s.CheckIdempotency(f.ctx, orgA, reused); !errors.Is(err, domain.ErrIdempotencyKeyReused) {
+		t.Fatalf("pre-check of a reused key with another request: %v", err)
+	}
 }
 
-// SupersedeRun marks a certified run as superseded by a replacement,
-// without touching its own sealed certification.
-func TestReconciliation_SupersedeRun(t *testing.T) {
-	f := newFixture(t)
-	def := f.defineReconciliation(orgA, "supersede-check", 0)
-	pops := []domain.PopulationInput{
+func (f *fixture) matchAndCertify(runID string) {
+	f.t.Helper()
+	if _, err := f.s.Match(f.ctx, orgA, runID, domain.MatchRequest{}, "test-operator", f.claim("Match", runID)); err != nil {
+		f.t.Fatalf("match %s: %v", runID, err)
+	}
+	if _, err := f.s.Certify(f.ctx, orgA, runID, "test-operator", f.claim("Certify", runID)); err != nil {
+		f.t.Fatalf("certify %s: %v", runID, err)
+	}
+}
+
+func cleanPops() []testPop {
+	return []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
 	}
-	oldRun := f.startRun(orgA, def.DefinitionID, pops)
-	if _, err := f.s.Match(f.ctx, orgA, oldRun.RunID, domain.MatchRequest{}, "test-operator", f.claim("Match-old", oldRun.RunID)); err != nil {
-		t.Fatalf("match old run: %v", err)
-	}
-	if _, err := f.s.Certify(f.ctx, orgA, oldRun.RunID, "test-operator", f.claim("Certify-old", oldRun.RunID)); err != nil {
-		t.Fatalf("certify old run: %v", err)
-	}
+}
 
-	newRun := f.startRun(orgA, def.DefinitionID, pops)
+// SupersedeRun marks a certified run as superseded by a certified
+// replacement of the same definition, records who did it, and does not touch
+// the superseded run's own sealed certification.
+func TestReconciliation_SupersedeRun(t *testing.T) {
+	f := newFixture(t)
+	def := f.defineReconciliation(orgA, "supersede-check", 0)
+	oldRun := f.startRun(orgA, def, cleanPops())
+	f.matchAndCertify(oldRun.RunID)
+	newRun := f.startRun(orgA, def, cleanPops())
+	f.matchAndCertify(newRun.RunID)
 
 	superseded, err := f.s.SupersedeRun(f.ctx, orgA, oldRun.RunID, domain.SupersedeRunRequest{
 		NewRunID: newRun.RunID, Reason: "corrected population re-submitted",
-	}, "test-operator", f.claim("Supersede", oldRun.RunID))
+	}, "controller-carol", f.claim("Supersede", oldRun.RunID))
 	if err != nil {
 		t.Fatalf("supersede run: %v", err)
 	}
 	if superseded.Status != domain.RunSuperseded || superseded.SupersededByRunID == nil || *superseded.SupersededByRunID != newRun.RunID {
 		t.Fatalf("superseded run: %+v", superseded)
+	}
+	if superseded.SupersededBy == nil || *superseded.SupersededBy != "controller-carol" || superseded.SupersededAt == nil {
+		t.Fatalf("supersession actor/time not recorded: %+v", superseded)
 	}
 
 	cert, err := f.s.GetCertification(f.ctx, orgA, oldRun.RunID)
@@ -257,7 +283,7 @@ func TestReconciliation_SupersedeRun(t *testing.T) {
 func TestReconciliation_TenantIsolation(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "isolation-check", 0)
-	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+	run := f.startRun(orgA, def, []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
 	})
@@ -280,7 +306,7 @@ func TestReconciliation_TenantIsolation(t *testing.T) {
 func TestReconciliation_EmptySide_SurfacesExceptionsAndBlocksCertify(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "empty-side", 0)
-	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+	run := f.startRun(orgA, def, []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("REF-1", 100), item("REF-2", 200)}},
 		{Side: "Ledger", SourceSystem: "GL"},
 	})
@@ -305,7 +331,7 @@ func TestReconciliation_EmptySide_SurfacesExceptionsAndBlocksCertify(t *testing.
 func TestReconciliation_ManualMatchCannotHideAmountDifference(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "manual-match-tolerance", 0)
-	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+	run := f.startRun(orgA, def, []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("BANK-REF", 10000), item("BANK-REF-2", 500)}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("GL-REF", 9000)}},
 	})
@@ -370,7 +396,7 @@ func TestReconciliation_RedefiningRulesBumpsVersion(t *testing.T) {
 func TestReconciliation_RunCannotSupersedeItself(t *testing.T) {
 	f := newFixture(t)
 	def := f.defineReconciliation(orgA, "self-supersede", 0)
-	run := f.startRun(orgA, def.DefinitionID, []domain.PopulationInput{
+	run := f.startRun(orgA, def, []testPop{
 		{Side: "Bank", SourceSystem: "BANK", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
 		{Side: "Ledger", SourceSystem: "GL", Items: []domain.PopulationItemInput{item("REF-1", 100)}},
 	})

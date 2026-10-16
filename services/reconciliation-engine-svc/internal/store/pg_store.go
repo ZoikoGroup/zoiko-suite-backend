@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,7 +31,10 @@ import (
 // Store is the DATA-07 persistence contract.
 type Store interface {
 	DefineReconciliation(ctx context.Context, tenantID string, req domain.DefineReconciliationRequest, actor string) (*domain.ReconciliationDefinition, error)
-	StartRun(ctx context.Context, tenantID string, req domain.StartRunRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
+	GetDefinition(ctx context.Context, tenantID, definitionID string) (*domain.ReconciliationDefinition, error)
+	CheckIdempotency(ctx context.Context, tenantID string, claim domain.IdempotencyClaim) error
+	StartRun(ctx context.Context, tenantID string, req domain.StartRunRequest, expectedDefinitionVersion int64,
+		pops []domain.FrozenPopulation, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	Match(ctx context.Context, tenantID, runID string, req domain.MatchRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
 	RaiseException(ctx context.Context, tenantID, runID string, req domain.RaiseExceptionRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationException, error)
 	Reperform(ctx context.Context, tenantID, runID string, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error)
@@ -123,43 +127,63 @@ func abs64(n int64) int64 {
 
 // ── ReconciliationDefinition ────────────────────────────────────────────────
 
-const definitionColumns = `definition_id, tenant_id, name, match_key_fields, tolerance_amount_minor_units,
-	materiality_amount_minor_units, version, created_at, created_by, updated_at`
+const definitionColumns = `definition_id, tenant_id, legal_entity_id::text, name, populations, match_key_fields, amount_scale,
+	tolerance_amount_minor_units, materiality_amount_minor_units, version, created_at, created_by, updated_at`
 
 func scanDefinition(row pgx.Row) (*domain.ReconciliationDefinition, error) {
 	var d domain.ReconciliationDefinition
-	if err := row.Scan(&d.DefinitionID, &d.TenantID, &d.Name, &d.MatchKeyFields, &d.ToleranceAmountMinorUnits,
-		&d.MaterialityAmountMinorUnits, &d.Version, &d.CreatedAt, &d.CreatedBy, &d.UpdatedAt); err != nil {
+	var entity *string
+	var scale *int
+	var pops []byte
+	if err := row.Scan(&d.DefinitionID, &d.TenantID, &entity, &d.Name, &pops, &d.MatchKeyFields, &scale,
+		&d.ToleranceAmountMinorUnits, &d.MaterialityAmountMinorUnits, &d.Version, &d.CreatedAt, &d.CreatedBy, &d.UpdatedAt); err != nil {
 		return nil, err
+	}
+	if entity != nil {
+		d.LegalEntityID = *entity
+	}
+	if scale != nil {
+		d.AmountScale = *scale
+	}
+	if len(pops) > 0 {
+		if err := json.Unmarshal(pops, &d.Populations); err != nil {
+			return nil, fmt.Errorf("decode definition populations: %w", err)
+		}
 	}
 	return &d, nil
 }
 
-// DefineReconciliation upserts a definition by (tenant, name) — mutable
-// reference config, same idiom as search_policies/commercial_currencies
-// elsewhere in this platform. Every update bumps version server-side
-// (see the migration's trigger); a run copies the current version's
-// values onto itself and never reads this table again, so an edit here
-// never reaches back into an already-started run.
+// DefineReconciliation upserts a definition by (tenant, legal entity, name).
+// The version is bumped server-side only when a rule column changes (see the
+// versioning trigger); a run copies the current version's values onto itself
+// and never reads this table again, so an edit here never reaches back into
+// an already-started run.
 func (s *PgStore) DefineReconciliation(ctx context.Context, tenantID string, req domain.DefineReconciliationRequest, actor string) (*domain.ReconciliationDefinition, error) {
 	if err := req.Validate(); err != nil {
 		return nil, err
 	}
+	pops, err := json.Marshal(req.Populations)
+	if err != nil {
+		return nil, fmt.Errorf("encode populations: %w", err)
+	}
 	var out *domain.ReconciliationDefinition
-	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		id := newID(domain.PrefixDefinition)
 		got, err := scanDefinition(tx.QueryRow(ctx, `
-			INSERT INTO reconciliation_definitions (definition_id, tenant_id, name, match_key_fields,
-				tolerance_amount_minor_units, materiality_amount_minor_units, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (tenant_id, name) DO UPDATE SET
+			INSERT INTO reconciliation_definitions (definition_id, tenant_id, legal_entity_id, name, populations, match_key_fields,
+				amount_scale, tolerance_amount_minor_units, materiality_amount_minor_units, created_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (tenant_id, legal_entity_id, name) DO UPDATE SET
+				populations = EXCLUDED.populations,
 				match_key_fields = EXCLUDED.match_key_fields,
+				amount_scale = EXCLUDED.amount_scale,
 				tolerance_amount_minor_units = EXCLUDED.tolerance_amount_minor_units,
 				materiality_amount_minor_units = EXCLUDED.materiality_amount_minor_units
-				-- version and updated_at are owned by trigger_definition_versioning
-				-- (migration 000003): bumped only when a rule column changes.
+				-- version and updated_at are owned by trigger_definition_versioning:
+				-- bumped only when a rule column changes.
 			RETURNING `+definitionColumns,
-			id, tenantID, req.Name, req.MatchKeyFields, req.ToleranceAmountMinorUnits, req.MaterialityAmountMinorUnits, actor))
+			id, tenantID, req.LegalEntityID, req.Name, pops, req.MatchKeyFields, *req.AmountScale,
+			req.ToleranceAmountMinorUnits, req.MaterialityAmountMinorUnits, actor))
 		if err != nil {
 			return fmt.Errorf("upsert reconciliation definition: %w", err)
 		}
@@ -169,31 +193,63 @@ func (s *PgStore) DefineReconciliation(ctx context.Context, tenantID string, req
 	return out, err
 }
 
-func loadDefinition(ctx context.Context, tx pgx.Tx, tenantID, definitionID string) (*domain.ReconciliationDefinition, error) {
-	d, err := scanDefinition(tx.QueryRow(ctx, `SELECT `+definitionColumns+` FROM reconciliation_definitions WHERE tenant_id = $1 AND definition_id = $2`,
-		tenantID, definitionID))
+func loadDefinition(ctx context.Context, tx pgx.Tx, tenantID, definitionID string, lock bool) (*domain.ReconciliationDefinition, error) {
+	q := `SELECT ` + definitionColumns + ` FROM reconciliation_definitions WHERE tenant_id = $1 AND definition_id = $2`
+	if lock {
+		q += ` FOR SHARE`
+	}
+	d, err := scanDefinition(tx.QueryRow(ctx, q, tenantID, definitionID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrDefinitionNotFound
 	}
 	return d, err
 }
 
+func (s *PgStore) GetDefinition(ctx context.Context, tenantID, definitionID string) (*domain.ReconciliationDefinition, error) {
+	var out *domain.ReconciliationDefinition
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		d, err := loadDefinition(ctx, tx, tenantID, definitionID, false)
+		out = d
+		return err
+	})
+	return out, err
+}
+
 // ── ReconciliationRun ────────────────────────────────────────────────────────
 
-const runColumns = `run_id, tenant_id, definition_id, definition_version, status, tolerance_amount_minor_units,
-	materiality_amount_minor_units, supersedes_run_id, superseded_by_run_id, superseded_reason, started_at, started_by,
-	certified_at, certified_by`
+const runColumns = `run_id, tenant_id, legal_entity_id::text, definition_id, definition_version, status, period_id, scope,
+	amount_scale, tolerance_amount_minor_units, materiality_amount_minor_units, supersedes_run_id, superseded_by_run_id,
+	superseded_reason, superseded_by, superseded_at, started_at, started_by, certified_at, certified_by`
 
 func scanRun(row pgx.Row) (*domain.ReconciliationRun, error) {
 	var r domain.ReconciliationRun
-	var certifiedBy *string
-	if err := row.Scan(&r.RunID, &r.TenantID, &r.DefinitionID, &r.DefinitionVersion, &r.Status, &r.ToleranceAmountMinorUnits,
-		&r.MaterialityAmountMinorUnits, &r.SupersedesRunID, &r.SupersededByRunID, &r.SupersededReason, &r.StartedAt, &r.StartedBy,
-		&r.CertifiedAt, &certifiedBy); err != nil {
+	var certifiedBy, entity, period *string
+	var scale *int
+	var scope []byte
+	if err := row.Scan(&r.RunID, &r.TenantID, &entity, &r.DefinitionID, &r.DefinitionVersion, &r.Status, &period, &scope,
+		&scale, &r.ToleranceAmountMinorUnits, &r.MaterialityAmountMinorUnits, &r.SupersedesRunID, &r.SupersededByRunID,
+		&r.SupersededReason, &r.SupersededBy, &r.SupersededAt, &r.StartedAt, &r.StartedBy, &r.CertifiedAt, &certifiedBy); err != nil {
 		return nil, err
 	}
 	if certifiedBy != nil {
 		r.CertifiedBy = *certifiedBy
+	}
+	if entity != nil {
+		r.LegalEntityID = *entity
+	}
+	if period != nil {
+		r.PeriodID = *period
+	}
+	if scale != nil {
+		r.AmountScale = *scale
+	}
+	if len(scope) > 0 {
+		if err := json.Unmarshal(scope, &r.Scope); err != nil {
+			return nil, fmt.Errorf("decode run scope: %w", err)
+		}
+		if len(r.Scope) == 0 {
+			r.Scope = nil
+		}
 	}
 	return &r, nil
 }
@@ -220,18 +276,55 @@ func (s *PgStore) GetRun(ctx context.Context, tenantID, runID string) (*domain.R
 	return out, err
 }
 
-// StartRun freezes every submitted population and its items — the
-// "frozen populations" core control — and copies the definition's
-// CURRENT rule version onto the run itself, so nothing about a
-// definition edited later can ever reach back into this run.
-func (s *PgStore) StartRun(ctx context.Context, tenantID string, req domain.StartRunRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
+// CheckIdempotency reports, without claiming anything, whether claim's key
+// was already used: an IdempotentReplayError for the same request, or
+// ErrIdempotencyKeyReused for a different one. StartRun calls it before
+// reading any source, so a retry of a run that already started replays it
+// instead of re-reading populations that may since have moved.
+func (s *PgStore) CheckIdempotency(ctx context.Context, tenantID string, c domain.IdempotencyClaim) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var reqHash, resourceID string
+		err := tx.QueryRow(ctx, `
+			SELECT request_sha256, resource_id FROM idempotency_keys
+			WHERE tenant_id = $1 AND owner_scope = $2 AND principal_id = $3 AND idempotency_key = $4`,
+			tenantID, c.OwnerScope, c.PrincipalID, c.Key).Scan(&reqHash, &resourceID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read idempotency claim: %w", err)
+		}
+		if reqHash != c.RequestSHA256 {
+			return domain.ErrIdempotencyKeyReused
+		}
+		return &domain.IdempotentReplayError{ResourceID: resourceID}
+	})
+}
+
+// StartRun freezes the two populations the caller read from their sources —
+// the "frozen populations" core control — and copies the definition's rules
+// onto the run itself, so nothing about a definition edited later can ever
+// reach back into this run. The populations were read for definition version
+// expectedVersion; if the definition changed meanwhile, the populations may
+// not be the ones it now names, and the run is refused (ErrDefinitionChanged).
+func (s *PgStore) StartRun(ctx context.Context, tenantID string, req domain.StartRunRequest, expectedVersion int64,
+	pops []domain.FrozenPopulation, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
 	if err := req.Validate(); err != nil {
 		return nil, err
 	}
 	var out *domain.ReconciliationRun
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		def, err := loadDefinition(ctx, tx, tenantID, req.DefinitionID)
+		def, err := loadDefinition(ctx, tx, tenantID, req.DefinitionID, true)
 		if err != nil {
+			return err
+		}
+		if def.Legacy() {
+			return domain.ErrLegacyRecord
+		}
+		if def.Version != expectedVersion {
+			return domain.ErrDefinitionChanged
+		}
+		if err := checkPopulationsMatchDefinition(def, pops); err != nil {
 			return err
 		}
 
@@ -241,18 +334,30 @@ func (s *PgStore) StartRun(ctx context.Context, tenantID string, req domain.Star
 			return err
 		}
 
+		scope, err := json.Marshal(req.Scope)
+		if err != nil {
+			return fmt.Errorf("encode run scope: %w", err)
+		}
+		if req.Scope == nil {
+			scope = []byte("{}")
+		}
+		var period *string
+		if req.PeriodID != "" {
+			period = &req.PeriodID
+		}
 		run, err := scanRun(tx.QueryRow(ctx, `
-			INSERT INTO reconciliation_runs (run_id, tenant_id, definition_id, definition_version, status,
-				tolerance_amount_minor_units, materiality_amount_minor_units, started_by)
-			VALUES ($1, $2, $3, $4, 'Planned', $5, $6, $7)
+			INSERT INTO reconciliation_runs (run_id, tenant_id, legal_entity_id, definition_id, definition_version, status,
+				period_id, scope, amount_scale, tolerance_amount_minor_units, materiality_amount_minor_units, started_by)
+			VALUES ($1, $2, $3, $4, $5, 'Planned', $6, $7, $8, $9, $10, $11)
 			RETURNING `+runColumns,
-			runID, tenantID, def.DefinitionID, def.Version, def.ToleranceAmountMinorUnits, def.MaterialityAmountMinorUnits, actor))
+			runID, tenantID, def.LegalEntityID, def.DefinitionID, def.Version, period, scope, def.AmountScale,
+			def.ToleranceAmountMinorUnits, def.MaterialityAmountMinorUnits, actor))
 		if err != nil {
 			return fmt.Errorf("create reconciliation run: %w", err)
 		}
 
-		for _, pop := range req.Populations {
-			if err := freezePopulation(ctx, tx, tenantID, runID, pop); err != nil {
+		for _, pop := range pops {
+			if err := freezePopulation(ctx, tx, tenantID, runID, def.AmountScale, pop); err != nil {
 				return err
 			}
 		}
@@ -264,37 +369,73 @@ func (s *PgStore) StartRun(ctx context.Context, tenantID string, req domain.Star
 	return out, err
 }
 
-func freezePopulation(ctx context.Context, tx pgx.Tx, tenantID, runID string, pop domain.PopulationInput) error {
-	snapshotID := newID(domain.PrefixSnapshot)
-	var total int64
-	rows := make([][]byte, 0, len(pop.Items))
-	for _, it := range pop.Items {
-		total += it.AmountMinorUnits
-		dimJSON, err := json.Marshal(it.Dimensions)
-		if err != nil {
-			return fmt.Errorf("marshal item dimensions: %w", err)
+// checkPopulationsMatchDefinition refuses populations that are not exactly the
+// definition's two sides, each read from the system its spec names.
+func checkPopulationsMatchDefinition(def *domain.ReconciliationDefinition, pops []domain.FrozenPopulation) error {
+	if len(pops) != len(def.Populations) {
+		return fmt.Errorf("%w: %d populations supplied, the definition names %d", domain.ErrInvalidArgument, len(pops), len(def.Populations))
+	}
+	want := map[string]string{}
+	for _, sp := range def.Populations {
+		want[sp.Side] = sp.System
+	}
+	for _, p := range pops {
+		sys, ok := want[p.Side]
+		if !ok || sys != p.SourceSystem {
+			return fmt.Errorf("%w: population %q/%q is not one the definition names", domain.ErrInvalidArgument, p.Side, p.SourceSystem)
 		}
-		rows = append(rows, dimJSON)
+		delete(want, p.Side)
 	}
-	manifest, err := json.Marshal(pop)
-	if err != nil {
-		return fmt.Errorf("marshal population for hashing: %w", err)
-	}
-	contentHash := sha256Hex(manifest)
+	return nil
+}
 
+// freezePopulation writes one side's snapshot and items. The snapshot's
+// control totals are computed here from the items themselves, with overflow
+// checks (A14): a total that does not fit an int64 refuses the run instead of
+// wrapping. The row count must equal the source's declared row count (the
+// table's CHECK enforces the same).
+func freezePopulation(ctx context.Context, tx pgx.Tx, tenantID, runID string, scale int, pop domain.FrozenPopulation) error {
+	if strings.TrimSpace(pop.Watermark) == "" {
+		return fmt.Errorf("%w: population %q has no source watermark", domain.ErrInvalidArgument, pop.Side)
+	}
+	if pop.DeclaredTotals == nil || pop.DeclaredRowCount != int64(len(pop.Items)) {
+		return fmt.Errorf("%w: population %q does not carry declared totals for %d rows", domain.ErrInvalidArgument, pop.Side, len(pop.Items))
+	}
+	perCcy, total, err := domain.ControlTotals(pop.Items)
+	if err != nil {
+		return fmt.Errorf("population %q: %w", pop.Side, err)
+	}
+	controlJSON, err := json.Marshal(perCcy)
+	if err != nil {
+		return fmt.Errorf("encode control totals: %w", err)
+	}
+	declaredJSON, err := json.Marshal(pop.DeclaredTotals)
+	if err != nil {
+		return fmt.Errorf("encode declared totals: %w", err)
+	}
+
+	snapshotID := newID(domain.PrefixSnapshot)
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, source_system, item_count, total_amount_minor_units, content_hash)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		snapshotID, tenantID, runID, pop.Side, pop.SourceSystem, len(pop.Items), total, contentHash); err != nil {
+		INSERT INTO population_snapshots (snapshot_id, tenant_id, run_id, side, source_system, spec_ref, source_watermark,
+			item_count, amount_scale, total_amount_minor_units, control_totals, declared_row_count, declared_totals, content_hash)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		snapshotID, tenantID, runID, pop.Side, pop.SourceSystem, pop.SpecRef, pop.Watermark,
+		len(pop.Items), scale, total, controlJSON, pop.DeclaredRowCount, declaredJSON, domain.HashPopulation(pop.Items)); err != nil {
 		return fmt.Errorf("freeze population snapshot: %w", err)
 	}
 
-	for i, it := range pop.Items {
-		itemID := newID(domain.PrefixItem)
+	for _, it := range pop.Items {
+		dims, err := json.Marshal(it.Dimensions)
+		if err != nil {
+			return fmt.Errorf("marshal item dimensions: %w", err)
+		}
+		if it.Dimensions == nil {
+			dims = []byte("{}")
+		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO population_items (item_id, tenant_id, snapshot_id, ref_id, amount_minor_units, occurred_at, dimensions)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			itemID, tenantID, snapshotID, it.RefID, it.AmountMinorUnits, it.OccurredAt, rows[i]); err != nil {
+			INSERT INTO population_items (item_id, tenant_id, snapshot_id, source_record_id, ref_id, amount_minor_units, currency, occurred_at, dimensions)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			newID(domain.PrefixItem), tenantID, snapshotID, it.SourceRecordID, it.RefID, it.AmountMinorUnits, it.Currency, it.OccurredAt, dims); err != nil {
 			return fmt.Errorf("freeze population item: %w", err)
 		}
 	}
@@ -806,7 +947,13 @@ func (s *PgStore) GetCertification(ctx context.Context, tenantID, runID string) 
 // append-only correction pattern used for lineage edges and ingestion
 // runs elsewhere in DATA-0x. If remediation needs to happen, it happens
 // in the owning domain; this only records that this run's result has
-// been superseded and by what.
+// been superseded, by what, and by whom.
+//
+// The replacement must reconcile the same thing (same definition) and must
+// itself have reached a terminal state (Certified or Failed): a result is
+// never superseded by one that does not exist yet (A13). A replacement
+// supersedes at most one run. Both runs are locked in run_id order so two
+// concurrent supersessions cannot deadlock on each other.
 func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req domain.SupersedeRunRequest, actor string, claim domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
 	if err := req.Validate(); err != nil {
 		return nil, err
@@ -816,21 +963,33 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req 
 	}
 	var out *domain.ReconciliationRun
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		run, err := loadRunForUpdate(ctx, tx, tenantID, runID)
-		if err != nil {
-			return err
+		locked := map[string]*domain.ReconciliationRun{}
+		ids := []string{runID, req.NewRunID}
+		sort.Strings(ids)
+		for _, id := range ids {
+			r, err := loadRunForUpdate(ctx, tx, tenantID, id)
+			if err != nil {
+				return err
+			}
+			locked[id] = r
 		}
+		run, replacement := locked[runID], locked[req.NewRunID]
 		if run.Status != domain.RunCertified && run.Status != domain.RunFailed {
 			return domain.ErrRunNotOpen
 		}
-
-		var newRunExists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM reconciliation_runs WHERE tenant_id = $1 AND run_id = $2)`,
-			tenantID, req.NewRunID).Scan(&newRunExists); err != nil {
+		if replacement.DefinitionID != run.DefinitionID {
+			return domain.ErrSupersedeDifferentDefinition
+		}
+		if replacement.Status != domain.RunCertified && replacement.Status != domain.RunFailed {
+			return domain.ErrReplacementNotTerminal
+		}
+		var used bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM reconciliation_runs WHERE tenant_id = $1 AND superseded_by_run_id = $2)`,
+			tenantID, req.NewRunID).Scan(&used); err != nil {
 			return fmt.Errorf("check replacement run: %w", err)
 		}
-		if !newRunExists {
-			return domain.ErrRunNotFound
+		if used {
+			return domain.ErrReplacementAlreadyUsed
 		}
 
 		claim.ResourceID = runID
@@ -839,13 +998,12 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req 
 		}
 
 		updated, err := scanRun(tx.QueryRow(ctx, `
-			UPDATE reconciliation_runs SET status = 'Superseded', superseded_by_run_id = $2, superseded_reason = $3
+			UPDATE reconciliation_runs SET status = 'Superseded', superseded_by_run_id = $2, superseded_reason = $3, superseded_by = $4
 			WHERE run_id = $1 RETURNING `+runColumns,
-			runID, req.NewRunID, req.Reason))
+			runID, req.NewRunID, req.Reason, actor))
 		if err != nil {
 			return fmt.Errorf("supersede run: %w", err)
 		}
-		_ = actor
 		out = updated
 		return outbox.Insert(ctx, tx, outbox.Event{AggregateType: "reconciliation_run", AggregateID: runID,
 			EventType: "CONTROL.ReconciliationSuperseded", TenantID: &tenantID, Payload: updated})
@@ -855,13 +1013,32 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, runID string, req 
 
 // ── Read surfaces ────────────────────────────────────────────────────────────
 
-const snapshotColumns = `snapshot_id, tenant_id, run_id, side, source_system, item_count, total_amount_minor_units, content_hash, created_at`
+const snapshotColumns = `snapshot_id, tenant_id, run_id, side, source_system, spec_ref, source_watermark, item_count, amount_scale,
+	total_amount_minor_units, control_totals, declared_row_count, declared_totals, content_hash, created_at`
 
 func scanSnapshot(row pgx.Row) (*domain.PopulationSnapshot, error) {
 	var p domain.PopulationSnapshot
-	if err := row.Scan(&p.SnapshotID, &p.TenantID, &p.RunID, &p.Side, &p.SourceSystem, &p.ItemCount, &p.TotalAmountMinorUnits,
-		&p.ContentHash, &p.CreatedAt); err != nil {
+	var specRef, watermark *string
+	var control, declared []byte
+	if err := row.Scan(&p.SnapshotID, &p.TenantID, &p.RunID, &p.Side, &p.SourceSystem, &specRef, &watermark, &p.ItemCount,
+		&p.AmountScale, &p.TotalAmountMinorUnits, &control, &p.DeclaredRowCount, &declared, &p.ContentHash, &p.CreatedAt); err != nil {
 		return nil, err
+	}
+	if specRef != nil {
+		p.SpecRef = *specRef
+	}
+	if watermark != nil {
+		p.SourceWatermark = *watermark
+	}
+	if len(control) > 0 {
+		if err := json.Unmarshal(control, &p.ControlTotals); err != nil {
+			return nil, fmt.Errorf("decode control totals: %w", err)
+		}
+	}
+	if len(declared) > 0 {
+		if err := json.Unmarshal(declared, &p.DeclaredTotals); err != nil {
+			return nil, fmt.Errorf("decode declared totals: %w", err)
+		}
 	}
 	return &p, nil
 }

@@ -3,30 +3,54 @@ package domain
 import (
 	"errors"
 	"testing"
-	"time"
 )
 
-func pop(side string, n int) PopulationInput {
-	p := PopulationInput{Side: side, SourceSystem: side}
-	for i := 0; i < n; i++ {
-		p.Items = append(p.Items, PopulationItemInput{RefID: "REF", AmountMinorUnits: 100, OccurredAt: time.Unix(0, 0)})
-	}
-	return p
+func spec(side string) PopulationSpec {
+	return PopulationSpec{Side: side, System: "gl", Population: "account-postings"}
+}
+
+func defineReq(pops ...PopulationSpec) DefineReconciliationRequest {
+	scale := 2
+	return DefineReconciliationRequest{LegalEntityID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", Name: "n", Populations: pops,
+		MatchKeyFields: []string{"ref_id"}, AmountScale: &scale}
 }
 
 // The matcher compares two sides only; a third population would be frozen but
-// never reconciled, so it is refused rather than silently ignored.
-func TestStartRunRequest_RequiresExactlyTwoPopulations(t *testing.T) {
-	for name, pops := range map[string][]PopulationInput{
-		"one":   {pop("A", 1)},
-		"three": {pop("A", 1), pop("B", 1), pop("C", 1)},
+// never reconciled, so a definition naming anything but two is refused.
+func TestDefineRequest_RequiresExactlyTwoDistinctPopulations(t *testing.T) {
+	for name, pops := range map[string][]PopulationSpec{
+		"one":       {spec("A")},
+		"three":     {spec("A"), spec("B"), spec("C")},
+		"same side": {spec("A"), spec("A")},
+		"bad name":  {spec("A"), {Side: "B", System: "gl", Population: "../etc"}},
+		"reserved":  {spec("A"), {Side: "B", System: "gl", Population: "p", Params: map[string]string{"legal_entity_id": "x"}}},
 	} {
-		if err := (StartRunRequest{DefinitionID: "d", Populations: pops}).Validate(); err == nil {
-			t.Fatalf("%s population(s) should be refused", name)
+		if err := defineReq(pops...).Validate(); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("%s: got %v, want ErrInvalidArgument", name, err)
 		}
 	}
-	if err := (StartRunRequest{DefinitionID: "d", Populations: []PopulationInput{pop("A", 1), pop("B", 0)}}).Validate(); err != nil {
-		t.Fatalf("two populations (one empty) should be accepted: %v", err)
+	if err := defineReq(spec("A"), spec("B")).Validate(); err != nil {
+		t.Fatalf("two populations should be accepted: %v", err)
+	}
+}
+
+// The scale and the entity are part of what "balanced" means; neither has a default.
+func TestDefineRequest_RequiresEntityAndScale(t *testing.T) {
+	r := defineReq(spec("A"), spec("B"))
+	r.AmountScale = nil
+	if err := r.Validate(); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("missing amount_scale: %v", err)
+	}
+	r = defineReq(spec("A"), spec("B"))
+	r.LegalEntityID = "tenant-not-an-entity"
+	if err := r.Validate(); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("non-UUID legal_entity_id: %v", err)
+	}
+	big := MaxAmountScale + 1
+	r = defineReq(spec("A"), spec("B"))
+	r.AmountScale = &big
+	if err := r.Validate(); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("scale above max: %v", err)
 	}
 }
 
