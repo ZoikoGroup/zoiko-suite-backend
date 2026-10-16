@@ -36,6 +36,7 @@ type fakeStore struct {
 	def        *domain.ReconciliationDefinition
 	run        *domain.ReconciliationRun
 	startCalls int
+	failures   []domain.RunFailure
 }
 
 func (s *fakeStore) GetDefinition(context.Context, string, string) (*domain.ReconciliationDefinition, error) {
@@ -53,11 +54,21 @@ func (s *fakeStore) GetRun(context.Context, string, string) (*domain.Reconciliat
 func (s *fakeStore) GetMatchResults(context.Context, string, string) ([]domain.MatchResult, error) {
 	return nil, nil
 }
-func (s *fakeStore) CheckIdempotency(context.Context, string, domain.IdempotencyClaim) error { return nil }
+func (s *fakeStore) CheckIdempotency(context.Context, string, domain.IdempotencyClaim) error {
+	return nil
+}
 func (s *fakeStore) StartRun(_ context.Context, _ string, _ domain.StartRunRequest, _ int64, _ []domain.FrozenPopulation,
 	_ string, _ domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
 	s.startCalls++
 	return &domain.ReconciliationRun{RunID: "rcr_x", LegalEntityID: s.def.LegalEntityID}, nil
+}
+
+func (s *fakeStore) RecordFailedRun(_ context.Context, _ string, _ domain.StartRunRequest, _ int64, f domain.RunFailure,
+	_ string, _ domain.IdempotencyClaim) (*domain.ReconciliationRun, error) {
+	s.failures = append(s.failures, f)
+	code := f.Code
+	return &domain.ReconciliationRun{RunID: "rcr_failed", LegalEntityID: s.def.LegalEntityID, Status: domain.RunFailed,
+		ResultState: domain.ResultIndeterminate, CertificationState: domain.CertUncertified, FailureCode: &code}, nil
 }
 
 type failingFetcher struct{ err error }
@@ -120,30 +131,49 @@ func TestAuthorization_LegacyRecordIsRefused(t *testing.T) {
 	}
 }
 
-// A1: StartRun authorizes against the definition's entity, and a population
-// that cannot be proven complete starts no run.
-func TestStartRun_SourceFailureStartsNoRun(t *testing.T) {
+// A1/A6: StartRun authorizes against the definition's entity; a population
+// that cannot be proven complete freezes nothing but is recorded as a Failed /
+// INDETERMINATE run with the failure's code, returned with 502 or 422.
+func TestStartRun_SourceFailureRecordsFailedRun(t *testing.T) {
 	for name, tc := range map[string]struct {
 		err  error
 		code int
+		want domain.FailureCode
 	}{
-		"source down":      {source.ErrSourceUnavailable, http.StatusBadGateway},
-		"no declared tots": {source.ErrSourceInconsistent, http.StatusUnprocessableEntity},
-		"unregistered":     {source.ErrSourceUnknown, http.StatusUnprocessableEntity},
+		"source down":      {source.ErrSourceUnavailable, http.StatusBadGateway, domain.FailureSourceUnavailable},
+		"no declared tots": {source.ErrSourceInconsistent, http.StatusUnprocessableEntity, domain.FailureSourceInconsistent},
+		"unregistered":     {source.ErrSourceUnknown, http.StatusUnprocessableEntity, domain.FailureSourceUnregistered},
 	} {
 		az := &recordingAuthz{}
 		st := &fakeStore{def: definition()}
 		h := NewHandler(st, az, failingFetcher{err: tc.err}, zap.NewNop())
 		w := serve(h, http.MethodPost, "/v1/reconciliation/runs", `{"definition_id":"rdf_1","period_id":"2026-09"}`)
-		if w.Code != tc.code || !strings.Contains(w.Body.String(), "INDETERMINATE") {
+		if w.Code != tc.code || !strings.Contains(w.Body.String(), `"result_state":"INDETERMINATE"`) ||
+			!strings.Contains(w.Body.String(), `"rcr_failed"`) {
 			t.Fatalf("%s: %d %s", name, w.Code, w.Body)
 		}
 		if st.startCalls != 0 {
-			t.Fatalf("%s: a run was started on an unproven population", name)
+			t.Fatalf("%s: populations were frozen for an unproven population", name)
+		}
+		if len(st.failures) != 1 || st.failures[0].Code != tc.want || st.failures[0].Reason == "" {
+			t.Fatalf("%s: failed runs recorded %+v, want one with code %s", name, st.failures, tc.want)
 		}
 		if len(az.entities) != 1 || az.entities[0] != entityA {
 			t.Fatalf("%s: StartRun authorized against %v, want the definition's entity", name, az.entities)
 		}
+	}
+}
+
+// A request error — a scope value the run does not carry — is the caller's,
+// not a finding about the populations: 400, and no run of any kind.
+func TestStartRun_RequestErrorRecordsNothing(t *testing.T) {
+	def := definition()
+	def.Populations[0].Params = map[string]string{"as_of": "${scope.as_of}"}
+	st := &fakeStore{def: def}
+	h := NewHandler(st, &recordingAuthz{}, failingFetcher{err: source.ErrSourceUnavailable}, zap.NewNop())
+	w := serve(h, http.MethodPost, "/v1/reconciliation/runs", `{"definition_id":"rdf_1","period_id":"2026-09"}`)
+	if w.Code != http.StatusBadRequest || st.startCalls != 0 || len(st.failures) != 0 {
+		t.Fatalf("missing scope: %d %s, starts %d, failures %v", w.Code, w.Body, st.startCalls, st.failures)
 	}
 }
 

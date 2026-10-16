@@ -317,11 +317,41 @@ func ResolveScopeParams(spec domain.PopulationSpec, runScope map[string]string) 
 	return out, nil
 }
 
+// PopulationError is a population that was attempted and could not be proven
+// complete and reproducible. It is a finding about the run — the run is
+// recorded Failed / INDETERMINATE — unlike an error in the request itself (a
+// scope value the run does not carry), which starts nothing.
+type PopulationError struct {
+	Side string
+	Err  error
+}
+
+func (e *PopulationError) Error() string { return fmt.Sprintf("population %q: %v", e.Side, e.Err) }
+func (e *PopulationError) Unwrap() error { return e.Err }
+
+// Code is the run failure code for this error.
+func (e *PopulationError) Code() domain.FailureCode {
+	switch {
+	case errors.Is(e.Err, ErrSourceUnavailable):
+		return domain.FailureSourceUnavailable
+	case errors.Is(e.Err, ErrSourceUnknown):
+		return domain.FailureSourceUnregistered
+	case errors.Is(e.Err, ErrPopulationTooLarge):
+		return domain.FailurePopulationTooLarge
+	case errors.Is(e.Err, ErrSourceInconsistent):
+		return domain.FailureSourceInconsistent
+	default:
+		// An invalid record, an amount the definition's scale cannot represent,
+		// an overflowing total, a duplicate record id.
+		return domain.FailurePopulationInvalid
+	}
+}
+
 // BuildPopulations reads both of a definition's populations for one run and
 // converts them to frozen items at the definition's amount scale. Any failure
 // (an unreachable or unregistered source, a missing or moving watermark,
 // absent or untied declared totals, an invalid record, an amount the scale
-// cannot represent exactly) returns an error and nothing is frozen.
+// cannot represent exactly) returns a *PopulationError and nothing is frozen.
 func BuildPopulations(ctx context.Context, f Fetcher, def domain.ReconciliationDefinition, req domain.StartRunRequest,
 	scope Scope) ([]domain.FrozenPopulation, error) {
 	if err := domain.ValidatePopulationSpecs(def.Populations); err != nil {
@@ -335,11 +365,11 @@ func BuildPopulations(ctx context.Context, f Fetcher, def domain.ReconciliationD
 		}
 		got, err := f.Fetch(ctx, bound, scope)
 		if err != nil {
-			return nil, fmt.Errorf("population %q: %w", spec.Side, err)
+			return nil, &PopulationError{Side: spec.Side, Err: err}
 		}
 		fp, err := domain.NewFrozenPopulation(bound, got.Watermark, got.DeclaredRowCount, got.DeclaredTotals, got.Records, def.AmountScale)
 		if err != nil {
-			return nil, fmt.Errorf("population %q: %w", spec.Side, err)
+			return nil, &PopulationError{Side: spec.Side, Err: err}
 		}
 		out = append(out, fp)
 	}

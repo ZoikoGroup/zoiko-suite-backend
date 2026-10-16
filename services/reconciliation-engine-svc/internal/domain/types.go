@@ -142,35 +142,38 @@ const (
 	RunSuperseded     RunStatus = "Superseded"
 )
 
-// ReconciliationRun freezes the definition's rules onto itself at
-// StartRun time — ToleranceAmountMinorUnits/MaterialityAmountMinorUnits/
-// DefinitionVersion never change after that, and once Status reaches
-// Certified the row becomes fully immutable (see the "tolerance cannot
-// be widened during a certified run" acceptance test — enforced as a
-// strict subset of "nothing about a certified run can change at all").
+// ReconciliationRun freezes the definition's rules onto itself at StartRun
+// time — the tolerance policy, match key, balance dimensions, materiality and
+// definition version never change after that (B16). Status is the lifecycle;
+// ResultState and CertificationState are the other two state dimensions
+// (state.go). A Failed run carries why it could not determine a result.
 type ReconciliationRun struct {
-	RunID                       string            `json:"run_id"`
-	TenantID                    string            `json:"tenant_id"`
-	LegalEntityID               string            `json:"legal_entity_id"`
-	DefinitionID                string            `json:"definition_id"`
-	DefinitionVersion           int64             `json:"definition_version"`
-	Status                      RunStatus         `json:"status"`
-	PeriodID                    string            `json:"period_id,omitempty"`
-	Scope                       map[string]string `json:"scope,omitempty"`
-	AmountScale                 int               `json:"amount_scale"`
-	MatchKeyFields              []string          `json:"match_key_fields,omitempty"`
-	BalanceDimensions           []string          `json:"balance_dimensions,omitempty"`
-	Tolerance                   *TolerancePolicy  `json:"tolerance,omitempty"`
-	MaterialityAmountMinorUnits int64             `json:"materiality_amount_minor_units"`
-	SupersedesRunID             *string           `json:"supersedes_run_id,omitempty"`
-	SupersededByRunID           *string           `json:"superseded_by_run_id,omitempty"`
-	SupersededReason            *string           `json:"superseded_reason,omitempty"`
-	SupersededBy                *string           `json:"superseded_by,omitempty"`
-	SupersededAt                *time.Time        `json:"superseded_at,omitempty"`
-	StartedAt                   time.Time         `json:"started_at"`
-	StartedBy                   string            `json:"started_by"`
-	CertifiedAt                 *time.Time        `json:"certified_at,omitempty"`
-	CertifiedBy                 string            `json:"certified_by,omitempty"`
+	RunID                       string             `json:"run_id"`
+	TenantID                    string             `json:"tenant_id"`
+	LegalEntityID               string             `json:"legal_entity_id"`
+	DefinitionID                string             `json:"definition_id"`
+	DefinitionVersion           int64              `json:"definition_version"`
+	Status                      RunStatus          `json:"status"`
+	ResultState                 ResultState        `json:"result_state"`
+	CertificationState          CertificationState `json:"certification_state"`
+	FailureCode                 *FailureCode       `json:"failure_code,omitempty"`
+	FailureReason               *string            `json:"failure_reason,omitempty"`
+	PeriodID                    string             `json:"period_id,omitempty"`
+	Scope                       map[string]string  `json:"scope,omitempty"`
+	AmountScale                 int                `json:"amount_scale"`
+	MatchKeyFields              []string           `json:"match_key_fields,omitempty"`
+	BalanceDimensions           []string           `json:"balance_dimensions,omitempty"`
+	Tolerance                   *TolerancePolicy   `json:"tolerance,omitempty"`
+	MaterialityAmountMinorUnits int64              `json:"materiality_amount_minor_units"`
+	SupersedesRunID             *string            `json:"supersedes_run_id,omitempty"`
+	SupersededByRunID           *string            `json:"superseded_by_run_id,omitempty"`
+	SupersededReason            *string            `json:"superseded_reason,omitempty"`
+	SupersededBy                *string            `json:"superseded_by,omitempty"`
+	SupersededAt                *time.Time         `json:"superseded_at,omitempty"`
+	StartedAt                   time.Time          `json:"started_at"`
+	StartedBy                   string             `json:"started_by"`
+	CertifiedAt                 *time.Time         `json:"certified_at,omitempty"`
+	CertifiedBy                 string             `json:"certified_by,omitempty"`
 }
 
 // PopulationSnapshot is one frozen side of a run's comparison (e.g.
@@ -425,4 +428,7 @@ var (
 	ErrSupersedeDifferentDefinition = errorString("a replacement run must use the same definition as the run it supersedes")
 	ErrReplacementNotTerminal       = errorString("a replacement run must be Certified or Failed before it can supersede another run")
 	ErrReplacementAlreadyUsed       = errorString("the replacement run already supersedes another run")
+	ErrInvalidTransition            = errorString("invalid state transition")
+	ErrRunNotEvaluated              = errorString("the run has not been matched yet; match it before raising exceptions or certifying")
+	ErrRunNotEligible               = errorString("the run's result is not a MATCH and it is not eligible for certification")
 )

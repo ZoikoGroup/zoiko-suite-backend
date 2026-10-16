@@ -247,3 +247,50 @@ func TestBuildPopulations(t *testing.T) {
 		t.Fatalf("one side unavailable must refuse the whole run: %v", err)
 	}
 }
+
+type errFetcher struct{ err error }
+
+func (f errFetcher) Fetch(context.Context, domain.PopulationSpec, Scope) (*Fetched, error) {
+	return nil, f.err
+}
+
+// A population that was attempted and could not be proven is a
+// *PopulationError carrying the run's failure code; an error in the request
+// itself (a scope value the run does not carry) is not, and starts nothing.
+func TestBuildPopulations_ClassifiesFailures(t *testing.T) {
+	def := domain.ReconciliationDefinition{AmountScale: 2, Populations: []domain.PopulationSpec{
+		{Side: "AR", System: "ar", Population: "invoices"},
+		{Side: "GL", System: "gl", Population: "account-postings"},
+	}}
+	req := domain.StartRunRequest{DefinitionID: "d"}
+	for name, tc := range map[string]struct {
+		f    Fetcher
+		want domain.FailureCode
+	}{
+		"down":         {errFetcher{fmt.Errorf("%w: timeout", ErrSourceUnavailable)}, domain.FailureSourceUnavailable},
+		"unregistered": {errFetcher{fmt.Errorf("%w: %q", ErrSourceUnknown, "ar")}, domain.FailureSourceUnregistered},
+		"untied":       {errFetcher{fmt.Errorf("%w: totals", ErrSourceInconsistent)}, domain.FailureSourceInconsistent},
+		"too large":    {errFetcher{ErrPopulationTooLarge}, domain.FailurePopulationTooLarge},
+		"excess precision": {fakeFetcher{
+			"ar": {Records: []domain.PopulationRecord{{RecordID: "r1", Reference: "R", Amount: "1.505", Currency: "USD", Date: "2026-09-01"}},
+				Watermark: "w", DeclaredRowCount: 1, DeclaredTotals: map[string]string{"USD": "1.505"}},
+		}, domain.FailurePopulationInvalid},
+	} {
+		_, err := BuildPopulations(context.Background(), tc.f, def, req, scope)
+		var pe *PopulationError
+		if !errors.As(err, &pe) || pe.Code() != tc.want || pe.Side != "AR" {
+			t.Errorf("%s: %v, want a PopulationError on AR with code %s", name, err, tc.want)
+		}
+	}
+
+	scoped := def
+	scoped.Populations = []domain.PopulationSpec{
+		{Side: "AR", System: "ar", Population: "invoices", Params: map[string]string{"as_of": "${scope.as_of}"}},
+		def.Populations[1],
+	}
+	_, err := BuildPopulations(context.Background(), errFetcher{ErrSourceUnavailable}, scoped, req, scope)
+	var pe *PopulationError
+	if errors.As(err, &pe) || !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("a missing run scope is a request error, not a population finding: %v", err)
+	}
+}

@@ -20,11 +20,14 @@ from their owning services through the control population contract, with
 watermarks, declared totals and hashes pinned on the frozen snapshot (B7), and
 definitions and runs carry a legal entity (B9). Matching honours the declared
 composite key, compares currency and dates, and checks per-currency balance
-for the population and every declared dimension (B13–B15). Still missing:
-a result dimension and exception governance (A6, A7), materiality (A4),
-rounding and business-day tolerance (A5). Defects fixed: B1–B4; Stage 1
-closed A1, A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
-(B13–B17).
+for the population and every declared dimension (B13–B15). A run carries
+three state dimensions — lifecycle, result and certification — with an
+append-only history, and a run that cannot prove its populations is recorded
+Failed / INDETERMINATE (B18–B19). Still missing: exception governance (A7),
+materiality (A4), rounding and business-day tolerance (A5), and any defined
+meaning for a PARTIAL result (A16). Defects fixed: B1–B4; Stage 1 closed A1,
+A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
+(B13–B17); Stage 3a closed A6 (B18–B20).
 
 ## A. Not implemented / weaker than the spec
 
@@ -43,11 +46,8 @@ closed A1, A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   and tax services; they are not to be hardcoded here. §10's "expected clearing
   date" for a timing difference needs a reconciling-item state on the
   exception, which belongs with A7.
-- **A6. No result dimension.** DQC-03 defines MATCH / VARIANCE /
-  INDETERMINATE / PARTIAL / SUPERSEDED; ZS-CONTROL-001 §7 separates lifecycle,
-  result, exception and certification. Here a single `status` carries
-  everything, there is no INDETERMINATE or PARTIAL outcome, and the `Failed`
-  status in the DATA-07 lifecycle is never set by any code path.
+- **A6. Closed** — three state dimensions, transition history, reachable
+  Failed / INDETERMINATE; see B18–B19.
 - **A7. Exceptions have no governance fields or lifecycle.** An exception has
   free-text `reason`, `amount`, `Open/Resolved`. Missing per ZS-CONTROL-001
   Invariant 7 and §21: owner, severity, category/assertion, due date/SLA,
@@ -55,7 +55,11 @@ closed A1, A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   consumes its item; there is no waiver/accepted-risk path (DQC-05 "accepted
   risk never changes a FAIL into PASS"). An item that is genuinely unmatched
   because the source is wrong can therefore never be closed in its run: the
-  run can only be superseded.
+  run can only be superseded. The same holds for a BALANCE exception (B13)
+  and for an exception raised by `RaiseException` on an item that was already
+  matched — the only items it accepts, since an unmatched item already has an
+  automatic exception: a manual match cannot resolve it, because the item is
+  matched.
 - **A8. Reperform does nothing useful.** `Reperform` re-runs auto-matching on
   items with neither a match nor an exception — after the first `Match` there
   are none, so it only changes the status to `Reperformed`. Because
@@ -98,6 +102,26 @@ closed A1, A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   detail. Until it is decided, a currency declares exactly one kind (B15);
   declaring both is refused. Once decided, the change is a `combine` field on
   the currency tolerance (`EITHER` / `BOTH`), versioned with the policy.
+- **A16. What makes a run PARTIAL is unspecified.** Text checked:
+  ZS-SVC-Z-001 DQC-03 result table "PARTIAL — Only defined subset matched;
+  never presented as full population certification"; INV-26 "A partial
+  reconciliation cannot be represented as full certification"; NP-26 "Partial
+  population labeled full match — Must fail safe; preserve evidence; block or
+  isolate affected certification"; the reconciliation state row "NOT_RUN /
+  MATCH / VARIANCE / INDETERMINATE" (which omits PARTIAL). None says how a
+  subset is *defined* — a run scope narrower than the definition's population,
+  a declared exclusion list (ZS-CONTROL-001 names exclusions on a snapshot),
+  or a source that declares itself incomplete — nor whether a PARTIAL result
+  can carry a certification of its own subset ("cannot be represented as
+  *full* certification" implies some narrower certification may exist). This
+  service has no subset concept: every population is proven complete against
+  the source's declared totals or the run fails (B7, B19). So PARTIAL is in
+  the result vocabulary and the column's CHECK, but neither the domain nor the
+  lifecycle trigger lets a run enter it, and a PARTIAL could never be ELIGIBLE
+  or CERTIFIED (only a MATCH can). Deciding the subset model is a control-design
+  question for the definition owner; once decided it is a definition field
+  (the declared subset), a snapshot field (what was excluded and why) and an
+  edge into PARTIAL.
 
 ## B. Interpretations and additions (decisions a reviewer may want to reverse)
 
@@ -170,11 +194,10 @@ closed A1, A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   anyway. If a third consumer appears, the client is a candidate for
   `_contract/` plus a rollout step, done as its own change.
 
-  *Interim failure posture.* A population that cannot be proven complete
-  starts **no run**: the request answers 502 (source unreachable) or 422
-  (anything else) with `"result": "INDETERMINATE"` and the reason, and nothing
-  is frozen. A durable Failed/INDETERMINATE run needs the result dimension
-  (A6). The read runs on a context detached from the request (3-minute bound;
+  *Failure posture.* A population that cannot be proven complete freezes
+  nothing. Stage 1 started no run at all; since Stage 3a (B19) the attempt is
+  recorded as a Failed / INDETERMINATE run, answered with 502 (source
+  unreachable) or 422 (anything else). The read runs on a context detached from the request (3-minute bound;
   the server's write timeout is 4 minutes), so a client that disconnects does
   not abandon a run that was about to freeze. The Idempotency-Key is checked
   *before* any source is read, so a retry of a run that already started
@@ -325,3 +348,81 @@ closed A1, A10, A13 and A14 (B7–B12); Stage 2 closed A2 and A3 and most of A5
   expectations because the behaviour is now stricter: an empty side now also
   raises a population-level BALANCE exception. Migrations 000004–000005 were
   round-tripped, and the 000005 down refusal was exercised.
+- **B18. Three state dimensions (closes A6).** Copied from
+  financial-control-svc's state model, with this service's own vocabularies:
+  *lifecycle* stays DATA-07's `status` (Planned → Running → ExceptionsOpen →
+  Reperformed → Certified / Failed, plus Superseded) rather than ZS-CONTROL-001
+  §7's longer list, because DATA-07 is this service's contract; *result* is
+  DQC-03's `NOT_RUN / MATCH / VARIANCE / INDETERMINATE / PARTIAL /
+  SUPERSEDED`; *certification* is ZS-SVC-Z-001's `UNCERTIFIED / ELIGIBLE /
+  CERTIFIED / SUPERSEDED` (REVOKED is left out: revocation is A12, out of
+  scope, and adding a state nothing can reach would only pretend). Rules
+  (`internal/domain/state.go`, enforced again by migration 000006's CHECK and
+  lifecycle trigger): a run is created Planned / NOT_RUN / UNCERTIFIED; no
+  result before matching; an open run's result is MATCH with no open
+  exception and VARIANCE otherwise, re-evaluated in the same transaction as
+  every match, manual match, raised exception and reperformance; ELIGIBLE
+  exactly while the result is MATCH; Certify requires ELIGIBLE (so a VARIANCE,
+  INDETERMINATE or PARTIAL can never be certified — INV-05, INV-26); Certified
+  ⇔ CERTIFIED; ExceptionsOpen ⇒ VARIANCE; INDETERMINATE can only become
+  SUPERSEDED (INV-05); a result is never reset to NOT_RUN; supersession sets
+  the result (and a certification) to SUPERSEDED. Every change to any
+  dimension appends a row to `reconciliation_run_transitions` (append-only,
+  tenant RLS), read at `GET /runs/{id}/transitions`; superseding a run
+  therefore keeps its earlier result in that history and, if certified, in
+  its sealed certification, whose manifest now also records the result
+  ("earlier evidence remains immutable"). Lifecycle edges are financial-control
+  style: a closed table, one `advanceRun` that validates all three dimensions
+  and writes the history. Two consequences a reader may want to reverse:
+  `RaiseException` and `Certify` on a Planned run are refused
+  (`ErrRunNotEvaluated`, 409) — before, `RaiseException` there tried
+  Planned → ExceptionsOpen, which the trigger refused with a raw database error;
+  and Reperform with exceptions still open stays Reperformed with a VARIANCE
+  (A8 is unchanged). Existing rows were backfilled from their status and open
+  exceptions, recorded as transitions by `migration:000006`; the migration
+  refuses to run if a Failed run exists, because no code path could set
+  Failed before it and any such row was written by hand.
+- **B19. A run that cannot prove its populations is recorded Failed /
+  INDETERMINATE.** Scenario 09 ("outage ⇒ Indeterminate/Failed, never Pass")
+  and DATA-07's Failed state. When either population is unreachable,
+  unregistered, inconsistent with its declared totals, too large, or contains a
+  record or amount that cannot be frozen exactly (`source.PopulationError`),
+  StartRun records a run pinned to the definition version it attempted, with
+  no frozen population, lifecycle Failed, result INDETERMINATE, certification
+  UNCERTIFIED, a stable `failure_code` (SOURCE_UNAVAILABLE,
+  SOURCE_UNREGISTERED, SOURCE_INCONSISTENT, POPULATION_TOO_LARGE,
+  POPULATION_INVALID) and the reason, and emits `CONTROL.ReconciliationFailed`
+  (the name mirrors financial-control-svc's run-failed event; DATA-07 lists no
+  failure event). The response keeps Stage 1's status codes — 502 for an
+  unreachable source, 422 otherwise — now with the run in the body, so a
+  client that treated those codes as failure still does. The Idempotency-Key
+  is claimed by the failed run: a retry with the same key replays it (200 with
+  its id, like every replay); a new attempt uses a new key and is a new run,
+  which can supersede the failed one once it is Certified. Failure details are
+  written once, on entering Failed, and kept through supersession. Not a run:
+  an error in the request itself (a scope value the run does not carry — 400),
+  a definition that changed during the read (409), or a failure to write the
+  failed run. The population write after the read now has its own 30-second
+  detached budget, so a read that used the whole 3-minute bound can still be
+  recorded.
+- **B20. Verification of B18–B19.** Unit tests in `internal/domain` for every
+  lifecycle edge and cross-dimension invariant, the result and certification
+  edges (INDETERMINATE → MATCH, reset to NOT_RUN and entering PARTIAL
+  refused), and failure validation; `internal/source` for the failure-code
+  classification and for a scope error not being a population failure;
+  handler tests that a source failure records exactly one failed run with the
+  right code and status and freezes nothing, and that a request error records
+  nothing. Integration tests: a clean run through certification and
+  supersession with its exact transition history; a VARIANCE refused for
+  certification and re-evaluated to MATCH by a manual match; a failed run that
+  is INDETERMINATE, pinned, unfrozen, closed to Match and Certify, replayed
+  under its key and superseded by a certified run; RaiseException and Certify
+  refused on a Planned run; direct SQL refused for coercing INDETERMINATE,
+  certifying a VARIANCE, certifying outside the command, entering PARTIAL,
+  resetting a result, rewriting a failure, creating a run in a later state and
+  editing or deleting history; transition history tenant-isolated. Migration
+  000006 was round-tripped on a database holding runs in every status, the
+  backfill checked per status (Running with nothing open → MATCH / ELIGIBLE,
+  Reperformed and ExceptionsOpen with an open exception → VARIANCE /
+  UNCERTIFIED, Certified, Superseded, Planned), and both refusals exercised
+  (down with live history; up with a hand-made Failed row).

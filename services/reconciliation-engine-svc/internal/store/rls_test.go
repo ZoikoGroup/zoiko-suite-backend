@@ -45,6 +45,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, _ = pool.Exec(ctx, `
+		DROP TABLE IF EXISTS reconciliation_run_transitions CASCADE;
 		DROP TABLE IF EXISTS outbox_events CASCADE;
 		DROP TABLE IF EXISTS idempotency_keys CASCADE;
 		DROP TABLE IF EXISTS certifications CASCADE;
@@ -57,6 +58,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 		DROP FUNCTION IF EXISTS enforce_exception_resolution() CASCADE;
 		DROP FUNCTION IF EXISTS reject_immutable_row() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_run_lifecycle() CASCADE;
+		DROP FUNCTION IF EXISTS enforce_run_creation() CASCADE;
 		DROP FUNCTION IF EXISTS enforce_definition_versioning() CASCADE;`)
 
 	_, thisFile, _, _ := runtime.Caller(0)
