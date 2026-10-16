@@ -171,6 +171,8 @@ func NewMetrics(serviceName string) *Metrics {
 		OutcomeAllowed, OutcomeNoToken, OutcomeInvalidToken, OutcomeIncompleteClaims,
 		OutcomeTenantHostnameMismatch, OutcomeCartaBlocked,
 		OutcomeTenantContextDenied, OutcomeTenantContextUnresolved,
+		OutcomeRateLimited, OutcomeOverloaded, OutcomeRequestTooLarge, OutcomeRequestEncodingRefused,
+		OutcomeMalformedRequest, OutcomeVersionUnsupported,
 	} {
 		m.VerifyDecisionsTotal.WithLabelValues(outcome)
 	}
@@ -214,6 +216,21 @@ const (
 	// OutcomeTenantContextUnresolved — the registry could not be reached, so no
 	// decision exists. Fail-closed, and an outage rather than a refusal.
 	OutcomeTenantContextUnresolved = "tenant_context_unresolved"
+	// OutcomeRateLimited — a client or tenant quota was exhausted (INT-RATE-007).
+	OutcomeRateLimited = "rate_limited"
+	// OutcomeOverloaded — the gateway shed the request above its concurrency
+	// ceiling (INT-BP-016). Distinct from a refusal: nothing about the caller
+	// was judged.
+	OutcomeOverloaded = "overloaded"
+	// OutcomeRequestTooLarge — a declared body length above the admission cap.
+	OutcomeRequestTooLarge = "request_too_large"
+	// OutcomeRequestEncodingRefused — a compressed request body that is not
+	// accepted (decompression-bomb protection).
+	OutcomeRequestEncodingRefused = "request_encoding_refused"
+	// OutcomeMalformedRequest — an unreadable length or request URI.
+	OutcomeMalformedRequest = "malformed_request"
+	// OutcomeVersionUnsupported — an API version that is not routed (INT-VERS-012).
+	OutcomeVersionUnsupported = "version_unsupported"
 )
 
 // ── handler.DomainMetrics implementation ─────────────────────────────────────

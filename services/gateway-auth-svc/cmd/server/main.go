@@ -15,6 +15,8 @@ import (
 
 	"go.uber.org/zap"
 
+	"zoiko.io/gateway-auth-svc/internal/admin"
+	"zoiko.io/gateway-auth-svc/internal/admission"
 	"zoiko.io/gateway-auth-svc/internal/carta"
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/handler"
@@ -102,8 +104,61 @@ func main() {
 			"resolution; tenant operability and cross-tenant entity ownership are not checked at the gateway")
 	}
 
-	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log).UseMetrics(metrics)
+	// INT-01 admission: quota, request-shape and version admission, overload
+	// shedding, and the bounded record of refusals. All in-process; none adds a
+	// dependency to the verification path.
+	adm := handler.Admission{
+		Policy: admission.Policy{
+			MaxBodyBytes:       cfg.MaxBodyBytes,
+			AllowedEncodings:   cfg.AllowedRequestEncodings,
+			MaxCompressedBytes: cfg.MaxCompressedBodyBytes,
+			SupportedVersions:  cfg.SupportedAPIVersions,
+		},
+		IPLimiter:     admission.NewLimiter(cfg.RateIPPerSecond, cfg.RateIPBurst, 0, nil),
+		TenantLimiter: admission.NewLimiter(cfg.RateTenantPerSecond, cfg.RateTenantBurst, 0, nil),
+		Gate:          admission.NewGate(cfg.MaxInFlight),
+		Recorder:      admission.NewRecorder(cfg.DecisionWindow, cfg.AbuseThresholdPerMinute, nil),
+	}
+	log.Info("gateway admission configured",
+		zap.Int64("max_body_bytes", cfg.MaxBodyBytes),
+		zap.Strings("allowed_request_encodings", cfg.AllowedRequestEncodings),
+		zap.Strings("supported_api_versions", cfg.SupportedAPIVersions),
+		zap.Float64("rate_ip_per_second", cfg.RateIPPerSecond),
+		zap.Float64("rate_tenant_per_second", cfg.RateTenantPerSecond),
+		zap.Int("max_in_flight", cfg.MaxInFlight))
+	if !adm.IPLimiter.Enabled() || !adm.TenantLimiter.Enabled() || cfg.MaxInFlight == 0 {
+		log.Warn("a gateway admission protection is DISABLED by configuration (a limit of 0)")
+	}
+
+	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log).UseMetrics(metrics).UseAdmission(adm)
 	r := router.New(h, jwksClient, metrics)
+
+	// Read-only decision queries: a second port of this same service, served
+	// only when both an address and a token file are configured (config.Load
+	// refuses one without the other). The token comes from a file.
+	var adminSrv *http.Server
+	if cfg.AdminAddr != "" {
+		token, err := admin.LoadToken(cfg.AdminTokenFile)
+		if err != nil {
+			log.Fatal("admin listener: cannot load the token", zap.Error(err))
+		}
+		handlerAdmin, err := admin.New(admin.Source{
+			Recorder: adm.Recorder, IPLimiter: adm.IPLimiter, TenantLimiter: adm.TenantLimiter, Policy: adm.Policy,
+		}, token)
+		if err != nil {
+			log.Fatal("admin listener: cannot start", zap.Error(err))
+		}
+		adminSrv = &http.Server{
+			Addr: cfg.AdminAddr, Handler: handlerAdmin,
+			ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
+		}
+		go func() {
+			log.Info("gateway decision query listener starting", zap.String("addr", cfg.AdminAddr))
+			if err := adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatal("admin listener error", zap.Error(err))
+			}
+		}()
+	}
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
@@ -130,6 +185,11 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	if adminSrv != nil {
+		if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+			log.Error("admin listener shutdown failed", zap.Error(err))
+		}
 	}
 	log.Info("gateway-auth-svc stopped")
 }

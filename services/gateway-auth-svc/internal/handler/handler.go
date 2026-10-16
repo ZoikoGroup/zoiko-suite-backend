@@ -12,9 +12,11 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/gateway-auth-svc/internal/admission"
 	"zoiko.io/gateway-auth-svc/internal/carta"
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
+	"zoiko.io/gateway-auth-svc/internal/problem"
 	"zoiko.io/gateway-auth-svc/internal/siem"
 	"zoiko.io/gateway-auth-svc/internal/tenantctx"
 )
@@ -26,6 +28,12 @@ type Handler struct {
 	siem   *siem.Client
 	tenant *tenantctx.Resolver
 	log    *zap.Logger
+
+	// adm and rec are the INT-01 admission controls and the bounded record of
+	// refusals. rec is never nil; adm is the zero value (admit everything)
+	// until UseAdmission.
+	adm Admission
+	rec *admission.Recorder
 
 	// metrics is never nil — New installs nopMetrics.
 	metrics DomainMetrics
@@ -86,6 +94,7 @@ func New(
 		tenant:  tenantResolver,
 		log:     log,
 		metrics: nopMetrics{},
+		rec:     admission.NewRecorder(1024, 0, nil),
 	}
 }
 
@@ -152,9 +161,16 @@ const (
 // other status is returned to the client verbatim — fail-closed, the
 // protected backend never sees an unverified request.
 func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
+	rc := h.requestContext(r)
+	release, admitted := h.admit(w, r, rc)
+	if !admitted {
+		return
+	}
+	defer release()
+
 	rawToken, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
-		h.deny(w, "missing bearer token", outcomeNoToken)
+		h.refuseAuth(w, r, rc, outcomeNoToken, "a bearer credential is required")
 		return
 	}
 
@@ -191,7 +207,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			zap.Error(err),
 			zap.String("forwarded_uri", r.Header.Get("X-Forwarded-Uri")),
 		)
-		h.deny(w, "invalid token", outcomeInvalidToken)
+		h.refuseAuth(w, r, rc, outcomeInvalidToken, "the credential could not be verified")
 		return
 	}
 
@@ -205,7 +221,16 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 			zap.String("tenant_id", claims.TenantID),
 			zap.String("forwarded_uri", r.Header.Get("X-Forwarded-Uri")),
 		)
-		h.deny(w, "invalid token", outcomeIncompleteClaims)
+		h.refuseAuth(w, r, rc, outcomeIncompleteClaims, "the credential could not be verified")
+		return
+	}
+
+	// The token has named a tenant and a principal: from here refusals are
+	// evidenced against them, and the tenant quota applies. It runs before the
+	// CARTA and registry calls so a tenant over its quota cannot spend those
+	// services' capacity.
+	rc.tenantID, rc.principalID = claims.TenantID, claims.Principal.PrincipalID
+	if !h.admitTenant(w, r, rc) {
 		return
 	}
 
@@ -247,7 +272,10 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		h.siem.Stream(ctx, claims.TenantID, "auth.tenant_hostname_mismatch", siem.SeverityCritical,
 			"token for tenant "+claims.TenantID+" presented against hostname-resolved tenant "+resolvedTenantID+
 				" by principal "+claims.Principal.PrincipalID)
-		h.denyMismatch(w, "token tenant does not match the hostname-resolved tenant")
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeTenantHostnameMismatch, code: problem.CodeContextInvalid, status: http.StatusForbidden,
+			detail: "token tenant does not match the hostname-resolved tenant", severity: siem.SeverityCritical, dedicated: true,
+		})
 		return
 	}
 
@@ -292,8 +320,11 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		// value carta-svc adds later, or an empty one from a reply that
 		// parsed but carried no decision — and CARTA having answered is not
 		// the unreachable case that Evaluate deliberately fails open on.
-		h.metrics.VerifyDecision(outcomeCartaBlocked)
-		h.denyCarta(w, "access denied by continuous risk assessment", string(assessment.Decision))
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeCartaBlocked, code: problem.CodeAuthDenied, status: http.StatusForbidden,
+			detail: "access denied by continuous risk assessment", severity: severityFor(assessment.Decision), dedicated: true,
+			headers: [][2]string{{"X-Carta-Decision", string(assessment.Decision)}},
+		})
 		return
 	}
 
@@ -306,7 +337,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	resolved, err := h.tenant.Resolve(ctx,
 		claims.TenantID, claims.LegalEntityID, materialWrite(originalMethod(r)))
 	if err != nil {
-		h.denyResolution(w, r, claims, err)
+		h.denyResolution(w, r, rc, claims, err)
 		return
 	}
 
@@ -350,6 +381,7 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.metrics.VerifyDecision(outcomeAllowed)
+	h.rec.Allowed(claims.TenantID)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -431,7 +463,7 @@ func materialWrite(method string) bool {
 // its own — and re-authenticating will not change it, so 403. ErrUnavailable is
 // the absence of a decision; answering 403 would tell the caller it had been
 // refused when in fact nothing could be determined, so 503 with Retry-After.
-func (h *Handler) denyResolution(w http.ResponseWriter, r *http.Request, claims *envelopeClaims, err error) {
+func (h *Handler) denyResolution(w http.ResponseWriter, r *http.Request, rc *reqCtx, claims *envelopeClaims, err error) {
 	h.log.Warn("tenant context resolution failed",
 		zap.Error(err),
 		zap.String("principal_id", claims.Principal.PrincipalID),
@@ -448,25 +480,25 @@ func (h *Handler) denyResolution(w http.ResponseWriter, r *http.Request, claims 
 	// and have different fixes.
 	if errors.Is(err, tenantctx.ErrUnavailable) {
 		h.metrics.TenantContext("unavailable")
-		h.metrics.VerifyDecision(outcomeTenantContextUnresolved)
 		// Fail closed, and say why: no fallback to a global or default tenant,
 		// and no proceeding on a context nobody could confirm.
-		w.Header().Set("X-Tenant-Context", "unresolved")
-		w.Header().Set(denialReasonHeader, outcomeTenantContextUnresolved)
-		w.Header().Set("Retry-After", "5")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("tenant context could not be resolved"))
+		h.refuse(w, r, rc, refusal{
+			outcome: outcomeTenantContextUnresolved, code: problem.CodeContextInvalid,
+			status: http.StatusServiceUnavailable, detail: "tenant context could not be resolved",
+			retryable: true, retryAfter: 5, severity: siem.SeverityHigh,
+			headers: [][2]string{{"X-Tenant-Context", "unresolved"}},
+		})
 		return
 	}
 
 	h.metrics.TenantContext("denied")
-	h.metrics.VerifyDecision(outcomeTenantContextDenied)
 	h.siem.Stream(r.Context(), claims.TenantID, "tenant_context.denied", siem.SeverityHigh,
 		"tenant context denied for principal "+claims.Principal.PrincipalID)
-	w.Header().Set("X-Tenant-Context", "denied")
-	w.Header().Set(denialReasonHeader, outcomeTenantContextDenied)
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte("tenant context denied"))
+	h.refuse(w, r, rc, refusal{
+		outcome: outcomeTenantContextDenied, code: problem.CodeContextInvalid, status: http.StatusForbidden,
+		detail: "tenant context denied", severity: siem.SeverityHigh, dedicated: true,
+		headers: [][2]string{{"X-Tenant-Context", "denied"}},
+	})
 }
 
 func severityFor(d carta.Decision) siem.Severity {
@@ -533,6 +565,8 @@ const (
 	outcomeCartaBlocked            = "carta_blocked"
 	outcomeTenantContextDenied     = "tenant_context_denied"
 	outcomeTenantContextUnresolved = "tenant_context_unresolved"
+	outcomeRateLimited             = "rate_limited"
+	outcomeOverloaded              = "overloaded"
 )
 
 // denialReasonHeader names why a request was refused, on every refusal.
@@ -541,35 +575,3 @@ const (
 // status, body and headers — so this reaches the caller and is what lets a
 // console tell the gateway's own refusals apart from the backend's.
 const denialReasonHeader = "X-Auth-Denial-Reason"
-
-// deny refuses with 401 and names the reason.
-func (h *Handler) deny(w http.ResponseWriter, msg, outcome string) {
-	h.metrics.VerifyDecision(outcome)
-	w.Header().Set(denialReasonHeader, outcome)
-	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = w.Write([]byte(msg))
-}
-
-// denyCarta refuses with 403 because continuous risk assessment said so.
-//
-// X-Carta-Decision is set here and ONLY here. It used to be set by a shared
-// helper that the tenant/hostname mismatch also called, so a token-spoofing
-// rejection was reported to the caller as a decision the risk engine had made
-// — attributing a refusal to a component that had not been consulted, and
-// sending anyone reading the header to carta-svc's logs to look for a decision
-// that was never there.
-func (h *Handler) denyCarta(w http.ResponseWriter, msg, decision string) {
-	w.Header().Set("X-Carta-Decision", decision)
-	w.Header().Set(denialReasonHeader, outcomeCartaBlocked)
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte(msg))
-}
-
-// denyMismatch refuses with 403 because the token's tenant is not the tenant
-// the caller's hostname resolved to.
-func (h *Handler) denyMismatch(w http.ResponseWriter, msg string) {
-	h.metrics.VerifyDecision(outcomeTenantHostnameMismatch)
-	w.Header().Set(denialReasonHeader, outcomeTenantHostnameMismatch)
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte(msg))
-}
