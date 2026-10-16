@@ -269,9 +269,8 @@ func (p *Publisher) PublishSessionInvalidated(
 		"invalidation_reason": reason,
 		"correlation_id":      correlationID,
 	}
-	if err := p.emit(ctx, EventSessionInvalidated, "", "", principalID, correlationID, sessionContextID, payload); err != nil {
-		return err
-	}
+	// ZS-IAM-001 §23 canonical name. The legacy session.invalidated name
+	// retired once all consumers subscribed to identity.session.revoked.
 	return p.emit(ctx, EventSessionRevoked, "", "", principalID, correlationID, sessionContextID, payload)
 }
 
@@ -310,9 +309,8 @@ func (p *Publisher) PublishPrincipalStatusChanged(
 		"actor":          actorID,
 		"correlation_id": correlationID,
 	}
-	if err := p.emit(ctx, EventPrincipalStatusChanged, tenantID, "", actorID, correlationID, principalID, payload); err != nil {
-		return err
-	}
+	// ZS-IAM-001 canonical names. The legacy principal.status.changed name
+	// retired once all consumers subscribed to identity.subject.*.
 	switch newStatus {
 	case domain.PrincipalStatusDisabled, domain.PrincipalStatusSuspended:
 		return p.emit(ctx, EventSubjectDisabled, tenantID, "", actorID, correlationID, principalID, payload)

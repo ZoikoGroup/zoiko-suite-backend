@@ -124,11 +124,13 @@ func writeViolation(w http.ResponseWriter, err *ValidationError) {
 	w.WriteHeader(StatusFor(err))
 	_ = json.NewEncoder(w).Encode(struct {
 		Error      string      `json:"error"`
+		ErrorCode  string      `json:"error_code"`
 		Detail     string      `json:"detail"`
 		Service    string      `json:"service,omitempty"`
 		Violations []Violation `json:"violations"`
 	}{
 		Error:      "envelope_incomplete",
+		ErrorCode:  "CONTEXT_INVALID", // ORG §3 typed error: trusted context not established
 		Detail:     err.Error(),
 		Service:    err.Service,
 		Violations: err.Violations,

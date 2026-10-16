@@ -193,7 +193,7 @@ func main() {
 	// the tenant scoping — a Redis session key names no owner, so the handlers
 	// cannot enforce isolation on the cache alone.
 	redisSessions := session.NewCache(rdb, cfg.Redis.SessionTTLSeconds)
-	sessionCache := session.NewDurableCache(redisSessions, principalRepo, log)
+	sessionCache := session.NewDurableCache(redisSessions, principalRepo, log, cfg.MaxSessionsPerPrincipal)
 
 	// ── Kafka consumer ────────────────────────────────────────────────────
 	// Revocation events reach the estate through here: authority.revoked,

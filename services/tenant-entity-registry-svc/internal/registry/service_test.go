@@ -957,24 +957,30 @@ func TestMutationsRequireVerifiedPrincipal(t *testing.T) {
 
 // recordingAuthZ captures what the service asked authorization-svc, so the
 // tests can prove the decision subject is the real caller and the scope is
-// the caller's own tenant — not values taken from the request body.
+// the envelope's legal entity — not values taken from the request body, and
+// never the tenant id, which authorization-svc refuses in the entity
+// position. err lets a test drive the denied-or-unavailable paths.
 type recordingAuthZ struct {
 	principalID string
 	scopeID     string
 	resource    string
 	action      string
 	calls       int
+	err         error
 }
 
 func (a *recordingAuthZ) Authorize(_ context.Context, principalID, scopeID, resource, action string) error {
 	a.principalID, a.scopeID, a.resource, a.action = principalID, scopeID, resource, action
 	a.calls++
-	return nil
+	return a.err
 }
 
-// TestAuthorizeReceivesVerifiedPrincipalAndTenantScope pins the two values
-// that decide who a mutation is evaluated for.
-func TestAuthorizeReceivesVerifiedPrincipalAndTenantScope(t *testing.T) {
+// TestAuthorizeReceivesVerifiedPrincipalAndEnvelopeEntity pins the two values
+// that decide who a mutation is evaluated for: the verified principal, and the
+// legal entity the envelope names. The tenant id must never travel in the
+// entity position — authorization-svc answers tenant_scope_mismatch for one,
+// which this client fails closed on as 503.
+func TestAuthorizeReceivesVerifiedPrincipalAndEnvelopeEntity(t *testing.T) {
 	ms := newMemStore()
 	rec := &recordingAuthZ{}
 	svc := newSvc(t, ms, rec, acceptAllJurisd{})
@@ -982,14 +988,14 @@ func TestAuthorizeReceivesVerifiedPrincipalAndTenantScope(t *testing.T) {
 	entityID := "ent-scope-test"
 	seedEntity(ms, entityID)
 
-	ctx := domain.WithTenant(authCtx(), "ten-verified")
+	ctx := domain.WithLegalEntity(domain.WithTenant(authCtx(), "ten-verified"), "le-envelope-7")
 	newName := "Updated"
 	_, err := svc.UpdateEntity(ctx, entityID, domain.UpdateEntityRequest{TradingName: &newName})
 	require.NoError(t, err)
 
 	require.Equal(t, 1, rec.calls)
 	assert.Equal(t, testPrincipal, rec.principalID, "decision subject must be the verified principal")
-	assert.Equal(t, "ten-verified", rec.scopeID, "decision scope must be the caller's verified tenant")
+	assert.Equal(t, "le-envelope-7", rec.scopeID, "decision scope must be the envelope's legal entity")
 }
 
 // TestProvisionTenantUsesPlatformScope — tenant creation is the one mutation

@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"go.uber.org/zap"
@@ -76,14 +77,15 @@ type HotCache interface {
 }
 
 type DurableCache struct {
-	cache HotCache
-	store ContextStore
-	log   *zap.Logger
+	cache               HotCache
+	store               ContextStore
+	log                 *zap.Logger
+	maxSessionsPerPrincipal int
 }
 
 // NewDurableCache wraps a Redis cache with a durable evidence store.
-func NewDurableCache(cache HotCache, store ContextStore, log *zap.Logger) *DurableCache {
-	return &DurableCache{cache: cache, store: store, log: log}
+func NewDurableCache(cache HotCache, store ContextStore, log *zap.Logger, maxSessionsPerPrincipal int) *DurableCache {
+	return &DurableCache{cache: cache, store: store, log: log, maxSessionsPerPrincipal: maxSessionsPerPrincipal}
 }
 
 // *Cache is the production HotCache. Asserted at compile time so a signature
@@ -188,7 +190,65 @@ func (d *DurableCache) PersistSessionContextWithEvent(
 			zap.String("session_context_id", sc.SessionContextID),
 			zap.Error(err))
 	}
+
+	// ZS-IAM-001 §15 session-concurrency cap: invalidate the principal's
+	// oldest live sessions when the new one would exceed the configured limit.
+	if d.maxSessionsPerPrincipal > 0 {
+		if err := d.enforcePrincipalSessionCap(ctx, sc.PrincipalID, sc.TenantID); err != nil {
+			d.log.Warn("session-concurrency cap enforcement failed — new session still issued",
+				zap.String("principal_id", sc.PrincipalID),
+				zap.String("tenant_id", sc.TenantID),
+				zap.Int("max_sessions", d.maxSessionsPerPrincipal),
+				zap.Error(err))
+		}
+	}
 	return nil
+}
+
+// enforcePrincipalSessionCap revokes the principal's oldest live sessions
+// until at most maxSessionsPerPrincipal remain. It reads live sessions from
+// the durable store (the complete source) and invalidates by created_at,
+// oldest first.
+func (d *DurableCache) enforcePrincipalSessionCap(ctx context.Context, principalID, tenantID string) error {
+	now := time.Now().UTC()
+	ids, err := d.store.FindLiveSessionIDsForPrincipal(ctx, principalID, tenantID, now)
+	if err != nil {
+		return fmt.Errorf("find live sessions: %w", err)
+	}
+	if len(ids) <= d.maxSessionsPerPrincipal {
+		return nil
+	}
+	// Sort by session id (ULID, lexicographic = creation order) to invalidate
+	// oldest first. A stable order matters: the newest session is the one just
+	// issued and must survive.
+	slices.Sort(ids)
+	toRevoke := ids[:len(ids)-d.maxSessionsPerPrincipal]
+	revoked := 0
+	var firstErr error
+	for _, id := range toRevoke {
+		if err := d.Invalidate(ctx, id, tenantID, domain.InvalidationReasonSessionConcurrencyCap, now); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := d.cache.Evict(ctx, id); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		revoked++
+	}
+	if revoked > 0 {
+		d.log.Info("session-concurrency cap enforced",
+			zap.String("principal_id", principalID),
+			zap.String("tenant_id", tenantID),
+			zap.Int("max_sessions", d.maxSessionsPerPrincipal),
+			zap.Int("revoked", revoked),
+		)
+	}
+	if err := d.cache.ClearPrincipalIndex(ctx, principalID); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 // EvictAllForTenant revokes every live session in a tenant.

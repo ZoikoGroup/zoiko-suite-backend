@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	svcenvelope "zoiko.io/gateway-auth-svc/internal/envelope"
 )
 
 // Decision mirrors carta-svc's domain.Decision.
@@ -135,6 +137,7 @@ func (c *Client) Evaluate(ctx context.Context, principalID, tenantID, legalEntit
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
+	svcenvelope.ForwardTo(ctx, req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

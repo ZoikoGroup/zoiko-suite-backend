@@ -171,6 +171,12 @@ type Config struct {
 	// keep evidence too long rather than delete it early.
 	SessionEvidenceRetentionDays int
 
+	// MaxSessionsPerPrincipal caps how many live sessions one principal may
+	// hold at once (ZS-IAM-001 §15 session-concurrency control). Zero means
+	// uncapped. When a new session would exceed it, the principal's oldest
+	// live session is invalidated first.
+	MaxSessionsPerPrincipal int
+
 	// RetentionSweepIntervalMinutes is how often the disposition sweep runs.
 	RetentionSweepIntervalMinutes int
 
@@ -419,6 +425,7 @@ func Load() (*Config, error) {
 		SupportContextDefaultTTLSeconds: envInt("SUPPORT_CONTEXT_DEFAULT_TTL_SECONDS", 60*60),
 
 		SessionEvidenceRetentionDays:  envInt("SESSION_EVIDENCE_RETENTION_DAYS", 0),
+		MaxSessionsPerPrincipal:       envInt("MAX_SESSIONS_PER_PRINCIPAL", 5),
 		RetentionSweepIntervalMinutes: envInt("RETENTION_SWEEP_INTERVAL_MINUTES", 360),
 		OutboxRetentionDays:           envInt("OUTBOX_RETENTION_DAYS", 7),
 		OutboxRelayBatchSize:          envInt("OUTBOX_RELAY_BATCH_SIZE", 100),

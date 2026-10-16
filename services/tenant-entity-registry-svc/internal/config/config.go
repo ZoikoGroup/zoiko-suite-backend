@@ -36,12 +36,15 @@ type Config struct {
 	AuthZServiceURL string
 
 	// AuthZPlatformScopeID is the legal_entity_id presented to
-	// authorization-svc for operations that have no tenant yet — in practice
-	// only ProvisionTenant, which is what creates the tenant. Every other
-	// mutation is scoped to the caller's own tenant. authorization-svc
-	// rejects an empty legal_entity_id with 400, so a synthetic
-	// platform-scope entity is required; role assignments granting
-	// TENANT_PROVISION must be made against this same ID.
+	// authorization-svc for decisions that belong to the platform rather
+	// than to one legal entity: ProvisionTenant (which is what creates the
+	// tenant), the tenant-creation and home-region approvals, and any
+	// mutation whose caller envelope names no entity (X-Legal-Entity-Id).
+	// Every other mutation is evaluated at the caller's envelope entity,
+	// whose owning tenant authorization-svc resolves and checks.
+	// authorization-svc rejects an empty legal_entity_id with 400, so a
+	// synthetic platform-scope entity is required; role assignments granting
+	// platform-scope actions must be made against this same ID.
 	AuthZPlatformScopeID string
 
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP

@@ -1845,6 +1845,7 @@ components:
         `emergency_scope_denied` — the key is not in the break-glass allowlist.
         `not_a_feature_flag` — a kill switch was requested for a key not declared as a flag.
         `runtime_identity_mismatch` — `runtime_id` is not the calling workload.
+        `change_self_approval` — the proposer of a C2/C3 change cannot approve it.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -1877,6 +1878,7 @@ components:
         `version_immutable` — the published version cannot be modified.
         `snapshot_rollback_rejected` — the pinned snapshot cannot roll back.
         `change_approval_required` — a C2/C3 change must clear approval before activation.
+        `change_not_approvable` — only a PROPOSED or VALIDATED change can be approved or rejected.
         `drift_detected` — the expected-before hash does not match the pinned snapshot.
         `consumer_incompatible` — a consumer pinned to an older version blocks this.
         `flag_key_retired` — the flag was retired.

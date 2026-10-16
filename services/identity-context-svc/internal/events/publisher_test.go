@@ -89,13 +89,14 @@ func TestPublishSessionInvalidated_RepeatEventsOnSameSession_GetDistinctEventIDs
 		require.NoError(t, err)
 	}
 
-	// Each call emits two events: session.invalidated + identity.session.revoked
-	require.Len(t, w.msgs, 4)
+	// Each call emits one event: identity.session.revoked (the legacy
+	// session.invalidated name retired once consumers subscribed to it).
+	require.Len(t, w.msgs, 2)
 	eventIDs := make(map[string]bool)
 	for _, msg := range w.msgs {
 		env := decode(t, msg)
 		eventIDs[env.EventID] = true
 	}
-	// All 4 events should have distinct event_ids
-	assert.Len(t, eventIDs, 4)
+	// All 2 events should have distinct event_ids
+	assert.Len(t, eventIDs, 2)
 }

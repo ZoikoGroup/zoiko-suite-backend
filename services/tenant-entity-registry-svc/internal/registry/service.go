@@ -1276,9 +1276,20 @@ func (s *Service) TransitionTaxIdentityBundleStatus(
 // itself without checking the signature — so both the subject of the decision
 // and the audit identity were caller-chosen. See internal/middleware.
 //
-// Scope is the tenant the caller is acting within. ProvisionTenant is the one
-// operation with no tenant yet — it is evaluated against the configured
-// platform scope, since authorization-svc rejects an empty legal_entity_id.
+// The scope is the legal entity the verified envelope names (X-Legal-Entity-Id).
+// The entity is load-bearing: authorization-svc resolves which tenant owns it
+// and refuses a question whose entity and tenant disagree. This call passed
+// the TENANT id in the entity position — a merge artifact carried over from a
+// client whose slot meant "scope" — and once authorization-svc began enforcing
+// entity scope every guarded command failed closed as 503: it replied 403
+// tenant_scope_mismatch ("legal_entity_id is outside the request's tenant
+// scope") and this client fails closed on any non-decision answer.
+//
+// A caller whose envelope names no entity is evaluated at the configured
+// platform scope instead — the same scope ProvisionTenant has always used.
+// The question belongs to no single legal entity, so only a platform-scope
+// grant can answer it; a tenant-scoped grant cannot match, and the command is
+// refused. Fail closed, not fail broken.
 func (s *Service) authorize(ctx context.Context, resource, action string) error {
 	principalID := domain.PrincipalFromContext(ctx)
 	if principalID == "" {
@@ -1292,7 +1303,7 @@ func (s *Service) authorize(ctx context.Context, resource, action string) error 
 		return ErrUnauthenticated
 	}
 
-	scopeID := domain.TenantFromContext(ctx)
+	scopeID := domain.LegalEntityFromContext(ctx)
 	if scopeID == "" {
 		scopeID = s.platformScopeID
 	}
@@ -1308,7 +1319,10 @@ func (s *Service) authorizeIn(ctx context.Context, scopeID, resource, action str
 		return ErrUnauthenticated
 	}
 	if scopeID == "" {
-		scopeID = domain.TenantFromContext(ctx)
+		// A missing scope here can only mean the platform scope: every caller
+		// passes one explicitly, and the tenant id is not a legal entity —
+		// sending it is refused by authorization-svc with tenant_scope_mismatch.
+		scopeID = s.platformScopeID
 	}
 	return s.authorizeAs(ctx, principalID, scopeID, resource, action)
 }
