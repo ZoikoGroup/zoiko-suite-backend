@@ -140,7 +140,7 @@ func TestStatus_CoversTheWholeCatalogueExactlyOnce(t *testing.T) {
 		code := "FIN-CTRL-" + pad3(i)
 		assert.True(t, seen[code], "%s is missing from the status report", code)
 	}
-	assert.Len(t, items, 48, "45 catalogue controls + 3 payroll extensions")
+	assert.Len(t, items, 49, "45 catalogue controls + 4 payroll extensions")
 }
 
 func pad3(i int) string {
@@ -168,7 +168,7 @@ func TestStatus_BlockedControlsAlwaysNameTheirBlocker(t *testing.T) {
 			assert.GreaterOrEqual(t, c.Wave, 4, "%s: a not-started control belongs to a later wave", c.Code)
 		}
 	}
-	assert.Equal(t, 25, blocked)
+	assert.Equal(t, 23, blocked)
 }
 
 // The status report must agree with what the catalogue can actually create.
@@ -183,8 +183,10 @@ func TestStatus_ImplementedControlsAreExactlyTheOnesTheCatalogueBuilds(t *testin
 	require.NoError(t, err)
 	w6, err := Wave6("2026-09-01")
 	require.NoError(t, err)
+	w7, err := Wave7("2026-09-01")
+	require.NoError(t, err)
 	built := map[string]bool{}
-	for _, d := range append(append(append(append(w2, w3...), w4...), w5...), w6...) {
+	for _, d := range append(append(append(append(append(w2, w3...), w4...), w5...), w6...), w7...) {
 		built[d.ControlCode] = true
 	}
 	impl := map[string]bool{}
@@ -205,12 +207,13 @@ func TestStatus_KeyBlockersAreSpecific(t *testing.T) {
 		by[c.Code] = c
 	}
 	assert.Contains(t, by["FIN-CTRL-007"].BlockedBy[0], "tax ledger")
-	assert.Contains(t, by["FIN-CTRL-005"].BlockedBy[0], "payroll")
+	assert.Equal(t, StatePartial, by["FIN-CTRL-005"].State, "unblocked by the WFP interface, and honest about what it covers")
+	assert.Contains(t, by["FIN-CTRL-006"].Note, "not that Banking settled")
 	assert.Contains(t, by["FIN-CTRL-011"].BlockedBy[0], "PostAccountingEvent")
 	assert.Contains(t, by["FIN-CTRL-013"].Note, "valuation")
 	sum := Summary(Status())
-	assert.Equal(t, 25, sum[StateBlocked])
-	assert.Equal(t, 12, sum[StateImplemented], "7 catalogue controls (001,002,003,020,027,028,032) + 3 payroll extensions + 041, 042 computed in-service")
-	assert.Equal(t, 11, sum[StatePartial], "013, 014, 015, 017, 019, 021, 022, 023, 037, 038, 045")
+	assert.Equal(t, 23, sum[StateBlocked])
+	assert.Equal(t, 13, sum[StateImplemented], "7 catalogue controls (001,002,003,020,027,028,032) + 4 payroll extensions + 041, 042 computed in-service")
+	assert.Equal(t, 13, sum[StatePartial], "005, 006, 013, 014, 015, 017, 019, 021, 022, 023, 037, 038, 045")
 	assert.Equal(t, 0, sum[StateNotStarted], "every catalogue control now has a stated position")
 }

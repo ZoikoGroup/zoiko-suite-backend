@@ -73,7 +73,7 @@ const instrCols = `i.instruction_id::text, i.tenant_id, i.legal_entity_id, i.ins
 	(SELECT count(DISTINCT a.approver) FROM wfp_payment_approvals a WHERE a.instruction_id = i.instruction_id AND a.invalidated_at IS NULL AND a.fingerprint = i.fingerprint)::int,
 	i.approved_fingerprint, i.approved_at, i.invalidation_reason, i.invalidated_at, i.cancel_reason, i.attempt_id, i.banking_status,
 	i.banking_error, i.submitted_by, i.submitted_at, i.handed_off_at, i.idempotency_key, i.version, i.correlation_id, i.created_by,
-	i.created_at, i.updated_at`
+	i.created_at, i.updated_at, i.payment_id, i.returned_at, i.return_reason`
 
 func scanInstruction(row pgx.Row) (*domain.PaymentInstruction, error) {
 	var p domain.PaymentInstruction
@@ -83,7 +83,7 @@ func scanInstruction(row pgx.Row) (*domain.PaymentInstruction, error) {
 		&p.PolicyResult, &p.PolicyVersionID, &p.RequiredSignatures, &p.SignaturesCollected,
 		&p.ApprovedFingerprint, &p.ApprovedAt, &p.InvalidationReason, &p.InvalidatedAt, &p.CancelReason, &p.AttemptID, &p.BankingStatus,
 		&p.BankingError, &p.SubmittedBy, &p.SubmittedAt, &p.HandedOffAt, &p.IdempotencyKey, &p.Version, &p.CorrelationID, &p.CreatedBy,
-		&p.CreatedAt, &p.UpdatedAt)
+		&p.CreatedAt, &p.UpdatedAt, &p.PaymentID, &p.ReturnedAt, &p.ReturnReason)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrInstructionNotFound
 	}
@@ -109,7 +109,7 @@ func updateInstructionTx(ctx context.Context, tx pgx.Tx, tenantID, id, setSQL st
 func activeLiabilityAmountTx(ctx context.Context, tx pgx.Tx, tenantID, liabilityID string) (*big.Rat, error) {
 	var s string
 	err := tx.QueryRow(ctx, `SELECT COALESCE(sum(amount), 0)::text FROM wfp_payment_instructions
-		WHERE tenant_id = $1 AND liability_id = $2::uuid AND state NOT IN ('CANCELLED', 'SUPERSEDED')`, tenantID, liabilityID).Scan(&s)
+		WHERE tenant_id = $1 AND liability_id = $2::uuid AND state NOT IN ('CANCELLED', 'SUPERSEDED', 'RETURNED')`, tenantID, liabilityID).Scan(&s)
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +181,26 @@ func (s *PgStore) CreatePaymentInstruction(ctx context.Context, in *domain.Payme
 				return domain.ErrExceedsOutstanding
 			}
 		}
+		if in.InstructionType == domain.PayTypeNetPay && in.WorkerID != nil {
+			// WFP-CTRL-021: a replacement net-pay instruction (a correction result of the same entity and
+			// period) waits until the original Banking attempt is resolved; blind duplication is how
+			// an unknown outcome becomes a double payment.
+			var open int
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM wfp_payment_instructions i
+				JOIN wfp_payroll_run_refs r ON r.run_ref_id = i.run_ref_id
+				JOIN wfp_payroll_run_refs me ON me.run_ref_id = $3::uuid
+				WHERE i.tenant_id = $1 AND i.worker_id = $2::uuid AND i.instruction_type = 'NET_PAY'
+				  AND i.state IN ('SUBMITTED_TO_BANKING', 'HANDED_OFF') AND i.result_id <> $4::uuid
+				  AND r.legal_entity_id = me.legal_entity_id AND r.payroll_period_id = me.payroll_period_id
+				  AND COALESCE((SELECT o.outcome FROM wfp_instruction_banking_observations o WHERE o.instruction_id = i.instruction_id
+				                ORDER BY o.observed_at DESC, o.observation_id DESC LIMIT 1), 'NONE') IN ('NONE', 'IN_FLIGHT', 'UNRESOLVED')`,
+				tenantID, *in.WorkerID, in.RunRefID, in.ResultID).Scan(&open); err != nil {
+				return err
+			}
+			if open > 0 {
+				return domain.ErrOutcomeUnresolved
+			}
+		}
 		_, err := tx.Exec(ctx, `SAVEPOINT create_instruction`)
 		if err != nil {
 			return err
@@ -236,7 +256,7 @@ func findExistingInstructionTx(ctx context.Context, tx pgx.Tx, tenantID string, 
 	}
 	return scanInstruction(tx.QueryRow(ctx, `SELECT `+instrCols+` FROM wfp_payment_instructions i
 		WHERE i.tenant_id = $1 AND i.result_id = $2::uuid AND i.worker_id = $3::uuid AND i.instruction_type = 'NET_PAY'
-		  AND i.state NOT IN ('CANCELLED', 'SUPERSEDED')`, tenantID, in.ResultID, in.WorkerID))
+		  AND i.state NOT IN ('CANCELLED', 'SUPERSEDED', 'RETURNED')`, tenantID, in.ResultID, in.WorkerID))
 }
 
 func (s *PgStore) GetPaymentInstruction(ctx context.Context, id string) (*domain.PaymentInstruction, error) {
@@ -502,7 +522,7 @@ func (s *PgStore) SupersedeInstructionsForRun(ctx context.Context, runRefID stri
 			return domain.ErrResultNotSuperseded
 		}
 		rows, err := tx.Query(ctx, `SELECT i.instruction_id::text FROM wfp_payment_instructions i
-			WHERE i.tenant_id = $1 AND i.run_ref_id = $2::uuid AND i.state NOT IN ('CANCELLED', 'SUPERSEDED') ORDER BY i.created_at FOR UPDATE OF i`, tenantID, runRefID)
+			WHERE i.tenant_id = $1 AND i.run_ref_id = $2::uuid AND i.state NOT IN ('CANCELLED', 'SUPERSEDED', 'RETURNED') ORDER BY i.created_at FOR UPDATE OF i`, tenantID, runRefID)
 		if err != nil {
 			return err
 		}

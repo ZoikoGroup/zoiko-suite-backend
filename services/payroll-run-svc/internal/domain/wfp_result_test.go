@@ -321,7 +321,7 @@ func TestBuildZoikoResultRequest_PromotesACompletedRunWithoutRecomputing(t *test
 	assert.Equal(t, "finalized:snap-1", req.SourceApprovalRef, "finality evidence is the snapshot hash taken at finalization")
 	assert.Equal(t, domain.ZoikoCalculationRef, req.CalculationRef)
 	assert.Equal(t, run.RunID, *req.PayrollRunID)
-	assert.ElementsMatch(t, []string{domain.FlagPlaceholderTaxRate, domain.FlagEmployerLiabilitiesNotComputed}, req.EvidenceFlags,
+	assert.ElementsMatch(t, []string{domain.FlagPlaceholderTaxRate, domain.FlagEmployerLiabilitiesNotComputed, domain.FlagInputNotFrozen}, req.EvidenceFlags,
 		"the calculation's known weaknesses are labelled, not implied away")
 	assert.Equal(t, "5100.5000", req.RunTotals.Gross)
 	assert.Equal(t, "1120.1000", req.RunTotals.EmployeeDeductions, "tax + other deductions")

@@ -574,6 +574,12 @@ type ZoikoResultParams struct {
 	SourceRunVersion int
 	RunKind          string
 	InputBatchID     *string
+	// TaxEngineCertified is the operator's declaration that payroll-tax-svc's engine is certified. Without it a
+	// result whose tax came from the engine carries TAX_ENGINE_UNCERTIFIED.
+	TaxEngineCertified bool
+	// InputFrozen is whether the run consumed a FROZEN WFP input batch (WFP-CTRL-006). Without it the
+	// result carries INPUT_NOT_FROZEN.
+	InputFrozen bool
 }
 
 // BuildZoikoResultRequest builds a WFP-04 submission from a COMPLETED Zoiko run
@@ -614,7 +620,7 @@ func BuildZoikoResultRequest(run PayrollRun, slips []PaySlip, p ZoikoResultParam
 		SourceRunVersion: p.SourceRunVersion, RunKind: p.RunKind, PayrollPeriodID: p.PayrollPeriodID, PayDate: run.PayDate,
 		RuleManifestID: p.RuleManifestID, SourceRunStatus: "FINAL", SourceApprovalRef: approval,
 		CalculationRef: ZoikoCalculationRef, Currency: currency, InputBatchID: p.InputBatchID, PayrollRunID: &run.RunID,
-		EvidenceFlags: []string{FlagPlaceholderTaxRate, FlagEmployerLiabilitiesNotComputed},
+		EvidenceFlags: runEvidenceFlags(slips, p),
 	}
 
 	taxable := new(big.Rat)
@@ -646,7 +652,19 @@ func BuildZoikoResultRequest(run PayrollRun, slips []PaySlip, p ZoikoResultParam
 			base = new(big.Rat)
 		}
 		w.Components = append(w.Components, ResultComponentInput{Code: "BASE", Kind: KindEarning, Amount: FormatDecimal(base)})
-		if tax.Sign() > 0 {
+		if len(s.TaxLines) > 0 {
+			// The engine's own components, each classified; a type this service cannot classify
+			// refuses the promotion rather than being defaulted.
+			for _, tl := range s.TaxLines {
+				kind, err := ComponentKindForTaxType(tl.TaxType)
+				if err != nil {
+					return ReceivePayrollResultRequest{}, err
+				}
+				if a := dec(tl.Amount); a.Sign() > 0 {
+					w.Components = append(w.Components, ResultComponentInput{Code: TaxComponentCode(tl.TaxName), Kind: kind, Amount: FormatDecimal(a)})
+				}
+			}
+		} else if tax.Sign() > 0 {
 			w.Components = append(w.Components, ResultComponentInput{Code: "TAX_WITHHELD", Kind: KindEmployeeTax, Amount: FormatDecimal(tax)})
 		}
 		req.Workers = append(req.Workers, w)
@@ -658,6 +676,24 @@ func BuildZoikoResultRequest(run PayrollRun, slips []PaySlip, p ZoikoResultParam
 		EmployerLiabilities: FormatDecimal(new(big.Rat)), NetPay: FormatDecimal(dec(run.TotalNetPay)),
 	}
 	return req, nil
+}
+
+// runEvidenceFlags states what the calculation does and does not establish. Employer liabilities are never
+// computed (neither the legacy calculation nor payroll-tax-svc produces them), so that flag is always set.
+func runEvidenceFlags(slips []PaySlip, p ZoikoResultParams) []string {
+	flags := []string{}
+	src := TaxSourceOf(slips)
+	if src.PlaceholderSlips > 0 {
+		flags = append(flags, FlagPlaceholderTaxRate)
+	}
+	if src.EngineSlips > 0 && !p.TaxEngineCertified {
+		flags = append(flags, FlagTaxEngineUncertified)
+	}
+	flags = append(flags, FlagEmployerLiabilitiesNotComputed)
+	if !p.InputFrozen {
+		flags = append(flags, FlagInputNotFrozen)
+	}
+	return flags
 }
 
 // ── events & errors ──────────────────────────────────────────────────────────

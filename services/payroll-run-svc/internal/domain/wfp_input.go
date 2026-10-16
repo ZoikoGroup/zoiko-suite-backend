@@ -27,11 +27,12 @@ const (
 	SourceCompBonus       = "COMP_BONUS"
 	SourceBenefitEmployee = "BENEFIT_EMPLOYEE"
 	SourceBenefitEmployer = "BENEFIT_EMPLOYER"
+	SourceManual          = "MANUAL"
 )
 
 var validInputSourceKinds = map[string]bool{
 	SourceBaseSalary: true, SourceCompComponent: true, SourceCompBonus: true,
-	SourceBenefitEmployee: true, SourceBenefitEmployer: true,
+	SourceBenefitEmployee: true, SourceBenefitEmployer: true, SourceManual: true,
 }
 
 const (
@@ -122,7 +123,7 @@ func (r RegisterInputCodeMappingRequest) IsActive() bool { return r.Active == ni
 
 func (r RegisterInputCodeMappingRequest) Validate() error {
 	if !validInputSourceKinds[r.SourceKind] {
-		return fmt.Errorf("source_kind must be one of BASE_SALARY, COMP_COMPONENT, COMP_BONUS, BENEFIT_EMPLOYEE, BENEFIT_EMPLOYER")
+		return fmt.Errorf("source_kind must be one of BASE_SALARY, COMP_COMPONENT, COMP_BONUS, BENEFIT_EMPLOYEE, BENEFIT_EMPLOYER, MANUAL")
 	}
 	if strings.TrimSpace(r.SourceCode) == "" {
 		return fmt.Errorf("source_code is required")
@@ -293,11 +294,24 @@ type SourceElection struct {
 	EmployerAmount               float64
 }
 
+// SourceManualInput is an APPROVED manual input (maker-checker) for one worker. It is pulled into a batch like
+// any other source and classified by the governed mapping of source kind MANUAL and its input code.
+type SourceManualInput struct {
+	ManualID, Code, Category string
+	Amount                   float64
+	Currency, EffectiveDate  string
+	Reason, EvidenceRef      string
+	ApprovedBy               string
+}
+
 // WorkerContext is employee-master-svc's verdict (WFP-01) for one worker.
 type WorkerContext struct {
 	Valid         bool
 	Reason        string // first reason when not valid
 	PayCurrencies []string
+	// PayrollJurisdictions are the distinct payroll jurisdictions of the worker's active financial
+	// profile on the as-of date. Exactly one is needed to compute tax; none or several is refused.
+	PayrollJurisdictions []string
 }
 
 // WorkerSource is everything pulled for one worker. A nil Base means the worker
@@ -309,6 +323,7 @@ type WorkerSource struct {
 	Components []SourceComponent
 	Bonuses    []SourceBonus
 	Elections  []SourceElection
+	Manuals    []SourceManualInput
 }
 
 // FormatAmount writes a source float as an exact 4-decimal string and returns
@@ -400,6 +415,15 @@ func BuildInputLines(sources []WorkerSource, mappings map[string]InputCodeMappin
 			cands = append(cands, candidate{
 				kind: SourceBenefitEmployer, sourceLineID: "BEN-ER:" + e.ElectionID, sourceRef: e.ElectionID, code: e.PlanType,
 				expectedCategory: CategoryBenefit, amount: e.EmployerAmount, currency: e.Currency, date: periodEnd, reason: "plan=" + e.PlanID,
+			})
+		}
+		for _, m := range w.Manuals {
+			// A manual input's provenance is its proposal, and it always carries its approver.
+			approver := m.ApprovedBy
+			cands = append(cands, candidate{
+				kind: SourceManual, sourceLineID: "MANUAL:" + m.ManualID, sourceRef: m.ManualID, code: m.Code,
+				expectedCategory: m.Category, amount: m.Amount, currency: m.Currency, date: m.EffectiveDate,
+				approvalRef: &approver, needsApproval: true, reason: "MANUAL:" + m.Reason + " [evidence=" + m.EvidenceRef + "]",
 			})
 		}
 		for _, c := range cands {

@@ -117,6 +117,9 @@ type PaymentInstruction struct {
 	CreatedBy              string            `json:"created_by"`
 	CreatedAt              time.Time         `json:"created_at"`
 	UpdatedAt              time.Time         `json:"updated_at"`
+	PaymentID              *string           `json:"payment_id,omitempty"`
+	ReturnedAt             *time.Time        `json:"returned_at,omitempty"`
+	ReturnReason           *string           `json:"return_reason,omitempty"`
 	Approvals              []PaymentApproval `json:"approvals,omitempty"`
 }
 

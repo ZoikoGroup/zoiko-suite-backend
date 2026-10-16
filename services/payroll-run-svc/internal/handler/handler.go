@@ -35,6 +35,12 @@ type Store interface {
 	EnqueueRunEvent(ctx context.Context, run domain.PayrollRun, fn store.RunEventFunc) error
 	// ControlPopulation serves the control-population contract (pay-slips, payroll-runs).
 	ControlPopulation(ctx context.Context, q domain.ControlPopulationQuery) (*domain.ControlPopulationPage, error)
+
+	// The frozen WFP input batch a calculation may take its inputs from (WFP-CTRL-006).
+	GetInputBatch(ctx context.Context, id string) (*domain.InputBatch, error)
+	GetInputBatchByRun(ctx context.Context, runID string) (*domain.InputBatch, error)
+	ListInputLines(ctx context.Context, batchID, state, workerID string) ([]domain.InputLine, error)
+	ConsumeInputBatch(ctx context.Context, id string, expectedVersion int, runID string, mk store.InputEventBuilder) (*domain.InputBatch, error)
 }
 
 type AuthZClient interface {
@@ -78,6 +84,10 @@ type Handler struct {
 	// and applied to the correct base rather than to gross.
 	defaultTaxRate float64
 	log            *zap.Logger
+
+	// tax and jurisdictions, when set (WithTaxEngine), replace the placeholder rate with payroll-tax-svc.
+	tax           TaxEngine
+	jurisdictions WorkerJurisdictions
 }
 
 func New(st Store, authz AuthZClient, empClient EmployeeClient, ctrClient ContractClient, compClient CompensationClient, defaultTaxRate float64, log *zap.Logger) *Handler {
@@ -223,6 +233,13 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Frozen WFP input batch (WFP-CTRL-006): the one this run already consumed, or the one the request names.
+	rb, bfail := h.resolveInputBatch(r, principalID, run, req.InputBatchID)
+	if bfail != nil {
+		bfail.write(h, w)
+		return
+	}
+
 	// 2. Build shadow lookup map if provided
 	shadowMap := make(map[string]domain.ShadowInputItem)
 	for _, item := range req.ShadowBaselineItems {
@@ -247,73 +264,43 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 	// be confirmed now blocks the entire calculation instead. Each
 	// employee's contract is fetched exactly once and cached here.
 	if len(activeEmployees) > 0 {
-		contracts := make(map[string]*contract.ActiveContract, len(activeEmployees))
-		var missingContracts []string
-		for _, emp := range activeEmployees {
-			if h.ctrClient == nil {
-				missingContracts = append(missingContracts, emp.EmployeeID)
-				continue
-			}
-			ctr, err := h.ctrClient.GetActiveContract(r.Context(), tenantID, principalID, emp.EmployeeID)
-			if err != nil || ctr == nil || ctr.BaseSalaryAmount <= 0 {
-				h.log.Error("failed to verify active salary contract for employee",
-					zap.String("employee_id", emp.EmployeeID), zap.Error(err))
-				missingContracts = append(missingContracts, emp.EmployeeID)
-				continue
-			}
-			contracts[emp.EmployeeID] = ctr
+		// Inputs come from the frozen WFP batch when the run names (or already consumed) one, otherwise from the
+		// employee's contract and compensation structure. Either way: fail closed.
+		var inputs map[string]slipInput
+		var ifail *inputFailure
+		if rb != nil {
+			inputs, ifail = h.batchInputs(tenantID, activeEmployees, rb)
+		} else {
+			inputs, ifail = h.legacyInputs(r, tenantID, principalID, activeEmployees)
 		}
-		if len(missingContracts) > 0 {
-			h.enqueueBlocked(r, principalID, *run, domain.ErrContractLookupFailed.Error())
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-				"error_code":         "contract_lookup_failed",
-				"error_message":      domain.ErrContractLookupFailed.Error(),
-				"employees_affected": missingContracts,
-			})
+		if ifail != nil {
+			if ifail.block != "" {
+				h.enqueueBlocked(r, principalID, *run, ifail.block)
+			}
+			ifail.write(h, w)
 			return
 		}
 
-		// Resolve each employee's compensation breakdown. The base salary still
-		// comes from the contract above — that is the authoritative figure.
-		// compensation-svc supplies only the composition layered on it.
-		//
-		// An employee with no structure configured is a normal state: they are
-		// paid a flat base salary. compensation-svc being unreachable is not,
-		// and blocks the run rather than inventing deductions.
-		breakdowns := make(map[string]*compensation.Breakdown, len(activeEmployees))
-		for _, emp := range activeEmployees {
-			if h.compClient == nil {
-				continue
-			}
-			bd, err := h.compClient.GetBreakdown(r.Context(), tenantID, principalID, emp.EmployeeID, contracts[emp.EmployeeID].BaseSalaryAmount)
-			if errors.Is(err, compensation.ErrNoStructure) {
-				continue
-			}
-			if err != nil {
-				h.log.Error("failed to resolve compensation breakdown",
-					zap.String("employee_id", emp.EmployeeID), zap.Error(err))
-				h.enqueueBlocked(r, principalID, *run, domain.ErrCompensationLookupFailed.Error())
-				writeError(w, http.StatusServiceUnavailable, "compensation_lookup_failed", string(domain.ErrCompensationLookupFailed))
-				return
-			}
-			breakdowns[emp.EmployeeID] = bd
+		// Tax from the tax engine when it is configured (fail closed); nil means the legacy placeholder rate.
+		taxes, tfail := h.computeTaxes(r.Context(), tenantID, principalID, run, activeEmployees, inputs)
+		if tfail != nil {
+			h.enqueueBlocked(r, principalID, *run, tfail.message)
+			writeJSON(w, tfail.status, tfail.body())
+			return
 		}
 
 		for _, emp := range activeEmployees {
-			ctr := contracts[emp.EmployeeID]
-			curr := "USD"
-			if ctr.Currency != "" {
-				curr = ctr.Currency
+			in := inputs[emp.EmployeeID]
+			slipCalc := in.calc
+			taxOut := taxes[emp.EmployeeID]
+			if taxOut != nil {
+				taxOut.apply(&slipCalc)
 			}
-
-			slipCalc := h.calculateSlip(ctr.BaseSalaryAmount, breakdowns[emp.EmployeeID])
 			gross := slipCalc.gross
 			tax := slipCalc.tax
 			benefits := slipCalc.deductions
 			net := slipCalc.net
-			if slipCalc.currency != "" {
-				curr = slipCalc.currency
-			}
+			curr := in.currency
 
 			totalGross += gross
 			totalNet += net
@@ -337,7 +324,8 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 				EffectiveDate:      run.PayDate,
 				TaxableAmount:      slipCalc.taxable,
 				StructureID:        slipCalc.structureID,
-				Items:              buildSlipItems(tenantID, slipID, now, breakdowns[emp.EmployeeID]),
+				Items:              in.items(slipID, now),
+				TaxLines:           taxLinesOf(taxOut, tenantID, slipID, now),
 				CreatedAt:          now,
 			}
 			slips = append(slips, slip)
@@ -436,6 +424,21 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if rb != nil && !rb.alreadyConsumed {
+		// Tie the batch to this run now that every input has been resolved and every tax answered. A batch that
+		// another run consumed in the meantime, or that changed, refuses here and nothing is stored.
+		if _, cerr := h.store.ConsumeInputBatch(r.Context(), rb.batch.BatchID, rb.batch.Version, run.RunID, inputEventBuilder(r, principalID, tenantID)); cerr != nil {
+			switch {
+			case errors.Is(cerr, domain.ErrRunAlreadyLinked), errors.Is(cerr, domain.ErrInputBatchNotFrozen), errors.Is(cerr, domain.ErrVersionConflict):
+				writeError(w, http.StatusConflict, "batch_consume_conflict", cerr.Error())
+			default:
+				h.log.Error("failed to consume the input batch", zap.Error(cerr))
+				writeError(w, http.StatusServiceUnavailable, "store_unavailable", "cannot consume the input batch")
+			}
+			return
+		}
+	}
+
 	if err := h.store.SaveCalculatedResults(store.WithRunEvent(r.Context(), h.runEvent(events.RunCalculated, getCorrelationID(r), principalID, "")), id, totalGross, totalNet, totalTax, totalDeductions, slips, shadowComps); err != nil {
 		h.log.Error("failed to save calculated payroll results", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -448,6 +451,7 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 		"run":                updatedRun,
 		"pay_slips":          slips,
 		"shadow_comparisons": shadowComps,
+		"input_batch_id":     inputBatchIDOf(rb),
 	})
 }
 

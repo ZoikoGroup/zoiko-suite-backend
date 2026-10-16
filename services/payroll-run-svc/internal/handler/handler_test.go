@@ -37,6 +37,12 @@ type stubStore struct {
 	cpErr   error
 	cpCalls int
 	cpLast  domain.ControlPopulationQuery
+
+	// frozen input batch stub state (see calculate_batch_test.go)
+	batches    map[string]*domain.InputBatch
+	batchLines map[string][]domain.InputLine
+	consumeErr error
+	consumed   []string
 }
 
 func newStubStore() *stubStore {
