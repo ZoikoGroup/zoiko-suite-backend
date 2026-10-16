@@ -53,11 +53,39 @@ PostgreSQL Row-Level Security (`FORCE ROW LEVEL SECURITY`) is applied to all tab
 
 Tenant isolation is verified fail-closed via `tenant_isolation_policy` comparing `tenant_id` to `app.tenant_id`.
 
+The verified `X-Tenant-Id` is **required on every request** to the rights routes (enforced at the transport boundary by `internal/middleware`); a missing, empty or whitespace-only value is rejected with HTTP 401 before any handler runs. Only the trimmed value is used as the transaction-local `app.tenant_id`.
+
 ### 4. §18.1 Idempotency Key Handling
-All mutating APIs support the `Idempotency-Key` header:
+All mutating APIs **require** the `Idempotency-Key` header; a missing or blank value is rejected with HTTP 400 before any side effect:
 - First execution stores the request hash, status, and response body in `rights_idempotency_keys`.
 - Retried execution with the same key and identical payload returns the cached response with `Idempotency-Replay: true`.
 - Retried execution with the same key but differing payload returns HTTP 409 Conflict with `PRV-020: IMMUTABLE_EVIDENCE_CONFLICT`.
+- Authorization is evaluated **before** the idempotency lookup, so a replayed key can never bypass the authorization decision.
+
+### 5. §18.1 Request Envelope Headers
+Every mutating API requires the following service-boundary headers, validated after authentication and before any idempotency lookup/persistence, database mutation or event publication:
+
+| Header | Requirement | On violation |
+|---|---|---|
+| `X-Tenant-Id` | non-empty, non-whitespace tenant scope | HTTP 401 `{"error":"X-Tenant-Id header is required"}` |
+| `Idempotency-Key` | non-empty, non-whitespace | HTTP 400 `{"error":"Idempotency-Key header is required"}` |
+| `X-Correlation-ID` | non-empty, non-whitespace | HTTP 400 `{"error":"X-Correlation-ID header is required"}` |
+| `X-Principal-Id` | non-empty actor context | HTTP 401 `{"error":"X-Principal-Id header is required"}` |
+
+### 6. §19 Event Alignment
+`ZS-SVC-W-001` §19 declares no rights-intake or rights-closure event. The service therefore publishes **no** domain events for `RECEIVED`/`CLOSED` transitions (previously emitted `privacy.rights_request.received` / `privacy.rights_request.closed`, which are not in the §19 catalogue, have been removed). The only rights-related §19 event, `privacy.rights.action_required` (payload: request, domain, action type/scope, deadline/WFC ref; consumers: domain adapter + WFC evidence collector), is not emitted by this service — its production is WFC/domain-orchestration territory per §14.1, not PRV-04's own privacy-meaning state.
+
+### 7. §32 Code Usage Notes
+`PRV-001..PRV-020` are used only for the conditions §32 actually names. §32 declares **no** request-not-found code and **no** input-validation code, so:
+- a missing rights request returns HTTP 404 with a plain structured error (`{"error":"rights request not found"}`), never `PRV-001`;
+- caller input errors return HTTP 400 with a plain structured error, never `PRV-005`.
+
+The §15.2 disclosure gate continues to use `PRV-012`/`PRV-013`, double-close/immutability uses `PRV-020`, and tenant mismatch uses `PRV-003`.
+
+### 8. §18 Canonical Response Fields
+The §18 API table's critical response fields are exposed additively (existing fields are unchanged):
+- **Create / request responses:** `classification` (`{right_family, jurisdiction}`, derived from the stored record) and `identity_state` (`VERIFIED` / `UNVERIFIED`, derived from `identity_verified`).
+- **Discovery-manifest responses:** `hash` (the §18 name for the manifest `content_hash`).
 
 ---
 

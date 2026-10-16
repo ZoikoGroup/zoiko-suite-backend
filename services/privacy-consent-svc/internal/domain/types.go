@@ -79,17 +79,31 @@ type Notice struct {
 // manifest-svc's own doctrine of storing a pointer/snapshot rather than
 // re-implementing another service's job.
 type NoticeVersion struct {
-	NoticeVersionID       string              `json:"notice_version_id"`
-	NoticeID              string              `json:"notice_id"`
-	Locale                string              `json:"locale"`
-	Audience              string              `json:"audience"`
-	ContentHash           string              `json:"content_hash"`
-	VersionStatus         NoticeVersionStatus `json:"version_status"`
-	EffectiveFrom         *time.Time          `json:"effective_from,omitempty"`
-	SupersedesVersionID   *string             `json:"supersedes_version_id,omitempty"`
-	ApprovedByPrincipalID *string             `json:"approved_by_principal_id,omitempty"`
-	CreatedAt             time.Time           `json:"created_at"`
-	CreatedByPrincipalID  string              `json:"created_by_principal_id"`
+	NoticeVersionID string              `json:"notice_version_id"`
+	NoticeID        string              `json:"notice_id"`
+	Locale          string              `json:"locale"`
+	Audience        string              `json:"audience"`
+	ContentHash     string              `json:"content_hash"`
+	VersionStatus   NoticeVersionStatus `json:"version_status"`
+	EffectiveFrom   *time.Time          `json:"effective_from,omitempty"`
+	// EffectiveTo closes the §10.1 "effective window" when a successor is
+	// published — set, in the same transaction as the supersession, to the
+	// successor's EffectiveFrom. Nil while this version is still PUBLISHED
+	// (or was never published), which is a window still open, not a missing
+	// fact.
+	EffectiveTo           *time.Time `json:"effective_to,omitempty"`
+	SupersedesVersionID   *string    `json:"supersedes_version_id,omitempty"`
+	ApprovedByPrincipalID *string    `json:"approved_by_principal_id,omitempty"`
+	// PublishedByPrincipalID/PublishedAt are the §10.1 "publisher" evidence —
+	// distinct from CreatedByPrincipalID (the maker) and ApprovedByPrincipalID
+	// (the checker). Before this, PublishNoticeVersion recorded no actor at
+	// all for the act of publishing, so the SoD check that refuses the maker
+	// or the approver from publishing produced a row with no record of who
+	// actually did.
+	PublishedByPrincipalID *string    `json:"published_by_principal_id,omitempty"`
+	PublishedAt            *time.Time `json:"published_at,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
 }
 
 // PresentationReceipt is append-only evidence that a notice version was
@@ -122,7 +136,9 @@ func (a ConsentAction) Valid() bool {
 }
 
 // ConsentStatus is the DERIVED (never stored) resolved state for a
-// (subject_ref, purpose_id) pair — see ResolveConsentStatus.
+// (subject_ref, purpose_id) pair — see ResolveConsentStatus. §6's
+// "Orthogonal State Architecture" names six values; WITHDRAWN, EXPIRED and
+// INVALIDATED are three distinct terminal facts, never collapsed into one.
 type ConsentStatus string
 
 const (
@@ -130,21 +146,39 @@ const (
 	ConsentStatusGranted      ConsentStatus = "GRANTED"
 	ConsentStatusDenied       ConsentStatus = "DENIED"
 	ConsentStatusWithdrawn    ConsentStatus = "WITHDRAWN"
+	// ConsentStatusExpired is derived from ConsentReceipt.ExpiresAt — a
+	// time-boxed grant that has run out. Distinct from withdrawal (the
+	// subject acted) and invalidation (the platform acted).
+	ConsentStatusExpired ConsentStatus = "EXPIRED"
+	// ConsentStatusInvalidated is set by a ConsentInvalidation record — a
+	// platform-initiated correction (e.g. a compromised capture channel or a
+	// fraud finding), never a subject-initiated act. See WithdrawConsent vs
+	// InvalidateConsent.
+	ConsentStatusInvalidated ConsentStatus = "INVALIDATED"
 )
 
 // ConsentRequest is the documented object (§10.1) representing the request
 // context presented to the subject: exact purpose, scope, data/recipient/technology
 // context, required/optional status, notice version, policy package. Distinct
-// from the receipt itself.
+// from the receipt itself, and persisted as its own evidence row (migration
+// 000005) — it used to be accepted on the wire and silently discarded before
+// the INSERT, so nothing was ever actually preserved from it.
+//
+// Vendor/StorageLifetime/JurisdictionRuleRef are §11.1's web/mobile tracking
+// scope: "model storage/access technology, purpose, vendor, lifetime and
+// jurisdictional rule reference."
 type ConsentRequest struct {
-	PurposeID         string `json:"purpose_id"`
-	Scope             string `json:"scope,omitempty"`
-	DataContext       string `json:"data_context,omitempty"`
-	RecipientContext  string `json:"recipient_context,omitempty"`
-	TechnologyContext string `json:"technology_context,omitempty"`
-	RequiredStatus    string `json:"required_status,omitempty"` // REQUIRED | OPTIONAL
-	NoticeVersionID   string `json:"notice_version_id,omitempty"`
-	PolicyPackage     string `json:"policy_package,omitempty"`
+	PurposeID           string `json:"purpose_id"`
+	Scope               string `json:"scope,omitempty"`
+	DataContext         string `json:"data_context,omitempty"`
+	RecipientContext    string `json:"recipient_context,omitempty"`
+	TechnologyContext   string `json:"technology_context,omitempty"`
+	Vendor              string `json:"vendor,omitempty"`
+	StorageLifetime     string `json:"storage_lifetime,omitempty"`
+	JurisdictionRuleRef string `json:"jurisdiction_rule_ref,omitempty"`
+	RequiredStatus      string `json:"required_status,omitempty"` // REQUIRED | OPTIONAL
+	NoticeVersionID     string `json:"notice_version_id,omitempty"`
+	PolicyPackage       string `json:"policy_package,omitempty"`
 }
 
 // ConsentReceipt is append-only evidence of one grant/deny event —
@@ -153,23 +187,51 @@ type ConsentRequest struct {
 // Includes Proxy / Authorized Representative evidence (§11.1) and
 // Affirmative-action evidence (§10.1).
 type ConsentReceipt struct {
-	ConsentReceiptID             string          `json:"consent_receipt_id"`
-	TenantID                     *string         `json:"tenant_id,omitempty"`
-	SubjectRef                   string          `json:"subject_ref"`
-	PurposeID                    string          `json:"purpose_id"`
-	NoticeVersionID              *string         `json:"notice_version_id,omitempty"`
-	Action                       ConsentAction   `json:"action"`
-	CaptureChannel               string          `json:"capture_channel"`
-	ActorPrincipalID             string          `json:"actor_principal_id"`
-	CorrelationID                string          `json:"correlation_id,omitempty"`
-	CreatedAt                    time.Time       `json:"created_at"`
-	IsProxy                      bool            `json:"is_proxy"`
-	RepresentativeSubjectRef     *string         `json:"representative_subject_ref,omitempty"`
-	RepresentativeAuthorityRef   *string         `json:"representative_authority_ref,omitempty"`
-	RepresentativeEvidence       *string         `json:"representative_evidence,omitempty"`
-	AffirmativeActionType        string          `json:"affirmative_action_type"`
-	AffirmativeEvidence          *string         `json:"affirmative_evidence,omitempty"`
-	ConsentRequest               *ConsentRequest `json:"consent_request,omitempty"`
+	ConsentReceiptID           string          `json:"consent_receipt_id"`
+	TenantID                   *string         `json:"tenant_id,omitempty"`
+	SubjectRef                 string          `json:"subject_ref"`
+	PurposeID                  string          `json:"purpose_id"`
+	NoticeVersionID            *string         `json:"notice_version_id,omitempty"`
+	Action                     ConsentAction   `json:"action"`
+	CaptureChannel             string          `json:"capture_channel"`
+	ActorPrincipalID           string          `json:"actor_principal_id"`
+	CorrelationID              string          `json:"correlation_id,omitempty"`
+	CreatedAt                  time.Time       `json:"created_at"`
+	IsProxy                    bool            `json:"is_proxy"`
+	RepresentativeSubjectRef   *string         `json:"representative_subject_ref,omitempty"`
+	RepresentativeAuthorityRef *string         `json:"representative_authority_ref,omitempty"`
+	RepresentativeEvidence     *string         `json:"representative_evidence,omitempty"`
+	AffirmativeActionType      string          `json:"affirmative_action_type"`
+	AffirmativeEvidence        *string         `json:"affirmative_evidence,omitempty"`
+	ConsentRequest             *ConsentRequest `json:"consent_request,omitempty"`
+
+	// ReceiptIntegrityHash is §10.1's "receipt integrity": a SHA-256 over the
+	// receipt's own material fields, computed once at insert time and never
+	// recomputed. It lets a later reader detect whether a row that claims to
+	// be this receipt actually is — append-only triggers already stop an
+	// in-place edit, but this also catches a row reconstructed by a restore
+	// or a migration that didn't go through RecordConsent.
+	ReceiptIntegrityHash string `json:"receipt_integrity_hash"`
+
+	// AgeBand is §11.1 "children/minors": age/age-band evidence, never a
+	// single hard-coded threshold.
+	AgeBand *string `json:"age_band,omitempty"`
+
+	// IsOfflineImport and the Import* fields are §11.1 "offline/imported
+	// consent": source, capture method, original evidence reference and
+	// migration provenance — never a fabricated current-platform timestamp.
+	// CreatedAt is still "when this service recorded the row"; ImportedAt is
+	// "when the consent actually happened," which can predate CreatedAt by
+	// years for a migrated book of business.
+	IsOfflineImport     bool       `json:"is_offline_import"`
+	ImportSource        *string    `json:"import_source,omitempty"`
+	ImportCaptureMethod *string    `json:"import_capture_method,omitempty"`
+	ImportEvidenceRef   *string    `json:"import_evidence_ref,omitempty"`
+	ImportedAt          *time.Time `json:"imported_at,omitempty"`
+
+	// ExpiresAt backs ConsentStatusExpired. Nil means the grant does not
+	// time-box itself.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // WithdrawalReceipt is append-only evidence that a specific ConsentReceipt
@@ -183,17 +245,42 @@ type WithdrawalReceipt struct {
 	WithdrawnByPrincipalID string    `json:"withdrawn_by_principal_id"`
 	Channel                string    `json:"channel"`
 	CreatedAt              time.Time `json:"created_at"`
+	// PropagationCorrelationID is §10.1's "downstream propagation correlation
+	// IDs": a single id this service stamps on the withdrawal and on the
+	// privacy.consent.changed event it publishes, so a downstream consumer
+	// that fans a withdrawal out to other systems can be traced back to this
+	// one row. Generated server-side at withdrawal time, not caller-supplied
+	// — this service cannot fabricate a real external propagation id before
+	// propagation has happened, it can only mint the id that identifies it.
+	PropagationCorrelationID string `json:"propagation_correlation_id"`
+}
+
+// ConsentInvalidation is append-only evidence that a ConsentReceipt was
+// invalidated by the platform — distinct from WithdrawalReceipt (a
+// subject-initiated act) per §6's orthogonal state list. A compromised
+// capture channel or a confirmed fraud finding invalidates a grant the
+// subject never asked to end; recording that as a "withdrawal" would
+// misattribute the act to the wrong party in every downstream audit trail.
+type ConsentInvalidation struct {
+	ConsentInvalidationID    string    `json:"consent_invalidation_id"`
+	TenantID                 *string   `json:"tenant_id,omitempty"`
+	ConsentReceiptID         string    `json:"consent_receipt_id"`
+	InvalidatedByPrincipalID string    `json:"invalidated_by_principal_id"`
+	Reason                   string    `json:"reason"`
+	Channel                  string    `json:"channel"`
+	CreatedAt                time.Time `json:"created_at"`
 }
 
 // ConsentResolution is the read-side answer to "what is the current
 // status of this subject's consent for this purpose" — computed from the
 // evidence, never itself stored.
 type ConsentResolution struct {
-	SubjectRef        string             `json:"subject_ref"`
-	PurposeID         string             `json:"purpose_id"`
-	Status            ConsentStatus      `json:"status"`
-	LatestReceipt     *ConsentReceipt    `json:"latest_receipt,omitempty"`
-	WithdrawalReceipt *WithdrawalReceipt `json:"withdrawal_receipt,omitempty"`
+	SubjectRef          string               `json:"subject_ref"`
+	PurposeID           string               `json:"purpose_id"`
+	Status              ConsentStatus        `json:"status"`
+	LatestReceipt       *ConsentReceipt      `json:"latest_receipt,omitempty"`
+	WithdrawalReceipt   *WithdrawalReceipt   `json:"withdrawal_receipt,omitempty"`
+	ConsentInvalidation *ConsentInvalidation `json:"consent_invalidation,omitempty"`
 }
 
 // ── Preference ───────────────────────────────────────────────────────────────
@@ -268,9 +355,29 @@ type RecordConsentRequest struct {
 	AffirmativeActionType      string          `json:"affirmative_action_type,omitempty"`
 	AffirmativeEvidence        string          `json:"affirmative_evidence,omitempty"`
 	ConsentRequest             *ConsentRequest `json:"consent_request,omitempty"`
+
+	// AgeBand/offline-import/expiry — see ConsentReceipt's own doc comment
+	// for what each backs.
+	AgeBand             string     `json:"age_band,omitempty"`
+	IsOfflineImport     bool       `json:"is_offline_import,omitempty"`
+	ImportSource        string     `json:"import_source,omitempty"`
+	ImportCaptureMethod string     `json:"import_capture_method,omitempty"`
+	ImportEvidenceRef   string     `json:"import_evidence_ref,omitempty"`
+	ImportedAt          *time.Time `json:"imported_at,omitempty"`
+	ExpiresAt           *time.Time `json:"expires_at,omitempty"`
 }
 
 type WithdrawConsentRequest struct {
+	Channel string `json:"channel"`
+}
+
+// InvalidateConsentRequest backs POST /privacy/consents/{id}/invalidate —
+// the platform-initiated counterpart to WithdrawConsentRequest. Reason is
+// mandatory: an invalidation with no stated reason is not evidence, and §1
+// treats "stable error/evidence" as the minimum bar for any privileged
+// correction.
+type InvalidateConsentRequest struct {
+	Reason  string `json:"reason"`
 	Channel string `json:"channel"`
 }
 
@@ -301,16 +408,28 @@ type errorString string
 func (e errorString) Error() string { return string(e) }
 
 var (
-	ErrNoticeNotFound                    = errorString("notice not found")
-	ErrNoticeVersionNotFound             = errorString("notice version not found")
-	ErrInvalidNoticeTransition           = errorString("invalid notice version status transition")
-	ErrConsentReceiptNotFound            = errorString("consent receipt not found")
-	ErrAlreadyWithdrawn                  = errorString("consent receipt is already withdrawn")
-	ErrPurposeNotRegistered              = errorString("purpose is not a registered, published purpose")
-	ErrStoreUnavailable                  = errorString("privacy-consent store unavailable")
-	ErrIdempotencyConflict               = errorString("idempotency key reused with different request payload")
-	ErrRepresentativeAuthorityRequired   = errorString("proxy consent requires representative_subject_ref and representative_authority_ref")
-	ErrNoticeSelfApprovalForbidden       = errorString("creator of notice version cannot approve it")
-	ErrNoticeSelfPublishForbidden        = errorString("creator of notice version cannot publish it")
-	ErrNoticeApproverCannotPublish       = errorString("approver of notice version cannot also publish it")
+	ErrNoticeNotFound        = errorString("notice not found")
+	ErrNoticeVersionNotFound = errorString("notice version not found")
+	// ErrNoticeVersionInvalid is §32 PRV-008 NOTICE_VERSION_INVALID: a
+	// presentation or consent receipt referenced a notice version that is not
+	// a currently PUBLISHED version of its notice (draft, approved, withdrawn,
+	// superseded, malformed id, or nonexistent). §6: "Receipt always binds
+	// exact published notice version."
+	ErrNoticeVersionInvalid            = errorString("PRV-008: notice_version_id must name a currently PUBLISHED notice version")
+	ErrInvalidNoticeTransition         = errorString("invalid notice version status transition")
+	ErrConsentReceiptNotFound          = errorString("consent receipt not found")
+	ErrAlreadyWithdrawn                = errorString("consent receipt is already withdrawn")
+	ErrAlreadyInvalidated              = errorString("consent receipt is already invalidated")
+	ErrPurposeNotRegistered            = errorString("purpose is not a registered, published purpose")
+	ErrStoreUnavailable                = errorString("privacy-consent store unavailable")
+	ErrIdempotencyConflict             = errorString("idempotency key reused with different request payload")
+	ErrIdempotencyKeyRequired          = errorString("Idempotency-Key header is required on this operation (§18.1)")
+	ErrCorrelationIDRequired           = errorString("X-Correlation-ID header is required on this operation (§18.1)")
+	ErrRepresentativeAuthorityRequired = errorString("proxy consent requires representative_subject_ref and representative_authority_ref")
+	ErrNoticeSelfApprovalForbidden     = errorString("creator of notice version cannot approve it")
+	ErrNoticeSelfPublishForbidden      = errorString("creator of notice version cannot publish it")
+	ErrNoticeApproverCannotPublish     = errorString("approver of notice version cannot also publish it")
+	ErrTenantScopeRequired             = errorString("X-Tenant-Id header is required — the gateway sets it from a verified identity envelope")
+	ErrTenantScopeMismatch             = errorString("tenant_id does not match the verified X-Tenant-Id")
+	ErrIdentityMissing                 = errorString("X-Principal-Id header is required — the gateway sets it from a verified identity envelope")
 )

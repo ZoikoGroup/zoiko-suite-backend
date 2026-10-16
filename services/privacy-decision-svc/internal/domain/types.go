@@ -4,8 +4,6 @@
 package domain
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"time"
 )
@@ -51,26 +49,26 @@ const (
 
 // §32 Stable Error and Reason Codes
 const (
-	PRV001PurposeNotRegistered            = "PRV-001: PURPOSE_NOT_REGISTERED"
-	PRV002ProcessingActivityInactive      = "PRV-002: PROCESSING_ACTIVITY_INACTIVE"
-	PRV003PrivacyRoleUnresolved           = "PRV-003: PRIVACY_ROLE_UNRESOLVED"
-	PRV004JurisdictionUnresolved          = "PRV-004: JURISDICTION_UNRESOLVED"
-	PRV005PolicyUnavailable               = "PRV-005: POLICY_UNAVAILABLE"
-	PRV006ConsentRequiredMissing          = "PRV-006: CONSENT_REQUIRED_MISSING"
-	PRV007ConsentWithdrawn                = "PRV-007: CONSENT_WITHDRAWN"
-	PRV008NoticeVersionInvalid            = "PRV-008: NOTICE_VERSION_INVALID"
-	PRV009PurposeIncompatible             = "PRV-009: PURPOSE_INCOMPATIBLE"
-	PRV010DataCategoryRestricted          = "PRV-010: DATA_CATEGORY_RESTRICTED"
-	PRV011MinimizationRequired            = "PRV-011: MINIMIZATION_REQUIRED"
-	PRV012IdentityAssuranceInsufficient   = "PRV-012: IDENTITY_ASSURANCE_INSUFFICIENT"
-	PRV013ThirdPartyReviewRequired        = "PRV-013: THIRD_PARTY_REVIEW_REQUIRED"
-	PRV014RetentionOrHoldBlock            = "PRV-014: RETENTION_OR_HOLD_BLOCK"
-	PRV015TransferNotAuthorized           = "PRV-015: TRANSFER_NOT_AUTHORIZED"
-	PRV016AssessmentRequired              = "PRV-016: ASSESSMENT_REQUIRED"
-	PRV017ProcessorInstructionMissing     = "PRV-017: PROCESSOR_INSTRUCTION_MISSING"
-	PRV018SubprocessorNotApproved         = "PRV-018: SUBPROCESSOR_NOT_APPROVED"
-	PRV019PrivacyContextIndeterminate     = "PRV-019: PRIVACY_CONTEXT_INDETERMINATE"
-	PRV020ImmutableEvidenceConflict       = "PRV-020: IMMUTABLE_EVIDENCE_CONFLICT"
+	PRV001PurposeNotRegistered          = "PRV-001: PURPOSE_NOT_REGISTERED"
+	PRV002ProcessingActivityInactive    = "PRV-002: PROCESSING_ACTIVITY_INACTIVE"
+	PRV003PrivacyRoleUnresolved         = "PRV-003: PRIVACY_ROLE_UNRESOLVED"
+	PRV004JurisdictionUnresolved        = "PRV-004: JURISDICTION_UNRESOLVED"
+	PRV005PolicyUnavailable             = "PRV-005: POLICY_UNAVAILABLE"
+	PRV006ConsentRequiredMissing        = "PRV-006: CONSENT_REQUIRED_MISSING"
+	PRV007ConsentWithdrawn              = "PRV-007: CONSENT_WITHDRAWN"
+	PRV008NoticeVersionInvalid          = "PRV-008: NOTICE_VERSION_INVALID"
+	PRV009PurposeIncompatible           = "PRV-009: PURPOSE_INCOMPATIBLE"
+	PRV010DataCategoryRestricted        = "PRV-010: DATA_CATEGORY_RESTRICTED"
+	PRV011MinimizationRequired          = "PRV-011: MINIMIZATION_REQUIRED"
+	PRV012IdentityAssuranceInsufficient = "PRV-012: IDENTITY_ASSURANCE_INSUFFICIENT"
+	PRV013ThirdPartyReviewRequired      = "PRV-013: THIRD_PARTY_REVIEW_REQUIRED"
+	PRV014RetentionOrHoldBlock          = "PRV-014: RETENTION_OR_HOLD_BLOCK"
+	PRV015TransferNotAuthorized         = "PRV-015: TRANSFER_NOT_AUTHORIZED"
+	PRV016AssessmentRequired            = "PRV-016: ASSESSMENT_REQUIRED"
+	PRV017ProcessorInstructionMissing   = "PRV-017: PROCESSOR_INSTRUCTION_MISSING"
+	PRV018SubprocessorNotApproved       = "PRV-018: SUBPROCESSOR_NOT_APPROVED"
+	PRV019PrivacyContextIndeterminate   = "PRV-019: PRIVACY_CONTEXT_INDETERMINATE"
+	PRV020ImmutableEvidenceConflict     = "PRV-020: IMMUTABLE_EVIDENCE_CONFLICT"
 
 	// Backwards-compatible aliases
 	ReasonActivityNotActive         = PRV002ProcessingActivityInactive
@@ -96,8 +94,8 @@ type DataContext struct {
 	DataCategories   []string `json:"data_categories,omitempty"`
 	DataCategory     string   `json:"data_category,omitempty"`
 	SensitivityFlags []string `json:"sensitivity_flags,omitempty"` // SENSITIVE, SPECIAL_CATEGORY, HEALTH, BIOMETRIC, CHILD_DATA, HIGH_RISK
-	Source           string   `json:"source,omitempty"`           // DIRECT, DERIVED, THIRD_PARTY, PUBLIC
-	Classification   string   `json:"classification,omitempty"`   // PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED, ANONYMOUS
+	Source           string   `json:"source,omitempty"`            // DIRECT, DERIVED, THIRD_PARTY, PUBLIC
+	Classification   string   `json:"classification,omitempty"`    // PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED, ANONYMOUS
 }
 
 // RecipientContext captures §12.1 recipient and destination dimensions.
@@ -125,7 +123,7 @@ type DecisionConstraint struct {
 
 // ConsentCheckRequest is opt-in, or triggered by activity dependency.
 type ConsentCheckRequest struct {
-	Required bool   `json:"required"`
+	Required  bool   `json:"required"`
 	ReceiptID string `json:"receipt_id,omitempty"`
 }
 
@@ -155,11 +153,12 @@ type EvaluateDecisionRequest struct {
 	DeidentificationControlRef string                 `json:"deidentification_control_ref,omitempty"`
 }
 
-// PrivacyDecision is the append-only evidence record for one evaluation — §13.2 "decision durability".
+// PrivacyDecision is the append-only evidence record for one evaluation — §13.2 "decision durability" & §18 canonical contract.
 type PrivacyDecision struct {
 	DecisionID           string               `json:"decision_id"`
 	TenantID             *string              `json:"tenant_id,omitempty"`
 	InputFingerprint     string               `json:"input_fingerprint"`
+	ContextHash          string               `json:"context_hash"` // §18 alias for input_fingerprint
 	SubjectRef           string               `json:"subject_ref"`
 	SubjectContext       *SubjectContext      `json:"subject_context,omitempty"`
 	DataContext          *DataContext         `json:"data_context,omitempty"`
@@ -173,6 +172,9 @@ type PrivacyDecision struct {
 	Result               DecisionResult       `json:"result"`
 	ReasonCodes          []string             `json:"reason_codes"`
 	Constraints          []DecisionConstraint `json:"constraints"`
+	PolicyRefs           []string             `json:"policy_refs"`          // §18
+	EvidenceRef          string               `json:"evidence_ref"`         // §18
+	ExpiresAt            *time.Time           `json:"expires_at,omitempty"` // §18
 	ConsentReceiptID     *string              `json:"consent_receipt_id,omitempty"`
 	NoticeVersionID      *string              `json:"notice_version_id,omitempty"`
 	LegalHoldID          *string              `json:"legal_hold_id,omitempty"`
@@ -186,31 +188,12 @@ type PrivacyDecision struct {
 type IdempotencyRecord struct {
 	Key          string    `json:"idempotency_key"`
 	TenantID     string    `json:"tenant_id"`
+	PrincipalID  string    `json:"principal_id"`
 	Endpoint     string    `json:"endpoint"`
 	RequestHash  string    `json:"request_hash"`
 	ResponseCode int       `json:"response_code"`
 	ResponseBody []byte    `json:"response_body"`
 	CreatedAt    time.Time `json:"created_at"`
-}
-
-// ComputeInputFingerprint generates the SHA-256 context hash of normalized input dimensions (§13.2).
-func ComputeInputFingerprint(req *EvaluateDecisionRequest, tenantID string) string {
-	normalized := map[string]interface{}{
-		"tenant_id":                  tenantID,
-		"subject_ref":                req.SubjectRef,
-		"processing_activity_id":     req.ProcessingActivityID,
-		"purpose_id":                 req.PurposeID,
-		"proposed_operation":         string(req.ProposedOperation),
-		"secondary_purpose_id":       req.SecondaryPurposeID,
-		"proposed_secondary_purpose": req.ProposedSecondaryPurpose,
-		"subject_context":            req.SubjectContext,
-		"data_context":               req.DataContext,
-		"recipient_context":          req.RecipientContext,
-		"deidentification_control":   req.DeidentificationControlRef,
-	}
-	raw, _ := json.Marshal(normalized)
-	hash := sha256.Sum256(raw)
-	return hex.EncodeToString(hash[:])
 }
 
 // MarshalJSONB / UnmarshalJSONB helpers
@@ -263,6 +246,26 @@ func UnmarshalReasonCodes(raw []byte) []string {
 		codes = []string{}
 	}
 	return codes
+}
+
+func MarshalPolicyRefs(refs []string) []byte {
+	if refs == nil {
+		refs = []string{}
+	}
+	raw, _ := json.Marshal(refs)
+	return raw
+}
+
+func UnmarshalPolicyRefs(raw []byte) []string {
+	var refs []string
+	if len(raw) == 0 {
+		return []string{}
+	}
+	_ = json.Unmarshal(raw, &refs)
+	if refs == nil {
+		refs = []string{}
+	}
+	return refs
 }
 
 // ── sentinel errors ──────────────────────────────────────────────────────────
