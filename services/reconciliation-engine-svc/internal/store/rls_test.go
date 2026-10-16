@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,28 +153,87 @@ func (f *fixture) claim(op, resource string) domain.IdempotencyClaim {
 	}
 }
 
+const (
+	entityA = "aaaaaaaa-0000-0000-0000-00000000000a"
+	entityB = "bbbbbbbb-0000-0000-0000-00000000000b"
+)
+
+// testSpecs are the two population sources every fixture definition names.
+func testSpecs() []domain.PopulationSpec {
+	return []domain.PopulationSpec{
+		{Side: "Bank", System: "BANK", Population: "bank-transactions"},
+		{Side: "Ledger", System: "GL", Population: "account-postings", Params: map[string]string{"account_codes": "1100"}},
+	}
+}
+
+func defineRequest(name string, toleranceMinor int64) domain.DefineReconciliationRequest {
+	scale := 2
+	return domain.DefineReconciliationRequest{
+		LegalEntityID: entityA, Name: name, Populations: testSpecs(), MatchKeyFields: []string{"ref_id"},
+		AmountScale: &scale, ToleranceAmountMinorUnits: toleranceMinor, MaterialityAmountMinorUnits: 100000,
+	}
+}
+
 func (f *fixture) defineReconciliation(org, name string, toleranceMinor int64) *domain.ReconciliationDefinition {
 	f.t.Helper()
-	d, err := f.s.DefineReconciliation(f.ctx, org, domain.DefineReconciliationRequest{
-		Name: name, MatchKeyFields: []string{"ref_id"},
-		ToleranceAmountMinorUnits: toleranceMinor, MaterialityAmountMinorUnits: 100000,
-	}, "test-operator")
+	d, err := f.s.DefineReconciliation(f.ctx, org, defineRequest(name, toleranceMinor), "test-operator")
 	if err != nil {
 		f.t.Fatalf("define reconciliation %s: %v", name, err)
 	}
 	return d
 }
 
-func (f *fixture) startRun(org, definitionID string, populations []domain.PopulationInput) *domain.ReconciliationRun {
+// testPop is one side's items as a test writes them; frozen() turns it into
+// what the population client hands StartRun after reading a source.
+type testPop struct {
+	Side         string
+	SourceSystem string
+	Items        []domain.PopulationItemInput
+}
+
+func frozen(p testPop) domain.FrozenPopulation {
+	declared := map[string]string{}
+	sums := map[string]int64{}
+	for _, it := range p.Items {
+		sums[it.Currency] += it.AmountMinorUnits
+	}
+	for c, v := range sums {
+		declared[c] = fmt.Sprintf("%d.%02d", v/100, v%100)
+	}
+	ref := "BANK/bank-transactions"
+	if p.Side == "Ledger" {
+		ref = "GL/account-postings?account_codes=1100"
+	}
+	return domain.FrozenPopulation{Side: p.Side, SourceSystem: p.SourceSystem, SpecRef: ref, Watermark: "wm-" + p.Side,
+		DeclaredRowCount: int64(len(p.Items)), DeclaredTotals: declared, Items: p.Items}
+}
+
+func frozenAll(pops []testPop) []domain.FrozenPopulation {
+	out := make([]domain.FrozenPopulation, len(pops))
+	for i, p := range pops {
+		out[i] = frozen(p)
+	}
+	return out
+}
+
+func (f *fixture) startRunE(org string, def *domain.ReconciliationDefinition, populations []testPop) (*domain.ReconciliationRun, error) {
+	return f.s.StartRun(f.ctx, org, domain.StartRunRequest{DefinitionID: def.DefinitionID, PeriodID: "2026-09"}, def.Version,
+		frozenAll(populations), "test-operator", f.claim("StartRun", def.DefinitionID))
+}
+
+func (f *fixture) startRun(org string, def *domain.ReconciliationDefinition, populations []testPop) *domain.ReconciliationRun {
 	f.t.Helper()
-	r, err := f.s.StartRun(f.ctx, org, domain.StartRunRequest{DefinitionID: definitionID, Populations: populations},
-		"test-operator", f.claim("StartRun", definitionID))
+	r, err := f.startRunE(org, def, populations)
 	if err != nil {
 		f.t.Fatalf("start run: %v", err)
 	}
 	return r
 }
 
+var itemSeq int64
+
 func item(refID string, amountMinor int64) domain.PopulationItemInput {
-	return domain.PopulationItemInput{RefID: refID, AmountMinorUnits: amountMinor, OccurredAt: time.Now().UTC()}
+	n := atomic.AddInt64(&itemSeq, 1)
+	return domain.PopulationItemInput{SourceRecordID: fmt.Sprintf("rec-%06d", n), RefID: refID, AmountMinorUnits: amountMinor,
+		Currency: "USD", OccurredAt: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)}
 }

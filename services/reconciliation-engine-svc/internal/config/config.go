@@ -22,6 +22,11 @@ type Config struct {
 	// MTLSManagementServiceURL is where this service provisions its own
 	// client-side mTLS identity, used only when AuthzMTLSEnabled is true.
 	MTLSManagementServiceURL string
+
+	// SourceEndpoints maps a population source system name to its base URL,
+	// e.g. "general-ledger=http://general-ledger-svc:8098". Only registered
+	// systems can be read; a definition can never supply a URL.
+	SourceEndpoints string
 }
 
 func Load() *Config {
@@ -45,6 +50,7 @@ func Load() *Config {
 		AuthzMTLSEnabled:         authzMTLSEnabled,
 		AuthzMTLSURL:             authzMTLSURL,
 		MTLSManagementServiceURL: mtlsManagementServiceURL,
+		SourceEndpoints:          os.Getenv("SOURCE_ENDPOINTS"),
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"zoiko.io/reconciliation-engine-svc/internal/handler"
 	"zoiko.io/reconciliation-engine-svc/internal/mtls"
 	"zoiko.io/reconciliation-engine-svc/internal/outbox"
+	"zoiko.io/reconciliation-engine-svc/internal/source"
 	"zoiko.io/reconciliation-engine-svc/internal/store"
 	"zoiko.io/reconciliation-engine-svc/internal/telemetry"
 )
@@ -78,14 +79,22 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzURL, logger)
 	}
 
-	h := handler.NewHandler(dataStore, authzClient, logger)
+	endpoints, err := source.ParseEndpoints(cfg.SourceEndpoints)
+	if err != nil {
+		logger.Fatal("invalid SOURCE_ENDPOINTS", zap.Error(err))
+	}
+	if len(endpoints) == 0 {
+		logger.Warn("SOURCE_ENDPOINTS is empty: every StartRun will be refused until population sources are registered")
+	}
+
+	h := handler.NewHandler(dataStore, authzClient, source.NewHTTPFetcher(endpoints, nil), logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      router,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: 4 * time.Minute, // StartRun reads both populations synchronously; see handler.populationReadTimeout
 		IdleTimeout:  60 * time.Second,
 	}
 
