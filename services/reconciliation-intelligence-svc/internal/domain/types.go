@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -102,6 +103,42 @@ type AnalyzeReconciliationRequest struct {
 type ApplyResolutionRequest struct {
 	ResolutionStatus ResolutionStatus `json:"resolution_status"` // APPROVED, REJECTED, EXECUTED
 	ResolutionNotes  string           `json:"resolution_notes"`
+}
+
+var (
+	ErrInvalidResolutionStatus = errors.New("resolution_status must be APPROVED, REJECTED or EXECUTED")
+	ErrResolutionTransition    = errors.New("resolution status transition not allowed")
+)
+
+// resolutionEdges is the human decision path over a recommendation. A decision
+// is never silently overwritten: REJECTED and EXECUTED are final, and EXECUTED
+// (the owning domain acted on the recommendation) is reachable only from an
+// explicit APPROVED, never straight from the machine's RECOMMENDED.
+var resolutionEdges = map[ResolutionStatus][]ResolutionStatus{
+	StatusRecommended: {StatusApproved, StatusRejected},
+	StatusApproved:    {StatusExecuted},
+}
+
+// ValidateResolutionTarget rejects a requested status a caller may not set.
+func ValidateResolutionTarget(to ResolutionStatus) error {
+	switch to {
+	case StatusApproved, StatusRejected, StatusExecuted:
+		return nil
+	}
+	return fmt.Errorf("%w: got %q", ErrInvalidResolutionStatus, to)
+}
+
+// ValidateResolutionTransition checks a decision against the item's current status.
+func ValidateResolutionTransition(from, to ResolutionStatus) error {
+	if err := ValidateResolutionTarget(to); err != nil {
+		return err
+	}
+	for _, allowed := range resolutionEdges[from] {
+		if allowed == to {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s -> %s", ErrResolutionTransition, from, to)
 }
 
 func (r *AnalyzeReconciliationRequest) Validate() error {
@@ -220,20 +257,23 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 				})
 			}
 		} else {
-			// Missing Reference in System B
+			// Missing Reference in System B. The tolerance is a magnitude: a
+			// large credit (negative amount) is as material as a large debit and
+			// must never qualify as a "small amount" write-off.
+			magnitude := math.Abs(txA.Amount)
 			confScore := missingReferenceManualReviewConfidence
 			rec := RecommendationManualReview
 			var rationale string
-			if txA.Amount < missingReferenceTolerance {
+			if magnitude < missingReferenceTolerance {
 				rec = RecommendationWriteOff
 				confScore = missingReferenceWriteOffConfidence
 				rationale = fmt.Sprintf(
-					"heuristic rule: amount $%.2f is below the $%.2f governed small-amount write-off tolerance",
-					txA.Amount, missingReferenceTolerance)
+					"heuristic rule: amount magnitude $%.2f is below the $%.2f governed small-amount write-off tolerance",
+					magnitude, missingReferenceTolerance)
 			} else {
 				rationale = fmt.Sprintf(
-					"heuristic rule: no matching reference in system B; amount $%.2f is at or above the $%.2f governed small-amount tolerance, so manual review is recommended rather than automatic write-off",
-					txA.Amount, missingReferenceTolerance)
+					"heuristic rule: no matching reference in system B; amount magnitude $%.2f is at or above the $%.2f governed small-amount tolerance, so manual review is recommended rather than automatic write-off",
+					magnitude, missingReferenceTolerance)
 			}
 
 			unmatchedItems = append(unmatchedItems, UnmatchedItem{
@@ -242,7 +282,7 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 				TransactionRefA:   txA.RefID,
 				AmountA:           txA.Amount,
 				AmountB:           0.0,
-				DiscrepancyAmount: txA.Amount,
+				DiscrepancyAmount: magnitude,
 				DiscrepancyType:   DiscrepancyMissingReference,
 				ConfidenceScore:   confScore,
 				Recommendation:    rec,

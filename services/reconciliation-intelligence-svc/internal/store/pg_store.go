@@ -299,7 +299,8 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 	queryItem := `
 		SELECT id, tenant_id, job_id, transaction_ref_a, transaction_ref_b, amount_a, amount_b,
 		       discrepancy_amount, discrepancy_type, confidence_score, recommendation, resolution_status, COALESCE(resolution_notes, ''), created_at, updated_at
-		FROM reconciliation_unmatched_items WHERE id = $1 AND job_id = $2`
+		FROM reconciliation_unmatched_items WHERE id = $1 AND job_id = $2
+		FOR UPDATE`
 
 	err = tx.QueryRow(ctx, queryItem, itemID, jobID).Scan(
 		&item.ID, &item.TenantID, &item.JobID, &item.TransactionRefA, &item.TransactionRefB,
@@ -308,6 +309,9 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unmatched item not found: %w", err)
+	}
+	if err := domain.ValidateResolutionTransition(item.ResolutionStatus, status); err != nil {
+		return nil, err
 	}
 
 	// Append rather than overwrite. item.ResolutionNotes at this point still
@@ -451,6 +455,9 @@ func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, item
 
 	for i := range j.UnmatchedItems {
 		if j.UnmatchedItems[i].ID == itemID {
+			if err := domain.ValidateResolutionTransition(j.UnmatchedItems[i].ResolutionStatus, status); err != nil {
+				return nil, err
+			}
 			// Append rather than overwrite — mirrors PgStore exactly. See its
 			// comment: the machine's rationale must survive a human's
 			// empty-note approval.

@@ -190,6 +190,10 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 	if req.ResolutionStatus == "" {
 		req.ResolutionStatus = domain.StatusApproved
 	}
+	if err := domain.ValidateResolutionTarget(req.ResolutionStatus); err != nil {
+		h.respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	job, err := h.store.GetJobByID(r.Context(), tenantID, jobID)
 	if err != nil {
@@ -208,6 +212,10 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 
 	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.ResolutionStatus, req.ResolutionNotes,
 		job.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"))
+	if errors.Is(err, domain.ErrResolutionTransition) {
+		h.respondError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if err != nil {
 		h.respondError(w, http.StatusNotFound, err.Error())
 		return
